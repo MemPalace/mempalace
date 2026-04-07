@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import queue
 import threading
 from datetime import datetime
@@ -117,11 +118,15 @@ class MempalaceProvider:
         identity_path = Path(
             self._config.get("identity_path", "~/.mempalace/identity.txt")
         ).expanduser()
-        self._identity = (
-            identity_path.read_text(encoding="utf-8").strip()
-            if identity_path.exists()
-            else ""
-        )
+        try:
+            self._identity = (
+                identity_path.read_text(encoding="utf-8").strip()
+                if identity_path.exists()
+                else ""
+            )
+        except Exception as exc:
+            logger.warning("MemPalace: could not load identity.txt: %s", exc)
+            self._identity = ""
 
         # Create ChromaDB client once so all callers share a single connection
         import chromadb as _chromadb
@@ -133,10 +138,11 @@ class MempalaceProvider:
         logger.info("MemPalace: ChromaDB client ready (palace=%s)", self._palace_path)
 
         # Start background filing worker
-        self._worker_thread = threading.Thread(
-            target=self._background_worker, daemon=True, name="mempalace-worker"
-        )
-        self._worker_thread.start()
+        if self._worker_thread is None or not self._worker_thread.is_alive():
+            self._worker_thread = threading.Thread(
+                target=self._background_worker, daemon=True, name="mempalace-worker"
+            )
+            self._worker_thread.start()
 
         self._initialized = True
         logger.info("MemPalace: initialized (palace=%s)", self._palace_path)
@@ -164,15 +170,16 @@ class MempalaceProvider:
             from mempalace.searcher import search_memories
 
             n = int(self._config.get("n_prefetch", 3))
-            results = search_memories(query, palace_path=self._palace_path, n_results=n)
-            if not results:
+            result = search_memories(query, palace_path=self._palace_path, n_results=n)
+            hits = result.get("results", [])
+            if not hits:
                 return ""
             lines = ["## MemPalace — relevant context"]
-            for r in results:
+            for r in hits:
                 wing = r.get("wing", "")
                 room = r.get("room", "")
                 tag = f"[{wing}/{room}] " if wing else ""
-                lines.append(f"{tag}{r.get('document', '').strip()}")
+                lines.append(f"{tag}{r.get('text', '').strip()}")
             return "\n\n".join(lines)
         except Exception as exc:
             logger.debug("MemPalace prefetch error: %s", exc)
@@ -181,11 +188,11 @@ class MempalaceProvider:
     def sync_turn(self, turn: dict) -> None:
         """File an exchange to the palace (non-blocking — queued to background thread)."""
         if turn:
-            self._worker_queue.put(("file_turn", turn))
+            self._worker_queue.put(("file_turn", dict(turn)))
 
     def on_session_end(self, session: dict) -> None:
         """Mine the full session and regenerate AAAK critical-facts layer."""
-        self._worker_queue.put(("session_end", session))
+        self._worker_queue.put(("session_end", dict(session)))
         # Refresh wake-up cache for next session (background — non-blocking)
         threading.Thread(
             target=self._refresh_wake_up_cache, daemon=True, name="mempalace-wakeup"
@@ -194,7 +201,7 @@ class MempalaceProvider:
     def on_pre_compress(self, messages: list[dict]) -> list[dict]:
         """Extract key exchanges before Hermes compresses context."""
         try:
-            self._worker_queue.put(("pre_compress", messages))
+            self._worker_queue.put(("pre_compress", list(messages)))
         except Exception as exc:
             logger.debug("MemPalace pre-compress error: %s", exc)
         return messages
@@ -312,14 +319,18 @@ class MempalaceProvider:
         try:
             from mempalace.searcher import search_memories
 
-            results = search_memories(
+            n_results = max(1, min(int(n_results or 5), 50))
+            data = search_memories(
                 query,
                 palace_path=self._palace_path,
                 wing=wing,
                 room=room,
                 n_results=n_results,
             )
-            return {"results": results, "count": len(results)}
+            if "error" in data:
+                return data
+            hits = data.get("results", [])
+            return {"results": hits, "count": len(hits)}
         except Exception as exc:
             return {"error": str(exc)}
 
@@ -374,8 +385,9 @@ class MempalaceProvider:
         try:
             from mempalace.knowledge_graph import KnowledgeGraph
 
-            kg = KnowledgeGraph(palace_path=self._palace_path)
-            results = kg.query(entity, since=since)
+            db_path = str(Path(self._palace_path).parent / "knowledge_graph.sqlite3")
+            kg = KnowledgeGraph(db_path=db_path)
+            results = kg.query_entity(entity, as_of=since)
             return {"entity": entity, "relations": results}
         except Exception as exc:
             return {"error": str(exc)}
@@ -384,8 +396,9 @@ class MempalaceProvider:
         try:
             from mempalace.knowledge_graph import KnowledgeGraph
 
-            kg = KnowledgeGraph(palace_path=self._palace_path)
-            kg.add(subject=subject, predicate=predicate, object=object)
+            db_path = str(Path(self._palace_path).parent / "knowledge_graph.sqlite3")
+            kg = KnowledgeGraph(db_path=db_path)
+            kg.add_triple(subject=subject, predicate=predicate, obj=object)
             return {"status": "ok", "triple": [subject, predicate, object]}
         except Exception as exc:
             return {"error": str(exc)}
@@ -399,17 +412,26 @@ class MempalaceProvider:
             }
             with open(diary_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
             return {"status": "ok"}
         except Exception as exc:
             return {"error": str(exc)}
 
     def _tool_diary_read(self, n: int = 10) -> dict:
         try:
+            if n <= 0:
+                return {"entries": []}
             diary_path = Path(self._palace_path).parent / "diary.jsonl"
             if not diary_path.exists():
                 return {"entries": []}
             lines = diary_path.read_text(encoding="utf-8").strip().splitlines()
-            recent = [json.loads(line) for line in lines[-n:]]
+            recent = []
+            for raw_line in lines[-n:]:
+                try:
+                    recent.append(json.loads(raw_line))
+                except json.JSONDecodeError:
+                    logger.debug("MemPalace: skipping malformed diary line")
             return {"entries": recent}
         except Exception as exc:
             return {"error": str(exc)}
@@ -495,12 +517,10 @@ class MempalaceProvider:
         """Mine a full session dict into the palace at session end."""
         try:
             messages = session.get("messages", [])
-            for msg in messages:
+            for idx, msg in enumerate(messages):
                 role = msg.get("role", "")
                 content = msg.get("content", "")
                 if role == "user" and content:
-                    # Pair with the next assistant message if available
-                    idx = messages.index(msg)
                     assistant_content = ""
                     if idx + 1 < len(messages) and messages[idx + 1].get("role") == "assistant":
                         assistant_content = messages[idx + 1].get("content", "")
@@ -513,21 +533,23 @@ class MempalaceProvider:
         while True:
             try:
                 task, payload = self._worker_queue.get(timeout=5)
-                if task == "file_turn":
-                    self._file_turn(payload)
-                elif task == "session_end":
-                    self._mine_session(payload)
-                elif task == "pre_compress":
-                    # File key exchanges before compression
-                    for msg in payload or []:
-                        if msg.get("role") == "user":
-                            self._file_turn(
-                                {
-                                    "user": msg.get("content", ""),
-                                    "assistant": "",
-                                }
-                            )
-                self._worker_queue.task_done()
+                try:
+                    if task == "file_turn":
+                        self._file_turn(payload)
+                    elif task == "session_end":
+                        self._mine_session(payload)
+                    elif task == "pre_compress":
+                        # File key exchanges before compression
+                        for msg in payload or []:
+                            if msg.get("role") == "user":
+                                self._file_turn(
+                                    {
+                                        "user": msg.get("content", ""),
+                                        "assistant": "",
+                                    }
+                                )
+                finally:
+                    self._worker_queue.task_done()
             except queue.Empty:
                 continue
             except Exception as exc:
