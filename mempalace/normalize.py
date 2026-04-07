@@ -172,10 +172,17 @@ def normalize(filepath: str) -> str:
     if sum(1 for line in lines if line.strip().startswith(">")) >= 3:
         return content
 
+    ext = Path(filepath).suffix.lower()
+
+    # Try Aider markdown normalization
+    if ext == ".md" and sum(1 for line in lines if line.startswith("#### ")) >= 2:
+        normalized = _try_aider_md(content)
+        if normalized:
+            return normalized
+
     # Try JSON normalization. strip_noise is applied inside the Claude Code
     # JSONL parser (the only format that injects system tags/hook chrome);
     # other formats pass through verbatim.
-    ext = Path(filepath).suffix.lower()
     if ext in (".json", ".jsonl") or content.strip()[:1] in ("{", "["):
         normalized = _try_normalize_json(content)
         if normalized:
@@ -220,6 +227,38 @@ def normalize_conversations(filepath: str) -> list:
             return split
 
     return [content]
+
+
+def _try_aider_md(content: str) -> Optional[str]:
+    """Aider chat history markdown (.aider.chat.history.md)."""
+    lines = content.split("\n")
+    messages = []
+    current_user = None
+    assistant_lines = []
+
+    for line in lines:
+        if line.startswith("#### "):
+            if current_user:
+                messages.append(("user", current_user))
+                assistant_text = "\n".join(assistant_lines).strip()
+                if assistant_text:
+                    messages.append(("assistant", assistant_text))
+            current_user = line[5:].strip()
+            assistant_lines = []
+            continue
+
+        if current_user is not None:
+            assistant_lines.append(line)
+
+    if current_user:
+        messages.append(("user", current_user))
+        assistant_text = "\n".join(assistant_lines).strip()
+        if assistant_text:
+            messages.append(("assistant", assistant_text))
+
+    if len(messages) >= 2:
+        return _messages_to_transcript(messages)
+    return None
 
 
 def _try_normalize_json(content: str) -> Optional[str]:
