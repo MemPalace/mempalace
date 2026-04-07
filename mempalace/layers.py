@@ -439,7 +439,9 @@ class MemoryStack:
 
         # Parse the L2 output to get individual drawer lines
         lines = raw.split("\n")
-        content_lines = [line.strip() for line in lines if line.strip() and not line.startswith("## ")]
+        content_lines = [
+            line.strip() for line in lines if line.strip() and not line.startswith("## ")
+        ]
 
         # Deduplicate: skip lines with >70% overlap with already-seen content
         seen = []
