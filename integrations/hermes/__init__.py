@@ -19,10 +19,8 @@ import json
 import logging
 import queue
 import threading
-import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 logger = logging.getLogger("mempalace.hermes")
 
@@ -411,7 +409,7 @@ class MempalaceProvider:
             if not diary_path.exists():
                 return {"entries": []}
             lines = diary_path.read_text(encoding="utf-8").strip().splitlines()
-            recent = [json.loads(l) for l in lines[-n:]]
+            recent = [json.loads(line) for line in lines[-n:]]
             return {"entries": recent}
         except Exception as exc:
             return {"error": str(exc)}
