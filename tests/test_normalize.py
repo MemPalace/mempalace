@@ -78,6 +78,23 @@ def test_normalize_json_content_detected_by_brace(tmp_path):
     assert "Hey" in result
 
 
+def test_aider_md(tmp_path):
+    """Aider chat history markdown is normalized into > question / answer pairs."""
+    content = (
+        "#### How do I add a new route?\n\n"
+        "You can add a new route by creating a file in the `routes/` directory.\n\n"
+        "#### Can you also add tests for it?\n\n"
+        "Sure, here's a test file.\n"
+    )
+    f = tmp_path / "session.aider.chat.history.md"
+    f.write_text(content)
+    result = normalize(str(f))
+    assert "How do I add a new route?" in result
+    assert "You can add a new route" in result
+    assert "Can you also add tests for it?" in result
+    assert "Sure, here's a test file." in result
+
+
 def test_normalize_whitespace_only(tmp_path):
     f = tmp_path / "ws.txt"
     f.write_text("   \n  \n  ")
