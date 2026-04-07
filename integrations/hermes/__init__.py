@@ -53,6 +53,10 @@ class MempalaceProvider:
         self._worker_queue: queue.Queue = queue.Queue()
         self._worker_thread: threading.Thread | None = None
         self._initialized = False
+        # ChromaDB client cached here so all callers share one connection
+        self._chroma_client = None
+        self._chroma_collection = None
+        self._chroma_lock = threading.Lock()
 
     # --------------------------------------------------------- provider hooks
 
@@ -121,8 +125,14 @@ class MempalaceProvider:
             else ""
         )
 
-        # Warm up wake-up cache (non-blocking — best effort)
-        self._wake_up_cache = self._generate_wake_up()
+        # Create ChromaDB client once so all callers share a single connection
+        import chromadb as _chromadb
+
+        self._chroma_client = _chromadb.PersistentClient(path=self._palace_path)
+        self._chroma_collection = self._chroma_client.get_or_create_collection(
+            "mempalace_drawers"
+        )
+        logger.info("MemPalace: ChromaDB client ready (palace=%s)", self._palace_path)
 
         # Start background filing worker
         self._worker_thread = threading.Thread(
@@ -132,6 +142,11 @@ class MempalaceProvider:
 
         self._initialized = True
         logger.info("MemPalace: initialized (palace=%s)", self._palace_path)
+
+        # Warm up wake-up cache in background — avoids blocking initialize()
+        threading.Thread(
+            target=self._refresh_wake_up_cache, daemon=True, name="mempalace-wakeup"
+        ).start()
 
     def system_prompt_block(self) -> str:
         """Inject identity + AAAK wake-up at session start."""
@@ -173,8 +188,10 @@ class MempalaceProvider:
     def on_session_end(self, session: dict) -> None:
         """Mine the full session and regenerate AAAK critical-facts layer."""
         self._worker_queue.put(("session_end", session))
-        # Refresh wake-up cache for next session
-        self._wake_up_cache = self._generate_wake_up()
+        # Refresh wake-up cache for next session (background — non-blocking)
+        threading.Thread(
+            target=self._refresh_wake_up_cache, daemon=True, name="mempalace-wakeup"
+        ).start()
 
     def on_pre_compress(self, messages: list[dict]) -> list[dict]:
         """Extract key exchanges before Hermes compresses context."""
@@ -310,10 +327,9 @@ class MempalaceProvider:
 
     def _tool_status(self) -> dict:
         try:
-            import chromadb
-
-            client = chromadb.PersistentClient(path=self._palace_path)
-            col = client.get_collection("mempalace_drawers")
+            col = self._get_collection()
+            if col is None:
+                return {"error": "MemPalace not initialized"}
             count = col.count()
             metas = col.get(include=["metadatas"])["metadatas"]
             wings: dict[str, int] = {}
@@ -330,10 +346,9 @@ class MempalaceProvider:
 
     def _tool_list_wings(self) -> dict:
         try:
-            import chromadb
-
-            client = chromadb.PersistentClient(path=self._palace_path)
-            col = client.get_collection("mempalace_drawers")
+            col = self._get_collection()
+            if col is None:
+                return {"error": "MemPalace not initialized"}
             metas = col.get(include=["metadatas"])["metadatas"]
             wings: dict[str, int] = {}
             for m in metas:
@@ -345,10 +360,9 @@ class MempalaceProvider:
 
     def _tool_list_rooms(self, wing: str) -> dict:
         try:
-            import chromadb
-
-            client = chromadb.PersistentClient(path=self._palace_path)
-            col = client.get_collection("mempalace_drawers")
+            col = self._get_collection()
+            if col is None:
+                return {"error": "MemPalace not initialized"}
             metas = col.get(where={"wing": wing}, include=["metadatas"])["metadatas"]
             rooms: dict[str, int] = {}
             for m in metas:
@@ -404,6 +418,18 @@ class MempalaceProvider:
 
     # -------------------------------------------------------- internal helpers
 
+    def _get_collection(self):
+        """Return the cached ChromaDB collection, or None if not yet initialized."""
+        with self._chroma_lock:
+            return self._chroma_collection
+
+    def _refresh_wake_up_cache(self) -> None:
+        """Regenerate AAAK wake-up context and store in cache (safe to run in thread)."""
+        try:
+            self._wake_up_cache = self._generate_wake_up()
+        except Exception as exc:
+            logger.debug("MemPalace wake-up refresh error: %s", exc)
+
     def _generate_wake_up(self) -> str:
         """Generate AAAK wake-up context from the palace (L1 layer)."""
         try:
@@ -435,12 +461,15 @@ class MempalaceProvider:
     def _file_turn(self, turn: dict) -> None:
         """Write a single turn exchange to the palace."""
         try:
-            import chromadb
             import hashlib
 
             user_msg = turn.get("user", "")
             assistant_msg = turn.get("assistant", "")
             if not user_msg and not assistant_msg:
+                return
+
+            col = self._get_collection()
+            if col is None:
                 return
 
             text = f"User: {user_msg}\n\nAssistant: {assistant_msg}".strip()
@@ -449,8 +478,6 @@ class MempalaceProvider:
             ts = datetime.utcnow().isoformat()
             doc_id = hashlib.sha256(f"{ts}:{text[:120]}".encode()).hexdigest()[:16]
 
-            client = chromadb.PersistentClient(path=self._palace_path)
-            col = client.get_or_create_collection("mempalace_drawers")
             col.upsert(
                 ids=[doc_id],
                 documents=[text],
