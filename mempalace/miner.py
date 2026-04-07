@@ -280,6 +280,28 @@ def is_force_included(path: Path, project_path: Path, include_paths: set) -> boo
     return False
 
 
+def is_excluded(path: Path, project_path: Path, exclude_paths: set) -> bool:
+    """Return True when a path matches any exclude pattern."""
+    if not exclude_paths:
+        return False
+
+    try:
+        relative = path.relative_to(project_path).as_posix().strip("/")
+    except ValueError:
+        return False
+
+    if not relative:
+        return False
+
+    for excl in exclude_paths:
+        if relative == excl:
+            return True
+        if relative.startswith(f"{excl}/"):
+            return True
+
+    return False
+
+
 # =============================================================================
 # CONFIG
 # =============================================================================
@@ -936,6 +958,7 @@ def scan_project(
     project_dir: str,
     respect_gitignore: bool = True,
     include_ignored: list = None,
+    exclude_paths: list = None,
 ) -> list:
     """Return list of all readable file paths."""
     project_path = Path(project_dir).expanduser().resolve()
@@ -943,6 +966,7 @@ def scan_project(
     active_matchers = []
     matcher_cache = {}
     include_paths = normalize_include_paths(include_ignored)
+    exclude_set = normalize_include_paths(exclude_paths)
 
     for root, dirs, filenames in os.walk(project_path):
         root_path = Path(root)
@@ -970,6 +994,13 @@ def scan_project(
                 if is_force_included(root_path / d, project_path, include_paths)
                 or not is_gitignored(root_path / d, active_matchers, is_dir=True)
             ]
+        if exclude_set:
+            dirs[:] = [
+                d
+                for d in dirs
+                if is_force_included(root_path / d, project_path, include_paths)
+                or not is_excluded(root_path / d, project_path, exclude_set)
+            ]
 
         for filename in filenames:
             filepath = root_path / filename
@@ -982,6 +1013,9 @@ def scan_project(
                 continue
             if respect_gitignore and active_matchers and not force_include:
                 if is_gitignored(filepath, active_matchers, is_dir=False):
+                    continue
+            if exclude_set and not force_include:
+                if is_excluded(filepath, project_path, exclude_set):
                     continue
             # Skip symlinks — prevents following links to /dev/urandom, etc.
             if filepath.is_symlink():
@@ -1010,6 +1044,7 @@ def mine(
     dry_run: bool = False,
     respect_gitignore: bool = True,
     include_ignored: list = None,
+    exclude_paths: list = None,
     files: list = None,
 ):
     """Mine a project directory into the palace.
@@ -1068,11 +1103,16 @@ def _mine_impl(
     wing = wing_override or config["wing"]
     rooms = config.get("rooms", [{"name": "general", "description": "All project files"}])
 
+    # Merge CLI excludes with config excludes
+    config_excludes = config.get("exclude", [])
+    all_excludes = list(set((exclude_paths or []) + config_excludes))
+
     if files is None:
         files = scan_project(
             project_dir,
             respect_gitignore=respect_gitignore,
             include_ignored=include_ignored,
+            exclude_paths=all_excludes,
         )
     if limit > 0:
         files = files[:limit]
@@ -1093,6 +1133,8 @@ def _mine_impl(
         print("  .gitignore: DISABLED")
     if include_ignored:
         print(f"  Include: {', '.join(sorted(normalize_include_paths(include_ignored)))}")
+    if all_excludes:
+        print(f"  Exclude: {', '.join(sorted(all_excludes))}")
     print(f"{'-' * 55}\n")
 
     if not dry_run:

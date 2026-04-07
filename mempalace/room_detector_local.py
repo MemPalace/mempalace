@@ -279,7 +279,19 @@ def get_user_approval(rooms: list) -> list:
     return rooms
 
 
-def save_config(project_dir: str, project_name: str, rooms: list):
+def get_exclude_paths() -> list:
+    """Prompt user for paths to exclude from mining."""
+    print("\n  Exclude folders from mining?")
+    print("  These paths will be skipped in addition to .gitignore and built-in skips.")
+    print("  You can also add/edit these later in mempalace.yaml under 'exclude:'.")
+    print("  Example: dist, vendor, tmp, generated")
+    raw = input("\n  Paths to exclude (comma-separated, or enter to skip): ").strip()
+    if not raw:
+        return []
+    return [p.strip().strip("/") for p in raw.split(",") if p.strip()]
+
+
+def save_config(project_dir: str, project_name: str, rooms: list, exclude: list = None):
     config = {
         "wing": project_name,
         "rooms": [
@@ -291,11 +303,15 @@ def save_config(project_dir: str, project_name: str, rooms: list):
             for r in rooms
         ],
     }
+    if exclude:
+        config["exclude"] = exclude
     config_path = Path(project_dir).expanduser().resolve() / "mempalace.yaml"
     with open(config_path, "w") as f:
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
     print(f"\n  Config saved: {config_path}")
+    if exclude:
+        print(f"  Excluded: {', '.join(exclude)}")
     print("\n  Next step:")
     print(f"    mempalace mine {project_dir}")
     print(f"\n{'=' * 55}\n")
@@ -334,6 +350,8 @@ def detect_rooms_local(project_dir: str, yes: bool = False):
     print_proposed_structure(project_name, rooms, len(files), source)
     if yes:
         approved_rooms = rooms
+        exclude = []
     else:
         approved_rooms = get_user_approval(rooms)
-    save_config(project_dir, project_name, approved_rooms)
+        exclude = get_exclude_paths()
+    save_config(project_dir, project_name, approved_rooms, exclude=exclude)
