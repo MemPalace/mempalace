@@ -17,6 +17,7 @@ from mempalace.backends import BackendMismatchError
 from mempalace.searcher import (
     SearchError,
     _result_drawer_id,
+    brief,
     build_where_filter,
     get_collection,
     search,
@@ -189,6 +190,12 @@ class TestSearchMemories:
             result = search_memories("test", "/fake/path")
         hit = result["results"][0]
         assert hit["created_at"] == "unknown"
+
+    def test_brief(self, palace_path, seeded_collection):
+        """Brief returns a deduplicated overview."""
+        result = brief(palace_path=palace_path)
+        assert "Brief" in result
+        assert "topics" in result
 
     def test_search_memories_query_error(self):
         """search_memories returns error dict when query raises."""
