@@ -150,10 +150,17 @@ SKIP_FILENAMES = {
     "mempal.yaml",
     "mempal.yml",
     ".gitignore",
+    ".mempalace-ignore",
     "package-lock.json",
     "pnpm-lock.yaml",
     "yarn.lock",
 }
+
+# Per-directory mempalace-specific ignore file. Same syntax as .gitignore but
+# honoured independently so users can exclude files from mining without
+# touching their project's git config, and it still applies when
+# --no-gitignore is passed.
+MEMPALACE_IGNORE_FILENAME = ".mempalace-ignore"
 
 # Re-export the shared defaults from ``config`` so legacy callers that
 # import ``CHUNK_SIZE`` / ``CHUNK_OVERLAP`` / ``MIN_CHUNK_SIZE`` from
@@ -238,7 +245,7 @@ def _resolve_max_chunks_per_file(override: Optional[int] = None) -> int:
 
 
 class GitignoreMatcher:
-    """Lightweight matcher for one directory's .gitignore patterns."""
+    """Lightweight matcher for one directory's gitignore-style ignore file."""
 
     def __init__(self, base_dir: Path, rules: list):
         self.base_dir = base_dir
@@ -288,8 +295,8 @@ class GitignoreMatcher:
         return rules
 
     @classmethod
-    def from_dir(cls, dir_path: Path):
-        gitignore_path = dir_path / ".gitignore"
+    def from_dir(cls, dir_path: Path, filename: str = ".gitignore"):
+        gitignore_path = dir_path / filename
         if not gitignore_path.is_file():
             return None
 
@@ -383,15 +390,16 @@ class GitignoreMatcher:
         return matches(0, 0)
 
 
-def load_gitignore_matcher(dir_path: Path, cache: dict):
-    """Load and cache one directory's .gitignore matcher."""
-    if dir_path not in cache:
-        cache[dir_path] = GitignoreMatcher.from_dir(dir_path)
-    return cache[dir_path]
+def load_gitignore_matcher(dir_path: Path, cache: dict, filename: str = ".gitignore"):
+    """Load and cache a gitignore-style matcher for ``filename`` in ``dir_path``."""
+    key = (dir_path, filename)
+    if key not in cache:
+        cache[key] = GitignoreMatcher.from_dir(dir_path, filename=filename)
+    return cache[key]
 
 
 def is_gitignored(path: Path, matchers: list, is_dir: bool = False) -> bool:
-    """Apply active .gitignore matchers in ancestor order; last match wins."""
+    """Apply active ignore matchers in ancestor order; last match wins."""
     ignored = False
     for matcher in matchers:
         decision = matcher.matches(path, is_dir=is_dir)
@@ -1642,15 +1650,26 @@ def scan_project(
     for root, dirs, filenames in os.walk(project_path):
         root_path = Path(root)
 
+        # Drop matchers whose base directory is no longer an ancestor of us.
+        active_matchers = [
+            matcher
+            for matcher in active_matchers
+            if root_path == matcher.base_dir or matcher.base_dir in root_path.parents
+        ]
+
+        # Load .gitignore for this directory (skipped when the caller opted out).
         if respect_gitignore:
-            active_matchers = [
-                matcher
-                for matcher in active_matchers
-                if root_path == matcher.base_dir or matcher.base_dir in root_path.parents
-            ]
-            current_matcher = load_gitignore_matcher(root_path, matcher_cache)
-            if current_matcher is not None:
-                active_matchers.append(current_matcher)
+            gitignore_matcher = load_gitignore_matcher(root_path, matcher_cache, ".gitignore")
+            if gitignore_matcher is not None:
+                active_matchers.append(gitignore_matcher)
+
+        # .mempalace-ignore is always honoured, even when --no-gitignore is set,
+        # so users can exclude files from mining without touching git config.
+        mempalace_ignore_matcher = load_gitignore_matcher(
+            root_path, matcher_cache, MEMPALACE_IGNORE_FILENAME
+        )
+        if mempalace_ignore_matcher is not None:
+            active_matchers.append(mempalace_ignore_matcher)
 
         dirs[:] = [
             d
@@ -1658,7 +1677,7 @@ def scan_project(
             if is_force_included(root_path / d, project_path, include_paths)
             or not should_skip_dir(d)
         ]
-        if respect_gitignore and active_matchers:
+        if active_matchers:
             dirs[:] = [
                 d
                 for d in dirs
@@ -1682,7 +1701,7 @@ def scan_project(
                 continue
             if filepath.suffix.lower() not in READABLE_EXTENSIONS and not exact_force_include:
                 continue
-            if respect_gitignore and active_matchers and not force_include:
+            if active_matchers and not force_include:
                 if is_gitignored(filepath, active_matchers, is_dir=False):
                     continue
             # Skip files matching project-level exclude_patterns (mempalace.yaml).
