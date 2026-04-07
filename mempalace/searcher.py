@@ -1915,6 +1915,14 @@ def search_memories(
     )
 
 
+def brief(palace_path: str, wing: str = None, room: str = None):
+    """Brief overview of a wing/room - deduplicated top drawers."""
+    from mempalace.layers import MemoryStack
+
+    stack = MemoryStack(palace_path=palace_path)
+    return stack.brief(wing=wing, room=room)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Virtual line numbering — read-time grid for drawers (3.3.6).
 #

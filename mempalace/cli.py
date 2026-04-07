@@ -1331,6 +1331,14 @@ def cmd_search(args):
         sys.exit(1)
 
 
+def cmd_brief(args):
+    from .searcher import brief
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    result = brief(palace_path=palace_path, wing=args.wing, room=args.room)
+    print(result)
+
+
 def cmd_wakeup(args):
     """Show L0 (identity) + L1 (essential story) — the wake-up context."""
     from .layers import MemoryStack
@@ -2702,6 +2710,11 @@ def main():
         help="Only drawers filed strictly before this ISO date/datetime (exclusive)",
     )
 
+    p_brief = sub.add_parser("brief", help="Condensed overview of a wing or room")
+    p_brief.add_argument("--wing", default=None, help="Wing to summarize")
+    p_brief.add_argument("--room", default=None, help="Room to summarize")
+    p_brief.add_argument("--palace", default=None, help="Palace path")
+
     # compress
     p_compress = sub.add_parser(
         "compress", help="Compress drawers using AAAK Dialect (~30x reduction)"
@@ -3165,6 +3178,7 @@ def main():
         "search": cmd_search,
         "sweep": cmd_sweep,
         "sync": cmd_sync,
+        "brief": cmd_brief,
         "mcp": cmd_mcp,
         "serve": cmd_serve,
         "compress": cmd_compress,
