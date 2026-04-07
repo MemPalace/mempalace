@@ -163,6 +163,18 @@ Discoverable at runtime via `mempalace_list_agents` — no bloat in your
 system prompt:
 [mempalaceofficial.com/concepts/agents](https://mempalaceofficial.com/concepts/agents.html).
 
+## Hermes integration
+
+MemPalace plugs into [Hermes](https://github.com/NousResearch/hermes-agent)
+as a native memory provider:
+
+```bash
+pip install mempalace
+mempalace hermes install
+```
+
+See [`integrations/hermes/`](integrations/hermes/) for details.
+
 ## Auto-save hooks
 
 Two Claude Code hooks save periodically and before context compression:

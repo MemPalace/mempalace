@@ -1024,6 +1024,146 @@ def cmd_mcp(args):
         print(f"  {base_server_cmd} --palace /path/to/palace")
 
 
+def cmd_hermes_install(args):
+    """Install the MemPalace memory provider plugin into a Hermes agent."""
+    import shutil
+
+    # 1. Find Hermes installation
+    hermes_home = None
+    if args.hermes_home:
+        hermes_home = Path(args.hermes_home).expanduser()
+    elif os.environ.get("HERMES_HOME"):
+        hermes_home = Path(os.environ["HERMES_HOME"]).expanduser()
+    else:
+        hermes_home = Path("~/.hermes").expanduser()
+
+    agent_dir = hermes_home / "hermes-agent"
+    if not agent_dir.exists():
+        print(f"Error: Hermes agent directory not found: {agent_dir}")
+        print("Is Hermes installed? Expected: ~/.hermes/hermes-agent/")
+        sys.exit(1)
+
+    # 2. Find Hermes venv
+    venv_python = agent_dir / "venv" / "bin" / "python3"
+    if not venv_python.exists():
+        print("Could not find Hermes venv. Is Hermes installed?")
+        print(f"Expected: {venv_python}")
+        sys.exit(1)
+
+    # 3. Install mempalace in Hermes venv (if not already)
+    print("Installing mempalace in Hermes venv...")
+    ret = os.system(f"{venv_python} -m pip install mempalace --quiet")
+    if ret != 0:
+        print("Warning: pip install returned non-zero. Continuing anyway.")
+
+    # 4. Copy plugin files
+    plugin_dir = agent_dir / "plugins" / "memory" / "mempalace"
+    plugin_dir.mkdir(parents=True, exist_ok=True)
+
+    # Find the integration source files
+    integration_dir = Path(__file__).parent.parent / "integrations" / "hermes"
+    if not integration_dir.exists():
+        # Fall back to installed package data
+        import mempalace as _mp_pkg
+        integration_dir = Path(_mp_pkg.__file__).parent.parent / "integrations" / "hermes"
+
+    for fname in ("__init__.py", "backfill.py"):
+        src = integration_dir / fname
+        dst = plugin_dir / fname
+        if src.exists():
+            shutil.copy2(src, dst)
+            print(f"  Copied {fname} -> {dst}")
+        else:
+            print(f"  Warning: source file not found: {src}")
+
+    # 5. Update Hermes config.yaml
+    config_yaml = hermes_home / "config.yaml"
+    config_updated = False
+    if config_yaml.exists():
+        try:
+            content = config_yaml.read_text(encoding="utf-8")
+            lines = content.splitlines()
+            in_memory = False
+            provider_found = False
+            new_lines = []
+            for line in lines:
+                stripped = line.strip()
+                if stripped == "memory:" or stripped.startswith("memory:"):
+                    in_memory = True
+                    new_lines.append(line)
+                    continue
+                if in_memory and stripped.startswith("provider:"):
+                    new_lines.append(line.replace(stripped, "provider: mempalace"))
+                    provider_found = True
+                    in_memory = False
+                    config_updated = True
+                    continue
+                if in_memory and stripped and not stripped.startswith("#") and ":" not in stripped:
+                    in_memory = False
+                if in_memory and stripped and not stripped.startswith("provider") and ":" in stripped and not stripped.startswith("#"):
+                    # We're still in memory section, next key — insert provider before it
+                    new_lines.append("  provider: mempalace")
+                    provider_found = True
+                    in_memory = False
+                    config_updated = True
+                new_lines.append(line)
+
+            if not provider_found:
+                # Append memory section
+                new_lines.append("memory:")
+                new_lines.append("  provider: mempalace")
+                config_updated = True
+
+            config_yaml.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+        except Exception as exc:
+            print(f"Warning: could not update config.yaml: {exc}")
+    else:
+        print(f"Warning: config.yaml not found at {config_yaml} — skipping")
+
+    # 6. Check palace initialized
+    palace_path = Path("~/.mempalace/palace").expanduser()
+    if not palace_path.exists():
+        print("\nPalace not initialized. Run: mempalace init <your-project-dir>")
+
+    # 7. Optionally backfill
+    if not args.skip_backfill:
+        if args.yes:
+            do_backfill = True
+        else:
+            answer = input("\nMine existing Hermes sessions into your palace? [y/N] ").strip().lower()
+            do_backfill = answer in ("y", "yes")
+
+        sessions_mined = 0
+        if do_backfill:
+            try:
+                sys.path.insert(0, str(agent_dir))
+                from plugins.memory.mempalace.backfill import backfill
+                sessions_dir = hermes_home / "sessions"
+                sessions_mined = backfill(
+                    sessions_dir=sessions_dir,
+                    palace_path=str(palace_path),
+                )
+            except Exception as exc:
+                print(f"Backfill error: {exc}")
+    else:
+        do_backfill = False
+        sessions_mined = 0
+
+    # 8. Print success summary
+    print("\n✓ MemPalace provider installed in Hermes")
+    if config_updated:
+        print("✓ config.yaml updated: memory.provider = mempalace")
+    if do_backfill:
+        print(f"✓ {sessions_mined} sessions mined into palace")
+    else:
+        print("  Backfill skipped")
+    print()
+    print("Next steps:")
+    print("  1. Run: mempalace init ~/your-project  (if you haven't already)")
+    print("  2. Restart Hermes: hermes gateway start")
+    print("  3. Your AI will now remember everything across sessions.")
+
+
 def cmd_compress(args):
     """Compress drawers in a wing using AAAK Dialect."""
     from .dialect import Dialect
@@ -1577,6 +1717,31 @@ def main():
 
     sub.add_parser("status", help="Show what's been filed")
 
+    # hermes
+    p_hermes = sub.add_parser("hermes", help="Hermes agent integration commands")
+    hermes_sub = p_hermes.add_subparsers(dest="hermes_command")
+
+    p_hermes_install = hermes_sub.add_parser(
+        "install",
+        help="Install the MemPalace memory provider plugin into your Hermes agent",
+    )
+    p_hermes_install.add_argument(
+        "--hermes-home",
+        default=None,
+        metavar="PATH",
+        help="Path to Hermes home directory [default: ~/.hermes]",
+    )
+    p_hermes_install.add_argument(
+        "--skip-backfill",
+        action="store_true",
+        help="Skip mining existing Hermes sessions into the palace",
+    )
+    p_hermes_install.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip all confirmation prompts",
+    )
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1598,6 +1763,14 @@ def main():
             return
         args.name = name
         cmd_instructions(args)
+        return
+
+    if args.command == "hermes":
+        if not getattr(args, "hermes_command", None):
+            p_hermes.print_help()
+            return
+        if args.hermes_command == "install":
+            cmd_hermes_install(args)
         return
 
     dispatch = {
