@@ -86,7 +86,8 @@ def test_aider_md(tmp_path):
         "#### Can you also add tests for it?\n\n"
         "Sure, here's a test file.\n"
     )
-    f = tmp_path / "session.aider.chat.history.md"
+    # Must use Aider's exact filename to trigger the parser
+    f = tmp_path / ".aider.chat.history.md"
     f.write_text(content)
     result = normalize(str(f))
     assert "How do I add a new route?" in result
