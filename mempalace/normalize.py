@@ -174,8 +174,8 @@ def normalize(filepath: str) -> str:
 
     ext = Path(filepath).suffix.lower()
 
-    # Try Aider markdown normalization
-    if ext == ".md" and sum(1 for line in lines if line.startswith("#### ")) >= 2:
+    # Try Aider markdown normalization (filename fingerprint to avoid false positives)
+    if ext == ".md" and Path(filepath).name == ".aider.chat.history.md":
         normalized = _try_aider_md(content)
         if normalized:
             return normalized
