@@ -741,7 +741,13 @@ def tool_search(
     return result
 
 
-def tool_check_duplicate(content: str, threshold: float = 0.9):
+# Default dedup similarity threshold — used by diary guard and dedup report.
+# Strict enough to catch semantically identical content while allowing
+# genuinely different entries about similar topics to coexist.
+DEDUP_THRESHOLD = 0.92
+
+
+def tool_check_duplicate(content: str, threshold: float = 0.9, where: dict | None = None):
     col = _get_collection()
     if not col:
         return _no_palace()
@@ -760,11 +766,14 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
             ),
         }
     try:
-        results = col.query(
-            query_texts=[content],
-            n_results=5,
-            include=["metadatas", "documents", "distances"],
-        )
+        query_kwargs = {
+            "query_texts": [content],
+            "n_results": 5,
+            "include": ["metadatas", "documents", "distances"],
+        }
+        if where:
+            query_kwargs["where"] = where
+        results = col.query(**query_kwargs)
         duplicates = []
         if results["ids"] and results["ids"][0]:
             for i, drawer_id in enumerate(results["ids"][0]):
@@ -1307,8 +1316,10 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
     if not col:
         return _no_palace()
 
-    # Duplicate check — prevent reinforcement of near-identical entries
-    dup = tool_check_duplicate(entry, threshold=0.92)
+    # Duplicate check — scoped to diary room to avoid false positives from mined code
+    dup = tool_check_duplicate(
+        entry, threshold=DEDUP_THRESHOLD, where={"room": "diary"}
+    )
     if dup.get("is_duplicate"):
         return {
             "success": False,
@@ -1367,7 +1378,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
 
 
 def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
-def tool_dedup_report(threshold: float = 0.92, wing: str = None, limit: int = 1000):
+def tool_dedup_report(threshold: float = DEDUP_THRESHOLD, wing: str = None, limit: int = 1000):
     """
     Scan the palace for near-duplicate drawers and return a diagnostic report.
 
