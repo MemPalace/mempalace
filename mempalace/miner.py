@@ -33,6 +33,8 @@ from .palace import (
 
 logger = logging.getLogger("mempalace_mcp")
 
+from mempalace.output import safe_separator
+
 READABLE_EXTENSIONS = {
     ".txt",
     ".md",
@@ -1093,7 +1095,7 @@ def _mine_impl(
         print("  .gitignore: DISABLED")
     if include_ignored:
         print(f"  Include: {', '.join(sorted(normalize_include_paths(include_ignored)))}")
-    print(f"{'-' * 55}\n")
+    print(f"{safe_separator(55)}\n")
 
     if not dry_run:
         collection = get_collection(palace_path)

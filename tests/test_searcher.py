@@ -269,10 +269,8 @@ class TestSearchCLI:
 
     def test_search_no_results(self, palace_path, collection, capsys):
         """Empty collection returns no results message."""
-        # collection is empty (no seeded data)
         result = search("xyzzy_nonexistent_query", palace_path, n_results=1)
         captured = capsys.readouterr()
-        # Either prints "No results" or returns None
         assert result is None or "No results" in captured.out
 
     def test_search_query_error_raises(self):
@@ -287,7 +285,6 @@ class TestSearchCLI:
     def test_search_n_results(self, palace_path, seeded_collection, capsys):
         search("code", palace_path, n_results=1)
         captured = capsys.readouterr()
-        # Should have output with at least one result block
         assert "[1]" in captured.out
 
     def test_search_applies_bm25_hybrid_rerank(self, capsys):
@@ -388,22 +385,28 @@ class TestSearchCLI:
         # Second result renders with fallback '?' values instead of crashing
         assert "second doc" in captured.out
 
-    def test_cli_search_uses_ascii_separator_on_cp1252_stdout(self, monkeypatch):
-        class _FakeCollection:
-            def query(self, **_kwargs):
-                return {
-                    "documents": [["JWT auth details"]],
-                    "metadatas": [[{"wing": "project", "room": "backend", "source_file": "auth.py"}]],
-                    "distances": [[0.1]],
-                }
+# ── Shared fakes for CLI separator tests ──────────────────────────────
 
-        class _FakeClient:
-            def __init__(self, path):
-                self.path = path
 
-            def get_collection(self, _name):
-                return _FakeCollection()
+class _FakeCollection:
+    def query(self, **_kwargs):
+        return {
+            "documents": [["JWT auth details"]],
+            "metadatas": [[{"wing": "project", "room": "backend", "source_file": "auth.py"}]],
+            "distances": [[0.1]],
+        }
 
+
+class _FakeClient:
+    def __init__(self, path):
+        self.path = path
+
+    def get_collection(self, _name):
+        return _FakeCollection()
+
+
+class TestSearchCli:
+    def test_uses_ascii_separator_on_cp1252_stdout(self, monkeypatch):
         monkeypatch.setattr("mempalace.searcher.chromadb.PersistentClient", _FakeClient)
 
         buf = io.BytesIO()
@@ -415,3 +418,16 @@ class TestSearchCLI:
         output = buf.getvalue().decode("cp1252")
 
         assert "  " + ("-" * 56) in output
+
+    def test_uses_unicode_separator_on_utf8_stdout(self, monkeypatch):
+        monkeypatch.setattr("mempalace.searcher.chromadb.PersistentClient", _FakeClient)
+
+        buf = io.BytesIO()
+        fake_stdout = io.TextIOWrapper(buf, encoding="utf-8")
+        monkeypatch.setattr("sys.stdout", fake_stdout)
+
+        search("anything", "/tmp/fake-palace")
+        fake_stdout.flush()
+        output = buf.getvalue().decode("utf-8")
+
+        assert "  " + ("─" * 56) in output
