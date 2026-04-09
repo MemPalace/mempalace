@@ -113,6 +113,44 @@ def chunk_exchanges(content: str) -> list:
         return _chunk_by_paragraph(content)
 
 
+def _extract_assistant_turns(content: str) -> list:
+    """Extract each assistant response as a standalone chunk.
+
+    Parses the > marker transcript format and returns each AI response block
+    separately with full content (no line cap). Unlike exchange chunking,
+    this lets the palace answer "what did the assistant say about X?" without
+    requiring the user question to be in the same chunk.
+
+    Returns list of {"content": str, "chunk_index": int}.
+    """
+    lines = content.split("\n")
+    chunks = []
+    i = 0
+
+    while i < len(lines):
+        line = lines[i]
+        if line.strip().startswith(">") or line.strip().startswith("---"):
+            i += 1
+            continue
+
+        # Collect contiguous non-user, non-separator lines as one assistant turn
+        ai_lines = []
+        while i < len(lines):
+            next_line = lines[i]
+            if next_line.strip().startswith(">") or next_line.strip().startswith("---"):
+                break
+            if next_line.strip():
+                ai_lines.append(next_line.strip())
+            i += 1
+
+        if ai_lines:
+            response = "\n".join(ai_lines)
+            if len(response.strip()) >= MIN_CHUNK_SIZE:
+                chunks.append({"content": response, "chunk_index": len(chunks)})
+
+    return chunks
+
+
 def _chunk_by_exchange(lines: list) -> list:
     """One user turn (>) + the AI response that follows = one or more chunks.
 
@@ -387,12 +425,18 @@ def mine_convos(
     limit: int = 0,
     dry_run: bool = False,
     extract_mode: str = "exchange",
+    include_assistant: bool = False,
 ):
     """Mine a directory of conversation files into the palace.
 
     extract_mode:
         "exchange" — default exchange-pair chunking (Q+A = one unit)
         "general"  — general extractor: decisions, preferences, milestones, problems, emotions
+
+    include_assistant:
+        When True, also indexes each assistant response as a standalone drawer with
+        turn_role="assistant" metadata. Enables targeted retrieval of what the assistant
+        said, independent of the user question that preceded it.
     """
 
     convo_path = Path(convo_dir).expanduser().resolve()
@@ -496,6 +540,38 @@ def mine_convos(
             room_counts[r] += n
 
         total_drawers += drawers_added
+
+        # Optionally index assistant turns as standalone drawers
+        if include_assistant and extract_mode == "exchange":
+            asst_chunks = _extract_assistant_turns(content)
+            asst_added = 0
+            for asst_chunk in asst_chunks:
+                asst_room = detect_convo_room(asst_chunk["content"])
+                asst_id = f"asst_{wing}_{asst_room}_{hashlib.sha256((source_file + 'asst' + str(asst_chunk['chunk_index'])).encode()).hexdigest()[:24]}"
+                try:
+                    collection.add(
+                        documents=[asst_chunk["content"]],
+                        ids=[asst_id],
+                        metadatas=[
+                            {
+                                "wing": wing,
+                                "room": asst_room,
+                                "source_file": source_file,
+                                "chunk_index": asst_chunk["chunk_index"],
+                                "added_by": agent,
+                                "filed_at": datetime.now().isoformat(),
+                                "ingest_mode": "convos",
+                                "extract_mode": extract_mode,
+                                "turn_role": "assistant",
+                            }
+                        ],
+                    )
+                    asst_added += 1
+                except Exception as e:
+                    if "already exists" not in str(e).lower():
+                        raise
+            total_drawers += asst_added
+
         print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")
 
     print(f"\n{'=' * 55}")
