@@ -285,7 +285,10 @@ def get_exclude_paths() -> list:
     print("  These paths will be skipped in addition to .gitignore and built-in skips.")
     print("  You can also add/edit these later in mempalace.yaml under 'exclude:'.")
     print("  Example: dist, vendor, tmp, generated")
-    raw = input("\n  Paths to exclude (comma-separated, or enter to skip): ").strip()
+    try:
+        raw = input("\n  Paths to exclude (comma-separated, or enter to skip): ").strip()
+    except (EOFError, OSError):
+        return []
     if not raw:
         return []
     return [p.strip().strip("/") for p in raw.split(",") if p.strip()]
