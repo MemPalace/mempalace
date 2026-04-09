@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 
 from .palace import get_closets_collection, get_collection
-from mempalace.output import safe_separator
+from .output import safe_separator
 
 # Closet pointer line format: "topic|entities|→drawer_id_a,drawer_id_b"
 # Multiple lines may join with newlines inside one closet document.
@@ -289,11 +289,6 @@ def _warn_if_legacy_metric(col) -> None:
         file=sys.stderr,
     )
 
-
-def _separator_line(width: int = 56) -> str:
-    return safe_separator(width)
-
-
 def search(query: str, palace_path: str, wing: str = None, room: str = None, n_results: int = 5):
     """
     Search the palace. Returns verbatim drawer content.
@@ -356,7 +351,7 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
     if room:
         print(f"  Room: {room}")
     print(f"{'=' * 60}\n")
-    separator = _separator_line()
+    separator = safe_separator()
 
     for i, hit in enumerate(hits, 1):
         vec_sim = round(max(0.0, 1 - hit["distance"]), 3)

@@ -18,7 +18,7 @@ Usage:
 
 from pathlib import Path
 from mempalace.entity_registry import EntityRegistry
-from mempalace.output import safe_separator
+from .output import safe_separator
 from mempalace.entity_detector import detect_entities, scan_for_detection
 
 

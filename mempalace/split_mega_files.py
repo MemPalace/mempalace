@@ -28,7 +28,7 @@ import os
 import re
 from pathlib import Path
 
-from mempalace.output import safe_separator
+from .output import safe_separator
 
 HOME = Path.home()
 LUMI_DIR = Path(os.environ.get("MEMPALACE_SOURCE_DIR", str(HOME / "Desktop/transcripts")))

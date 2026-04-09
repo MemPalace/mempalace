@@ -16,7 +16,7 @@ import yaml
 from pathlib import Path
 from collections import defaultdict
 
-from mempalace.output import safe_separator
+from .output import safe_separator
 
 logger = logging.getLogger(__name__)
 

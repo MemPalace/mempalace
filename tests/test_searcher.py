@@ -407,27 +407,31 @@ class _FakeClient:
 
 class TestSearchCli:
     def test_uses_ascii_separator_on_cp1252_stdout(self, monkeypatch):
-        monkeypatch.setattr("mempalace.searcher.chromadb.PersistentClient", _FakeClient)
+        monkeypatch.setattr("mempalace.searcher.get_collection", lambda path, create=False: _FakeCollection())
 
         buf = io.BytesIO()
         fake_stdout = io.TextIOWrapper(buf, encoding="cp1252", errors="strict")
         monkeypatch.setattr("sys.stdout", fake_stdout)
 
-        search("anything", "/tmp/fake-palace")
-        fake_stdout.flush()
-        output = buf.getvalue().decode("cp1252")
+        try:
+            search("anything", "/tmp/fake-palace")
+        finally:
+            fake_stdout.flush()
 
+        output = buf.getvalue().decode("cp1252")
         assert "  " + ("-" * 56) in output
 
     def test_uses_unicode_separator_on_utf8_stdout(self, monkeypatch):
-        monkeypatch.setattr("mempalace.searcher.chromadb.PersistentClient", _FakeClient)
+        monkeypatch.setattr("mempalace.searcher.get_collection", lambda path, create=False: _FakeCollection())
 
         buf = io.BytesIO()
         fake_stdout = io.TextIOWrapper(buf, encoding="utf-8")
         monkeypatch.setattr("sys.stdout", fake_stdout)
 
-        search("anything", "/tmp/fake-palace")
-        fake_stdout.flush()
-        output = buf.getvalue().decode("utf-8")
+        try:
+            search("anything", "/tmp/fake-palace")
+        finally:
+            fake_stdout.flush()
 
+        output = buf.getvalue().decode("utf-8")
         assert "  " + ("─" * 56) in output

@@ -33,7 +33,7 @@ from .palace import (
 
 logger = logging.getLogger("mempalace_mcp")
 
-from mempalace.output import safe_separator
+from .output import safe_separator
 
 READABLE_EXTENSIONS = {
     ".txt",
