@@ -1066,6 +1066,7 @@ def mine(
             dry_run=dry_run,
             respect_gitignore=respect_gitignore,
             include_ignored=include_ignored,
+            exclude_paths=exclude_paths,
             files=files,
         )
 
@@ -1082,6 +1083,7 @@ def mine(
             dry_run=dry_run,
             respect_gitignore=respect_gitignore,
             include_ignored=include_ignored,
+            exclude_paths=exclude_paths,
             files=files,
         )
 
@@ -1095,6 +1097,7 @@ def _mine_impl(
     dry_run: bool = False,
     respect_gitignore: bool = True,
     include_ignored: list = None,
+    exclude_paths: list = None,
     files: list = None,
 ):
     project_path = Path(project_dir).expanduser().resolve()
