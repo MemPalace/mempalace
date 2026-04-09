@@ -33,6 +33,8 @@ from .palace import (
 
 logger = logging.getLogger("mempalace_mcp")
 
+from .scanner import scan_content
+
 READABLE_EXTENSIONS = {
     ".txt",
     ".md",
@@ -829,6 +831,14 @@ def process_file(
     content = content.strip()
     if len(content) < MIN_CHUNK_SIZE:
         return 0, "general"
+
+    findings = scan_content(content)
+    if findings:
+        names = ", ".join(sorted({f["pattern_name"] for f in findings}))
+        print(
+            f"  ⚠ {filepath.name}: sensitive content detected ({names})",
+            file=sys.stderr,
+        )
 
     room = detect_room(filepath, content, rooms, project_path)
     chunks = chunk_text(content, source_file)

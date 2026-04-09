@@ -82,6 +82,7 @@ from .palace_graph import (  # noqa: E402
 )
 
 from .knowledge_graph import KnowledgeGraph, DEFAULT_KG_PATH  # noqa: E402
+from .scanner import scan_content, format_warnings  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stderr)
 logger = logging.getLogger("mempalace_mcp")
@@ -931,6 +932,8 @@ def tool_add_drawer(
     except Exception:
         logger.debug("Idempotency pre-check failed for %s", drawer_id, exc_info=True)
 
+    findings = scan_content(content)
+
     try:
         col.upsert(
             ids=[drawer_id],
@@ -954,7 +957,10 @@ def tool_add_drawer(
             )
         _metadata_cache = None
         logger.info(f"Filed drawer: {drawer_id} → {wing}/{room}")
-        return {"success": True, "drawer_id": drawer_id, "wing": wing, "room": room}
+        result = {"success": True, "drawer_id": drawer_id, "wing": wing, "room": room}
+        if findings:
+            result["warnings"] = format_warnings(findings)
+        return result
     except Exception as e:
         return {"success": False, "error": str(e)}
 
