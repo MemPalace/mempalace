@@ -30,16 +30,16 @@ def test_people_map_missing(tmp_path):
     assert cfg.people_map == {}
 
 
-def test_topic_wings_default(tmp_path):
+def test_wings_default(tmp_path):
     cfg = MempalaceConfig(config_dir=str(tmp_path))
-    assert isinstance(cfg.topic_wings, list)
-    assert "emotions" in cfg.topic_wings
+    assert isinstance(cfg.wings, list)
+    assert "wing_user" in cfg.wings
 
 
-def test_hall_keywords_default(tmp_path):
+def test_halls_default(tmp_path):
     cfg = MempalaceConfig(config_dir=str(tmp_path))
-    assert isinstance(cfg.hall_keywords, dict)
-    assert "technical" in cfg.hall_keywords
+    assert isinstance(cfg.halls, list)
+    assert "hall_facts" in cfg.halls
 
 
 def test_init_idempotent(tmp_path):
