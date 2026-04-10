@@ -531,6 +531,40 @@ def mine_palace_lock(palace_path: str):
 mine_global_lock = mine_palace_lock
 
 
+def _build_where(wing: str, room: str | None = None) -> dict:
+    """Build a ChromaDB where filter for wing/room scoped operations."""
+    if room:
+        return {"$and": [{"wing": wing}, {"room": room}]}
+    return {"wing": wing}
+
+
+def count_drawers(collection, wing: str, room: str | None = None) -> int:
+    """Count drawers in a wing (and optionally a specific room)."""
+    try:
+        results = collection.get(where=_build_where(wing, room), include=[])
+        return len(results.get("ids", []))
+    except Exception:
+        return 0
+
+
+def delete_drawers(collection, wing: str, room: str | None = None) -> int:
+    """Delete all drawers in a wing (and optionally a specific room).
+
+    Returns the number of drawers removed. Safe to call on collections that
+    do not exist — the caller is responsible for passing a valid collection.
+    """
+    where = _build_where(wing, room)
+    try:
+        existing = collection.get(where=where, include=[])
+        count = len(existing.get("ids", []))
+        if count == 0:
+            return 0
+        collection.delete(where=where)
+        return count
+    except Exception:
+        return 0
+
+
 def file_already_mined(collection, source_file: str, check_mtime: bool = False) -> bool:
     """Check if a file has already been filed in the palace.
 

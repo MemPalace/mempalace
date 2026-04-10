@@ -18,6 +18,9 @@ Commands:
     mempalace wake-up                     Show L0 + L1 wake-up context
     mempalace wake-up --wing my_app       Wake-up for a specific project
     mempalace status                      Show what's been filed
+    mempalace clean --wing my_app         Remove all drawers in a wing
+    mempalace clean --wing my_app --room costs
+                                          Remove drawers in one room of a wing
 
 Examples:
     mempalace init ~/projects/my_app
@@ -951,6 +954,118 @@ def cmd_repair(args):
     print(f"\n{'=' * 55}\n")
 
 
+def cmd_clean(args):
+    """Remove drawers from a wing or a specific room within a wing."""
+    import chromadb
+    from .palace import count_drawers, delete_drawers
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+
+    if not os.path.isdir(palace_path):
+        print(f"\n  No palace found at {palace_path}")
+        sys.exit(1)
+
+    wing = args.wing
+    room = args.room
+    scope = f"wing '{wing}'" + (f", room '{room}'" if room else "")
+
+    try:
+        client = chromadb.PersistentClient(path=palace_path)
+    except Exception as e:
+        print(f"\n  Error opening palace: {e}")
+        sys.exit(1)
+
+    try:
+        drawers_col = client.get_collection("mempalace_drawers")
+    except Exception:
+        print(f"\n  No drawers collection in {palace_path}")
+        sys.exit(1)
+
+    try:
+        compressed_col = client.get_collection("mempalace_compressed")
+    except Exception:
+        compressed_col = None
+
+    drawer_count = count_drawers(drawers_col, wing, room)
+    compressed_count = count_drawers(compressed_col, wing, room) if compressed_col else 0
+
+    print(f"\n{'=' * 55}")
+    print("  MemPalace Clean")
+    print(f"{'=' * 55}\n")
+    print(f"  Palace: {palace_path}")
+    print(f"  Target: {scope}")
+    print(f"  Drawers to remove:    {drawer_count}")
+    if compressed_col is not None:
+        print(f"  Compressed to remove: {compressed_count}")
+
+    if drawer_count == 0 and compressed_count == 0:
+        print("\n  Nothing to clean.")
+        print(
+            "\n  Note: the knowledge graph (~/.mempalace/knowledge_graph.sqlite3) "
+            "is not touched by clean."
+        )
+        return
+
+    if args.dry_run:
+        print("\n  (dry run — nothing removed)")
+        return
+
+    if not args.yes:
+        prompt = f"\n  Delete {drawer_count} drawer(s) from {scope}? [y/N] "
+        try:
+            answer = input(prompt).strip().lower()
+        except EOFError:
+            answer = ""
+        if answer not in ("y", "yes"):
+            print("  Cancelled.")
+            return
+
+    removed_drawers = delete_drawers(drawers_col, wing, room)
+    removed_compressed = delete_drawers(compressed_col, wing, room) if compressed_col else 0
+
+    # Log the operation to the WAL for audit trail
+    try:
+        import json
+        from datetime import datetime
+        from pathlib import Path
+
+        wal_dir = Path(os.path.expanduser("~/.mempalace/wal"))
+        wal_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            wal_dir.chmod(0o700)
+        except (OSError, NotImplementedError):
+            pass
+        wal_file = wal_dir / "write_log.jsonl"
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "operation": "clean_room" if room else "clean_wing",
+            "params": {
+                "palace_path": palace_path,
+                "wing": wing,
+                "room": room,
+                "drawers_deleted": removed_drawers,
+                "compressed_deleted": removed_compressed,
+            },
+        }
+        with open(wal_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+        try:
+            wal_file.chmod(0o600)
+        except (OSError, NotImplementedError):
+            pass
+    except Exception:
+        pass
+
+    print(f"\n  Removed {removed_drawers} drawer(s) from {scope}.")
+    if compressed_col is not None:
+        print(f"  Removed {removed_compressed} compressed drawer(s).")
+    print(
+        "\n  Note: the knowledge graph (~/.mempalace/knowledge_graph.sqlite3) "
+        "is not touched by clean."
+    )
+    print(f"\n{'=' * 55}\n")
+
+
 def cmd_hook(args):
     """Run hook logic: reads JSON from stdin, outputs JSON to stdout."""
     from .hooks_cli import run_hook
@@ -1370,6 +1485,32 @@ def main():
         help="Only split files containing at least N sessions (default: 2)",
     )
 
+    # clean
+    p_clean = sub.add_parser(
+        "clean",
+        help="Remove drawers from a wing or a specific room",
+        description=(
+            "Remove drawers from the palace. Scope to a whole wing or a specific "
+            "room within a wing. The knowledge graph is not touched."
+        ),
+    )
+    p_clean.add_argument("--wing", required=True, help="Wing to clean (required)")
+    p_clean.add_argument(
+        "--room",
+        default=None,
+        help="Room to clean (optional — limits deletion to this room within the wing)",
+    )
+    p_clean.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be removed without deleting",
+    )
+    p_clean.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the interactive confirmation prompt",
+    )
+
     # hook
     p_hook = sub.add_parser(
         "hook",
@@ -1540,6 +1681,7 @@ def main():
         "repair-status": cmd_repair_status,
         "migrate": cmd_migrate,
         "status": cmd_status,
+        "clean": cmd_clean,
     }
     dispatch[args.command](args)
 
