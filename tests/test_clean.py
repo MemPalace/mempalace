@@ -8,10 +8,29 @@ import chromadb
 import pytest
 
 from mempalace import cli
-from mempalace.palace import count_drawers, delete_drawers
+from mempalace.palace import count_drawers, find_drawer_ids
 
 
-# ── palace.count_drawers / delete_drawers ────────────────────────────────
+# ── palace.find_drawer_ids / count_drawers ───────────────────────────────
+
+
+def test_find_drawer_ids_by_wing(seeded_collection):
+    ids = find_drawer_ids(seeded_collection, "project")
+    assert sorted(ids) == [
+        "drawer_proj_backend_aaa",
+        "drawer_proj_backend_bbb",
+        "drawer_proj_frontend_ccc",
+    ]
+
+
+def test_find_drawer_ids_by_wing_and_room(seeded_collection):
+    ids = find_drawer_ids(seeded_collection, "project", "backend")
+    assert sorted(ids) == ["drawer_proj_backend_aaa", "drawer_proj_backend_bbb"]
+
+
+def test_find_drawer_ids_no_match_returns_empty_list(seeded_collection):
+    assert find_drawer_ids(seeded_collection, "missing") == []
+    assert find_drawer_ids(seeded_collection, "project", "missing") == []
 
 
 def test_count_drawers_by_wing(seeded_collection):
@@ -26,23 +45,18 @@ def test_count_drawers_by_wing_and_room(seeded_collection):
     assert count_drawers(seeded_collection, "project", "missing") == 0
 
 
-def test_delete_drawers_by_wing_leaves_other_wings(seeded_collection):
-    removed = delete_drawers(seeded_collection, "project")
-    assert removed == 3
-    assert count_drawers(seeded_collection, "project") == 0
-    assert count_drawers(seeded_collection, "notes") == 1
+def test_find_drawer_ids_single_scan(seeded_collection, monkeypatch):
+    """find_drawer_ids must hit ChromaDB.get exactly once per call."""
+    call_count = {"n": 0}
+    real_get = seeded_collection.get
 
+    def counting_get(*args, **kwargs):
+        call_count["n"] += 1
+        return real_get(*args, **kwargs)
 
-def test_delete_drawers_by_room_leaves_sibling_rooms(seeded_collection):
-    removed = delete_drawers(seeded_collection, "project", "backend")
-    assert removed == 2
-    assert count_drawers(seeded_collection, "project", "backend") == 0
-    assert count_drawers(seeded_collection, "project", "frontend") == 1
-    assert count_drawers(seeded_collection, "notes") == 1
-
-
-def test_delete_drawers_nothing_to_remove_returns_zero(seeded_collection):
-    assert delete_drawers(seeded_collection, "missing") == 0
+    monkeypatch.setattr(seeded_collection, "get", counting_get)
+    find_drawer_ids(seeded_collection, "project")
+    assert call_count["n"] == 1
 
 
 # ── cli.cmd_clean ─────────────────────────────────────────────────────────
@@ -211,6 +225,49 @@ def test_clean_missing_wing_flag_exits_nonzero(palace_path, monkeypatch):
     with pytest.raises(SystemExit) as exc:
         cli.main()
     assert exc.value.code != 0
+
+
+def test_clean_scans_each_collection_exactly_once(palace_path, monkeypatch):
+    """Perf guarantee: cmd_clean must call collection.get() at most once per collection.
+
+    Regression test for the count-then-delete pattern that previously caused
+    up to 6 scans per clean operation.
+    """
+    _seed_palace(palace_path)
+
+    import chromadb
+
+    real_client_cls = chromadb.PersistentClient
+    scan_counts: dict[str, int] = {}
+
+    class CountingClient:
+        def __init__(self, *args, **kwargs):
+            self._inner = real_client_cls(*args, **kwargs)
+
+        def get_collection(self, name):
+            col = self._inner.get_collection(name)
+            real_get = col.get
+            real_delete = col.delete
+
+            def counting_get(*a, **kw):
+                if "where" in kw:
+                    scan_counts[name] = scan_counts.get(name, 0) + 1
+                return real_get(*a, **kw)
+
+            col.get = counting_get
+            col.delete = real_delete
+            return col
+
+    monkeypatch.setattr(chromadb, "PersistentClient", CountingClient)
+
+    cli.cmd_clean(_Args(palace=palace_path, wing="proj", yes=True))
+
+    assert scan_counts.get("mempalace_drawers", 0) == 1, (
+        f"expected 1 scan of mempalace_drawers, got {scan_counts.get('mempalace_drawers', 0)}"
+    )
+    assert scan_counts.get("mempalace_compressed", 0) == 1, (
+        f"expected 1 scan of mempalace_compressed, got {scan_counts.get('mempalace_compressed', 0)}"
+    )
 
 
 def test_clean_no_palace_exits_nonzero(tmp_dir, capsys):

@@ -538,31 +538,24 @@ def _build_where(wing: str, room: str | None = None) -> dict:
     return {"wing": wing}
 
 
-def count_drawers(collection, wing: str, room: str | None = None) -> int:
-    """Count drawers in a wing (and optionally a specific room)."""
+def find_drawer_ids(collection, wing: str, room: str | None = None) -> list[str]:
+    """Return drawer IDs matching a wing (and optional room) in one scan.
+
+    Uses ``include=[]`` so ChromaDB only fetches IDs — no documents,
+    embeddings, or metadatas. Callers that need both a count and a
+    subsequent delete should call this once and reuse the result to
+    avoid a second scan.
+    """
     try:
         results = collection.get(where=_build_where(wing, room), include=[])
-        return len(results.get("ids", []))
+        return list(results.get("ids", []))
     except Exception:
-        return 0
+        return []
 
 
-def delete_drawers(collection, wing: str, room: str | None = None) -> int:
-    """Delete all drawers in a wing (and optionally a specific room).
-
-    Returns the number of drawers removed. Safe to call on collections that
-    do not exist — the caller is responsible for passing a valid collection.
-    """
-    where = _build_where(wing, room)
-    try:
-        existing = collection.get(where=where, include=[])
-        count = len(existing.get("ids", []))
-        if count == 0:
-            return 0
-        collection.delete(where=where)
-        return count
-    except Exception:
-        return 0
+def count_drawers(collection, wing: str, room: str | None = None) -> int:
+    """Count drawers in a wing (and optionally a specific room)."""
+    return len(find_drawer_ids(collection, wing, room))
 
 
 def file_already_mined(collection, source_file: str, check_mtime: bool = False) -> bool:
