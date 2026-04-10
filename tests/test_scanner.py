@@ -9,7 +9,13 @@ class TestScanContent:
     # ── API key patterns ──────────────────────────────────────────────
 
     def test_detects_openai_api_key(self):
-        content = "Use this key: sk-abc123def456ghi789jkl012mno345"
+        content = "Use this key: sk-proj-abc123def456ghi789jkl012mno345"
+        findings = scan_content(content)
+        assert len(findings) == 1
+        assert findings[0]["pattern_name"] == "api_key"
+
+    def test_detects_anthropic_api_key(self):
+        content = "ANTHROPIC_KEY=sk-ant-abc123def456ghi789jkl012mno345"
         findings = scan_content(content)
         assert len(findings) == 1
         assert findings[0]["pattern_name"] == "api_key"
@@ -157,6 +163,21 @@ class TestScanContent:
         findings = scan_content(content)
         assert len(findings) == 0
 
+    def test_no_false_positive_on_bare_sk_prefix(self):
+        content = "The variable sk-session-key-manager-helper is used for routing."
+        findings = scan_content(content)
+        assert len(findings) == 0
+
+    def test_no_false_positive_on_env_var_password(self):
+        content = 'password: "${DB_PASSWORD}"'
+        findings = scan_content(content)
+        assert len(findings) == 0
+
+    def test_no_false_positive_on_env_ref_password(self):
+        content = "password = '${MYSQL_ROOT_PASSWORD}'"
+        findings = scan_content(content)
+        assert len(findings) == 0
+
     # ── Edge cases ────────────────────────────────────────────────────
 
     def test_empty_content(self):
@@ -166,9 +187,10 @@ class TestScanContent:
         assert scan_content(None) == []
 
     def test_multiple_findings(self):
+        prefix = "sk-proj-"
         content = (
             "Keys:\n"
-            "  OPENAI: sk-proj-abcdefghijklmnopqrst1234\n"
+            f"  OPENAI: {prefix}abcdefghijklmnopqrst1234\n"
             "  AWS: AKIAIOSFODNN7EXAMPLE1234\n"
             "  password = 'admin123_secret'\n"
         )
@@ -179,7 +201,7 @@ class TestScanContent:
         assert len(findings) >= 3
 
     def test_findings_have_position_not_content(self):
-        content = "secret: sk-abc123def456ghi789jkl012mno345"
+        content = "secret: sk-proj-abc123def456ghi789jkl012mno345"
         findings = scan_content(content)
         assert "start" in findings[0]
         assert "end" in findings[0]

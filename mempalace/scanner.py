@@ -9,14 +9,14 @@ import re
 
 PATTERNS = {
     "api_key": re.compile(
-        r"(?:sk-|AKIA|ghp_|gho_|github_pat_|sk_live_|sk_test_|xoxb-|xoxp-|npm_)"
+        r"(?:sk-(?:proj-|ant-|or-)|AKIA|ghp_|gho_|github_pat_|sk_live_|sk_test_|xoxb-|xoxp-|npm_)"
         r"[A-Za-z0-9_-]{20,}"
     ),
     "bearer_token": re.compile(
         r"Bearer\s+[A-Za-z0-9_-]{20,}", re.IGNORECASE
     ),
     "password_assignment": re.compile(
-        r"""(?:password|passwd|pwd)["']?\s*[=:]\s*['"][^'"]+['"]""", re.IGNORECASE
+        r"""(?:password|passwd|pwd)["']?\s*[=:]\s*['"][^'"$][^'"]*['"]""", re.IGNORECASE
     ),
     "private_key": re.compile(
         r"-----BEGIN (?:RSA |EC )?PRIVATE KEY-----"
