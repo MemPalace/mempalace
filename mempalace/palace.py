@@ -746,3 +746,21 @@ def prefetch_mined_set(collection, extract_mode: Optional[str] = None) -> set[st
     except Exception:
         logger.warning("prefetch_mined_set: partial fetch, %d files loaded", len(mined))
     return mined
+
+# Shared pagination constant — used by mcp_server and miner
+METADATA_PAGE_SIZE = 1000
+
+
+def get_all_metadatas(col, **extra_kwargs):
+    """Paginate through all metadatas in a collection to avoid the 10K truncation bug."""
+    all_meta = []
+    offset = 0
+    while True:
+        kwargs = {"include": ["metadatas"], "limit": METADATA_PAGE_SIZE, "offset": offset}
+        kwargs.update(extra_kwargs)
+        batch = col.get(**kwargs)
+        all_meta.extend(batch["metadatas"])
+        if not batch["ids"] or len(batch["ids"]) < METADATA_PAGE_SIZE:
+            break
+        offset += len(batch["ids"])
+    return all_meta

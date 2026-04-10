@@ -464,8 +464,8 @@
       "builder",
       "factory",
       "one",
-      "azure",
-      "notion"
+      "azure_functions",
+      "notion_api"
     ]
   }
 }
