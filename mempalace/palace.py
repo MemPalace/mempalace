@@ -672,7 +672,7 @@ def file_already_mined(
             if stored_mtime is None:
                 return False
             current_mtime = os.path.getmtime(source_file)
-            return abs(float(stored_mtime) - current_mtime) < 0.001
+            return abs(float(stored_mtime) - current_mtime) < 0.01
         return True
     except Exception:
         return False
