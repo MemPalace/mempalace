@@ -182,6 +182,29 @@ class MempalaceConfig:
             except (json.JSONDecodeError, OSError):
                 self._file_config = {}
 
+        self._migrate_legacy_keys()
+
+    def _migrate_legacy_keys(self):
+        """One-time migration: rename old taxonomy keys to canonical names."""
+        renames = {
+            "topic_wings": "wings",
+            "hall_keywords": "halls",
+        }
+        changed = False
+        for old_key, new_key in renames.items():
+            if old_key in self._file_config and new_key not in self._file_config:
+                self._file_config[new_key] = self._file_config.pop(old_key)
+                changed = True
+            elif old_key in self._file_config:
+                del self._file_config[old_key]
+                changed = True
+        if changed and self._config_file.exists():
+            try:
+                with open(self._config_file, "w") as f:
+                    json.dump(self._file_config, f, indent=2)
+            except OSError:
+                pass
+
     @property
     def palace_path(self):
         """Path to the memory palace data directory."""
