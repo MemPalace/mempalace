@@ -876,7 +876,7 @@ def cmd_repair(args):
 def cmd_scan(args):
     """Scan palace drawers for sensitive content."""
     import chromadb
-    from .scanner import scan_content
+    from .scanner import scan_content, format_warnings
 
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     try:
@@ -886,30 +886,39 @@ def cmd_scan(args):
         print(f"\n  No palace found at {palace_path}")
         return
 
-    kwargs = {"include": ["documents", "metadatas"], "limit": 10000}
-    if args.wing:
-        kwargs["where"] = {"wing": args.wing}
-    data = col.get(**kwargs)
-
-    total_drawers = len(data["ids"])
+    total_count = col.count()
     flagged_drawers = 0
     total_findings = 0
+    total_scanned = 0
+    batch_size = 500
 
-    print(f"\n  Scanning {total_drawers} drawers for sensitive content...\n")
+    print(f"\n  Scanning {total_count} drawers for sensitive content...\n")
 
-    for drawer_id, doc, meta in zip(data["ids"], data["documents"], data["metadatas"]):
-        findings = scan_content(doc)
-        if findings:
-            flagged_drawers += 1
-            total_findings += len(findings)
-            wing = meta.get("wing", "?")
-            room = meta.get("room", "?")
-            print(f"  {drawer_id}  ({wing}/{room})")
-            for f in findings:
-                preview = f["match"][:50] + "..." if len(f["match"]) > 50 else f["match"]
-                print(f"    - {f['pattern_name']}: {preview}")
+    while total_scanned < total_count:
+        kwargs = {
+            "include": ["documents", "metadatas"],
+            "limit": batch_size,
+            "offset": total_scanned,
+        }
+        if args.wing:
+            kwargs["where"] = {"wing": args.wing}
+        data = col.get(**kwargs)
+        if not data["ids"]:
+            break
 
-    print(f"\n  Scanned {total_drawers} drawers, "
+        for drawer_id, doc, meta in zip(data["ids"], data["documents"], data["metadatas"]):
+            findings = scan_content(doc)
+            if findings:
+                flagged_drawers += 1
+                total_findings += len(findings)
+                wing = meta.get("wing", "?")
+                room = meta.get("room", "?")
+                print(f"  {drawer_id}  ({wing}/{room})")
+                print(f"    {format_warnings(findings)}")
+
+        total_scanned += len(data["ids"])
+
+    print(f"\n  Scanned {total_scanned} drawers, "
           f"found {total_findings} sensitive patterns in {flagged_drawers} drawers.\n")
 
 

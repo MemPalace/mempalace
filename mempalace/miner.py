@@ -33,7 +33,7 @@ from .palace import (
 
 logger = logging.getLogger("mempalace_mcp")
 
-from .scanner import scan_content
+from .scanner import scan_content, format_warnings
 
 READABLE_EXTENSIONS = {
     ".txt",
@@ -834,9 +834,8 @@ def process_file(
 
     findings = scan_content(content)
     if findings:
-        names = ", ".join(sorted({f["pattern_name"] for f in findings}))
         print(
-            f"  ⚠ {filepath.name}: sensitive content detected ({names})",
+            f"  ⚠ {filepath.name}: {format_warnings(findings)}",
             file=sys.stderr,
         )
 
