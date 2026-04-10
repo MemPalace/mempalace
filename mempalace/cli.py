@@ -1207,7 +1207,7 @@ def main():
         "--include-assistant",
         action="store_true",
         dest="include_assistant",
-        help="Also index each assistant turn as a standalone drawer with turn_role=assistant metadata (convos mode only)",
+        help="Also index each assistant turn as a standalone drawer with turn_role=assistant metadata (convos mode only). Expects Claude export format: user turns begin with '>'; all other non-separator lines are treated as assistant content.",
     )
 
     # sweep
