@@ -690,6 +690,45 @@ def test_empty_legacy_dir_does_not_hijack_xdg(monkeypatch, tmp_path):
     assert _default_config_dir() == xdg / "mempalace"
 
 
+def test_bare_palace_dir_does_not_trigger_legacy(monkeypatch, tmp_path):
+    # A bare ~/.mempalace/palace directory (without an actual ChromaDB
+    # store inside) should not be treated as a legacy install -- some
+    # other tool may have created the directory.
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    legacy = fake_home / ".mempalace"
+    legacy.mkdir()
+    (legacy / "palace").mkdir()
+    xdg = tmp_path / "xdg"
+    xdg.mkdir()
+
+    _set_home(monkeypatch, fake_home)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.delenv("MEMPALACE_CONFIG_DIR", raising=False)
+
+    assert _default_config_dir() == xdg / "mempalace"
+
+
+def test_palace_with_chromadb_triggers_legacy(monkeypatch, tmp_path):
+    # A ~/.mempalace/palace directory that actually contains the ChromaDB
+    # store counts as a real legacy install even without config.json.
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    legacy = fake_home / ".mempalace"
+    legacy.mkdir()
+    palace = legacy / "palace"
+    palace.mkdir()
+    (palace / "chroma.sqlite3").write_bytes(b"")
+    xdg = tmp_path / "xdg"
+    xdg.mkdir()
+
+    _set_home(monkeypatch, fake_home)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.delenv("MEMPALACE_CONFIG_DIR", raising=False)
+
+    assert _default_config_dir() == legacy
+
+
 def test_mempalace_config_dir_env_overrides_everything(monkeypatch, tmp_path):
     fake_home = tmp_path / "home"
     fake_home.mkdir()

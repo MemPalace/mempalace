@@ -202,7 +202,19 @@ def sanitize_content(value: str, max_length: int = 100_000) -> str:
 
 # Files that mark a ~/.mempalace directory as a real legacy install rather
 # than an empty/leftover directory. Any one is enough for back-compat.
-_LEGACY_MARKERS = ("config.json", "people_map.json", "palace")
+_LEGACY_MARKERS = ("config.json", "people_map.json")
+
+
+def _has_legacy_install(legacy: Path) -> bool:
+    """Return True if ``legacy`` is a real legacy install, not an empty dir.
+
+    A bare ``palace`` directory created by some other tool should not hijack
+    the XDG path, so the palace sub-directory only counts when it contains
+    an actual ChromaDB store (``chroma.sqlite3``).
+    """
+    if any((legacy / marker).is_file() for marker in _LEGACY_MARKERS):
+        return True
+    return (legacy / "palace" / "chroma.sqlite3").is_file()
 
 
 def _default_config_dir() -> Path:
@@ -215,7 +227,7 @@ def _default_config_dir() -> Path:
         return Path(env_dir).expanduser()
 
     legacy = Path.home() / ".mempalace"
-    if legacy.is_dir() and any((legacy / marker).exists() for marker in _LEGACY_MARKERS):
+    if legacy.is_dir() and _has_legacy_install(legacy):
         return legacy
 
     xdg = os.environ.get("XDG_CONFIG_HOME")
