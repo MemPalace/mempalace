@@ -71,12 +71,18 @@ def test_layer0_default_path():
 
 
 def _mock_chromadb_for_layer(docs, metas, monkeypatch=None):
-    """Return a mock collection whose get() returns docs/metas."""
+    """Return a mock collection whose get() returns docs/metas.
+
+    Layer1._fetch_drawers() has two phases: a fast-path (importance pre-filter)
+    and a fallback full-scan.  For small test datasets (< 500 items), each phase
+    makes exactly one col.get() call before breaking (len < _BATCH).  We
+    provide two identical responses: one consumed by the fast path and one by
+    the fallback.
+    """
     mock_col = MagicMock()
-    # First batch returns data, second batch returns empty (end of pagination)
     mock_col.get.side_effect = [
-        {"documents": docs, "metadatas": metas},
-        {"documents": [], "metadatas": []},
+        {"documents": docs, "metadatas": metas},  # fast-path batch
+        {"documents": docs, "metadatas": metas},  # fallback batch (< MAX_DRAWERS → fallback)
     ]
     return mock_col
 
@@ -141,9 +147,12 @@ def test_layer1_with_wing_filter():
         result = layer.generate()
 
     assert "ESSENTIAL STORY" in result
-    # Verify wing filter was passed
+    # Verify wing filter was passed in the first (fast-path) call.
+    # The fast-path combines wing with an importance pre-filter via $and.
     call_kwargs = mock_col.get.call_args_list[0][1]
-    assert call_kwargs.get("where") == {"wing": "project_x"}
+    where = call_kwargs.get("where", {})
+    assert "$and" in where
+    assert {"wing": "project_x"} in where["$and"]
 
 
 def test_layer1_truncates_long_snippets():
@@ -202,11 +211,13 @@ def test_layer1_importance_from_various_keys():
 
 
 def test_layer1_batch_exception_breaks():
-    """If col.get raises on a batch, loop breaks gracefully."""
+    """If the fast-path raises, fallback scan still returns results gracefully."""
     mock_col = MagicMock()
+    # Call 1: fast-path raises — caught, fast-path resets to empty
+    # Call 2: fallback returns one doc successfully
     mock_col.get.side_effect = [
-        {"documents": ["doc1"], "metadatas": [{"room": "r"}]},
         RuntimeError("batch error"),
+        {"documents": ["doc1"], "metadatas": [{"room": "r", "importance": 5}]},
     ]
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
