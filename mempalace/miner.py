@@ -1083,6 +1083,129 @@ def scan_project(
 
 
 # =============================================================================
+# ORPHAN SWEEP
+# =============================================================================
+
+
+def sweep_orphans(collection, wing: str, project_path: str) -> tuple:
+    """Delete drawers for files that no longer exist on disk.
+
+    Only sweeps drawers whose source_file is under project_path so mining one
+    project doesn't touch other wings or projects stored in the same palace.
+    Returns (deleted_count, list_of_purged_paths).
+    """
+    try:
+        results = collection.get(
+            where={"wing": wing},
+            include=["metadatas"],
+            limit=100000,
+        )
+    except Exception:
+        return 0, []
+
+    project_root = str(Path(project_path).expanduser().resolve())
+    seen: set = set()
+    orphan_files: list = []
+
+    for meta in results.get("metadatas", []):
+        src = meta.get("source_file", "")
+        if not src or src in seen:
+            continue
+        seen.add(src)
+        if not src.startswith(project_root):
+            continue
+        if not Path(src).exists():
+            orphan_files.append(src)
+
+    deleted = 0
+    for src in orphan_files:
+        try:
+            collection.delete(where={"source_file": src})
+            deleted += 1
+        except Exception:
+            pass
+
+    return deleted, orphan_files
+
+
+# =============================================================================
+# FIND PROJECT ROOT
+# =============================================================================
+
+
+def find_project_root(file_path: Path) -> Path:
+    """Walk up from file_path to find the nearest directory with mempalace.yaml."""
+    current = file_path.parent
+    while True:
+        if (current / "mempalace.yaml").exists() or (current / "mempal.yaml").exists():
+            return current
+        parent = current.parent
+        if parent == current:
+            raise FileNotFoundError(
+                f"No mempalace.yaml found in any parent directory of {file_path}"
+            )
+        current = parent
+
+
+# =============================================================================
+# MINE SINGLE FILE
+# =============================================================================
+
+
+def mine_file(
+    file_path: str,
+    palace_path: str,
+    wing_override: str = None,
+    agent: str = "mempalace",
+    dry_run: bool = False,
+) -> None:
+    """Mine a single file into the palace without scanning its whole directory."""
+    filepath = Path(file_path).expanduser().resolve()
+    if not filepath.is_file():
+        print(f"ERROR: Not a file: {filepath}")
+        sys.exit(1)
+
+    try:
+        project_path = find_project_root(filepath)
+    except FileNotFoundError as e:
+        print(f"ERROR: {e}")
+        sys.exit(1)
+
+    config = load_config(str(project_path))
+    wing = wing_override or config["wing"]
+    rooms = config.get("rooms", [{"name": "general", "description": "All project files"}])
+
+    print(f"\n{'=' * 55}")
+    print("  MemPalace Mine File")
+    print(f"{'=' * 55}")
+    print(f"  File:    {filepath}")
+    print(f"  Wing:    {wing}")
+    print(f"  Palace:  {palace_path}")
+    if dry_run:
+        print("  DRY RUN — nothing will be filed")
+    print(f"{'─' * 55}\n")
+
+    collection = None if dry_run else get_collection(palace_path)
+
+    drawers, room = process_file(
+        filepath=filepath,
+        project_path=project_path,
+        collection=collection,
+        wing=wing,
+        rooms=rooms,
+        agent=agent,
+        dry_run=dry_run,
+    )
+
+    if drawers == 0 and not dry_run:
+        print(f"  → {filepath.name} unchanged, skipped")
+    else:
+        print(f"  ✓ {filepath.name} → room:{room} +{drawers} drawers")
+
+    print(f"\n{'=' * 55}\n")
+
+
+# =============================================================================
 # MAIN: MINE
 # =============================================================================
 
@@ -1252,6 +1375,15 @@ def _mine_impl(
         print(f"  Files processed: {len(files) - files_skipped}")
         print(f"  Files skipped (already filed): {files_skipped}")
         print(f"  Drawers filed: {total_drawers}")
+
+        # Purge drawers for files that were deleted or moved since the last mine.
+        if not dry_run:
+            orphans_deleted, orphan_files = sweep_orphans(collection, wing, str(project_path))
+            if orphans_deleted > 0:
+                print(f"\n  Orphans purged: {orphans_deleted} files")
+                for f in orphan_files:
+                    print(f"    ✗ {Path(f).name}")
+
         print("\n  By room:")
         for room, count in sorted(room_counts.items(), key=lambda x: x[1], reverse=True):
             print(f"    {room:20} {count} files")
