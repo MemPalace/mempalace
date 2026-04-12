@@ -102,7 +102,12 @@ class Layer1:
         """
         _BATCH = 500
 
-        # Fast path: only fetch drawers with importance >= 3
+        # Fast path: only fetch drawers with importance >= 3.
+        # This is an optimization that catches the common case — importance is
+        # the primary signal in generate()'s scoring.  generate() also considers
+        # emotional_weight and weight, but those are rarely set without a
+        # corresponding importance value.  The fallback full-scan below ensures
+        # nothing is missed when the fast path returns too few results.
         importance_filter = {"importance": {"$gte": 3}}
         if self.wing:
             where = {"$and": [{"wing": self.wing}, importance_filter]}
