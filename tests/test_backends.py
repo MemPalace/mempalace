@@ -19,6 +19,7 @@ from mempalace.backends import (
     get_backend,
 )
 from mempalace.backends.chroma import (
+    CHROMA_SETTINGS,
     ChromaBackend,
     ChromaCollection,
     _HNSW_MISSING_METADATA_DATA_FLOOR,
@@ -313,7 +314,9 @@ def test_chroma_cache_picks_up_db_created_after_first_open(tmp_path):
     # Use a real chromadb call so _fix_blob_seq_ids and PersistentClient succeed.
     import chromadb as _chromadb
 
-    _chromadb.PersistentClient(path=str(palace_path)).get_or_create_collection("seed")
+    _chromadb.PersistentClient(
+        path=str(palace_path), settings=CHROMA_SETTINGS
+    ).get_or_create_collection("seed")
     assert (palace_path / "chroma.sqlite3").is_file()
 
     # Next _client() call must detect the 0 → nonzero transition and rebuild.
@@ -372,7 +375,7 @@ def test_chroma_backend_create_true_creates_directory_and_collection(tmp_path):
     assert palace_path.is_dir()
     assert isinstance(collection, ChromaCollection)
 
-    client = chromadb.PersistentClient(path=str(palace_path))
+    client = chromadb.PersistentClient(path=str(palace_path), settings=CHROMA_SETTINGS)
     client.get_collection("mempalace_drawers")
 
 
@@ -385,7 +388,7 @@ def test_chroma_backend_creates_collection_with_cosine_distance(tmp_path):
         create=True,
     )
 
-    client = chromadb.PersistentClient(path=str(palace_path))
+    client = chromadb.PersistentClient(path=str(palace_path), settings=CHROMA_SETTINGS)
     col = client.get_collection("mempalace_drawers")
     assert col.metadata.get("hnsw:space") == "cosine"
 
@@ -408,7 +411,7 @@ def test_chroma_backend_sets_hnsw_bloat_guard_on_creation(tmp_path):
         create=True,
     )
 
-    client = chromadb.PersistentClient(path=str(palace_path))
+    client = chromadb.PersistentClient(path=str(palace_path), settings=CHROMA_SETTINGS)
     col = client.get_collection("mempalace_drawers")
     assert col.metadata.get("hnsw:batch_size") == 50_000
     assert col.metadata.get("hnsw:sync_threshold") == 50_000
@@ -420,7 +423,7 @@ def test_chroma_backend_create_collection_sets_hnsw_bloat_guard(tmp_path):
 
     ChromaBackend().create_collection(str(palace_path), "mempalace_drawers")
 
-    client = chromadb.PersistentClient(path=str(palace_path))
+    client = chromadb.PersistentClient(path=str(palace_path), settings=CHROMA_SETTINGS)
     col = client.get_collection("mempalace_drawers")
     assert col.metadata.get("hnsw:batch_size") == 50_000
     assert col.metadata.get("hnsw:sync_threshold") == 50_000
@@ -823,9 +826,9 @@ def test_make_client_quarantines_only_on_first_call_per_palace(tmp_path, monkeyp
     ChromaBackend.make_client(palace_path)
     ChromaBackend.make_client(palace_path)
 
-    assert calls == [
-        palace_path
-    ], "quarantine_stale_hnsw should fire once per palace per process, not on every reconnect"
+    assert calls == [palace_path], (
+        "quarantine_stale_hnsw should fire once per palace per process, not on every reconnect"
+    )
 
 
 def test_make_client_gates_invalid_metadata_on_first_call(tmp_path, monkeypatch):
@@ -941,9 +944,9 @@ def test_client_quarantines_only_on_first_call_per_palace(tmp_path, monkeypatch)
     finally:
         backend.close()
 
-    assert (
-        calls == [palace_path]
-    ), "quarantine_stale_hnsw should fire once per palace per process from _client(), not on every call"
+    assert calls == [palace_path], (
+        "quarantine_stale_hnsw should fire once per palace per process from _client(), not on every call"
+    )
 
 
 # ── _pin_hnsw_threads (per-process retrofit, separate from this PR's gate) ──
@@ -954,7 +957,7 @@ def test_pin_hnsw_threads_retrofits_legacy_collection(tmp_path):
     palace_path = tmp_path / "legacy-palace"
     palace_path.mkdir()
 
-    client = chromadb.PersistentClient(path=str(palace_path))
+    client = chromadb.PersistentClient(path=str(palace_path), settings=CHROMA_SETTINGS)
     col = client.create_collection(
         "mempalace_drawers",
         metadata={"hnsw:space": "cosine"},  # no num_threads — legacy
@@ -982,7 +985,7 @@ def test_get_collection_applies_retrofit_on_existing_palace(tmp_path):
     palace_path.mkdir()
 
     # Simulate a legacy palace: create collection without num_threads
-    bootstrap_client = chromadb.PersistentClient(path=str(palace_path))
+    bootstrap_client = chromadb.PersistentClient(path=str(palace_path), settings=CHROMA_SETTINGS)
     bootstrap_client.create_collection("mempalace_drawers", metadata={"hnsw:space": "cosine"})
     del bootstrap_client  # drop reference so a fresh client reopens cleanly
 
@@ -1018,7 +1021,7 @@ def test_get_collection_raises_collection_not_initialized_on_empty_palace(tmp_pa
     palace_path = tmp_path / "palace"
     palace_path.mkdir()
     # PersistentClient lazily creates chroma.sqlite3 — no collection yet.
-    chromadb.PersistentClient(path=str(palace_path))
+    chromadb.PersistentClient(path=str(palace_path), settings=CHROMA_SETTINGS)
     assert (palace_path / "chroma.sqlite3").is_file()
 
     with pytest.raises(CollectionNotInitializedError) as excinfo:
@@ -1175,7 +1178,8 @@ def test_chroma_backend_preflights_metadata_before_persistent_client(tmp_path, m
         pass
 
     monkeypatch.setattr(
-        "mempalace.backends.chroma.chromadb.PersistentClient", lambda path: DummyClient()
+        "mempalace.backends.chroma.chromadb.PersistentClient",
+        lambda path, **kwargs: DummyClient(),
     )
 
     backend = ChromaBackend()
@@ -1212,7 +1216,8 @@ def test_chroma_backend_stale_quarantine_is_cold_start_only_on_refresh(tmp_path,
         pass
 
     monkeypatch.setattr(
-        "mempalace.backends.chroma.chromadb.PersistentClient", lambda path: DummyClient()
+        "mempalace.backends.chroma.chromadb.PersistentClient",
+        lambda path, **kwargs: DummyClient(),
     )
 
     backend = ChromaBackend()
@@ -1254,7 +1259,8 @@ def test_chroma_backend_requarantines_after_inode_replacement(tmp_path, monkeypa
         pass
 
     monkeypatch.setattr(
-        "mempalace.backends.chroma.chromadb.PersistentClient", lambda path: DummyClient()
+        "mempalace.backends.chroma.chromadb.PersistentClient",
+        lambda path, **kwargs: DummyClient(),
     )
 
     backend = ChromaBackend()

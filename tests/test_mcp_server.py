@@ -63,12 +63,12 @@ def test_mcp_main_strips_leaked_pythonpath_from_env():
     )
     diag = f"rc={result.returncode}; stdout={result.stdout!r}; stderr={result.stderr!r}"
     assert result.returncode == 0, f"subprocess failed: {diag}"
-    assert (
-        f"ENV_MID: {expected_env!r}" in result.stderr
-    ), f"package import unexpectedly stripped env (regression in __init__.py): {diag}"
-    assert (
-        "SENTINEL_IN_PATH: False" in result.stderr
-    ), f"package import did not filter sys.path (regression in __init__.py): {diag}"
+    assert f"ENV_MID: {expected_env!r}" in result.stderr, (
+        f"package import unexpectedly stripped env (regression in __init__.py): {diag}"
+    )
+    assert "SENTINEL_IN_PATH: False" in result.stderr, (
+        f"package import did not filter sys.path (regression in __init__.py): {diag}"
+    )
     assert "ENV_AFTER: None" in result.stderr, f"MCP server did not strip PYTHONPATH: {diag}"
 
 
@@ -89,8 +89,9 @@ def _get_collection(palace_path, create=False):
     when they are done.
     """
     import chromadb
+    from mempalace.backends.chroma import CHROMA_SETTINGS
 
-    client = chromadb.PersistentClient(path=palace_path)
+    client = chromadb.PersistentClient(path=palace_path, settings=CHROMA_SETTINGS)
     if create:
         return (
             client,
@@ -250,9 +251,9 @@ class TestColdStartDiagnostics:
         )
         assert result.returncode == 0, f"stderr={result.stderr!r}"
         assert not marker.exists(), f"warmup ran for explicit-falsy value {value!r}"
-        assert (
-            "not recognized" not in result.stderr
-        ), f"explicit-falsy {value!r} should not log a warning; stderr={result.stderr!r}"
+        assert "not recognized" not in result.stderr, (
+            f"explicit-falsy {value!r} should not log a warning; stderr={result.stderr!r}"
+        )
 
     @pytest.mark.parametrize("value", ["tru", "maybe", "ENABLED", "2"])
     def test_eager_warmup_unrecognized_value_warns_and_skips_collection_open(self, tmp_path, value):
@@ -298,9 +299,9 @@ class TestColdStartDiagnostics:
             extra_code=extra,
         )
         assert result.returncode == 0, f"stderr={result.stderr!r}"
-        assert (
-            open_marker.exists()
-        ), f"_get_collection not called for {value!r}; stderr={result.stderr!r}"
+        assert open_marker.exists(), (
+            f"_get_collection not called for {value!r}; stderr={result.stderr!r}"
+        )
         assert query_marker.exists(), (
             f"col.query not invoked for {value!r} — warmup is a no-op "
             f"(would let cold-load hit first MCP call); stderr={result.stderr!r}"
@@ -665,10 +666,11 @@ class TestReadTools:
         should return total_drawers: 0, not 'No palace found'.
         """
         import chromadb
+        from mempalace.backends.chroma import CHROMA_SETTINGS
 
         _patch_mcp_server(monkeypatch, config, kg)
         # Create the DB file (init does this) but NOT the collection
-        client = chromadb.PersistentClient(path=palace_path)
+        client = chromadb.PersistentClient(path=palace_path, settings=CHROMA_SETTINGS)
         del client
         from mempalace.mcp_server import tool_status
 
@@ -1134,9 +1136,9 @@ class TestWriteTools:
 
         assert result1["success"] is True
         assert result2["success"] is True
-        assert (
-            result1["drawer_id"] != result2["drawer_id"]
-        ), "Documents with shared header but different content must have distinct drawer IDs"
+        assert result1["drawer_id"] != result2["drawer_id"], (
+            "Documents with shared header but different content must have distinct drawer IDs"
+        )
 
     def test_delete_drawer(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -2121,9 +2123,9 @@ class TestCacheInvalidation:
         all_calls = captured["get"] + captured["create"]
         assert all_calls, "expected get_collection or create_collection to be called"
         for kwargs in all_calls:
-            assert (
-                "embedding_function" in kwargs
-            ), f"missing embedding_function= in chromadb call: {kwargs}"
+            assert "embedding_function" in kwargs, (
+                f"missing embedding_function= in chromadb call: {kwargs}"
+            )
             assert kwargs["embedding_function"] is not None
 
         # Same expectation on the create=False (cache-miss) reopen path.
@@ -2561,9 +2563,9 @@ class TestKGLazyCache:
 
         result = mcp_server._canonicalize_kg_path("/some/Path/KG.sqlite3")
 
-        assert (
-            result == "<NC:<RP:/some/Path/KG.sqlite3>>"
-        ), f"expected normcase(realpath(p)) composition, got {result!r}"
+        assert result == "<NC:<RP:/some/Path/KG.sqlite3>>", (
+            f"expected normcase(realpath(p)) composition, got {result!r}"
+        )
 
     def test_get_kg_dedupes_symlink_alias_end_to_end(self, tmp_path, monkeypatch):
         """End-to-end: two ``_get_kg()`` calls via different symlink layers
