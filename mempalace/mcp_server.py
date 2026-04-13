@@ -51,6 +51,22 @@ def _parse_args():
         metavar="PATH",
         help="Path to the palace directory (overrides config file and env var)",
     )
+    parser.add_argument("--serve-http", action="store_true", help="Serve MCP over HTTP instead of stdio")
+    parser.add_argument("--port", type=int, default=8080, help="HTTP port (with --serve-http)")
+    parser.add_argument("--host", default="0.0.0.0", help="HTTP bind host (with --serve-http)")
+    parser.add_argument(
+        "--auth",
+        choices=["none", "bearer-static", "oidc-jwt"],
+        default="none",
+        help="Auth mode for HTTP transport",
+    )
+    parser.add_argument("--issuer", help="OIDC issuer URL (with --auth oidc-jwt)")
+    parser.add_argument("--audience", help="Expected token audience (with --auth oidc-jwt)")
+    parser.add_argument(
+        "--token-env",
+        default="MEMPALACE_TOKEN",
+        help="Env var holding the static bearer token (with --auth bearer-static)",
+    )
     args, unknown = parser.parse_known_args()
     if unknown:
         logger.debug("Ignoring unknown args: %s", unknown)
@@ -1561,13 +1577,28 @@ def handle_request(request, identity: str = "anonymous"):
 
 
 def main():
-    """Entry point for `python -m mempalace.mcp_server`. Dispatches to the selected transport.
+    """Entry point for `python -m mempalace.mcp_server`. Dispatches to the selected transport."""
+    args = _parse_args()
+    if args.serve_http:
+        from mempalace.transport.http import build_app
+        from mempalace.auth.bearer_static import BearerStaticAuth
+        from mempalace.auth.oidc_jwt import OIDCJWTAuth
+        import uvicorn
 
-    Argument parsing for --serve-http and auth flags is added in Task 12.
-    For now: keep 100% backward compatible — default to stdio.
-    """
-    from mempalace.transport.stdio import serve
-    serve()
+        if args.auth == "bearer-static":
+            auth = BearerStaticAuth(token_env=args.token_env)
+        elif args.auth == "oidc-jwt":
+            if not args.issuer or not args.audience:
+                raise SystemExit("--auth oidc-jwt requires --issuer and --audience")
+            auth = OIDCJWTAuth(issuer=args.issuer, audience=args.audience)
+        else:
+            auth = None
+
+        app = build_app(auth=auth)
+        uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    else:
+        from mempalace.transport.stdio import serve
+        serve()
 
 
 if __name__ == "__main__":
