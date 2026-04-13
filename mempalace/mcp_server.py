@@ -1068,6 +1068,19 @@ def tool_reconnect():
 
 # ==================== MCP PROTOCOL ====================
 
+# Tool names whose handlers mutate palace state. The HTTP transport (see
+# mempalace.transport.http) serialises these through writer_lock to prevent
+# concurrent index corruption and interleaved WAL writes. Stdio doesn't need
+# this (single-threaded event loop), but the set is still authoritative.
+WRITE_TOOL_NAMES: frozenset[str] = frozenset({
+    "mempalace_add_drawer",
+    "mempalace_delete_drawer",
+    "mempalace_update_drawer",
+    "mempalace_diary_write",
+    "mempalace_kg_add",
+    "mempalace_kg_invalidate",
+})
+
 TOOLS = {
     "mempalace_status": {
         "description": "Palace overview — total drawers, wing and room counts",
