@@ -1548,24 +1548,13 @@ def handle_request(request, identity: str = "anonymous"):
 
 
 def main():
-    logger.info("MemPalace MCP Server starting...")
-    while True:
-        try:
-            line = sys.stdin.readline()
-            if not line:
-                break
-            line = line.strip()
-            if not line:
-                continue
-            request = json.loads(line)
-            response = handle_request(request)
-            if response is not None:
-                sys.stdout.write(json.dumps(response) + "\n")
-                sys.stdout.flush()
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            logger.error(f"Server error: {e}")
+    """Entry point for `python -m mempalace.mcp_server`. Dispatches to the selected transport.
+
+    Argument parsing for --serve-http and auth flags is added in Task 12.
+    For now: keep 100% backward compatible — default to stdio.
+    """
+    from mempalace.transport.stdio import serve
+    serve()
 
 
 if __name__ == "__main__":
