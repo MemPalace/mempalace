@@ -1,0 +1,7 @@
+[
+  {"name": "mempalace_status", "arguments": {}},
+  {"name": "mempalace_list_wings", "arguments": {}},
+  {"name": "mempalace_get_taxonomy", "arguments": {}},
+  {"name": "mempalace_search", "arguments": {"query": "test", "limit": 3}},
+  {"name": "mempalace_list_rooms", "arguments": {"wing": "projects"}}
+]

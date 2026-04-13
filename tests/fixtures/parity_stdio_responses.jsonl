@@ -1,0 +1,5 @@
+{"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": "{\n  \"error\": \"No palace found\",\n  \"hint\": \"Run: mempalace init <dir> && mempalace mine <dir>\"\n}"}]}}
+{"jsonrpc": "2.0", "id": 2, "result": {"content": [{"type": "text", "text": "{\n  \"error\": \"No palace found\",\n  \"hint\": \"Run: mempalace init <dir> && mempalace mine <dir>\"\n}"}]}}
+{"jsonrpc": "2.0", "id": 3, "result": {"content": [{"type": "text", "text": "{\n  \"error\": \"No palace found\",\n  \"hint\": \"Run: mempalace init <dir> && mempalace mine <dir>\"\n}"}]}}
+{"jsonrpc": "2.0", "id": 4, "result": {"content": [{"type": "text", "text": "{\n  \"error\": \"No palace found\",\n  \"hint\": \"Run: mempalace init <dir> && mempalace mine <dir>\"\n}"}]}}
+{"jsonrpc": "2.0", "id": 5, "result": {"content": [{"type": "text", "text": "{\n  \"error\": \"No palace found\",\n  \"hint\": \"Run: mempalace init <dir> && mempalace mine <dir>\"\n}"}]}}
