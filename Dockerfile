@@ -1,27 +1,48 @@
-FROM python:3.11-slim AS builder
+# syntax=docker/dockerfile:1.7
+FROM python:3.12-slim-bookworm AS builder
 
 WORKDIR /build
-RUN apt-get update && apt-get install -y --no-install-recommends build-essential && rm -rf /var/lib/apt/lists/*
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml README.md ./
 COPY mempalace ./mempalace
 RUN pip install --no-cache-dir --prefix=/install .
 
-FROM python:3.11-slim
+FROM ubuntu:24.04
 
-RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python3.12 \
+        python3-pip \
+        ca-certificates \
+        curl \
+        libgomp1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.12 /usr/local/bin/python \
+    && ln -sf /usr/bin/python3.12 /usr/local/bin/python3
 
-COPY --from=builder /install /usr/local
+# Ubuntu's python3.12 reads from /usr/local/lib/python3.12/dist-packages
+# but the builder's pip writes to /install/lib/python3.12/site-packages.
+# Copy binaries into /usr/local (entry_points, headers, etc) and merge the
+# packages into the path Ubuntu's Python actually searches.
+COPY --from=builder /install/bin /usr/local/bin
+COPY --from=builder /install/lib/python3.12/site-packages /usr/local/lib/python3.12/dist-packages
+
 COPY mempalace /app/mempalace
 
 WORKDIR /app
-RUN useradd -u 1000 -m mempalace && \
-    mkdir -p /home/mempalace/.mempalace && \
-    chown -R mempalace:mempalace /home/mempalace
 
-USER mempalace
+# Default rootless UID per home-operations/containers standard.
+# k8s runtime may override via securityContext.runAsUser / fsGroup.
+USER 65534:65534
+
 ENV PYTHONUNBUFFERED=1
-ENV MEMPALACE_PALACE_PATH=/home/mempalace/.mempalace/palace
+# Palace lives on a PVC mounted at /data. HOME also points here so the
+# existing WAL path (~/.mempalace/wal) resolves inside the mount.
+ENV HOME=/data
+ENV MEMPALACE_PALACE_PATH=/data/palace
 
 EXPOSE 8080
 
