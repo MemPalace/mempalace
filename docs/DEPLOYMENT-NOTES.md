@@ -59,3 +59,33 @@ Ready for Plan 2 (k8s deployment).
 - `persistence.tmp`: `emptyDir` mounted at `/tmp`
 - `persistence.data`: PVC mounted at `/data` (ceph-block, >=15Gi)
 
+
+## Plan 2 validation record
+
+- **Date closed:** 2026-04-14
+- **Deployed image digest:** ghcr.io/gavinmcfall/mempalace@sha256:53b56e8c4b54486e9bdce23a3a35606722abd0f1a01378127215eeee027c9fbd
+- **Reachable at:** https://mempalace.nerdz.cloud
+- **Auth:** bearer-static (OIDC deferred to Plan 2.5)
+- **Palace:** fresh empty, Ceph RBD PVC `mempalace` (15 Gi)
+- **Backups:** VolSync — `mempalace` (NFS, sync window minute 25) and `mempalace-b2` (Backblaze B2, sync window minute 49); both healthy with recent successful syncs
+- **MCP round-trip verified:** initialize → add_drawer → search → pod restart → search (drawer survived)
+- **Bearer identity (all callers):** `static-client` — will be per-device OIDC identities in Plan 2.5
+
+### Deviations from original plan
+- Switched from OIDC-JWT to bearer-static (Plan 2.5 will revisit)
+- Added ExternalSecret (onepassword-connect) pulling `mempalace` item's `MEMPALACE_TOKEN` field
+- ExternalSecret shape corrected in a follow-up PR #1827 (dataFrom extract pattern, matches mem0)
+- VolSync minutes: 25 / 49 (collision avoidance — see PR #1825)
+
+### Exit criteria met
+- [x] Flux reconciles cleanly
+- [x] Pod 1/1 Ready
+- [x] healthz OK over Cloudflare Tunnel
+- [x] /mcp 401 without auth / 200 with valid token
+- [x] add_drawer + search round-trip
+- [x] WAL identity + schema_version
+- [x] Palace persists pod restart
+- [x] VolSync ReplicationSources active
+- [x] /metrics Prometheus format
+
+Ready for informal soak + Plan 2.5 (OIDC) + Plan 3 (cutover).
