@@ -32,3 +32,30 @@ Always pin by digest in Plan 2's HelmRelease, never by moving tag.
 - [x] No suppression comments introduced beyond the two documented above
 
 Ready for Plan 2 (k8s deployment).
+
+## Plan 1.5 hardening record
+
+- **Date closed:** 2026-04-14
+- **Ubuntu 24.04 runtime, Python 3.12**
+- **Default UID:** 65534 (rootless per home-operations/containers)
+- **Architectures:** linux/amd64, linux/arm64
+- **readOnlyRootFilesystem verified:** YES (requires emptyDir at /tmp in k8s)
+- **Palace mount path:** `/data` (PVC mount), with `MEMPALACE_PALACE_PATH=/data/palace` and `HOME=/data`
+- **New image digest (canonical for Plan 2):** `ghcr.io/gavinmcfall/mempalace@sha256:53b56e8c4b54486e9bdce23a3a35606722abd0f1a01378127215eeee027c9fbd`
+- **Superseded Plan 1 digest:** `ghcr.io/gavinmcfall/mempalace@sha256:0b25f34f1bfbde78f78634e4ba49a9fc23ae4e57b8302a7b88febd59a895423b`
+
+### Adaptations applied during Plan 1.5
+
+- Plan called for builder on `python:3.11-slim-bookworm` + runtime on Ubuntu 24.04 (Python 3.12). That cross-version setup failed at runtime with `ModuleNotFoundError: No module named 'chromadb'` because pip produced `cp311-cp311` wheels that Python 3.12 cannot import. Builder was switched to `python:3.12-slim-bookworm` to match.
+- Second issue: Ubuntu's packaged `python3.12` reads from `/usr/local/lib/python3.12/dist-packages`, but `pip install --prefix=/install` writes to `site-packages`. The Dockerfile now copies `/install/bin` into `/usr/local/bin` and `/install/lib/python3.12/site-packages` into `/usr/local/lib/python3.12/dist-packages` so Ubuntu's Python resolves modules correctly.
+- Volume ownership: `docker run` with a named volume created as root causes `PermissionError: [Errno 13]` when UID 65534 tries to write `/data/.mempalace`. Locally we `chown -R 65534:65534 /data` before starting the container. In k8s this is handled natively by `securityContext.fsGroup: 568`.
+
+### K8s runtime contract (for Plan 2)
+
+- `securityContext.runAsUser: 568` (home-ops convention) — overrides the image's 65534 default
+- `securityContext.runAsGroup: 568`
+- `securityContext.fsGroup: 568` — palace files will be owned by this group
+- `securityContext.readOnlyRootFilesystem: true`
+- `persistence.tmp`: `emptyDir` mounted at `/tmp`
+- `persistence.data`: PVC mounted at `/data` (ceph-block, >=15Gi)
+
