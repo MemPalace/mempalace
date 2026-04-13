@@ -2,62 +2,48 @@
 
 ## Summary
 
-Add a first-class export snapshot feature that produces a human-readable, archive-friendly view of a MemPalace palace without changing stored memory contents or storage layout.
+MemPalace now includes a first-class snapshot export workflow for human-readable, archive-friendly markdown output.
 
-The feature will expose a new CLI command, `mempalace export <output_dir>`, and build on the existing markdown exporter in `mempalace/exporter.py`. The output will be a timestamped snapshot directory containing:
-
-- `overview.md` for human-first summary and navigation
-- `manifest.json` for machine-readable snapshot metadata
-- `index.md` at the snapshot root
-- `index.md` inside each exported wing
-- Existing room-level markdown files containing verbatim drawer content
-
-This is an observability feature, not a retrieval or storage feature. It must preserve MemPalace's verbatim guarantee and local-first model.
-
-## Goals
-
-- Make palace exports easier for humans to read, browse, and archive
-- Preserve verbatim drawer content exactly as exported today
-- Reuse the current exporter implementation and file layout as much as possible
-- Add a stable machine-readable snapshot manifest for future tooling
-- Keep the first version additive and backward compatible
-
-## Non-Goals
-
-- No changes to ChromaDB or SQLite schema
-- No HTML export
-- No snapshot diffing against previous exports
-- No AI-generated summaries or lossy condensation
-- No changes to mining, search, MCP tools, or knowledge graph behavior
-
-## Current State
-
-`mempalace/exporter.py` already exports the palace as markdown files grouped by wing and room and writes a root `index.md`. `tests/test_exporter.py` covers this basic behavior.
-
-The CLI does not currently expose export as a formal command, so export is available as code but not as a stable user-facing workflow. The current output is useful as raw data, but it lacks:
-
-- A snapshot identity for archiving
-- A human-first overview page
-- Wing-level navigation pages
-- A machine-readable manifest for future comparison or automation
-
-## User Experience
-
-### Command
+The feature is exposed through:
 
 ```bash
 mempalace export <output_dir>
 ```
 
-### Optional arguments
+It builds on the existing exporter and preserves verbatim room content while adding snapshot-level navigation and metadata files.
 
-- `--palace <path>`: export from a non-default palace path
-- `--snapshot-name <name>`: use a caller-provided snapshot directory name
-- `--wing <name>`: export only one wing
+## Implemented Scope
 
-### Default behavior
+The implemented snapshot export supports:
 
-Running `mempalace export ./exports` creates:
+- `mempalace export <output_dir>`
+- `--palace <path>`
+- `--snapshot-name <name>`
+- `--wing <name>`
+- Timestamped snapshot directories when `--snapshot-name` is omitted
+- `overview.md`
+- `manifest.json`
+- Snapshot root `index.md`
+- Per-wing `index.md`
+- Existing room-level verbatim markdown files
+
+The feature is additive. It does not change storage layout, drawer contents, search behavior, mining behavior, MCP behavior, or knowledge graph behavior.
+
+## Command Behavior
+
+### CLI
+
+`mempalace/cli.py` provides an `export` subcommand that resolves the palace path using the same pattern as the other CLI commands and delegates the work to `export_snapshot()` in `mempalace/exporter.py`.
+
+### Output structure
+
+Running:
+
+```bash
+mempalace export ./exports
+```
+
+creates a timestamped snapshot directory like:
 
 ```text
 ./exports/
@@ -74,227 +60,80 @@ Running `mempalace export ./exports` creates:
       docs.md
 ```
 
-If `--snapshot-name` is omitted, the command generates a timestamp-based name in local time using `YYYY-MM-DD_HHMMSS`.
+When `--snapshot-name` is passed, that name is used directly as the snapshot directory.
 
-If `--wing` is provided, the snapshot contains only that wing and all summary statistics are scoped to the filtered export, not the whole palace.
+When `--wing` is passed, only that wing is exported and the generated statistics are scoped to the filtered output.
 
-## Detailed Design
+## Exporter Design
 
-### CLI changes
+`mempalace/exporter.py` now has two public entry points:
 
-`mempalace/cli.py` will gain:
+- `export_palace()` for the original markdown tree export
+- `export_snapshot()` for snapshot exports
 
-- A new `cmd_export(args)` handler
-- A new `export` subcommand in argument parsing
+Shared logic is kept inside internal helpers so both export styles reuse the same room-writing behavior.
 
-The handler will:
+### Shared export flow
 
-1. Resolve `palace_path` using existing CLI conventions
-2. Resolve `output_dir`
-3. Pass `palace_path`, `output_dir`, `snapshot_name`, and optional `wing` filter into a new snapshot export function
-4. Print the generated snapshot path and summary stats
+The exporter:
 
-The command should follow the style of existing CLI commands such as `status`, `search`, and `split`.
+1. Opens the palace collection
+2. Streams drawers in paginated batches
+3. Groups drawers by wing and room
+4. Writes room markdown files incrementally
+5. Accumulates summary counts for wings and rooms
 
-### Exporter changes
+This keeps memory use bounded while preserving the existing room markdown format.
 
-`mempalace/exporter.py` will be extended with a new high-level function:
+### Snapshot-specific files
 
-```python
-export_snapshot(
-    palace_path: str,
-    output_dir: str,
-    snapshot_name: str | None = None,
-    wing: str | None = None,
-) -> dict
-```
+`export_snapshot()` adds:
 
-This function will:
+- `overview.md`
+  Human-readable summary with snapshot identity, filters, totals, and links to each wing
+- `manifest.json`
+  Machine-readable metadata including snapshot name, export timestamp, version, filters, and aggregated counts
+- Snapshot root `index.md`
+  Navigation into exported wings
+- Per-wing `index.md`
+  Navigation into exported room files
 
-1. Build the final snapshot directory path
-2. Query the palace collection
-3. Stream drawers in batches, as the current exporter already does
-4. Write room-level markdown files with the current verbatim format
-5. Write wing-level `index.md` files
-6. Write snapshot root `index.md`
-7. Write `overview.md`
-8. Write `manifest.json`
-9. Return structured stats including the final snapshot path
+### Room markdown compatibility
 
-The existing `export_palace()` function should remain available. To minimize duplication, shared batching and write logic should be factored into small internal helpers inside `exporter.py`, but only where that meaningfully reduces duplication for snapshot export. This is a targeted extraction, not a general refactor.
+Room markdown files keep the existing export format:
 
-### Output file responsibilities
+- `# wing / room` heading
+- one section per drawer
+- blockquoted verbatim content
+- metadata table for source, filed time, and added-by
 
-#### `manifest.json`
-
-Machine-readable metadata for scripting and future diff support.
-
-Proposed structure:
-
-```json
-{
-  "snapshot_name": "2026-04-13_145200",
-  "exported_at": "2026-04-13T14:52:00+08:00",
-  "mempalace_version": "3.1.0",
-  "palace_path": "/abs/path/to/palace",
-  "format": "markdown_snapshot",
-  "filters": {
-    "wing": null
-  },
-  "stats": {
-    "wings": 2,
-    "rooms": 3,
-    "drawers": 42
-  },
-  "wings": [
-    {
-      "name": "alpha",
-      "rooms": 2,
-      "drawers": 30
-    },
-    {
-      "name": "beta",
-      "rooms": 1,
-      "drawers": 12
-    }
-  ]
-}
-```
-
-Field expectations:
-
-- `snapshot_name`: final directory name
-- `exported_at`: local ISO-8601 timestamp
-- `mempalace_version`: from `mempalace.version`
-- `palace_path`: absolute path used for export
-- `format`: fixed identifier for this output shape
-- `filters`: currently only wing filtering
-- `stats`: counts scoped to the exported data set
-- `wings`: sorted wing summary list
-
-#### `overview.md`
-
-Human-first entry point with:
-
-- Snapshot identity
-- Export time
-- Palace path
-- Active filters
-- Total counts
-- A wing summary table with links
-
-This file should not summarize drawer content. It should only describe exported structure and navigation.
-
-#### Root `index.md`
-
-Compact navigation page that lists exported wings and links into each wing directory. This remains close to the existing root index behavior, but in the snapshot layout rather than directly under the caller's output directory.
-
-#### Wing `index.md`
-
-A new per-wing index with:
-
-- Wing name
-- Room counts
-- Drawer counts per room
-- Links to room markdown files
-
-#### Room markdown files
-
-Continue using the current exporter format:
-
-- Header for `wing / room`
-- One section per drawer
-- Blockquoted verbatim content
-- Metadata table
-
-This protects backward compatibility for anyone already consuming exported room files.
-
-## Data Flow
-
-1. CLI resolves palace and output arguments
-2. Exporter opens the Chroma collection
-3. Exporter streams drawers in paginated batches
-4. Each batch is grouped by wing and room
-5. Room markdown files are appended incrementally
-6. In-memory counters accumulate summary stats per wing and room
-7. After streaming completes, exporter writes overview and index files from accumulated stats
-8. Exporter writes `manifest.json`
-9. CLI prints final snapshot path and stats
-
-This keeps memory usage proportional to batch size plus summary metadata, not total drawer volume.
+This keeps existing exported room content stable while allowing richer snapshot output above it.
 
 ## Error Handling
 
-- Empty palace: preserve current behavior and return zero stats without writing a misleading partial snapshot
-- Missing palace: surface the same style of error the existing exporter and CLI already use
-- Invalid wing filter: export succeeds with zero stats if no matching drawers exist, but the overview and manifest must make the filter explicit
-- Existing snapshot directory collision:
-  - If the generated timestamp directory already exists, append a numeric suffix
-  - If the user supplies `--snapshot-name` and the target exists, fail clearly rather than silently merging content
-- Unsafe filenames: continue using the existing path component sanitizer
+The implemented behavior is:
 
-## Compatibility
+- empty palace exports return zero counts
+- explicit `--snapshot-name` collisions raise `FileExistsError`
+- generated timestamp collisions are resolved by appending a numeric suffix
+- path components continue to be sanitized before writing directories or files
 
-This design is additive:
+## Files Changed
 
-- Existing `export_palace()` callers continue to work
-- Existing room markdown shape remains intact
-- No storage or schema changes
-- No behavior changes to search, mine, repair, MCP, or KG modules
-
-The only new user-facing surface is the CLI `export` command and the richer snapshot output layout when that command is used.
-
-## Risks
-
-### Large palace exports
-
-`overview.md` and wing indexes may become long in very large palaces. This is acceptable for v1 because they remain navigational documents, not full-content dumps.
-
-### Manifest stability
-
-Once `manifest.json` ships, downstream scripts may start depending on it. The initial field set should therefore stay small and deliberate.
-
-### Path disclosure
-
-Including absolute `palace_path` helps debugging and archival provenance, but it also exposes local paths inside the snapshot. This is acceptable for local-first storage and human archiving, but future work may add optional path redaction.
-
-## Testing
-
-### Unit and integration coverage
-
-Update tests to cover:
-
-- CLI dispatch for `mempalace export`
-- Snapshot directory creation with generated timestamp
-- Snapshot directory creation with explicit `--snapshot-name`
-- Wing-filtered export
-- `overview.md` content
-- `manifest.json` content and scoped stats
-- Wing-level `index.md` generation
-- Existing room markdown content remains unchanged
-- Collision handling for generated snapshot names
-
-### Regression protection
-
-Existing exporter tests should remain and continue to validate the base markdown room format.
-
-## Implementation Plan Preview
-
-Expected files to change:
+The snapshot export feature is implemented through changes in:
 
 - `mempalace/cli.py`
 - `mempalace/exporter.py`
 - `tests/test_cli.py`
 - `tests/test_exporter.py`
 
-No new runtime dependencies are required.
+## Validation
 
-## Future Extensions
+This implementation was verified with:
 
-The snapshot structure intentionally leaves room for later additions without rethinking the model:
+```bash
+C:\Users\SZGF\AppData\Local\Programs\Python\Python311\python.exe -m pytest tests -v
+C:\Users\SZGF\AppData\Local\Programs\Python\Python311\python.exe -m ruff check mempalace/exporter.py mempalace/cli.py tests/test_exporter.py tests/test_cli.py
+```
 
-- Snapshot diff reports
-- JSON-only export mode
-- Optional path redaction
-- Source file distribution tables
-- Last-filed-at summaries when reliable metadata is present
+The branch-level verification completed successfully at the time of writing, including full-suite test coverage.
