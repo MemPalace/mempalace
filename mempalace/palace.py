@@ -753,6 +753,9 @@ METADATA_PAGE_SIZE = 1000
 
 def get_all_metadatas(col, **extra_kwargs):
     """Paginate through all metadatas in a collection to avoid the 10K truncation bug."""
+    # Strip keys that would silently override internal pagination control.
+    for _reserved in ("limit", "offset", "include"):
+        extra_kwargs.pop(_reserved, None)
     all_meta = []
     offset = 0
     while True:

@@ -465,7 +465,10 @@
       "factory",
       "one",
       "azure_functions",
-      "notion_api"
+      "notion_api",
+      "azure_devops",
+      "azure_pipelines",
+      "notion_workspace"
     ]
   }
 }

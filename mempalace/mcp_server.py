@@ -2075,7 +2075,7 @@ TOOLS = {
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Max results (default 5)",
+                    "description": "Max results (default 5). Clamped to 1-100.",
                     "minimum": 1,
                     "maximum": 100,
                 },
