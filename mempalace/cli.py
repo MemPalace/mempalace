@@ -13,6 +13,7 @@ Commands:
     mempalace split <dir>                 Split concatenated mega-files into per-session files
     mempalace mine <dir>                  Mine project files (default)
     mempalace mine <dir> --mode convos    Mine conversation exports
+    mempalace export <dir>                Export a human-readable markdown snapshot
     mempalace search "query"              Find anything, exact words
     mempalace mcp                         Show MCP setup command
     mempalace wake-up                     Show L0 + L1 wake-up context
@@ -593,6 +594,19 @@ def cmd_search(args):
         )
     except SearchError:
         sys.exit(1)
+
+
+def cmd_export(args):
+    """Export a human-readable markdown snapshot of the palace."""
+    from .exporter import export_snapshot
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    export_snapshot(
+        palace_path=palace_path,
+        output_dir=args.output_dir,
+        snapshot_name=args.snapshot_name,
+        wing=args.wing,
+    )
 
 
 def cmd_wakeup(args):
@@ -1221,6 +1235,19 @@ def main():
     p_search.add_argument("--room", default=None, help="Limit to one room")
     p_search.add_argument("--results", type=int, default=5, help="Number of results")
 
+    # export
+    p_export = sub.add_parser(
+        "export",
+        help="Export a human-readable markdown snapshot of the palace",
+    )
+    p_export.add_argument("output_dir", help="Directory where snapshot exports should be written")
+    p_export.add_argument(
+        "--snapshot-name",
+        default=None,
+        help="Optional snapshot directory name (default: local timestamp)",
+    )
+    p_export.add_argument("--wing", default=None, help="Export only one wing")
+
     # compress
     p_compress = sub.add_parser(
         "compress", help="Compress drawers using AAAK Dialect (~30x reduction)"
@@ -1421,6 +1448,7 @@ def main():
         "mine": cmd_mine,
         "split": cmd_split,
         "search": cmd_search,
+        "export": cmd_export,
         "sweep": cmd_sweep,
         "mcp": cmd_mcp,
         "compress": cmd_compress,

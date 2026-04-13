@@ -11,6 +11,7 @@ import pytest
 
 from mempalace.cli import (
     cmd_compress,
+    cmd_export,
     cmd_hook,
     cmd_init,
     cmd_instructions,
@@ -610,6 +611,35 @@ def test_cmd_wakeup(mock_config_cls, capsys):
     assert "tokens" in out
 
 
+# ── cmd_export ─────────────────────────────────────────────────────────
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_export_calls_export_snapshot(mock_config_cls, capsys):
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    args = argparse.Namespace(
+        palace=None,
+        output_dir="/tmp/export",
+        snapshot_name="snapshot-1",
+        wing="alpha",
+    )
+    with patch("mempalace.exporter.export_snapshot") as mock_export:
+        mock_export.return_value = {
+            "snapshot_path": "/tmp/export/snapshot-1",
+            "wings": 1,
+            "rooms": 2,
+            "drawers": 3,
+        }
+        cmd_export(args)
+        mock_export.assert_called_once_with(
+            palace_path="/fake/palace",
+            output_dir="/tmp/export",
+            snapshot_name="snapshot-1",
+            wing="alpha",
+        )
+    assert capsys.readouterr().out == ""
+
+
 # ── cmd_split ──────────────────────────────────────────────────────────
 
 
@@ -688,6 +718,15 @@ def test_main_split_dispatches():
     with (
         patch("sys.argv", ["mempalace", "split", "/chats"]),
         patch("mempalace.cli.cmd_split") as mock_cmd,
+    ):
+        main()
+        mock_cmd.assert_called_once()
+
+
+def test_main_export_dispatches():
+    with (
+        patch("sys.argv", ["mempalace", "export", "/tmp/export"]),
+        patch("mempalace.cli.cmd_export") as mock_cmd,
     ):
         main()
         mock_cmd.assert_called_once()
