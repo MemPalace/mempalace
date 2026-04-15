@@ -365,7 +365,10 @@ def scan_convos(convo_dir: str) -> list:
                         pass
                     continue
                 try:
-                    if filepath.stat().st_size > MAX_FILE_SIZE:
+                    file_size = filepath.stat().st_size
+                    if file_size > MAX_FILE_SIZE:
+                        print(f"  SKIP: {filepath.name} ({file_size / (1024 * 1024):.1f} MB)"
+                              f" exceeds {MAX_FILE_SIZE // (1024 * 1024)} MB limit")
                         continue
                 except OSError:
                     continue

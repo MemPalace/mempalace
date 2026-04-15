@@ -567,6 +567,24 @@ def test_entity_metadata_matches_known_names_case_insensitively(monkeypatch):
     assert "Lumi" in matched_mixed
 
 
+def test_scan_project_skips_oversized_files(tmp_path, capsys, monkeypatch):
+    import mempalace.miner as miner_mod
+
+    monkeypatch.setattr(miner_mod, "MAX_FILE_SIZE", 100)
+
+    write_file(tmp_path / "small.py", "x = 1\n" * 10)
+    write_file(tmp_path / "big.py", "x = 1\n" * 100)
+
+    files = scan_project(str(tmp_path))
+    names = [f.name for f in files]
+    assert "small.py" in names
+    assert "big.py" not in names
+
+    captured = capsys.readouterr()
+    assert "SKIP: big.py" in captured.out
+    assert "exceeds" in captured.out
+
+
 def test_file_already_mined_check_mtime():
     tmpdir = tempfile.mkdtemp()
     try:

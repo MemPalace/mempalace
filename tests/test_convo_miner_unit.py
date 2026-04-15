@@ -373,6 +373,23 @@ class TestScanConvos:
         assert "deep/subdir/nested.jsonl" in err
         assert "(symlink)" in err
 
+    def test_scan_skips_oversized_files(self, tmp_path, capsys, monkeypatch):
+        import mempalace.convo_miner as convo_mod
+
+        monkeypatch.setattr(convo_mod, "MAX_FILE_SIZE", 100)
+
+        (tmp_path / "small.txt").write_text("hello " * 5, encoding="utf-8")
+        (tmp_path / "big.txt").write_text("hello " * 100, encoding="utf-8")
+
+        files = scan_convos(str(tmp_path))
+        names = [f.name for f in files]
+        assert "small.txt" in names
+        assert "big.txt" not in names
+
+        captured = capsys.readouterr()
+        assert "SKIP: big.txt" in captured.out
+        assert "exceeds" in captured.out
+
 
 class TestFileChunksLocked:
     def test_uses_bounded_upsert_batches(self, monkeypatch):
