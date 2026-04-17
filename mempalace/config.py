@@ -587,6 +587,25 @@ class MempalaceConfig:
         return max(1, parsed)
 
     @property
+    def lang(self):
+        """Primary language code for search tokenization and localized output.
+
+        Resolution order: ``MEMPALACE_LANG`` / ``MEMPAL_LANG`` env var,
+        ``config.json["lang"]``, first entry of ``entity_languages``, then
+        ``"en"``. Always returns a non-empty string.
+        """
+        env_val = os.environ.get("MEMPALACE_LANG") or os.environ.get("MEMPAL_LANG")
+        if env_val and env_val.strip():
+            return env_val.strip()
+        cfg = self._file_config.get("lang")
+        if isinstance(cfg, str) and cfg.strip():
+            return cfg.strip()
+        entity_langs = self.entity_languages
+        if entity_langs:
+            return entity_langs[0]
+        return "en"
+
+    @property
     def hook_silent_save(self):
         """Whether the stop hook saves directly (True) or blocks for MCP calls (False)."""
         return self._file_config.get("hooks", {}).get("silent_save", True)

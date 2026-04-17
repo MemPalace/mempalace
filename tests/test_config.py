@@ -618,3 +618,48 @@ def test_hooks_auto_save_env_override_true():
         assert cfg.hooks_auto_save is True
     finally:
         del os.environ["MEMPALACE_HOOKS_AUTO_SAVE"]
+
+
+# ── cfg.lang resolution ────────────────────────────────────────────────
+
+
+def test_lang_defaults_to_english():
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    assert cfg.lang == "en"
+
+
+def test_lang_reads_config_file():
+    tmpdir = tempfile.mkdtemp()
+    with open(os.path.join(tmpdir, "config.json"), "w") as f:
+        json.dump({"lang": "ja"}, f)
+    cfg = MempalaceConfig(config_dir=tmpdir)
+    assert cfg.lang == "ja"
+
+
+def test_lang_env_var_overrides_file():
+    tmpdir = tempfile.mkdtemp()
+    with open(os.path.join(tmpdir, "config.json"), "w") as f:
+        json.dump({"lang": "ja"}, f)
+    os.environ["MEMPALACE_LANG"] = "ru"
+    try:
+        cfg = MempalaceConfig(config_dir=tmpdir)
+        assert cfg.lang == "ru"
+    finally:
+        del os.environ["MEMPALACE_LANG"]
+
+
+def test_lang_falls_back_to_entity_languages_first_entry():
+    """Without explicit lang, use entity_languages[0] so existing configs keep working."""
+    tmpdir = tempfile.mkdtemp()
+    with open(os.path.join(tmpdir, "config.json"), "w") as f:
+        json.dump({"entity_languages": ["ko", "en"]}, f)
+    cfg = MempalaceConfig(config_dir=tmpdir)
+    assert cfg.lang == "ko"
+
+
+def test_lang_strips_whitespace():
+    tmpdir = tempfile.mkdtemp()
+    with open(os.path.join(tmpdir, "config.json"), "w") as f:
+        json.dump({"lang": "  fr  "}, f)
+    cfg = MempalaceConfig(config_dir=tmpdir)
+    assert cfg.lang == "fr"

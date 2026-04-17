@@ -9,14 +9,18 @@ weak closets (regex extraction on narrative content) can only help, never
 hide drawers the direct path would have found.
 """
 
+import functools
 import logging
 import math
 import os
 import re
 import sqlite3
 from pathlib import Path
+from typing import Optional
 
 from .backends import CollectionNotInitializedError, PalaceNotFoundError
+from .config import MempalaceConfig
+from .i18n import get_stopwords
 from .palace import get_closets_collection, get_collection
 
 # Closet pointer line format: "topic|entities|→drawer_id_a,drawer_id_b"
@@ -48,16 +52,42 @@ def _first_or_empty(results, key: str) -> list:
     return outer[0] or []
 
 
-def _tokenize(text: str) -> list:
+def _tokenize(text: str, stop_words: frozenset = frozenset()) -> list:
     """Lowercase + strip to alphanumeric tokens of length ≥ 2.
 
     Tolerates ``None`` documents — Chroma can return ``None`` in the
     ``documents`` field for drawers without text content, which would
     otherwise raise ``AttributeError`` mid-rerank.
+
+    When ``stop_words`` is non-empty, filters tokens that match any entry.
+    The set is expected to already be lowercased so callers can share one
+    instance across query + document tokenization.
     """
     if not text:
         return []
-    return _TOKEN_RE.findall(text.lower())
+    tokens = _TOKEN_RE.findall(text.lower())
+    if stop_words:
+        return [t for t in tokens if t not in stop_words]
+    return tokens
+
+
+@functools.lru_cache(maxsize=16)
+def _resolve_stop_words(lang: Optional[str]) -> frozenset:
+    """Return the BM25 stop-word set for ``lang`` or the configured default.
+
+    Config resolution is isolated here so ``search_memories`` stays under
+    ruff's mccabe complexity ceiling and so tests can monkeypatch a single
+    seam instead of env + file fixtures. Results are cached per-``lang`` so
+    the search hot path does not re-read ``config.json`` on every call —
+    16 slots is more than the count of shipped locales.
+    """
+    if lang is None:
+        try:
+            lang = MempalaceConfig().lang
+        except Exception:
+            logger.debug("lang resolution failed, defaulting to en", exc_info=True)
+            lang = "en"
+    return frozenset(get_stopwords(lang))
 
 
 def _bm25_scores(
@@ -65,6 +95,7 @@ def _bm25_scores(
     documents: list,
     k1: float = 1.5,
     b: float = 0.75,
+    stop_words: frozenset = frozenset(),
 ) -> list:
     """Compute Okapi-BM25 scores for ``query`` against each document.
 
@@ -82,11 +113,11 @@ def _bm25_scores(
     Returns a list of scores in the same order as ``documents``.
     """
     n_docs = len(documents)
-    query_terms = set(_tokenize(query))
+    query_terms = set(_tokenize(query, stop_words))
     if not query_terms or n_docs == 0:
         return [0.0] * n_docs
 
-    tokenized = [_tokenize(d) for d in documents]
+    tokenized = [_tokenize(d, stop_words) for d in documents]
     doc_lens = [len(toks) for toks in tokenized]
     if not any(doc_lens):
         return [0.0] * n_docs
@@ -124,6 +155,7 @@ def _hybrid_rank(
     query: str,
     vector_weight: float = 0.6,
     bm25_weight: float = 0.4,
+    stop_words: frozenset = frozenset(),
 ) -> list:
     """Re-rank ``results`` by a convex combination of vector similarity and BM25.
 
@@ -147,7 +179,7 @@ def _hybrid_rank(
         return results
 
     docs = [r.get("text", "") for r in results]
-    bm25_raw = _bm25_scores(query, docs)
+    bm25_raw = _bm25_scores(query, docs, stop_words=stop_words)
     max_bm25 = max(bm25_raw) if bm25_raw else 0.0
     bm25_norm = [s / max_bm25 for s in bm25_raw] if max_bm25 > 0 else [0.0] * len(bm25_raw)
 
@@ -755,6 +787,7 @@ def search_memories(
     vector_disabled: bool = False,
     candidate_strategy: str = "vector",
     collection_name: str = None,
+    lang: Optional[str] = None,
 ) -> dict:
     """Programmatic search — returns a dict instead of printing.
 
@@ -792,6 +825,9 @@ def search_memories(
               When ``max_distance > 0.0`` is also set, BM25-only candidates
               are skipped — they have no vector distance and would silently
               violate the requested distance threshold.
+        lang: Locale code for BM25 stop-word filtering. When omitted, reads
+            ``MempalaceConfig().lang`` which resolves via env, config.json,
+            ``entity_languages[0]``, then falls back to English.
     """
     # Validate the strategy eagerly so invalid values fail the same way
     # regardless of whether the call routes through the vector path or
@@ -807,6 +843,8 @@ def search_memories(
             n_results=n_results,
             collection_name=collection_name,
         )
+
+    stop_words = _resolve_stop_words(lang)
 
     try:
         drawers_col = get_collection(palace_path, collection_name=collection_name, create=False)
@@ -962,7 +1000,7 @@ def search_memories(
         indexed.sort(key=lambda p: p[0])
         ordered_docs = [d for _, d in indexed]
 
-        query_terms = set(_tokenize(query))
+        query_terms = set(_tokenize(query, stop_words))
         best_idx, best_score = 0, -1
         for idx, d in enumerate(ordered_docs):
             d_lower = d.lower()
@@ -1005,7 +1043,7 @@ def search_memories(
     # would return up to 4× ``n_results`` (vector hits + BM25 union pool),
     # breaking the existing ``search_memories`` size contract that the MCP
     # ``limit`` parameter is built on.
-    hits = _hybrid_rank(hits, query)[:n_results]
+    hits = _hybrid_rank(hits, query, stop_words=stop_words)[:n_results]
     for h in hits:
         h.pop("_sort_key", None)
         h.pop("_source_file_full", None)
