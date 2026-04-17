@@ -476,8 +476,8 @@ def test_bm25_scores_all_stopword_docs_returns_zero_vector():
     assert scores == [0.0, 0.0]
 
 
-def test_resolve_stop_words_falls_back_when_config_raises(monkeypatch):
-    """If MempalaceConfig() blows up, default to English and log without crashing."""
+def test_resolve_stop_words_falls_back_silently_when_config_raises(monkeypatch):
+    """If MempalaceConfig() blows up, return an empty set so search keeps working."""
     from mempalace import searcher
 
     searcher._resolve_stop_words.cache_clear()
@@ -486,9 +486,34 @@ def test_resolve_stop_words_falls_back_when_config_raises(monkeypatch):
         raise OSError("config.json unreadable")
 
     monkeypatch.setattr(searcher, "MempalaceConfig", boom)
+    assert searcher._resolve_stop_words(None) == frozenset()
+
+
+def test_resolve_stop_words_none_with_no_explicit_lang_returns_empty(monkeypatch):
+    """Unconfigured palaces must not suddenly filter stop words."""
+    from mempalace import searcher
+
+    searcher._resolve_stop_words.cache_clear()
+
+    class FakeCfg:
+        lang_explicit = None
+
+    monkeypatch.setattr(searcher, "MempalaceConfig", FakeCfg)
+    assert searcher._resolve_stop_words(None) == frozenset()
+
+
+def test_resolve_stop_words_none_with_explicit_lang_applies_filter(monkeypatch):
+    """When the user opts in via lang_explicit, the locale's stop words load."""
+    from mempalace import searcher
+
+    searcher._resolve_stop_words.cache_clear()
+
+    class FakeCfg:
+        lang_explicit = "ja"
+
+    monkeypatch.setattr(searcher, "MempalaceConfig", FakeCfg)
     sw = searcher._resolve_stop_words(None)
-    # English default: "the" is in en.json regex.stop_words
-    assert "the" in sw
+    assert "した" in sw
 
 
 def test_resolve_stop_words_caches_per_lang():

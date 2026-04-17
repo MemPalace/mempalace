@@ -73,20 +73,28 @@ def _tokenize(text: str, stop_words: frozenset = frozenset()) -> list:
 
 @functools.lru_cache(maxsize=16)
 def _resolve_stop_words(lang: Optional[str]) -> frozenset:
-    """Return the BM25 stop-word set for ``lang`` or the configured default.
+    """Return the BM25 stop-word set for ``lang`` as an opt-in feature.
+
+    When ``lang`` is an explicit string, loads that locale's stop words.
+    When ``lang`` is ``None``, reads ``MempalaceConfig().lang_explicit``:
+    the user must have set ``MEMPALACE_LANG`` / ``MEMPAL_LANG`` or
+    ``config.json["lang"]`` for filtering to activate. Palaces that never
+    configured a language get an empty set, preserving pre-PR scoring
+    byte-for-byte.
 
     Config resolution is isolated here so ``search_memories`` stays under
-    ruff's mccabe complexity ceiling and so tests can monkeypatch a single
-    seam instead of env + file fixtures. Results are cached per-``lang`` so
-    the search hot path does not re-read ``config.json`` on every call —
-    16 slots is more than the count of shipped locales.
+    ruff's mccabe complexity ceiling. Results are cached per-``lang``
+    (16 slots, more than the count of shipped locales) so the search hot
+    path does not re-read ``config.json`` on every call.
     """
     if lang is None:
         try:
-            lang = MempalaceConfig().lang
+            lang = MempalaceConfig().lang_explicit
         except Exception:
-            logger.debug("lang resolution failed, defaulting to en", exc_info=True)
-            lang = "en"
+            logger.debug("lang resolution failed, skipping stop-word filter", exc_info=True)
+            return frozenset()
+        if lang is None:
+            return frozenset()
     return frozenset(get_stopwords(lang))
 
 
