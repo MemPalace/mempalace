@@ -72,6 +72,17 @@ def _tokenize(text: str, stop_words: frozenset = frozenset()) -> list:
 
 
 @functools.lru_cache(maxsize=16)
+def _stopwords_for_lang(lang: str) -> frozenset:
+    """Cached stop-word set keyed by an explicit locale code.
+
+    Split out from ``_resolve_stop_words`` so the cache key is a canonical
+    lang string, not the raw ``Optional[str]`` input. Caching by ``None``
+    would pin the first result for the lifetime of the process even after
+    ``MEMPALACE_LANG`` / ``config.json["lang"]`` changes.
+    """
+    return frozenset(get_stopwords(lang))
+
+
 def _resolve_stop_words(lang: Optional[str]) -> frozenset:
     """Return the BM25 stop-word set for ``lang`` as an opt-in feature.
 
@@ -82,10 +93,9 @@ def _resolve_stop_words(lang: Optional[str]) -> frozenset:
     configured a language get an empty set, preserving pre-PR scoring
     byte-for-byte.
 
-    Config resolution is isolated here so ``search_memories`` stays under
-    ruff's mccabe complexity ceiling. Results are cached per-``lang``
-    (16 slots, more than the count of shipped locales) so the search hot
-    path does not re-read ``config.json`` on every call.
+    Config resolution runs on every call so mid-process env/config changes
+    take effect immediately; the per-locale parse stays cached inside
+    ``_stopwords_for_lang``.
     """
     if lang is None:
         try:
@@ -95,7 +105,7 @@ def _resolve_stop_words(lang: Optional[str]) -> frozenset:
             return frozenset()
         if lang is None:
             return frozenset()
-    return frozenset(get_stopwords(lang))
+    return _stopwords_for_lang(lang)
 
 
 def _bm25_scores(

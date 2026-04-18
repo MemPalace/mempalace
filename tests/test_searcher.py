@@ -480,7 +480,7 @@ def test_resolve_stop_words_falls_back_silently_when_config_raises(monkeypatch):
     """If MempalaceConfig() blows up, return an empty set so search keeps working."""
     from mempalace import searcher
 
-    searcher._resolve_stop_words.cache_clear()
+    searcher._stopwords_for_lang.cache_clear()
 
     def boom(*args, **kwargs):
         raise OSError("config.json unreadable")
@@ -493,7 +493,7 @@ def test_resolve_stop_words_none_with_no_explicit_lang_returns_empty(monkeypatch
     """Unconfigured palaces must not suddenly filter stop words."""
     from mempalace import searcher
 
-    searcher._resolve_stop_words.cache_clear()
+    searcher._stopwords_for_lang.cache_clear()
 
     class FakeCfg:
         lang_explicit = None
@@ -506,7 +506,7 @@ def test_resolve_stop_words_none_with_explicit_lang_applies_filter(monkeypatch):
     """When the user opts in via lang_explicit, the locale's stop words load."""
     from mempalace import searcher
 
-    searcher._resolve_stop_words.cache_clear()
+    searcher._stopwords_for_lang.cache_clear()
 
     class FakeCfg:
         lang_explicit = "ja"
@@ -520,7 +520,31 @@ def test_resolve_stop_words_caches_per_lang():
     """Repeat lookups for the same lang hit the lru_cache and return the same object."""
     from mempalace import searcher
 
-    searcher._resolve_stop_words.cache_clear()
+    searcher._stopwords_for_lang.cache_clear()
     a = searcher._resolve_stop_words("ja")
     b = searcher._resolve_stop_words("ja")
     assert a is b
+
+
+def test_resolve_stop_words_none_reflects_config_change_between_calls(monkeypatch):
+    """The None-arg path must re-read config on every call; a stale cache key
+    would pin the first result for the lifetime of the process (igorls, #977)."""
+    from mempalace import searcher
+
+    searcher._stopwords_for_lang.cache_clear()
+
+    class FakeCfgUnset:
+        lang_explicit = None
+
+    monkeypatch.setattr(searcher, "MempalaceConfig", FakeCfgUnset)
+    first = searcher._resolve_stop_words(None)
+    assert first == frozenset()
+
+    class FakeCfgJa:
+        lang_explicit = "ja"
+
+    monkeypatch.setattr(searcher, "MempalaceConfig", FakeCfgJa)
+    second = searcher._resolve_stop_words(None)
+    assert (
+        "した" in second
+    ), f"cache pinned stale empty set for None after config change; got {second!r}"
