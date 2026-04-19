@@ -843,9 +843,12 @@ def search_memories(
               When ``max_distance > 0.0`` is also set, BM25-only candidates
               are skipped — they have no vector distance and would silently
               violate the requested distance threshold.
-        lang: Locale code for BM25 stop-word filtering. When omitted, reads
-            ``MempalaceConfig().lang`` which resolves via env, config.json,
-            ``entity_languages[0]``, then falls back to English.
+        lang: Locale code for BM25 stop-word filtering (opt-in). When
+            omitted, reads ``MempalaceConfig().lang_explicit`` — returns an
+            empty set unless the user has set ``MEMPALACE_LANG`` /
+            ``MEMPAL_LANG`` or ``config.json["lang"]``. Palaces without an
+            explicit language skip filtering entirely, preserving pre-PR
+            byte-identical scoring.
     """
     # Validate the strategy eagerly so invalid values fail the same way
     # regardless of whether the call routes through the vector path or
