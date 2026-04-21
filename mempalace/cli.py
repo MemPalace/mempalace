@@ -722,6 +722,119 @@ def cmd_migrate(args):
     )
 
 
+def cmd_purge(args):
+    """Delete drawers by wing and/or room.
+
+    Extracts the drawers to *keep*, nukes the palace directory, and
+    re-inserts them into a fresh ChromaDB. This avoids HNSW ghost entries
+    that ChromaDB's in-place ``collection.delete()`` leaves behind, which
+    can cause segfaults on subsequent queries or inserts (see #521 for the
+    underlying hnswlib ``updatePoint`` race on modified-file re-mines).
+
+    Note: ``--room`` without ``--wing`` purges that room across ALL wings.
+
+    Not idempotent — running purge twice on the same criteria will print
+    "No drawers found" the second time. The operation is destructive; the
+    ``--yes`` flag skips the interactive confirmation.
+    """
+    import chromadb
+    import shutil
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    try:
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_collection("mempalace_drawers")
+    except Exception:
+        print(f"\n  No palace found at {palace_path}")
+        return
+
+    where = {}
+    if args.wing and args.room:
+        where = {"$and": [{"wing": args.wing}, {"room": args.room}]}
+    elif args.wing:
+        where = {"wing": args.wing}
+    elif args.room:
+        where = {"room": args.room}
+    else:
+        print("  Error: specify --wing and/or --room")
+        return
+
+    total = col.count()
+
+    # Count matching drawers
+    match_ids = set()
+    offset = 0
+    while True:
+        batch = col.get(limit=10000, offset=offset, where=where, include=[])
+        if not batch["ids"]:
+            break
+        match_ids.update(batch["ids"])
+        offset += len(batch["ids"])
+
+    if not match_ids:
+        label = f"wing={args.wing}" if args.wing else ""
+        if args.room:
+            label = f"{label} room={args.room}" if label else f"room={args.room}"
+        print(f"\n  No drawers found matching {label}\n")
+        return
+
+    label = f"wing={args.wing}" if args.wing else ""
+    if args.room:
+        label = f"{label} room={args.room}" if label else f"room={args.room}"
+    keep_count = total - len(match_ids)
+    print(f"\n  Found {len(match_ids):,} drawers matching {label}")
+    print(f"  Will keep {keep_count:,} drawers, rebuild index")
+
+    if not args.yes:
+        confirm = input(f"  Purge {len(match_ids):,} drawers? [y/N] ").strip().lower()
+        if confirm not in ("y", "yes"):
+            print("  Aborted.")
+            return
+
+    # Extract drawers to keep (everything NOT matching the filter)
+    print("  Extracting drawers to keep...")
+    keep_ids, keep_docs, keep_metas = [], [], []
+    offset = 0
+    batch_size = 5000
+    while offset < total:
+        batch = col.get(limit=batch_size, offset=offset, include=["documents", "metadatas"])
+        if not batch["ids"]:
+            break
+        for i, doc_id in enumerate(batch["ids"]):
+            if doc_id not in match_ids:
+                keep_ids.append(doc_id)
+                keep_docs.append(batch["documents"][i])
+                keep_metas.append(batch["metadatas"][i])
+        offset += len(batch["ids"])
+    print(f"  Extracted {len(keep_ids):,} drawers to keep")
+
+    # Release client before nuking — ChromaDB holds open file handles
+    # (WAL journal, HNSW mmap) that block rmtree on Windows and some Linux FS.
+    del col, client
+
+    # Nuke and rebuild with clean HNSW index
+    palace_path = palace_path.rstrip(os.sep)
+    print("  Rebuilding palace...")
+    shutil.rmtree(palace_path)
+    os.makedirs(palace_path, mode=0o700)
+
+    new_client = chromadb.PersistentClient(path=palace_path)
+    new_col = new_client.create_collection("mempalace_drawers", metadata={"hnsw:space": "cosine"})
+
+    filed = 0
+    for i in range(0, len(keep_ids), batch_size):
+        end = min(i + batch_size, len(keep_ids))
+        new_col.add(
+            documents=keep_docs[i:end],
+            ids=keep_ids[i:end],
+            metadatas=keep_metas[i:end],
+        )
+        filed += end - i
+        print(f"  Re-filed {filed:,} / {len(keep_ids):,}...", flush=True)
+
+    print(f"\n  Purged {len(match_ids):,} drawers. Remaining: {new_col.count():,}\n")
+
+
 def cmd_status(args):
     from .miner import status
 
@@ -1503,6 +1616,18 @@ def main():
 
     sub.add_parser("status", help="Show what's been filed")
 
+    # purge
+    p_purge = sub.add_parser(
+        "purge",
+        help="Delete drawers by wing and/or room (nuke-and-reinsert to avoid HNSW ghost entries)",
+    )
+    p_purge.add_argument("--wing", help="Wing to purge")
+    p_purge.add_argument("--room", help="Room to purge (across all wings if --wing omitted)")
+    p_purge.add_argument("--palace", help="Path to palace directory (default: from config)")
+    p_purge.add_argument(
+        "--yes", action="store_true", help="Skip interactive confirmation (destructive!)"
+    )
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1539,6 +1664,7 @@ def main():
         "repair": cmd_repair,
         "repair-status": cmd_repair_status,
         "migrate": cmd_migrate,
+        "purge": cmd_purge,
         "status": cmd_status,
     }
     dispatch[args.command](args)

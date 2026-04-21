@@ -15,6 +15,7 @@ from mempalace.cli import (
     cmd_init,
     cmd_instructions,
     cmd_mine,
+    cmd_purge,
     cmd_repair,
     cmd_search,
     cmd_split,
@@ -47,6 +48,85 @@ def test_cmd_status_custom_palace(mock_config_cls):
 
         expected = os.path.expanduser("~/my_palace")
         mock_miner.status.assert_called_once_with(palace_path=expected)
+
+
+# ── cmd_purge ──────────────────────────────────────────────────────────
+
+
+def _make_purge_args(**overrides):
+    """Build a Namespace with all purge args set."""
+    defaults = {"palace": None, "wing": None, "room": None, "yes": True}
+    defaults.update(overrides)
+    return argparse.Namespace(**defaults)
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_purge_no_palace_found(mock_config_cls, capsys):
+    """Purge prints a clear message when the palace doesn't exist."""
+    mock_config_cls.return_value.palace_path = "/nonexistent/palace"
+    args = _make_purge_args(wing="any")
+    mock_chromadb = MagicMock()
+    mock_chromadb.PersistentClient.side_effect = Exception("no palace")
+    with patch.dict("sys.modules", {"chromadb": mock_chromadb, "shutil": MagicMock()}):
+        cmd_purge(args)
+    out = capsys.readouterr().out
+    assert "No palace found" in out
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_purge_requires_filter(mock_config_cls, capsys):
+    """Purge refuses to run without --wing or --room (no mass-delete safety valve)."""
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    args = _make_purge_args()  # no wing, no room
+    mock_col = MagicMock()
+    mock_client = MagicMock()
+    mock_client.get_collection.return_value = mock_col
+    mock_chromadb = MagicMock()
+    mock_chromadb.PersistentClient.return_value = mock_client
+    with patch.dict("sys.modules", {"chromadb": mock_chromadb, "shutil": MagicMock()}):
+        cmd_purge(args)
+    out = capsys.readouterr().out
+    assert "Error: specify --wing and/or --room" in out
+    mock_col.count.assert_not_called()  # didn't touch data
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_purge_no_matches(mock_config_cls, capsys):
+    """When the filter matches zero drawers, purge exits cleanly without rebuilding."""
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    args = _make_purge_args(wing="empty-wing")
+    mock_col = MagicMock()
+    mock_col.count.return_value = 100
+    mock_col.get.return_value = {"ids": []}
+    mock_client = MagicMock()
+    mock_client.get_collection.return_value = mock_col
+    mock_chromadb = MagicMock()
+    mock_chromadb.PersistentClient.return_value = mock_client
+    mock_shutil = MagicMock()
+    with patch.dict("sys.modules", {"chromadb": mock_chromadb, "shutil": mock_shutil}):
+        cmd_purge(args)
+    out = capsys.readouterr().out
+    assert "No drawers found matching" in out
+    mock_shutil.rmtree.assert_not_called()  # nothing to rebuild
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_purge_wing_and_room_uses_and_filter(mock_config_cls):
+    """Purge builds a $and filter when both --wing and --room are set."""
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    args = _make_purge_args(wing="myproj", room="drafts")
+    mock_col = MagicMock()
+    mock_col.count.return_value = 0
+    mock_col.get.return_value = {"ids": []}
+    mock_client = MagicMock()
+    mock_client.get_collection.return_value = mock_col
+    mock_chromadb = MagicMock()
+    mock_chromadb.PersistentClient.return_value = mock_client
+    with patch.dict("sys.modules", {"chromadb": mock_chromadb, "shutil": MagicMock()}):
+        cmd_purge(args)
+    # First col.get call builds the match-id set, and its `where` should be $and
+    first_call = mock_col.get.call_args_list[0]
+    assert first_call.kwargs["where"] == {"$and": [{"wing": "myproj"}, {"room": "drafts"}]}
 
 
 # ── cmd_search ─────────────────────────────────────────────────────────
