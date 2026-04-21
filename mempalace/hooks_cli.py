@@ -247,13 +247,19 @@ def _get_mine_targets() -> list[tuple[str, str]]:
     ``_ingest_transcript`` — emitting it here too would double-mine the
     same JSONL into a different wing on every hook fire (#1231 review).
 
+    MEMPAL_DIR is resolved via Path.resolve() (follows symlinks) to prevent
+    symlink traversal to sensitive directories before use.
+
     An empty list means no MEMPAL_DIR ingest should run.
     """
     targets: list[tuple[str, str]] = []
     mempal_dir = os.environ.get("MEMPAL_DIR", "")
     if mempal_dir:
-        resolved = Path(mempal_dir).expanduser().resolve()
-        if resolved.is_dir():
+        try:
+            resolved = Path(mempal_dir).expanduser().resolve()
+        except (OSError, ValueError):
+            resolved = None
+        if resolved is not None and resolved.is_dir():
             targets.append((str(resolved), "projects"))
     return targets
 
