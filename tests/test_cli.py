@@ -20,6 +20,7 @@ from mempalace.cli import (
     cmd_repair,
     cmd_search,
     cmd_split,
+    cmd_export,
     cmd_status,
     cmd_wakeup,
     main,
@@ -111,6 +112,36 @@ def test_cmd_status_custom_palace(mock_config_cls):
 
         expected = os.path.expanduser("~/my_palace")
         mock_miner.status.assert_called_once_with(palace_path=expected)
+
+
+# ── cmd_export ─────────────────────────────────────────────────────────
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_export_default_palace(mock_config_cls):
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    args = argparse.Namespace(palace=None, output="/tmp/export_target")
+    mock_exporter = MagicMock()
+    with patch.dict("sys.modules", {"mempalace.exporter": mock_exporter}):
+        cmd_export(args)
+        mock_exporter.export_palace.assert_called_once_with(
+            palace_path="/fake/palace", output_dir="/tmp/export_target"
+        )
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_export_custom_palace_and_output(mock_config_cls):
+    args = argparse.Namespace(palace="~/my_palace", output="~/export_target")
+    mock_exporter = MagicMock()
+    with patch.dict("sys.modules", {"mempalace.exporter": mock_exporter}):
+        cmd_export(args)
+        import os
+
+        expected_palace = os.path.expanduser("~/my_palace")
+        expected_output = os.path.expanduser("~/export_target")
+        mock_exporter.export_palace.assert_called_once_with(
+            palace_path=expected_palace, output_dir=expected_output
+        )
 
 
 # ── cmd_search ─────────────────────────────────────────────────────────

@@ -824,6 +824,17 @@ def cmd_migrate_wings(args):
     )
 
 
+def cmd_export(args):
+    """Export palace drawers as browsable markdown files."""
+    from .exporter import export_palace
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    output_dir = os.path.expanduser(args.output)
+    print(f"  Exporting palace to {output_dir}...")
+    export_palace(palace_path=palace_path, output_dir=output_dir)
+    print("  Done.")
+
+
 def cmd_status(args):
     from .miner import status
 
@@ -1765,6 +1776,18 @@ def main():
         help="Storage backend (default: config/env/detected/chroma)",
     )
 
+    # export
+    p_export = sub.add_parser(
+        "export",
+        help="Export palace as browsable markdown files (one file per room)",
+    )
+    p_export.add_argument(
+        "-o", "--output", required=True, help="Output directory for markdown files"
+    )
+    p_export.add_argument(
+        "--palace", help="Path to palace directory (default: from config)"
+    )
+
     args = parser.parse_args()
     _apply_backend_arg(args)
 
@@ -1810,6 +1833,7 @@ def main():
         "repair-status": cmd_repair_status,
         "migrate": cmd_migrate,
         "migrate-wings": cmd_migrate_wings,
+        "export": cmd_export,
         "status": cmd_status,
     }
     dispatch[args.command](args)
