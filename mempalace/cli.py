@@ -1784,9 +1784,7 @@ def main():
     p_export.add_argument(
         "-o", "--output", required=True, help="Output directory for markdown files"
     )
-    p_export.add_argument(
-        "--palace", help="Path to palace directory (default: from config)"
-    )
+    p_export.add_argument("--palace", help="Path to palace directory (default: from config)")
 
     args = parser.parse_args()
     _apply_backend_arg(args)
