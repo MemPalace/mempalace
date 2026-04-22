@@ -232,14 +232,14 @@ def detect_rooms_from_files(project_dir: str) -> list:
 
 def print_proposed_structure(project_name: str, rooms: list, total_files: int, source: str):
     print(f"\n{'=' * 55}")
-    print("  MemPalace Init — Local setup")
+    print("  MemPalace Init -- Local setup")
     print(f"{'=' * 55}")
     print(f"\n  WING: {project_name}")
     print(f"  ({total_files} files found, rooms detected from {source})\n")
     for room in rooms:
         print(f"    ROOM: {room['name']}")
         print(f"          {room['description']}")
-    print(f"\n{'─' * 55}")
+    print(f"\n{'-' * 55}")
 
 
 def get_user_approval(rooms: list) -> list:
@@ -259,7 +259,7 @@ def get_user_approval(rooms: list) -> list:
     if choice == "edit":
         print("\n  Current rooms:")
         for i, room in enumerate(rooms):
-            print(f"    {i + 1}. {room['name']} — {room['description']}")
+            print(f"    {i + 1}. {room['name']} -- {room['description']}")
         remove = input("\n  Room numbers to REMOVE (comma-separated, or enter to skip): ").strip()
         if remove:
             to_remove = {int(x.strip()) - 1 for x in remove.split(",") if x.strip().isdigit()}

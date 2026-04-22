@@ -57,7 +57,7 @@ DEFAULT_WINGS = {
 
 
 def _hr():
-    print(f"\n{'─' * 58}")
+    print(f"\n{'-' * 58}")
 
 
 def _header(text):
@@ -121,9 +121,9 @@ def _ask_mode() -> str:
 """)
     print("  How are you using MemPalace?")
     print()
-    print("    [1]  Work     — notes, projects, clients, colleagues, decisions")
-    print("    [2]  Personal — diary, family, health, relationships, reflections")
-    print("    [3]  Both     — personal and professional mixed")
+    print("    [1]  Work     -- notes, projects, clients, colleagues, decisions")
+    print("    [2]  Personal -- diary, family, health, relationships, reflections")
+    print("    [3]  Both     -- personal and professional mixed")
     print()
 
     while True:

@@ -168,7 +168,7 @@ def dedup_palace(
     print(f"  Drawers: {col.count():,}")
     print(f"  Threshold: {threshold}")
     print(f"  Mode: {'DRY RUN' if dry_run else 'LIVE'}")
-    print(f"{'─' * 55}")
+    print(f"{'-' * 55}")
 
     if wing:
         print(f"  Wing: {wing}")
@@ -195,7 +195,7 @@ def dedup_palace(
 
     elapsed = time.time() - t0
 
-    print(f"\n{'─' * 55}")
+    print(f"\n{'-' * 55}")
     print(f"  Done in {elapsed:.1f}s")
     print(
         f"  Drawers: {total_kept + total_deleted:,} → {total_kept:,}  (-{total_deleted:,} removed)"

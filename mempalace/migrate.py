@@ -280,7 +280,7 @@ def migrate(palace_path: str, dry_run: bool = False, confirm: bool = False):
             print(f"      ROOM: {room:30} {count:5}")
 
     if dry_run:
-        print("\n  DRY RUN — no changes made.")
+        print("\n  DRY RUN -- no changes made.")
         print(f"  Would migrate {len(drawers)} drawers.")
         return True
 

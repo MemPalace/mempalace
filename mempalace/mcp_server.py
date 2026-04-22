@@ -1226,7 +1226,7 @@ def tool_add_drawer(
                 "The palace index may be stale; run reconnect or repair."
             )
         _metadata_cache = None
-        logger.info(f"Filed drawer: {drawer_id} → {wing}/{room} ({len(chunk_ids)} chunks)")
+        logger.info(f"Filed drawer: {drawer_id} -> {wing}/{room} ({len(chunk_ids)} chunks)")
         return {
             "success": True,
             "drawer_id": drawer_id,
@@ -1711,7 +1711,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
                 }
             )
         col.add(ids=chunk_ids, documents=chunk_docs, metadatas=chunk_metas)
-        logger.info(f"Diary entry: {entry_id} → {wing}/diary/{topic} ({len(chunk_ids)} chunks)")
+        logger.info(f"Diary entry: {entry_id} -> {wing}/diary/{topic} ({len(chunk_ids)} chunks)")
         return {
             "success": True,
             "entry_id": entry_id,

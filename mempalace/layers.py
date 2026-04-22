@@ -446,7 +446,7 @@ if __name__ == "__main__":
     import json
 
     def usage():
-        print("layers.py — 4-Layer Memory Stack")
+        print("layers.py -- 4-Layer Memory Stack")
         print()
         print("Usage:")
         print("  python layers.py wake-up              Show L0 + L1")

@@ -329,7 +329,7 @@ def prune_corrupt(palace_path=None, confirm=False, collection_name: Optional[str
     bad_file = os.path.join(palace_path, "corrupt_ids.txt")
 
     if not os.path.exists(bad_file):
-        print("  No corrupt_ids.txt found — run scan first.")
+        print("  No corrupt_ids.txt found -- run scan first.")
         return
 
     with open(bad_file) as f:
@@ -337,7 +337,7 @@ def prune_corrupt(palace_path=None, confirm=False, collection_name: Optional[str
     print(f"  {len(bad_ids):,} corrupt IDs queued for deletion")
 
     if not confirm:
-        print("\n  DRY RUN — no deletions performed.")
+        print("\n  DRY RUN -- no deletions performed.")
         print("  Re-run with --confirm to actually delete.")
         return
 
@@ -366,7 +366,7 @@ def prune_corrupt(palace_path=None, confirm=False, collection_name: Optional[str
     after = col.count()
     print(f"\n  Deleted: {deleted:,}")
     print(f"  Failed:  {failed:,}")
-    print(f"  Collection size: {before:,} → {after:,}")
+    print(f"  Collection size: {before:,} -> {after:,}")
 
 
 # ChromaDB's ``collection.get()`` enforces an internal default ``limit``
@@ -750,7 +750,7 @@ def rebuild_index(
         return
 
     progress(f"\n{'=' * 55}")
-    progress("  MemPalace Repair — Index Rebuild")
+    progress("  MemPalace Repair -- Index Rebuild")
     progress(f"{'=' * 55}\n")
     progress(f" Palace: {palace_path}")
 
