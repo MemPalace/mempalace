@@ -296,11 +296,41 @@ class KnowledgeGraph:
 
                 # Check for existing identical triple
                 existing = conn.execute(
-                    "SELECT id FROM triples WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
+                    "SELECT id, valid_from, confidence, source_closet, source_file, "
+                    "source_drawer_id, adapter_name "
+                    "FROM triples WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
                     (sub_id, pred, obj_id),
                 ).fetchone()
                 if existing:
-                    return existing["id"]  # Already exists and still valid
+                    # Idempotent write preserving the original id, but with
+                    # NULL-field backfill so a later adapter can add provenance
+                    # (RFC 002 §5.5) or a start date that the first writer did
+                    # not know. Non-NULL fields are never overwritten — explicit
+                    # invalidate() is the only path to change settled values.
+                    # Confidence is the one exception: a strictly higher value
+                    # replaces a weaker one so stronger evidence wins.
+                    updates = []
+                    params = []
+                    for col, new_val, old_val in (
+                        ("valid_from", valid_from, existing["valid_from"]),
+                        ("source_closet", source_closet, existing["source_closet"]),
+                        ("source_file", source_file, existing["source_file"]),
+                        ("source_drawer_id", source_drawer_id, existing["source_drawer_id"]),
+                        ("adapter_name", adapter_name, existing["adapter_name"]),
+                    ):
+                        if old_val is None and new_val is not None:
+                            updates.append(f"{col} = ?")
+                            params.append(new_val)
+                    if confidence > (existing["confidence"] or 0):
+                        updates.append("confidence = ?")
+                        params.append(confidence)
+                    if updates:
+                        params.append(existing["id"])
+                        conn.execute(
+                            f"UPDATE triples SET {', '.join(updates)} WHERE id = ?",
+                            params,
+                        )
+                    return existing["id"]
 
                 triple_id = f"t_{sub_id}_{pred}_{obj_id}_{hashlib.sha256(f'{valid_from}{datetime.now().isoformat()}'.encode()).hexdigest()[:12]}"
                 conn.execute(
