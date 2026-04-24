@@ -740,6 +740,40 @@ class TestDiaryTools:
         assert entry1 in contents
         assert entry2 in contents
 
+    def test_diary_read_empty_wing_spans_all_wings(self, monkeypatch, config, palace_path, kg):
+        """diary_read(wing='') must return entries from every wing this agent
+        wrote to. Hooks write to project-derived wings (#659); a reader that
+        silos by default wing would never see those entries."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_diary_read, tool_diary_write
+
+        w1 = tool_diary_write(
+            agent_name="TestAgent",
+            entry="default-wing entry",
+            topic="general",
+        )
+        w2 = tool_diary_write(
+            agent_name="TestAgent",
+            entry="project-wing entry",
+            topic="general",
+            wing="wing_someproject",
+        )
+        assert w1["success"] and w2["success"]
+
+        # Empty wing → return both entries
+        r = tool_diary_read(agent_name="TestAgent", wing="")
+        assert r["total"] == 2
+        contents = {e["content"] for e in r["entries"]}
+        assert "default-wing entry" in contents
+        assert "project-wing entry" in contents
+
+        # Explicit wing → return only that wing's entries
+        r_scoped = tool_diary_read(agent_name="TestAgent", wing="wing_someproject")
+        assert r_scoped["total"] == 1
+        assert r_scoped["entries"][0]["content"] == "project-wing entry"
+
 
 # ── Cache Invalidation (inode/mtime) ──────────────────────────────────
 

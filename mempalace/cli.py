@@ -179,12 +179,12 @@ def cmd_sweep(args):
         failures = result.get("failures") or []
         if failures:
             print(
-                f"  ⚠ {len(failures)} file(s) failed to sweep — see stderr / logs for details.",
+                f"  WARNING: {len(failures)} file(s) failed to sweep - see stderr / logs for details.",
                 file=sys.stderr,
             )
             sys.exit(2)
     else:
-        print(f"  ✗ Not a file or directory: {target}", file=sys.stderr)
+        print(f"  ERROR: Not a file or directory: {target}", file=sys.stderr)
         sys.exit(1)
 
 

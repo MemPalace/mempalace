@@ -321,7 +321,7 @@ def sweep_directory(dir_path: str, palace_path: str) -> dict:
             result = sweep(str(f), palace_path, source_label=str(f))
         except Exception as exc:
             logger.error("sweeper: sweep failed on %s: %s", f, exc)
-            print(f"  \u26a0 sweep failed on {f}: {exc}", file=sys.stderr)
+            print(f"  WARNING: sweep failed on {f}: {exc}", file=sys.stderr)
             failures.append({"file": str(f), "error": str(exc)})
             continue
         total_added += result["drawers_added"]

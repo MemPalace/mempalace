@@ -615,6 +615,8 @@ def _normalize_get_collection_args(args, kwargs):
         create = kwargs.pop("create", False)
         if rest:
             create = rest.pop(0)
+        if rest:
+            raise TypeError(f"unexpected positional args: {rest!r}")
         if kwargs:
             raise TypeError(f"unexpected kwargs: {sorted(kwargs)}")
         return (

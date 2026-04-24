@@ -30,6 +30,7 @@ with patch.dict("sys.modules", {"chromadb": MagicMock()}):
         build_graph,
         find_tunnels,
         graph_stats,
+        invalidate_graph_cache,
         traverse,
     )
 
@@ -38,6 +39,9 @@ with patch.dict("sys.modules", {"chromadb": MagicMock()}):
 
 
 class TestBuildGraph:
+    def setup_method(self):
+        invalidate_graph_cache()
+
     def test_empty_collection(self):
         col = _make_fake_collection([])
         nodes, edges = build_graph(col=col)
@@ -114,11 +118,43 @@ class TestBuildGraph:
         nodes, _ = build_graph(col=col)
         assert len(nodes["busy"]["dates"]) <= 5
 
+    def test_cache_returns_same_result(self):
+        """Second call within TTL returns cached nodes without re-scanning.
+
+        The cache intentionally ignores col/config args when warm — this is
+        correct for the MCP server's single-palace use case. Callers that
+        switch collections must call invalidate_graph_cache() first.
+        """
+        col = _make_fake_collection(
+            [{"room": "auth", "wing": "wing_code", "hall": "security", "date": "2026-01-01"}]
+        )
+        nodes1, edges1 = build_graph(col=col)
+        # Second call with a *different* collection — should still return cached result
+        col2 = _make_fake_collection([])
+        nodes2, edges2 = build_graph(col=col2)
+        assert nodes1 == nodes2
+        assert edges1 == edges2
+
+    def test_invalidate_clears_cache(self):
+        """invalidate_graph_cache() forces a fresh scan on next call."""
+        col = _make_fake_collection(
+            [{"room": "auth", "wing": "wing_code", "hall": "security", "date": "2026-01-01"}]
+        )
+        build_graph(col=col)
+        invalidate_graph_cache()
+        col_empty = _make_fake_collection([])
+        nodes, edges = build_graph(col=col_empty)
+        assert nodes == {}
+        assert edges == []
+
 
 # --- traverse ---
 
 
 class TestTraverse:
+    def setup_method(self):
+        invalidate_graph_cache()
+
     def _build_col(self):
         return _make_fake_collection(
             [
@@ -156,6 +192,9 @@ class TestTraverse:
 
 
 class TestFindTunnels:
+    def setup_method(self):
+        invalidate_graph_cache()
+
     def _build_tunnel_col(self):
         return _make_fake_collection(
             [
@@ -192,6 +231,9 @@ class TestFindTunnels:
 
 
 class TestGraphStats:
+    def setup_method(self):
+        invalidate_graph_cache()
+
     def test_empty_graph(self):
         col = _make_fake_collection([])
         stats = graph_stats(col=col)

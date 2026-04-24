@@ -11,6 +11,7 @@ function normalizeBase(base?: string): string {
 
 const docsBase = normalizeBase(process.env.DOCS_BASE || '/')
 const editBranch = process.env.DOCS_EDIT_BRANCH || 'main'
+const gaId = process.env.MEMPALACE_DOCS_GA_ID
 
 export default withMermaid(
   defineConfig({
@@ -20,14 +21,18 @@ export default withMermaid(
 
     head: [
       ['link', { rel: 'icon', href: `${docsBase}mempalace_logo.png` }],
+      ['link', { rel: 'preconnect', href: 'https://api.fontshare.com' }],
+      ['link', { href: 'https://api.fontshare.com/v2/css?f[]=neue-machina@300,400,500,700,800&f[]=satoshi@300,400,500,700&display=swap', rel: 'stylesheet' }],
       ['link', { rel: 'preconnect', href: 'https://fonts.googleapis.com' }],
       ['link', { rel: 'preconnect', href: 'https://fonts.gstatic.com', crossorigin: '' }],
-      ['link', { href: 'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@300;400;500&family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;0,600;0,700;1,300;1,400&family=Geist:wght@300;400;500;600&display=swap', rel: 'stylesheet' }],
+      ['link', { href: 'https://fonts.googleapis.com/css2?family=Onest:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap', rel: 'stylesheet' }],
       ['meta', { property: 'og:title', content: 'MemPalace — AI Memory System' }],
       ['meta', { property: 'og:description', content: '96.6% LongMemEval recall. Zero API calls. Local, free, open source.' }],
       ['meta', { property: 'og:image', content: `${docsBase}mempalace_logo.png` }],
-      ['script', { async: '', src: 'https://www.googletagmanager.com/gtag/js?id=G-PPQE4Z7P1K' }],
-      ['script', {}, `window.dataLayer = window.dataLayer || [];\nfunction gtag(){dataLayer.push(arguments);}\ngtag('js', new Date());\ngtag('config', 'G-PPQE4Z7P1K');`],
+      ...(gaId ? [
+        ['script', { async: '', src: `https://www.googletagmanager.com/gtag/js?id=${gaId}` }],
+        ['script', {}, `window.dataLayer = window.dataLayer || [];\nfunction gtag(){dataLayer.push(arguments);}\ngtag('js', new Date());\ngtag('config', '${gaId}');`],
+      ] as const : []),
     ],
 
     themeConfig: {
