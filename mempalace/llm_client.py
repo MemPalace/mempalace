@@ -1,7 +1,7 @@
 """
 llm_client.py — Minimal provider abstraction for LLM-assisted entity refinement.
 
-Three providers cover the useful space:
+Four providers cover the useful space:
 
 - ``ollama`` (default): local models via http://localhost:11434. Works fully
   offline. Honors MemPalace's "zero-API required" principle.
@@ -10,21 +10,29 @@ Three providers cover the useful space:
   Together, and most self-hosted setups.
 - ``anthropic``: the official Messages API. Opt-in for users who want Haiku
   quality without setting up a local model.
+- ``claude-code``: the local ``claude`` CLI binary. Routes through the user's
+  existing Claude Pro/Max subscription via ``claude auth login`` -- no API
+  key required. Subprocess-based, zero new pip deps. Subject to Anthropic
+  policy on subscription use from third-party tools.
 
 All providers expose the same ``classify(system, user, json_mode)`` method and
-the same ``check_available()`` probe. No external SDK dependencies — stdlib
-``urllib`` only.
+the same ``check_available()`` probe. No external SDK dependencies -- stdlib
+``urllib`` plus ``subprocess`` (for ``claude-code``) only.
 
 JSON mode matters here: we always ask for structured output. Providers
 differ on how to request it (Ollama: ``format: json``; OpenAI-compat:
-``response_format``; Anthropic: prompt-level instruction) and this module
-normalizes that away from the caller.
+``response_format``; Anthropic: prompt-level instruction; claude-code:
+prompt-level instruction) and this module normalizes that away from the
+caller.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from typing import Optional
 from urllib.error import HTTPError, URLError
@@ -436,6 +444,118 @@ class AnthropicProvider(LLMProvider):
         return LLMResponse(text=text, model=self.model, provider=self.name, raw=data)
 
 
+# ==================== CLAUDE CODE (CLI subprocess) ====================
+
+
+class ClaudeCodeProvider(LLMProvider):
+    """Routes through the local ``claude`` CLI binary using subscription auth.
+
+    Auth happens once via ``claude auth login`` (stored in the user's keychain
+    by Claude Code itself); we shell out to ``claude -p`` for each call. No
+    API key, no new pip dependencies -- the CLI itself is the bundled
+    transport.
+
+    Going direct via ``subprocess`` rather than the ``claude-agent-sdk``
+    Python wrapper is deliberate: the SDK is async-only, requires
+    Python >= 3.10 (we still support 3.9), and itself spawns the same binary.
+    Skipping the wrapper avoids a dependency and an asyncio bridge.
+
+    Subscription use from third-party harnesses is governed by Anthropic's
+    policy, which has changed in 2026. The ``claude -p`` CLI invocation
+    pattern is currently sanctioned for first-party tools but may be
+    restricted later; ``check_available()`` will surface auth errors at that
+    point so callers can fall back.
+    """
+
+    name = "claude-code"
+    DEFAULT_MODEL = "claude-haiku-4-5"
+
+    def __init__(
+        self,
+        model: str,
+        timeout: int = 120,
+        **_: object,  # endpoint/api_key ignored -- auth comes from `claude auth login`
+    ):
+        super().__init__(model=model, timeout=timeout)
+
+    def check_available(self) -> tuple[bool, str]:
+        binary = shutil.which("claude")
+        if not binary:
+            return (
+                False,
+                "`claude` CLI not found in PATH. "
+                "Install Claude Code: https://claude.com/product/claude-code",
+            )
+        try:
+            r = subprocess.run(
+                ["claude", "auth", "status", "--text"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            return False, f"`claude auth status` failed: {e}"
+        if r.returncode != 0:
+            return (
+                False,
+                "Not authenticated. Run `claude auth login` to use your Claude subscription.",
+            )
+        return True, "ok"
+
+    def classify(self, system: str, user: str, json_mode: bool = True) -> LLMResponse:
+        sys_prompt = system
+        if json_mode:
+            sys_prompt += "\n\nRespond with valid JSON only, no prose."
+        # `--bare` would skip hooks, plugins, CLAUDE.md auto-discovery, but it
+        # also forces claude to use ANTHROPIC_API_KEY only and ignore OAuth /
+        # keychain. That defeats this provider's whole point (subscription
+        # auth), so we omit it. To keep the surrounding context minimal we
+        # invoke from a temp cwd so claude does not pick up a project-level
+        # CLAUDE.md it does not need.
+        #
+        # System prompt is prepended to stdin instead of being passed via
+        # `--system-prompt` argv. argv is visible to other local users via
+        # `ps` / /proc/*/cmdline, and the prompt can carry sensitive context
+        # (entity names, project paths). The SYSTEM/USER framing is a
+        # convention `claude -p` follows reliably for classification tasks.
+        cmd = [
+            "claude",
+            "-p",
+            "--no-session-persistence",  # don't pollute Claude Code session history
+            "--output-format",
+            "json",
+            "--model",
+            self.model,
+        ]
+        combined_input = f"SYSTEM:\n{sys_prompt}\n\nUSER:\n{user}"
+        try:
+            r = subprocess.run(
+                cmd,
+                input=combined_input,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout,
+                cwd=tempfile.gettempdir(),
+            )
+        except subprocess.TimeoutExpired as e:
+            raise LLMError(f"`claude -p` timed out after {self.timeout}s") from e
+        except OSError as e:
+            raise LLMError(f"`claude -p` failed to spawn: {e}") from e
+        if r.returncode != 0:
+            stderr = (r.stderr or "").strip()[:500]
+            raise LLMError(f"`claude -p` exited {r.returncode}: {stderr or 'no stderr'}")
+        try:
+            envelope = json.loads(r.stdout)
+        except json.JSONDecodeError as e:
+            raise LLMError(f"`claude -p` returned non-JSON envelope: {e}") from e
+        # `--output-format json` returns:
+        # {"type":"result","result":"<text>","total_cost_usd":...,...}
+        text = envelope.get("result", "")
+        if not text:
+            raise LLMError(f"`claude -p` returned empty result: {envelope}")
+        return LLMResponse(text=text, model=self.model, provider=self.name, raw=envelope)
+
+
 # ==================== FACTORY ====================
 
 
@@ -443,6 +563,7 @@ PROVIDERS: dict[str, type[LLMProvider]] = {
     "ollama": OllamaProvider,
     "openai-compat": OpenAICompatProvider,
     "anthropic": AnthropicProvider,
+    "claude-code": ClaudeCodeProvider,
 }
 
 

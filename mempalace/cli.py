@@ -1254,20 +1254,30 @@ def main():
     p_init.add_argument(
         "--llm-provider",
         default="ollama",
-        choices=["ollama", "openai-compat", "anthropic"],
-        help="LLM provider (default: ollama). Pass --no-llm to disable LLM-assisted refinement entirely.",
+        choices=["ollama", "openai-compat", "anthropic", "claude-code"],
+        help=(
+            "LLM provider (default: ollama). Pass --no-llm to disable LLM-assisted "
+            "refinement entirely. claude-code routes through the local `claude` CLI "
+            "using your Claude Pro/Max subscription (run `claude auth login` first); "
+            "no API key needed."
+        ),
     )
     p_init.add_argument(
         "--llm-model",
         default="gemma4:e4b",
-        help="Model name for the chosen provider (default: gemma4:e4b for Ollama).",
+        help=(
+            "Model name for the chosen provider (default: gemma4:e4b for Ollama). "
+            "For claude-code, pass an Anthropic model name "
+            "such as claude-haiku-4-5."
+        ),
     )
     p_init.add_argument(
         "--llm-endpoint",
         default=None,
         help=(
             "Provider endpoint URL. Default for Ollama: http://localhost:11434. "
-            "Required for openai-compat."
+            "Required for openai-compat. Ignored for claude-code (auth comes "
+            "from the local CLI)."
         ),
     )
     p_init.add_argument(
@@ -1275,7 +1285,8 @@ def main():
         default=None,
         help=(
             "API key for the provider. For anthropic, defaults to $ANTHROPIC_API_KEY; "
-            "for openai-compat, defaults to $OPENAI_API_KEY."
+            "for openai-compat, defaults to $OPENAI_API_KEY. "
+            "Ignored for claude-code (auth comes from `claude auth login`)."
         ),
     )
     p_init.add_argument(
