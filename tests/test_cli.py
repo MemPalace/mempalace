@@ -125,72 +125,104 @@ def _make_purge_args(**overrides):
 
 
 @patch("mempalace.cli.MempalaceConfig")
-def test_cmd_purge_no_palace_found(mock_config_cls, capsys):
+def test_cmd_purge_no_palace_found(mock_config_cls, capsys, tmp_path):
     """Purge prints a clear message when the palace doesn't exist."""
-    mock_config_cls.return_value.palace_path = "/nonexistent/palace"
-    args = _make_purge_args(wing="any")
-    mock_chromadb = MagicMock()
-    mock_chromadb.PersistentClient.side_effect = Exception("no palace")
-    with patch.dict("sys.modules", {"chromadb": mock_chromadb, "shutil": MagicMock()}):
-        cmd_purge(args)
+    missing = tmp_path / "nonexistent"
+    mock_config_cls.return_value.palace_path = str(missing)
+    args = _make_purge_args(wing="any", palace=str(missing))
+    cmd_purge(args)
     out = capsys.readouterr().out
     assert "No palace found" in out
 
 
 @patch("mempalace.cli.MempalaceConfig")
-def test_cmd_purge_requires_filter(mock_config_cls, capsys):
+def test_cmd_purge_requires_filter(mock_config_cls, capsys, tmp_path):
     """Purge refuses to run without --wing or --room (no mass-delete safety valve)."""
-    mock_config_cls.return_value.palace_path = "/fake/palace"
-    args = _make_purge_args()  # no wing, no room
-    mock_col = MagicMock()
-    mock_client = MagicMock()
-    mock_client.get_collection.return_value = mock_col
-    mock_chromadb = MagicMock()
-    mock_chromadb.PersistentClient.return_value = mock_client
-    with patch.dict("sys.modules", {"chromadb": mock_chromadb, "shutil": MagicMock()}):
-        cmd_purge(args)
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    (palace / "chroma.sqlite3").write_text("")
+    mock_config_cls.return_value.palace_path = str(palace)
+    args = _make_purge_args(palace=str(palace))  # no wing, no room
+    cmd_purge(args)
     out = capsys.readouterr().out
     assert "Error: specify --wing and/or --room" in out
-    mock_col.count.assert_not_called()  # didn't touch data
 
 
 @patch("mempalace.cli.MempalaceConfig")
-def test_cmd_purge_no_matches(mock_config_cls, capsys):
-    """When the filter matches zero drawers, purge exits cleanly without rebuilding."""
-    mock_config_cls.return_value.palace_path = "/fake/palace"
-    args = _make_purge_args(wing="empty-wing")
+def test_cmd_purge_no_matches(mock_config_cls, capsys, tmp_path):
+    """When the filter matches zero drawers, purge exits cleanly."""
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    (palace / "chroma.sqlite3").write_text("")
+    mock_config_cls.return_value.palace_path = str(palace)
+    args = _make_purge_args(wing="empty-wing", palace=str(palace))
+
     mock_col = MagicMock()
-    mock_col.count.return_value = 100
     mock_col.get.return_value = {"ids": []}
-    mock_client = MagicMock()
-    mock_client.get_collection.return_value = mock_col
-    mock_chromadb = MagicMock()
-    mock_chromadb.PersistentClient.return_value = mock_client
-    mock_shutil = MagicMock()
-    with patch.dict("sys.modules", {"chromadb": mock_chromadb, "shutil": mock_shutil}):
+    mock_backend = MagicMock()
+    mock_backend.return_value.get_collection.return_value = mock_col
+    with patch("mempalace.backends.chroma.ChromaBackend", mock_backend):
         cmd_purge(args)
     out = capsys.readouterr().out
     assert "No drawers found matching" in out
-    mock_shutil.rmtree.assert_not_called()  # nothing to rebuild
+    mock_col.delete.assert_not_called()
 
 
 @patch("mempalace.cli.MempalaceConfig")
-def test_cmd_purge_wing_and_room_uses_and_filter(mock_config_cls):
+def test_cmd_purge_wing_and_room_uses_and_filter(mock_config_cls, tmp_path):
     """Purge builds a $and filter when both --wing and --room are set."""
-    mock_config_cls.return_value.palace_path = "/fake/palace"
-    args = _make_purge_args(wing="myproj", room="drafts")
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    (palace / "chroma.sqlite3").write_text("")
+    mock_config_cls.return_value.palace_path = str(palace)
+    args = _make_purge_args(wing="myproj", room="drafts", palace=str(palace))
+
     mock_col = MagicMock()
-    mock_col.count.return_value = 0
     mock_col.get.return_value = {"ids": []}
-    mock_client = MagicMock()
-    mock_client.get_collection.return_value = mock_col
-    mock_chromadb = MagicMock()
-    mock_chromadb.PersistentClient.return_value = mock_client
-    with patch.dict("sys.modules", {"chromadb": mock_chromadb, "shutil": MagicMock()}):
+    mock_backend = MagicMock()
+    mock_backend.return_value.get_collection.return_value = mock_col
+    with patch("mempalace.backends.chroma.ChromaBackend", mock_backend):
         cmd_purge(args)
-    # First col.get call builds the match-id set, and its `where` should be $and
     first_call = mock_col.get.call_args_list[0]
     assert first_call.kwargs["where"] == {"$and": [{"wing": "myproj"}, {"room": "drafts"}]}
+
+
+def test_cmd_purge_deletes_via_where_clause(tmp_path):
+    """End-to-end: purge filters via collection.delete(where=...) — preserves
+    embedding function, no rmtree, no rebuild. Regression for igorls' #1087
+    review concerns 1, 2, 3."""
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    # Real chromadb palace via the backend so the embedding function is
+    # whatever the backend resolves (the actual concern from the review).
+    from mempalace.backends.chroma import ChromaBackend
+
+    backend = ChromaBackend()
+    col = backend.get_collection(str(palace), "mempalace_drawers", create=True)
+    col.add(
+        ids=["k1", "k2", "p1", "p2"],
+        documents=["keep one", "keep two", "purge one", "purge two"],
+        metadatas=[
+            {"wing": "keep", "room": "r"},
+            {"wing": "keep", "room": "r"},
+            {"wing": "purge-me", "room": "r"},
+            {"wing": "purge-me", "room": "r"},
+        ],
+    )
+    assert col.count() == 4
+
+    args = _make_purge_args(wing="purge-me", palace=str(palace))
+    with patch("mempalace.cli.MempalaceConfig") as mock_config_cls:
+        mock_config_cls.return_value.palace_path = str(palace)
+        cmd_purge(args)
+
+    # Re-open through the backend to confirm survivors and that the index
+    # still works (no nuke, embedding function intact).
+    col2 = backend.get_collection(str(palace), "mempalace_drawers", create=False)
+    assert col2.count() == 2
+    surviving = col2.get(include=["metadatas"])
+    surviving_ids = surviving.get("ids") if isinstance(surviving, dict) else surviving.ids
+    assert set(surviving_ids) == {"k1", "k2"}
 
 
 # ── cmd_search ─────────────────────────────────────────────────────────
