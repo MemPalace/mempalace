@@ -171,6 +171,17 @@ def _hybrid_rank(
 # — "which closet matched best for this source" — is more reliable than
 # absolute distance on narrative content, where closet distances cluster
 # in 1.2–1.5 regardless of match quality.
+#
+# Empirical note (A/B ablation 2026-04-27 on the 151K canonical palace,
+# 12-probe set covering recent fork-side work + transcript content):
+# boost fires on ~20% of result rows, concentrated in queries whose
+# answer lives in mined files; closets are sparse on chat-transcript
+# queries (most fork-side decisions). When the boost did fire, it
+# re-ordered chunks within a single source file rather than displacing
+# right answers with wrong ones — i.e., VecRecall's critique
+# (https://github.com/MemPalace/mempalace/discussions/1129, "org-layer
+# in retrieval path drops R@5") didn't reproduce here. Kept as a
+# rare-but-cheap signal; ablation script lived in /tmp, not committed.
 CLOSET_RANK_BOOSTS = [0.40, 0.25, 0.15, 0.08, 0.04]
 CLOSET_DISTANCE_CAP = 1.5  # cosine dist > 1.5 = too weak to use as signal
 
