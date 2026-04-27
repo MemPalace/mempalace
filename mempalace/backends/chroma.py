@@ -1033,8 +1033,9 @@ class ChromaBackend(BaseBackend):
         if options and isinstance(options, dict):
             hnsw_space = options.get("hnsw_space", hnsw_space)
 
-        ef = self._resolve_embedding_function()
-        ef_kwargs = {"embedding_function": ef} if ef is not None else {}
+        # Q6600 AVX FIX: Use SentenceTransformer instead of default ONNX EF
+        from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+        ef = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
 
         if create:
             collection = client.get_or_create_collection(
@@ -1044,10 +1045,13 @@ class ChromaBackend(BaseBackend):
                     "hnsw:num_threads": 1,
                     **_HNSW_BLOAT_GUARD,
                 },
-                **ef_kwargs,
+                embedding_function=ef,
             )
         else:
-            collection = client.get_collection(collection_name, **ef_kwargs)
+            collection = client.get_collection(
+                collection_name,
+                embedding_function=ef,
+            )
         _pin_hnsw_threads(collection)
         return ChromaCollection(collection)
 
@@ -1089,8 +1093,10 @@ class ChromaBackend(BaseBackend):
         self, palace_path: str, collection_name: str, hnsw_space: str = "cosine"
     ) -> ChromaCollection:
         """Create (not get-or-create) ``collection_name`` with the given HNSW space."""
-        ef = self._resolve_embedding_function()
-        ef_kwargs = {"embedding_function": ef} if ef is not None else {}
+        # Q6600 AVX FIX: Use SentenceTransformer instead of default ONNX EF
+        from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+        ef = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+
         collection = self._client(palace_path).create_collection(
             collection_name,
             metadata={
@@ -1098,7 +1104,7 @@ class ChromaBackend(BaseBackend):
                 "hnsw:num_threads": 1,
                 **_HNSW_BLOAT_GUARD,
             },
-            **ef_kwargs,
+            embedding_function=ef,
         )
         return ChromaCollection(collection)
 

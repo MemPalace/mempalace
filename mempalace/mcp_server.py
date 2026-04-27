@@ -277,6 +277,10 @@ def _get_collection(create=False):
     try:
         client = _get_client()
         if create:
+            # Q6600 AVX FIX: Use SentenceTransformer instead of default ONNX EF
+            from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+            ef = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+            
             # hnsw:num_threads=1 disables ChromaDB's multi-threaded ParallelFor
             # HNSW insert path, which has a race in repairConnectionsForUpdate /
             # addPoint (see issues #974, #965). Set via metadata on fresh
@@ -291,13 +295,18 @@ def _get_collection(create=False):
                     "hnsw:num_threads": 1,
                     **_HNSW_BLOAT_GUARD,
                 },
+                embedding_function=ef,
             )
             _pin_hnsw_threads(raw)
             _collection_cache = ChromaCollection(raw)
             _metadata_cache = None
             _metadata_cache_time = 0
         elif _collection_cache is None:
-            raw = client.get_collection(_config.collection_name)
+            # Q6600 AVX FIX: Use SentenceTransformer instead of default ONNX EF
+            from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+            ef = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+            
+            raw = client.get_collection(_config.collection_name, embedding_function=ef)
             _pin_hnsw_threads(raw)
             _collection_cache = ChromaCollection(raw)
             _metadata_cache = None
@@ -1910,11 +1919,6 @@ def _restore_stdout():
 
 
 def main():
-    _restore_stdout()
-    logger.info("MemPalace MCP Server starting...")
-    # Pre-flight: probe HNSW capacity before any tool call so the warning
-    # is visible at startup rather than on first use (#1222). Pure
-    # filesystem read; never opens a chromadb client.
     _refresh_vector_disabled_flag()
     while True:
         try:
@@ -1927,8 +1931,15 @@ def main():
             request = json.loads(line)
             response = handle_request(request)
             if response is not None:
-                sys.stdout.write(json.dumps(response) + "\n")
-                sys.stdout.flush()
+                # Use the REAL stdout (the original FD 1) for the JSON-RPC response.
+                # Since FD 1 was globally redirected to stderr via os.dup2(2, 1),
+                # we must write to the saved file descriptor or a wrapper around it.
+                res_json = json.dumps(response) + "\n"
+                if _REAL_STDOUT_FD is not None:
+                    os.write(_REAL_STDOUT_FD, res_json.encode("utf-8"))
+                else:
+                    _REAL_STDOUT.write(res_json)
+                    _REAL_STDOUT.flush()
         except KeyboardInterrupt:
             break
         except Exception as e:
