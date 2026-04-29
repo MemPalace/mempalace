@@ -868,11 +868,15 @@ class ChromaBackend(BaseBackend):
         the EF explicitly — ChromaDB 1.x does not persist it with the
         collection, so a reader that omits the argument silently gets the
         library default and its queries won't match the writer's vectors.
+        
+        Uses unified offline local embedding function from embedding.py module.
         """
         try:
             from ..embedding import get_embedding_function
 
-            return get_embedding_function()
+            ef = get_embedding_function()
+            logger.debug(f"Using embedding function: {ef.name() if hasattr(ef, 'name') else type(ef).__name__}")
+            return ef
         except Exception:
             logger.exception("Failed to build embedding function; using chromadb default")
             return None
@@ -1033,9 +1037,8 @@ class ChromaBackend(BaseBackend):
         if options and isinstance(options, dict):
             hnsw_space = options.get("hnsw_space", hnsw_space)
 
-        # Q6600 AVX FIX: Use SentenceTransformer instead of default ONNX EF
-        from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
-        ef = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+        from ..embedding import get_embedding_function
+        ef = get_embedding_function()
 
         if create:
             collection = client.get_or_create_collection(
@@ -1093,9 +1096,8 @@ class ChromaBackend(BaseBackend):
         self, palace_path: str, collection_name: str, hnsw_space: str = "cosine"
     ) -> ChromaCollection:
         """Create (not get-or-create) ``collection_name`` with the given HNSW space."""
-        # Q6600 AVX FIX: Use SentenceTransformer instead of default ONNX EF
-        from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
-        ef = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+        from ..embedding import get_embedding_function
+        ef = get_embedding_function()
 
         collection = self._client(palace_path).create_collection(
             collection_name,

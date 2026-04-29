@@ -48,6 +48,7 @@ import logging  # noqa: E402
 import hashlib  # noqa: E402
 import time  # noqa: E402
 from datetime import datetime  # noqa: E402
+import threading  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 from .config import (  # noqa: E402
@@ -128,6 +129,21 @@ _vector_disabled_reason = ""
 # at module-eval time in 3.10.
 _vector_capacity_status = None  # type: Optional[dict]
 
+
+_model_ready_event = threading.Event()
+
+def _warmup_model():
+    """Background thread to pre-load the SentenceTransformer model."""
+    logger.info("MCP Warm-up: Starting model pre-load...")
+    try:
+        # This triggers SentenceTransformer loading
+        _get_collection()
+        _model_ready_event.set()
+        logger.info("MCP Warm-up: Model loaded successfully.")
+    except Exception as e:
+        logger.error(f"MCP Warm-up failed: {e}")
+        # Still set the event so we don't block forever if load fails
+        _model_ready_event.set()
 
 def _refresh_vector_disabled_flag() -> None:
     """Re-run the HNSW capacity probe and update the module-level flag.
@@ -276,11 +292,11 @@ def _get_collection(create=False):
     global _collection_cache, _metadata_cache, _metadata_cache_time
     try:
         client = _get_client()
+        # Use unified offline local embedding function through embedding.py
+        from .embedding import get_embedding_function
+        ef = get_embedding_function()
+        
         if create:
-            # Q6600 AVX FIX: Use SentenceTransformer instead of default ONNX EF
-            from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
-            ef = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
-            
             # hnsw:num_threads=1 disables ChromaDB's multi-threaded ParallelFor
             # HNSW insert path, which has a race in repairConnectionsForUpdate /
             # addPoint (see issues #974, #965). Set via metadata on fresh
@@ -302,10 +318,6 @@ def _get_collection(create=False):
             _metadata_cache = None
             _metadata_cache_time = 0
         elif _collection_cache is None:
-            # Q6600 AVX FIX: Use SentenceTransformer instead of default ONNX EF
-            from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
-            ef = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
-            
             raw = client.get_collection(_config.collection_name, embedding_function=ef)
             _pin_hnsw_threads(raw)
             _collection_cache = ChromaCollection(raw)
@@ -1826,6 +1838,9 @@ def handle_request(request):
         # Notifications (no id) never get a response per JSON-RPC spec
         return None
     elif method == "tools/list":
+        # Wait for model to be ready (max 60s) to ensure Hermes discovers tools
+        if not _model_ready_event.wait(timeout=60):
+            logger.warning("MCP: tools/list waited 60s for model but timed out. Returning anyway.")
         return {
             "jsonrpc": "2.0",
             "id": req_id,
@@ -1919,6 +1934,8 @@ def _restore_stdout():
 
 
 def main():
+    # Start background model loading
+    threading.Thread(target=_warmup_model, daemon=True).start()
     _refresh_vector_disabled_flag()
     while True:
         try:
