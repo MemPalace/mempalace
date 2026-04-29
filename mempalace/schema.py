@@ -9,6 +9,8 @@ Also fixes a known data-level issue where seq_id values are stored as
 BLOBs instead of INTEGERs after cross-version migration.
 """
 
+from __future__ import annotations
+
 import os
 import shutil
 import sqlite3
