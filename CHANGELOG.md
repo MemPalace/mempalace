@@ -322,6 +322,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Improvements
 - Optimize entity detection with regex caching and pre-compilation (#828)
 - Extract locked filing block into helper to keep `mine_convos` under C901 complexity
+- `hooks.auto_mine` config flag decouples the background mine from the diary save in stop/precompact hooks — set `false` (via `mempalace_hook_settings` MCP tool, `config.json`, or `MEMPALACE_HOOKS_AUTO_MINE` env var) to keep fast diary writes without the recursive `~/.claude/projects/<cwd>/` walk that can peg CPU on large archives; defaults to `true` to preserve existing behavior
 
 ### Documentation
 - Add `docs/CLOSETS.md` — closet layer overview

@@ -255,7 +255,7 @@ def test_extract_recent_messages_missing_file():
 # --- hook_stop ---
 
 
-def _capture_hook_output(hook_fn, data, harness="claude-code", state_dir=None):
+def _capture_hook_output(hook_fn, data, harness="claude-code", state_dir=None, auto_mine=True):
     """Run a hook and capture its JSON stdout output."""
     import io
     from unittest.mock import PropertyMock
@@ -273,6 +273,7 @@ def _capture_hook_output(hook_fn, data, harness="claude-code", state_dir=None):
     mock_config = MagicMock()
     type(mock_config).hook_silent_save = PropertyMock(return_value=True)
     type(mock_config).hook_desktop_toast = PropertyMock(return_value=False)
+    type(mock_config).hook_auto_mine = PropertyMock(return_value=auto_mine)
     patches.append(patch("mempalace.config.MempalaceConfig", return_value=mock_config))
     with contextlib.ExitStack() as stack:
         for p in patches:
@@ -595,6 +596,76 @@ def test_wing_from_transcript_path_cwd_handles_non_string_cwd(tmp_path):
         encoding="utf-8",
     )
     assert _wing_from_transcript_path(str(transcript)) == "wing_proper_name"
+
+
+# --- hooks.auto_mine gating ---
+
+
+def test_stop_hook_auto_mine_disabled_skips_ingest(tmp_path):
+    """auto_mine=False: diary still saves, but ingest + auto-ingest are skipped."""
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
+    )
+    save_result = {"count": 15, "themes": ["hooks"]}
+    with (
+        patch("mempalace.hooks_cli._save_diary_direct", return_value=save_result) as mock_save,
+        patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest,
+        patch("mempalace.hooks_cli._maybe_auto_ingest") as mock_auto_ingest,
+    ):
+        result = _capture_hook_output(
+            hook_stop,
+            {"session_id": "test", "stop_hook_active": False, "transcript_path": str(transcript)},
+            state_dir=tmp_path,
+            auto_mine=False,
+        )
+    assert "systemMessage" in result
+    mock_save.assert_called_once()
+    mock_ingest.assert_not_called()
+    mock_auto_ingest.assert_not_called()
+
+
+def test_stop_hook_auto_mine_enabled_default(tmp_path):
+    """auto_mine=True (default): diary saves AND both ingest paths fire."""
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
+    )
+    save_result = {"count": 15, "themes": ["hooks"]}
+    with (
+        patch("mempalace.hooks_cli._save_diary_direct", return_value=save_result) as mock_save,
+        patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest,
+        patch("mempalace.hooks_cli._maybe_auto_ingest") as mock_auto_ingest,
+    ):
+        result = _capture_hook_output(
+            hook_stop,
+            {"session_id": "test", "stop_hook_active": False, "transcript_path": str(transcript)},
+            state_dir=tmp_path,
+            auto_mine=True,
+        )
+    assert "systemMessage" in result
+    mock_save.assert_called_once()
+    mock_ingest.assert_called_once_with(str(transcript))
+    mock_auto_ingest.assert_called_once_with()
+
+
+def test_precompact_auto_mine_disabled(tmp_path):
+    """auto_mine=False: precompact returns empty output without ingesting or mining."""
+    with (
+        patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest,
+        patch("mempalace.hooks_cli._mine_sync") as mock_mine,
+    ):
+        result = _capture_hook_output(
+            hook_precompact,
+            {"session_id": "test", "transcript_path": str(tmp_path / "t.jsonl")},
+            state_dir=tmp_path,
+            auto_mine=False,
+        )
+    assert result == {}
+    mock_ingest.assert_not_called()
+    mock_mine.assert_not_called()
 
 
 # --- _log ---
