@@ -6,13 +6,19 @@ When ChromaDB's HNSW index accumulates duplicate entries (from repeated
 add() calls with the same ID), link_lists.bin can grow unbounded —
 terabytes on large palaces — eventually causing segfaults.
 
-This module provides four operations:
+This module provides several operations:
 
-  status  — compare sqlite vs HNSW element counts (read-only health check)
-  scan    — find every corrupt/unfetchable ID in the palace
-  prune   — delete only the corrupt IDs (surgical)
-  rebuild — extract all drawers, delete the collection, recreate with
-            correct HNSW settings, and upsert everything back
+  status       — compare sqlite vs HNSW element counts (read-only health check)
+  scan         — find every corrupt/unfetchable ID in the palace
+  prune        — delete only the corrupt IDs (surgical)
+  rebuild      — extract all drawers, delete the collection, recreate with
+                 correct HNSW settings, and upsert everything back
+  hnsw-rebuild — segment-level HNSW rebuild from data_level0.bin +
+                 index_metadata.pickle; avoids re-embedding, bounded memory,
+                 atomic swap-aside with rollback. Productionises the
+                 recovery path from the 2026-04-19 incident. Issue #1046.
+  max-seq-id   — un-poison ``max_seq_id`` rows corrupted by the legacy 0.6.x
+                 BLOB shim misreading chromadb 1.5.x's native format.
 
 The rebuild backs up ONLY chroma.sqlite3 (the source of truth), not the
 full palace directory — so it works even when link_lists.bin is bloated.
@@ -22,20 +28,35 @@ Usage (standalone):
     python -m mempalace.repair scan [--wing X]
     python -m mempalace.repair prune --confirm
     python -m mempalace.repair rebuild
+    python -m mempalace.repair hnsw --segment <uuid> [--dry-run] [--purge-queue] ...
+    python -m mempalace.repair max-seq-id [--segment <uuid>] [--from-sidecar <path>]
 
 Usage (from CLI):
     mempalace repair
-    mempalace repair-scan [--wing X]
-    mempalace repair-prune --confirm
+    mempalace repair --mode hnsw --segment <uuid>
+    mempalace repair --mode max-seq-id [--segment <uuid>] [--from-sidecar <path>]
+
+The hnsw-rebuild path imports numpy and hnswlib lazily — they are not
+core mempalace dependencies (per CONTRIBUTING.md). Install only when
+running this rescue command.
 """
 
+from __future__ import annotations
+
 import argparse
+import gc
+import json
+import logging
 import os
+import pickle
 import shutil
 import sqlite3
+import struct
+import tempfile
 import time
 from collections import defaultdict
 from contextlib import closing
+from dataclasses import dataclass
 from datetime import datetime
 import re
 from typing import Callable, Iterator, Optional
@@ -43,6 +64,8 @@ from typing import Callable, Iterator, Optional
 from chromadb.errors import NotFoundError as ChromaNotFoundError
 
 from .backends.chroma import ChromaBackend, hnsw_capacity_status
+
+logger = logging.getLogger(__name__)
 
 
 COLLECTION_NAME = "mempalace_drawers"
@@ -88,6 +111,8 @@ def _recoverable_collections() -> tuple[str, ...]:
 # should call ``_recoverable_collections()`` so config changes are picked
 # up at call time.
 RECOVERABLE_COLLECTIONS = (COLLECTION_NAME, CLOSETS_COLLECTION_NAME)
+
+_FLOAT32_SIZE = 4
 
 
 def _get_palace_path():
@@ -1280,6 +1305,8 @@ def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
 
     for label, info in (("drawers", drawers), ("closets", closets)):
         print(f"\n  [{label}]")
+        if info.get("segment_id"):
+            print(f"    segment id:     {info['segment_id']}")
         if info["sqlite_count"] is None:
             print("    sqlite count:   (unreadable)")
         else:
@@ -1295,10 +1322,355 @@ def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
         if info["message"]:
             print(f"    note:           {info['message']}")
 
+    diverged_segments = [
+        (label, info["segment_id"])
+        for label, info in (("drawers", drawers), ("closets", closets))
+        if info["diverged"] and info.get("segment_id")
+    ]
     if drawers["diverged"] or closets["diverged"]:
-        print("\n  Recommended: run `mempalace repair` to rebuild the index.")
+        print("\n  Recommended next steps:")
+        if diverged_segments:
+            print(
+                "    - Targeted segment rebuild (faster, no re-embed):"
+                " `mempalace repair --mode hnsw --segment <uuid>`"
+            )
+            for label, seg_id in diverged_segments:
+                print(f"        {label}: {seg_id}")
+        print("    - Full-palace rebuild (re-embeds, slower): `mempalace repair`")
     print()
     return {"drawers": drawers, "closets": closets}
+
+
+# ---------------------------------------------------------------------------
+# hnsw-mode: segment-level rebuild (issue #1046)
+# ---------------------------------------------------------------------------
+
+
+class RebuildVerificationError(RuntimeError):
+    """Raised when the rebuilt index fails its self-query sanity check."""
+
+
+@dataclass
+class _HnswHeader:
+    """Subset of the chromadb-wrapped hnswlib header we rely on.
+
+    Byte layout (little-endian) of the first 100 bytes:
+      off  0:  u32  format_version
+      off  4:  u64  offset_level0
+      off 12:  u64  max_elements
+      off 20:  u64  cur_count
+      off 28:  u64  size_per_element
+      off 36:  u64  label_offset
+      off 44:  u64  offset_data
+      off 52:  i32  maxlevel
+      off 56:  u32  enterpoint_node
+      off 60:  u64  maxM
+      off 68:  u64  maxM0
+      off 76:  u64  M
+      off 84:  f64  mult
+      off 92:  u64  ef_construction
+    """
+
+    format_version: int
+    max_elements: int
+    cur_count: int
+    size_per_element: int
+    label_offset: int
+    offset_data: int
+    M: int
+    ef_construction: int
+    dim: int
+
+
+def _parse_hnsw_header(data: bytes) -> _HnswHeader:
+    """Parse the 100-byte hnswlib header.
+
+    Derives ``dim`` from ``size_per_element - offset_data - 8`` (trailing
+    8 bytes are the u64 label), divided by 4 (float32).
+    """
+    if len(data) < 100:
+        raise ValueError(f"HNSW header too short: {len(data)} bytes")
+
+    format_version = struct.unpack_from("<I", data, 0)[0]
+    max_elements = struct.unpack_from("<Q", data, 12)[0]
+    cur_count = struct.unpack_from("<Q", data, 20)[0]
+    size_per_element = struct.unpack_from("<Q", data, 28)[0]
+    label_offset = struct.unpack_from("<Q", data, 36)[0]
+    offset_data = struct.unpack_from("<Q", data, 44)[0]
+    M = struct.unpack_from("<Q", data, 76)[0]
+    ef_construction = struct.unpack_from("<Q", data, 92)[0]
+
+    vector_bytes = size_per_element - offset_data - 8
+    if vector_bytes <= 0 or vector_bytes % _FLOAT32_SIZE != 0:
+        raise ValueError(
+            f"Inferred vector width is invalid: "
+            f"size_per_element={size_per_element}, offset_data={offset_data}"
+        )
+    dim = vector_bytes // _FLOAT32_SIZE
+
+    return _HnswHeader(
+        format_version=format_version,
+        max_elements=max_elements,
+        cur_count=cur_count,
+        size_per_element=size_per_element,
+        label_offset=label_offset,
+        offset_data=offset_data,
+        M=M,
+        ef_construction=ef_construction,
+        dim=dim,
+    )
+
+
+def _extract_vectors(data: bytes, hdr: _HnswHeader):
+    """Return ``(labels, vectors)`` as numpy arrays of length ``cur_count``."""
+    import numpy as np
+
+    n = hdr.cur_count
+    stride = hdr.size_per_element
+    expected = hdr.max_elements * stride
+    if len(data) < expected:
+        raise ValueError(f"data_level0.bin is {len(data)} bytes, expected >= {expected}")
+
+    labels = np.empty(n, dtype=np.uint64)
+    vectors = np.empty((n, hdr.dim), dtype=np.float32)
+    vec_end = hdr.offset_data + hdr.dim * _FLOAT32_SIZE
+    for i in range(n):
+        slot = i * stride
+        vectors[i] = np.frombuffer(data[slot + hdr.offset_data : slot + vec_end], dtype=np.float32)
+        labels[i] = struct.unpack_from("<Q", data, slot + hdr.label_offset)[0]
+    return labels, vectors
+
+
+def _sanitize_vectors(labels, vectors):
+    """Drop ``label == 0`` and deduplicate, keeping the last occurrence.
+
+    hnswlib rejects duplicate labels; drift sometimes leaves zero-labelled
+    slots. Reverse-unique preserves the most-recent write for each label,
+    which is the copy that matches the pickle mapping.
+    """
+    import numpy as np
+
+    if len(labels) == 0:
+        return labels, vectors
+
+    n = len(labels)
+    rev_idx = np.arange(n)[::-1]
+    _, first_rev = np.unique(labels[::-1], return_index=True)
+    keep = np.sort(rev_idx[first_rev])
+    labels = labels[keep]
+    vectors = vectors[keep]
+
+    zero_mask = labels == 0
+    if zero_mask.any():
+        labels = labels[~zero_mask]
+        vectors = vectors[~zero_mask]
+    return labels, vectors
+
+
+def _detect_space(palace_path: str, segment: str) -> str:
+    """Look up ``hnsw:space`` for the collection that owns ``segment``.
+
+    Falls back to ``"l2"`` (hnswlib's default) with a warning if absent —
+    matches ChromaDB's default when no metadata is recorded.
+    """
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        logger.warning("No chroma.sqlite3 at %s — defaulting space to l2", palace_path)
+        return "l2"
+
+    row = None
+    with sqlite3.connect(db_path) as conn:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(collection_metadata)").fetchall()]
+        value_col = "str_value" if "str_value" in cols else "string_value"
+        try:
+            row = conn.execute(
+                f"""
+                SELECT cm.{value_col}
+                FROM segments s
+                JOIN collection_metadata cm ON cm.collection_id = s.collection
+                WHERE s.id = ? AND cm.key = 'hnsw:space'
+                """,
+                (segment,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            row = None
+
+    if row and row[0]:
+        return row[0]
+    logger.warning("No hnsw:space for segment %s — defaulting to l2 (ChromaDB default)", segment)
+    return "l2"
+
+
+def _reconcile_with_pickle(labels, pickle_path: str):
+    """Intersect HNSW labels with the pickle's ``label_to_id`` mapping.
+
+    Returns ``(keep_mask, orphan_hnsw_labels, stale_pickle_ids, meta)``
+    where ``meta`` has had its three mapping tables pruned to the healthy
+    set (caller persists it afterwards).
+    """
+    import numpy as np
+
+    with open(pickle_path, "rb") as f:
+        meta = pickle.load(f)
+
+    mapped_labels = set(meta.label_to_id.keys())
+    hnsw_labels = set(int(x) for x in labels)
+    healthy = hnsw_labels & mapped_labels
+    orphan_hnsw = hnsw_labels - mapped_labels
+    stale_uids = [uid for lbl, uid in meta.label_to_id.items() if lbl not in healthy]
+    dropped_uid_set = set(stale_uids)
+
+    meta.label_to_id = {lbl: uid for lbl, uid in meta.label_to_id.items() if lbl in healthy}
+    meta.id_to_label = {
+        uid: lbl for uid, lbl in meta.id_to_label.items() if uid not in dropped_uid_set
+    }
+    meta.id_to_seq_id = {
+        uid: sid for uid, sid in meta.id_to_seq_id.items() if uid not in dropped_uid_set
+    }
+
+    keep_mask = np.fromiter((int(x) in healthy for x in labels), dtype=bool, count=len(labels))
+    return keep_mask, sorted(orphan_hnsw), stale_uids, meta
+
+
+def _compute_max_elements(count: int, override: Optional[int]) -> int:
+    """Pick the ``max_elements`` value for the new index.
+
+    Default ``max(count * 1.3, 200_000)`` leaves headroom so the next
+    flush does not auto-resize (the very bug #2594 we are fixing).
+    """
+    if override is not None:
+        if override < count:
+            raise ValueError(
+                f"--max-elements={override} is smaller than healthy vector count {count}"
+            )
+        return int(override)
+    return max(int(count * 1.3), 200_000)
+
+
+def _build_persistent_index(
+    vectors,
+    labels,
+    *,
+    space: str,
+    dim: int,
+    max_elements: int,
+    persistence_location: str,
+    M: int = 16,
+    ef_construction: int = 100,
+):
+    """Build a persistent hnswlib index and write it to ``persistence_location``."""
+    import hnswlib
+
+    idx = hnswlib.Index(space=space, dim=dim)
+    idx.init_index(
+        max_elements=max_elements,
+        ef_construction=ef_construction,
+        M=M,
+        is_persistent_index=True,
+        persistence_location=persistence_location,
+    )
+    idx.set_num_threads(1)
+
+    n = len(labels)
+    chunk = 10_000
+    for i in range(0, n, chunk):
+        j = min(i + chunk, n)
+        idx.add_items(vectors[i:j], labels[i:j], num_threads=1)
+    idx.persist_dirty()
+    return idx
+
+
+def _self_query_verify(index, sample_vectors, sample_labels) -> None:
+    """Verify the rebuilt index returns each sample as its own top-1 neighbor."""
+    if len(sample_labels) == 0:
+        return
+    labels, _dists = index.knn_query(sample_vectors, k=1)
+    flat = labels.flatten()
+    expected = [int(x) for x in sample_labels]
+    got = [int(x) for x in flat]
+    if got != expected:
+        raise RebuildVerificationError(
+            f"Self-query mismatch: expected top-1 labels {expected}, got {got}"
+        )
+
+
+def _atomic_swap_segment(tmpdir: str, segment_dir: str) -> None:
+    """Rename-aside swap: move live out of the way, drop new in, rollback on failure."""
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    stale = f"{segment_dir}.old-{stamp}"
+    os.rename(segment_dir, stale)
+    try:
+        os.replace(tmpdir, segment_dir)
+    except OSError:
+        try:
+            os.rename(stale, segment_dir)
+        except OSError:
+            logger.exception("Swap failed AND rollback failed. Live segment left at %s", stale)
+        raise
+    shutil.rmtree(stale, ignore_errors=True)
+
+
+def _backup_segment(palace_path: str, segment: str, timestamp: str) -> str:
+    """Copy chroma.sqlite3 plus the small HNSW files (skip bloated link_lists.bin)."""
+    seg_dir = os.path.join(palace_path, segment)
+    backup_dir = os.path.join(palace_path, f"{segment}.hnsw-backup-{timestamp}")
+    os.makedirs(backup_dir, exist_ok=True)
+
+    sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
+    if os.path.isfile(sqlite_path):
+        shutil.copy2(sqlite_path, os.path.join(backup_dir, "chroma.sqlite3"))
+
+    for fname in ("header.bin", "data_level0.bin", "index_metadata.pickle", "length.bin"):
+        src = os.path.join(seg_dir, fname)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(backup_dir, fname))
+    return backup_dir
+
+
+def _purge_segment_queue(palace_path: str, segment: str) -> int:
+    """Delete ``embeddings_queue`` rows for the collection that owns ``segment``.
+
+    ``topic`` is ``persistent://default/default/<COLLECTION_UUID>`` — we look
+    up the collection UUID via ``segments.collection`` and match by pattern.
+    """
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return 0
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute("SELECT collection FROM segments WHERE id = ?", (segment,)).fetchone()
+        if not row:
+            return 0
+        collection_uuid = row[0]
+        cur = conn.execute(
+            "DELETE FROM embeddings_queue WHERE topic LIKE ?",
+            (f"%{collection_uuid}%",),
+        )
+        deleted = cur.rowcount
+        conn.commit()
+    return int(deleted or 0)
+
+
+def _quarantine_orphans(palace_path: str, stale_ids, orphan_labels) -> str:
+    """Append dropped UUIDs + orphan HNSW labels to a sidecar JSON file."""
+    sidecar = os.path.join(palace_path, "quarantined_orphans.json")
+    entry = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "stale_pickle_ids": list(stale_ids),
+        "orphan_hnsw_labels": [int(x) for x in orphan_labels],
+    }
+    history: list = []
+    if os.path.isfile(sidecar):
+        try:
+            with open(sidecar) as f:
+                history = json.load(f)
+            if not isinstance(history, list):
+                history = [history]
+        except Exception:
+            history = []
+    history.append(entry)
+    with open(sidecar, "w") as f:
+        json.dump(history, f, indent=2)
+    return sidecar
 
 
 # ---------------------------------------------------------------------------
@@ -1313,7 +1685,6 @@ def _close_chroma_handles(palace_path: str, backend: "ChromaBackend | None" = No
     releases the handles it was already using. Otherwise fall back to a
     transient backend instance for the max-seq-id repair path.
     """
-    import gc
 
     try:
         closer = backend if backend is not None else ChromaBackend()
@@ -1563,14 +1934,273 @@ def repair_max_seq_id(
     return result
 
 
+# ---------------------------------------------------------------------------
+# hnsw-mode driver: rebuild a single segment from data_level0.bin (issue #1046)
+# ---------------------------------------------------------------------------
+
+
+def _peak_memory_mb() -> float:
+    """Return the process peak RSS in MB (mac returns bytes, linux kilobytes)."""
+    try:
+        import resource
+        import sys
+
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if sys.platform == "darwin":
+            return peak / (1024 * 1024)
+        return peak / 1024
+    except Exception:
+        return 0.0
+
+
+def rebuild_hnsw_segment(
+    palace_path: str,
+    *,
+    segment: str,
+    max_elements: Optional[int] = None,
+    backup: bool = True,
+    purge_queue: bool = False,
+    quarantine_orphans: bool = False,
+    dry_run: bool = False,
+    assume_yes: bool = False,
+) -> dict:
+    """Rebuild a single HNSW segment from on-disk ``data_level0.bin`` + pickle.
+
+    Avoids re-embedding by reading vectors straight out of the persistent
+    HNSW data file. Atomic swap-aside with rollback keeps the live palace
+    untouched on any failure. Issue #1046.
+
+    On successful completion the palace is healthy on disk; if the running
+    MCP server still has ``_vector_disabled`` set from a prior #1222 capacity
+    probe, calling ``mempalace_reconnect`` will refresh the probe and clear
+    the flag — the runtime check is the authoritative source of truth and
+    re-runs at every reconnect.
+    """
+    from .migrate import confirm_destructive_action, contains_palace_database
+
+    palace_path = os.path.abspath(os.path.expanduser(palace_path))
+    seg_dir = os.path.join(palace_path, segment)
+    header_path = os.path.join(seg_dir, "header.bin")
+    data_path = os.path.join(seg_dir, "data_level0.bin")
+    pickle_path = os.path.join(seg_dir, "index_metadata.pickle")
+
+    result: dict = {
+        "palace_path": palace_path,
+        "segment": segment,
+        "dry_run": dry_run,
+        "aborted": False,
+    }
+
+    print(f"\n{'=' * 55}")
+    print("  MemPalace Repair — HNSW Segment Rebuild")
+    print(f"{'=' * 55}\n")
+    print(f"  Palace:  {palace_path}")
+    print(f"  Segment: {segment}")
+
+    if not os.path.isdir(palace_path):
+        print(f"  No palace found at {palace_path}")
+        result["aborted"] = True
+        result["reason"] = "palace-missing"
+        return result
+    if not contains_palace_database(palace_path):
+        print(f"  No palace database at {palace_path}")
+        result["aborted"] = True
+        result["reason"] = "db-missing"
+        return result
+    if not os.path.isdir(seg_dir):
+        print(f"  Segment directory not found: {seg_dir}")
+        result["aborted"] = True
+        result["reason"] = "segment-missing"
+        return result
+    if not os.path.isfile(data_path):
+        print(f"  data_level0.bin not found in {seg_dir}")
+        result["aborted"] = True
+        result["reason"] = "data-missing"
+        return result
+
+    try:
+        import numpy  # noqa: F401
+        import hnswlib  # noqa: F401
+    except ImportError as e:
+        print(f"  Required dependency missing: {e}")
+        print("  Install with: pip install numpy chroma-hnswlib")
+        result["aborted"] = True
+        result["reason"] = "deps-missing"
+        return result
+
+    header_src = header_path if os.path.isfile(header_path) else data_path
+    with open(header_src, "rb") as f:
+        header_bytes = f.read(100)
+    hdr = _parse_hnsw_header(header_bytes)
+    print(
+        f"  Header:  dim={hdr.dim}, cur_count={hdr.cur_count:,}, "
+        f"max_elements={hdr.max_elements:,}, size_per_element={hdr.size_per_element}"
+    )
+
+    space = _detect_space(palace_path, segment)
+    print(f"  Space:   {space}")
+
+    with open(data_path, "rb") as f:
+        data_bytes = f.read()
+    labels, vectors = _extract_vectors(data_bytes, hdr)
+    del data_bytes
+    raw_n = len(labels)
+    labels, vectors = _sanitize_vectors(labels, vectors)
+    sanitized_n = len(labels)
+
+    orphan_hnsw: list = []
+    stale_uids: list = []
+    meta = None
+    if os.path.isfile(pickle_path):
+        keep_mask, orphan_hnsw, stale_uids, meta = _reconcile_with_pickle(labels, pickle_path)
+        labels = labels[keep_mask]
+        vectors = vectors[keep_mask]
+    else:
+        logger.warning("No index_metadata.pickle for segment %s — skipping reconcile", segment)
+
+    healthy_n = len(labels)
+    new_max = _compute_max_elements(healthy_n, max_elements)
+
+    data_bytes_size = os.path.getsize(data_path)
+    link_lists_path = os.path.join(seg_dir, "link_lists.bin")
+    link_lists_size = os.path.getsize(link_lists_path) if os.path.isfile(link_lists_path) else 0
+
+    print()
+    print("  Report")
+    print(f"    raw labels          {raw_n:>10,}")
+    print(f"    after dedup/zeros   {sanitized_n:>10,}")
+    print(f"    healthy (in pickle) {healthy_n:>10,}")
+    print(f"    orphan HNSW labels  {len(orphan_hnsw):>10,}")
+    print(f"    stale pickle ids    {len(stale_uids):>10,}")
+    print(f"    new max_elements    {new_max:>10,}")
+    print(f"    data_level0.bin     {data_bytes_size:>10,} bytes")
+    print(f"    link_lists.bin      {link_lists_size:>10,} bytes (will be rebuilt)")
+
+    result.update(
+        {
+            "raw_labels": raw_n,
+            "sanitized_labels": sanitized_n,
+            "healthy_labels": healthy_n,
+            "orphan_hnsw_labels": len(orphan_hnsw),
+            "stale_pickle_ids": len(stale_uids),
+            "max_elements": new_max,
+            "data_bytes": data_bytes_size,
+            "link_lists_bytes": link_lists_size,
+            "space": space,
+            "dim": hdr.dim,
+        }
+    )
+
+    if dry_run:
+        print("\n  DRY RUN — no files modified.\n" + "=" * 55 + "\n")
+        return result
+
+    if healthy_n == 0:
+        print("  No healthy labels to rebuild — aborting.")
+        result["aborted"] = True
+        result["reason"] = "no-healthy-labels"
+        return result
+
+    if not confirm_destructive_action("Rebuild HNSW segment", palace_path, assume_yes=assume_yes):
+        result["aborted"] = True
+        result["reason"] = "user-aborted"
+        return result
+
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    backup_dir: Optional[str] = None
+    if backup:
+        backup_dir = _backup_segment(palace_path, segment, timestamp)
+        print(f"  Backup:  {backup_dir}")
+
+    _close_chroma_handles(palace_path)
+
+    tmpdir = tempfile.mkdtemp(prefix="mempalace_hnsw_", dir=palace_path)
+    t0 = time.time()
+    try:
+        idx = _build_persistent_index(
+            vectors,
+            labels,
+            space=space,
+            dim=hdr.dim,
+            max_elements=new_max,
+            persistence_location=tmpdir,
+            M=hdr.M or 16,
+            ef_construction=hdr.ef_construction or 100,
+        )
+    except Exception:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise
+    build_seconds = time.time() - t0
+    print(f"  Built:   {healthy_n:,} vectors in {build_seconds:.1f}s")
+
+    try:
+        sample_n = min(3, healthy_n)
+        _self_query_verify(idx, vectors[:sample_n], labels[:sample_n])
+    except RebuildVerificationError:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise
+    finally:
+        del idx
+        gc.collect()
+
+    if meta is not None:
+        meta.total_elements_added = healthy_n
+        with open(os.path.join(tmpdir, "index_metadata.pickle"), "wb") as f:
+            pickle.dump(meta, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    _atomic_swap_segment(tmpdir, seg_dir)
+
+    if purge_queue:
+        deleted = _purge_segment_queue(palace_path, segment)
+        print(f"  Queue:   purged {deleted:,} embeddings_queue rows")
+        result["queue_rows_purged"] = deleted
+    if quarantine_orphans and (stale_uids or orphan_hnsw):
+        sidecar = _quarantine_orphans(palace_path, stale_uids, orphan_hnsw)
+        print(f"  Orphans: appended to {sidecar}")
+        result["orphan_sidecar"] = sidecar
+
+    peak_mb = _peak_memory_mb()
+    print(f"\n  Rebuild complete in {build_seconds:.1f}s (peak RSS ≈ {peak_mb:.0f} MB)")
+    print(f"  Backup:  {backup_dir or '(skipped)'}")
+    print("\n  If the MCP server is currently running with vector_disabled set")
+    print("  (e.g. after a #1222 capacity-divergence detection), call the")
+    print("  `mempalace_reconnect` tool to refresh the capacity probe and")
+    print("  restore vector search.")
+    print(f"\n{'=' * 55}\n")
+
+    result.update({"build_seconds": build_seconds, "peak_rss_mb": peak_mb, "backup": backup_dir})
+    return result
+
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="MemPalace repair tools")
-    p.add_argument("command", choices=["status", "scan", "prune", "rebuild"])
     p.add_argument("--palace", default=None, help="Palace directory path")
-    p.add_argument("--wing", default=None, help="Scan only this wing")
-    p.add_argument("--confirm", action="store_true", help="Actually delete corrupt IDs")
-    args = p.parse_args()
+    sub = p.add_subparsers(dest="command", required=True)
+    sub.add_parser("status", help="Read-only sqlite-vs-HNSW capacity health check")
+    p_scan = sub.add_parser("scan")
+    p_scan.add_argument("--wing", default=None)
+    p_prune = sub.add_parser("prune")
+    p_prune.add_argument("--confirm", action="store_true")
+    sub.add_parser("rebuild")
+    p_hnsw = sub.add_parser("hnsw", help="Single-segment HNSW rebuild (issue #1046)")
+    p_hnsw.add_argument("--segment", required=True)
+    p_hnsw.add_argument("--max-elements", type=int, default=None)
+    p_hnsw.add_argument("--backup", action=argparse.BooleanOptionalAction, default=True)
+    p_hnsw.add_argument("--purge-queue", action="store_true")
+    p_hnsw.add_argument("--quarantine-orphans", action="store_true")
+    p_hnsw.add_argument("--dry-run", action="store_true")
+    p_hnsw.add_argument("--yes", action="store_true")
+    p_msi = sub.add_parser(
+        "max-seq-id", help="Un-poison max_seq_id rows (legacy 0.6.x shim damage)"
+    )
+    p_msi.add_argument("--segment", default=None)
+    p_msi.add_argument("--from-sidecar", default=None)
+    p_msi.add_argument("--backup", action=argparse.BooleanOptionalAction, default=True)
+    p_msi.add_argument("--dry-run", action="store_true")
+    p_msi.add_argument("--yes", action="store_true")
 
+    args = p.parse_args()
     path = os.path.expanduser(args.palace) if args.palace else None
 
     if args.command == "status":
@@ -1581,3 +2211,23 @@ if __name__ == "__main__":
         prune_corrupt(palace_path=path, confirm=args.confirm)
     elif args.command == "rebuild":
         rebuild_index(palace_path=path)
+    elif args.command == "hnsw":
+        rebuild_hnsw_segment(
+            path or _get_palace_path(),
+            segment=args.segment,
+            max_elements=args.max_elements,
+            backup=args.backup,
+            purge_queue=args.purge_queue,
+            quarantine_orphans=args.quarantine_orphans,
+            dry_run=args.dry_run,
+            assume_yes=args.yes,
+        )
+    elif args.command == "max-seq-id":
+        repair_max_seq_id(
+            path or _get_palace_path(),
+            segment=args.segment,
+            from_sidecar=args.from_sidecar,
+            backup=args.backup,
+            dry_run=args.dry_run,
+            assume_yes=args.yes,
+        )
