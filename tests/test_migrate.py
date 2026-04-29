@@ -50,6 +50,10 @@ def test_migrate_aborts_without_confirmation(tmp_path, capsys):
             "mempalace.migrate.extract_drawers_from_sqlite",
             return_value=[{"id": "id1", "document": "doc", "metadata": {"wing": "w", "room": "r"}}],
         ),
+        patch(
+            "mempalace.schema.create_reference_schema",
+            return_value={"tables": {}, "indexes": {}},
+        ),
         patch("builtins.input", return_value="n"),
         patch("mempalace.migrate.shutil.copytree") as mock_copytree,
         patch("mempalace.migrate.shutil.rmtree") as mock_rmtree,
@@ -473,7 +477,7 @@ def test_migrate_already_readable(tmp_dir):
 
 def test_migrate_full_flow_with_validation(palace_06x):
     """End-to-end migration with schema validation."""
-    result = migrate(palace_06x, dry_run=False)
+    result = migrate(palace_06x, dry_run=False, confirm=True)
     assert result is True
 
     # Verify drawer content survived via raw SQL (avoids ChromaDB init issues)
@@ -503,7 +507,7 @@ def test_migrate_aborts_on_validation_failure(palace_06x):
 
     with patch("mempalace.schema.validate_and_patch") as mock_vp:
         mock_vp.return_value = (False, ["FAILED missing_table: critical table missing"])
-        result = migrate(palace_06x, dry_run=False)
+        result = migrate(palace_06x, dry_run=False, confirm=True)
 
     assert result is False
 
