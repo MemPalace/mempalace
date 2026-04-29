@@ -517,7 +517,6 @@ class _SafePersistentDataUnpickler:
 
     @classmethod
     def load(cls, path: str):
-
         class _Restricted(pickle.Unpickler):
             def find_class(self, module: str, name: str):
                 if (module, name) in cls._ALLOWED:
