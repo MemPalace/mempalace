@@ -18,11 +18,13 @@ Usage:
     mempalace migrate --dry-run                # show what would be migrated
 """
 
-import errno
+import gc
 import os
 import shutil
 import sqlite3
+import sys
 import tempfile
+import time
 import uuid
 from collections import defaultdict
 from contextlib import closing
@@ -211,6 +213,29 @@ def collection_write_roundtrip_works(col) -> bool:
         return False
 
 
+def _move_with_windows_retry(src: str, dst: str) -> None:
+    """Rename ``src`` to ``dst``, tolerating briefly-open mmap handles on Windows.
+
+    ChromaDB mmap's HNSW segment files (``data_level0.bin``); on Windows those
+    handles can linger for a beat after Python drops the client reference,
+    causing ``shutil.move`` to fail with ``WinError 32``. Elsewhere this is a
+    single direct call.
+    """
+    if sys.platform != "win32":
+        shutil.move(src, dst)
+        return
+    last_err = None
+    for _ in range(10):
+        try:
+            shutil.move(src, dst)
+            return
+        except PermissionError as err:
+            last_err = err
+            gc.collect()
+            time.sleep(0.2)
+    raise last_err if last_err is not None else RuntimeError("move failed")
+
+
 def migrate(palace_path: str, dry_run: bool = False, confirm: bool = False):
     """Migrate a palace to the currently installed ChromaDB version."""
     from .backends.chroma import ChromaBackend
@@ -326,6 +351,7 @@ def migrate(palace_path: str, dry_run: bool = False, confirm: bool = False):
         # Verify before swapping
         final_count = col.count()
         del col
+        fresh_backend.close()
         del fresh_backend
 
         # Validate schema before swapping
@@ -338,6 +364,11 @@ def migrate(palace_path: str, dry_run: bool = False, confirm: bool = False):
             print("\n  ERROR: Schema validation failed. Aborting.")
             return False
 
+        # Force chromadb finalizers to run so mmap'd segment files are released.
+        # Windows cannot rename/unlink a file with open handles, so we must fully
+        # drop the fresh_backend's PersistentClient before the swap below.
+        gc.collect()
+
         # Swap: rename old palace aside, then move new one into place.
         # This avoids a window where both old and new are missing.
         print("  Swapping old palace for migrated version...")
@@ -346,24 +377,16 @@ def migrate(palace_path: str, dry_run: bool = False, confirm: bool = False):
             shutil.rmtree(stale_path)
         os.replace(palace_path, stale_path)
         try:
-            os.replace(temp_palace, palace_path)
-        except OSError as e:
-            # EXDEV = temp lives on a different filesystem; fall back to copy+delete.
-            # Anything else is a real error — don't mask it with shutil.move.
-            if getattr(e, "errno", None) != errno.EXDEV:
-                _restore_stale_palace(palace_path, stale_path)
-                raise
-            try:
-                shutil.move(temp_palace, palace_path)
-            except Exception:
-                _restore_stale_palace(palace_path, stale_path)
-                raise
+            _move_with_windows_retry(temp_palace, palace_path)
+        except Exception:
+            _restore_stale_palace(palace_path, stale_path)
+            raise
         shutil.rmtree(stale_path, ignore_errors=True)
     finally:
-        # On the happy path os.replace/shutil.move consumed temp_palace, so
-        # the directory no longer exists at the temp location — the existence
-        # guard makes this a no-op then. On any failure path it actually
-        # removes the orphan.
+        # On the happy path the move consumed temp_palace, so the directory
+        # no longer exists at the temp location — the existence guard makes
+        # this a no-op then. On any failure path it actually removes the
+        # orphan.
         if os.path.exists(temp_palace):
             shutil.rmtree(temp_palace, ignore_errors=True)
 
