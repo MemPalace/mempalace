@@ -2218,9 +2218,9 @@ def test_rebuild_hnsw_rollback_on_build_failure(synthetic_segment, monkeypatch):
     assert os.path.isdir(seg_dir), "live segment dir must survive a failed build"
     assert sorted(os.listdir(seg_dir)) == pre_contents
     for name in pre_contents:
-        assert os.path.getsize(os.path.join(seg_dir, name)) == pre_sizes[name], (
-            f"{name} was modified despite rollback"
-        )
+        assert (
+            os.path.getsize(os.path.join(seg_dir, name)) == pre_sizes[name]
+        ), f"{name} was modified despite rollback"
     # No stray .old-* dirs left around
     assert not any(n.startswith(segment + ".old-") for n in os.listdir(palace))
 
