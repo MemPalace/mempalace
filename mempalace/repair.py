@@ -1605,17 +1605,34 @@ def _build_persistent_index(
     return idx
 
 
-def _self_query_verify(index, sample_vectors, sample_labels) -> None:
-    """Verify the rebuilt index returns each sample as its own top-1 neighbor."""
+def _self_query_verify(index, sample_vectors, sample_labels, k: int = 10) -> None:
+    """Verify the rebuilt index returns each sample within its own top-k neighbors.
+
+    Looser than top-1 to tolerate near-duplicates — mined corpora regularly contain
+    drawers with byte-identical vectors (e.g. the same code snippet appearing in
+    multiple transcripts), so an exact top-1 check false-positives on corpora that
+    are actually indexed correctly.
+
+    Bumps ``ef`` before querying: hnswlib's default (≈10) is too tight a search
+    beam for a ~500k-element index with ``M=16`` and can miss even a byte-identical
+    self-match because its neighborhood in the HNSW graph is sparse. ChromaDB sets
+    its own ``ef`` at query time, so this only affects the verify step.
+    """
     if len(sample_labels) == 0:
         return
-    labels, _dists = index.knn_query(sample_vectors, k=1)
-    flat = labels.flatten()
+    index.set_ef(max(200, k * 4))
+    labels, _dists = index.knn_query(sample_vectors, k=k)
     expected = [int(x) for x in sample_labels]
-    got = [int(x) for x in flat]
-    if got != expected:
+    misses = []
+    for i, exp in enumerate(expected):
+        row = [int(x) for x in labels[i]]
+        if exp not in row:
+            misses.append((exp, row))
+    if misses:
         raise RebuildVerificationError(
-            f"Self-query mismatch: expected top-1 labels {expected}, got {got}"
+            f"Self-query mismatch (top-{k}): {len(misses)}/{len(expected)} samples "
+            f"did not include their own label — first miss: expected {misses[0][0]}, "
+            f"got {misses[0][1]}"
         )
 
 
@@ -2161,7 +2178,7 @@ def rebuild_hnsw_segment(
 
     try:
         sample_n = min(3, healthy_n)
-        _self_query_verify(idx, vectors[:sample_n], labels[:sample_n])
+        _self_query_verify(idx, vectors[:sample_n], labels[:sample_n], k=min(10, healthy_n))
     except RebuildVerificationError:
         shutil.rmtree(tmpdir, ignore_errors=True)
         raise
