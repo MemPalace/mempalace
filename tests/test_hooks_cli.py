@@ -202,6 +202,60 @@ def test_count_handles_list_content(tmp_path):
     assert _count_human_messages(str(transcript)) == 1
 
 
+def test_count_skips_tool_results(tmp_path):
+    """Tool results arrive as role: 'user' but should not count as human messages."""
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            {"message": {"role": "user", "content": "real human message"}},
+            {
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tu_1",
+                            "content": "file contents",
+                        },
+                    ],
+                }
+            },
+            {
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "tu_2", "content": "ok"},
+                        {"type": "tool_result", "tool_use_id": "tu_3", "content": "ok"},
+                    ],
+                }
+            },
+            {"message": {"role": "user", "content": "another real message"}},
+        ],
+    )
+    assert _count_human_messages(str(transcript)) == 2
+
+
+def test_count_mixed_content_not_skipped(tmp_path):
+    """Messages with both tool_result and text blocks should still count."""
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            {
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "tu_1", "content": "ok"},
+                        {"type": "text", "text": "and here is my follow-up"},
+                    ],
+                }
+            },
+        ],
+    )
+    assert _count_human_messages(str(transcript)) == 1
+
+
 def test_count_missing_file():
     assert _count_human_messages("/nonexistent/path.jsonl") == 0
 
