@@ -1501,6 +1501,19 @@ def _detect_space(palace_path: str, segment: str) -> str:
     return "l2"
 
 
+def _meta_get(meta, key):
+    """Read a field from index_metadata (0.6.x attr-object or 1.5.x dict)."""
+    return meta[key] if isinstance(meta, dict) else getattr(meta, key)
+
+
+def _meta_set(meta, key, value):
+    """Write a field to index_metadata (0.6.x attr-object or 1.5.x dict)."""
+    if isinstance(meta, dict):
+        meta[key] = value
+    else:
+        setattr(meta, key, value)
+
+
 def _reconcile_with_pickle(labels, pickle_path: str):
     """Intersect HNSW labels with the pickle's ``label_to_id`` mapping.
 
@@ -1513,20 +1526,32 @@ def _reconcile_with_pickle(labels, pickle_path: str):
     with open(pickle_path, "rb") as f:
         meta = pickle.load(f)
 
-    mapped_labels = set(meta.label_to_id.keys())
+    label_to_id = _meta_get(meta, "label_to_id")
+    id_to_label = _meta_get(meta, "id_to_label")
+    id_to_seq_id = _meta_get(meta, "id_to_seq_id")
+
+    mapped_labels = set(label_to_id.keys())
     hnsw_labels = set(int(x) for x in labels)
     healthy = hnsw_labels & mapped_labels
     orphan_hnsw = hnsw_labels - mapped_labels
-    stale_uids = [uid for lbl, uid in meta.label_to_id.items() if lbl not in healthy]
+    stale_uids = [uid for lbl, uid in label_to_id.items() if lbl not in healthy]
     dropped_uid_set = set(stale_uids)
 
-    meta.label_to_id = {lbl: uid for lbl, uid in meta.label_to_id.items() if lbl in healthy}
-    meta.id_to_label = {
-        uid: lbl for uid, lbl in meta.id_to_label.items() if uid not in dropped_uid_set
-    }
-    meta.id_to_seq_id = {
-        uid: sid for uid, sid in meta.id_to_seq_id.items() if uid not in dropped_uid_set
-    }
+    _meta_set(
+        meta,
+        "label_to_id",
+        {lbl: uid for lbl, uid in label_to_id.items() if lbl in healthy},
+    )
+    _meta_set(
+        meta,
+        "id_to_label",
+        {uid: lbl for uid, lbl in id_to_label.items() if uid not in dropped_uid_set},
+    )
+    _meta_set(
+        meta,
+        "id_to_seq_id",
+        {uid: sid for uid, sid in id_to_seq_id.items() if uid not in dropped_uid_set},
+    )
 
     keep_mask = np.fromiter((int(x) in healthy for x in labels), dtype=bool, count=len(labels))
     return keep_mask, sorted(orphan_hnsw), stale_uids, meta
@@ -2145,7 +2170,7 @@ def rebuild_hnsw_segment(
         gc.collect()
 
     if meta is not None:
-        meta.total_elements_added = healthy_n
+        _meta_set(meta, "total_elements_added", healthy_n)
         with open(os.path.join(tmpdir, "index_metadata.pickle"), "wb") as f:
             pickle.dump(meta, f, protocol=pickle.HIGHEST_PROTOCOL)
 
