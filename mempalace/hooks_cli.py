@@ -162,10 +162,7 @@ def _count_human_messages(transcript_path: str) -> int:
                             if "<command-message>" in content:
                                 continue
                         elif isinstance(content, list):
-                            # Skip tool results — Claude Code sends these as
-                            # role: "user" with content blocks of type
-                            # "tool_result", but they aren't human input.
-                            # Safe no-op for LLMs that use role: "tool".
+                            # Skip tool results (role: "user" but not human input)
                             if all(
                                 isinstance(b, dict) and b.get("type") == "tool_result"
                                 for b in content

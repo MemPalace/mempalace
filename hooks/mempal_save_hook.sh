@@ -252,9 +252,7 @@ with open(sys.argv[1]) as f:
                 # Skip system/command messages
                 if isinstance(content, str) and '<command-message>' in content:
                     continue
-                # Skip tool results — Claude Code sends these as role: "user"
-                # with content blocks of type "tool_result", but they aren't
-                # human input. Safe no-op for other LLMs that use role: "tool".
+                # Skip tool results (role: "user" but not human input)
                 if isinstance(content, list) and all(
                     isinstance(b, dict) and b.get('type') == 'tool_result'
                     for b in content
