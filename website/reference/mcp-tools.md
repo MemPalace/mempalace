@@ -365,14 +365,15 @@ Read recent diary entries.
 
 ### `mempalace_hook_settings`
 
-Get or set auto-save hook behaviour. `silent_save=true` saves directly without MCP-level clutter; `silent_save=false` uses the legacy blocking path. `desktop_toast=true` surfaces a desktop notification when a save completes. Call with no arguments to view the current settings.
+Get or set auto-save hook behaviour. `silent_save=true` saves directly without MCP-level clutter; `silent_save=false` uses the legacy blocking path. `desktop_toast=true` surfaces a desktop notification when a save completes. `auto_mine=true` (default) runs the background mine after the diary save; set `false` to keep the fast diary write but skip the recursive `~/.claude/projects/<cwd>/` walk that can peg CPU on large archives. Call with no arguments to view the current settings.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `silent_save` | boolean | No | `true` = silent direct save, `false` = blocking MCP calls |
 | `desktop_toast` | boolean | No | `true` = show desktop toast via `notify-send` |
+| `auto_mine` | boolean | No | `true` = run background mine in hooks, `false` = diary only |
 
-**Returns:** `{ silent_save, desktop_toast }`
+**Returns:** `{ silent_save, desktop_toast, auto_mine }`
 
 ---
 

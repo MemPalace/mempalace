@@ -592,6 +592,27 @@ class MempalaceConfig:
         return self._file_config.get("hooks", {}).get("silent_save", True)
 
     @property
+    def hook_auto_mine(self):
+        """Whether the stop/precompact hooks run the background mine after the diary save.
+
+        Set to ``False`` to keep the fast diary write but skip the
+        ``_ingest_transcript`` + ``_maybe_auto_ingest`` calls that walk the
+        ``~/.claude/projects/<cwd>/`` tree and can peg a CPU core for hours on
+        large archives. Diary writes (``_save_diary_direct``) still fire.
+
+        Env var ``MEMPALACE_HOOKS_AUTO_MINE`` (or legacy ``MEMPAL_HOOKS_AUTO_MINE``)
+        overrides the config file. Accepts ``0``/``false``/``no``/``off`` as
+        falsey; anything else is truthy. Default: ``True`` (preserves existing
+        behavior for users who don't opt out).
+        """
+        env_val = os.environ.get("MEMPALACE_HOOKS_AUTO_MINE") or os.environ.get(
+            "MEMPAL_HOOKS_AUTO_MINE"
+        )
+        if env_val:
+            return env_val.strip().lower() not in ("0", "false", "no", "off")
+        return self._file_config.get("hooks", {}).get("auto_mine", True)
+
+    @property
     def hook_desktop_toast(self):
         """Whether the stop hook shows a desktop notification via notify-send."""
         return self._file_config.get("hooks", {}).get("desktop_toast", False)
