@@ -291,6 +291,12 @@ if [ "$SINCE_LAST" -ge "$SAVE_INTERVAL" ] && [ "$EXCHANGE_COUNT" -gt 0 ]; then
     #      (code, notes, docs)
     # MEMPAL_DIR is *additive*, not an override: a user with MEMPAL_DIR
     # pointed at their project still gets the active conversation mined.
+    #
+    # Cap ONNX intra_op threads so the background mine doesn't pin every
+    # core on multi-core hosts. See ``_read_thread_cap()`` in
+    # ``mempalace/embedding.py``. ``TOKENIZERS_PARALLELISM=false`` silences
+    # the Hugging Face fork warning.
+    export MEMPAL_MAX_THREADS=2 TOKENIZERS_PARALLELISM=false
     if is_valid_transcript_path "$TRANSCRIPT_PATH" && [ -f "$TRANSCRIPT_PATH" ]; then
         mempalace mine "$(dirname "$TRANSCRIPT_PATH")" --mode convos \
             >> "$STATE_DIR/hook.log" 2>&1 &

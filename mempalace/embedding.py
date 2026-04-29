@@ -27,14 +27,49 @@ in ``~/.mempalace/config.json``):
 
 Requesting an unavailable accelerator emits a warning and falls back to CPU
 rather than hard-failing — mining must still work on a laptop without CUDA.
+
+ONNX Runtime's intra-op thread pool is capped via ``MEMPAL_MAX_THREADS``
+(default 2; ``0``/``off``/``default``/``none`` disables the cap). Without
+this, ORT spawns ≈physical-core-count workers and a background mine can
+peg 400-500%% CPU. ``OMP_NUM_THREADS`` does not control the ORT pool.
 """
 
 from __future__ import annotations
 
 import logging
+import os
+from functools import cached_property
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_THREAD_CAP = 2
+
+
+def _read_thread_cap() -> int:
+    """Return the ONNX intra-op thread cap from ``MEMPAL_MAX_THREADS``.
+
+    * Unset → ``_DEFAULT_THREAD_CAP`` (2).
+    * ``"0"`` / ``"off"`` / ``"default"`` / ``"none"`` / empty → 0 (no cap).
+    * Positive int → that int.
+    * Anything else → 0 with a warning (fail-open: never break mining on a typo).
+    """
+    raw = os.environ.get("MEMPAL_MAX_THREADS")
+    if raw is None:
+        return _DEFAULT_THREAD_CAP
+    raw = raw.strip().lower()
+    if raw in ("", "0", "off", "default", "none"):
+        return 0
+    try:
+        n = int(raw)
+    except ValueError:
+        logger.warning(
+            "MEMPAL_MAX_THREADS=%r is not an integer; leaving ORT defaults",
+            raw,
+        )
+        return 0
+    return n if n > 0 else 0
+
 
 _PROVIDER_MAP = {
     "cpu": ["CPUExecutionProvider"],
@@ -107,7 +142,7 @@ def _resolve_providers(device: str) -> tuple[list, str]:
     return (requested, device)
 
 
-def _build_ef_class():
+def _build_ef_class(thread_cap: int = 0):
     """Subclass ``ONNXMiniLM_L6_V2`` with name ``"default"``.
 
     Why the rename: ChromaDB 1.5 persists the EF identity on the collection
@@ -116,6 +151,12 @@ def _build_ef_class():
     ``name()`` tag differs — so spoofing the name lets one EF class serve
     palaces created with ``DefaultEmbeddingFunction`` *and* palaces we
     create ourselves, with the same GPU-capable ``preferred_providers``.
+
+    When ``thread_cap > 0`` the ``model`` cached property is overridden so
+    the ORT ``InferenceSession`` is built with explicit ``SessionOptions``
+    capping ``intra_op_num_threads`` and ``inter_op_num_threads=1``. This
+    keeps the background mine from pinning every core on multi-core hosts;
+    ``OMP_NUM_THREADS`` does not control ORT's intra-op pool.
     """
     from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2
 
@@ -124,7 +165,27 @@ def _build_ef_class():
         def name() -> str:
             return "default"
 
-    return _MempalaceONNX
+    if thread_cap <= 0:
+        return _MempalaceONNX
+
+    class _CappedMempalaceONNX(_MempalaceONNX):
+        _mempal_thread_cap = thread_cap
+
+        @cached_property
+        def model(self):  # type: ignore[override]
+            so = self.ort.SessionOptions()
+            so.log_severity_level = 3
+            so.intra_op_num_threads = self._mempal_thread_cap
+            so.inter_op_num_threads = 1
+            if not self._preferred_providers:
+                self._preferred_providers = ["CPUExecutionProvider"]
+            return self.ort.InferenceSession(
+                os.path.join(self.DOWNLOAD_PATH, self.EXTRACTED_FOLDER_NAME, "model.onnx"),
+                providers=self._preferred_providers,
+                sess_options=so,
+            )
+
+    return _CappedMempalaceONNX
 
 
 # Embeddinggemma-300m ONNX (q8) — 100+ languages, MRL-truncated to 384 dims so
@@ -158,10 +219,11 @@ class EmbeddinggemmaONNX:
         # when switching models. Keep it stable.
         return "embeddinggemma_300m"
 
-    def __init__(self, preferred_providers=None):
+    def __init__(self, preferred_providers=None, thread_cap: int = 0):
         self._providers = (
             list(preferred_providers) if preferred_providers else ["CPUExecutionProvider"]
         )
+        self._thread_cap = thread_cap if thread_cap and thread_cap > 0 else 0
         self._session = None
         self._tokenizer = None
         self._np = None
@@ -193,7 +255,15 @@ class EmbeddinggemmaONNX:
         )
         tok_path = hf_hub_download(_EMBEDDINGGEMMA_REPO, filename="tokenizer.json")
 
-        self._session = ort.InferenceSession(model_path, providers=self._providers)
+        sess_options = None
+        if self._thread_cap:
+            sess_options = ort.SessionOptions()
+            sess_options.log_severity_level = 3
+            sess_options.intra_op_num_threads = self._thread_cap
+            sess_options.inter_op_num_threads = 1
+        self._session = ort.InferenceSession(
+            model_path, providers=self._providers, sess_options=sess_options
+        )
         out_names = [o.name for o in self._session.get_outputs()]
         # Model card: sentence_embedding is the pooled output (last_hidden_state
         # is the per-token output we don't want).
@@ -230,7 +300,8 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
     ``device=None`` reads :attr:`MempalaceConfig.embedding_device`;
     ``model=None`` reads :attr:`MempalaceConfig.embedding_model`.
     The returned function is shared across calls with the same resolved
-    provider list + model so we only pay model-load cost once per process.
+    provider list, model, and ``MEMPAL_MAX_THREADS`` cap so we only pay
+    model-load cost once per process.
     """
     if device is None or model is None:
         from .config import MempalaceConfig
@@ -242,24 +313,26 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
             model = cfg.embedding_model
 
     providers, effective = _resolve_providers(device)
-    cache_key = (model, tuple(providers))
+    thread_cap = _read_thread_cap()
+    cache_key = (model, tuple(providers), thread_cap)
     cached = _EF_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
     if model == "embeddinggemma":
-        ef = EmbeddinggemmaONNX(preferred_providers=providers)
+        ef = EmbeddinggemmaONNX(preferred_providers=providers, thread_cap=thread_cap)
     else:
         # Default: minilm (or anything we don't recognize — back-compat win).
-        ef_cls = _build_ef_class()
+        ef_cls = _build_ef_class(thread_cap)
         ef = ef_cls(preferred_providers=providers)
 
     _EF_CACHE[cache_key] = ef
     logger.info(
-        "Embedding function initialized (model=%s device=%s providers=%s)",
+        "Embedding function initialized (model=%s device=%s providers=%s thread_cap=%d)",
         model,
         effective,
         providers,
+        thread_cap,
     )
     return ef
 
