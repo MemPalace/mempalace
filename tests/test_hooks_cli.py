@@ -245,6 +245,9 @@ def test_count_mixed_content_not_skipped(tmp_path):
             {
                 "message": {
                     "role": "user",
+                    # Mixed content: a tool_result block alongside a text block.
+                    # The text block means a human actually typed something, so
+                    # this message should still count as a human exchange.
                     "content": [
                         {"type": "tool_result", "tool_use_id": "tu_1", "content": "ok"},
                         {"type": "text", "text": "and here is my follow-up"},
