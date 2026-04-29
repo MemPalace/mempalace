@@ -18,6 +18,7 @@ Usage:
     mempalace migrate --dry-run                # show what would be migrated
 """
 
+import errno
 import gc
 import os
 import shutil
@@ -213,27 +214,28 @@ def collection_write_roundtrip_works(col) -> bool:
         return False
 
 
-def _move_with_windows_retry(src: str, dst: str) -> None:
-    """Rename ``src`` to ``dst``, tolerating briefly-open mmap handles on Windows.
+def _atomic_swap_move(src: str, dst: str) -> None:
+    """Rename ``src`` to ``dst`` atomically, retrying on Windows mmap handles.
 
     ChromaDB mmap's HNSW segment files (``data_level0.bin``); on Windows those
-    handles can linger for a beat after Python drops the client reference,
-    causing ``shutil.move`` to fail with ``WinError 32``. Elsewhere this is a
-    single direct call.
+    handles can linger briefly after Python drops the client reference. We use
+    ``os.rename`` (atomic — no copytree fallback that can leave partial state)
+    and retry a few times on Windows if the rename fails with a lingering
+    handle error.
     """
     if sys.platform != "win32":
-        shutil.move(src, dst)
+        os.rename(src, dst)
         return
     last_err = None
     for _ in range(10):
         try:
-            shutil.move(src, dst)
+            os.rename(src, dst)
             return
-        except PermissionError as err:
+        except OSError as err:
             last_err = err
             gc.collect()
             time.sleep(0.2)
-    raise last_err if last_err is not None else RuntimeError("move failed")
+    raise last_err if last_err is not None else RuntimeError("rename failed")
 
 
 def migrate(palace_path: str, dry_run: bool = False, confirm: bool = False):
@@ -364,9 +366,13 @@ def migrate(palace_path: str, dry_run: bool = False, confirm: bool = False):
             print("\n  ERROR: Schema validation failed. Aborting.")
             return False
 
-        # Force chromadb finalizers to run so mmap'd segment files are released.
-        # Windows cannot rename/unlink a file with open handles, so we must fully
-        # drop the fresh_backend's PersistentClient before the swap below.
+        # Drop chromadb's singleton client cache so mmap'd segment files are
+        # released. Clearing ChromaBackend's own dict above isn't enough —
+        # chromadb holds its own module-level strong refs, which on Windows
+        # keep data_level0.bin open and block the rename below.
+        from chromadb.api.client import SharedSystemClient
+
+        SharedSystemClient.clear_system_cache()
         gc.collect()
 
         # Swap: rename old palace aside, then move new one into place.
@@ -377,10 +383,18 @@ def migrate(palace_path: str, dry_run: bool = False, confirm: bool = False):
             shutil.rmtree(stale_path)
         os.replace(palace_path, stale_path)
         try:
-            _move_with_windows_retry(temp_palace, palace_path)
-        except Exception:
-            _restore_stale_palace(palace_path, stale_path)
-            raise
+            _atomic_swap_move(temp_palace, palace_path)
+        except OSError as e:
+            # EXDEV = temp lives on a different filesystem; fall back to copy+delete.
+            # Anything else is a real error — don't mask it.
+            if getattr(e, "errno", None) != errno.EXDEV:
+                _restore_stale_palace(palace_path, stale_path)
+                raise
+            try:
+                shutil.move(temp_palace, palace_path)
+            except Exception:
+                _restore_stale_palace(palace_path, stale_path)
+                raise
         shutil.rmtree(stale_path, ignore_errors=True)
     finally:
         # On the happy path the move consumed temp_palace, so the directory
