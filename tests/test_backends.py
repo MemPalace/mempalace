@@ -26,6 +26,7 @@ from mempalace.backends.chroma import (
     _fix_missing_collection_type,
     _pin_hnsw_threads,
     _segment_appears_healthy,
+    _segment_pickle_counts_consistent,
     quarantine_invalid_hnsw_metadata,
     quarantine_stale_hnsw,
 )
@@ -970,6 +971,124 @@ def test_quarantine_stale_hnsw_skips_already_quarantined(tmp_path):
     moved = quarantine_stale_hnsw(str(palace), stale_seconds=3600.0)
     assert moved == []
     assert drift.exists()
+
+
+# ── pickle-counts consistency gate (stage 3) ──────────────────────────────
+
+import pickle as _pickle  # noqa: E402  -- intentionally local to fixture helpers
+
+
+def _write_meta_pickle(seg_path: Path, label_count: int, total_added: int) -> None:
+    """Write a chromadb-1.5.x-shaped index_metadata.pickle."""
+    obj = {
+        "id_to_label": {f"id-{i}": i for i in range(label_count)},
+        "total_elements_added": total_added,
+        "dimensionality": None,
+        "max_seq_id": None,
+        "id_to_seq_id": {},
+    }
+    (seg_path / "index_metadata.pickle").write_bytes(_pickle.dumps(obj))
+
+
+def test_segment_pickle_counts_consistent_matching(tmp_path):
+    """Pickle with id_to_label count == total_elements_added returns True."""
+    seg = tmp_path / "seg"
+    seg.mkdir()
+    _write_meta_pickle(seg, label_count=10, total_added=10)
+    assert _segment_pickle_counts_consistent(str(seg)) is True
+
+
+def test_segment_pickle_counts_consistent_off_by_one(tmp_path):
+    """Pickle with total_elements_added one ahead of id_to_label returns
+    False — exact shape of the chroma-core/chroma#6979 corruption (write
+    killed mid-flush)."""
+    seg = tmp_path / "seg"
+    seg.mkdir()
+    _write_meta_pickle(seg, label_count=522_938, total_added=522_939)
+    assert _segment_pickle_counts_consistent(str(seg)) is False
+
+
+def test_segment_pickle_counts_consistent_returns_none_for_class_pickle(tmp_path):
+    """Pickle that requires class instantiation (e.g. 0.6.x attr-object
+    metadata format) returns None — the bounded unpickler refuses any
+    non-builtin module, so the existing byte-sniff verdict stands."""
+    import datetime as _datetime
+
+    seg = tmp_path / "seg"
+    seg.mkdir()
+    # datetime.date pickles via datetime._reconstruct which is not in
+    # _BoundedUnpickler._ALLOWED_BUILTINS — stand-in for any non-dict
+    # custom-class metadata format.
+    (seg / "index_metadata.pickle").write_bytes(_pickle.dumps(_datetime.date(2026, 1, 1)))
+    assert _segment_pickle_counts_consistent(str(seg)) is None
+
+
+def test_segment_pickle_counts_consistent_returns_none_when_keys_missing(tmp_path):
+    """Pickle missing one of the expected keys returns None — undetermined
+    rather than False, so the byte-sniff verdict stands."""
+    seg = tmp_path / "seg"
+    seg.mkdir()
+    (seg / "index_metadata.pickle").write_bytes(_pickle.dumps({"id_to_label": {}}))
+    assert _segment_pickle_counts_consistent(str(seg)) is None
+
+
+def test_segment_pickle_counts_consistent_returns_none_when_file_missing(tmp_path):
+    """No metadata file at all returns None."""
+    seg = tmp_path / "seg"
+    seg.mkdir()
+    assert _segment_pickle_counts_consistent(str(seg)) is None
+
+
+def test_quarantine_stale_hnsw_quarantines_off_by_one_pickle(tmp_path):
+    """Stale segment whose pickle parses but has off-by-one between
+    id_to_label and total_elements_added is quarantined — byte-sniff
+    alone misses this (file is structurally valid). Issue #1046 / chroma-
+    core/chroma#6979."""
+    now = 1_700_000_000.0
+    palace, seg = _make_palace_with_segment(
+        tmp_path,
+        hnsw_mtime=now - 7200,
+        sqlite_mtime=now,
+        meta_bytes=None,  # we'll write a real pickle below
+    )
+    _write_meta_pickle(seg, label_count=99, total_added=100)
+    moved = quarantine_stale_hnsw(str(palace), stale_seconds=3600.0)
+    assert len(moved) == 1
+    assert ".drift-" in moved[0]
+    assert not seg.exists()
+
+
+def test_quarantine_stale_hnsw_leaves_consistent_pickle_alone(tmp_path):
+    """Stale segment whose pickle parses with matching counts is left in
+    place — flush-lag, not corruption."""
+    now = 1_700_000_000.0
+    palace, seg = _make_palace_with_segment(
+        tmp_path,
+        hnsw_mtime=now - 7200,
+        sqlite_mtime=now,
+        meta_bytes=None,
+    )
+    _write_meta_pickle(seg, label_count=100, total_added=100)
+    moved = quarantine_stale_hnsw(str(palace), stale_seconds=3600.0)
+    assert moved == []
+    assert seg.exists()
+
+
+def test_quarantine_stale_hnsw_leaves_unparseable_byte_healthy_alone(tmp_path):
+    """Stale segment whose pickle passes byte-sniff but cannot be parsed
+    by the bounded unpickler stays untouched — undetermined verdict
+    falls back to the byte-sniff pass. Protects 0.6.x attr-object
+    palaces from regressing into a quarantine loop on this gate."""
+    now = 1_700_000_000.0
+    palace, seg = _make_palace_with_segment(
+        tmp_path,
+        hnsw_mtime=now - 7200,
+        sqlite_mtime=now,
+        meta_bytes=_HEALTHY_META,  # passes byte-sniff but isn't a valid pickle
+    )
+    moved = quarantine_stale_hnsw(str(palace), stale_seconds=3600.0)
+    assert moved == []
+    assert seg.exists()
 
 
 # ── make_client cold-start gate ──────────────────────────────────────────
