@@ -259,6 +259,24 @@ def test_count_mixed_content_not_skipped(tmp_path):
     assert _count_human_messages(str(transcript)) == 1
 
 
+def test_count_skips_empty_content_list(tmp_path):
+    """Messages with content=[] are not human input.
+
+    Regression: ``all([])`` is vacuously True, which previously caused
+    empty-content user messages to slip past the tool_result guard and be
+    counted as human exchanges, undercounting the save trigger.
+    """
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            {"message": {"role": "user", "content": []}},
+            {"message": {"role": "user", "content": "real human message"}},
+        ],
+    )
+    assert _count_human_messages(str(transcript)) == 1
+
+
 def test_count_missing_file():
     assert _count_human_messages("/nonexistent/path.jsonl") == 0
 
