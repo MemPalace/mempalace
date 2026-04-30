@@ -2370,3 +2370,46 @@ def test_quarantine_orphans_appends(tmp_path):
     assert len(data) == 2
     assert data[0]["stale_pickle_ids"] == ["uid-1"]
     assert data[1]["orphan_hnsw_labels"] == [1001]
+
+
+# ── status() integration: capacity-divergence fix-it hint (#1046 + #1222) ──
+
+
+def test_status_suggests_hnsw_segment_mode_when_diverged(tmp_path, monkeypatch, capsys):
+    """When hnsw_capacity_status reports divergence, status() should print
+    the actionable `--mode hnsw --segment <uuid>` recovery command alongside
+    the legacy full-rebuild option, with the segment UUID inline.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    seg_uuid = "deadbeef-1111-2222-3333-444455556666"
+
+    def _fake_status(_palace, collection):
+        if collection == "mempalace_drawers":
+            return {
+                "segment_id": seg_uuid,
+                "sqlite_count": 200_000,
+                "hnsw_count": 16_384,
+                "divergence": 183_616,
+                "diverged": True,
+                "status": "diverged",
+                "message": "HNSW frozen at stale max_elements",
+            }
+        return {
+            "segment_id": None,
+            "sqlite_count": 0,
+            "hnsw_count": None,
+            "divergence": None,
+            "diverged": False,
+            "status": "ok",
+            "message": "",
+        }
+
+    monkeypatch.setattr(repair, "hnsw_capacity_status", _fake_status)
+    result = repair.status(palace_path=str(palace))
+    out = capsys.readouterr().out
+
+    assert result["drawers"]["diverged"] is True
+    assert "--mode hnsw --segment" in out
+    assert seg_uuid in out
+    assert "mempalace repair" in out  # legacy full-rebuild path also surfaced
