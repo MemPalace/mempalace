@@ -2435,3 +2435,230 @@ def test_status_suggests_hnsw_segment_mode_when_diverged(tmp_path, monkeypatch, 
     assert "--mode hnsw --segment" in out
     assert seg_uuid in out
     assert "mempalace repair" in out  # legacy full-rebuild path also surfaced
+
+
+# ── reconcile_orphan_sql_rows ─────────────────────────────────────────
+
+
+@pytest.fixture
+def reconcile_palace(tmp_path):
+    """Build a synthetic palace with consistent pickle (no stale entries)."""
+    pytest.importorskip("numpy")
+    pytest.importorskip("hnswlib")
+    palace = tmp_path / "palace"
+    segment, coll, healthy_uids, vectors = _seed_hnsw_segment(str(palace), extra_pickle_ids=())
+    return {
+        "palace": str(palace),
+        "segment": segment,
+        "collection": coll,
+        "uids": healthy_uids,
+        "vectors": vectors,
+    }
+
+
+def _add_metadata_segment(palace_path, coll_uuid, healthy_uids, orphan_uids):
+    """Augment a ``_seed_hnsw_segment`` palace with a sibling METADATA segment.
+
+    Adds the ``embeddings`` and ``embedding_metadata`` tables chromadb would
+    normally create, with one row per UID — both healthy (already in HNSW)
+    and orphan (SQL-only).
+    """
+    metadata_segment = "11111111-2222-3333-4444-555566667777"
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE embeddings(
+            id INTEGER PRIMARY KEY,
+            segment_id TEXT NOT NULL,
+            embedding_id TEXT NOT NULL,
+            seq_id BLOB NOT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (segment_id, embedding_id)
+        );
+        CREATE TABLE embedding_metadata(
+            id INTEGER REFERENCES embeddings(id),
+            key TEXT NOT NULL,
+            string_value TEXT,
+            int_value INTEGER,
+            float_value REAL,
+            bool_value INTEGER,
+            PRIMARY KEY (id, key)
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO segments VALUES (?, 'urn:chroma:segment/metadata/sqlite', 'METADATA', ?)",
+        (metadata_segment, coll_uuid),
+    )
+    rowid = 0
+    for uid in list(healthy_uids) + list(orphan_uids):
+        rowid += 1
+        conn.execute(
+            "INSERT INTO embeddings(id, segment_id, embedding_id, seq_id) VALUES (?, ?, ?, ?)",
+            (rowid, metadata_segment, uid, b"\x00" * 6),
+        )
+        conn.execute(
+            "INSERT INTO embedding_metadata(id, key, string_value) VALUES (?, ?, ?)",
+            (rowid, "chroma:document", f"document text for {uid}"),
+        )
+    conn.commit()
+    conn.close()
+    return metadata_segment
+
+
+def _make_recording_ef(dim):
+    """Return a deterministic embedding function that records calls."""
+    import numpy as np
+
+    captured = []
+
+    def ef(docs):
+        captured.append(list(docs))
+        out = np.zeros((len(docs), dim), dtype=np.float32)
+        for i, d in enumerate(docs):
+            out[i, 0] = float(abs(hash(d)) % 1000) / 1000.0 + 0.001
+            out[i, 1] = float(len(d) % 100) / 100.0 + 0.001
+        norms = np.linalg.norm(out, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        return out / norms
+
+    return ef, captured
+
+
+def test_reconcile_resolves_metadata_segment(tmp_path):
+    db_path = str(tmp_path / "chroma.sqlite3")
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE segments(id TEXT PRIMARY KEY, type TEXT, scope TEXT, collection TEXT);
+        INSERT INTO segments VALUES ('vec-1', 't', 'VECTOR', 'coll-1');
+        INSERT INTO segments VALUES ('meta-1', 't', 'METADATA', 'coll-1');
+        INSERT INTO segments VALUES ('vec-2', 't', 'VECTOR', 'coll-2');
+        """
+    )
+    conn.commit()
+    conn.close()
+    assert repair._resolve_metadata_segment(db_path, "vec-1") == "meta-1"
+    # vec-2 has no METADATA sibling — returns None
+    assert repair._resolve_metadata_segment(db_path, "vec-2") is None
+
+
+def test_reconcile_dry_run_reports_orphans(reconcile_palace):
+    palace = reconcile_palace["palace"]
+    segment = reconcile_palace["segment"]
+    coll = reconcile_palace["collection"]
+    healthy = reconcile_palace["uids"]
+    orphans = ["uid-orphan-a", "uid-orphan-b"]
+    metadata_segment = _add_metadata_segment(palace, coll, healthy, orphans)
+    seg_dir = os.path.join(palace, segment)
+    before = {
+        name: os.stat(os.path.join(seg_dir, name)).st_mtime_ns for name in os.listdir(seg_dir)
+    }
+
+    result = repair.reconcile_orphan_sql_rows(
+        palace,
+        segment=segment,
+        metadata_segment=metadata_segment,
+        dry_run=True,
+        assume_yes=True,
+    )
+    assert result["aborted"] is False
+    assert result["dry_run"] is True
+    assert result["existing_labels"] == 4
+    assert result["sql_only_orphans"] == 2
+
+    after = {name: os.stat(os.path.join(seg_dir, name)).st_mtime_ns for name in os.listdir(seg_dir)}
+    assert before == after
+
+
+def test_reconcile_appends_orphans_and_updates_pickle(reconcile_palace):
+    palace = reconcile_palace["palace"]
+    segment = reconcile_palace["segment"]
+    coll = reconcile_palace["collection"]
+    healthy = reconcile_palace["uids"]
+    orphans = ["uid-orphan-a", "uid-orphan-b", "uid-orphan-c"]
+    metadata_segment = _add_metadata_segment(palace, coll, healthy, orphans)
+    ef, captured = _make_recording_ef(_DIM)
+
+    result = repair.reconcile_orphan_sql_rows(
+        palace,
+        segment=segment,
+        metadata_segment=metadata_segment,
+        max_elements=500,
+        assume_yes=True,
+        embedding_function=ef,
+    )
+    assert result["aborted"] is False
+    assert result["new_labels"] == 3
+    assert result["total_elements_added"] == 7
+
+    embedded = [d for batch in captured for d in batch]
+    for uid in orphans:
+        assert any(uid in d for d in embedded), f"orphan {uid} was not embedded"
+
+    seg_dir = os.path.join(palace, segment)
+    with open(os.path.join(seg_dir, "index_metadata.pickle"), "rb") as f:
+        meta = pickle.load(f)
+    id_to_label = repair._meta_get(meta, "id_to_label")
+    label_to_id = repair._meta_get(meta, "label_to_id")
+    assert len(id_to_label) == 7
+    assert len(label_to_id) == 7
+    assert repair._meta_get(meta, "total_elements_added") == 7
+    for uid in orphans:
+        assert uid in id_to_label
+        assert id_to_label[uid] in label_to_id
+
+
+def test_reconcile_no_orphans_short_circuits(synthetic_segment):
+    palace = synthetic_segment["palace"]
+    segment = synthetic_segment["segment"]
+    coll = synthetic_segment["collection"]
+    healthy = synthetic_segment["uids"]
+    metadata_segment = _add_metadata_segment(palace, coll, healthy, [])
+
+    result = repair.reconcile_orphan_sql_rows(
+        palace,
+        segment=segment,
+        metadata_segment=metadata_segment,
+        assume_yes=True,
+    )
+    assert result["aborted"] is False
+    assert result["sql_only_orphans"] == 0
+    assert "new_labels" not in result
+
+
+def test_reconcile_aborts_on_inconsistent_pickle(synthetic_segment):
+    palace = synthetic_segment["palace"]
+    segment = synthetic_segment["segment"]
+    coll = synthetic_segment["collection"]
+    metadata_segment = _add_metadata_segment(palace, coll, synthetic_segment["uids"], ["x"])
+
+    pickle_path = os.path.join(palace, segment, "index_metadata.pickle")
+    with open(pickle_path, "rb") as f:
+        meta = pickle.load(f)
+    repair._meta_set(meta, "total_elements_added", 999)
+    with open(pickle_path, "wb") as f:
+        pickle.dump(meta, f)
+
+    result = repair.reconcile_orphan_sql_rows(
+        palace,
+        segment=segment,
+        metadata_segment=metadata_segment,
+        assume_yes=True,
+    )
+    assert result["aborted"] is True
+    assert result["reason"] == "pickle-inconsistent"
+
+
+def test_reconcile_aborts_when_metadata_segment_unresolved(synthetic_segment):
+    palace = synthetic_segment["palace"]
+    segment = synthetic_segment["segment"]
+    # No METADATA segment added → auto-detect fails.
+    result = repair.reconcile_orphan_sql_rows(
+        palace,
+        segment=segment,
+        assume_yes=True,
+    )
+    assert result["aborted"] is True
+    assert result["reason"] == "metadata-segment-unresolved"
