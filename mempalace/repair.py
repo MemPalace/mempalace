@@ -2215,6 +2215,308 @@ def rebuild_hnsw_segment(
     return result
 
 
+# ---------------------------------------------------------------------------
+# reconcile mode: re-embed SQL-only rows that never landed an HNSW label
+# ---------------------------------------------------------------------------
+
+
+def _resolve_metadata_segment(db_path: str, vector_segment: str) -> Optional[str]:
+    """Find the METADATA segment that shares a collection with ``vector_segment``."""
+    if not os.path.isfile(db_path):
+        return None
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT collection FROM segments WHERE id = ?", (vector_segment,)
+        ).fetchone()
+        if not row:
+            return None
+        rows = conn.execute(
+            "SELECT id FROM segments WHERE collection = ? AND scope = 'METADATA'",
+            (row[0],),
+        ).fetchall()
+    if len(rows) != 1:
+        return None
+    return str(rows[0][0])
+
+
+def _fetch_sql_only_docs(db_path: str, metadata_segment: str, hnsw_uuids: set) -> list:
+    """Return ``[(embedding_id, document), ...]`` for SQL rows missing from HNSW.
+
+    Stable order by ``embedding_id`` so reconciles are reproducible.
+    """
+    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        rows = conn.execute(
+            """
+            SELECT e.embedding_id, em.string_value
+            FROM embeddings e
+            JOIN embedding_metadata em ON e.id = em.id
+            WHERE e.segment_id = ? AND em.key = 'chroma:document'
+            ORDER BY e.embedding_id
+            """,
+            (metadata_segment,),
+        ).fetchall()
+    return [(uid, doc) for uid, doc in rows if uid not in hnsw_uuids]
+
+
+def _embed_in_batches(ef, docs, *, dim: int, batch: int = 64):
+    """Encode ``docs`` with ``ef`` in fixed-size batches; return ``np.ndarray``."""
+    import numpy as np
+
+    out = np.empty((len(docs), dim), dtype=np.float32)
+    for i in range(0, len(docs), batch):
+        j = min(i + batch, len(docs))
+        out[i:j] = np.asarray(ef(docs[i:j]), dtype=np.float32)
+    return out
+
+
+def reconcile_orphan_sql_rows(
+    palace_path: str,
+    *,
+    segment: str,
+    metadata_segment: Optional[str] = None,
+    max_elements: Optional[int] = None,
+    backup: bool = True,
+    dry_run: bool = False,
+    assume_yes: bool = False,
+    embedding_function=None,
+) -> dict:
+    """Re-embed SQL-only embeddings into the HNSW vector ``segment``.
+
+    Some chromadb crash modes (e.g. issue #6979) commit ``embeddings``/
+    ``embedding_metadata`` rows transactionally to SQL but lose the
+    corresponding HNSW additions, leaving a subset of drawers visible to
+    metadata queries but unreachable to vector search. This mode finds
+    those orphans, embeds their ``chroma:document`` payloads with the
+    palace's configured embedding function, and writes a fresh persistent
+    index containing both the existing labels (extracted from
+    ``data_level0.bin``) and freshly-allocated labels for the SQL-only
+    rows. Atomic swap with rollback on failure — same safety profile as
+    ``--mode hnsw``.
+
+    ``metadata_segment`` is auto-detected from the sibling METADATA
+    segment in the ``segments`` table when omitted. ``embedding_function``
+    is injectable for tests; production callers should leave it as
+    ``None`` so the palace's configured EF is resolved.
+    """
+    from .migrate import confirm_destructive_action, contains_palace_database
+
+    palace_path = os.path.abspath(os.path.expanduser(palace_path))
+    seg_dir = os.path.join(palace_path, segment)
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    pickle_path = os.path.join(seg_dir, "index_metadata.pickle")
+    data_path = os.path.join(seg_dir, "data_level0.bin")
+    header_path = os.path.join(seg_dir, "header.bin")
+
+    result: dict = {
+        "palace_path": palace_path,
+        "segment": segment,
+        "dry_run": dry_run,
+        "aborted": False,
+    }
+
+    print(f"\n{'=' * 55}")
+    print("  MemPalace Repair — SQL/HNSW Reconcile")
+    print(f"{'=' * 55}\n")
+    print(f"  Palace:  {palace_path}")
+    print(f"  Segment: {segment}")
+
+    if not os.path.isdir(palace_path):
+        print(f"  No palace found at {palace_path}")
+        result["aborted"] = True
+        result["reason"] = "palace-missing"
+        return result
+    if not contains_palace_database(palace_path):
+        print(f"  No palace database at {palace_path}")
+        result["aborted"] = True
+        result["reason"] = "db-missing"
+        return result
+    if not os.path.isdir(seg_dir):
+        print(f"  Segment directory not found: {seg_dir}")
+        result["aborted"] = True
+        result["reason"] = "segment-missing"
+        return result
+    if not os.path.isfile(pickle_path):
+        print(f"  index_metadata.pickle not found in {seg_dir}")
+        result["aborted"] = True
+        result["reason"] = "pickle-missing"
+        return result
+
+    try:
+        import hnswlib  # noqa: F401
+        import numpy  # noqa: F401
+    except ImportError as e:
+        print(f"  Required dependency missing: {e}")
+        result["aborted"] = True
+        result["reason"] = "deps-missing"
+        return result
+
+    if metadata_segment is None:
+        metadata_segment = _resolve_metadata_segment(db_path, segment)
+    if not metadata_segment:
+        print("  Could not resolve sibling METADATA segment — pass --metadata-segment")
+        result["aborted"] = True
+        result["reason"] = "metadata-segment-unresolved"
+        return result
+    print(f"  Metadata segment: {metadata_segment}")
+
+    with open(pickle_path, "rb") as f:
+        meta = pickle.load(f)
+    id_to_label = dict(_meta_get(meta, "id_to_label") or {})
+    label_to_id = dict(_meta_get(meta, "label_to_id") or {})
+    pickle_total = int(_meta_get(meta, "total_elements_added") or 0)
+    if len(id_to_label) != pickle_total:
+        print(
+            f"  Pickle inconsistent: id_to_label={len(id_to_label)} "
+            f"vs total_elements_added={pickle_total}. Run --mode hnsw first."
+        )
+        result["aborted"] = True
+        result["reason"] = "pickle-inconsistent"
+        return result
+
+    src = header_path if os.path.isfile(header_path) else data_path
+    with open(src, "rb") as f:
+        hdr = _parse_hnsw_header(f.read(100))
+    space = _detect_space(palace_path, segment)
+
+    missing = _fetch_sql_only_docs(db_path, metadata_segment, set(id_to_label.keys()))
+    print()
+    print("  Report")
+    print(f"    existing labels      {len(id_to_label):>10,}")
+    print(f"    sql-only orphans     {len(missing):>10,}")
+    print(f"    space                {space}")
+    print(f"    dim                  {hdr.dim}")
+
+    result.update(
+        {
+            "existing_labels": len(id_to_label),
+            "sql_only_orphans": len(missing),
+            "space": space,
+            "dim": hdr.dim,
+        }
+    )
+
+    if not missing:
+        print("  Nothing to reconcile.")
+        print(f"\n{'=' * 55}\n")
+        return result
+
+    if dry_run:
+        print("\n  DRY RUN — no embedding, no HNSW write, no swap.\n" + "=" * 55 + "\n")
+        return result
+
+    if not confirm_destructive_action("Reconcile HNSW segment", palace_path, assume_yes=assume_yes):
+        result["aborted"] = True
+        result["reason"] = "user-aborted"
+        return result
+
+    if embedding_function is None:
+        from .embedding import get_embedding_function
+
+        embedding_function = get_embedding_function()
+
+    import numpy as np
+
+    with open(data_path, "rb") as f:
+        data_bytes = f.read()
+    raw_labels, raw_vectors = _extract_vectors(data_bytes, hdr)
+    del data_bytes
+    keep_set = set(id_to_label.values())
+    keep_mask = np.array([int(x) in keep_set for x in raw_labels], dtype=bool)
+    existing_labels = raw_labels[keep_mask]
+    existing_vectors = raw_vectors[keep_mask]
+    if len(existing_labels) != len(id_to_label):
+        print(f"  WARN: extracted healthy ({len(existing_labels)}) != pickle ({len(id_to_label)}).")
+
+    docs = [d for _uid, d in missing]
+    uuids = [u for u, _d in missing]
+    new_vectors = _embed_in_batches(embedding_function, docs, dim=hdr.dim)
+    max_label = max(id_to_label.values()) if id_to_label else 0
+    new_labels = np.arange(max_label + 1, max_label + 1 + len(missing), dtype=np.int64)
+    new_total = len(id_to_label) + len(missing)
+    new_max = _compute_max_elements(new_total, max_elements)
+    if int(new_labels[-1]) >= new_max:
+        new_max = max(new_max, int(new_labels[-1]) + 1)
+
+    all_vectors = np.concatenate([existing_vectors, new_vectors])
+    all_labels = np.concatenate([existing_labels.astype(np.int64), new_labels])
+
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_dir: Optional[str] = None
+    if backup:
+        backup_dir = _backup_segment(palace_path, segment, timestamp)
+        print(f"  Backup:  {backup_dir}")
+
+    _close_chroma_handles(palace_path)
+
+    tmpdir = tempfile.mkdtemp(prefix="mempalace_reconcile_", dir=palace_path)
+    t0 = time.time()
+    try:
+        idx = _build_persistent_index(
+            all_vectors,
+            all_labels,
+            space=space,
+            dim=hdr.dim,
+            max_elements=new_max,
+            persistence_location=tmpdir,
+            M=hdr.M or 16,
+            ef_construction=hdr.ef_construction or 100,
+        )
+    except Exception:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise
+    build_seconds = time.time() - t0
+
+    try:
+        sample_n = min(3, len(missing))
+        existing_n = min(3, len(existing_vectors))
+        sv = np.concatenate([existing_vectors[:existing_n], new_vectors[:sample_n]])
+        sl = np.concatenate(
+            [
+                existing_labels[:existing_n].astype(np.int64),
+                new_labels[:sample_n],
+            ]
+        )
+        _self_query_verify(idx, sv, sl, k=min(10, len(all_labels)))
+    except Exception:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise
+    finally:
+        del idx
+        gc.collect()
+
+    new_id_to_label = dict(id_to_label)
+    new_label_to_id = dict(label_to_id)
+    for uid, lbl in zip(uuids, new_labels):
+        new_id_to_label[uid] = int(lbl)
+        new_label_to_id[int(lbl)] = uid
+    _meta_set(meta, "id_to_label", new_id_to_label)
+    _meta_set(meta, "label_to_id", new_label_to_id)
+    _meta_set(meta, "total_elements_added", new_total)
+    with open(os.path.join(tmpdir, "index_metadata.pickle"), "wb") as f:
+        pickle.dump(meta, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    _atomic_swap_segment(tmpdir, seg_dir)
+
+    peak_mb = _peak_memory_mb()
+    print(
+        f"\n  Reconcile complete: {len(missing):,} new labels appended in "
+        f"{build_seconds:.1f}s (peak RSS ≈ {peak_mb:.0f} MB)"
+    )
+    print(f"  Backup:  {backup_dir or '(skipped)'}")
+    print(f"\n{'=' * 55}\n")
+
+    result.update(
+        {
+            "new_labels": len(missing),
+            "total_elements_added": new_total,
+            "build_seconds": build_seconds,
+            "peak_rss_mb": peak_mb,
+            "backup": backup_dir,
+        }
+    )
+    return result
+
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="MemPalace repair tools")
     p.add_argument("--palace", default=None, help="Palace directory path")
