@@ -821,9 +821,9 @@ def test_make_client_quarantines_only_on_first_call_per_palace(tmp_path, monkeyp
     ChromaBackend.make_client(palace_path)
     ChromaBackend.make_client(palace_path)
 
-    assert calls == [
-        palace_path
-    ], "quarantine_stale_hnsw should fire once per palace per process, not on every reconnect"
+    assert calls == [palace_path], (
+        "quarantine_stale_hnsw should fire once per palace per process, not on every reconnect"
+    )
 
 
 def test_make_client_gates_invalid_metadata_on_first_call(tmp_path, monkeypatch):
@@ -852,6 +852,34 @@ def test_make_client_gates_invalid_metadata_on_first_call(tmp_path, monkeypatch)
     ChromaBackend.make_client(palace_path)
 
     assert calls == [palace_path]
+
+
+def test_make_client_gates_invalid_metadata_on_first_call(tmp_path, monkeypatch):
+    """Invalid metadata quarantine runs on each open; stale-HNSW gating is separate."""
+    from mempalace.backends.chroma import ChromaBackend
+
+    palace_path = str(tmp_path / "palace")
+    os.makedirs(palace_path, exist_ok=True)
+    (Path(palace_path) / "chroma.sqlite3").write_text("")
+
+    monkeypatch.setattr(ChromaBackend, "_quarantined_paths", set())
+
+    calls: list[str] = []
+
+    def _invalid(path, *args, **kwargs):
+        calls.append(path)
+        return []
+
+    def _stale(path, stale_seconds=300.0):
+        return []
+
+    monkeypatch.setattr("mempalace.backends.chroma.quarantine_invalid_hnsw_metadata", _invalid)
+    monkeypatch.setattr("mempalace.backends.chroma.quarantine_stale_hnsw", _stale)
+
+    ChromaBackend.make_client(palace_path)
+    ChromaBackend.make_client(palace_path)
+
+    assert calls == [palace_path, palace_path]
 
 
 def test_make_client_quarantines_each_palace_independently(tmp_path, monkeypatch):
