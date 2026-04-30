@@ -602,14 +602,18 @@ class MempalaceConfig:
 
         Env var ``MEMPALACE_HOOKS_AUTO_MINE`` (or legacy ``MEMPAL_HOOKS_AUTO_MINE``)
         overrides the config file. Accepts ``0``/``false``/``no``/``off`` as
-        falsey; anything else is truthy. Default: ``True`` (preserves existing
+        falsey; anything else (including ``true``/``1``/``yes``/``on``) is
+        truthy. Empty / whitespace-only values are treated as unset and fall
+        back to the config file. Default: ``True`` (preserves existing
         behavior for users who don't opt out).
         """
-        env_val = os.environ.get("MEMPALACE_HOOKS_AUTO_MINE") or os.environ.get(
-            "MEMPAL_HOOKS_AUTO_MINE"
-        )
-        if env_val:
-            return env_val.strip().lower() not in ("0", "false", "no", "off")
+        env_val = os.environ.get("MEMPALACE_HOOKS_AUTO_MINE")
+        if env_val is None:
+            env_val = os.environ.get("MEMPAL_HOOKS_AUTO_MINE")
+        if env_val is not None:
+            stripped = env_val.strip().lower()
+            if stripped:
+                return stripped not in ("0", "false", "no", "off")
         return self._file_config.get("hooks", {}).get("auto_mine", True)
 
     @property
