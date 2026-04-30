@@ -183,6 +183,36 @@ def test_hook_auto_mine_legacy_env_prefix():
         del os.environ["MEMPAL_HOOKS_AUTO_MINE"]
 
 
+@pytest.mark.parametrize("empty", ["", "   ", "\t", "\n"])
+def test_hook_auto_mine_empty_env_falls_back_to_config(empty):
+    """Empty / whitespace-only env values must fall back to config, not flip to True."""
+    tmpdir = tempfile.mkdtemp()
+    with open(os.path.join(tmpdir, "config.json"), "w") as f:
+        json.dump({"hooks": {"auto_mine": False}}, f)
+    os.environ["MEMPALACE_HOOKS_AUTO_MINE"] = empty
+    try:
+        cfg = MempalaceConfig(config_dir=tmpdir)
+        assert cfg.hook_auto_mine is False
+    finally:
+        del os.environ["MEMPALACE_HOOKS_AUTO_MINE"]
+
+
+def test_hook_auto_mine_empty_primary_does_not_leak_to_legacy():
+    """An empty primary env var must not silently fall through to the legacy var."""
+    tmpdir = tempfile.mkdtemp()
+    with open(os.path.join(tmpdir, "config.json"), "w") as f:
+        json.dump({"hooks": {"auto_mine": False}}, f)
+    os.environ["MEMPALACE_HOOKS_AUTO_MINE"] = ""
+    os.environ["MEMPAL_HOOKS_AUTO_MINE"] = "true"
+    try:
+        cfg = MempalaceConfig(config_dir=tmpdir)
+        # Primary is set (to ""), so legacy must be ignored; empty -> fall back to config.
+        assert cfg.hook_auto_mine is False
+    finally:
+        del os.environ["MEMPALACE_HOOKS_AUTO_MINE"]
+        del os.environ["MEMPAL_HOOKS_AUTO_MINE"]
+
+
 # --- sanitize_name ---
 
 
