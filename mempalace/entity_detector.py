@@ -716,7 +716,7 @@ def _print_entity_list(entities: list, label: str):
         print("    (none detected)")
         return
     for i, e in enumerate(entities):
-        confidence_bar = "●" * int(e["confidence"] * 5) + "○" * (5 - int(e["confidence"] * 5))
+        confidence_bar = "#" * int(e["confidence"] * 5) + "." * (5 - int(e["confidence"] * 5))
         signals_str = ", ".join(e["signals"][:2]) if e["signals"] else ""
         print(f"    {i + 1:2}. {e['name']:20} [{confidence_bar}] {signals_str}")
 
@@ -783,7 +783,7 @@ def confirm_entities(detected: dict, yes: bool = False) -> dict:
         if detected["uncertain"]:
             print("\n  Uncertain entities -- classify each:")
             for e in detected["uncertain"]:
-                ans = input(f"    {e['name']} — (p)erson, (r)project, or (s)kip? ").strip().lower()
+                ans = input(f"    {e['name']} -- (p)erson, (r)project, or (s)kip? ").strip().lower()
                 if ans == "p":
                     confirmed_people.append(e["name"])
                 elif ans == "r":
