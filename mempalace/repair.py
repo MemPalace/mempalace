@@ -31,10 +31,13 @@ Usage (from CLI):
 
 import argparse
 import os
+import re
+import secrets
+import shlex
 import shutil
 import sqlite3
 import time
-from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime
 import re
 from typing import Callable, Iterator, Optional
@@ -42,6 +45,7 @@ from typing import Callable, Iterator, Optional
 from chromadb.errors import NotFoundError as ChromaNotFoundError
 
 from .backends.chroma import ChromaBackend, hnsw_capacity_status
+from .palace import PalaceWriteAlreadyRunning, palace_write_lock
 
 
 COLLECTION_NAME = "mempalace_drawers"
@@ -87,6 +91,282 @@ def _recoverable_collections() -> tuple[str, ...]:
 # should call ``_recoverable_collections()`` so config changes are picked
 # up at call time.
 RECOVERABLE_COLLECTIONS = (COLLECTION_NAME, CLOSETS_COLLECTION_NAME)
+DEFAULT_FROM_SQLITE_BATCH_SIZE = 5000
+
+_SQLITE_EXTRACT_ROWS_SQL = """
+SELECT e.embedding_id, em.key, em.string_value, em.int_value,
+       em.float_value, em.bool_value
+FROM embeddings e
+JOIN embedding_metadata em ON em.id = e.id
+WHERE e.segment_id = ?
+ORDER BY e.segment_id, e.embedding_id
+"""
+
+
+def _sqlite_metadata_segment_id(conn: sqlite3.Connection, collection_name: str) -> Optional[str]:
+    row = conn.execute(
+        """
+        SELECT s.id FROM segments s
+        JOIN collections c ON s.collection = c.id
+        WHERE c.name = ? AND s.scope = 'METADATA'
+        """,
+        (collection_name,),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def _sqlite_collection_id(conn: sqlite3.Connection, collection_name: str) -> Optional[str]:
+    row = conn.execute(
+        "SELECT id FROM collections WHERE name = ?",
+        (collection_name,),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def _sqlite_collection_topic(conn: sqlite3.Connection, collection_name: str) -> Optional[str]:
+    collection_id = _sqlite_collection_id(conn, collection_name)
+    if collection_id is None:
+        return None
+
+    topic = f"persistent://default/default/{collection_id}"
+    row = conn.execute(
+        "SELECT 1 FROM embeddings_queue WHERE topic = ? LIMIT 1",
+        (topic,),
+    ).fetchone()
+    if row:
+        return topic
+
+    row = conn.execute(
+        "SELECT topic FROM embeddings_queue WHERE topic LIKE ? LIMIT 1",
+        (f"%/{collection_id}",),
+    ).fetchone()
+    return row[0] if row else topic
+
+
+def _load_sqlite_vectors(palace_path: str, collection_name: str) -> dict[str, object]:
+    """Load latest stored vectors for a collection from Chroma's queue WAL.
+
+    ChromaDB stores vector payloads in ``embeddings_queue`` as FLOAT32 blobs.
+    Passing those vectors back to ``upsert`` avoids re-embedding every document
+    during SQLite recovery. The table has no useful topic/id index, so this
+    intentionally does one sequential scan for the collection topic and keeps
+    the newest non-null vector per embedding ID.
+    """
+    sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(sqlite_path):
+        return {}
+
+    import numpy as np
+
+    conn = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
+    try:
+        topic = _sqlite_collection_topic(conn, collection_name)
+        if topic is None:
+            return {}
+
+        vectors = {}
+        for emb_id, vector, encoding in conn.execute(
+            """
+            SELECT id, vector, encoding
+            FROM embeddings_queue
+            WHERE topic = ? AND vector IS NOT NULL
+            ORDER BY seq_id
+            """,
+            (topic,),
+        ):
+            if encoding and encoding.upper() != "FLOAT32":
+                continue
+            vectors[emb_id] = np.frombuffer(vector, dtype="<f4")
+        return vectors
+    finally:
+        conn.close()
+
+
+def _sqlite_embedding_ids(palace_path: str, collection_name: str) -> list[str]:
+    sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(sqlite_path):
+        return []
+
+    conn = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
+    try:
+        segment_id = _sqlite_metadata_segment_id(conn, collection_name)
+        if segment_id is None:
+            return []
+        rows = conn.execute(
+            "SELECT embedding_id FROM embeddings WHERE segment_id = ? ORDER BY embedding_id",
+            (segment_id,),
+        ).fetchall()
+        return [str(row[0]) for row in rows]
+    finally:
+        conn.close()
+
+
+def _recoverable_collection_names(palace_path: str, primary_collection: str) -> tuple[str, ...]:
+    sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
+    fallback = (
+        (primary_collection, "mempalace_closets")
+        if primary_collection != "mempalace_closets"
+        else (primary_collection,)
+    )
+    if not os.path.isfile(sqlite_path):
+        return fallback
+
+    try:
+        conn = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
+        try:
+            rows = conn.execute(
+                """
+                SELECT c.name
+                FROM collections c
+                JOIN segments s ON s.collection = c.id AND s.scope = 'METADATA'
+                JOIN embeddings e ON e.segment_id = s.id
+                GROUP BY c.name
+                HAVING COUNT(e.embedding_id) > 0
+                """
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        return fallback
+
+    names = {str(row[0]) for row in rows if not _is_repair_internal_collection(str(row[0]))}
+    ordered = [primary_collection]
+    if "mempalace_closets" in names and primary_collection != "mempalace_closets":
+        ordered.append("mempalace_closets")
+    ordered.extend(sorted(names - set(ordered)))
+    return tuple(name for name in ordered if name in names or name == primary_collection)
+
+
+def _is_repair_internal_collection(collection_name: str) -> bool:
+    """Return whether ``collection_name`` is an internal repair staging collection."""
+    return bool(
+        re.search(
+            r"__repair_tmp__\d{20}__\d+__[0-9a-f]{8}$",
+            collection_name,
+        )
+    )
+
+
+def _unique_temp_collection_name(collection_name: str) -> str:
+    ts = datetime.now().strftime("%Y%m%d%H%M%S%f")
+    return f"{collection_name}__repair_tmp__{ts}__{os.getpid()}__{secrets.token_hex(4)}"
+
+
+@dataclass(frozen=True)
+class CollectionInventory:
+    name: str
+    count: int
+    ids: frozenset[str]
+    missing_documents: frozenset[str]
+
+
+def _sqlite_collection_inventory(palace_path: str, collection_name: str) -> CollectionInventory:
+    sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(sqlite_path):
+        raise RuntimeError(f"source palace has no chroma.sqlite3 at {sqlite_path}")
+
+    conn = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
+    try:
+        segment_id = _sqlite_metadata_segment_id(conn, collection_name)
+        if segment_id is None:
+            return CollectionInventory(collection_name, 0, frozenset(), frozenset())
+
+        id_rows = conn.execute(
+            "SELECT embedding_id FROM embeddings WHERE segment_id = ?",
+            (segment_id,),
+        ).fetchall()
+        ids = frozenset(str(row[0]) for row in id_rows)
+        doc_rows = conn.execute(
+            """
+            SELECT e.embedding_id
+            FROM embeddings e
+            LEFT JOIN embedding_metadata em
+              ON em.id = e.id AND em.key = 'chroma:document'
+            WHERE e.segment_id = ? AND em.id IS NULL
+            """,
+            (segment_id,),
+        ).fetchall()
+        missing = frozenset(str(row[0]) for row in doc_rows)
+        return CollectionInventory(collection_name, len(ids), ids, missing)
+    finally:
+        conn.close()
+
+
+def _sqlite_inventories(
+    palace_path: str, collection_names: tuple[str, ...]
+) -> dict[str, CollectionInventory]:
+    return {
+        name: _sqlite_collection_inventory(palace_path, name)
+        for name in collection_names
+        if not _is_repair_internal_collection(name)
+    }
+
+
+def _validate_no_missing_documents(inventories: dict[str, CollectionInventory]) -> None:
+    offenders = {
+        name: inv.missing_documents for name, inv in inventories.items() if inv.missing_documents
+    }
+    if not offenders:
+        return
+    parts = []
+    for name, missing in offenders.items():
+        sample = ", ".join(sorted(missing)[:5])
+        parts.append(f"{name}: {len(missing)} row(s) missing chroma:document ({sample})")
+    raise RuntimeError("source SQLite metadata corruption: " + "; ".join(parts))
+
+
+def _validate_destination_inventory(
+    expected: CollectionInventory, actual: CollectionInventory
+) -> None:
+    if actual.count != expected.count:
+        raise RuntimeError(
+            f"{expected.name} count mismatch: expected {expected.count}, got {actual.count}; "
+            "run again with --audit-content after resolving the inventory mismatch"
+        )
+    if actual.ids != expected.ids:
+        missing = expected.ids - actual.ids
+        extra = actual.ids - expected.ids
+        detail = []
+        if missing:
+            detail.append(f"missing IDs: {', '.join(sorted(missing)[:5])}")
+        if extra:
+            detail.append(f"extra IDs: {', '.join(sorted(extra)[:5])}")
+        raise RuntimeError(
+            f"{expected.name} ID set mismatch ({'; '.join(detail)}); "
+            "run again with --audit-content after resolving the inventory mismatch"
+        )
+    if actual.missing_documents:
+        sample = ", ".join(sorted(actual.missing_documents)[:5])
+        raise RuntimeError(
+            f"{expected.name} destination has {len(actual.missing_documents)} row(s) "
+            f"missing chroma:document ({sample})"
+        )
+
+
+def _sqlite_documents_by_id(palace_path: str, collection_name: str) -> dict[str, str]:
+    return {emb_id: doc for emb_id, doc, _meta in extract_via_sqlite(palace_path, collection_name)}
+
+
+def _audit_collection_content(source_palace: str, dest_palace: str, collection_name: str) -> None:
+    source_docs = _sqlite_documents_by_id(source_palace, collection_name)
+    dest_docs = _sqlite_documents_by_id(dest_palace, collection_name)
+    if source_docs == dest_docs:
+        return
+    missing = set(source_docs) - set(dest_docs)
+    extra = set(dest_docs) - set(source_docs)
+    changed = {
+        emb_id
+        for emb_id in source_docs.keys() & dest_docs.keys()
+        if source_docs[emb_id] != dest_docs[emb_id]
+    }
+    detail = []
+    if missing:
+        detail.append(f"missing docs: {', '.join(sorted(missing)[:5])}")
+    if extra:
+        detail.append(f"extra docs: {', '.join(sorted(extra)[:5])}")
+    if changed:
+        detail.append(f"changed docs: {', '.join(sorted(changed)[:5])}")
+    raise RuntimeError(f"{collection_name} content audit failed ({'; '.join(detail)})")
 
 
 def _get_palace_path():
@@ -139,30 +419,143 @@ def _paginate_ids(col, where=None):
     return ids
 
 
-def _extract_drawers(col, total: int, batch_size: int):
+def _sanitize_metadatas(metadatas):
+    # ChromaDB 1.5.x rejects None / {} metadata during upsert; preserve
+    # rebuild progress by replacing sparse historical rows with a sentinel.
+    return [
+        m if (isinstance(m, dict) and len(m) > 0) else {"_repaired_empty_meta": True}
+        for m in metadatas
+    ]
+
+
+def _extract_drawers(col, total: int, batch_size: int, include_embeddings: bool = False):
     all_ids = []
     all_docs = []
     all_metas = []
+    all_embeddings = []
     offset = 0
+    include = ["documents", "metadatas"]
+    if include_embeddings:
+        include.append("embeddings")
     while offset < total:
-        batch = col.get(limit=batch_size, offset=offset, include=["documents", "metadatas"])
+        batch = col.get(
+            limit=batch_size,
+            offset=offset,
+            include=include,
+        )
         if not batch["ids"]:
             break
         all_ids.extend(batch["ids"])
         all_docs.extend(batch["documents"])
-        # chromadb 1.5.x's upsert validates that every metadatas[i] is a
-        # non-empty dict (chromadb/api/types.py:validate_metadata). Drawers
-        # extracted from sqlite ground truth can come back with None or {}
-        # for sparse historical writes — coerce those to a sentinel so the
-        # rebuild upsert can complete instead of raising ValueError ~80%
-        # through a multi-hour run. See #1458 for full context.
-        sanitized_metas = [
-            m if (isinstance(m, dict) and len(m) > 0) else {"_repaired_empty_meta": True}
-            for m in batch["metadatas"]
-        ]
-        all_metas.extend(sanitized_metas)
+        all_metas.extend(_sanitize_metadatas(batch["metadatas"]))
+        if include_embeddings:
+            embeddings = batch.get("embeddings")
+            if embeddings is not None:
+                all_embeddings.extend(embeddings)
         offset += len(batch["ids"])
-    return all_ids, all_docs, all_metas
+    if len(all_embeddings) != len(all_ids):
+        all_embeddings = []
+    return all_ids, all_docs, all_metas, all_embeddings or None
+
+
+def _stage_collection_from_source(
+    backend,
+    palace_path: str,
+    source_col,
+    total: int,
+    batch_size: int,
+    collection_name: str,
+    *,
+    include_embeddings: bool,
+    temp_name: Optional[str] = None,
+    progress=print,
+):
+    temp_name = temp_name or _unique_temp_collection_name(collection_name)
+    _delete_collection_if_exists(backend, palace_path, temp_name)
+
+    progress(f"  Building temporary collection: {temp_name}")
+    temp_col = backend.create_collection(palace_path, temp_name)
+    include = ["documents", "metadatas"]
+    if include_embeddings:
+        include.append("embeddings")
+
+    staged = 0
+    offset = 0
+    try:
+        while offset < total:
+            batch = source_col.get(limit=batch_size, offset=offset, include=include)
+            batch_ids = batch.get("ids") or []
+            if not batch_ids:
+                break
+            kwargs = {
+                "ids": batch_ids,
+                "documents": batch["documents"],
+                "metadatas": _sanitize_metadatas(batch["metadatas"]),
+            }
+            embeddings = batch.get("embeddings") if include_embeddings else None
+            if include_embeddings:
+                if embeddings is None or len(embeddings) != len(batch_ids):
+                    progress(
+                        "  Stored embeddings were not returned for a full batch; "
+                        "restarting temp rebuild with fresh embeddings for every row."
+                    )
+                    _delete_collection_if_exists(backend, palace_path, temp_name)
+                    return _stage_collection_from_source(
+                        backend,
+                        palace_path,
+                        source_col,
+                        total,
+                        batch_size,
+                        collection_name,
+                        include_embeddings=False,
+                        temp_name=temp_name,
+                        progress=progress,
+                    )
+                kwargs["embeddings"] = embeddings
+            temp_col.upsert(**kwargs)
+            staged += len(batch_ids)
+            offset += len(batch_ids)
+            progress(f"  Staged {staged}/{total} drawers...")
+
+        _verify_collection_count(temp_col, staged, "temporary rebuild")
+    except Exception:
+        _delete_collection_if_exists(backend, palace_path, temp_name)
+        raise
+    return temp_col, temp_name, staged
+
+
+def _swap_temp_collection_into_live(
+    backend,
+    palace_path: str,
+    temp_col,
+    temp_name: str,
+    collection_name: str,
+    expected: int,
+    *,
+    progress=print,
+) -> int:
+    progress("  Swapping temporary collection into live name...")
+    try:
+        backend.delete_collection(palace_path, collection_name)
+    except Exception as exc:
+        try:
+            _delete_collection_if_exists(backend, palace_path, temp_name)
+        except Exception:
+            pass
+        raise RebuildCollectionError(str(exc), live_replaced=False) from exc
+
+    try:
+        _rename_collection(temp_col, collection_name)
+        live_col = backend.get_collection(palace_path, collection_name)
+        _verify_collection_count(live_col, expected, "rebuilt live collection")
+    except Exception as exc:
+        raise RebuildCollectionError(str(exc), live_replaced=True) from exc
+
+    try:
+        _delete_collection_if_exists(backend, palace_path, temp_name)
+    except Exception:
+        pass
+    return expected
 
 
 def _verify_collection_count(col, expected: int, label: str) -> None:
@@ -187,6 +580,10 @@ def _delete_collection_if_exists(backend, palace_path: str, collection_name: str
         return
 
 
+def _rename_collection(collection, new_name: str) -> None:
+    collection.modify(name=new_name)
+
+
 class RebuildCollectionError(RuntimeError):
     """Raised when temp rebuild fails, carrying whether the live swap happened."""
 
@@ -204,11 +601,11 @@ def _rebuild_collection_via_temp(
     batch_size: int,
     collection_name: Optional[str] = None,
     progress=print,
+    all_embeddings=None,
 ) -> int:
     expected = len(all_ids)
     collection_name = collection_name or _drawers_collection_name()
-    temp_name = f"{collection_name}__repair_tmp"
-    live_replaced = False
+    temp_name = _unique_temp_collection_name(collection_name)
 
     try:
         _delete_collection_if_exists(backend, palace_path, temp_name)
@@ -220,37 +617,35 @@ def _rebuild_collection_via_temp(
             batch_ids = all_ids[i : i + batch_size]
             batch_docs = all_docs[i : i + batch_size]
             batch_metas = all_metas[i : i + batch_size]
-            temp_col.upsert(documents=batch_docs, ids=batch_ids, metadatas=batch_metas)
+            kwargs = {"documents": batch_docs, "ids": batch_ids, "metadatas": batch_metas}
+            if all_embeddings is not None:
+                kwargs["embeddings"] = all_embeddings[i : i + batch_size]
+            temp_col.upsert(**kwargs)
             staged += len(batch_ids)
             progress(f"  Staged {staged}/{expected} drawers...")
         _verify_collection_count(temp_col, expected, "temporary rebuild")
 
-        progress("  Rebuilding live collection...")
-        backend.delete_collection(palace_path, collection_name)
-        live_replaced = True
-        new_col = backend.create_collection(palace_path, collection_name)
-
-        rebuilt = 0
-        for i in range(0, expected, batch_size):
-            batch_ids = all_ids[i : i + batch_size]
-            batch_docs = all_docs[i : i + batch_size]
-            batch_metas = all_metas[i : i + batch_size]
-            new_col.upsert(documents=batch_docs, ids=batch_ids, metadatas=batch_metas)
-            rebuilt += len(batch_ids)
-            progress(f"  Re-filed {rebuilt}/{expected} drawers...")
-        _verify_collection_count(new_col, expected, "rebuilt live collection")
-
+        return _swap_temp_collection_into_live(
+            backend,
+            palace_path,
+            temp_col,
+            temp_name,
+            collection_name,
+            expected,
+            progress=progress,
+        )
+    except RebuildCollectionError as exc:
         try:
             _delete_collection_if_exists(backend, palace_path, temp_name)
         except Exception:
             pass
-        return rebuilt
+        raise exc
     except Exception as exc:
         try:
             _delete_collection_if_exists(backend, palace_path, temp_name)
         except Exception:
             pass
-        raise RebuildCollectionError(str(exc), live_replaced=live_replaced) from exc
+        raise RebuildCollectionError(str(exc), live_replaced=False) from exc
 
 
 def scan_palace(palace_path=None, only_wing=None, collection_name: Optional[str] = None):
@@ -482,20 +877,18 @@ def sqlite_drawer_count(palace_path: str, collection_name: Optional[str] = None)
     sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
     if not os.path.exists(sqlite_path):
         return None
+    collection_name = collection_name or _get_collection_name()
     try:
         import sqlite3
 
         conn = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
         try:
+            segment_id = _sqlite_metadata_segment_id(conn, collection_name)
+            if segment_id is None:
+                return 0
             row = conn.execute(
-                """
-                SELECT COUNT(*)
-                FROM embeddings e
-                JOIN segments s ON e.segment_id = s.id
-                JOIN collections c ON s.collection = c.id
-                WHERE c.name = ?
-                """,
-                (collection_name,),
+                "SELECT COUNT(*) FROM embeddings WHERE segment_id = ?",
+                (segment_id,),
             ).fetchone()
             return int(row[0]) if row and row[0] is not None else None
         finally:
@@ -695,16 +1088,17 @@ def rebuild_index(
     confirm_truncation_ok: bool = False,
     collection_name: Optional[str] = None,
     progress: Optional[Callable[[str], None]] = None,
+    reembed: bool = False,
 ):
-    """Rebuild the HNSW index from scratch.
+    """Rebuild the HNSW index through a verified temporary collection.
 
-    1. Extract all drawers via ChromaDB get()
-    2. Cross-check against the SQLite ground truth (#1208 guard)
-    3. Back up ONLY chroma.sqlite3 (not the bloated HNSW files)
-    4. Delete and recreate the collection with hnsw:space=cosine
-    5. Upsert all drawers back
+    1. Back up ONLY chroma.sqlite3 (not the bloated HNSW files)
+    2. Stream drawers from ChromaDB into a temporary collection
+    3. Cross-check the staged count against SQLite ground truth (#1208 guard)
+    4. Swap the temporary collection into the live collection name
+    5. Restore the SQLite backup if the live swap fails
 
-    ``confirm_truncation_ok`` overrides the safety guard from step 2.
+    ``confirm_truncation_ok`` overrides the safety guard from step 3.
     Set to ``True`` only when you have independently verified that the
     palace genuinely contains exactly the extracted number of drawers
     (typically only a concern for palaces sized at exactly 10 000 rows).
@@ -714,14 +1108,32 @@ def rebuild_index(
     annotations on ``Staged N/M`` and ``Re-filed N/M`` lines. Pass a
     custom callable (e.g. a daemon-side capture for HTTP status, or a
     silent ``lambda *_: None`` for tests) to override.
+
+    By default, stored embeddings are reused batch-by-batch while staging.
+    ``reembed=True`` omits embeddings from the staged upserts so ChromaDB
+    regenerates every vector under the configured embedding function.
     """
     if progress is None:
         progress = _DefaultProgress()
     palace_path = palace_path or _get_palace_path()
     collection_name = collection_name or _drawers_collection_name()
+    try:
+        repair_lock = palace_write_lock(palace_path, operation="repair")
+        repair_lock.__enter__()
+    except PalaceWriteAlreadyRunning as exc:
+        print(f"\n  ABORT: {exc}")
+        return
+    lock_released = False
+
+    def _release_repair_lock() -> None:
+        nonlocal lock_released
+        if not lock_released:
+            repair_lock.__exit__(None, None, None)
+            lock_released = True
 
     if not os.path.isdir(palace_path):
         progress(f"\n  No palace found at {palace_path}")
+        _release_repair_lock()
         return
 
     progress(f"\n{'=' * 55}")
@@ -738,6 +1150,7 @@ def rebuild_index(
     sqlite_errors = sqlite_integrity_errors(palace_path)
     if sqlite_errors:
         print_sqlite_integrity_abort(palace_path, sqlite_errors)
+        _release_repair_lock()
         return
 
     preflight = maybe_repair_poisoned_max_seq_id_before_rebuild(
@@ -745,87 +1158,128 @@ def rebuild_index(
         assume_yes=True,
     )
     if preflight is not None:
+        _release_repair_lock()
         return
 
-    backend = ChromaBackend()
+    try:
+        backend = ChromaBackend()
+    except Exception:
+        _release_repair_lock()
+        raise
     try:
         col = backend.get_collection(palace_path, collection_name)
         total = col.count()
     except Exception as e:
         progress(f"  Error reading palace: {e}")
         progress("  Palace may need to be re-mined from source files.")
+        _release_repair_lock()
         return
 
     progress(f"  Drawers found: {total}")
 
     if total == 0:
         progress("  Nothing to repair.")
+        _release_repair_lock()
         return
 
-    # Extract all drawers in batches
+    # Back up BEFORE creating the temp collection. The snapshot must represent
+    # the pre-repair palace, and backup failures must not leave temp HNSW files.
+    sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
+    backup_path = sqlite_path + ".backup"
+    if os.path.exists(sqlite_path):
+        try:
+            size_mb = os.path.getsize(sqlite_path) / 1e6
+            progress(f"  Backing up chroma.sqlite3 ({size_mb:.0f} MB)...")
+            shutil.copy2(sqlite_path, backup_path)
+        except Exception:
+            _release_repair_lock()
+            raise
+        progress(f"  Backup: {backup_path}")
+
+    # Stage drawers in batches. Keep batches bounded instead of materializing
+    # the full embedding matrix in Python memory.
     progress("\n  Extracting drawers...")
     batch_size = 5000
-    all_ids, all_docs, all_metas = _extract_drawers(col, total, batch_size)
-    progress(f"  Extracted {len(all_ids)} drawers")
-
-    # ── #1208 guard ──────────────────────────────────────────────────
-    # Refuse to ``delete_collection`` + rebuild when extraction looks
-    # short of the SQLite ground truth (or when extraction == chromadb
-    # default get() cap and the SQLite check couldn't run).
+    temp_col = None
+    temp_name = None
     try:
+        temp_col, temp_name, extracted = _stage_collection_from_source(
+            backend,
+            palace_path,
+            col,
+            total,
+            batch_size,
+            collection_name,
+            include_embeddings=not reembed,
+            progress=progress,
+        )
+        progress(f"  Extracted {extracted} drawers")
+
+        # ── #1208 guard ──────────────────────────────────────────────
+        # Refuse to swap when extraction looks short of SQLite ground truth.
         check_extraction_safety(
             palace_path,
-            len(all_ids),
+            extracted,
             confirm_truncation_ok,
             collection_name=collection_name,
         )
     except TruncationDetected as e:
         progress(e.message)
+        if temp_name is not None:
+            _delete_collection_if_exists(backend, palace_path, temp_name)
+        _release_repair_lock()
         return
+    except Exception as exc:
+        if temp_name is not None:
+            _delete_collection_if_exists(backend, palace_path, temp_name)
+        e = RebuildCollectionError(str(exc), live_replaced=False)
+        progress(f"\n  ERROR during rebuild: {e}")
+        progress("  Rebuild aborted before completion.")
+        progress("  Live collection was not replaced; leaving the original palace untouched.")
+        _release_repair_lock()
+        raise e
 
-    # Back up ONLY the SQLite database, not the bloated HNSW files
-    sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
-    backup_path = sqlite_path + ".backup"
-    if os.path.exists(sqlite_path):
-        progress(f"  Backing up chroma.sqlite3 ({os.path.getsize(sqlite_path) / 1e6:.0f} MB)...")
-        shutil.copy2(sqlite_path, backup_path)
-        progress(f"  Backup: {backup_path}")
-
-    # Rebuild with correct HNSW settings
     progress("  Rebuilding collection with hnsw:space=cosine...")
     try:
-        filed = _rebuild_collection_via_temp(
+        filed = _swap_temp_collection_into_live(
             backend,
             palace_path,
-            all_ids,
-            all_docs,
-            all_metas,
-            batch_size,
-            collection_name=collection_name,
+            temp_col,
+            temp_name,
+            collection_name,
+            extracted,
             progress=progress,
         )
-    except RebuildCollectionError as e:
+    except Exception as exc:
+        e = (
+            exc
+            if isinstance(exc, RebuildCollectionError)
+            else RebuildCollectionError(str(exc), live_replaced=False)
+        )
         progress(f"\n  ERROR during rebuild: {e}")
         progress("  Rebuild aborted before completion.")
         if e.live_replaced and os.path.exists(backup_path):
             progress(f"  Restoring from backup: {backup_path}")
             try:
                 _close_chroma_handles(palace_path, backend=backend)
+                _delete_collection_if_exists(backend, palace_path, temp_name)
                 _delete_collection_if_exists(backend, palace_path, collection_name)
                 shutil.copy2(backup_path, sqlite_path)
                 progress("  Backup restored. Palace is back to pre-repair state.")
             except Exception as restore_error:
                 progress(f"  Backup restore failed: {restore_error}")
                 progress(f"  Manual restore required from: {backup_path}")
-        elif e.live_replaced:
-            progress("  No backup available. Re-mine from source files to recover.")
+        elif not e.live_replaced:
+            progress("  Live collection was not replaced; leaving the original palace untouched.")
         else:
-            print("  Live collection was not replaced; leaving the original palace untouched.")
-        raise
+            progress("  No backup available. Re-mine from source files to recover.")
+        _release_repair_lock()
+        raise e
 
-    print(f"\n  Repair complete. {filed} drawers rebuilt.")
-    print("  HNSW index is now clean with cosine distance metric.")
-    print(f"\n{'=' * 55}\n")
+    progress(f"\n  Repair complete. {filed} drawers rebuilt.")
+    progress("  HNSW index is now clean with cosine distance metric.")
+    progress(f"\n{'=' * 55}\n")
+    _release_repair_lock()
 
 
 class RebuildPartialError(Exception):
@@ -864,6 +1318,7 @@ def _rebuild_one_collection(
     batch_size: int,
     archive_path: Optional[str],
     counts_so_far: dict[str, int],
+    reembed: bool = False,
 ) -> int:
     """Stream rows for one collection from SQLite and upsert into a
     freshly-created collection at ``dest_palace``. Returns rows
@@ -872,17 +1327,29 @@ def _rebuild_one_collection(
     caller can stop the loop and print recovery instructions instead of
     silently shipping a partial palace.
     """
+    vectors_by_id = {}
     ids: list[str] = []
     docs: list[str] = []
     metas: list[dict] = []
     upserted = 0
+    failure_stage = "preparing rebuild"
     col = None
 
     def _flush() -> int:
         nonlocal upserted
         if not ids:
             return upserted
-        col.upsert(ids=list(ids), documents=list(docs), metadatas=list(metas))
+
+        if vectors_by_id:
+            col.upsert(
+                ids=list(ids),
+                documents=list(docs),
+                metadatas=list(metas),
+                embeddings=[vectors_by_id[emb_id] for emb_id in ids],
+            )
+        else:
+            col.upsert(ids=list(ids), documents=list(docs), metadatas=list(metas))
+
         upserted += len(ids)
         print(f"    upserted {upserted}")
         ids.clear()
@@ -897,8 +1364,20 @@ def _rebuild_one_collection(
         # reported as a structured ``RebuildPartialError`` carrying
         # ``archive_path`` — instead of an unstructured exception that
         # strands the user without recovery instructions.
+        failure_stage = "loading source IDs"
+        source_ids = _sqlite_embedding_ids(source_palace, collection_name)
+        failure_stage = "loading stored embeddings"
+        vectors_by_id = {} if reembed else _load_sqlite_vectors(source_palace, collection_name)
+        if vectors_by_id:
+            source_id_set = set(source_ids)
+            if not source_id_set or not source_id_set.issubset(vectors_by_id):
+                print("    stored embeddings incomplete; re-embedding this collection")
+                vectors_by_id = {}
+        if vectors_by_id:
+            print(f"    loaded {len(vectors_by_id)} stored embeddings")
+        failure_stage = "creating destination collection"
         col = backend.create_collection(dest_palace, collection_name)
-
+        failure_stage = "extracting and upserting rows"
         for emb_id, doc, meta in extract_via_sqlite(source_palace, collection_name):
             ids.append(emb_id)
             docs.append(doc or "")
@@ -913,23 +1392,32 @@ def _rebuild_one_collection(
             if len(ids) >= batch_size:
                 _flush()
         _flush()
+        if source_ids and upserted != len(source_ids):
+            failure_stage = "validating extracted source row count"
+            raise RuntimeError(
+                f"source/extracted count mismatch for {collection_name!r}: "
+                f"source has {len(source_ids)} rows, extracted {upserted}"
+            )
+        failure_stage = "validating destination count"
+        _verify_collection_count(col, upserted, f"rebuilt {collection_name}")
     except Exception as exc:  # noqa: BLE001 — chromadb raises many shapes
         partial = dict(counts_so_far)
         partial[collection_name] = upserted
         msg_parts = [
-            f"Upsert failed in collection {collection_name!r} after {upserted} rows: {exc!r}",
+            f"Rebuild failed in collection {collection_name!r} during {failure_stage} "
+            f"after {upserted} rows: {exc!r}",
             f"Partial palace left at: {dest_palace}",
         ]
         if archive_path is not None:
             msg_parts.append(f"Original palace archived at: {archive_path}")
             msg_parts.append(
                 "  Recover by removing the partial dest and re-running with "
-                f"--source {archive_path}"
+                f"mempalace --palace {shlex.quote(dest_palace)} repair "
+                f"--mode from-sqlite --source {shlex.quote(archive_path)} --yes"
             )
         else:
             msg_parts.append("  Source palace is unchanged. Remove the partial dest and re-run.")
         message = "\n  ".join(msg_parts)
-        print(f"\n  ERROR: {message}")
         raise RebuildPartialError(
             message,
             partial_counts=partial,
@@ -975,48 +1463,71 @@ def extract_via_sqlite(palace_path: str, collection_name: str) -> Iterator[tuple
 
     conn = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
     try:
-        seg_row = conn.execute(
-            """
-            SELECT s.id FROM segments s
-            JOIN collections c ON s.collection = c.id
-            WHERE c.name = ? AND s.scope = 'METADATA'
-            """,
-            (collection_name,),
-        ).fetchone()
-        if not seg_row:
+        segment_id = _sqlite_metadata_segment_id(conn, collection_name)
+        if segment_id is None:
             return
-        segment_id = seg_row[0]
 
-        per_id: dict[str, dict] = defaultdict(dict)
-        order: list[str] = []
-        for emb_id, key, sv, iv, fv, bv in conn.execute(
-            """
-            SELECT e.embedding_id, em.key, em.string_value, em.int_value,
-                   em.float_value, em.bool_value
-            FROM embedding_metadata em
-            JOIN embeddings e ON em.id = e.id
-            WHERE e.segment_id = ?
-            ORDER BY em.id
-            """,
-            (segment_id,),
-        ):
-            if emb_id not in per_id:
-                order.append(emb_id)
+        current_id: Optional[str] = None
+        current_meta: dict = {}
+
+        def _value_from_columns(sv, iv, fv, bv):
             if sv is not None:
-                per_id[emb_id][key] = sv
-            elif iv is not None:
-                per_id[emb_id][key] = iv
-            elif fv is not None:
-                per_id[emb_id][key] = fv
-            elif bv is not None:
-                per_id[emb_id][key] = bool(bv)
+                return sv
+            if iv is not None:
+                return iv
+            if fv is not None:
+                return fv
+            if bv is not None:
+                return bool(bv)
+            return None
 
-        for emb_id in order:
-            kv = per_id[emb_id]
-            doc = kv.pop("chroma:document", "")
-            yield emb_id, doc, kv
+        def _emit_current():
+            if current_id is None:
+                return None
+            kv = dict(current_meta)
+            if "chroma:document" not in kv:
+                return None
+            doc = kv.pop("chroma:document")
+            return current_id, doc, kv
+
+        for emb_id, key, sv, iv, fv, bv in conn.execute(_SQLITE_EXTRACT_ROWS_SQL, (segment_id,)):
+            if current_id is None:
+                current_id = emb_id
+            elif emb_id != current_id:
+                emitted = _emit_current()
+                if emitted is not None:
+                    yield emitted
+                current_id = emb_id
+                current_meta = {}
+
+            value = _value_from_columns(sv, iv, fv, bv)
+            if value is not None:
+                current_meta[key] = value
+
+        emitted = _emit_current()
+        if emitted is not None:
+            yield emitted
     finally:
         conn.close()
+
+
+def _restore_in_place_rebuild_archive(
+    *,
+    archive_path: str,
+    dest_palace: str,
+    collection_name: str,
+    source_inventories: dict[str, CollectionInventory],
+    backend: ChromaBackend | None,
+) -> int:
+    print("  In-place rebuild failed before completion; restoring archived palace...")
+    _close_chroma_handles(dest_palace, backend=backend)
+    if os.path.exists(dest_palace):
+        shutil.rmtree(dest_palace)
+    shutil.move(archive_path, dest_palace)
+    restored = _sqlite_collection_inventory(dest_palace, collection_name)
+    _validate_destination_inventory(source_inventories[collection_name], restored)
+    print(f"  Restore verified: {restored.count} rows in {collection_name}")
+    return restored.count
 
 
 def rebuild_from_sqlite(
@@ -1024,7 +1535,10 @@ def rebuild_from_sqlite(
     dest_palace: str,
     *,
     archive_existing_dest: bool = False,
-    batch_size: int = 1000,
+    batch_size: int = DEFAULT_FROM_SQLITE_BATCH_SIZE,
+    collection_name: Optional[str] = None,
+    reembed: bool = False,
+    audit_content: bool = False,
 ) -> dict[str, int]:
     """Rebuild a palace by reading drawers from ``source_palace``'s
     ``chroma.sqlite3`` and upserting them into a fresh palace at
@@ -1040,12 +1554,9 @@ def rebuild_from_sqlite(
     function bypasses the chromadb read path entirely via
     :func:`extract_via_sqlite`.
 
-    Re-embeds documents at upsert time using the configured embedding
-    function; the original HNSW vectors are not preserved (they live in
-    the corrupt ``data_level0.bin`` / ``link_lists.bin``, not in
-    SQLite). Acceptable for a corruption-recovery flow because the
-    embedding model is deterministic — same model + same document text
-    yields semantically equivalent search results.
+    Reuses stored vectors from Chroma's SQLite queue by default so recovery
+    does not call the embedding model for every row. Pass ``reembed=True`` to
+    regenerate vectors instead.
 
     ``archive_existing_dest`` controls behavior when ``dest_palace``
     already exists:
@@ -1059,18 +1570,12 @@ def rebuild_from_sqlite(
 
     Returns a ``{collection_name: row_count}`` dict so callers (CLI,
     tests) can verify the per-collection rebuild count without parsing
-    stdout. A successful rebuild always returns a dict with one key per
-    recoverable collection (values may be ``0`` when a collection is
-    legitimately empty in the source). The empty dict ``{}`` is reserved
-    for validation refusals (missing source DB, refusing to overwrite an
-    existing dest, in-place mode without ``archive_existing_dest``); CLI
-    callers should treat ``{}`` as an error and exit non-zero so CI and
-    scripts can distinguish "invalid inputs" from "successful recovery
-    that found zero rows." Raises :class:`RebuildPartialError` if a
-    chromadb upsert fails partway through; the dest palace is left in
-    place so the user can inspect what landed, and the in-place archive
-    (when applicable) is reported in the error so the user can re-run
-    against it.
+    stdout. Returns ``{}`` on validation failures (missing source,
+    refusing to overwrite). Raises :class:`RebuildPartialError` if a
+    chromadb upsert fails partway through. Cross-palace partial rebuilds
+    are left in place so the user can inspect what landed. In-place
+    partial rebuilds restore the archived palace before returning the
+    nonzero failure to the caller.
 
     .. warning::
 
@@ -1096,18 +1601,43 @@ def rebuild_from_sqlite(
     is a known divergence and matches the existing migrate-path
     behavior.
     """
-    source_palace = os.path.abspath(os.path.expanduser(source_palace))
-    dest_palace = os.path.abspath(os.path.expanduser(dest_palace))
+    source_palace = os.path.realpath(os.path.abspath(os.path.expanduser(source_palace)))
+    dest_palace = os.path.realpath(os.path.abspath(os.path.expanduser(dest_palace)))
+    collection_name = collection_name or _drawers_collection_name()
 
     src_db = os.path.join(source_palace, "chroma.sqlite3")
 
-    in_place = source_palace == dest_palace
+    in_place = os.path.normcase(source_palace) == os.path.normcase(dest_palace)
+    repair_locks = []
+
+    def _release_repair_locks() -> None:
+        while repair_locks:
+            repair_locks.pop().__exit__(None, None, None)
+
+    try:
+        repair_lock = palace_write_lock(dest_palace, operation="repair")
+        repair_lock.__enter__()
+        repair_locks.append(repair_lock)
+        if not in_place:
+            source_lock = palace_write_lock(source_palace, operation="repair source")
+            source_lock.__enter__()
+            repair_locks.append(source_lock)
+    except PalaceWriteAlreadyRunning as exc:
+        _release_repair_locks()
+        print(f"\n  ABORT: {exc}")
+        return {}
 
     print(f"\n{'=' * 55}")
     print("  MemPalace Repair — Rebuild from SQLite")
     print(f"{'=' * 55}\n")
     print(f"  Source: {source_palace}")
     print(f"  Dest:   {dest_palace}")
+
+    def _source_primary_count() -> "int | None":
+        count = sqlite_drawer_count(source_palace, collection_name)
+        if count == 0:
+            print(f"\n  Source collection {collection_name!r} has no rows; refusing rebuild.")
+        return count
 
     # Validate source BEFORE any destructive moves. An earlier draft
     # archived the dest first and surfaced the missing-chroma.sqlite3
@@ -1122,13 +1652,22 @@ def rebuild_from_sqlite(
                 "the existing palace aside, or pass a different source_palace= "
                 "(CLI: --source)."
             )
+            _release_repair_locks()
             return {}
         if not os.path.isfile(src_db):
             print(f"\n  Source palace has no chroma.sqlite3 at {src_db}")
+            _release_repair_locks()
+            return {}
+        if _source_primary_count() == 0:
+            _release_repair_locks()
             return {}
     else:
         if not os.path.isfile(src_db):
             print(f"\n  Source palace has no chroma.sqlite3 at {src_db}")
+            _release_repair_locks()
+            return {}
+        if _source_primary_count() == 0:
+            _release_repair_locks()
             return {}
         if os.path.exists(dest_palace):
             print(
@@ -1137,12 +1676,20 @@ def rebuild_from_sqlite(
                 "archive_existing_dest=True if rebuilding in place "
                 "(source_palace == dest_palace)."
             )
+            _release_repair_locks()
             return {}
+
+    try:
+        recoverable_collections = _recoverable_collection_names(source_palace, collection_name)
+        source_inventories = _sqlite_inventories(source_palace, recoverable_collections)
+        _validate_no_missing_documents(source_inventories)
+    except Exception:
+        _release_repair_locks()
+        raise
 
     archive_path: Optional[str] = None
     if in_place:
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        archive_path = f"{dest_palace}.pre-rebuild-{ts}"
+        archive_path = _unique_archive_path(dest_palace)
         print(f"  Archiving {dest_palace} → {archive_path}")
         shutil.move(dest_palace, archive_path)
         source_palace = archive_path
@@ -1164,21 +1711,12 @@ def rebuild_from_sqlite(
                 "in-place rebuild may fail with 'Collection already exists'."
             )
 
-    os.makedirs(dest_palace, exist_ok=True)
-
-    # Backend lifetime is wrapped in try/finally so the dest palace's
-    # PersistentClient handle (opened lazily inside ``create_collection``
-    # / ``get_collection``) is released on every exit path: success,
-    # ``RebuildPartialError``, or any unexpected exception. Without this,
-    # a long-running process that calls ``rebuild_from_sqlite`` would
-    # leak SQLite/HNSW file handles into Chroma's ``SharedSystemClient``
-    # cache, surfacing later as "Collection already exists" on the next
-    # in-place rebuild or as a Windows file-lock failure on cleanup
-    # (cf. #1285's lifecycle hardening for the legacy rebuild path).
-    backend = ChromaBackend()
+    backend: ChromaBackend | None = None
     counts: dict[str, int] = {}
     try:
-        for cname in _recoverable_collections():
+        os.makedirs(dest_palace, exist_ok=True)
+        backend = ChromaBackend()
+        for cname in recoverable_collections:
             print(f"\n  [{cname}]")
             upserted = _rebuild_one_collection(
                 backend=backend,
@@ -1188,21 +1726,150 @@ def rebuild_from_sqlite(
                 batch_size=batch_size,
                 archive_path=archive_path,
                 counts_so_far=counts,
+                reembed=reembed,
             )
             counts[cname] = upserted
             if upserted == 0:
                 print(f"    no rows found for {cname} in source palace")
             else:
                 print(f"    done: {upserted} rows in {cname}")
+            actual = _sqlite_collection_inventory(dest_palace, cname)
+            _validate_destination_inventory(source_inventories[cname], actual)
+            if audit_content:
+                _audit_collection_content(source_palace, dest_palace, cname)
+    except RebuildPartialError as exc:
+        try:
+            if archive_path is not None:
+                restored_count = _restore_in_place_rebuild_archive(
+                    archive_path=archive_path,
+                    dest_palace=dest_palace,
+                    collection_name=collection_name,
+                    source_inventories=source_inventories,
+                    backend=backend,
+                )
+                restored_message = "\n  ".join(
+                    [
+                        exc.message.split("\n", 1)[0],
+                        f"Original palace restored at: {dest_palace}",
+                        f"Restore verified: {restored_count} rows in {collection_name}",
+                        "Failed partial rebuild was removed; the source palace is the restored live path.",
+                    ]
+                )
+                print(f"\n  ERROR: {restored_message}")
+                raise RebuildPartialError(
+                    restored_message,
+                    partial_counts=exc.partial_counts,
+                    failed_collection=exc.failed_collection,
+                    dest_palace=dest_palace,
+                    archive_path=None,
+                ) from exc
+            print(f"\n  ERROR: {exc.message}")
+            raise
+        finally:
+            if backend is not None:
+                backend.close()
+            _release_repair_locks()
+    except Exception:
+        try:
+            if archive_path is not None:
+                _restore_in_place_rebuild_archive(
+                    archive_path=archive_path,
+                    dest_palace=dest_palace,
+                    collection_name=collection_name,
+                    source_inventories=source_inventories,
+                    backend=backend,
+                )
+            raise
+        finally:
+            if backend is not None:
+                backend.close()
+            _release_repair_locks()
 
-        print(f"\n  Rebuild complete. {sum(counts.values())} total rows.")
-        if archive_path is not None:
-            print(f"  Original palace archived at: {archive_path}")
-        print(f"{'=' * 55}\n")
-        return counts
-    finally:
+    print(f"\n  Rebuild complete. {sum(counts.values())} total rows.")
+    if archive_path is not None:
+        print(f"  Original palace archived at: {archive_path}")
+    print(f"{'=' * 55}\n")
+    if backend is not None:
         backend.close()
-def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
+    _release_repair_locks()
+    return counts
+
+
+def _unique_archive_path(dest_palace: str) -> str:
+    """Return a non-existing in-place rebuild archive path for ``dest_palace``."""
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    base = f"{dest_palace}.pre-rebuild-{ts}"
+    if not os.path.exists(base):
+        return base
+    for suffix in range(2, 1000):
+        candidate = f"{base}-{suffix}"
+        if not os.path.exists(candidate):
+            return candidate
+    raise RuntimeError(f"could not allocate unique archive path for {dest_palace}")
+
+
+def _repair_internal_collection_counts(palace_path: str) -> dict[str, int]:
+    """Return stale internal repair collection names and metadata row counts."""
+    sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(sqlite_path):
+        return {}
+
+    conn = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
+    try:
+        rows = conn.execute(
+            """
+            SELECT c.name, COUNT(e.id)
+            FROM collections c
+            JOIN segments s ON s.collection = c.id
+            LEFT JOIN embeddings e ON e.segment_id = s.id
+            WHERE s.scope = 'METADATA'
+              AND c.name LIKE ?
+            GROUP BY c.name
+            ORDER BY c.name
+            """,
+            ("%__repair_tmp%",),
+        ).fetchall()
+        return {
+            str(name): int(count)
+            for name, count in rows
+            if _is_repair_internal_collection(str(name))
+        }
+    finally:
+        conn.close()
+
+
+def _cleanup_repair_internal_collections(
+    palace_path: str, artifacts: dict[str, int]
+) -> dict[str, str]:
+    """Delete internal repair staging collections via Chroma and report outcomes."""
+    if not artifacts:
+        return {}
+    outcomes: dict[str, str] = {}
+    try:
+        with palace_write_lock(palace_path, operation="repair cleanup"):
+            backend = ChromaBackend()
+            try:
+                for name in artifacts:
+                    try:
+                        backend.delete_collection(palace_path, name)
+                        outcomes[name] = "deleted"
+                    except Exception as exc:  # noqa: BLE001 - Chroma raises several shapes
+                        outcomes[name] = f"failed: {exc}"
+            finally:
+                backend.close()
+    except PalaceWriteAlreadyRunning as exc:
+        for name in artifacts:
+            outcomes[name] = f"refused: {exc}"
+    return outcomes
+
+
+def status(
+    palace_path=None,
+    collection_name: Optional[str] = None,
+    *,
+    cleanup_temp: bool = False,
+    assume_yes: bool = False,
+) -> dict:
     """Read-only health check: compare sqlite vs HNSW element counts.
 
     Catches the #1222 failure mode where chromadb's HNSW segment freezes
@@ -1215,9 +1882,14 @@ def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
     The check itself never opens a chromadb client and never imports
     hnswlib — it reads ``chroma.sqlite3`` and ``index_metadata.pickle``
     directly via :func:`mempalace.backends.chroma.hnsw_capacity_status`.
+    Passing ``cleanup_temp=True`` is the explicit exception: it takes the
+    palace write lock and deletes stale internal collections matching
+    MemPalace's generated repair-temp naming scheme after reporting them.
 
-    Returns the capacity-status dict (also printed). Returns a dict with
-    ``status="unknown"`` when no palace exists at the given path.
+    Returns a wrapper dict with per-collection capacity checks
+    (``drawers`` and ``closets``), detected ``repair_artifacts``, and
+    ``cleanup`` outcomes. Missing palace paths return the same wrapper
+    shape with unknown per-collection statuses.
     """
     palace_path = palace_path or _get_palace_path()
     collection_name = collection_name or _drawers_collection_name()
@@ -1228,8 +1900,24 @@ def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
 
     if not os.path.isdir(palace_path):
         print("  No palace found.\n")
-        return {"status": "unknown", "message": "no palace at path"}
+        unknown = {
+            "status": "unknown",
+            "message": "no palace at path",
+            "sqlite_count": None,
+            "hnsw_count": None,
+            "divergence": None,
+            "diverged": False,
+        }
+        return {
+            "status": "unknown",
+            "message": "no palace at path",
+            "drawers": unknown,
+            "closets": unknown,
+            "repair_artifacts": {},
+            "cleanup": {},
+        }
 
+    artifacts = _repair_internal_collection_counts(palace_path)
     drawers = hnsw_capacity_status(palace_path, collection_name)
     closets = hnsw_capacity_status(palace_path, CLOSETS_COLLECTION_NAME)
 
@@ -1252,8 +1940,50 @@ def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
 
     if drawers["diverged"] or closets["diverged"]:
         print("\n  Recommended: run `mempalace repair` to rebuild the index.")
+    cleanup_results: dict[str, str] = {}
+    print("\n  [repair artifacts]")
+    if not artifacts:
+        print("    none found")
+    else:
+        for name, count in artifacts.items():
+            print(f"    {name}: {count:,} rows")
+        print("    status:         stale internal temp collection(s)")
+        print(
+            "    note:           live collections are present; temp collections are ignored by recovery"
+        )
+        print(
+            "    cleanup:        mempalace "
+            f"--palace {shlex.quote(palace_path)} repair-status --cleanup-temp --yes"
+        )
+        if cleanup_temp:
+            if not assume_yes:
+                print(
+                    "    cleanup skipped: pass --yes with --cleanup-temp to delete temp collections"
+                )
+            else:
+                cleanup_results = _cleanup_repair_internal_collections(palace_path, artifacts)
+                for name, outcome in cleanup_results.items():
+                    print(f"    cleanup {name}: {outcome}")
+                artifacts = {
+                    name: count
+                    for name, count in artifacts.items()
+                    if cleanup_results.get(name) != "deleted"
+                }
     print()
-    return {"drawers": drawers, "closets": closets}
+    if drawers["diverged"] or closets["diverged"]:
+        status_value = "needs_repair"
+    elif artifacts:
+        status_value = "artifacts"
+    else:
+        status_value = "ok"
+    return {
+        "status": status_value,
+        "message": "",
+        "drawers": drawers,
+        "closets": closets,
+        "repair_artifacts": artifacts,
+        "cleanup": cleanup_results,
+    }
 
 
 # ---------------------------------------------------------------------------

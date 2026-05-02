@@ -3,7 +3,9 @@ import pickle
 import shutil
 import sqlite3
 from contextlib import closing
+from contextlib import nullcontext
 from pathlib import Path
+from unittest.mock import patch
 
 import chromadb
 import pytest
@@ -65,6 +67,9 @@ class _FakeCollection:
 
     def delete(self, **kwargs):
         self.calls.append(("delete", kwargs))
+
+    def modify(self, **kwargs):
+        self.calls.append(("modify", kwargs))
 
     def count(self):
         self.calls.append(("count", {}))
@@ -141,11 +146,27 @@ def test_chroma_collection_delegates_writes():
 
     collection.add(documents=["d"], ids=["1"], metadatas=[{"wing": "w"}])
     collection.upsert(documents=["u"], ids=["2"], metadatas=[{"room": "r"}])
+    collection.modify(name="renamed", metadata={"hnsw:space": "cosine"})
     collection.delete(ids=["1"])
     assert collection.count() == 7
 
     kinds = [call[0] for call in fake.calls]
-    assert kinds == ["add", "upsert", "delete", "count"]
+    assert kinds == ["add", "upsert", "modify", "delete", "count"]
+    assert fake.calls[2] == (
+        "modify",
+        {"name": "renamed", "metadata": {"hnsw:space": "cosine"}},
+    )
+
+
+def test_chroma_collection_modify_uses_write_lock():
+    fake = _FakeCollection()
+    collection = ChromaCollection(fake, palace_path="/fake/palace")
+
+    with patch.object(collection, "_write_lock", return_value=nullcontext()) as lock:
+        collection.modify(name="renamed")
+
+    lock.assert_called_once_with()
+    assert fake.calls == [("modify", {"name": "renamed"})]
 
 
 def test_registry_exposes_chroma_by_default():
@@ -826,8 +847,8 @@ def test_make_client_quarantines_only_on_first_call_per_palace(tmp_path, monkeyp
     )
 
 
-def test_make_client_gates_invalid_metadata_on_first_call(tmp_path, monkeypatch):
-    """Invalid metadata quarantine is gated on the first make_client() call."""
+def test_make_client_runs_invalid_metadata_on_each_call(tmp_path, monkeypatch):
+    """Invalid metadata quarantine stays unconditional; stale quarantine is gated."""
     from mempalace.backends.chroma import ChromaBackend
 
     palace_path = str(tmp_path / "palace")
@@ -836,13 +857,15 @@ def test_make_client_gates_invalid_metadata_on_first_call(tmp_path, monkeypatch)
 
     monkeypatch.setattr(ChromaBackend, "_quarantined_paths", set())
 
-    calls: list[str] = []
+    invalid_calls: list[str] = []
+    stale_calls: list[str] = []
 
     def _invalid(path, *args, **kwargs):
-        calls.append(path)
+        invalid_calls.append(path)
         return []
 
     def _stale(path, stale_seconds=300.0):
+        stale_calls.append(path)
         return []
 
     monkeypatch.setattr("mempalace.backends.chroma.quarantine_invalid_hnsw_metadata", _invalid)
@@ -851,7 +874,8 @@ def test_make_client_gates_invalid_metadata_on_first_call(tmp_path, monkeypatch)
     ChromaBackend.make_client(palace_path)
     ChromaBackend.make_client(palace_path)
 
-    assert calls == [palace_path]
+    assert invalid_calls == [palace_path, palace_path]
+    assert stale_calls == [palace_path]
 
 
 def test_make_client_gates_invalid_metadata_on_first_call(tmp_path, monkeypatch):
@@ -1216,6 +1240,7 @@ def test_chroma_backend_stale_quarantine_is_cold_start_only_on_refresh(tmp_path,
         ("invalid", str(palace)),
         ("stale", str(palace)),
         ("blob", str(palace)),
+        ("invalid", str(palace)),
     ]
 
 

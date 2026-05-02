@@ -205,6 +205,20 @@ def collection_write_roundtrip_works(col) -> bool:
         return False
 
 
+def _drop_migrate_probe_drawers(drawers: list[dict]) -> list[dict]:
+    """Filter synthetic migrate probe rows from SQLite fallback extraction."""
+    filtered = []
+    for drawer in drawers:
+        drawer_id = str(drawer.get("id", ""))
+        source_file = str(drawer.get("metadata", {}).get("source_file", ""))
+        if drawer_id.startswith("_mempalace_migrate_probe_"):
+            continue
+        if source_file == "mempalace_migrate_probe":
+            continue
+        filtered.append(drawer)
+    return filtered
+
+
 def migrate(palace_path: str, dry_run: bool = False, confirm: bool = False):
     """Migrate a palace to the currently installed ChromaDB version."""
     from .backends.chroma import ChromaBackend
@@ -229,30 +243,68 @@ def migrate(palace_path: str, dry_run: bool = False, confirm: bool = False):
     print(f"  Source:    ChromaDB {source_version}")
     print(f"  Target:    ChromaDB {target_version}")
 
-    # Try reading and writing with current chromadb first.
+    # Check whether the current backend can at least read the live collection.
     #
-    # A plain count() is not enough: some 0.6.x -> 1.5.x migrated collections
-    # are readable but silently drop upsert/delete operations. In that state,
-    # migrate must rebuild from SQLite instead of returning "No migration needed."
+    # We defer the write/delete round-trip probe until after dry-run and
+    # destructive-action confirmation so no-op flows never mutate the source
+    # palace with probe rows.
+    readable_collection = None
+    readable_count = None
     try:
         col = ChromaBackend().get_collection(palace_path, "mempalace_drawers")
-        count = col.count()
+        readable_count = col.count()
+        readable_collection = col
+        print(f"\n Palace is readable by chromadb {target_version}.")
+    except Exception:
+        print(f"\n Palace is NOT readable by chromadb {target_version}.")
+        print(" Extracting from SQLite directly...")
 
-        if collection_write_roundtrip_works(col):
+    if dry_run:
+        if readable_collection is not None:
+            print("  DRY RUN skips live write/delete verification.")
+
+        drawers = _drop_migrate_probe_drawers(extract_drawers_from_sqlite(db_path))
+        print(f"  Extracted {len(drawers)} drawers from SQLite")
+
+        if drawers:
+            wings = defaultdict(lambda: defaultdict(int))
+            for d in drawers:
+                w = d["metadata"].get("wing", "?")
+                r = d["metadata"].get("room", "?")
+                wings[w][r] += 1
+
+            print("\n  Summary:")
+            for wing, rooms in sorted(wings.items()):
+                total = sum(rooms.values())
+                print(f"    WING: {wing} ({total} drawers)")
+                for room, count in sorted(rooms.items(), key=lambda x: -x[1]):
+                    print(f"      ROOM: {room:30} {count:5}")
+
+        print("\n  DRY RUN — no changes made.")
+        print(f"  Would migrate {len(drawers)} drawers.")
+        return True
+
+    confirmed = False
+    if readable_collection is not None:
+        if not confirm_destructive_action("Migration", palace_path, assume_yes=confirm):
+            return False
+        confirmed = True
+
+        # A plain count() is not enough: some 0.6.x -> 1.5.x migrated
+        # collections are readable but silently drop upsert/delete operations.
+        # Probe only after the user has confirmed the migration path.
+        if collection_write_roundtrip_works(readable_collection):
             print(f"\n Palace is already readable and writable by chromadb {target_version}.")
-            print(f" {count} drawers found. No migration needed.")
+            print(f" {readable_count} drawers found. No migration needed.")
             return True
 
         print(
             f"\n Palace is readable by chromadb {target_version}, but write/delete verification failed."
         )
         print(" Rebuilding from SQLite to restore native write/delete behavior...")
-    except Exception:
-        print(f"\n Palace is NOT readable by chromadb {target_version}.")
-        print(" Extracting from SQLite directly...")
 
     # Extract all drawers via raw SQL
-    drawers = extract_drawers_from_sqlite(db_path)
+    drawers = _drop_migrate_probe_drawers(extract_drawers_from_sqlite(db_path))
     print(f"  Extracted {len(drawers)} drawers from SQLite")
 
     if not drawers:
@@ -273,12 +325,9 @@ def migrate(palace_path: str, dry_run: bool = False, confirm: bool = False):
         for room, count in sorted(rooms.items(), key=lambda x: -x[1]):
             print(f"      ROOM: {room:30} {count:5}")
 
-    if dry_run:
-        print("\n  DRY RUN — no changes made.")
-        print(f"  Would migrate {len(drawers)} drawers.")
-        return True
-
-    if not confirm_destructive_action("Migration", palace_path, assume_yes=confirm):
+    if not confirmed and not confirm_destructive_action(
+        "Migration", palace_path, assume_yes=confirm
+    ):
         return False
 
     # Backup the old palace

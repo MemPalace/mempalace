@@ -938,6 +938,16 @@ class ChromaCollection(BaseCollection):
         with self._write_lock():
             self._collection.upsert(**kwargs)
 
+    def modify(self, *, name=None, metadata=None, configuration=None):
+        kwargs: dict[str, Any] = {}
+        if name is not None:
+            kwargs["name"] = name
+        if metadata is not None:
+            kwargs["metadata"] = metadata
+        if configuration is not None:
+            kwargs["configuration"] = configuration
+        self._collection.modify(**kwargs)
+
     def update(
         self,
         *,
@@ -1246,27 +1256,28 @@ class ChromaBackend(BaseBackend):
     # Public static helpers (legacy; prefer :meth:`get_collection`)
     # ------------------------------------------------------------------
 
-    # Per-process record of palaces that have already had the cold-start
-    # quarantine invoked at least once. The proactive HNSW checks are a
-    # *cold-start* protection — they catch segments that arrive stale relative
-    # to ``chroma.sqlite3`` or invalid on disk (e.g. cross-machine replication,
-    # partial restore, crashed-mid-write). Once a long-running process has
-    # opened the palace cleanly, re-firing the stale check on every reconnect
-    # is a *runtime thrash*: the daemon's own writes bump sqlite mtime but HNSW
-    # flushes batch on chromadb's internal cadence, so the mtime gap naturally
-    # exceeds the threshold under steady write load even though nothing is
-    # corrupt.
+    # Per-process record of palaces that have already had stale-HNSW mtime
+    # quarantine invoked at least once. Stale quarantine is a *cold-start*
+    # protection — it catches segments that arrive stale relative to
+    # ``chroma.sqlite3`` (e.g. cross-machine replication, partial restore,
+    # crashed-mid-write). Once a long-running process has opened the palace
+    # cleanly, re-firing the stale check on every reconnect is a *runtime
+    # thrash*: the daemon's own writes bump sqlite mtime but HNSW flushes batch
+    # on chromadb's internal cadence, so the mtime gap naturally exceeds the
+    # threshold under steady write load even though nothing is corrupt.
+    # Invalid metadata quarantine is cheaper and deterministic, so it runs on
+    # every client open/reconnect and is not gated by this set.
     # Real runtime drift is still handled — palace-daemon's ``_auto_repair``
     # calls :func:`quarantine_stale_hnsw` directly on observed HNSW errors,
     # which bypasses this gate.
     #
     # Thread-safety: this set is mutated without a lock. Two concurrent
-    # ``make_client()`` calls for the same palace can both pass the
-    # membership check and both invoke the cold-start quarantine. That's
-    # safe because the functions are idempotent (mtime checks + timestamped
-    # rename of distinct directories), so the worst-case race produces one
-    # redundant rename attempt that no-ops. Idempotency is the safety
-    # property; locking would add cost without correctness gain.
+    # ``make_client()`` calls for the same palace can both pass the membership
+    # check and both invoke stale quarantine. That's safe because the function
+    # is idempotent (mtime checks + timestamped rename of distinct directories),
+    # so the worst-case race produces one redundant rename attempt that no-ops.
+    # Idempotency is the safety property; locking would add cost without
+    # correctness gain.
     _quarantined_paths: set[str] = set()
 
     @staticmethod
@@ -1280,21 +1291,23 @@ class ChromaBackend(BaseBackend):
 
         1. ``_fix_blob_seq_ids`` — repairs the BLOB seq_id quirk that bites
            certain chromadb migrations.
-        2. ``quarantine_invalid_hnsw_metadata`` + ``quarantine_stale_hnsw`` —
-           gated by :attr:`_quarantined_paths` so they fire once per palace
-           per process unless the underlying sqlite inode changes. This keeps
-           reconnect paths cheap while still re-running the preflight after an
-           on-disk palace replacement.
+        2. ``quarantine_invalid_hnsw_metadata`` — runs on every open so
+           reconnect paths still quarantine newly-corrupted metadata files.
+        3. ``quarantine_stale_hnsw`` — gated by :attr:`_quarantined_paths`
+           so it fires once per palace per process unless the underlying
+           sqlite inode changes. This keeps reconnect paths cheap while still
+           re-running the stale-segment preflight after an on-disk palace
+           replacement.
 
         Idempotent: safe to call from any code path that is about to open or
         re-open a palace. The ``_quarantined_paths`` gate prevents thrash on
         hot paths (e.g. ``_client()`` is called on every backend operation).
         """
         _fix_blob_seq_ids(palace_path)
+        quarantine_invalid_hnsw_metadata(palace_path)
         if reset_quarantine:
             ChromaBackend._quarantined_paths.discard(palace_path)
         if palace_path not in ChromaBackend._quarantined_paths:
-            quarantine_invalid_hnsw_metadata(palace_path)
             quarantine_stale_hnsw(palace_path)
             ChromaBackend._quarantined_paths.add(palace_path)
 
@@ -1306,9 +1319,10 @@ class ChromaBackend(BaseBackend):
         own client cache. New code should obtain a collection through
         :meth:`get_collection` which manages caching internally.
 
-        Quarantines HNSW segments **once per palace per process**. See
-        :attr:`_quarantined_paths` for the rationale (cold-start protection
-        vs. runtime thrash on steady-write daemons).
+        Runs invalid-metadata quarantine on every call, but only runs stale-HNSW
+        mtime quarantine once per palace per process. See
+        :attr:`_quarantined_paths` for the stale-quarantine rationale
+        (cold-start protection vs. runtime thrash on steady-write daemons).
         """
         ChromaBackend._prepare_palace_for_open(palace_path)
         return chromadb.PersistentClient(path=palace_path)
