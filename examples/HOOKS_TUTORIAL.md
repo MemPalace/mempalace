@@ -7,26 +7,41 @@ MemPalace hooks act as an "Auto-Save" feature. They help your AI keep a permanen
 * **PreCompact Hook** (`mempal_precompact_hook.sh`): Saves your context right before the AI's memory window fills up.
 
 ### 2. Setup for Claude Code
-Add this to your configuration file to enable automatic background saving:
+Add this to `~/.claude/settings.local.json` (global) or `.claude/settings.local.json` (project-scoped) to enable automatic background saving:
 
 ```json
 {
   "hooks": {
     "Stop": [
       {
-        "matcher": "", 
-        "hooks": [{"type": "command", "command": "./hooks/mempal_save_hook.sh"}]
+        "matcher": "*", 
+        "hooks": [{
+          "type": "command",
+          "command": "/absolute/path/to/hooks/mempal_save_hook.sh",
+          "timeout": 30
+        }]
       }
     ],
     "PreCompact": [
       {
-        "matcher": "", 
-        "hooks": [{"type": "command", "command": "./hooks/mempal_precompact_hook.sh"}]
+        "hooks": [{
+          "type": "command",
+          "command": "/absolute/path/to/hooks/mempal_precompact_hook.sh",
+          "timeout": 30
+        }]
       }
     ]
   }
 }
 ```
+
+Make the hooks executable:
+```bash
+chmod +x /absolute/path/to/hooks/mempal_save_hook.sh
+chmod +x /absolute/path/to/hooks/mempal_precompact_hook.sh
+```
+
+**Note:** Replace `/absolute/path/to/hooks/` with the actual path where you cloned the MemPalace repository (e.g., `~/projects/mempalace/hooks/`).
 
 ### 3. What changed (v3.1.0+)
 

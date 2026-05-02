@@ -197,16 +197,23 @@ def _output(data: dict):
     sys.stdout.buffer.flush()
 
 
-def _get_mine_dir(transcript_path: str = "") -> str:
-    """Determine directory to mine from MEMPAL_DIR or transcript path."""
+def _get_mine_targets() -> list[tuple[str, str]]:
+    """Return the list of ``(dir, mode)`` targets for auto-ingest.
+
+    MEMPAL_DIR (when set and resolvable) contributes a ``"projects"``
+    target. Transcript ingestion is handled separately by
+    ``_ingest_transcript`` — emitting it here too would double-mine the
+    same JSONL into a different wing on every hook fire (#1231 review).
+
+    An empty list means no MEMPAL_DIR ingest should run.
+    """
+    targets: list[tuple[str, str]] = []
     mempal_dir = os.environ.get("MEMPAL_DIR", "")
-    if mempal_dir and os.path.isdir(mempal_dir):
-        return mempal_dir
-    if transcript_path:
-        path = Path(transcript_path).expanduser()
-        if path.is_file():
-            return str(path.parent)
-    return ""
+    if mempal_dir:
+        resolved = Path(mempal_dir).expanduser().resolve()
+        if resolved.is_dir():
+            targets.append((str(resolved), "projects"))
+    return targets
 
 
 _MINE_PID_FILE = STATE_DIR / "mine.pid"
@@ -263,37 +270,58 @@ def _spawn_mine(cmd: list) -> None:
     _MINE_PID_FILE.write_text(str(proc.pid))
 
 
-def _maybe_auto_ingest(transcript_path: str = ""):
-    """Run mempalace mine in background if a mine directory is available."""
-    mine_dir = _get_mine_dir(transcript_path)
-    if not mine_dir:
+def _maybe_auto_ingest():
+    """Background-mine MEMPAL_DIR (project files) if set.
+
+    Transcript convos are ingested separately via ``_ingest_transcript``
+    in the hook handlers — this function does not handle them, to avoid
+    asymmetric interpreter handling and PID-file overwrite when both
+    targets fire from a single hook call (#1231 review).
+    """
+    targets = _get_mine_targets()
+    if not targets:
         return
     if _mine_already_running():
         _log("Skipping auto-ingest: mine already running")
         return
-    try:
-        _spawn_mine([sys.executable, "-m", "mempalace", "mine", mine_dir])
-    except OSError:
-        pass
+    for mine_dir, mode in targets:
+        try:
+            _spawn_mine([_mempalace_python(), "-m", "mempalace", "mine", mine_dir, "--mode", mode])
+        except OSError:
+            pass
 
 
-def _mine_sync(transcript_path: str = ""):
-    """Run mempalace mine synchronously (for precompact -- data must land first)."""
-    mine_dir = _get_mine_dir(transcript_path)
-    if not mine_dir:
+def _mine_sync():
+    """Synchronously mine MEMPAL_DIR (precompact path).
+
+    Transcript convos are ingested separately via ``_ingest_transcript``
+    in ``hook_precompact`` — keeping them out of this function avoids
+    timeout stacking against the harness 30s ceiling (#1231 review).
+    """
+    targets = _get_mine_targets()
+    if not targets:
         return
-    try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        log_path = STATE_DIR / "hook.log"
-        with open(log_path, "a") as log_f:
-            subprocess.run(
-                [sys.executable, "-m", "mempalace", "mine", mine_dir],
-                stdout=log_f,
-                stderr=log_f,
-                timeout=60,
-            )
-    except (OSError, subprocess.TimeoutExpired):
-        pass
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = STATE_DIR / "hook.log"
+    for mine_dir, mode in targets:
+        try:
+            with open(log_path, "a") as log_f:
+                subprocess.run(
+                    [
+                        _mempalace_python(),
+                        "-m",
+                        "mempalace",
+                        "mine",
+                        mine_dir,
+                        "--mode",
+                        mode,
+                    ],
+                    stdout=log_f,
+                    stderr=log_f,
+                    timeout=60,
+                )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
 
 def _desktop_toast(body: str, title: str = "MemPalace"):
@@ -592,7 +620,7 @@ def hook_stop(data: dict, harness: str):
                     transcript_path, session_id, wing=project_wing, toast=toast
                 )
                 _ingest_transcript(transcript_path)
-            _maybe_auto_ingest(transcript_path)
+            _maybe_auto_ingest()
             # Only advance save marker after successful save
             count = result.get("count", 0)
             if count > 0:
@@ -622,7 +650,7 @@ def hook_stop(data: dict, harness: str):
                 pass
             if transcript_path:
                 _ingest_transcript(transcript_path)
-            _maybe_auto_ingest(transcript_path)
+            _maybe_auto_ingest()
             reason = STOP_BLOCK_REASON + f" Write diary entry to wing={project_wing}."
             _output({"decision": "block", "reason": reason})
     else:
@@ -655,8 +683,10 @@ def hook_precompact(data: dict, harness: str):
     if transcript_path:
         _ingest_transcript(transcript_path)
 
-    # Mine synchronously so data lands before compaction proceeds
-    _mine_sync(transcript_path)
+    # Mine MEMPAL_DIR synchronously so project data lands before
+    # compaction proceeds. Transcript convos were already kicked off
+    # above via _ingest_transcript.
+    _mine_sync()
 
     _output({})
 

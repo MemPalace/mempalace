@@ -11,7 +11,9 @@ hide drawers the direct path would have found.
 
 import logging
 import math
+import os
 import re
+import sqlite3
 from pathlib import Path
 
 from .palace import get_closets_collection, get_collection
@@ -46,7 +48,14 @@ def _first_or_empty(results, key: str) -> list:
 
 
 def _tokenize(text: str) -> list:
-    """Lowercase + strip to alphanumeric tokens of length ≥ 2."""
+    """Lowercase + strip to alphanumeric tokens of length ≥ 2.
+
+    Tolerates ``None`` documents — Chroma can return ``None`` in the
+    ``documents`` field for drawers without text content, which would
+    otherwise raise ``AttributeError`` mid-rerank.
+    """
+    if not text:
+        return []
     return _TOKEN_RE.findall(text.lower())
 
 
@@ -236,6 +245,42 @@ def _expand_with_neighbors(drawers_col, matched_doc: str, matched_meta: dict, ra
     }
 
 
+def _warn_if_legacy_metric(col) -> None:
+    """Print a one-line notice if the palace was created without
+    ``hnsw:space=cosine``.
+
+    ChromaDB's default is L2 (Euclidean), under which cosine-based
+    similarity interpretation falls apart — distances routinely exceed
+    1.0 and the display ``max(0, 1 - dist)`` floors every result to 0.
+    Legacy palaces (mined before this metadata was consistently set)
+    need ``mempalace repair`` to rebuild with the correct metric.
+
+    The warning fires only for palaces that clearly have the wrong
+    metric; palaces with no metadata table at all (empty dict) also
+    fall under this check since that is the signal of a pre-metadata
+    palace.
+    """
+    try:
+        meta = getattr(col, "metadata", None)
+    except Exception:
+        return
+    if not isinstance(meta, dict):
+        return
+    space = meta.get("hnsw:space")
+    if space == "cosine":
+        return
+    # Either missing or set to something else — both are suspect.
+    import sys as _sys
+
+    detail = f"hnsw:space={space!r}" if space else "no hnsw:space metadata"
+    print(
+        f"\n  NOTICE: this palace was created without cosine distance ({detail}).\n"
+        "          Semantic similarity scores will not be meaningful.\n"
+        "          Run `mempalace repair` to rebuild the index with the correct metric.",
+        file=_sys.stderr,
+    )
+
+
 def search(query: str, palace_path: str, wing: str = None, room: str = None, n_results: int = 5):
     """
     Search the palace. Returns verbatim drawer content.
@@ -247,6 +292,10 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
         print(f"\n  No palace found at {palace_path}")
         print("  Run: mempalace init <dir> then mempalace mine <dir>")
         raise SearchError(f"No palace found at {palace_path}")
+
+    # Alert the user if this palace predates hnsw:space=cosine being set on
+    # creation — their similarity scores will be junk until they run repair.
+    _warn_if_legacy_metric(col)
 
     where = build_where_filter(wing, room)
 
@@ -273,6 +322,20 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
         print(f'\n  No results found for: "{query}"')
         return
 
+    # Pure-cosine retrieval on the CLI path was missing lexical matches:
+    # a drawer whose text contains every query term can still score distance
+    # >= 1.0 against the natural-language query when the drawer is a
+    # mechanical artifact (directory listing, diff, log fragment) that
+    # embeds as file-tree noise rather than as prose about its subject.
+    # The MCP tool path already hybridizes BM25 with vector sim via
+    # `_hybrid_rank`; do the same here so CLI results match what agents
+    # see via `mempalace_search`.
+    hits = [
+        {"text": doc, "distance": float(dist), "metadata": meta or {}}
+        for doc, meta, dist in zip(docs, metas, dists)
+    ]
+    hits = _hybrid_rank(hits, query)
+
     print(f"\n{'=' * 60}")
     print(f'  Results for: "{query}"')
     if wing:
@@ -281,24 +344,205 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
         print(f"  Room: {room}")
     print(f"{'=' * 60}\n")
 
-    for i, (doc, meta, dist) in enumerate(zip(docs, metas, dists), 1):
-        similarity = round(max(0.0, 1 - dist), 3)
-        meta = meta or {}
+    for i, hit in enumerate(hits, 1):
+        vec_sim = round(max(0.0, 1 - hit["distance"]), 3)
+        bm25 = hit.get("bm25_score", 0.0)
+        meta = hit["metadata"]
         source = Path(meta.get("source_file", "?")).name
         wing_name = meta.get("wing", "?")
         room_name = meta.get("room", "?")
 
         print(f"  [{i}] {wing_name} / {room_name}")
         print(f"      Source: {source}")
-        print(f"      Match:  {similarity}")
+        print(f"      Match:  cosine={vec_sim}  bm25={bm25}")
         print()
         # Print the verbatim text, indented
-        for line in doc.strip().split("\n"):
+        for line in hit["text"].strip().split("\n"):
             print(f"      {line}")
         print()
         print(f"  {'─' * 56}")
 
     print()
+
+
+def _bm25_only_via_sqlite(
+    query: str,
+    palace_path: str,
+    wing: str = None,
+    room: str = None,
+    n_results: int = 5,
+    max_candidates: int = 500,
+) -> dict:
+    """BM25-only search reading drawers directly from chroma.sqlite3.
+
+    Used when HNSW is diverged or unloadable (#1222). Bypasses chromadb's
+    Python client entirely so a corrupt vector segment can't segfault the
+    MCP server. Routes through chromadb's own FTS5 trigram index
+    (``embedding_fulltext_search``) for candidate selection, then re-ranks
+    with the same Okapi-BM25 used in :func:`_hybrid_rank` so the result
+    shape matches the vector path.
+
+    The query is split into ≥3-char trigram-tokens and OR-joined for the
+    FTS5 MATCH — chromadb writes the index with ``tokenize='trigram'``,
+    so single-character tokens never match. When no usable token survives
+    (e.g. "is a"), candidate selection falls back to the most-recent
+    ``max_candidates`` rows so we still return *something* rather than
+    nothing.
+    """
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return {
+            "error": "No palace found",
+            "hint": "Run: mempalace init <dir> && mempalace mine <dir>",
+        }
+
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error as e:
+        return {"error": f"sqlite open failed: {e}"}
+
+    try:
+        # FTS5 MATCH expects whitespace-separated tokens. Drop tokens
+        # shorter than 3 chars (trigram tokenizer can't match them).
+        tokens = [t for t in _tokenize(query) if len(t) >= 3]
+        candidate_ids: list[int] = []
+        if tokens:
+            fts_query = " OR ".join(tokens)
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT rowid
+                    FROM embedding_fulltext_search
+                    WHERE embedding_fulltext_search MATCH ?
+                    LIMIT ?
+                    """,
+                    (fts_query, max_candidates),
+                ).fetchall()
+                candidate_ids = [r[0] for r in rows]
+            except sqlite3.Error:
+                # FTS5 tokenizer mismatch or syntax error — fall through
+                # to the recency-window selector below.
+                logger.debug("FTS5 MATCH failed; using recency fallback", exc_info=True)
+
+        if not candidate_ids:
+            # No FTS hits (or no usable tokens) — pull the most recent
+            # rows for the drawers segment so we can BM25-rank something
+            # rather than return empty-handed. Wrapped in try/except
+            # because the schema may differ on legacy palaces (older
+            # chromadb without ``created_at``, missing ``segments``
+            # rows after partial restore, etc.); on schema mismatch we
+            # fall back to ordering by primary-key id and finally to an
+            # empty result rather than letting search raise.
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT e.id
+                    FROM embeddings e
+                    JOIN segments s ON e.segment_id = s.id
+                    JOIN collections c ON s.collection = c.id
+                    WHERE c.name = 'mempalace_drawers'
+                    ORDER BY e.created_at DESC
+                    LIMIT ?
+                    """,
+                    (max_candidates,),
+                ).fetchall()
+                candidate_ids = [r[0] for r in rows]
+            except sqlite3.Error:
+                logger.debug(
+                    "recency-window query failed; trying id-ordered fallback",
+                    exc_info=True,
+                )
+                try:
+                    rows = conn.execute(
+                        """
+                        SELECT e.id
+                        FROM embeddings e
+                        JOIN segments s ON e.segment_id = s.id
+                        JOIN collections c ON s.collection = c.id
+                        WHERE c.name = 'mempalace_drawers'
+                        ORDER BY e.id DESC
+                        LIMIT ?
+                        """,
+                        (max_candidates,),
+                    ).fetchall()
+                    candidate_ids = [r[0] for r in rows]
+                except sqlite3.Error:
+                    logger.debug("id-ordered fallback also failed", exc_info=True)
+                    candidate_ids = []
+
+        if not candidate_ids:
+            return {
+                "query": query,
+                "filters": {"wing": wing, "room": room},
+                "total_before_filter": 0,
+                "results": [],
+                "fallback": "bm25_only_via_sqlite",
+            }
+
+        placeholders = ",".join(["?"] * len(candidate_ids))
+        meta_rows = conn.execute(
+            f"""
+            SELECT id, key, string_value, int_value
+            FROM embedding_metadata
+            WHERE id IN ({placeholders})
+            """,
+            candidate_ids,
+        ).fetchall()
+    finally:
+        conn.close()
+
+    # Group metadata rows into per-drawer dicts.
+    drawers: dict[int, dict] = {}
+    for emb_id, key, sval, ival in meta_rows:
+        d = drawers.setdefault(emb_id, {"_id": emb_id, "metadata": {}, "text": ""})
+        if key == "chroma:document":
+            d["text"] = sval or ""
+        else:
+            d["metadata"][key] = sval if sval is not None else ival
+
+    # Apply wing/room filters in Python (FTS5 candidates may include
+    # entries from other wings).
+    candidates = []
+    for d in drawers.values():
+        meta = d["metadata"]
+        if wing and meta.get("wing") != wing:
+            continue
+        if room and meta.get("room") != room:
+            continue
+        candidates.append(
+            {
+                "text": d["text"],
+                "wing": meta.get("wing", "unknown"),
+                "room": meta.get("room", "unknown"),
+                "source_file": Path(meta.get("source_file", "?") or "?").name,
+                "created_at": meta.get("filed_at", "unknown"),
+                # No vector distance available in BM25-only mode.
+                "similarity": None,
+                "distance": None,
+                "matched_via": "bm25_sqlite",
+            }
+        )
+
+    # Local BM25 over the candidate set.
+    docs = [c["text"] for c in candidates]
+    bm25_raw = _bm25_scores(query, docs)
+    max_bm25 = max(bm25_raw) if bm25_raw else 0.0
+    for c, raw in zip(candidates, bm25_raw):
+        c["bm25_score"] = round(raw, 3)
+        c["_score"] = (raw / max_bm25) if max_bm25 > 0 else 0.0
+    candidates.sort(key=lambda c: c["_score"], reverse=True)
+    hits = candidates[:n_results]
+    for h in hits:
+        h.pop("_score", None)
+
+    return {
+        "query": query,
+        "filters": {"wing": wing, "room": room},
+        "total_before_filter": len(candidates),
+        "results": hits,
+        "fallback": "bm25_only_via_sqlite",
+        "fallback_reason": "vector_search_disabled",
+    }
 
 
 def search_memories(
@@ -308,6 +552,7 @@ def search_memories(
     room: str = None,
     n_results: int = 5,
     max_distance: float = 0.0,
+    vector_disabled: bool = False,
 ) -> dict:
     """Programmatic search — returns a dict instead of printing.
 
@@ -323,7 +568,20 @@ def search_memories(
             cosine distance (hnsw:space=cosine) — 0 = identical, 2 = opposite.
             Results with distance > this value are filtered out. A value of
             0.0 disables filtering. Typical useful range: 0.3–1.0.
+        vector_disabled: When True, route to the sqlite-only BM25 fallback
+            (#1222). Set by the MCP server when the HNSW capacity probe
+            detects a divergence that would segfault chromadb on segment
+            load.
     """
+    if vector_disabled:
+        return _bm25_only_via_sqlite(
+            query,
+            palace_path,
+            wing=wing,
+            room=room,
+            n_results=n_results,
+        )
+
     try:
         drawers_col = get_collection(palace_path, create=False)
     except Exception as e:

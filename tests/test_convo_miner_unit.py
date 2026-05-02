@@ -1,6 +1,9 @@
 """Unit tests for convo_miner pure functions (no chromadb needed)."""
 
+import contextlib
+
 from mempalace.convo_miner import (
+    _file_chunks_locked,
     chunk_exchanges,
     detect_convo_room,
     scan_convos,
@@ -111,3 +114,36 @@ class TestScanConvos:
     def test_scan_empty_dir(self, tmp_path):
         files = scan_convos(str(tmp_path))
         assert files == []
+
+
+class TestFileChunksLocked:
+    def test_uses_bounded_upsert_batches(self, monkeypatch):
+        import mempalace.convo_miner as convo_miner
+
+        class FakeCol:
+            def __init__(self):
+                self.batch_sizes = []
+
+            def delete(self, *args, **kwargs):
+                pass
+
+            def upsert(self, documents, ids, metadatas):
+                self.batch_sizes.append(len(documents))
+
+        chunks = [{"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(5)]
+        col = FakeCol()
+        monkeypatch.setattr(convo_miner, "DRAWER_UPSERT_BATCH_SIZE", 2)
+        monkeypatch.setattr(
+            convo_miner, "file_already_mined", lambda collection, source_file: False
+        )
+        monkeypatch.setattr(convo_miner, "mine_lock", lambda source_file: contextlib.nullcontext())
+        monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda content: "conversations")
+
+        drawers, room_counts, skipped = _file_chunks_locked(
+            col, "chat.txt", chunks, "wing", "general", "agent", "exchange"
+        )
+
+        assert drawers == 5
+        assert dict(room_counts) == {}
+        assert skipped is False
+        assert col.batch_sizes == [2, 2, 1]

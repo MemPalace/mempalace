@@ -148,6 +148,33 @@ def test_classify_entity_pronoun_only_is_uncertain():
     assert result["type"] == "uncertain"
 
 
+def test_classify_entity_high_pronoun_signal_is_person():
+    """A diary's main character hit by many pronouns should still classify
+    as a person even with only the pronoun signal category. Example from
+    real data: `Lu` has 16 pronoun hits out of 30 mentions."""
+    scores = {
+        "person_score": 32,
+        "project_score": 0,
+        "person_signals": ["pronoun nearby (16x)"],
+        "project_signals": [],
+    }
+    result = classify_entity("Lu", 30, scores)
+    assert result["type"] == "person"
+
+
+def test_classify_entity_low_pronoun_proximity_is_uncertain():
+    """Common sentence-start words (Never, Before) get a few pronouns nearby
+    incidentally. The ratio stays low (<20%), so they stay uncertain."""
+    scores = {
+        "person_score": 4,
+        "project_score": 0,
+        "person_signals": ["pronoun nearby (2x)"],
+        "project_signals": [],
+    }
+    result = classify_entity("Never", 21, scores)
+    assert result["type"] == "uncertain"
+
+
 def test_classify_entity_mixed_signals():
     scores = {
         "person_score": 5,
@@ -208,13 +235,13 @@ def test_detect_entities_empty_files(tmp_path):
     f = tmp_path / "empty.txt"
     f.write_text("")
     result = detect_entities([f])
-    assert result == {"people": [], "projects": [], "uncertain": []}
+    assert result == {"people": [], "projects": [], "topics": [], "uncertain": []}
 
 
 def test_detect_entities_handles_missing_file(tmp_path):
     missing = tmp_path / "nonexistent.txt"
     result = detect_entities([missing])
-    assert result == {"people": [], "projects": [], "uncertain": []}
+    assert result == {"people": [], "projects": [], "topics": [], "uncertain": []}
 
 
 def test_detect_entities_respects_max_files(tmp_path):

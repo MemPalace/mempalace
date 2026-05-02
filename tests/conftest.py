@@ -46,6 +46,14 @@ def _reset_mcp_cache():
             mcp_server._collection_cache = None
         except (ImportError, AttributeError):
             pass
+        try:
+            # Reset the per-process quarantine gate so tests don't leak
+            # state through ChromaBackend._quarantined_paths.
+            from mempalace.backends.chroma import ChromaBackend
+
+            ChromaBackend._quarantined_paths.clear()
+        except (ImportError, AttributeError):
+            pass
 
     _clear_cache()
     yield

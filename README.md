@@ -149,6 +149,10 @@ system prompt:
 Two Claude Code hooks save periodically and before context compression:
 [mempalaceofficial.com/guide/hooks](https://mempalaceofficial.com/guide/hooks.html).
 
+For per-message recall on top of the file-level chunks the hooks produce,
+run `mempalace sweep <transcript-dir>` periodically — it stores one
+verbatim drawer per user/assistant message, idempotent and resume-safe.
+
 ---
 
 ## Requirements

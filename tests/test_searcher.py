@@ -121,6 +121,44 @@ class TestSearchMemories:
         assert none_hit["room"] == "unknown"
 
 
+# ── BM25 internals: None / empty document safety ─────────────────────
+
+
+class TestBM25NoneSafety:
+    """Regression tests for the AttributeError observed in production when
+    Chroma returned ``None`` documents inside a hybrid-rerank pass.
+
+    Trace from the daemon log (2026-04-24 21:07:05):
+        File "mempalace/searcher.py", line 81, in _bm25_scores
+            tokenized = [_tokenize(d) for d in documents]
+        File "mempalace/searcher.py", line 52, in _tokenize
+            return _TOKEN_RE.findall(text.lower())
+        AttributeError: 'NoneType' object has no attribute 'lower'
+    """
+
+    def test_tokenize_handles_none(self):
+        from mempalace.searcher import _tokenize
+
+        assert _tokenize(None) == []
+
+    def test_tokenize_handles_empty_string(self):
+        from mempalace.searcher import _tokenize
+
+        assert _tokenize("") == []
+
+    def test_bm25_scores_does_not_crash_on_none_documents(self):
+        """A ``None`` mixed into the corpus must yield score 0.0 for that doc
+        and finite scores for the rest, not raise AttributeError."""
+        from mempalace.searcher import _bm25_scores
+
+        scores = _bm25_scores(
+            "postgres migration", ["postgres migration done", None, "kafka rebalance"]
+        )
+        assert len(scores) == 3
+        assert scores[1] == 0.0
+        assert scores[0] > 0.0
+
+
 # ── search() (CLI print function) ─────────────────────────────────────
 
 
@@ -172,6 +210,85 @@ class TestSearchCLI:
         captured = capsys.readouterr()
         # Should have output with at least one result block
         assert "[1]" in captured.out
+
+    def test_search_applies_bm25_hybrid_rerank(self, capsys):
+        """CLI search must call the same hybrid rerank that the MCP path uses.
+
+        Regression for a bug where the CLI only consulted ChromaDB cosine
+        distance: a drawer whose body contained every query term still
+        scored zero similarity if its embedding happened to be far from
+        the query (e.g. the drawer was a shell-output fragment that
+        embeds as "file tree noise"). Hybrid rerank fixes this by
+        combining BM25 with cosine — lexical matches rise above pure
+        vector noise.
+
+        Simulates: three candidates, all with distance >= 1.0 (cosine = 0);
+        candidate 2 contains every query term. After the fix, candidate 2
+        should rank first and display a non-zero bm25 score.
+        """
+        mock_col = MagicMock()
+        mock_col.metadata = {"hnsw:space": "cosine"}
+        mock_col.query.return_value = {
+            "documents": [
+                [
+                    "unrelated directory listing -rw-rw-r-- file.txt",
+                    "foo bar baz is a multi-word phrase",
+                    "another unrelated chunk about colors",
+                ]
+            ],
+            "metadatas": [
+                [
+                    {"source_file": "a.md", "wing": "w", "room": "r"},
+                    {"source_file": "b.md", "wing": "w", "room": "r"},
+                    {"source_file": "c.md", "wing": "w", "room": "r"},
+                ]
+            ],
+            "distances": [[1.5, 1.5, 1.5]],
+        }
+        with patch("mempalace.searcher.get_collection", return_value=mock_col):
+            search("foo bar baz", "/fake/path")
+        captured = capsys.readouterr()
+        first_block, _, _ = captured.out.partition("[2]")
+        # Lexical match must rank first
+        assert (
+            "b.md" in first_block
+        ), f"expected lexical match 'b.md' at rank 1, got:\n{captured.out}"
+        # Non-zero bm25 reported
+        assert "bm25=" in first_block
+        assert "bm25=0.0" not in first_block
+        # Cosine still reported for transparency
+        assert "cosine=" in first_block
+
+    def test_search_warns_when_palace_uses_wrong_distance_metric(self, capsys):
+        """Legacy palaces created without `hnsw:space=cosine` silently
+        use L2, which breaks similarity interpretation. CLI must warn
+        the user and point them at `mempalace repair` rather than
+        pretending the `Match` scores are meaningful."""
+        mock_col = MagicMock()
+        mock_col.metadata = {}  # legacy: no hnsw:space set
+        mock_col.query.return_value = {
+            "documents": [["some drawer content"]],
+            "metadatas": [[{"source_file": "a.md", "wing": "w", "room": "r"}]],
+            "distances": [[1.2]],
+        }
+        with patch("mempalace.searcher.get_collection", return_value=mock_col):
+            search("anything", "/fake/path")
+        captured = capsys.readouterr()
+        assert "mempalace repair" in captured.err
+        assert "cosine" in captured.err.lower()
+
+    def test_search_does_not_warn_when_palace_is_correctly_configured(self, capsys):
+        mock_col = MagicMock()
+        mock_col.metadata = {"hnsw:space": "cosine"}
+        mock_col.query.return_value = {
+            "documents": [["some drawer content"]],
+            "metadatas": [[{"source_file": "a.md", "wing": "w", "room": "r"}]],
+            "distances": [[0.3]],
+        }
+        with patch("mempalace.searcher.get_collection", return_value=mock_col):
+            search("anything", "/fake/path")
+        captured = capsys.readouterr()
+        assert "mempalace repair" not in captured.err
 
     def test_search_handles_none_metadata_without_crash(self, palace_path, capsys):
         """ChromaDB can return `None` entries in the metadatas list when a

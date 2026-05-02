@@ -8,6 +8,7 @@ Supported:
     - ChatGPT conversations.json
     - Claude Code JSONL (with tool_use/tool_result block capture)
     - OpenAI Codex CLI JSONL
+    - Gemini CLI JSONL (~/.gemini/tmp/<project_hash>/chats/session-*.jsonl)
     - Slack JSON export
     - Plain text (pass through for paragraph chunking)
 
@@ -157,6 +158,10 @@ def _try_normalize_json(content: str) -> Optional[str]:
     if normalized:
         return normalized
 
+    normalized = _try_gemini_jsonl(content)
+    if normalized:
+        return normalized
+
     try:
         data = json.loads(content)
     except json.JSONDecodeError:
@@ -276,6 +281,74 @@ def _try_codex_jsonl(content: str) -> Optional[str]:
             messages.append(("assistant", text))
 
     if len(messages) >= 2 and has_session_meta:
+        return _messages_to_transcript(messages)
+    return None
+
+
+def _try_gemini_jsonl(content: str) -> Optional[str]:
+    """Gemini CLI sessions (~/.gemini/tmp/<project_hash>/chats/session-*.jsonl).
+
+    Schema (per google-gemini/gemini-cli#15292): a session_metadata record
+    on the first line, then a stream of ``{"type": "user", "content":
+    [{"text": "..."}]}`` and ``{"type": "gemini", "content": [...]}``
+    records, with optional ``message_update`` records carrying token
+    counts only.
+
+    Detection requires a ``session_metadata`` record so this parser does
+    not false-positive against Claude Code or Codex JSONL passed through
+    the dispatch chain. Any ``user``/``gemini`` lines that appear before
+    ``session_metadata`` are discarded — they are treated as preamble
+    noise, not conversational turns. ``message_update`` entries are
+    skipped — they have no message text. Multiple text blocks within a
+    single message's content array are concatenated in order, separated
+    by newlines.
+    """
+    lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
+    messages = []
+    has_session_metadata = False
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+
+        entry_type = entry.get("type", "")
+        if entry_type == "session_metadata":
+            has_session_metadata = True
+            continue
+
+        # Discard everything (including user/gemini turns) until the
+        # session_metadata sentinel has been seen.
+        if not has_session_metadata:
+            continue
+
+        if entry_type not in ("user", "gemini"):
+            # Skips message_update, system events, anything else.
+            continue
+
+        content_blocks = entry.get("content", [])
+        if not isinstance(content_blocks, list):
+            continue
+
+        parts = []
+        for block in content_blocks:
+            if not isinstance(block, dict):
+                continue
+            text = block.get("text", "")
+            if isinstance(text, str) and text.strip():
+                parts.append(text)
+        if not parts:
+            continue
+        joined = "\n".join(parts)
+
+        if entry_type == "user":
+            messages.append(("user", joined))
+        else:  # "gemini"
+            messages.append(("assistant", joined))
+
+    if len(messages) >= 2 and has_session_metadata:
         return _messages_to_transcript(messages)
     return None
 

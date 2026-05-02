@@ -874,3 +874,104 @@ class TestCacheInvalidation:
         assert result["success"] is True
         assert "Reconnected" in result["message"]
         assert isinstance(result["drawers"], int)
+
+    def test_get_collection_create_true_avoids_get_or_create_on_reopen(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """Regression for the MCP-server half of #1262.
+
+        ChromaDB 1.5.x's Rust bindings SIGSEGV when
+        ``client.get_or_create_collection`` is called with metadata that
+        differs from the collection's stored metadata. The Stop hook
+        path (``tool_diary_write`` -> ``_get_collection(create=True)``)
+        was reaching that codepath on every session-end; #1262 fixed
+        the equivalent crash class in ``ChromaBackend`` but left this
+        site untouched. ``_get_collection(create=True)`` must call
+        ``client.get_collection`` first and only fall back to
+        ``client.create_collection`` when the collection does not yet
+        exist on disk.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        col1 = mcp_server._get_collection(create=True)
+        assert col1 is not None
+
+        client = mcp_server._client_cache
+        assert client is not None
+
+        # Patch at the class level — chromadb's mtime-change detection
+        # may rebuild the client between calls, so an instance-level
+        # spy would not survive.
+        client_cls = type(client)
+        calls: list[tuple] = []
+
+        def _spy(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            raise AssertionError(
+                "get_or_create_collection must not be called on reopen "
+                "(SIGSEGV path on metadata mismatch)"
+            )
+
+        monkeypatch.setattr(client_cls, "get_or_create_collection", _spy)
+        mcp_server._collection_cache = None
+
+        col2 = mcp_server._get_collection(create=True)
+        assert col2 is not None
+        assert calls == [], f"get_or_create_collection was called: {calls}"
+
+    def test_get_collection_passes_embedding_function(self, monkeypatch, config, palace_path, kg):
+        """Regression for #1299.
+
+        ``mcp_server._get_collection`` must pass ``embedding_function=`` into
+        both ``client.get_collection`` and ``client.create_collection``,
+        mirroring ``ChromaBackend.get_collection``. Without it, ChromaDB 1.x
+        falls back to its built-in ``DefaultEmbeddingFunction`` (whose lazy
+        ONNX provider selection has SIGSEGV'd on python 3.14 + Apple Silicon),
+        and writers/readers can disagree with the miner about which EF is
+        bound to the collection. The miner / Stop hook ingest path routes
+        through ``ChromaBackend.get_collection`` which does this correctly;
+        the MCP server must match.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        client = mcp_server._get_client()
+        client_cls = type(client)
+        captured: dict[str, list[dict]] = {"get": [], "create": []}
+        real_get = client_cls.get_collection
+        real_create = client_cls.create_collection
+
+        def _spy_get(self, name, **kwargs):
+            captured["get"].append(dict(kwargs))
+            return real_get(self, name, **kwargs)
+
+        def _spy_create(self, name, **kwargs):
+            captured["create"].append(dict(kwargs))
+            return real_create(self, name, **kwargs)
+
+        monkeypatch.setattr(client_cls, "get_collection", _spy_get)
+        monkeypatch.setattr(client_cls, "create_collection", _spy_create)
+        mcp_server._collection_cache = None
+
+        col = mcp_server._get_collection(create=True)
+        assert col is not None
+
+        all_calls = captured["get"] + captured["create"]
+        assert all_calls, "expected get_collection or create_collection to be called"
+        for kwargs in all_calls:
+            assert (
+                "embedding_function" in kwargs
+            ), f"missing embedding_function= in chromadb call: {kwargs}"
+            assert kwargs["embedding_function"] is not None
+
+        # Same expectation on the create=False (cache-miss) reopen path.
+        mcp_server._collection_cache = None
+        captured["get"].clear()
+        captured["create"].clear()
+        col2 = mcp_server._get_collection()
+        assert col2 is not None
+        assert captured["get"], "expected get_collection on cache-miss reopen"
+        for kwargs in captured["get"]:
+            assert "embedding_function" in kwargs
+            assert kwargs["embedding_function"] is not None

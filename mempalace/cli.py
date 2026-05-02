@@ -34,10 +34,167 @@ import argparse
 from pathlib import Path
 
 from .config import MempalaceConfig
+from .corpus_origin import detect_origin_heuristic, detect_origin_llm
+from .llm_client import LLMError, get_provider
 from .version import __version__
 
 
 _MEMPALACE_PROJECT_FILES = ("mempalace.yaml", "entities.json")
+
+# Pass 0 corpus-origin sampling caps. Tier 1 reads FULL file content (no
+# front-bias sampling) but bounds total memory on enormous corpora. Tier 2
+# trims to a smaller view because LLM context windows are finite.
+_PASS_ZERO_MAX_FILES = 30
+_PASS_ZERO_PER_FILE_CAP = 100_000  # 100KB per file is generous for prose
+_PASS_ZERO_TOTAL_CAP = 5_000_000  # 5MB total ceiling — bounds memory
+_PASS_ZERO_LLM_PER_SAMPLE = 2_000  # for Tier 2 LLM call only
+_PASS_ZERO_LLM_MAX_SAMPLES = 20  # caps the LLM-tier sample count
+
+
+def _gather_origin_samples(project_dir) -> list:
+    """Collect Tier-1 samples for corpus-origin detection.
+
+    Reads FULL file content (capped at ``_PASS_ZERO_PER_FILE_CAP`` per file
+    and ``_PASS_ZERO_TOTAL_CAP`` overall). No front-bias sampling — AI
+    signal that lives past the first N chars of a file must still trip
+    detection, so we read the whole file up to the cap.
+
+    Skips mempalace's own per-project artifacts (``entities.json``,
+    ``mempalace.yaml``) so a re-run of ``mempalace init`` produces the
+    same classification result it did on the first run. Without this
+    filter, the first run writes entities.json into the corpus, the
+    second run picks it up as a sample, and the Tier-1 density math
+    drifts (different total_chars). That makes init non-idempotent.
+
+    Returns a list of strings (one per readable file). Empty list when
+    the project has no readable text.
+    """
+    from .entity_detector import scan_for_detection
+
+    files = scan_for_detection(project_dir, max_files=_PASS_ZERO_MAX_FILES)
+    samples: list = []
+    total_chars = 0
+    for filepath in files:
+        if filepath.name in _MEMPALACE_PROJECT_FILES:
+            continue
+        if total_chars >= _PASS_ZERO_TOTAL_CAP:
+            break
+        try:
+            with open(filepath, encoding="utf-8", errors="replace") as f:
+                content = f.read(_PASS_ZERO_PER_FILE_CAP)
+        except OSError:
+            continue
+        if not content:
+            continue
+        samples.append(content)
+        total_chars += len(content)
+    return samples
+
+
+def _trim_samples_for_llm(samples: list) -> list:
+    """Reduce Tier-1 full-content samples to LLM-friendly size.
+
+    Tier 2 hits an LLM with a finite context window — we trim each sample
+    to ``_PASS_ZERO_LLM_PER_SAMPLE`` chars and cap the overall sample
+    count at ``_PASS_ZERO_LLM_MAX_SAMPLES``.
+    """
+    return [s[:_PASS_ZERO_LLM_PER_SAMPLE] for s in samples[:_PASS_ZERO_LLM_MAX_SAMPLES]]
+
+
+def _run_pass_zero(project_dir, palace_dir, llm_provider) -> dict:
+    """Pass 0: detect whether the corpus is AI-dialogue and persist the
+    result to ``<palace>/.mempalace/origin.json``.
+
+    Returns the wrapped result dict (same shape as origin.json) on success,
+    or ``None`` when there are no readable samples to detect from. The
+    return value is what cmd_init forwards to ``discover_entities`` via
+    the ``corpus_origin`` kwarg.
+
+    File-write failures (e.g. read-only palace) are caught and reported on
+    stderr; init never blocks on them.
+    """
+    import json
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    samples = _gather_origin_samples(project_dir)
+    if not samples:
+        print("  Skipping corpus-origin detection — no readable samples.")
+        return None
+
+    # Tier 1 — always runs. Cheap regex grep, no API.
+    result = detect_origin_heuristic(samples)
+
+    # Tier 2 — runs only when an LLM provider is available. The provider
+    # contract is best-effort: corpus_origin internally falls back to a
+    # conservative default on transport/parse failure, so we don't need a
+    # try/except here, but we still keep one for any unforeseen exception.
+    #
+    # MERGE-FIELDS, NOT REPLACE: Tier 2's persona/user/platform extraction
+    # is the whole reason to run it, but a weak local model (e.g. Ollama
+    # gemma4:e4b) can return a wrong likely_ai_dialogue/confidence call
+    # that overrides a confident heuristic answer. Per @igorls's review of
+    # PR #1211: keep the heuristic's likely_ai_dialogue + confidence
+    # (don't let a weak LLM flip a confident regex answer), and merge in
+    # LLM's persona-related fields + combined evidence.
+    if llm_provider is not None:
+        try:
+            llm_result = detect_origin_llm(_trim_samples_for_llm(samples), llm_provider)
+            # Heuristic owns: likely_ai_dialogue, confidence (do NOT touch).
+            # LLM contributes: primary_platform, user_name, agent_persona_names
+            # (heuristic doesn't extract any of these).
+            if llm_result.primary_platform:
+                result.primary_platform = llm_result.primary_platform
+            if llm_result.user_name:
+                result.user_name = llm_result.user_name
+            if llm_result.agent_persona_names:
+                result.agent_persona_names = list(llm_result.agent_persona_names)
+            # Combine evidence — keep both signal trails for the audit record,
+            # prefixed so the on-disk origin.json says which tier produced
+            # each entry. Idempotent: re-prefixing an already-tagged entry
+            # is a no-op.
+            tier1_prefix = "Tier-1 heuristic: "
+            tier2_prefix = "Tier-2 LLM: "
+            heuristic_evidence = [
+                s if s.startswith(tier1_prefix) else f"{tier1_prefix}{s}"
+                for s in (str(e) for e in result.evidence)
+            ]
+            llm_evidence = [
+                s if s.startswith(tier2_prefix) else f"{tier2_prefix}{s}"
+                for s in (str(e) for e in llm_result.evidence)
+            ]
+            result.evidence = heuristic_evidence + llm_evidence
+        except Exception as exc:  # noqa: BLE001 — never block init on LLM failure
+            print(f"  LLM corpus-origin tier failed ({exc}); using heuristic only.")
+
+    wrapped = {
+        "schema_version": 1,
+        "detected_at": datetime.now(timezone.utc).isoformat(),
+        "result": result.to_dict(),
+    }
+
+    origin_path = Path(palace_dir).expanduser() / ".mempalace" / "origin.json"
+    try:
+        origin_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(origin_path, "w", encoding="utf-8") as f:
+            json.dump(wrapped, f, indent=2, ensure_ascii=False)
+    except OSError as exc:
+        print(f"  Could not write {origin_path}: {exc}", file=sys.stderr)
+        # Return the wrapped dict anyway so the in-memory pipeline still
+        # benefits from the detection result this run.
+        return wrapped
+
+    # Banner — one line, two-space indent matching existing init style.
+    res = result
+    if res.likely_ai_dialogue:
+        platform = res.primary_platform or "AI dialogue (platform unidentified)"
+        user = res.user_name or "—"
+        agents = ", ".join(res.agent_persona_names) if res.agent_persona_names else "—"
+        print(f"  Detected: {platform} (user: {user}, agents: {agents})")
+    else:
+        print(f"  Corpus origin: not AI-dialogue (confidence: {res.confidence:.2f})")
+
+    return wrapped
 
 
 def _ensure_mempalace_files_gitignored(project_dir) -> bool:
@@ -71,7 +228,8 @@ def _ensure_mempalace_files_gitignored(project_dir) -> bool:
 def cmd_init(args):
     import json
     from pathlib import Path
-    from .entity_detector import scan_for_detection, detect_entities, confirm_entities
+    from .entity_detector import confirm_entities
+    from .project_scanner import discover_entities
     from .room_detector_local import detect_rooms_local
 
     cfg = MempalaceConfig()
@@ -85,25 +243,131 @@ def cmd_init(args):
         languages = cfg.entity_languages
     languages_tuple = tuple(languages)
 
-    # Pass 1: auto-detect people and projects from file content
+    # --llm is ON by default. --no-llm is the explicit opt-out. Provider
+    # precedence is unchanged (Ollama localhost first, then openai-compat,
+    # then anthropic). Never block init on a missing LLM: when no provider
+    # responds, print a one-line message pointing at --no-llm and fall
+    # through to heuristics-only.
+    llm_provider = None
+    if not getattr(args, "no_llm", False):
+        provider_name = getattr(args, "llm_provider", "ollama") or "ollama"
+        provider_model = getattr(args, "llm_model", "gemma4:e4b") or "gemma4:e4b"
+        try:
+            candidate = get_provider(
+                name=provider_name,
+                model=provider_model,
+                endpoint=getattr(args, "llm_endpoint", None),
+                api_key=getattr(args, "llm_api_key", None),
+            )
+            ok, msg = candidate.check_available()
+            if ok:
+                llm_provider = candidate
+                print(f"  LLM enabled: {provider_name}/{provider_model}")
+                # Privacy warning (issue #24): if the configured endpoint
+                # sends data off the user's machine/network, surface that
+                # before init proceeds. URL-based — Ollama on localhost,
+                # LM Studio on LAN, etc. won't trigger; Anthropic /
+                # cloud OpenAI-compat / any non-local endpoint will.
+                if candidate.is_external_service:
+                    print(
+                        f"  ⚠ {provider_name} is an EXTERNAL API. Your folder "
+                        f"content will be sent to the provider during init. "
+                        f"MemPalace does not control how the provider logs, "
+                        f"retains, or uses your data. Pass --no-llm to keep "
+                        f"init fully local."
+                    )
+                    # Consent gate (issue #26): block init when the api_key
+                    # was acquired via env-fallback (stray credential in
+                    # shell env). Explicit --llm-api-key (api_key_source ==
+                    # "flag") means the user already opted in.
+                    # --accept-external-llm bypasses for CI / non-interactive.
+                    api_key_source = getattr(candidate, "api_key_source", None)
+                    accept_flag = getattr(args, "accept_external_llm", False)
+                    if api_key_source == "env" and not accept_flag:
+                        try:
+                            answer = (
+                                input(
+                                    "  Your API key was loaded from the environment "
+                                    "(not passed via --llm-api-key). Continue with "
+                                    "external LLM? [y/N] "
+                                )
+                                .strip()
+                                .lower()
+                            )
+                        except EOFError:
+                            answer = ""
+                        if answer != "y":
+                            print(
+                                "  Declined — falling back to heuristics-only. "
+                                "Pass --llm-api-key explicitly or "
+                                "--accept-external-llm to skip this prompt."
+                            )
+                            llm_provider = None
+            else:
+                print(
+                    f"  No LLM provider reachable ({msg}). "
+                    f"Running heuristics-only — pass --no-llm to silence this."
+                )
+        except LLMError as e:
+            print(
+                f"  LLM init failed ({e}). "
+                f"Running heuristics-only — pass --no-llm to silence this."
+            )
+
+    # Pass 0: detect whether the corpus is AI-dialogue. Writes
+    # <palace>/.mempalace/origin.json and supplies corpus context to the
+    # entity classifier so it can correctly handle agent persona names
+    # (e.g. "Echo", "Sparrow") without misclassifying them as people.
+    corpus_origin = _run_pass_zero(
+        project_dir=args.dir,
+        palace_dir=cfg.palace_path,
+        llm_provider=llm_provider,
+    )
+
+    # Pass 1: discover entities — manifests + git authors first, prose detection
+    # as supplement for names mentioned only in docs/notes. Optional phase-2
+    # LLM refinement runs inside discover_entities when llm_provider is given.
     print(f"\n  Scanning for entities in: {args.dir}")
     if languages_tuple != ("en",):
         print(f"  Languages: {', '.join(languages_tuple)}")
-    files = scan_for_detection(args.dir)
-    if files:
-        print(f"  Reading {len(files)} files...")
-        detected = detect_entities(files, languages=languages_tuple)
-        total = len(detected["people"]) + len(detected["projects"]) + len(detected["uncertain"])
-        if total > 0:
-            confirmed = confirm_entities(detected, yes=getattr(args, "yes", False))
-            # Save confirmed entities to <project>/entities.json for the miner
-            if confirmed["people"] or confirmed["projects"]:
-                entities_path = Path(args.dir).expanduser().resolve() / "entities.json"
-                with open(entities_path, "w") as f:
-                    json.dump(confirmed, f, indent=2)
-                print(f"  Entities saved: {entities_path}")
-        else:
-            print("  No entities detected — proceeding with directory-based rooms.")
+    detected = discover_entities(
+        args.dir,
+        languages=languages_tuple,
+        llm_provider=llm_provider,
+        corpus_origin=corpus_origin,
+    )
+    total = (
+        len(detected["people"])
+        + len(detected["projects"])
+        + len(detected.get("topics", []))
+        + len(detected["uncertain"])
+    )
+    if total > 0:
+        confirmed = confirm_entities(detected, yes=getattr(args, "yes", False))
+        # Save confirmed entities to <project>/entities.json (per-project
+        # audit trail — user can inspect or hand-edit) AND merge into the
+        # global registry the miner reads at mine time. Topics are kept
+        # separately so the miner can later compute cross-wing tunnels
+        # from shared topics (see palace_graph.compute_topic_tunnels).
+        if confirmed["people"] or confirmed["projects"] or confirmed.get("topics"):
+            project_path = Path(args.dir).expanduser().resolve()
+            entities_path = project_path / "entities.json"
+            with open(entities_path, "w", encoding="utf-8") as f:
+                json.dump(confirmed, f, indent=2, ensure_ascii=False)
+            print(f"  Entities saved: {entities_path}")
+
+            from .config import normalize_wing_name
+            from .miner import add_to_known_entities
+
+            # Match the slug ``room_detector_local`` writes into
+            # ``mempalace.yaml`` so the miner's tunnel lookup hits the
+            # same key in ``topics_by_wing`` at mine time (issue #1194 —
+            # without this, hyphenated dirnames silently lose tunnels).
+            wing = normalize_wing_name(project_path.name)
+            registry_path = add_to_known_entities(confirmed, wing=wing)
+            print(f"  Registry updated: {registry_path}")
+    else:
+        print("  No entities detected — proceeding with directory-based rooms.")
 
     # Pass 2: detect rooms from folder structure
     detect_rooms_local(project_dir=args.dir, yes=getattr(args, "yes", False))
@@ -112,12 +376,123 @@ def cmd_init(args):
     # Pass 3: protect git repos from accidentally committing per-project files
     _ensure_mempalace_files_gitignored(args.dir)
 
+    # Pass 4: offer to run mine immediately. The directory just had its
+    # rooms + entities set up, so 99% of users will mine next anyway —
+    # asking here removes the "remember to type the next command" friction.
+    # `--auto-mine` skips the prompt and mines automatically; `--yes` is
+    # SCOPED to entity auto-accept and does NOT imply mining.
+    _maybe_run_mine_after_init(args, cfg)
+
+
+def _format_size_mb(num_bytes: int) -> str:
+    """Render a byte count as a human-readable size for the mine estimate.
+
+    < 1 MB rounds up to ``<1 MB`` so users never see a misleading ``0 MB``
+    on small projects. Otherwise reports an integer megabyte count.
+    """
+    if num_bytes <= 0:
+        return "<1 MB"
+    mb = num_bytes / (1024 * 1024)
+    if mb < 1:
+        return "<1 MB"
+    return f"{mb:.0f} MB"
+
+
+def _maybe_run_mine_after_init(args, cfg) -> None:
+    """Prompt the user to mine the directory just initialised, or auto-mine
+    when ``--auto-mine`` was passed. Extracted so the prompt path is
+    unit-testable.
+
+    Behaviour matrix:
+
+    - default (no flags) — prompt, default Yes, mine in-process if accepted
+    - ``--yes`` — entity auto-accept only; STILL prompts for the mine step
+    - ``--auto-mine`` — skip the mine prompt and mine directly
+    - ``--yes --auto-mine`` — fully non-interactive
+
+    Mine errors are surfaced (not swallowed): a failing mine exits with a
+    non-zero status via :func:`sys.exit` so downstream scripts can see it.
+    The pre-scan that produces the file-count estimate is reused as the
+    mine input so we never walk the corpus twice.
+    """
+    from .miner import mine, scan_project
+
+    project_dir = args.dir
+    auto_mine = bool(getattr(args, "auto_mine", False))
+
+    # Single corpus walk: this scan feeds BOTH the "what would be mined"
+    # estimate the user sees in the prompt AND the file list mine() will
+    # process. We pass the result into mine() via the `files` kwarg so it
+    # doesn't re-walk the tree.
+    try:
+        scanned_files = scan_project(project_dir)
+        file_count = len(scanned_files)
+        total_bytes = 0
+        for fp in scanned_files:
+            try:
+                total_bytes += fp.stat().st_size
+            except OSError:
+                # Skip files that vanished between scan and stat — mine()
+                # will skip them too.
+                continue
+        size_str = _format_size_mb(total_bytes)
+    except Exception:
+        scanned_files = None
+        file_count = None
+        size_str = None
+
+    # Show the scope estimate BEFORE the prompt so the user knows what
+    # they are agreeing to. On a real corpus mine takes minutes; hitting
+    # Enter on a default-Y prompt with no size cue is a footgun.
+    if isinstance(file_count, int):
+        if size_str:
+            print(f"  ~{file_count} files (~{size_str}) would be mined into this palace.\n")
+        else:
+            print(f"  ~{file_count} files would be mined into this palace.\n")
+
+    if not auto_mine:
+        try:
+            answer = input("  Mine this directory now? [Y/n] ").strip().lower()
+        except EOFError:
+            # Non-interactive stdin (e.g. piped) — treat like decline so
+            # we don't block. User can re-run with --auto-mine to opt in.
+            answer = "n"
+        if answer not in ("", "y", "yes"):
+            print(f"\n  Skipped. Run `mempalace mine {shlex.quote(project_dir)}` when ready.")
+            return
+
+    palace_path = cfg.palace_path
+    try:
+        mine(
+            project_dir=project_dir,
+            palace_path=palace_path,
+            files=scanned_files,
+        )
+    except KeyboardInterrupt:
+        # mine() handles its own SIGINT summary + sys.exit(130); re-raise
+        # any KeyboardInterrupt that escapes (shouldn't happen) so the
+        # shell still sees a clean interrupt rather than a swallowed one.
+        raise
+    except Exception as e:
+        print(f"\n  ERROR: mine failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
 
 def cmd_mine(args):
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     include_ignored = []
     for raw in args.include_ignored or []:
         include_ignored.extend(part.strip() for part in raw.split(",") if part.strip())
+
+    # --redetect-origin re-runs corpus_origin on the current corpus state
+    # and overwrites <palace>/.mempalace/origin.json before mining proceeds.
+    # Heuristic-only by design — full LLM detection lives on `mempalace init`.
+    if getattr(args, "redetect_origin", False):
+        _run_pass_zero(
+            project_dir=args.dir,
+            palace_dir=palace_path,
+            llm_provider=None,
+        )
 
     if args.mode == "convos":
         from .convo_miner import mine_convos
@@ -260,15 +635,38 @@ def cmd_status(args):
     status(palace_path=palace_path)
 
 
+def cmd_repair_status(args):
+    """Read-only HNSW capacity health check (#1222)."""
+    from .repair import status as repair_status
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    repair_status(palace_path=palace_path)
+
+
 def cmd_repair(args):
     """Rebuild palace vector index from SQLite metadata."""
     import shutil
     from .backends.chroma import ChromaBackend
     from .migrate import confirm_destructive_action, contains_palace_database
+    from .repair import TruncationDetected, check_extraction_safety
 
     palace_path = os.path.abspath(
         os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     )
+
+    if getattr(args, "mode", "legacy") == "max-seq-id":
+        from .repair import repair_max_seq_id
+
+        repair_max_seq_id(
+            palace_path,
+            segment=getattr(args, "segment", None),
+            from_sidecar=getattr(args, "from_sidecar", None),
+            backup=getattr(args, "backup", True),
+            dry_run=getattr(args, "dry_run", False),
+            assume_yes=getattr(args, "yes", False),
+        )
+        return
+
     db_path = os.path.join(palace_path, "chroma.sqlite3")
 
     if not os.path.isdir(palace_path):
@@ -313,11 +711,30 @@ def cmd_repair(args):
     offset = 0
     while offset < total:
         batch = col.get(limit=batch_size, offset=offset, include=["documents", "metadatas"])
+        if not batch["ids"]:
+            break
         all_ids.extend(batch["ids"])
         all_docs.extend(batch["documents"])
         all_metas.extend(batch["metadatas"])
-        offset += batch_size
+        offset += len(batch["ids"])
     print(f"  Extracted {len(all_ids)} drawers")
+
+    # ── #1208 guard ──────────────────────────────────────────────────
+    # Cross-check against the SQLite ground truth before doing anything
+    # destructive. Catches the user-reported case where chromadb's
+    # collection-layer get() silently caps at 10,000 rows even on much
+    # larger palaces (e.g. after manual HNSW quarantine). Override with
+    # --confirm-truncation-ok only after independently verifying the
+    # extraction count is real.
+    try:
+        check_extraction_safety(
+            palace_path,
+            len(all_ids),
+            confirm_truncation_ok=getattr(args, "confirm_truncation_ok", False),
+        )
+    except TruncationDetected as e:
+        print(e.message)
+        return
 
     # Backup and rebuild
     palace_path = os.path.normpath(palace_path)
@@ -542,6 +959,14 @@ def main():
         help="Auto-accept all detected entities (non-interactive)",
     )
     p_init.add_argument(
+        "--auto-mine",
+        action="store_true",
+        help=(
+            "Skip the post-init mine prompt and run mine automatically. "
+            "Combine with --yes for a fully non-interactive setup."
+        ),
+    )
+    p_init.add_argument(
         "--lang",
         default=None,
         help=(
@@ -549,6 +974,61 @@ def main():
             "(e.g. 'en' or 'en,pt-br'). Defaults to value from config "
             "(MEMPALACE_ENTITY_LANGUAGES env var or config.json), or 'en'. "
             "When given, the value is also persisted to config.json."
+        ),
+    )
+    p_init.add_argument(
+        "--llm",
+        action="store_true",
+        help=(
+            "DEPRECATED — LLM-assisted entity refinement is now ON by default. "
+            "This flag is preserved for backward compatibility; pass --no-llm "
+            "to opt out instead."
+        ),
+    )
+    p_init.add_argument(
+        "--no-llm",
+        action="store_true",
+        help=(
+            "Disable LLM-assisted entity refinement. Run init in heuristics-only "
+            "mode (no provider acquisition, no LLM calls). Use when running "
+            "without a local LLM and you don't want the graceful-fallback message."
+        ),
+    )
+    p_init.add_argument(
+        "--llm-provider",
+        default="ollama",
+        choices=["ollama", "openai-compat", "anthropic"],
+        help="LLM provider (default: ollama). Pass --no-llm to disable LLM-assisted refinement entirely.",
+    )
+    p_init.add_argument(
+        "--llm-model",
+        default="gemma4:e4b",
+        help="Model name for the chosen provider (default: gemma4:e4b for Ollama).",
+    )
+    p_init.add_argument(
+        "--llm-endpoint",
+        default=None,
+        help=(
+            "Provider endpoint URL. Default for Ollama: http://localhost:11434. "
+            "Required for openai-compat."
+        ),
+    )
+    p_init.add_argument(
+        "--llm-api-key",
+        default=None,
+        help=(
+            "API key for the provider. For anthropic, defaults to $ANTHROPIC_API_KEY; "
+            "for openai-compat, defaults to $OPENAI_API_KEY."
+        ),
+    )
+    p_init.add_argument(
+        "--accept-external-llm",
+        action="store_true",
+        help=(
+            "Bypass the interactive consent prompt that fires when an external "
+            "LLM is configured via an environment-variable API key (issue #26). "
+            "Use this in CI / non-interactive runs where you've already decided "
+            "the external send is acceptable."
         ),
     )
 
@@ -579,6 +1059,17 @@ def main():
         help="Your name — recorded on every drawer (default: mempalace)",
     )
     p_mine.add_argument("--limit", type=int, default=0, help="Max files to process (0 = all)")
+    p_mine.add_argument(
+        "--redetect-origin",
+        action="store_true",
+        help=(
+            "Re-run corpus_origin detection on this directory and overwrite "
+            "<palace>/.mempalace/origin.json. Useful when the corpus has grown "
+            "since `mempalace init` and the stored origin may be stale. "
+            "Heuristic-only (no LLM call) — re-run `mempalace init --llm` for "
+            "Tier 2 refinement."
+        ),
+    )
     p_mine.add_argument(
         "--dry-run", action="store_true", help="Show what would be filed without filing"
     )
@@ -676,10 +1167,65 @@ def main():
         instructions_sub.add_parser(instr_name, help=f"Output {instr_name} instructions")
 
     # repair
-    sub.add_parser(
+    p_repair = sub.add_parser(
         "repair",
-        help="Rebuild palace vector index from stored data (fixes segfaults after corruption)",
-    ).add_argument("--yes", action="store_true", help="Skip confirmation for destructive changes")
+        help=(
+            "Rebuild palace vector index (legacy mode) or un-poison max_seq_id rows "
+            "(--mode max-seq-id)"
+        ),
+    )
+    p_repair.add_argument(
+        "--yes", action="store_true", help="Skip confirmation for destructive changes"
+    )
+    p_repair.add_argument(
+        "--confirm-truncation-ok",
+        action="store_true",
+        help=(
+            "Override the #1208 safety guard. Required when chromadb's collection-layer "
+            "extraction returns exactly 10,000 drawers and the SQLite ground-truth check "
+            "either matches or can't be read. Use only after independently confirming "
+            "the palace really contains that count."
+        ),
+    )
+    p_repair.add_argument(
+        "--mode",
+        choices=["legacy", "max-seq-id"],
+        default="legacy",
+        help=(
+            "legacy: full-palace rebuild (default). "
+            "max-seq-id: un-poison max_seq_id rows corrupted by the legacy 0.6.x shim."
+        ),
+    )
+    p_repair.add_argument(
+        "--segment",
+        default=None,
+        help="Segment UUID filter for --mode max-seq-id (repairs only that segment).",
+    )
+    p_repair.add_argument(
+        "--from-sidecar",
+        default=None,
+        help=(
+            "Path to a pre-corruption chroma.sqlite3 sidecar (for --mode max-seq-id); "
+            "clean values are copied from its max_seq_id table verbatim."
+        ),
+    )
+    p_repair.add_argument(
+        "--backup",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Back up SQLite before mutation (default: on)",
+    )
+    p_repair.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print detected poisoned rows and exit without mutation (--mode max-seq-id only)",
+    )
+
+    # repair-status — read-only HNSW capacity health check (#1222)
+    sub.add_parser(
+        "repair-status",
+        help="Compare sqlite vs HNSW element counts (read-only; never opens a chromadb client)",
+    )
 
     # mcp
     sub.add_parser(
@@ -737,6 +1283,7 @@ def main():
         "compress": cmd_compress,
         "wake-up": cmd_wakeup,
         "repair": cmd_repair,
+        "repair-status": cmd_repair_status,
         "migrate": cmd_migrate,
         "status": cmd_status,
     }

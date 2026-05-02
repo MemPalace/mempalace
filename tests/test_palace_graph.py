@@ -54,6 +54,27 @@ class TestBuildGraph:
         assert nodes == {}
         assert edges == []
 
+    def test_none_metadata_does_not_crash(self):
+        """ChromaDB can return None for drawers without metadata (legacy
+        data, partial writes — upstream #1020 territory). build_graph
+        must skip None entries silently rather than crash the whole
+        graph build with AttributeError. Caught 2026-04-25 by
+        palace-daemon's verify-routes.sh smoke test against the
+        canonical 151K palace; /stats was 500-ing on a single None
+        drawer and taking out every consumer of build_graph for the
+        whole call path."""
+        col = _make_fake_collection(
+            [
+                {"room": "auth", "wing": "wing_code", "hall": "security", "date": "2026-01-01"},
+                None,  # legacy / partial-write drawer with no metadata
+                {"room": "auth", "wing": "wing_code", "hall": "security", "date": "2026-01-02"},
+            ]
+        )
+        nodes, edges = build_graph(col=col)
+        # The two real drawers were processed; the None one was skipped.
+        assert "auth" in nodes
+        assert nodes["auth"]["count"] == 2
+
     def test_single_wing_no_edges(self):
         col = _make_fake_collection(
             [

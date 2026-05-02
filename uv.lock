@@ -1174,15 +1174,31 @@ source = { editable = "." }
 dependencies = [
     { name = "chromadb" },
     { name = "pyyaml" },
+    { name = "tomli", marker = "python_full_version < '3.11'" },
 ]
 
 [package.optional-dependencies]
+coreml = [
+    { name = "onnxruntime", version = "1.20.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
+    { name = "onnxruntime", version = "1.24.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.10.*'" },
+    { name = "onnxruntime", version = "1.24.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+]
 dev = [
     { name = "psutil" },
     { name = "pytest", version = "8.4.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
     { name = "pytest", version = "9.0.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
     { name = "pytest-cov" },
     { name = "ruff" },
+]
+dml = [
+    { name = "onnxruntime-directml", version = "1.20.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
+    { name = "onnxruntime-directml", version = "1.24.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.10.*'" },
+    { name = "onnxruntime-directml", version = "1.24.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+]
+gpu = [
+    { name = "onnxruntime-gpu", version = "1.20.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
+    { name = "onnxruntime-gpu", version = "1.24.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.10.*'" },
+    { name = "onnxruntime-gpu", version = "1.25.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
 spellcheck = [
     { name = "autocorrect" },
@@ -1201,13 +1217,17 @@ dev = [
 requires-dist = [
     { name = "autocorrect", marker = "extra == 'spellcheck'", specifier = ">=2.0" },
     { name = "chromadb", specifier = ">=1.5.4,<2" },
+    { name = "onnxruntime", marker = "extra == 'coreml'", specifier = ">=1.16" },
+    { name = "onnxruntime-directml", marker = "extra == 'dml'", specifier = ">=1.16" },
+    { name = "onnxruntime-gpu", marker = "extra == 'gpu'", specifier = ">=1.16" },
     { name = "psutil", marker = "extra == 'dev'", specifier = ">=5.9" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=4.0" },
     { name = "pyyaml", specifier = ">=6.0,<7" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4.0" },
+    { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2.0.0" },
 ]
-provides-extras = ["dev", "spellcheck"]
+provides-extras = ["dev", "spellcheck", "gpu", "dml", "coreml"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -1811,6 +1831,154 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/7f/6f/60e2c0acea1e1ac09b3e794b5a19c166eebf91c0b860b3e6db8e74983fda/onnxruntime-1.24.4-cp314-cp314-win_arm64.whl", hash = "sha256:3f0b910e86b759a4732663ec61fd57ac42ee1b0066f68299de164220b660546d", size = 12594365, upload-time = "2026-03-17T22:05:35.795Z" },
     { url = "https://files.pythonhosted.org/packages/cf/68/0c05d10f8f6c40fe0912ebec0d5a33884aaa2af2053507e864dab0883208/onnxruntime-1.24.4-cp314-cp314t-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:aa12ddc54c9c4594073abcaa265cd9681e95fb89dae982a6f508a794ca42e661", size = 15176889, upload-time = "2026-03-17T22:03:48.021Z" },
     { url = "https://files.pythonhosted.org/packages/6c/1d/1666dc64e78d8587d168fec4e3b7922b92eb286a2ddeebcf6acb55c7dc82/onnxruntime-1.24.4-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:e1cc6a518255f012134bc791975a6294806be9a3b20c4a54cca25194c90cf731", size = 17247021, upload-time = "2026-03-17T22:04:52.377Z" },
+]
+
+[[package]]
+name = "onnxruntime-directml"
+version = "1.20.1"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version < '3.10'",
+]
+dependencies = [
+    { name = "coloredlogs", marker = "python_full_version < '3.10'" },
+    { name = "flatbuffers", marker = "python_full_version < '3.10'" },
+    { name = "numpy", version = "2.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
+    { name = "packaging", marker = "python_full_version < '3.10'" },
+    { name = "protobuf", marker = "python_full_version < '3.10'" },
+    { name = "sympy", marker = "python_full_version < '3.10'" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3c/4f/f433239b05304aa9af0217da20508abbbcec1dcd58ee821e3dab8939ecfe/onnxruntime_directml-1.20.1-cp310-cp310-win_amd64.whl", hash = "sha256:d4aa43694799559fb5570fdf0e96a154d4b4d0bb9b73c3e81744eb7fe0c0de8d", size = 22760521, upload-time = "2024-11-21T00:49:40.179Z" },
+    { url = "https://files.pythonhosted.org/packages/df/5f/16337318bd99d2d837cbb2e91e8a12b0915cb80d7c1ae8f80ca2f5d47a09/onnxruntime_directml-1.20.1-cp311-cp311-win_amd64.whl", hash = "sha256:c7861057ad4caa64186c910efb3b54c1f575cd0e64732509c9bd927d2d20187b", size = 22762384, upload-time = "2024-11-21T00:49:44.01Z" },
+    { url = "https://files.pythonhosted.org/packages/8f/50/4599c6573bd71cc0c80820c63dea599a0b489ce874f93a5e021ca20a9e1f/onnxruntime_directml-1.20.1-cp312-cp312-win_amd64.whl", hash = "sha256:4b9a9f8349d68eef947fc692b3572e7a6490cb95effb151ace1a6ffc15884940", size = 22764330, upload-time = "2024-11-21T00:49:47.264Z" },
+    { url = "https://files.pythonhosted.org/packages/60/40/7d8489d9101b4aa7bae29227075ce31bc5764cbe87b78c995fdb296e3eff/onnxruntime_directml-1.20.1-cp313-cp313-win_amd64.whl", hash = "sha256:86a8c4b69e377bb18ed2a18aaf2337baa83a57ff87a97224d027e546dfa99fde", size = 22764517, upload-time = "2024-11-21T00:49:50.213Z" },
+]
+
+[[package]]
+name = "onnxruntime-directml"
+version = "1.24.3"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version == '3.10.*'",
+]
+dependencies = [
+    { name = "flatbuffers", marker = "python_full_version == '3.10.*'" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.10.*'" },
+    { name = "packaging", marker = "python_full_version == '3.10.*'" },
+    { name = "protobuf", marker = "python_full_version == '3.10.*'" },
+    { name = "sympy", marker = "python_full_version == '3.10.*'" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ed/65/36ce5a5e79fb5d7b4d7636bc6e6c4024f3ff0571789e8eedb7149bb7c538/onnxruntime_directml-1.24.3-cp311-cp311-win_amd64.whl", hash = "sha256:442fecea5d52df315b6cecfbcbb44aff6681880b6bbf23546a6c00125fec66f1", size = 25106769, upload-time = "2026-03-05T16:27:07.495Z" },
+    { url = "https://files.pythonhosted.org/packages/05/40/c948c0ee42b7b6297dd45956092f5a53a6954610c3911a5847c7555b4930/onnxruntime_directml-1.24.3-cp312-cp312-win_amd64.whl", hash = "sha256:d889010e6ed2f30026522308173d295bcfdaf6f28d1df6054c748ffa750a7ad5", size = 25114531, upload-time = "2026-03-05T16:27:11.256Z" },
+    { url = "https://files.pythonhosted.org/packages/56/f0/9de329f39a66142aab4c1d9a48edc0e432de27c6ba09e8039e0dc51885e7/onnxruntime_directml-1.24.3-cp313-cp313-win_amd64.whl", hash = "sha256:f684adcb29dd48ee172b52fcf1d19a1da1a67a051384ac3418b36d200d0d105c", size = 25114902, upload-time = "2026-03-05T16:27:13.925Z" },
+    { url = "https://files.pythonhosted.org/packages/fe/7a/8b3014ca4065a32bd6672221bf4cb0b5b9a726d28a9caafdb86a076a5981/onnxruntime_directml-1.24.3-cp314-cp314-win_amd64.whl", hash = "sha256:42b17de7030445e75a7e83a4a317f9c655ed2dd7045fe79a7a21dce7b60103b6", size = 25570589, upload-time = "2026-03-05T16:27:17.278Z" },
+]
+
+[[package]]
+name = "onnxruntime-directml"
+version = "1.24.4"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.14'",
+    "python_full_version == '3.13.*'",
+    "python_full_version >= '3.11' and python_full_version < '3.13'",
+]
+dependencies = [
+    { name = "flatbuffers", marker = "python_full_version >= '3.11'" },
+    { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "packaging", marker = "python_full_version >= '3.11'" },
+    { name = "protobuf", marker = "python_full_version >= '3.11'" },
+    { name = "sympy", marker = "python_full_version >= '3.11'" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/be/90/99566dc6398028e7691a5b12720fd85f757a0901818b84599d28abb3f085/onnxruntime_directml-1.24.4-cp311-cp311-win_amd64.whl", hash = "sha256:96642a787e5a6f33bf043521c0f06eb1eb663f6b830e5862a2026d03f9c90543", size = 25106000, upload-time = "2026-03-17T21:47:15.438Z" },
+    { url = "https://files.pythonhosted.org/packages/88/ea/33814eb0ec96775eda4c1d30b0d86e91d7d2cd0d84c66d3915aef0e06fa3/onnxruntime_directml-1.24.4-cp312-cp312-win_amd64.whl", hash = "sha256:f2ecb68b7b7b259d2ef3112ae760149f9b5a1e7c0fbb73d539da6250a648a614", size = 25111930, upload-time = "2026-03-17T21:47:18.419Z" },
+    { url = "https://files.pythonhosted.org/packages/60/53/2bd2696fac19cf8ca55496a0bcfe431f3aff9579eabbb0e231dc238acf6f/onnxruntime_directml-1.24.4-cp313-cp313-win_amd64.whl", hash = "sha256:2f1031cb2281e5b27cca9efe0b9399317c7286e4d226f7a79d4ab79bbd94d19e", size = 25112253, upload-time = "2026-03-17T21:47:22.043Z" },
+    { url = "https://files.pythonhosted.org/packages/b7/04/816932a3ade867a687e406716ca76e0774c6b921545b45818e3ebfcc54ce/onnxruntime_directml-1.24.4-cp314-cp314-win_amd64.whl", hash = "sha256:51d86bb949488e572b00422f344990a4a81d982416d73b6c0e4ced2bcd423d19", size = 25571098, upload-time = "2026-03-17T21:47:25.461Z" },
+]
+
+[[package]]
+name = "onnxruntime-gpu"
+version = "1.20.2"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version < '3.10'",
+]
+dependencies = [
+    { name = "coloredlogs", marker = "python_full_version < '3.10'" },
+    { name = "flatbuffers", marker = "python_full_version < '3.10'" },
+    { name = "numpy", version = "2.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
+    { name = "packaging", marker = "python_full_version < '3.10'" },
+    { name = "protobuf", marker = "python_full_version < '3.10'" },
+    { name = "sympy", marker = "python_full_version < '3.10'" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/04/ad/4e5534dcaafe36f596792ebd0049177f7f0b7afa0f696505974ed1d6f72c/onnxruntime_gpu-1.20.2-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:dfba508f110ec062dedfd3032e6eee8cde325026e9d7c5792884e8b9d4ebb9c3", size = 291522233, upload-time = "2025-03-07T05:46:08.901Z" },
+    { url = "https://files.pythonhosted.org/packages/a5/2a/8afc5aee996fd33fb816bc3067fdbde96a2a7520d4c275fa502f3aef7e54/onnxruntime_gpu-1.20.2-cp310-cp310-win_amd64.whl", hash = "sha256:75a7557292b2741e63fb73236ee84faa08075cead52d9a8d302a67036fc64f16", size = 279696089, upload-time = "2025-03-07T05:39:24.924Z" },
+    { url = "https://files.pythonhosted.org/packages/5e/53/9341b875b0ed29953485b43713e94b335a449c3770fed67dddb3c9b84af0/onnxruntime_gpu-1.20.2-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:85057c7006457bee14fc2a57417b7e4f396f10d9c1b08b11aae08ac2b825eeda", size = 291518407, upload-time = "2025-03-07T05:46:22.943Z" },
+    { url = "https://files.pythonhosted.org/packages/0b/7a/0999993ceae7bf191d5d63a4e1b2208596763d8e586aa7dc5cc091f960c0/onnxruntime_gpu-1.20.2-cp311-cp311-win_amd64.whl", hash = "sha256:d0eafd873e4336949c89e6c7429a68e7e1d0233d9cb363e9780ca76c3c6f865c", size = 279697437, upload-time = "2025-03-07T05:39:38.418Z" },
+    { url = "https://files.pythonhosted.org/packages/5b/db/c1fcdf45cad147d3b3609cf66a1c6083b54382f58a41d7fc526cd5909090/onnxruntime_gpu-1.20.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:aa66d2e6de13fe6f4d1554b1c219bd2e4778b540ed9d3dc62957c95a8af43d66", size = 291510804, upload-time = "2025-03-07T05:46:36.178Z" },
+    { url = "https://files.pythonhosted.org/packages/27/67/4f979650557738a8b148dd7e0b82522d20ffcfb2c3964141c861a61e82c7/onnxruntime_gpu-1.20.2-cp312-cp312-win_amd64.whl", hash = "sha256:564a6a1187b208012f57c3bb3723ba65f6bc5cddff6e6b917ac96865768b39f5", size = 279699596, upload-time = "2025-03-07T05:39:50.858Z" },
+    { url = "https://files.pythonhosted.org/packages/48/a4/60f0cf16b24f05d123f90525408a705741fa92e0c38ab122cdf1d239e3fe/onnxruntime_gpu-1.20.2-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:6af5b30b9b0e729d3ca1dfff493a39771f143cfc22af1d77d487022033cae284", size = 291511859, upload-time = "2025-03-07T05:46:49.302Z" },
+    { url = "https://files.pythonhosted.org/packages/ab/a2/0eb7a3fa417adc7af0be73b0ea35f1f0d6f92e3722eb6468e36dfe2e762d/onnxruntime_gpu-1.20.2-cp313-cp313-win_amd64.whl", hash = "sha256:6ffe5108d2dbd96a9a40bf76573219e04b67d0330aa93ca5114f1478185ade19", size = 279697061, upload-time = "2025-03-07T05:40:03.559Z" },
+    { url = "https://files.pythonhosted.org/packages/4e/de/6c692ac8604a451011a2a01e35e94f84bea8775ef97f6830985bbe8de172/onnxruntime_gpu-1.20.2-cp313-cp313t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:407e5b7a21d656aac6f994d2e329f5577eb3d7f98b63aa1e49e71a702ffa1da1", size = 291502464, upload-time = "2025-03-07T05:47:03.191Z" },
+]
+
+[[package]]
+name = "onnxruntime-gpu"
+version = "1.24.3"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version == '3.10.*'",
+]
+dependencies = [
+    { name = "flatbuffers", marker = "python_full_version == '3.10.*'" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.10.*'" },
+    { name = "packaging", marker = "python_full_version == '3.10.*'" },
+    { name = "protobuf", marker = "python_full_version == '3.10.*'" },
+    { name = "sympy", marker = "python_full_version == '3.10.*'" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/28/f4/c8050f3f4916ab6c75432724f0ba51c1548dc1c3d66d40c0f8a9611e370f/onnxruntime_gpu-1.24.3-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:ac922633819e1cdc81c9b3a28b5e37d788805307bbaa708a01a3d7150e345625", size = 252750845, upload-time = "2026-03-05T16:35:33.604Z" },
+    { url = "https://files.pythonhosted.org/packages/07/b7/81e8936354651915192a362a1718253c6d03da6b902a95237aa392b1d260/onnxruntime_gpu-1.24.3-cp311-cp311-win_amd64.whl", hash = "sha256:0fe6ece3042db149f36f4991cbebd19a690b7ffd82af89450a261b47f4704a37", size = 207192429, upload-time = "2026-03-05T16:39:57.015Z" },
+    { url = "https://files.pythonhosted.org/packages/24/fa/58ceca812214c9c1a286407c376e42e0b7de3e2c6e14b61cdf3caf6d6d9c/onnxruntime_gpu-1.24.3-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:537bdd6d95006a9200ae81f2e73ba9e621e723fdf0deb5901e2e62fb2cccf876", size = 252756089, upload-time = "2026-03-05T16:35:46.004Z" },
+    { url = "https://files.pythonhosted.org/packages/3c/07/2f36920b513bd8939e25591153e37d9cfda94115bd119f2874da0750fce2/onnxruntime_gpu-1.24.3-cp312-cp312-win_amd64.whl", hash = "sha256:d72065b3ab5fdaef74d8b6b8f39b7ce20d89731610e3e63cb40e997d3dce177e", size = 207197001, upload-time = "2026-03-05T16:40:05.691Z" },
+    { url = "https://files.pythonhosted.org/packages/49/57/9e6206dac76e08f028d2ae95f2ab1b3a7c3317fb6c0374a530aad48dab5c/onnxruntime_gpu-1.24.3-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:3242a70010934e5bb0aeaa9dde4c25c6c2da577b55c6308c0caa828ba3b7be23", size = 252753349, upload-time = "2026-03-05T16:35:58.09Z" },
+    { url = "https://files.pythonhosted.org/packages/4e/ae/f0be395602c13a3a8d22fa6632133550a64536c58bc3623abbba5d0a575e/onnxruntime_gpu-1.24.3-cp313-cp313-win_amd64.whl", hash = "sha256:a423b164dbc26cb7f8736367b11698c2a7294748d3c144c39542ecac28d225c9", size = 207197331, upload-time = "2026-03-05T16:40:14.944Z" },
+    { url = "https://files.pythonhosted.org/packages/b4/af/a64c9789769d8d7fabc6d35dcce2f2897b2d9e0fe113044efc2903f7cd07/onnxruntime_gpu-1.24.3-cp313-cp313t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:9696d54974a1313ef0d87f4cbd04f9abfd13839194638d52bb5967a15615341d", size = 252762923, upload-time = "2026-03-05T16:36:10.043Z" },
+    { url = "https://files.pythonhosted.org/packages/c1/bb/1cf7dffac2fb01e8de9f0882438165f7543f0aab57f86d1f587e6faa8528/onnxruntime_gpu-1.24.3-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:b8ca744f40b33380bc9136988213e574c927d2b919ed42149977e006b138f74f", size = 252754914, upload-time = "2026-03-05T16:36:30.739Z" },
+    { url = "https://files.pythonhosted.org/packages/cf/39/3949d56103bd9cd9381de59b060f9bce8dc2c7363f465bf207ebd0c7a5d0/onnxruntime_gpu-1.24.3-cp314-cp314-win_amd64.whl", hash = "sha256:c60c44e2b388720e6670a948b52626f3d089e960ef7da66e4fa6b2b33a11116f", size = 209599131, upload-time = "2026-03-05T16:40:24.074Z" },
+    { url = "https://files.pythonhosted.org/packages/f3/60/51bfbcf2d0540dbfa426a73a9b80046b71a63de7303d16c0f2682c8edfd2/onnxruntime_gpu-1.24.3-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:29048407a2398361d93de5537c2d2079d79d720337a0743d4a2cc28db981e776", size = 252764115, upload-time = "2026-03-05T16:36:44.681Z" },
+]
+
+[[package]]
+name = "onnxruntime-gpu"
+version = "1.25.0"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.14'",
+    "python_full_version == '3.13.*'",
+    "python_full_version >= '3.11' and python_full_version < '3.13'",
+]
+dependencies = [
+    { name = "flatbuffers", marker = "python_full_version >= '3.11'" },
+    { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "packaging", marker = "python_full_version >= '3.11'" },
+    { name = "protobuf", marker = "python_full_version >= '3.11'" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2d/7e/f58f8fc505a876b31fd2a34c1eb8f9863b75bf1589c3297c8efd48b93151/onnxruntime_gpu-1.25.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:e8625bb31ee2d88524414e7458cc604f4f958f323ef8832cc00882f6cd42b9a1", size = 270337732, upload-time = "2026-04-22T17:27:59.993Z" },
+    { url = "https://files.pythonhosted.org/packages/55/5d/2561b3aa667d87a4ae9cd01c5a565955aab5a3d44a6076f723beb9cdde0a/onnxruntime_gpu-1.25.0-cp311-cp311-win_amd64.whl", hash = "sha256:2e702159a025aa5c69f0b747adf9a451e0c9e4b20120163a918c8459d3171b87", size = 220845585, upload-time = "2026-04-22T17:20:38.939Z" },
+    { url = "https://files.pythonhosted.org/packages/1d/6d/2c13d3eff74caa9e59820a044a75becd34e9cbeeaf7617ad7679cdb1fdb7/onnxruntime_gpu-1.25.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:2f0c36c63c8b0eb4091f2567067f480f66f0aedc189eb009545c98ce7e919056", size = 270342429, upload-time = "2026-04-22T17:28:10.526Z" },
+    { url = "https://files.pythonhosted.org/packages/8c/2e/9fc303ae59d4caeb85ec3cea6881b7de8ca1d2a07140fade39913cd7ff10/onnxruntime_gpu-1.25.0-cp312-cp312-win_amd64.whl", hash = "sha256:61178cc4d84f59861714554531e01cccbd33ddf13cc0e87a3adea13b24d297ce", size = 220847708, upload-time = "2026-04-22T17:20:47.993Z" },
+    { url = "https://files.pythonhosted.org/packages/f5/15/e63fe7b1abad6884bed07e9bb333e9f0ea48fbb8cbc1ea4a67ee6019d5d0/onnxruntime_gpu-1.25.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:e462eb13ee9955117baec4f518916c1e7cb1a96001114105632bc6d454c6aee6", size = 270342324, upload-time = "2026-04-22T17:28:21.142Z" },
+    { url = "https://files.pythonhosted.org/packages/21/10/b3533243d062b589d4b1f3ae26584af332c5cde618e7f6f5ff6fabbfd5f2/onnxruntime_gpu-1.25.0-cp313-cp313-win_amd64.whl", hash = "sha256:9a3682158e5e911385252eb95d6332b6f525972746c582e10f8a78213b39e624", size = 220848188, upload-time = "2026-04-22T17:20:56.946Z" },
+    { url = "https://files.pythonhosted.org/packages/35/6c/d7706dd1d0eaafdba44d5c89f8d952de41e425a1b0cbd3ecfa60f918c249/onnxruntime_gpu-1.25.0-cp313-cp313t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:8514b92c5929c953850090d823d018770cba2a971efab5f8f69a3c4280cdc632", size = 270364210, upload-time = "2026-04-22T17:28:33.568Z" },
+    { url = "https://files.pythonhosted.org/packages/37/01/9f1b16ea857e3a4b5e82a2d70b52ea46a0083569f737d840f74a1b86818f/onnxruntime_gpu-1.25.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:ffe9df4016b061ec3a5565a4fc08cdb86808cd8b9c255c42301066c0c24a81b5", size = 270345126, upload-time = "2026-04-22T17:28:44.416Z" },
+    { url = "https://files.pythonhosted.org/packages/56/c8/aae22f3c9cea9160d8d969734a1927720fcb4d4ad4abe269c407c1d2b63c/onnxruntime_gpu-1.25.0-cp314-cp314-win_amd64.whl", hash = "sha256:2173b71631208177fe704ce2d92eac3acbf758285327247ea40a31a9f0bcc073", size = 223385369, upload-time = "2026-04-22T17:21:06.026Z" },
+    { url = "https://files.pythonhosted.org/packages/ed/0a/79fba6a1a32803a2bf8b99187e0ea5d5d69ffe0c5c0f469bde232ceb8327/onnxruntime_gpu-1.25.0-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:8576c721c600cc669717a2ae49af30fdfff230480099653adc7b79d58a240852", size = 270364130, upload-time = "2026-04-22T17:28:54.708Z" },
 ]
 
 [[package]]

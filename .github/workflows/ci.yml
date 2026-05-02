@@ -17,6 +17,7 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
+          cache: 'pip'
       - run: pip install -e ".[dev]"
       - run: python -m pytest tests/ -v --ignore=tests/benchmarks --cov=mempalace --cov-report=term-missing --cov-fail-under=80 --durations=10
 
@@ -26,7 +27,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.9"
+          python-version: "3.13"
+          cache: 'pip'
       - run: pip install -e ".[dev]"
       - run: python -m pytest tests/ -v --ignore=tests/benchmarks --cov=mempalace --cov-report=term-missing --cov-fail-under=80 --durations=10
 
@@ -36,7 +38,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.9"
+          python-version: "3.13"
+          cache: 'pip'
       - run: pip install -e ".[dev]"
       - run: python -m pytest tests/ -v --ignore=tests/benchmarks --cov=mempalace --cov-report=term-missing --cov-fail-under=80 --durations=10
   lint:
@@ -46,6 +49,7 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
+          cache: 'pip'
       - run: pip install "ruff>=0.4.0,<0.5"
       - run: ruff check .
       - run: ruff format --check .

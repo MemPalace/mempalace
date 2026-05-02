@@ -12,11 +12,12 @@ from mempalace.hooks_cli import (
     SAVE_INTERVAL,
     _count_human_messages,
     _extract_recent_messages,
-    _get_mine_dir,
+    _get_mine_targets,
     _log,
     _maybe_auto_ingest,
     _mempalace_python,
     _mine_already_running,
+    _mine_sync,
     _parse_harness_input,
     _sanitize_session_id,
     _validate_transcript_path,
@@ -434,7 +435,7 @@ def test_maybe_auto_ingest_no_env(tmp_path):
 
 
 def test_maybe_auto_ingest_with_env(tmp_path):
-    """With MEMPAL_DIR set to a valid directory, spawns subprocess."""
+    """With MEMPAL_DIR set, spawns mine in projects mode against that dir."""
     mempal_dir = tmp_path / "project"
     mempal_dir.mkdir()
     with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
@@ -443,18 +444,96 @@ def test_maybe_auto_ingest_with_env(tmp_path):
                 with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
                     _maybe_auto_ingest()
                     mock_popen.assert_called_once()
+                    cmd = mock_popen.call_args[0][0]
+                    assert "mine" in cmd
+                    assert str(mempal_dir.resolve()) in cmd
+                    assert cmd[cmd.index("--mode") + 1] == "projects"
 
 
-def test_maybe_auto_ingest_with_transcript(tmp_path):
-    """Falls back to transcript directory when MEMPAL_DIR is not set."""
-    transcript = tmp_path / "t.jsonl"
+def test_maybe_auto_ingest_uses_mempalace_python(tmp_path):
+    """Spawned mine command uses _mempalace_python(), not bare sys.executable.
+
+    Hook subprocesses inherit the harness PATH which on GUI-launched
+    Claude Code may resolve to a system Python without chromadb. The
+    interpreter used here must be the same one the hook itself runs
+    under (typically the venv that owns mempalace).
+    """
+    mempal_dir = tmp_path / "project"
+    mempal_dir.mkdir()
+    with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli._MINE_PID_FILE", tmp_path / "mine.pid"):
+                with patch(
+                    "mempalace.hooks_cli._mempalace_python", return_value="/fake/venv/python"
+                ):
+                    with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                        _maybe_auto_ingest()
+                        cmd = mock_popen.call_args[0][0]
+                        assert cmd[0] == "/fake/venv/python"
+
+
+def test_mine_sync_with_env_uses_projects_mode(tmp_path):
+    """Precompact sync path uses projects mode when MEMPAL_DIR is set."""
+    mempal_dir = tmp_path / "project"
+    mempal_dir.mkdir()
+    with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli.subprocess.run") as mock_run:
+                _mine_sync()
+                mock_run.assert_called_once()
+                cmd = mock_run.call_args[0][0]
+                assert cmd[cmd.index("--mode") + 1] == "projects"
+
+
+def test_mine_sync_uses_mempalace_python(tmp_path):
+    """Sync mine command uses _mempalace_python(), not bare sys.executable."""
+    mempal_dir = tmp_path / "project"
+    mempal_dir.mkdir()
+    with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli._mempalace_python", return_value="/fake/venv/python"):
+                with patch("mempalace.hooks_cli.subprocess.run") as mock_run:
+                    _mine_sync()
+                    cmd = mock_run.call_args[0][0]
+                    assert cmd[0] == "/fake/venv/python"
+
+
+def test_maybe_auto_ingest_ignores_transcript_arg_path(tmp_path):
+    """_maybe_auto_ingest does NOT mine the transcript directory.
+
+    Transcript convos are handled by _ingest_transcript (called separately
+    in hook handlers). _maybe_auto_ingest only handles MEMPAL_DIR — even
+    when invoked in a context where a transcript is also being processed,
+    no second spawn for the transcript dir should appear here.
+    """
+    convo_dir = tmp_path / "convos"
+    convo_dir.mkdir()
+    transcript = convo_dir / "session.jsonl"
     transcript.write_text("")
     with patch.dict("os.environ", {}, clear=True):
         with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
             with patch("mempalace.hooks_cli._MINE_PID_FILE", tmp_path / "mine.pid"):
                 with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
-                    _maybe_auto_ingest(str(transcript))
-                    mock_popen.assert_called_once()
+                    _maybe_auto_ingest()
+                    mock_popen.assert_not_called()
+
+
+def test_mine_sync_ignores_transcript(tmp_path):
+    """_mine_sync does not run a convos mine for the transcript dir.
+
+    The precompact transcript ingest is the responsibility of
+    _ingest_transcript; routing it through _mine_sync would stack a
+    second 60s timeout against the harness 30s ceiling.
+    """
+    convo_dir = tmp_path / "convos"
+    convo_dir.mkdir()
+    transcript = convo_dir / "session.jsonl"
+    transcript.write_text("")
+    with patch.dict("os.environ", {}, clear=True):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli.subprocess.run") as mock_run:
+                _mine_sync()
+                mock_run.assert_not_called()
 
 
 def test_maybe_auto_ingest_oserror(tmp_path):
@@ -513,31 +592,78 @@ def test_mine_already_running_corrupt_file(tmp_path):
         assert _mine_already_running() is False
 
 
-# --- _get_mine_dir ---
+# --- _get_mine_targets ---
 
 
-def test_get_mine_dir_mempal_dir(tmp_path):
-    """MEMPAL_DIR takes priority over transcript_path."""
+def test_get_mine_targets_mempal_dir_only(tmp_path):
+    """MEMPAL_DIR alone yields a single projects target, expanded/resolved."""
     mempal_dir = tmp_path / "project"
     mempal_dir.mkdir()
-    transcript = tmp_path / "t.jsonl"
-    transcript.write_text("")
     with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
-        assert _get_mine_dir(str(transcript)) == str(mempal_dir)
+        targets = _get_mine_targets()
+    assert len(targets) == 1
+    assert Path(targets[0][0]).resolve() == mempal_dir.resolve()
+    assert targets[0][1] == "projects"
 
 
-def test_get_mine_dir_transcript_fallback(tmp_path):
-    """Falls back to transcript parent dir when MEMPAL_DIR is not set."""
+def test_get_mine_targets_mempal_dir_tilde(tmp_path):
+    """MEMPAL_DIR with a tilde prefix is expanded correctly."""
+    mempal_dir = tmp_path / "project"
+    mempal_dir.mkdir()
+    home = Path.home()
+    try:
+        rel = mempal_dir.relative_to(home)
+    except ValueError:
+        pytest.skip("tmp_path is not under home, cannot build ~-relative path")
+    tilde_path = "~/" + str(rel)
+    with patch.dict("os.environ", {"MEMPAL_DIR": tilde_path}):
+        targets = _get_mine_targets()
+    assert len(targets) == 1
+    assert Path(targets[0][0]).resolve() == mempal_dir.resolve()
+    assert targets[0][1] == "projects"
+
+
+def test_get_mine_targets_no_transcript_target(tmp_path):
+    """_get_mine_targets does not emit a convos target for the transcript path.
+
+    Transcript ingestion is owned by _ingest_transcript; emitting it
+    here too would double-mine the same JSONL into a different wing on
+    every hook fire (#1231 review).
+    """
     transcript = tmp_path / "t.jsonl"
     transcript.write_text("")
     with patch.dict("os.environ", {}, clear=True):
-        assert _get_mine_dir(str(transcript)) == str(tmp_path)
+        targets = _get_mine_targets()
+    assert targets == []
 
 
-def test_get_mine_dir_empty():
-    """Returns empty string when nothing is available."""
+def test_get_mine_targets_only_returns_mempal_dir(tmp_path):
+    """When MEMPAL_DIR is set, exactly one projects target — never a convos target."""
+    mempal_dir = tmp_path / "project"
+    mempal_dir.mkdir()
+    with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
+        targets = _get_mine_targets()
+    assert len(targets) == 1
+    assert targets[0][1] == "projects"
+
+
+def test_validate_transcript_path_traversal_rejected_jsonl(tmp_path):
+    """Path traversal is rejected even when the path has a .jsonl suffix.
+
+    The pre-fix test used "../../etc/passwd" which lacks an extension and
+    so was rejected by the suffix gate before the traversal check ever
+    fired (Copilot review on #1231). Use a .jsonl path with `..`
+    segments to exercise the traversal guard specifically.
+    """
+    assert _validate_transcript_path("../t.jsonl") is None
+    assert _validate_transcript_path("a/../b.jsonl") is None
+    assert _validate_transcript_path("/tmp/../etc/t.jsonl") is None
+
+
+def test_get_mine_targets_empty():
+    """Returns empty list when MEMPAL_DIR is unset or invalid."""
     with patch.dict("os.environ", {}, clear=True):
-        assert _get_mine_dir("") == ""
+        assert _get_mine_targets() == []
 
 
 # --- _parse_harness_input ---
@@ -657,21 +783,33 @@ def test_precompact_with_timeout(tmp_path):
 
 
 def test_precompact_mines_transcript_dir(tmp_path, monkeypatch):
-    """Precompact mines transcript directory when no MEMPAL_DIR."""
+    """Precompact ingests the active transcript via _ingest_transcript.
+
+    With no MEMPAL_DIR, _mine_sync is a no-op; the transcript ingest is
+    the only mining that should fire, and it goes through Popen
+    (background) inside _ingest_transcript. Pre-#1231-review this test
+    asserted against subprocess.run, which corresponded to the
+    duplicate-mine path that has now been removed.
+    """
     transcript = tmp_path / "t.jsonl"
-    transcript.write_text("")
+    # _ingest_transcript skips files smaller than 100 bytes, so pad it.
+    transcript.write_text("x" * 200)
     monkeypatch.delenv("MEMPAL_DIR", raising=False)
-    with patch("mempalace.hooks_cli.subprocess.run") as mock_run:
-        result = _capture_hook_output(
-            hook_precompact,
-            {"session_id": "test", "transcript_path": str(transcript)},
-            state_dir=tmp_path,
-        )
+    with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+        with patch("mempalace.hooks_cli.subprocess.run") as mock_run:
+            result = _capture_hook_output(
+                hook_precompact,
+                {"session_id": "test", "transcript_path": str(transcript)},
+                state_dir=tmp_path,
+            )
     assert result == {}
-    mock_run.assert_called_once()
-    # Verify mine dir is the transcript's parent
-    call_args = mock_run.call_args[0][0]
-    assert str(tmp_path) in call_args[-1]
+    mock_run.assert_not_called()
+    mock_popen.assert_called_once()
+    cmd = mock_popen.call_args[0][0]
+    # Mines the transcript's parent dir as convos, into wing "sessions".
+    assert str(tmp_path) in cmd
+    assert cmd[cmd.index("--mode") + 1] == "convos"
+    assert cmd[cmd.index("--wing") + 1] == "sessions"
 
 
 # --- run_hook ---

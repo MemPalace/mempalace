@@ -19,6 +19,16 @@ MAX_NAME_LENGTH = 128
 _SAFE_NAME_RE = re.compile(r"^(?:[^\W_]|[^\W_][\w .'-]{0,126}[^\W_])$")
 
 
+def normalize_wing_name(name: str) -> str:
+    """Lower-case + collapse separators (`-`, ` `) to `_` for wing slugs.
+
+    The same rule is applied by ``init`` when persisting `topics_by_wing`
+    and when writing `mempalace.yaml`, so the miner's lookup matches at
+    mine time regardless of the source dirname.
+    """
+    return name.lower().replace(" ", "_").replace("-", "_")
+
+
 def sanitize_name(value: str, field_name: str = "name") -> str:
     """Validate and sanitize a wing/room/entity name.
 
@@ -168,7 +178,10 @@ class MempalaceConfig:
         """Path to the memory palace data directory."""
         env_val = os.environ.get("MEMPALACE_PALACE_PATH") or os.environ.get("MEMPAL_PALACE_PATH")
         if env_val:
-            return env_val
+            # Normalize: expand ~ and collapse .. to match the CLI --palace
+            # code path (mcp_server.py:62) and prevent surprise redirection
+            # when the env var contains unresolved components.
+            return os.path.abspath(os.path.expanduser(env_val))
         return self._file_config.get("palace_path", DEFAULT_PALACE_PATH)
 
     @property
@@ -232,6 +245,49 @@ class MempalaceConfig:
         except (OSError, NotImplementedError):
             pass
         return normalized
+
+    @property
+    def embedding_device(self):
+        """Hardware device for the ONNX embedding model.
+
+        Values: ``"auto"`` (default), ``"cpu"``, ``"cuda"``, ``"coreml"``,
+        ``"dml"``. Read from env ``MEMPALACE_EMBEDDING_DEVICE`` first, then
+        ``embedding_device`` in ``config.json``, then ``"auto"``.
+
+        ``auto`` resolves to the first available accelerator at runtime via
+        :mod:`mempalace.embedding`; requesting an unavailable accelerator
+        logs a warning and falls back to CPU.
+        """
+        env_val = os.environ.get("MEMPALACE_EMBEDDING_DEVICE")
+        if env_val:
+            return env_val.strip().lower()
+        return str(self._file_config.get("embedding_device", "auto")).strip().lower()
+
+    @property
+    def topic_tunnel_min_count(self):
+        """Minimum number of overlapping confirmed topics required to create
+        a cross-wing tunnel between two wings.
+
+        Default is ``1`` — any single shared topic produces a tunnel. Bump
+        to ``2+`` if your projects share lots of common-tech labels (Python,
+        Docker, Git) and you want only meaningfully overlapping wings to
+        link. Reads ``MEMPALACE_TOPIC_TUNNEL_MIN_COUNT`` env first, then the
+        config-file value, then ``1``.
+        """
+        env_val = os.environ.get("MEMPALACE_TOPIC_TUNNEL_MIN_COUNT")
+        if env_val:
+            try:
+                parsed = int(env_val)
+                if parsed >= 1:
+                    return parsed
+            except ValueError:
+                pass
+        cfg_val = self._file_config.get("topic_tunnel_min_count")
+        try:
+            parsed = int(cfg_val) if cfg_val is not None else 1
+        except (TypeError, ValueError):
+            parsed = 1
+        return max(1, parsed)
 
     @property
     def hook_silent_save(self):

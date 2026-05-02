@@ -63,10 +63,14 @@ def test_save_people_map(tmp_path):
 def test_env_mempal_palace_path(tmp_path):
     """MEMPAL_PALACE_PATH (legacy) should also work."""
     os.environ.pop("MEMPALACE_PALACE_PATH", None)
-    os.environ["MEMPAL_PALACE_PATH"] = "/legacy/path"
+    raw = "/legacy/path"
+    os.environ["MEMPAL_PALACE_PATH"] = raw
     try:
         cfg = MempalaceConfig(config_dir=str(tmp_path))
-        assert cfg.palace_path == "/legacy/path"
+        # palace_path is normalized via abspath + expanduser — compare
+        # against the normalized form so the test is portable between
+        # POSIX (no-op) and Windows (prepends current drive letter).
+        assert cfg.palace_path == os.path.abspath(os.path.expanduser(raw))
     finally:
         del os.environ["MEMPAL_PALACE_PATH"]
 

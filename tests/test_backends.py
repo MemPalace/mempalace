@@ -1,5 +1,6 @@
 import os
 import sqlite3
+from pathlib import Path
 
 import chromadb
 import pytest
@@ -16,6 +17,7 @@ from mempalace.backends.chroma import (
     ChromaBackend,
     ChromaCollection,
     _fix_blob_seq_ids,
+    _pin_hnsw_threads,
     quarantine_stale_hnsw,
 )
 
@@ -334,17 +336,76 @@ def test_chroma_backend_creates_collection_with_cosine_distance(tmp_path):
     assert col.metadata.get("hnsw:space") == "cosine"
 
 
+def test_chroma_backend_sets_hnsw_bloat_guard_on_creation(tmp_path):
+    """The HNSW guard from #344 must land on freshly-created collection metadata.
+
+    Without batch_size + sync_threshold, mining ~10K+ drawers triggers the
+    resize+persist drift that bloats link_lists.bin into hundreds of GB sparse
+    and segfaults `status` / `search` / `repair`. The guard belongs at
+    collection-creation time so every fresh palace gets it without needing
+    a runtime retrofit. Asserting both keys land on the persisted metadata
+    also covers the #1161 "config silently dropped" concern at CI time.
+    """
+    palace_path = tmp_path / "palace"
+
+    ChromaBackend().get_collection(
+        str(palace_path),
+        collection_name="mempalace_drawers",
+        create=True,
+    )
+
+    client = chromadb.PersistentClient(path=str(palace_path))
+    col = client.get_collection("mempalace_drawers")
+    assert col.metadata.get("hnsw:batch_size") == 50_000
+    assert col.metadata.get("hnsw:sync_threshold") == 50_000
+
+
+def test_chroma_backend_create_collection_sets_hnsw_bloat_guard(tmp_path):
+    """Same guard must apply via the legacy create_collection() path."""
+    palace_path = tmp_path / "palace"
+
+    ChromaBackend().create_collection(str(palace_path), "mempalace_drawers")
+
+    client = chromadb.PersistentClient(path=str(palace_path))
+    col = client.get_collection("mempalace_drawers")
+    assert col.metadata.get("hnsw:batch_size") == 50_000
+    assert col.metadata.get("hnsw:sync_threshold") == 50_000
+
+
+def test_get_collection_create_true_is_idempotent(tmp_path):
+    """Calling get_collection(create=True) twice on the same name must not crash.
+
+    ChromaDB 1.5.x's Rust bindings SIGSEGV when get_or_create_collection is
+    called with metadata that differs from the stored collection metadata. The
+    fix splits the call into get_collection -> fallback create_collection so the
+    metadata-comparison codepath in chromadb_rust_bindings is never reached for
+    existing collections. Regression guard for issue #1089.
+    """
+    palace = str(tmp_path / "palace")
+    backend = ChromaBackend()
+    backend.get_collection(palace, collection_name="mempalace_drawers", create=True)
+    col2 = backend.get_collection(palace, collection_name="mempalace_drawers", create=True)
+    assert isinstance(col2, ChromaCollection)
+
+
+def test_get_collection_create_true_preserves_existing_metadata(tmp_path):
+    """Existing collection metadata is not overwritten when reopened with create=True."""
+    palace = str(tmp_path / "palace")
+    backend = ChromaBackend()
+    backend.get_collection(palace, collection_name="mempalace_drawers", create=True)
+    col = backend.get_collection(palace, collection_name="mempalace_drawers", create=True)
+    assert col._collection.metadata["hnsw:space"] == "cosine"
+    assert col._collection.metadata.get("hnsw:batch_size") == 50_000
+
+
 def test_fix_blob_seq_ids_converts_blobs_to_integers(tmp_path):
     """Simulate a ChromaDB 0.6.x database with BLOB seq_ids and verify repair."""
     db_path = tmp_path / "chroma.sqlite3"
     conn = sqlite3.connect(str(db_path))
     conn.execute("CREATE TABLE embeddings (rowid INTEGER PRIMARY KEY, seq_id)")
-    conn.execute("CREATE TABLE max_seq_id (rowid INTEGER PRIMARY KEY, seq_id)")
-    # Insert BLOB seq_ids like ChromaDB 0.6.x would
+    # Insert BLOB seq_id like ChromaDB 0.6.x would
     blob_42 = (42).to_bytes(8, byteorder="big")
-    blob_99 = (99).to_bytes(8, byteorder="big")
     conn.execute("INSERT INTO embeddings (seq_id) VALUES (?)", (blob_42,))
-    conn.execute("INSERT INTO max_seq_id (seq_id) VALUES (?)", (blob_99,))
     conn.commit()
     conn.close()
 
@@ -353,8 +414,6 @@ def test_fix_blob_seq_ids_converts_blobs_to_integers(tmp_path):
     conn = sqlite3.connect(str(db_path))
     row = conn.execute("SELECT seq_id, typeof(seq_id) FROM embeddings").fetchone()
     assert row == (42, "integer")
-    row = conn.execute("SELECT seq_id, typeof(seq_id) FROM max_seq_id").fetchone()
-    assert row == (99, "integer")
     conn.close()
 
 
@@ -380,39 +439,236 @@ def test_fix_blob_seq_ids_noop_without_database(tmp_path):
     _fix_blob_seq_ids(str(tmp_path))  # should not raise
 
 
+def test_fix_blob_seq_ids_does_not_touch_max_seq_id(tmp_path):
+    """chromadb 1.5.x owns max_seq_id; the shim must not interpret its BLOBs.
+
+    Regression guard for the 2026-04-20 incident: the old shim ran
+    int.from_bytes(..., 'big') over chromadb 1.5.x's native
+    b'\\x11\\x11' + ASCII-digit BLOB, producing a ~1.23e18 integer that
+    silently suppressed every subsequent embeddings_queue write.
+    """
+    db_path = tmp_path / "chroma.sqlite3"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE embeddings (rowid INTEGER PRIMARY KEY, seq_id)")
+    conn.execute("CREATE TABLE max_seq_id (rowid INTEGER PRIMARY KEY, seq_id)")
+    sysdb10_blob = b"\x11\x11502607"
+    conn.execute("INSERT INTO max_seq_id (seq_id) VALUES (?)", (sysdb10_blob,))
+    conn.commit()
+    conn.close()
+
+    _fix_blob_seq_ids(str(tmp_path))
+
+    conn = sqlite3.connect(str(db_path))
+    row = conn.execute("SELECT seq_id, typeof(seq_id) FROM max_seq_id").fetchone()
+    assert row == (sysdb10_blob, "blob")
+    conn.close()
+
+
+def test_fix_blob_seq_ids_skips_sysdb10_prefix_in_embeddings(tmp_path):
+    """Defense-in-depth: sysdb-10 prefix in embeddings.seq_id is skipped."""
+    db_path = tmp_path / "chroma.sqlite3"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE embeddings (rowid INTEGER PRIMARY KEY, seq_id)")
+    sysdb10_blob = b"\x11\x11502607"
+    conn.execute("INSERT INTO embeddings (seq_id) VALUES (?)", (sysdb10_blob,))
+    conn.commit()
+    conn.close()
+
+    _fix_blob_seq_ids(str(tmp_path))
+
+    conn = sqlite3.connect(str(db_path))
+    row = conn.execute("SELECT seq_id, typeof(seq_id) FROM embeddings").fetchone()
+    # Still a BLOB — not converted to 1.23e18.
+    assert row == (sysdb10_blob, "blob")
+    conn.close()
+
+
+def test_fix_blob_seq_ids_still_converts_legacy_blobs_in_embeddings(tmp_path):
+    """Regression guard: pure big-endian u64 BLOBs still convert for genuine 0.6.x."""
+    db_path = tmp_path / "chroma.sqlite3"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE embeddings (rowid INTEGER PRIMARY KEY, seq_id)")
+    conn.execute("INSERT INTO embeddings (seq_id) VALUES (?)", ((42).to_bytes(8, "big"),))
+    conn.execute("INSERT INTO embeddings (seq_id) VALUES (?)", (b"\x11\x11502607",))
+    conn.execute("INSERT INTO embeddings (seq_id) VALUES (?)", ((7).to_bytes(8, "big"),))
+    conn.commit()
+    conn.close()
+
+    _fix_blob_seq_ids(str(tmp_path))
+
+    conn = sqlite3.connect(str(db_path))
+    rows = conn.execute("SELECT seq_id, typeof(seq_id) FROM embeddings ORDER BY rowid").fetchall()
+    assert rows[0] == (42, "integer")
+    assert rows[1] == (b"\x11\x11502607", "blob")  # sysdb-10 row left alone
+    assert rows[2] == (7, "integer")
+    conn.close()
+
+
+def test_fix_blob_seq_ids_writes_marker_after_blob_path(tmp_path):
+    """The .blob_seq_ids_migrated marker is written after a successful BLOB → INTEGER conversion."""
+    from mempalace.backends.chroma import _BLOB_FIX_MARKER
+
+    db_path = tmp_path / "chroma.sqlite3"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE embeddings (rowid INTEGER PRIMARY KEY, seq_id)")
+    conn.execute("INSERT INTO embeddings (seq_id) VALUES (?)", ((42).to_bytes(8, "big"),))
+    conn.commit()
+    conn.close()
+
+    marker = tmp_path / _BLOB_FIX_MARKER
+    assert not marker.exists()
+
+    _fix_blob_seq_ids(str(tmp_path))
+
+    assert marker.is_file(), "marker must be written after a successful migration"
+
+
+def test_fix_blob_seq_ids_writes_marker_when_already_integer(tmp_path):
+    """The marker is written even when the migration is a no-op (already INTEGER).
+
+    The point of the marker is to skip the sqlite3 open on subsequent calls,
+    not to record that a conversion happened. So a clean palace gets the
+    marker on first run too — next ``_fix_blob_seq_ids`` call short-circuits
+    before touching the sqlite3 file.
+    """
+    from mempalace.backends.chroma import _BLOB_FIX_MARKER
+
+    db_path = tmp_path / "chroma.sqlite3"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE embeddings (rowid INTEGER PRIMARY KEY, seq_id INTEGER)")
+    conn.execute("INSERT INTO embeddings (seq_id) VALUES (42)")
+    conn.commit()
+    conn.close()
+
+    marker = tmp_path / _BLOB_FIX_MARKER
+    assert not marker.exists()
+
+    _fix_blob_seq_ids(str(tmp_path))
+
+    assert marker.is_file(), "marker must be written even when no BLOBs found"
+
+
+def test_fix_blob_seq_ids_skips_sqlite_when_marker_present(tmp_path):
+    """When the marker exists, ``_fix_blob_seq_ids`` does not open sqlite3.
+
+    This is the load-bearing property of the marker — opening Python's
+    sqlite3 against a live ChromaDB 1.5.x WAL DB corrupts the next
+    PersistentClient call (#1090). Once a palace has been migrated, we
+    never want to open it again, even read-only.
+    """
+    from unittest.mock import patch
+    from mempalace.backends.chroma import _BLOB_FIX_MARKER
+
+    # Pre-create the marker so the function should short-circuit.
+    db_path = tmp_path / "chroma.sqlite3"
+    db_path.write_bytes(b"sentinel")  # presence required for the function to proceed
+    (tmp_path / _BLOB_FIX_MARKER).touch()
+
+    with patch("mempalace.backends.chroma.sqlite3.connect") as mock_connect:
+        _fix_blob_seq_ids(str(tmp_path))
+
+    mock_connect.assert_not_called()
+
+
 # ── quarantine_stale_hnsw ─────────────────────────────────────────────────
 
 
-def _make_palace_with_segment(tmp_path, hnsw_mtime, sqlite_mtime):
-    """Helper: build a palace dir with one HNSW segment + sqlite at given mtimes."""
+# Marker bytes for the chromadb segment metadata file. A complete
+# write begins with PROTO opcode (0x80) and ends with STOP opcode
+# (0x2e); _segment_appears_healthy sniffs these bytes without parsing
+# the file.
+_HEALTHY_META = b"\x80\x04" + b"\x00" * 32 + b"\x2e"
+_CORRUPT_META = b"\x00" * 64
+
+
+def _make_palace_with_segment(tmp_path, hnsw_mtime, sqlite_mtime, meta_bytes=_HEALTHY_META):
+    """Helper: build a palace dir with one HNSW segment + sqlite at given
+    mtimes. ``meta_bytes`` controls whether the segment looks healthy
+    (default), corrupt (``_CORRUPT_META``), or has no metadata file at
+    all (``None``)."""
     palace = tmp_path / "palace"
     palace.mkdir()
     (palace / "chroma.sqlite3").write_text("")
     seg = palace / "abcd-1234-5678"
     seg.mkdir()
     (seg / "data_level0.bin").write_text("")
+    if meta_bytes is not None:
+        (seg / "index_metadata.pickle").write_bytes(meta_bytes)
     os.utime(seg / "data_level0.bin", (hnsw_mtime, hnsw_mtime))
     os.utime(palace / "chroma.sqlite3", (sqlite_mtime, sqlite_mtime))
     return palace, seg
 
 
-def test_quarantine_stale_hnsw_renames_drifted_segment(tmp_path):
-    """Segment whose data_level0.bin is 2h older than sqlite gets renamed."""
+def test_quarantine_stale_hnsw_renames_corrupt_segment(tmp_path):
+    """Segment with stale mtime AND a malformed metadata file gets renamed."""
     now = 1_700_000_000.0
-    palace, seg = _make_palace_with_segment(tmp_path, hnsw_mtime=now - 7200, sqlite_mtime=now)
+    palace, seg = _make_palace_with_segment(
+        tmp_path,
+        hnsw_mtime=now - 7200,
+        sqlite_mtime=now,
+        meta_bytes=_CORRUPT_META,
+    )
     moved = quarantine_stale_hnsw(str(palace), stale_seconds=3600.0)
     assert len(moved) == 1
     assert ".drift-" in moved[0]
     assert not seg.exists()
-    # the renamed directory still exists and contains the original file
     renamed = list(palace.iterdir())
     drift_dirs = [p for p in renamed if ".drift-" in p.name]
     assert len(drift_dirs) == 1
     assert (drift_dirs[0] / "data_level0.bin").exists()
 
 
+def test_quarantine_stale_hnsw_leaves_healthy_segment_with_drift_alone(tmp_path):
+    """Segment with stale mtime but a complete metadata file is NOT
+    renamed — this is the chromadb-1.5.x async-flush steady state, not
+    corruption. Production case at 06:24 PDT 2026-04-26: cold-start
+    quarantine renamed three healthy segments after a clean shutdown,
+    leaving 151K-drawer palace with vector_ranked=0."""
+    now = 1_700_000_000.0
+    palace, seg = _make_palace_with_segment(
+        tmp_path,
+        hnsw_mtime=now - 7200,
+        sqlite_mtime=now,
+        meta_bytes=_HEALTHY_META,
+    )
+    moved = quarantine_stale_hnsw(str(palace), stale_seconds=3600.0)
+    assert moved == []
+    assert seg.exists()
+
+
+def test_quarantine_stale_hnsw_leaves_segment_without_metadata_alone(tmp_path):
+    """Segment with no metadata file is treated as fresh / never-flushed
+    and not quarantined — renaming an empty dir orphans nothing."""
+    now = 1_700_000_000.0
+    palace, seg = _make_palace_with_segment(
+        tmp_path,
+        hnsw_mtime=now - 7200,
+        sqlite_mtime=now,
+        meta_bytes=None,
+    )
+    moved = quarantine_stale_hnsw(str(palace), stale_seconds=3600.0)
+    assert moved == []
+    assert seg.exists()
+
+
+def test_quarantine_stale_hnsw_renames_truncated_metadata(tmp_path):
+    """Segment with a truncated (under-floor-size) metadata file is
+    quarantined — shape of a partial-flush during process kill."""
+    now = 1_700_000_000.0
+    palace, seg = _make_palace_with_segment(
+        tmp_path,
+        hnsw_mtime=now - 7200,
+        sqlite_mtime=now,
+        meta_bytes=b"\x80\x04",
+    )
+    moved = quarantine_stale_hnsw(str(palace), stale_seconds=3600.0)
+    assert len(moved) == 1
+    assert ".drift-" in moved[0]
+
+
 def test_quarantine_stale_hnsw_leaves_fresh_segment_alone(tmp_path):
-    """Segment with recent mtime vs sqlite is not touched."""
+    """Segment with recent mtime vs sqlite is not touched (mtime gate
+    short-circuits before integrity gate)."""
     now = 1_700_000_000.0
     palace, seg = _make_palace_with_segment(tmp_path, hnsw_mtime=now - 10, sqlite_mtime=now)
     moved = quarantine_stale_hnsw(str(palace), stale_seconds=3600.0)
@@ -443,3 +699,115 @@ def test_quarantine_stale_hnsw_skips_already_quarantined(tmp_path):
     moved = quarantine_stale_hnsw(str(palace), stale_seconds=3600.0)
     assert moved == []
     assert drift.exists()
+
+
+# ── make_client cold-start gate ──────────────────────────────────────────
+
+
+def test_make_client_quarantines_only_on_first_call_per_palace(tmp_path, monkeypatch):
+    """Quarantine fires on first ``make_client()`` for a palace, then is
+    skipped on subsequent calls — prevents runtime thrash where a daemon's
+    own steady writes bump ``chroma.sqlite3`` faster than HNSW flushes,
+    making the mtime heuristic falsely trigger every reconnect."""
+    from mempalace.backends.chroma import ChromaBackend
+
+    palace_path = str(tmp_path / "palace")
+    os.makedirs(palace_path, exist_ok=True)
+    (Path(palace_path) / "chroma.sqlite3").write_text("")
+
+    # Reset the per-process cache so this test is independent of others.
+    monkeypatch.setattr(ChromaBackend, "_quarantined_paths", set())
+
+    calls: list[str] = []
+
+    def _spy(path, stale_seconds=300.0):
+        calls.append(path)
+        return []
+
+    monkeypatch.setattr("mempalace.backends.chroma.quarantine_stale_hnsw", _spy)
+
+    ChromaBackend.make_client(palace_path)
+    ChromaBackend.make_client(palace_path)
+    ChromaBackend.make_client(palace_path)
+
+    assert calls == [
+        palace_path
+    ], "quarantine_stale_hnsw should fire once per palace per process, not on every reconnect"
+
+
+def test_make_client_quarantines_each_palace_independently(tmp_path, monkeypatch):
+    """Two distinct palaces each get one quarantine attempt — the gate is
+    keyed by palace path, not global."""
+    from mempalace.backends.chroma import ChromaBackend
+
+    palace_a = str(tmp_path / "palace_a")
+    palace_b = str(tmp_path / "palace_b")
+    for p in (palace_a, palace_b):
+        os.makedirs(p, exist_ok=True)
+        (Path(p) / "chroma.sqlite3").write_text("")
+
+    monkeypatch.setattr(ChromaBackend, "_quarantined_paths", set())
+
+    calls: list[str] = []
+
+    def _spy(path, stale_seconds=300.0):
+        calls.append(path)
+        return []
+
+    monkeypatch.setattr("mempalace.backends.chroma.quarantine_stale_hnsw", _spy)
+
+    ChromaBackend.make_client(palace_a)
+    ChromaBackend.make_client(palace_b)
+    ChromaBackend.make_client(palace_a)  # already gated
+    ChromaBackend.make_client(palace_b)  # already gated
+
+    assert calls == [palace_a, palace_b]
+
+
+# ── _pin_hnsw_threads (per-process retrofit, separate from this PR's gate) ──
+
+
+def test_pin_hnsw_threads_retrofits_legacy_collection(tmp_path):
+    """Legacy collections (created without num_threads) get the retrofit applied."""
+    palace_path = tmp_path / "legacy-palace"
+    palace_path.mkdir()
+
+    client = chromadb.PersistentClient(path=str(palace_path))
+    col = client.create_collection(
+        "mempalace_drawers",
+        metadata={"hnsw:space": "cosine"},  # no num_threads — legacy
+    )
+    assert col.configuration_json.get("hnsw", {}).get("num_threads") is None
+
+    _pin_hnsw_threads(col)
+
+    assert col.configuration_json["hnsw"]["num_threads"] == 1
+
+
+def test_pin_hnsw_threads_swallows_all_errors():
+    """Retrofit never raises even when collection.modify explodes."""
+
+    class _ExplodingCollection:
+        def modify(self, *args, **kwargs):
+            raise RuntimeError("boom")
+
+    _pin_hnsw_threads(_ExplodingCollection())  # must not raise
+
+
+def test_get_collection_applies_retrofit_on_existing_palace(tmp_path):
+    """ChromaBackend.get_collection(create=False) applies the retrofit."""
+    palace_path = tmp_path / "palace"
+    palace_path.mkdir()
+
+    # Simulate a legacy palace: create collection without num_threads
+    bootstrap_client = chromadb.PersistentClient(path=str(palace_path))
+    bootstrap_client.create_collection("mempalace_drawers", metadata={"hnsw:space": "cosine"})
+    del bootstrap_client  # drop reference so a fresh client reopens cleanly
+
+    wrapper = ChromaBackend().get_collection(
+        str(palace_path),
+        collection_name="mempalace_drawers",
+        create=False,
+    )
+
+    assert wrapper._collection.configuration_json["hnsw"]["num_threads"] == 1

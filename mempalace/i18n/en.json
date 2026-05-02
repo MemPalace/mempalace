@@ -42,7 +42,7 @@
     "action_pattern": "(?:built|fixed|wrote|added|pushed|measured|tested|reviewed|created|deleted|updated|configured|deployed|migrated)\\s+[\\w\\s]{3,30}"
   },
   "entity": {
-    "candidate_pattern": "[A-Z][a-z]{1,19}",
+    "candidate_pattern": "[A-Z][a-z]+(?:[A-Z][a-z]+|[A-Z]{2,})+|[A-Z][a-z]{1,19}",
     "multi_word_pattern": "[A-Z][a-z]+(?:\\s+[A-Z][a-z]+)+",
     "person_verb_patterns": [
       "\\b{name}\\s+said\\b",
@@ -140,7 +140,17 @@
       "agents", "tools", "others", "guards", "ethics", "regulation",
       "learning", "thinking", "memory", "language", "intelligence",
       "technology", "society", "culture", "future", "history", "science",
-      "model", "models", "network", "networks", "training", "inference"
+      "model", "models", "network", "networks", "training", "inference",
+      "created", "updated", "deleted", "added", "removed", "modified",
+      "extracted", "processed", "generated", "compiled", "launched", "installed",
+      "deployed", "executed", "loaded", "parsed", "validated", "configured",
+      "total", "summary", "covered", "included", "pending", "failed", "success",
+      "ready", "active", "disabled", "enabled", "available", "completed",
+      "auto", "multi", "mini", "micro", "meta", "super", "hybrid",
+      "context", "bridge", "batch", "local", "global", "native", "cloud",
+      "before", "after", "during", "often", "always", "never",
+      "project", "contributor", "software",
+      "backend", "frontend", "server", "client", "service", "app", "api"
     ]
   }
 }

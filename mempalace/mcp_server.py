@@ -57,7 +57,15 @@ from .config import (  # noqa: E402
     sanitize_content,
 )
 from .version import __version__  # noqa: E402
-from .backends.chroma import ChromaBackend, ChromaCollection  # noqa: E402
+from chromadb.errors import NotFoundError as _ChromaNotFoundError  # noqa: E402
+
+from .backends.chroma import (  # noqa: E402
+    ChromaBackend,
+    ChromaCollection,
+    _HNSW_BLOAT_GUARD,
+    _pin_hnsw_threads,
+    hnsw_capacity_status,
+)
 from .query_sanitizer import sanitize_query  # noqa: E402
 from .searcher import search_memories  # noqa: E402
 from .palace_graph import (  # noqa: E402
@@ -107,6 +115,55 @@ _client_cache = None
 _collection_cache = None
 _palace_db_inode = 0  # inode of chroma.sqlite3 at cache time
 _palace_db_mtime = 0.0  # mtime of chroma.sqlite3 at cache time
+
+# ── Vector-search disabled flag (#1222) ──────────────────────────────────
+# Set when ``hnsw_capacity_status`` reports a divergence between sqlite
+# and the HNSW segment large enough that chromadb would segfault on
+# segment load. While this is set, vector-shaped tools (``search``,
+# ``check_duplicate``) route to the sqlite-only BM25 fallback in
+# :func:`mempalace.searcher._bm25_only_via_sqlite`. Cleared after a
+# successful repair via :func:`tool_reconnect` (which re-runs the probe).
+_vector_disabled = False
+_vector_disabled_reason = ""
+# Optional[dict] (not ``dict | None``) keeps Python 3.9 import-time
+# parsing happy — PEP 604 unions in annotations only became unconditional
+# at module-eval time in 3.10.
+_vector_capacity_status = None  # type: Optional[dict]
+
+
+def _refresh_vector_disabled_flag() -> None:
+    """Re-run the HNSW capacity probe and update the module-level flag.
+
+    Called from :func:`_get_client` whenever the client cache is rebuilt
+    (first open or palace replacement). Cheap — pure sqlite + pickle
+    read, no chromadb interaction. Never raises: a probe that crashes
+    would defeat the point.
+    """
+    global _vector_disabled, _vector_disabled_reason, _vector_capacity_status
+    try:
+        info = hnsw_capacity_status(_config.palace_path, "mempalace_drawers")
+    except Exception:
+        logger.debug("HNSW capacity probe raised", exc_info=True)
+        return
+    _vector_capacity_status = info
+    if info.get("diverged"):
+        if not _vector_disabled:
+            logger.warning(
+                "HNSW capacity divergence detected (%s) — routing search to "
+                "BM25-only sqlite fallback. Run `mempalace repair` to restore "
+                "vector search.",
+                info.get("message", "unknown"),
+            )
+        _vector_disabled = True
+        _vector_disabled_reason = info.get("message", "")
+    else:
+        if _vector_disabled:
+            logger.info(
+                "HNSW capacity within tolerance (%s) — vector search re-enabled",
+                info.get("message", ""),
+            )
+        _vector_disabled = False
+        _vector_disabled_reason = ""
 
 
 # ==================== WRITE-AHEAD LOG ====================
@@ -202,6 +259,11 @@ def _get_client():
     mtime_changed = current_mtime != 0.0 and abs(current_mtime - _palace_db_mtime) > 0.01
 
     if _client_cache is None or inode_changed or mtime_changed:
+        # Run the HNSW capacity probe BEFORE chromadb opens the segment —
+        # if the index is severely undersized, segment load can segfault
+        # the whole MCP server (#1222). The probe is pure sqlite +
+        # metadata-pickle read; never touches the HNSW binary files.
+        _refresh_vector_disabled_flag()
         _client_cache = ChromaBackend.make_client(_config.palace_path)
         _collection_cache = None
         _metadata_cache = None
@@ -216,16 +278,59 @@ def _get_collection(create=False):
     global _collection_cache, _metadata_cache, _metadata_cache_time
     try:
         client = _get_client()
+        # ChromaDB 1.x persists the EF *identity* (its ``name()``) with the
+        # collection but not the EF *instance/configuration*. So a reader or
+        # writer that omits ``embedding_function=`` silently gets chromadb's
+        # built-in ``DefaultEmbeddingFunction`` — its ``name()`` matches the
+        # one we spoof in ``mempalace.embedding`` (both report ``"default"``,
+        # the identity check passes), but the *provider list* is chromadb's
+        # default rather than the user's resolved device. On bleeding-edge
+        # interpreters (#1299: python 3.14 + chromadb 1.5.x on Apple Silicon)
+        # that default provider selection can SIGSEGV the host process on
+        # first ``col.add()``. The miner / Stop hook ingest path avoids this
+        # because it routes through ``ChromaBackend.get_collection``, which
+        # resolves the EF via ``ChromaBackend._resolve_embedding_function``;
+        # the MCP server bypassed that abstraction. Resolve the EF inside the
+        # branches that actually open a collection so warm-cache reads stay
+        # zero-cost. Reuse the backend helper so the two call sites can't
+        # drift on logging or fallback semantics.
         if create:
-            _collection_cache = ChromaCollection(
-                client.get_or_create_collection(
-                    _config.collection_name, metadata={"hnsw:space": "cosine"}
+            ef = ChromaBackend._resolve_embedding_function()
+            ef_kwargs = {"embedding_function": ef} if ef is not None else {}
+            # hnsw:num_threads=1 disables ChromaDB's multi-threaded ParallelFor
+            # HNSW insert path, which has a race in repairConnectionsForUpdate /
+            # addPoint (see issues #974, #965). Set via metadata on fresh
+            # collections and re-applied via _pin_hnsw_threads() for legacy
+            # palaces whose collections were created before this fix (the
+            # runtime config does not persist cross-process in chromadb 1.5.x,
+            # so the retrofit runs every time _get_collection opens a cache).
+            #
+            # ChromaDB 1.5.x's Rust binding SIGSEGVs when get_or_create_collection
+            # is called with metadata that differs from what's stored. The split
+            # below skips the metadata-comparison codepath for existing
+            # collections, mirroring the backend-layer fix from #1262.
+            try:
+                raw = client.get_collection(_config.collection_name, **ef_kwargs)
+            except _ChromaNotFoundError:
+                raw = client.create_collection(
+                    _config.collection_name,
+                    metadata={
+                        "hnsw:space": "cosine",
+                        "hnsw:num_threads": 1,
+                        **_HNSW_BLOAT_GUARD,
+                    },
+                    **ef_kwargs,
                 )
-            )
+            _pin_hnsw_threads(raw)
+            _collection_cache = ChromaCollection(raw)
             _metadata_cache = None
             _metadata_cache_time = 0
         elif _collection_cache is None:
-            _collection_cache = ChromaCollection(client.get_collection(_config.collection_name))
+            ef = ChromaBackend._resolve_embedding_function()
+            ef_kwargs = {"embedding_function": ef} if ef is not None else {}
+            raw = client.get_collection(_config.collection_name, **ef_kwargs)
+            _pin_hnsw_threads(raw)
+            _collection_cache = ChromaCollection(raw)
             _metadata_cache = None
             _metadata_cache_time = 0
         return _collection_cache
@@ -293,11 +398,91 @@ def _sanitize_optional_name(value: str = None, field_name: str = "name") -> str:
 # ==================== READ TOOLS ====================
 
 
+def _tool_status_via_sqlite() -> dict:
+    """Pure-sqlite status reader for the #1222 fallback path.
+
+    When the HNSW capacity probe detects divergence, opening the chromadb
+    persistent client can segfault. This reader pulls the same wing/room
+    breakdown directly from ``embedding_metadata`` so the operator still
+    gets a working status response — and crucially the
+    ``vector_disabled`` flag — without us touching the vector segment.
+    """
+    import sqlite3 as _sqlite3
+
+    db_path = os.path.join(_config.palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return _no_palace()
+
+    wings: dict = {}
+    rooms: dict = {}
+    total = 0
+    try:
+        conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            row = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM embeddings e
+                JOIN segments s ON e.segment_id = s.id
+                JOIN collections c ON s.collection = c.id
+                WHERE c.name = 'mempalace_drawers'
+                """
+            ).fetchone()
+            total = int(row[0]) if row and row[0] is not None else 0
+            for key, target in (("wing", wings), ("room", rooms)):
+                for value, count in conn.execute(
+                    """
+                    SELECT em.string_value, COUNT(*)
+                    FROM embedding_metadata em
+                    JOIN embeddings e ON em.id = e.id
+                    JOIN segments s ON e.segment_id = s.id
+                    JOIN collections c ON s.collection = c.id
+                    WHERE c.name = 'mempalace_drawers'
+                      AND em.key = ?
+                      AND em.string_value IS NOT NULL
+                    GROUP BY em.string_value
+                    """,
+                    (key,),
+                ):
+                    target[value] = count
+        finally:
+            conn.close()
+    except _sqlite3.Error:
+        logger.exception("tool_status sqlite fallback read failed")
+
+    result = {
+        "total_drawers": total,
+        "wings": wings,
+        "rooms": rooms,
+        "palace_path": _config.palace_path,
+        "protocol": PALACE_PROTOCOL,
+        "aaak_dialect": AAAK_SPEC,
+        "vector_disabled": True,
+        "vector_disabled_reason": _vector_disabled_reason,
+    }
+    if _vector_capacity_status:
+        result["hnsw_capacity"] = {
+            "sqlite_count": _vector_capacity_status.get("sqlite_count"),
+            "hnsw_count": _vector_capacity_status.get("hnsw_count"),
+            "divergence": _vector_capacity_status.get("divergence"),
+        }
+    return result
+
+
 def tool_status():
+    # Run the safe sqlite/pickle probe before we touch chromadb. In the
+    # #1222 failure mode, opening the persistent client to call .count()
+    # can segfault — short-circuit to a pure-sqlite path when divergence
+    # is detected so status stays reachable.
+    db_exists = os.path.isfile(os.path.join(_config.palace_path, "chroma.sqlite3"))
+    _refresh_vector_disabled_flag()
+
+    if _vector_disabled:
+        return _tool_status_via_sqlite()
+
     # Use create=True only when a palace DB already exists on disk -- this
     # bootstraps the ChromaDB collection on a valid-but-empty palace without
     # accidentally creating a palace in a non-existent directory (#830).
-    db_exists = os.path.isfile(os.path.join(_config.palace_path, "chroma.sqlite3"))
     col = _get_collection(create=db_exists)
     if not col:
         return _no_palace()
@@ -446,6 +631,11 @@ def tool_search(
     dist = (1.0 - min_similarity) if min_similarity is not None else max_distance
     # Mitigate system prompt contamination (Issue #333)
     sanitized = sanitize_query(query)
+    # Ensure the vector-disabled probe has been run via the safe
+    # sqlite/pickle path before we touch chromadb. Calling _get_client()
+    # here would defeat the fallback — it constructs a PersistentClient
+    # which can segfault on segment load in the #1222 failure mode.
+    _refresh_vector_disabled_flag()
     result = search_memories(
         sanitized["clean_query"],
         palace_path=_config.palace_path,
@@ -453,7 +643,11 @@ def tool_search(
         room=room,
         n_results=limit,
         max_distance=dist,
+        vector_disabled=_vector_disabled,
     )
+    if _vector_disabled:
+        result["vector_disabled"] = True
+        result["vector_disabled_reason"] = _vector_disabled_reason
     # Attach sanitizer metadata for transparency
     if sanitized["was_sanitized"]:
         result["query_sanitized"] = True
@@ -472,6 +666,20 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
     col = _get_collection()
     if not col:
         return _no_palace()
+    if _vector_disabled:
+        # Without a usable HNSW we can't compute cosine similarity for
+        # near-duplicate detection. Report the limitation rather than
+        # silently returning "not a duplicate" — false negatives here
+        # would let the AI re-file content the palace already holds.
+        return {
+            "is_duplicate": False,
+            "matches": [],
+            "vector_disabled": True,
+            "vector_disabled_reason": _vector_disabled_reason,
+            "hint": (
+                "duplicate detection requires vector search; run " "`mempalace repair` to restore"
+            ),
+        }
     try:
         results = col.query(
             query_texts=[content],
@@ -929,6 +1137,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
     try:
         agent_name = sanitize_name(agent_name, "agent_name")
         entry = sanitize_content(entry)
+        topic = sanitize_name(topic, "topic")
     except ValueError as e:
         return {"success": False, "error": str(e)}
 
@@ -1139,10 +1348,22 @@ def tool_reconnect():
     Use after external scripts or CLI commands modify the palace database
     directly, which can leave the in-memory HNSW index stale.
     """
-    global _collection_cache, _palace_db_inode, _palace_db_mtime
+    global \
+        _client_cache, \
+        _collection_cache, \
+        _palace_db_inode, \
+        _palace_db_mtime, \
+        _vector_disabled, \
+        _vector_disabled_reason
+    _client_cache = None
     _collection_cache = None
     _palace_db_inode = 0
     _palace_db_mtime = 0.0
+    # Force probe re-run on next _get_client by clearing the flag now;
+    # _refresh_vector_disabled_flag will re-set it if the divergence
+    # still applies after the reconnect.
+    _vector_disabled = False
+    _vector_disabled_reason = ""
     try:
         col = _get_collection()
         if col is None:
@@ -1150,8 +1371,15 @@ def tool_reconnect():
                 "success": False,
                 "message": "No palace found after reconnect",
                 "drawers": 0,
+                "vector_disabled": _vector_disabled,
             }
-        return {"success": True, "message": "Reconnected to palace", "drawers": col.count()}
+        return {
+            "success": True,
+            "message": "Reconnected to palace",
+            "drawers": col.count(),
+            "vector_disabled": _vector_disabled,
+            "vector_disabled_reason": _vector_disabled_reason,
+        }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -1715,6 +1943,10 @@ def _restore_stdout():
 def main():
     _restore_stdout()
     logger.info("MemPalace MCP Server starting...")
+    # Pre-flight: probe HNSW capacity before any tool call so the warning
+    # is visible at startup rather than on first use (#1222). Pure
+    # filesystem read; never opens a chromadb client.
+    _refresh_vector_disabled_flag()
     while True:
         try:
             line = sys.stdin.readline()

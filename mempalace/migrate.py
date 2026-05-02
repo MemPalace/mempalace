@@ -18,11 +18,32 @@ Usage:
     mempalace migrate --dry-run                # show what would be migrated
 """
 
+import errno
 import os
 import shutil
 import sqlite3
 from collections import defaultdict
 from datetime import datetime
+
+
+def _restore_stale_palace(palace_path: str, stale_path: str) -> None:
+    """Roll back a failed swap.
+
+    shutil.move() can partially create palace_path before raising, which
+    would make a bare os.replace(stale_path, palace_path) fail (dest exists).
+    Clear any partial destination first, then restore. Best-effort: if the
+    restore itself fails, log both paths so the operator can recover by hand.
+    """
+    try:
+        if os.path.lexists(palace_path):
+            shutil.rmtree(palace_path, ignore_errors=True)
+        os.replace(stale_path, palace_path)
+    except Exception as err:
+        print(
+            f"  CRITICAL: rollback failed — original palace at {stale_path}, "
+            f"partial migration data at {palace_path}. Restore manually. "
+            f"({err})"
+        )
 
 
 def extract_drawers_from_sqlite(db_path: str) -> list:
@@ -231,10 +252,27 @@ def migrate(palace_path: str, dry_run: bool = False, confirm: bool = False):
     del col
     del fresh_backend
 
-    # Swap: remove old palace, move new one into place
+    # Swap: rename old palace aside, then move new one into place.
+    # This avoids a window where both old and new are missing.
     print("  Swapping old palace for migrated version...")
-    shutil.rmtree(palace_path)
-    shutil.move(temp_palace, palace_path)
+    stale_path = palace_path + ".old"
+    if os.path.exists(stale_path):
+        shutil.rmtree(stale_path)
+    os.replace(palace_path, stale_path)
+    try:
+        os.replace(temp_palace, palace_path)
+    except OSError as e:
+        # EXDEV = temp lives on a different filesystem; fall back to copy+delete.
+        # Anything else is a real error — don't mask it with shutil.move.
+        if getattr(e, "errno", None) != errno.EXDEV:
+            _restore_stale_palace(palace_path, stale_path)
+            raise
+        try:
+            shutil.move(temp_palace, palace_path)
+        except Exception:
+            _restore_stale_palace(palace_path, stale_path)
+            raise
+    shutil.rmtree(stale_path, ignore_errors=True)
 
     print("\n  Migration complete.")
     print(f"  Drawers migrated: {final_count}")
