@@ -650,9 +650,9 @@ class TestWriteTools:
 
         assert result1["success"] is True
         assert result2["success"] is True
-        assert (
-            result1["drawer_id"] != result2["drawer_id"]
-        ), "Documents with shared header but different content must have distinct drawer IDs"
+        assert result1["drawer_id"] != result2["drawer_id"], (
+            "Documents with shared header but different content must have distinct drawer IDs"
+        )
 
     def test_delete_drawer(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)

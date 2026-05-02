@@ -102,6 +102,56 @@ class TestSearchMemories:
             create=False,
         )
 
+    def test_search_memories_accepts_explicit_candidate_strategy(self):
+        """Regression: ``candidate_strategy`` must remain in the API
+        signature so callers can opt into the BM25-union candidate pool
+        without hitting a ``NameError`` inside ``search_memories``."""
+        mock_col = MagicMock()
+        mock_col.query.return_value = {
+            "documents": [[]],
+            "metadatas": [[]],
+            "distances": [[]],
+            "ids": [[]],
+        }
+
+        with (
+            patch("mempalace.searcher.get_collection", return_value=mock_col),
+            patch("mempalace.searcher.get_closets_collection", return_value=mock_col),
+        ):
+            result = search_memories(
+                "test",
+                "/fake/path",
+                candidate_strategy="union",
+            )
+
+        assert result["results"] == []
+
+    def test_search_memories_preserves_candidate_strategy_positional_order(self):
+        mock_col = MagicMock()
+        mock_col.query.return_value = {
+            "documents": [[]],
+            "metadatas": [[]],
+            "distances": [[]],
+            "ids": [[]],
+        }
+
+        with (
+            patch("mempalace.searcher.get_collection", return_value=mock_col),
+            patch("mempalace.searcher.get_closets_collection", return_value=mock_col),
+        ):
+            result = search_memories(
+                "test",
+                "/fake/path",
+                None,
+                None,
+                5,
+                0.0,
+                False,
+                "union",
+            )
+
+        assert result["results"] == []
+
     def test_search_memories_filters_in_result(self, palace_path, seeded_collection):
         result = search_memories("test", palace_path, wing="project", room="backend")
         assert result["filters"]["wing"] == "project"
@@ -327,9 +377,9 @@ class TestSearchCLI:
         captured = capsys.readouterr()
         first_block, _, _ = captured.out.partition("[2]")
         # Lexical match must rank first
-        assert (
-            "b.md" in first_block
-        ), f"expected lexical match 'b.md' at rank 1, got:\n{captured.out}"
+        assert "b.md" in first_block, (
+            f"expected lexical match 'b.md' at rank 1, got:\n{captured.out}"
+        )
         # Non-zero bm25 reported
         assert "bm25=" in first_block
         assert "bm25=0.0" not in first_block

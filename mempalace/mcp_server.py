@@ -56,6 +56,7 @@ from typing import Optional  # noqa: E402
 
 from .config import (  # noqa: E402
     MempalaceConfig,
+    DEFAULT_COLLECTION_NAME,
     sanitize_kg_value,
     sanitize_name,
     sanitize_content,
@@ -225,6 +226,17 @@ _vector_disabled_reason = ""
 _vector_capacity_status: Optional[dict] = None
 
 
+def _collection_name() -> str:
+    """Return the configured drawer collection name with a safe default.
+
+    Some tests and embedding callers swap ``_config`` for a tiny stand-in
+    that only exposes ``palace_path``. Fallback/status paths should keep
+    working in that setup instead of assuming the full ``MempalaceConfig``
+    surface is present.
+    """
+    return getattr(_config, "collection_name", DEFAULT_COLLECTION_NAME)
+
+
 def _refresh_vector_disabled_flag() -> None:
     """Re-run the HNSW capacity probe and update the module-level flag.
 
@@ -235,7 +247,7 @@ def _refresh_vector_disabled_flag() -> None:
     """
     global _vector_disabled, _vector_disabled_reason, _vector_capacity_status
     try:
-        info = hnsw_capacity_status(_config.palace_path, _config.collection_name)
+        info = hnsw_capacity_status(_config.palace_path, _collection_name())
     except Exception:
         logger.debug("HNSW capacity probe raised", exc_info=True)
         return
@@ -532,7 +544,7 @@ def _tool_status_via_sqlite() -> dict:
     db_path = os.path.join(_config.palace_path, "chroma.sqlite3")
     if not os.path.isfile(db_path):
         return _no_palace()
-    collection_name = _config.collection_name
+    collection_name = _collection_name()
 
     wings: dict = {}
     rooms: dict = {}
