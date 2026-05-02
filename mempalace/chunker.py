@@ -80,6 +80,29 @@ _DIFF_RE = re.compile(r"^\s*\d+[+\-:]\s")
 # filesystem metadata, not memory.
 _ARROW_LINE_RE = re.compile(r"^\s*→\s")
 
+# JSON object/JSONL line: starts with `{"key":` (the canonical Claude Code
+# session log shape). Matched anchored to line start so prose mentioning
+# `{"foo": 1}` inline is not flagged.
+_JSON_OBJECT_LINE_RE = re.compile(r'^\s*\{"\w+":')
+
+# JSON key/value separator. Counts the canonical `,"key":` shape that
+# appears between adjacent pairs in a JSON object. We use the looser
+# `,"key":` form (comma + open-quote + word + close-quote + colon) rather
+# than `","key":` so that array-close transitions like `"],"sessionId":`
+# also count — the real session-log shape interleaves arrays of strings
+# with object keys, and the strict form misses those boundaries. Real
+# prose almost never has `,"word":` without surrounding whitespace, so
+# the false-positive risk is small.
+_JSON_KV_PAIR_RE = re.compile(r',"\w+":')
+
+# Strong markers that the chunk is a Claude Code or chat-platform session
+# log fragment. Any one of these in combination with high JSON-KV density
+# is decisive.
+_TRANSCRIPT_MARKER_RE = re.compile(
+    r'"(?:uuid|sessionId|requestId|messageId|parentUuid)"\s*:'
+    r'|"timestamp"\s*:\s*"\d{4}-\d{2}-\d{2}'
+)
+
 
 def is_excluded_content(text: str) -> bool:
     """True if `text` is dominated by tool-output noise.
@@ -98,6 +121,11 @@ def is_excluded_content(text: str) -> bool:
     - The chunk is essentially just a truncation message
     - The chunk is a dense run of arrow-redirected tool output (>5
       arrows on a single visual line)
+    - >=50% of non-empty lines start with a JSON object pattern
+      ({"key":), or the chunk has a high density of JSON key/value
+      separators (`","key":`) combined with a transcript marker
+      (uuid/sessionId/etc.) — catches Claude Code session logs spilled
+      into tool-results files or pasted into transcripts as raw JSONL.
     """
     if not text or not text.strip():
         return True
@@ -136,6 +164,28 @@ def is_excluded_content(text: str) -> bool:
     # collapsed into a single visual line by the per-line strip-and-join
     # path the previous chunker used.
     if n <= 3 and text.count(" → ") > 5:
+        return True
+
+    # JSONL session-log shape: each non-empty line is its own JSON object
+    # starting with `{"key":...`. Catches raw Claude Code session files
+    # parsed as plain text (e.g., when normalize() falls through because
+    # the JSON parsers couldn't extract messages).
+    json_object_lines = sum(1 for ln in lines if _JSON_OBJECT_LINE_RE.match(ln))
+    if json_object_lines >= 0.5 * n:
+        return True
+
+    # Inline JSON-blob density: tool-results files or transcript blobs
+    # frequently arrive as one giant line/paragraph rather than line-per-
+    # object. Density of `","key":` patterns plus a transcript marker
+    # (uuid/sessionId/timestamp) is decisive. Threshold: >=1 KV pair per
+    # 200 chars (real prose maxes out around 1 per 800-1200 chars even
+    # when describing JSON).
+    kv_pairs = len(_JSON_KV_PAIR_RE.findall(text))
+    if (
+        kv_pairs > 0
+        and _TRANSCRIPT_MARKER_RE.search(text)
+        and kv_pairs * 200 >= len(text)
+    ):
         return True
 
     return False

@@ -120,6 +120,69 @@ class TestIsExcludedContent:
         assert is_excluded_content("") is True
         assert is_excluded_content("   \n\n  ") is True
 
+    # --- JSON-blob and Claude Code session-log shapes ---
+
+    def test_jsonl_session_log_excluded(self):
+        # Each line is its own JSON object — the canonical Claude Code
+        # session log shape. Should be dropped wholesale.
+        text = (
+            '{"type":"permission-mode","permissionMode":"default","sessionId":"abc"}\n'
+            '{"type":"file-history-snapshot","messageId":"90a7","timestamp":"2026-04-02T23:12:57.330Z"}\n'
+            '{"parentUuid":null,"isSidechain":false,"type":"user","message":{"role":"user"}}\n'
+            '{"type":"assistant","uuid":"158113b8","timestamp":"2026-04-02T23:13:01.448Z"}\n'
+        )
+        assert is_excluded_content(text) is True
+
+    def test_inline_json_blob_with_transcript_marker_excluded(self):
+        # Real production failure shape: a single visual line with high
+        # `","key":` density and embedded uuid/timestamp markers, taken
+        # verbatim from the b5k5gj8gj.txt tool-results dump that
+        # produced 82 mid-line drawers in the 2026-05-02 audit.
+        text = (
+            'andard","inference_geo":"not_available"}},"requestId":"req_011CZfntLLhXGsFZaH",'
+            '"type":"assistant","uuid":"158113b8-5455-4668-8b94-356cd9523bbc",'
+            '"timestamp":"2026-04-02T23:13:01.448Z","userType":"external","entrypoint":"cli",'
+            '"cwd":"/Users/jameswinans/Documents/Temenos/Ves","sessionId":"1ada0a3a"}'
+        )
+        assert is_excluded_content(text) is True
+
+    def test_long_quoted_tool_list_excluded(self):
+        # The tool-name list shape: comma-separated quoted strings with
+        # no transcript marker. High `","key":`-density alone is not
+        # enough — but if there's a transcript marker, it should fire.
+        # This case has a marker, so excluded.
+        text = (
+            '"tools":["mcp__library-rag__delete_file","mcp__library-rag__ingest_data",'
+            '"mcp__library-rag__ingest_file","mcp__library-rag__list_files",'
+            '"mcp__library-rag__query_documents","mcp__library-rag__status"],'
+            '"sessionId":"abc","timestamp":"2026-04-02T23:13:01.448Z"'
+        )
+        assert is_excluded_content(text) is True
+
+    def test_prose_mentioning_uuid_kept(self):
+        # Prose that mentions a uuid or session id in passing must
+        # survive — only blob density triggers exclusion.
+        text = (
+            "I traced the issue back to the session with sessionId "
+            '"abc-123-def" — that one had a permissionMode mismatch. '
+            "The fix is to normalize the JSON envelope before passing "
+            "it to the next stage. We've seen this twice before in the "
+            "April 17 logs and once in early May; the pattern is "
+            "consistent enough that it warrants a regression test."
+        )
+        assert is_excluded_content(text) is False
+
+    def test_prose_with_one_json_object_kept(self):
+        # One inlined JSON example in otherwise prose content stays.
+        text = (
+            "The handler returns a payload like\n\n"
+            '{"status":"ok","count":5,"latency_ms":42}\n\n'
+            "which downstream services parse and route. The key thing "
+            "to notice is the latency field — it lets us decide whether "
+            "to retry on a slow path."
+        )
+        assert is_excluded_content(text) is False
+
 
 # ---------------------------------------------------------------------------
 # smart_split — boundary preservation, no mid-word cuts

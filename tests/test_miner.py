@@ -224,6 +224,35 @@ def test_scan_project_skip_dirs_still_apply_without_override():
         shutil.rmtree(tmpdir)
 
 
+def test_scan_project_skips_tool_results_subdir():
+    """Claude Code spills oversized tool outputs to
+    ``.claude/projects/{session}/tool-results/*.txt``. Those files are
+    raw tool artifacts (JSON dumps, log captures) and have produced
+    unusable drawers when mined as conversations. The directory walker
+    should skip the subtree entirely.
+    """
+    tmpdir = tempfile.mkdtemp()
+    try:
+        project_root = Path(tmpdir).resolve()
+
+        # Real prose at the project root: must survive.
+        write_file(project_root / "notes.md", "# Notes\n\nReal prose here.\n" * 5)
+
+        # tool-results subdirectory that the walker must skip.
+        write_file(
+            project_root / "session-abc" / "tool-results" / "b5k5gj8gj.txt",
+            '{"type":"permission-mode","sessionId":"abc"}\n' * 10,
+        )
+
+        scanned = scanned_files(project_root, respect_gitignore=False)
+        assert "notes.md" in scanned
+        assert not any("tool-results" in p for p in scanned), (
+            f"tool-results subdir was not skipped: {scanned}"
+        )
+    finally:
+        shutil.rmtree(tmpdir)
+
+
 def test_entity_metadata_finds_cyrillic_names(monkeypatch):
     """Entity extraction must find non-Latin names when entity_languages includes the locale."""
     import mempalace.palace as palace_mod

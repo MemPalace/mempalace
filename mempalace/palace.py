@@ -35,6 +35,14 @@ SKIP_DIRS = {
     ".eggs",
     "htmlcov",
     "target",
+    # Claude Code spills oversized tool-call outputs to
+    # `.claude/projects/{session}/tool-results/*.txt`. Those files are
+    # raw tool artifacts (JSON dumps, log captures, error tracebacks
+    # containing inlined session metadata) — not conversation content —
+    # and produce unusable drawers when mined as text. Skip the whole
+    # subtree at the walker level rather than relying on chunk-level
+    # exclusion alone.
+    "tool-results",
 }
 
 _DEFAULT_BACKEND = ChromaBackend()

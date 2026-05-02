@@ -370,11 +370,12 @@ def chunk_text(content: str, source_file: str) -> list:
         return []
 
     pieces = smart_split(content, CHUNK_SIZE, CHUNK_MAX)
-    return [
-        {"content": piece, "chunk_index": idx}
-        for idx, piece in enumerate(pieces)
-        if len(piece.strip()) >= MIN_CHUNK_SIZE
+    kept = [
+        piece
+        for piece in pieces
+        if len(piece.strip()) >= MIN_CHUNK_SIZE and not is_excluded_content(piece)
     ]
+    return [{"content": piece, "chunk_index": idx} for idx, piece in enumerate(kept)]
 
 
 # =============================================================================

@@ -172,13 +172,22 @@ def _emit_chunks(content: str) -> list:
     Returns a list of chunk strings, each at least MIN_CHUNK_SIZE
     chars. Empty list if the content is excluded or all chunks fall
     below the minimum size.
+
+    Exclusion runs at two levels: once on the whole content (catches
+    bulk noise, drops the exchange), and once per resulting chunk (so a
+    largely-prose response containing one embedded log/JSON paragraph
+    drops only that chunk rather than discarding the whole turn).
     """
     if not content or not content.strip():
         return []
     if is_excluded_content(content):
         return []
     pieces = smart_split(content, CHUNK_SIZE, CHUNK_MAX)
-    return [p for p in pieces if len(p.strip()) >= MIN_CHUNK_SIZE]
+    return [
+        p
+        for p in pieces
+        if len(p.strip()) >= MIN_CHUNK_SIZE and not is_excluded_content(p)
+    ]
 
 
 # =============================================================================
