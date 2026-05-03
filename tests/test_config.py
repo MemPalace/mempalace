@@ -28,6 +28,14 @@ def test_default_config():
     assert cfg.collection_name == "mempalace_drawers"
 
 
+def test_config_dir_property_exposes_resolved_path(tmp_path):
+    """`config_dir` is the public accessor callers outside config.py rely on
+    to derive sibling locations (WAL dir, cache dir, etc.) without reaching
+    into the underscore-prefixed `_config_dir`."""
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.config_dir == tmp_path
+
+
 def test_config_from_file():
     tmpdir = tempfile.mkdtemp()
     with open(os.path.join(tmpdir, "config.json"), "w") as f:

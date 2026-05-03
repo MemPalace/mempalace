@@ -349,3 +349,17 @@ class TestCLI:
             _reconfigure_stdio_utf8_on_windows()
 
         assert stdin.reconfigure_calls == []
+
+    def test_default_palace_resolves_via_mempalace_config(self, tmp_path, monkeypatch):
+        """Without `--palace`, the CLI must fall back to
+        `MempalaceConfig().palace_path`, not a hardcoded `~/.mempalace/palace`.
+        Otherwise XDG-aware config-dir users get a stale legacy default."""
+        fake_config = tmp_path / "xdg_config"
+        fake_config.mkdir()
+        monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(fake_config))
+        monkeypatch.delenv("MEMPALACE_PALACE_PATH", raising=False)
+        monkeypatch.delenv("MEMPAL_PALACE_PATH", raising=False)
+
+        from mempalace.fact_checker import _default_palace_path
+
+        assert _default_palace_path() == str(fake_config / "palace")

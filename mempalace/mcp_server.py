@@ -387,7 +387,7 @@ def _refresh_vector_disabled_flag() -> None:
 # This provides an audit trail for detecting memory poisoning and
 # enables review/rollback of writes from external or untrusted sources.
 
-_WAL_DIR = Path(os.path.expanduser("~/.mempalace/wal"))
+_WAL_DIR = Path(_config.config_dir) / "wal"
 _WAL_DIR.mkdir(parents=True, exist_ok=True)
 try:
     _WAL_DIR.chmod(0o700)

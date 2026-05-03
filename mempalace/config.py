@@ -358,6 +358,16 @@ class MempalaceConfig:
                 self._file_config = {}
 
     @property
+    def config_dir(self):
+        """Active config directory (XDG-aware).
+
+        Public accessor for the resolved config-dir path so callers outside
+        ``config.py`` can derive sibling locations (write-ahead-log dir,
+        cache dir, etc.) without reaching into ``_config_dir``.
+        """
+        return self._config_dir
+
+    @property
     def palace_path(self):
         """Path to the memory palace data directory.
 
