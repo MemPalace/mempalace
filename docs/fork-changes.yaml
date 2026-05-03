@@ -24,6 +24,55 @@
 
 entries:
 
+  - id: chunking-defaults-no-materialize
+    date: 2026-05-03
+    bucket: Fixed
+    commit: 6ce37c0
+    area: CLI
+    summary: "`cfg.init()` no longer materializes chunking defaults into `config.json`"
+    body: |
+      `cfg.init()` was unconditionally writing ``chunk_size: 800``,
+      ``chunk_overlap: 100``, and ``min_chunk_size: 50`` into
+      ``config.json`` on first run. The values match ``miner.py``'s
+      module-level constants but conflict with ``convo_miner.py``'s
+      stricter ``MIN_CHUNK_SIZE = 30`` floor — and ``convo_miner.py``
+      lines 427-431 explicitly distinguishes "user has tuned this"
+      from "user is on defaults" by checking
+      ``_file_config.get("min_chunk_size") is None``. Materializing
+      the value as a default broke that detection: any user who ran
+      ``mempalace init`` then mined conversations would silently lose
+      exchanges shorter than 50 characters, even though the convo
+      miner's intended floor is 30.
+
+      Surfaced by a pytest fixture leak. ``tests/conftest.py:21-27``
+      redirects ``HOME`` to a session-tmp directory so tests don't
+      trash the real ``~/.mempalace``. The first test that calls
+      ``cmd_init`` writes the bloated default config into the
+      session-tmp ``~/.mempalace``, and downstream
+      ``test_convo_miner`` runs (in-process, same session) then read
+      ``min_chunk_size: 50`` and skip the test fixture's ~30-char
+      exchanges entirely. Both tests pass in isolation; the second
+      fails when chained.
+
+      Fix: drop the three chunking keys from ``cfg.init()``'s
+      default-config-write. The
+      ``MempalaceConfig.chunk_size``/``.chunk_overlap``/``.min_chunk_size``
+      properties already provide the right fallbacks via
+      ``_file_config.get(key, default)`` when the key is absent.
+      Users who want to tune chunking still set the keys explicitly;
+      the contract ``convo_miner.py`` relies on (``is None`` ⇔
+      "untuned") is restored.
+
+      Same fix pushed to the open #1024 PR branch as commit
+      ``df9187c`` so the bug doesn't get reintroduced when #1024
+      merges. Amends fork-ahead row 17.
+    tests: "1548/1548 (was 1546/1548 with 2 isolation failures in test_convo_miner)"
+    pr: 1024
+    pr_state: OPEN
+    files:
+      - mempalace/config.py
+    supersedes: []
+
   - id: kind-filter-retired
     date: 2026-04-27
     bucket: Changed
