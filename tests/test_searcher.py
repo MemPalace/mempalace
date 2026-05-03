@@ -5,6 +5,7 @@ Uses the real ChromaDB fixtures from conftest.py for integration tests,
 plus mock-based tests for error paths.
 """
 
+import sqlite3
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -548,3 +549,116 @@ def test_resolve_stop_words_none_reflects_config_change_between_calls(monkeypatc
     assert (
         "した" in second
     ), f"cache pinned stale empty set for None after config change; got {second!r}"
+
+
+# ── stop_words propagation through BM25-only / union-merge paths (post-#1306) ──
+#
+# #1306 added a second BM25 scoring site inside `_bm25_only_via_sqlite` that
+# the original PR didn't cover (it landed on develop after this branch was
+# opened). These tests pin the propagation chain so the BM25 fallback and the
+# `candidate_strategy="union"` merge tokenize at the same locale as
+# `_hybrid_rank`.
+
+
+def test_bm25_only_via_sqlite_forwards_stop_words_to_bm25_scores(monkeypatch, tmp_path):
+    """`_bm25_only_via_sqlite` must pass `stop_words` into `_bm25_scores`.
+
+    Without this, vector-disabled (#1222) palaces silently lose stop-word
+    filtering on the BM25 fallback path.
+    """
+    from mempalace import searcher
+
+    captured = {}
+    real_bm25 = searcher._bm25_scores
+
+    def _spy(query, docs, **kwargs):
+        captured["stop_words"] = kwargs.get("stop_words")
+        return real_bm25(query, docs, **kwargs)
+
+    monkeypatch.setattr(searcher, "_bm25_scores", _spy)
+
+    # Build a minimal chroma.sqlite3 with one matching drawer so the scoring
+    # path is reached. Schema mirrors what `_bm25_only_via_sqlite` reads,
+    # including the embeddings/segments/collections JOIN added by #1306 to
+    # scope candidate selection by collection name.
+    db = tmp_path / "chroma.sqlite3"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE VIRTUAL TABLE embedding_fulltext_search USING fts5(string_value, tokenize='trigram');
+        CREATE TABLE embedding_metadata (id INTEGER, key TEXT, string_value TEXT, int_value INTEGER);
+        CREATE TABLE collections (id TEXT PRIMARY KEY, name TEXT);
+        CREATE TABLE segments (id TEXT PRIMARY KEY, collection TEXT);
+        CREATE TABLE embeddings (id INTEGER PRIMARY KEY, segment_id TEXT, created_at TEXT);
+        INSERT INTO collections VALUES ('c1', 'mempalace_drawers');
+        INSERT INTO segments VALUES ('s1', 'c1');
+        INSERT INTO embeddings VALUES (1, 's1', '2026-05-03');
+        INSERT INTO embedding_fulltext_search (rowid, string_value) VALUES (1, 'the cat sat');
+        INSERT INTO embedding_metadata VALUES (1, 'chroma:document', 'the cat sat', NULL);
+        INSERT INTO embedding_metadata VALUES (1, 'wing', 'general', NULL);
+        INSERT INTO embedding_metadata VALUES (1, 'room', 'inbox', NULL);
+        INSERT INTO embedding_metadata VALUES (1, 'source_file', '/x/cat.md', NULL);
+        INSERT INTO embedding_metadata VALUES (1, 'filed_at', '2026-05-03', NULL);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    searcher._bm25_only_via_sqlite(
+        "the cat",
+        str(tmp_path),
+        n_results=5,
+        collection_name="mempalace_drawers",
+        stop_words=frozenset({"the"}),
+    )
+
+    assert captured["stop_words"] == frozenset({"the"})
+
+
+def test_apply_candidate_strategy_forwards_stop_words_to_merger(monkeypatch):
+    """`_apply_candidate_strategy` must forward `stop_words` to the merger."""
+    from mempalace import searcher
+
+    captured = {}
+
+    def _stub_merger(hits, query, palace, wing, room, n, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setitem(searcher._CANDIDATE_MERGERS, "union", _stub_merger)
+
+    searcher._apply_candidate_strategy(
+        "union",
+        [],
+        "q",
+        "/p",
+        None,
+        None,
+        n_results=5,
+        max_distance=0.0,
+        stop_words=frozenset({"a", "an"}),
+    )
+
+    assert captured["stop_words"] == frozenset({"a", "an"})
+
+
+def test_search_memories_vector_disabled_uses_resolved_stop_words(monkeypatch, tmp_path):
+    """`vector_disabled=True` must route `_resolve_stop_words(lang)` into the
+    BM25 fallback, not skip stop-word resolution as it did pre-fix."""
+    from mempalace import searcher
+
+    captured = {}
+
+    def _stub(*args, **kwargs):
+        captured["stop_words"] = kwargs.get("stop_words")
+        return {"results": [], "fallback": "bm25_only_via_sqlite"}
+
+    monkeypatch.setattr(searcher, "_bm25_only_via_sqlite", _stub)
+    monkeypatch.setattr(searcher, "_resolve_stop_words", lambda lang: frozenset({"de", "es"}))
+
+    searcher.search_memories(
+        query="q",
+        palace_path=str(tmp_path),
+        vector_disabled=True,
+    )
+
+    assert captured["stop_words"] == frozenset({"de", "es"})
