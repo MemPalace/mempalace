@@ -169,6 +169,80 @@ def test_cmd_hook_calls_run_hook():
 
 
 @patch("mempalace.cli.MempalaceConfig")
+def test_cmd_init_hints_when_claude_code_paired_with_ollama_default_model(
+    mock_config_cls, tmp_path, capsys
+):
+    """When --llm-provider is claude-code but --llm-model stays at the
+    Ollama-shaped default ``gemma4:e4b``, cmd_init must print a one-line
+    hint pointing at a real Anthropic model. Without this, claude -p
+    rejects the call with a confusing model-not-found error and the user
+    has no idea why."""
+
+    args = argparse.Namespace(
+        dir=str(tmp_path),
+        yes=True,
+        no_llm=False,
+        llm_provider="claude-code",
+        llm_model="gemma4:e4b",
+        llm_endpoint=None,
+        llm_api_key=None,
+        accept_external_llm=False,
+        palace=None,
+        lang=None,
+    )
+
+    bad_provider = MagicMock()
+    bad_provider.check_available.return_value = (False, "no claude binary")
+
+    with (
+        patch("mempalace.cli.get_provider", return_value=bad_provider),
+        patch("mempalace.entity_detector.scan_for_detection", return_value=[]),
+        patch("mempalace.room_detector_local.detect_rooms_local"),
+        patch("mempalace.cli._maybe_run_mine_after_init"),
+    ):
+        cmd_init(args)
+
+    err = capsys.readouterr().err
+    assert "claude-code expects an Anthropic model name" in err
+    assert "claude-haiku-4-5" in err
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_init_no_hint_when_claude_code_with_explicit_anthropic_model(
+    mock_config_cls, tmp_path, capsys
+):
+    """No hint when the user explicitly picked an Anthropic model name --
+    the trap is the silent default, not the explicit pairing."""
+
+    args = argparse.Namespace(
+        dir=str(tmp_path),
+        yes=True,
+        no_llm=False,
+        llm_provider="claude-code",
+        llm_model="claude-haiku-4-5",
+        llm_endpoint=None,
+        llm_api_key=None,
+        accept_external_llm=False,
+        palace=None,
+        lang=None,
+    )
+
+    bad_provider = MagicMock()
+    bad_provider.check_available.return_value = (False, "no claude binary")
+
+    with (
+        patch("mempalace.cli.get_provider", return_value=bad_provider),
+        patch("mempalace.entity_detector.scan_for_detection", return_value=[]),
+        patch("mempalace.room_detector_local.detect_rooms_local"),
+        patch("mempalace.cli._maybe_run_mine_after_init"),
+    ):
+        cmd_init(args)
+
+    err = capsys.readouterr().err
+    assert "claude-haiku-4-5" not in err or "Hint" not in err
+
+
+@patch("mempalace.cli.MempalaceConfig")
 def test_cmd_init_no_entities(mock_config_cls, tmp_path):
     args = argparse.Namespace(dir=str(tmp_path), yes=True)
     with (

@@ -261,6 +261,18 @@ def cmd_init(args):
     if not getattr(args, "no_llm", False):
         provider_name = getattr(args, "llm_provider", "ollama") or "ollama"
         provider_model = getattr(args, "llm_model", "gemma4:e4b") or "gemma4:e4b"
+        # Friendly hint when claude-code is paired with the Ollama-shaped
+        # default model. claude -p rejects "gemma4:e4b" as an unknown
+        # Anthropic model with a confusing error; surface what the user
+        # likely meant and continue (they may have set the same value
+        # explicitly on purpose).
+        if provider_name == "claude-code" and provider_model == "gemma4:e4b":
+            print(
+                "  Hint: --llm-model defaults to 'gemma4:e4b' (Ollama). "
+                "claude-code expects an Anthropic model name like "
+                "'claude-haiku-4-5'. Pass --llm-model claude-haiku-4-5 to silence.",
+                file=sys.stderr,
+            )
         try:
             candidate = get_provider(
                 name=provider_name,

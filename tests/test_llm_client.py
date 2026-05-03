@@ -625,7 +625,7 @@ def test_claude_code_classify_json_mode_off_keeps_system_clean():
     assert resp.text == "plain text reply"
 
 
-def test_claude_code_strips_anthropic_env_vars(monkeypatch):
+def test_claude_code_strips_anthropic_credential_env_vars(monkeypatch):
     captured = {}
 
     def fake_run(cmd, **kwargs):
@@ -634,7 +634,10 @@ def test_claude_code_strips_anthropic_env_vars(monkeypatch):
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-key")
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "tok-test")
-    monkeypatch.setenv("anthropic_other", "lower")  # case-insensitive prefix scrub
+    monkeypatch.setenv("anthropic_api_key", "sk-lower")  # case-insensitive match
+    # ANTHROPIC_BASE_URL is configuration, not credentials -- a corporate
+    # proxy / internal gateway needs it to survive into the subprocess.
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://anthropic.internal.corp/api")
     monkeypatch.setenv("UNRELATED_VAR", "kept")
 
     with patch("mempalace.llm_client.shutil.which", return_value=_FAKE_CLAUDE_BIN):
@@ -644,11 +647,16 @@ def test_claude_code_strips_anthropic_env_vars(monkeypatch):
 
     env = captured["env"]
     assert env is not None
-    # ANTHROPIC_* in any case is stripped so claude -p can't fall back to
-    # API-key auth and bill the API account instead of the subscription.
+    # API_KEY / AUTH_TOKEN (credential-bearing) get stripped so claude -p
+    # can't fall back to API-key auth and bill the API account instead of
+    # the subscription. Case-insensitive match guards against a lowercased
+    # export that would otherwise sneak through.
     assert "ANTHROPIC_API_KEY" not in env
     assert "ANTHROPIC_AUTH_TOKEN" not in env
-    assert "anthropic_other" not in env
+    assert "anthropic_api_key" not in env
+    # Configuration vars (BASE_URL etc.) MUST pass through so corporate-proxy
+    # users keep their custom endpoint routing.
+    assert env.get("ANTHROPIC_BASE_URL") == "https://anthropic.internal.corp/api"
     # Unrelated env vars must still pass through.
     assert env.get("UNRELATED_VAR") == "kept"
 
