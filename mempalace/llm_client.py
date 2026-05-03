@@ -478,6 +478,21 @@ class ClaudeCodeProvider(LLMProvider):
     ):
         super().__init__(model=model, timeout=timeout)
 
+    @property
+    def is_external_service(self) -> bool:
+        # The CLI binary runs locally but routes every classify call to
+        # Anthropic's hosted models, so user content does leave the machine.
+        # Override the URL-based default in the base class.
+        return True
+
+    def _subprocess_env(self) -> dict:
+        # Strip ANTHROPIC_* env vars before spawning `claude -p`. If the user
+        # has ANTHROPIC_API_KEY exported in their shell, the CLI may fall
+        # back to API-key auth and bill the API account instead of the
+        # subscription this provider is built around. Removing the vars
+        # forces OAuth / keychain auth, which is the documented path.
+        return {k: v for k, v in os.environ.items() if not k.upper().startswith("ANTHROPIC_")}
+
     def check_available(self) -> tuple[bool, str]:
         binary = shutil.which("claude")
         if not binary:
@@ -488,12 +503,15 @@ class ClaudeCodeProvider(LLMProvider):
             )
         try:
             r = subprocess.run(
-                ["claude", "auth", "status", "--text"],
+                [binary, "auth", "status", "--text"],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=10,
+                env=self._subprocess_env(),
             )
-        except (subprocess.TimeoutExpired, OSError) as e:
+        except (subprocess.SubprocessError, OSError) as e:
             return False, f"`claude auth status` failed: {e}"
         if r.returncode != 0:
             return (
@@ -506,6 +524,9 @@ class ClaudeCodeProvider(LLMProvider):
         sys_prompt = system
         if json_mode:
             sys_prompt += "\n\nRespond with valid JSON only, no prose."
+        binary = shutil.which("claude")
+        if not binary:
+            raise LLMError("`claude` CLI not found in PATH")
         # `--bare` would skip hooks, plugins, CLAUDE.md auto-discovery, but it
         # also forces claude to use ANTHROPIC_API_KEY only and ignore OAuth /
         # keychain. That defeats this provider's whole point (subscription
@@ -513,13 +534,13 @@ class ClaudeCodeProvider(LLMProvider):
         # invoke from a temp cwd so claude does not pick up a project-level
         # CLAUDE.md it does not need.
         #
-        # System prompt is prepended to stdin instead of being passed via
-        # `--system-prompt` argv. argv is visible to other local users via
-        # `ps` / /proc/*/cmdline, and the prompt can carry sensitive context
-        # (entity names, project paths). The SYSTEM/USER framing is a
-        # convention `claude -p` follows reliably for classification tasks.
+        # System and user content go through stdin (not argv) so they are
+        # not visible to other local users via `ps` / /proc/*/cmdline, and
+        # to keep prompt-injection surface narrow we frame them with XML-
+        # like tags rather than literal "SYSTEM:" / "USER:" markers a
+        # malicious drawer could spoof.
         cmd = [
-            "claude",
+            binary,
             "-p",
             "--no-session-persistence",  # don't pollute Claude Code session history
             "--output-format",
@@ -527,15 +548,18 @@ class ClaudeCodeProvider(LLMProvider):
             "--model",
             self.model,
         ]
-        combined_input = f"SYSTEM:\n{sys_prompt}\n\nUSER:\n{user}"
+        combined_input = f"<system>\n{sys_prompt}\n</system>\n<user>\n{user}\n</user>"
         try:
             r = subprocess.run(
                 cmd,
                 input=combined_input,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=self.timeout,
                 cwd=tempfile.gettempdir(),
+                env=self._subprocess_env(),
             )
         except subprocess.TimeoutExpired as e:
             raise LLMError(f"`claude -p` timed out after {self.timeout}s") from e
@@ -547,7 +571,10 @@ class ClaudeCodeProvider(LLMProvider):
         try:
             envelope = json.loads(r.stdout)
         except json.JSONDecodeError as e:
-            raise LLMError(f"`claude -p` returned non-JSON envelope: {e}") from e
+            stdout_excerpt = (r.stdout or "").strip()[:200]
+            raise LLMError(
+                f"`claude -p` returned non-JSON envelope: {e}; stdout={stdout_excerpt!r}"
+            ) from e
         # `--output-format json` returns:
         # {"type":"result","result":"<text>","total_cost_usd":...,...}
         text = envelope.get("result", "")
