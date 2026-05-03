@@ -1427,7 +1427,7 @@ def _extract_vectors(data: bytes, hdr: _HnswHeader):
 
     n = hdr.cur_count
     stride = hdr.size_per_element
-    expected = hdr.max_elements * stride
+    expected = n * stride
     if len(data) < expected:
         raise ValueError(f"data_level0.bin is {len(data)} bytes, expected >= {expected}")
 

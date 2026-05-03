@@ -2285,6 +2285,26 @@ def test_parse_hnsw_header_too_short():
         repair._parse_hnsw_header(b"\x00" * 20)
 
 
+def test_extract_vectors_accepts_cur_count_sized_file():
+    np = pytest.importorskip("numpy")
+    cur_count, max_elements = 5, 100
+    header = _pack_header(max_elements=max_elements, cur_count=cur_count)
+    hdr = repair._parse_hnsw_header(header)
+
+    data = bytearray(cur_count * _SIZE_PER_ELEMENT)
+    data[:100] = header
+    vectors = np.arange(cur_count * _DIM, dtype=np.float32).reshape(cur_count, _DIM)
+    for i in range(cur_count):
+        slot = i * _SIZE_PER_ELEMENT
+        data[slot + _OFFSET_DATA : slot + _OFFSET_DATA + _DIM * 4] = vectors[i].tobytes()
+        struct.pack_into("<Q", data, slot + _LABEL_OFFSET, i + 1)
+
+    labels, out_vectors = repair._extract_vectors(bytes(data), hdr)
+    assert len(labels) == cur_count
+    assert out_vectors.shape == (cur_count, _DIM)
+    assert list(int(x) for x in labels) == [1, 2, 3, 4, 5]
+
+
 def test_sanitize_vectors_drops_zeros_and_dedups():
     np = pytest.importorskip("numpy")
     labels = np.array([5, 5, 0, 7, 3], dtype=np.uint64)
