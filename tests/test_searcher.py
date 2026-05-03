@@ -662,3 +662,36 @@ def test_search_memories_vector_disabled_uses_resolved_stop_words(monkeypatch, t
     )
 
     assert captured["stop_words"] == frozenset({"de", "es"})
+
+
+def test_search_cli_threads_resolved_stop_words_to_hybrid_rank(monkeypatch):
+    """The `mempalace search ...` CLI handler must resolve stop_words and
+    pass them to `_hybrid_rank`, matching the MCP `search_memories` path so
+    `MEMPALACE_LANG` filtering works for CLI users too."""
+    from mempalace import searcher
+
+    captured = {}
+
+    def _fake_get_collection(palace_path, create=False):
+        class _Col:
+            def query(self, **kwargs):
+                return {
+                    "documents": [["the cat sat"]],
+                    "metadatas": [[{"wing": "general"}]],
+                    "distances": [[0.5]],
+                }
+
+        return _Col()
+
+    def _hybrid_spy(results, query, **kwargs):
+        captured["stop_words"] = kwargs.get("stop_words")
+        return results
+
+    monkeypatch.setattr(searcher, "get_collection", _fake_get_collection)
+    monkeypatch.setattr(searcher, "_warn_if_legacy_metric", lambda col: None)
+    monkeypatch.setattr(searcher, "_resolve_stop_words", lambda lang: frozenset({"the"}))
+    monkeypatch.setattr(searcher, "_hybrid_rank", _hybrid_spy)
+
+    searcher.search(query="cat", palace_path="/tmp/nonexistent")
+
+    assert captured["stop_words"] == frozenset({"the"})

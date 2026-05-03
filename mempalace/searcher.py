@@ -414,7 +414,8 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
         {"text": doc or "", "distance": float(dist), "metadata": meta or {}}
         for doc, meta, dist in zip(docs, metas, dists)
     ]
-    hits = _hybrid_rank(hits, query)
+    stop_words = _resolve_stop_words(None)
+    hits = _hybrid_rank(hits, query, stop_words=stop_words)
 
     print(f"\n{'=' * 60}")
     print(f'  Results for: "{query}"')
