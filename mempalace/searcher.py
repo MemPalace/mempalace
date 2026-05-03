@@ -20,7 +20,7 @@ from typing import Optional
 
 from .backends import CollectionNotInitializedError, PalaceNotFoundError
 from .config import MempalaceConfig
-from .i18n import get_stopwords
+from .i18n import _canonical_lang, get_stopwords
 from .palace import get_closets_collection, get_collection
 
 # Closet pointer line format: "topic|entities|→drawer_id_a,drawer_id_b"
@@ -72,37 +72,53 @@ def _tokenize(text: str, stop_words: frozenset = frozenset()) -> list:
 
 
 @functools.lru_cache(maxsize=16)
-def _stopwords_for_lang(lang: str) -> frozenset:
-    """Cached stop-word set keyed by an explicit locale code.
+def _stopwords_for_canonical(canonical_lang: str) -> frozenset:
+    """Cached stop-word set keyed by a canonical locale code.
 
-    Split out from ``_resolve_stop_words`` so the cache key is a canonical
-    lang string, not the raw ``Optional[str]`` input. Caching by ``None``
-    would pin the first result for the lifetime of the process even after
-    ``MEMPALACE_LANG`` / ``config.json["lang"]`` changes.
+    Splitting canonicalization out of the cache key avoids thrashing when
+    callers pass equivalent variants (``"EN"``, ``"en"``, ``"en-US"``) —
+    they all hit the same cache slot.
     """
-    return frozenset(get_stopwords(lang))
+    return frozenset(get_stopwords(canonical_lang))
+
+
+def _stopwords_for_lang(lang: str) -> frozenset:
+    """Resolve raw ``lang`` to its canonical form before cache lookup.
+
+    Kept as the public-shaped helper (callers and tests reach for this
+    name) while the lru_cache lives on ``_stopwords_for_canonical`` to
+    keep the cache key normalized.
+    """
+    canonical = _canonical_lang(lang) or lang.lower()
+    return _stopwords_for_canonical(canonical)
 
 
 def _resolve_stop_words(lang: Optional[str]) -> frozenset:
     """Return the BM25 stop-word set for ``lang`` as an opt-in feature.
 
     When ``lang`` is an explicit string, loads that locale's stop words.
-    When ``lang`` is ``None``, reads ``MempalaceConfig().lang_explicit``:
-    the user must have set ``MEMPALACE_LANG`` / ``MEMPAL_LANG`` or
-    ``config.json["lang"]`` for filtering to activate. Palaces that never
-    configured a language get an empty set, preserving pre-PR scoring
-    byte-for-byte.
+    When ``lang`` is ``None``, resolution order is:
 
-    Config resolution runs on every call so mid-process env/config changes
-    take effect immediately; the per-locale parse stays cached inside
-    ``_stopwords_for_lang``.
+    1. ``MEMPALACE_LANG`` / ``MEMPAL_LANG`` environment variable.
+    2. ``MempalaceConfig().lang_explicit`` (which itself reads the env vars
+       first, then ``config.json["lang"]``).
+
+    The env-var fast path avoids constructing ``MempalaceConfig`` (which
+    reads ``config.json`` from disk) on the hot search path when the user
+    has set the env var — the common case for explicit-locale palaces.
+    Palaces that never configured a language get an empty set, preserving
+    pre-PR scoring byte-for-byte.
     """
     if lang is None:
-        try:
-            lang = MempalaceConfig().lang_explicit
-        except Exception:
-            logger.debug("lang resolution failed, skipping stop-word filter", exc_info=True)
-            return frozenset()
+        env_val = os.environ.get("MEMPALACE_LANG") or os.environ.get("MEMPAL_LANG")
+        if env_val and env_val.strip():
+            lang = env_val.strip()
+        else:
+            try:
+                lang = MempalaceConfig().lang_explicit
+            except Exception:
+                logger.debug("lang resolution failed, skipping stop-word filter", exc_info=True)
+                return frozenset()
         if lang is None:
             return frozenset()
     return _stopwords_for_lang(lang)

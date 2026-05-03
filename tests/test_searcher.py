@@ -477,11 +477,32 @@ def test_bm25_scores_all_stopword_docs_returns_zero_vector():
     assert scores == [0.0, 0.0]
 
 
+@pytest.fixture(autouse=True)
+def _isolate_stopword_cache_and_env(monkeypatch):
+    """Reset the stop-word resolution surface before each test.
+
+    Two things would otherwise leak across tests in this module:
+
+    * ``_stopwords_for_canonical`` is ``@lru_cache``'d, so the first test to
+      load a locale pins it for the rest of the run. Clearing here turns
+      every locale lookup into a fresh load.
+    * ``_resolve_stop_words(None)`` reads ``MEMPALACE_LANG`` /
+      ``MEMPAL_LANG`` env vars before consulting ``MempalaceConfig``. A
+      developer running tests with one of those exported in their shell
+      would silently bypass the ``MempalaceConfig`` mocks below and see
+      different results than CI. Strip them here.
+    """
+    from mempalace import searcher
+
+    searcher._stopwords_for_canonical.cache_clear()
+    monkeypatch.delenv("MEMPALACE_LANG", raising=False)
+    monkeypatch.delenv("MEMPAL_LANG", raising=False)
+    yield
+
+
 def test_resolve_stop_words_falls_back_silently_when_config_raises(monkeypatch):
     """If MempalaceConfig() blows up, return an empty set so search keeps working."""
     from mempalace import searcher
-
-    searcher._stopwords_for_lang.cache_clear()
 
     def boom(*args, **kwargs):
         raise OSError("config.json unreadable")
@@ -494,8 +515,6 @@ def test_resolve_stop_words_none_with_no_explicit_lang_returns_empty(monkeypatch
     """Unconfigured palaces must not suddenly filter stop words."""
     from mempalace import searcher
 
-    searcher._stopwords_for_lang.cache_clear()
-
     class FakeCfg:
         lang_explicit = None
 
@@ -507,8 +526,6 @@ def test_resolve_stop_words_none_with_explicit_lang_applies_filter(monkeypatch):
     """When the user opts in via lang_explicit, the locale's stop words load."""
     from mempalace import searcher
 
-    searcher._stopwords_for_lang.cache_clear()
-
     class FakeCfg:
         lang_explicit = "ja"
 
@@ -517,11 +534,46 @@ def test_resolve_stop_words_none_with_explicit_lang_applies_filter(monkeypatch):
     assert "した" in sw
 
 
+def test_resolve_stop_words_uses_env_var_before_config(monkeypatch):
+    """The env-var fast path must avoid constructing MempalaceConfig at all
+    on the hot search path when the user has set MEMPALACE_LANG."""
+    from mempalace import searcher
+
+    monkeypatch.setenv("MEMPALACE_LANG", "ja")
+
+    sentinel_calls = []
+
+    class TripwireCfg:
+        def __init__(self):
+            sentinel_calls.append("config-loaded")
+
+        lang_explicit = None
+
+    monkeypatch.setattr(searcher, "MempalaceConfig", TripwireCfg)
+    sw = searcher._resolve_stop_words(None)
+    assert "した" in sw
+    assert sentinel_calls == [], "MempalaceConfig was constructed despite MEMPALACE_LANG being set"
+
+
+def test_resolve_stop_words_canonicalizes_cache_key():
+    """Case variants of the same locale must hit the same lru_cache slot.
+
+    Without canonicalization, ``"en"`` and ``"EN"`` would each consume a
+    cache entry pointing at the same set; ``maxsize=16`` could be exhausted
+    by a tenant rotating through capitalizations.
+    """
+    from mempalace import searcher
+
+    a = searcher._resolve_stop_words("en")
+    b = searcher._resolve_stop_words("EN")
+    c = searcher._resolve_stop_words("En")
+    assert a is b is c
+
+
 def test_resolve_stop_words_caches_per_lang():
     """Repeat lookups for the same lang hit the lru_cache and return the same object."""
     from mempalace import searcher
 
-    searcher._stopwords_for_lang.cache_clear()
     a = searcher._resolve_stop_words("ja")
     b = searcher._resolve_stop_words("ja")
     assert a is b
@@ -531,8 +583,6 @@ def test_resolve_stop_words_none_reflects_config_change_between_calls(monkeypatc
     """The None-arg path must re-read config on every call; a stale cache key
     would pin the first result for the lifetime of the process (igorls, #977)."""
     from mempalace import searcher
-
-    searcher._stopwords_for_lang.cache_clear()
 
     class FakeCfgUnset:
         lang_explicit = None
