@@ -373,6 +373,54 @@ class TestScanConvos:
         assert "deep/subdir/nested.jsonl" in err
         assert "(symlink)" in err
 
+    def test_scan_skips_subagent_dirs_by_default(self, tmp_path):
+        # Mimic Claude Code layout: ~/.claude/projects/<slug>/<session>/subagents/agent-*.jsonl
+        session_dir = tmp_path / "session-abc"
+        session_dir.mkdir()
+        (session_dir / "main.jsonl").write_text('{"type":"user"}\n', encoding="utf-8")
+        subagents_dir = session_dir / "subagents"
+        subagents_dir.mkdir()
+        (subagents_dir / "agent-abc.jsonl").write_text('{"type":"user"}\n', encoding="utf-8")
+        (subagents_dir / "agent-def.jsonl").write_text('{"type":"user"}\n', encoding="utf-8")
+
+        files = scan_convos(str(tmp_path))
+        names = [f.name for f in files]
+
+        assert "main.jsonl" in names
+        assert "agent-abc.jsonl" not in names
+        assert "agent-def.jsonl" not in names
+
+    def test_scan_includes_subagent_dirs_when_opted_in(self, tmp_path):
+        session_dir = tmp_path / "session-abc"
+        session_dir.mkdir()
+        (session_dir / "main.jsonl").write_text('{"type":"user"}\n', encoding="utf-8")
+        subagents_dir = session_dir / "subagents"
+        subagents_dir.mkdir()
+        (subagents_dir / "agent-abc.jsonl").write_text('{"type":"user"}\n', encoding="utf-8")
+
+        files = scan_convos(str(tmp_path), include_subagents=True)
+        names = [f.name for f in files]
+
+        assert "main.jsonl" in names
+        assert "agent-abc.jsonl" in names
+
+    def test_scan_skips_subagent_dirs_at_any_depth(self, tmp_path):
+        # The "subagents" name match is by directory name, not by depth — verify
+        # both shallow (top-level) and nested subagents/ get skipped.
+        (tmp_path / "subagents").mkdir()
+        (tmp_path / "subagents" / "agent-top.jsonl").write_text("{}", encoding="utf-8")
+        nested = tmp_path / "session" / "subagents"
+        nested.mkdir(parents=True)
+        (nested / "agent-deep.jsonl").write_text("{}", encoding="utf-8")
+        (tmp_path / "session" / "main.jsonl").write_text("{}", encoding="utf-8")
+
+        files = scan_convos(str(tmp_path))
+        names = [f.name for f in files]
+
+        assert "main.jsonl" in names
+        assert "agent-top.jsonl" not in names
+        assert "agent-deep.jsonl" not in names
+
 
 class TestFileChunksLocked:
     def test_uses_bounded_upsert_batches(self, monkeypatch):
