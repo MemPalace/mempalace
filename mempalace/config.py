@@ -335,14 +335,19 @@ class MempalaceConfig:
         except (OSError, NotImplementedError):
             pass  # Windows doesn't support Unix permissions
         if not self._config_file.exists():
+            # Chunking parameters (chunk_size, chunk_overlap, min_chunk_size)
+            # are intentionally NOT written here — convo_miner.py distinguishes
+            # "user has tuned this" from "user is on defaults" by checking
+            # ``_file_config.get("min_chunk_size") is None``. Writing the
+            # miner.py defaults (50) into config.json breaks that detection
+            # and silently overrides convo_miner's stricter 30-char floor,
+            # dropping legitimate short conversation exchanges. Module-level
+            # defaults already apply correctly when these keys are absent.
             default_config = {
                 "palace_path": DEFAULT_PALACE_PATH,
                 "collection_name": DEFAULT_COLLECTION_NAME,
                 "topic_wings": DEFAULT_TOPIC_WINGS,
                 "hall_keywords": DEFAULT_HALL_KEYWORDS,
-                "chunk_size": 800,
-                "chunk_overlap": 100,
-                "min_chunk_size": 50,
             }
             with open(self._config_file, "w") as f:
                 json.dump(default_config, f, indent=2)
