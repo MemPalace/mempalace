@@ -3208,3 +3208,78 @@ class TestUnknownParamName:
         )
         assert "error" not in resp
         assert "result" in resp
+
+
+# ── Windows stdio UTF-8 reconfigure ──────────────────────────────────────
+
+
+class _ReconfigurableStdio:
+    """Stdio stub recording every reconfigure call without touching real OS handles."""
+
+    def __init__(self):
+        self.calls = []
+
+    def reconfigure(self, **kwargs):
+        self.calls.append(kwargs)
+
+
+def test_main_reconfigures_stdio_per_stream_policy_on_windows(monkeypatch):
+    """Each stream must reconfigure to UTF-8 with the right errors policy.
+
+    stdin uses surrogateescape so a malformed byte from a misbehaving MCP
+    client is stashed as a lone surrogate the json.loads error path can
+    surface as -32700, instead of UnicodeDecodeError killing readline.
+    stdout/stderr stay strict because we control what is written there.
+    """
+    from mempalace import mcp_server
+
+    monkeypatch.setattr(mcp_server.sys, "platform", "win32")
+
+    stdin = _ReconfigurableStdio()
+    stdout = _ReconfigurableStdio()
+    stderr = _ReconfigurableStdio()
+    monkeypatch.setattr(mcp_server.sys, "stdin", stdin)
+    monkeypatch.setattr(mcp_server.sys, "stdout", stdout)
+    monkeypatch.setattr(mcp_server.sys, "stderr", stderr)
+
+    def _exit(*_a, **_kw):
+        raise SystemExit(0)
+
+    stdin.readline = _exit
+    monkeypatch.setattr(mcp_server, "_restore_stdout", lambda: None)
+    monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", lambda: None)
+
+    with pytest.raises(SystemExit):
+        mcp_server.main()
+
+    assert stdin.calls == [{"encoding": "utf-8", "errors": "surrogateescape"}]
+    assert stdout.calls == [{"encoding": "utf-8", "errors": "strict"}]
+    assert stderr.calls == [{"encoding": "utf-8", "errors": "strict"}]
+
+
+def test_main_skips_reconfigure_off_windows(monkeypatch):
+    """On Linux / macOS the platform branch is a no-op."""
+    from mempalace import mcp_server
+
+    monkeypatch.setattr(mcp_server.sys, "platform", "linux")
+
+    stdin = _ReconfigurableStdio()
+    stdout = _ReconfigurableStdio()
+    stderr = _ReconfigurableStdio()
+    monkeypatch.setattr(mcp_server.sys, "stdin", stdin)
+    monkeypatch.setattr(mcp_server.sys, "stdout", stdout)
+    monkeypatch.setattr(mcp_server.sys, "stderr", stderr)
+
+    def _exit(*_a, **_kw):
+        raise SystemExit(0)
+
+    stdin.readline = _exit
+    monkeypatch.setattr(mcp_server, "_restore_stdout", lambda: None)
+    monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", lambda: None)
+
+    with pytest.raises(SystemExit):
+        mcp_server.main()
+
+    assert stdin.calls == []
+    assert stdout.calls == []
+    assert stderr.calls == []
