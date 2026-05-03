@@ -485,13 +485,21 @@ class ClaudeCodeProvider(LLMProvider):
         # Override the URL-based default in the base class.
         return True
 
+    # Only the credential-bearing ANTHROPIC_* vars get stripped. Configuration
+    # vars like ANTHROPIC_BASE_URL (corporate proxy / custom endpoint) must
+    # pass through so users behind an internal gateway keep working. A broad
+    # prefix-strip would break those deployments without warning.
+    _SUBPROCESS_ENV_STRIP = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+
     def _subprocess_env(self) -> dict:
-        # Strip ANTHROPIC_* env vars before spawning `claude -p`. If the user
-        # has ANTHROPIC_API_KEY exported in their shell, the CLI may fall
-        # back to API-key auth and bill the API account instead of the
-        # subscription this provider is built around. Removing the vars
-        # forces OAuth / keychain auth, which is the documented path.
-        return {k: v for k, v in os.environ.items() if not k.upper().startswith("ANTHROPIC_")}
+        # Strip credential env vars before spawning `claude -p`. If the user
+        # has ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN exported in their
+        # shell, the CLI may fall back to API-key auth and bill the API
+        # account instead of the subscription this provider is built
+        # around. Removing them forces OAuth / keychain auth, which is the
+        # documented path. Other ANTHROPIC_* (BASE_URL, etc.) are passed
+        # through.
+        return {k: v for k, v in os.environ.items() if k.upper() not in self._SUBPROCESS_ENV_STRIP}
 
     def check_available(self) -> tuple[bool, str]:
         binary = shutil.which("claude")
