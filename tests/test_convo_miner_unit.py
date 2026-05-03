@@ -405,7 +405,7 @@ class TestScanConvos:
         assert "agent-abc.jsonl" in names
 
     def test_scan_skips_subagent_dirs_at_any_depth(self, tmp_path):
-        # The "subagents" name match is by directory name, not by depth — verify
+        # The "subagents" name match is by directory name, not by depth: verify
         # both shallow (top-level) and nested subagents/ get skipped.
         (tmp_path / "subagents").mkdir()
         (tmp_path / "subagents" / "agent-top.jsonl").write_text("{}", encoding="utf-8")
@@ -420,6 +420,37 @@ class TestScanConvos:
         assert "main.jsonl" in names
         assert "agent-top.jsonl" not in names
         assert "agent-deep.jsonl" not in names
+
+    def test_scan_does_not_skip_suffix_named_dirs(self, tmp_path):
+        # Exact name match only: 'mysubagents' or 'subagentsbackup' must still
+        # be mined. Guards against future regression to substring/regex match.
+        for dir_name in ("mysubagents", "subagentsbackup", "subagent"):
+            d = tmp_path / dir_name
+            d.mkdir()
+            (d / f"{dir_name}.jsonl").write_text("{}", encoding="utf-8")
+
+        files = scan_convos(str(tmp_path))
+        names = {f.name for f in files}
+
+        assert "mysubagents.jsonl" in names
+        assert "subagentsbackup.jsonl" in names
+        assert "subagent.jsonl" in names
+
+    def test_scan_skips_subagents_case_insensitive(self, tmp_path):
+        # On Windows + macOS APFS the filesystem is case-preserving; if Claude
+        # Code or a plugin ever emits 'Subagents' (capitalized), the filter
+        # must still match. Only one variant per tmp_path because case-
+        # insensitive filesystems collapse 'Subagents' and 'SUBAGENTS'.
+        d = tmp_path / "Subagents"
+        d.mkdir()
+        (d / "agent.jsonl").write_text("{}", encoding="utf-8")
+        (tmp_path / "main.jsonl").write_text("{}", encoding="utf-8")
+
+        files = scan_convos(str(tmp_path))
+        names = {f.name for f in files}
+
+        assert "main.jsonl" in names
+        assert "agent.jsonl" not in names
 
 
 class TestFileChunksLocked:
