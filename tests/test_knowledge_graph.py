@@ -97,7 +97,7 @@ class TestTripleOperations:
         assert facts[0]["valid_from"] == "2015-04-01"
 
     def test_duplicate_add_backfills_null_provenance(self, kg):
-        """RFC 002 §5.5 provenance fields must backfill on a later add."""
+        """corpus-origin provenance fields backfill when supplied on a later add_triple call."""
         tid = kg.add_triple("Alice", "works_at", "Acme")
         kg.add_triple(
             "Alice",
