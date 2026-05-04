@@ -531,6 +531,45 @@ class TestWriteTools:
         result = tool_get_drawer("nonexistent_drawer")
         assert "error" in result
 
+    def test_get_drawer_does_not_leak_absolute_source_file_path(
+        self, monkeypatch, config, palace_path, collection, kg
+    ):
+        """tool_get_drawer must not expose the absolute filesystem path
+        that the miners write into ``source_file``. Same threat class as
+        the palace_path leak in mempalace_status: in nested-agent or
+        multi-server MCP topologies the client is a separate trust
+        domain, and the directory layout of the host has no documented
+        client-side use. Basename is enough for citation."""
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        secret_dir = "/private/home/alice/secret-research/2026"
+        absolute_source = f"{secret_dir}/notes.md"
+        collection.add(
+            ids=["drawer_leak_probe"],
+            documents=["verbatim drawer body for leak probe"],
+            metadatas=[
+                {
+                    "wing": "research",
+                    "room": "notes",
+                    "source_file": absolute_source,
+                    "chunk_index": 0,
+                    "added_by": "miner",
+                    "filed_at": "2026-05-03T00:00:00",
+                }
+            ],
+        )
+
+        from mempalace.mcp_server import tool_get_drawer
+
+        result = tool_get_drawer("drawer_leak_probe")
+        assert result["drawer_id"] == "drawer_leak_probe"
+        assert result["metadata"]["source_file"] == "notes.md"
+        # Defense-in-depth: no field anywhere in the response should
+        # contain the absolute path or its parent directory.
+        serialized = json.dumps(result)
+        assert absolute_source not in serialized
+        assert secret_dir not in serialized
+
     def test_list_drawers(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace.mcp_server import tool_list_drawers
@@ -650,6 +689,90 @@ class TestKGTools:
             ended="2026-03-01",
         )
         assert result["success"] is True
+        # Regression #1314: response must echo the actual ended date,
+        # not silently drop it and return the literal string "today".
+        assert result["ended"] == "2026-03-01"
+
+    def test_kg_add_forwards_valid_to(self, monkeypatch, config, palace_path, kg):
+        """Regression #1314 case 1: valid_to must round-trip through kg_add."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_kg_add
+
+        result = tool_kg_add(
+            subject="_test_temporal",
+            predicate="had_value",
+            object="probe",
+            valid_from="2026-01-01",
+            valid_to="2026-04-28",
+        )
+        assert result["success"] is True
+
+        facts = kg.query_entity("_test_temporal")
+        assert len(facts) == 1
+        assert facts[0]["valid_from"] == "2026-01-01"
+        assert facts[0]["valid_to"] == "2026-04-28"
+        # An already-ended fact must not be reported as still current.
+        assert facts[0]["current"] is False
+
+    def test_kg_add_forwards_source_provenance(self, monkeypatch, config, palace_path, kg):
+        """Regression #1314 case 3: source_file / source_drawer_id reach storage."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_kg_add
+
+        result = tool_kg_add(
+            subject="operating-verb",
+            predicate="candidate",
+            object="husbandry",
+            valid_from="2026-04-28",
+            source_closet="closet-42",
+            source_file="docs/decisions.md",
+            source_drawer_id="drawer_abc123",
+        )
+        assert result["success"] is True
+
+        triple_id = result["triple_id"]
+        # Read raw row to verify all provenance columns persisted.
+        with kg._lock:
+            row = (
+                kg._conn()
+                .execute(
+                    "SELECT source_closet, source_file, source_drawer_id FROM triples WHERE id = ?",
+                    (triple_id,),
+                )
+                .fetchone()
+            )
+        assert row is not None
+        assert row["source_closet"] == "closet-42"
+        assert row["source_file"] == "docs/decisions.md"
+        assert row["source_drawer_id"] == "drawer_abc123"
+
+    def test_kg_invalidate_returns_actual_ended_date(
+        self, monkeypatch, config, palace_path, seeded_kg
+    ):
+        """Regression #1314 case 2: response reports the resolved date, not 'today'."""
+        from datetime import date as _date
+
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        from mempalace.mcp_server import tool_kg_invalidate
+
+        # Caller-supplied date round-trips into the response.
+        explicit = tool_kg_invalidate(
+            subject="Max",
+            predicate="does",
+            object="swimming",
+            ended="2026-04-28",
+        )
+        assert explicit["ended"] == "2026-04-28"
+
+        # Caller-omitted date resolves to today's ISO date — never the
+        # literal string "today" the buggy implementation used to return.
+        implicit = tool_kg_invalidate(
+            subject="Max",
+            predicate="loves",
+            object="Chess",
+        )
+        assert implicit["ended"] != "today"
+        assert implicit["ended"] == _date.today().isoformat()
 
     def test_kg_timeline(self, monkeypatch, config, palace_path, seeded_kg):
         _patch_mcp_server(monkeypatch, config, seeded_kg)
@@ -682,7 +805,8 @@ class TestDiaryTools:
             topic="architecture",
         )
         assert w["success"] is True
-        assert w["agent"] == "TestAgent"
+        # agent_name is normalized to lowercase on write (#1243).
+        assert w["agent"] == "testagent"
 
         r = tool_diary_read(agent_name="TestAgent")
         assert r["total"] == 1
@@ -773,6 +897,50 @@ class TestDiaryTools:
         r_scoped = tool_diary_read(agent_name="TestAgent", wing="wing_someproject")
         assert r_scoped["total"] == 1
         assert r_scoped["entries"][0]["content"] == "project-wing entry"
+
+    def test_diary_read_case_insensitive_agent(self, monkeypatch, config, palace_path, kg):
+        """Regression for #1243: diary_read must be case-insensitive over
+        agent_name. Writing as "Claude" and reading as "claude" (or vice
+        versa) must surface the same entries — sanitize_name preserved
+        case, which silently dropped reads when the agent name's casing
+        differed from the write."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_diary_read, tool_diary_write
+
+        # Write as "Claude" → read as "claude" should match.
+        w1 = tool_diary_write(
+            agent_name="Claude",
+            entry="entry written as Claude",
+            topic="general",
+        )
+        assert w1["success"]
+
+        r1 = tool_diary_read(agent_name="claude")
+        assert "entries" in r1, r1
+        contents1 = {e["content"] for e in r1["entries"]}
+        assert "entry written as Claude" in contents1
+
+        # Write as "CLAUDE" → read as "Claude" should also match the
+        # same agent. After normalization both writes target the same
+        # lowercase agent identity, so both entries are returned.
+        w2 = tool_diary_write(
+            agent_name="CLAUDE",
+            entry="entry written as CLAUDE",
+            topic="general",
+        )
+        assert w2["success"]
+
+        r2 = tool_diary_read(agent_name="Claude")
+        contents2 = {e["content"] for e in r2["entries"]}
+        assert "entry written as Claude" in contents2
+        assert "entry written as CLAUDE" in contents2
+
+        # The stored agent metadata is the lowercase form, and the
+        # default wing is derived from that lowercase form too.
+        assert w1["agent"] == "claude"
+        assert w2["agent"] == "claude"
 
 
 # ── Cache Invalidation (inode/mtime) ──────────────────────────────────

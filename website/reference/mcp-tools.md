@@ -10,7 +10,7 @@ Palace overview: total drawers, wing and room counts, AAAK spec, and memory prot
 
 **Parameters:** None
 
-**Returns:** `{ total_drawers, wings, rooms, palace_path, protocol, aaak_dialect }`
+**Returns:** `{ total_drawers, wings, rooms, protocol, aaak_dialect }`
 
 ---
 
@@ -122,7 +122,7 @@ Fetch a single drawer by ID — returns full content and metadata.
 |-----------|------|----------|-------------|
 | `drawer_id` | string | **Yes** | ID of the drawer to fetch |
 
-**Returns:** `{ drawer: { id, wing, room, content, ... } }`
+**Returns:** `{ drawer_id, content, wing, room, metadata }` where `metadata.source_file`, when present, is the basename only — the absolute path written by the miners is reduced before the dict is returned to MCP clients.
 
 ---
 
@@ -378,4 +378,4 @@ Force a reconnect to the palace database. Use this after external scripts or CLI
 
 **Parameters:** None
 
-**Returns:** `{ success, palace_path }`
+**Returns:** `{ success, message, drawers, vector_disabled[, vector_disabled_reason] }` (on no-palace: `{ success: false, message, drawers, vector_disabled }`; on exception: `{ success: false, error }`)

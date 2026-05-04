@@ -993,7 +993,7 @@ class ChromaBackend(BaseBackend):
         )
 
         if cached is None or inode_changed or mtime_changed or mtime_appeared:
-            _fix_blob_seq_ids(palace_path)
+            ChromaBackend._prepare_palace_for_open(palace_path)
             cached = chromadb.PersistentClient(path=palace_path)
             self._clients[palace_path] = cached
             # Re-stat after the client constructor runs: chromadb creates
@@ -1029,6 +1029,31 @@ class ChromaBackend(BaseBackend):
     _quarantined_paths: set[str] = set()
 
     @staticmethod
+    def _prepare_palace_for_open(palace_path: str) -> None:
+        """Run the pre-open safety pass shared by :meth:`make_client` and
+        :meth:`_client`.
+
+        Two steps, both required before constructing a ``PersistentClient``:
+
+        1. ``_fix_blob_seq_ids`` — repairs the BLOB seq_id quirk that bites
+           certain chromadb migrations.
+        2. ``quarantine_stale_hnsw`` — gated by :attr:`_quarantined_paths` so
+           it fires once per palace per process. This is the SIGSEGV
+           prevention path for stale HNSW segments (see #1121, #1132, #1263);
+           wiring it through this helper means CLI mining, search, repair,
+           and status all benefit, not just the legacy ``make_client``
+           callers.
+
+        Idempotent: safe to call from any code path that is about to open or
+        re-open a palace. The ``_quarantined_paths`` gate prevents thrash on
+        hot paths (e.g. ``_client()`` is called on every backend operation).
+        """
+        _fix_blob_seq_ids(palace_path)
+        if palace_path not in ChromaBackend._quarantined_paths:
+            quarantine_stale_hnsw(palace_path)
+            ChromaBackend._quarantined_paths.add(palace_path)
+
+    @staticmethod
     def make_client(palace_path: str):
         """Create a fresh ``PersistentClient`` (fixes BLOB seq_ids first).
 
@@ -1040,10 +1065,7 @@ class ChromaBackend(BaseBackend):
         :attr:`_quarantined_paths` for the rationale (cold-start protection
         vs. runtime thrash on steady-write daemons).
         """
-        _fix_blob_seq_ids(palace_path)
-        if palace_path not in ChromaBackend._quarantined_paths:
-            quarantine_stale_hnsw(palace_path)
-            ChromaBackend._quarantined_paths.add(palace_path)
+        ChromaBackend._prepare_palace_for_open(palace_path)
         return chromadb.PersistentClient(path=palace_path)
 
     @staticmethod

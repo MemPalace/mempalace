@@ -764,6 +764,67 @@ def test_make_client_quarantines_each_palace_independently(tmp_path, monkeypatch
     assert calls == [palace_a, palace_b]
 
 
+# ── _client() cold-start gate (#1121, #1132, #1263) ──────────────────────
+
+
+def test_client_quarantines_corrupt_segment_on_first_open(tmp_path, monkeypatch):
+    """The instance ``_client()`` path must run ``quarantine_stale_hnsw``
+    on first open, mirroring the ``make_client()`` static helper. Before
+    PR #1173's wiring was extended here, CLI mining / search / repair /
+    status all skipped the quarantine pass and would SIGSEGV on a stale
+    HNSW segment (#1121, #1132, #1263)."""
+    now = 1_700_000_000.0
+    palace, seg = _make_palace_with_segment(
+        tmp_path,
+        hnsw_mtime=now - 7200,
+        sqlite_mtime=now,
+        meta_bytes=_CORRUPT_META,
+    )
+
+    monkeypatch.setattr(ChromaBackend, "_quarantined_paths", set())
+
+    backend = ChromaBackend()
+    try:
+        backend._client(str(palace))
+    finally:
+        backend.close()
+
+    assert not seg.exists(), "_client() should have quarantined the corrupt segment"
+    drift_dirs = [p for p in palace.iterdir() if ".drift-" in p.name]
+    assert len(drift_dirs) == 1
+
+
+def test_client_quarantines_only_on_first_call_per_palace(tmp_path, monkeypatch):
+    """Repeated ``_client()`` calls for the same palace re-run quarantine
+    at most once — the ``_quarantined_paths`` gate prevents runtime
+    thrash on hot paths (``_client()`` is hit on every backend op)."""
+    palace_path = str(tmp_path / "palace")
+    os.makedirs(palace_path, exist_ok=True)
+    (Path(palace_path) / "chroma.sqlite3").write_text("")
+
+    monkeypatch.setattr(ChromaBackend, "_quarantined_paths", set())
+
+    calls: list[str] = []
+
+    def _spy(path, stale_seconds=300.0):
+        calls.append(path)
+        return []
+
+    monkeypatch.setattr("mempalace.backends.chroma.quarantine_stale_hnsw", _spy)
+
+    backend = ChromaBackend()
+    try:
+        backend._client(palace_path)
+        backend._client(palace_path)
+        backend._client(palace_path)
+    finally:
+        backend.close()
+
+    assert (
+        calls == [palace_path]
+    ), "quarantine_stale_hnsw should fire once per palace per process from _client(), not on every call"
+
+
 # ── _pin_hnsw_threads (per-process retrofit, separate from this PR's gate) ──
 
 

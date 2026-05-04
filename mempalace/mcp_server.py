@@ -47,7 +47,7 @@ import json  # noqa: E402
 import logging  # noqa: E402
 import hashlib  # noqa: E402
 import time  # noqa: E402
-from datetime import datetime  # noqa: E402
+from datetime import date, datetime  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 from .config import (  # noqa: E402
@@ -454,7 +454,6 @@ def _tool_status_via_sqlite() -> dict:
         "total_drawers": total,
         "wings": wings,
         "rooms": rooms,
-        "palace_path": _config.palace_path,
         "protocol": PALACE_PROTOCOL,
         "aaak_dialect": AAAK_SPEC,
         "vector_disabled": True,
@@ -493,7 +492,6 @@ def tool_status():
         "total_drawers": count,
         "wings": wings,
         "rooms": rooms,
-        "palace_path": _config.palace_path,
         "protocol": PALACE_PROTOCOL,
         "aaak_dialect": AAAK_SPEC,
     }
@@ -677,7 +675,7 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
             "vector_disabled": True,
             "vector_disabled_reason": _vector_disabled_reason,
             "hint": (
-                "duplicate detection requires vector search; run " "`mempalace repair` to restore"
+                "duplicate detection requires vector search; run `mempalace repair` to restore"
             ),
         }
     try:
@@ -914,12 +912,21 @@ def tool_get_drawer(drawer_id: str):
             return {"error": f"Drawer not found: {drawer_id}"}
         meta = result["metadatas"][0]
         doc = result["documents"][0]
+        # source_file is the absolute filesystem path written by the
+        # miners. Reduce to its basename before handing it to the MCP
+        # client — same threat model as the palace_path leak fix:
+        # nested-agent / multi-server topologies treat the client as a
+        # separate trust domain. Basename preserves citation utility.
+        # Mirrors the searcher.search_memories() return shape.
+        safe_meta = dict(meta) if meta else {}
+        if safe_meta.get("source_file"):
+            safe_meta["source_file"] = Path(safe_meta["source_file"]).name
         return {
             "drawer_id": drawer_id,
             "content": doc,
-            "wing": meta.get("wing", ""),
-            "room": meta.get("room", ""),
-            "metadata": meta,
+            "wing": safe_meta.get("wing", ""),
+            "room": safe_meta.get("room", ""),
+            "metadata": safe_meta,
         }
     except Exception as e:
         return {"error": str(e)}
@@ -1061,9 +1068,26 @@ def tool_kg_query(entity: str, as_of: str = None, direction: str = "both"):
 
 
 def tool_kg_add(
-    subject: str, predicate: str, object: str, valid_from: str = None, source_closet: str = None
+    subject: str,
+    predicate: str,
+    object: str,
+    valid_from: str = None,
+    valid_to: str = None,
+    source_closet: str = None,
+    source_file: str = None,
+    source_drawer_id: str = None,
 ):
-    """Add a relationship to the knowledge graph."""
+    """Add a relationship to the knowledge graph.
+
+    All temporal and provenance fields are optional. ``valid_to`` lets callers
+    backfill historical facts with a known end date in a single call (instead
+    of a separate ``kg_invalidate``). ``source_file`` and ``source_drawer_id``
+    are RFC 002 provenance fields populated by adapters / bulk importers.
+
+    TODO(#1283): once the ISO-8601 validation PR lands, wire ``validate_iso_date``
+    over ``valid_from`` / ``valid_to`` here so malformed dates fail fast at the
+    MCP boundary instead of silently producing empty query results.
+    """
     try:
         subject = sanitize_kg_value(subject, "subject")
         predicate = sanitize_name(predicate, "predicate")
@@ -1078,32 +1102,56 @@ def tool_kg_add(
             "predicate": predicate,
             "object": object,
             "valid_from": valid_from,
+            "valid_to": valid_to,
             "source_closet": source_closet,
+            "source_file": source_file,
+            "source_drawer_id": source_drawer_id,
         },
     )
     triple_id = _kg.add_triple(
-        subject, predicate, object, valid_from=valid_from, source_closet=source_closet
+        subject,
+        predicate,
+        object,
+        valid_from=valid_from,
+        valid_to=valid_to,
+        source_closet=source_closet,
+        source_file=source_file,
+        source_drawer_id=source_drawer_id,
     )
     return {"success": True, "triple_id": triple_id, "fact": f"{subject} → {predicate} → {object}"}
 
 
 def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = None):
-    """Mark a fact as no longer true (set end date)."""
+    """Mark a fact as no longer true (set end date).
+
+    Returns the actual ``ended`` date that was stored — when the caller omits
+    ``ended``, the underlying graph stamps ``date.today()``, and the response
+    reflects that resolved value (instead of the literal string ``"today"``)
+    so callers can verify what was persisted.
+
+    TODO(#1283): apply ``validate_iso_date`` to ``ended`` once that PR lands.
+    """
     try:
         subject = sanitize_kg_value(subject, "subject")
         predicate = sanitize_name(predicate, "predicate")
         object = sanitize_kg_value(object, "object")
     except ValueError as e:
         return {"success": False, "error": str(e)}
+    resolved_ended = ended or date.today().isoformat()
     _wal_log(
         "kg_invalidate",
-        {"subject": subject, "predicate": predicate, "object": object, "ended": ended},
+        {
+            "subject": subject,
+            "predicate": predicate,
+            "object": object,
+            "ended": resolved_ended,
+        },
     )
-    _kg.invalidate(subject, predicate, object, ended=ended)
+    _kg.invalidate(subject, predicate, object, ended=resolved_ended)
     return {
         "success": True,
         "fact": f"{subject} → {predicate} → {object}",
-        "ended": ended or "today",
+        "ended": resolved_ended,
     }
 
 
@@ -1133,9 +1181,13 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
 
     This is the agent's personal journal — observations, thoughts,
     what it worked on, what it noticed, what it thinks matters.
+
+    Note: ``agent_name`` is normalized to lowercase before storage so
+    that diary reads are case-insensitive (see #1243). "Claude",
+    "claude", and "CLAUDE" all resolve to the same agent.
     """
     try:
-        agent_name = sanitize_name(agent_name, "agent_name")
+        agent_name = sanitize_name(agent_name, "agent_name").lower()
         entry = sanitize_content(entry)
         topic = sanitize_name(topic, "topic")
     except ValueError as e:
@@ -1144,7 +1196,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
     if wing:
         wing = sanitize_name(wing)
     else:
-        wing = f"wing_{agent_name.lower().replace(' ', '_')}"
+        wing = f"wing_{agent_name.replace(' ', '_')}"
     room = "diary"
     col = _get_collection(create=True)
     if not col:
@@ -1209,9 +1261,14 @@ def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
     written to. Diary writes from hooks land in project-derived wings
     (``wing_<project>``), so requiring a specific wing on read would
     silo those entries from agent-initiated reads.
+
+    Note: ``agent_name`` is normalized to lowercase before filtering so
+    that reads are case-insensitive (see #1243). Entries written under
+    pre-fix mixed-case agent names will not match the lowercase filter;
+    use ``mempalace repair`` to migrate legacy data if needed.
     """
     try:
-        agent_name = sanitize_name(agent_name, "agent_name")
+        agent_name = sanitize_name(agent_name, "agent_name").lower()
         if wing:
             wing = sanitize_name(wing)
     except ValueError as e:
@@ -1440,7 +1497,7 @@ TOOLS = {
         "handler": tool_kg_query,
     },
     "mempalace_kg_add": {
-        "description": "Add a fact to the knowledge graph. Subject → predicate → object with optional time window. E.g. ('Max', 'started_school', 'Year 7', valid_from='2026-09-01').",
+        "description": "Add a fact to the knowledge graph. Subject → predicate → object with optional time window. E.g. ('Max', 'started_school', 'Year 7', valid_from='2026-09-01'). Pass valid_to to backfill an already-ended historical fact in a single call.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -1454,9 +1511,21 @@ TOOLS = {
                     "type": "string",
                     "description": "When this became true (YYYY-MM-DD, optional)",
                 },
+                "valid_to": {
+                    "type": "string",
+                    "description": "When this stopped being true (YYYY-MM-DD, optional). Use for backfilling already-ended historical facts.",
+                },
                 "source_closet": {
                     "type": "string",
                     "description": "Closet ID where this fact appears (optional)",
+                },
+                "source_file": {
+                    "type": "string",
+                    "description": "Source file path the fact was extracted from (optional)",
+                },
+                "source_drawer_id": {
+                    "type": "string",
+                    "description": "Drawer ID the fact was extracted from (optional, RFC 002 provenance)",
                 },
             },
             "required": ["subject", "predicate", "object"],

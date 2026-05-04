@@ -175,6 +175,61 @@ def test_cmd_init_normalizes_wing_name_for_topics_registry(mock_config_cls, tmp_
         assert mock_register.call_args.kwargs["wing"] == "my_cool_app"
 
 
+def test_cmd_init_honors_palace_flag(tmp_path, monkeypatch):
+    """Regression for #1313: ``cmd_init`` must honor ``--palace`` instead of
+    silently writing to ``~/.mempalace``. Mirrors the env-var pattern used
+    by ``cmd_mine`` / ``cmd_status`` / ``mcp_server`` so every downstream
+    read of ``cfg.palace_path`` (Pass 0, ``cfg.init()``, post-init mine)
+    routes to the user-specified location.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    palace = tmp_path / "custom_palace"
+
+    # Make sure no leftover env var from another test leaks in — we want to
+    # verify that --palace ALONE drives the resolution. Prime monkeypatch's
+    # undo list with setenv first so that the env var ``cmd_init`` writes
+    # below is rolled back at teardown (``delenv(raising=False)`` on a
+    # missing key registers no undo entry, which would leak into the next
+    # test).
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", "")
+    monkeypatch.setenv("MEMPAL_PALACE_PATH", "")
+    monkeypatch.delenv("MEMPALACE_PALACE_PATH")
+    monkeypatch.delenv("MEMPAL_PALACE_PATH")
+
+    args = argparse.Namespace(
+        dir=str(project),
+        palace=str(palace),
+        yes=True,
+        auto_mine=False,
+    )
+
+    captured = {}
+
+    def fake_pass_zero(project_dir, palace_dir, llm_provider):
+        # Capture the palace_dir Pass 0 sees — this is the smoking-gun
+        # value for the bug. Pre-fix it was always ~/.mempalace.
+        captured["pass_zero_palace_dir"] = palace_dir
+        return None
+
+    with (
+        patch("mempalace.entity_detector.scan_for_detection", return_value=[]),
+        patch("mempalace.room_detector_local.detect_rooms_local"),
+        patch("mempalace.cli._run_pass_zero", side_effect=fake_pass_zero),
+        patch("mempalace.cli._maybe_run_mine_after_init"),
+    ):
+        cmd_init(args)
+
+    expected = str(palace)
+    # Pass 0 must have been handed the --palace location, not ~/.mempalace.
+    assert captured["pass_zero_palace_dir"] == expected
+    # And the env var must point at the custom palace so any downstream
+    # ``cfg.palace_path`` read in this process resolves correctly too.
+    import os
+
+    assert os.environ.get("MEMPALACE_PALACE_PATH") == os.path.abspath(expected)
+
+
 @patch("mempalace.cli.MempalaceConfig")
 def test_cmd_init_with_entities_zero_total(mock_config_cls, tmp_path, capsys):
     """When entities detected but total is 0, prints 'No entities' message."""
@@ -889,7 +944,7 @@ def test_cmd_compress_with_config(mock_config_cls, tmp_path, capsys):
 
 @patch("mempalace.cli.MempalaceConfig")
 def test_cmd_compress_stores_results(mock_config_cls, capsys):
-    """Non-dry-run compress stores to mempalace_compressed collection."""
+    """Non-dry-run compress stores to mempalace_closets collection (#1244)."""
     mock_config_cls.return_value.palace_path = "/fake/palace"
     args = argparse.Namespace(palace=None, wing=None, dry_run=False, config=None)
     mock_col = MagicMock()
@@ -927,6 +982,53 @@ def test_cmd_compress_stores_results(mock_config_cls, capsys):
     assert "Stored" in out
     assert "Total:" in out
     mock_comp_col.upsert.assert_called_once()
+    # Verify the compress output goes to the closets collection so that
+    # palace.get_closets_collection() / searcher can read it back (#1244).
+    (call_args, _kwargs) = mock_backend.get_or_create_collection.call_args
+    assert (
+        call_args[1] == "mempalace_closets"
+    ), f"compress should write to mempalace_closets, got {call_args[1]!r}"
+    assert "mempalace_closets" in out
+
+
+def test_cmd_compress_output_readable_via_get_closets_collection(tmp_path, capsys):
+    """End-to-end: cmd_compress output must be readable via the same code
+    path palace.py uses (`get_closets_collection`). Regression for #1244."""
+    from mempalace.backends.chroma import ChromaBackend
+    from mempalace.palace import get_closets_collection, get_collection
+
+    palace_path = str(tmp_path / "palace")
+
+    # Seed a drawer in the palace so cmd_compress has something to compress.
+    drawers = get_collection(palace_path, "mempalace_drawers", create=True)
+    drawers.upsert(
+        ids=["drawer-1"],
+        documents=["The quick brown fox jumps over the lazy dog."],
+        metadatas=[{"wing": "test", "room": "demo", "source_file": "fox.txt"}],
+    )
+
+    args = argparse.Namespace(palace=palace_path, wing=None, dry_run=False, config=None)
+    with patch("mempalace.cli.MempalaceConfig") as mock_config_cls:
+        mock_config_cls.return_value.palace_path = palace_path
+        # Use a real ChromaBackend so the write actually lands on disk and
+        # the read-side helper can find it.
+        with patch("mempalace.backends.chroma.ChromaBackend", side_effect=ChromaBackend):
+            cmd_compress(args)
+
+    out = capsys.readouterr().out
+    assert "Stored" in out
+
+    # Now read via the *same* code path palace.py / searcher uses.
+    closets = get_closets_collection(palace_path, create=False)
+    got = closets.get(ids=["drawer-1"], include=["documents", "metadatas"])
+    assert got["ids"] == ["drawer-1"], (
+        "compressed drawer not found in mempalace_closets — "
+        "cmd_compress wrote to the wrong collection (#1244)"
+    )
+    assert got["documents"] and got["documents"][0], "empty compressed doc"
+    meta = got["metadatas"][0]
+    assert meta.get("wing") == "test"
+    assert "compression_ratio" in meta
 
 
 def test_cmd_repair_trailing_slash_does_not_recurse():
