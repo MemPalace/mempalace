@@ -95,6 +95,23 @@ def _parse_args():
         metavar="PATH",
         help="Path to the palace directory (overrides config file and env var)",
     )
+    parser.add_argument(
+        "--allowed-wings",
+        metavar="WINGS",
+        help=(
+            "Comma-separated list of wings this agent may access. "
+            "If set, all other wings are implicitly denied. "
+            "Example: --allowed-wings=wing_user,wing_code,wing_kestrel"
+        ),
+    )
+    parser.add_argument(
+        "--blocked-wings",
+        metavar="WINGS",
+        help=(
+            "Comma-separated list of wings to always deny, even if listed in --allowed-wings. "
+            "Example: --blocked-wings=wing_surveillance,wing_financial"
+        ),
+    )
     args, unknown = parser.parse_known_args()
     if unknown:
         logger.debug("Ignoring unknown args: %s", unknown)
@@ -163,6 +180,65 @@ def _call_kg(op):
                 continue
             raise
 
+
+class WingPolicy:
+    """
+    Server-level wing access control, enforced on every tool call.
+
+    Instantiated once from CLI flags (--allowed-wings / --blocked-wings).
+    The agent controls its own tool arguments, but the server silently omits
+    blocked wings from aggregate results and returns access_denied errors for
+    any direct request targeting a blocked wing.
+
+    Blocked wings take precedence over allowed wings.
+
+    Usage (in claude_desktop_config.json or .claude/settings.json):
+        "args": ["--allowed-wings", "wing_user,wing_code,wing_projects"]
+        "args": ["--blocked-wings", "wing_surveillance,wing_financial"]
+    """
+
+    def __init__(self, allowed_wings=None, blocked_wings=None):
+        self.allowed = frozenset(allowed_wings) if allowed_wings else None
+        self.blocked = frozenset(blocked_wings) if blocked_wings else frozenset()
+
+    @property
+    def active(self) -> bool:
+        return self.allowed is not None or bool(self.blocked)
+
+    def is_allowed(self, wing: str) -> bool:
+        if wing in self.blocked:
+            return False
+        if self.allowed is not None and wing not in self.allowed:
+            return False
+        return True
+
+    def denied(self, wing: str) -> dict:
+        return {
+            "error": "access_denied",
+            "wing": wing,
+            "message": (
+                f"Wing '{wing}' is not accessible to this agent. "
+                f"Configure server access with --allowed-wings / --blocked-wings."
+            ),
+        }
+
+
+def _parse_wing_list(raw: str) -> list:
+    """Parse a comma-separated wing list from a CLI arg, stripping whitespace."""
+    return [w.strip() for w in raw.split(",") if w.strip()]
+
+
+_policy = WingPolicy(
+    allowed_wings=_parse_wing_list(_args.allowed_wings) if _args.allowed_wings else None,
+    blocked_wings=_parse_wing_list(_args.blocked_wings) if _args.blocked_wings else None,
+)
+
+if _policy.active:
+    logger.info(
+        "Wing policy active — allowed: %s  blocked: %s",
+        sorted(_policy.allowed) if _policy.allowed is not None else "*",
+        sorted(_policy.blocked) if _policy.blocked else "none",
+    )
 
 _client_cache = None
 _collection_cache = None
@@ -621,9 +697,13 @@ def tool_status():
         for m in all_meta:
             m = m or {}
             w = m.get("wing", "unknown")
+            if not _policy.is_allowed(w):
+                continue
             r = m.get("room", "unknown")
             wings[w] = wings.get(w, 0) + 1
             rooms[r] = rooms.get(r, 0) + 1
+        if _policy.active:
+            result["total_drawers"] = sum(wings.values())
     except Exception as e:
         logger.exception("tool_status metadata fetch failed")
         result["error"] = str(e)
@@ -675,6 +755,8 @@ def tool_list_wings():
         for m in all_meta:
             m = m or {}
             w = m.get("wing", "unknown")
+            if not _policy.is_allowed(w):
+                continue
             wings[w] = wings.get(w, 0) + 1
     except Exception as e:
         logger.exception("tool_list_wings metadata fetch failed")
@@ -688,6 +770,8 @@ def tool_list_rooms(wing: str = None):
         wing = _sanitize_optional_name(wing, "wing")
     except ValueError as e:
         return {"error": str(e)}
+    if wing and not _policy.is_allowed(wing):
+        return _policy.denied(wing)
     col = _get_collection()
     if not col:
         return _no_palace()
@@ -698,6 +782,8 @@ def tool_list_rooms(wing: str = None):
         all_meta = _fetch_all_metadata(col, where=where)
         for m in all_meta:
             m = m or {}
+            if not _policy.is_allowed(m.get("wing", "unknown")):
+                continue
             r = m.get("room", "unknown")
             rooms[r] = rooms.get(r, 0) + 1
     except Exception as e:
@@ -718,6 +804,8 @@ def tool_get_taxonomy():
         for m in all_meta:
             m = m or {}
             w = m.get("wing", "unknown")
+            if not _policy.is_allowed(w):
+                continue
             r = m.get("room", "unknown")
             if w not in taxonomy:
                 taxonomy[w] = {}
@@ -744,6 +832,8 @@ def tool_search(
         room = _sanitize_optional_name(room, "room")
     except ValueError as e:
         return {"error": str(e)}
+    if wing and not _policy.is_allowed(wing):
+        return _policy.denied(wing)
     # Backwards compat: accept old name
     # Backwards compat: convert old similarity scale (higher=stricter) to
     # distance scale (lower=stricter). Similarity 0.8 → distance 0.2.
@@ -786,6 +876,10 @@ def tool_search(
     if _vector_disabled:
         result["vector_disabled"] = True
         result["vector_disabled_reason"] = _vector_disabled_reason
+    # Post-filter: when no wing was specified, drop hits from blocked wings.
+    # This prevents the agent from learning blocked content exists via search.
+    if _policy.active and isinstance(result, dict) and "results" in result:
+        result["results"] = [r for r in result["results"] if _policy.is_allowed(r.get("wing", ""))]
     # Attach sanitizer metadata for transparency
     if sanitized["was_sanitized"]:
         result["query_sanitized"] = True
@@ -828,12 +922,15 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
         duplicates = []
         if results["ids"] and results["ids"][0]:
             for i, drawer_id in enumerate(results["ids"][0]):
+                # Chroma 1.5.x can return None for partially-flushed rows;
+                # coerce to empty sentinels so downstream .get() is safe.
+                meta = results["metadatas"][0][i] or {}
+                # Don't reveal that content in blocked wings exists.
+                if not _policy.is_allowed(meta.get("wing", "")):
+                    continue
                 dist = results["distances"][0][i]
                 similarity = round(max(0.0, 1 - dist), 3)
                 if similarity >= threshold:
-                    # Chroma 1.5.x can return None for partially-flushed rows;
-                    # coerce to empty sentinels so downstream .get() is safe.
-                    meta = results["metadatas"][0][i] or {}
                     doc = results["documents"][0][i] or ""
                     duplicates.append(
                         {
@@ -859,7 +956,12 @@ def tool_get_aaak_spec():
 
 
 def tool_traverse_graph(start_room: str, max_hops: int = 2):
-    """Walk the palace graph from a room. Find connected ideas across wings."""
+    """Walk the palace graph from a room. Find connected ideas across wings.
+
+    Note: wing policy is not enforced on graph traversal. Traversal may follow
+    edges into blocked wings. Full enforcement requires policy-aware pagination
+    in palace_graph.traverse() — tracked as a follow-up.
+    """
     max_hops = max(1, min(max_hops, 10))
     col = _get_collection()
     if not col:
@@ -874,6 +976,10 @@ def tool_find_tunnels(wing_a: str = None, wing_b: str = None):
         wing_b = _sanitize_optional_name(wing_b, "wing_b")
     except ValueError as e:
         return {"error": str(e)}
+    if wing_a and not _policy.is_allowed(wing_a):
+        return _policy.denied(wing_a)
+    if wing_b and not _policy.is_allowed(wing_b):
+        return _policy.denied(wing_b)
     col = _get_collection()
     if not col:
         return _no_palace()
@@ -881,7 +987,11 @@ def tool_find_tunnels(wing_a: str = None, wing_b: str = None):
 
 
 def tool_graph_stats():
-    """Palace graph overview: nodes, tunnels, edges, connectivity."""
+    """Palace graph overview: nodes, tunnels, edges, connectivity.
+
+    Note: wing policy is not enforced here — counts include drawers from all
+    wings regardless of the active policy. Follow-up to palace_graph.graph_stats().
+    """
     col = _get_collection()
     if not col:
         return _no_palace()
@@ -910,6 +1020,10 @@ def tool_create_tunnel(
         target_room = sanitize_name(target_room, "target_room")
     except ValueError as e:
         return {"error": str(e)}
+    if not _policy.is_allowed(source_wing):
+        return _policy.denied(source_wing)
+    if not _policy.is_allowed(target_wing):
+        return _policy.denied(target_wing)
     return create_tunnel(
         source_wing,
         source_room,
@@ -927,13 +1041,38 @@ def tool_list_tunnels(wing: str = None):
         wing = _sanitize_optional_name(wing, "wing")
     except ValueError as e:
         return {"error": str(e)}
-    return list_tunnels(wing)
+    if wing and not _policy.is_allowed(wing):
+        return _policy.denied(wing)
+    tunnels = list_tunnels(wing)
+    # Post-filter: drop tunnels where either endpoint sits in a blocked wing.
+    # Tunnels are bidirectional, so leaking either endpoint exposes the link.
+    if _policy.active and isinstance(tunnels, list):
+        tunnels = [
+            t
+            for t in tunnels
+            if _policy.is_allowed(t.get("source", {}).get("wing", ""))
+            and _policy.is_allowed(t.get("target", {}).get("wing", ""))
+        ]
+    return tunnels
 
 
 def tool_delete_tunnel(tunnel_id: str):
     """Delete an explicit tunnel by its ID."""
     if not tunnel_id or not isinstance(tunnel_id, str):
         return {"error": "tunnel_id is required"}
+    # Look up the tunnel to enforce wing policy on either endpoint. If the
+    # tunnel is invisible under the active policy, refuse without revealing
+    # whether the ID exists.
+    if _policy.active:
+        match = next((t for t in list_tunnels() if t.get("id") == tunnel_id), None)
+        if match is None:
+            return {"deleted": tunnel_id}
+        src_wing = match.get("source", {}).get("wing", "")
+        tgt_wing = match.get("target", {}).get("wing", "")
+        if not _policy.is_allowed(src_wing):
+            return _policy.denied(src_wing)
+        if not _policy.is_allowed(tgt_wing):
+            return _policy.denied(tgt_wing)
     return delete_tunnel(tunnel_id)
 
 
@@ -944,8 +1083,14 @@ def tool_follow_tunnels(wing: str, room: str):
         room = sanitize_name(room, "room")
     except ValueError as e:
         return {"error": str(e)}
+    if not _policy.is_allowed(wing):
+        return _policy.denied(wing)
     col = _get_collection()
-    return follow_tunnels(wing, room, col=col)
+    result = follow_tunnels(wing, room, col=col)
+    # Post-filter: don't surface tunnel endpoints in blocked wings.
+    if _policy.active and isinstance(result, list):
+        result = [c for c in result if _policy.is_allowed(c.get("connected_wing", ""))]
+    return result
 
 
 # ==================== WRITE TOOLS ====================
@@ -962,6 +1107,9 @@ def tool_add_drawer(
         content = sanitize_content(content)
     except ValueError as e:
         return {"success": False, "error": str(e)}
+
+    if not _policy.is_allowed(wing):
+        return _policy.denied(wing)
 
     col = _get_collection(create=True)
     if not col:
@@ -1025,9 +1173,13 @@ def tool_delete_drawer(drawer_id: str):
     col = _get_collection()
     if not col:
         return _no_palace()
-    existing = col.get(ids=[drawer_id])
+    existing = col.get(ids=[drawer_id], include=["documents", "metadatas"])
     if not existing["ids"]:
         return {"success": False, "error": f"Drawer not found: {drawer_id}"}
+
+    drawer_wing = existing["metadatas"][0].get("wing", "") if existing["metadatas"] else ""
+    if not _policy.is_allowed(drawer_wing):
+        return _policy.denied(drawer_wing)
 
     # Log the deletion with the content being removed for audit trail
     deleted_content = existing.get("documents", [""])[0] if existing.get("documents") else ""
@@ -1094,6 +1246,8 @@ def tool_get_drawer(drawer_id: str):
         if not result["ids"]:
             return {"error": f"Drawer not found: {drawer_id}"}
         meta = result["metadatas"][0]
+        if not _policy.is_allowed(meta.get("wing", "")):
+            return _policy.denied(meta.get("wing", ""))
         doc = result["documents"][0]
         # source_file is the absolute filesystem path written by the
         # miners. Reduce to its basename before handing it to the MCP
@@ -1124,6 +1278,8 @@ def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offse
         room = _sanitize_optional_name(room, "room")
     except ValueError as e:
         return {"error": str(e)}
+    if wing and not _policy.is_allowed(wing):
+        return _policy.denied(wing)
     col = _get_collection()
     if not col:
         return _no_palace()
@@ -1154,6 +1310,8 @@ def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offse
         drawers = []
         for i, did in enumerate(result["ids"]):
             meta = result["metadatas"][i]
+            if not _policy.is_allowed(meta.get("wing", "")):
+                continue
             doc = result["documents"][i]
             drawers.append(
                 {
@@ -1192,6 +1350,10 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
         old_meta = existing["metadatas"][0]
         old_doc = existing["documents"][0]
 
+        old_wing = old_meta.get("wing", "")
+        if not _policy.is_allowed(old_wing):
+            return _policy.denied(old_wing)
+
         new_doc = old_doc
         if content is not None:
             try:
@@ -1205,6 +1367,8 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
                 new_meta["wing"] = sanitize_name(wing, "wing")
             except ValueError as e:
                 return {"success": False, "error": str(e)}
+            if not _policy.is_allowed(new_meta["wing"]):
+                return _policy.denied(new_meta["wing"])
         if room is not None:
             try:
                 new_meta["room"] = sanitize_name(room, "room")
@@ -1398,6 +1562,8 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
         wing = sanitize_name(wing)
     else:
         wing = f"wing_{agent_name.replace(' ', '_')}"
+    if not _policy.is_allowed(wing):
+        return _policy.denied(wing)
     room = "diary"
     col = _get_collection(create=True)
     if not col:
@@ -1474,6 +1640,8 @@ def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
             wing = sanitize_name(wing)
     except ValueError as e:
         return {"error": str(e)}
+    if wing and not _policy.is_allowed(wing):
+        return _policy.denied(wing)
     last_n = max(1, min(last_n, 100))
     col = _get_collection()
     if not col:
@@ -1496,9 +1664,15 @@ def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
         if not results["ids"]:
             return {"agent": agent_name, "entries": [], "message": "No diary entries yet."}
 
-        # Combine and sort by timestamp
+        # Combine and sort by timestamp. When wing was unspecified, drop
+        # entries from blocked wings — otherwise the spans-all-wings path
+        # leaks diary content the policy means to hide.
         entries = []
+        kept_ids = 0
         for doc, meta in zip(results["documents"], results["metadatas"]):
+            if not _policy.is_allowed(meta.get("wing", "")):
+                continue
+            kept_ids += 1
             entries.append(
                 {
                     "date": meta.get("date", ""),
@@ -1514,7 +1688,7 @@ def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
         return {
             "agent": agent_name,
             "entries": entries,
-            "total": len(results["ids"]),
+            "total": kept_ids,
             "showing": len(entries),
         }
     except Exception:
