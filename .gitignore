@@ -28,6 +28,7 @@ Thumbs.db
 # Coverage
 htmlcov/
 .coverage
+.coverage.*
 coverage.xml
 
 # Virtual environments
