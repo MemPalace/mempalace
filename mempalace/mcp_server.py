@@ -696,9 +696,12 @@ def tool_status():
         all_meta = _get_cached_metadata(col)
         for m in all_meta:
             m = m or {}
-            w = m.get("wing", "unknown")
-            if not _policy.is_allowed(w):
+            # Policy check uses "" so a user can't accidentally allowlist
+            # the "unknown" display label and bypass the gate.
+            wing_raw = m.get("wing", "")
+            if not _policy.is_allowed(wing_raw):
                 continue
+            w = wing_raw or "unknown"
             r = m.get("room", "unknown")
             wings[w] = wings.get(w, 0) + 1
             rooms[r] = rooms.get(r, 0) + 1
@@ -754,9 +757,10 @@ def tool_list_wings():
         all_meta = _get_cached_metadata(col)
         for m in all_meta:
             m = m or {}
-            w = m.get("wing", "unknown")
-            if not _policy.is_allowed(w):
+            wing_raw = m.get("wing", "")
+            if not _policy.is_allowed(wing_raw):
                 continue
+            w = wing_raw or "unknown"
             wings[w] = wings.get(w, 0) + 1
     except Exception as e:
         logger.exception("tool_list_wings metadata fetch failed")
@@ -782,7 +786,7 @@ def tool_list_rooms(wing: str = None):
         all_meta = _fetch_all_metadata(col, where=where)
         for m in all_meta:
             m = m or {}
-            if not _policy.is_allowed(m.get("wing", "unknown")):
+            if not _policy.is_allowed(m.get("wing", "")):
                 continue
             r = m.get("room", "unknown")
             rooms[r] = rooms.get(r, 0) + 1
@@ -803,9 +807,10 @@ def tool_get_taxonomy():
         all_meta = _get_cached_metadata(col)
         for m in all_meta:
             m = m or {}
-            w = m.get("wing", "unknown")
-            if not _policy.is_allowed(w):
+            wing_raw = m.get("wing", "")
+            if not _policy.is_allowed(wing_raw):
                 continue
+            w = wing_raw or "unknown"
             r = m.get("room", "unknown")
             if w not in taxonomy:
                 taxonomy[w] = {}
@@ -956,12 +961,19 @@ def tool_get_aaak_spec():
 
 
 def tool_traverse_graph(start_room: str, max_hops: int = 2):
-    """Walk the palace graph from a room. Find connected ideas across wings.
-
-    Note: wing policy is not enforced on graph traversal. Traversal may follow
-    edges into blocked wings. Full enforcement requires policy-aware pagination
-    in palace_graph.traverse() — tracked as a follow-up.
-    """
+    """Walk the palace graph from a room. Find connected ideas across wings."""
+    # Traversal can follow edges into any wing. Until palace_graph.traverse()
+    # is policy-aware, hard-deny under any active policy rather than silently
+    # leak blocked-wing content through graph hops.
+    if _policy.active:
+        return {
+            "error": "access_denied",
+            "tool": "traverse_graph",
+            "message": (
+                "graph traversal is disabled while a wing policy is active "
+                "(traversal is not yet policy-aware)."
+            ),
+        }
     max_hops = max(1, min(max_hops, 10))
     col = _get_collection()
     if not col:
@@ -987,11 +999,19 @@ def tool_find_tunnels(wing_a: str = None, wing_b: str = None):
 
 
 def tool_graph_stats():
-    """Palace graph overview: nodes, tunnels, edges, connectivity.
-
-    Note: wing policy is not enforced here — counts include drawers from all
-    wings regardless of the active policy. Follow-up to palace_graph.graph_stats().
-    """
+    """Palace graph overview: nodes, tunnels, edges, connectivity."""
+    # Counts span every wing. Until palace_graph.graph_stats() is
+    # policy-aware, hard-deny under any active policy rather than disclose
+    # blocked-wing presence through aggregate totals.
+    if _policy.active:
+        return {
+            "error": "access_denied",
+            "tool": "graph_stats",
+            "message": (
+                "graph stats are disabled while a wing policy is active "
+                "(stats are not yet policy-aware)."
+            ),
+        }
     col = _get_collection()
     if not col:
         return _no_palace()
@@ -1060,19 +1080,20 @@ def tool_delete_tunnel(tunnel_id: str):
     """Delete an explicit tunnel by its ID."""
     if not tunnel_id or not isinstance(tunnel_id, str):
         return {"error": "tunnel_id is required"}
-    # Look up the tunnel to enforce wing policy on either endpoint. If the
-    # tunnel is invisible under the active policy, refuse without revealing
-    # whether the ID exists.
+    # Look up the tunnel to enforce wing policy on either endpoint. When a
+    # policy is active and the ID does not match a visible tunnel, return the
+    # idempotent {"deleted": ...} shape used for missing IDs — claiming the
+    # no-op explicitly is the intentional symmetry that prevents an agent
+    # from distinguishing "no such tunnel" from "tunnel touches a blocked
+    # wing" by inspecting the response.
     if _policy.active:
         match = next((t for t in list_tunnels() if t.get("id") == tunnel_id), None)
         if match is None:
             return {"deleted": tunnel_id}
         src_wing = match.get("source", {}).get("wing", "")
         tgt_wing = match.get("target", {}).get("wing", "")
-        if not _policy.is_allowed(src_wing):
-            return _policy.denied(src_wing)
-        if not _policy.is_allowed(tgt_wing):
-            return _policy.denied(tgt_wing)
+        if not _policy.is_allowed(src_wing) or not _policy.is_allowed(tgt_wing):
+            return {"deleted": tunnel_id}
     return delete_tunnel(tunnel_id)
 
 
@@ -1174,12 +1195,16 @@ def tool_delete_drawer(drawer_id: str):
     if not col:
         return _no_palace()
     existing = col.get(ids=[drawer_id], include=["documents", "metadatas"])
+    not_found = {"success": False, "error": f"Drawer not found: {drawer_id}"}
     if not existing["ids"]:
-        return {"success": False, "error": f"Drawer not found: {drawer_id}"}
+        return not_found
 
     drawer_wing = existing["metadatas"][0].get("wing", "") if existing["metadatas"] else ""
     if not _policy.is_allowed(drawer_wing):
-        return _policy.denied(drawer_wing)
+        # Mirror the not-found response: drawer IDs are deterministic on
+        # wing+room+content, so a distinguishable access_denied would let an
+        # agent confirm whether known content exists in a blocked wing.
+        return not_found
 
     # Log the deletion with the content being removed for audit trail
     deleted_content = existing.get("documents", [""])[0] if existing.get("documents") else ""
@@ -1243,11 +1268,14 @@ def tool_get_drawer(drawer_id: str):
         return _no_palace()
     try:
         result = col.get(ids=[drawer_id], include=["documents", "metadatas"])
+        not_found = {"error": f"Drawer not found: {drawer_id}"}
         if not result["ids"]:
-            return {"error": f"Drawer not found: {drawer_id}"}
+            return not_found
         meta = result["metadatas"][0]
         if not _policy.is_allowed(meta.get("wing", "")):
-            return _policy.denied(meta.get("wing", ""))
+            # See tool_delete_drawer: collapse 'not found' and 'blocked wing'
+            # so the response can't be used to probe blocked-wing contents.
+            return not_found
         doc = result["documents"][0]
         # source_file is the absolute filesystem path written by the
         # miners. Reduce to its basename before handing it to the MCP
@@ -1344,15 +1372,20 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
         return _no_palace()
     try:
         existing = col.get(ids=[drawer_id], include=["documents", "metadatas"])
+        not_found = {"success": False, "error": f"Drawer not found: {drawer_id}"}
         if not existing["ids"]:
-            return {"success": False, "error": f"Drawer not found: {drawer_id}"}
+            return not_found
 
         old_meta = existing["metadatas"][0]
         old_doc = existing["documents"][0]
 
         old_wing = old_meta.get("wing", "")
         if not _policy.is_allowed(old_wing):
-            return _policy.denied(old_wing)
+            # See tool_delete_drawer: hide existence of blocked-wing drawers
+            # by returning the same response as a missing ID. The new-wing
+            # check below stays as access_denied because the caller supplied
+            # that wing argument explicitly.
+            return not_found
 
         new_doc = old_doc
         if content is not None:
