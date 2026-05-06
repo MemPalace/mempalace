@@ -868,7 +868,7 @@ def _sqlite_fallback_and_scope(
     return available_in_scope, warnings
 
 
-def search_memories(
+def search_memories(  # noqa: C901  # complex by intent — dispatches vector / BM25 / fallback paths
     query: str,
     palace_path: str,
     wing: str = None,
