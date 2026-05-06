@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **`sqlite_vec` backend** — alternate vector backend implementing the full `BaseBackend` / `BaseCollection` contract using `sqlite-vec`'s `vec0` virtual table. Useful on platforms where `chromadb_rust_bindings` is unsafe (notably macOS 26 / ARM64; see chroma-core/chroma#6852, #1355, #1376) since it has no Tokio runtime, no Rust bindings, and no recursive-walker codepath. Storage is a single `sqlite_vec.db` file per palace with chroma-style metadata filters compiled to SQL over `json_extract(meta, ...)`. Optional dep — opt in via `pip install mempalace[sqlite-vec]` and select with the `mempalace.backends` registry by name `"sqlite_vec"`. A migration helper at `examples/migrate_chroma_to_sqlite_vec.py` reads `chroma.sqlite3` directly via stdlib `sqlite3` (no chromadb code involved, so the UAF cannot fire) and re-embeds via the existing ONNX MiniLM. Migration is resumable on `drawer_id` uniqueness. Tested on a 664k-drawer palace; exact count parity with the source. (#1386)
+
+---
+
 ## [3.3.5] — 2026-05-09
 
 ### Bug Fixes

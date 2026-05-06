@@ -43,6 +43,7 @@ mempalace-mcp = "mempalace.mcp_server:main"
 
 [project.entry-points."mempalace.backends"]
 chroma = "mempalace.backends.chroma:ChromaBackend"
+sqlite_vec = "mempalace.backends.sqlite_vec:SqliteVecBackend"
 
 # RFC 002 source-adapter entry-point group. Core publishes no first-party
 # adapters under this group yet; ``miner.py`` and ``convo_miner.py`` migrate
@@ -61,6 +62,12 @@ spellcheck = ["autocorrect>=2.0"]
 gpu = ["onnxruntime-gpu>=1.16"]
 dml = ["onnxruntime-directml>=1.16"]
 coreml = ["onnxruntime>=1.16"]
+# Alternate vector backend using sqlite-vec's vec0 virtual table. Useful on
+# platforms where the chromadb_rust_bindings extension is unsafe (notably
+# macOS 26 / ARM64; see chroma-core/chroma#6852, MemPalace/mempalace#1355,
+# MemPalace/mempalace#1376). Install via ``pip install mempalace[sqlite-vec]``
+# and select with the ``mempalace.backends`` registry by name ``"sqlite_vec"``.
+sqlite-vec = ["sqlite-vec>=0.1.6"]
 
 [dependency-groups]
 dev = ["pytest>=7.0", "pytest-cov>=4.0", "ruff>=0.4.0", "psutil>=5.9"]
