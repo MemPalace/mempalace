@@ -810,7 +810,9 @@ def process_file(
 
     # Skip if already filed
     source_file = str(filepath)
-    if not dry_run and file_already_mined(collection, source_file, check_mtime=True):
+    if collection is not None and file_already_mined(collection, source_file, check_mtime=True):
+        if dry_run:
+            print(f"    [DRY RUN] {filepath.name} -> SKIP (already filed, mtime unchanged)")
         return 0, "general"
 
     try:
@@ -1089,7 +1091,13 @@ def _mine_impl(
         collection = get_collection(palace_path)
         closets_col = get_closets_collection(palace_path)
     else:
-        collection = None
+        # Read-only handle so the dry-run skip check has data to query.
+        # Falls back to None if the palace doesn't yet exist; process_file
+        # then treats every file as new (matches real-run behavior).
+        try:
+            collection = get_collection(palace_path, create=False)
+        except Exception:
+            collection = None
         closets_col = None
 
     total_drawers = 0
@@ -1118,7 +1126,7 @@ def _mine_impl(
                 raise
             files_processed = i
             last_file = filepath.name
-            if drawers == 0 and not dry_run:
+            if drawers == 0:
                 files_skipped += 1
             else:
                 total_drawers += drawers
