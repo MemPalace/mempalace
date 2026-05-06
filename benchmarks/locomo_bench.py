@@ -636,7 +636,7 @@ def run_benchmark(
     llm_base_url="",
 ):
     """Run LoCoMo retrieval benchmark."""
-    with open(data_file) as f:
+    with open(data_file, encoding="utf-8") as f:
         data = json.load(f)
 
     if limit > 0:
@@ -661,7 +661,7 @@ def run_benchmark(
             Path(__file__).parent / "palace_cache_locomo.json"
         )
         if Path(_palace_cache_path).exists():
-            with open(_palace_cache_path) as f:
+            with open(_palace_cache_path, encoding="utf-8") as f:
                 palace_cache = json.load(f)
             print(f"  Palace cache: {len(palace_cache)} room assignments loaded")
 
@@ -675,7 +675,7 @@ def run_benchmark(
     print(f"  Top-k:       {top_k}")
     print(f"  Mode:        {mode}{rerank_label}")
     print(f"  Granularity: {granularity}")
-    print(f"{'─' * 60}\n")
+    print(f"{'-' * 60}\n")
 
     all_recall = []
     per_category = defaultdict(list)
@@ -703,14 +703,14 @@ def run_benchmark(
             )
             # Persist updated cache after each conversation
             if _palace_cache_path:
-                with open(_palace_cache_path, "w") as f:
+                with open(_palace_cache_path, "w", encoding="utf-8") as f:
                     json.dump(palace_cache, f, indent=2)
             rooms_summary = {}
             for sid, room in room_assignments.items():
                 rooms_summary[room] = rooms_summary.get(room, 0) + 1
             print(
                 f"  [{conv_idx + 1}/{len(data)}] {sample_id}: "
-                f"{len(sessions)} sessions → {len(rooms_summary)} rooms, {len(qa_pairs)} questions"
+                f"{len(sessions)} sessions -> {len(rooms_summary)} rooms, {len(qa_pairs)} questions"
             )
             print(f"    Rooms: {dict(sorted(rooms_summary.items(), key=lambda x: -x[1]))}")
         else:
@@ -977,7 +977,7 @@ def run_benchmark(
     print(f"\n{'=' * 60}\n")
 
     if out_file:
-        with open(out_file, "w") as f:
+        with open(out_file, "w", encoding="utf-8") as f:
             json.dump(results_log, f, indent=2)
         print(f"  Results saved to: {out_file}")
 
