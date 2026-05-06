@@ -27,7 +27,15 @@ classifiers = [
     "Topic :: Utilities",
 ]
 dependencies = [
-    "chromadb>=1.5.4,<2",
+    # chromadb upper bound capped at <1.5.4 due to a use-after-free
+    # in `chromadb_rust_bindings.abi3.so` that crashes (SIGSEGV) on
+    # macOS 26 / ARM64 the moment a populated palace is opened. Bisect
+    # confirmed 1.5.3 works; 1.5.4 .. 1.5.9 (latest) all crash with
+    # the same recursive-walker / poisoned-pointer-in-mutex-unlock
+    # signature. See MemPalace/mempalace#1355 and
+    # chroma-core/chroma#6852. Lift this cap once upstream chroma
+    # ships a fix.
+    "chromadb>=1.5.0,<1.5.4",
     "pyyaml>=6.0,<7",
     "tomli>=2.0.0; python_version < '3.11'",
 ]
