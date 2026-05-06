@@ -375,6 +375,21 @@ def test_wing_from_transcript_path_matches_operator_mine():
     assert _wing_from_transcript_path(path) == operator_wing
 
 
+def test_wing_from_transcript_path_non_projects_dashed_collapses():
+    """Documented limitation (Copilot finding on #10): project names
+    with dashes that live OUTSIDE ~/Projects/ collapse to the last
+    dash-separated token via the fallback path. ``~/dev/realm-watch``
+    → wing ``watch``. The encoding from Claude Code is lossy here —
+    ``-dev-realm-watch`` and ``-dev-realm-watch-subproject`` are
+    ambiguous without path-depth info. Pinned as a regression test
+    so future "fixes" that try to handle dashes don't accidentally
+    break ``~/dev/<parent>/<project>`` layouts that DO want the last
+    token (see ``test_wing_from_transcript_path_non_projects_layout``).
+    """
+    path = "/home/igor/.claude/projects/-home-igor-dev-realm-watch/session.jsonl"
+    assert _wing_from_transcript_path(path) == "watch"
+
+
 # --- _log ---
 
 

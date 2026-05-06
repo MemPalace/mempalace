@@ -779,25 +779,23 @@ def cmd_mined(args):
         print(f"\n  Error reading palace: {e}")
         return
 
-    # Wing-by-source aggregation. Mirrors miner.status's pagination so
+    # Wing-by-source aggregation. Pagination mirrors miner.status so
     # palaces with hundreds of thousands of drawers don't trip SQLite's
-    # max-variable limit on a single col.get(limit=total). When --wing
-    # is given, push the filter into the query so we scan only that
-    # wing rather than the full collection (Copilot finding on #4).
+    # max-variable limit on a single col.get(limit=total).
+    #
+    # When --wing is given, push the filter into each batch's where=
+    # so we never scan unrelated wings. The previous version called
+    # col.get(where=..., include=[]) without pagination to size the loop;
+    # ChromaDB returns at most ~10K ids on a single get() call, silently
+    # truncating beyond that — so the inner loop's `offset < total` would
+    # have undercounted on a wing > 10K drawers, missing late entries.
+    # Drop the upfront sizing entirely; the inner loop reads until it
+    # gets back an empty batch (Copilot finding on jphein/mempalace#7).
     where = {"wing": args.wing} if args.wing else None
-    if where is not None:
-        try:
-            scope = col.get(where=where, include=[])
-            scope_ids = scope.get("ids") if isinstance(scope, dict) else getattr(scope, "ids", [])
-            total = len(scope_ids or [])
-        except Exception:
-            total = col.count()
-    else:
-        total = col.count()
     wing_sources: dict = defaultdict(lambda: defaultdict(int))
     batch_size = 5000
     offset = 0
-    while offset < total:
+    while True:
         kwargs = {"limit": batch_size, "offset": offset, "include": ["metadatas"]}
         if where is not None:
             kwargs["where"] = where
@@ -813,6 +811,12 @@ def cmd_mined(args):
             wing = m.get("wing", "?")
             wing_sources[wing][src] += 1
         offset += len(batch)
+        # Defensive: if the backend returned fewer than batch_size, we're
+        # past the last page. Saves one trailing empty col.get on palaces
+        # whose wing-count is an exact multiple of batch_size (rare but
+        # cheap to handle).
+        if len(batch) < batch_size:
+            break
 
     if not wing_sources:
         scope = f" in wing={args.wing}" if args.wing else ""
@@ -843,7 +847,19 @@ def cmd_repair_status(args):
 
 
 def cmd_repair(args):
-    """Rebuild palace vector index."""
+    """Repair palace state.
+
+    Default mode is full HNSW rebuild via extract + re-upsert
+    (``--mode rebuild`` / ``--mode legacy``, synonyms). Also handles
+    ``--mode max-seq-id`` for un-poisoning ``max_seq_id`` rows
+    corrupted by the legacy 0.6.x → 1.5.x chromadb migration shim
+    (#1208 / #1288 family). The earlier ``reorganize`` mode was
+    retired alongside the recovery collection (PR #8 / row 32).
+
+    Closes Copilot finding on jphein/mempalace#8: docstring claimed
+    only "rebuild" while the function continued to dispatch
+    ``max-seq-id`` based on ``args.mode``.
+    """
     import shutil
     from .backends.chroma import ChromaBackend
     from .migrate import confirm_destructive_action, contains_palace_database

@@ -517,37 +517,56 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
     """Derive a project wing name from a Claude Code transcript path.
 
     Claude Code encodes the project's source directory by replacing path
-    separators with dashes, producing folders like:
-        ~/.claude/projects/-home-<user>-Projects-<project>/session.jsonl
-        ~/.claude/projects/-home-<user>-dev-<parent>-<project>/session.jsonl
-        ~/.claude/projects/-Users-<user>-<folder>-<project>/session.jsonl
+    separators with dashes:
 
-    Returns the project's basename run through
-    :func:`mempalace.config.normalize_wing_name` (lowercases, replaces
-    spaces and hyphens with underscores) so hook-derived wings match
-    operator-mined wing names exactly. Falls back to ``"sessions"`` for
-    paths that don't match the standard Claude Code projects layout.
+        ~/Projects/realm-watch
+            → /.claude/projects/-home-jp-Projects-realm-watch/
+
+        ~/dev/realm-watch
+            → /.claude/projects/-home-igor-dev-realm-watch/
+
+        ~/dev/MemPalace/mempalace
+            → /.claude/projects/-home-igor-dev-MemPalace-mempalace/
+
+    The encoding is lossy: ``-`` separates path components but project
+    names also commonly contain ``-``, and we don't know the path's
+    depth from the encoded form alone. The ``-Projects-`` segment is
+    the only unambiguous marker (operators don't typically use
+    ``Projects`` as a project name); it's the resolution we trust.
 
     Resolution order:
 
-    1. ``-Projects-<name>`` segment when present — preserves project
-       names containing dashes (``realm-watch`` resolves to
-       ``realm_watch`` instead of collapsing to ``watch``). Closes
-       Copilot finding on jphein/mempalace#9.
-    2. Last dash-separated token of ``/.claude/projects/-...`` — covers
-       non-Projects layouts (``-Users-<user>-<folder>-<project>``).
-    3. ``"sessions"`` fallback.
+    1. ``-Projects-<name>`` — preserves dashes in ``<name>``. Matches
+       JP's ``~/Projects/<project>`` layout exactly. Wing equals
+       ``normalize_wing_name(project)``.
+    2. Last dash-separated token of ``/.claude/projects/-...`` —
+       best-effort fallback for non-Projects layouts.
+
+    **Known limitation** (Copilot finding on jphein/mempalace#10):
+    in the fallback path, project names containing dashes collapse to
+    the last segment. ``~/dev/realm-watch`` → wing ``watch`` (hook)
+    vs ``realm_watch`` (operator mine of the same dir). We don't add
+    ``-dev-``/``-code-``/etc. markers because they're ALSO ambiguous
+    (``~/dev/<project>`` vs ``~/dev/<parent>/<project>`` encode
+    identically). Workaround for affected setups: pass ``--wing
+    <expected>`` to ``mempalace mine`` so the operator-side wing
+    matches the hook-derived one, or move the project to
+    ``~/Projects/``.
+
+    Returns ``"sessions"`` for paths that don't match
+    ``/.claude/projects/-...``.
     """
     from .config import normalize_wing_name
 
     normalized = transcript_path.replace("\\", "/")
     # Primary: explicit ``-Projects-<name>`` segment. Preferred because
-    # it preserves project names that themselves contain dashes.
+    # it's the only path layout where the project boundary is
+    # unambiguously recoverable.
     match = re.search(r"-Projects-([^/]+?)(?:/|$)", normalized)
     if match:
         return normalize_wing_name(match.group(1))
-    # Secondary: last dash-separated token of ``/.claude/projects/-...``.
-    # Used for projects under non-Projects parents (e.g. ~/dev, ~/code).
+    # Fallback: last dash-separated token of the encoded folder.
+    # Best-effort; loses dashes within project names (documented above).
     match = re.search(r"/\.claude/projects/-([^/]+)", normalized)
     if match:
         encoded = match.group(1)
@@ -673,15 +692,25 @@ def hook_session_start(data: dict, harness: str):
 
 
 def hook_precompact(data: dict, harness: str):
-    """Precompact hook: mine the transcript synchronously, then allow compaction.
+    """Precompact hook: trigger transcript ingest + project mine, then allow compaction.
 
-    The recovery-marker write was removed in this PR (it used to land
-    a "where we were" diary entry in the dedicated
-    mempalace_session_recovery collection). The verbatim transcript
-    chunks captured by _ingest_transcript already cover the recovery
-    use case — searching for any phrase from the last few messages
-    locates the session. The collection itself and its read tool are
-    untouched in this PR; a follow-up retires them once nothing writes.
+    Two write paths fire in sequence:
+      1. ``_ingest_transcript(transcript_path)`` — local mode spawns a
+         background ``mempalace mine`` Popen (best-effort, non-blocking);
+         daemon-strict mode POSTs to ``/mine`` (the daemon serializes
+         under its own ``_mine_sem``, replays from a queue if a rebuild
+         is in progress). NOT a synchronous-write contract — by the time
+         compaction starts, the mine subprocess may still be running.
+      2. ``_mine_sync()`` — synchronous mempalace mine of MEMPAL_DIR
+         (project files) when set. Blocks until exit (subprocess.run).
+
+    Closes Copilot finding on jphein/mempalace#6: previous docstring
+    claimed step 1 was synchronous; corrected to describe the actual
+    fire-and-forget semantics. Recoverability of "where we were" is
+    delivered by the verbatim transcript chunks landing in
+    mempalace_drawers — searching any phrase from the last few messages
+    finds the session. (The earlier dedicated session-recovery collection
+    has since been retired; see PR #8 / row 32 of CLAUDE.md.)
     """
     parsed = _parse_harness_input(data, harness)
     session_id = parsed["session_id"]
