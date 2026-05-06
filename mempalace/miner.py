@@ -66,6 +66,12 @@ SKIP_FILENAMES = {
     "mempal.yml",
     ".gitignore",
     "package-lock.json",
+    "composer.lock",
+    "yarn.lock",
+    "poetry.lock",
+    "Pipfile.lock",
+    "Gemfile.lock",
+    "cargo.lock",
 }
 
 CHUNK_SIZE = 800  # chars per drawer
@@ -962,6 +968,11 @@ def scan_project(
             exact_force_include = is_exact_force_include(filepath, project_path, include_paths)
 
             if not force_include and filename in SKIP_FILENAMES:
+                continue
+            # Skip minified and sourcemap files
+            if filename.endswith(".min.js") or filename.endswith(".min.css"):
+                continue
+            if filename.endswith(".map"):
                 continue
             if filepath.suffix.lower() not in READABLE_EXTENSIONS and not exact_force_include:
                 continue
