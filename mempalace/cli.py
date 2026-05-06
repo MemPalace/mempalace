@@ -14,6 +14,7 @@ Commands:
     mempalace mine <dir>                  Mine project files (default)
     mempalace mine <dir> --mode convos    Mine conversation exports
     mempalace search "query"              Find anything, exact words
+    mempalace export -o <dir>             Export the palace as browsable markdown (one file per room)
     mempalace mcp                         Show MCP setup command
     mempalace wake-up                     Show L0 + L1 wake-up context
     mempalace wake-up --wing my_app       Wake-up for a specific project
@@ -25,6 +26,7 @@ Examples:
     mempalace mine ~/.claude/projects/-Users-you-Projects-my_app --mode convos --wing my_app
     mempalace search "why did we switch to GraphQL"
     mempalace search "pricing discussion" --wing my_app --room costs
+    mempalace export -o ~/Desktop/palace-export
 """
 
 import os
@@ -1522,7 +1524,10 @@ def main():
     p_export.add_argument(
         "-o", "--output", required=True, help="Output directory for markdown files"
     )
-    p_export.add_argument("--palace", help="Path to palace directory (default: from config)")
+    # No per-subcommand --palace: rely on the root parser's global --palace
+    # so usage is `mempalace --palace <path> export -o <dir>` — consistent
+    # with mine / search / mcp / status / wake-up which all read args.palace
+    # from the global flag.
 
     args = parser.parse_args()
 

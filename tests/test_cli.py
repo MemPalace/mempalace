@@ -724,6 +724,36 @@ def test_main_split_dispatches():
         mock_cmd.assert_called_once()
 
 
+def test_main_export_dispatches():
+    """Argparse wiring + main() dispatch for the export subcommand.
+
+    Locks in -o/--output as the required arg and that the global
+    --palace flag (root parser) reaches cmd_export via args.palace
+    — there is no per-subcommand --palace.
+    """
+    from mempalace.cli import cmd_export  # noqa: F401 — sanity import
+
+    with (
+        patch("sys.argv", ["mempalace", "--palace", "/tmp/p", "export", "-o", "/tmp/out"]),
+        patch("mempalace.cli.cmd_export") as mock_cmd,
+    ):
+        main()
+        mock_cmd.assert_called_once()
+        # Forwarded args carry both the global --palace and -o/--output.
+        forwarded = mock_cmd.call_args[0][0]
+        assert forwarded.palace == "/tmp/p"
+        assert forwarded.output == "/tmp/out"
+
+    # And the long form -o == --output.
+    with (
+        patch("sys.argv", ["mempalace", "export", "--output", "/tmp/out2"]),
+        patch("mempalace.cli.cmd_export") as mock_cmd,
+    ):
+        main()
+        mock_cmd.assert_called_once()
+        assert mock_cmd.call_args[0][0].output == "/tmp/out2"
+
+
 def test_mcp_command_prints_setup_guidance(monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", ["mempalace", "mcp"])
 
