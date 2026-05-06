@@ -21,6 +21,7 @@ Reads :data:`mempalace.searcher.CLOSET_RANK_BOOSTS` and patches it to
 writes; safe on a live palace as long as no concurrent search is
 expected to be deterministic during the run window.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -83,9 +84,7 @@ def compare(query: str, palace_path: str, n_results: int) -> dict:
     default_order = [fingerprint(h) for h in default_hits]
     zero_order = [fingerprint(h) for h in zero_hits]
 
-    boost_fired = sum(
-        1 for h in default_hits if h.get("matched_via") == "drawer+closet"
-    )
+    boost_fired = sum(1 for h in default_hits if h.get("matched_via") == "drawer+closet")
     same_set = set(default_order) == set(zero_order)
     same_order = default_order == zero_order
 
@@ -101,9 +100,7 @@ def compare(query: str, palace_path: str, n_results: int) -> dict:
 
 def main(argv: List[str] | None = None) -> int:
     global searcher
-    parser = argparse.ArgumentParser(
-        description="Closet-boost A/B ablation reproducer."
-    )
+    parser = argparse.ArgumentParser(description="Closet-boost A/B ablation reproducer.")
     parser.add_argument("palace", help="Path to the palace directory.")
     parser.add_argument(
         "--n-results",
@@ -158,9 +155,11 @@ def main(argv: List[str] | None = None) -> int:
         )
 
     print()
-    print(f"Summary:  total_boost_fires={fired_total}  "
-          f"queries_with_set_change={set_change_total}  "
-          f"queries_with_order_change={order_change_total}")
+    print(
+        f"Summary:  total_boost_fires={fired_total}  "
+        f"queries_with_set_change={set_change_total}  "
+        f"queries_with_order_change={order_change_total}"
+    )
     print()
     print("Reading the result:")
     print("  fired ≈ 20% of rows on a chat-heavy palace (per 2026-04-27 finding).")
