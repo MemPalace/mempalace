@@ -90,12 +90,18 @@ _HOOK_LINE_RE = re.compile(
 _COLLAPSED_LINES_RE = re.compile(r"(?m)^(?:> )?…\s*\+\d+ lines.*\n?")
 
 
-def strip_noise(text: str) -> str:
+def strip_noise(text: str, verbatim: bool = False) -> str:
     """Remove system tags, hook output, and Claude Code UI chrome from text.
 
     All patterns are line-anchored. User prose that happens to mention these
     strings inline (e.g., documenting them) is preserved verbatim.
+
+    When ``verbatim=True``, returns ``text`` unchanged (system tags / hook
+    chrome / collapsed-output markers are real transcript content for
+    callers who want a full record).
     """
+    if verbatim:
+        return text
     for pat in _NOISE_TAG_PATTERNS:
         text = pat.sub("", text)
     for pat in _NOISE_LINE_PATTERNS:
@@ -110,10 +116,15 @@ def strip_noise(text: str) -> str:
     return text.strip()
 
 
-def normalize(filepath: str) -> str:
+def normalize(filepath: str, verbatim: bool = False) -> str:
     """
     Load a file and normalize to transcript format if it's a chat export.
     Plain text files pass through unchanged.
+
+    When ``verbatim=True``, the Claude Code JSONL parser preserves system
+    tags, hook output, and full tool input/output (no head/tail collapse,
+    no byte caps, no Read/Edit/Write omission). Other transcript formats
+    are already verbatim — the flag is a no-op for them.
     """
     try:
         file_size = os.path.getsize(filepath)
@@ -140,17 +151,21 @@ def normalize(filepath: str) -> str:
     # other formats pass through verbatim.
     ext = Path(filepath).suffix.lower()
     if ext in (".json", ".jsonl") or content.strip()[:1] in ("{", "["):
-        normalized = _try_normalize_json(content)
+        normalized = _try_normalize_json(content, verbatim=verbatim)
         if normalized:
             return normalized
 
     return content
 
 
-def _try_normalize_json(content: str) -> Optional[str]:
-    """Try all known JSON chat schemas."""
+def _try_normalize_json(content: str, verbatim: bool = False) -> Optional[str]:
+    """Try all known JSON chat schemas.
 
-    normalized = _try_claude_code_jsonl(content)
+    Only the Claude Code JSONL path consumes ``verbatim``; the other
+    schemas (Codex, Gemini, claude.ai, ChatGPT, Slack) don't truncate.
+    """
+
+    normalized = _try_claude_code_jsonl(content, verbatim=verbatim)
     if normalized:
         return normalized
 
@@ -175,7 +190,7 @@ def _try_normalize_json(content: str) -> Optional[str]:
     return None
 
 
-def _try_claude_code_jsonl(content: str) -> Optional[str]:
+def _try_claude_code_jsonl(content: str, verbatim: bool = False) -> Optional[str]:
     """Claude Code JSONL sessions."""
     lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
     messages = []
@@ -207,11 +222,11 @@ def _try_claude_code_jsonl(content: str) -> Optional[str]:
             is_tool_only = isinstance(msg_content, list) and all(
                 isinstance(b, dict) and b.get("type") == "tool_result" for b in msg_content
             )
-            text = _extract_content(msg_content, tool_use_map=tool_use_map)
+            text = _extract_content(msg_content, tool_use_map=tool_use_map, verbatim=verbatim)
             # Strip Claude Code system-injected noise per message, never across
             # message boundaries — prevents span-eating.
             if text:
-                text = strip_noise(text)
+                text = strip_noise(text, verbatim=verbatim)
             if text:
                 if is_tool_only and messages and messages[-1][0] == "assistant":
                     # Append tool results to the previous assistant message
@@ -220,9 +235,9 @@ def _try_claude_code_jsonl(content: str) -> Optional[str]:
                 elif not is_tool_only:
                     messages.append(("user", text))
         elif msg_type == "assistant":
-            text = _extract_content(msg_content, tool_use_map=tool_use_map)
+            text = _extract_content(msg_content, tool_use_map=tool_use_map, verbatim=verbatim)
             if text:
-                text = strip_noise(text)
+                text = strip_noise(text, verbatim=verbatim)
             if text:
                 # If previous message is also assistant (multi-turn tool loop),
                 # merge into the same assistant turn
@@ -485,13 +500,15 @@ def _try_slack_json(data) -> Optional[str]:
     return None
 
 
-def _extract_content(content, tool_use_map: dict = None) -> str:
+def _extract_content(content, tool_use_map: dict = None, verbatim: bool = False) -> str:
     """Pull text from content — handles str, list of blocks, or dict.
 
     Args:
         content: Message content — string, list of content blocks, or dict.
         tool_use_map: Optional mapping of tool_use_id → tool_name, used to
                       select the right formatting strategy for tool_result blocks.
+        verbatim: When True, tool_use blocks aren't truncated and tool_result
+                  blocks aren't head/tail/byte-capped or omitted.
     """
     if isinstance(content, str):
         return content.strip()
@@ -505,12 +522,12 @@ def _extract_content(content, tool_use_map: dict = None) -> str:
                 if block_type == "text":
                     parts.append(item.get("text", ""))
                 elif block_type == "tool_use":
-                    parts.append(_format_tool_use(item))
+                    parts.append(_format_tool_use(item, verbatim=verbatim))
                 elif block_type == "tool_result":
                     tid = item.get("tool_use_id", "")
                     tname = (tool_use_map or {}).get(tid, "Unknown")
                     result_content = item.get("content", "")
-                    formatted = _format_tool_result(result_content, tname)
+                    formatted = _format_tool_result(result_content, tname, verbatim=verbatim)
                     if formatted:
                         parts.append(formatted)
         return "\n".join(p for p in parts if p).strip()
@@ -519,14 +536,18 @@ def _extract_content(content, tool_use_map: dict = None) -> str:
     return ""
 
 
-def _format_tool_use(block: dict) -> str:
-    """Format a tool_use block into a human-readable one-liner."""
+def _format_tool_use(block: dict, verbatim: bool = False) -> str:
+    """Format a tool_use block into a human-readable one-liner.
+
+    When ``verbatim=True``, the Bash command and unknown-tool JSON input
+    are not truncated.
+    """
     name = block.get("name", "Unknown")
     inp = block.get("input", {})
 
     if name == "Bash":
         cmd = inp.get("command", "")
-        if len(cmd) > 200:
+        if not verbatim and len(cmd) > 200:
             cmd = cmd[:200] + "..."
         return f"[Bash] {cmd}"
 
@@ -556,7 +577,7 @@ def _format_tool_use(block: dict) -> str:
 
     # Unknown tool — serialize input, truncate
     summary = json.dumps(inp, separators=(",", ":"))
-    if len(summary) > 200:
+    if not verbatim and len(summary) > 200:
         summary = summary[:200] + "..."
     return f"[{name}] {summary}"
 
@@ -566,12 +587,16 @@ _TOOL_RESULT_MAX_MATCHES = 20  # Grep/Glob cap
 _TOOL_RESULT_MAX_BYTES = 2048  # fallback cap for unknown tools
 
 
-def _format_tool_result(content, tool_name: str) -> str:
+def _format_tool_result(content, tool_name: str, verbatim: bool = False) -> str:
     """Format a tool_result based on the originating tool's type.
 
     Args:
         content: Result text (str) or list of content blocks (list of dicts).
         tool_name: Name of the tool that produced this result.
+        verbatim: When True, full output is included — Read/Edit/Write
+                  results are no longer omitted, Bash output isn't head/tail
+                  collapsed, Grep/Glob match lists aren't capped, and
+                  unknown-tool output isn't byte-capped.
 
     Returns:
         Formatted string prefixed with ``→ ``, or empty string if omitted.
@@ -592,14 +617,20 @@ def _format_tool_result(content, tool_name: str) -> str:
     if not text:
         return ""
 
-    # Read/Edit/Write — omit result (content is in palace or git)
+    # Read/Edit/Write — omit result (content is in palace or git).
+    # In verbatim mode, include the full result so the transcript carries
+    # exactly what Claude saw.
     if tool_name in ("Read", "Edit", "Write"):
-        return ""
+        if not verbatim:
+            return ""
+        return "→ " + "\n→ ".join(text.split("\n"))
 
     lines = text.split("\n")
 
-    # Bash — head + tail
+    # Bash — head + tail (full output in verbatim mode).
     if tool_name == "Bash":
+        if verbatim:
+            return "→ " + "\n→ ".join(lines)
         n = _TOOL_RESULT_MAX_LINES_BASH
         if len(lines) <= n * 2:
             return "→ " + "\n→ ".join(lines)
@@ -614,8 +645,10 @@ def _format_tool_result(content, tool_name: str) -> str:
             + "\n→ ".join(tail)
         )
 
-    # Grep/Glob — cap matches
+    # Grep/Glob — cap matches (full list in verbatim mode).
     if tool_name in ("Grep", "Glob"):
+        if verbatim:
+            return "→ " + "\n→ ".join(lines)
         cap = _TOOL_RESULT_MAX_MATCHES
         if len(lines) <= cap:
             return "→ " + "\n→ ".join(lines)
@@ -623,8 +656,8 @@ def _format_tool_result(content, tool_name: str) -> str:
         remaining = len(lines) - cap
         return "→ " + "\n→ ".join(kept) + f"\n→ ... [{remaining} more matches]"
 
-    # Unknown — byte cap
-    if len(text) > _TOOL_RESULT_MAX_BYTES:
+    # Unknown — byte cap (uncapped in verbatim mode).
+    if not verbatim and len(text) > _TOOL_RESULT_MAX_BYTES:
         return "→ " + text[:_TOOL_RESULT_MAX_BYTES] + f"... [truncated, {len(text)} chars]"
     return "→ " + text
 

@@ -299,6 +299,18 @@ class MempalaceConfig:
         """Whether the stop hook shows a desktop notification via notify-send."""
         return self._file_config.get("hooks", {}).get("desktop_toast", False)
 
+    @property
+    def hook_verbatim_mode(self):
+        """Skip truncation/noise-stripping in transcript ingest.
+
+        When True, ``normalize()`` preserves Claude Code system tags, hook
+        chrome, full Bash commands, full Bash output, full Grep/Glob match
+        lists, full Read/Edit/Write results, and uncapped tool inputs.
+        Default False — existing behavior is unchanged for upstream-shape
+        installs and for users who haven't opted in.
+        """
+        return self._file_config.get("hooks", {}).get("verbatim_mode", False)
+
     def set_hook_setting(self, key: str, value: bool):
         """Update a hook setting and write config to disk."""
         if "hooks" not in self._file_config:

@@ -1407,3 +1407,153 @@ class TestStripNoiseRemovesSystemChrome:
         assert "line two" in out
         # Should collapse to no more than 3 newlines
         assert "\n\n\n\n" not in out
+
+
+# ── verbatim mode ──────────────────────────────────────────────────────
+
+
+class TestVerbatimMode:
+    """Verbatim mode preserves system tags, hook chrome, and full
+    tool input/output. Backs the ``hook_verbatim_mode`` config flag
+    plumbed through ``mempalace.convo_miner.mine_convos``.
+    """
+
+    def test_strip_noise_passthrough(self):
+        text = "> User:\n<system-reminder>injected</system-reminder>\n> Real."
+        out = strip_noise(text, verbatim=True)
+        assert "<system-reminder>injected</system-reminder>" in out
+        assert out == text
+
+    def test_format_tool_use_bash_no_truncation(self):
+        long_cmd = "echo " + ("x" * 500)
+        block = {"type": "tool_use", "name": "Bash", "input": {"command": long_cmd}}
+        truncated = _format_tool_use(block)
+        full = _format_tool_use(block, verbatim=True)
+        assert "..." in truncated and len(truncated) <= 220
+        assert full == f"[Bash] {long_cmd}"
+        assert "..." not in full
+
+    def test_format_tool_use_unknown_no_truncation(self):
+        big_input = {"k": "v" * 500}
+        block = {"type": "tool_use", "name": "Custom", "input": big_input}
+        truncated = _format_tool_use(block)
+        full = _format_tool_use(block, verbatim=True)
+        assert truncated.endswith("...")
+        assert not full.endswith("...")
+        assert json.dumps(big_input, separators=(",", ":")) in full
+
+    def test_format_tool_result_read_included(self):
+        """Read/Edit/Write results stay omitted by default; verbatim includes them."""
+        for tname in ("Read", "Edit", "Write"):
+            assert _format_tool_result("file body", tname) == ""
+            full = _format_tool_result("file body\nsecond line", tname, verbatim=True)
+            assert full.startswith("→ ")
+            assert "file body" in full
+            assert "second line" in full
+
+    def test_format_tool_result_bash_no_head_tail_collapse(self):
+        big_output = "\n".join(f"line {i}" for i in range(100))
+        truncated = _format_tool_result(big_output, "Bash")
+        full = _format_tool_result(big_output, "Bash", verbatim=True)
+        assert "lines omitted" in truncated
+        assert "lines omitted" not in full
+        for i in range(100):
+            assert f"line {i}" in full
+
+    def test_format_tool_result_grep_no_match_cap(self):
+        many_matches = "\n".join(f"path/to/file{i}.py" for i in range(50))
+        truncated = _format_tool_result(many_matches, "Grep")
+        full = _format_tool_result(many_matches, "Grep", verbatim=True)
+        assert "more matches" in truncated
+        assert "more matches" not in full
+        assert "path/to/file49.py" in full
+
+    def test_format_tool_result_unknown_no_byte_cap(self):
+        big_blob = "z" * 5000
+        truncated = _format_tool_result(big_blob, "Unknown")
+        full = _format_tool_result(big_blob, "Unknown", verbatim=True)
+        assert "[truncated" in truncated
+        assert "[truncated" not in full
+        assert big_blob in full
+
+    def test_normalize_jsonl_verbatim_round_trip(self, tmp_path):
+        """End-to-end: verbatim normalize keeps the Read result and the
+        full Bash output; default normalize strips them."""
+        long_bash_out = "\n".join(f"row {i}" for i in range(80))
+        lines = [
+            json.dumps({"type": "human", "message": {"content": "Show file then run cmd"}}),
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "r1",
+                                "name": "Read",
+                                "input": {"file_path": "/tmp/x"},
+                            },
+                            {
+                                "type": "tool_use",
+                                "id": "b1",
+                                "name": "Bash",
+                                "input": {"command": "ls"},
+                            },
+                        ]
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "human",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "r1",
+                                "content": "secret file body never to truncate",
+                            },
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "b1",
+                                "content": long_bash_out,
+                            },
+                        ]
+                    },
+                }
+            ),
+            json.dumps({"type": "assistant", "message": {"content": "Done."}}),
+        ]
+        f = tmp_path / "session.jsonl"
+        f.write_text("\n".join(lines))
+
+        default_out = normalize(str(f))
+        verbatim_out = normalize(str(f), verbatim=True)
+
+        # Default behavior unchanged: Read result is omitted, Bash collapsed.
+        assert "secret file body never to truncate" not in default_out
+        assert "lines omitted" in default_out
+
+        # Verbatim mode: Read result present, Bash uncollapsed.
+        assert "secret file body never to truncate" in verbatim_out
+        assert "lines omitted" not in verbatim_out
+        for i in range(80):
+            assert f"row {i}" in verbatim_out
+
+    def test_config_default_off(self):
+        """``hook_verbatim_mode`` defaults to False so existing behavior
+        survives — important for the upstream-shape install path."""
+        from mempalace.config import MempalaceConfig
+
+        cfg = MempalaceConfig()
+        assert cfg.hook_verbatim_mode is False
+
+    def test_config_reads_from_hooks_block(self, tmp_path, monkeypatch):
+        from mempalace.config import MempalaceConfig
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        cfg_dir = tmp_path / ".mempalace"
+        cfg_dir.mkdir()
+        (cfg_dir / "config.json").write_text(json.dumps({"hooks": {"verbatim_mode": True}}))
+        cfg = MempalaceConfig()
+        assert cfg.hook_verbatim_mode is True

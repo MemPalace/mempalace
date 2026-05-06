@@ -429,6 +429,7 @@ def mine_convos(
     # 50, which would drop legitimate short conversation exchanges.
     raw_min = palace_config._file_config.get("min_chunk_size")
     cfg_min_chunk_size = raw_min if raw_min is not None else MIN_CHUNK_SIZE
+    cfg_verbatim = palace_config.hook_verbatim_mode
 
     convo_path = Path(convo_dir).expanduser().resolve()
     if not wing:
@@ -467,7 +468,7 @@ def mine_convos(
 
         # Normalize format
         try:
-            content = normalize(str(filepath))
+            content = normalize(str(filepath), verbatim=cfg_verbatim)
         except (OSError, ValueError):
             if not dry_run:
                 _register_file(collection, source_file, wing, agent)
