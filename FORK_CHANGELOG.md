@@ -18,6 +18,56 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ---
 
 
+## [2026-05-05]
+
+
+### Added
+
+
+- **`hook_verbatim_mode` config flag preserves system tags + full tool I/O during transcript ingest** ([`ef98961`](https://github.com/jphein/mempalace/commit/ef98961))
+  `normalize()` defaults match upstream — system tags, hook chrome,
+  Read/Edit/Write tool results, long Bash output, and large
+  Grep/Glob match lists are stripped or truncated so chunk
+  embeddings don't drift on chrome tokens. That's the right
+  default for a search-quality optimization but it also drops
+  content a verbatim-archive consumer wants to keep.
+
+  Adds a `hooks.verbatim_mode` opt-in in `config.json`
+  (`MempalaceConfig.hook_verbatim_mode`, default `False`).
+  `mempalace.convo_miner.mine_convos` reads the flag and passes
+  `verbatim=...` through `normalize()` →
+  `_try_normalize_json()` → `_try_claude_code_jsonl()` →
+  `_extract_content()` → `_format_tool_use()` /
+  `_format_tool_result()` / `strip_noise()`. When `verbatim` is
+  true: `strip_noise` is a passthrough; Bash commands and
+  unknown-tool JSON inputs aren't 200-char truncated; Bash output
+  isn't head/tail-collapsed; Grep/Glob match lists aren't capped;
+  Read/Edit/Write results are included rather than omitted;
+  unknown-tool output isn't byte-capped.
+
+  Other transcript schemas (Codex, Gemini, claude.ai, ChatGPT,
+  Slack) didn't truncate to begin with, so they're already
+  verbatim — the flag is a no-op for them.
+
+  Daemon path picks up the toggle transparently because the
+  daemon spawns `mempalace mine ...` as a subprocess that goes
+  through `convo_miner.mine_convos`.
+
+  Backs JP's 2026-05-05 question — "we're not missing any tool
+  calls or anything, right?" — without altering the upstream
+  default for installs that benefit from chrome-stripped
+  embeddings.
+
+  *Tests:* 9 new tests in `tests/test_normalize.py::TestVerbatimMode` —
+covers strip_noise passthrough, Bash and unknown-tool input
+no-truncation, Read/Edit/Write result inclusion, Bash
+head/tail no-collapse, Grep/Glob match no-cap, unknown-tool
+byte no-cap, full JSONL round-trip, default-off contract, and
+config-file readback. Suite total 1562 passed.
+
+  *Files:* `mempalace/config.py`, `mempalace/convo_miner.py`, `mempalace/normalize.py`, `tests/test_normalize.py`
+
+
 ## [2026-05-03]
 
 
