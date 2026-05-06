@@ -161,6 +161,68 @@ def test_cmd_purge_deletes_via_where_clause(tmp_path):
     assert set(surviving_ids) == {"k1", "k2"}
 
 
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_purge_interactive_abort_leaves_data_intact(mock_config_cls, capsys, tmp_path):
+    """yes=False + the user types anything other than 'y'/'yes' → no delete.
+
+    The custom input() prompt was retired in #1087's rewrite in favor of
+    confirm_destructive_action() (mempalace/migrate.py); this test
+    exercises the interactive branch end-to-end via patched input() and
+    asserts both the operator-visible message and that .delete() was
+    never called.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    (palace / "chroma.sqlite3").write_text("")
+    mock_config_cls.return_value.palace_path = str(palace)
+    args = _make_purge_args(wing="purge-me", palace=str(palace), yes=False)
+
+    mock_col = MagicMock()
+    mock_col.get.return_value = {"ids": ["d1", "d2"]}
+    mock_backend = MagicMock()
+    mock_backend.return_value.get_collection.return_value = mock_col
+
+    with (
+        patch("mempalace.backends.chroma.ChromaBackend", mock_backend),
+        patch("builtins.input", return_value="n"),
+    ):
+        cmd_purge(args)
+
+    out = capsys.readouterr().out
+    assert "Aborted" in out, f"abort message missing: {out!r}"
+    mock_col.delete.assert_not_called()
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_purge_eof_on_confirm_aborts_safely(mock_config_cls, capsys, tmp_path):
+    """yes=False + EOF on stdin (non-interactive call) → abort, not crash.
+
+    Closes the EOFError concern — purge piped from a non-tty (CI, cron,
+    `< /dev/null`) used to raise an unhandled exception. Now
+    confirm_destructive_action catches EOFError and aborts cleanly.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    (palace / "chroma.sqlite3").write_text("")
+    mock_config_cls.return_value.palace_path = str(palace)
+    args = _make_purge_args(wing="purge-me", palace=str(palace), yes=False)
+
+    mock_col = MagicMock()
+    mock_col.get.return_value = {"ids": ["d1"]}
+    mock_backend = MagicMock()
+    mock_backend.return_value.get_collection.return_value = mock_col
+
+    with (
+        patch("mempalace.backends.chroma.ChromaBackend", mock_backend),
+        patch("builtins.input", side_effect=EOFError),
+    ):
+        cmd_purge(args)
+
+    out = capsys.readouterr().out
+    assert "Aborted" in out
+    mock_col.delete.assert_not_called()
+
+
 # ── cmd_search ─────────────────────────────────────────────────────────
 
 
