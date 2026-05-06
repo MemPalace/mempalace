@@ -522,10 +522,14 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
         ~/.claude/projects/-home-<user>-dev-<parent>-<project>/session.jsonl
         ~/.claude/projects/-Users-<user>-<folder>-<project>/session.jsonl
 
-    The project directory name is the final dash-separated token of the
-    encoded folder. Returns ``wing_<project>`` (lowercased, spaces → ``_``).
-    Falls back to ``wing_sessions`` if the path does not match a Claude Code
-    project-folder layout.
+    Returns the project directory's basename, lowercased, with spaces
+    collapsed to underscores. Falls back to ``"sessions"`` for paths
+    that don't match the standard Claude Code projects layout.
+
+    The earlier shape returned ``wing_<project>``, which silently split
+    content between hook-derived ``wing_<project>`` wings and
+    operator-mined bare-name wings. The bare project name converges
+    them.
     """
     # Normalize path separators for cross-platform (Windows backslashes)
     normalized = transcript_path.replace("\\", "/")
@@ -536,14 +540,13 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
         encoded = match.group(1)
         project = encoded.rsplit("-", 1)[-1]
         if project:
-            return f"wing_{project.lower().replace(' ', '_')}"
+            return project.lower().replace(" ", "_")
     # Legacy fallback: explicit ``-Projects-<name>`` segment, useful for
     # transcripts not under the standard Claude Code projects dir.
     match = re.search(r"-Projects-([^/]+?)(?:/|$)", normalized)
     if match:
-        project = match.group(1).lower().replace(" ", "_")
-        return f"wing_{project}"
-    return "wing_sessions"
+        return match.group(1).lower().replace(" ", "_")
+    return "sessions"
 
 
 def hook_stop(data: dict, harness: str):
