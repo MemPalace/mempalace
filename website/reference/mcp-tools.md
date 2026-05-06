@@ -347,23 +347,6 @@ Read recent diary entries.
 
 ---
 
-### `mempalace_session_recovery_read`
-
-Read Stop-hook auto-save checkpoint entries from the dedicated session-recovery collection. Use for session recovery, hook auditing, or "what was I doing 2 hours ago" lookup. Checkpoints are stored separately from the main searchable corpus so they don't dominate `mempalace_search` results — read them through this tool instead.
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `session_id` | string | No | Filter by Claude Code session id. |
-| `agent` | string | No | Filter by agent name (typically `session-hook`). |
-| `since` | string | No | ISO datetime — entries strictly newer than this. |
-| `until` | string | No | ISO datetime — entries strictly older than this. |
-| `wing` | string | No | Filter by project wing. |
-| `limit` | integer | No | Max entries to return (default 50, max 500). |
-
-**Returns:** `{ entries: [{ drawer_id, date, timestamp, topic, agent, wing, session_id, content }], total }` — newest-first.
-
----
-
 ## System Tools
 
 ### `mempalace_hook_settings`

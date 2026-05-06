@@ -25,8 +25,6 @@ import sqlite3
 from collections import defaultdict
 from datetime import datetime
 
-from .palace import _CHECKPOINT_TOPICS
-
 
 def _restore_stale_palace(palace_path: str, stale_path: str) -> None:
     """Roll back a failed swap.
@@ -285,94 +283,3 @@ def migrate(palace_path: str, dry_run: bool = False, confirm: bool = False):
 
     print(f"\n{'=' * 60}\n")
     return True
-
-
-# ---------------------------------------------------------------------------
-# Phase D: move existing topic=checkpoint drawers from the main searchable
-# collection into the dedicated session-recovery collection. The main
-# collection is the *verbatim* store — chats, tool calls, mined files —
-# and should not carry derivative summary entries (Stop-hook auto-save
-# checkpoints) that wreck vector ranking. See spec at
-# docs/superpowers/specs/2026-04-25-checkpoint-collection-split.md.
-# ---------------------------------------------------------------------------
-
-
-def migrate_checkpoints_to_recovery(palace_path: str, batch_size: int = 1000) -> int:
-    """Move all topic=checkpoint drawers from main → recovery collection.
-
-    Idempotent: re-running on a fully-migrated palace returns 0. Drawer
-    IDs and metadata are preserved exactly. The original drawer is added
-    to the recovery collection first, then deleted from main — so a
-    crash mid-migration leaves a duplicate (recoverable) rather than a
-    loss.
-
-    Returns the number of drawers moved on this invocation.
-    """
-    from .palace import get_collection, get_session_recovery_collection
-
-    palace_path = os.path.abspath(os.path.expanduser(palace_path))
-    if not contains_palace_database(palace_path):
-        return 0
-
-    try:
-        main = get_collection(palace_path, create=False)
-    except Exception:
-        # Palace dir exists but main collection isn't readable — nothing to migrate.
-        return 0
-    recovery = get_session_recovery_collection(palace_path, create=True)
-
-    moved_total = 0
-    offset = 0
-    # Walk the main collection in pages. We deliberately don't use a
-    # ``where={"topic": {"$in": _CHECKPOINT_TOPICS}}`` clause: the
-    # ChromaDB 1.5.x filter-planner bug surfaced earlier this week with
-    # ``$in``/``$nin`` on metadata. Pull batches plain and filter in
-    # Python.
-    while True:
-        try:
-            batch = main.get(
-                limit=batch_size,
-                offset=offset,
-                include=["documents", "metadatas"],
-            )
-        except Exception:
-            # Defensive: a chromadb error on the read path stops the
-            # migration cleanly without corrupting state. Caller can retry.
-            break
-
-        ids = batch.get("ids") or []
-        if not ids:
-            break
-
-        docs = batch.get("documents") or []
-        metas = batch.get("metadatas") or []
-
-        ids_to_move: list = []
-        docs_to_move: list = []
-        metas_to_move: list = []
-
-        for i, doc, meta in zip(ids, docs, metas):
-            meta = meta or {}
-            if meta.get("topic") in _CHECKPOINT_TOPICS:
-                ids_to_move.append(i)
-                docs_to_move.append(doc)
-                metas_to_move.append(meta)
-
-        if ids_to_move:
-            recovery.add(
-                ids=ids_to_move,
-                documents=docs_to_move,
-                metadatas=metas_to_move,
-            )
-            main.delete(ids=ids_to_move)
-            moved_total += len(ids_to_move)
-            # The delete shrinks main; the *next* page would skip
-            # ``len(ids_to_move)`` drawers. Reset offset so we re-page
-            # over the (now smaller) collection from the same logical
-            # position — equivalent to the standard "delete-during-walk"
-            # fixup.
-            continue
-
-        offset += len(ids)
-
-    return moved_total

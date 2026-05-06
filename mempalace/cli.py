@@ -843,39 +843,15 @@ def cmd_repair_status(args):
 
 
 def cmd_repair(args):
-    """Rebuild palace vector index, or reorganize derivative drawers."""
+    """Rebuild palace vector index."""
     import shutil
     from .backends.chroma import ChromaBackend
-    from .migrate import (
-        confirm_destructive_action,
-        contains_palace_database,
-        migrate_checkpoints_to_recovery,
-    )
+    from .migrate import confirm_destructive_action, contains_palace_database
     from .repair import TruncationDetected, check_extraction_safety
 
     palace_path = os.path.abspath(
         os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     )
-
-    # mode=reorganize: move topic=checkpoint drawers from main → recovery.
-    # Non-destructive, idempotent. Designed to run on first daemon startup
-    # post-upgrade to land the checkpoint-collection split (phase D).
-    if getattr(args, "mode", "rebuild") == "reorganize":
-        if not os.path.isdir(palace_path) or not contains_palace_database(palace_path):
-            print(f"\n  No palace database found at {palace_path}")
-            return
-        print(f"\n{'=' * 55}")
-        print("  MemPalace Reorganize — checkpoint → session-recovery")
-        print(f"{'=' * 55}\n")
-        print(f"  Palace: {palace_path}")
-        moved = migrate_checkpoints_to_recovery(palace_path)
-        if moved == 0:
-            print("  Nothing to move — palace is already reorganized.")
-        else:
-            print(f"  Moved {moved} checkpoint drawer(s) to mempalace_session_recovery.")
-            print("  mempalace_search now queries content-only.")
-        print(f"\n{'=' * 55}\n")
-        return
 
     if getattr(args, "mode", "legacy") == "max-seq-id":
         from .repair import repair_max_seq_id
@@ -1417,13 +1393,11 @@ def main():
     )
     p_repair.add_argument(
         "--mode",
-        choices=["rebuild", "legacy", "reorganize", "max-seq-id"],
+        choices=["rebuild", "legacy", "max-seq-id"],
         default="legacy",
         help=(
             "rebuild/legacy: full-palace HNSW rebuild via extract + re-upsert (default; "
             "rebuild and legacy are synonyms). "
-            "reorganize: move existing topic=checkpoint drawers from the main "
-            "collection into mempalace_session_recovery (idempotent; safe to re-run). "
             "max-seq-id: un-poison max_seq_id rows corrupted by the legacy 0.6.x shim."
         ),
     )
