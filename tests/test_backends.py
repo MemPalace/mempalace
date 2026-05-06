@@ -161,6 +161,7 @@ def test_chroma_collection_query_coerces_none_metadatas_to_empty_dict():
     # Ids/docs/distances unaffected — their inner None handling is already
     # covered by the outer-list coercion.
     assert result.ids == [["a", "b", "c"]]
+    assert result.documents == [["da", "db", "dc"]]
     assert result.distances == [[0.1, 0.2, 0.3]]
 
 
