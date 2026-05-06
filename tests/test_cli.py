@@ -494,6 +494,7 @@ def test_cmd_mine_projects_mode(mock_config_cls):
         cmd_mine(args)
         mock_mine.assert_called_once_with(
             project_dir="/src",
+            config_dir="/src",
             palace_path="/fake/palace",
             wing_override=None,
             agent="mempalace",

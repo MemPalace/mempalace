@@ -486,6 +486,7 @@ def _maybe_run_mine_after_init(args, cfg) -> None:
 
 def cmd_mine(args):
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    config_dir = os.path.expanduser(args.config) if getattr(args, "config", None) else args.dir
     include_ignored = []
     for raw in args.include_ignored or []:
         include_ignored.extend(part.strip() for part in raw.split(",") if part.strip())
@@ -517,6 +518,7 @@ def cmd_mine(args):
 
         mine(
             project_dir=args.dir,
+            config_dir=config_dir,
             palace_path=palace_path,
             wing_override=args.wing,
             agent=args.agent,
@@ -1096,6 +1098,11 @@ def main():
     )
     p_mine.add_argument(
         "--dry-run", action="store_true", help="Show what would be filed without filing"
+    )
+    p_mine.add_argument(
+        "--config",
+        default=None,
+        help="Directory containing mempalace.yaml (default: same as mined directory)",
     )
     p_mine.add_argument(
         "--extract",
