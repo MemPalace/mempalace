@@ -181,8 +181,13 @@ def _hybrid_rank(
 # right answers with wrong ones — i.e., VecRecall's critique
 # (https://github.com/MemPalace/mempalace/discussions/1129, "org-layer
 # in retrieval path drops R@5") didn't reproduce here. Kept as a
-# rare-but-cheap signal; ablation script lived in /tmp, not committed.
-CLOSET_RANK_BOOSTS = [0.40, 0.25, 0.15, 0.08, 0.04]
+# rare-but-cheap signal. Reproducer at
+# ``scripts/closet_boost_ablation.py``.
+#
+# Tuple (not list) — these are constants, not a working buffer. Patch
+# at module attribute level via ``searcher.CLOSET_RANK_BOOSTS = (...)``
+# rather than mutating in place.
+CLOSET_RANK_BOOSTS = (0.40, 0.25, 0.15, 0.08, 0.04)
 CLOSET_DISTANCE_CAP = 1.5  # cosine dist > 1.5 = too weak to use as signal
 
 
