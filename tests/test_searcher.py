@@ -74,6 +74,40 @@ class TestSearchMemories:
         hit = result["results"][0]
         assert hit["created_at"] == "unknown"
 
+    def test_source_metadata_fields_are_returned_when_present(self):
+        """Original source metadata is surfaced alongside search result text."""
+        mock_col = MagicMock()
+        mock_col.query.return_value = {
+            "ids": [["drawer_source_date"]],
+            "documents": [["Source note body with original dates"]],
+            "metadatas": [
+                [
+                    {
+                        "wing": "project",
+                        "room": "backend",
+                        "source_file": "note.md",
+                        "filed_at": "2026-05-06T00:00:00",
+                        "source_item_id": "trilium:abc123",
+                        "source_title": "Source Note",
+                        "source_created_at": "2026-05-01T10:00:00",
+                        "source_modified_at": "2026-05-02T11:00:00",
+                        "source_observed_at": "2026-05-03T12:00:00",
+                    }
+                ]
+            ],
+            "distances": [[0.1]],
+        }
+
+        with patch("mempalace.searcher.get_collection", return_value=mock_col):
+            result = search_memories("original dates", "/fake/path")
+
+        hit = result["results"][0]
+        assert hit["source_item_id"] == "trilium:abc123"
+        assert hit["source_title"] == "Source Note"
+        assert hit["source_created_at"] == "2026-05-01T10:00:00"
+        assert hit["source_modified_at"] == "2026-05-02T11:00:00"
+        assert hit["source_observed_at"] == "2026-05-03T12:00:00"
+
     def test_search_memories_query_error(self):
         """search_memories returns error dict when query raises."""
         mock_col = MagicMock()
@@ -367,3 +401,33 @@ class TestSearchCLI:
         assert "[2]" in captured.out
         # Second result renders with fallback '?' values instead of crashing
         assert "second doc" in captured.out
+
+    def test_search_prints_source_metadata_when_present(self, capsys):
+        """CLI output includes original source metadata for GUI parsing."""
+        mock_col = MagicMock()
+        mock_col.metadata = {"hnsw:space": "cosine"}
+        mock_col.query.return_value = {
+            "documents": [["source body with original metadata"]],
+            "metadatas": [
+                [
+                    {
+                        "source_file": "note.md",
+                        "wing": "w",
+                        "room": "r",
+                        "source_item_id": "trilium:abc123",
+                        "source_title": "Source Note",
+                        "source_created_at": "2026-05-01T10:00:00",
+                        "source_modified_at": "2026-05-02T11:00:00",
+                    }
+                ]
+            ],
+            "distances": [[0.2]],
+        }
+
+        with patch("mempalace.searcher.get_collection", return_value=mock_col):
+            search("metadata", "/fake/path")
+
+        captured = capsys.readouterr()
+        assert "Item:   Source Note" in captured.out
+        assert "ID:     trilium:abc123" in captured.out
+        assert "Dates:  created=2026-05-01T10:00:00  modified=2026-05-02T11:00:00" in captured.out

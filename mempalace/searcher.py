@@ -176,6 +176,38 @@ def build_where_filter(wing: str = None, room: str = None) -> dict:
     return {}
 
 
+def _copy_source_fields(entry: dict, meta: dict) -> dict:
+    """Copy optional original source metadata into a search result entry."""
+
+    for field in (
+        "source_item_id",
+        "source_title",
+        "source_created_at",
+        "source_modified_at",
+        "source_observed_at",
+    ):
+        value = meta.get(field)
+        if value not in (None, ""):
+            entry[field] = value
+    return entry
+
+
+def _format_original_date_metadata(meta: dict) -> str:
+    """Return a compact display string for optional original source dates."""
+
+    labels = (
+        ("created", "source_created_at"),
+        ("modified", "source_modified_at"),
+        ("observed", "source_observed_at"),
+    )
+    parts = []
+    for label, field in labels:
+        value = meta.get(field)
+        if value not in (None, ""):
+            parts.append(f"{label}={value}")
+    return "  ".join(parts)
+
+
 def _extract_drawer_ids_from_closet(closet_doc: str) -> list:
     """Parse all `→drawer_id_a,drawer_id_b` pointers out of a closet document.
 
@@ -363,6 +395,13 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
 
         print(f"  [{i}] {wing_name} / {room_name}")
         print(f"      Source: {source}")
+        if meta.get("source_title"):
+            print(f"      Item:   {meta['source_title']}")
+        if meta.get("source_item_id"):
+            print(f"      ID:     {meta['source_item_id']}")
+        original_dates = _format_original_date_metadata(meta)
+        if original_dates:
+            print(f"      Dates:  {original_dates}")
         print(f"      Match:  cosine={vec_sim}  bm25={bm25}")
         print()
         # Print the verbatim text, indented
@@ -520,26 +559,25 @@ def _bm25_only_via_sqlite(
         if room and meta.get("room") != room:
             continue
         full_source = meta.get("source_file", "") or ""
-        candidates.append(
-            {
-                "text": d["text"],
-                "wing": meta.get("wing", "unknown"),
-                "room": meta.get("room", "unknown"),
-                "source_file": Path(full_source).name if full_source else "?",
-                "created_at": meta.get("filed_at", "unknown"),
-                # No vector distance available in BM25-only mode.
-                "similarity": None,
-                "distance": None,
-                "matched_via": "bm25_sqlite",
-                # Internal: full path + chunk_index let callers (notably
-                # candidate_strategy="union") dedupe at chunk granularity
-                # rather than basename — two files in different directories
-                # may share a basename, and one source_file is split across
-                # multiple chunks. Stripped before this helper returns.
-                "_source_file_full": full_source,
-                "_chunk_index": meta.get("chunk_index"),
-            }
-        )
+        entry = {
+            "text": d["text"],
+            "wing": meta.get("wing", "unknown"),
+            "room": meta.get("room", "unknown"),
+            "source_file": Path(full_source).name if full_source else "?",
+            "created_at": meta.get("filed_at", "unknown"),
+            # No vector distance available in BM25-only mode.
+            "similarity": None,
+            "distance": None,
+            "matched_via": "bm25_sqlite",
+            # Internal: full path + chunk_index let callers (notably
+            # candidate_strategy="union") dedupe at chunk granularity
+            # rather than basename — two files in different directories
+            # may share a basename, and one source_file is split across
+            # multiple chunks. Stripped before this helper returns.
+            "_source_file_full": full_source,
+            "_chunk_index": meta.get("chunk_index"),
+        }
+        candidates.append(_copy_source_fields(entry, meta))
 
     # Local BM25 over the candidate set.
     docs = [c["text"] for c in candidates]
@@ -853,6 +891,7 @@ def search_memories(
             "_source_file_full": source,
             "_chunk_index": meta.get("chunk_index"),
         }
+        _copy_source_fields(entry, meta)
         if closet_preview:
             entry["closet_preview"] = closet_preview
         scored.append(entry)
