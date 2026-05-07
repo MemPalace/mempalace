@@ -230,7 +230,14 @@ class KnowledgeGraph:
         return triple_id
 
     def invalidate(self, subject: str, predicate: str, obj: str, ended: str = None):
-        """Mark a relationship as no longer valid (set valid_to date)."""
+        """Mark a relationship as no longer valid (set valid_to date).
+
+        Rejects calls that would create an inverted interval — ``ended``
+        strictly before any matched row's ``valid_from``. Such a row would
+        never satisfy ``valid_from <= as_of AND valid_to >= as_of``, so it
+        would be invisible to every query — silently corrupt. Mirrors the
+        guard in :meth:`add_triple`.
+        """
         sub_id = self._entity_id(subject)
         obj_id = self._entity_id(obj)
         pred = predicate.lower().replace(" ", "_")
@@ -239,6 +246,21 @@ class KnowledgeGraph:
         with self._lock:
             conn = self._conn()
             with conn:
+                # Reject inverted intervals before the UPDATE. SELECT and
+                # UPDATE run in the same transaction so a concurrent insert
+                # cannot race a row past the guard.
+                rows = conn.execute(
+                    "SELECT valid_from FROM triples WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
+                    (sub_id, pred, obj_id),
+                ).fetchall()
+                for row in rows:
+                    vf = row["valid_from"]
+                    if vf is not None and ended < vf:
+                        raise ValueError(
+                            f"ended={ended!r} is before valid_from={vf!r}; "
+                            "an inverted interval would be invisible to every KG query"
+                        )
+
                 conn.execute(
                     "UPDATE triples SET valid_to=? WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
                     (ended, sub_id, pred, obj_id),

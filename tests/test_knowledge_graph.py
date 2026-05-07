@@ -79,6 +79,41 @@ class TestTripleOperations:
         tid2 = kg.add_triple("Alice", "knew", "Bob", valid_to="2026-03-01")
         assert tid2.startswith("t_alice_knew_bob_")
 
+    def test_invalidate_rejects_ended_before_valid_from(self, kg):
+        # Mirror of test_add_triple_rejects_inverted_interval but on the
+        # invalidate path: closing a relationship with `ended` strictly
+        # before its `valid_from` produces the same invisible-to-query
+        # state add_triple already rejects. #1371.
+        kg.add_triple("Alice", "knows", "Bob", valid_from="2026-01-01")
+        with pytest.raises(ValueError, match="before valid_from"):
+            kg.invalidate("Alice", "knows", "Bob", ended="2020-01-01")
+        # The original row must remain open after the rejection.
+        results = kg.query_entity("Alice", direction="outgoing")
+        rows = [r for r in results if r["predicate"] == "knows"]
+        assert len(rows) == 1
+        assert rows[0]["valid_to"] is None
+
+    def test_invalidate_accepts_ended_equal_to_valid_from(self, kg):
+        # Same-day close is a legitimate point-in-time fact, mirroring
+        # test_add_triple_accepts_equal_dates.
+        kg.add_triple("Alice", "joined", "Acme", valid_from="2026-03-15")
+        kg.invalidate("Alice", "joined", "Acme", ended="2026-03-15")
+        results = kg.query_entity("Alice", direction="outgoing")
+        rows = [r for r in results if r["predicate"] == "joined"]
+        assert len(rows) == 1
+        assert rows[0]["valid_to"] == "2026-03-15"
+
+    def test_invalidate_passes_through_open_intervals(self, kg):
+        # A row added with no valid_from cannot be inverted by any `ended`,
+        # so the guard does not fire. Non-regression for the original
+        # invalidate contract.
+        kg.add_triple("Alice", "works_at", "Acme")
+        kg.invalidate("Alice", "works_at", "Acme", ended="2020-01-01")
+        results = kg.query_entity("Alice", direction="outgoing")
+        rows = [r for r in results if r["predicate"] == "works_at"]
+        assert len(rows) == 1
+        assert rows[0]["valid_to"] == "2020-01-01"
+
 
 class TestQueries:
     def test_query_outgoing(self, seeded_kg):
