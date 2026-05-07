@@ -147,3 +147,49 @@ class TestFileChunksLocked:
         assert dict(room_counts) == {}
         assert skipped is False
         assert col.batch_sizes == [2, 2, 1]
+
+    def test_copies_source_metadata_to_conversation_drawers(self, monkeypatch):
+        import mempalace.convo_miner as convo_miner
+
+        class FakeCol:
+            def __init__(self):
+                self.metadatas = []
+
+            def delete(self, *args, **kwargs):
+                pass
+
+            def upsert(self, documents, ids, metadatas):
+                self.metadatas.extend(metadatas)
+
+        source_metadata = {
+            "source_item_id": "claude:conversation-1",
+            "source_title": "Conversation One",
+            "source_created_at": "2026-05-06T10:00:00+00:00",
+            "source_modified_at": "2026-05-06T10:05:00+00:00",
+        }
+        chunks = [{"content": "chunk content " * 20, "chunk_index": 0}]
+        col = FakeCol()
+        monkeypatch.setattr(
+            convo_miner, "file_already_mined", lambda collection, source_file: False
+        )
+        monkeypatch.setattr(convo_miner, "mine_lock", lambda source_file: contextlib.nullcontext())
+        monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda content: "conversations")
+
+        drawers, room_counts, skipped = _file_chunks_locked(
+            col,
+            "chat.md",
+            chunks,
+            "claude",
+            "technical",
+            "agent",
+            "exchange",
+            source_metadata,
+        )
+
+        assert drawers == 1
+        assert dict(room_counts) == {}
+        assert skipped is False
+        assert col.metadatas[0]["source_item_id"] == "claude:conversation-1"
+        assert col.metadatas[0]["source_title"] == "Conversation One"
+        assert col.metadatas[0]["source_created_at"] == "2026-05-06T10:00:00+00:00"
+        assert col.metadatas[0]["source_modified_at"] == "2026-05-06T10:05:00+00:00"
