@@ -1785,6 +1785,12 @@ TOOLS = {
                     "type": "number",
                     "description": "Max cosine distance threshold (0=identical, 2=opposite). Results further than this are dropped. Lower = stricter. Default 1.5. Set to 0 to disable.",
                 },
+                "min_similarity": {
+                    "type": "number",
+                    "description": "Minimum similarity threshold (-1.0 to 1.0). Results below this similarity are filtered out. Default 0.0 filters negatives. Higher = stricter.",
+                    "minimum": -1.0,
+                    "maximum": 1.0,
+                },
                 "context": {
                     "type": "string",
                     "description": "Background context for the search (optional). NOT used for embedding — only for future re-ranking.",

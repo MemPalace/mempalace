@@ -290,11 +290,19 @@ def _warn_if_legacy_metric(col) -> None:
     )
 
 
-def search(query: str, palace_path: str, wing: str = None, room: str = None, n_results: int = 5):
+def search(
+    query: str,
+    palace_path: str,
+    wing: str = None,
+    room: str = None,
+    n_results: int = 5,
+    min_similarity: float = 0.0,
+):
     """
     Search the palace. Returns verbatim drawer content.
     Optionally filter by wing (project) or room (aspect).
     """
+    _validate_min_similarity(min_similarity)
     try:
         col = get_collection(palace_path, create=False)
     except Exception as e:
@@ -353,15 +361,19 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
         print(f"  Room: {room}")
     print(f"{'=' * 60}\n")
 
-    for i, hit in enumerate(hits, 1):
-        vec_sim = round(max(0.0, 1 - hit["distance"]), 3)
+    displayed = 0
+    for hit in hits:
+        vec_sim = round(1 - hit["distance"], 3)
+        if vec_sim < min_similarity:
+            continue
+        displayed += 1
         bm25 = hit.get("bm25_score", 0.0)
         meta = hit["metadata"]
         source = Path(meta.get("source_file", "?")).name
         wing_name = meta.get("wing", "?")
         room_name = meta.get("room", "?")
 
-        print(f"  [{i}] {wing_name} / {room_name}")
+        print(f"  [{displayed}] {wing_name} / {room_name}")
         print(f"      Source: {source}")
         print(f"      Match:  cosine={vec_sim}  bm25={bm25}")
         print()
@@ -370,6 +382,9 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
             print(f"      {line}")
         print()
         print(f"  {'─' * 56}")
+
+    if displayed == 0:
+        print(f'\n  No results above similarity threshold ({min_similarity}) for: "{query}"')
 
     print()
 
@@ -660,6 +675,29 @@ def _validate_candidate_strategy(strategy: str) -> None:
         )
 
 
+def _validate_min_similarity(value: float) -> None:
+    """Raise ``ValueError`` if ``value`` is outside the cosine similarity range.
+
+    Cosine similarity is bounded by [-1.0, 1.0]; thresholds outside that
+    range are nonsensical. Extracted into a helper so the same check can
+    be reused by ``search`` and ``search_memories`` without inflating
+    cyclomatic complexity at either call site.
+    """
+    if value < -1.0 or value > 1.0:
+        raise ValueError(f"min_similarity must be between -1.0 and 1.0, got {value}")
+
+
+def _drop_below_threshold(results: list, min_similarity: float) -> list:
+    """Filter result entries whose ``similarity`` is below ``min_similarity``.
+
+    Applied to the final post-rerank result list, not the pre-rerank
+    candidate pool — filtering before the hybrid BM25 rerank would drop
+    legitimate lexical matches whose vector cosine is poor but whose
+    BM25 score lifts them to relevance.
+    """
+    return [r for r in results if r["similarity"] >= min_similarity]
+
+
 def _apply_candidate_strategy(
     strategy: str,
     hits: list,
@@ -686,6 +724,7 @@ def search_memories(
     wing: str = None,
     room: str = None,
     n_results: int = 5,
+    min_similarity: float = 0.0,
     max_distance: float = 0.0,
     vector_disabled: bool = False,
     candidate_strategy: str = "vector",
@@ -700,6 +739,8 @@ def search_memories(
         wing: Optional wing filter.
         room: Optional room filter.
         n_results: Max results to return.
+        min_similarity: Minimum similarity threshold -1.0 to 1.0 (default 0.0).
+            Results with similarity below this are filtered out.
         max_distance: Max cosine distance threshold. The palace collection uses
             cosine distance (hnsw:space=cosine) — 0 = identical, 2 = opposite.
             Results with distance > this value are filtered out. A value of
@@ -726,6 +767,44 @@ def search_memories(
               When ``max_distance > 0.0`` is also set, BM25-only candidates
               are skipped — they have no vector distance and would silently
               violate the requested distance threshold.
+    """
+    try:
+        _validate_min_similarity(min_similarity)
+    except ValueError as e:
+        return {"error": str(e)}
+    result = _search_memories_impl(
+        query,
+        palace_path,
+        wing=wing,
+        room=room,
+        n_results=n_results,
+        min_similarity=min_similarity,
+        max_distance=max_distance,
+        vector_disabled=vector_disabled,
+        candidate_strategy=candidate_strategy,
+    )
+    if isinstance(result, dict) and "results" in result:
+        result["results"] = _drop_below_threshold(result["results"], min_similarity)
+    return result
+
+
+def _search_memories_impl(
+    query: str,
+    palace_path: str,
+    wing: str = None,
+    room: str = None,
+    n_results: int = 5,
+    min_similarity: float = 0.0,
+    max_distance: float = 0.0,
+    vector_disabled: bool = False,
+    candidate_strategy: str = "vector",
+) -> dict:
+    """Implementation half of ``search_memories``.
+
+    Split out so ``search_memories`` is a thin validation+dispatch wrapper
+    and this function (which contains the actual search pipeline) stays
+    under the codebase's cyclomatic-complexity ceiling. Callers should
+    use ``search_memories``; this is internal.
     """
     # Validate the strategy eagerly so invalid values fail the same way
     # regardless of whether the call routes through the vector path or
@@ -834,13 +913,14 @@ def search_memories(
         # and (b) makes the sort key land *below* ordinary positive distances,
         # inverting the ranking so the best hybrid matches sort last.
         effective_dist = max(0.0, min(2.0, dist - boost))
+        similarity = round(1 - effective_dist, 3)
         entry = {
             "text": doc,
             "wing": meta.get("wing", "unknown"),
             "room": meta.get("room", "unknown"),
             "source_file": Path(source).name if source else "?",
             "created_at": meta.get("filed_at", "unknown"),
-            "similarity": round(max(0.0, 1 - effective_dist), 3),
+            "similarity": similarity,
             "distance": round(dist, 4),
             "effective_distance": round(effective_dist, 4),
             "closet_boost": round(boost, 3),
