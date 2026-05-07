@@ -28,13 +28,23 @@ COLLECTION = "mempalace_drawers"
 # ── Fixtures ──────────────────────────────────────────────────────────
 
 
-def _seed_chroma_db(palace: str, sqlite_count: int, segment_id: str) -> None:
+def _seed_chroma_db(
+    palace: str,
+    sqlite_count: int,
+    segment_id: str,
+    sync_threshold: int | None = None,
+) -> None:
     """Create a minimal chroma.sqlite3 with one collection + VECTOR segment.
 
     Mirrors the columns the probe queries: ``segments``, ``collections``,
-    ``embeddings``, ``embedding_metadata``. Schema matches chromadb
-    1.5.x; column types are kept loose because we read with COUNT(*) and
-    SELECT key, *_value rather than driver-specific casts.
+    ``collection_metadata``, ``embeddings``, ``embedding_metadata``.
+    Schema matches chromadb 1.5.x; column types are kept loose because
+    we read with COUNT(*) and SELECT key, *_value rather than driver-
+    specific casts.
+
+    When ``sync_threshold`` is supplied, an ``hnsw:sync_threshold`` row
+    is added to ``collection_metadata`` so the divergence floor scales
+    accordingly. Omit to model an older palace that pre-dates PR #1191.
     """
     db_path = os.path.join(palace, "chroma.sqlite3")
     conn = sqlite3.connect(db_path)
@@ -44,6 +54,15 @@ def _seed_chroma_db(palace: str, sqlite_count: int, segment_id: str) -> None:
             CREATE TABLE collections (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL
+            );
+            CREATE TABLE collection_metadata (
+                collection_id TEXT REFERENCES collections(id) ON DELETE CASCADE,
+                key TEXT NOT NULL,
+                str_value TEXT,
+                int_value INTEGER,
+                float_value REAL,
+                bool_value INTEGER,
+                PRIMARY KEY (collection_id, key)
             );
             CREATE TABLE segments (
                 id TEXT PRIMARY KEY,
@@ -73,6 +92,12 @@ def _seed_chroma_db(palace: str, sqlite_count: int, segment_id: str) -> None:
         col_id = "col-test"
         meta_seg = "seg-meta"
         conn.execute("INSERT INTO collections (id, name) VALUES (?, ?)", (col_id, COLLECTION))
+        if sync_threshold is not None:
+            conn.execute(
+                """INSERT INTO collection_metadata (collection_id, key, int_value)
+                   VALUES (?, 'hnsw:sync_threshold', ?)""",
+                (col_id, sync_threshold),
+            )
         conn.execute(
             "INSERT INTO segments (id, collection, scope) VALUES (?, ?, 'VECTOR')",
             (segment_id, col_id),
@@ -213,20 +238,118 @@ def test_capacity_status_tolerates_flush_lag(tmp_path):
     assert info["status"] == "ok"
 
 
-def test_capacity_status_flags_unflushed_with_large_sqlite(tmp_path):
-    """No pickle + many sqlite rows is its own divergence signal."""
+def test_capacity_status_does_not_flag_unflushed_with_large_sqlite(tmp_path):
+    """No pickle + many sqlite rows is inconclusive, not divergence."""
     seg = "seg-noflush"
     _seed_chroma_db(str(tmp_path), sqlite_count=10_000, segment_id=seg)
     info = hnsw_capacity_status(str(tmp_path), COLLECTION)
-    assert info["diverged"] is True
+    assert info["diverged"] is False
+    assert info["status"] == "unknown"
+    assert info["divergence"] is None
     assert info["hnsw_count"] is None
-    assert "never flushed" in info["message"]
+    assert "capacity unavailable" in info["message"]
+    assert "leaving vector search enabled" in info["message"]
+
+
+def test_mcp_probe_does_not_disable_vectors_for_unflushed_metadata(tmp_path, monkeypatch):
+    """The MCP preflight must not route all searches to BM25 on this signal."""
+    from mempalace import mcp_server
+
+    seg = "seg-mcp-noflush"
+    _seed_chroma_db(str(tmp_path), sqlite_count=10_000, segment_id=seg)
+
+    class _Cfg:
+        palace_path = str(tmp_path)
+        collection_name = "mempalace_drawers"
+
+    monkeypatch.setattr(mcp_server, "_config", _Cfg())
+    monkeypatch.setattr(mcp_server, "_vector_disabled", True)
+    monkeypatch.setattr(mcp_server, "_vector_disabled_reason", "old divergence")
+
+    mcp_server._refresh_vector_disabled_flag()
+
+    assert mcp_server._vector_disabled is False
+    assert mcp_server._vector_disabled_reason == ""
+    assert mcp_server._vector_capacity_status["status"] == "unknown"
+    assert "leaving vector search enabled" in mcp_server._vector_capacity_status["message"]
 
 
 def test_capacity_status_quiet_for_empty_palace(tmp_path):
     info = hnsw_capacity_status(str(tmp_path), COLLECTION)
     assert info["diverged"] is False
     assert info["status"] == "unknown"
+
+
+# ── Divergence threshold scales with hnsw:sync_threshold ───────────────
+
+
+def test_capacity_status_tolerates_lag_under_large_sync_threshold(tmp_path):
+    """Regression for the PR #1191 / PR #1227 conflict.
+
+    Palaces created via mempalace's _HNSW_BLOAT_GUARD (sync_threshold=
+    50_000) naturally accumulate up to ~50K queued entries between
+    flushes. The pickle-vs-sqlite probe must scale its tolerance to
+    ``2 × sync_threshold`` so this expected lag is not flagged as
+    corruption — otherwise vector search disables for ~80% of the
+    write cycle on any actively-mined ≥100K palace.
+    """
+    seg = "seg-bloat-guard"
+    _seed_chroma_db(str(tmp_path), sqlite_count=100_000, segment_id=seg, sync_threshold=50_000)
+    _write_pickle(str(tmp_path), seg, hnsw_count=50_000)
+    info = hnsw_capacity_status(str(tmp_path), COLLECTION)
+    # 50K divergence is exactly one flush window — well within 2× = 100K.
+    assert info["diverged"] is False, info["message"]
+    assert info["status"] == "ok"
+    assert info["divergence"] == 50_000
+
+
+def test_capacity_status_still_flags_real_corruption_under_large_sync(tmp_path):
+    """The dynamic floor must still catch genuine #1222-style corruption.
+
+    sqlite at 200K with HNSW frozen at 16K is the original #1222 shape —
+    any reasonable threshold should flag it, regardless of whether the
+    collection was created with sync_threshold=1000 or 50_000.
+    """
+    seg = "seg-1222-with-bloat-guard"
+    _seed_chroma_db(str(tmp_path), sqlite_count=200_000, segment_id=seg, sync_threshold=50_000)
+    _write_pickle(str(tmp_path), seg, hnsw_count=16_384)
+    info = hnsw_capacity_status(str(tmp_path), COLLECTION)
+    # 183,616 missing — far past 2 × 50K = 100K floor and 10% of 200K = 20K.
+    assert info["diverged"] is True
+    assert info["status"] == "diverged"
+    assert info["divergence"] == 183_616
+
+
+def test_capacity_status_default_threshold_when_no_sync_metadata(tmp_path):
+    """Older palaces without ``hnsw:sync_threshold`` fall back to 2000 floor.
+
+    Pre-PR-#1191 collections only carry ``hnsw:space``. The probe must
+    use chromadb's own default sync_threshold of 1000 → floor of 2000,
+    matching pre-fix behavior.
+    """
+    seg = "seg-legacy"
+    # No sync_threshold supplied — collection_metadata stays empty.
+    _seed_chroma_db(str(tmp_path), sqlite_count=10_000, segment_id=seg)
+    _write_pickle(str(tmp_path), seg, hnsw_count=7_500)
+    info = hnsw_capacity_status(str(tmp_path), COLLECTION)
+    # 2,500 divergence > max(2000 floor, 10% of 10K = 1000) → DIVERGED
+    assert info["diverged"] is True
+    assert info["divergence"] == 2_500
+
+
+def test_unflushed_path_also_uses_dynamic_floor(tmp_path):
+    """The never-flushed branch must scale with sync_threshold too.
+
+    A 30K-drawer collection under sync_threshold=50_000 hasn't reached
+    its first flush yet — pickle is absent. Pre-fix this would flag
+    DIVERGED (30K > fixed 2000 floor); post-fix the 30K stays under
+    the dynamic 100K floor.
+    """
+    seg = "seg-preflush-large"
+    _seed_chroma_db(str(tmp_path), sqlite_count=30_000, segment_id=seg, sync_threshold=50_000)
+    info = hnsw_capacity_status(str(tmp_path), COLLECTION)
+    assert info["hnsw_count"] is None
+    assert info["diverged"] is False, info["message"]
 
 
 # ── BM25-only sqlite fallback ─────────────────────────────────────────
@@ -275,6 +398,17 @@ def _seed_drawers(palace: str, segment_id: str, drawers: list[tuple[str, dict, s
         conn.close()
 
 
+def _set_drawer_created_at(palace: str, timestamps: dict[int, str]) -> None:
+    db_path = os.path.join(palace, "chroma.sqlite3")
+    conn = sqlite3.connect(db_path)
+    try:
+        for emb_id, created_at in timestamps.items():
+            conn.execute("UPDATE embeddings SET created_at = ? WHERE id = ?", (created_at, emb_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 @pytest.fixture
 def palace_with_drawers(tmp_path):
     seg = "seg-bm25"
@@ -318,6 +452,122 @@ def test_bm25_fallback_filters_by_wing(palace_with_drawers):
         "memory palace recall", str(palace_with_drawers), wing="design", n_results=5
     )
     assert all(r["wing"] == "design" for r in out["results"])
+
+
+def test_bm25_fallback_applies_wing_before_fts_candidate_limit(tmp_path):
+    seg = "seg-bm25-fts-limit"
+    _seed_chroma_db(str(tmp_path), sqlite_count=0, segment_id=seg)
+    _seed_drawers(
+        str(tmp_path),
+        seg,
+        [
+            (
+                "shared token outside target wing",
+                {"wing": "ops", "room": "incidents", "source_file": "/x/ops.md"},
+                "d-1",
+            ),
+            (
+                "shared token inside target wing",
+                {"wing": "project", "room": "diary", "source_file": "/x/project.md"},
+                "d-2",
+            ),
+        ],
+    )
+
+    out = _bm25_only_via_sqlite("shared token", str(tmp_path), wing="project", max_candidates=1)
+
+    assert out["total_before_filter"] == 1
+    assert len(out["results"]) == 1
+    assert out["results"][0]["wing"] == "project"
+
+
+def test_bm25_fallback_applies_room_before_fts_candidate_limit(tmp_path):
+    seg = "seg-bm25-room-limit"
+    _seed_chroma_db(str(tmp_path), sqlite_count=0, segment_id=seg)
+    _seed_drawers(
+        str(tmp_path),
+        seg,
+        [
+            (
+                "shared token wrong room",
+                {"wing": "project", "room": "scratch", "source_file": "/x/scratch.md"},
+                "d-1",
+            ),
+            (
+                "shared token right room",
+                {"wing": "project", "room": "diary", "source_file": "/x/diary.md"},
+                "d-2",
+            ),
+        ],
+    )
+
+    out = _bm25_only_via_sqlite(
+        "shared token",
+        str(tmp_path),
+        wing="project",
+        room="diary",
+        max_candidates=1,
+    )
+
+    assert out["total_before_filter"] == 1
+    assert len(out["results"]) == 1
+    assert out["results"][0]["wing"] == "project"
+    assert out["results"][0]["room"] == "diary"
+
+
+def test_bm25_fallback_applies_wing_before_recency_candidate_limit(tmp_path):
+    seg = "seg-bm25-recency-limit"
+    _seed_chroma_db(str(tmp_path), sqlite_count=0, segment_id=seg)
+    _seed_drawers(
+        str(tmp_path),
+        seg,
+        [
+            (
+                "target drawer for short query",
+                {"wing": "project", "room": "diary", "source_file": "/x/project.md"},
+                "d-1",
+            ),
+            (
+                "newer drawer outside target wing",
+                {"wing": "ops", "room": "incidents", "source_file": "/x/ops.md"},
+                "d-2",
+            ),
+        ],
+    )
+    _set_drawer_created_at(
+        str(tmp_path),
+        {
+            1: "2026-01-01 00:00:00",
+            2: "2026-02-01 00:00:00",
+        },
+    )
+
+    out = _bm25_only_via_sqlite("a", str(tmp_path), wing="project", max_candidates=1)
+
+    assert out["total_before_filter"] == 1
+    assert len(out["results"]) == 1
+    assert out["results"][0]["wing"] == "project"
+
+
+def test_bm25_fallback_returns_empty_when_filtered_wing_has_no_candidates(tmp_path):
+    seg = "seg-bm25-empty-filter"
+    _seed_chroma_db(str(tmp_path), sqlite_count=0, segment_id=seg)
+    _seed_drawers(
+        str(tmp_path),
+        seg,
+        [
+            (
+                "shared token outside target wing",
+                {"wing": "ops", "room": "incidents", "source_file": "/x/ops.md"},
+                "d-1",
+            ),
+        ],
+    )
+
+    out = _bm25_only_via_sqlite("shared token", str(tmp_path), wing="project", max_candidates=1)
+
+    assert out["total_before_filter"] == 0
+    assert out["results"] == []
 
 
 def test_bm25_fallback_no_palace(tmp_path):
@@ -376,6 +626,7 @@ def test_tool_status_via_sqlite_returns_breakdown(palace_with_drawers, monkeypat
     # MempalaceConfig.
     class _Cfg:
         palace_path = str(palace_with_drawers)
+        collection_name = "mempalace_drawers"
 
     monkeypatch.setattr(mcp_server, "_config", _Cfg())
     monkeypatch.setattr(mcp_server, "_vector_disabled", True)

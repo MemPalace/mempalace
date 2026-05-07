@@ -6,10 +6,15 @@ Consolidates collection access patterns used by both miners and the MCP server.
 
 import contextlib
 import hashlib
+import logging
 import os
 import re
+import threading
+from typing import Optional
 
 from .backends.chroma import ChromaBackend
+
+logger = logging.getLogger("mempalace_mcp")
 
 SKIP_DIRS = {
     ".git",
@@ -52,10 +57,14 @@ NORMALIZE_VERSION = 2
 
 def get_collection(
     palace_path: str,
-    collection_name: str = "mempalace_drawers",
+    collection_name: Optional[str] = None,
     create: bool = True,
 ):
     """Get the palace collection through the backend layer."""
+    if collection_name is None:
+        from .config import get_configured_collection_name
+
+        collection_name = get_configured_collection_name()
     return _DEFAULT_BACKEND.get_collection(
         palace_path,
         collection_name=collection_name,
@@ -228,7 +237,7 @@ def purge_file_closets(closets_col, source_file: str) -> None:
     try:
         closets_col.delete(where={"source_file": source_file})
     except Exception:
-        pass
+        logger.debug("Closet purge failed for %s", source_file, exc_info=True)
 
 
 def upsert_closet_lines(closets_col, closet_id_base, lines, metadata):
@@ -306,12 +315,53 @@ def mine_lock(source_file: str):
 
                 fcntl.flock(lf, fcntl.LOCK_UN)
         except Exception:
-            pass
+            logger.debug("Mine-lock release failed", exc_info=True)
         lf.close()
 
 
 class MineAlreadyRunning(RuntimeError):
     """Raised when another `mempalace mine` already holds the per-palace lock."""
+
+
+# Per-thread record of palaces this thread already holds the lock for. Used by
+# `mine_palace_lock` to short-circuit re-entrant acquisition from the same
+# thread (e.g. miner.mine() acquires the outer lock then calls
+# ChromaCollection.upsert which now also tries to acquire). Without this guard
+# the inner call would block on its own outer flock (Linux fcntl locks are per
+# open file description, so a same-thread second open of the lock file is a
+# distinct lock and self-deadlocks).
+#
+# The holder set is tagged with ``pid`` so that a forked child does NOT
+# inherit re-entrant credit from its parent: the OS-level flock IS NOT
+# inherited as a "we hold it" semantically — the child must reacquire — but
+# Python's ``threading.local`` IS inherited across fork. The pid check
+# clears stale state so a forked child correctly hits the fcntl path.
+_palace_lock_holders = threading.local()
+
+
+def _holder_state():
+    """Return the per-thread (pid, keys) record, refreshing after fork."""
+    keys = getattr(_palace_lock_holders, "keys", None)
+    pid = getattr(_palace_lock_holders, "pid", None)
+    current_pid = os.getpid()
+    if keys is None or pid != current_pid:
+        keys = set()
+        _palace_lock_holders.keys = keys
+        _palace_lock_holders.pid = current_pid
+    return keys
+
+
+def _held_by_this_thread(lock_key: str) -> bool:
+    """Return True if this thread already holds ``mine_palace_lock`` for ``lock_key``."""
+    return lock_key in _holder_state()
+
+
+def _mark_held(lock_key: str) -> None:
+    _holder_state().add(lock_key)
+
+
+def _mark_released(lock_key: str) -> None:
+    _holder_state().discard(lock_key)
 
 
 @contextlib.contextmanager
@@ -338,6 +388,12 @@ def mine_palace_lock(palace_path: str):
     Non-blocking: if another `mine` is already writing to this palace,
     raise MineAlreadyRunning so the caller can exit cleanly instead of
     piling up as a waiting worker.
+
+    Re-entrant: if the current thread already holds the lock for the same
+    palace, the context manager passes through without re-acquiring. This
+    lets ChromaCollection write methods (which acquire the lock themselves
+    to protect MCP/direct callers) compose with miner.mine() (which holds
+    the outer lock for the entire mine pipeline) without self-deadlock.
     """
     lock_dir = os.path.join(os.path.expanduser("~"), ".mempalace", "locks")
     os.makedirs(lock_dir, exist_ok=True)
@@ -345,6 +401,11 @@ def mine_palace_lock(palace_path: str):
     lock_key_source = os.path.normcase(resolved)
     palace_key = hashlib.sha256(lock_key_source.encode()).hexdigest()[:16]
     lock_path = os.path.join(lock_dir, f"mine_palace_{palace_key}.lock")
+
+    if _held_by_this_thread(palace_key):
+        # Same thread already holds the lock for this palace — pass through.
+        yield
+        return
 
     lf = open(lock_path, "w")
     acquired = False
@@ -369,7 +430,11 @@ def mine_palace_lock(palace_path: str):
                 raise MineAlreadyRunning(
                     f"another `mempalace mine` is already running against {resolved}"
                 ) from exc
-        yield
+        _mark_held(palace_key)
+        try:
+            yield
+        finally:
+            _mark_released(palace_key)
     finally:
         if acquired:
             try:

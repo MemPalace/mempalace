@@ -426,3 +426,60 @@ def test_openai_compat_provider_outside_tailscale_cgnat_is_external():
             f"Address {endpoint} ({label}) is OUTSIDE Tailscale CGNAT and "
             f"should remain external; got is_external_service={p.is_external_service}"
         )
+
+
+# ── api_key_source provenance tracking (issue #26) ──────────────────────
+#
+# Distinguishes whether `api_key` was set via explicit constructor arg
+# (= --llm-api-key flag → "flag") vs via environment-variable fallback
+# (OPENAI_API_KEY / ANTHROPIC_API_KEY → "env"). cmd_init uses this to
+# decide whether to block on a consent prompt: stray env-fallback keys
+# require explicit user confirmation; explicit flag-passed keys are
+# treated as already-consented.
+
+
+def test_openai_compat_api_key_source_flag_when_explicit(monkeypatch):
+    """When ``api_key`` is passed explicitly to the constructor, the
+    provider records ``api_key_source == "flag"`` even if the same env
+    var is also set. Flag wins over env."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-from-env-irrelevant")
+    p = OpenAICompatProvider(model="x", endpoint="http://h", api_key="sk-from-flag")
+    assert p.api_key == "sk-from-flag"
+    assert (
+        p.api_key_source == "flag"
+    ), f"Explicit api_key arg must produce api_key_source='flag'; got {p.api_key_source!r}"
+
+
+def test_openai_compat_api_key_source_env_when_fallback(monkeypatch):
+    """When ``api_key`` arg is None but ``OPENAI_API_KEY`` is set, the
+    provider falls back to env and records ``api_key_source == "env"``.
+    This is the "stray key" case — user didn't explicitly authorize this
+    run to use the env-resolved credential."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-from-env")
+    p = OpenAICompatProvider(model="x", endpoint="http://h")
+    assert p.api_key == "sk-from-env"
+    assert (
+        p.api_key_source == "env"
+    ), f"Env-fallback api_key must produce api_key_source='env'; got {p.api_key_source!r}"
+
+
+def test_anthropic_api_key_source_tracking(monkeypatch):
+    """AnthropicProvider tracks api_key_source the same way: 'flag' when
+    passed explicitly, 'env' when resolved from ANTHROPIC_API_KEY env."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-env")
+    p_flag = AnthropicProvider(model="claude-haiku", api_key="sk-ant-flag")
+    assert (
+        p_flag.api_key_source == "flag"
+    ), f"Explicit api_key must produce 'flag'; got {p_flag.api_key_source!r}"
+    p_env = AnthropicProvider(model="claude-haiku")
+    assert p_env.api_key == "sk-ant-env"
+    assert (
+        p_env.api_key_source == "env"
+    ), f"Env-fallback must produce 'env'; got {p_env.api_key_source!r}"
+
+
+def test_ollama_api_key_source_is_none():
+    """Ollama doesn't use api_key at all; ``api_key_source`` should be None."""
+    p = OllamaProvider(model="gemma4:e4b")
+    assert p.api_key is None
+    assert p.api_key_source is None

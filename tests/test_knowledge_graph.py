@@ -55,6 +55,38 @@ class TestTripleOperations:
         tid2 = kg.add_triple("Alice", "works_at", "Acme")
         assert tid1 != tid2  # new triple since old one was closed
 
+    def test_add_triple_rejects_inverted_interval(self, kg):
+        # valid_to before valid_from would never satisfy
+        # `valid_from <= as_of AND valid_to >= as_of` — silently invisible
+        # to every query. Reject at write time instead.
+        with pytest.raises(ValueError, match="before valid_from"):
+            kg.add_triple(
+                "Alice",
+                "worked_at",
+                "Acme",
+                valid_from="2026-03-01",
+                valid_to="2026-02-01",
+            )
+
+    def test_add_triple_accepts_equal_dates(self, kg):
+        # Same-day intervals are valid (point-in-time facts).
+        tid = kg.add_triple(
+            "Alice",
+            "joined",
+            "Acme",
+            valid_from="2026-03-15",
+            valid_to="2026-03-15",
+        )
+        assert tid.startswith("t_alice_joined_acme_")
+
+    def test_add_triple_allows_only_one_bound(self, kg):
+        # The guard only fires when BOTH bounds are set.
+        tid1 = kg.add_triple("Alice", "knows", "Bob", valid_from="2026-01-01")
+        assert tid1.startswith("t_alice_knows_bob_")
+        kg.invalidate("Alice", "knows", "Bob", ended="2026-02-01")
+        tid2 = kg.add_triple("Alice", "knew", "Bob", valid_to="2026-03-01")
+        assert tid2.startswith("t_alice_knew_bob_")
+
 
 class TestQueries:
     def test_query_outgoing(self, seeded_kg):
@@ -282,9 +314,9 @@ class TestMultiProcessLocking:
             kg = KnowledgeGraph(db_path=db_path)
             stats = kg.stats()
             expected_triples = num_workers * triples_per_worker
-            assert (
-                stats["triples"] == expected_triples
-            ), f"Expected {expected_triples} triples, got {stats['triples']}"
+            assert stats["triples"] == expected_triples, (
+                f"Expected {expected_triples} triples, got {stats['triples']}"
+            )
             kg.close()
 
 

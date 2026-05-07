@@ -40,6 +40,7 @@ import json
 import os
 import re
 import time
+import urllib.parse
 import urllib.request
 import urllib.error
 from datetime import datetime
@@ -101,6 +102,14 @@ class LLMConfig:
         self.endpoint = (endpoint or os.environ.get("LLM_ENDPOINT", "")).rstrip("/")
         self.key = key or os.environ.get("LLM_KEY", "")
         self.model = model or os.environ.get("LLM_MODEL", "")
+        if self.endpoint:
+            # Privacy-by-architecture: reject file:// and other non-HTTP schemes
+            # so a misconfigured endpoint cannot exfiltrate local files.
+            scheme = urllib.parse.urlparse(self.endpoint).scheme.lower()
+            if scheme not in ("http", "https"):
+                raise ValueError(
+                    f"LLM_ENDPOINT must use http:// or https:// (got scheme {scheme!r})"
+                )
 
     def missing(self) -> list:
         missing = []
@@ -221,17 +230,28 @@ def regenerate_closets(
         print("No drawers in palace.")
         return {"processed": 0}
 
-    all_data = drawers_col.get(limit=total, include=["documents", "metadatas"])
-    by_source = {}
-    for doc_id, doc, meta in zip(all_data["ids"], all_data["documents"], all_data["metadatas"]):
-        source = meta.get("source_file", "unknown")
-        w = meta.get("wing", "")
-        if wing and w != wing:
-            continue
-        if source not in by_source:
-            by_source[source] = {"drawer_ids": [], "content": [], "meta": meta}
-        by_source[source]["drawer_ids"].append(doc_id)
-        by_source[source]["content"].append(doc)
+    # Paginate the fetch — a single get(limit=total, ...) blows through
+    # SQLite's SQLITE_MAX_VARIABLE_NUMBER (32766) on large palaces and
+    # crashes inside chromadb (see #802, #850, #1073).
+    by_source: dict = {}
+    batch_size = 5000
+    offset = 0
+    while offset < total:
+        batch = drawers_col.get(limit=batch_size, offset=offset, include=["documents", "metadatas"])
+        ids = batch["ids"]
+        if not ids:
+            break
+        for doc_id, doc, meta in zip(ids, batch["documents"], batch["metadatas"]):
+            meta = meta or {}
+            source = meta.get("source_file", "unknown")
+            w = meta.get("wing", "")
+            if wing and w != wing:
+                continue
+            if source not in by_source:
+                by_source[source] = {"drawer_ids": [], "content": [], "meta": meta}
+            by_source[source]["drawer_ids"].append(doc_id)
+            by_source[source]["content"].append(doc)
+        offset += len(ids)
 
     sources = list(by_source.keys())
     if sample > 0:

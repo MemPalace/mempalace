@@ -135,19 +135,77 @@ def test_different_palaces_dont_conflict(tmp_path, monkeypatch):
 
 
 def test_palace_path_is_normalized(tmp_path, monkeypatch):
-    """Relative and absolute forms of the same path must use the same lock."""
+    """Relative and absolute forms of the same path must use the same lock.
+
+    Cross-process variant: a child holds the absolute form, a relative form
+    in the parent must hash to the same lock key and raise
+    ``MineAlreadyRunning``. (The same-thread case is now a re-entrant
+    pass-through by design — see ``test_reentrant_same_thread_passes_through``
+    — so we exercise the normalization invariant across a process boundary
+    where re-entrance does not apply.)
+    """
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.chdir(tmp_path)
     os.makedirs(tmp_path / "palace", exist_ok=True)
     absolute = str(tmp_path / "palace")
-    relative = "palace"
+    ready = str(tmp_path / "ready")
+    release = str(tmp_path / "release")
 
-    # Hold the lock with the absolute form; attempting to re-acquire with
-    # the relative form (which resolves to the same absolute path) must fail.
-    with mine_palace_lock(absolute):
+    ctx = _get_mp_context()
+    holder = ctx.Process(target=_hold_lock, args=(absolute, ready, release))
+    holder.start()
+    try:
+        for _ in range(500):
+            if os.path.exists(ready):
+                break
+            time.sleep(0.01)
+        assert os.path.exists(ready), "holder failed to acquire lock in time"
+
+        # Parent holds CWD = tmp_path so "palace" is the same on-disk dir as
+        # the absolute form. The lock key is sha256(realpath+normcase) so the
+        # two forms must collide.
         with pytest.raises(MineAlreadyRunning):
-            with mine_palace_lock(relative):
+            with mine_palace_lock("palace"):
                 pytest.fail("normalized path collision should have raised")
+    finally:
+        open(release, "w").close()
+        holder.join(timeout=5)
+
+
+def test_reentrant_same_thread_passes_through(tmp_path, monkeypatch):
+    """Same thread re-acquiring the same palace lock must not deadlock or raise.
+
+    This is the invariant that makes ``ChromaCollection`` write methods (which
+    take ``mine_palace_lock`` for MCP/direct-writer protection) compose with
+    ``miner.mine()`` (which already holds the lock for the entire mine
+    pipeline). Without the per-thread re-entrant guard the inner acquire
+    would self-deadlock on the outer flock.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    palace = str(tmp_path / "palace")
+    with mine_palace_lock(palace):
+        # Re-enter from the same thread — must yield without raising or hanging.
+        with mine_palace_lock(palace):
+            pass
+        # After the inner exits, the outer is still held: confirm via a
+        # subprocess that tries to acquire and reports back.
+        ctx = _get_mp_context()
+        result_q = ctx.Queue()
+        child = ctx.Process(target=_try_acquire_expect_busy, args=(palace, result_q))
+        child.start()
+        child.join(timeout=5)
+        assert (
+            result_q.get(timeout=1) == "busy"
+        ), "outer lock should still be held by parent after inner re-entrant exit"
+
+
+def _try_acquire_expect_busy(palace_path, result_q):
+    """Helper: try to acquire, push 'busy' (raised) or 'free' (acquired) into queue."""
+    try:
+        with mine_palace_lock(palace_path):
+            result_q.put("free")
+    except MineAlreadyRunning:
+        result_q.put("busy")
 
 
 def test_mine_global_lock_is_alias_for_back_compat(tmp_path, monkeypatch):

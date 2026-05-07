@@ -575,7 +575,7 @@ def follow_tunnels(wing: str, room: str, col=None, config=None):
                     if did and did in drawer_map:
                         c["drawer_preview"] = drawer_map[did][:300]
             except Exception:
-                pass
+                logger.debug("Drawer preview hydration failed", exc_info=True)
 
     return connections
 

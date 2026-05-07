@@ -127,11 +127,18 @@ class LLMProvider:
         endpoint: Optional[str] = None,
         api_key: Optional[str] = None,
         timeout: int = 120,
+        api_key_source: Optional[str] = None,
     ):
         self.model = model
         self.endpoint = endpoint
         self.api_key = api_key
         self.timeout = timeout
+        # Provenance of api_key (issue #26): "flag" when the constructor
+        # received an explicit api_key arg, "env" when it fell back to an
+        # environment variable, None when no key is in play. cmd_init
+        # uses this to gate the consent prompt — stray env-resolved keys
+        # require explicit user confirmation.
+        self.api_key_source = api_key_source
 
     def classify(self, system: str, user: str, json_mode: bool = True) -> LLMResponse:
         raise NotImplementedError
@@ -253,8 +260,20 @@ class OpenAICompatProvider(LLMProvider):
         timeout: int = 120,
         **_: object,
     ):
-        resolved_key = api_key or os.environ.get("OPENAI_API_KEY")
-        super().__init__(model=model, endpoint=endpoint, api_key=resolved_key, timeout=timeout)
+        if api_key:
+            resolved_key = api_key
+            source: Optional[str] = "flag"
+        else:
+            env_key = os.environ.get("OPENAI_API_KEY")
+            resolved_key = env_key or None
+            source = "env" if env_key else None
+        super().__init__(
+            model=model,
+            endpoint=endpoint,
+            api_key=resolved_key,
+            timeout=timeout,
+            api_key_source=source,
+        )
 
     def _resolve_url(self) -> str:
         if not self.endpoint:
@@ -321,12 +340,19 @@ class AnthropicProvider(LLMProvider):
         timeout: int = 120,
         **_: object,
     ):
-        key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+        if api_key:
+            resolved_key = api_key
+            source: Optional[str] = "flag"
+        else:
+            env_key = os.environ.get("ANTHROPIC_API_KEY")
+            resolved_key = env_key or None
+            source = "env" if env_key else None
         super().__init__(
             model=model,
             endpoint=endpoint or self.DEFAULT_ENDPOINT,
-            api_key=key,
+            api_key=resolved_key,
             timeout=timeout,
+            api_key_source=source,
         )
 
     def check_available(self) -> tuple[bool, str]:

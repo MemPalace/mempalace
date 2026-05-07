@@ -1830,3 +1830,195 @@ def test_init_no_privacy_warning_with_no_llm_flag(ai_dialogue_corpus: Path, tmp_
     assert (
         "EXTERNAL API" not in out
     ), f"Privacy warning fired on --no-llm path — should not have. Got: {out!r}"
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Consent gate for stray env-fallback API keys (issue #26).
+#
+# The #1224 warning is informational — init keeps going. That's
+# "warning theater" if a user wasn't paying attention. #26 adds a
+# blocking [y/N] prompt when the api_key was acquired via env fallback
+# (OPENAI_API_KEY / ANTHROPIC_API_KEY) AND the endpoint is external.
+# Explicit --llm-api-key (api_key_source == "flag") = user opted in.
+# --accept-external-llm bypasses for CI / non-interactive.
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def _external_env_provider():
+    """Build a fake provider matching the 'stray env-fallback API key
+    pointed at external endpoint' scenario — the case #26 must gate."""
+    p = MagicMock()
+    p.check_available.return_value = (True, "ok")
+    p.is_external_service = True
+    p.api_key_source = "env"
+    p.classify.return_value = MagicMock(text='{"classifications": []}')
+    return p
+
+
+def test_init_blocks_with_consent_prompt_when_api_key_from_env(
+    ai_dialogue_corpus: Path, tmp_path: Path, capsys
+):
+    """When provider is external AND api_key_source=='env' AND
+    --accept-external-llm is NOT set, cmd_init MUST call input() to
+    block on user consent. No bypass = blocking prompt."""
+    from mempalace.cli import cmd_init
+
+    palace = tmp_path / "palace"
+    args = _init_args(ai_dialogue_corpus)
+    fake_provider = _external_env_provider()
+
+    with (
+        patch("mempalace.cli.MempalaceConfig", return_value=_stub_cfg(palace)),
+        patch("mempalace.cli.get_provider", return_value=fake_provider),
+        patch("mempalace.cli._maybe_run_mine_after_init"),
+        patch("mempalace.room_detector_local.detect_rooms_local"),
+        patch("builtins.input", return_value="y") as mock_input,
+    ):
+        cmd_init(args)
+
+    assert mock_input.called, (
+        "Stray env-fallback api_key + external endpoint MUST trigger a "
+        "blocking consent prompt. input() was never called."
+    )
+
+
+def test_init_consent_prompt_y_proceeds_with_llm(ai_dialogue_corpus: Path, tmp_path: Path, capsys):
+    """If user types 'y' at the consent prompt, init proceeds with the
+    LLM — provider.classify() is invoked during Pass 0 / refinement."""
+    from mempalace.cli import cmd_init
+
+    palace = tmp_path / "palace"
+    args = _init_args(ai_dialogue_corpus)
+    fake_provider = _external_env_provider()
+
+    with (
+        patch("mempalace.cli.MempalaceConfig", return_value=_stub_cfg(palace)),
+        patch("mempalace.cli.get_provider", return_value=fake_provider),
+        patch("mempalace.cli._maybe_run_mine_after_init"),
+        patch("mempalace.room_detector_local.detect_rooms_local"),
+        patch("builtins.input", return_value="y"),
+    ):
+        cmd_init(args)
+
+    assert fake_provider.classify.called, (
+        "After 'y' consent, the LLM provider must be used. "
+        "classify() was never called — gate dropped llm_provider on the floor."
+    )
+
+
+def test_init_consent_prompt_n_falls_back_to_heuristic(
+    ai_dialogue_corpus: Path, tmp_path: Path, capsys
+):
+    """If user types 'n' (or anything not 'y'), init drops the LLM and
+    falls back to heuristics-only — provider.classify() must NOT run."""
+    from mempalace.cli import cmd_init
+
+    palace = tmp_path / "palace"
+    args = _init_args(ai_dialogue_corpus)
+    fake_provider = _external_env_provider()
+
+    with (
+        patch("mempalace.cli.MempalaceConfig", return_value=_stub_cfg(palace)),
+        patch("mempalace.cli.get_provider", return_value=fake_provider),
+        patch("mempalace.cli._maybe_run_mine_after_init"),
+        patch("mempalace.room_detector_local.detect_rooms_local"),
+        patch("builtins.input", return_value="n"),
+    ):
+        cmd_init(args)
+
+    assert not fake_provider.classify.called, (
+        "Declined consent ('n') must drop the provider — classify() "
+        "should never be invoked when the user said no."
+    )
+
+
+def test_init_no_consent_prompt_when_api_key_from_flag(
+    ai_dialogue_corpus: Path, tmp_path: Path, capsys
+):
+    """Explicit --llm-api-key means user already opted in. The consent
+    prompt MUST NOT fire when api_key_source == 'flag', even if the
+    endpoint is external."""
+    from mempalace.cli import cmd_init
+
+    palace = tmp_path / "palace"
+    args = _init_args(ai_dialogue_corpus, llm_api_key="sk-explicit")
+    fake_provider = MagicMock()
+    fake_provider.check_available.return_value = (True, "ok")
+    fake_provider.is_external_service = True
+    fake_provider.api_key_source = "flag"  # explicit flag = no gate
+    fake_provider.classify.return_value = MagicMock(text='{"classifications": []}')
+
+    with (
+        patch("mempalace.cli.MempalaceConfig", return_value=_stub_cfg(palace)),
+        patch("mempalace.cli.get_provider", return_value=fake_provider),
+        patch("mempalace.cli._maybe_run_mine_after_init"),
+        patch("mempalace.room_detector_local.detect_rooms_local"),
+        patch("builtins.input") as mock_input,
+    ):
+        cmd_init(args)
+
+    assert not mock_input.called, (
+        "Explicit --llm-api-key (api_key_source='flag') must NOT trigger "
+        "the consent prompt. User already opted in by passing the flag."
+    )
+
+
+def test_init_accept_external_llm_flag_bypasses_consent_prompt(
+    ai_dialogue_corpus: Path, tmp_path: Path, capsys
+):
+    """--accept-external-llm is the non-interactive bypass for CI. With
+    the flag set, the consent prompt MUST NOT fire even when the
+    api_key came from env-fallback."""
+    from mempalace.cli import cmd_init
+
+    palace = tmp_path / "palace"
+    args = _init_args(ai_dialogue_corpus, accept_external_llm=True)
+    fake_provider = _external_env_provider()
+
+    with (
+        patch("mempalace.cli.MempalaceConfig", return_value=_stub_cfg(palace)),
+        patch("mempalace.cli.get_provider", return_value=fake_provider),
+        patch("mempalace.cli._maybe_run_mine_after_init"),
+        patch("mempalace.room_detector_local.detect_rooms_local"),
+        patch("builtins.input") as mock_input,
+    ):
+        cmd_init(args)
+
+    assert not mock_input.called, (
+        "--accept-external-llm must bypass the consent prompt for "
+        "non-interactive / CI use. input() was called anyway."
+    )
+    assert (
+        fake_provider.classify.called
+    ), "With --accept-external-llm, init must proceed with the LLM."
+
+
+def test_init_no_consent_prompt_when_endpoint_is_local(
+    ai_dialogue_corpus: Path, tmp_path: Path, capsys
+):
+    """Stray env-fallback api_key on a LOCAL endpoint (e.g. LM Studio
+    on localhost with OPENAI_API_KEY in shell env) must NOT trigger the
+    prompt. Nothing leaves the machine — no consent needed."""
+    from mempalace.cli import cmd_init
+
+    palace = tmp_path / "palace"
+    args = _init_args(ai_dialogue_corpus)
+    fake_provider = MagicMock()
+    fake_provider.check_available.return_value = (True, "ok")
+    fake_provider.is_external_service = False  # localhost / LAN — no leak
+    fake_provider.api_key_source = "env"  # stray key, but URL is local
+    fake_provider.classify.return_value = MagicMock(text='{"classifications": []}')
+
+    with (
+        patch("mempalace.cli.MempalaceConfig", return_value=_stub_cfg(palace)),
+        patch("mempalace.cli.get_provider", return_value=fake_provider),
+        patch("mempalace.cli._maybe_run_mine_after_init"),
+        patch("mempalace.room_detector_local.detect_rooms_local"),
+        patch("builtins.input") as mock_input,
+    ):
+        cmd_init(args)
+
+    assert not mock_input.called, (
+        "Local endpoint (is_external_service=False) must NOT trigger the "
+        "consent prompt regardless of api_key_source. Nothing leaves the box."
+    )

@@ -6,6 +6,10 @@
 > domain — including `mempalace.tech` — is an impostor and may distribute
 > malware. Details and timeline: [docs/HISTORY.md](docs/HISTORY.md).
 
+> [!IMPORTANT]
+> **🚨 Claude Code sessions expire in 30 days w/out auto-save hooks wired!** **[Read this →](https://github.com/MemPalace/mempalace/discussions/1388)**
+
+
 <div align="center">
 
 <img src="assets/mempalace_logo.png" alt="MemPalace" width="240">

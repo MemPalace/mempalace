@@ -7,6 +7,7 @@ Priority: env vars > config file (~/.mempalace/config.json) > defaults
 import json
 import os
 import re
+from functools import lru_cache
 from pathlib import Path
 
 
@@ -81,6 +82,38 @@ def sanitize_kg_value(value: str, field_name: str = "value") -> str:
     return value
 
 
+# ISO-8601 date validator for knowledge-graph temporal parameters
+# (as_of, valid_from, valid_to, ended). Parameterized queries already
+# prevent SQL injection, but unvalidated date strings silently miss
+# every row — callers cannot distinguish "no fact at this time" from
+# "your date format was unrecognized." Require full YYYY-MM-DD: KG
+# queries compare TEXT dates lexicographically, so partials like "2026"
+# would re-introduce silent empty results (e.g. "2026-01-01" <= "2026"
+# is False), defeating the purpose of validation.
+_ISO_DATE_RE = re.compile(r"^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])$")
+
+
+def sanitize_iso_date(value, field_name: str = "date"):
+    """Validate an ISO-8601 date string, accepting None or empty as-is.
+
+    Accepts only ``YYYY-MM-DD``. Raises ValueError on any other
+    non-empty input so the MCP layer can surface a clear error to the
+    caller instead of silently returning empty results. Partial dates
+    (``YYYY``, ``YYYY-MM``) are rejected because KG queries compare
+    TEXT dates lexicographically and would silently exclude valid facts.
+    """
+    if value is None or value == "":
+        return value
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string")
+    value = value.strip()
+    if not _ISO_DATE_RE.match(value):
+        raise ValueError(
+            f"{field_name}={value!r} is not a valid ISO-8601 date " f"(expected YYYY-MM-DD)"
+        )
+    return value
+
+
 def sanitize_content(value: str, max_length: int = 100_000) -> str:
     """Validate drawer/diary content length."""
     if not isinstance(value, str) or not value.strip():
@@ -94,6 +127,13 @@ def sanitize_content(value: str, max_length: int = 100_000) -> str:
 
 DEFAULT_PALACE_PATH = os.path.expanduser("~/.mempalace/palace")
 DEFAULT_COLLECTION_NAME = "mempalace_drawers"
+
+
+@lru_cache(maxsize=1)
+def get_configured_collection_name() -> str:
+    """Return the configured drawer collection name without repeated config-file reads."""
+    return MempalaceConfig().collection_name
+
 
 DEFAULT_TOPIC_WINGS = [
     "emotions",

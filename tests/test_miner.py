@@ -699,6 +699,83 @@ def test_mine_keyboard_interrupt_quotes_path_with_spaces_in_resume_hint(tmp_path
     assert f"mempalace mine {shlex.quote(str(project_root))}" in out
 
 
+def test_skip_filenames_includes_lockfiles():
+    """pnpm-lock.yaml and yarn.lock must be skipped alongside package-lock.json
+    so a Windows mine over a typical JS monorepo doesn't OOM the ONNX embedder
+    on a 24K-line lockfile (#1296)."""
+    from mempalace import miner
+
+    assert "package-lock.json" in miner.SKIP_FILENAMES
+    assert "pnpm-lock.yaml" in miner.SKIP_FILENAMES
+    assert "yarn.lock" in miner.SKIP_FILENAMES
+
+
+def test_process_file_skips_when_chunks_exceed_max(tmp_path, monkeypatch):
+    """A file producing more than MAX_CHUNKS_PER_FILE chunks must be skipped
+    with a clear message and zero upserts. Generated artifacts (CSVs, lock
+    files not in SKIP_FILENAMES) hit this — the cap is what prevents ONNX
+    bad_alloc on Windows when the embedder is asked to swallow thousands of
+    chunks in one batch (#1296)."""
+    from unittest.mock import MagicMock
+
+    from mempalace import miner
+
+    monkeypatch.setattr(miner, "MAX_CHUNKS_PER_FILE", 5)
+    over_cap = [{"content": f"chunk {i}", "chunk_index": i} for i in range(7)]
+    monkeypatch.setattr(miner, "chunk_text", lambda content, source_file: over_cap)
+
+    source = tmp_path / "huge.csv"
+    source.write_text("col1,col2\n" + "x,y\n" * 500, encoding="utf-8")
+    col = MagicMock()
+    col.get.return_value = {"ids": []}
+
+    drawers, room = miner.process_file(
+        source,
+        tmp_path,
+        col,
+        "wing",
+        [{"name": "general", "description": "General"}],
+        "agent",
+        False,
+    )
+
+    assert drawers == 0
+    col.upsert.assert_not_called()
+
+
+def test_mine_arbitrary_exception_prints_summary_and_reraises(tmp_path, capsys):
+    """A non-KeyboardInterrupt exception mid-mine must surface a summary
+    banner before propagating, so users don't see a silent exit-0 with no
+    completion message (#1296 Failure 2). Re-raise preserves the traceback
+    and yields a non-zero exit code."""
+    import pytest
+    from unittest.mock import patch
+
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=4)
+    palace_path = project_root / "palace"
+
+    call_count = {"n": 0}
+
+    def fake_process_file(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            raise RuntimeError("simulated ONNX bad_alloc")
+        return (1, "general")
+
+    with patch("mempalace.miner.process_file", side_effect=fake_process_file):
+        with pytest.raises(RuntimeError, match="simulated ONNX bad_alloc"):
+            mine(str(project_root), str(palace_path))
+
+    out = capsys.readouterr().out
+    assert "Mine aborted by exception." in out
+    assert "files_processed: 1/" in out
+    assert "drawers_filed:" in out
+    assert "RuntimeError: simulated ONNX bad_alloc" in out
+    assert "upserted idempotently" in out
+
+
 def test_mine_cleans_up_pid_file_on_interrupt(tmp_path):
     """Our own PID entry in mine.pid is removed in the finally clause."""
     import pytest

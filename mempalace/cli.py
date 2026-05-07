@@ -232,6 +232,13 @@ def cmd_init(args):
     from .project_scanner import discover_entities
     from .room_detector_local import detect_rooms_local
 
+    # Honor --palace (issue #1313): without this, init silently ignored the
+    # flag and always used ~/.mempalace. Mirror the env-var pattern used by
+    # mcp_server.py so every downstream read of ``cfg.palace_path`` (Pass 0,
+    # cfg.init(), the post-init mine) routes to the user-specified location.
+    if getattr(args, "palace", None):
+        os.environ["MEMPALACE_PALACE_PATH"] = os.path.abspath(os.path.expanduser(args.palace))
+
     cfg = MempalaceConfig()
 
     # Resolve entity-detection languages: --lang overrides config.
@@ -276,6 +283,33 @@ def cmd_init(args):
                         f"retains, or uses your data. Pass --no-llm to keep "
                         f"init fully local."
                     )
+                    # Consent gate (issue #26): block init when the api_key
+                    # was acquired via env-fallback (stray credential in
+                    # shell env). Explicit --llm-api-key (api_key_source ==
+                    # "flag") means the user already opted in.
+                    # --accept-external-llm bypasses for CI / non-interactive.
+                    api_key_source = getattr(candidate, "api_key_source", None)
+                    accept_flag = getattr(args, "accept_external_llm", False)
+                    if api_key_source == "env" and not accept_flag:
+                        try:
+                            answer = (
+                                input(
+                                    "  Your API key was loaded from the environment "
+                                    "(not passed via --llm-api-key). Continue with "
+                                    "external LLM? [y/N] "
+                                )
+                                .strip()
+                                .lower()
+                            )
+                        except EOFError:
+                            answer = ""
+                        if answer != "y":
+                            print(
+                                "  Declined — falling back to heuristics-only. "
+                                "Pass --llm-api-key explicitly or "
+                                "--accept-external-llm to skip this prompt."
+                            )
+                            llm_provider = None
             else:
                 print(
                     f"  No LLM provider reachable ({msg}). "
@@ -283,8 +317,7 @@ def cmd_init(args):
                 )
         except LLMError as e:
             print(
-                f"  LLM init failed ({e}). "
-                f"Running heuristics-only — pass --no-llm to silence this."
+                f"  LLM init failed ({e}). Running heuristics-only — pass --no-llm to silence this."
             )
 
     # Pass 0: detect whether the corpus is AI-dialogue. Writes
@@ -621,10 +654,22 @@ def cmd_repair(args):
     import shutil
     from .backends.chroma import ChromaBackend
     from .migrate import confirm_destructive_action, contains_palace_database
-    from .repair import TruncationDetected, check_extraction_safety
+    from .repair import (
+        RebuildCollectionError,
+        TruncationDetected,
+        _close_chroma_handles,
+        _extract_drawers,
+        _rebuild_collection_via_temp,
+        check_extraction_safety,
+        maybe_repair_poisoned_max_seq_id_before_rebuild,
+        print_sqlite_integrity_abort,
+        sqlite_integrity_errors,
+    )
 
+    config = MempalaceConfig()
+    collection_name = config.collection_name
     palace_path = os.path.abspath(
-        os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+        os.path.expanduser(args.palace) if args.palace else config.palace_path
     )
 
     if getattr(args, "mode", "legacy") == "max-seq-id":
@@ -640,17 +685,89 @@ def cmd_repair(args):
         )
         return
 
+    if getattr(args, "mode", "legacy") == "from-sqlite":
+        from .migrate import confirm_destructive_action
+        from .repair import RebuildPartialError, rebuild_from_sqlite
+
+        source_path = getattr(args, "source", None)
+        source_path = (
+            os.path.abspath(os.path.expanduser(source_path)) if source_path else palace_path
+        )
+        archive_existing = getattr(args, "archive_existing", False)
+
+        # Gate any path that touches the user's existing palace dir
+        # behind confirm_destructive_action. The legacy mode already
+        # gates; from-sqlite needs the same protection because:
+        # (a) --archive-existing renames the existing palace,
+        # (b) --source PATH writes into --palace dir which the user
+        #     may not realize is also a palace.
+        # No prompt when source != dest AND dest does not exist (pure
+        # extract-into-fresh-dir case is non-destructive to existing
+        # palaces).
+        is_destructive_to_dest = source_path == palace_path or os.path.exists(palace_path)
+        if is_destructive_to_dest and not confirm_destructive_action(
+            "Rebuild from SQLite", palace_path, assume_yes=getattr(args, "yes", False)
+        ):
+            return
+
+        try:
+            counts = rebuild_from_sqlite(
+                source_palace=source_path,
+                dest_palace=palace_path,
+                archive_existing_dest=archive_existing,
+            )
+        except RebuildPartialError as exc:
+            # The error itself was already printed by rebuild_from_sqlite
+            # with recovery instructions; surface a non-zero exit so
+            # scripts and CI gates see the failure.
+            print(
+                "\n  Rebuild partial — see message above. "
+                f"Failed in collection: {exc.failed_collection}"
+            )
+            sys.exit(1)
+        # An empty counts dict is rebuild_from_sqlite's documented signal
+        # for a validation refusal (missing source, existing dest,
+        # in-place without --archive-existing). The library already
+        # printed an actionable message; exit non-zero so unattended
+        # scripts/CI distinguish "invalid inputs" from a successful
+        # rebuild that legitimately found zero rows (which still returns
+        # a populated dict with 0-valued counts).
+        if not counts:
+            sys.exit(1)
+        return
+
     db_path = os.path.join(palace_path, "chroma.sqlite3")
 
     if not os.path.isdir(palace_path):
         print(f"\n  No palace found at {palace_path}")
         return
     if not contains_palace_database(palace_path):
-        print(f"\n  No palace database found at {db_path}")
+        print(f"\n No palace database found at {db_path}")
+        return
+
+    # Run the SQLite integrity preflight before any chromadb client open.
+    # ChromaDB's rust binding raises pyo3_runtime.PanicException on a
+    # malformed page, which is not a regular Exception subclass and
+    # propagates past the try/except below — the user gets a 30-line
+    # stack trace instead of the friendly abort message. Run quick_check
+    # here so we can surface the clear recovery instructions and exit
+    # cleanly before chromadb's compactor touches the disk.
+    sqlite_errors = sqlite_integrity_errors(palace_path)
+    if sqlite_errors:
+        print_sqlite_integrity_abort(palace_path, sqlite_errors)
+        sys.exit(1)
+
+    preflight = maybe_repair_poisoned_max_seq_id_before_rebuild(
+        palace_path,
+        backup=getattr(args, "backup", True),
+        dry_run=getattr(args, "dry_run", False),
+        assume_yes=getattr(args, "yes", False),
+    )
+    if preflight is not None:
         return
 
     print(f"\n{'=' * 55}")
-    print("  MemPalace Repair")
+    print(" MemPalace Repair")
     print(f"{'=' * 55}\n")
     print(f"  Palace: {palace_path}")
 
@@ -658,7 +775,7 @@ def cmd_repair(args):
 
     # Try to read existing drawers
     try:
-        col = backend.get_collection(palace_path, "mempalace_drawers")
+        col = backend.get_collection(palace_path, collection_name)
         total = col.count()
         print(f"  Drawers found: {total}")
     except Exception as e:
@@ -678,18 +795,7 @@ def cmd_repair(args):
     # Extract all drawers in batches
     print("\n  Extracting drawers...")
     batch_size = 5000
-    all_ids = []
-    all_docs = []
-    all_metas = []
-    offset = 0
-    while offset < total:
-        batch = col.get(limit=batch_size, offset=offset, include=["documents", "metadatas"])
-        if not batch["ids"]:
-            break
-        all_ids.extend(batch["ids"])
-        all_docs.extend(batch["documents"])
-        all_metas.extend(batch["metadatas"])
-        offset += len(batch["ids"])
+    all_ids, all_docs, all_metas = _extract_drawers(col, total, batch_size)
     print(f"  Extracted {len(all_ids)} drawers")
 
     # ── #1208 guard ──────────────────────────────────────────────────
@@ -704,12 +810,12 @@ def cmd_repair(args):
             palace_path,
             len(all_ids),
             confirm_truncation_ok=getattr(args, "confirm_truncation_ok", False),
+            collection_name=collection_name,
         )
     except TruncationDetected as e:
         print(e.message)
         return
 
-    # Backup and rebuild
     palace_path = os.path.normpath(palace_path)
     backup_path = palace_path + ".backup"
     if os.path.exists(backup_path):
@@ -723,18 +829,34 @@ def cmd_repair(args):
     print(f"  Backing up to {backup_path}...")
     shutil.copytree(palace_path, backup_path)
 
-    print("  Rebuilding collection...")
-    backend.delete_collection(palace_path, "mempalace_drawers")
-    new_col = backend.create_collection(palace_path, "mempalace_drawers")
-
-    filed = 0
-    for i in range(0, len(all_ids), batch_size):
-        batch_ids = all_ids[i : i + batch_size]
-        batch_docs = all_docs[i : i + batch_size]
-        batch_metas = all_metas[i : i + batch_size]
-        new_col.add(documents=batch_docs, ids=batch_ids, metadatas=batch_metas)
-        filed += len(batch_ids)
-        print(f"  Re-filed {filed}/{len(all_ids)} drawers...")
+    try:
+        filed = _rebuild_collection_via_temp(
+            backend,
+            palace_path,
+            all_ids,
+            all_docs,
+            all_metas,
+            batch_size,
+            collection_name=collection_name,
+            progress=print,
+        )
+    except RebuildCollectionError as e:
+        print(f"  Repair failed: {e}")
+        if getattr(e, "live_replaced", False):
+            print("  Live collection was already replaced; restoring from backup...")
+            try:
+                _close_chroma_handles(palace_path, backend=backend)
+                if os.path.exists(palace_path):
+                    shutil.rmtree(palace_path)
+                shutil.copytree(backup_path, palace_path)
+                print(f"  Restore complete from backup: {backup_path}")
+            except Exception as restore_error:
+                print(f"  Automatic restore failed: {restore_error}")
+                print("  Manual recovery required:")
+                print(f"    1. Remove or rename the broken directory: {palace_path}")
+                print(f"    2. Restore the backup directory to: {palace_path}")
+                print(f"       Backup location: {backup_path}")
+        sys.exit(1)
 
     print(f"\n  Repair complete. {filed} drawers rebuilt.")
     print(f"  Backup saved at {backup_path}")
@@ -875,7 +997,7 @@ def cmd_compress(args):
     # Store compressed versions (unless dry-run)
     if not args.dry_run:
         try:
-            comp_col = backend.get_or_create_collection(palace_path, "mempalace_compressed")
+            comp_col = backend.get_or_create_collection(palace_path, "mempalace_closets")
             for doc_id, compressed, meta, stats in compressed_entries:
                 comp_meta = dict(meta)
                 comp_meta["compression_ratio"] = round(stats["size_ratio"], 1)
@@ -886,7 +1008,7 @@ def cmd_compress(args):
                     metadatas=[comp_meta],
                 )
             print(
-                f"  Stored {len(compressed_entries)} compressed drawers in 'mempalace_compressed' collection."
+                f"  Stored {len(compressed_entries)} compressed drawers in 'mempalace_closets' collection."
             )
         except Exception as e:
             print(f"  Error storing compressed drawers: {e}")
@@ -902,7 +1024,25 @@ def cmd_compress(args):
         print("  (dry run -- nothing stored)")
 
 
+def _reconfigure_stdio_utf8_on_windows():
+    """Decode stdio as UTF-8 on Windows for the primary `mempalace` CLI.
+
+    Thin wrapper around the shared helper in ``mempalace._stdio``. The CLI
+    overrides stdout/stderr to ``replace`` because ``mempalace search``
+    prints verbatim drawer text that may carry surrogate halves
+    round-tripped from filenames -- ``strict`` would crash mid-print and
+    lose the rest of the search result block. stdin keeps the default
+    ``surrogateescape`` so a redirected non-UTF-8 file does not kill the
+    read on the first bad byte.
+    """
+    from ._stdio import reconfigure_stdio_utf8_on_windows
+
+    reconfigure_stdio_utf8_on_windows(stdout_errors="replace", stderr_errors="replace")
+
+
 def main():
+    _reconfigure_stdio_utf8_on_windows()
+
     version_label = f"MemPalace {__version__}"
     parser = argparse.ArgumentParser(
         description="MemPalace — Give your AI a memory. No API key required.",
@@ -992,6 +1132,16 @@ def main():
         help=(
             "API key for the provider. For anthropic, defaults to $ANTHROPIC_API_KEY; "
             "for openai-compat, defaults to $OPENAI_API_KEY."
+        ),
+    )
+    p_init.add_argument(
+        "--accept-external-llm",
+        action="store_true",
+        help=(
+            "Bypass the interactive consent prompt that fires when an external "
+            "LLM is configured via an environment-variable API key (issue #26). "
+            "Use this in CI / non-interactive runs where you've already decided "
+            "the external send is acceptable."
         ),
     )
 
@@ -1152,11 +1302,31 @@ def main():
     )
     p_repair.add_argument(
         "--mode",
-        choices=["legacy", "max-seq-id"],
+        choices=["legacy", "max-seq-id", "from-sqlite"],
         default="legacy",
         help=(
-            "legacy: full-palace rebuild (default). "
-            "max-seq-id: un-poison max_seq_id rows corrupted by the legacy 0.6.x shim."
+            "legacy: full-palace rebuild via the chromadb client (default). "
+            "max-seq-id: un-poison max_seq_id rows corrupted by the legacy 0.6.x shim. "
+            "from-sqlite: rebuild by reading rows directly from chroma.sqlite3, "
+            "bypassing the chromadb client. Use when legacy mode bails because the "
+            "chromadb client cannot open the collection."
+        ),
+    )
+    p_repair.add_argument(
+        "--source",
+        default=None,
+        help=(
+            "Source palace path for --mode from-sqlite (defaults to --palace). "
+            "Use when extracting from an archived corrupt palace into a new location."
+        ),
+    )
+    p_repair.add_argument(
+        "--archive-existing",
+        action="store_true",
+        help=(
+            "For --mode from-sqlite when --source equals --palace: rename the "
+            "existing palace to <palace>.pre-rebuild-<timestamp> before "
+            "rebuilding so the corrupt copy is preserved."
         ),
     )
     p_repair.add_argument(
