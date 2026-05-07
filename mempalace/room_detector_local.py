@@ -274,7 +274,7 @@ def save_config(project_dir: str, project_name: str, rooms: list):
     print(f"\n{'=' * 55}\n")
 
 
-def detect_rooms_local(project_dir: str, yes: bool = False):
+def detect_rooms_local(project_dir: str, yes: bool = False, pattern: str = None):
     """Main entry point for local setup."""
     project_path = Path(project_dir).expanduser().resolve()
     project_name = project_path.name.lower().replace(" ", "_").replace("-", "_")
@@ -286,7 +286,7 @@ def detect_rooms_local(project_dir: str, yes: bool = False):
     # Count files
     from .miner import scan_project
 
-    files = scan_project(project_dir)
+    files = scan_project(project_dir, pattern=pattern)
 
     # Try folder structure first
     rooms = detect_rooms_from_folders(project_dir)

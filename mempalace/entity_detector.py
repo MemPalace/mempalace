@@ -810,13 +810,17 @@ def confirm_entities(detected: dict, yes: bool = False) -> dict:
 # ==================== SCAN HELPER ====================
 
 
-def scan_for_detection(project_dir: str, max_files: int = 10) -> list:
+def scan_for_detection(project_dir: str, max_files: int = 10, pattern: str = None) -> list:
     """
     Collect prose file paths for entity detection.
     Prose only (.txt, .md, .rst, .csv) — code files produce too many false positives.
     Falls back to all readable files if no prose found.
+    Optional regex pattern filters by relative path.
     """
+    import re
+
     project_path = Path(project_dir).expanduser().resolve()
+    compiled_pattern = re.compile(pattern) if pattern else None
     prose_files = []
     all_files = []
 
@@ -824,6 +828,14 @@ def scan_for_detection(project_dir: str, max_files: int = 10) -> list:
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
         for filename in filenames:
             filepath = Path(root) / filename
+            # Regex pattern filter
+            if compiled_pattern is not None:
+                try:
+                    rel = str(filepath.relative_to(project_path).as_posix())
+                    if not compiled_pattern.search(rel):
+                        continue
+                except ValueError:
+                    continue
             ext = filepath.suffix.lower()
             if ext in PROSE_EXTENSIONS:
                 prose_files.append(filepath)

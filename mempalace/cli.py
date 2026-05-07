@@ -44,7 +44,7 @@ def cmd_init(args):
 
     # Pass 1: auto-detect people and projects from file content
     print(f"\n  Scanning for entities in: {args.dir}")
-    files = scan_for_detection(args.dir)
+    files = scan_for_detection(args.dir, pattern=getattr(args, "pattern", None))
     if files:
         print(f"  Reading {len(files)} files...")
         detected = detect_entities(files)
@@ -61,7 +61,11 @@ def cmd_init(args):
             print("  No entities detected — proceeding with directory-based rooms.")
 
     # Pass 2: detect rooms from folder structure
-    detect_rooms_local(project_dir=args.dir, yes=getattr(args, "yes", False))
+    detect_rooms_local(
+        project_dir=args.dir,
+        yes=getattr(args, "yes", False),
+        pattern=getattr(args, "pattern", None),
+    )
     MempalaceConfig().init()
 
 
@@ -86,7 +90,7 @@ def cmd_mine(args):
     else:
         from .miner import mine
 
-        mine(
+        mine_kwargs = dict(
             project_dir=args.dir,
             palace_path=palace_path,
             wing_override=args.wing,
@@ -96,6 +100,9 @@ def cmd_mine(args):
             respect_gitignore=not args.no_gitignore,
             include_ignored=include_ignored,
         )
+        if getattr(args, "pattern", None):
+            mine_kwargs["pattern"] = args.pattern
+        mine(**mine_kwargs)
 
 
 def cmd_search(args):
@@ -413,6 +420,11 @@ def main():
     p_init.add_argument(
         "--yes", action="store_true", help="Auto-accept all detected entities (non-interactive)"
     )
+    p_init.add_argument(
+        "--pattern",
+        default=None,
+        help="Only scan files whose relative path matches this regex (e.g. '.*\\.md$')",
+    )
 
     # mine
     p_mine = sub.add_parser("mine", help="Mine files into the palace")
@@ -434,6 +446,11 @@ def main():
         action="append",
         default=[],
         help="Always scan these project-relative paths even if ignored; repeat or pass comma-separated paths",
+    )
+    p_mine.add_argument(
+        "--pattern",
+        default=None,
+        help="Only mine files whose relative path matches this regex (e.g. '.*\\.py$')",
     )
     p_mine.add_argument(
         "--agent",

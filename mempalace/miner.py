@@ -9,6 +9,7 @@ Stores verbatim chunks as drawers. No summaries. Ever.
 
 import os
 import sys
+import re
 import hashlib
 import fnmatch
 from pathlib import Path
@@ -472,10 +473,12 @@ def scan_project(
     project_dir: str,
     respect_gitignore: bool = True,
     include_ignored: list = None,
+    pattern: str = None,
 ) -> list:
-    """Return list of all readable file paths."""
+    """Return list of all readable file paths, optionally filtered by regex pattern."""
     project_path = Path(project_dir).expanduser().resolve()
     files = []
+    compiled_pattern = re.compile(pattern) if pattern else None
     active_matchers = []
     matcher_cache = {}
     include_paths = normalize_include_paths(include_ignored)
@@ -528,6 +531,14 @@ def scan_project(
                     continue
             except OSError:
                 continue
+            # Regex pattern filter
+            if compiled_pattern is not None:
+                try:
+                    rel = str(filepath.relative_to(project_path).as_posix())
+                    if not compiled_pattern.search(rel):
+                        continue
+                except ValueError:
+                    continue
             files.append(filepath)
     return files
 
@@ -546,6 +557,7 @@ def mine(
     dry_run: bool = False,
     respect_gitignore: bool = True,
     include_ignored: list = None,
+    pattern: str = None,
 ):
     """Mine a project directory into the palace."""
 
@@ -559,6 +571,7 @@ def mine(
         project_dir,
         respect_gitignore=respect_gitignore,
         include_ignored=include_ignored,
+        pattern=pattern,
     )
     if limit > 0:
         files = files[:limit]
@@ -576,6 +589,8 @@ def mine(
         print("  .gitignore: DISABLED")
     if include_ignored:
         print(f"  Include: {', '.join(sorted(normalize_include_paths(include_ignored)))}")
+    if pattern:
+        print(f"  Pattern: {pattern}")
     print(f"{'─' * 55}\n")
 
     if not dry_run:

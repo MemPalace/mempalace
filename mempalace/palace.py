@@ -34,6 +34,38 @@ SKIP_DIRS = {
 }
 
 
+def _get_best_embedding_function():
+    """Return a GPU embedding function if available, else None for CPU default."""
+    # Path 1: ONNX Runtime GPU (preferred — zero code change, just install onnxruntime-gpu)
+    try:
+        import onnxruntime as ort
+        providers = ort.get_available_providers()
+        if "CUDAExecutionProvider" in providers or "ROCMExecutionProvider" in providers:
+            # ChromaDB's default EF will use the GPU provider automatically
+            return None
+    except ImportError:
+        pass
+
+    # Path 2: Sentence Transformers with torch CUDA
+    try:
+        import torch
+        if torch.cuda.is_available():
+            from chromadb.utils.embedding_functions import (
+                SentenceTransformerEmbeddingFunction,
+            )
+
+            print("  Using GPU-accelerated embeddings (CUDA via sentence-transformers)")
+            return SentenceTransformerEmbeddingFunction(
+                model_name="all-MiniLM-L6-v2",
+                device="cuda",
+            )
+    except ImportError:
+        pass
+
+    # Path 3: Default CPU
+    return None
+
+
 def get_collection(palace_path: str, collection_name: str = "mempalace_drawers"):
     """Get or create the palace ChromaDB collection."""
     os.makedirs(palace_path, exist_ok=True)
@@ -45,6 +77,9 @@ def get_collection(palace_path: str, collection_name: str = "mempalace_drawers")
     try:
         return client.get_collection(collection_name)
     except Exception:
+        ef = _get_best_embedding_function()
+        if ef:
+            return client.create_collection(collection_name, embedding_function=ef)
         return client.create_collection(collection_name)
 
 
