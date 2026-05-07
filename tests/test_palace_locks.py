@@ -11,14 +11,17 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import threading
 import time
 
 import pytest
 
 from mempalace.palace import (
     MineAlreadyRunning,
+    PalaceWriteAlreadyRunning,
     mine_global_lock,
     mine_palace_lock,
+    palace_write_lock,
 )
 
 
@@ -310,3 +313,107 @@ def test_mine_global_lock_is_alias_for_back_compat(tmp_path, monkeypatch):
     assert mine_global_lock is mine_palace_lock
     with mine_global_lock(str(tmp_path / "palace")):
         pass  # the alias accepts the same palace_path argument
+
+
+def test_mine_lock_conflicts_with_shared_writer_lock(tmp_path, monkeypatch):
+    """Repair and mine must share the same per-palace write boundary."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    palace = str(tmp_path / "palace")
+    result_box = {}
+
+    with palace_write_lock(palace, operation="repair"):
+        thread = threading.Thread(
+            target=lambda: result_box.setdefault(
+                "result",
+                "busy"
+                if _raises_mine_busy(palace)
+                else "free",
+            )
+        )
+        thread.start()
+        thread.join(timeout=2)
+
+    assert result_box["result"] == "busy"
+
+
+def _raises_mine_busy(palace_path: str) -> bool:
+    try:
+        with mine_palace_lock(palace_path):
+            return False
+    except MineAlreadyRunning:
+        return True
+
+
+def test_shared_writer_lock_conflicts_with_mine_lock(tmp_path, monkeypatch):
+    """The compatibility mine lock must block generic palace writers too."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    palace = str(tmp_path / "palace")
+    result_box = {}
+
+    with mine_palace_lock(palace):
+        thread = threading.Thread(
+            target=lambda: result_box.setdefault(
+                "result",
+                "busy"
+                if _raises_writer_busy(palace)
+                else "free",
+            )
+        )
+        thread.start()
+        thread.join(timeout=2)
+
+    assert result_box["result"] == "busy"
+
+
+def _raises_writer_busy(palace_path: str) -> bool:
+    try:
+        with palace_write_lock(palace_path, operation="repair"):
+            return False
+    except PalaceWriteAlreadyRunning:
+        return True
+
+
+def test_shared_writer_lock_normalizes_symlink_and_trailing_slash(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    real = tmp_path / "real_palace"
+    real.mkdir()
+    link = tmp_path / "palace_link"
+    link.symlink_to(real, target_is_directory=True)
+    result_box = {}
+
+    with palace_write_lock(str(real) + "/", operation="repair"):
+        thread = threading.Thread(
+            target=lambda: result_box.setdefault(
+                "result",
+                "busy"
+                if _raises_writer_busy(str(link))
+                else "free",
+            )
+        )
+        thread.start()
+        thread.join(timeout=2)
+
+    assert result_box["result"] == "busy"
+
+
+def test_shared_writer_lock_can_wait_for_existing_writer(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    palace = str(tmp_path / "palace")
+    acquired = []
+    waiter = {}
+
+    def wait_for_lock():
+        cm = palace_write_lock(palace, operation="mcp add_drawer", blocking=True)
+        cm.__enter__()
+        waiter["cm"] = cm
+        acquired.append("entered")
+
+    with palace_write_lock(palace, operation="repair"):
+        thread = threading.Thread(target=wait_for_lock)
+        thread.start()
+        time.sleep(0.1)
+        assert acquired == []
+
+    thread.join(timeout=2)
+    assert acquired == ["entered"]
+    waiter["cm"].__exit__(None, None, None)

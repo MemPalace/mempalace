@@ -860,7 +860,7 @@ class ChromaCollection(BaseCollection):
     """Thin adapter translating ChromaDB dict returns into typed results.
 
     When ``palace_path`` is set, all write methods (``add``, ``upsert``,
-    ``update``, ``delete``) acquire ``mine_palace_lock(palace_path)`` for the
+    ``modify``, ``update``, ``delete``) acquire ``mine_palace_lock(palace_path)`` for the
     duration of the underlying chromadb call. This serializes MCP and other
     direct-backend writers against ``mempalace mine`` and against each other,
     closing the race between concurrent writers that triggers ChromaDB's
@@ -946,7 +946,8 @@ class ChromaCollection(BaseCollection):
             kwargs["metadata"] = metadata
         if configuration is not None:
             kwargs["configuration"] = configuration
-        self._collection.modify(**kwargs)
+        with self._write_lock():
+            self._collection.modify(**kwargs)
 
     def update(
         self,

@@ -12,6 +12,8 @@ import os
 import subprocess
 import sys
 from unittest.mock import MagicMock
+import threading
+import time
 
 import pytest
 
@@ -631,6 +633,41 @@ class TestWriteTools:
         assert result["success"] is False
         assert "not readable" in result["error"]
 
+    def test_add_drawer_waits_when_palace_write_lock_active(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+        from mempalace.palace import palace_write_lock
+
+        class _FakeGetResult:
+            def __init__(self, ids=None):
+                self.ids = ids or []
+
+        class _FakeCol:
+            written = False
+
+            def get(self, **kwargs):
+                return _FakeGetResult(["drawer"]) if self.written else _FakeGetResult()
+
+            def upsert(self, **kwargs):
+                self.written = True
+
+        palace = config.palace_path
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: _FakeCol())
+        result_box = {}
+
+        with palace_write_lock(palace, operation="repair"):
+            thread = threading.Thread(
+                target=lambda: result_box.setdefault(
+                    "result", mcp_server.tool_add_drawer("w", "r", "content")
+                )
+            )
+            thread.start()
+            time.sleep(0.1)
+            assert result_box == {}
+
+        thread.join(timeout=2)
+        assert result_box["result"]["success"] is True
+
     def test_add_drawer_shared_header_no_collision(self, monkeypatch, config, palace_path, kg):
         """Documents sharing a >100-char header must get distinct IDs (full-content hash)."""
         _patch_mcp_server(monkeypatch, config, kg)
@@ -660,6 +697,28 @@ class TestWriteTools:
 
         result = tool_delete_drawer("drawer_proj_backend_aaa")
         assert result["success"] is True
+        assert seeded_collection.count() == 3
+
+    def test_delete_drawer_waits_when_palace_write_lock_active(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_delete_drawer
+        from mempalace.palace import palace_write_lock
+
+        result_box = {}
+        with palace_write_lock(palace_path, operation="repair"):
+            thread = threading.Thread(
+                target=lambda: result_box.setdefault(
+                    "result", tool_delete_drawer("drawer_proj_backend_aaa")
+                )
+            )
+            thread.start()
+            time.sleep(0.1)
+            assert result_box == {}
+
+        thread.join(timeout=3)
+        assert result_box["result"]["success"] is True
         assert seeded_collection.count() == 3
 
     def test_delete_drawer_not_found(self, monkeypatch, config, palace_path, seeded_collection, kg):
@@ -898,6 +957,25 @@ class TestKGTools:
             valid_from="2025-01-01",
         )
         assert result["success"] is True
+
+    def test_kg_add_waits_when_palace_write_lock_active(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_kg_add
+        from mempalace.palace import palace_write_lock
+
+        result_box = {}
+        with palace_write_lock(palace_path, operation="repair"):
+            thread = threading.Thread(
+                target=lambda: result_box.setdefault(
+                    "result", tool_kg_add("Alice", "likes", "coffee")
+                )
+            )
+            thread.start()
+            time.sleep(0.1)
+            assert result_box == {}
+
+        thread.join(timeout=2)
+        assert result_box["result"]["success"] is True
 
     def test_kg_query(self, monkeypatch, config, palace_path, seeded_kg):
         _patch_mcp_server(monkeypatch, config, seeded_kg)
@@ -1282,6 +1360,27 @@ class TestDiaryTools:
         assert r["total"] == 1
         assert r["entries"][0]["topic"] == "architecture"
         assert "authentication" in r["entries"][0]["content"]
+
+    def test_diary_write_waits_when_palace_write_lock_active(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_diary_write
+        from mempalace.palace import palace_write_lock
+
+        result_box = {}
+        with palace_write_lock(palace_path, operation="repair"):
+            thread = threading.Thread(
+                target=lambda: result_box.setdefault(
+                    "result", tool_diary_write("TestAgent", "SESSION:test", topic="status")
+                )
+            )
+            thread.start()
+            time.sleep(0.1)
+            assert result_box == {}
+
+        thread.join(timeout=3)
+        assert result_box["result"]["success"] is True
 
     def test_diary_read_empty(self, monkeypatch, config, palace_path, kg):
         _patch_mcp_server(monkeypatch, config, kg)
