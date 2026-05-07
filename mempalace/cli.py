@@ -31,6 +31,7 @@ Examples:
 
 import os
 import sys
+import json
 import shlex
 import argparse
 from pathlib import Path
@@ -39,6 +40,215 @@ from .config import MempalaceConfig
 from .corpus_origin import detect_origin_heuristic, detect_origin_llm
 from .llm_client import LLMError, get_provider
 from .version import __version__
+
+
+# ==================== DAEMON ROUTING ====================
+# When ``PALACE_DAEMON_URL`` is set, palace-daemon is the single writer
+# for the canonical palace and high-traffic CLI subcommands route there
+# instead of opening a local chromadb client. Mirrors the gate already
+# in ``mempalace.hooks_cli`` (mining side) and
+# ``mempalace.mcp_server`` (MCP dispatch). Currently routes ``status``,
+# ``search``, and ``mine``; the remaining subcommands (``repair``,
+# ``export``, ``sweep``, ``init``) still need on-host filesystem access
+# and stay local. When the daemon URL is unset, all paths run locally
+# unchanged.
+
+_DAEMON_TIMEOUT_DEFAULT = 120  # seconds; tune via PALACE_MCP_TIMEOUT
+
+
+class DaemonError(RuntimeError):
+    """Raised when a daemon HTTP call fails or returns a JSON-RPC error."""
+
+
+def _daemon_strict() -> bool:
+    """True when ``PALACE_DAEMON_URL`` is set and strict mode is enabled.
+
+    Set ``PALACE_DAEMON_STRICT=0`` to opt out and force the local-palace
+    path even when the daemon URL is configured.
+    """
+    return (
+        os.environ.get("PALACE_DAEMON_URL", "").strip() != ""
+        and os.environ.get("PALACE_DAEMON_STRICT", "1") != "0"
+    )
+
+
+def _daemon_url() -> str:
+    return os.environ.get("PALACE_DAEMON_URL", "").strip().rstrip("/")
+
+
+def _daemon_timeout() -> int:
+    raw = os.environ.get("PALACE_MCP_TIMEOUT", str(_DAEMON_TIMEOUT_DEFAULT))
+    try:
+        return int(raw)
+    except ValueError:
+        return _DAEMON_TIMEOUT_DEFAULT
+
+
+def _call_daemon_tool(name: str, arguments: dict) -> dict:
+    """JSON-RPC ``tools/call`` against the daemon's ``/mcp`` endpoint.
+
+    Returns the inner tool result already parsed from the JSON text
+    payload (the ``content[0].text`` envelope MCP wraps every tool
+    response in). Raises :class:`DaemonError` on network failure or a
+    JSON-RPC error response — the CLI must surface failures to the
+    caller, never silently fall back to local (that would re-introduce
+    the split-brain that daemon-strict was created to prevent).
+    """
+    import urllib.error
+    import urllib.request
+
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": name, "arguments": arguments},
+    }
+    headers = {"content-type": "application/json"}
+    api_key = os.environ.get("PALACE_API_KEY", "").strip()
+    if api_key:
+        headers["x-api-key"] = api_key
+    req = urllib.request.Request(
+        f"{_daemon_url()}/mcp",
+        data=json.dumps(request).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=_daemon_timeout()) as resp:
+            body = resp.read()
+        envelope = json.loads(body.decode("utf-8", errors="replace"))
+    except (urllib.error.URLError, ConnectionError, OSError, json.JSONDecodeError) as e:
+        raise DaemonError(f"daemon unreachable at {_daemon_url()}: {e}") from e
+    if "error" in envelope:
+        err = envelope["error"]
+        raise DaemonError(f"daemon error {err.get('code')}: {err.get('message')}")
+    content = (envelope.get("result") or {}).get("content") or []
+    if not content:
+        return {}
+    text = content[0].get("text") or ""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # Non-JSON tool output (rare). Return as-is for the caller to
+        # decide what to do.
+        return {"_raw": text}
+
+
+def _post_daemon_mine_cli(directory: str, wing: str, mode: str = "convos") -> bool:
+    """POST a mine request to the daemon's ``/mine`` endpoint.
+
+    CLI-shaped variant of :func:`mempalace.hooks_cli._post_daemon_mine`:
+    on failure, prints to stderr and returns ``False`` so the caller can
+    ``sys.exit(1)``. Hooks_cli's version logs to a file and swallows
+    silently because a missed-mine isn't worth crashing a hook over;
+    here, the user invoked `mempalace mine` and expects to see errors.
+    """
+    import urllib.error
+    import urllib.request
+
+    headers = {"content-type": "application/json"}
+    api_key = os.environ.get("PALACE_API_KEY", "").strip()
+    if api_key:
+        headers["x-api-key"] = api_key
+    req = urllib.request.Request(
+        f"{_daemon_url()}/mine",
+        data=json.dumps({"dir": directory, "wing": wing, "mode": mode}).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=_daemon_timeout()) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+        print(f"  Daemon mine accepted: {body[:200]}")
+        return True
+    except (urllib.error.URLError, ConnectionError, OSError) as e:
+        print(f"  ERROR: daemon mine failed: {e}", file=sys.stderr)
+        return False
+
+
+def _print_daemon_status(data: dict) -> None:
+    """Format ``mempalace_status`` JSON for human reading.
+
+    The daemon's status tool returns a flat ``wings: {name: count}``
+    dict (not the wing×room nested shape that ``miner.status`` builds
+    from raw metadata). We print the daemon's shape rather than
+    over-fetching to reconstruct the local layout — the daemon URL is
+    visible in the header so the reader knows which view they're
+    looking at.
+    """
+    import json as _json
+
+    total = data.get("total_drawers", 0)
+    wings = data.get("wings") or {}
+    print(f"\n{'=' * 55}")
+    print(f"  MemPalace Status — {total} drawers")
+    print(f"  via palace-daemon @ {_daemon_url()}")
+    print(f"{'=' * 55}\n")
+    if isinstance(wings, dict) and wings:
+        for wing, count in sorted(wings.items(), key=lambda kv: kv[1], reverse=True):
+            if isinstance(count, dict):
+                # Defensive: if a future daemon returns wing×room nested,
+                # still render something useful.
+                inner = count.get("total", sum((count.get("rooms") or {}).values()))
+                print(f"  WING: {wing:30} {inner:>6} drawers")
+            else:
+                print(f"  WING: {wing:30} {count:>6} drawers")
+    elif "error" in data:
+        print(f"  daemon reported error: {data['error']}")
+    else:
+        # Surface unexpected shapes verbatim.
+        print(_json.dumps(data, indent=2))
+    print(f"\n{'=' * 55}\n")
+
+
+def _print_daemon_search(query: str, data: dict, wing: str = None, room: str = None) -> None:
+    """Format ``mempalace_search`` JSON; mirrors ``searcher.search`` output."""
+    if "error" in data and not data.get("results"):
+        print(f"\n  {data['error']}")
+        if "hint" in data:
+            print(f"  {data['hint']}")
+        raise DaemonError(data["error"])
+
+    hits = data.get("results") or []
+    warnings = data.get("warnings") or []
+
+    if not hits:
+        print(f'\n  No results found for: "{query}"')
+        for w in warnings:
+            print(f"  ! {w}")
+        return
+
+    print(f"\n{'=' * 60}")
+    print(f'  Results for: "{query}"')
+    if wing:
+        print(f"  Wing: {wing}")
+    if room:
+        print(f"  Room: {room}")
+    if data.get("available_in_scope") is not None:
+        print(f"  Scope has: {data['available_in_scope']} drawers matching filter")
+    if warnings:
+        for w in warnings:
+            print(f"  ! {w}")
+    print(f"  via palace-daemon @ {_daemon_url()}")
+    print(f"{'=' * 60}\n")
+
+    for i, hit in enumerate(hits, 1):
+        print(f"  [{i}] {hit.get('wing', '?')} / {hit.get('room', '?')}")
+        print(f"      Source: {hit.get('source_file', '?')}")
+        sim = hit.get("similarity")
+        bm25 = hit.get("bm25_score")
+        if sim is not None and bm25 is not None:
+            print(f"      Match:  cosine={sim}  bm25={bm25}")
+        elif sim is not None:
+            print(f"      Match:  {sim}")
+        elif bm25 is not None:
+            print(f"      BM25:   {bm25}  (matched_via: {hit.get('matched_via', 'drawer')})")
+        print()
+        for line in (hit.get("text") or "").strip().split("\n"):
+            print(f"      {line}")
+        print()
+        print(f"  {'─' * 56}")
+    print()
 
 
 _MEMPALACE_PROJECT_FILES = ("mempalace.yaml", "entities.json")
@@ -487,6 +697,39 @@ def _maybe_run_mine_after_init(args, cfg) -> None:
 
 
 def cmd_mine(args):
+    if _daemon_strict() and not args.palace:
+        # Daemon-strict: route to /mine. The daemon owns the canonical
+        # palace and its filesystem layout, and translates client-side
+        # paths via PALACE_DAEMON_PATH_MAP. Flags that only make sense
+        # on the local FS (--redetect-origin, --include-ignored,
+        # --no-gitignore, --dry-run) are warned about but not passed —
+        # the daemon's /mine endpoint does not expose them.
+        ignored_flags = []
+        if getattr(args, "redetect_origin", False):
+            ignored_flags.append("--redetect-origin")
+        if getattr(args, "dry_run", False):
+            ignored_flags.append("--dry-run")
+        if getattr(args, "no_gitignore", False):
+            ignored_flags.append("--no-gitignore")
+        if getattr(args, "include_ignored", None):
+            ignored_flags.append("--include-ignored")
+        if ignored_flags:
+            print(
+                f"  WARN: daemon-strict mode ignores these local-only flags: {', '.join(ignored_flags)}",
+                file=sys.stderr,
+            )
+
+        directory = os.path.abspath(os.path.expanduser(args.dir))
+        wing = args.wing
+        if not wing:
+            # Match local-mine semantics: derive wing from directory name
+            # the same way miner / convo_miner do when --wing is omitted.
+            from .config import normalize_wing_name
+
+            wing = normalize_wing_name(Path(directory).name)
+        ok = _post_daemon_mine_cli(directory, wing=wing, mode=args.mode)
+        sys.exit(0 if ok else 1)
+
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     include_ignored = []
     for raw in args.include_ignored or []:
@@ -572,6 +815,20 @@ def cmd_sweep(args):
 
 
 def cmd_search(args):
+    if _daemon_strict() and not args.palace:
+        arguments = {"query": args.query, "max_results": args.results}
+        if args.wing:
+            arguments["wing"] = args.wing
+        if args.room:
+            arguments["room"] = args.room
+        try:
+            data = _call_daemon_tool("mempalace_search", arguments)
+            _print_daemon_search(args.query, data, wing=args.wing, room=args.room)
+        except DaemonError as e:
+            print(f"\n  ERROR: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
     from .searcher import search, SearchError
 
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
@@ -743,6 +1000,17 @@ def cmd_purge(args):
 
 
 def cmd_status(args):
+    if _daemon_strict() and not args.palace:
+        # --palace overrides routing: an explicit local-path argument
+        # means the user wants to inspect THAT palace, not the daemon.
+        try:
+            data = _call_daemon_tool("mempalace_status", {})
+        except DaemonError as e:
+            print(f"\n  ERROR: {e}", file=sys.stderr)
+            sys.exit(1)
+        _print_daemon_status(data)
+        return
+
     from .miner import status
 
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
