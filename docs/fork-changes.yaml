@@ -24,6 +24,114 @@
 
 entries:
 
+  - id: cli-daemon-routing
+    date: 2026-05-07
+    bucket: Added
+    commit: 22ef562
+    area: CLI
+    summary: "daemon-route `mempalace status` / `search` / `mine` when PALACE_DAEMON_URL is set"
+    body: |
+      Companion to the `mcp_server` routing in commit `41359ba`. Closes
+      the last desktop-side path that opened a local chromadb client.
+
+      Adds `_daemon_strict()`, `_call_daemon_tool()`,
+      `_post_daemon_mine_cli()` helpers in `cli.py` mirroring the gate
+      already in `mempalace.hooks_cli` and `mempalace.mcp_server`.
+      `cmd_status`, `cmd_search`, `cmd_mine` route through the daemon
+      when `PALACE_DAEMON_URL` is set:
+
+      - Read paths (`status`, `search`) → JSON-RPC `tools/call` against
+        the daemon's `/mcp` endpoint. Output is formatted to match
+        the local `miner.status` / `searcher.search` printers — same
+        human-readable shape, with the daemon URL surfaced in the
+        header so the reader knows which view they're looking at.
+
+      - Write path (`mine`) → POST `/mine` (same endpoint
+        `hooks_cli._post_daemon_mine` already uses). CLI-friendly
+        errors print to stderr and exit non-zero; hooks_cli's variant
+        logs silently because a missed-mine isn't worth crashing a
+        hook.
+
+      `--palace <path>` always overrides routing — explicit path
+      means the user asked for THAT palace, not the canonical one.
+
+      Local-only commands (`init`, `repair`, `export`, `sweep`,
+      `purge`, `mined`, `wakeup`) stay local because they need on-host
+      filesystem access (HNSW rebuild, palace dump, sweeper
+      deduplication state). When `mempalace-data/` is archived those
+      commands will fail with "no palace found" until pointed
+      elsewhere with `--palace` — that's the right "your data is at
+      the daemon, not local" signpost.
+
+      Live smoke against `disks.jphe.in:8085`: `mempalace status`
+      returns 160,351 drawers, `mempalace search "daemon routing"`
+      returns properly-formatted hits.
+    tests: |
+      14 new tests in `tests/test_cli_daemon.py` — gate semantics,
+      `_call_daemon_tool` body shape + JSON-RPC error surfacing,
+      `_post_daemon_mine_cli` body shape + stderr-on-failure, mine
+      routing in both projects and convos modes, fall-through-to-local
+      when env var is unset. Suite 1591 passed (1577 + 14 new).
+    files:
+      - mempalace/cli.py
+      - tests/test_cli_daemon.py
+
+  - id: mcp-server-daemon-routing
+    date: 2026-05-07
+    bucket: Added
+    commit: 41359ba
+    area: Reliability
+    summary: "daemon-route `mcp_server.py` via the `handle_request` JSON-RPC chokepoint"
+    body: |
+      Mirrors the `PALACE_DAEMON_URL` gate that `hooks_cli.py` shipped
+      on 2026-04-24 (the daemon-strict fix for the HNSW drift
+      incident). Closes the last in-process write path inside
+      `mempalace.mcp_server` that bypassed the daemon.
+
+      Adds `_daemon_strict()` and `_forward_to_daemon()` helpers and
+      gates at the JSON-RPC chokepoint in `handle_request()`: when
+      `PALACE_DAEMON_URL` is set and `PALACE_DAEMON_STRICT != "0"`,
+      every method (`initialize`, `tools/list`, `tools/call`, `ping`)
+      is forwarded to palace-daemon's `/mcp` proxy and the daemon's
+      response is returned verbatim. Notifications skip the network
+      round-trip per JSON-RPC spec.
+
+      Single chokepoint at `handle_request` is functionally equivalent
+      to per-handler gates — every JSON-RPC method funnels through it
+      — and avoids 30+ duplicated branches across the TOOLS dispatch.
+      No local chromadb client opens in strict mode. Startup
+      `_refresh_vector_disabled_flag()` HNSW probe is skipped when
+      daemon-strict (the daemon owns its palace's capacity).
+
+      `tests/conftest.py` updated to scrub
+      `PALACE_DAEMON_URL`/`PALACE_DAEMON_STRICT`/`PALACE_API_KEY` at
+      module load (matching the existing HOME-redirect pattern) so
+      existing local-path tests don't accidentally hit the live
+      daemon when run from a shell where the env var is set.
+
+      Pitchable upstream as a single-file replacement for the
+      standalone `palace-daemon/clients/mempalace-mcp.py` bridge —
+      anyone running `python -m mempalace.mcp_server` with the env
+      var set now gets daemon proxying natively.
+
+      Also: `~/.mempalace/config.json` had its `palace_path` key
+      removed (was pinning `/home/jp/Projects/mempalace-data/palace`);
+      falls back to default `~/.mempalace/palace`. With row 34 also
+      shipped, `mempalace-data/` (308 MB) has no live consumers and
+      is archivable.
+    tests: |
+      15 new tests in `tests/test_mcp_server_daemon.py` — gate
+      semantics, `_forward_to_daemon` body shape, network-failure
+      surfacing as JSON-RPC error envelope, forwarded
+      `initialize`/`tools/call`/error propagation, sentinel TOOLS
+      patch proving no local handler runs in strict mode. End-to-end
+      smoke against `disks.jphe.in:8085` returns 160,351 drawers
+      from the canonical palace. Suite 1577 passed.
+    files:
+      - mempalace/mcp_server.py
+      - tests/conftest.py
+      - tests/test_mcp_server_daemon.py
+
   - id: verbatim-mode-toggle
     date: 2026-05-05
     bucket: Added
