@@ -1,5 +1,6 @@
 """ChromaDB-backed MemPalace storage backend (RFC 001 reference implementation)."""
 
+import contextlib
 import datetime as _dt
 import logging
 import os
@@ -8,6 +9,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import chromadb
+from chromadb.errors import NotFoundError as _ChromaNotFoundError
 
 from .base import (
     BaseBackend,
@@ -675,11 +677,58 @@ def _as_list(v: Any) -> list:
     return [v]
 
 
-class ChromaCollection(BaseCollection):
-    """Thin adapter translating ChromaDB dict returns into typed results."""
+def _close_client(client) -> None:
+    """Call ``PersistentClient.close()`` if available, swallow otherwise.
 
-    def __init__(self, collection):
+    chromadb 1.5.x exposes ``Client.close()`` to release rust-side SQLite
+    file locks; older versions relied on GC. Try/except keeps forward-compat.
+    """
+    if client is None:
+        return
+    try:
+        client.close()
+    except Exception:
+        logger.debug("client.close() unavailable or failed", exc_info=True)
+
+
+class ChromaCollection(BaseCollection):
+    """Thin adapter translating ChromaDB dict returns into typed results.
+
+    When ``palace_path`` is set, all write methods (``add``, ``upsert``,
+    ``update``, ``delete``) acquire ``mine_palace_lock(palace_path)`` for the
+    duration of the underlying chromadb call. This serializes MCP and other
+    direct-backend writers against ``mempalace mine`` and against each other,
+    closing the race between concurrent writers that triggers ChromaDB's
+    multi-threaded HNSW corruption (#974/#965).
+
+    The lock is the same primitive used by ``miner.mine()`` so re-entrant
+    acquisition from inside the mine pipeline (mine -> _mine_body ->
+    collection.upsert) is short-circuited by the per-thread guard inside
+    ``mine_palace_lock`` — no self-deadlock.
+
+    ``palace_path=None`` disables the wrapping, preserving the legacy
+    no-lock behaviour for callers that construct a ``ChromaCollection``
+    directly without going through ``ChromaBackend``.
+    """
+
+    def __init__(self, collection, palace_path: Optional[str] = None):
         self._collection = collection
+        self._palace_path = palace_path
+
+    @contextlib.contextmanager
+    def _write_lock(self):
+        """Acquire ``mine_palace_lock`` for the configured palace, if any.
+
+        No-op (yields immediately) when ``self._palace_path`` is None.
+        """
+        if self._palace_path is None:
+            yield
+            return
+        # Late import — palace.py imports ChromaBackend from this module.
+        from ..palace import mine_palace_lock
+
+        with mine_palace_lock(self._palace_path):
+            yield
 
     # ------------------------------------------------------------------
     # Writes
@@ -691,7 +740,8 @@ class ChromaCollection(BaseCollection):
             kwargs["metadatas"] = metadatas
         if embeddings is not None:
             kwargs["embeddings"] = embeddings
-        self._collection.add(**kwargs)
+        with self._write_lock():
+            self._collection.add(**kwargs)
 
     def upsert(self, *, documents, ids, metadatas=None, embeddings=None):
         kwargs: dict[str, Any] = {"documents": documents, "ids": ids}
@@ -699,7 +749,8 @@ class ChromaCollection(BaseCollection):
             kwargs["metadatas"] = metadatas
         if embeddings is not None:
             kwargs["embeddings"] = embeddings
-        self._collection.upsert(**kwargs)
+        with self._write_lock():
+            self._collection.upsert(**kwargs)
 
     def update(
         self,
@@ -718,7 +769,8 @@ class ChromaCollection(BaseCollection):
             kwargs["metadatas"] = metadatas
         if embeddings is not None:
             kwargs["embeddings"] = embeddings
-        self._collection.update(**kwargs)
+        with self._write_lock():
+            self._collection.update(**kwargs)
 
     # ------------------------------------------------------------------
     # Reads
@@ -862,7 +914,8 @@ class ChromaCollection(BaseCollection):
             kwargs["ids"] = ids
         if where is not None:
             kwargs["where"] = where
-        self._collection.delete(**kwargs)
+        with self._write_lock():
+            self._collection.delete(**kwargs)
 
     def count(self):
         return self._collection.count()
@@ -976,7 +1029,7 @@ class ChromaBackend(BaseBackend):
         db_path = os.path.join(palace_path, "chroma.sqlite3")
         # DB was present when cache was built but is now missing → invalidate.
         if cached is not None and not os.path.isfile(db_path):
-            self._clients.pop(palace_path, None)
+            _close_client(self._clients.pop(palace_path, None))
             self._freshness.pop(palace_path, None)
             cached = None
             cached_inode, cached_mtime = 0, 0.0
@@ -992,7 +1045,7 @@ class ChromaBackend(BaseBackend):
         )
 
         if cached is None or inode_changed or mtime_changed or mtime_appeared:
-            _fix_blob_seq_ids(palace_path)
+            ChromaBackend._prepare_palace_for_open(palace_path)
             cached = chromadb.PersistentClient(path=palace_path)
             self._clients[palace_path] = cached
             # Re-stat after the client constructor runs: chromadb creates
@@ -1028,6 +1081,31 @@ class ChromaBackend(BaseBackend):
     _quarantined_paths: set[str] = set()
 
     @staticmethod
+    def _prepare_palace_for_open(palace_path: str) -> None:
+        """Run the pre-open safety pass shared by :meth:`make_client` and
+        :meth:`_client`.
+
+        Two steps, both required before constructing a ``PersistentClient``:
+
+        1. ``_fix_blob_seq_ids`` — repairs the BLOB seq_id quirk that bites
+           certain chromadb migrations.
+        2. ``quarantine_stale_hnsw`` — gated by :attr:`_quarantined_paths` so
+           it fires once per palace per process. This is the SIGSEGV
+           prevention path for stale HNSW segments (see #1121, #1132, #1263);
+           wiring it through this helper means CLI mining, search, repair,
+           and status all benefit, not just the legacy ``make_client``
+           callers.
+
+        Idempotent: safe to call from any code path that is about to open or
+        re-open a palace. The ``_quarantined_paths`` gate prevents thrash on
+        hot paths (e.g. ``_client()`` is called on every backend operation).
+        """
+        _fix_blob_seq_ids(palace_path)
+        if palace_path not in ChromaBackend._quarantined_paths:
+            quarantine_stale_hnsw(palace_path)
+            ChromaBackend._quarantined_paths.add(palace_path)
+
+    @staticmethod
     def make_client(palace_path: str):
         """Create a fresh ``PersistentClient`` (fixes BLOB seq_ids first).
 
@@ -1039,10 +1117,7 @@ class ChromaBackend(BaseBackend):
         :attr:`_quarantined_paths` for the rationale (cold-start protection
         vs. runtime thrash on steady-write daemons).
         """
-        _fix_blob_seq_ids(palace_path)
-        if palace_path not in ChromaBackend._quarantined_paths:
-            quarantine_stale_hnsw(palace_path)
-            ChromaBackend._quarantined_paths.add(palace_path)
+        ChromaBackend._prepare_palace_for_open(palace_path)
         return chromadb.PersistentClient(path=palace_path)
 
     @staticmethod
@@ -1093,29 +1168,40 @@ class ChromaBackend(BaseBackend):
         ef_kwargs = {"embedding_function": ef} if ef is not None else {}
 
         if create:
-            collection = client.get_or_create_collection(
-                collection_name,
-                metadata={
-                    "hnsw:space": hnsw_space,
-                    "hnsw:num_threads": 1,
-                    **_HNSW_BLOAT_GUARD,
-                },
-                **ef_kwargs,
-            )
+            try:
+                collection = client.get_collection(collection_name, **ef_kwargs)
+            except _ChromaNotFoundError:
+                collection = client.create_collection(
+                    collection_name,
+                    metadata={
+                        "hnsw:space": hnsw_space,
+                        "hnsw:num_threads": 1,
+                        **_HNSW_BLOAT_GUARD,
+                    },
+                    **ef_kwargs,
+                )
         else:
             collection = client.get_collection(collection_name, **ef_kwargs)
         _pin_hnsw_threads(collection)
-        return ChromaCollection(collection)
+        return ChromaCollection(collection, palace_path=palace_path)
 
     def close_palace(self, palace) -> None:
-        """Drop cached handles for ``palace``. Accepts ``PalaceRef`` or legacy path str."""
+        """Drop cached handles for ``palace`` and release its SQLite file lock.
+
+        Accepts ``PalaceRef`` or legacy path str. chromadb's rust-side file
+        lock is held until ``PersistentClient.close()`` is called, so plain
+        dict eviction would leave the palace path unreopenable and
+        unremovable in the same process.
+        """
         path = palace.local_path if isinstance(palace, PalaceRef) else palace
         if path is None:
             return
-        self._clients.pop(path, None)
+        _close_client(self._clients.pop(path, None))
         self._freshness.pop(path, None)
 
     def close(self) -> None:
+        for client in self._clients.values():
+            _close_client(client)
         self._clients.clear()
         self._freshness.clear()
         self._closed = True
@@ -1156,7 +1242,7 @@ class ChromaBackend(BaseBackend):
             },
             **ef_kwargs,
         )
-        return ChromaCollection(collection)
+        return ChromaCollection(collection, palace_path=palace_path)
 
 
 def _normalize_get_collection_args(args, kwargs):

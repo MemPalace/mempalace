@@ -232,6 +232,13 @@ def cmd_init(args):
     from .project_scanner import discover_entities
     from .room_detector_local import detect_rooms_local
 
+    # Honor --palace (issue #1313): without this, init silently ignored the
+    # flag and always used ~/.mempalace. Mirror the env-var pattern used by
+    # mcp_server.py so every downstream read of ``cfg.palace_path`` (Pass 0,
+    # cfg.init(), the post-init mine) routes to the user-specified location.
+    if getattr(args, "palace", None):
+        os.environ["MEMPALACE_PALACE_PATH"] = os.path.abspath(os.path.expanduser(args.palace))
+
     cfg = MempalaceConfig()
 
     # Resolve entity-detection languages: --lang overrides config.
@@ -310,8 +317,7 @@ def cmd_init(args):
                 )
         except LLMError as e:
             print(
-                f"  LLM init failed ({e}). "
-                f"Running heuristics-only — pass --no-llm to silence this."
+                f"  LLM init failed ({e}). Running heuristics-only — pass --no-llm to silence this."
             )
 
     # Pass 0: detect whether the corpus is AI-dialogue. Writes
@@ -902,7 +908,7 @@ def cmd_compress(args):
     # Store compressed versions (unless dry-run)
     if not args.dry_run:
         try:
-            comp_col = backend.get_or_create_collection(palace_path, "mempalace_compressed")
+            comp_col = backend.get_or_create_collection(palace_path, "mempalace_closets")
             for doc_id, compressed, meta, stats in compressed_entries:
                 comp_meta = dict(meta)
                 comp_meta["compression_ratio"] = round(stats["size_ratio"], 1)
@@ -913,7 +919,7 @@ def cmd_compress(args):
                     metadatas=[comp_meta],
                 )
             print(
-                f"  Stored {len(compressed_entries)} compressed drawers in 'mempalace_compressed' collection."
+                f"  Stored {len(compressed_entries)} compressed drawers in 'mempalace_closets' collection."
             )
         except Exception as e:
             print(f"  Error storing compressed drawers: {e}")
@@ -929,7 +935,25 @@ def cmd_compress(args):
         print("  (dry run -- nothing stored)")
 
 
+def _reconfigure_stdio_utf8_on_windows():
+    """Decode stdio as UTF-8 on Windows for the primary `mempalace` CLI.
+
+    Thin wrapper around the shared helper in ``mempalace._stdio``. The CLI
+    overrides stdout/stderr to ``replace`` because ``mempalace search``
+    prints verbatim drawer text that may carry surrogate halves
+    round-tripped from filenames -- ``strict`` would crash mid-print and
+    lose the rest of the search result block. stdin keeps the default
+    ``surrogateescape`` so a redirected non-UTF-8 file does not kill the
+    read on the first bad byte.
+    """
+    from ._stdio import reconfigure_stdio_utf8_on_windows
+
+    reconfigure_stdio_utf8_on_windows(stdout_errors="replace", stderr_errors="replace")
+
+
 def main():
+    _reconfigure_stdio_utf8_on_windows()
+
     version_label = f"MemPalace {__version__}"
     parser = argparse.ArgumentParser(
         description="MemPalace — Give your AI a memory. No API key required.",

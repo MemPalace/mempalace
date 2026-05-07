@@ -120,6 +120,65 @@ class TestSearchMemories:
         assert none_hit["wing"] == "unknown"
         assert none_hit["room"] == "unknown"
 
+    def test_effective_distance_clamped_to_valid_cosine_range(self):
+        """A strong closet boost (up to 0.40) applied to a low-distance drawer
+        can drive ``dist - boost`` negative. That violates the cosine-distance
+        invariant ``[0, 2]``: the API returns ``similarity > 1.0`` and the
+        internal ``_sort_key`` sinks below ordinary positive distances,
+        inverting the ranking so the best hybrid matches sort last.
+
+        With the clamp, ``effective_distance`` stays in ``[0, 2]``,
+        ``similarity`` stays in ``[0, 1]``, and the sort order is stable.
+        """
+        # Drawer a.md gets a tiny base distance (0.08) — nearly exact match.
+        # Drawer b.md gets a larger base distance (0.35).
+        drawers_col = MagicMock()
+        drawers_col.query.return_value = {
+            "documents": [["doc-a", "doc-b"]],
+            "metadatas": [
+                [
+                    {"source_file": "a.md", "wing": "w", "room": "r", "chunk_index": 0},
+                    {"source_file": "b.md", "wing": "w", "room": "r", "chunk_index": 0},
+                ]
+            ],
+            "distances": [[0.08, 0.35]],
+            "ids": [["d-a", "d-b"]],
+        }
+        # A strong closet at rank 0 points at a.md → boost = 0.40,
+        # which exceeds a.md's base distance and would go negative without
+        # the clamp. No closet for b.md.
+        closets_col = MagicMock()
+        closets_col.query.return_value = {
+            "documents": [["closet-preview-a"]],
+            "metadatas": [[{"source_file": "a.md"}]],
+            "distances": [[0.2]],  # within CLOSET_DISTANCE_CAP (1.5)
+            "ids": [["c-a"]],
+        }
+
+        with (
+            patch("mempalace.searcher.get_collection", return_value=drawers_col),
+            patch("mempalace.searcher.get_closets_collection", return_value=closets_col),
+        ):
+            result = search_memories("query", "/fake/path", n_results=5)
+
+        hits = result["results"]
+        assert hits, "should return results"
+
+        # Invariants on every hit.
+        for h in hits:
+            assert (
+                0.0 <= h["similarity"] <= 1.0
+            ), f"similarity out of range: {h['similarity']} for {h['source_file']}"
+            assert 0.0 <= h["effective_distance"] <= 2.0, (
+                f"effective_distance out of range: {h['effective_distance']} "
+                f"for {h['source_file']}"
+            )
+
+        # With the clamp, the closet-boosted a.md still ranks ahead of b.md —
+        # the boost still wins, but it no longer flips the ranking.
+        assert hits[0]["source_file"] == "a.md"
+        assert hits[0]["matched_via"] == "drawer+closet"
+
 
 # ── BM25 internals: None / empty document safety ─────────────────────
 

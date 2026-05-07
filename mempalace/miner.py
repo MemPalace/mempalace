@@ -12,6 +12,7 @@ import sys
 import shlex
 import hashlib
 import fnmatch
+import logging
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
@@ -30,6 +31,8 @@ from .palace import (
     purge_file_closets,
     upsert_closet_lines,
 )
+
+logger = logging.getLogger("mempalace_mcp")
 
 READABLE_EXTENSIONS = {
     ".txt",
@@ -842,7 +845,7 @@ def process_file(
         try:
             collection.delete(where={"source_file": source_file})
         except Exception:
-            pass
+            logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
 
         # Batch chunks into bounded upserts so the embedding model sees many
         # chunks per forward pass without building one huge Chroma/SQLite

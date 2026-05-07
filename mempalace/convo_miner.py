@@ -11,6 +11,7 @@ Same palace as project mining. Different ingest strategy.
 import os
 import sys
 import hashlib
+import logging
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
@@ -23,6 +24,8 @@ from .palace import (
     get_collection,
     mine_lock,
 )
+
+logger = logging.getLogger("mempalace_mcp")
 
 
 # Cached hall keywords — avoids re-reading config per drawer
@@ -331,7 +334,7 @@ def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extr
         try:
             collection.delete(where={"source_file": source_file})
         except Exception:
-            pass
+            logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
 
         # Batch chunks into bounded upserts so large transcripts keep most of
         # the embedding speedup without one huge Chroma/SQLite request. Keep
