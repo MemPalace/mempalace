@@ -127,15 +127,19 @@ def test_confirm_from_sqlite_same_path_without_archive_does_not_prompt(capsys):
 def test_confirm_from_sqlite_canonicalizes_same_path(tmp_path, capsys):
     palace = tmp_path / "palace"
     palace.mkdir()
-    relative_palace = os.path.relpath(palace, Path.cwd())
+    original_cwd = Path.cwd()
+    os.chdir(tmp_path)
 
-    with patch("builtins.input", return_value="y"):
-        confirmed = _confirm_from_sqlite_rebuild(
-            palace_path=relative_palace,
-            source_path=str(palace.resolve()),
-            archive_existing=True,
-            assume_yes=False,
-        )
+    try:
+        with patch("builtins.input", return_value="y"):
+            confirmed = _confirm_from_sqlite_rebuild(
+                palace_path="palace",
+                source_path=str(palace.resolve()),
+                archive_existing=True,
+                assume_yes=False,
+            )
+    finally:
+        os.chdir(original_cwd)
 
     out = capsys.readouterr().out
     assert confirmed is True
@@ -1165,7 +1169,7 @@ def test_cmd_repair_staging_failure_suggests_sqlite_recovery(mock_config_cls, tm
     assert excinfo.value.code == 1
     assert "Live collection was not replaced" in out
     assert (
-        f"mempalace --palace {str(palace_dir)} repair --mode from-sqlite --archive-existing --yes"
+        f"mempalace --palace {shlex.quote(str(palace_dir))} repair --mode from-sqlite --archive-existing --yes"
     ) in out
     assert mock_backend.delete_collection.call_args_list == [
         call(str(palace_dir), ANY),
@@ -1246,6 +1250,29 @@ def test_cmd_repair_releases_write_lock_on_backup_failure(mock_config_cls, tmp_p
     ):
         cmd_repair(args)
 
+    lock.__enter__.assert_called_once_with()
+    lock.__exit__.assert_called_once_with(None, None, None)
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_releases_write_lock_when_backend_init_fails(mock_config_cls, tmp_path):
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    sqlite3.connect(str(palace_dir / "chroma.sqlite3")).close()
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
+    args = argparse.Namespace(palace=None, yes=True)
+    lock = MagicMock()
+
+    with (
+        patch("mempalace.repair.sqlite_integrity_errors", return_value=[]),
+        patch("mempalace.palace.palace_write_lock", return_value=lock),
+        patch("mempalace.backends.chroma.ChromaBackend", side_effect=RuntimeError("init failed")),
+        pytest.raises(SystemExit) as excinfo,
+    ):
+        cmd_repair(args)
+
+    assert excinfo.value.code == 1
     lock.__enter__.assert_called_once_with()
     lock.__exit__.assert_called_once_with(None, None, None)
 

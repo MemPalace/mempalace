@@ -1242,9 +1242,7 @@ class ChromaBackend(BaseBackend):
         )
 
         if cached is None or inode_changed or mtime_changed or mtime_appeared:
-            ChromaBackend._prepare_palace_for_open(
-                palace_path, reset_quarantine=inode_changed
-            )
+            ChromaBackend._prepare_palace_for_open(palace_path, reset_quarantine=inode_changed)
             cached = chromadb.PersistentClient(path=palace_path)
             self._clients[palace_path] = cached
             # Re-stat after the client constructor runs: chromadb creates
@@ -1282,9 +1280,7 @@ class ChromaBackend(BaseBackend):
     _quarantined_paths: set[str] = set()
 
     @staticmethod
-    def _prepare_palace_for_open(
-        palace_path: str, *, reset_quarantine: bool = False
-    ) -> None:
+    def _prepare_palace_for_open(palace_path: str, *, reset_quarantine: bool = False) -> None:
         """Run the pre-open safety pass shared by :meth:`make_client` and
         :meth:`_client`.
 

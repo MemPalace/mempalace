@@ -29,6 +29,8 @@ Usage (from CLI):
     mempalace repair-prune --confirm
 """
 
+from __future__ import annotations
+
 import argparse
 import os
 import re
@@ -39,7 +41,6 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import datetime
-import re
 from typing import Callable, Iterator, Optional
 
 from chromadb.errors import NotFoundError as ChromaNotFoundError
@@ -1118,168 +1119,144 @@ def rebuild_index(
     palace_path = palace_path or _get_palace_path()
     collection_name = collection_name or _drawers_collection_name()
     try:
-        repair_lock = palace_write_lock(palace_path, operation="repair")
-        repair_lock.__enter__()
-    except PalaceWriteAlreadyRunning as exc:
-        print(f"\n  ABORT: {exc}")
-        return
-    lock_released = False
+        with palace_write_lock(palace_path, operation="repair"):
+            if not os.path.isdir(palace_path):
+                progress(f"\n  No palace found at {palace_path}")
+                return
 
-    def _release_repair_lock() -> None:
-        nonlocal lock_released
-        if not lock_released:
-            repair_lock.__exit__(None, None, None)
-            lock_released = True
+            progress(f"\n{'=' * 55}")
+            progress("  MemPalace Repair — Index Rebuild")
+            progress(f"{'=' * 55}\n")
+            progress(f" Palace: {palace_path}")
 
-    if not os.path.isdir(palace_path):
-        progress(f"\n  No palace found at {palace_path}")
-        _release_repair_lock()
-        return
+            # Run the SQLite integrity preflight before any chromadb client open.
+            # ChromaDB's rust binding raises pyo3_runtime.PanicException (which is
+            # not a regular Exception subclass) on a malformed page, propagating
+            # past the try/except around get_collection below. Catching the
+            # corruption here lets us surface the clear recovery instructions and
+            # exit cleanly before chromadb's compactor touches the disk.
+            sqlite_errors = sqlite_integrity_errors(palace_path)
+            if sqlite_errors:
+                print_sqlite_integrity_abort(palace_path, sqlite_errors)
+                return
 
-    progress(f"\n{'=' * 55}")
-    progress("  MemPalace Repair — Index Rebuild")
-    progress(f"{'=' * 55}\n")
-    progress(f" Palace: {palace_path}")
+            preflight = maybe_repair_poisoned_max_seq_id_before_rebuild(
+                palace_path,
+                assume_yes=True,
+            )
+            if preflight is not None:
+                return
 
-    # Run the SQLite integrity preflight before any chromadb client open.
-    # ChromaDB's rust binding raises pyo3_runtime.PanicException (which is
-    # not a regular Exception subclass) on a malformed page, propagating
-    # past the try/except around get_collection below. Catching the
-    # corruption here lets us surface the clear recovery instructions and
-    # exit cleanly before chromadb's compactor touches the disk.
-    sqlite_errors = sqlite_integrity_errors(palace_path)
-    if sqlite_errors:
-        print_sqlite_integrity_abort(palace_path, sqlite_errors)
-        _release_repair_lock()
-        return
-
-    preflight = maybe_repair_poisoned_max_seq_id_before_rebuild(
-        palace_path,
-        assume_yes=True,
-    )
-    if preflight is not None:
-        _release_repair_lock()
-        return
-
-    try:
-        backend = ChromaBackend()
-    except Exception:
-        _release_repair_lock()
-        raise
-    try:
-        col = backend.get_collection(palace_path, collection_name)
-        total = col.count()
-    except Exception as e:
-        progress(f"  Error reading palace: {e}")
-        progress("  Palace may need to be re-mined from source files.")
-        _release_repair_lock()
-        return
-
-    progress(f"  Drawers found: {total}")
-
-    if total == 0:
-        progress("  Nothing to repair.")
-        _release_repair_lock()
-        return
-
-    # Back up BEFORE creating the temp collection. The snapshot must represent
-    # the pre-repair palace, and backup failures must not leave temp HNSW files.
-    sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
-    backup_path = sqlite_path + ".backup"
-    if os.path.exists(sqlite_path):
-        try:
-            size_mb = os.path.getsize(sqlite_path) / 1e6
-            progress(f"  Backing up chroma.sqlite3 ({size_mb:.0f} MB)...")
-            shutil.copy2(sqlite_path, backup_path)
-        except Exception:
-            _release_repair_lock()
-            raise
-        progress(f"  Backup: {backup_path}")
-
-    # Stage drawers in batches. Keep batches bounded instead of materializing
-    # the full embedding matrix in Python memory.
-    progress("\n  Extracting drawers...")
-    batch_size = 5000
-    temp_col = None
-    temp_name = None
-    try:
-        temp_col, temp_name, extracted = _stage_collection_from_source(
-            backend,
-            palace_path,
-            col,
-            total,
-            batch_size,
-            collection_name,
-            include_embeddings=not reembed,
-            progress=progress,
-        )
-        progress(f"  Extracted {extracted} drawers")
-
-        # ── #1208 guard ──────────────────────────────────────────────
-        # Refuse to swap when extraction looks short of SQLite ground truth.
-        check_extraction_safety(
-            palace_path,
-            extracted,
-            confirm_truncation_ok,
-            collection_name=collection_name,
-        )
-    except TruncationDetected as e:
-        progress(e.message)
-        if temp_name is not None:
-            _delete_collection_if_exists(backend, palace_path, temp_name)
-        _release_repair_lock()
-        return
-    except Exception as exc:
-        if temp_name is not None:
-            _delete_collection_if_exists(backend, palace_path, temp_name)
-        e = RebuildCollectionError(str(exc), live_replaced=False)
-        progress(f"\n  ERROR during rebuild: {e}")
-        progress("  Rebuild aborted before completion.")
-        progress("  Live collection was not replaced; leaving the original palace untouched.")
-        _release_repair_lock()
-        raise e
-
-    progress("  Rebuilding collection with hnsw:space=cosine...")
-    try:
-        filed = _swap_temp_collection_into_live(
-            backend,
-            palace_path,
-            temp_col,
-            temp_name,
-            collection_name,
-            extracted,
-            progress=progress,
-        )
-    except Exception as exc:
-        e = (
-            exc
-            if isinstance(exc, RebuildCollectionError)
-            else RebuildCollectionError(str(exc), live_replaced=False)
-        )
-        progress(f"\n  ERROR during rebuild: {e}")
-        progress("  Rebuild aborted before completion.")
-        if e.live_replaced and os.path.exists(backup_path):
-            progress(f"  Restoring from backup: {backup_path}")
+            backend = ChromaBackend()
             try:
-                _close_chroma_handles(palace_path, backend=backend)
-                _delete_collection_if_exists(backend, palace_path, temp_name)
-                _delete_collection_if_exists(backend, palace_path, collection_name)
-                shutil.copy2(backup_path, sqlite_path)
-                progress("  Backup restored. Palace is back to pre-repair state.")
-            except Exception as restore_error:
-                progress(f"  Backup restore failed: {restore_error}")
-                progress(f"  Manual restore required from: {backup_path}")
-        elif not e.live_replaced:
-            progress("  Live collection was not replaced; leaving the original palace untouched.")
-        else:
-            progress("  No backup available. Re-mine from source files to recover.")
-        _release_repair_lock()
-        raise e
+                col = backend.get_collection(palace_path, collection_name)
+                total = col.count()
+            except Exception as e:
+                progress(f"  Error reading palace: {e}")
+                progress("  Palace may need to be re-mined from source files.")
+                return
 
-    progress(f"\n  Repair complete. {filed} drawers rebuilt.")
-    progress("  HNSW index is now clean with cosine distance metric.")
-    progress(f"\n{'=' * 55}\n")
-    _release_repair_lock()
+            progress(f"  Drawers found: {total}")
+
+            if total == 0:
+                progress("  Nothing to repair.")
+                return
+
+            # Back up BEFORE creating the temp collection. The snapshot must represent
+            # the pre-repair palace, and backup failures must not leave temp HNSW files.
+            sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
+            backup_path = sqlite_path + ".backup"
+            if os.path.exists(sqlite_path):
+                size_mb = os.path.getsize(sqlite_path) / 1e6
+                progress(f"  Backing up chroma.sqlite3 ({size_mb:.0f} MB)...")
+                shutil.copy2(sqlite_path, backup_path)
+                progress(f"  Backup: {backup_path}")
+
+            # Stage drawers in batches. Keep batches bounded instead of materializing
+            # the full embedding matrix in Python memory.
+            progress("\n  Extracting drawers...")
+            batch_size = 5000
+            temp_col = None
+            temp_name = None
+            try:
+                temp_col, temp_name, extracted = _stage_collection_from_source(
+                    backend,
+                    palace_path,
+                    col,
+                    total,
+                    batch_size,
+                    collection_name,
+                    include_embeddings=not reembed,
+                    progress=progress,
+                )
+                progress(f"  Extracted {extracted} drawers")
+
+                # ── #1208 guard ──────────────────────────────────────────────
+                # Refuse to swap when extraction looks short of SQLite ground truth.
+                check_extraction_safety(
+                    palace_path,
+                    extracted,
+                    confirm_truncation_ok,
+                    collection_name=collection_name,
+                )
+            except TruncationDetected as e:
+                progress(e.message)
+                if temp_name is not None:
+                    _delete_collection_if_exists(backend, palace_path, temp_name)
+                return
+            except Exception as exc:
+                if temp_name is not None:
+                    _delete_collection_if_exists(backend, palace_path, temp_name)
+                e = RebuildCollectionError(str(exc), live_replaced=False)
+                progress(f"\n  ERROR during rebuild: {e}")
+                progress("  Rebuild aborted before completion.")
+                progress("  Live collection was not replaced; leaving the original palace untouched.")
+                raise e
+
+            progress("  Rebuilding collection with hnsw:space=cosine...")
+            try:
+                filed = _swap_temp_collection_into_live(
+                    backend,
+                    palace_path,
+                    temp_col,
+                    temp_name,
+                    collection_name,
+                    extracted,
+                    progress=progress,
+                )
+            except Exception as exc:
+                e = (
+                    exc
+                    if isinstance(exc, RebuildCollectionError)
+                    else RebuildCollectionError(str(exc), live_replaced=False)
+                )
+                progress(f"\n  ERROR during rebuild: {e}")
+                progress("  Rebuild aborted before completion.")
+                if e.live_replaced and os.path.exists(backup_path):
+                    progress(f"  Restoring from backup: {backup_path}")
+                    try:
+                        _close_chroma_handles(palace_path, backend=backend)
+                        _delete_collection_if_exists(backend, palace_path, temp_name)
+                        _delete_collection_if_exists(backend, palace_path, collection_name)
+                        shutil.copy2(backup_path, sqlite_path)
+                        progress("  Backup restored. Palace is back to pre-repair state.")
+                    except Exception as restore_error:
+                        progress(f"  Backup restore failed: {restore_error}")
+                        progress(f"  Manual restore required from: {backup_path}")
+                elif not e.live_replaced:
+                    progress(
+                        "  Live collection was not replaced; leaving the original palace untouched."
+                    )
+                else:
+                    progress("  No backup available. Re-mine from source files to recover.")
+                raise e
+
+            progress(f"\n  Repair complete. {filed} drawers rebuilt.")
+            progress("  HNSW index is now clean with cosine distance metric.")
+            progress(f"\n{'=' * 55}\n")
+    except PalaceWriteAlreadyRunning as exc:
+        progress(f"\n  ABORT: {exc}")
+        return
 
 
 class RebuildPartialError(Exception):
@@ -1633,51 +1610,21 @@ def rebuild_from_sqlite(
     print(f"  Source: {source_palace}")
     print(f"  Dest:   {dest_palace}")
 
-    def _source_primary_count() -> "int | None":
-        count = sqlite_drawer_count(source_palace, collection_name)
-        if count == 0:
-            print(f"\n  Source collection {collection_name!r} has no rows; refusing rebuild.")
-        return count
-
     # Validate source BEFORE any destructive moves. An earlier draft
     # archived the dest first and surfaced the missing-chroma.sqlite3
     # error after — leaving the user with a renamed dir to manually undo
     # when the archive itself was empty. Validate first so a user error
     # (--source pointing at a non-palace dir) bails cleanly.
-    if in_place:
-        if not archive_existing_dest:
-            print(
-                "\n  Source and dest are the same path. Pass "
-                "archive_existing_dest=True (CLI: --archive-existing) to move "
-                "the existing palace aside, or pass a different source_palace= "
-                "(CLI: --source)."
-            )
-            _release_repair_locks()
-            return {}
-        if not os.path.isfile(src_db):
-            print(f"\n  Source palace has no chroma.sqlite3 at {src_db}")
-            _release_repair_locks()
-            return {}
-        if _source_primary_count() == 0:
-            _release_repair_locks()
-            return {}
-    else:
-        if not os.path.isfile(src_db):
-            print(f"\n  Source palace has no chroma.sqlite3 at {src_db}")
-            _release_repair_locks()
-            return {}
-        if _source_primary_count() == 0:
-            _release_repair_locks()
-            return {}
-        if os.path.exists(dest_palace):
-            print(
-                f"\n  Refusing to rebuild into existing path: {dest_palace}\n"
-                "  Move it aside, pass a different dest, or set "
-                "archive_existing_dest=True if rebuilding in place "
-                "(source_palace == dest_palace)."
-            )
-            _release_repair_locks()
-            return {}
+    if not _validate_rebuild_from_sqlite_inputs(
+        source_palace,
+        dest_palace,
+        source_db_path=src_db,
+        collection_name=collection_name,
+        in_place=in_place,
+        archive_existing_dest=archive_existing_dest,
+    ):
+        _release_repair_locks()
+        return {}
 
     try:
         recoverable_collections = _recoverable_collection_names(source_palace, collection_name)
@@ -1689,27 +1636,13 @@ def rebuild_from_sqlite(
 
     archive_path: Optional[str] = None
     if in_place:
-        archive_path = _unique_archive_path(dest_palace)
-        print(f"  Archiving {dest_palace} → {archive_path}")
-        shutil.move(dest_palace, archive_path)
-        source_palace = archive_path
-        src_db = os.path.join(source_palace, "chroma.sqlite3")
-
-        # In-place only: drop chromadb's process-wide System registry so
-        # the new client at dest_palace builds a fresh System. Without
-        # this, ``create_collection`` raises "Collection already exists"
-        # because the cached System still holds the pre-rename schema.
-        # Cross-palace mode does not need this and would needlessly
-        # invalidate other callers' clients (see docstring warning).
         try:
-            from chromadb.api.client import SharedSystemClient
-
-            SharedSystemClient.clear_system_cache()
-        except Exception as exc:  # noqa: BLE001
-            print(
-                f"  Warning: could not clear chromadb system cache ({exc!r}); "
-                "in-place rebuild may fail with 'Collection already exists'."
-            )
+            archive_path = _prepare_in_place_rebuild_source(dest_palace)
+            source_palace = archive_path
+            src_db = os.path.join(source_palace, "chroma.sqlite3")
+        except Exception:
+            _release_repair_locks()
+            raise
 
     backend: ChromaBackend | None = None
     counts: dict[str, int] = {}
@@ -1795,6 +1728,73 @@ def rebuild_from_sqlite(
     return counts
 
 
+def _validate_rebuild_from_sqlite_inputs(
+    source_palace: str,
+    dest_palace: str,
+    *,
+    source_db_path: str,
+    collection_name: str,
+    in_place: bool,
+    archive_existing_dest: bool,
+) -> bool:
+    """Return True when the from-SQLite rebuild preflight passes."""
+
+    def _source_primary_count() -> "int | None":
+        count = sqlite_drawer_count(source_palace, collection_name)
+        if count == 0:
+            print(f"\n  Source collection {collection_name!r} has no rows; refusing rebuild.")
+        return count
+
+    if not in_place and os.path.exists(dest_palace):
+        print(
+            f"\n  Refusing to rebuild into existing path: {dest_palace}\n"
+            "  Move it aside, pass a different dest, or set "
+            "archive_existing_dest=True if rebuilding in place "
+            "(source_palace == dest_palace)."
+        )
+        return False
+
+    if in_place and not archive_existing_dest:
+        print(
+            "\n  Source and dest are the same path. Pass "
+            "archive_existing_dest=True (CLI: --archive-existing) to move "
+            "the existing palace aside, or pass a different source_palace= "
+            "(CLI: --source)."
+        )
+        return False
+
+    if not os.path.isfile(source_db_path):
+        print(f"\n  Source palace has no chroma.sqlite3 at {source_db_path}")
+        return False
+
+    return _source_primary_count() != 0
+
+
+def _prepare_in_place_rebuild_source(dest_palace: str) -> str:
+    """Archive ``dest_palace`` and clear the cached Chroma system state."""
+    archive_path = _unique_archive_path(dest_palace)
+    print(f"  Archiving {dest_palace} → {archive_path}")
+    shutil.move(dest_palace, archive_path)
+
+    # In-place only: drop chromadb's process-wide System registry so
+    # the new client at dest_palace builds a fresh System. Without
+    # this, ``create_collection`` raises "Collection already exists"
+    # because the cached System still holds the pre-rename schema.
+    # Cross-palace mode does not need this and would needlessly
+    # invalidate other callers' clients (see docstring warning).
+    try:
+        from chromadb.api.client import SharedSystemClient
+
+        SharedSystemClient.clear_system_cache()
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"  Warning: could not clear chromadb system cache ({exc!r}); "
+            "in-place rebuild may fail with 'Collection already exists'."
+        )
+
+    return archive_path
+
+
 def _unique_archive_path(dest_palace: str) -> str:
     """Return a non-existing in-place rebuild archive path for ``dest_palace``."""
     ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -1823,11 +1823,10 @@ def _repair_internal_collection_counts(palace_path: str) -> dict[str, int]:
             JOIN segments s ON s.collection = c.id
             LEFT JOIN embeddings e ON e.segment_id = s.id
             WHERE s.scope = 'METADATA'
-              AND c.name LIKE ?
+              AND instr(c.name, '__repair_tmp__') > 0
             GROUP BY c.name
             ORDER BY c.name
-            """,
-            ("%__repair_tmp%",),
+            """
         ).fetchall()
         return {
             str(name): int(count)

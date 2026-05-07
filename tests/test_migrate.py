@@ -207,20 +207,31 @@ def test_migrate_dry_run_rebuilds_when_collection_is_readable_but_not_writable(t
     assert "DRY RUN" in out
 
 
-def test_migrate_confirmation_abort_skips_live_write_probe(tmp_path, capsys):
+def test_migrate_confirmation_abort_skips_rebuild_when_probe_fails(tmp_path, capsys):
     palace_dir = tmp_path / "palace"
     palace_dir.mkdir()
     (palace_dir / "chroma.sqlite3").write_text("db")
 
     fake_col = MagicMock()
     fake_col.count.return_value = 102
+    drawers = [
+        {
+            "id": "id1",
+            "document": "hello",
+            "metadata": {"wing": "test-wing", "room": "general"},
+        }
+    ]
 
     with (
         patch("mempalace.migrate.detect_chromadb_version", return_value="1.x"),
         patch("mempalace.backends.chroma.ChromaBackend") as mock_backend,
-        patch("mempalace.migrate.collection_write_roundtrip_works") as mock_probe,
+        patch(
+            "mempalace.migrate.collection_write_roundtrip_works", return_value=False
+        ) as mock_probe,
         patch("builtins.input", return_value="n"),
-        patch("mempalace.migrate.extract_drawers_from_sqlite") as mock_extract,
+        patch(
+            "mempalace.migrate.extract_drawers_from_sqlite", return_value=drawers
+        ) as mock_extract,
         patch("mempalace.migrate.shutil.copytree") as mock_copytree,
     ):
         mock_backend.backend_version.return_value = "1.5.8"
@@ -232,9 +243,42 @@ def test_migrate_confirmation_abort_skips_live_write_probe(tmp_path, capsys):
 
     assert result is False
     assert "Aborted." in out
-    mock_probe.assert_not_called()
-    mock_extract.assert_not_called()
+    mock_probe.assert_called_once_with(fake_col)
+    mock_extract.assert_called_once_with(
+        os.path.join(os.path.abspath(os.fspath(palace_dir)), "chroma.sqlite3")
+    )
     mock_copytree.assert_not_called()
+
+
+def test_migrate_healthy_readable_palace_returns_success_without_confirmation(tmp_path, capsys):
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    (palace_dir / "chroma.sqlite3").write_text("db")
+
+    fake_col = MagicMock()
+    fake_col.count.return_value = 102
+
+    with (
+        patch("mempalace.migrate.detect_chromadb_version", return_value="1.x"),
+        patch("mempalace.backends.chroma.ChromaBackend") as mock_backend,
+        patch(
+            "mempalace.migrate.collection_write_roundtrip_works", return_value=True
+        ) as mock_probe,
+        patch("mempalace.migrate.confirm_destructive_action") as confirm_action,
+        patch("mempalace.migrate.extract_drawers_from_sqlite") as mock_extract,
+    ):
+        mock_backend.backend_version.return_value = "1.5.8"
+        mock_backend.return_value.get_collection.return_value = fake_col
+
+        result = migrate(str(palace_dir))
+
+    out = capsys.readouterr().out
+
+    assert result is True
+    mock_probe.assert_called_once_with(fake_col)
+    confirm_action.assert_not_called()
+    mock_extract.assert_not_called()
+    assert "No migration needed." in out
 
 
 def test_drop_migrate_probe_drawers_filters_synthetic_probe_rows():
@@ -249,6 +293,11 @@ def test_drop_migrate_probe_drawers_filters_synthetic_probe_rows():
             "document": "real",
             "metadata": {"source_file": "notes.md"},
         },
+        {
+            "id": "real-user-drawer",
+            "document": "user content",
+            "metadata": {"source_file": "mempalace_migrate_probe"},
+        },
     ]
 
     filtered = _drop_migrate_probe_drawers(drawers)
@@ -258,5 +307,10 @@ def test_drop_migrate_probe_drawers_filters_synthetic_probe_rows():
             "id": "real-drawer",
             "document": "real",
             "metadata": {"source_file": "notes.md"},
-        }
+        },
+        {
+            "id": "real-user-drawer",
+            "document": "user content",
+            "metadata": {"source_file": "mempalace_migrate_probe"},
+        },
     ]

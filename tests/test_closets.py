@@ -904,9 +904,9 @@ class TestTunnels:
 
         assert not errors, f"worker raised: {errors}"
         tunnels = list_tunnels()
-        assert len(tunnels) == 5, (
-            f"expected 5 concurrent tunnels, got {len(tunnels)} — " "write race dropped some"
-        )
+        assert (
+            len(tunnels) == 5
+        ), f"expected 5 concurrent tunnels, got {len(tunnels)} — write race dropped some"
 
     def test_created_at_is_timezone_aware(self):
         """Regression: created_at must be tz-aware UTC, not naive."""

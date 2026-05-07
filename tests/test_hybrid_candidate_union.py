@@ -78,10 +78,9 @@ class TestCandidateUnion:
         _seed_drawers(palace)
         result = search_memories(_NARRATIVE_QUERY, palace, n_results=5, candidate_strategy="union")
         ids = [h["source_file"] for h in result["results"]]
-        assert "brand_voice_D4.md" in ids, (
-            "union mode must surface BM25-strong docs even when vector signal "
-            f"is weak; got {ids}"
-        )
+        assert (
+            "brand_voice_D4.md" in ids
+        ), f"union mode must surface BM25-strong docs even when vector signal is weak; got {ids}"
 
     def test_union_preserves_vector_hits(self, tmp_path):
         """Union mode must not drop docs that vector-only mode finds —

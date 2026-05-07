@@ -486,6 +486,13 @@ def _write_lock_refused(exc: PalaceWriteAlreadyRunning) -> dict:
     }
 
 
+def _write_lock_error(exc: PalaceWriteAlreadyRunning) -> dict:
+    return {
+        "error": str(exc),
+        "code": "palace_write_lock_active",
+    }
+
+
 # ==================== HELPERS ====================
 
 
@@ -944,7 +951,7 @@ def tool_create_tunnel(
                 target_drawer_id=target_drawer_id,
             )
     except PalaceWriteAlreadyRunning as exc:
-        return _write_lock_refused(exc)
+        return _write_lock_error(exc)
 
 
 def tool_list_tunnels(wing: str = None):
@@ -964,7 +971,7 @@ def tool_delete_tunnel(tunnel_id: str):
         with palace_write_lock(_config.palace_path, operation="mcp delete_tunnel", blocking=True):
             return delete_tunnel(tunnel_id)
     except PalaceWriteAlreadyRunning as exc:
-        return _write_lock_refused(exc)
+        return _write_lock_error(exc)
 
 
 def tool_follow_tunnels(wing: str, room: str):
@@ -1065,7 +1072,9 @@ def tool_delete_drawer(drawer_id: str):
                 return {"success": False, "error": f"Drawer not found: {drawer_id}"}
 
             # Log the deletion with the content being removed for audit trail
-            deleted_content = existing.get("documents", [""])[0] if existing.get("documents") else ""
+            deleted_content = (
+                existing.get("documents", [""])[0] if existing.get("documents") else ""
+            )
             deleted_meta = existing.get("metadatas", [{}])[0] if existing.get("metadatas") else {}
             _wal_log(
                 "delete_drawer",
@@ -1394,9 +1403,7 @@ def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = N
                     "ended": resolved_ended,
                 },
             )
-            _call_kg(
-                lambda kg: kg.invalidate(subject, predicate, object, ended=resolved_ended)
-            )
+            _call_kg(lambda kg: kg.invalidate(subject, predicate, object, ended=resolved_ended))
             return {
                 "success": True,
                 "fact": f"{subject} → {predicate} → {object}",

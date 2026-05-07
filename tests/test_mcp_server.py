@@ -687,9 +687,9 @@ class TestWriteTools:
 
         assert result1["success"] is True
         assert result2["success"] is True
-        assert result1["drawer_id"] != result2["drawer_id"], (
-            "Documents with shared header but different content must have distinct drawer IDs"
-        )
+        assert (
+            result1["drawer_id"] != result2["drawer_id"]
+        ), "Documents with shared header but different content must have distinct drawer IDs"
 
     def test_delete_drawer(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -727,6 +727,34 @@ class TestWriteTools:
 
         result = tool_delete_drawer("nonexistent_drawer")
         assert result["success"] is False
+
+    def test_create_tunnel_lock_refusal_uses_error_shape(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(
+            mcp_server,
+            "palace_write_lock",
+            MagicMock(side_effect=mcp_server.PalaceWriteAlreadyRunning("busy")),
+        )
+
+        result = mcp_server.tool_create_tunnel("a", "r1", "b", "r2")
+
+        assert result == {"error": "busy", "code": "palace_write_lock_active"}
+
+    def test_delete_tunnel_lock_refusal_uses_error_shape(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(
+            mcp_server,
+            "palace_write_lock",
+            MagicMock(side_effect=mcp_server.PalaceWriteAlreadyRunning("busy")),
+        )
+
+        result = mcp_server.tool_delete_tunnel("tunnel-1")
+
+        assert result == {"error": "busy", "code": "palace_write_lock_active"}
 
     def test_check_duplicate_handles_none_metadata(self, monkeypatch, config, kg):
         """tool_check_duplicate must tolerate None entries in the result lists

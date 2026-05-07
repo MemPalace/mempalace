@@ -210,10 +210,7 @@ def _drop_migrate_probe_drawers(drawers: list[dict]) -> list[dict]:
     filtered = []
     for drawer in drawers:
         drawer_id = str(drawer.get("id", ""))
-        source_file = str(drawer.get("metadata", {}).get("source_file", ""))
         if drawer_id.startswith("_mempalace_migrate_probe_"):
-            continue
-        if source_file == "mempalace_migrate_probe":
             continue
         filtered.append(drawer)
     return filtered
@@ -284,15 +281,11 @@ def migrate(palace_path: str, dry_run: bool = False, confirm: bool = False):
         print(f"  Would migrate {len(drawers)} drawers.")
         return True
 
-    confirmed = False
     if readable_collection is not None:
-        if not confirm_destructive_action("Migration", palace_path, assume_yes=confirm):
-            return False
-        confirmed = True
-
         # A plain count() is not enough: some 0.6.x -> 1.5.x migrated
         # collections are readable but silently drop upsert/delete operations.
-        # Probe only after the user has confirmed the migration path.
+        # For non-dry-run flows we must still distinguish the healthy
+        # no-op case from the rebuild-needed case before prompting.
         if collection_write_roundtrip_works(readable_collection):
             print(f"\n Palace is already readable and writable by chromadb {target_version}.")
             print(f" {readable_count} drawers found. No migration needed.")
@@ -325,9 +318,7 @@ def migrate(palace_path: str, dry_run: bool = False, confirm: bool = False):
         for room, count in sorted(rooms.items(), key=lambda x: -x[1]):
             print(f"      ROOM: {room:30} {count:5}")
 
-    if not confirmed and not confirm_destructive_action(
-        "Migration", palace_path, assume_yes=confirm
-    ):
+    if not confirm_destructive_action("Migration", palace_path, assume_yes=confirm):
         return False
 
     # Backup the old palace

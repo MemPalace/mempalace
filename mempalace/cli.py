@@ -27,6 +27,8 @@ Examples:
     mempalace search "pricing discussion" --wing my_app --room costs
 """
 
+from __future__ import annotations
+
 import os
 import sys
 import shlex
@@ -852,8 +854,10 @@ def _cmd_repair_from_sqlite(args, palace_path: str, collection_name: str) -> Non
         if counts == {}:
             sys.exit(1)
         primary_count = counts.get(collection_name)
-        if primary_count is not None and primary_count <= 0 and any(
-            count > 0 for count in counts.values()
+        if (
+            primary_count is not None
+            and primary_count <= 0
+            and any(count > 0 for count in counts.values())
         ):
             sys.exit(1)
     except RebuildPartialError as exc:
@@ -882,8 +886,6 @@ def cmd_repair(args):
         _stage_collection_from_source,
         _swap_temp_collection_into_live,
         check_extraction_safety,
-        sqlite_drawer_count,
-        maybe_repair_poisoned_max_seq_id_before_rebuild,
         sqlite_drawer_count,
         maybe_repair_poisoned_max_seq_id_before_rebuild,
         print_sqlite_integrity_abort,
@@ -969,126 +971,129 @@ def cmd_repair(args):
         return
 
     repair_lock = _acquire_repair_write_lock(palace_path)
+    lock_released = False
 
-    backend = ChromaBackend()
+    def _release_repair_lock() -> None:
+        nonlocal lock_released
+        if not lock_released:
+            repair_lock.__exit__(None, None, None)
+            lock_released = True
+
+    backend = None
 
     try:
+        backend = ChromaBackend()
         col = backend.get_collection(palace_path, collection_name)
         total = col.count()
         if total == 0:
             print("  Nothing to repair.")
-            repair_lock.__exit__(None, None, None)
             return
     except Exception as e:
         print(f"  Error reading palace after acquiring repair lock: {e}")
-        repair_lock.__exit__(None, None, None)
+        _release_repair_lock()
         sys.exit(1)
 
-    palace_path = os.path.normpath(palace_path)
-    backup_path = palace_path + ".backup"
     try:
+        palace_path = os.path.normpath(palace_path)
+        backup_path = palace_path + ".backup"
         if os.path.exists(backup_path):
             if not contains_palace_database(backup_path):
                 print(
                     "  Backup validation failed: backup path exists but does not contain chroma.sqlite3. "
                     f"Please remove or rename: {backup_path}"
                 )
-                repair_lock.__exit__(None, None, None)
                 return
             shutil.rmtree(backup_path)
         print(f"  Backing up to {backup_path}...")
         shutil.copytree(palace_path, backup_path)
-    except Exception:
-        repair_lock.__exit__(None, None, None)
-        raise
 
-    # Stage drawers in batches after backup creation. Keep batches bounded
-    # without letting failed backup validation leave a temp collection behind.
-    print("\n  Extracting drawers...")
-    batch_size = 5000
-    reembed = getattr(args, "reembed", False)
-    temp_name = None
-    try:
-        temp_col, temp_name, extracted = _stage_collection_from_source(
-            backend,
-            palace_path,
-            col,
-            total,
-            batch_size,
-            collection_name,
-            include_embeddings=not reembed,
-            progress=print,
-        )
-        print(f"  Extracted {extracted} drawers")
+        # Stage drawers in batches after backup creation. Keep batches bounded
+        # without letting failed backup validation leave a temp collection behind.
+        print("\n  Extracting drawers...")
+        batch_size = 5000
+        reembed = getattr(args, "reembed", False)
+        temp_name = None
+        try:
+            temp_col, temp_name, extracted = _stage_collection_from_source(
+                backend,
+                palace_path,
+                col,
+                total,
+                batch_size,
+                collection_name,
+                include_embeddings=not reembed,
+                progress=print,
+            )
+            print(f"  Extracted {extracted} drawers")
 
-        # ── #1208 guard ──────────────────────────────────────────────
-        # Cross-check against SQLite ground truth before live swap.
-        check_extraction_safety(
-            palace_path,
-            extracted,
-            confirm_truncation_ok=getattr(args, "confirm_truncation_ok", False),
-            collection_name=collection_name,
-        )
-    except TruncationDetected as e:
-        print(e.message)
-        _delete_repair_temp_if_known(backend, palace_path, temp_name)
-        repair_lock.__exit__(None, None, None)
-        return
-    except Exception as exc:
-        _delete_repair_temp_if_known(backend, palace_path, temp_name)
-        print(f"  Repair failed: {exc}")
-        print("  Live collection was not replaced; leaving the original palace untouched.")
-        print(
-            "  The Chroma collection path could not complete staging. Try the SQLite "
-            "recovery path instead:"
-        )
-        print(
-            "    mempalace "
-            f"--palace {shlex.quote(palace_path)} repair "
-            "--mode from-sqlite --archive-existing --yes"
-        )
-        repair_lock.__exit__(None, None, None)
-        sys.exit(1)
+            # ── #1208 guard ──────────────────────────────────────────────
+            # Cross-check against SQLite ground truth before live swap.
+            check_extraction_safety(
+                palace_path,
+                extracted,
+                confirm_truncation_ok=getattr(args, "confirm_truncation_ok", False),
+                collection_name=collection_name,
+            )
+        except TruncationDetected as e:
+            print(e.message)
+            _delete_repair_temp_if_known(backend, palace_path, temp_name)
+            return
+        except Exception as exc:
+            _delete_repair_temp_if_known(backend, palace_path, temp_name)
+            print(f"  Repair failed: {exc}")
+            print("  Live collection was not replaced; leaving the original palace untouched.")
+            print(
+                "  The Chroma collection path could not complete staging. Try the SQLite "
+                "recovery path instead:"
+            )
+            print(
+                "    mempalace "
+                f"--palace {shlex.quote(palace_path)} repair "
+                "--mode from-sqlite --archive-existing --yes"
+            )
+            sys.exit(1)
 
-    try:
-        filed = _swap_temp_collection_into_live(
-            backend,
-            palace_path,
-            temp_col,
-            temp_name,
-            collection_name,
-            extracted,
-            progress=print,
-        )
-    except Exception as exc:
-        e = (
-            exc
-            if isinstance(exc, RebuildCollectionError)
-            else RebuildCollectionError(str(exc), live_replaced=False)
-        )
-        print(f"  Repair failed: {e}")
-        if getattr(e, "live_replaced", False):
-            print("  Live collection was already replaced; restoring from backup...")
-            try:
-                _close_chroma_handles(palace_path, backend=backend)
-                _delete_repair_temp_if_known(backend, palace_path, temp_name)
-                if os.path.exists(palace_path):
-                    shutil.rmtree(palace_path)
-                shutil.copytree(backup_path, palace_path)
-                print(f"  Restore complete from backup: {backup_path}")
-            except Exception as restore_error:
-                print(f"  Automatic restore failed: {restore_error}")
-                print("  Manual recovery required:")
-                print(f"    1. Remove or rename the broken directory: {palace_path}")
-                print(f"    2. Restore the backup directory to: {palace_path}")
-                print(f"       Backup location: {backup_path}")
-        repair_lock.__exit__(None, None, None)
-        sys.exit(1)
+        try:
+            filed = _swap_temp_collection_into_live(
+                backend,
+                palace_path,
+                temp_col,
+                temp_name,
+                collection_name,
+                extracted,
+                progress=print,
+            )
+        except Exception as exc:
+            e = (
+                exc
+                if isinstance(exc, RebuildCollectionError)
+                else RebuildCollectionError(str(exc), live_replaced=False)
+            )
+            print(f"  Repair failed: {e}")
+            if getattr(e, "live_replaced", False):
+                print("  Live collection was already replaced; restoring from backup...")
+                try:
+                    _close_chroma_handles(palace_path, backend=backend)
+                    _delete_repair_temp_if_known(backend, palace_path, temp_name)
+                    if os.path.exists(palace_path):
+                        shutil.rmtree(palace_path)
+                    shutil.copytree(backup_path, palace_path)
+                    print(f"  Restore complete from backup: {backup_path}")
+                except Exception as restore_error:
+                    print(f"  Automatic restore failed: {restore_error}")
+                    print("  Manual recovery required:")
+                    print(f"    1. Remove or rename the broken directory: {palace_path}")
+                    print(f"    2. Restore the backup directory to: {palace_path}")
+                    print(f"       Backup location: {backup_path}")
+            sys.exit(1)
 
-    print(f"\n  Repair complete. {filed} drawers rebuilt.")
-    print(f"  Backup saved at {backup_path}")
-    print(f"\n{'=' * 55}\n")
-    repair_lock.__exit__(None, None, None)
+        print(f"\n  Repair complete. {filed} drawers rebuilt.")
+        print(f"  Backup saved at {backup_path}")
+        print(f"\n{'=' * 55}\n")
+    finally:
+        if backend is not None:
+            backend.close()
+        _release_repair_lock()
 
 
 def cmd_hook(args):

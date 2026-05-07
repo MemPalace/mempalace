@@ -177,9 +177,9 @@ def test_corpus_origin_reclassifies_personas(
 
     # All three personas land in the new bucket.
     expected_personas = {"Echo", "Sparrow", "Cipher"}
-    assert expected_personas <= persona_names_in_bucket, (
-        f"Expected all three personas in agent_personas, got: " f"{persona_names_in_bucket}"
-    )
+    assert (
+        expected_personas <= persona_names_in_bucket
+    ), f"Expected all three personas in agent_personas, got: {persona_names_in_bucket}"
 
     # And NONE of them remain in the people bucket.
     leaked = expected_personas & persona_names_in_people
@@ -292,10 +292,9 @@ def test_init_pass_zero_writes_origin_json_to_palace(ai_dialogue_corpus: Path, t
     assert "result" in data, "origin.json must wrap the CorpusOriginResult under 'result'"
     assert isinstance(data["result"].get("likely_ai_dialogue"), bool)
     # Fixture is heavy AI-dialogue — heuristic should classify as such.
-    assert data["result"]["likely_ai_dialogue"] is True, (
-        "Heuristic should classify the AI-dialogue fixture as AI-dialogue. "
-        f"Got: {data['result']}"
-    )
+    assert (
+        data["result"]["likely_ai_dialogue"] is True
+    ), f"Heuristic should classify the AI-dialogue fixture as AI-dialogue. Got: {data['result']}"
 
 
 def test_init_pass_zero_passes_corpus_origin_to_discover_entities(
@@ -1614,20 +1613,19 @@ def test_merge_tier_fields_heuristic_yes_llm_yes_combines_evidence():
     ), f"LLM evidence string missing from merged result. Got: {res['evidence']}"
     # Heuristic always produces at least one evidence line for AI-dialogue
     # input (brand-term match), so the combined list has more than just LLM's.
-    assert len(res["evidence"]) >= 2, (
-        f"Combined evidence should include both heuristic + LLM lines. " f"Got: {res['evidence']}"
-    )
+    assert (
+        len(res["evidence"]) >= 2
+    ), f"Combined evidence should include both heuristic + LLM lines. Got: {res['evidence']}"
     # Each entry must carry its tier prefix so on-disk origin.json is
     # auditable — readers can tell which tier produced which signal line.
     tier1_lines = [e for e in res["evidence"] if e.startswith("Tier-1 heuristic: ")]
     tier2_lines = [e for e in res["evidence"] if e.startswith("Tier-2 LLM: ")]
-    assert tier1_lines, (
-        f"Expected at least one 'Tier-1 heuristic: ' prefixed evidence line. "
-        f"Got: {res['evidence']}"
-    )
-    assert tier2_lines, (
-        f"Expected at least one 'Tier-2 LLM: ' prefixed evidence line. " f"Got: {res['evidence']}"
-    )
+    assert (
+        tier1_lines
+    ), f"Expected at least one 'Tier-1 heuristic: ' prefixed evidence line. Got: {res['evidence']}"
+    assert (
+        tier2_lines
+    ), f"Expected at least one 'Tier-2 LLM: ' prefixed evidence line. Got: {res['evidence']}"
     # Every entry should be tier-prefixed (no untagged passthrough).
     untagged = [
         e
@@ -1758,9 +1756,9 @@ def test_init_prints_privacy_warning_when_provider_is_external(
         cmd_init(args)
 
     out = capsys.readouterr().out
-    assert "EXTERNAL API" in out, (
-        f"Privacy warning must mention 'EXTERNAL API' when provider is external. " f"Got: {out!r}"
-    )
+    assert (
+        "EXTERNAL API" in out
+    ), f"Privacy warning must mention 'EXTERNAL API' when provider is external. Got: {out!r}"
     assert (
         "--no-llm" in out
     ), f"Privacy warning must point users at --no-llm to opt out. Got: {out!r}"
@@ -1803,9 +1801,9 @@ def test_init_no_privacy_warning_when_provider_is_local(
         cmd_init(args)
 
     out = capsys.readouterr().out
-    assert "EXTERNAL API" not in out, (
-        f"Privacy warning fired for a LOCAL provider — should not have. " f"Got: {out!r}"
-    )
+    assert (
+        "EXTERNAL API" not in out
+    ), f"Privacy warning fired for a LOCAL provider — should not have. Got: {out!r}"
 
 
 def test_init_no_privacy_warning_with_no_llm_flag(ai_dialogue_corpus: Path, tmp_path: Path, capsys):

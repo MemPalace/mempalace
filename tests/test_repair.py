@@ -1,6 +1,7 @@
 """Tests for mempalace.repair — scan, prune, and rebuild HNSW index."""
 
 import os
+import shlex
 import sqlite3
 import struct
 from contextlib import closing
@@ -89,10 +90,13 @@ def test_extract_drawers_preserves_valid_metadata():
         "documents": ["doc1", "doc2"],
         "metadatas": [{"wing": "a", "room": "1"}, {"wing": "b", "room": "2"}],
     }
-    all_ids, all_docs, all_metas = repair._extract_drawers(col, total=2, batch_size=2)
+    all_ids, all_docs, all_metas, embeddings = repair._extract_drawers(
+        col, total=2, batch_size=2
+    )
     assert all_ids == ["id1", "id2"]
     assert all_docs == ["doc1", "doc2"]
     assert all_metas == [{"wing": "a", "room": "1"}, {"wing": "b", "room": "2"}]
+    assert embeddings is None
 
 
 def test_extract_drawers_sanitizes_none_metadata():
@@ -108,10 +112,11 @@ def test_extract_drawers_sanitizes_none_metadata():
         "documents": ["doc1", "doc2", "doc3"],
         "metadatas": [{"wing": "a"}, None, {"wing": "c"}],
     }
-    _, _, all_metas = repair._extract_drawers(col, total=3, batch_size=3)
+    _, _, all_metas, embeddings = repair._extract_drawers(col, total=3, batch_size=3)
     assert all_metas[0] == {"wing": "a"}
     assert all_metas[1] == {"_repaired_empty_meta": True}
     assert all_metas[2] == {"wing": "c"}
+    assert embeddings is None
 
 
 def test_extract_drawers_sanitizes_empty_dict_metadata():
@@ -126,9 +131,10 @@ def test_extract_drawers_sanitizes_empty_dict_metadata():
         "documents": ["doc1", "doc2"],
         "metadatas": [{}, {"wing": "b"}],
     }
-    _, _, all_metas = repair._extract_drawers(col, total=2, batch_size=2)
+    _, _, all_metas, embeddings = repair._extract_drawers(col, total=2, batch_size=2)
     assert all_metas[0] == {"_repaired_empty_meta": True}
     assert all_metas[1] == {"wing": "b"}
+    assert embeddings is None
 
 
 def test_extract_drawers_sanitization_preserves_alignment():
@@ -144,13 +150,16 @@ def test_extract_drawers_sanitization_preserves_alignment():
         "documents": ["d1", "d2", "d3", "d4"],
         "metadatas": [None, {"k": "v"}, {}, None],
     }
-    all_ids, all_docs, all_metas = repair._extract_drawers(col, total=4, batch_size=4)
+    all_ids, all_docs, all_metas, embeddings = repair._extract_drawers(
+        col, total=4, batch_size=4
+    )
     assert len(all_ids) == len(all_docs) == len(all_metas) == 4
     assert all_ids == ["id1", "id2", "id3", "id4"]
     assert all_metas[0] == {"_repaired_empty_meta": True}
     assert all_metas[1] == {"k": "v"}
     assert all_metas[2] == {"_repaired_empty_meta": True}
     assert all_metas[3] == {"_repaired_empty_meta": True}
+    assert embeddings is None
 
 
 def test_extract_drawers_multiple_batches():
@@ -161,9 +170,12 @@ def test_extract_drawers_multiple_batches():
         {"ids": ["id3"], "documents": ["d3"], "metadatas": [{}]},
         {"ids": [], "documents": [], "metadatas": []},
     ]
-    all_ids, all_docs, all_metas = repair._extract_drawers(col, total=3, batch_size=2)
+    all_ids, all_docs, all_metas, embeddings = repair._extract_drawers(
+        col, total=3, batch_size=2
+    )
     assert all_ids == ["id1", "id2", "id3"]
     assert all_metas == [{"a": 1}, {"_repaired_empty_meta": True}, {"_repaired_empty_meta": True}]
+    assert embeddings is None
 
 
 # ── scan_palace ───────────────────────────────────────────────────────
@@ -376,7 +388,9 @@ def test_rebuild_index_releases_write_lock_on_backup_failure(mock_backend_cls, t
         repair.rebuild_index(palace_path=str(tmp_path))
 
     lock.__enter__.assert_called_once_with()
-    lock.__exit__.assert_called_once_with(None, None, None)
+    assert lock.__exit__.call_count == 1
+    assert lock.__exit__.call_args.args[0] is OSError
+    assert str(lock.__exit__.call_args.args[1]) == "copy failed"
 
 
 def test_extract_drawers_includes_embeddings_when_available():
@@ -837,6 +851,7 @@ def test_status_default_uses_configured_drawer_collection(tmp_path):
     assert result["status"] == "ok"
     assert result["message"] == ""
 
+
 def _status_info():
     return {
         "sqlite_count": 1,
@@ -904,7 +919,9 @@ def test_status_reports_stale_repair_temp_collections(tmp_path, capsys):
     assert result["status"] == "artifacts"
     assert result["repair_artifacts"] == {unique_temp: 2}
     assert f"{unique_temp}: 2 rows" in out
-    assert f"mempalace --palace {str(tmp_path)} repair-status --cleanup-temp --yes" in out
+    assert (
+        f"mempalace --palace {shlex.quote(str(tmp_path))} repair-status --cleanup-temp --yes" in out
+    )
 
 
 def test_status_does_not_treat_user_collection_with_temp_substring_as_artifact(tmp_path, capsys):
@@ -2047,7 +2064,9 @@ def test_rebuild_index_repairs_poisoned_max_seq_id_before_collection_rebuild(tmp
     assert "non-destructive max_seq_id repair" in out
 
 
-def test_rebuild_index_releases_lock_when_max_seq_id_preflight_short_circuits(tmp_path, monkeypatch):
+def test_rebuild_index_releases_lock_when_max_seq_id_preflight_short_circuits(
+    tmp_path, monkeypatch
+):
     palace = str(tmp_path / "palace")
     os.makedirs(palace)
     lock = MagicMock()
@@ -2076,6 +2095,26 @@ def test_rebuild_index_releases_lock_when_sqlite_integrity_preflight_aborts(tmp_
 
     lock.__enter__.assert_called_once_with()
     lock.__exit__.assert_called_once_with(None, None, None)
+
+
+def test_rebuild_index_releases_lock_when_max_seq_id_preflight_raises(tmp_path, monkeypatch):
+    palace = str(tmp_path / "palace")
+    os.makedirs(palace)
+    lock = MagicMock()
+    monkeypatch.setattr(repair, "palace_write_lock", MagicMock(return_value=lock))
+    monkeypatch.setattr(
+        repair,
+        "maybe_repair_poisoned_max_seq_id_before_rebuild",
+        MagicMock(side_effect=RuntimeError("boom")),
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        repair.rebuild_index(palace)
+
+    lock.__enter__.assert_called_once_with()
+    assert lock.__exit__.call_count == 1
+    assert lock.__exit__.call_args.args[0] is RuntimeError
+    assert str(lock.__exit__.call_args.args[1]) == "boom"
 
 
 # ── extract_via_sqlite + rebuild_from_sqlite (#1308) ──────────────────
@@ -2696,8 +2735,11 @@ def test_rebuild_one_collection_recovery_hint_includes_dest_and_source(tmp_path)
             counts_so_far={},
         )
 
-    assert f"mempalace --palace {dest_path} repair --mode from-sqlite" in excinfo.value.message
-    assert f"--source {archive_path}" in excinfo.value.message
+    assert (
+        f"mempalace --palace {shlex.quote(dest_path)} repair --mode from-sqlite"
+        in excinfo.value.message
+    )
+    assert f"--source {shlex.quote(archive_path)}" in excinfo.value.message
     assert "during extracting and upserting rows" in excinfo.value.message
 
 
@@ -3097,6 +3139,21 @@ def test_rebuild_from_sqlite_releases_dest_lock_when_source_lock_active(
     assert "ABORT: source busy" in out
     dest_lock.__enter__.assert_called_once_with()
     dest_lock.__exit__.assert_called_once_with(None, None, None)
+
+
+def test_rebuild_from_sqlite_releases_lock_on_archive_move_failure(tmp_path, monkeypatch):
+    palace = tmp_path / "palace"
+    _seed_palace(palace, "mempalace_drawers", [("d1", "body", {"wing": "w"})])
+    lock = MagicMock()
+    monkeypatch.setattr(repair, "palace_write_lock", MagicMock(return_value=lock))
+    monkeypatch.setattr(repair.shutil, "move", MagicMock(side_effect=OSError("archive failed")))
+
+    with pytest.raises(OSError, match="archive failed"):
+        repair.rebuild_from_sqlite(str(palace), str(palace), archive_existing_dest=True)
+
+    lock.__enter__.assert_called_once_with()
+    lock.__exit__.assert_called_once_with(None, None, None)
+    assert (palace / "chroma.sqlite3").exists()
 
 
 def test_recoverable_collection_names_orders_primary_and_ignores_empty(tmp_path):
