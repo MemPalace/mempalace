@@ -512,6 +512,21 @@ def cmd_mine(args):
             dry_run=args.dry_run,
             extract_mode=args.extract,
         )
+    elif args.mode == "git-log":
+        from .git_miner import mine_git_log
+
+        mine_git_log(
+            repo_dir=args.dir,
+            palace_path=palace_path,
+            wing=args.wing,
+            agent=args.agent,
+            limit=args.limit,
+            dry_run=args.dry_run,
+            extract_mode=args.extract,
+            since=args.since,
+            until=args.until,
+            branch=args.branch,
+        )
     else:
         from .miner import mine
 
@@ -1061,9 +1076,9 @@ def main():
     p_mine.add_argument("dir", help="Directory to mine")
     p_mine.add_argument(
         "--mode",
-        choices=["projects", "convos"],
+        choices=["projects", "convos", "git-log"],
         default="projects",
-        help="Ingest mode: 'projects' for code/docs (default), 'convos' for chat exports",
+        help="Ingest mode: 'projects' for code/docs (default), 'convos' for chat exports, 'git-log' for git history",
     )
     p_mine.add_argument("--wing", default=None, help="Wing name (default: directory name)")
     p_mine.add_argument(
@@ -1101,7 +1116,22 @@ def main():
         "--extract",
         choices=["exchange", "general"],
         default="exchange",
-        help="Extraction strategy for convos mode: 'exchange' (default) or 'general' (5 memory types)",
+        help="Extraction strategy for convos/git-log mode: 'exchange' (default) or 'general' (5 memory types)",
+    )
+    p_mine.add_argument(
+        "--since",
+        default=None,
+        help="Git log: only commits after this date (e.g. 2025-01-01)",
+    )
+    p_mine.add_argument(
+        "--until",
+        default=None,
+        help="Git log: only commits before this date",
+    )
+    p_mine.add_argument(
+        "--branch",
+        default=None,
+        help="Git log: branch to mine (default: current HEAD)",
     )
 
     # sweep
