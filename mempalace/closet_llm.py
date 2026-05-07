@@ -169,7 +169,7 @@ def _call_llm(cfg: LLMConfig, source_file: str, wing: str, room: str, content: s
             parsed = json.loads(text)
             return parsed, payload.get("usage")
         except json.JSONDecodeError:
-            return None, None
+            continue  # LLM output is nondeterministic; retry
         except urllib.error.HTTPError as e:
             # 429 / 503 = retry with backoff
             if e.code in (429, 503) and attempt < 2:

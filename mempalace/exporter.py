@@ -48,6 +48,7 @@ def export_palace(palace_path: str, output_dir: str, format: str = "markdown") -
         print("  Palace is empty — nothing to export.")
         return {"wings": 0, "rooms": 0, "drawers": 0}
 
+    output_dir = os.path.realpath(output_dir)
     os.makedirs(output_dir, exist_ok=True)
     try:
         os.chmod(output_dir, 0o700)
