@@ -115,6 +115,39 @@ def test_save_preserves_previous_on_serialization_failure(tmp_path, monkeypatch)
     # Restore os.replace before reading so the assertion can rely on it.
     monkeypatch.setattr(_os, "replace", real_replace)
     assert target.read_text(encoding="utf-8") == original
+    assert not (tmp_path / "entity_registry.json.tmp").exists()
+
+
+def test_save_removes_tmp_on_fsync_failure(tmp_path, monkeypatch):
+    """A temp-write failure must not leave entity_registry.json.tmp behind."""
+
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    registry.seed(
+        mode="personal",
+        people=[{"name": "Alice", "relationship": "friend", "context": "personal"}],
+        projects=[],
+    )
+
+    target = tmp_path / "entity_registry.json"
+    original = target.read_text(encoding="utf-8")
+    tmp_file = tmp_path / "entity_registry.json.tmp"
+
+    import os as _os
+
+    def boom(fd):
+        raise OSError("simulated fsync failure")
+
+    monkeypatch.setattr(_os, "fsync", boom)
+
+    with pytest.raises(OSError):
+        registry.seed(
+            mode="personal",
+            people=[{"name": "Bob", "relationship": "friend", "context": "personal"}],
+            projects=[],
+        )
+
+    assert target.read_text(encoding="utf-8") == original
+    assert not tmp_file.exists()
 
 
 # ── seed ────────────────────────────────────────────────────────────────
