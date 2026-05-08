@@ -820,9 +820,10 @@ def process_file(
 
     # Skip if already filed
     source_file = str(filepath)
-    if file_already_mined(collection, source_file, check_mtime=True) if not dry_run else False:
+    if not dry_run:
+        if file_already_mined(collection, source_file, check_mtime=True):
+            return 0, "general"
         if hash_db and hash_db.check_and_add(filepath):
-            hash_db.record(filepath)
             return 0, "general"
 
     try:
