@@ -429,10 +429,12 @@ def mine_convos(
 
         # Skip if already filed
         if file_already_mined(collection, source_file):
-            if hash_db and hash_db.check_and_add(filepath):
-                hash_db.record(filepath)
-                files_skipped += 1
-                continue
+            files_skipped += 1
+            continue
+
+        if hash_db and hash_db.check_and_add(filepath):
+            files_skipped += 1
+            continue
 
         # Normalize format
         try:
