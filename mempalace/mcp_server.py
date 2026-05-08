@@ -741,7 +741,13 @@ def tool_search(
     return result
 
 
-def tool_check_duplicate(content: str, threshold: float = 0.9):
+# Default dedup similarity threshold — used by diary guard and dedup report.
+# Strict enough to catch semantically identical content while allowing
+# genuinely different entries about similar topics to coexist.
+DEDUP_THRESHOLD = 0.92
+
+
+def tool_check_duplicate(content: str, threshold: float = 0.9, where: dict | None = None):
     col = _get_collection()
     if not col:
         return _no_palace()
@@ -760,11 +766,14 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
             ),
         }
     try:
-        results = col.query(
-            query_texts=[content],
-            n_results=5,
-            include=["metadatas", "documents", "distances"],
-        )
+        query_kwargs = {
+            "query_texts": [content],
+            "n_results": 5,
+            "include": ["metadatas", "documents", "distances"],
+        }
+        if where:
+            query_kwargs["where"] = where
+        results = col.query(**query_kwargs)
         duplicates = []
         if results["ids"] and results["ids"][0]:
             for i, drawer_id in enumerate(results["ids"][0]):
@@ -1287,6 +1296,9 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
     Note: ``agent_name`` is normalized to lowercase before storage so
     that diary reads are case-insensitive (see #1243). "Claude",
     "claude", and "CLAUDE" all resolve to the same agent.
+
+    Duplicate entries (cosine similarity >= 0.92) are rejected to
+    prevent reinforcement of identical or near-identical content.
     """
     try:
         agent_name = sanitize_name(agent_name, "agent_name").lower()
@@ -1303,6 +1315,18 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
     col = _get_collection(create=True)
     if not col:
         return _no_palace()
+
+    # Duplicate check — scoped to diary room to avoid false positives from mined code
+    dup = tool_check_duplicate(
+        entry, threshold=DEDUP_THRESHOLD, where={"room": "diary"}
+    )
+    if dup.get("is_duplicate"):
+        return {
+            "success": False,
+            "reason": "duplicate_diary_entry",
+            "message": "A near-identical diary entry already exists.",
+            "matches": dup["matches"],
+        }
 
     now = datetime.now()
     entry_id = (
@@ -1354,6 +1378,93 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
 
 
 def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
+def tool_dedup_report(threshold: float = DEDUP_THRESHOLD, wing: str = None, limit: int = 1000):
+    """
+    Scan the palace for near-duplicate drawers and return a diagnostic report.
+
+    Groups duplicates by cluster so users can decide which to keep.
+    Does NOT delete anything — read-only diagnostic.
+    """
+    col = _get_collection()
+    if not col:
+        return _no_palace()
+
+    try:
+        where_filter = {"wing": wing} if wing else None
+        all_data = col.get(
+            limit=limit,
+            where=where_filter,
+            include=["metadatas", "documents"],
+        )
+
+        if not all_data["ids"]:
+            return {"clusters": [], "total_duplicates": 0, "scanned": 0}
+
+        seen = set()
+        clusters = []
+
+        for i, (doc_id, doc, meta) in enumerate(
+            zip(all_data["ids"], all_data["documents"], all_data["metadatas"])
+        ):
+            if doc_id in seen:
+                continue
+
+            # Query for near-duplicates of this document
+            results = col.query(
+                query_texts=[doc],
+                n_results=min(10, len(all_data["ids"])),
+                include=["metadatas", "documents", "distances"],
+            )
+
+            cluster_members = []
+            if results["ids"] and results["ids"][0]:
+                for j, match_id in enumerate(results["ids"][0]):
+                    if match_id == doc_id:
+                        continue
+                    if match_id in seen:
+                        continue
+
+                    dist = results["distances"][0][j]
+                    similarity = round(1 - dist, 3)
+                    if similarity >= threshold:
+                        match_meta = results["metadatas"][0][j]
+                        match_doc = results["documents"][0][j]
+                        cluster_members.append({
+                            "id": match_id,
+                            "wing": match_meta.get("wing", "?"),
+                            "room": match_meta.get("room", "?"),
+                            "similarity": similarity,
+                            "filed_at": match_meta.get("filed_at", "?"),
+                            "preview": match_doc[:150] + "..." if len(match_doc) > 150 else match_doc,
+                        })
+                        seen.add(match_id)
+
+            if cluster_members:
+                seen.add(doc_id)
+                clusters.append({
+                    "anchor": {
+                        "id": doc_id,
+                        "wing": meta.get("wing", "?"),
+                        "room": meta.get("room", "?"),
+                        "filed_at": meta.get("filed_at", "?"),
+                        "preview": doc[:150] + "..." if len(doc) > 150 else doc,
+                    },
+                    "duplicates": cluster_members,
+                })
+
+        total_dupes = sum(len(c["duplicates"]) for c in clusters)
+        return {
+            "clusters": clusters,
+            "total_duplicates": total_dupes,
+            "total_clusters": len(clusters),
+            "scanned": len(all_data["ids"]),
+            "threshold": threshold,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def tool_diary_read(agent_name: str, last_n: int = 10):
     """
     Read an agent's recent diary entries. Returns the last N entries
     in chronological order — the agent's personal journal.
@@ -2026,6 +2137,26 @@ TOOLS = {
             "properties": {},
         },
         "handler": tool_reconnect,
+    "mempalace_dedup_report": {
+        "description": "Scan the palace for near-duplicate drawers. Returns clusters of similar content so you can identify redundancy. Read-only — does not delete anything.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "threshold": {
+                    "type": "number",
+                    "description": "Similarity threshold (0.0-1.0). Default: 0.92. Higher = stricter.",
+                },
+                "wing": {
+                    "type": "string",
+                    "description": "Optional: restrict scan to a specific wing",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max drawers to scan (default: 1000)",
+                },
+            },
+        },
+        "handler": tool_dedup_report,
     },
 }
 
