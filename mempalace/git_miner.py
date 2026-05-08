@@ -22,6 +22,11 @@ from .palace import (
     upsert_closet_lines,
 )
 
+# Chunking constants (matching miner.py)
+CHUNK_SIZE = 2000
+CHUNK_OVERLAP = 200
+MIN_CHUNK_SIZE = 50
+
 
 def run_git(repo_path: Path, *args) -> str:
     """Run a git command and return stdout."""
@@ -152,6 +157,64 @@ def detect_room_from_files(filepaths: list, fallback: str = "general") -> str:
     return top_component if component_counts[top_component] > 1 else fallback
 
 
+def chunk_diff(diff: str) -> list:
+    """Split diff into drawer-sized chunks. Returns list of (chunk_index, chunk_content)."""
+    if not diff or len(diff) <= CHUNK_SIZE:
+        return [(0, diff)]
+
+    chunks = []
+    start = 0
+    chunk_index = 0
+
+    while start < len(diff):
+        end = min(start + CHUNK_SIZE, len(diff))
+
+        # Try to break at a reasonable boundary (diff section header or newline)
+        if end < len(diff):
+            # Try to break at diff section header (@@)
+            header_pos = diff.rfind("@@", start, end)
+            if header_pos > start + CHUNK_SIZE // 2:
+                end = header_pos
+            else:
+                # Try to break at newline
+                newline_pos = diff.rfind("\n", start, end)
+                if newline_pos > start + CHUNK_SIZE // 2:
+                    end = newline_pos
+
+        chunk = diff[start:end].strip()
+        if len(chunk) >= MIN_CHUNK_SIZE:
+            chunks.append((chunk_index, chunk))
+            chunk_index += 1
+
+        start = end - CHUNK_OVERLAP if end < len(diff) else end
+
+    return chunks
+
+
+def build_commit_header(commit: dict, files_changed: list) -> str:
+    """Build the commit metadata header (same for all chunks)."""
+    commit_hash = commit["hash"]
+    subject = commit.get("subject", "")
+    body = commit.get("body", "")
+    author = commit.get("author", "")
+    email = commit.get("email", "")
+    date = commit.get("date", "")
+
+    return f"""commit {commit_hash}
+Author: {author} <{email}>
+Date:   {date}
+
+{subject}
+
+{body}
+
+Files changed:
+{chr(10).join(files_changed) if files_changed else '(none)'}
+
+Diff:
+"""
+
+
 def add_git_drawer(
     collection,
     wing: str,
@@ -161,7 +224,7 @@ def add_git_drawer(
     chunk_index: int,
     agent: str,
 ):
-    """Add one drawer for a git commit."""
+    """Add one drawer for a git commit chunk."""
     drawer_id = f"git_{wing}_{room}_{hashlib.sha256((source + str(chunk_index)).encode()).hexdigest()[:24]}"
     try:
         metadata = {
@@ -191,7 +254,7 @@ def process_commit(
     agent: str,
     dry_run: bool,
 ):
-    """Process a single commit into the palace."""
+    """Process a single commit into the palace, chunking diff into multiple drawers."""
     commit_hash = commit["hash"]
     source = f"{repo_path}:{commit_hash[:8]}"
 
@@ -201,32 +264,12 @@ def process_commit(
 
     diff = get_commit_diff(repo_path, commit_hash)
     files_changed = get_commit_files_changed(repo_path, commit_hash)
-
-    subject = commit.get("subject", "")
-    body = commit.get("body", "")
-    author = commit.get("author", "")
-    date = commit.get("date", "")
-
-    content = f"""commit {commit_hash}
-Author: {author} <{commit.get('email', '')}>
-Date:   {date}
-
-{subject}
-
-{body}
-
-Files changed:
-{chr(10).join(files_changed) if files_changed else '(none)'}
-
-Diff:
-{diff}
-""".strip()
-
     room = detect_room_from_files(files_changed)
 
     if dry_run:
-        print(f"    [DRY RUN] {commit_hash[:8]} -> room:{room}")
-        return 1, room
+        chunks = chunk_diff(diff)
+        print(f"    [DRY RUN] {commit_hash[:8]} -> room:{room} ({len(chunks)} chunks)")
+        return len(chunks), room
 
     with mine_lock(source):
         if file_already_mined(collection, source, check_mtime=False):
@@ -237,31 +280,60 @@ Diff:
         except Exception:
             pass
 
-        added = add_git_drawer(
-            collection=collection,
-            wing=wing,
-            room=room,
-            content=content,
-            source=source,
-            chunk_index=0,
-            agent=agent,
-        )
+        # Build header (commit metadata)
+        header = build_commit_header(commit, files_changed)
 
-        if closets_col and added:
-            drawer_id = f"git_{wing}_{room}_{hashlib.sha256((source + '0').encode()).hexdigest()[:24]}"
-            closet_lines = build_closet_lines(source, [drawer_id], content, wing, room)
-            closet_id_base = f"closet_{wing}_{room}_{hashlib.sha256(source.encode()).hexdigest()[:24]}"
-            closet_meta = {
-                "wing": wing,
-                "room": room,
-                "source_file": source,
-                "drawer_count": 1,
-                "filed_at": datetime.now().isoformat(),
-            }
-            purge_file_closets(closets_col, source)
-            upsert_closet_lines(closets_col, closet_id_base, closet_lines, closet_meta)
+        # Chunk the diff
+        diff_chunks = chunk_diff(diff)
 
-        return 1 if added else 0, room
+        if not diff_chunks:
+            # No valid chunks, still file with header only
+            added = add_git_drawer(
+                collection=collection,
+                wing=wing,
+                room=room,
+                content=header + "(no diff)",
+                source=source,
+                chunk_index=0,
+                agent=agent,
+            )
+            total_added = 1 if added else 0
+        else:
+            total_added = 0
+            drawer_ids = []
+
+            for chunk_index, diff_chunk in diff_chunks:
+                content = header + diff_chunk
+                added = add_git_drawer(
+                    collection=collection,
+                    wing=wing,
+                    room=room,
+                    content=content,
+                    source=source,
+                    chunk_index=chunk_index,
+                    agent=agent,
+                )
+                if added:
+                    drawer_id = f"git_{wing}_{room}_{hashlib.sha256((source + str(chunk_index)).encode()).hexdigest()[:24]}"
+                    drawer_ids.append(drawer_id)
+                    total_added += 1
+
+            # Build closet for all drawers
+            if closets_col and drawer_ids:
+                all_content = header + diff
+                closet_lines = build_closet_lines(source, drawer_ids, all_content, wing, room)
+                closet_id_base = f"closet_{wing}_{room}_{hashlib.sha256(source.encode()).hexdigest()[:24]}"
+                closet_meta = {
+                    "wing": wing,
+                    "room": room,
+                    "source_file": source,
+                    "drawer_count": len(drawer_ids),
+                    "filed_at": datetime.now().isoformat(),
+                }
+                purge_file_closets(closets_col, source)
+                upsert_closet_lines(closets_col, closet_id_base, closet_lines, closet_meta)
+
+        return total_added, room
 
 
 def mine_git(
@@ -343,7 +415,7 @@ def mine_git(
                 branch_counts[branch] += 1
                 commits_processed += 1
                 if not dry_run:
-                    print(f"    + {commit['hash'][:8]} {commit['subject'][:50]}")
+                    print(f"    + {commit['hash'][:8]} [{drawers} drawers] {commit['subject'][:40]}")
 
         if limit > 0 and commits_processed >= limit:
             break

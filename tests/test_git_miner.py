@@ -186,5 +186,42 @@ class TestProcessCommit:
             dry_run=True,
         )
 
-        assert drawers == 1
+        assert drawers >= 1
         assert room is not None
+
+
+class TestChunkDiff:
+    def test_single_chunk_for_small_diff(self):
+        from mempalace.git_miner import chunk_diff
+
+        small_diff = "@@ -1,3 +1,3 @@\n-old line\n+new line\n"
+        chunks = chunk_diff(small_diff)
+        assert len(chunks) == 1
+        assert chunks[0][0] == 0  # chunk_index
+
+    def test_multiple_chunks_for_large_diff(self):
+        from mempalace.git_miner import chunk_diff, CHUNK_SIZE
+
+        # Create a diff larger than CHUNK_SIZE
+        large_diff = "@@ -1,100 +1,100 @@\n" + "line content\n" * 200
+        chunks = chunk_diff(large_diff)
+        assert len(chunks) > 1
+        # Check that chunk indices are sequential
+        indices = [c[0] for c in chunks]
+        assert indices == list(range(len(chunks)))
+
+    def test_empty_diff_returns_single_empty_chunk(self):
+        from mempalace.git_miner import chunk_diff
+
+        chunks = chunk_diff("")
+        assert len(chunks) == 1
+        assert chunks[0] == (0, "")
+
+    def test_chunk_boundaries(self):
+        from mempalace.git_miner import chunk_diff
+
+        # Create diff with clear section headers
+        diff = "@@ -1,3 +1,3 @@ function_a\nold\n@@ -10,3 +10,3 @@ function_b\nold\n"
+        chunks = chunk_diff(diff)
+        # Should try to break at @@ boundaries
+        assert len(chunks) >= 1
