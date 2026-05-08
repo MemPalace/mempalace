@@ -141,6 +141,11 @@ READABLE_EXTENSIONS = {
     ".sln",
     ".razor",
     ".cshtml",
+    # C / C++
+    ".hpp",
+    ".cpp",
+    ".c",
+    ".h",
 } | PHP_EXTENSIONS
 
 SKIP_FILENAMES = {
