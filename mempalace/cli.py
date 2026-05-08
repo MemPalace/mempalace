@@ -490,12 +490,15 @@ def cmd_mine(args):
     for raw in args.include_ignored or []:
         include_ignored.extend(part.strip() for part in raw.split(",") if part.strip())
 
+    # Canonicalize path to prevent directory traversal attacks
+    source_dir = str(Path(args.dir).expanduser().resolve())
+
     # --redetect-origin re-runs corpus_origin on the current corpus state
     # and overwrites <palace>/.mempalace/origin.json before mining proceeds.
     # Heuristic-only by design — full LLM detection lives on `mempalace init`.
     if getattr(args, "redetect_origin", False):
         _run_pass_zero(
-            project_dir=args.dir,
+            project_dir=source_dir,
             palace_dir=palace_path,
             llm_provider=None,
         )
@@ -504,7 +507,7 @@ def cmd_mine(args):
         from .convo_miner import mine_convos
 
         mine_convos(
-            convo_dir=args.dir,
+            convo_dir=source_dir,
             palace_path=palace_path,
             wing=args.wing,
             agent=args.agent,
@@ -516,7 +519,7 @@ def cmd_mine(args):
         from .miner import mine
 
         mine(
-            project_dir=args.dir,
+            project_dir=source_dir,
             palace_path=palace_path,
             wing_override=args.wing,
             agent=args.agent,
