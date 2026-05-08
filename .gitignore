@@ -5,3 +5,35 @@ __pycache__/
 *.pyc
 .pytest_cache/
 mempal.yaml
+.a5c/
+.claude/
+.codex/
+.codex
+
+# Environment
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Coverage
+htmlcov/
+.coverage
+coverage.xml
+
+# Virtual environments
+.venv/
+venv/
+
+# ChromaDB local data
+*.sqlite3-journal
+.envrc

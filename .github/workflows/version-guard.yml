@@ -1,0 +1,101 @@
+name: Version Guard
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    paths:
+      - 'pyproject.toml'
+      - 'mempalace/version.py'
+      - '.claude-plugin/marketplace.json'
+      - '.claude-plugin/plugin.json'
+      - '.codex-plugin/plugin.json'
+      - '.github/workflows/version-guard.yml'
+
+jobs:
+  check-versions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Extract versions from all sources
+        id: versions
+        run: |
+          set -euo pipefail
+          py_version=$(grep -E '^__version__' mempalace/version.py | cut -d'"' -f2)
+          pyproject_version=$(grep -E '^version' pyproject.toml | head -1 | cut -d'"' -f2)
+          marketplace_version=$(jq -r '.plugins[0].version' .claude-plugin/marketplace.json)
+          plugin_version=$(jq -r '.version' .claude-plugin/plugin.json)
+          codex_version=$(jq -r '.version' .codex-plugin/plugin.json)
+
+          echo "py_version=$py_version" >> "$GITHUB_OUTPUT"
+          echo "pyproject_version=$pyproject_version" >> "$GITHUB_OUTPUT"
+          echo "marketplace_version=$marketplace_version" >> "$GITHUB_OUTPUT"
+          echo "plugin_version=$plugin_version" >> "$GITHUB_OUTPUT"
+          echo "codex_version=$codex_version" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Detected versions"
+            echo ""
+            echo "| Source | Version |"
+            echo "| --- | --- |"
+            echo "| mempalace/version.py | \`$py_version\` |"
+            echo "| pyproject.toml | \`$pyproject_version\` |"
+            echo "| .claude-plugin/marketplace.json | \`$marketplace_version\` |"
+            echo "| .claude-plugin/plugin.json | \`$plugin_version\` |"
+            echo "| .codex-plugin/plugin.json | \`$codex_version\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify all sources agree
+        env:
+          PY: ${{ steps.versions.outputs.py_version }}
+          PYPROJECT: ${{ steps.versions.outputs.pyproject_version }}
+          MARKETPLACE: ${{ steps.versions.outputs.marketplace_version }}
+          PLUGIN: ${{ steps.versions.outputs.plugin_version }}
+          CODEX: ${{ steps.versions.outputs.codex_version }}
+        run: |
+          set -euo pipefail
+          fail=0
+          check() {
+            local name="$1" value="$2" expected="$3"
+            if [[ "$value" != "$expected" ]]; then
+              echo "::error file=$name::version mismatch — expected $expected, got $value"
+              fail=1
+            fi
+          }
+          # All five must agree with each other (use version.py as the reference, per CLAUDE.md)
+          check "pyproject.toml" "$PYPROJECT" "$PY"
+          check ".claude-plugin/marketplace.json" "$MARKETPLACE" "$PY"
+          check ".claude-plugin/plugin.json" "$PLUGIN" "$PY"
+          check ".codex-plugin/plugin.json" "$CODEX" "$PY"
+          exit $fail
+
+      - name: Verify tag matches manifest (tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          PY: ${{ steps.versions.outputs.py_version }}
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+
+          # Semver pre-release tags (v3.4.0-rc1, v1.0.0-beta.2, ...) are treated
+          # as internal/staging and are not validated against the manifest. They
+          # do not flow to end users via `/plugin update`, which reads the
+          # manifest on the default branch.
+          if [[ "$tag_version" == *-* ]]; then
+            echo "Pre-release tag $GITHUB_REF_NAME — skipping strict manifest match."
+            {
+              echo ""
+              echo "> Pre-release tag detected: \`$GITHUB_REF_NAME\`."
+              echo "> Manifest ($PY) is not required to match. Pre-releases are not published via \`/plugin update\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [[ "$tag_version" != "$PY" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match manifest version $PY"
+            echo "Bump mempalace/version.py, pyproject.toml, and all plugin manifests before tagging a stable release."
+            echo "For an internal/staging tag, use a semver pre-release suffix (e.g. v${PY}-rc1)."
+            exit 1
+          fi
+          echo "Tag $GITHUB_REF_NAME matches manifest version $PY"

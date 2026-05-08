@@ -1,6 +1,9 @@
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.9.0
+    # Keep in lock-step with the ruff version pinned in .github/workflows/ci.yml
+    # (>=0.4.0,<0.5). Using a newer rev here produces a different formatter
+    # output than CI and breaks `ruff format --check` in the lint job.
+    rev: v0.4.10
     hooks:
       - id: ruff
         args: [--fix]

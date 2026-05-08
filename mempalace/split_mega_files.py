@@ -50,7 +50,7 @@ def _load_known_names_config(force_reload: bool = False):
 
     if _KNOWN_NAMES_PATH.exists():
         try:
-            _KNOWN_NAMES_CACHE = json.loads(_KNOWN_NAMES_PATH.read_text())
+            _KNOWN_NAMES_CACHE = json.loads(_KNOWN_NAMES_PATH.read_text(encoding="utf-8"))
             return _KNOWN_NAMES_CACHE
         except (json.JSONDecodeError, OSError):
             pass
@@ -182,6 +182,10 @@ def split_file(filepath, output_dir, dry_run=False):
     Returns list of output paths written (or would be written if dry_run).
     """
     path = Path(filepath)
+    max_size = 500 * 1024 * 1024  # 500 MB safety limit
+    if path.stat().st_size > max_size:
+        print(f"  SKIP: {path.name} exceeds {max_size // (1024 * 1024)} MB limit")
+        return []
     lines = path.read_text(errors="replace").splitlines(keepends=True)
 
     boundaries = find_session_boundaries(lines)
@@ -219,8 +223,8 @@ def split_file(filepath, output_dir, dry_run=False):
         if dry_run:
             print(f"  [{i + 1}/{len(boundaries) - 1}] {name}  ({len(chunk)} lines)")
         else:
-            out_path.write_text("".join(chunk))
-            print(f"  ✓ {name}  ({len(chunk)} lines)")
+            out_path.write_text("".join(chunk), encoding="utf-8")
+            print(f"  + {name}  ({len(chunk)} lines)")
 
         written.append(out_path)
 
@@ -257,7 +261,7 @@ def main():
     )
     args = parser.parse_args()
 
-    src_dir = Path(args.source) if args.source else LUMI_DIR
+    src_dir = Path(args.source).expanduser().resolve() if args.source else LUMI_DIR
     output_dir = args.output_dir or None  # None = same dir as file
 
     if args.file:
@@ -266,7 +270,11 @@ def main():
         files = sorted(src_dir.glob("*.txt"))
 
     mega_files = []
+    max_scan_size = 500 * 1024 * 1024  # 500 MB
     for f in files:
+        if f.stat().st_size > max_scan_size:
+            print(f"  SKIP: {f.name} exceeds {max_scan_size // (1024 * 1024)} MB limit")
+            continue
         lines = f.read_text(errors="replace").splitlines(keepends=True)
         boundaries = find_session_boundaries(lines)
         if len(boundaries) >= args.min_sessions:
@@ -282,7 +290,7 @@ def main():
     print(f"  Source:      {src_dir}")
     print(f"  Output:      {output_dir or 'same dir as source'}")
     print(f"  Mega-files:  {len(mega_files)}")
-    print(f"{'─' * 60}\n")
+    print(f"{'-' * 60}\n")
 
     total_written = 0
     for f, n_sessions in mega_files:
@@ -293,11 +301,11 @@ def main():
         if not args.dry_run and written:
             backup = f.with_suffix(".mega_backup")
             f.rename(backup)
-            print(f"  → Original renamed to {backup.name}\n")
+            print(f"  -> Original renamed to {backup.name}\n")
         else:
             print()
 
-    print(f"{'─' * 60}")
+    print(f"{'-' * 60}")
     if args.dry_run:
         print(f"  DRY RUN — would create {total_written} files from {len(mega_files)} mega-files")
     else:

@@ -158,6 +158,8 @@ _FLAG_SIGNALS = {
 }
 
 # Common filler/stop words to strip from topic extraction
+_ALPHA_RE = re.compile(r"[^a-zA-Z]")
+
 _STOP_WORDS = {
     "the",
     "a",
@@ -317,13 +319,17 @@ class Dialect:
         dialect.generate_layer1("zettels/", output="LAYER1.aaak")
     """
 
-    def __init__(self, entities: Dict[str, str] = None, skip_names: List[str] = None):
+    def __init__(
+        self, entities: Dict[str, str] = None, skip_names: List[str] = None, lang: str = None
+    ):
         """
         Args:
             entities: Mapping of full names -> short codes.
                       e.g. {"Alice": "ALC", "Bob": "BOB"}
                       If None, entities are auto-coded from first 3 chars.
             skip_names: Names to skip (fictional characters, etc.)
+            lang: Language code (e.g. "fr", "ko"). Loads AAAK instruction
+                  and regex patterns from i18n dictionary.
         """
         self.entity_codes = {}
         if entities:
@@ -331,6 +337,15 @@ class Dialect:
                 self.entity_codes[name] = code
                 self.entity_codes[name.lower()] = code
         self.skip_names = [n.lower() for n in (skip_names or [])]
+
+        # Load language-specific AAAK instruction and regex patterns
+        from mempalace.i18n import load_lang, t, current_lang, get_regex
+
+        if lang:
+            load_lang(lang)
+        self.lang = lang or current_lang()
+        self.aaak_instruction = t("aaak.instruction")
+        self.lang_regex = get_regex()
 
     @classmethod
     def from_config(cls, config_path: str) -> "Dialect":
@@ -347,6 +362,7 @@ class Dialect:
         return cls(
             entities=config.get("entities", {}),
             skip_names=config.get("skip_names", []),
+            lang=config.get("lang", "en"),
         )
 
     def save_config(self, config_path: str):
@@ -527,7 +543,7 @@ class Dialect:
         # Fallback: find capitalized words that look like names (2+ chars, not sentence-start)
         words = text.split()
         for i, w in enumerate(words):
-            clean = re.sub(r"[^a-zA-Z]", "", w)
+            clean = _ALPHA_RE.sub("", w)
             if (
                 len(clean) >= 2
                 and clean[0].isupper()
@@ -857,7 +873,7 @@ class Dialect:
 
         for date_key in sorted(by_date.keys()):
             lines.append(f"=MOMENTS[{date_key}]=")
-            for z, fnum in by_date[date_key]:
+            for z, _fnum in by_date[date_key]:
                 entities = []
                 for p in z.get("people", []):
                     code = self.encode_entity(p)

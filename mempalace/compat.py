@@ -60,7 +60,9 @@ def ensure_palace_safe(palace_path: str) -> None:
     meta = read_palace_metadata(palace_path)
 
     if meta is None:
-        if current_major is not None and current_major >= 1:
+        palace_dir = Path(palace_path).expanduser()
+        has_chroma_payload = (palace_dir / "chroma.sqlite3").exists()
+        if current_major is not None and current_major >= 1 and has_chroma_payload:
             raise RuntimeError(
                 "Refusing to open palace without compatibility metadata under Chroma 1.x. "
                 "Use a tested Chroma <1 environment or rebuild the palace with this version of MemPalace."

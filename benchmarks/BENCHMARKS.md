@@ -41,23 +41,57 @@ Both are real. Both are reproducible. Neither is the whole picture alone.
 
 ## Comparison vs Published Systems (LongMemEval)
 
-| # | System | R@5 | LLM Required | Which LLM | Notes |
+> **Important caveat — read before quoting this table.**
+> MemPal's `R@5` in this table is **retrieval recall**: is the labelled
+> session for this question inside the top-5 retrieved candidates?
+>
+> Several of the other systems below publish **end-to-end QA accuracy** —
+> a different metric that scores whether the system's generated answer
+> is correct. Retrieval recall and QA accuracy are not comparable; a
+> system can have 100% retrieval recall and 40% QA accuracy, and vice
+> versa.
+>
+> - **Mastra's 94.87%** is binary QA accuracy with GPT-5-mini, per
+>   [mastra.ai/research/observational-memory](https://mastra.ai/research/observational-memory).
+> - **Supermemory ASMR's ~99%** is QA accuracy with an 8-/12-agent
+>   ensemble, and the authors explicitly frame it as an experimental
+>   proof-of-concept, not production, per
+>   [their ASMR post](https://supermemory.ai/blog/we-broke-the-frontier-in-agent-memory-introducing-99-sota-memory-system/).
+> - **Mem0** does not publish a LongMemEval number; their published
+>   metric is LoCoMo QA accuracy (~66.9%), per
+>   [mem0.ai/research](https://mem0.ai/research).
+>
+> The table is kept here as a historical record of how the comparison
+> was originally framed. Public-facing pages (`README.md`,
+> `mempalaceofficial.com`) no longer present this table, per issue
+> [#875](https://github.com/MemPalace/mempalace/issues/875). For a fair
+> head-to-head, run the same metric on the same split.
+
+| # | System | R@5 (retrieval recall, unless noted) | LLM Required | Which LLM | Notes |
 |---|---|---|---|---|---|
-| 1 | **MemPal (hybrid v4 + rerank)** | **100%** | Optional | Haiku | Reproducible, 500/500 |
-| 2 | Supermemory ASMR | ~99% | Yes | Undisclosed | Research only, not in production |
+| 1 | **MemPal (hybrid v4 + Haiku rerank)** | **100%** | Optional | Haiku | 500/500 — but the 99.4%→100% step tuned on 3 specific wrong answers (see "Benchmark Integrity" below). Held-out 450q is 98.4%. |
+| 2 | Supermemory ASMR | ~99% *(QA accuracy, not R@5)* | Yes | Ensemble of Gemini 2.0 Flash / GPT-4o-mini | Experimental, not production, per authors |
 | 3 | MemPal (hybrid v3 + rerank) | 99.4% | Optional | Haiku | Reproducible |
 | 3 | MemPal (palace + rerank) | 99.4% | Optional | Haiku | Independent architecture |
-| 4 | Mastra | 94.87% | Yes | GPT-5-mini | — |
-| 5 | **MemPal (raw, no LLM)** | **96.6%** | **None** | **None** | **Highest zero-API score published** |
-| 6 | Hindsight | 91.4% | Yes | Gemini-3 | — |
-| 7 | Supermemory (production) | ~85% | Yes | Undisclosed | — |
-| 8 | Stella (dense retriever) | ~85% | None | None | Academic baseline |
-| 9 | Contriever | ~78% | None | None | Academic baseline |
+| 4 | Mastra | 94.87% *(QA accuracy, not R@5)* | Yes | GPT-5-mini | Different metric — not directly comparable to R@5 |
+| 5 | **MemPal (raw, no LLM)** | **96.6%** | **None** | **None** | **Reproducible, 500/500** |
+| 6 | MemPal hybrid v4 held-out 450 | 98.4% | None | None | Honest generalisable hybrid-pipeline figure |
+| 7 | Hindsight | 91.4% *(per their release, metric unverified)* | Yes | Gemini-3 | Check their published methodology |
+| 8 | Stella (dense retriever) | ~85% | None | None | Academic retrieval baseline |
+| 9 | Contriever | ~78% | None | None | Academic retrieval baseline |
 | 10 | BM25 (sparse) | ~70% | None | None | Keyword baseline |
 
-**MemPal raw (96.6%) is the highest published LongMemEval score that requires no API key, no cloud, and no LLM at any stage.**
+The MemPal raw 96.6% is the headline we ship on public surfaces: it's
+retrieval recall, it requires no API key, and it reproduces.
 
-**MemPal hybrid v4 + Haiku rerank (100%) is the first perfect score on LongMemEval — 500/500 questions, all 6 question types at 100%.**
+The MemPal hybrid v4 + Haiku rerank 100% remains an internal
+result — reproducible with `--mode hybrid_v4 --llm-rerank` — but we
+don't quote it on public pages because the final 0.6% was reached by
+inspecting three specific wrong answers (see "Benchmark Integrity"
+below), which is teaching to the test. The honest generalisable figure
+when an LLM is in the loop is the held-out 98.4% R@5 on 450 unseen
+questions, or the model-agnostic 99.2% R@5 / 100% R@10 we reproduced
+with minimax-m2.7 on the full 500.
 
 ---
 
@@ -308,9 +342,9 @@ The palace classifies each question into one of 5 halls. Pass 1 searches only wi
 ### Setup
 
 ```bash
-git clone -b ben/benchmarking https://github.com/aya-thekeeper/mempal.git
-cd mempal
-pip install chromadb pyyaml
+git clone https://github.com/MemPalace/mempalace.git
+cd mempalace
+uv sync --extra dev   # or: pip install -e ".[dev]"
 mkdir -p /tmp/longmemeval-data
 curl -fsSL -o /tmp/longmemeval-data/longmemeval_s_cleaned.json \
   https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_s_cleaned.json
@@ -690,8 +724,8 @@ python benchmarks/longmemeval_bench.py /tmp/longmemeval-data/longmemeval_s_clean
 The question: how much of the 96.6% → 99.4% improvement is the heuristics, and how much would come from just using a better embedding model?
 
 ```bash
-pip install fastembed
-python benchmarks/longmemeval_bench.py /tmp/longmemeval-data/longmemeval_s_cleaned.json \
+uv pip install fastembed   # or: pip install fastembed
+uv run python benchmarks/longmemeval_bench.py /tmp/longmemeval-data/longmemeval_s_cleaned.json \
   --mode raw --embed-model bge-large
 ```
 

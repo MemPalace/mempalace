@@ -1,0 +1,51 @@
+name: Bump Version
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  bump-version:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Bump patch version
+        run: |
+          CURRENT=$(python3 -c "exec(open('mempalace/version.py').read()); print(__version__)")
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          PATCH=$((PATCH + 1))
+          NEW="${MAJOR}.${MINOR}.${PATCH}"
+          echo "__version__ = \"${NEW}\"" > mempalace/version.py
+          # Prepend docstring
+          sed -i '1i"""Single source of truth for the MemPalace package version."""\n' mempalace/version.py
+          echo "version=$NEW" >> "$GITHUB_OUTPUT"
+        id: version
+
+      - name: Sync plugin.json
+        run: |
+          jq --arg v "${{ steps.version.outputs.version }}" '.version = $v' .claude-plugin/plugin.json > tmp.json && mv tmp.json .claude-plugin/plugin.json
+
+      - name: Sync marketplace.json
+        run: |
+          jq --arg v "${{ steps.version.outputs.version }}" '.plugins[0].version = $v' .claude-plugin/marketplace.json > tmp.json && mv tmp.json .claude-plugin/marketplace.json
+
+      - name: Sync codex plugin.json
+        run: |
+          jq --arg v "${{ steps.version.outputs.version }}" '.version = $v' .codex-plugin/plugin.json > tmp.json && mv tmp.json .codex-plugin/plugin.json
+
+      - name: Sync pyproject.toml
+        run: |
+          sed -i "s/^version = \".*\"/version = \"${{ steps.version.outputs.version }}\"/" pyproject.toml
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add mempalace/version.py .claude-plugin/plugin.json .claude-plugin/marketplace.json .codex-plugin/plugin.json pyproject.toml
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: bump version to ${{ steps.version.outputs.version }}"
+            git push
+          fi

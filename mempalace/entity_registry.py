@@ -16,6 +16,7 @@ Usage:
 """
 
 import json
+import os
 import re
 import urllib.request
 import urllib.parse
@@ -178,6 +179,12 @@ def _wikipedia_lookup(word: str) -> dict:
     Look up a word via Wikipedia REST API.
     Returns inferred type (person/place/concept/unknown) + confidence + summary.
     Free, no API key, handles disambiguation pages.
+
+    **Privacy warning:** This function makes an outbound HTTPS request to
+    en.wikipedia.org, sending the queried word over the network.  It should
+    only be called when the caller has explicitly opted in via
+    ``allow_network=True`` in :meth:`EntityRegistry.research`.  The default
+    behaviour of ``research()`` is local-only (no network calls).
     """
     try:
         url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(word)}"
@@ -244,13 +251,14 @@ def _wikipedia_lookup(word: str) -> dict:
 
     except urllib.error.HTTPError as e:
         if e.code == 404:
-            # Not in Wikipedia — strong signal it's a proper noun (unusual name, nickname)
+            # Not in Wikipedia — this tells us nothing definitive about
+            # the word.  Return "unknown" so the caller can decide.
             return {
-                "inferred_type": "person",
-                "confidence": 0.70,
+                "inferred_type": "unknown",
+                "confidence": 0.3,
                 "wiki_summary": None,
                 "wiki_title": None,
-                "note": "not found in Wikipedia — likely a proper noun or unusual name",
+                "note": "not found in Wikipedia",
             }
         return {"inferred_type": "unknown", "confidence": 0.0, "wiki_summary": None}
     except (urllib.error.URLError, OSError, json.JSONDecodeError, KeyError):
@@ -301,7 +309,7 @@ class EntityRegistry:
         path = (Path(config_dir) / "entity_registry.json") if config_dir else cls.DEFAULT_PATH
         if path.exists():
             try:
-                data = json.loads(path.read_text())
+                data = json.loads(path.read_text(encoding="utf-8"))
                 return cls(data, path)
             except (json.JSONDecodeError, OSError):
                 pass
@@ -309,7 +317,39 @@ class EntityRegistry:
 
     def save(self):
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(json.dumps(self._data, indent=2))
+        try:
+            self._path.parent.chmod(0o700)
+        except (OSError, NotImplementedError):
+            pass
+        # Atomic write: serialize to a sibling temp file in the same dir
+        # (so os.replace stays on one filesystem), fsync, then rename over
+        # the target. A crash mid-write leaves the previous registry intact
+        # instead of a half-written file or an empty file from the truncate.
+        payload = json.dumps(self._data, indent=2)
+        tmp_path = self._path.with_name(self._path.name + ".tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            tmp_path.chmod(0o600)
+        except (OSError, NotImplementedError):
+            pass
+        os.replace(tmp_path, self._path)
+        # On ext4 (and similar) the rename's durability across power loss
+        # requires an additional fsync on the parent directory. Without it,
+        # the kernel can ack the rename and a crash reverts to the state
+        # where the temp file is present and the target is at the old version.
+        try:
+            dir_fd = os.open(str(self._path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            # Windows and some special filesystems reject directory fds — they
+            # have different durability semantics on rename anyway.
+            pass
 
     @staticmethod
     def _empty() -> dict:
@@ -502,20 +542,41 @@ class EntityRegistry:
 
     # ── Research unknown words ───────────────────────────────────────────────
 
-    def research(self, word: str, auto_confirm: bool = False) -> dict:
+    def research(self, word: str, auto_confirm: bool = False, allow_network: bool = False) -> dict:
         """
-        Research an unknown word via Wikipedia.
-        Caches result. If auto_confirm=False, marks as unconfirmed (needs user review).
-        Returns the lookup result.
+        Research an unknown word.
+
+        By default this is **local-only**: it checks the wiki cache and
+        returns ``"unknown"`` for uncached words.  Pass
+        ``allow_network=True`` to explicitly opt in to an outbound
+        Wikipedia lookup.  This design honours the project's
+        *local-first, zero API* and *privacy by architecture* principles
+        — no data leaves the machine unless the caller requests it.
+
+        Caches result.  If *auto_confirm* is ``False``, marks the entry
+        as unconfirmed (needs user review).
         """
-        # Already cached?
-        cache = self._data.setdefault("wiki_cache", {})
+        # Check cache (read-only — no mutation when allow_network is False)
+        cache = self._data.get("wiki_cache", {})
         if word in cache:
             return cache[word]
 
+        if not allow_network:
+            return {
+                "inferred_type": "unknown",
+                "confidence": 0.0,
+                "wiki_summary": None,
+                "wiki_title": None,
+                "word": word,
+                "confirmed": False,
+                "note": "network lookup disabled — pass allow_network=True to query Wikipedia",
+            }
+
+        # Network path — ensure wiki_cache key exists before writing
+        cache = self._data.setdefault("wiki_cache", {})
         result = _wikipedia_lookup(word)
-        result["word"] = word
-        result["confirmed"] = auto_confirm
+        result.setdefault("word", word)
+        result.setdefault("confirmed", auto_confirm)
 
         cache[word] = result
         self.save()
@@ -547,15 +608,19 @@ class EntityRegistry:
 
     # ── Learn from sessions ──────────────────────────────────────────────────
 
-    def learn_from_text(self, text: str, min_confidence: float = 0.75) -> list:
+    def learn_from_text(self, text: str, min_confidence: float = 0.75, languages=("en",)) -> list:
         """
         Scan session text for new entity candidates.
         Returns list of newly discovered candidates for review.
+
+        ``languages`` is forwarded to entity detection — pass the user's
+        configured ``MempalaceConfig().entity_languages`` to match the
+        locales used at ``mempalace init`` time.
         """
         from mempalace.entity_detector import extract_candidates, score_entity, classify_entity
 
         lines = text.splitlines()
-        candidates = extract_candidates(text)
+        candidates = extract_candidates(text, languages=languages)
         new_candidates = []
 
         for name, frequency in candidates.items():
@@ -563,7 +628,7 @@ class EntityRegistry:
             if name in self.people or name in self.projects:
                 continue
 
-            scores = score_entity(name, text, lines)
+            scores = score_entity(name, text, lines, languages=languages)
             entity = classify_entity(name, frequency, scores)
 
             if entity["type"] == "person" and entity["confidence"] >= min_confidence:
@@ -616,7 +681,9 @@ class EntityRegistry:
         Find capitalized words in query that aren't in registry or common words.
         These are candidates for Wikipedia research.
         """
-        candidates = re.findall(r"\b[A-Z][a-z]{2,15}\b", query)
+        from .palace import _candidate_entity_words
+
+        candidates = _candidate_entity_words(query)
         unknown = []
         for word in set(candidates):
             if word.lower() in COMMON_ENGLISH_WORDS:

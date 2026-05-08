@@ -1,0 +1,44 @@
+{
+  "lang": "ko",
+  "label": "한국어",
+  "terms": {
+    "palace": "궁전",
+    "wing": "날개",
+    "hall": "복도",
+    "closet": "벽장",
+    "drawer": "서랍",
+    "mine": "채굴",
+    "search": "검색",
+    "status": "상태",
+    "init": "초기화",
+    "repair": "수리",
+    "migrate": "마이그레이션",
+    "entity": "개체",
+    "topic": "주제"
+  },
+  "cli": {
+    "mine_start": "{path} 채굴 중...",
+    "mine_complete": "완료. 벽장 {closets}개, 서랍 {drawers}개 생성.",
+    "mine_skip": "이미 채굴됨. --force로 다시 실행하세요.",
+    "search_no_results": "결과 없음: {query}",
+    "search_results": "{count}개 결과 발견:",
+    "status_palace": "궁전: {path}",
+    "status_wings": "날개 {count}개",
+    "status_closets": "벽장 {count}개",
+    "status_drawers": "서랍 {count}개",
+    "init_complete": "{path}에 궁전 초기화 완료",
+    "init_exists": "{path}에 궁전이 이미 존재합니다",
+    "repair_complete": "수리 완료. {fixed}개 문제 해결.",
+    "migrate_complete": "마이그레이션 완료.",
+    "no_palace": "궁전을 찾을 수 없습니다. 실행: mempalace init <폴더>"
+  },
+  "aaak": {
+    "instruction": "한국어로 압축하세요. 개념 사이에 파이프(|), 단어 연결에 하이픈(-). 조사와 접속사는 생략. 고유명사와 숫자는 정확히 유지."
+  },
+  "regex": {
+    "topic_pattern": "[가-힣]{2,}|[A-Za-z][A-Za-z0-9_]{2,}",
+    "stop_words": "은 는 이 가 을 를 에 에서 의 로 으로 와 과 도 만 까지 부터 처럼 보다 한 하는 했다 합니다 했습니다 되었 있는 것 수 등 및 또는 그리고 하지만 때문에",
+    "quote_pattern": "\"([^\"]{10,100})\"|'([^']{10,100})'",
+    "action_pattern": "(구축|수정|추가|삭제|확인|생성|구현|수리|작성|테스트|검증|업데이트|설정|시작|중지)(?:했|한|하여|합니다|했습니다)"
+  }
+}
