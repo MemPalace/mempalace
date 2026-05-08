@@ -33,34 +33,13 @@ from .palace import (
 
 logger = logging.getLogger("mempalace_mcp")
 
-READABLE_EXTENSIONS = {
-    ".txt",
-    ".md",
-    ".py",
-    ".js",
-    ".ts",
-    ".jsx",
-    ".tsx",
-    ".json",
-    ".jsonl",
-    ".yaml",
-    ".yml",
-    ".html",
-    ".css",
-    ".java",
-    ".go",
-    ".rs",
-    ".rb",
-    ".sh",
-    ".csv",
-    ".sql",
-    ".toml",
-    ".cs",
-    ".hpp",
-    ".cpp",
-    ".c",
-    ".h"
-}
+
+def get_readable_extensions() -> set:
+    """Get the set of readable file extensions."""
+    from .config import MempalaceConfig
+
+    return MempalaceConfig().readable_extensions
+
 
 SKIP_FILENAMES = {
     "entities.json",
@@ -983,7 +962,7 @@ def scan_project(
 
             if not force_include and filename in SKIP_FILENAMES:
                 continue
-            if filepath.suffix.lower() not in READABLE_EXTENSIONS and not exact_force_include:
+            if filepath.suffix.lower() not in get_readable_extensions() and not exact_force_include:
                 continue
             if respect_gitignore and active_matchers and not force_include:
                 if is_gitignored(filepath, active_matchers, is_dir=False):

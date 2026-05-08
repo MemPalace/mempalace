@@ -25,7 +25,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
-from mempalace.miner import MAX_FILE_SIZE, READABLE_EXTENSIONS, scan_project
+from mempalace.miner import MAX_FILE_SIZE, get_readable_extensions, scan_project
 
 
 class TestJsonlNotSilentlySkipped:
@@ -37,7 +37,7 @@ class TestJsonlNotSilentlySkipped:
         of Claude Code's transcripts, ChatGPT exports, and similar
         tooling writes `.jsonl`. Excluding it silently drops user data.
         """
-        assert ".jsonl" in READABLE_EXTENSIONS, (
+        assert ".jsonl" in get_readable_extensions(), (
             "mempalace/miner.py:READABLE_EXTENSIONS contains `.json` "
             "but NOT `.jsonl`. Every jsonl file in a mined project is "
             "silently skipped at miner.py:722 "

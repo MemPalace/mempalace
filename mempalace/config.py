@@ -186,6 +186,36 @@ DEFAULT_HALL_KEYWORDS = {
 }
 
 
+DEFAULT_READABLE_EXTENSIONS = {
+    ".txt",
+    ".md",
+    ".py",
+    ".js",
+    ".ts",
+    ".jsx",
+    ".tsx",
+    ".json",
+    ".jsonl",
+    ".yaml",
+    ".yml",
+    ".html",
+    ".css",
+    ".java",
+    ".go",
+    ".rs",
+    ".rb",
+    ".sh",
+    ".csv",
+    ".sql",
+    ".toml",
+    ".cs",
+    ".hpp",
+    ".cpp",
+    ".c",
+    ".h"
+}
+
+
 class MempalaceConfig:
     """Configuration manager for MemPalace.
 
@@ -249,6 +279,11 @@ class MempalaceConfig:
     def hall_keywords(self):
         """Mapping of hall names to keyword lists."""
         return self._file_config.get("hall_keywords", DEFAULT_HALL_KEYWORDS)
+
+    @property
+    def readable_extensions(self):
+        """Set of file extensions that are considered readable for mining."""
+        return set(self._file_config.get("readable_extensions", DEFAULT_READABLE_EXTENSIONS))
 
     @property
     def entity_languages(self):
@@ -364,6 +399,7 @@ class MempalaceConfig:
                 "collection_name": DEFAULT_COLLECTION_NAME,
                 "topic_wings": DEFAULT_TOPIC_WINGS,
                 "hall_keywords": DEFAULT_HALL_KEYWORDS,
+                "readable_extensions": list(DEFAULT_READABLE_EXTENSIONS),
             }
             with open(self._config_file, "w") as f:
                 json.dump(default_config, f, indent=2)

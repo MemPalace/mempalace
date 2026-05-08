@@ -693,9 +693,12 @@ def scan_for_detection(project_dir: str, max_files: int = 10) -> list:
     Prose only (.txt, .md, .rst, .csv) — code files produce too many false positives.
     Falls back to all readable files if no prose found.
     """
+    from .config import MempalaceConfig
+    
     project_path = Path(project_dir).expanduser().resolve()
     prose_files = []
     all_files = []
+    readable_extensions = MempalaceConfig().readable_extensions
 
     for root, dirs, filenames in os.walk(project_path):
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
@@ -706,7 +709,7 @@ def scan_for_detection(project_dir: str, max_files: int = 10) -> list:
             ext = filepath.suffix.lower()
             if ext in PROSE_EXTENSIONS:
                 prose_files.append(filepath)
-            elif ext in READABLE_EXTENSIONS:
+            elif ext in readable_extensions:
                 all_files.append(filepath)
 
     # Prefer prose files — fall back to all readable if too few prose files
