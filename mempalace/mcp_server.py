@@ -741,7 +741,7 @@ def tool_search(
     return result
 
 
-def tool_check_duplicate(content: str, threshold: float = 0.9):
+def tool_check_duplicate(content: str, threshold: float = 0.5):
     col = _get_collection()
     if not col:
         return _no_palace()
@@ -1847,7 +1847,12 @@ TOOLS = {
                 "content": {"type": "string", "description": "Content to check"},
                 "threshold": {
                     "type": "number",
-                    "description": "Similarity threshold 0-1 (default 0.9)",
+                    "description": (
+                        "Minimum similarity score to flag as duplicate (0-1, default 0.5). "
+                        "Similarity is 1 - cosine_distance: 1.0 = identical, ~0.7 = partial "
+                        "overlap, ~0.5 = semantically related. The previous default of 0.9 "
+                        "only caught near-exact copies and missed partial duplicates."
+                    ),
                 },
             },
             "required": ["content"],
