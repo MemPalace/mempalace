@@ -288,6 +288,7 @@ def mine_git(
     commits_processed = 0
     commits_skipped = 0
     branch_counts = defaultdict(int)
+    visited = set()
 
     for branch in target_branches:
         print(f"  Branch: {branch}")
@@ -296,6 +297,11 @@ def mine_git(
         for commit in commits:
             if limit > 0 and commits_processed >= limit:
                 break
+
+            commit_hash = commit["hash"]
+            if commit_hash in visited:
+                continue
+            visited.add(commit_hash)
 
             drawers, room = process_commit(
                 repo_path=repo_path,
