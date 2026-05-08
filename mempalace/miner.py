@@ -13,6 +13,7 @@ import shlex
 import hashlib
 import fnmatch
 import logging
+import json
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
@@ -93,6 +94,67 @@ MAX_CHUNKS_PER_FILE = 500
 # =============================================================================
 # IGNORE MATCHING
 # =============================================================================
+
+
+SOURCE_FRONTMATTER_FIELDS = (
+    "source_item_id",
+    "source_title",
+    "source_created_at",
+    "source_modified_at",
+    "source_observed_at",
+)
+
+
+def extract_staged_source_metadata(content: str) -> dict:
+    """Extract source metadata from mempalace-sync staged front matter."""
+
+    if not content.startswith("---\n"):
+        return {}
+    lines = content.splitlines()
+    if len(lines) < 4 or lines[0] != "---":
+        return {}
+    try:
+        end = lines[1:].index("---") + 1
+    except ValueError:
+        return {}
+
+    parsed: dict = {}
+    for line in lines[1:end]:
+        if ": " not in line:
+            continue
+        key, value = line.split(": ", 1)
+        if key == "source_item_id" and value:
+            parsed["source_item_id"] = value
+        elif key == "title" and value:
+            parsed["source_title"] = value
+        elif key == "metadata" and value:
+            try:
+                metadata = json.loads(value)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(metadata, dict):
+                continue
+            for field in (
+                "source_created_at",
+                "source_modified_at",
+                "source_observed_at",
+            ):
+                field_value = metadata.get(field)
+                if isinstance(field_value, (str, int, float, bool)) and field_value != "":
+                    parsed[field] = field_value
+    return parsed
+
+
+def apply_source_metadata(metadata: dict, source_metadata: Optional[dict]) -> dict:
+    """Copy supported staged source metadata fields into Chroma metadata."""
+
+    if not source_metadata:
+        return metadata
+    for field in SOURCE_FRONTMATTER_FIELDS:
+        value = source_metadata.get(field)
+        if isinstance(value, (str, int, float, bool)) and value != "":
+            metadata[field] = value
+    return metadata
 
 
 class GitignoreMatcher:
@@ -749,6 +811,7 @@ def _build_drawer_metadata(
     agent: str,
     content: str,
     source_mtime: Optional[float],
+    source_metadata: Optional[dict] = None,
 ) -> dict:
     """Build the metadata dict for one drawer without upserting.
 
@@ -767,6 +830,7 @@ def _build_drawer_metadata(
     }
     if source_mtime is not None:
         metadata["source_mtime"] = source_mtime
+    apply_source_metadata(metadata, source_metadata)
     metadata["hall"] = detect_hall(content)
     entities = _extract_entities_for_metadata(content)
     if entities:
@@ -829,6 +893,7 @@ def process_file(
     content = content.strip()
     if len(content) < MIN_CHUNK_SIZE:
         return 0, "general"
+    source_metadata = extract_staged_source_metadata(content)
 
     room = detect_room(filepath, content, rooms, project_path)
     chunks = chunk_text(content, source_file)
@@ -889,6 +954,7 @@ def process_file(
                         agent,
                         chunk["content"],
                         source_mtime,
+                        source_metadata,
                     )
                 )
             collection.upsert(
@@ -919,6 +985,7 @@ def process_file(
                 "filed_at": datetime.now().isoformat(),
                 "normalize_version": NORMALIZE_VERSION,
             }
+            apply_source_metadata(closet_meta, source_metadata)
             if entities:
                 closet_meta["entities"] = entities
             purge_file_closets(closets_col, source_file)

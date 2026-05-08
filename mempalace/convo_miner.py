@@ -17,6 +17,7 @@ from datetime import datetime
 from collections import defaultdict
 
 from .normalize import normalize
+from .miner import apply_source_metadata, extract_staged_source_metadata
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
@@ -310,7 +311,16 @@ def scan_convos(convo_dir: str) -> list:
 # =============================================================================
 
 
-def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extract_mode):
+def _file_chunks_locked(
+    collection,
+    source_file,
+    chunks,
+    wing,
+    room,
+    agent,
+    extract_mode,
+    source_metadata=None,
+):
     """Lock the source file, purge stale drawers, and upsert fresh chunks.
 
     Combines the per-file serialization that prevents concurrent agents from
@@ -352,20 +362,19 @@ def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extr
                 drawer_id = f"drawer_{wing}_{chunk_room}_{hashlib.sha256((source_file + str(chunk['chunk_index'])).encode()).hexdigest()[:24]}"
                 batch_docs.append(chunk["content"])
                 batch_ids.append(drawer_id)
-                batch_metas.append(
-                    {
-                        "wing": wing,
-                        "room": chunk_room,
-                        "hall": _detect_hall_cached(chunk["content"]),
-                        "source_file": source_file,
-                        "chunk_index": chunk["chunk_index"],
-                        "added_by": agent,
-                        "filed_at": filed_at,
-                        "ingest_mode": "convos",
-                        "extract_mode": extract_mode,
-                        "normalize_version": NORMALIZE_VERSION,
-                    }
-                )
+                metadata = {
+                    "wing": wing,
+                    "room": chunk_room,
+                    "hall": _detect_hall_cached(chunk["content"]),
+                    "source_file": source_file,
+                    "chunk_index": chunk["chunk_index"],
+                    "added_by": agent,
+                    "filed_at": filed_at,
+                    "ingest_mode": "convos",
+                    "extract_mode": extract_mode,
+                    "normalize_version": NORMALIZE_VERSION,
+                }
+                batch_metas.append(apply_source_metadata(metadata, source_metadata))
             try:
                 collection.upsert(
                     documents=batch_docs,
@@ -442,6 +451,7 @@ def mine_convos(
             if not dry_run:
                 _register_file(collection, source_file, wing, agent)
             continue
+        source_metadata = extract_staged_source_metadata(content)
 
         # Chunk — either exchange pairs or general extraction
         if extract_mode == "general":
@@ -487,7 +497,7 @@ def mine_convos(
         # Lock + purge stale + file fresh chunks. Lock serializes concurrent
         # agents; purge removes pre-v2 drawers so the schema bump applies.
         drawers_added, room_delta, skipped = _file_chunks_locked(
-            collection, source_file, chunks, wing, room, agent, extract_mode
+            collection, source_file, chunks, wing, room, agent, extract_mode, source_metadata
         )
         if skipped:
             files_skipped += 1

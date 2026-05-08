@@ -1,3 +1,4 @@
+import json
 import os
 import shlex
 import shutil
@@ -7,7 +8,7 @@ from pathlib import Path
 import chromadb
 import yaml
 
-from mempalace.miner import load_config, mine, scan_project, status
+from mempalace.miner import extract_staged_source_metadata, load_config, mine, scan_project, status
 from mempalace.palace import NORMALIZE_VERSION, file_already_mined
 
 
@@ -440,6 +441,91 @@ def test_process_file_uses_bounded_upsert_batches(tmp_path, monkeypatch):
     assert drawers == 5
     assert room == "general"
     assert col.batch_sizes == [2, 2, 1]
+
+
+def test_extract_staged_source_metadata_reads_supported_front_matter_fields():
+    source_metadata = extract_staged_source_metadata(
+        "---\n"
+        "source_item_id: trilium:abc123\n"
+        "title: Source Note\n"
+        'metadata: {"source_created_at": "2026-05-01T10:00:00", '
+        '"source_modified_at": "2026-05-02T11:00:00", '
+        '"source_observed_at": "2026-05-03T12:00:00", '
+        '"other": "ignored"}\n'
+        "---\n\n"
+        "# Source Note\n\nBody text."
+    )
+
+    assert source_metadata == {
+        "source_item_id": "trilium:abc123",
+        "source_title": "Source Note",
+        "source_created_at": "2026-05-01T10:00:00",
+        "source_modified_at": "2026-05-02T11:00:00",
+        "source_observed_at": "2026-05-03T12:00:00",
+    }
+
+
+def test_process_file_copies_source_metadata_to_drawers_and_closets(tmp_path, monkeypatch):
+    from mempalace import miner
+
+    class FakeCol:
+        def __init__(self):
+            self.metadatas = []
+
+        def get(self, *args, **kwargs):
+            return {"ids": []}
+
+        def delete(self, *args, **kwargs):
+            pass
+
+        def upsert(self, documents, ids, metadatas):
+            self.metadatas.extend(metadatas)
+
+    source_metadata = {
+        "source_created_at": "2026-05-01T10:00:00",
+        "source_modified_at": "2026-05-02T11:00:00",
+        "source_observed_at": "2026-05-03T12:00:00",
+    }
+    source = tmp_path / "note.md"
+    source.write_text(
+        "---\n"
+        "source_item_id: trilium:abc123\n"
+        "title: Source Note\n"
+        f"metadata: {json.dumps(source_metadata, sort_keys=True)}\n"
+        "---\n\n"
+        "# Source Note\n\n"
+        + ("Body text. " * 20),
+        encoding="utf-8",
+    )
+    drawers = FakeCol()
+    closets = FakeCol()
+    monkeypatch.setattr(
+        miner,
+        "chunk_text",
+        lambda content, source_file: [{"content": "Body text. " * 20, "chunk_index": 0}],
+    )
+    monkeypatch.setattr(miner, "detect_hall", lambda content: "general")
+    monkeypatch.setattr(miner, "_extract_entities_for_metadata", lambda content: "")
+
+    drawer_count, room = miner.process_file(
+        source,
+        tmp_path,
+        drawers,
+        "wing",
+        [{"name": "general", "description": "General"}],
+        "agent",
+        False,
+        closets_col=closets,
+    )
+
+    assert drawer_count == 1
+    assert room == "general"
+    for metadata in (drawers.metadatas[0], closets.metadatas[0]):
+        assert metadata["source_item_id"] == "trilium:abc123"
+        assert metadata["source_title"] == "Source Note"
+        assert metadata["source_created_at"] == "2026-05-01T10:00:00"
+        assert metadata["source_modified_at"] == "2026-05-02T11:00:00"
+        assert metadata["source_observed_at"] == "2026-05-03T12:00:00"
 
 
 # ── normalize_version schema gate ───────────────────────────────────────
