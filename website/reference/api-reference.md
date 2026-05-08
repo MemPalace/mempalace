@@ -108,7 +108,7 @@ Unified 4-layer interface.
 
 | Method | Parameters | Returns | Description |
 |--------|-----------|---------|-------------|
-| `wake_up(wing=None)` | Optional wing | `str` | L0 + L1 context (~170–900 tokens) |
+| `wake_up(wing=None)` | Optional wing | `str` | L0 + L1 context (~600–900 tokens) |
 | `recall(wing, room, n_results=10)` | Filters | `str` | L2 on-demand retrieval |
 | `search(query, wing, room, n_results=5)` | Query + filters | `str` | L3 deep search |
 | `status()` | — | `dict` | All layer status info |

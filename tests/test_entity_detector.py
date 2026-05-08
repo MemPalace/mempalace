@@ -148,6 +148,33 @@ def test_classify_entity_pronoun_only_is_uncertain():
     assert result["type"] == "uncertain"
 
 
+def test_classify_entity_high_pronoun_signal_is_person():
+    """A diary's main character hit by many pronouns should still classify
+    as a person even with only the pronoun signal category. Example from
+    real data: `Lu` has 16 pronoun hits out of 30 mentions."""
+    scores = {
+        "person_score": 32,
+        "project_score": 0,
+        "person_signals": ["pronoun nearby (16x)"],
+        "project_signals": [],
+    }
+    result = classify_entity("Lu", 30, scores)
+    assert result["type"] == "person"
+
+
+def test_classify_entity_low_pronoun_proximity_is_uncertain():
+    """Common sentence-start words (Never, Before) get a few pronouns nearby
+    incidentally. The ratio stays low (<20%), so they stay uncertain."""
+    scores = {
+        "person_score": 4,
+        "project_score": 0,
+        "person_signals": ["pronoun nearby (2x)"],
+        "project_signals": [],
+    }
+    result = classify_entity("Never", 21, scores)
+    assert result["type"] == "uncertain"
+
+
 def test_classify_entity_mixed_signals():
     scores = {
         "person_score": 5,
@@ -208,13 +235,13 @@ def test_detect_entities_empty_files(tmp_path):
     f = tmp_path / "empty.txt"
     f.write_text("")
     result = detect_entities([f])
-    assert result == {"people": [], "projects": [], "uncertain": []}
+    assert result == {"people": [], "projects": [], "topics": [], "uncertain": []}
 
 
 def test_detect_entities_handles_missing_file(tmp_path):
     missing = tmp_path / "nonexistent.txt"
     result = detect_entities([missing])
-    assert result == {"people": [], "projects": [], "uncertain": []}
+    assert result == {"people": [], "projects": [], "topics": [], "uncertain": []}
 
 
 def test_detect_entities_respects_max_files(tmp_path):
@@ -661,3 +688,102 @@ def test_boundary_chars_english_regression():
     result = extract_candidates(text, languages=("en",))
     assert "Riley" in result
     assert result["Riley"] >= 3
+
+
+# ── Chinese (zh-TW / zh-CN) entity detection ──────────────────────────
+
+# CJK scripts have no word delimiters — a regex-based extractor can only
+# catch names when they have a non-CJK neighbour (whitespace, punctuation,
+# newline, or mixed English). Real-world technical notes in zh-TW / zh-CN
+# routinely satisfy this: names appear at the start of bullet lines, next
+# to English terms, or before full-width punctuation 「」：，。. The patterns
+# below target that realistic regime.
+
+
+def test_zh_tw_candidate_extraction_at_boundaries():
+    """A 3-char Traditional Chinese name is extracted when neighboured by
+    whitespace, English, full-width punctuation, or line-start."""
+    text = (
+        "# 會議紀錄\n"
+        "- 朱宜振 主持\n"
+        "朱宜振 跟 Jeffrey 討論。\n"
+        "朱宜振: 方向正確。\n"
+        "朱宜振, 明天 pitch。\n"
+    )
+    result = extract_candidates(text, languages=("zh-TW",))
+    assert "朱宜振" in result, f"expected 朱宜振 in {result}"
+    assert result["朱宜振"] >= 3
+
+
+def test_zh_tw_person_classification():
+    """A Traditional Chinese name with dialogue + verb context classifies
+    as a person."""
+    text = (
+        "朱宜振: 「我們要 6 月 launch。」\n"
+        "朱宜振 同意 Arnold 的方案。\n"
+        "朱宜振 覺得 Hermes 方向對。\n"
+        "朱宜振 決定 ship pitch。\n"
+    )
+    lines = text.splitlines()
+    scores = score_entity("朱宜振", text, lines, languages=("zh-TW",))
+    # Dialogue + action signals fire — person score dominates
+    assert scores["person_score"] > 0, f"expected person signals, got {scores}"
+
+
+def test_zh_tw_stopwords_filter_common_particles():
+    """Common Chinese particles / pronouns should be stopword-filtered
+    even if they happen to share a surname prefix like 甘 or 習."""
+    from mempalace.i18n import get_entity_patterns
+
+    patterns = get_entity_patterns(("zh-TW",))
+    stopwords = set(patterns["stopwords"])
+    # Sanity: stopwords are lower-cased from the source list
+    assert "這個" in stopwords
+    assert "我們" in stopwords
+    assert "他們" in stopwords
+    assert "完成" in stopwords
+
+
+def test_zh_tw_falls_back_to_english_for_non_cjk_names():
+    """English names embedded in Chinese text are still captured via the
+    English pattern — Lman's Chinese notes mix in names like 'Jeffrey Lai'."""
+    text = (
+        "朱宜振 跟 Jeffrey Lai 討論 pitch。\n"
+        "Jeffrey Lai 報告進度。\n"
+        "朱宜振 同意 Jeffrey Lai 的方案。\n"
+        "朱宜振: 確認。\n"
+    )
+    result = extract_candidates(text, languages=("zh-TW", "en"))
+    assert "Jeffrey Lai" in result or "Jeffrey" in result
+    assert "朱宜振" in result
+
+
+def test_zh_cn_candidate_extraction():
+    """Simplified-Chinese name extraction mirrors zh-TW behaviour."""
+    text = "张三 今天主持。\n- 张三 跟 Bob 谈。\n张三: 已经搞定了。\n张三, 明天继续。\n"
+    result = extract_candidates(text, languages=("zh-CN",))
+    assert "张三" in result, f"expected 张三 in {result}"
+    assert result["张三"] >= 3
+
+
+def test_zh_cn_and_zh_tw_union_covers_both_variants():
+    """Passing both zh-CN and zh-TW unions the surname sets — a document
+    mixing simplified 张三 and traditional 張三 extracts both."""
+    text = "张三 说 hello。张三 笑了。张三 同意。\n張三 也參加。張三 寫 code。張三 決定。\n"
+    result = extract_candidates(text, languages=("zh-TW", "zh-CN"))
+    # At least one variant meets freq>=3
+    assert "张三" in result or "張三" in result
+
+
+def test_zh_tw_known_limitation_inline_name_no_boundary():
+    """Documented limitation: a name sandwiched between CJK chars with no
+    whitespace or punctuation break is not extracted. This is a fundamental
+    limit of regex-based CJK entity detection — words have no delimiters.
+    Realistic Chinese writing has enough non-CJK boundaries (punctuation,
+    newlines, mixed English) that 3+ occurrences normally produce matches
+    elsewhere in the document, so this rarely degrades real-world recall."""
+    # 朱宜振 appears 4x but every instance is flanked by CJK on both sides.
+    text = "他是朱宜振今天來。說朱宜振決定。又朱宜振負責。問朱宜振意見。"
+    result = extract_candidates(text, languages=("zh-TW",))
+    # Extraction is expected to miss this adversarial case.
+    assert "朱宜振" not in result

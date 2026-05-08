@@ -157,7 +157,7 @@ def test_generate_aaak_bootstrap_entities_content(tmp_path):
     wings = ["family"]
     _generate_aaak_bootstrap(people, projects, wings, "personal", config_dir=tmp_path)
 
-    content = (tmp_path / "aaak_entities.md").read_text()
+    content = (tmp_path / "aaak_entities.md").read_text(encoding="utf-8")
     assert "Riley" in content
     assert "RIL" in content  # entity code
     assert "MemPalace" in content
@@ -171,7 +171,7 @@ def test_generate_aaak_bootstrap_facts_content(tmp_path):
     wings = ["projects"]
     _generate_aaak_bootstrap(people, projects, wings, "work", config_dir=tmp_path)
 
-    content = (tmp_path / "critical_facts.md").read_text()
+    content = (tmp_path / "critical_facts.md").read_text(encoding="utf-8")
     assert "Alice" in content
     assert "Acme" in content
     assert "work" in content.lower()
@@ -190,7 +190,7 @@ def test_generate_aaak_bootstrap_collision(tmp_path):
         {"name": "Alison", "relationship": "coworker", "context": "work"},
     ]
     _generate_aaak_bootstrap(people, [], ["work"], "work", config_dir=tmp_path)
-    content = (tmp_path / "aaak_entities.md").read_text()
+    content = (tmp_path / "aaak_entities.md").read_text(encoding="utf-8")
     assert "ALI" in content
     assert "ALIS" in content
 
@@ -199,7 +199,7 @@ def test_generate_aaak_bootstrap_no_relationship(tmp_path):
     """Person without relationship string still generates entry."""
     people = [{"name": "Bob", "context": "work"}]
     _generate_aaak_bootstrap(people, [], ["work"], "work", config_dir=tmp_path)
-    content = (tmp_path / "aaak_entities.md").read_text()
+    content = (tmp_path / "aaak_entities.md").read_text(encoding="utf-8")
     assert "BOB=Bob" in content
 
 

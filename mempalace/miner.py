@@ -9,11 +9,14 @@ Stores verbatim chunks as drawers. No summaries. Ever.
 
 import os
 import sys
+import shlex
 import hashlib
 import fnmatch
+import logging
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
+from typing import Optional
 
 from .palace import (
     NORMALIZE_VERSION,
@@ -23,9 +26,12 @@ from .palace import (
     get_closets_collection,
     get_collection,
     mine_lock,
+    mine_palace_lock,
     purge_file_closets,
     upsert_closet_lines,
 )
+
+logger = logging.getLogger("mempalace_mcp")
 
 READABLE_EXTENSIONS = {
     ".txt",
@@ -36,6 +42,7 @@ READABLE_EXTENSIONS = {
     ".jsx",
     ".tsx",
     ".json",
+    ".jsonl",
     ".yaml",
     ".yml",
     ".html",
@@ -51,18 +58,36 @@ READABLE_EXTENSIONS = {
 }
 
 SKIP_FILENAMES = {
+    "entities.json",
     "mempalace.yaml",
     "mempalace.yml",
     "mempal.yaml",
     "mempal.yml",
     ".gitignore",
     "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
 }
 
 CHUNK_SIZE = 800  # chars per drawer
 CHUNK_OVERLAP = 100  # overlap between chunks
 MIN_CHUNK_SIZE = 50  # skip tiny chunks
-MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB — skip files larger than this
+DRAWER_UPSERT_BATCH_SIZE = 1000
+MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB — skip files larger than this.
+# A single file producing more chunks than this is almost always a generated
+# artifact (CSV/JSON dump, lockfile not in SKIP_FILENAMES, etc.). Embedding
+# thousands of chunks from one file in one batch has triggered ONNX runtime
+# `bad allocation` errors on Windows (#1296). The cap is conservative: a
+# 500-chunk file at CHUNK_SIZE=800 is ~400 KB of source, which covers most
+# legitimate hand-written content while bounding the worst-case batch.
+MAX_CHUNKS_PER_FILE = 500
+# Long Claude Code sessions and large transcript exports routinely exceed
+# 10 MB. The cap exists as a defensive rail against pathological binary
+# files, not as a limit on legitimate text. Per-drawer size is bounded
+# by CHUNK_SIZE, but larger sources still produce proportionally more
+# drawers and therefore more storage, embedding, and processing work —
+# and file reads are not streamed (the whole content is loaded into
+# memory before chunking), so memory use scales with source size too.
 
 
 # =============================================================================
@@ -272,7 +297,15 @@ def load_config(project_dir: str) -> dict:
         if legacy_path.exists():
             config_path = legacy_path
         else:
-            wing_name = resolved_project_dir.name
+            from .config import normalize_wing_name
+
+            # Normalize the dirname-derived fallback wing the same way
+            # ``cmd_init`` and ``room_detector_local`` do — otherwise a
+            # hyphenated project mined without a yaml file lands under a
+            # raw-name wing while ``topics_by_wing`` was keyed under the
+            # normalized slug, silently dropping every topic tunnel
+            # (the no-yaml branch of issue #1194).
+            wing_name = normalize_wing_name(resolved_project_dir.name)
             print(
                 f"  No mempalace.yaml found in {resolved_project_dir} "
                 f"— using auto-detected defaults (wing='{wing_name}'). "
@@ -428,7 +461,16 @@ def _refresh_known_entities_cache() -> None:
             data = json.load(f)
         if isinstance(data, dict):
             raw = data
-            for cat in data.values():
+            for cat_key, cat in data.items():
+                # Special wing-keyed map — its inner values are topic
+                # names but its outer keys are wings, which must NOT be
+                # surfaced as known entities. Pull the topic names out
+                # explicitly instead of treating it as a generic category.
+                if cat_key == "topics_by_wing" and isinstance(cat, dict):
+                    for topic_list in cat.values():
+                        if isinstance(topic_list, list):
+                            names.update(str(n) for n in topic_list if n)
+                    continue
                 if isinstance(cat, list):
                     names.update(str(n) for n in cat if n)
                 elif isinstance(cat, dict):
@@ -461,6 +503,172 @@ def _load_known_entities_raw() -> dict:
     """
     _refresh_known_entities_cache()
     return dict(_ENTITY_REGISTRY_CACHE["raw"])
+
+
+def _set_wing_topics(existing: dict, wing_key: str, topics_for_wing: list, coerce) -> None:
+    """Update ``existing['topics_by_wing'][wing_key]`` to the deduped list.
+
+    Replaces (does not union) the wing's topic list — re-running ``init``
+    should reflect the user's latest confirmation rather than accumulate
+    stale labels. Empty input drops the wing entry; an empty map drops
+    the ``topics_by_wing`` key entirely.
+    """
+    topics_map = existing.get("topics_by_wing")
+    if not isinstance(topics_map, dict):
+        topics_map = {}
+    seen_lower: set = set()
+    ordered: list = []
+    for n in topics_for_wing:
+        name = coerce(n)
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen_lower:
+            continue
+        seen_lower.add(key)
+        ordered.append(name)
+    if ordered:
+        topics_map[wing_key] = ordered
+    else:
+        topics_map.pop(wing_key, None)
+    if topics_map:
+        existing["topics_by_wing"] = topics_map
+    else:
+        existing.pop("topics_by_wing", None)
+
+
+def add_to_known_entities(entities_by_category: dict, wing: str = None) -> str:
+    """Union ``entities_by_category`` into ``~/.mempalace/known_entities.json``.
+
+    Accepts ``{category: [names]}`` shape as produced by ``mempalace init``
+    and merges into the registry the miner reads at mine time. Existing
+    categories are preserved untouched unless also present in the input;
+    for categories present in both, entries are unioned case-insensitively
+    without changing the on-disk ordering of pre-existing names.
+
+    If a category is stored on-disk as ``{name: code}`` (the alternate
+    miner-supported shape, used by dialect-style configs), new names are
+    added as keys with ``None`` values so existing code mappings aren't
+    overwritten. A later compress pass can assign codes.
+
+    When ``wing`` is provided AND ``entities_by_category`` contains a
+    ``topics`` list, those topics are also recorded under
+    ``topics_by_wing[wing]`` (case-insensitive dedup, preserving the
+    casing of the first observed name). This is the signal source for
+    ``palace_graph.compute_topic_tunnels`` at mine time. Topics for a
+    wing are *replaced*, not unioned, so a re-run of ``init`` reflects
+    the user's latest confirmation rather than accumulating stale labels
+    indefinitely.
+
+    The in-process cache is invalidated on write so same-process callers
+    (notably ``cmd_init`` → ``cmd_mine`` in sequence) see the update
+    immediately instead of waiting for a mtime re-check.
+
+    Returns the registry path as a string for logging.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    registry_path = _Path(_ENTITY_REGISTRY_PATH)
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+
+    existing: dict = {}
+    if registry_path.exists():
+        try:
+            loaded = _json.loads(registry_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                existing = loaded
+        except (_json.JSONDecodeError, OSError):
+            existing = {}
+
+    def _coerce_name(value):
+        if not value:
+            return None
+        name = str(value)
+        return name if name else None
+
+    # Separate the topics_by_wing key from regular categories so we don't
+    # treat it as a flat name-list elsewhere in this function.
+    topics_for_wing = None
+    if wing and isinstance(wing, str) and wing.strip():
+        topics_for_wing = entities_by_category.get("topics") or []
+
+    for category, names in entities_by_category.items():
+        if category == "topics_by_wing":
+            # Reserved key — managed separately below.
+            continue
+        if not isinstance(names, list) or not names:
+            continue
+        current = existing.get(category)
+        if isinstance(current, list):
+            seen_lower = {str(n).lower() for n in current}
+            for n in names:
+                name = _coerce_name(n)
+                if not name:
+                    continue
+                if name.lower() not in seen_lower:
+                    current.append(name)
+                    seen_lower.add(name.lower())
+        elif isinstance(current, dict):
+            seen_lower = {str(name).lower() for name in current}
+            for n in names:
+                name = _coerce_name(n)
+                if not name or name.lower() in seen_lower:
+                    continue
+                current[name] = None
+                seen_lower.add(name.lower())
+        else:
+            # Missing or unrecognized shape — seed as a fresh list, deduped
+            seen: set = set()
+            ordered: list = []
+            for n in names:
+                name = _coerce_name(n)
+                if not name:
+                    continue
+                key = name.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                ordered.append(name)
+            existing[category] = ordered
+
+    if topics_for_wing is not None:
+        _set_wing_topics(existing, wing.strip(), topics_for_wing, _coerce_name)
+
+    registry_path.write_text(_json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8")
+    try:
+        registry_path.chmod(0o600)
+    except (OSError, NotImplementedError):
+        pass
+
+    # Invalidate in-process cache so later calls in the same run see the write.
+    _ENTITY_REGISTRY_CACHE["mtime"] = None
+    _ENTITY_REGISTRY_CACHE["names"] = frozenset()
+    _ENTITY_REGISTRY_CACHE["raw"] = {}
+
+    return str(registry_path)
+
+
+def get_topics_by_wing() -> dict:
+    """Return ``topics_by_wing`` from the global registry as a dict.
+
+    Returns ``{}`` if the registry is missing, malformed, or has no
+    ``topics_by_wing`` key. Casing is preserved from disk; callers that
+    need case-insensitive comparison should normalize themselves.
+    """
+    raw = _load_known_entities_raw()
+    topics_map = raw.get("topics_by_wing")
+    if not isinstance(topics_map, dict):
+        return {}
+    out: dict = {}
+    for wing, topics in topics_map.items():
+        if not isinstance(wing, str) or not wing.strip():
+            continue
+        if isinstance(topics, list):
+            cleaned = [str(t) for t in topics if isinstance(t, str) and t.strip()]
+            if cleaned:
+                out[wing.strip()] = cleaned
+    return out
 
 
 _HALL_KEYWORDS_CACHE = None
@@ -513,8 +721,10 @@ def _extract_entities_for_metadata(content: str) -> str:
         if re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", content):
             matched.add(name)
 
+    from .palace import _candidate_entity_words
+
     window = content[:_ENTITY_EXTRACT_WINDOW]
-    words = re.findall(r"\b[A-Z][a-z]{2,}\b", window)
+    words = _candidate_entity_words(window)
     freq: dict = {}
     for w in words:
         if w in _ENTITY_STOPLIST:
@@ -531,40 +741,62 @@ def _extract_entities_for_metadata(content: str) -> str:
     return ";".join(capped)
 
 
+def _build_drawer_metadata(
+    wing: str,
+    room: str,
+    source_file: str,
+    chunk_index: int,
+    agent: str,
+    content: str,
+    source_mtime: Optional[float],
+) -> dict:
+    """Build the metadata dict for one drawer without upserting.
+
+    Split out from ``add_drawer`` so ``process_file`` can batch all chunks
+    of a file into a single ``collection.upsert`` — one embedding forward
+    pass per batch instead of per chunk.
+    """
+    metadata = {
+        "wing": wing,
+        "room": room,
+        "source_file": source_file,
+        "chunk_index": chunk_index,
+        "added_by": agent,
+        "filed_at": datetime.now().isoformat(),
+        "normalize_version": NORMALIZE_VERSION,
+    }
+    if source_mtime is not None:
+        metadata["source_mtime"] = source_mtime
+    metadata["hall"] = detect_hall(content)
+    entities = _extract_entities_for_metadata(content)
+    if entities:
+        metadata["entities"] = entities
+    return metadata
+
+
 def add_drawer(
     collection, wing: str, room: str, content: str, source_file: str, chunk_index: int, agent: str
 ):
-    """Add one drawer to the palace."""
+    """Add one drawer to the palace.
+
+    Kept for backward compatibility with external callers. In-tree the
+    miner uses ``_build_drawer_metadata`` + a batched ``collection.upsert``
+    to amortize the embedding model's forward-pass cost across chunks.
+    """
     drawer_id = f"drawer_{wing}_{room}_{hashlib.sha256((source_file + str(chunk_index)).encode()).hexdigest()[:24]}"
     try:
-        metadata = {
-            "wing": wing,
-            "room": room,
-            "source_file": source_file,
-            "chunk_index": chunk_index,
-            "added_by": agent,
-            "filed_at": datetime.now().isoformat(),
-            "normalize_version": NORMALIZE_VERSION,
-        }
-        # Store file mtime so we can detect modifications later.
-        try:
-            metadata["source_mtime"] = os.path.getmtime(source_file)
-        except OSError:
-            pass
-        # Tag with hall for graph connectivity within wings
-        metadata["hall"] = detect_hall(content)
-        # Tag with entity names for filterable search
-        entities = _extract_entities_for_metadata(content)
-        if entities:
-            metadata["entities"] = entities
-        collection.upsert(
-            documents=[content],
-            ids=[drawer_id],
-            metadatas=[metadata],
-        )
-        return True
-    except Exception:
-        raise
+        source_mtime = os.path.getmtime(source_file)
+    except OSError:
+        source_mtime = None
+    metadata = _build_drawer_metadata(
+        wing, room, source_file, chunk_index, agent, content, source_mtime
+    )
+    collection.upsert(
+        documents=[content],
+        ids=[drawer_id],
+        metadatas=[metadata],
+    )
+    return True
 
 
 # =============================================================================
@@ -601,8 +833,15 @@ def process_file(
     room = detect_room(filepath, content, rooms, project_path)
     chunks = chunk_text(content, source_file)
 
+    if len(chunks) > MAX_CHUNKS_PER_FILE:
+        print(
+            f"  ! [skip] {filepath.name[:50]:50} produced {len(chunks)} chunks "
+            f"(> {MAX_CHUNKS_PER_FILE}); add to SKIP_FILENAMES or .gitignore"
+        )
+        return 0, room
+
     if dry_run:
-        print(f"    [DRY RUN] {filepath.name} → room:{room} ({len(chunks)} drawers)")
+        print(f"    [DRY RUN] {filepath.name} -> room:{room} ({len(chunks)} drawers)")
         return len(chunks), room
 
     # Lock this file so concurrent agents don't interleave delete+insert.
@@ -621,21 +860,43 @@ def process_file(
         try:
             collection.delete(where={"source_file": source_file})
         except Exception:
-            pass
+            logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
+
+        # Batch chunks into bounded upserts so the embedding model sees many
+        # chunks per forward pass without building one huge Chroma/SQLite
+        # request for pathological files. A bad chunk can fail its sub-batch;
+        # that is the deliberate trade-off for amortizing embedding overhead.
+        try:
+            source_mtime = os.path.getmtime(source_file)
+        except OSError:
+            source_mtime = None
 
         drawers_added = 0
-        for chunk in chunks:
-            added = add_drawer(
-                collection=collection,
-                wing=wing,
-                room=room,
-                content=chunk["content"],
-                source_file=source_file,
-                chunk_index=chunk["chunk_index"],
-                agent=agent,
+        for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
+            batch_docs: list = []
+            batch_ids: list = []
+            batch_metas: list = []
+            for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
+                drawer_id = f"drawer_{wing}_{room}_{hashlib.sha256((source_file + str(chunk['chunk_index'])).encode()).hexdigest()[:24]}"
+                batch_docs.append(chunk["content"])
+                batch_ids.append(drawer_id)
+                batch_metas.append(
+                    _build_drawer_metadata(
+                        wing,
+                        room,
+                        source_file,
+                        chunk["chunk_index"],
+                        agent,
+                        chunk["content"],
+                        source_mtime,
+                    )
+                )
+            collection.upsert(
+                documents=batch_docs,
+                ids=batch_ids,
+                metadatas=batch_metas,
             )
-            if added:
-                drawers_added += 1
+            drawers_added += len(batch_docs)
 
         # Build closet — the searchable index pointing to these drawers.
         # Purge first: a re-mine (mtime change or normalize_version bump) must
@@ -749,22 +1010,74 @@ def mine(
     dry_run: bool = False,
     respect_gitignore: bool = True,
     include_ignored: list = None,
+    files: list = None,
 ):
-    """Mine a project directory into the palace."""
+    """Mine a project directory into the palace.
 
+    ``files`` may optionally be a pre-scanned list of file paths from
+    :func:`scan_project`. When provided, the corpus walk is skipped — the
+    caller (e.g. ``init`` showing a file-count estimate before the mine
+    prompt) avoids walking the tree twice. When ``None`` (the default),
+    ``mine`` walks the tree itself just like before.
+    """
+
+    if dry_run:
+        return _mine_impl(
+            project_dir,
+            palace_path,
+            wing_override=wing_override,
+            agent=agent,
+            limit=limit,
+            dry_run=dry_run,
+            respect_gitignore=respect_gitignore,
+            include_ignored=include_ignored,
+            files=files,
+        )
+
+    # MineAlreadyRunning propagates so the CLI can render a clear holder-aware
+    # message and exit non-zero. In-process callers (tests, library users) that
+    # expect to coexist with another writer should handle the exception.
+    with mine_palace_lock(palace_path):
+        return _mine_impl(
+            project_dir,
+            palace_path,
+            wing_override=wing_override,
+            agent=agent,
+            limit=limit,
+            dry_run=dry_run,
+            respect_gitignore=respect_gitignore,
+            include_ignored=include_ignored,
+            files=files,
+        )
+
+
+def _mine_impl(
+    project_dir: str,
+    palace_path: str,
+    wing_override: str = None,
+    agent: str = "mempalace",
+    limit: int = 0,
+    dry_run: bool = False,
+    respect_gitignore: bool = True,
+    include_ignored: list = None,
+    files: list = None,
+):
     project_path = Path(project_dir).expanduser().resolve()
     config = load_config(project_dir)
 
     wing = wing_override or config["wing"]
     rooms = config.get("rooms", [{"name": "general", "description": "All project files"}])
 
-    files = scan_project(
-        project_dir,
-        respect_gitignore=respect_gitignore,
-        include_ignored=include_ignored,
-    )
+    if files is None:
+        files = scan_project(
+            project_dir,
+            respect_gitignore=respect_gitignore,
+            include_ignored=include_ignored,
+        )
     if limit > 0:
         files = files[:limit]
+
+    from .embedding import describe_device
 
     print(f"\n{'=' * 55}")
     print("  MemPalace Mine")
@@ -773,13 +1086,14 @@ def mine(
     print(f"  Rooms:   {', '.join(r['name'] for r in rooms)}")
     print(f"  Files:   {len(files)}")
     print(f"  Palace:  {palace_path}")
+    print(f"  Device:  {describe_device()}")
     if dry_run:
         print("  DRY RUN — nothing will be filed")
     if not respect_gitignore:
         print("  .gitignore: DISABLED")
     if include_ignored:
         print(f"  Include: {', '.join(sorted(normalize_include_paths(include_ignored)))}")
-    print(f"{'─' * 55}\n")
+    print(f"{'-' * 55}\n")
 
     if not dry_run:
         collection = get_collection(palace_path)
@@ -790,37 +1104,153 @@ def mine(
 
     total_drawers = 0
     files_skipped = 0
+    files_processed = 0
+    last_file = None
     room_counts = defaultdict(int)
 
-    for i, filepath in enumerate(files, 1):
-        drawers, room = process_file(
-            filepath=filepath,
-            project_path=project_path,
-            collection=collection,
-            wing=wing,
-            rooms=rooms,
-            agent=agent,
-            dry_run=dry_run,
-            closets_col=closets_col,
-        )
-        if drawers == 0 and not dry_run:
-            files_skipped += 1
-        else:
-            total_drawers += drawers
-            room_counts[room] += 1
-            if not dry_run:
-                print(f"  ✓ [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers}")
+    try:
+        for i, filepath in enumerate(files, 1):
+            try:
+                drawers, room = process_file(
+                    filepath=filepath,
+                    project_path=project_path,
+                    collection=collection,
+                    wing=wing,
+                    rooms=rooms,
+                    agent=agent,
+                    dry_run=dry_run,
+                    closets_col=closets_col,
+                )
+            except KeyboardInterrupt:
+                # Re-raise so the outer handler prints the summary; we
+                # capture the last-attempted file via last_file below.
+                last_file = filepath.name
+                raise
+            files_processed = i
+            last_file = filepath.name
+            if drawers == 0 and not dry_run:
+                files_skipped += 1
+            else:
+                total_drawers += drawers
+                room_counts[room] += 1
+                if not dry_run:
+                    print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers}")
 
-    print(f"\n{'=' * 55}")
-    print("  Done.")
-    print(f"  Files processed: {len(files) - files_skipped}")
-    print(f"  Files skipped (already filed): {files_skipped}")
-    print(f"  Drawers filed: {total_drawers}")
-    print("\n  By room:")
-    for room, count in sorted(room_counts.items(), key=lambda x: x[1], reverse=True):
-        print(f"    {room:20} {count} files")
-    print('\n  Next: mempalace search "what you\'re looking for"')
-    print(f"{'=' * 55}\n")
+        if not dry_run:
+            # Cross-wing topic tunnels: after every file in this wing has been
+            # processed, link this wing to any other wing that shares a
+            # confirmed TOPIC label. Out of scope for v1: manifest-dependency
+            # overlap, per-topic allow/deny lists, search-result surfacing.
+            try:
+                tunnels_added = _compute_topic_tunnels_for_wing(wing)
+                if tunnels_added:
+                    print(f"\n  Topic tunnels: +{tunnels_added} cross-wing link(s)")
+            except Exception as e:
+                # Tunnel computation must never fail a mine — degrade quietly.
+                print(
+                    f"\n  WARNING: topic tunnel computation skipped — {e}",
+                    file=sys.stderr,
+                )
+
+        print(f"\n{'=' * 55}")
+        print("  Done.")
+        print(f"  Files processed: {len(files) - files_skipped}")
+        print(f"  Files skipped (already filed): {files_skipped}")
+        print(f"  Drawers filed: {total_drawers}")
+        print("\n  By room:")
+        for room, count in sorted(room_counts.items(), key=lambda x: x[1], reverse=True):
+            print(f"    {room:20} {count} files")
+        print('\n  Next: mempalace search "what you\'re looking for"')
+        print(f"{'=' * 55}\n")
+    except KeyboardInterrupt:
+        # Idempotent re-mine: deterministic drawer IDs mean already-filed
+        # drawers upsert to the same row on next run, so partial progress
+        # is safe to leave in place. A second Ctrl-C during this print
+        # propagates to the default handler — we don't try to catch
+        # everything.
+        print("\n\n  Mine interrupted.")
+        print(f"    files_processed: {files_processed}/{len(files)}")
+        print(f"    drawers_filed:   {total_drawers}")
+        print(f"    last_file:       {last_file or '<none>'}")
+        print(
+            f"\n  Re-run `mempalace mine {shlex.quote(project_dir)}` to resume — "
+            "already-filed drawers are\n  upserted idempotently and will not duplicate.\n"
+        )
+        sys.exit(130)
+    except Exception as exc:
+        # Without this, an arbitrary exception (ONNX bad_alloc, chromadb HNSW
+        # error, OS fault) propagates and the process exits with no completion
+        # banner — the operator sees only the final progress line and assumes
+        # the mine succeeded (#1296). Print the partial-progress summary the
+        # way we do for KeyboardInterrupt, then re-raise so the original
+        # traceback still surfaces and the exit code is non-zero.
+        print("\n\n  Mine aborted by exception.")
+        print(f"    files_processed: {files_processed}/{len(files)}")
+        print(f"    drawers_filed:   {total_drawers}")
+        print(f"    last_file:       {last_file or '<none>'}")
+        print(f"    error:           {type(exc).__name__}: {exc}")
+        print(
+            f"\n  Re-run `mempalace mine {shlex.quote(project_dir)}` after addressing "
+            "the cause — already-filed\n  drawers are upserted idempotently and will "
+            "not duplicate.\n"
+        )
+        raise
+    finally:
+        # Clean up the hooks-side PID lock if it points at us. Stale
+        # entries already pass _pid_alive() == False on POSIX, but
+        # actively removing the file makes the state observable
+        # (callers can stat it) and avoids accidental PID reuse on
+        # short-lived test runs. Only remove if the file claims our
+        # own PID — never another process's.
+        _cleanup_mine_pid_file()
+
+
+def _cleanup_mine_pid_file() -> None:
+    """Remove this process's per-target PID slot on exit.
+
+    Hook-spawned mines receive ``MEMPALACE_MINE_PID_FILE`` in their env
+    pointing at the slot the hook claimed for them
+    (``~/.mempalace/hook_state/mine_pids/mine_<sha>.pid``). When the
+    subprocess exits — cleanly, on error, or via Ctrl-C — it removes its
+    own slot so the next hook fire isn't briefly fooled by a stale PID
+    before ``_pid_alive`` returns False.
+
+    Only delete the slot if it claims our own PID; any other PID is left
+    alone (it could belong to an unrelated mine that just claimed the
+    same slot via a stale-reclaim race).
+    """
+    pid_file_env = os.environ.get("MEMPALACE_MINE_PID_FILE", "")
+    if not pid_file_env:
+        return
+    try:
+        pid_file = Path(pid_file_env)
+        if not pid_file.exists():
+            return
+        recorded = pid_file.read_text().strip()
+        if recorded and recorded.isdigit() and int(recorded) == os.getpid():
+            pid_file.unlink()
+    except OSError:
+        # Best-effort cleanup; never fail the mine over PID bookkeeping.
+        pass
+
+
+def _compute_topic_tunnels_for_wing(wing: str) -> int:
+    """Drop tunnels between ``wing`` and every other wing that shares
+    confirmed topics, honoring the ``topic_tunnel_min_count`` config knob.
+
+    Returns the number of tunnels created or refreshed. Zero means no
+    overlap found (or the registry has no ``topics_by_wing`` map yet).
+    """
+    from .config import MempalaceConfig
+    from .palace_graph import topic_tunnels_for_wing
+
+    topics_map = get_topics_by_wing()
+    if not topics_map or wing not in topics_map:
+        return 0
+    cfg = MempalaceConfig()
+    min_count = cfg.topic_tunnel_min_count
+    created = topic_tunnels_for_wing(wing, topics_map, min_count=min_count)
+    return len(created)
 
 
 # =============================================================================
@@ -837,17 +1267,24 @@ def status(palace_path: str):
         print("  Run: mempalace init <dir> then mempalace mine <dir>")
         return
 
-    # Count by wing and room
+    # Count by wing and room — paginate to avoid SQLite "too many SQL
+    # variables" error on large palaces (see #802, #850).
     total = col.count()
-    r = col.get(limit=total, include=["metadatas"]) if total else {"metadatas": []}
-    metas = r["metadatas"]
-
-    wing_rooms = defaultdict(lambda: defaultdict(int))
-    for m in metas:
-        wing_rooms[m.get("wing", "?")][m.get("room", "?")] += 1
+    wing_rooms: dict = defaultdict(lambda: defaultdict(int))
+    batch_size = 5000
+    offset = 0
+    while offset < total:
+        r = col.get(limit=batch_size, offset=offset, include=["metadatas"])
+        batch = r["metadatas"]
+        if not batch:
+            break
+        for m in batch:
+            m = m or {}
+            wing_rooms[m.get("wing", "?")][m.get("room", "?")] += 1
+        offset += len(batch)
 
     print(f"\n{'=' * 55}")
-    print(f"  MemPalace Status — {len(metas)} drawers")
+    print(f"  MemPalace Status — {total} drawers")
     print(f"{'=' * 55}\n")
     for wing, rooms in sorted(wing_rooms.items()):
         print(f"  WING: {wing}")

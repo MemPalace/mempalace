@@ -7,13 +7,18 @@ PRs welcome. MemPalace is open source and we welcome contributions of all sizes 
 ```bash
 git clone https://github.com/MemPalace/mempalace.git
 cd mempalace
-pip install -e ".[dev]"
+
+# Recommended: uv (https://docs.astral.sh/uv/) manages the venv for you
+uv sync --extra dev
+
+# Or with pip in your own venv:
+# pip install -e ".[dev]"
 ```
 
 ## Running Tests
 
 ```bash
-pytest tests/ -v
+uv run pytest tests/ -v
 ```
 
 All tests must pass before submitting a PR. Tests should run without API keys or network access.
@@ -22,10 +27,10 @@ All tests must pass before submitting a PR. Tests should run without API keys or
 
 ```bash
 # Quick test (20 questions, ~30 seconds)
-python benchmarks/longmemeval_bench.py /path/to/longmemeval_s_cleaned.json --limit 20
+uv run python benchmarks/longmemeval_bench.py /path/to/longmemeval_s_cleaned.json --limit 20
 
 # Full benchmark (500 questions, ~5 minutes)
-python benchmarks/longmemeval_bench.py /path/to/longmemeval_s_cleaned.json
+uv run python benchmarks/longmemeval_bench.py /path/to/longmemeval_s_cleaned.json
 ```
 
 See [Benchmarks](/reference/benchmarks) for data download instructions.
@@ -35,7 +40,7 @@ See [Benchmarks](/reference/benchmarks) for data download instructions.
 1. Fork the repo and create a feature branch: `git checkout -b feat/my-thing`
 2. Write your code
 3. Add or update tests if applicable
-4. Run `pytest tests/ -v` — everything must pass
+4. Run `uv run pytest tests/ -v` — everything must pass
 5. Commit with clear [conventional commits](https://www.conventionalcommits.org/):
    - `feat: add Notion export format`
    - `fix: handle empty transcript files`

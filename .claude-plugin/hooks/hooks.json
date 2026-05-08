@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/mempal-stop-hook.sh"
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/mempal-stop-hook.sh\""
           }
         ]
       }
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/mempal-precompact-hook.sh"
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/mempal-precompact-hook.sh\""
           }
         ]
       }

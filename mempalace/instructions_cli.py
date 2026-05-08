@@ -25,4 +25,4 @@ def run_instructions(name: str):
         print(f"Instructions file not found: {md_path}", file=sys.stderr)
         sys.exit(1)
 
-    print(md_path.read_text())
+    print(md_path.read_text(encoding="utf-8"))

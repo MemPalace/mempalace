@@ -202,7 +202,7 @@ def detect_rooms_from_files(project_dir: str) -> list:
 
     SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build"}
 
-    for root, dirs, filenames in os.walk(project_path):
+    for _root, dirs, filenames in os.walk(project_path):
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
         for filename in filenames:
             name_lower = filename.lower().replace("-", "_").replace(" ", "_")
@@ -303,8 +303,10 @@ def save_config(project_dir: str, project_name: str, rooms: list):
 
 def detect_rooms_local(project_dir: str, yes: bool = False):
     """Main entry point for local setup."""
+    from .config import normalize_wing_name
+
     project_path = Path(project_dir).expanduser().resolve()
-    project_name = project_path.name.lower().replace(" ", "_").replace("-", "_")
+    project_name = normalize_wing_name(project_path.name)
 
     if not project_path.exists():
         print(f"ERROR: Directory not found: {project_dir}")

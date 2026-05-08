@@ -113,7 +113,7 @@ Every benchmark runs deterministically from this repository.
 ```bash
 git clone https://github.com/MemPalace/mempalace.git
 cd mempalace
-pip install -e ".[dev]"
+uv sync --extra dev   # or: pip install -e ".[dev]"
 
 # LongMemEval — raw (96.6%)
 curl -fsSL -o /tmp/longmemeval_s_cleaned.json \

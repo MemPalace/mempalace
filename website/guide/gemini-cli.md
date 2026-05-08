@@ -9,22 +9,30 @@ MemPalace works natively with [Gemini CLI](https://github.com/google/gemini-cli)
 
 ## Installation
 
+We recommend [`uv`](https://docs.astral.sh/uv/) — it creates and manages the
+virtual environment for you:
+
 ```bash
 # Clone the repository
 git clone https://github.com/MemPalace/mempalace.git
 cd mempalace
 
-# Create a virtual environment
-python3 -m venv .venv
+# Create the venv and install MemPalace + dependencies
+uv sync
+```
 
-# Install dependencies
+This produces a `.venv/` directory with the project installed in editable
+mode. If you prefer plain pip, the equivalent is:
+
+```bash
+python3 -m venv .venv
 .venv/bin/pip install -e .
 ```
 
 ## Initialize the Palace
 
 ```bash
-.venv/bin/python3 -m mempalace init .
+uv run python -m mempalace init .
 ```
 
 ### Identity and Project Configuration (Optional)
@@ -40,12 +48,14 @@ You can optionally create or edit:
 Register MemPalace as an MCP server:
 
 ```bash
-gemini mcp add mempalace /absolute/path/to/mempalace/.venv/bin/python3 \
-  -m mempalace.mcp_server --scope user
+gemini mcp add --scope user mempalace \
+  -- /absolute/path/to/mempalace/.venv/bin/python -m mempalace.mcp_server
 ```
 
 ::: warning
-Use the **absolute path** to the Python binary to ensure it works from any directory.
+Use the **absolute path** to the Python binary so the server starts from any
+working directory. The `--` separator prevents Gemini from parsing
+`-m mempalace.mcp_server` as its own flags.
 :::
 
 ## Enable Auto-Saving
@@ -86,7 +96,7 @@ Once connected, Gemini CLI will automatically:
 
 Mine existing code or docs:
 ```bash
-.venv/bin/python3 -m mempalace mine /path/to/your/project
+uv run python -m mempalace mine /path/to/your/project
 ```
 
 ### Verification

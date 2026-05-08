@@ -36,7 +36,7 @@ from mempalace.layers import MemoryStack
 stack = MemoryStack()  # uses default paths from MempalaceConfig
 
 # Wake-up: L0 (identity) + L1 (essential story)
-context = stack.wake_up(wing="myapp")  # ~170-900 tokens
+context = stack.wake_up(wing="myapp")  # ~600-900 tokens
 
 # On-demand: L2 retrieval
 recall = stack.recall(wing="myapp", room="auth", n_results=10)

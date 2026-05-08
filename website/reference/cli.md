@@ -89,7 +89,7 @@ mempalace split <dir> --output-dir ~/split-output/
 
 ## `mempalace wake-up`
 
-Show L0 + L1 wake-up context (~170–900 tokens).
+Show L0 + L1 wake-up context (~600–900 tokens).
 
 ```bash
 mempalace wake-up

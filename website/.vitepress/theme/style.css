@@ -1,67 +1,73 @@
 /* ── MemPalace Custom Theme ──────────────────────────────────────────── */
-/* Deep indigo / cyan palette — evoking architectural grandeur          */
+/* Crystal Lattice palette — crystalline cyan through deep blue-black    */
 
 :root {
-  /* Brand palette */
-  --mp-indigo: #4f46e5;
-  --mp-indigo-light: #6366f1;
-  --mp-indigo-dark: #3730a3;
-  --mp-cyan: #06b6d4;
-  --mp-cyan-light: #22d3ee;
-  --mp-purple: #8b5cf6;
-  --mp-purple-light: #a78bfa;
-  --mp-emerald: #10b981;
-  --mp-amber: #f59e0b;
+  /* Crystal Lattice palette */
+  --mp-bg: #080C18;
+  --mp-surface: #0F1524;
+  --mp-surface-high: #182033;
+  --mp-border: #1C2640;
+  --mp-border-soft: #121829;
+  --mp-cyan: #7DD3FC;
+  --mp-cyan-vivid: #38BDF8;
+  --mp-ice: #DBE7F5;
+  --mp-body: #CDD5E0;
+  --mp-muted: #8B99B0;
+  --mp-dim: #5B6B82;
+  --mp-ok: #34D399;
+  --mp-warn: #FBBF24;
+  --mp-hot: #FF8B8B;
+  --mp-violet: #A78BFA;
 
   /* VitePress overrides */
-  --vp-c-brand-1: var(--mp-indigo);
-  --vp-c-brand-2: var(--mp-indigo-light);
-  --vp-c-brand-3: var(--mp-purple);
-  --vp-c-brand-soft: rgba(79, 70, 229, 0.14);
+  --vp-c-brand-1: var(--mp-cyan-vivid);
+  --vp-c-brand-2: var(--mp-cyan);
+  --vp-c-brand-3: var(--mp-violet);
+  --vp-c-brand-soft: rgba(56, 189, 248, 0.14);
 
-  --vp-font-family-base: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  --vp-font-family-mono: 'JetBrains Mono', 'Fira Code', monospace;
+  --vp-font-family-base: 'Onest', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --vp-font-family-mono: 'JetBrains Mono', monospace;
 
   /* Home hero gradient */
   --vp-home-hero-name-color: transparent;
-  --vp-home-hero-name-background: linear-gradient(135deg, var(--mp-indigo) 0%, var(--mp-cyan) 50%, var(--mp-purple) 100%);
-  --vp-home-hero-image-background-image: linear-gradient(135deg, rgba(79, 70, 229, 0.25) 0%, rgba(6, 182, 212, 0.25) 50%, rgba(139, 92, 246, 0.15) 100%);
+  --vp-home-hero-name-background: linear-gradient(135deg, var(--mp-ice) 0%, var(--mp-cyan-vivid) 60%, var(--mp-violet) 100%);
+  --vp-home-hero-image-background-image: linear-gradient(135deg, rgba(56, 189, 248, 0.25) 0%, rgba(125, 211, 252, 0.2) 50%, rgba(167, 139, 250, 0.15) 100%);
   --vp-home-hero-image-filter: blur(56px);
 
   /* Button colors */
   --vp-button-brand-border: transparent;
-  --vp-button-brand-text: #ffffff;
-  --vp-button-brand-bg: var(--mp-indigo);
+  --vp-button-brand-text: #080C18;
+  --vp-button-brand-bg: var(--mp-cyan-vivid);
   --vp-button-brand-hover-border: transparent;
-  --vp-button-brand-hover-text: #ffffff;
-  --vp-button-brand-hover-bg: var(--mp-indigo-light);
+  --vp-button-brand-hover-text: #080C18;
+  --vp-button-brand-hover-bg: var(--mp-cyan);
 
-  --vp-button-alt-border: rgba(79, 70, 229, 0.25);
-  --vp-button-alt-text: var(--mp-indigo);
-  --vp-button-alt-bg: rgba(79, 70, 229, 0.08);
-  --vp-button-alt-hover-border: rgba(79, 70, 229, 0.4);
-  --vp-button-alt-hover-text: var(--mp-indigo-dark);
-  --vp-button-alt-hover-bg: rgba(79, 70, 229, 0.14);
+  --vp-button-alt-border: rgba(56, 189, 248, 0.25);
+  --vp-button-alt-text: var(--mp-cyan-vivid);
+  --vp-button-alt-bg: rgba(56, 189, 248, 0.08);
+  --vp-button-alt-hover-border: rgba(56, 189, 248, 0.4);
+  --vp-button-alt-hover-text: var(--mp-cyan);
+  --vp-button-alt-hover-bg: rgba(56, 189, 248, 0.14);
 }
 
 /* Dark mode overrides */
 .dark {
-  --vp-c-brand-1: var(--mp-cyan-light);
+  --vp-c-brand-1: var(--mp-cyan-vivid);
   --vp-c-brand-2: var(--mp-cyan);
-  --vp-c-brand-3: var(--mp-purple-light);
-  --vp-c-brand-soft: rgba(6, 182, 212, 0.14);
+  --vp-c-brand-3: var(--mp-violet);
+  --vp-c-brand-soft: rgba(56, 189, 248, 0.14);
 
-  --vp-button-brand-bg: var(--mp-indigo-light);
-  --vp-button-brand-hover-bg: var(--mp-indigo);
+  --vp-button-brand-bg: var(--mp-cyan-vivid);
+  --vp-button-brand-hover-bg: var(--mp-cyan);
 
-  --vp-button-alt-border: rgba(34, 211, 238, 0.25);
-  --vp-button-alt-text: var(--mp-cyan-light);
-  --vp-button-alt-bg: rgba(34, 211, 238, 0.08);
-  --vp-button-alt-hover-border: rgba(34, 211, 238, 0.4);
+  --vp-button-alt-border: rgba(56, 189, 248, 0.25);
+  --vp-button-alt-text: var(--mp-cyan-vivid);
+  --vp-button-alt-bg: rgba(56, 189, 248, 0.08);
+  --vp-button-alt-hover-border: rgba(56, 189, 248, 0.4);
   --vp-button-alt-hover-text: var(--mp-cyan);
-  --vp-button-alt-hover-bg: rgba(34, 211, 238, 0.14);
+  --vp-button-alt-hover-bg: rgba(56, 189, 248, 0.14);
 
-  --vp-home-hero-image-background-image: linear-gradient(135deg, rgba(99, 102, 241, 0.3) 0%, rgba(6, 182, 212, 0.3) 50%, rgba(139, 92, 246, 0.2) 100%);
+  --vp-home-hero-image-background-image: linear-gradient(135deg, rgba(56, 189, 248, 0.3) 0%, rgba(125, 211, 252, 0.2) 50%, rgba(167, 139, 250, 0.15) 100%);
 }
 
 /* ── Hero section ───────────────────────────────────────────────────── */
@@ -72,19 +78,22 @@
 }
 
 .VPHero .name {
-  font-weight: 700 !important;
+  font-family: 'Neue Machina', 'Satoshi', sans-serif !important;
+  font-weight: 500 !important;
+  letter-spacing: -1.5px;
 }
 
 .VPHero .text {
+  font-family: 'Satoshi', 'Onest', sans-serif;
   font-weight: 500;
-  background: linear-gradient(135deg, var(--vp-c-text-1) 0%, var(--mp-indigo-light) 100%);
+  background: linear-gradient(135deg, var(--vp-c-text-1) 0%, var(--mp-cyan-vivid) 100%);
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
   background-clip: text;
 }
 
 .dark .VPHero .text {
-  background: linear-gradient(135deg, var(--vp-c-text-1) 0%, var(--mp-cyan-light) 100%);
+  background: linear-gradient(135deg, var(--mp-ice) 0%, var(--mp-cyan-vivid) 100%);
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
   background-clip: text;
@@ -99,16 +108,17 @@
 
 .VPFeature:hover {
   transform: translateY(-4px);
-  border-color: var(--mp-indigo);
-  box-shadow: 0 12px 40px rgba(79, 70, 229, 0.12);
+  border-color: var(--mp-cyan-vivid);
+  box-shadow: 0 12px 40px rgba(56, 189, 248, 0.12);
 }
 
 .dark .VPFeature:hover {
-  border-color: var(--mp-cyan);
-  box-shadow: 0 12px 40px rgba(6, 182, 212, 0.12);
+  border-color: var(--mp-cyan-vivid);
+  box-shadow: 0 12px 40px rgba(56, 189, 248, 0.12);
 }
 
 .VPFeature .title {
+  font-family: 'Satoshi', 'Onest', sans-serif;
   font-weight: 600;
 }
 
@@ -119,12 +129,12 @@
 }
 
 .VPSidebar .VPSidebarItem.is-active .text {
-  color: var(--mp-indigo) !important;
+  color: var(--mp-cyan-vivid) !important;
   font-weight: 600;
 }
 
 .dark .VPSidebar .VPSidebarItem.is-active .text {
-  color: var(--mp-cyan-light) !important;
+  color: var(--mp-cyan-vivid) !important;
 }
 
 /* ── Code blocks ────────────────────────────────────────────────────── */
@@ -135,21 +145,21 @@
 }
 
 .dark .vp-doc div[class*='language-'] {
-  border-color: rgba(6, 182, 212, 0.15);
+  border-color: rgba(56, 189, 248, 0.15);
 }
 
 /* ── Custom containers ──────────────────────────────────────────────── */
 
 .vp-doc .custom-block.tip {
-  border-color: var(--mp-cyan);
+  border-color: var(--mp-ok);
 }
 
 .vp-doc .custom-block.warning {
-  border-color: var(--mp-amber);
+  border-color: var(--mp-warn);
 }
 
 .vp-doc .custom-block.info {
-  border-color: var(--mp-indigo);
+  border-color: var(--mp-cyan-vivid);
 }
 
 /* ── Tables ─────────────────────────────────────────────────────────── */
@@ -160,19 +170,20 @@
 }
 
 .vp-doc th {
-  background: rgba(79, 70, 229, 0.06);
+  background: rgba(56, 189, 248, 0.06);
   font-weight: 600;
 }
 
 .dark .vp-doc th {
-  background: rgba(6, 182, 212, 0.08);
+  background: rgba(56, 189, 248, 0.08);
 }
 
 /* ── Nav ────────────────────────────────────────────────────────────── */
 
 .VPNavBar .VPNavBarTitle .title {
-  font-weight: 700;
-  letter-spacing: -0.01em;
+  font-family: 'Neue Machina', 'Satoshi', sans-serif;
+  font-weight: 500;
+  letter-spacing: -0.4px;
 }
 
 /* ── Footer ─────────────────────────────────────────────────────────── */
@@ -193,11 +204,11 @@
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: var(--mp-indigo);
+  background: var(--mp-cyan-vivid);
 }
 
 .dark ::-webkit-scrollbar-thumb:hover {
-  background: var(--mp-cyan);
+  background: var(--mp-cyan-vivid);
 }
 
 /* ── Smooth transitions ─────────────────────────────────────────────── */

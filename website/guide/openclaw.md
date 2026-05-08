@@ -27,7 +27,7 @@ Or by directly editing your OpenClaw configuration:
 
 ## How It Works
 
-Once connected, OpenClaw agents receive all 19 tools along with the **Memory Protocol**—a strict behavioral guide indicating they should:
+Once connected, OpenClaw agents receive all 29 tools along with the **Memory Protocol**—a strict behavioral guide indicating they should:
 1. **Never guess**: Query `mempalace_search` or `mempalace_kg_query` before confidently answering.
 2. **Keep an agent diary**: Maintain continuity between sessions by writing to `mempalace_diary_write`.
 3. **Manage the Knowledge Graph**: Update declarative facts when things change using `mempalace_kg_add` and `mempalace_kg_invalidate`.

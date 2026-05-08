@@ -2,6 +2,9 @@
 """
 entity_detector.py — Auto-detect people and projects from file content.
 
+Uses ``from __future__ import annotations`` so PEP 604 union syntax
+(``dict | None``) works on the Python 3.9 baseline.
+
 Two-pass approach:
   Pass 1: scan files, extract entity candidates with signal counts
   Pass 2: score and classify each candidate as person, project, or uncertain
@@ -26,6 +29,8 @@ Usage:
     candidates = detect_entities(paths, languages=("en", "pt-br"))
     confirmed = confirm_entities(candidates)  # interactive review
 """
+
+from __future__ import annotations
 
 import re
 import os
@@ -113,6 +118,23 @@ SKIP_DIRS = {
     ".next",
     "coverage",
     ".mempalace",
+    ".terraform",
+    "vendor",
+    "target",
+}
+
+# Files whose content is boilerplate prose — poisons entity detection.
+# Matched by stem (case-insensitive), with or without an extension.
+SKIP_FILENAMES = {
+    "license",
+    "licence",
+    "copying",
+    "copyright",
+    "notice",
+    "authors",
+    "patents",
+    "third_party_notices",
+    "third-party-notices",
 }
 
 
@@ -193,7 +215,7 @@ def _build_patterns(name: str, languages: tuple = ("en",)) -> dict:
         "person_verbs": _compile_each(sources["person_verb_patterns"]),
         "project_verbs": _compile_each(sources["project_verb_patterns"]),
         "direct": direct_compiled,
-        "versioned": re.compile(rf"\b{n}[-v]\w+", re.IGNORECASE),
+        "versioned": re.compile(rf"\b{n}[-_]v?\d+(?:\.\d+)*\b", re.IGNORECASE),
         "code_ref": re.compile(rf"\b{n}\.(py|js|ts|yaml|yml|json|sh)\b", re.IGNORECASE),
     }
 
@@ -227,12 +249,19 @@ def score_entity(name: str, text: str, lines: list, languages=("en",)) -> dict:
 
     # --- Person signals ---
 
-    # Dialogue markers (strong signal)
+    # Dialogue markers (strong signal).
+    # The bare `^NAME:\s` colon-prefix pattern matches metadata lines like
+    # `Created: 2026-04-21`, so we require >= 2 hits for it to count as dialogue
+    # (real speaker markers repeat; single-line metadata doesn't).
     for rx in patterns["dialogue"]:
         matches = len(rx.findall(text))
-        if matches > 0:
-            person_score += matches * 3
-            person_signals.append(f"dialogue marker ({matches}x)")
+        if matches == 0:
+            continue
+        is_bare_colon = rx.pattern.endswith(r":\s") and not rx.pattern.endswith(r"[:\s]")
+        if is_bare_colon and matches < 2:
+            continue
+        person_score += matches * 3
+        person_signals.append(f"dialogue marker ({matches}x)")
 
     # Person verbs
     for rx in patterns["person_verbs"]:
@@ -328,17 +357,28 @@ def classify_entity(name: str, frequency: int, scores: dict) -> dict:
             signal_categories.add("addressed")
 
     has_two_signal_types = len(signal_categories) >= 2
-    _ = signal_categories - {"pronoun"}  # reserved for future thresholds
+    # Single-category pronoun signal still classifies as person when the
+    # evidence is overwhelming — a diary's main character is referenced
+    # with pronouns, not dialogue markers. Require both: many pronoun hits
+    # AND a high pronoun-to-frequency ratio so common sentence-start words
+    # (Never, Before, etc.) with incidental pronoun proximity don't qualify.
+    pronoun_hits = 0
+    for s in scores["person_signals"]:
+        m = re.search(r"pronoun nearby \((\d+)x\)", s)
+        if m:
+            pronoun_hits = int(m.group(1))
+            break
+    strong_pronoun_signal = pronoun_hits >= 5 and frequency > 0 and pronoun_hits / frequency >= 0.2
 
-    if person_ratio >= 0.7 and has_two_signal_types and ps >= 5:
+    if person_ratio >= 0.7 and (has_two_signal_types and ps >= 5 or strong_pronoun_signal):
         entity_type = "person"
         confidence = min(0.99, 0.5 + person_ratio * 0.5)
         signals = scores["person_signals"] or [f"appears {frequency}x"]
-    elif person_ratio >= 0.7 and (not has_two_signal_types or ps < 5):
-        # Pronoun-only match — downgrade to uncertain
+    elif person_ratio >= 0.7:
+        # Weak single-category person signal — downgrade to uncertain
         entity_type = "uncertain"
         confidence = 0.4
-        signals = scores["person_signals"] + [f"appears {frequency}x — pronoun-only match"]
+        signals = scores["person_signals"] + [f"appears {frequency}x — weak person signal"]
     elif person_ratio <= 0.3:
         entity_type = "project"
         confidence = min(0.99, 0.5 + (1 - person_ratio) * 0.5)
@@ -361,7 +401,12 @@ def classify_entity(name: str, frequency: int, scores: dict) -> dict:
 # ==================== MAIN DETECT ====================
 
 
-def detect_entities(file_paths: list, max_files: int = 10, languages=("en",)) -> dict:
+def detect_entities(
+    file_paths: list,
+    max_files: int = 10,
+    languages=("en",),
+    corpus_origin: dict | None = None,
+) -> dict:
     """
     Scan files and detect entity candidates.
 
@@ -370,12 +415,23 @@ def detect_entities(file_paths: list, max_files: int = 10, languages=("en",)) ->
         max_files: Max files to read (for speed)
         languages: Tuple of language codes whose entity patterns should be
             applied (union). Defaults to ``("en",)``.
+        corpus_origin: Optional corpus-origin context (the dict produced
+            by ``mempalace.corpus_origin`` and persisted to
+            ``<palace>/.mempalace/origin.json`` by ``mempalace init``).
+            When supplied and the corpus is identified as AI-dialogue with
+            known agent persona names, candidates whose name matches an
+            agent persona are moved out of ``people``/``uncertain`` and
+            into a new ``agent_personas`` bucket. Shape:
+            ``{"schema_version": 1, "result": {"agent_persona_names": [...], ...}}``.
 
     Returns:
         {
             "people":   [...entity dicts...],
             "projects": [...entity dicts...],
             "uncertain":[...entity dicts...],
+            # Only present when corpus_origin reclassifies at least one
+            # candidate as an agent persona:
+            "agent_personas": [...entity dicts...],
         }
     """
     langs = _normalize_langs(languages)
@@ -405,7 +461,10 @@ def detect_entities(file_paths: list, max_files: int = 10, languages=("en",)) ->
     candidates = extract_candidates(combined_text, languages=langs)
 
     if not candidates:
-        return {"people": [], "projects": [], "uncertain": []}
+        return _apply_corpus_origin(
+            {"people": [], "projects": [], "topics": [], "uncertain": []},
+            corpus_origin,
+        )
 
     # Score and classify each candidate
     people = []
@@ -428,11 +487,74 @@ def detect_entities(file_paths: list, max_files: int = 10, languages=("en",)) ->
     projects.sort(key=lambda x: x["confidence"], reverse=True)
     uncertain.sort(key=lambda x: x["frequency"], reverse=True)
 
-    # Cap results to most relevant
-    return {
+    detected = {
         "people": people[:15],
         "projects": projects[:10],
+        "topics": [],
         "uncertain": uncertain[:8],
+    }
+
+    return _apply_corpus_origin(detected, corpus_origin)
+
+
+def _apply_corpus_origin(detected: dict, corpus_origin: dict | None) -> dict:
+    """Reclassify per-candidate buckets using corpus-origin context.
+
+    When the corpus is identified as AI-dialogue with known agent persona
+    names, a candidate whose name case-insensitively matches one of those
+    personas is moved from ``people``/``uncertain`` into an
+    ``agent_personas`` bucket. The candidate's per-entity ``type`` is also
+    rewritten to ``"agent_persona"``.
+
+    No-op when ``corpus_origin`` is ``None`` or contains no usable persona
+    names. Pure: returns a new dict, does not mutate the input.
+    """
+    if not corpus_origin:
+        return detected
+
+    origin_result = corpus_origin.get("result") or {}
+    raw_personas = origin_result.get("agent_persona_names") or []
+    persona_lower = {n.lower() for n in raw_personas if isinstance(n, str)}
+    if not persona_lower:
+        return detected
+
+    agent_personas: list = []
+    new_people: list = []
+    new_uncertain: list = []
+
+    for entity in detected.get("people", []):
+        if entity["name"].lower() in persona_lower:
+            agent_personas.append(_tag_as_persona(entity))
+        else:
+            new_people.append(entity)
+
+    for entity in detected.get("uncertain", []):
+        if entity["name"].lower() in persona_lower:
+            agent_personas.append(_tag_as_persona(entity))
+        else:
+            new_uncertain.append(entity)
+
+    if not agent_personas:
+        return detected
+
+    agent_personas.sort(key=lambda x: x.get("confidence", 0), reverse=True)
+
+    return {
+        **detected,
+        "people": new_people,
+        "uncertain": new_uncertain,
+        "agent_personas": agent_personas,
+    }
+
+
+def _tag_as_persona(entity: dict) -> dict:
+    """Return a new entity dict tagged as agent_persona with provenance signal."""
+    existing_signals = entity.get("signals", [])
+    return {
+        **entity,
+        "type": "agent_persona",
+        "confidence": max(0.95, entity.get("confidence", 0.0)),
+        "signals": ["matched corpus_origin agent_persona_names"] + existing_signals[:2],
     }
 
 
@@ -454,7 +576,13 @@ def confirm_entities(detected: dict, yes: bool = False) -> dict:
     """
     Interactive confirmation step.
     User reviews detected entities, removes wrong ones, adds missing ones.
-    Returns confirmed {people: [names], projects: [names]}
+    Returns confirmed {people: [names], projects: [names], topics: [names]}.
+
+    Topics are not surfaced for interactive review — they come from the
+    LLM-refined ``TOPIC`` bucket and are passed through verbatim. They
+    feed cross-wing tunnel computation at mine time (see
+    ``palace_graph.compute_topic_tunnels``); a wrong topic at worst adds
+    a low-traffic tunnel and never alters drawer storage.
 
     Pass yes=True to auto-accept all detected entities without prompting.
     """
@@ -466,18 +594,28 @@ def confirm_entities(detected: dict, yes: bool = False) -> dict:
     _print_entity_list(detected["people"], "PEOPLE")
     _print_entity_list(detected["projects"], "PROJECTS")
 
+    if detected.get("topics"):
+        _print_entity_list(detected["topics"], "TOPICS (cross-wing tunnel signal)")
+
     if detected["uncertain"]:
         _print_entity_list(detected["uncertain"], "UNCERTAIN (need your call)")
 
     confirmed_people = [e["name"] for e in detected["people"]]
     confirmed_projects = [e["name"] for e in detected["projects"]]
+    confirmed_topics = [e["name"] for e in detected.get("topics", [])]
 
     if yes:
         # Auto-accept: include all detected (skip uncertain — ambiguous without user input)
         print(
-            f"\n  Auto-accepting {len(confirmed_people)} people, {len(confirmed_projects)} projects."
+            f"\n  Auto-accepting {len(confirmed_people)} people, "
+            f"{len(confirmed_projects)} projects, "
+            f"{len(confirmed_topics)} topics."
         )
-        return {"people": confirmed_people, "projects": confirmed_projects}
+        return {
+            "people": confirmed_people,
+            "projects": confirmed_projects,
+            "topics": confirmed_topics,
+        }
 
     print(f"\n{'─' * 58}")
     print("  Options:")
@@ -535,11 +673,14 @@ def confirm_entities(detected: dict, yes: bool = False) -> dict:
     print("  Confirmed:")
     print(f"  People:   {', '.join(confirmed_people) or '(none)'}")
     print(f"  Projects: {', '.join(confirmed_projects) or '(none)'}")
+    if confirmed_topics:
+        print(f"  Topics:   {', '.join(confirmed_topics)}")
     print(f"{'=' * 58}\n")
 
     return {
         "people": confirmed_people,
         "projects": confirmed_projects,
+        "topics": confirmed_topics,
     }
 
 
@@ -560,6 +701,8 @@ def scan_for_detection(project_dir: str, max_files: int = 10) -> list:
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
         for filename in filenames:
             filepath = Path(root) / filename
+            if filepath.stem.lower() in SKIP_FILENAMES:
+                continue
             ext = filepath.suffix.lower()
             if ext in PROSE_EXTENSIONS:
                 prose_files.append(filepath)

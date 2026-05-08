@@ -83,6 +83,8 @@ class KnowledgeGraph:
                 confidence REAL DEFAULT 1.0,
                 source_closet TEXT,
                 source_file TEXT,
+                source_drawer_id TEXT,
+                adapter_name TEXT,
                 extracted_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (subject) REFERENCES entities(id),
                 FOREIGN KEY (object) REFERENCES entities(id)
@@ -93,7 +95,24 @@ class KnowledgeGraph:
             CREATE INDEX IF NOT EXISTS idx_triples_predicate ON triples(predicate);
             CREATE INDEX IF NOT EXISTS idx_triples_valid ON triples(valid_from, valid_to);
         """)
+        self._migrate_schema(conn)
         conn.commit()
+
+    def _migrate_schema(self, conn):
+        """Backwards-compatible schema migration for older triples tables.
+
+        Fresh palaces get ``source_drawer_id`` / ``adapter_name`` (RFC 002 §5.5)
+        directly from the canonical ``CREATE TABLE`` above, so this path is a
+        no-op on new installs. It exists for palaces that were created before
+        those columns were added: SQLite has no ``ADD COLUMN IF NOT EXISTS``,
+        so we introspect the schema and only issue the ALTER when the column
+        is missing.
+        """
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(triples)")}
+        if "source_drawer_id" not in existing:
+            conn.execute("ALTER TABLE triples ADD COLUMN source_drawer_id TEXT")
+        if "adapter_name" not in existing:
+            conn.execute("ALTER TABLE triples ADD COLUMN adapter_name TEXT")
 
     def _conn(self):
         if self._connection is None:
@@ -137,15 +156,30 @@ class KnowledgeGraph:
         confidence: float = 1.0,
         source_closet: str = None,
         source_file: str = None,
+        source_drawer_id: str = None,
+        adapter_name: str = None,
     ):
         """
         Add a relationship triple: subject → predicate → object.
+
+        ``source_drawer_id`` and ``adapter_name`` are RFC 002 §5.5 provenance
+        fields populated by adapters that advertise ``supports_kg_triples``;
+        they default to ``None`` so every existing caller stays source-compatible.
 
         Examples:
             add_triple("Max", "child_of", "Alice", valid_from="2015-04-01")
             add_triple("Max", "does", "swimming", valid_from="2025-01-01")
             add_triple("Alice", "worried_about", "Max injury", valid_from="2026-01", valid_to="2026-02")
         """
+        # Reject inverted intervals: a triple with valid_to < valid_from
+        # would never satisfy `valid_from <= as_of AND valid_to >= as_of`,
+        # so it would be invisible to every query — silently corrupt.
+        if valid_from is not None and valid_to is not None and valid_to < valid_from:
+            raise ValueError(
+                f"valid_to={valid_to!r} is before valid_from={valid_from!r}; "
+                "an inverted interval would be invisible to every KG query"
+            )
+
         sub_id = self._entity_id(subject)
         obj_id = self._entity_id(obj)
         pred = predicate.lower().replace(" ", "_")
@@ -173,8 +207,12 @@ class KnowledgeGraph:
                 triple_id = f"t_{sub_id}_{pred}_{obj_id}_{hashlib.sha256(f'{valid_from}{datetime.now().isoformat()}'.encode()).hexdigest()[:12]}"
 
                 conn.execute(
-                    """INSERT INTO triples (id, subject, predicate, object, valid_from, valid_to, confidence, source_closet, source_file)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    """INSERT INTO triples (
+                        id, subject, predicate, object,
+                        valid_from, valid_to, confidence,
+                        source_closet, source_file,
+                        source_drawer_id, adapter_name
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         triple_id,
                         sub_id,
@@ -185,6 +223,8 @@ class KnowledgeGraph:
                         confidence,
                         source_closet,
                         source_file,
+                        source_drawer_id,
+                        adapter_name,
                     ),
                 )
         return triple_id
