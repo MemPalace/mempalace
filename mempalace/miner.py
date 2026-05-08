@@ -12,6 +12,7 @@ import sys
 import shlex
 import hashlib
 import fnmatch
+import logging
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
@@ -22,7 +23,6 @@ from .vector_store import get_collection as _get_vector_store_collection
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
-    MineAlreadyRunning,
     build_closet_lines,
     file_already_mined,
     get_closets_collection,
@@ -31,6 +31,8 @@ from .palace import (
     purge_file_closets,
     upsert_closet_lines,
 )
+
+logger = logging.getLogger("mempalace_mcp")
 
 READABLE_EXTENSIONS = {
     ".txt",
@@ -64,6 +66,8 @@ SKIP_FILENAMES = {
     "mempal.yml",
     ".gitignore",
     "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
 }
 
 CHUNK_SIZE = 800  # chars per drawer
@@ -71,6 +75,13 @@ CHUNK_OVERLAP = 100  # overlap between chunks
 MIN_CHUNK_SIZE = 50  # skip tiny chunks
 DRAWER_UPSERT_BATCH_SIZE = 1000
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB — skip files larger than this.
+# A single file producing more chunks than this is almost always a generated
+# artifact (CSV/JSON dump, lockfile not in SKIP_FILENAMES, etc.). Embedding
+# thousands of chunks from one file in one batch has triggered ONNX runtime
+# `bad allocation` errors on Windows (#1296). The cap is conservative: a
+# 500-chunk file at CHUNK_SIZE=800 is ~400 KB of source, which covers most
+# legitimate hand-written content while bounding the worst-case batch.
+MAX_CHUNKS_PER_FILE = 500
 # Long Claude Code sessions and large transcript exports routinely exceed
 # 10 MB. The cap exists as a defensive rail against pathological binary
 # files, not as a limit on legitimate text. Per-drawer size is bounded
@@ -287,7 +298,15 @@ def load_config(project_dir: str) -> dict:
         if legacy_path.exists():
             config_path = legacy_path
         else:
-            wing_name = resolved_project_dir.name
+            from .config import normalize_wing_name
+
+            # Normalize the dirname-derived fallback wing the same way
+            # ``cmd_init`` and ``room_detector_local`` do — otherwise a
+            # hyphenated project mined without a yaml file lands under a
+            # raw-name wing while ``topics_by_wing`` was keyed under the
+            # normalized slug, silently dropping every topic tunnel
+            # (the no-yaml branch of issue #1194).
+            wing_name = normalize_wing_name(resolved_project_dir.name)
             print(
                 f"  No mempalace.yaml found in {resolved_project_dir} "
                 f"— using auto-detected defaults (wing='{wing_name}'). "
@@ -815,6 +834,13 @@ def process_file(
     room = detect_room(filepath, content, rooms, project_path)
     chunks = chunk_text(content, source_file)
 
+    if len(chunks) > MAX_CHUNKS_PER_FILE:
+        print(
+            f"  ! [skip] {filepath.name[:50]:50} produced {len(chunks)} chunks "
+            f"(> {MAX_CHUNKS_PER_FILE}); add to SKIP_FILENAMES or .gitignore"
+        )
+        return 0, room
+
     if dry_run:
         print(f"    [DRY RUN] {filepath.name} -> room:{room} ({len(chunks)} drawers)")
         return len(chunks), room
@@ -835,7 +861,7 @@ def process_file(
         try:
             collection.delete(where={"source_file": source_file})
         except Exception:
-            pass
+            logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
 
         # Batch chunks into bounded upserts so the embedding model sees many
         # chunks per forward pass without building one huge Chroma/SQLite
@@ -1009,26 +1035,21 @@ def mine(
             files=files,
         )
 
-    try:
-        with mine_palace_lock(palace_path):
-            return _mine_impl(
-                project_dir,
-                palace_path,
-                wing_override=wing_override,
-                agent=agent,
-                limit=limit,
-                dry_run=dry_run,
-                respect_gitignore=respect_gitignore,
-                include_ignored=include_ignored,
-                files=files,
-            )
-    except MineAlreadyRunning:
-        print(
-            f"mempalace: another `mine` is already running against "
-            f"{palace_path} — exiting cleanly.",
-            file=sys.stderr,
+    # MineAlreadyRunning propagates so the CLI can render a clear holder-aware
+    # message and exit non-zero. In-process callers (tests, library users) that
+    # expect to coexist with another writer should handle the exception.
+    with mine_palace_lock(palace_path):
+        return _mine_impl(
+            project_dir,
+            palace_path,
+            wing_override=wing_override,
+            agent=agent,
+            limit=limit,
+            dry_run=dry_run,
+            respect_gitignore=respect_gitignore,
+            include_ignored=include_ignored,
+            files=files,
         )
-        return
 
 
 def _mine_impl(
@@ -1157,6 +1178,24 @@ def _mine_impl(
             "already-filed drawers are\n  upserted idempotently and will not duplicate.\n"
         )
         sys.exit(130)
+    except Exception as exc:
+        # Without this, an arbitrary exception (ONNX bad_alloc, chromadb HNSW
+        # error, OS fault) propagates and the process exits with no completion
+        # banner — the operator sees only the final progress line and assumes
+        # the mine succeeded (#1296). Print the partial-progress summary the
+        # way we do for KeyboardInterrupt, then re-raise so the original
+        # traceback still surfaces and the exit code is non-zero.
+        print("\n\n  Mine aborted by exception.")
+        print(f"    files_processed: {files_processed}/{len(files)}")
+        print(f"    drawers_filed:   {total_drawers}")
+        print(f"    last_file:       {last_file or '<none>'}")
+        print(f"    error:           {type(exc).__name__}: {exc}")
+        print(
+            f"\n  Re-run `mempalace mine {shlex.quote(project_dir)}` after addressing "
+            "the cause — already-filed\n  drawers are upserted idempotently and will "
+            "not duplicate.\n"
+        )
+        raise
     finally:
         # Clean up the hooks-side PID lock if it points at us. Stale
         # entries already pass _pid_alive() == False on POSIX, but
@@ -1168,30 +1207,29 @@ def _mine_impl(
 
 
 def _cleanup_mine_pid_file() -> None:
-    """Remove the global mine PID file if it currently points at us.
+    """Remove this process's per-target PID slot on exit.
 
-    The PID file (``~/.mempalace/hook_state/mine.pid``, written by the
-    hook in :func:`mempalace.hooks_cli._spawn_mine`) tracks the PID of
-    the most recently spawned mine subprocess so the hook can dedup
-    concurrent auto-ingest fires. When that subprocess exits — cleanly,
-    on error, or via Ctrl-C — it should remove its own entry so the
-    next hook fire isn't briefly fooled by a stale PID before
-    ``_pid_alive`` returns False.
+    Hook-spawned mines receive ``MEMPALACE_MINE_PID_FILE`` in their env
+    pointing at the slot the hook claimed for them
+    (``~/.mempalace/hook_state/mine_pids/mine_<sha>.pid``). When the
+    subprocess exits — cleanly, on error, or via Ctrl-C — it removes its
+    own slot so the next hook fire isn't briefly fooled by a stale PID
+    before ``_pid_alive`` returns False.
 
-    We only delete the file if it claims our own PID; any other PID is
-    left alone (could be an unrelated mine running concurrently from
-    a different worktree / session).
+    Only delete the slot if it claims our own PID; any other PID is left
+    alone (it could belong to an unrelated mine that just claimed the
+    same slot via a stale-reclaim race).
     """
-    try:
-        from .hooks_cli import _MINE_PID_FILE
-    except Exception:
+    pid_file_env = os.environ.get("MEMPALACE_MINE_PID_FILE", "")
+    if not pid_file_env:
         return
     try:
-        if not _MINE_PID_FILE.exists():
+        pid_file = Path(pid_file_env)
+        if not pid_file.exists():
             return
-        recorded = _MINE_PID_FILE.read_text().strip()
+        recorded = pid_file.read_text().strip()
         if recorded and recorded.isdigit() and int(recorded) == os.getpid():
-            _MINE_PID_FILE.unlink()
+            pid_file.unlink()
     except OSError:
         # Best-effort cleanup; never fail the mine over PID bookkeeping.
         pass

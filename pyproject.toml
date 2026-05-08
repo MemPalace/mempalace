@@ -1,6 +1,6 @@
 [project]
 name = "mempalace"
-version = "3.3.3"
+version = "3.3.4"
 description = "Give your AI a memory — mine projects and conversations into a searchable palace. No API key required."
 readme = "README.md"
 requires-python = ">=3.9"

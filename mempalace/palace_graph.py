@@ -15,8 +15,14 @@ Enables queries like:
 No external graph DB needed — built from vector store metadata.
 """
 
+# PEP 604 (``str | None``) needs 3.10+ at runtime; the project still
+# supports 3.9, so defer annotation evaluation to keep the union syntax
+# working on the older interpreter.
+from __future__ import annotations
+
 import hashlib
 import json
+import logging
 import os
 import threading
 import time
@@ -26,6 +32,22 @@ from datetime import datetime, timezone
 from .config import MempalaceConfig
 from .vector_store import get_collection as _get_vector_store
 from .palace import mine_lock
+
+logger = logging.getLogger("mempalace_graph")
+
+
+def _normalize_wing(wing: str | None) -> str | None:
+    """Normalize a wing name for consistent lookup.
+
+    ``init`` stores wing names with hyphens and spaces replaced by underscores
+    (e.g. ``mempalace_public``).  Callers that pass the raw directory name
+    (``mempalace-public``) would silently miss.  This helper aligns the lookup
+    key with the stored metadata.
+    """
+    if wing is None:
+        return None
+    return wing.lower().replace(" ", "_").replace("-", "_")
+
 
 # Module-level graph cache with TTL and write-invalidation.
 # Warm cache serves build_graph() in O(1); invalidate_graph_cache() clears on writes.
@@ -88,6 +110,16 @@ def build_graph(col=None, config=None):
     while offset < total:
         batch = col.get(limit=1000, offset=offset, include=["metadatas"])
         for meta in batch["metadatas"]:
+            # ChromaDB can return ``None`` for drawers without metadata
+            # (legacy data, partial writes — upstream #1020 territory).
+            # Skip these silently rather than crash the whole graph
+            # build — a single None drawer shouldn't take down /stats
+            # or any caller of build_graph for the entire palace. Caught
+            # 2026-04-25 by palace-daemon's verify-routes.sh smoke test
+            # against the canonical 151K palace. Closes the same gap as
+            # upstream #999 / fork PR #1094 in a different read path.
+            if meta is None:
+                continue
             room = meta.get("room", "")
             wing = meta.get("wing", "")
             hall = meta.get("hall", "")
@@ -211,15 +243,18 @@ def find_tunnels(wing_a: str = None, wing_b: str = None, col=None, config=None):
     """
     nodes, edges = build_graph(col, config)
 
+    norm_a = _normalize_wing(wing_a)
+    norm_b = _normalize_wing(wing_b)
+
     tunnels = []
     for room, data in nodes.items():
         wings = data["wings"]
         if len(wings) < 2:
             continue
 
-        if wing_a and wing_a not in wings:
+        if norm_a and norm_a not in wings:
             continue
-        if wing_b and wing_b not in wings:
+        if norm_b and norm_b not in wings:
             continue
 
         tunnels.append(
@@ -230,6 +265,15 @@ def find_tunnels(wing_a: str = None, wing_b: str = None, col=None, config=None):
                 "count": data["count"],
                 "recent": data["dates"][-1] if data["dates"] else "",
             }
+        )
+
+    if not tunnels and (wing_a or wing_b):
+        logger.warning(
+            "No tunnels found for wing filter(s): wing_a=%r (normalized=%r), wing_b=%r (normalized=%r)",
+            wing_a,
+            norm_a,
+            wing_b,
+            norm_b,
         )
 
     tunnels.sort(key=lambda x: -x["count"])
@@ -412,6 +456,9 @@ def create_tunnel(
     target_wing = _require_name(target_wing, "target_wing")
     target_room = _require_name(target_room, "target_room")
 
+    source_wing = _normalize_wing(source_wing)
+    target_wing = _normalize_wing(target_wing)
+
     tunnel_id = _canonical_tunnel_id(source_wing, source_room, target_wing, target_room)
 
     tunnel = {
@@ -452,9 +499,14 @@ def list_tunnels(wing: str = None):
     Returns tunnels where ``wing`` appears as either source or target
     (tunnels are symmetric, so either endpoint is a valid filter match).
     """
+    norm_wing = _normalize_wing(wing)
     tunnels = _load_tunnels()
-    if wing:
-        tunnels = [t for t in tunnels if t["source"]["wing"] == wing or t["target"]["wing"] == wing]
+    if norm_wing:
+        tunnels = [
+            t
+            for t in tunnels
+            if t["source"]["wing"] == norm_wing or t["target"]["wing"] == norm_wing
+        ]
     return tunnels
 
 
@@ -473,6 +525,7 @@ def follow_tunnels(wing: str, room: str, col=None, config=None):
     Given a location (wing/room), finds all tunnels leading from or to it,
     and optionally fetches the connected drawer content.
     """
+    norm_wing = _normalize_wing(wing) or wing
     tunnels = _load_tunnels()
     connections = []
 
@@ -480,7 +533,7 @@ def follow_tunnels(wing: str, room: str, col=None, config=None):
         src = t["source"]
         tgt = t["target"]
 
-        if src["wing"] == wing and src["room"] == room:
+        if src["wing"] == norm_wing and src["room"] == room:
             connections.append(
                 {
                     "direction": "outgoing",
@@ -491,7 +544,7 @@ def follow_tunnels(wing: str, room: str, col=None, config=None):
                     "tunnel_id": t["id"],
                 }
             )
-        elif tgt["wing"] == wing and tgt["room"] == room:
+        elif tgt["wing"] == norm_wing and tgt["room"] == room:
             connections.append(
                 {
                     "direction": "incoming",
@@ -502,6 +555,9 @@ def follow_tunnels(wing: str, room: str, col=None, config=None):
                     "tunnel_id": t["id"],
                 }
             )
+
+    if not connections:
+        logger.warning("No explicit tunnels found for %s/%s", wing, room)
 
     # If we have a collection, fetch drawer content for connected items
     if col and connections:
@@ -515,7 +571,7 @@ def follow_tunnels(wing: str, room: str, col=None, config=None):
                     if did and did in drawer_map:
                         c["drawer_preview"] = drawer_map[did][:300]
             except Exception:
-                pass
+                logger.debug("Drawer preview hydration failed", exc_info=True)
 
     return connections
 

@@ -120,12 +120,28 @@ def ingest_diaries(
             continue
         date_str = date_match.group(1)
 
-        # Skip if content hasn't changed
+        # Skip if content hasn't changed. Hash-based — size alone false-negatives
+        # on same-length edits (e.g. "teh" → "the"), silently dropping real edits.
         state_key = f"{wing}|{diary_path.name}"
-        prev_size = state.get(state_key, {}).get("size", 0)
+        prev_entry = state.get(state_key, {})
+        prev_hash = prev_entry.get("content_hash")
+        prev_size = prev_entry.get("size", 0)
         curr_size = len(text)
-        if curr_size == prev_size and not force:
-            continue
+        curr_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if not force:
+            if prev_hash is not None:
+                if curr_hash == prev_hash:
+                    continue
+            elif curr_size == prev_size and prev_size > 0:
+                # Legacy state without content_hash: keep size-based skip but
+                # backfill the hash so future runs use the strict check.
+                state[state_key] = {**prev_entry, "content_hash": curr_hash}
+                continue
+
+        # An in-place edit (same entry count, different content) means existing
+        # closets are stale. Force a full rebuild whenever the hash changes,
+        # not only on entry-count growth.
+        content_changed = prev_hash is not None and curr_hash != prev_hash
 
         now_iso = datetime.now(timezone.utc).isoformat()
         drawer_id = _diary_drawer_id(wing, date_str)
@@ -153,7 +169,8 @@ def ingest_diaries(
 
             entries = _split_entries(text)
             prev_entry_count = state.get(state_key, {}).get("entry_count", 0)
-            new_entries = entries if force else entries[prev_entry_count:]
+            full_rebuild = force or content_changed
+            new_entries = entries if full_rebuild else entries[prev_entry_count:]
 
             if new_entries:
                 all_lines = []
@@ -175,15 +192,16 @@ def ingest_diaries(
                     }
                     if entities:
                         closet_meta["entities"] = entities
-                    # On a force rebuild, wipe any leftover numbered closets
-                    # from a longer prior run before re-writing.
-                    if force:
+                    # On any full rebuild (force or detected content edit),
+                    # wipe leftover closets from a prior run before re-writing.
+                    if full_rebuild:
                         purge_file_closets(closets_col, source_file)
                     n = upsert_closet_lines(closets_col, closet_id_base, all_lines, closet_meta)
                     closets_created += n
 
             state[state_key] = {
                 "size": curr_size,
+                "content_hash": curr_hash,
                 "entry_count": len(entries),
                 "ingested_at": now_iso,
             }

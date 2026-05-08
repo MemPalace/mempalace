@@ -597,6 +597,7 @@ def discover_entities(
     people_cap: int = 15,
     llm_provider: object = None,
     show_progress: bool = True,
+    corpus_origin: dict | None = None,
 ) -> dict:
     """Top-level entity discovery: real signals first, prose detection second.
 
@@ -613,11 +614,19 @@ def discover_entities(
          mentioned in docs/notes (not code)
       5. Optional LLM refinement pass — reclassifies ambiguous candidates
          using the caller-supplied provider
+      6. Optional corpus-origin persona filter — when the corpus is
+         identified as AI-dialogue, candidates whose name matches an
+         agent_persona_name are moved to an ``agent_personas`` bucket
+         instead of being reported as people.
 
     Passing ``llm_provider`` enables phase-2 refinement. The caller is
     responsible for constructing the provider (``llm_client.get_provider``)
     and confirming availability. Refinement is blocking-interactive:
     progress prints to stderr; Ctrl-C returns partial results.
+
+    Passing ``corpus_origin`` enables corpus-origin persona reclassification.
+    The expected shape is the dict written by ``mempalace init`` to
+    ``<palace>/.mempalace/origin.json`` (see ``corpus_origin.py``).
     """
     projects, people = scan(project_dir)
 
@@ -668,7 +677,7 @@ def discover_entities(
         drop_secondary_uncertain=has_real_signal and llm_provider is None,
     )
 
-    # Optional phase 2: LLM refinement.
+    # Optional LLM refinement pass (when an llm_provider was supplied).
     if llm_provider is not None:
         from mempalace.llm_refine import collect_corpus_text, refine_entities
 
@@ -679,6 +688,7 @@ def discover_entities(
             llm_provider,
             show_progress=show_progress,
             allow_project_promotions=not has_real_signal,
+            corpus_origin=corpus_origin,
         )
         if show_progress:
             status_bits = []
@@ -695,6 +705,14 @@ def discover_entities(
 
                 print(f"  LLM refine: {', '.join(status_bits)}", file=_sys.stderr)
         merged = result.merged
+
+    # Corpus-origin persona reclassification — applied last so it sweeps
+    # candidates contributed by every upstream source (manifests, git authors,
+    # prose, LLM refinement). Idempotent: no corpus_origin → exact v3.3.3 shape.
+    if corpus_origin is not None:
+        from mempalace.entity_detector import _apply_corpus_origin
+
+        merged = _apply_corpus_origin(merged, corpus_origin)
 
     return merged
 

@@ -67,6 +67,24 @@ def test_load_config_uses_defaults_when_yaml_missing():
         shutil.rmtree(tmpdir)
 
 
+def test_load_config_no_yaml_normalizes_hyphenated_wing():
+    """Fallback wing name is normalized so it matches topics_by_wing keys.
+
+    Regression for the no-yaml branch of #1194: ``cmd_init`` writes
+    ``topics_by_wing`` under the normalized slug, so the miner's
+    fallback wing must use the same normalization or the tunnel lookup
+    misses every key for hyphenated dirnames.
+    """
+    parent = tempfile.mkdtemp()
+    try:
+        project_root = Path(parent) / "my-cool-app"
+        project_root.mkdir()
+        config = load_config(str(project_root))
+        assert config["wing"] == "my_cool_app"
+    finally:
+        shutil.rmtree(parent)
+
+
 def test_scan_project_skips_mempalace_generated_files():
     with tempfile.TemporaryDirectory() as tmpdir:
         project_root = Path(tmpdir).resolve()
@@ -681,8 +699,85 @@ def test_mine_keyboard_interrupt_quotes_path_with_spaces_in_resume_hint(tmp_path
     assert f"mempalace mine {shlex.quote(str(project_root))}" in out
 
 
+def test_skip_filenames_includes_lockfiles():
+    """pnpm-lock.yaml and yarn.lock must be skipped alongside package-lock.json
+    so a Windows mine over a typical JS monorepo doesn't OOM the ONNX embedder
+    on a 24K-line lockfile (#1296)."""
+    from mempalace import miner
+
+    assert "package-lock.json" in miner.SKIP_FILENAMES
+    assert "pnpm-lock.yaml" in miner.SKIP_FILENAMES
+    assert "yarn.lock" in miner.SKIP_FILENAMES
+
+
+def test_process_file_skips_when_chunks_exceed_max(tmp_path, monkeypatch):
+    """A file producing more than MAX_CHUNKS_PER_FILE chunks must be skipped
+    with a clear message and zero upserts. Generated artifacts (CSVs, lock
+    files not in SKIP_FILENAMES) hit this — the cap is what prevents ONNX
+    bad_alloc on Windows when the embedder is asked to swallow thousands of
+    chunks in one batch (#1296)."""
+    from unittest.mock import MagicMock
+
+    from mempalace import miner
+
+    monkeypatch.setattr(miner, "MAX_CHUNKS_PER_FILE", 5)
+    over_cap = [{"content": f"chunk {i}", "chunk_index": i} for i in range(7)]
+    monkeypatch.setattr(miner, "chunk_text", lambda content, source_file: over_cap)
+
+    source = tmp_path / "huge.csv"
+    source.write_text("col1,col2\n" + "x,y\n" * 500, encoding="utf-8")
+    col = MagicMock()
+    col.get.return_value = {"ids": []}
+
+    drawers, room = miner.process_file(
+        source,
+        tmp_path,
+        col,
+        "wing",
+        [{"name": "general", "description": "General"}],
+        "agent",
+        False,
+    )
+
+    assert drawers == 0
+    col.upsert.assert_not_called()
+
+
+def test_mine_arbitrary_exception_prints_summary_and_reraises(tmp_path, capsys):
+    """A non-KeyboardInterrupt exception mid-mine must surface a summary
+    banner before propagating, so users don't see a silent exit-0 with no
+    completion message (#1296 Failure 2). Re-raise preserves the traceback
+    and yields a non-zero exit code."""
+    import pytest
+    from unittest.mock import patch
+
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=4)
+    palace_path = project_root / "palace"
+
+    call_count = {"n": 0}
+
+    def fake_process_file(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            raise RuntimeError("simulated ONNX bad_alloc")
+        return (1, "general")
+
+    with patch("mempalace.miner.process_file", side_effect=fake_process_file):
+        with pytest.raises(RuntimeError, match="simulated ONNX bad_alloc"):
+            mine(str(project_root), str(palace_path))
+
+    out = capsys.readouterr().out
+    assert "Mine aborted by exception." in out
+    assert "files_processed: 1/" in out
+    assert "drawers_filed:" in out
+    assert "RuntimeError: simulated ONNX bad_alloc" in out
+    assert "upserted idempotently" in out
+
+
 def test_mine_cleans_up_pid_file_on_interrupt(tmp_path):
-    """Our own PID entry in mine.pid is removed in the finally clause."""
+    """Our own per-target PID slot is removed in the finally clause."""
     import pytest
     from unittest.mock import patch
 
@@ -691,14 +786,16 @@ def test_mine_cleans_up_pid_file_on_interrupt(tmp_path):
     _make_minable_project(project_root, n_files=2)
     palace_path = project_root / "palace"
 
-    pid_file = tmp_path / "mine.pid"
+    pid_file = tmp_path / "mine_abc.pid"
     pid_file.write_text(str(os.getpid()))
 
     def fake_process_file(*args, **kwargs):
         raise KeyboardInterrupt
 
+    # The mine subprocess receives its slot path via env var; the cleanup
+    # hook in miner.py reads that var and removes the slot if it matches.
     with (
-        patch("mempalace.hooks_cli._MINE_PID_FILE", pid_file),
+        patch.dict(os.environ, {"MEMPALACE_MINE_PID_FILE": str(pid_file)}),
         patch("mempalace.miner.process_file", side_effect=fake_process_file),
     ):
         with pytest.raises(SystemExit):
@@ -708,7 +805,7 @@ def test_mine_cleans_up_pid_file_on_interrupt(tmp_path):
 
 
 def test_mine_cleans_up_pid_file_on_clean_exit(tmp_path):
-    """Successful mine also removes its own PID entry in the finally clause."""
+    """Successful mine also removes its own per-target PID slot."""
     from unittest.mock import patch
 
     project_root = tmp_path / "proj"
@@ -716,17 +813,17 @@ def test_mine_cleans_up_pid_file_on_clean_exit(tmp_path):
     _make_minable_project(project_root, n_files=1)
     palace_path = project_root / "palace"
 
-    pid_file = tmp_path / "mine.pid"
+    pid_file = tmp_path / "mine_abc.pid"
     pid_file.write_text(str(os.getpid()))
 
-    with patch("mempalace.hooks_cli._MINE_PID_FILE", pid_file):
+    with patch.dict(os.environ, {"MEMPALACE_MINE_PID_FILE": str(pid_file)}):
         mine(str(project_root), str(palace_path))
 
     assert not pid_file.exists()
 
 
 def test_mine_does_not_remove_other_processes_pid_file(tmp_path):
-    """A PID file pointing at someone else's PID is left untouched."""
+    """A PID slot pointing at someone else's PID is left untouched."""
     from unittest.mock import patch
 
     project_root = tmp_path / "proj"
@@ -735,10 +832,10 @@ def test_mine_does_not_remove_other_processes_pid_file(tmp_path):
     palace_path = project_root / "palace"
 
     other_pid = os.getpid() + 999_999  # a PID that isn't us
-    pid_file = tmp_path / "mine.pid"
+    pid_file = tmp_path / "mine_abc.pid"
     pid_file.write_text(str(other_pid))
 
-    with patch("mempalace.hooks_cli._MINE_PID_FILE", pid_file):
+    with patch.dict(os.environ, {"MEMPALACE_MINE_PID_FILE": str(pid_file)}):
         mine(str(project_root), str(palace_path))
 
     assert pid_file.exists(), "Foreign PID entries must not be removed"

@@ -171,6 +171,15 @@ class KnowledgeGraph:
             add_triple("Max", "does", "swimming", valid_from="2025-01-01")
             add_triple("Alice", "worried_about", "Max injury", valid_from="2026-01", valid_to="2026-02")
         """
+        # Reject inverted intervals: a triple with valid_to < valid_from
+        # would never satisfy `valid_from <= as_of AND valid_to >= as_of`,
+        # so it would be invisible to every query — silently corrupt.
+        if valid_from is not None and valid_to is not None and valid_to < valid_from:
+            raise ValueError(
+                f"valid_to={valid_to!r} is before valid_from={valid_from!r}; "
+                "an inverted interval would be invisible to every KG query"
+            )
+
         sub_id = self._entity_id(subject)
         obj_id = self._entity_id(obj)
         pred = predicate.lower().replace(" ", "_")

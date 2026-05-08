@@ -329,3 +329,48 @@ class TestTopicTunnels:
         tunnels = palace_graph.list_tunnels()
         kinds = sorted(t["kind"] for t in tunnels)
         assert kinds == ["explicit", "topic"]
+
+
+class TestHyphenatedWingNormalization:
+    """Wing names with hyphens or spaces are normalized to underscores on init.
+
+    Tunnel helpers must apply the same normalization at lookup time so that
+    ``mempalace-public`` resolves to ``mempalace_public`` and matches the
+    metadata written by ``room_detector_local.py``.
+    """
+
+    def test_list_tunnels_filters_hyphenated_wing(self, tmp_path, monkeypatch):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+
+        palace_graph.create_tunnel("mempalace_public", "auth", "wing_people", "users")
+
+        assert len(palace_graph.list_tunnels("mempalace-public")) == 1
+        assert len(palace_graph.list_tunnels("mempalace_public")) == 1
+
+    def test_follow_tunnels_matches_hyphenated_wing(self, tmp_path, monkeypatch):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+
+        palace_graph.create_tunnel("mempalace_public", "auth", "wing_people", "users")
+
+        by_hyphen = palace_graph.follow_tunnels("mempalace-public", "auth")
+        by_under = palace_graph.follow_tunnels("mempalace_public", "auth")
+        assert len(by_hyphen) == 1
+        assert len(by_under) == 1
+        assert by_hyphen[0]["connected_wing"] == "wing_people"
+
+    def test_create_tunnel_normalizes_wing_names(self, tmp_path, monkeypatch):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+
+        t = palace_graph.create_tunnel("my-project", "src", "your-project", "dst", label="cross")
+        assert t["source"]["wing"] == "my_project"
+        assert t["target"]["wing"] == "your_project"
+        assert len(palace_graph.list_tunnels("my_project")) == 1
+        assert len(palace_graph.list_tunnels("my-project")) == 1
+
+    def test_find_tunnels_warns_on_empty_result(self, tmp_path, monkeypatch, caplog):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        # No data in collection, so build_graph returns empty nodes
+        with caplog.at_level("WARNING", logger="mempalace_graph"):
+            result = palace_graph.find_tunnels("nonexistent-wing")
+        assert result == []
+        assert "No tunnels found" in caplog.text

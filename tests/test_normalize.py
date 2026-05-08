@@ -11,6 +11,7 @@ from mempalace.normalize import (
     _try_claude_ai_json,
     _try_claude_code_jsonl,
     _try_codex_jsonl,
+    _try_gemini_jsonl,
     _try_normalize_json,
     _try_slack_json,
     normalize,
@@ -448,6 +449,168 @@ def test_codex_jsonl_payload_not_dict():
     ]
     result = _try_codex_jsonl("\n".join(lines))
     assert result is not None
+
+
+# ── _try_gemini_jsonl ──────────────────────────────────────────────────
+#
+# Gemini CLI sessions live at ``~/.gemini/tmp/<project_hash>/chats/`` as
+# JSONL. The schema (per google-gemini/gemini-cli#15292):
+#
+#   {"type":"session_metadata","sessionId":"...","projectHash":"...",...}
+#   {"type":"user","id":"msg1","content":[{"text":"Hello"}]}
+#   {"type":"gemini","id":"msg2","content":[{"text":"Hi"}]}
+#   {"type":"message_update","id":"msg2","tokens":{"input":10,"output":5}}
+#
+# Detection requires a ``session_metadata`` record so this parser does
+# not false-positive against Claude Code or Codex JSONL. ``message_update``
+# entries (token-count deltas only) are skipped — they carry no message
+# text. ``content`` is an array of ``{"text": "..."}`` blocks; we join
+# all text blocks for a given message.
+
+
+def test_gemini_jsonl_valid():
+    lines = [
+        json.dumps({"type": "session_metadata", "sessionId": "abc", "projectHash": "h"}),
+        json.dumps({"type": "user", "id": "m1", "content": [{"text": "Hello"}]}),
+        json.dumps({"type": "gemini", "id": "m2", "content": [{"text": "Hi there"}]}),
+    ]
+    result = _try_gemini_jsonl("\n".join(lines))
+    assert result is not None
+    assert "> Hello" in result
+    assert "Hi there" in result
+
+
+def test_gemini_jsonl_multi_turn():
+    lines = [
+        json.dumps({"type": "session_metadata", "sessionId": "s"}),
+        json.dumps({"type": "user", "content": [{"text": "Q1"}]}),
+        json.dumps({"type": "gemini", "content": [{"text": "A1"}]}),
+        json.dumps({"type": "user", "content": [{"text": "Q2"}]}),
+        json.dumps({"type": "gemini", "content": [{"text": "A2"}]}),
+    ]
+    result = _try_gemini_jsonl("\n".join(lines))
+    assert result is not None
+    assert "> Q1" in result
+    assert "A1" in result
+    assert "> Q2" in result
+    assert "A2" in result
+
+
+def test_gemini_jsonl_no_session_metadata():
+    """Without session_metadata, parser returns None — guards against false
+    positives on Claude Code / Codex JSONL passed through the dispatch chain."""
+    lines = [
+        json.dumps({"type": "user", "content": [{"text": "Hi"}]}),
+        json.dumps({"type": "gemini", "content": [{"text": "Hello"}]}),
+    ]
+    result = _try_gemini_jsonl("\n".join(lines))
+    assert result is None
+
+
+def test_gemini_jsonl_skips_message_update():
+    """message_update records carry only token counts — must be ignored,
+    not turned into empty drawers or duplicated assistant turns."""
+    lines = [
+        json.dumps({"type": "session_metadata"}),
+        json.dumps({"type": "user", "content": [{"text": "Q"}]}),
+        json.dumps({"type": "gemini", "content": [{"text": "A"}]}),
+        json.dumps({"type": "message_update", "id": "m2", "tokens": {"input": 10, "output": 5}}),
+    ]
+    result = _try_gemini_jsonl("\n".join(lines))
+    assert result is not None
+    assert "tokens" not in result
+    assert "input" not in result
+
+
+def test_gemini_jsonl_too_few_messages():
+    """Mirror codex/claude_code behavior: < 2 conversational messages = None."""
+    lines = [
+        json.dumps({"type": "session_metadata"}),
+        json.dumps({"type": "user", "content": [{"text": "only one msg"}]}),
+    ]
+    result = _try_gemini_jsonl("\n".join(lines))
+    assert result is None
+
+
+def test_gemini_jsonl_multi_block_content():
+    """A single message can have multiple text blocks in its content array
+    (e.g. a thinking block + a final answer). Both should be concatenated
+    into one transcript turn, in order."""
+    lines = [
+        json.dumps({"type": "session_metadata"}),
+        json.dumps({"type": "user", "content": [{"text": "Q"}]}),
+        json.dumps(
+            {
+                "type": "gemini",
+                "content": [{"text": "First part."}, {"text": "Second part."}],
+            }
+        ),
+    ]
+    result = _try_gemini_jsonl("\n".join(lines))
+    assert result is not None
+    assert "First part." in result
+    assert "Second part." in result
+
+
+def test_gemini_jsonl_empty_content_skipped():
+    """A message whose content array yields no text should be skipped, not
+    emit an empty turn that would corrupt the transcript."""
+    lines = [
+        json.dumps({"type": "session_metadata"}),
+        json.dumps({"type": "user", "content": []}),
+        json.dumps({"type": "user", "content": [{"text": "real Q"}]}),
+        json.dumps({"type": "gemini", "content": [{"text": "real A"}]}),
+    ]
+    result = _try_gemini_jsonl("\n".join(lines))
+    assert result is not None
+    assert "> real Q" in result
+    assert "real A" in result
+
+
+def test_gemini_jsonl_invalid_json_lines_skipped():
+    """A malformed line in the middle of the stream must not abort parsing —
+    the rest of the session should still produce a transcript."""
+    lines = [
+        json.dumps({"type": "session_metadata"}),
+        "not-valid-json{",
+        json.dumps({"type": "user", "content": [{"text": "Q"}]}),
+        json.dumps({"type": "gemini", "content": [{"text": "A"}]}),
+    ]
+    result = _try_gemini_jsonl("\n".join(lines))
+    assert result is not None
+    assert "> Q" in result
+
+
+def test_gemini_jsonl_does_not_match_codex():
+    """Codex JSONL passed in must NOT be parsed by the gemini adapter — the
+    dispatch chain in _try_normalize_json relies on each adapter returning
+    None when it doesn't recognize a format."""
+    lines = [
+        json.dumps({"type": "session_meta", "payload": {}}),
+        json.dumps({"type": "event_msg", "payload": {"type": "user_message", "message": "Q"}}),
+        json.dumps({"type": "event_msg", "payload": {"type": "agent_message", "message": "A"}}),
+    ]
+    result = _try_gemini_jsonl("\n".join(lines))
+    assert result is None
+
+
+def test_gemini_jsonl_messages_before_session_metadata_discarded():
+    """user/gemini turns that appear before the session_metadata sentinel must
+    be silently discarded, not counted as conversational messages.  Only turns
+    after the sentinel contribute to the transcript."""
+    lines = [
+        json.dumps({"type": "user", "content": [{"text": "preamble Q"}]}),
+        json.dumps({"type": "gemini", "content": [{"text": "preamble A"}]}),
+        json.dumps({"type": "session_metadata", "sessionId": "s"}),
+        json.dumps({"type": "user", "content": [{"text": "real Q"}]}),
+        json.dumps({"type": "gemini", "content": [{"text": "real A"}]}),
+    ]
+    result = _try_gemini_jsonl("\n".join(lines))
+    assert result is not None
+    assert "preamble Q" not in result
+    assert "preamble A" not in result
+    assert "> real Q" in result
+    assert "real A" in result
 
 
 # ── _try_claude_ai_json ───────────────────────────────────────────────
