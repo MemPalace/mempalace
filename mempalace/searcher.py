@@ -14,9 +14,11 @@ import math
 import os
 import re
 import sqlite3
+import sys
 from pathlib import Path
 
 from .palace import get_closets_collection, get_collection
+from .output import safe_separator
 
 # Closet pointer line format: "topic|entities|→drawer_id_a,drawer_id_b"
 # Multiple lines may join with newlines inside one closet document.
@@ -279,16 +281,13 @@ def _warn_if_legacy_metric(col) -> None:
     if space == "cosine":
         return
     # Either missing or set to something else — both are suspect.
-    import sys as _sys
-
     detail = f"hnsw:space={space!r}" if space else "no hnsw:space metadata"
     print(
         f"\n  NOTICE: this palace was created without cosine distance ({detail}).\n"
         "          Semantic similarity scores will not be meaningful.\n"
         "          Run `mempalace repair` to rebuild the index with the correct metric.",
-        file=_sys.stderr,
+        file=sys.stderr,
     )
-
 
 def search(query: str, palace_path: str, wing: str = None, room: str = None, n_results: int = 5):
     """
@@ -352,6 +351,7 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
     if room:
         print(f"  Room: {room}")
     print(f"{'=' * 60}\n")
+    separator = safe_separator()
 
     for i, hit in enumerate(hits, 1):
         vec_sim = round(max(0.0, 1 - hit["distance"]), 3)
@@ -369,7 +369,7 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
         for line in hit["text"].strip().split("\n"):
             print(f"      {line}")
         print()
-        print(f"  {'─' * 56}")
+        print(f"  {separator}")
 
     print()
 

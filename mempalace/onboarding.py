@@ -18,6 +18,7 @@ Usage:
 
 from pathlib import Path
 from mempalace.entity_registry import EntityRegistry
+from .output import safe_separator
 from mempalace.entity_detector import detect_entities, scan_for_detection
 
 
@@ -57,7 +58,7 @@ DEFAULT_WINGS = {
 
 
 def _hr():
-    print(f"\n{'─' * 58}")
+    print(f"\n{safe_separator(58)}")
 
 
 def _header(text):

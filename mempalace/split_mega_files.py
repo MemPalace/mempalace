@@ -28,6 +28,8 @@ import os
 import re
 from pathlib import Path
 
+from .output import safe_separator
+
 HOME = Path.home()
 LUMI_DIR = Path(os.environ.get("MEMPALACE_SOURCE_DIR", str(HOME / "Desktop/transcripts")))
 
@@ -290,7 +292,7 @@ def main():
     print(f"  Source:      {src_dir}")
     print(f"  Output:      {output_dir or 'same dir as source'}")
     print(f"  Mega-files:  {len(mega_files)}")
-    print(f"{'-' * 60}\n")
+    print(f"{safe_separator(60)}\n")
 
     total_written = 0
     for f, n_sessions in mega_files:
@@ -305,7 +307,7 @@ def main():
         else:
             print()
 
-    print(f"{'-' * 60}")
+    print(f"{safe_separator(60)}")
     if args.dry_run:
         print(f"  DRY RUN — would create {total_written} files from {len(mega_files)} mega-files")
     else:

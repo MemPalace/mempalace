@@ -39,6 +39,7 @@ from pathlib import Path
 from collections import defaultdict
 
 from mempalace.i18n import get_entity_patterns
+from .output import safe_separator
 
 
 # ==================== LANGUAGE-AWARE PATTERN LOADING ====================
@@ -617,7 +618,7 @@ def confirm_entities(detected: dict, yes: bool = False) -> dict:
             "topics": confirmed_topics,
         }
 
-    print(f"\n{'─' * 58}")
+    print(f"\n{safe_separator(58)}")
     print("  Options:")
     print("    [enter]  Accept all")
     print("    [edit]   Remove wrong entries or reclassify uncertain")

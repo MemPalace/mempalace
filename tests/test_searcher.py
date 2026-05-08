@@ -5,6 +5,7 @@ Uses the real ChromaDB fixtures from conftest.py for integration tests,
 plus mock-based tests for error paths.
 """
 
+import io
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -13,6 +14,7 @@ from mempalace.searcher import SearchError, search, search_memories
 
 
 # ── search_memories (API) ──────────────────────────────────────────────
+
 
 
 class TestSearchMemories:
@@ -267,10 +269,8 @@ class TestSearchCLI:
 
     def test_search_no_results(self, palace_path, collection, capsys):
         """Empty collection returns no results message."""
-        # collection is empty (no seeded data)
         result = search("xyzzy_nonexistent_query", palace_path, n_results=1)
         captured = capsys.readouterr()
-        # Either prints "No results" or returns None
         assert result is None or "No results" in captured.out
 
     def test_search_query_error_raises(self):
@@ -285,7 +285,6 @@ class TestSearchCLI:
     def test_search_n_results(self, palace_path, seeded_collection, capsys):
         search("code", palace_path, n_results=1)
         captured = capsys.readouterr()
-        # Should have output with at least one result block
         assert "[1]" in captured.out
 
     def test_search_applies_bm25_hybrid_rerank(self, capsys):
@@ -385,3 +384,54 @@ class TestSearchCLI:
         assert "[2]" in captured.out
         # Second result renders with fallback '?' values instead of crashing
         assert "second doc" in captured.out
+
+# ── Shared fakes for CLI separator tests ──────────────────────────────
+
+
+class _FakeCollection:
+    def query(self, **_kwargs):
+        return {
+            "documents": [["JWT auth details"]],
+            "metadatas": [[{"wing": "project", "room": "backend", "source_file": "auth.py"}]],
+            "distances": [[0.1]],
+        }
+
+
+class _FakeClient:
+    def __init__(self, path):
+        self.path = path
+
+    def get_collection(self, _name):
+        return _FakeCollection()
+
+
+class TestSearchCli:
+    def test_uses_ascii_separator_on_cp1252_stdout(self, monkeypatch):
+        monkeypatch.setattr("mempalace.searcher.get_collection", lambda path, create=False: _FakeCollection())
+
+        buf = io.BytesIO()
+        fake_stdout = io.TextIOWrapper(buf, encoding="cp1252", errors="strict")
+        monkeypatch.setattr("sys.stdout", fake_stdout)
+
+        try:
+            search("anything", "/tmp/fake-palace")
+        finally:
+            fake_stdout.flush()
+
+        output = buf.getvalue().decode("cp1252")
+        assert "  " + ("-" * 56) in output
+
+    def test_uses_unicode_separator_on_utf8_stdout(self, monkeypatch):
+        monkeypatch.setattr("mempalace.searcher.get_collection", lambda path, create=False: _FakeCollection())
+
+        buf = io.BytesIO()
+        fake_stdout = io.TextIOWrapper(buf, encoding="utf-8")
+        monkeypatch.setattr("sys.stdout", fake_stdout)
+
+        try:
+            search("anything", "/tmp/fake-palace")
+        finally:
+            fake_stdout.flush()
+
+        output = buf.getvalue().decode("utf-8")
+        assert "  " + ("─" * 56) in output
