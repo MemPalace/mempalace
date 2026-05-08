@@ -362,6 +362,40 @@ def test_mine_dry_run_with_tiny_file_no_crash():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_mine_dry_run_summary_counts_skipped_tiny_files(capsys):
+    """Dry-run 'Files processed' count must subtract files that returned 0 drawers.
+
+    Before the fix, ``files_skipped`` was only incremented in non-dry-run mode,
+    so the dry-run summary printed every file as processed even when some were
+    too small to file a single drawer.
+    """
+    tmpdir = tempfile.mkdtemp()
+    try:
+        project_root = Path(tmpdir).resolve()
+
+        # 1 substantive + 2 below MIN_CHUNK_SIZE
+        write_file(project_root / "good.py", "def main():\n    print('hello world')\n" * 20)
+        write_file(project_root / "tiny_a.txt", "x")
+        write_file(project_root / "tiny_b.txt", "y")
+
+        with open(project_root / "mempalace.yaml", "w") as f:
+            yaml.dump(
+                {
+                    "wing": "test_project",
+                    "rooms": [{"name": "general", "description": "General"}],
+                },
+                f,
+            )
+
+        mine(str(project_root), str(project_root / "palace"), dry_run=True)
+
+        out = capsys.readouterr().out
+        assert "Files processed: 1" in out, out
+        assert "Files skipped (already filed): 2" in out, out
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def test_status_missing_palace_does_not_create_empty_collection(tmp_path, capsys):
     palace_path = tmp_path / "missing-palace"
 
