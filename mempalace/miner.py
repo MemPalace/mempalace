@@ -148,6 +148,19 @@ READABLE_EXTENSIONS = {
     ".h",
 } | PHP_EXTENSIONS
 
+
+def get_readable_extensions() -> set:
+    """Get the set of readable file extensions, including any project override.
+
+    Defaults to READABLE_EXTENSIONS (this module's built-in set, kept in sync
+    with config.DEFAULT_READABLE_EXTENSIONS); config.json's own
+    ``readable_extensions`` key can replace it entirely for callers who want
+    a narrower or wider allow-list.
+    """
+    from .config import MempalaceConfig
+
+    return MempalaceConfig().readable_extensions
+
 SKIP_FILENAMES = {
     "entities.json",
     "mempalace.yaml",
@@ -1583,7 +1596,7 @@ def scan_project(
 
             if not force_include and filename in SKIP_FILENAMES:
                 continue
-            if filepath.suffix.lower() not in READABLE_EXTENSIONS and not exact_force_include:
+            if filepath.suffix.lower() not in get_readable_extensions() and not exact_force_include:
                 continue
             if respect_gitignore and active_matchers and not force_include:
                 if is_gitignored(filepath, active_matchers, is_dir=False):
