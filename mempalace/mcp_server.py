@@ -990,6 +990,40 @@ def tool_delete_drawer(drawer_id: str):
         return {"success": False, "error": str(e)}
 
 
+def tool_sync(project_dir: str = None, wing: str = None, apply: bool = False):
+    """Prune drawers whose source files are gitignored, missing, or moved (#1252)."""
+    global _metadata_cache
+    from .palace import MineAlreadyRunning
+    from .sync import sync_palace
+
+    if not _config.palace_path:
+        np = _no_palace()
+        return {"success": False, "error": np.get("error", "no palace"), "hint": np.get("hint")}
+    project_dirs = [project_dir] if project_dir else None
+    try:
+        try:
+            report = sync_palace(
+                palace_path=_config.palace_path,
+                project_dirs=project_dirs,
+                wing=wing,
+                dry_run=not apply,
+                wal_log=_wal_log,
+            )
+            return {"success": True, **report}
+        # Order matters: typed handlers must precede the bare Exception
+        # below, otherwise MineAlreadyRunning and ValueError fall into the
+        # generic "sync failed" branch and break the structured-error tests.
+        except MineAlreadyRunning as exc:
+            return {"success": False, "error": f"another mine is in progress: {exc}"}
+        except ValueError as exc:
+            return {"success": False, "error": str(exc)}
+        except Exception as exc:
+            return {"success": False, "error": f"sync failed: {exc}"}
+    finally:
+        if apply:
+            _metadata_cache = None
+
+
 def tool_get_drawer(drawer_id: str):
     """Fetch a single drawer by ID. Returns full content and metadata."""
     col = _get_collection()
@@ -1885,6 +1919,24 @@ TOOLS = {
             "required": ["drawer_id"],
         },
         "handler": tool_delete_drawer,
+    },
+    "mempalace_sync": {
+        "description": "Prune drawers whose source files are gitignored, deleted, or moved. Returns dry-run report by default; pass apply=true to commit deletions.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "project_dir": {
+                    "type": "string",
+                    "description": "Project root to scope the sync (optional; auto-detected from drawer metadata if omitted)",
+                },
+                "wing": {"type": "string", "description": "Limit to one wing (optional)"},
+                "apply": {
+                    "type": "boolean",
+                    "description": "Actually delete drawers; default is dry-run preview",
+                },
+            },
+        },
+        "handler": tool_sync,
     },
     "mempalace_get_drawer": {
         "description": "Fetch a single drawer by ID — returns full content and metadata.",

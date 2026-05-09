@@ -97,3 +97,15 @@ If you're planning a significant change, open an issue first to discuss the appr
 ## License
 
 MIT — your contributions will be released under the same license.
+
+## Git identity for contributions
+
+Before pushing commits, verify that Git is configured with an email address that GitHub can associate with your account:
+
+```bash
+git config user.name
+git config user.email
+```
+
+This is especially important when commits are created through agentic coding tools or automation, because those tools may not inherit your normal shell Git configuration. Avoid placeholder values such as `your@email.com` or localized template text; unresolved author emails can create avoidable provenance and SBOM review friction for downstream users.
+
