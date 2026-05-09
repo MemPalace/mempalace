@@ -14,9 +14,52 @@ import math
 import os
 import re
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .palace import get_closets_collection, get_collection
+
+
+# --- Recency-aware ranking config -------------------------------------------
+# Backwards compatible: with weight=0.0 (default) ``_hybrid_rank`` behaves
+# exactly as before.  Set MEMPALACE_RECENCY_WEIGHT to a value in (0, 1] to
+# blend in an exponential-decay recency factor; older drawers fade by half
+# every MEMPALACE_RECENCY_HALF_LIFE_DAYS (default 30).  Useful when a palace
+# accumulates years of session transcripts but the user is asking about
+# *current* state ("what was the latest decision on X?").
+_RECENCY_WEIGHT_DEFAULT = float(os.environ.get("MEMPALACE_RECENCY_WEIGHT", "0.0") or 0.0)
+_RECENCY_HALF_LIFE_DAYS_DEFAULT = float(
+    os.environ.get("MEMPALACE_RECENCY_HALF_LIFE_DAYS", "30") or 30
+)
+
+
+def _recency_factor(filed_at_str, half_life_days: float = _RECENCY_HALF_LIFE_DAYS_DEFAULT) -> float:
+    """Return a recency multiplier in [0, 1] for a drawer's ``filed_at`` timestamp.
+
+    Returns 1.0 for "filed now" and decays by half every ``half_life_days``.
+    Future-dated entries (clock skew) are treated as fresh (1.0).
+    Returns 0.0 when ``filed_at_str`` is missing, ``"unknown"``, or unparseable —
+    so a drawer with no timestamp can never beat a recent dated drawer
+    on the recency axis alone.
+    """
+    if not filed_at_str or filed_at_str == "unknown":
+        return 0.0
+    if not isinstance(filed_at_str, str):
+        return 0.0
+    s = filed_at_str.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except (ValueError, TypeError):
+        return 0.0
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    age_days = (datetime.now(timezone.utc) - dt).total_seconds() / 86400.0
+    if age_days <= 0 or half_life_days <= 0:
+        return 1.0
+    return 2.0 ** (-age_days / half_life_days)
+
 
 # Closet pointer line format: "topic|entities|→drawer_id_a,drawer_id_b"
 # Multiple lines may join with newlines inside one closet document.
@@ -123,8 +166,11 @@ def _hybrid_rank(
     query: str,
     vector_weight: float = 0.6,
     bm25_weight: float = 0.4,
+    recency_weight: float = None,
+    half_life_days: float = None,
 ) -> list:
-    """Re-rank ``results`` by a convex combination of vector similarity and BM25.
+    """Re-rank ``results`` by a convex combination of vector similarity, BM25,
+    and (optionally) drawer recency.
 
     * Vector similarity uses absolute cosine sim ``max(0, 1 - distance)`` —
       ChromaDB's hnsw cosine distance lives in ``[0, 2]`` (0 = identical).
@@ -133,12 +179,34 @@ def _hybrid_rank(
     * BM25 is real Okapi-BM25 with corpus-relative IDF over the candidates
       themselves. Since the absolute scale is unbounded, BM25 is min-max
       normalized within the candidate set so weights are commensurable.
+    * Recency (opt-in) is an exponential-decay factor on drawer ``filed_at``;
+      half-life defaults to MEMPALACE_RECENCY_HALF_LIFE_DAYS (30).
 
-    Mutates each result dict to add ``bm25_score`` and reorders the list
-    in place. Returns the same list for convenience.
+    Final score is a weighted blend:
+        score = (1 - recency_weight) * (vector_weight * vec_sim
+                                        + bm25_weight  * bm25_norm)
+              + recency_weight       * recency_factor
+
+    With ``recency_weight=0`` (default) behavior is unchanged from before
+    this commit — it's a pure backward-compatible extension.
+
+    Mutates each result dict to add ``bm25_score`` (and ``recency_factor``
+    when recency blending is active) and reorders the list in place.
+    Returns the same list for convenience.
     """
     if not results:
         return results
+
+    if recency_weight is None:
+        recency_weight = _RECENCY_WEIGHT_DEFAULT
+    if half_life_days is None:
+        half_life_days = _RECENCY_HALF_LIFE_DAYS_DEFAULT
+
+    # Clamp recency_weight so callers can't accidentally invert the score.
+    if recency_weight < 0:
+        recency_weight = 0.0
+    elif recency_weight > 1:
+        recency_weight = 1.0
 
     docs = [r.get("text", "") for r in results]
     bm25_raw = _bm25_scores(query, docs)
@@ -149,7 +217,15 @@ def _hybrid_rank(
     for r, raw, norm in zip(results, bm25_raw, bm25_norm):
         vec_sim = max(0.0, 1.0 - r.get("distance", 1.0))
         r["bm25_score"] = round(raw, 3)
-        scored.append((vector_weight * vec_sim + bm25_weight * norm, r))
+        base = vector_weight * vec_sim + bm25_weight * norm
+        if recency_weight > 0:
+            filed_at = (r.get("metadata") or {}).get("filed_at")
+            recency = _recency_factor(filed_at, half_life_days=half_life_days)
+            r["recency_factor"] = round(recency, 3)
+            score = (1.0 - recency_weight) * base + recency_weight * recency
+        else:
+            score = base
+        scored.append((score, r))
 
     scored.sort(key=lambda pair: pair[0], reverse=True)
     results[:] = [r for _, r in scored]
