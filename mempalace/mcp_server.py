@@ -682,7 +682,7 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
                 dist = results["distances"][0][i]
                 similarity = round(1 - dist, 3)
                 if similarity >= threshold:
-                    meta = results["metadatas"][0][i]
+                    meta = (results["metadatas"][0][i] or {})
                     doc = results["documents"][0][i]
                     duplicates.append(
                         {
@@ -846,8 +846,8 @@ def tool_add_drawer(
             documents=[content],
             metadatas=[
                 {
-                    "wing": wing,
-                    "room": room,
+                    "wing": wing or "unknown",
+                    "room": room or "unknown",
                     "source_file": source_file or "",
                     "chunk_index": 0,
                     "added_by": added_by,

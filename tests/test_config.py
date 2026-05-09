@@ -10,6 +10,8 @@ def test_default_config():
     cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
     assert "palace" in cfg.palace_path
     assert cfg.collection_name == "mempalace_drawers"
+    assert cfg.embedding_model == "paraphrase-multilingual-MiniLM-L12-v2"
+    assert cfg.embedding_model_path.endswith("/opt/models/paraphrase-multilingual-MiniLM-L12-v2")
 
 
 def test_config_from_file():
@@ -26,22 +28,31 @@ def test_embedding_device_defaults_to_auto(monkeypatch):
     assert cfg.embedding_device == "auto"
 
 
-def test_embedding_device_from_config_is_normalized(tmp_path, monkeypatch):
-    monkeypatch.delenv("MEMPALACE_EMBEDDING_DEVICE", raising=False)
+def test_embedding_model_defaults_to_multilingual(monkeypatch):
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_MODEL", raising=False)
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    assert cfg.embedding_model == "paraphrase-multilingual-MiniLM-L12-v2"
+    assert cfg.embedding_model_path == "/opt/models/paraphrase-multilingual-MiniLM-L12-v2"
+
+
+def test_embedding_model_from_config_is_normalized(tmp_path, monkeypatch):
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_MODEL", raising=False)
     with open(tmp_path / "config.json", "w") as f:
-        json.dump({"embedding_device": "  CUDA  "}, f)
+        json.dump({"embedding_model": "  paraphrase-multilingual-MiniLM-L12-v2  "}, f)
 
     cfg = MempalaceConfig(config_dir=str(tmp_path))
-    assert cfg.embedding_device == "cuda"
+    assert cfg.embedding_model == "paraphrase-multilingual-MiniLM-L12-v2"
+    assert cfg.embedding_model_path == "/opt/models/paraphrase-multilingual-MiniLM-L12-v2"
 
 
-def test_embedding_device_env_overrides_config(tmp_path, monkeypatch):
+def test_embedding_model_env_overrides_config(tmp_path, monkeypatch):
     with open(tmp_path / "config.json", "w") as f:
-        json.dump({"embedding_device": "cpu"}, f)
-    monkeypatch.setenv("MEMPALACE_EMBEDDING_DEVICE", "  CoreML  ")
+        json.dump({"embedding_model": "all-MiniLM-L6-v2"}, f)
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "  /opt/models/custom-model  ")
 
     cfg = MempalaceConfig(config_dir=str(tmp_path))
-    assert cfg.embedding_device == "coreml"
+    assert cfg.embedding_model == "/opt/models/custom-model"
+    assert cfg.embedding_model_path == "/opt/models/custom-model"
 
 
 def test_env_override():

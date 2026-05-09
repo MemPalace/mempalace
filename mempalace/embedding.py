@@ -1,25 +1,14 @@
-"""Embedding function factory with hardware acceleration.
+"""Embedding function factory for MemPalace.
 
-Returns a ChromaDB-compatible embedding function bound to a user-selected
-ONNX Runtime execution provider. The same ``all-MiniLM-L6-v2`` model and
-384-dim vectors ChromaDB ships by default are reused, so switching device
-does not invalidate existing palaces.
-
-Supported devices (env ``MEMPALACE_EMBEDDING_DEVICE`` or ``embedding_device``
-in ``~/.mempalace/config.json``):
-
-* ``auto`` — prefer CUDA ▸ CoreML ▸ DirectML, fall back to CPU
-* ``cpu`` — force CPU (the historical default)
-* ``cuda`` — NVIDIA GPU via ``onnxruntime-gpu`` (``pip install mempalace[gpu]``)
-* ``coreml`` — Apple Neural Engine (macOS)
-* ``dml`` — DirectML (Windows / AMD / Intel GPUs)
-
-Requesting an unavailable accelerator emits a warning and falls back to CPU
-rather than hard-failing — mining must still work on a laptop without CUDA.
+Provides a ChromaDB-compatible embedding function that loads a local
+SentenceTransformer model from /opt/models, staying fully offline by default.
+The default model is ``paraphrase-multilingual-MiniLM-L12-v2`` so Chinese,
+Japanese, Korean, and other non-English text work better out of the box.
 
 Q6600 OFFLINE MODE:
-For Q6600 CPU (no AVX support), embedding uses local SentenceTransformer model
-with local_files_only=True to avoid triggering HuggingFace Hub lookups.
+For Q6600 CPU (no AVX support), embedding uses a local SentenceTransformer
+model with ``local_files_only=True`` to avoid triggering HuggingFace Hub
+lookups.
 """
 
 from __future__ import annotations
@@ -62,7 +51,7 @@ _WARNED: set = set()
 class OfflineLocalEmbeddingFunction:
     """
     ChromaDB-compatible embedding function using local SentenceTransformer model.
-    
+
     Enforces local_files_only=True to prevent HuggingFace Hub lookups on Q6600.
     Implements the ChromaDB EmbeddingFunction interface:
     - __call__(input): Encode texts to embeddings
@@ -70,9 +59,13 @@ class OfflineLocalEmbeddingFunction:
     - get_config(): Return configuration dict
     - build_from_config(config): Reconstruct from config
     """
-    
-    def __init__(self, model_path: str = "/opt/models/all-MiniLM-L6-v2"):
+
+    def __init__(self, model_path: str | None = None):
         """Initialize with explicit local model path and offline mode."""
+        if model_path is None:
+            from .config import MempalaceConfig
+
+            model_path = MempalaceConfig().embedding_model_path
         self.model_path = model_path
         self._model = None
         logger.info(f"OfflineLocalEmbeddingFunction initialized (model_path={model_path})")
@@ -108,6 +101,16 @@ class OfflineLocalEmbeddingFunction:
         )
         # Ensure output is list of lists (ChromaDB expects this)
         return embeddings.tolist() if hasattr(embeddings, "tolist") else list(embeddings)
+
+    def embed_documents(self, input: list[str]) -> list[list[float]]:
+        """ChromaDB query/document API compatibility shim."""
+        return self.__call__(input)
+
+    def embed_query(self, input: str) -> list[float]:
+        """ChromaDB query API compatibility shim for semantic search."""
+        if isinstance(input, list):
+            return self.__call__(input)
+        return self.__call__([input])[0]
     
     def name(self) -> str:
         """Return the function identifier (must match persisted collection config)."""
@@ -126,7 +129,7 @@ class OfflineLocalEmbeddingFunction:
     def build_from_config(config: dict) -> OfflineLocalEmbeddingFunction:
         """Reconstruct from saved configuration."""
         return OfflineLocalEmbeddingFunction(
-            model_path=config.get("model_path", "/opt/models/all-MiniLM-L6-v2")
+            model_path=config.get("model_path", "/opt/models/paraphrase-multilingual-MiniLM-L12-v2")
         )
 
 
@@ -199,25 +202,24 @@ def _build_ef_class():
 
 
 def get_embedding_function(device: Optional[str] = None):
-    """Return a cached embedding function bound to the requested device.
+    """Return a cached embedding function bound to the user's config.
 
-    ``device=None`` reads from :class:`MempalaceConfig.embedding_device`.
-    The returned function is shared across calls with the same resolved
-    provider list so we only pay model-load cost once per process.
-    
-    For Q6600 / offline environments, always uses OfflineLocalEmbeddingFunction
-    with local_files_only=True to prevent HuggingFace Hub lookups.
+    The embedding model is selected via :class:`MempalaceConfig.embedding_model`
+    and resolved to a local path under ``/opt/models``. ``device`` is retained
+    for API compatibility with older callers, but the current offline local
+    embedding path does not vary by accelerator.
     """
-    # Always use offline local embedding for consistency
-    # This ensures no HuggingFace Hub connections are made
-    cache_key = "offline_local"
+    from .config import MempalaceConfig
+
+    model_path = MempalaceConfig().embedding_model_path
+    cache_key = model_path
     cached = _EF_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
-    ef = OfflineLocalEmbeddingFunction()
+    ef = OfflineLocalEmbeddingFunction(model_path=model_path)
     _EF_CACHE[cache_key] = ef
-    logger.info("Embedding function initialized (offline local SentenceTransformer)")
+    logger.info("Embedding function initialized (offline local SentenceTransformer: %s)", model_path)
     return ef
 
 

@@ -94,6 +94,7 @@ def sanitize_content(value: str, max_length: int = 100_000) -> str:
 
 DEFAULT_PALACE_PATH = os.path.expanduser("~/.mempalace/palace")
 DEFAULT_COLLECTION_NAME = "mempalace_drawers"
+DEFAULT_EMBEDDING_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
 
 DEFAULT_TOPIC_WINGS = [
     "emotions",
@@ -264,6 +265,33 @@ class MempalaceConfig:
         return str(self._file_config.get("embedding_device", "auto")).strip().lower()
 
     @property
+    def embedding_model(self):
+        """SentenceTransformer model name used for embeddings.
+
+        Reads ``MEMPALACE_EMBEDDING_MODEL`` first, then ``embedding_model`` in
+        ``config.json``, then defaults to the multilingual MiniLM model so
+        Chinese/Japanese/Korean content works out of the box.
+        """
+        env_val = os.environ.get("MEMPALACE_EMBEDDING_MODEL")
+        if env_val:
+            return env_val.strip()
+        return str(self._file_config.get("embedding_model", DEFAULT_EMBEDDING_MODEL)).strip()
+
+    @property
+    def embedding_model_path(self):
+        """Resolved local path for the embedding model under ``/opt/models``.
+
+        Absolute paths are preserved; bare model names are resolved relative to
+        ``/opt/models`` so the recommended install path is a git clone under
+        that directory.
+        """
+        model = self.embedding_model
+        expanded = os.path.expanduser(model)
+        if os.path.isabs(expanded):
+            return expanded
+        return os.path.join("/opt/models", expanded)
+
+    @property
     def topic_tunnel_min_count(self):
         """Minimum number of overlapping confirmed topics required to create
         a cross-wing tunnel between two wings.
@@ -322,6 +350,7 @@ class MempalaceConfig:
             default_config = {
                 "palace_path": DEFAULT_PALACE_PATH,
                 "collection_name": DEFAULT_COLLECTION_NAME,
+                "embedding_model": DEFAULT_EMBEDDING_MODEL,
                 "topic_wings": DEFAULT_TOPIC_WINGS,
                 "hall_keywords": DEFAULT_HALL_KEYWORDS,
             }

@@ -23,7 +23,7 @@ mempalace search "deploy process" --results 10
 
 ## How Search Works
 
-1. Your query is embedded using the vector store's default model (`all-MiniLM-L6-v2` with the default ChromaDB backend).
+1. Your query is embedded using the vector store's default model (`paraphrase-multilingual-MiniLM-L12-v2` in the current local SentenceTransformer setup).
 2. The embedding is compared against all drawers using cosine similarity.
 3. Optional wing/room filters narrow the search scope — standard metadata filtering in the underlying vector store.
 4. Results are returned with similarity scores and source metadata.

@@ -71,21 +71,40 @@ def test_onnxruntime_import_error_falls_back_to_cpu(monkeypatch):
     assert embedding._resolve_providers("cuda") == (["CPUExecutionProvider"], "cpu")
 
 
-def test_get_embedding_function_caches_by_resolved_provider_tuple(monkeypatch):
-    class DummyEF:
-        def __init__(self, preferred_providers):
-            self.preferred_providers = preferred_providers
+def test_offline_embedding_function_has_query_compat_shims(monkeypatch):
+    ef = embedding.OfflineLocalEmbeddingFunction(model_path="/opt/models/paraphrase-multilingual-MiniLM-L12-v2")
 
-    monkeypatch.setattr(embedding, "_build_ef_class", lambda: DummyEF)
-    monkeypatch.setattr(
-        embedding, "_resolve_providers", lambda device: (["CPUExecutionProvider"], "cpu")
-    )
+    class DummyModel:
+        def encode(self, input, convert_to_numpy=True, show_progress_bar=False):
+            assert convert_to_numpy is True
+            assert show_progress_bar is False
+            return [[float(len(x))] * 3 for x in input]
+
+    monkeypatch.setattr(ef, "_load_model", lambda: DummyModel())
+
+    assert ef.embed_documents(["ab", "c"]) == [[2.0, 2.0, 2.0], [1.0, 1.0, 1.0]]
+    assert ef.embed_query("ab") == [2.0, 2.0, 2.0]
+    assert ef.embed_query(["ab", "c"]) == [[2.0, 2.0, 2.0], [1.0, 1.0, 1.0]]
+
+
+def test_get_embedding_function_caches_by_model_path(monkeypatch):
+    class DummyConfig:
+        @property
+        def embedding_model_path(self):
+            return "/opt/models/paraphrase-multilingual-MiniLM-L12-v2"
+
+    class DummyEF:
+        def __init__(self, model_path=None):
+            self.model_path = model_path
+
+    monkeypatch.setattr(embedding, "MempalaceConfig", DummyConfig)
+    monkeypatch.setattr(embedding, "OfflineLocalEmbeddingFunction", DummyEF)
 
     first = embedding.get_embedding_function("cpu")
     second = embedding.get_embedding_function("auto")
 
     assert first is second
-    assert first.preferred_providers == ["CPUExecutionProvider"]
+    assert first.model_path == "/opt/models/paraphrase-multilingual-MiniLM-L12-v2"
 
 
 def test_describe_device_uses_resolved_effective_device(monkeypatch):
