@@ -60,6 +60,7 @@ def _recency_factor(filed_at_str, half_life_days: float = _RECENCY_HALF_LIFE_DAY
         return 1.0
     return 2.0 ** (-age_days / half_life_days)
 
+
 # Closet pointer line format: "topic|entities|→drawer_id_a,drawer_id_b"
 # Multiple lines may join with newlines inside one closet document.
 _CLOSET_DRAWER_REF_RE = re.compile(r"→([\w,]+)")
