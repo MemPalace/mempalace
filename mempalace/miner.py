@@ -35,11 +35,17 @@ from .palace import (
 logger = logging.getLogger("mempalace_mcp")
 
 
+_READABLE_EXTS_CACHE = None
+
+
 def get_readable_extensions() -> set:
     """Get the set of readable file extensions."""
-    from .config import MempalaceConfig
+    global _READABLE_EXTS_CACHE
+    if _READABLE_EXTS_CACHE is None:
+        from .config import MempalaceConfig
 
-    return MempalaceConfig().readable_extensions
+        _READABLE_EXTS_CACHE = MempalaceConfig().readable_extensions
+    return _READABLE_EXTS_CACHE
 
 
 SKIP_FILENAMES = {
