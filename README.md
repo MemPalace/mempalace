@@ -159,6 +159,31 @@ Two Claude Code hooks save periodically and before context compression:
 
 No API key is required for the core benchmark path.
 
+## Embedding models
+
+The embedding model is bound to the palace at `init` time and stamped into ChromaDB collection metadata, so subsequent `mine` and `search` runs always use the same model that ingest used. To switch models you re-mine: `mempalace re-mine --model <name>`.
+
+Pick the model that matches your content shape:
+
+| Model | When to pick | Disk | Context window |
+|---|---|---|---|
+| `chromadb-default` (`all-MiniLM-L6-v2`) | English notes, short-form content, fastest mining | ~90 MB | 256 tokens |
+| `intfloat/multilingual-e5-base` | Multilingual notes / mixed-language workspaces | ~1.1 GB | 512 tokens |
+| `BAAI/bge-m3` | Long-form literary, philosophical, or scholarly text where 512-token chunks would break a passage mid-thought; multilingual including Greek, Latin, French | ~2.3 GB | 8192 tokens |
+
+```bash
+# default (English-leaning, fastest)
+mempalace init ~/projects/myapp
+
+# multilingual notes
+mempalace init ~/projects/myapp --model intfloat/multilingual-e5-base
+
+# long-form / classical / multilingual literary content
+mempalace init ~/library --model BAAI/bge-m3
+```
+
+The default chunk size is set per-model so chunks fit the model's token window without silent truncation. Larger context models trade longer mining time for better semantic fidelity on long passages.
+
 ## Docs
 
 - Getting started → [mempalaceofficial.com/guide/getting-started](https://mempalaceofficial.com/guide/getting-started.html)
