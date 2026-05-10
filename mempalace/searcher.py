@@ -320,6 +320,11 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
         results = col.query(**kwargs)
 
     except Exception as e:
+        if where and "Error finding id" in str(e):
+            print(
+                "\n  Hint: this palace's HNSW index predates 1.0 and fails on "
+                f"filtered queries.\n  Run: mempalace repair {palace_path}"
+            )
         print(f"\n  Search error: {e}")
         raise SearchError(f"Search error: {e}") from e
 
@@ -815,6 +820,11 @@ def search_memories(
             dkwargs["where"] = where
         drawer_results = drawers_col.query(**dkwargs)
     except Exception as e:
+        if where and "Error finding id" in str(e):
+            return {
+                "error": f"Search error: {e}",
+                "hint": f"This palace's HNSW index predates 1.0. Run: mempalace repair {palace_path}",
+            }
         return {"error": f"Search error: {e}"}
 
     # Gather closet hits (best-per-source) to build a boost lookup.

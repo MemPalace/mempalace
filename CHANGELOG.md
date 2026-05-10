@@ -220,6 +220,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Sync `version.py` to match `pyproject.toml` (#820)
 - Remove unused `main` import from `mempalace/__init__.py` (#827)
 - README audit — fix 7 stale claims (tool count, version badge, wake-up token cost, `dialect.py` lossless disclaimer, `pyproject.toml` version) with 42 regression-guard tests (#835)
+- Surface a `mempalace repair` hint when a filtered search hits an HNSW index from a pre-1.0 palace, instead of raising an opaque ChromaDB `Error finding id` (#1035)
 
 ### Improvements
 - Optimize entity detection with regex caching and pre-compilation (#828)

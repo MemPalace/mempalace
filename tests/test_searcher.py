@@ -385,3 +385,58 @@ class TestSearchCLI:
         assert "[2]" in captured.out
         # Second result renders with fallback '?' values instead of crashing
         assert "second doc" in captured.out
+
+
+# ── HNSW / pre-1.0 index-mismatch repair hint (#1035) ─────────────────
+
+
+class TestHNSWRepairHint:
+    """When a filtered query hits a pre-1.0 palace, ChromaDB raises
+    `Error finding id ...`. Surface a `mempalace repair` hint instead
+    of leaking the opaque error alone.
+    """
+
+    def test_cli_filtered_query_hints_repair(self, capsys):
+        """CLI path: filtered search + 'Error finding id' → hint printed
+        with the actual palace_path interpolated so it's copy-pasteable.
+        """
+        mock_col = MagicMock()
+        mock_col.query.side_effect = RuntimeError("Error finding id 1234")
+
+        with patch("mempalace.searcher.get_collection", return_value=mock_col):
+            with pytest.raises(SearchError, match="Search error"):
+                search("test", "/fake/path", wing="project")
+
+        captured = capsys.readouterr()
+        assert "mempalace repair /fake/path" in captured.out
+        # Placeholder must not leak through.
+        assert "<palace_path>" not in captured.out
+
+    def test_api_filtered_query_returns_hint(self):
+        """API path: filtered search + 'Error finding id' → dict has hint
+        with the actual palace_path interpolated.
+        """
+        mock_col = MagicMock()
+        mock_col.query.side_effect = RuntimeError("Error finding id 1234")
+
+        with patch("mempalace.searcher.get_collection", return_value=mock_col):
+            result = search_memories("test", "/fake/path", wing="project")
+
+        assert "error" in result
+        assert "hint" in result
+        assert "mempalace repair /fake/path" in result["hint"]
+        assert "<palace_path>" not in result["hint"]
+
+    def test_unfiltered_query_does_not_hint(self):
+        """Guard check: without a wing/room filter the hint must NOT fire,
+        even if the error text contains 'Error finding id'. Unrelated
+        failures should not get a misleading repair suggestion.
+        """
+        mock_col = MagicMock()
+        mock_col.query.side_effect = RuntimeError("Error finding id 1234")
+
+        with patch("mempalace.searcher.get_collection", return_value=mock_col):
+            result = search_memories("test", "/fake/path")
+
+        assert "error" in result
+        assert "hint" not in result
