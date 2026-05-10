@@ -131,6 +131,7 @@ _vector_capacity_status = None  # type: Optional[dict]
 
 
 _model_ready_event = threading.Event()
+_cache_lock = threading.Lock()
 
 def _warmup_model():
     """Background thread to pre-load the SentenceTransformer model."""
@@ -292,37 +293,40 @@ def _get_collection(create=False):
     global _collection_cache, _metadata_cache, _metadata_cache_time
     try:
         client = _get_client()
-        # Use unified offline local embedding function through embedding.py
-        from .embedding import get_embedding_function
-        ef = get_embedding_function()
-        
-        if create:
-            # hnsw:num_threads=1 disables ChromaDB's multi-threaded ParallelFor
-            # HNSW insert path, which has a race in repairConnectionsForUpdate /
-            # addPoint (see issues #974, #965). Set via metadata on fresh
-            # collections and re-applied via _pin_hnsw_threads() for legacy
-            # palaces whose collections were created before this fix (the
-            # runtime config does not persist cross-process in chromadb 1.5.x,
-            # so the retrofit runs every time _get_collection opens a cache).
-            raw = client.get_or_create_collection(
-                _config.collection_name,
-                metadata={
-                    "hnsw:space": "cosine",
-                    "hnsw:num_threads": 1,
-                    **_HNSW_BLOAT_GUARD,
-                },
-                embedding_function=ef,
-            )
-            _pin_hnsw_threads(raw)
-            _collection_cache = ChromaCollection(raw)
-            _metadata_cache = None
-            _metadata_cache_time = 0
-        elif _collection_cache is None:
-            raw = client.get_collection(_config.collection_name, embedding_function=ef)
-            _pin_hnsw_threads(raw)
-            _collection_cache = ChromaCollection(raw)
-            _metadata_cache = None
-            _metadata_cache_time = 0
+        # Resolve and initialize the embedding function inside a cache lock to
+        # avoid races with the warmup thread.
+        with _cache_lock:
+            ef = None
+            try:
+                ef = getattr(ChromaBackend, "_resolve_embedding_function")()
+            except Exception:
+                try:
+                    from .embedding import get_embedding_function
+
+                    ef = get_embedding_function()
+                except Exception:
+                    ef = None
+
+            if create:
+                raw = client.get_or_create_collection(
+                    _config.collection_name,
+                    metadata={
+                        "hnsw:space": "cosine",
+                        "hnsw:num_threads": 1,
+                        **_HNSW_BLOAT_GUARD,
+                    },
+                    embedding_function=ef,
+                )
+                _pin_hnsw_threads(raw)
+                _collection_cache = ChromaCollection(raw)
+                _metadata_cache = None
+                _metadata_cache_time = 0
+            elif _collection_cache is None:
+                raw = client.get_collection(_config.collection_name, embedding_function=ef)
+                _pin_hnsw_threads(raw)
+                _collection_cache = ChromaCollection(raw)
+                _metadata_cache = None
+                _metadata_cache_time = 0
         return _collection_cache
     except Exception:
         return None
@@ -1953,7 +1957,10 @@ def main():
                 # we must write to the saved file descriptor or a wrapper around it.
                 res_json = json.dumps(response) + "\n"
                 if _REAL_STDOUT_FD is not None:
-                    os.write(_REAL_STDOUT_FD, res_json.encode("utf-8"))
+                    data = res_json.encode("utf-8")
+                    written = 0
+                    while written < len(data):
+                        written += os.write(_REAL_STDOUT_FD, data[written:])
                 else:
                     _REAL_STDOUT.write(res_json)
                     _REAL_STDOUT.flush()

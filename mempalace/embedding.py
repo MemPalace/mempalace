@@ -117,7 +117,7 @@ class OfflineLocalEmbeddingFunction:
         # Keep the legacy Chroma collection identity so existing palaces can be
         # reopened without embedding-function conflict, while still enforcing
         # local_files_only=True inside the model loader.
-        return "sentence_transformer"
+        return "default"
     
     def get_config(self) -> dict:
         """Return configuration for persistence."""
@@ -128,9 +128,7 @@ class OfflineLocalEmbeddingFunction:
     @staticmethod
     def build_from_config(config: dict) -> OfflineLocalEmbeddingFunction:
         """Reconstruct from saved configuration."""
-        return OfflineLocalEmbeddingFunction(
-            model_path=config.get("model_path", "/opt/models/paraphrase-multilingual-MiniLM-L12-v2")
-        )
+        return OfflineLocalEmbeddingFunction(model_path=config.get("model_path"))
 
 
 def _resolve_providers(device: str) -> tuple[list, str]:
