@@ -437,32 +437,24 @@ def _select_bm25_candidate_ids(
 ) -> list:
     """Run the FTS5 → recency → id-ordered fallback chain.
 
-    Behavioral nuance preserved verbatim from the original inline logic:
-    a *successful but empty* FTS5 result terminates the chain — recency
-    fallback only runs when FTS5 itself raised, or when the query had no
-    usable trigram tokens. This avoids returning unrelated drawers under
-    a wing/room scope that legitimately has zero FTS5 matches.
+    Behavioral nuance preserved: a *successful but empty* FTS5 result
+    terminates the chain — recency fallback only runs when FTS5 itself
+    raised, or when the query had no usable trigram tokens. (Without this,
+    recency would surface unrelated drawers under a wing/room scope that
+    legitimately has zero FTS5 matches.)
     """
     # FTS5 MATCH expects whitespace-separated tokens. Drop tokens shorter
     # than 3 chars (the trigram tokenizer can't match them).
     tokens = [t for t in _tokenize(query) if len(t) >= 3]
-    use_recency_fallback = not tokens
     if tokens:
         fts_query = " OR ".join(tokens)
         try:
-            ids = _select_via_fts5(conn, fts_query, collection_name, wing, room, max_candidates)
+            return _select_via_fts5(conn, fts_query, collection_name, wing, room, max_candidates)
         except sqlite3.Error:
             logger.debug("FTS5 MATCH failed; using recency fallback", exc_info=True)
-            use_recency_fallback = True
-        else:
-            # Successful FTS5 — return its result, even if empty. A clean
-            # miss (especially under wing/room scope) must NOT cascade to
-            # recency, which would surface unrelated drawers.
-            return ids
 
-    if not use_recency_fallback:
-        return []
-
+    # Reached only if (a) no usable tokens or (b) FTS5 raised. Try recency,
+    # then id-ordered as the final fallback.
     try:
         return _select_via_recency(conn, collection_name, wing, room, max_candidates)
     except sqlite3.Error:
