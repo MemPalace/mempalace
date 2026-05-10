@@ -28,7 +28,10 @@ classifiers = [
 ]
 dependencies = [
     "chromadb>=1.5.4,<2",
+    "numpy<2.0",
+    "pytest>=8.4.2",
     "pyyaml>=6.0,<7",
+    "sentence-transformers>=5.1.2",
     "tomli>=2.0.0; python_version < '3.11'",
 ]
 
