@@ -8,7 +8,9 @@ via monkeypatch to avoid touching real data.
 
 from datetime import datetime
 import json
+import os
 import sys
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -18,7 +20,7 @@ def _patch_mcp_server(monkeypatch, config, kg):
     from mempalace import mcp_server
 
     monkeypatch.setattr(mcp_server, "_config", config)
-    monkeypatch.setattr(mcp_server, "_kg", kg)
+    monkeypatch.setattr(mcp_server, "_get_kg", lambda: kg)
 
 
 def _get_collection(palace_path, create=False):
@@ -146,6 +148,20 @@ class TestHandleRequest:
         )
         assert resp["error"]["code"] == -32601
 
+    def test_tools_call_missing_params(self):
+        from mempalace.mcp_server import handle_request
+
+        for bad_params in [None, {}, {"arguments": {}}]:
+            resp = handle_request(
+                {
+                    "method": "tools/call",
+                    "id": 15,
+                    "params": bad_params,
+                }
+            )
+            assert resp["error"]["code"] == -32602
+            assert "Invalid params" in resp["error"]["message"]
+
     def test_unknown_method(self):
         from mempalace.mcp_server import handle_request
 
@@ -187,6 +203,17 @@ class TestHandleRequest:
         # method=None with id → should return error, not crash
         resp = handle_request({"method": None, "id": 99, "params": {}})
         assert resp["error"]["code"] == -32601
+
+    @pytest.mark.parametrize("payload", [None, [], "plain", 42, True])
+    def test_handle_request_invalid_payload_returns_jsonrpc_error(self, payload):
+        from mempalace.mcp_server import handle_request
+
+        resp = handle_request(payload)
+        assert resp == {
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32600, "message": "Invalid Request"},
+        }
 
     def test_tools_call_dispatches(self, monkeypatch, config, palace_path, seeded_kg):
         _patch_mcp_server(monkeypatch, config, seeded_kg)
@@ -387,6 +414,76 @@ class TestSearchTool:
         result = mcp_server.tool_search(query="JWT", room="../backend")
         assert "error" in result
 
+    def test_search_retries_once_on_hnsw_flush_transient(self, monkeypatch, config, kg):
+        """Issue #1315: post-bulk-mine 'Error finding id' is retried once."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        calls = {"n": 0}
+        reset_calls = {"n": 0}
+
+        def fake_search(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {
+                    "error": "Search error: Error executing plan: Internal error: Error finding id"
+                }
+            return {"results": [{"text": "ok", "wing": "w", "room": "r"}]}
+
+        def fake_reset():
+            reset_calls["n"] += 1
+
+        monkeypatch.setattr(mcp_server, "search_memories", fake_search)
+        monkeypatch.setattr(mcp_server, "_force_chroma_cache_reset", fake_reset)
+        monkeypatch.setattr(mcp_server.time, "sleep", lambda _: None)
+
+        result = mcp_server.tool_search(query="anything")
+
+        assert calls["n"] == 2
+        assert reset_calls["n"] == 1
+        assert "results" in result
+        assert result.get("index_recovered") is True
+
+    def test_search_does_not_retry_on_non_transient_error(self, monkeypatch, config, kg):
+        """Validation / unrelated errors must not trigger the retry path."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        calls = {"n": 0}
+
+        def fake_search(*args, **kwargs):
+            calls["n"] += 1
+            return {"error": "Search error: invalid query syntax"}
+
+        monkeypatch.setattr(mcp_server, "search_memories", fake_search)
+
+        result = mcp_server.tool_search(query="anything")
+
+        assert calls["n"] == 1
+        assert "error" in result
+        assert "index_recovered" not in result
+
+    def test_search_returns_second_error_if_retry_also_fails(self, monkeypatch, config, kg):
+        """If the transient persists past the retry, surface the second error."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        calls = {"n": 0}
+
+        def fake_search(*args, **kwargs):
+            calls["n"] += 1
+            return {"error": "Search error: Error executing plan: Internal error: Error finding id"}
+
+        monkeypatch.setattr(mcp_server, "search_memories", fake_search)
+        monkeypatch.setattr(mcp_server, "_force_chroma_cache_reset", lambda: None)
+        monkeypatch.setattr(mcp_server.time, "sleep", lambda _: None)
+
+        result = mcp_server.tool_search(query="anything")
+
+        assert calls["n"] == 2
+        assert "error" in result
+        assert "index_recovered" not in result
+
     def test_list_drawers_rejects_invalid_wing(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace import mcp_server
@@ -457,6 +554,26 @@ class TestWriteTools:
         assert result2["success"] is True
         assert result2["reason"] == "already_exists"
 
+    def test_add_drawer_fails_when_readback_misses(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        class _FakeGetResult:
+            ids = []
+
+        class _FakeCol:
+            def get(self, **kwargs):
+                return _FakeGetResult()
+
+            def upsert(self, **kwargs):
+                return None
+
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: _FakeCol())
+
+        result = mcp_server.tool_add_drawer("w", "r", "content")
+        assert result["success"] is False
+        assert "not readable" in result["error"]
+
     def test_add_drawer_shared_header_no_collision(self, monkeypatch, config, palace_path, kg):
         """Documents sharing a >100-char header must get distinct IDs (full-content hash)."""
         _patch_mcp_server(monkeypatch, config, kg)
@@ -494,6 +611,41 @@ class TestWriteTools:
 
         result = tool_delete_drawer("nonexistent_drawer")
         assert result["success"] is False
+
+    def test_check_duplicate_handles_none_metadata(self, monkeypatch, config, kg):
+        """tool_check_duplicate must tolerate None entries in the result lists
+        that ChromaDB 1.5.x returns for partially-flushed rows.
+
+        Previously ``meta = results["metadatas"][0][i]`` was unguarded and
+        raised ``AttributeError: 'NoneType' object has no attribute 'get'``
+        the moment the first matching drawer came back with None metadata —
+        surfacing to the MCP client as the uninformative
+        ``"Duplicate check failed"`` because the broad ``except Exception``
+        wrapper swallows the real cause.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        mock_col = MagicMock()
+        mock_col.query.return_value = {
+            "ids": [["d1", "d2"]],
+            "distances": [[0.05, 0.05]],
+            "metadatas": [[{"wing": "w", "room": "r"}, None]],
+            "documents": [["first doc", None]],
+        }
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda: mock_col)
+
+        result = mcp_server.tool_check_duplicate("any content", threshold=0.5)
+
+        # Both entries land in matches (above threshold), None ones rendered
+        # with sentinel values rather than crashing the whole response.
+        assert result.get("is_duplicate") is True
+        assert len(result["matches"]) == 2
+        # The None-metadata entry falls back to sentinels.
+        none_entry = result["matches"][1]
+        assert none_entry["wing"] == "?"
+        assert none_entry["room"] == "?"
+        assert none_entry["content"] == ""
 
     def test_check_duplicate(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -788,6 +940,248 @@ class TestKGTools:
         result = tool_kg_stats()
         assert result["entities"] >= 4
 
+    # --- Date validation at the MCP boundary (issue #1164) ---
+
+    def test_kg_add_rejects_invalid_valid_from(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_kg_add
+
+        result = tool_kg_add(
+            subject="Alice",
+            predicate="likes",
+            object="coffee",
+            valid_from="Jan 2025",
+        )
+        assert result["success"] is False
+        assert "valid_from" in result["error"]
+        assert "ISO-8601" in result["error"]
+
+    def test_kg_query_rejects_invalid_as_of(self, monkeypatch, config, palace_path, seeded_kg):
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        from mempalace.mcp_server import tool_kg_query
+
+        result = tool_kg_query(entity="Max", as_of="March 2026")
+        assert "error" in result
+        assert "as_of" in result["error"]
+
+    def test_kg_invalidate_rejects_invalid_ended(self, monkeypatch, config, palace_path, seeded_kg):
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        from mempalace.mcp_server import tool_kg_invalidate
+
+        result = tool_kg_invalidate(
+            subject="Max",
+            predicate="does",
+            object="chess",
+            ended="yesterday",
+        )
+        assert result["success"] is False
+        assert "ended" in result["error"]
+
+    def test_kg_query_rejects_partial_iso_dates(self, monkeypatch, config, palace_path, seeded_kg):
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        from mempalace.mcp_server import tool_kg_query
+
+        # Partial ISO dates are rejected: KG queries compare TEXT dates
+        # lexicographically, so "2026-01-01" <= "2026" is False, which
+        # silently excludes facts. Reject at the boundary — only YYYY-MM-DD
+        # produces correct results.
+        for value in ("2026", "2026-03"):
+            result = tool_kg_query(entity="Max", as_of=value)
+            assert "error" in result, f"accepted partial date {value!r}: {result}"
+
+        # Full ISO-8601 dates still pass.
+        result = tool_kg_query(entity="Max", as_of="2026-03-15")
+        assert "error" not in result, f"rejected valid date: {result}"
+
+    def test_kg_add_accepts_datetime_valid_from(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        from mempalace import mcp_server
+
+        result = mcp_server.tool_kg_add(
+            "Alice",
+            "works_at",
+            "Acme",
+            valid_from="2026-05-06T14:23:00Z",
+        )
+
+        assert result["success"] is True
+
+        facts = kg.query_entity("Alice", direction="outgoing")
+        fact = next(r for r in facts if r["predicate"] == "works_at" and r["object"] == "Acme")
+
+        assert fact["valid_from"] == "2026-05-06T14:23:00Z"
+
+    def test_kg_add_accepts_datetime_valid_to(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        from mempalace import mcp_server
+
+        result = mcp_server.tool_kg_add(
+            "Alice",
+            "worked_at",
+            "OldCo",
+            valid_from="2026-05-06T14:00:00Z",
+            valid_to="2026-05-06T15:00:00Z",
+        )
+
+        assert result["success"] is True
+
+        facts = kg.query_entity("Alice", direction="outgoing")
+        fact = next(r for r in facts if r["predicate"] == "worked_at" and r["object"] == "OldCo")
+
+        assert fact["valid_from"] == "2026-05-06T14:00:00Z"
+        assert fact["valid_to"] == "2026-05-06T15:00:00Z"
+
+    def test_kg_query_accepts_datetime_as_of(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        kg.add_triple(
+            "Alice",
+            "works_at",
+            "Acme",
+            valid_from="2026-05-06T14:00:00Z",
+        )
+
+        from mempalace import mcp_server
+
+        result = mcp_server.tool_kg_query(
+            "Alice",
+            as_of="2026-05-06T14:23:00Z",
+            direction="outgoing",
+        )
+
+        assert "error" not in result
+        assert result["as_of"] == "2026-05-06T14:23:00Z"
+        assert result["count"] == 1
+        assert result["facts"][0]["object"] == "Acme"
+
+    def test_kg_invalidate_accepts_datetime_ended(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        kg.add_triple(
+            "Alice",
+            "works_at",
+            "Acme",
+            valid_from="2026-05-06T14:00:00Z",
+        )
+
+        from mempalace import mcp_server
+
+        result = mcp_server.tool_kg_invalidate(
+            "Alice",
+            "works_at",
+            "Acme",
+            ended="2026-05-06T14:23:00Z",
+        )
+
+        assert result["success"] is True
+        assert result["ended"] == "2026-05-06T14:23:00Z"
+
+        facts = kg.query_entity("Alice", direction="outgoing")
+        fact = next(r for r in facts if r["predicate"] == "works_at" and r["object"] == "Acme")
+
+        assert fact["valid_to"] == "2026-05-06T14:23:00Z"
+
+    def test_kg_add_rejects_non_canonical_datetimes(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        from mempalace import mcp_server
+
+        invalid_values = [
+            "2026-05-06T14:23:00+02:00",
+            "2026-05-06T14:23:00-05:30",
+            "2026-05-06T14:23:00.123Z",
+            "2026-05-06 14:23:00",
+            "2026-05-06T14:23:00",
+        ]
+
+        for value in invalid_values:
+            result = mcp_server.tool_kg_add(
+                "Alice",
+                "works_at",
+                "Acme",
+                valid_from=value,
+            )
+
+            assert result["success"] is False, value
+            assert "valid_from" in result["error"]
+            assert "YYYY-MM-DDTHH:MM:SSZ" in result["error"]
+
+    def test_kg_query_rejects_non_canonical_datetime_as_of(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        from mempalace import mcp_server
+
+        invalid_values = [
+            "2026-05-06T14:23:00+02:00",
+            "2026-05-06T14:23:00-05:30",
+            "2026-05-06T14:23:00.123Z",
+            "2026-05-06 14:23:00",
+            "2026-05-06T14:23:00",
+        ]
+
+        for value in invalid_values:
+            result = mcp_server.tool_kg_query(
+                "Alice",
+                as_of=value,
+                direction="outgoing",
+            )
+
+            assert "error" in result, value
+            assert "as_of" in result["error"]
+            assert "YYYY-MM-DDTHH:MM:SSZ" in result["error"]
+
+    def test_kg_invalidate_rejects_non_canonical_ended(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        kg.add_triple(
+            "Alice",
+            "works_at",
+            "Acme",
+            valid_from="2026-05-06T14:00:00Z",
+        )
+
+        from mempalace import mcp_server
+
+        invalid_values = [
+            "2026-05-06T14:23:00+02:00",
+            "2026-05-06T14:23:00-05:30",
+            "2026-05-06T14:23:00.123Z",
+            "2026-05-06 14:23:00",
+            "2026-05-06T14:23:00",
+        ]
+
+        for value in invalid_values:
+            result = mcp_server.tool_kg_invalidate(
+                "Alice",
+                "works_at",
+                "Acme",
+                ended=value,
+            )
+
+            assert result["success"] is False, value
+            assert "ended" in result["error"]
+            assert "YYYY-MM-DDTHH:MM:SSZ" in result["error"]
+
+    def test_kg_add_rejects_timezone_offset_datetime(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        from mempalace import mcp_server
+
+        result = mcp_server.tool_kg_add(
+            "Alice",
+            "works_at",
+            "Acme",
+            valid_from="2026-05-06T14:23:00+02:00",
+        )
+
+        assert result["success"] is False
+        assert "valid_from" in result["error"]
+        assert "YYYY-MM-DDTHH:MM:SSZ" in result["error"]
+
 
 # ── Diary Tools ─────────────────────────────────────────────────────────
 
@@ -1043,6 +1437,25 @@ class TestCacheInvalidation:
         assert "Reconnected" in result["message"]
         assert isinstance(result["drawers"], int)
 
+    def test_reconnect_closes_shared_backend(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from unittest.mock import MagicMock
+
+        from mempalace import mcp_server, palace
+
+        close_palace = MagicMock()
+        monkeypatch.setattr(palace._DEFAULT_BACKEND, "close_palace", close_palace)
+
+        class _FakeCol:
+            def count(self):
+                return 7
+
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: _FakeCol())
+
+        result = mcp_server.tool_reconnect()
+        assert result["success"] is True
+        close_palace.assert_called_once_with(config.palace_path)
+
     def test_get_collection_create_true_avoids_get_or_create_on_reopen(
         self, monkeypatch, config, palace_path, kg
     ):
@@ -1143,3 +1556,296 @@ class TestCacheInvalidation:
         for kwargs in captured["get"]:
             assert "embedding_function" in kwargs
             assert kwargs["embedding_function"] is not None
+
+    def test_get_collection_retries_once_on_exception(self, monkeypatch, config, palace_path, kg):
+        """Regression: a transient failure inside _get_collection must trigger
+        one retry after clearing the client/collection caches, not silently
+        return None.
+
+        Before this fix, a stale chromadb handle (e.g. the rust bindings
+        invalidating after an out-of-band write) would raise inside the
+        single ``try`` block, get swallowed by ``except Exception: return
+        None``, and every subsequent tool call would hit the same poisoned
+        cache returning None. The retry forces ``_get_client()`` to rebuild
+        the client (which re-runs ``quarantine_stale_hnsw`` per #1322), so
+        the second attempt heals the common stale-handle case.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace import mcp_server
+
+        # Force a cold cache so the first call goes through the open path.
+        mcp_server._client_cache = None
+        mcp_server._collection_cache = None
+
+        real_get_client = mcp_server._get_client
+        attempts = {"count": 0}
+
+        def flaky_get_client():
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise RuntimeError("simulated transient chromadb failure")
+            return real_get_client()
+
+        monkeypatch.setattr(mcp_server, "_get_client", flaky_get_client)
+
+        col = mcp_server._get_collection()
+
+        # Both attempts ran and the second succeeded.
+        assert attempts["count"] == 2
+        assert col is not None
+
+    def test_get_collection_returns_none_after_two_failures(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """If both attempts fail, return None (matches the prior contract for
+        permanent failures — only the transient case is now self-healing)."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace import mcp_server
+
+        mcp_server._client_cache = None
+        mcp_server._collection_cache = None
+
+        attempts = {"count": 0}
+
+        def always_fails():
+            attempts["count"] += 1
+            raise RuntimeError("permanent chromadb failure")
+
+        monkeypatch.setattr(mcp_server, "_get_client", always_fails)
+
+        col = mcp_server._get_collection()
+
+        assert attempts["count"] == 2
+        assert col is None
+
+
+class TestKGLazyCache:
+    """Lazy per-path KnowledgeGraph cache (issue #1136)."""
+
+    def test_lazy_init_no_import_side_effect(self, tmp_path):
+        """Importing mcp_server must not create knowledge_graph.sqlite3.
+
+        Runs in a fresh subprocess with HOME pointed at tmp_path so the
+        assertion targets a clean filesystem, independent of conftest's
+        session-level HOME patch.
+        """
+        import subprocess
+        import sys
+
+        kg_file = tmp_path / ".mempalace" / "knowledge_graph.sqlite3"
+        env = {k: v for k, v in os.environ.items() if not k.startswith("MEMPAL")}
+        env["HOME"] = str(tmp_path)
+        env["USERPROFILE"] = str(tmp_path)
+        result = subprocess.run(
+            [sys.executable, "-c", "import mempalace.mcp_server"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 0, f"import failed: {result.stderr}"
+        assert not kg_file.exists(), f"import created sqlite file at {kg_file} as a side effect"
+
+    def test_get_kg_returns_same_instance(self, tmp_path, monkeypatch):
+        """Two calls with the same resolved path return the same KG."""
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "_kg_by_path", {})
+        monkeypatch.setattr(mcp_server, "_palace_flag_given", True)
+        monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(tmp_path))
+
+        kg1 = mcp_server._get_kg()
+        kg2 = mcp_server._get_kg()
+        assert kg1 is kg2
+        assert len(mcp_server._kg_by_path) == 1
+
+    def test_get_kg_different_paths_different_instances(self, tmp_path, monkeypatch):
+        """Different palace paths map to different KG instances."""
+        from mempalace import mcp_server
+
+        tmp_a = tmp_path / "a"
+        tmp_b = tmp_path / "b"
+        tmp_a.mkdir()
+        tmp_b.mkdir()
+
+        monkeypatch.setattr(mcp_server, "_kg_by_path", {})
+        monkeypatch.setattr(mcp_server, "_palace_flag_given", True)
+
+        monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(tmp_a))
+        kg_a = mcp_server._get_kg()
+        monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(tmp_b))
+        kg_b = mcp_server._get_kg()
+
+        assert kg_a is not kg_b
+        assert len(mcp_server._kg_by_path) == 2
+
+    def test_multi_tenant_env_switch(self, tmp_path, monkeypatch):
+        """The issue #1136 acceptance scenario.
+
+        Rotating MEMPALACE_PALACE_PATH between MCP tool calls must route
+        each call to the correct tenant's KG sqlite file.
+        """
+        from mempalace import mcp_server
+
+        tmp_a = tmp_path / "tenant_a"
+        tmp_b = tmp_path / "tenant_b"
+        tmp_a.mkdir()
+        tmp_b.mkdir()
+
+        monkeypatch.setattr(mcp_server, "_kg_by_path", {})
+        monkeypatch.setattr(mcp_server, "_palace_flag_given", True)
+
+        monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(tmp_a))
+        add_result = mcp_server.tool_kg_add(
+            subject="alice_secret",
+            predicate="owns",
+            object="repo_a",
+        )
+        assert add_result.get("success") is True, add_result
+
+        monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(tmp_b))
+        query_b = mcp_server.tool_kg_query(entity="alice_secret")
+        assert query_b.get("count", 0) == 0, f"tenant B leaked tenant A's fact: {query_b}"
+
+        monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(tmp_a))
+        query_a = mcp_server.tool_kg_query(entity="alice_secret")
+        assert query_a.get("count", 0) >= 1, f"tenant A lost its own fact: {query_a}"
+
+    def test_cache_thread_safe(self, tmp_path, monkeypatch):
+        """Concurrent _get_kg() for the same path yields one instance."""
+        import concurrent.futures
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "_kg_by_path", {})
+        monkeypatch.setattr(mcp_server, "_palace_flag_given", True)
+        monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(tmp_path))
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+            results = list(pool.map(lambda _: mcp_server._get_kg(), range(16)))
+
+        ids = {id(kg) for kg in results}
+        assert len(ids) == 1, f"expected 1 unique instance, got {len(ids)}"
+        assert len(mcp_server._kg_by_path) == 1
+
+    def test_tool_reconnect_drains_kg_cache(self, monkeypatch):
+        """``tool_reconnect`` must close cached KG instances and clear the dict.
+
+        Without this, an external replacement of ``knowledge_graph.sqlite3``
+        leaves the server pinned to a stale ``sqlite3.Connection``.
+        """
+        from mempalace import mcp_server
+
+        class _FakeKG:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        fake_a = _FakeKG()
+        fake_b = _FakeKG()
+        monkeypatch.setattr(mcp_server, "_kg_by_path", {"/a": fake_a, "/b": fake_b})
+        # Bypass real ChromaDB so the test isolates KG-cache behaviour.
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda: None)
+
+        mcp_server.tool_reconnect()
+
+        assert fake_a.closed is True
+        assert fake_b.closed is True
+        assert mcp_server._kg_by_path == {}
+
+    def test_tool_reconnect_swallows_kg_close_errors(self, monkeypatch):
+        """A failing ``close()`` on one cached KG must not block cache clearing."""
+        from mempalace import mcp_server
+
+        class _BoomKG:
+            def close(self):
+                raise RuntimeError("boom")
+
+        monkeypatch.setattr(mcp_server, "_kg_by_path", {"/a": _BoomKG()})
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda: None)
+
+        mcp_server.tool_reconnect()
+
+        assert mcp_server._kg_by_path == {}
+
+    def test_call_kg_retries_after_concurrent_close(self, monkeypatch):
+        """A KG closed mid-handler must trigger a one-shot retry with a fresh
+        instance — not surface a -32000 to the MCP client."""
+        import sqlite3 as _sqlite3
+
+        from mempalace import mcp_server
+
+        path = "/fake/palace/knowledge_graph.sqlite3"
+        monkeypatch.setattr(mcp_server, "_resolve_kg_path", lambda: path)
+
+        class _ClosedKG:
+            def query_entity(self, entity, **kwargs):
+                raise _sqlite3.ProgrammingError("Cannot operate on a closed database")
+
+        class _FreshKG:
+            def query_entity(self, entity, **kwargs):
+                return [{"entity": entity}]
+
+        cache = {os.path.abspath(path): _ClosedKG()}
+        monkeypatch.setattr(mcp_server, "_kg_by_path", cache)
+
+        # Second _get_kg() call (after the cache eviction) constructs a new
+        # KG. Patch the constructor so we don't open a real sqlite file.
+        monkeypatch.setattr(mcp_server, "KnowledgeGraph", lambda **_: _FreshKG())
+
+        result = mcp_server._call_kg(lambda kg: kg.query_entity("Alice"))
+        assert result == [{"entity": "Alice"}]
+        # The closed instance must be evicted; the fresh one must be cached.
+        assert isinstance(cache[os.path.abspath(path)], _FreshKG)
+
+    def test_call_kg_does_not_retry_on_other_errors(self, monkeypatch):
+        """Non-ProgrammingError exceptions must propagate without retry —
+        we don't want the retry guard masking real bugs."""
+        from mempalace import mcp_server
+
+        path = "/fake/palace/knowledge_graph.sqlite3"
+        monkeypatch.setattr(mcp_server, "_resolve_kg_path", lambda: path)
+
+        calls = {"count": 0}
+
+        class _FailingKG:
+            def query_entity(self, entity, **kwargs):
+                calls["count"] += 1
+                raise ValueError("bad input")
+
+        monkeypatch.setattr(mcp_server, "_kg_by_path", {os.path.abspath(path): _FailingKG()})
+        monkeypatch.setattr(mcp_server, "KnowledgeGraph", lambda **_: _FailingKG())
+
+        with pytest.raises(ValueError, match="bad input"):
+            mcp_server._call_kg(lambda kg: kg.query_entity("Alice"))
+        assert calls["count"] == 1, "non-ProgrammingError must not trigger retry"
+
+    def test_call_kg_gives_up_after_one_retry(self, monkeypatch):
+        """If the second attempt also hits a closed DB, give up rather than
+        loop forever — a sustained close-stream is a different bug."""
+        import sqlite3 as _sqlite3
+
+        from mempalace import mcp_server
+
+        path = "/fake/palace/knowledge_graph.sqlite3"
+        monkeypatch.setattr(mcp_server, "_resolve_kg_path", lambda: path)
+
+        calls = {"count": 0}
+
+        class _AlwaysClosedKG:
+            def query_entity(self, entity, **kwargs):
+                calls["count"] += 1
+                raise _sqlite3.ProgrammingError("closed again")
+
+        cache = {}
+        monkeypatch.setattr(mcp_server, "_kg_by_path", cache)
+        monkeypatch.setattr(mcp_server, "KnowledgeGraph", lambda **_: _AlwaysClosedKG())
+
+        with pytest.raises(_sqlite3.ProgrammingError):
+            mcp_server._call_kg(lambda kg: kg.query_entity("Alice"))
+        assert calls["count"] == 2, "expected exactly one retry beyond the initial attempt"

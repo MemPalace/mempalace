@@ -124,6 +124,8 @@ class Layer1:
         # Score each drawer: prefer high importance, recent filing
         scored = []
         for doc, meta in zip(docs, metas):
+            meta = meta or {}
+            doc = doc or ""
             importance = 3
             # Try multiple metadata keys that might carry weight info
             for key in ("importance", "emotional_weight", "weight"):
@@ -155,7 +157,7 @@ class Layer1:
             lines.append(room_line)
             total_len += len(room_line)
 
-            for imp, meta, doc in entries:
+            for _imp, meta, doc in entries:
                 source = Path(meta.get("source_file", "")).name if meta.get("source_file") else ""
 
                 # Truncate doc to keep L1 compact
@@ -222,6 +224,8 @@ class Layer2:
 
         lines = [f"## L2 — ON-DEMAND ({len(docs)} drawers)"]
         for doc, meta in zip(docs[:n_results], metas[:n_results]):
+            meta = meta or {}
+            doc = doc or ""
             room_name = meta.get("room", "?")
             source = Path(meta.get("source_file", "")).name if meta.get("source_file") else ""
             snippet = doc.strip().replace("\n", " ")
@@ -283,7 +287,7 @@ class Layer3:
         for i, (doc, meta, dist) in enumerate(zip(docs, metas, dists), 1):
             meta = meta or {}
             doc = doc or ""
-            similarity = round(1 - dist, 3)
+            similarity = round(max(0.0, 1 - dist), 3)
             wing_name = meta.get("wing", "?")
             room_name = meta.get("room", "?")
             source = Path(meta.get("source_file", "")).name if meta.get("source_file") else ""

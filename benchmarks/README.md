@@ -7,7 +7,7 @@ Run the exact same benchmarks we report. Clone, install, run.
 ```bash
 git clone https://github.com/MemPalace/mempalace.git
 cd mempalace
-pip install -e ".[dev]"
+uv sync --extra dev   # or: pip install -e ".[dev]"
 ```
 
 ## Benchmark 1: LongMemEval (500 questions)

@@ -40,8 +40,9 @@ def _patch_mcp_config(monkeypatch, palace_path, tmp_path):
 
     import mempalace.mcp_server as mcp_mod
 
+    kg = KnowledgeGraph(db_path=str(tmp_path / "kg.sqlite3"))
     monkeypatch.setattr(mcp_mod, "_config", cfg)
-    monkeypatch.setattr(mcp_mod, "_kg", KnowledgeGraph(db_path=str(tmp_path / "kg.sqlite3")))
+    monkeypatch.setattr(mcp_mod, "_get_kg", lambda: kg)
 
 
 def _get_rss_mb():

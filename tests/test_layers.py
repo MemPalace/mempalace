@@ -655,3 +655,72 @@ def test_memory_stack_status_with_palace(tmp_path):
 
     assert result["total_drawers"] == 42
     assert result["L0_identity"]["exists"] is True
+
+
+# ── Layer1 / Layer2 None-metadata guards ───────────────────────────────
+#
+# Chroma 1.5.x can return ``None`` inside the ``metadatas`` / ``documents``
+# lists for partially-flushed rows. The Layer1.generate() and
+# Layer2.retrieve() loops previously called ``meta.get(...)`` without
+# coercing, raising ``AttributeError: 'NoneType' object has no attribute
+# 'get'`` and blowing up the whole wake-up render. These tests guard that
+# the loops tolerate the None entries and render the rest of the result.
+
+
+def test_layer1_handles_none_metadata():
+    """Layer1.generate tolerates None entries in the metadatas list."""
+    docs = ["important memory", "another memory"]
+    metas = [{"room": "decisions", "source_file": "a.txt"}, None]
+    mock_col = _mock_chromadb_for_layer(docs, metas)
+
+    with (
+        patch("mempalace.layers.MempalaceConfig") as mock_cfg,
+        patch("mempalace.layers._get_collection", return_value=mock_col),
+    ):
+        mock_cfg.return_value.palace_path = "/fake"
+        layer = Layer1(palace_path="/fake")
+        # Should not raise AttributeError on the None entry.
+        result = layer.generate()
+
+    assert "ESSENTIAL STORY" in result
+    assert "important memory" in result
+
+
+def test_layer1_handles_none_document():
+    """Layer1.generate tolerates None entries in the documents list."""
+    docs = ["first doc", None]
+    metas = [
+        {"room": "r", "source_file": "a.txt"},
+        {"room": "r", "source_file": "b.txt"},
+    ]
+    mock_col = _mock_chromadb_for_layer(docs, metas)
+
+    with (
+        patch("mempalace.layers.MempalaceConfig") as mock_cfg,
+        patch("mempalace.layers._get_collection", return_value=mock_col),
+    ):
+        mock_cfg.return_value.palace_path = "/fake"
+        layer = Layer1(palace_path="/fake")
+        result = layer.generate()
+
+    assert result  # Render succeeded despite the None document.
+
+
+def test_layer2_handles_none_metadata():
+    """Layer2.retrieve tolerates None entries in the metadatas list."""
+    mock_col = MagicMock()
+    mock_col.get.return_value = {
+        "documents": ["first doc", "second doc"],
+        "metadatas": [{"room": "r", "source_file": "a.txt"}, None],
+    }
+
+    with (
+        patch("mempalace.layers.MempalaceConfig") as mock_cfg,
+        patch("mempalace.layers._get_collection", return_value=mock_col),
+    ):
+        mock_cfg.return_value.palace_path = "/fake"
+        layer = Layer2(palace_path="/fake")
+        # Should not raise AttributeError on the None entry.
+        result = layer.retrieve()
+
+    assert "L2 — ON-DEMAND" in result

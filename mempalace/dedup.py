@@ -89,7 +89,7 @@ def dedup_source_group(col, drawer_ids, threshold=DEFAULT_THRESHOLD, dry_run=Tru
     kept = []
     to_delete = []
 
-    for did, doc, meta in items:
+    for did, doc, _meta in items:
         if not doc or len(doc) < 20:
             to_delete.append(did)
             continue

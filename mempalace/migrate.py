@@ -22,6 +22,7 @@ import errno
 import os
 import shutil
 import sqlite3
+import uuid
 from collections import defaultdict
 from datetime import datetime
 
@@ -155,6 +156,55 @@ def confirm_destructive_action(
     return True
 
 
+def _result_ids(result) -> list:
+    """Return ids from either the backend typed result or raw Chroma dict."""
+
+    if isinstance(result, dict):
+        return list(result.get("ids") or [])
+
+    return list(getattr(result, "ids", []) or [])
+
+
+def collection_write_roundtrip_works(col) -> bool:
+    """Return True only if the collection can upsert, read, and delete.
+
+    Some ChromaDB 0.6.x -> 1.5.x migrated collections remain readable while
+    writes and deletes silently no-op. A plain ``count()`` probe misses that
+    failure mode, so migrate must verify an actual write round-trip before
+    deciding that no rebuild is needed.
+    """
+
+    probe_id = f"_mempalace_migrate_probe_{uuid.uuid4().hex}"
+    probe_doc = "mempalace migrate write round-trip probe"
+    probe_meta = {
+        "wing": "_mempalace_probe",
+        "room": "_mempalace_probe",
+        "source_file": "mempalace_migrate_probe",
+        "chunk_index": 0,
+    }
+
+    try:
+        col.upsert(
+            ids=[probe_id],
+            documents=[probe_doc],
+            metadatas=[probe_meta],
+        )
+
+        after_upsert = col.get(ids=[probe_id], include=[])
+        if probe_id not in _result_ids(after_upsert):
+            return False
+
+        col.delete(ids=[probe_id])
+
+        after_delete = col.get(ids=[probe_id], include=[])
+        if probe_id in _result_ids(after_delete):
+            return False
+
+        return True
+    except Exception:
+        return False
+
+
 def migrate(palace_path: str, dry_run: bool = False, confirm: bool = False):
     """Migrate a palace to the currently installed ChromaDB version."""
     from .backends.chroma import ChromaBackend
@@ -179,16 +229,27 @@ def migrate(palace_path: str, dry_run: bool = False, confirm: bool = False):
     print(f"  Source:    ChromaDB {source_version}")
     print(f"  Target:    ChromaDB {target_version}")
 
-    # Try reading with current chromadb first
+    # Try reading and writing with current chromadb first.
+    #
+    # A plain count() is not enough: some 0.6.x -> 1.5.x migrated collections
+    # are readable but silently drop upsert/delete operations. In that state,
+    # migrate must rebuild from SQLite instead of returning "No migration needed."
     try:
         col = ChromaBackend().get_collection(palace_path, "mempalace_drawers")
         count = col.count()
-        print(f"\n  Palace is already readable by chromadb {target_version}.")
-        print(f"  {count} drawers found. No migration needed.")
-        return True
+
+        if collection_write_roundtrip_works(col):
+            print(f"\n Palace is already readable and writable by chromadb {target_version}.")
+            print(f" {count} drawers found. No migration needed.")
+            return True
+
+        print(
+            f"\n Palace is readable by chromadb {target_version}, but write/delete verification failed."
+        )
+        print(" Rebuilding from SQLite to restore native write/delete behavior...")
     except Exception:
-        print(f"\n  Palace is NOT readable by chromadb {target_version}.")
-        print("  Extracting from SQLite directly...")
+        print(f"\n Palace is NOT readable by chromadb {target_version}.")
+        print(" Extracting from SQLite directly...")
 
     # Extract all drawers via raw SQL
     drawers = extract_drawers_from_sqlite(db_path)

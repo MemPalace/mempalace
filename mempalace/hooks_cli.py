@@ -6,6 +6,7 @@ Supported hooks: session-start, stop, precompact
 Supported harnesses: claude-code, codex (extensible to cursor, gemini, etc.)
 """
 
+import hashlib
 import json
 import os
 import re
@@ -13,9 +14,48 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 SAVE_INTERVAL = 15
 STATE_DIR = Path.home() / ".mempalace" / "hook_state"
+PALACE_ROOT = Path.home() / ".mempalace"
+
+
+def _detached_popen_kwargs() -> dict:
+    """Kwargs that fully detach a Popen child so the hook process can exit.
+
+    Without these, Windows holds the parent open until the child closes the
+    inherited stdout/stderr handles — manifesting as "Stop hook hangs" at
+    session end (#1268). On POSIX the parent can already exit (orphan
+    reparents to init), but ``start_new_session`` makes the boundary
+    explicit so signals to the hook don't propagate to the background mine.
+    """
+    kwargs: dict = {"stdin": subprocess.DEVNULL, "close_fds": True}
+    if os.name == "nt":
+        flags = 0
+        for name in ("DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP", "CREATE_BREAKAWAY_FROM_JOB"):
+            flags |= getattr(subprocess, name, 0)
+        if flags:
+            kwargs["creationflags"] = flags
+    else:
+        kwargs["start_new_session"] = True
+    return kwargs
+
+
+def _palace_root_exists() -> bool:
+    """User-removable kill-switch.
+
+    If ~/.mempalace/ does not exist, the user has explicitly cleared it.
+    All hook side effects (logging, state dir creation, mining, ingestion)
+    must respect this and short-circuit BEFORE touching disk — including
+    before logging the short-circuit itself.
+
+    Uses ``is_dir()`` rather than ``exists()`` so a stray regular file at
+    ``~/.mempalace`` (or a broken symlink) is treated as absent — otherwise
+    the kill-switch would be bypassed and ``STATE_DIR.mkdir()`` would later
+    crash on ``NotADirectoryError``.
+    """
+    return PALACE_ROOT.is_dir()
 
 
 def _mempalace_python() -> str:
@@ -142,6 +182,8 @@ _state_dir_initialized = False
 
 def _log(message: str):
     """Append to hook state log file."""
+    if not _palace_root_exists():
+        return  # User removed the palace; do not recreate by logging
     global _state_dir_initialized
     try:
         if not _state_dir_initialized:
@@ -216,7 +258,45 @@ def _get_mine_targets() -> list[tuple[str, str]]:
     return targets
 
 
-_MINE_PID_FILE = STATE_DIR / "mine.pid"
+# Per-target PID guard.
+#
+# Hook fires ingest mines in the background. If a previous fire's child is
+# still running for the *same* target (same source dir, mode, wing), the new
+# fire should skip rather than pile up — multiple concurrent mines against the
+# same source corrupt the HNSW index and exhaust disk via duplicate upserts
+# (#1212, #1206). But mines targeting *different* sources / modes must remain
+# independent so the user can have e.g. project-mining and transcript-ingest
+# running in parallel.
+#
+# The single ``mine.pid`` global file used previously failed both ways: the
+# guard was rebuilt every spawn (so two near-simultaneous fires both passed
+# the check before either wrote), and the file was unconditionally overwritten
+# (so the second spawn lost the first PID, orphaning it). The replacement is
+# a directory of per-target slots, claimed via ``O_CREAT | O_EXCL`` so the
+# claim is atomic and per-target.
+_MINE_PID_DIR = STATE_DIR / "mine_pids"
+
+# The per-process PID file path is communicated to the mine subprocess via
+# this env var so the child's cleanup hook (in miner.py) can remove its
+# own slot on exit without scanning the whole directory.
+_MINE_PID_FILE_ENV = "MEMPALACE_MINE_PID_FILE"
+
+
+def _pid_file_for_cmd(cmd: list[str]) -> Path:
+    """Return the per-target PID file path for a mine subcommand.
+
+    The key is derived from the mine arguments (everything after ``mine``)
+    so different (dir, mode, wing) combinations get independent slots.
+    Two fires with the same arguments collapse to the same slot — which is
+    exactly the dedup we want.
+    """
+    try:
+        idx = cmd.index("mine")
+        key = " ".join(cmd[idx:])
+    except ValueError:
+        key = " ".join(cmd)
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+    return _MINE_PID_DIR / f"mine_{digest}.pid"
 
 
 def _pid_alive(pid: int) -> bool:
@@ -252,22 +332,96 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
-def _mine_already_running() -> bool:
-    """Return True if a background mine process from a previous hook fire is still alive."""
+def _mine_already_running(cmd: list[str]) -> bool:
+    """Return True if a previous mine for ``cmd``'s target is still alive."""
+    pid_file = _pid_file_for_cmd(cmd)
     try:
-        pid = int(_MINE_PID_FILE.read_text().strip())
-    except (OSError, ValueError):
+        recorded = pid_file.read_text().strip()
+    except OSError:
         return False
-    return _pid_alive(pid)
+    if not recorded.isdigit():
+        return False
+    return _pid_alive(int(recorded))
+
+
+def _claim_mine_slot(cmd: list[str]) -> Optional[Path]:
+    """Atomically reserve the per-target PID slot for ``cmd``.
+
+    Returns the slot path on success, or ``None`` if the target is
+    already being mined by a live process. The reservation is done via
+    ``O_CREAT | O_EXCL`` so two simultaneous hook fires can never both
+    pass the check; one wins, the other returns None.
+
+    A stale slot (file exists but the recorded PID is dead) is reclaimed
+    transparently — orphan miners that crashed without cleanup do not
+    block future hook fires forever.
+    """
+    pid_file = _pid_file_for_cmd(cmd)
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(str(pid_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(fd)
+        return pid_file
+    except FileExistsError:
+        pass
+    # Slot exists. If the holder is alive, defer.
+    if _mine_already_running(cmd):
+        return None
+    # Stale entry; reclaim. The unlink+create is racy against another hook
+    # firing right now, but the second create's O_EXCL will fail and that
+    # caller will see the live PID via the next round.
+    try:
+        pid_file.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return None
+    try:
+        fd = os.open(str(pid_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(fd)
+        return pid_file
+    except FileExistsError:
+        return None
 
 
 def _spawn_mine(cmd: list) -> None:
-    """Spawn a mine subprocess, write its PID to the lock file, log to hook.log."""
+    """Spawn a mine subprocess if no live mine is already targeting it.
+
+    The PID slot is claimed atomically *before* the spawn, so two near-
+    simultaneous hook fires can't both proceed — the second sees the
+    claimed slot and silently skips. The spawned process inherits a
+    ``MEMPALACE_MINE_PID_FILE`` env var so its cleanup hook can remove
+    the slot on exit without scanning the directory.
+    """
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     log_path = STATE_DIR / "hook.log"
+    pid_file = _claim_mine_slot(cmd)
+    if pid_file is None:
+        _log(f"Skipping mine: target already running ({' '.join(cmd[-3:])})")
+        return
+    child_env = os.environ.copy()
+    child_env[_MINE_PID_FILE_ENV] = str(pid_file)
     with open(log_path, "a") as log_f:
-        proc = subprocess.Popen(cmd, stdout=log_f, stderr=log_f)
-    _MINE_PID_FILE.write_text(str(proc.pid))
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=log_f,
+                stderr=log_f,
+                env=child_env,
+                **_detached_popen_kwargs(),
+            )
+        except OSError:
+            # Spawn failed; release the slot we just claimed so the next
+            # hook fire can try again rather than skipping forever.
+            try:
+                pid_file.unlink()
+            except OSError:
+                pass
+            raise
+    try:
+        pid_file.write_text(str(proc.pid))
+    except OSError:
+        pass
 
 
 def _maybe_auto_ingest():
@@ -277,12 +431,14 @@ def _maybe_auto_ingest():
     in the hook handlers — this function does not handle them, to avoid
     asymmetric interpreter handling and PID-file overwrite when both
     targets fire from a single hook call (#1231 review).
+
+    Per-target dedup is done by ``_spawn_mine`` itself: each (dir, mode)
+    target gets its own PID slot, so distinct targets never block each
+    other but a re-fire of the same target while the previous one is
+    still running is silently skipped.
     """
     targets = _get_mine_targets()
     if not targets:
-        return
-    if _mine_already_running():
-        _log("Skipping auto-ingest: mine already running")
         return
     for mine_dir, mode in targets:
         try:
@@ -331,6 +487,7 @@ def _desktop_toast(body: str, title: str = "MemPalace"):
             ["notify-send", "--app-name=MemPalace", "--icon=brain", title, body],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            **_detached_popen_kwargs(),
         )
     except OSError:
         pass
@@ -477,24 +634,22 @@ def _ingest_transcript(transcript_path: str):
         return
 
     try:
-        log_path = STATE_DIR / "hook.log"
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        with open(log_path, "a") as log_f:
-            subprocess.Popen(
-                [
-                    _mempalace_python(),
-                    "-m",
-                    "mempalace",
-                    "mine",
-                    str(path.parent),
-                    "--mode",
-                    "convos",
-                    "--wing",
-                    "sessions",
-                ],
-                stdout=log_f,
-                stderr=log_f,
-            )
+        # Route through ``_spawn_mine`` so the per-target PID guard kicks
+        # in here too — repeated Stop/PreCompact fires for the same
+        # transcript should not stack up parallel ingest mines.
+        _spawn_mine(
+            [
+                _mempalace_python(),
+                "-m",
+                "mempalace",
+                "mine",
+                str(path.parent),
+                "--mode",
+                "convos",
+                "--wing",
+                "sessions",
+            ]
+        )
         _log(f"Transcript ingest started: {path.name}")
     except OSError:
         pass
@@ -550,6 +705,9 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
 
 def hook_stop(data: dict, harness: str):
     """Stop hook: block every N messages for auto-save."""
+    if not _palace_root_exists():
+        _output({})
+        return
     parsed = _parse_harness_input(data, harness)
     session_id = parsed["session_id"]
     stop_hook_active = parsed["stop_hook_active"]
@@ -659,6 +817,9 @@ def hook_stop(data: dict, harness: str):
 
 def hook_session_start(data: dict, harness: str):
     """Session start hook: initialize session tracking state."""
+    if not _palace_root_exists():
+        _output({})
+        return
     parsed = _parse_harness_input(data, harness)
     session_id = parsed["session_id"]
 
@@ -673,6 +834,9 @@ def hook_session_start(data: dict, harness: str):
 
 def hook_precompact(data: dict, harness: str):
     """Precompact hook: mine transcript synchronously, then allow compaction."""
+    if not _palace_root_exists():
+        _output({})
+        return
     parsed = _parse_harness_input(data, harness)
     session_id = parsed["session_id"]
     transcript_path = parsed["transcript_path"]

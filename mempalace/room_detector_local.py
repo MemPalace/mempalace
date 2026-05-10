@@ -202,7 +202,7 @@ def detect_rooms_from_files(project_dir: str) -> list:
 
     SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build"}
 
-    for root, dirs, filenames in os.walk(project_path):
+    for _root, dirs, filenames in os.walk(project_path):
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
         for filename in filenames:
             name_lower = filename.lower().replace("-", "_").replace(" ", "_")

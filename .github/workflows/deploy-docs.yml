@@ -29,7 +29,7 @@ jobs:
 
       - name: Configure GitHub Pages
         id: pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
 
       - uses: oven-sh/setup-bun@v2
         with:

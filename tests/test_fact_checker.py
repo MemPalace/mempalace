@@ -286,3 +286,66 @@ class TestCLI:
         assert "similar_name" in out
         # Silence unused import warning.
         _ = (MagicMock, patch, fact_checker)
+
+    def test_reconfigures_stdio_to_utf8_on_windows(self):
+        """Windows fact_checker --stdin must decode payload as UTF-8.
+
+        Without this, Python defaults stdio to the system ANSI codepage
+        (cp1252/cp1251/cp950), which mojibakes non-ASCII text before
+        pattern parsing sees it.
+        """
+        import io
+        import sys
+
+        from mempalace.fact_checker import _reconfigure_stdio_utf8_on_windows
+
+        class _ReconfigurableStringIO(io.StringIO):
+            def __init__(self, initial_value=""):
+                super().__init__(initial_value)
+                self.reconfigure_calls = []
+
+            def reconfigure(self, **kwargs):
+                self.reconfigure_calls.append(kwargs)
+
+        stdin = _ReconfigurableStringIO()
+        stdout = _ReconfigurableStringIO()
+        stderr = _ReconfigurableStringIO()
+        with (
+            patch.object(sys, "platform", "win32"),
+            patch.object(sys, "stdin", stdin),
+            patch.object(sys, "stdout", stdout),
+            patch.object(sys, "stderr", stderr),
+        ):
+            _reconfigure_stdio_utf8_on_windows()
+
+        # Per-stream errors policy: stdin uses surrogateescape so a stray
+        # malformed byte from a redirected file does not crash the read,
+        # stdout/stderr use replace so an extracted fact carrying a
+        # surrogate half does not crash mid-print.
+        assert stdin.reconfigure_calls == [{"encoding": "utf-8", "errors": "surrogateescape"}]
+        assert stdout.reconfigure_calls == [{"encoding": "utf-8", "errors": "replace"}]
+        assert stderr.reconfigure_calls == [{"encoding": "utf-8", "errors": "replace"}]
+
+    def test_reconfigure_stdio_is_noop_off_windows(self):
+        """Linux/macOS already default to UTF-8 stdio -- helper must not touch streams."""
+        import io
+        import sys
+
+        from mempalace.fact_checker import _reconfigure_stdio_utf8_on_windows
+
+        class _ReconfigurableStringIO(io.StringIO):
+            def __init__(self):
+                super().__init__()
+                self.reconfigure_calls = []
+
+            def reconfigure(self, **kwargs):
+                self.reconfigure_calls.append(kwargs)
+
+        stdin = _ReconfigurableStringIO()
+        with (
+            patch.object(sys, "platform", "linux"),
+            patch.object(sys, "stdin", stdin),
+        ):
+            _reconfigure_stdio_utf8_on_windows()
+
+        assert stdin.reconfigure_calls == []

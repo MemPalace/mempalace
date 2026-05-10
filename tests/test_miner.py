@@ -7,7 +7,7 @@ from pathlib import Path
 import chromadb
 import yaml
 
-from mempalace.miner import load_config, mine, scan_project, status
+from mempalace.miner import detect_room, load_config, mine, scan_project, status
 from mempalace.palace import NORMALIZE_VERSION, file_already_mined
 
 
@@ -503,6 +503,103 @@ def test_file_already_mined_returns_false_for_stale_normalize_version():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_detect_room_uses_token_boundary_matching(tmp_path):
+    """Path-part routing must not fire on incidental substrings.
+
+    Regression: "views" is a substring of "interviews", so the old
+    substring check routed every file under views/ into a room keyed
+    by "interviews". Token-boundary matching prevents this while still
+    matching real tokens like "frontend" in "frontend-app".
+    """
+    project = tmp_path
+    rooms = [
+        {"name": "billing-page", "keywords": ["billing-page"]},
+        {"name": "interviews", "keywords": ["interviews"]},
+        {"name": "general", "keywords": []},
+    ]
+
+    # views/<X>/... must NOT route to "interviews" on the "views"⊂"interviews" accident
+    view_file = project / "views" / "billing-page" / "Foo.test.tsx"
+    view_file.parent.mkdir(parents=True)
+    view_file.write_text("content")
+    assert detect_room(view_file, "content", rooms, project) == "billing-page"
+
+    # data/interviews/... must route to "interviews" via the real token
+    data_file = project / "data" / "interviews" / "index.ts"
+    data_file.parent.mkdir(parents=True)
+    data_file.write_text("content")
+    assert detect_room(data_file, "content", rooms, project) == "interviews"
+
+
+def test_detect_room_preserves_token_matches(tmp_path):
+    """Real separator-bounded tokens still match in both directions."""
+    project = tmp_path
+    rooms = [
+        {"name": "frontend", "keywords": ["frontend"]},
+        {"name": "general", "keywords": []},
+    ]
+
+    # path part contains keyword as a token
+    f1 = project / "frontend-app" / "main.ts"
+    f1.parent.mkdir(parents=True)
+    f1.write_text("x")
+    assert detect_room(f1, "x", rooms, project) == "frontend"
+
+    # keyword contains path part as a token (reverse direction)
+    rooms2 = [
+        {"name": "data-retention", "keywords": ["data-retention"]},
+        {"name": "general", "keywords": []},
+    ]
+    f2 = project / "data" / "data-retention" / "policy.ts"
+    f2.parent.mkdir(parents=True)
+    f2.write_text("x")
+    assert detect_room(f2, "x", rooms2, project) == "data-retention"
+
+
+def test_detect_room_matches_keyword_distinct_from_name(tmp_path):
+    """Regression: PR #145 — path part must match a keyword even when the
+    room name itself doesn't contain the path part as a token.
+
+    Scenario: a folder named ``docs/`` should route to a room named
+    ``documentation`` that declares ``"docs"`` as a keyword.
+    """
+    project = tmp_path
+    rooms = [
+        {"name": "documentation", "keywords": ["docs"]},
+        {"name": "general", "keywords": []},
+    ]
+
+    f = project / "docs" / "readme.md"
+    f.parent.mkdir(parents=True)
+    f.write_text("x")
+    assert detect_room(f, "x", rooms, project) == "documentation"
+
+
+def test_detect_room_filename_match_uses_token_boundary(tmp_path):
+    """Priority 2 (filename match) must also use token-boundary rules."""
+    project = tmp_path
+    rooms = [
+        {"name": "review", "keywords": []},
+        {"name": "general", "keywords": []},
+    ]
+
+    # "review" is a substring of "reviewmodule" but not a token — should NOT match
+    f1 = project / "reviewmodule.ts"
+    f1.write_text("x")
+    assert detect_room(f1, "x", rooms, project) != "review"
+
+    # "review" IS a token of "review-page" — should match
+    f2 = project / "review-page.ts"
+    f2.write_text("x")
+    assert detect_room(f2, "x", rooms, project) == "review"
+
+    # Dotted filename stems like "Foo.test" split on "." too
+    rooms3 = [{"name": "foo", "keywords": []}, {"name": "general", "keywords": []}]
+    f3 = project / "foo.test.ts"
+    f3.write_text("x")
+    assert detect_room(f3, "x", rooms3, project) == "foo"
+
+
 def test_add_drawer_stamps_normalize_version(tmp_path):
     """Fresh drawers carry the current schema version so future upgrades work."""
     from mempalace.miner import add_drawer
@@ -711,8 +808,85 @@ def test_mine_keyboard_interrupt_quotes_path_with_spaces_in_resume_hint(tmp_path
     assert f"mempalace mine {shlex.quote(str(project_root))}" in out
 
 
+def test_skip_filenames_includes_lockfiles():
+    """pnpm-lock.yaml and yarn.lock must be skipped alongside package-lock.json
+    so a Windows mine over a typical JS monorepo doesn't OOM the ONNX embedder
+    on a 24K-line lockfile (#1296)."""
+    from mempalace import miner
+
+    assert "package-lock.json" in miner.SKIP_FILENAMES
+    assert "pnpm-lock.yaml" in miner.SKIP_FILENAMES
+    assert "yarn.lock" in miner.SKIP_FILENAMES
+
+
+def test_process_file_skips_when_chunks_exceed_max(tmp_path, monkeypatch):
+    """A file producing more than MAX_CHUNKS_PER_FILE chunks must be skipped
+    with a clear message and zero upserts. Generated artifacts (CSVs, lock
+    files not in SKIP_FILENAMES) hit this — the cap is what prevents ONNX
+    bad_alloc on Windows when the embedder is asked to swallow thousands of
+    chunks in one batch (#1296)."""
+    from unittest.mock import MagicMock
+
+    from mempalace import miner
+
+    monkeypatch.setattr(miner, "MAX_CHUNKS_PER_FILE", 5)
+    over_cap = [{"content": f"chunk {i}", "chunk_index": i} for i in range(7)]
+    monkeypatch.setattr(miner, "chunk_text", lambda content, source_file: over_cap)
+
+    source = tmp_path / "huge.csv"
+    source.write_text("col1,col2\n" + "x,y\n" * 500, encoding="utf-8")
+    col = MagicMock()
+    col.get.return_value = {"ids": []}
+
+    drawers, room = miner.process_file(
+        source,
+        tmp_path,
+        col,
+        "wing",
+        [{"name": "general", "description": "General"}],
+        "agent",
+        False,
+    )
+
+    assert drawers == 0
+    col.upsert.assert_not_called()
+
+
+def test_mine_arbitrary_exception_prints_summary_and_reraises(tmp_path, capsys):
+    """A non-KeyboardInterrupt exception mid-mine must surface a summary
+    banner before propagating, so users don't see a silent exit-0 with no
+    completion message (#1296 Failure 2). Re-raise preserves the traceback
+    and yields a non-zero exit code."""
+    import pytest
+    from unittest.mock import patch
+
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=4)
+    palace_path = project_root / "palace"
+
+    call_count = {"n": 0}
+
+    def fake_process_file(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            raise RuntimeError("simulated ONNX bad_alloc")
+        return (1, "general")
+
+    with patch("mempalace.miner.process_file", side_effect=fake_process_file):
+        with pytest.raises(RuntimeError, match="simulated ONNX bad_alloc"):
+            mine(str(project_root), str(palace_path))
+
+    out = capsys.readouterr().out
+    assert "Mine aborted by exception." in out
+    assert "files_processed: 1/" in out
+    assert "drawers_filed:" in out
+    assert "RuntimeError: simulated ONNX bad_alloc" in out
+    assert "upserted idempotently" in out
+
+
 def test_mine_cleans_up_pid_file_on_interrupt(tmp_path):
-    """Our own PID entry in mine.pid is removed in the finally clause."""
+    """Our own per-target PID slot is removed in the finally clause."""
     import pytest
     from unittest.mock import patch
 
@@ -721,14 +895,16 @@ def test_mine_cleans_up_pid_file_on_interrupt(tmp_path):
     _make_minable_project(project_root, n_files=2)
     palace_path = project_root / "palace"
 
-    pid_file = tmp_path / "mine.pid"
+    pid_file = tmp_path / "mine_abc.pid"
     pid_file.write_text(str(os.getpid()))
 
     def fake_process_file(*args, **kwargs):
         raise KeyboardInterrupt
 
+    # The mine subprocess receives its slot path via env var; the cleanup
+    # hook in miner.py reads that var and removes the slot if it matches.
     with (
-        patch("mempalace.hooks_cli._MINE_PID_FILE", pid_file),
+        patch.dict(os.environ, {"MEMPALACE_MINE_PID_FILE": str(pid_file)}),
         patch("mempalace.miner.process_file", side_effect=fake_process_file),
     ):
         with pytest.raises(SystemExit):
@@ -738,7 +914,7 @@ def test_mine_cleans_up_pid_file_on_interrupt(tmp_path):
 
 
 def test_mine_cleans_up_pid_file_on_clean_exit(tmp_path):
-    """Successful mine also removes its own PID entry in the finally clause."""
+    """Successful mine also removes its own per-target PID slot."""
     from unittest.mock import patch
 
     project_root = tmp_path / "proj"
@@ -746,17 +922,17 @@ def test_mine_cleans_up_pid_file_on_clean_exit(tmp_path):
     _make_minable_project(project_root, n_files=1)
     palace_path = project_root / "palace"
 
-    pid_file = tmp_path / "mine.pid"
+    pid_file = tmp_path / "mine_abc.pid"
     pid_file.write_text(str(os.getpid()))
 
-    with patch("mempalace.hooks_cli._MINE_PID_FILE", pid_file):
+    with patch.dict(os.environ, {"MEMPALACE_MINE_PID_FILE": str(pid_file)}):
         mine(str(project_root), str(palace_path))
 
     assert not pid_file.exists()
 
 
 def test_mine_does_not_remove_other_processes_pid_file(tmp_path):
-    """A PID file pointing at someone else's PID is left untouched."""
+    """A PID slot pointing at someone else's PID is left untouched."""
     from unittest.mock import patch
 
     project_root = tmp_path / "proj"
@@ -765,10 +941,10 @@ def test_mine_does_not_remove_other_processes_pid_file(tmp_path):
     palace_path = project_root / "palace"
 
     other_pid = os.getpid() + 999_999  # a PID that isn't us
-    pid_file = tmp_path / "mine.pid"
+    pid_file = tmp_path / "mine_abc.pid"
     pid_file.write_text(str(other_pid))
 
-    with patch("mempalace.hooks_cli._MINE_PID_FILE", pid_file):
+    with patch.dict(os.environ, {"MEMPALACE_MINE_PID_FILE": str(pid_file)}):
         mine(str(project_root), str(palace_path))
 
     assert pid_file.exists(), "Foreign PID entries must not be removed"

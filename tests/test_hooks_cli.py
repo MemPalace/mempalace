@@ -3,11 +3,13 @@ import io
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+import mempalace.hooks_cli as hooks_cli_mod
 from mempalace.hooks_cli import (
     SAVE_INTERVAL,
     _count_human_messages,
@@ -440,7 +442,7 @@ def test_maybe_auto_ingest_with_env(tmp_path):
     mempal_dir.mkdir()
     with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
         with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
-            with patch("mempalace.hooks_cli._MINE_PID_FILE", tmp_path / "mine.pid"):
+            with patch("mempalace.hooks_cli._MINE_PID_DIR", tmp_path / "mine_pids"):
                 with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
                     _maybe_auto_ingest()
                     mock_popen.assert_called_once()
@@ -462,7 +464,7 @@ def test_maybe_auto_ingest_uses_mempalace_python(tmp_path):
     mempal_dir.mkdir()
     with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
         with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
-            with patch("mempalace.hooks_cli._MINE_PID_FILE", tmp_path / "mine.pid"):
+            with patch("mempalace.hooks_cli._MINE_PID_DIR", tmp_path / "mine_pids"):
                 with patch(
                     "mempalace.hooks_cli._mempalace_python", return_value="/fake/venv/python"
                 ):
@@ -512,7 +514,7 @@ def test_maybe_auto_ingest_ignores_transcript_arg_path(tmp_path):
     transcript.write_text("")
     with patch.dict("os.environ", {}, clear=True):
         with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
-            with patch("mempalace.hooks_cli._MINE_PID_FILE", tmp_path / "mine.pid"):
+            with patch("mempalace.hooks_cli._MINE_PID_DIR", tmp_path / "mine_pids"):
                 with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
                     _maybe_auto_ingest()
                     mock_popen.assert_not_called()
@@ -542,54 +544,286 @@ def test_maybe_auto_ingest_oserror(tmp_path):
     mempal_dir.mkdir()
     with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
         with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
-            with patch("mempalace.hooks_cli._MINE_PID_FILE", tmp_path / "mine.pid"):
+            with patch("mempalace.hooks_cli._MINE_PID_DIR", tmp_path / "mine_pids"):
                 with patch("mempalace.hooks_cli.subprocess.Popen", side_effect=OSError("fail")):
                     _maybe_auto_ingest()  # should not raise
 
 
 def test_maybe_auto_ingest_skips_when_mine_running(tmp_path):
-    """Does not spawn a new mine process if one is already running."""
+    """Does not spawn a new mine process if a mine for the same target is alive."""
     mempal_dir = tmp_path / "project"
     mempal_dir.mkdir()
+    pid_dir = tmp_path / "mine_pids"
     with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
         with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
-            with patch("mempalace.hooks_cli._mine_already_running", return_value=True):
+            with patch("mempalace.hooks_cli._MINE_PID_DIR", pid_dir):
+                # Pre-populate the per-target slot with a live PID (our own).
+                from mempalace.hooks_cli import _pid_file_for_cmd
+
+                cmd = [
+                    sys.executable,
+                    "-m",
+                    "mempalace",
+                    "mine",
+                    str(mempal_dir.resolve()),
+                    "--mode",
+                    "projects",
+                ]
+                pid_file = _pid_file_for_cmd(cmd)
+                pid_file.parent.mkdir(parents=True, exist_ok=True)
+                pid_file.write_text(str(os.getpid()))
+                with patch("mempalace.hooks_cli._mempalace_python", return_value=sys.executable):
+                    with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                        _maybe_auto_ingest()
+                        mock_popen.assert_not_called()
+
+
+# --- _detached_popen_kwargs ---
+
+
+def test_detached_popen_kwargs_posix(monkeypatch):
+    """On POSIX, kwargs include start_new_session so the child detaches."""
+    from mempalace.hooks_cli import _detached_popen_kwargs
+
+    monkeypatch.setattr("mempalace.hooks_cli.os.name", "posix")
+    kwargs = _detached_popen_kwargs()
+    assert kwargs.get("start_new_session") is True
+    assert kwargs.get("stdin") is subprocess.DEVNULL
+    assert kwargs.get("close_fds") is True
+    assert "creationflags" not in kwargs
+
+
+def test_detached_popen_kwargs_windows(monkeypatch):
+    """On Windows, kwargs include creationflags that fully detach the child.
+
+    Without these, the parent hook hangs at session end on Windows because
+    the child's inherited stdout/stderr handles keep the parent's exit
+    blocked (#1268 root cause for the Python hook path).
+    """
+    from mempalace.hooks_cli import _detached_popen_kwargs
+
+    monkeypatch.setattr("mempalace.hooks_cli.os.name", "nt")
+    # Simulate Windows-only Popen flag constants. Patch on the imported
+    # subprocess module within hooks_cli so getattr() picks them up.
+    monkeypatch.setattr(
+        "mempalace.hooks_cli.subprocess.DETACHED_PROCESS", 0x00000008, raising=False
+    )
+    monkeypatch.setattr(
+        "mempalace.hooks_cli.subprocess.CREATE_NEW_PROCESS_GROUP", 0x00000200, raising=False
+    )
+    kwargs = _detached_popen_kwargs()
+    assert kwargs.get("stdin") is subprocess.DEVNULL
+    assert kwargs.get("close_fds") is True
+    flags = kwargs.get("creationflags", 0)
+    assert flags & 0x00000008, "DETACHED_PROCESS must be set"
+    assert flags & 0x00000200, "CREATE_NEW_PROCESS_GROUP must be set"
+
+
+def test_spawn_mine_uses_detached_kwargs(tmp_path):
+    """_spawn_mine forwards detached kwargs so the hook can exit cleanly."""
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        with patch("mempalace.hooks_cli._MINE_PID_DIR", tmp_path / "mine_pids"):
+            with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                mock_popen.return_value.pid = 9999
+                from mempalace.hooks_cli import _spawn_mine
+
+                _spawn_mine(["mempalace", "mine", "/tmp/x"])
+                kwargs = mock_popen.call_args.kwargs
+                # The exact key set varies by platform; assert on the
+                # shared invariants that protect against the Windows hang.
+                assert kwargs.get("stdin") is subprocess.DEVNULL
+                assert kwargs.get("close_fds") is True
+
+
+def test_spawn_mine_skips_when_target_running(tmp_path):
+    """A second spawn for the same cmd target while the first is alive must skip."""
+    pid_dir = tmp_path / "mine_pids"
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        with patch("mempalace.hooks_cli._MINE_PID_DIR", pid_dir):
+            from mempalace.hooks_cli import _pid_file_for_cmd, _spawn_mine
+
+            cmd = ["mempalace", "mine", "/tmp/proj", "--mode", "projects"]
+            pid_file = _pid_file_for_cmd(cmd)
+            pid_file.parent.mkdir(parents=True, exist_ok=True)
+            pid_file.write_text(str(os.getpid()))  # live PID
+
+            with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                _spawn_mine(cmd)
+                mock_popen.assert_not_called()
+
+
+def test_spawn_mine_distinct_targets_dont_block_each_other(tmp_path):
+    """Two spawn calls for *different* targets both proceed."""
+    pid_dir = tmp_path / "mine_pids"
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        with patch("mempalace.hooks_cli._MINE_PID_DIR", pid_dir):
+            with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                from mempalace.hooks_cli import _spawn_mine
+
+                mock_popen.return_value.pid = 1111
+                _spawn_mine(["mempalace", "mine", "/tmp/a", "--mode", "projects"])
+                mock_popen.return_value.pid = 2222
+                _spawn_mine(["mempalace", "mine", "/tmp/b", "--mode", "projects"])
+                assert mock_popen.call_count == 2
+
+
+def test_spawn_mine_reclaims_stale_slot(tmp_path):
+    """A slot pointing at a dead PID is reclaimed silently."""
+    pid_dir = tmp_path / "mine_pids"
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        with patch("mempalace.hooks_cli._MINE_PID_DIR", pid_dir):
+            from mempalace.hooks_cli import _pid_file_for_cmd, _spawn_mine
+
+            cmd = ["mempalace", "mine", "/tmp/proj", "--mode", "projects"]
+            pid_file = _pid_file_for_cmd(cmd)
+            pid_file.parent.mkdir(parents=True, exist_ok=True)
+            pid_file.write_text("999999999")  # dead PID
+
+            with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                mock_popen.return_value.pid = 4242
+                _spawn_mine(cmd)
+                mock_popen.assert_called_once()
+                # New PID is recorded in the reclaimed slot.
+                assert pid_file.read_text().strip() == "4242"
+
+
+def test_spawn_mine_releases_slot_on_oserror(tmp_path):
+    """If Popen raises OSError, the claimed slot must be released."""
+    pid_dir = tmp_path / "mine_pids"
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        with patch("mempalace.hooks_cli._MINE_PID_DIR", pid_dir):
+            from mempalace.hooks_cli import _pid_file_for_cmd, _spawn_mine
+
+            cmd = ["mempalace", "mine", "/tmp/proj", "--mode", "projects"]
+            pid_file = _pid_file_for_cmd(cmd)
+
+            with patch("mempalace.hooks_cli.subprocess.Popen", side_effect=OSError("spawn fail")):
+                with pytest.raises(OSError):
+                    _spawn_mine(cmd)
+                assert (
+                    not pid_file.exists()
+                ), "slot must be released so the next hook fire isn't permanently blocked"
+
+
+def test_spawn_mine_passes_pid_file_env_var(tmp_path):
+    """The child inherits MEMPALACE_MINE_PID_FILE so its cleanup hook can find the slot."""
+    pid_dir = tmp_path / "mine_pids"
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        with patch("mempalace.hooks_cli._MINE_PID_DIR", pid_dir):
+            with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                mock_popen.return_value.pid = 5555
+                from mempalace.hooks_cli import _pid_file_for_cmd, _spawn_mine
+
+                cmd = ["mempalace", "mine", "/tmp/x", "--mode", "projects"]
+                _spawn_mine(cmd)
+                child_env = mock_popen.call_args.kwargs.get("env", {})
+                expected = str(_pid_file_for_cmd(cmd))
+                assert child_env.get("MEMPALACE_MINE_PID_FILE") == expected
+
+
+def test_ingest_transcript_uses_detached_kwargs(tmp_path):
+    """_ingest_transcript spawns the convos mine with detach kwargs."""
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text("x" * 200)  # > 100 byte gate
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        with patch("mempalace.hooks_cli._MINE_PID_DIR", tmp_path / "mine_pids"):
+            with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                from mempalace.hooks_cli import _ingest_transcript
+
+                _ingest_transcript(str(transcript))
+                assert mock_popen.called
+                kwargs = mock_popen.call_args.kwargs
+                assert kwargs.get("stdin") is subprocess.DEVNULL
+                assert kwargs.get("close_fds") is True
+
+
+def test_ingest_transcript_skips_when_target_running(tmp_path):
+    """Repeated transcript ingests for the same transcript should dedup."""
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text("x" * 200)
+    pid_dir = tmp_path / "mine_pids"
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        with patch("mempalace.hooks_cli._MINE_PID_DIR", pid_dir):
+            with patch("mempalace.hooks_cli._mempalace_python", return_value=sys.executable):
+                from mempalace.hooks_cli import _ingest_transcript, _pid_file_for_cmd
+
+                expected_cmd = [
+                    sys.executable,
+                    "-m",
+                    "mempalace",
+                    "mine",
+                    str(transcript.parent),
+                    "--mode",
+                    "convos",
+                    "--wing",
+                    "sessions",
+                ]
+                pid_file = _pid_file_for_cmd(expected_cmd)
+                pid_file.parent.mkdir(parents=True, exist_ok=True)
+                pid_file.write_text(str(os.getpid()))  # live target
+
                 with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
-                    _maybe_auto_ingest()
+                    _ingest_transcript(str(transcript))
                     mock_popen.assert_not_called()
 
 
 # --- _mine_already_running ---
 
 
+def _seed_slot(pid_dir, cmd, body: str):
+    """Write ``body`` into the per-target slot for ``cmd`` under ``pid_dir``."""
+    from mempalace.hooks_cli import _pid_file_for_cmd
+
+    with patch("mempalace.hooks_cli._MINE_PID_DIR", pid_dir):
+        slot = _pid_file_for_cmd(cmd)
+    slot.parent.mkdir(parents=True, exist_ok=True)
+    slot.write_text(body)
+    return slot
+
+
 def test_mine_already_running_no_file(tmp_path):
-    """Returns False when no PID file exists."""
-    with patch("mempalace.hooks_cli._MINE_PID_FILE", tmp_path / "mine.pid"):
-        assert _mine_already_running() is False
+    """Returns False when no per-target slot exists."""
+    cmd = ["mempalace", "mine", "/tmp/x", "--mode", "projects"]
+    with patch("mempalace.hooks_cli._MINE_PID_DIR", tmp_path / "mine_pids"):
+        assert _mine_already_running(cmd) is False
 
 
 def test_mine_already_running_dead_pid(tmp_path):
-    """Returns False when PID file contains a PID that no longer exists."""
-    pid_file = tmp_path / "mine.pid"
-    pid_file.write_text("999999999")  # almost certainly not a real PID
-    with patch("mempalace.hooks_cli._MINE_PID_FILE", pid_file):
-        assert _mine_already_running() is False
+    """Returns False when the slot's recorded PID is no longer alive."""
+    pid_dir = tmp_path / "mine_pids"
+    cmd = ["mempalace", "mine", "/tmp/x", "--mode", "projects"]
+    _seed_slot(pid_dir, cmd, "999999999")  # almost certainly not a real PID
+    with patch("mempalace.hooks_cli._MINE_PID_DIR", pid_dir):
+        assert _mine_already_running(cmd) is False
 
 
 def test_mine_already_running_live_pid(tmp_path):
-    """Returns True when PID file contains the current process's own PID."""
-    pid_file = tmp_path / "mine.pid"
-    pid_file.write_text(str(os.getpid()))  # current process is definitely alive
-    with patch("mempalace.hooks_cli._MINE_PID_FILE", pid_file):
-        assert _mine_already_running() is True
+    """Returns True when the slot's recorded PID is alive."""
+    pid_dir = tmp_path / "mine_pids"
+    cmd = ["mempalace", "mine", "/tmp/x", "--mode", "projects"]
+    _seed_slot(pid_dir, cmd, str(os.getpid()))  # current process is alive
+    with patch("mempalace.hooks_cli._MINE_PID_DIR", pid_dir):
+        assert _mine_already_running(cmd) is True
 
 
 def test_mine_already_running_corrupt_file(tmp_path):
-    """Returns False when PID file contains non-integer content."""
-    pid_file = tmp_path / "mine.pid"
-    pid_file.write_text("not-a-pid")
-    with patch("mempalace.hooks_cli._MINE_PID_FILE", pid_file):
-        assert _mine_already_running() is False
+    """Returns False when the slot contains non-integer content."""
+    pid_dir = tmp_path / "mine_pids"
+    cmd = ["mempalace", "mine", "/tmp/x", "--mode", "projects"]
+    _seed_slot(pid_dir, cmd, "not-a-pid")
+    with patch("mempalace.hooks_cli._MINE_PID_DIR", pid_dir):
+        assert _mine_already_running(cmd) is False
+
+
+def test_mine_already_running_distinct_cmds_independent(tmp_path):
+    """Slots are keyed per cmd; an alive entry for cmd A doesn't shadow cmd B."""
+    pid_dir = tmp_path / "mine_pids"
+    cmd_a = ["mempalace", "mine", "/tmp/a", "--mode", "projects"]
+    cmd_b = ["mempalace", "mine", "/tmp/b", "--mode", "projects"]
+    _seed_slot(pid_dir, cmd_a, str(os.getpid()))
+    with patch("mempalace.hooks_cli._MINE_PID_DIR", pid_dir):
+        assert _mine_already_running(cmd_a) is True
+        assert _mine_already_running(cmd_b) is False
 
 
 # --- _get_mine_targets ---
@@ -959,3 +1193,108 @@ def test_stop_hook_rejects_injected_stop_hook_active(tmp_path):
     # The injected value is not "true"/"1"/"yes", so the hook should NOT pass through.
     # Save must have been attempted.
     assert mock_save.called
+
+
+# --- Absent palace root: hooks must not recreate ~/.mempalace ---
+#
+# When the user removes ~/.mempalace (e.g. `rm -rf`), that is the strongest
+# possible "do not auto-capture" signal. Hooks must short-circuit BEFORE
+# touching disk — including before the log-line that previously triggered
+# STATE_DIR.mkdir() on its own.
+
+
+def _redirect_palace_root(monkeypatch, tmp_path):
+    """Point PALACE_ROOT and STATE_DIR at a tmp location that does NOT exist."""
+    fake_root = tmp_path / "absent-mempalace"
+    monkeypatch.setattr(hooks_cli_mod, "PALACE_ROOT", fake_root)
+    monkeypatch.setattr(hooks_cli_mod, "STATE_DIR", fake_root / "hook_state")
+    monkeypatch.setattr(hooks_cli_mod, "_state_dir_initialized", False)
+    return fake_root
+
+
+def test_hook_stop_does_not_create_palace_dir_when_absent(tmp_path, monkeypatch):
+    fake_root = _redirect_palace_root(monkeypatch, tmp_path)
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text("")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        hook_stop(
+            {"session_id": "absent", "transcript_path": str(transcript), "stop_hook_active": False},
+            "claude-code",
+        )
+    assert json.loads(buf.getvalue() or "{}") == {}
+    assert not fake_root.exists()
+
+
+def test_hook_precompact_does_not_create_palace_dir_when_absent(tmp_path, monkeypatch):
+    fake_root = _redirect_palace_root(monkeypatch, tmp_path)
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text("")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        hook_precompact(
+            {"session_id": "absent", "transcript_path": str(transcript)},
+            "claude-code",
+        )
+    assert json.loads(buf.getvalue() or "{}") == {}
+    assert not fake_root.exists()
+
+
+def test_hook_session_start_does_not_create_palace_dir_when_absent(tmp_path, monkeypatch):
+    fake_root = _redirect_palace_root(monkeypatch, tmp_path)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        hook_session_start({"session_id": "absent"}, "claude-code")
+    assert json.loads(buf.getvalue() or "{}") == {}
+    assert not fake_root.exists()
+
+
+def test_log_does_not_create_palace_dir_when_absent(tmp_path, monkeypatch):
+    fake_root = _redirect_palace_root(monkeypatch, tmp_path)
+    _log("test message")
+    assert not fake_root.exists()
+
+
+def test_existing_dir_proceeds_normally(tmp_path, monkeypatch):
+    """Regression: when PALACE_ROOT exists, hooks must proceed (no short-circuit)."""
+    fake_root = tmp_path / "present-mempalace"
+    fake_root.mkdir()
+    monkeypatch.setattr(hooks_cli_mod, "PALACE_ROOT", fake_root)
+    monkeypatch.setattr(hooks_cli_mod, "STATE_DIR", fake_root / "hook_state")
+    monkeypatch.setattr(hooks_cli_mod, "_state_dir_initialized", False)
+    _log("test message")
+    # _log should have created the state dir under the existing palace root
+    assert (fake_root / "hook_state").exists()
+    assert (fake_root / "hook_state" / "hook.log").is_file()
+
+
+def test_regular_file_at_palace_root_treated_as_absent(tmp_path, monkeypatch):
+    """A regular file at ~/.mempalace must be treated the same as absent.
+
+    ``Path.exists()`` returns True for a regular file, which would let the
+    kill-switch be bypassed and crash later when ``STATE_DIR.mkdir()`` runs
+    on ``NotADirectoryError``. ``_palace_root_exists()`` must use
+    ``is_dir()`` so a stray file (or broken symlink) short-circuits cleanly.
+    """
+    fake_root = tmp_path / "file-not-dir"
+    fake_root.write_text("oops, this is a file not a directory")
+    monkeypatch.setattr(hooks_cli_mod, "PALACE_ROOT", fake_root)
+    monkeypatch.setattr(hooks_cli_mod, "STATE_DIR", fake_root / "hook_state")
+    monkeypatch.setattr(hooks_cli_mod, "_state_dir_initialized", False)
+
+    # _palace_root_exists() is the source of truth — it must return False.
+    assert hooks_cli_mod._palace_root_exists() is False
+
+    # Hooks must short-circuit (return {} on stdout) and not touch disk.
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        hook_session_start({"session_id": "file-at-root"}, "claude-code")
+    assert json.loads(buf.getvalue() or "{}") == {}
+
+    # _log must also short-circuit — it must NOT try to mkdir a path under a
+    # regular file (which would raise NotADirectoryError).
+    _log("test message")  # would raise if not short-circuited
+
+    # The stray file is left untouched; we never try to convert it.
+    assert fake_root.is_file()
+    assert fake_root.read_text() == "oops, this is a file not a directory"

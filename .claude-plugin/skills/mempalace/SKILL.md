@@ -16,10 +16,10 @@ Ensure `mempalace` is installed:
 mempalace --version
 ```
 
-If not installed:
+If not installed (uv recommended):
 
 ```bash
-pip install mempalace
+uv tool install mempalace   # or: pip install mempalace
 ```
 
 ## Usage

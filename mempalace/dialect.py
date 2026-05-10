@@ -873,7 +873,7 @@ class Dialect:
 
         for date_key in sorted(by_date.keys()):
             lines.append(f"=MOMENTS[{date_key}]=")
-            for z, fnum in by_date[date_key]:
+            for z, _fnum in by_date[date_key]:
                 entities = []
                 for p in z.get("people", []):
                     code = self.encode_entity(p)

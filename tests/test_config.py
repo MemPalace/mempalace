@@ -3,7 +3,14 @@ import json
 import tempfile
 
 import pytest
-from mempalace.config import MempalaceConfig, normalize_wing_name, sanitize_kg_value, sanitize_name
+from mempalace.config import (
+    MempalaceConfig,
+    normalize_wing_name,
+    sanitize_iso_date,
+    sanitize_iso_temporal,
+    sanitize_kg_value,
+    sanitize_name,
+)
 
 
 def test_default_config():
@@ -212,3 +219,129 @@ def test_kg_value_rejects_null_bytes():
 def test_kg_value_rejects_over_length():
     with pytest.raises(ValueError):
         sanitize_kg_value("a" * 129)
+
+
+# --- sanitize_iso_date ---
+
+
+def test_iso_date_rejects_year_only():
+    # Partial dates re-introduce silent empty result sets via lexicographic
+    # TEXT comparison in KG queries (e.g. "2026-01-01" <= "2026" is False).
+    with pytest.raises(ValueError):
+        sanitize_iso_date("2026")
+
+
+def test_iso_date_rejects_year_month():
+    with pytest.raises(ValueError):
+        sanitize_iso_date("2026-03")
+
+
+def test_iso_date_accepts_full_date():
+    assert sanitize_iso_date("2026-03-15") == "2026-03-15"
+
+
+def test_iso_date_passes_through_none():
+    assert sanitize_iso_date(None) is None
+
+
+def test_iso_date_passes_through_empty_string():
+    assert sanitize_iso_date("") == ""
+
+
+def test_iso_date_strips_whitespace():
+    assert sanitize_iso_date("  2026-03-15  ") == "2026-03-15"
+
+
+def test_iso_date_rejects_natural_language():
+    with pytest.raises(ValueError):
+        sanitize_iso_date("March 2026")
+
+
+def test_iso_date_rejects_abbreviated_month():
+    with pytest.raises(ValueError):
+        sanitize_iso_date("Jan 2025")
+
+
+def test_iso_date_rejects_us_format():
+    with pytest.raises(ValueError):
+        sanitize_iso_date("03/15/2026")
+
+
+def test_iso_date_rejects_invalid_month():
+    with pytest.raises(ValueError):
+        sanitize_iso_date("2026-13")
+
+
+def test_iso_date_rejects_invalid_day():
+    with pytest.raises(ValueError):
+        sanitize_iso_date("2026-02-32")
+
+
+def test_iso_date_rejects_non_string():
+    with pytest.raises(ValueError):
+        sanitize_iso_date(20260315)
+
+
+def test_iso_date_error_names_field():
+    with pytest.raises(ValueError, match="valid_from"):
+        sanitize_iso_date("yesterday", "valid_from")
+
+
+def test_iso_temporal_accepts_full_date():
+    assert sanitize_iso_temporal("2026-05-06") == "2026-05-06"
+
+
+def test_iso_temporal_accepts_canonical_utc_datetime():
+    assert sanitize_iso_temporal("2026-05-06T14:23:00Z") == "2026-05-06T14:23:00Z"
+
+
+def test_iso_temporal_strips_datetime_whitespace():
+    assert sanitize_iso_temporal(" 2026-05-06T14:23:00Z ") == "2026-05-06T14:23:00Z"
+
+
+def test_iso_date_backward_compatible_wrapper_accepts_datetime():
+    assert sanitize_iso_date("2026-05-06T14:23:00Z") == "2026-05-06T14:23:00Z"
+
+
+def test_iso_temporal_rejects_datetime_without_seconds():
+    with pytest.raises(ValueError):
+        sanitize_iso_temporal("2026-05-06T14:23")
+
+
+def test_iso_temporal_rejects_naive_datetime():
+    with pytest.raises(ValueError):
+        sanitize_iso_temporal("2026-05-06T14:23:00")
+
+
+def test_iso_temporal_rejects_fractional_seconds():
+    with pytest.raises(ValueError):
+        sanitize_iso_temporal("2026-05-06T14:23:00.123Z")
+
+
+def test_iso_temporal_rejects_timezone_offset():
+    with pytest.raises(ValueError):
+        sanitize_iso_temporal("2026-05-06T14:23:00+02:00")
+
+
+def test_iso_temporal_rejects_space_separator():
+    with pytest.raises(ValueError):
+        sanitize_iso_temporal("2026-05-06 14:23:00")
+
+
+def test_iso_temporal_rejects_invalid_datetime_hour():
+    with pytest.raises(ValueError):
+        sanitize_iso_temporal("2026-05-06T24:00:00Z")
+
+
+def test_iso_temporal_rejects_invalid_calendar_date():
+    with pytest.raises(ValueError):
+        sanitize_iso_temporal("2026-02-31")
+
+
+def test_iso_temporal_error_names_field():
+    with pytest.raises(ValueError, match="as_of"):
+        sanitize_iso_temporal("2026-05-06T14:23", "as_of")
+
+
+def test_iso_temporal_normalizes_plus_zero_offset_to_z():
+    assert sanitize_iso_temporal("2026-05-06T14:23:00+00:00") == "2026-05-06T14:23:00Z"

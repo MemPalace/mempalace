@@ -7,6 +7,8 @@ Priority: env vars > config file (~/.mempalace/config.json) > defaults
 import json
 import os
 import re
+from datetime import date, datetime
+from functools import lru_cache
 from pathlib import Path
 
 
@@ -81,6 +83,91 @@ def sanitize_kg_value(value: str, field_name: str = "value") -> str:
     return value
 
 
+# ISO-8601 temporal validator for knowledge-graph temporal parameters
+# (as_of, valid_from, valid_to, ended).
+#
+# The KG stores temporal values as TEXT. Lexicographic comparisons are only
+# safe when datetime values use one canonical shape. Accept full dates for
+# legacy compatibility and exact UTC datetimes for sub-day precision.
+#
+# Accepted:
+#   YYYY-MM-DD
+#   YYYY-MM-DDTHH:MM:SSZ
+#   YYYY-MM-DDTHH:MM:SS+00:00  (normalized to ...Z)
+#
+# Rejected:
+#   partial dates, naive datetimes, non-UTC timezone offsets, fractional
+#   seconds, and SQLite-style space-separated datetimes.
+_ISO_DATE_RE = re.compile(r"^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])$")
+
+_ISO_UTC_DATETIME_RE = re.compile(
+    r"^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])"
+    r"T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:Z|\+00:00)$"
+)
+
+
+def _validate_iso_temporal_calendar(value: str) -> None:
+    """Reject impossible calendar values after regex shape validation."""
+
+    if _ISO_DATE_RE.match(value):
+        date.fromisoformat(value)
+        return
+
+    if _ISO_UTC_DATETIME_RE.match(value):
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return
+
+    raise ValueError
+
+
+def sanitize_iso_temporal(value, field_name: str = "date"):
+    """Validate an ISO-8601 date or canonical UTC datetime string.
+
+    Accepts ``None`` and ``""`` as pass-through values.
+
+    Accepted non-empty string forms:
+
+    - ``YYYY-MM-DD``
+    - ``YYYY-MM-DDTHH:MM:SSZ``
+    - ``YYYY-MM-DDTHH:MM:SS+00:00`` normalized to ``...Z``
+
+    Partial dates are rejected because KG queries compare TEXT temporal values.
+    Non-canonical datetime forms are rejected because mixed temporal string
+    formats can silently return wrong KG query results.
+    """
+
+    if value is None or value == "":
+        return value
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string")
+
+    value = value.strip()
+
+    try:
+        _validate_iso_temporal_calendar(value)
+    except ValueError:
+        raise ValueError(
+            f"{field_name}={value!r} is not a valid ISO-8601 date or UTC datetime "
+            "(expected YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ)"
+        ) from None
+
+    if value.endswith("+00:00"):
+        value = f"{value[:-6]}Z"
+
+    return value
+
+
+def sanitize_iso_date(value, field_name: str = "date"):
+    """Backward-compatible wrapper for ISO temporal validation.
+
+    Historically this accepted only full dates. It now also accepts canonical
+    UTC datetimes, but the old name is kept so existing imports continue to
+    work.
+    """
+
+    return sanitize_iso_temporal(value, field_name)
+
+
 def sanitize_content(value: str, max_length: int = 100_000) -> str:
     """Validate drawer/diary content length."""
     if not isinstance(value, str) or not value.strip():
@@ -94,6 +181,13 @@ def sanitize_content(value: str, max_length: int = 100_000) -> str:
 
 DEFAULT_PALACE_PATH = os.path.expanduser("~/.mempalace/palace")
 DEFAULT_COLLECTION_NAME = "mempalace_drawers"
+
+
+@lru_cache(maxsize=1)
+def get_configured_collection_name() -> str:
+    """Return the configured drawer collection name without repeated config-file reads."""
+    return MempalaceConfig().collection_name
+
 
 DEFAULT_TOPIC_WINGS = [
     "emotions",
