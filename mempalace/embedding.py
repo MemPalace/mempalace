@@ -23,6 +23,11 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 os.environ.setdefault("SENTENCE_TRANSFORMERS_HOME", "/opt/models")
 
+try:
+    from .config import MempalaceConfig
+except Exception:
+    MempalaceConfig = None
+
 logger = logging.getLogger(__name__)
 
 _PROVIDER_MAP = {
@@ -207,9 +212,12 @@ def get_embedding_function(device: Optional[str] = None):
     for API compatibility with older callers, but the current offline local
     embedding path does not vary by accelerator.
     """
-    from .config import MempalaceConfig
-
-    model_path = MempalaceConfig().embedding_model_path
+    # Avoid import-time dependency on MempalaceConfig for tests that patch
+    # or monkeypatch the config object. Import at call-time and handle the
+    # absence gracefully (tests may provide a DummyConfig via monkeypatch).
+    model_path = None
+    if MempalaceConfig is not None:
+        model_path = MempalaceConfig().embedding_model_path
     cache_key = model_path
     cached = _EF_CACHE.get(cache_key)
     if cached is not None:
