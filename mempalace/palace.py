@@ -142,6 +142,8 @@ _ENTITY_STOPLIST = frozenset(
 
 
 _CANDIDATE_RX_CACHE = None
+_CLOSET_REGEX_CACHE = None
+_ENTITY_STOP_CACHE = None
 
 
 def _candidate_entity_words(text: str) -> list:
@@ -170,6 +172,30 @@ def _candidate_entity_words(text: str) -> list:
     return words
 
 
+def _get_closet_regex() -> dict:
+    """Return cached closet regex patterns (action + quote) for configured languages."""
+    global _CLOSET_REGEX_CACHE
+    if _CLOSET_REGEX_CACHE is None:
+        from .config import MempalaceConfig
+        from .i18n import get_closet_regex
+
+        _CLOSET_REGEX_CACHE = get_closet_regex(MempalaceConfig().entity_languages)
+    return _CLOSET_REGEX_CACHE
+
+
+def _get_entity_stoplist() -> frozenset:
+    """Return entity stoplist combining built-in English words and locale stopwords."""
+    global _ENTITY_STOP_CACHE
+    if _ENTITY_STOP_CACHE is None:
+        from .config import MempalaceConfig
+        from .i18n import get_entity_patterns
+
+        patterns = get_entity_patterns(MempalaceConfig().entity_languages)
+        locale_stops = frozenset(patterns.get("stopwords", []))
+        _ENTITY_STOP_CACHE = _ENTITY_STOPLIST | locale_stops
+    return _ENTITY_STOP_CACHE
+
+
 def build_closet_lines(source_file, drawer_ids, content, wing, room):
     """Build compact closet pointer lines from drawer content.
 
@@ -177,6 +203,10 @@ def build_closet_lines(source_file, drawer_ids, content, wing, room):
     pointer — never split across closets.
 
     Format: topic|entities|→drawer_ids
+
+    Uses i18n-aware patterns for topic extraction, quote detection, and
+    entity filtering so non-English content (e.g. Chinese) is also indexed.
+    Configure ``entity_languages`` in config.json to enable additional locales.
     """
     import re
     from pathlib import Path
@@ -184,12 +214,15 @@ def build_closet_lines(source_file, drawer_ids, content, wing, room):
     drawer_ref = ",".join(drawer_ids[:3])
     window = content[:CLOSET_EXTRACT_WINDOW]
 
+    closet_rx = _get_closet_regex()
+    stop = _get_entity_stoplist()
+
     # Extract proper nouns (2+ occurrences). Uses i18n-aware patterns so
     # non-Latin names (Cyrillic, accented Latin, etc.) are also detected.
     words = _candidate_entity_words(window)
     word_freq = {}
     for w in words:
-        if w in _ENTITY_STOPLIST:
+        if w in stop:
             continue
         word_freq[w] = word_freq.get(w, 0) + 1
     entities = sorted(
@@ -198,20 +231,24 @@ def build_closet_lines(source_file, drawer_ids, content, wing, room):
     )[:5]
     entity_str = ";".join(entities) if entities else ""
 
-    # Extract key phrases — action verbs + context
+    # Extract key phrases via i18n action patterns
     topics = []
-    for pattern in [
-        r"(?:built|fixed|wrote|added|pushed|tested|created|decided|migrated|reviewed|deployed|configured|removed|updated)\s+[\w\s]{3,40}",
-    ]:
-        topics.extend(re.findall(pattern, window, re.IGNORECASE))
+    for rx in closet_rx["action_patterns"]:
+        topics.extend(rx.findall(window))
     # Also grab section headers if present
     for header in re.findall(r"^#{1,3}\s+(.{5,60})$", window, re.MULTILINE):
         topics.append(header.strip())
     # Dedupe preserving order
     topics = list(dict.fromkeys(t.strip().lower() for t in topics))[:12]
 
-    # Extract quotes
-    quotes = re.findall(r'"([^"]{15,150})"', window)
+    # Extract quotes via i18n quote patterns
+    quotes = []
+    for rx in closet_rx["quote_patterns"]:
+        for m in rx.finditer(window):
+            # quote_pattern may have multiple groups (e.g. Chinese + English quotes)
+            q = next((g for g in m.groups() if g), None)
+            if q and 15 <= len(q) <= 150:
+                quotes.append(q)
 
     # Build pointer lines — each one is atomic, never split
     lines = []

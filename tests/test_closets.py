@@ -140,9 +140,9 @@ class TestMineLock:
         # Sort by entry time and verify the second entry is after the first exit.
         intervals.sort(key=lambda iv: iv[1])
         (_, enter_a, exit_a), (_, enter_b, exit_b) = intervals
-        assert (
-            enter_a < exit_a <= enter_b < exit_b
-        ), f"critical sections overlapped — lock failed to serialize: {intervals}"
+        assert enter_a < exit_a <= enter_b < exit_b, (
+            f"critical sections overlapped — lock failed to serialize: {intervals}"
+        )
 
 
 # ── build_closet_lines ─────────────────────────────────────────────────
@@ -217,6 +217,71 @@ class TestBuildClosetLines:
         ids = [f"drawer_{i}" for i in range(10)]
         lines = build_closet_lines("/x.md", ids, "# A\n# B", "w", "r")
         assert all("→drawer_0,drawer_1,drawer_2" in line for line in lines)
+
+
+class TestBuildClosetLinesI18n:
+    """Closet extraction for non-English content when zh-CN is enabled."""
+
+    def _enable_zh(self, monkeypatch):
+        """Configure entity_languages to include zh-CN."""
+        import mempalace.palace as _palace
+
+        monkeypatch.setattr(_palace, "_CANDIDATE_RX_CACHE", None)
+        monkeypatch.setattr(_palace, "_CLOSET_REGEX_CACHE", None)
+        monkeypatch.setattr(_palace, "_ENTITY_STOP_CACHE", None)
+        monkeypatch.setenv("MEMPALACE_ENTITY_LANGUAGES", "en,zh-CN")
+
+    def test_chinese_action_verbs_extracted(self, monkeypatch):
+        self._enable_zh(monkeypatch)
+        content = "我们创建了新的数据库模型。团队修复了部署问题。最后更新了配置文件。"
+        lines = build_closet_lines("/x.md", ["d1"], content, "w", "r")
+        joined = "\n".join(lines).lower()
+        assert any(kw in joined for kw in ["创建", "修复", "更新"]), (
+            f"Chinese action verbs not found in: {lines}"
+        )
+
+    def test_chinese_quotes_extracted(self, monkeypatch):
+        self._enable_zh(monkeypatch)
+        content = "他说“这个方案需要重新设计和评审才能上线”，然后我们开始讨论替代方案。"
+        lines = build_closet_lines("/x.md", ["d1"], content, "w", "r")
+        found_quote = any("“" in line or "这个方案" in line for line in lines)
+        assert found_quote, f"Chinese quoted phrase not found in: {lines}"
+
+    def test_chinese_entity_stoplist_filters(self, monkeypatch):
+        self._enable_zh(monkeypatch)
+        content = "我们今天讨论了方案。我们明天继续讨论。我们后天做总结。"
+        lines = build_closet_lines("/x.md", ["d1"], content, "w", "r")
+        entity_segments = [line.split("|")[1] for line in lines]
+        for seg in entity_segments:
+            tokens = set(seg.split(";")) if seg else set()
+            assert "我们" not in tokens, "Common Chinese pronoun should be filtered"
+            assert "今天" not in tokens, "Common Chinese time word should be filtered"
+
+    def test_mixed_content_extracts_both_languages(self, monkeypatch):
+        self._enable_zh(monkeypatch)
+        content = (
+            "# API Design\n\n"
+            "Built the REST endpoints for user management. "
+            "我们创建了新的认证模块。Igor reviewed the code."
+        )
+        lines = build_closet_lines("/x.md", ["d1"], content, "w", "r")
+        joined = "\n".join(lines).lower()
+        assert "api design" in joined, "English header should be extracted"
+        has_en_or_zh = ("built the rest" in joined) or ("创建" in joined)
+        assert has_en_or_zh, f"Neither EN nor ZH action extracted from: {lines}"
+
+    def test_default_english_still_works_without_zh(self, monkeypatch):
+        """Ensure the refactored code doesn't break when only English is configured."""
+        import mempalace.palace as _palace
+
+        monkeypatch.setattr(_palace, "_CANDIDATE_RX_CACHE", None)
+        monkeypatch.setattr(_palace, "_CLOSET_REGEX_CACHE", None)
+        monkeypatch.setattr(_palace, "_ENTITY_STOP_CACHE", None)
+        monkeypatch.setenv("MEMPALACE_ENTITY_LANGUAGES", "en")
+        content = "Built the prototype with WebAuthn. Reviewed the API surface."
+        lines = build_closet_lines("/x.md", ["d1"], content, "w", "r")
+        joined = "\n".join(lines).lower()
+        assert "built the prototype" in joined
 
 
 # ── upsert_closet_lines ───────────────────────────────────────────────
@@ -315,15 +380,15 @@ class TestMinerClosetRebuild:
         second_docs = "\n".join(second_pass["documents"]).lower()
         assert "only topic now" in second_docs
         for i in range(15):
-            assert (
-                f"topic {i}\n" not in second_docs
-            ), f"stale 'Topic {i}' from first mine survived the rebuild"
+            assert f"topic {i}\n" not in second_docs, (
+                f"stale 'Topic {i}' from first mine survived the rebuild"
+            )
         # Numbered closets that existed only in the larger first run must be gone.
         leftover = first_ids - set(second_pass["ids"])
         for stale_id in leftover:
-            assert not col.get(ids=[stale_id])[
-                "ids"
-            ], f"orphan closet {stale_id} from larger first run survived purge"
+            assert not col.get(ids=[stale_id])["ids"], (
+                f"orphan closet {stale_id} from larger first run survived purge"
+            )
 
 
 # ── _extract_drawer_ids_from_closet ───────────────────────────────────
@@ -702,9 +767,9 @@ class TestDiaryIngest:
 
         # No state file inside the user's diary dir.
         for entry in diary_dir.iterdir():
-            assert (
-                "diary_ingest" not in entry.name
-            ), f"state file leaked into user diary dir: {entry}"
+            assert "diary_ingest" not in entry.name, (
+                f"state file leaked into user diary dir: {entry}"
+            )
 
         # State file does exist under ~/.mempalace/state/.
         state_path = _state_file_for(str(palace_dir), diary_dir.resolve())
@@ -905,7 +970,7 @@ class TestTunnels:
         assert not errors, f"worker raised: {errors}"
         tunnels = list_tunnels()
         assert len(tunnels) == 5, (
-            f"expected 5 concurrent tunnels, got {len(tunnels)} — " "write race dropped some"
+            f"expected 5 concurrent tunnels, got {len(tunnels)} — write race dropped some"
         )
 
     def test_created_at_is_timezone_aware(self):

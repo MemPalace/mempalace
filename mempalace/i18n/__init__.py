@@ -270,6 +270,77 @@ def get_entity_patterns(languages=("en",)) -> dict:
     return merged
 
 
+def get_closet_regex(languages=("en",)) -> dict:
+    """Return merged regex patterns for closet extraction across languages.
+
+    Closet extraction uses ``action_pattern``, ``quote_pattern``, and
+    ``stop_words`` from each locale's ``regex`` section.  This function
+    merges them so ``build_closet_lines`` works for multilingual content.
+
+    Returns dict with keys:
+      - ``action_patterns``: list of compiled regex objects
+      - ``quote_patterns``: list of compiled regex objects
+      - ``stop_words``: frozenset of lowercase stop words
+    """
+    import re as _re
+
+    if not languages:
+        languages = ("en",)
+    languages = tuple(_canonical_lang(lang) or lang for lang in languages)
+
+    action_pats = []
+    quote_pats = []
+    stop_words: set = set()
+
+    found_any = False
+    for lang in languages:
+        canonical = _canonical_lang(lang) if lang != _canonical_lang(lang) else lang
+        lang_file = _LANG_DIR / f"{canonical or lang}.json"
+        try:
+            data = json.loads(lang_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        regex_sec = data.get("regex", {})
+        if not regex_sec:
+            continue
+        found_any = True
+        if regex_sec.get("action_pattern"):
+            try:
+                action_pats.append(_re.compile(regex_sec["action_pattern"], _re.IGNORECASE))
+            except _re.error:
+                pass
+        if regex_sec.get("quote_pattern"):
+            try:
+                quote_pats.append(_re.compile(regex_sec["quote_pattern"]))
+            except _re.error:
+                pass
+        for w in regex_sec.get("stop_words", "").split():
+            stop_words.add(w.lower())
+
+    if not found_any:
+        en_file = _LANG_DIR / "en.json"
+        data = json.loads(en_file.read_text(encoding="utf-8"))
+        regex_sec = data.get("regex", {})
+        if regex_sec.get("action_pattern"):
+            try:
+                action_pats.append(_re.compile(regex_sec["action_pattern"], _re.IGNORECASE))
+            except _re.error:
+                pass
+        if regex_sec.get("quote_pattern"):
+            try:
+                quote_pats.append(_re.compile(regex_sec["quote_pattern"]))
+            except _re.error:
+                pass
+        for w in regex_sec.get("stop_words", "").split():
+            stop_words.add(w.lower())
+
+    return {
+        "action_patterns": action_pats,
+        "quote_patterns": quote_pats,
+        "stop_words": frozenset(stop_words),
+    }
+
+
 def _dedupe(items: list) -> list:
     """Remove duplicates while preserving first-occurrence order."""
     seen = set()
