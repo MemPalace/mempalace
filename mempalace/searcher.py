@@ -1184,9 +1184,12 @@ def search_memories(  # noqa: C901  # complex by intent — dispatches vector / 
     # hit count) so the warning still surfaces when BM25 fallback filled
     # the request — vector is still the degraded layer; the fallback is
     # keyword-only and doesn't have semantic recall.
+    # `isinstance(..., int)` also rejects None and non-numeric stubs
+    # (MagicMock from test fixtures) — the comparison below is meaningless
+    # unless we have a real int.
     if (
         vector_underdelivered
-        and available_in_scope is not None
+        and isinstance(available_in_scope, int)
         and available_in_scope > vector_hit_count
     ):
         warnings.append(
