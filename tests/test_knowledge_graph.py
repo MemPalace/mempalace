@@ -139,6 +139,12 @@ class TestInvalidation:
         ):
             kg.invalidate("Alice", "works_at", "Acme", ended="2020-01-01")
 
+        results = kg.query_entity("Alice", direction="outgoing")
+        assert len(results) == 1
+        assert results[0]["valid_from"] == "2026-01-01"
+        assert results[0]["valid_to"] is None
+        assert results[0]["current"] is True
+
     def test_invalidate_accepts_ended_equal_to_valid_from(self, kg):
         kg.add_triple(
             "Alice",
@@ -150,6 +156,7 @@ class TestInvalidation:
         kg.invalidate("Alice", "works_at", "Acme", ended="2026-01-01")
 
         results = kg.query_entity("Alice", direction="outgoing")
+        assert len(results) == 1
         assert results[0]["valid_to"] == "2026-01-01"
         assert results[0]["current"] is False
 
@@ -159,8 +166,10 @@ class TestInvalidation:
         kg.invalidate("Alice", "works_at", "Acme", ended="2020-01-01")
 
         results = kg.query_entity("Alice", direction="outgoing")
+        assert len(results) == 1
         assert results[0]["valid_from"] is None
         assert results[0]["valid_to"] == "2020-01-01"
+        assert results[0]["current"] is False
 
 
 class TestTimeline:
