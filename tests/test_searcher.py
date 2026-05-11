@@ -84,6 +84,72 @@ class TestSearchMemories:
         assert "error" in result
         assert "query failed" in result["error"]
 
+    def test_search_memories_recovers_chroma_id_lookup_error_with_bm25(self):
+        """Chroma can raise while HNSW lags metadata; MCP should still search."""
+        mock_col = MagicMock()
+        mock_col.query.side_effect = RuntimeError(
+            "Error executing plan: Internal error: Error finding id drawer_1"
+        )
+        fallback = {
+            "query": "test",
+            "filters": {"wing": "project", "room": "backend"},
+            "total_before_filter": 1,
+            "results": [{"text": "fallback hit", "wing": "project", "room": "backend"}],
+            "fallback": "bm25_only_via_sqlite",
+            "fallback_reason": "vector_search_disabled",
+        }
+
+        with (
+            patch("mempalace.searcher.get_collection", return_value=mock_col),
+            patch("mempalace.searcher._bm25_only_via_sqlite", return_value=fallback) as bm25,
+        ):
+            result = search_memories(
+                "test",
+                "/fake/path",
+                wing="project",
+                room="backend",
+                n_results=3,
+                collection_name="custom_drawers",
+            )
+
+        bm25.assert_called_once_with(
+            "test",
+            "/fake/path",
+            wing="project",
+            room="backend",
+            n_results=3,
+            collection_name="custom_drawers",
+        )
+        assert result["results"][0]["text"] == "fallback hit"
+        assert result["vector_disabled"] is True
+        assert result["vector_disabled_reason"] == (
+            "chroma-id-lookup-divergence; recovered via BM25 sqlite fallback"
+        )
+        assert result["fallback_reason"] == "chroma_id_lookup_divergence"
+
+    def test_search_memories_keeps_drawer_results_when_closet_id_lookup_fails(self, caplog):
+        """Closet boost failure should degrade ranking, not fail the whole search."""
+        drawers_col = MagicMock()
+        drawers_col.query.return_value = {
+            "documents": [["drawer doc"]],
+            "metadatas": [[{"source_file": "a.md", "wing": "project", "room": "backend"}]],
+            "distances": [[0.2]],
+            "ids": [["d1"]],
+        }
+        closets_col = MagicMock()
+        closets_col.query.side_effect = RuntimeError("Internal error: Error finding id closet_1")
+
+        with (
+            patch("mempalace.searcher.get_collection", return_value=drawers_col),
+            patch("mempalace.searcher.get_closets_collection", return_value=closets_col),
+            caplog.at_level("WARNING", logger="mempalace_mcp"),
+        ):
+            result = search_memories("test", "/fake/path", wing="project", room="backend")
+
+        assert result["results"][0]["text"] == "drawer doc"
+        assert result["results"][0]["matched_via"] == "drawer"
+        assert "closet search" in caplog.text
+
     def test_search_memories_vector_path_uses_explicit_collection_name(self):
         mock_col = MagicMock()
         mock_col.query.return_value = {
@@ -184,12 +250,11 @@ class TestSearchMemories:
 
         # Invariants on every hit.
         for h in hits:
-            assert (
-                0.0 <= h["similarity"] <= 1.0
-            ), f"similarity out of range: {h['similarity']} for {h['source_file']}"
+            assert 0.0 <= h["similarity"] <= 1.0, (
+                f"similarity out of range: {h['similarity']} for {h['source_file']}"
+            )
             assert 0.0 <= h["effective_distance"] <= 2.0, (
-                f"effective_distance out of range: {h['effective_distance']} "
-                f"for {h['source_file']}"
+                f"effective_distance out of range: {h['effective_distance']} for {h['source_file']}"
             )
 
         # With the clamp, the closet-boosted a.md still ranks ahead of b.md —
@@ -327,9 +392,9 @@ class TestSearchCLI:
         captured = capsys.readouterr()
         first_block, _, _ = captured.out.partition("[2]")
         # Lexical match must rank first
-        assert (
-            "b.md" in first_block
-        ), f"expected lexical match 'b.md' at rank 1, got:\n{captured.out}"
+        assert "b.md" in first_block, (
+            f"expected lexical match 'b.md' at rank 1, got:\n{captured.out}"
+        )
         # Non-zero bm25 reported
         assert "bm25=" in first_block
         assert "bm25=0.0" not in first_block

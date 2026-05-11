@@ -25,8 +25,99 @@ _CLOSET_DRAWER_REF_RE = re.compile(r"→([\w,]+)")
 logger = logging.getLogger("mempalace_mcp")
 
 
+_CHROMA_ID_LOOKUP_MARKERS = (
+    "error finding id",
+    "finding id",
+)
+
+
 class SearchError(Exception):
     """Raised when search cannot proceed (e.g. no palace found)."""
+
+
+def _is_chroma_id_lookup_error(error: Exception) -> bool:
+    """Detect transient Chroma metadata/HNSW ID divergence errors."""
+    msg = str(error).lower()
+    return any(marker in msg for marker in _CHROMA_ID_LOOKUP_MARKERS)
+
+
+def _search_memories_bm25_recovery(
+    query: str,
+    palace_path: str,
+    wing: str,
+    room: str,
+    n_results: int,
+    collection_name: str,
+) -> dict:
+    result = _bm25_only_via_sqlite(
+        query,
+        palace_path,
+        wing=wing,
+        room=room,
+        n_results=n_results,
+        collection_name=collection_name,
+    )
+    if "error" not in result:
+        result["vector_disabled"] = True
+        result["vector_disabled_reason"] = (
+            "chroma-id-lookup-divergence; recovered via BM25 sqlite fallback"
+        )
+        result["fallback_reason"] = "chroma_id_lookup_divergence"
+    return result
+
+
+def _query_drawers_for_search(
+    drawers_col,
+    query: str,
+    palace_path: str,
+    where: dict,
+    wing: str,
+    room: str,
+    n_results: int,
+    collection_name: str,
+):
+    dkwargs = {
+        "query_texts": [query],
+        "n_results": n_results * 3,  # over-fetch for re-ranking
+        "include": ["documents", "metadatas", "distances"],
+    }
+    if where:
+        dkwargs["where"] = where
+    try:
+        return drawers_col.query(**dkwargs), None
+    except Exception as e:
+        if _is_chroma_id_lookup_error(e):
+            logger.warning(
+                "Chroma ID lookup divergence during drawer search; routing to BM25 fallback. "
+                "wing=%s room=%s err=%s",
+                wing,
+                room,
+                e,
+            )
+            try:
+                return None, _search_memories_bm25_recovery(
+                    query,
+                    palace_path,
+                    wing,
+                    room,
+                    n_results,
+                    collection_name,
+                )
+            except Exception:
+                logger.exception("BM25 fallback failed after Chroma ID lookup divergence")
+        return None, {"error": f"Search error: {e}"}
+
+
+def _log_chroma_id_lookup_or_debug(
+    error: Exception,
+    warning_message: str,
+    debug_message: str,
+    *args,
+) -> None:
+    if _is_chroma_id_lookup_error(error):
+        logger.warning(warning_message, *args, error)
+    else:
+        logger.debug(debug_message, *args, exc_info=True)
 
 
 _TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
@@ -805,17 +896,18 @@ def search_memories(
     # This avoids the "weak-closets regression" where narrative content
     # produces low-signal closets (regex extraction matches few topics)
     # and closet-first routing hides drawers that direct search would find.
-    try:
-        dkwargs = {
-            "query_texts": [query],
-            "n_results": n_results * 3,  # over-fetch for re-ranking
-            "include": ["documents", "metadatas", "distances"],
-        }
-        if where:
-            dkwargs["where"] = where
-        drawer_results = drawers_col.query(**dkwargs)
-    except Exception as e:
-        return {"error": f"Search error: {e}"}
+    drawer_results, drawer_error = _query_drawers_for_search(
+        drawers_col,
+        query,
+        palace_path,
+        where,
+        wing,
+        room,
+        n_results,
+        collection_name,
+    )
+    if drawer_error is not None:
+        return drawer_error
 
     # Gather closet hits (best-per-source) to build a boost lookup.
     closet_boost_by_source: dict = {}  # source_file -> (rank, closet_dist, preview)
@@ -840,9 +932,16 @@ def search_memories(
             source = cmeta.get("source_file", "")
             if source and source not in closet_boost_by_source:
                 closet_boost_by_source[source] = (rank, cdist, cdoc[:200])
-    except Exception:
+    except Exception as e:
         # No closets yet — hybrid degrades to pure drawer search.
-        logger.debug("Closet collection unavailable; using drawer-only search", exc_info=True)
+        _log_chroma_id_lookup_or_debug(
+            e,
+            "Chroma ID lookup divergence during closet search; using drawer-only ranking. "
+            "wing=%s room=%s err=%s",
+            "Closet collection unavailable; using drawer-only search. wing=%s room=%s",
+            wing,
+            room,
+        )
 
     # Rank-based boost. The ordinal signal ("which closet matched best") is
     # more reliable than absolute distance on narrative content, where
@@ -923,8 +1022,14 @@ def search_memories(
                 where={"source_file": full_source},
                 include=["documents", "metadatas"],
             )
-        except Exception:
-            logger.debug("Neighbor fetch failed for %s", full_source, exc_info=True)
+        except Exception as e:
+            _log_chroma_id_lookup_or_debug(
+                e,
+                "Chroma ID lookup divergence during neighbor fetch; returning base drawer. "
+                "source_file=%s err=%s",
+                "Neighbor fetch failed for %s",
+                full_source,
+            )
             continue
         docs = source_drawers.documents
         metas_ = source_drawers.metadatas
