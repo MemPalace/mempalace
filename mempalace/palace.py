@@ -90,11 +90,50 @@ def get_collection(
     # 1. Explicit override (init/re-mine)
     # 2. Read from existing collection metadata
     # 3. Default
+    existing_meta = read_collection_metadata(palace_path, collection_name)
     if model:
         current_model = model
     else:
-        existing_meta = read_collection_metadata(palace_path, collection_name)
         current_model = existing_meta.get("embedding_model", "chromadb-default")
+
+    # Mismatch pre-check: surface our domain error BEFORE chromadb's internal
+    # EF-conflict validator does. Without this, an explicit model override
+    # that differs from the stamped model triggers chromadb's generic
+    # `ValueError: An embedding function already exists ...` from inside
+    # backend get_collection() — masking the actionable
+    # EmbeddingModelMismatchError that tells the user to `re-mine --model`
+    # or pass `--force`. Cheap to check (read_collection_metadata is one
+    # SQLite query) and avoids loading the new model only to discard it.
+    stored_model = existing_meta.get("embedding_model")
+    if model and stored_model is not None and stored_model != current_model:
+        if not force:
+            raise EmbeddingModelMismatchError(stored_model, current_model)
+        # Forced mismatch: open the collection with the STORED EF (chromadb
+        # rejects any other), then re-stamp metadata to the requested
+        # model. Caller (typically `re-mine --model`) is responsible for
+        # the vector re-write that must follow — the metadata flip alone
+        # leaves drawers embedded under the old model.
+        stored_ef = get_embedding_function(model_name=stored_model, device=device)
+        col = _DEFAULT_BACKEND.get_collection(
+            palace_path,
+            collection_name=collection_name,
+            create=False,
+            embedding_function=stored_ef,
+        )
+        logger.warning(
+            "Embedding model mismatch (forced): %s -> %s",
+            stored_model,
+            current_model,
+        )
+        existing = col.metadata or {}
+        non_hnsw = {k: v for k, v in existing.items() if not k.startswith("hnsw:")}
+        forced_meta = {"embedding_model": current_model}
+        if chunk_size is not None:
+            forced_meta["chunk_size"] = chunk_size
+        if chunk_overlap is not None:
+            forced_meta["chunk_overlap"] = chunk_overlap
+        col.modify(metadata={**non_hnsw, **forced_meta})
+        return col
 
     ef = get_embedding_function(model_name=current_model, device=device)
 

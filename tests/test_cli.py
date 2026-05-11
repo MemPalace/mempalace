@@ -319,6 +319,63 @@ def test_maybe_run_mine_decline_quotes_path_with_spaces(tmp_path, capsys):
     assert f"mempalace mine {spaced_dir}`" not in out
 
 
+def test_maybe_run_mine_honours_args_palace_over_cfg(tmp_path):
+    """When `--palace <path>` is passed, the auto-mine step MUST mine into
+    that palace, not the default `cfg.palace_path`.
+
+    Regression guard for the footgun davidglidden surfaced on PR #442: init
+    correctly created the palace at `args.palace`, but the follow-up
+    auto-mine read `cfg.palace_path` and mined into the wrong directory —
+    leaving the just-initialised palace empty while polluting the default.
+    """
+    from mempalace.cli import _maybe_run_mine_after_init
+
+    explicit_palace = str(tmp_path / "explicit-palace")
+    args = argparse.Namespace(
+        dir=str(tmp_path),
+        yes=False,
+        auto_mine=True,
+        palace=explicit_palace,
+    )
+    cfg = _fake_cfg(tmp_path)  # cfg.palace_path is a DIFFERENT directory
+    assert explicit_palace != cfg.palace_path
+
+    with (
+        patch("mempalace.miner.mine") as mock_mine,
+        patch("mempalace.miner.scan_project", return_value=[]),
+    ):
+        _maybe_run_mine_after_init(args, cfg)
+
+    mock_mine.assert_called_once()
+    assert mock_mine.call_args.kwargs["palace_path"] == explicit_palace
+
+
+def test_maybe_run_mine_falls_back_to_cfg_when_palace_unset(tmp_path):
+    """When `args.palace` is None / missing, fall back to `cfg.palace_path`.
+
+    Preserves the default `mempalace init` UX where no explicit `--palace`
+    flag means "use the configured default palace."
+    """
+    from mempalace.cli import _maybe_run_mine_after_init
+
+    args = argparse.Namespace(
+        dir=str(tmp_path),
+        yes=False,
+        auto_mine=True,
+        palace=None,
+    )
+    cfg = _fake_cfg(tmp_path)
+
+    with (
+        patch("mempalace.miner.mine") as mock_mine,
+        patch("mempalace.miner.scan_project", return_value=[]),
+    ):
+        _maybe_run_mine_after_init(args, cfg)
+
+    mock_mine.assert_called_once()
+    assert mock_mine.call_args.kwargs["palace_path"] == cfg.palace_path
+
+
 def test_maybe_run_mine_eof_on_stdin_treated_as_decline(tmp_path, capsys):
     """Piped / non-interactive stdin (EOFError) declines without crashing."""
     from mempalace.cli import _maybe_run_mine_after_init

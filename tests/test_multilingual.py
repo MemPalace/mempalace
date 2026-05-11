@@ -2,6 +2,7 @@
 
 import json
 import os
+import sys
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -23,6 +24,32 @@ def reset_embedding_cache():
     cfg_mod._embedding_cache.clear()
     yield
     cfg_mod._embedding_cache.clear()
+
+
+@pytest.fixture(autouse=True)
+def stub_sentence_transformers_for_unit_tests():
+    """Stub `sentence_transformers` in sys.modules so unit tests that mock
+    `SentenceTransformerEmbeddingFunction` can pass on a stock dev env
+    without the `[multilingual]` extra installed.
+
+    `get_embedding_function` probes `import sentence_transformers` first
+    (PR #442 fix — surface missing dependency loudly rather than silently
+    swapping in MiniLM); this stub lets that probe succeed in tests that
+    don't care about the probe path. Tests that DO care (the
+    missing-dependency raise path) override sys.modules locally with
+    `patch.dict`, which takes precedence.
+    """
+    if "sentence_transformers" in sys.modules and sys.modules["sentence_transformers"] is not None:
+        # Real install present — leave it alone.
+        yield
+        return
+    sys.modules["sentence_transformers"] = MagicMock()
+    try:
+        yield
+    finally:
+        # Only clear what we put there; don't touch a real install.
+        if isinstance(sys.modules.get("sentence_transformers"), MagicMock):
+            del sys.modules["sentence_transformers"]
 
 
 # ── get_embedding_function ───────────────────────────────────────────────────
@@ -104,16 +131,30 @@ class TestGetEmbeddingFunctionDevice:
         mock_st_cls.assert_called_once_with(model_name="some-model")
 
 
-class TestGetEmbeddingFunctionFallback:
-    """Graceful fallback when sentence-transformers is not installed."""
+class TestGetEmbeddingFunctionMissingDependency:
+    """Hard-error (not silent fallback) when sentence-transformers is missing
+    for a non-default model.
 
-    def test_import_error_falls_back_to_default(self):
-        with patch(
-            "chromadb.utils.embedding_functions.SentenceTransformerEmbeddingFunction",
-            side_effect=ImportError("No module named 'sentence_transformers'"),
-        ):
-            result = get_embedding_function(model_name="some-model")
+    Silent fallback to MiniLM stamped a multilingual palace's metadata as
+    BAAI/bge-m3 while the embedding function was actually 384-dim English
+    MiniLM — a footgun davidglidden surfaced on PR #442. Surfacing the
+    missing dependency loudly is the only safe behaviour.
+    """
 
+    def test_import_error_raises_with_install_hint(self):
+        with patch.dict("sys.modules", {"sentence_transformers": None}):
+            with pytest.raises(ImportError) as excinfo:
+                get_embedding_function(model_name="BAAI/bge-m3")
+
+        msg = str(excinfo.value)
+        assert "BAAI/bge-m3" in msg
+        assert "pip install mempalace[multilingual]" in msg
+
+    def test_default_model_unaffected_by_missing_st(self):
+        """`None` / `chromadb-default` never touches sentence-transformers,
+        so a missing install must NOT raise on the default path."""
+        with patch.dict("sys.modules", {"sentence_transformers": None}):
+            result = get_embedding_function()
         assert result is not None
         assert callable(result)
 

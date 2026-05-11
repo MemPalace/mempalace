@@ -263,7 +263,9 @@ def _maybe_run_mine_after_init(args, cfg) -> None:
             print(f"\n  Skipped. Run `mempalace mine {shlex.quote(project_dir)}` when ready.")
             return
 
-    palace_path = cfg.palace_path
+    palace_path = (
+        os.path.expanduser(args.palace) if getattr(args, "palace", None) else cfg.palace_path
+    )
     try:
         mine(
             project_dir=project_dir,

@@ -406,29 +406,34 @@ def get_embedding_function(model_name: str = None, device: str = None):
         _embedding_cache[cache_key] = ef
         return ef
 
+    # davidglidden surfaced the footgun on PR #442: chromadb's
+    # SentenceTransformerEmbeddingFunction raises ValueError (not
+    # ImportError) when sentence_transformers is missing, and the previous
+    # warn-and-fall-back here silently swapped the requested model for the
+    # 384-dim English MiniLM default — while the palace metadata still
+    # stamped the originally-requested model. Probe sentence_transformers
+    # directly so we surface a hard, actionable error instead.
     try:
-        from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+        import sentence_transformers  # noqa: F401
+    except ImportError as e:
+        raise ImportError(
+            f"Cannot load embedding model '{effective_model}': sentence-transformers is required "
+            f"for non-default models. Install with: pip install mempalace[multilingual]"
+        ) from e
 
-        kwargs = {"model_name": effective_model}
-        if effective_device:
-            kwargs["device"] = effective_device
+    from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
-        ef = SentenceTransformerEmbeddingFunction(**kwargs)
-        logger.info(
-            "Using embedding model: %s (device=%s)",
-            effective_model,
-            effective_device or "default",
-        )
-    except Exception:
-        logger.warning(
-            "sentence-transformers not installed — falling back to ChromaDB default. "
-            "Install with: pip install mempalace[multilingual]"
-        )
-        try:
-            from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
-            ef = DefaultEmbeddingFunction()
-        except Exception:
-            ef = None
+    kwargs = {"model_name": effective_model}
+    if effective_device:
+        kwargs["device"] = effective_device
+
+    ef = SentenceTransformerEmbeddingFunction(**kwargs)
+
+    logger.info(
+        "Using embedding model: %s (device=%s)",
+        effective_model,
+        effective_device or "default",
+    )
 
     _embedding_cache[cache_key] = ef
     return ef
