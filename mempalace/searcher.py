@@ -112,12 +112,16 @@ def _log_chroma_id_lookup_or_debug(
     error: Exception,
     warning_message: str,
     debug_message: str,
-    *args,
+    context: dict[str, object] | None = None,
 ) -> None:
+    context_suffix = ""
+    if context:
+        context_suffix = " " + " ".join(f"{key}={value}" for key, value in context.items())
+
     if _is_chroma_id_lookup_error(error):
-        logger.warning(warning_message, *args, error)
+        logger.warning("%s%s err=%s", warning_message, context_suffix, error)
     else:
-        logger.debug(debug_message, *args, exc_info=True)
+        logger.debug("%s%s", debug_message, context_suffix, exc_info=True)
 
 
 _TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
@@ -936,11 +940,9 @@ def search_memories(
         # No closets yet — hybrid degrades to pure drawer search.
         _log_chroma_id_lookup_or_debug(
             e,
-            "Chroma ID lookup divergence during closet search; using drawer-only ranking. "
-            "wing=%s room=%s err=%s",
-            "Closet collection unavailable; using drawer-only search. wing=%s room=%s",
-            wing,
-            room,
+            "Chroma ID lookup divergence during closet search; using drawer-only ranking.",
+            "Closet collection unavailable; using drawer-only search.",
+            context={"wing": wing, "room": room},
         )
 
     # Rank-based boost. The ordinal signal ("which closet matched best") is
@@ -1025,10 +1027,9 @@ def search_memories(
         except Exception as e:
             _log_chroma_id_lookup_or_debug(
                 e,
-                "Chroma ID lookup divergence during neighbor fetch; returning base drawer. "
-                "source_file=%s err=%s",
-                "Neighbor fetch failed for %s",
-                full_source,
+                "Chroma ID lookup divergence during neighbor fetch; returning base drawer.",
+                "Neighbor fetch failed.",
+                context={"source_file": full_source},
             )
             continue
         docs = source_drawers.documents
