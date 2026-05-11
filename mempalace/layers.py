@@ -16,14 +16,18 @@ Reads directly from ChromaDB (mempalace_drawers)
 and ~/.mempalace/identity.txt.
 """
 
+import logging
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from collections import defaultdict
 
 from .config import MempalaceConfig
 from .palace import get_collection as _get_collection
 from .searcher import _first_or_empty, build_where_filter
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +342,147 @@ class Layer3:
                 }
             )
         return hits
+
+
+# ---------------------------------------------------------------------------
+# Diary read API
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DiaryEntry:
+    """One agent diary entry.
+
+    Mirrors the persistence shape used by ``tool_diary_write`` /
+    ``tool_diary_read`` in :mod:`mempalace.mcp_server`. Surfaces the
+    four caller-relevant fields directly so consumers (e.g. wakeup
+    prefetch in Vestige) don't reach into chromadb metadata themselves.
+
+    ``filed_at`` is the ISO 8601 timestamp persisted on write; it sorts
+    lexicographically, which matches chronological order — read_diary
+    uses it for the descending-sort + last-N slice.
+
+    ``content`` is the body text (the document blob in chromadb terms).
+    """
+
+    date: str
+    filed_at: str
+    topic: str
+    content: str
+
+
+class DiaryUnavailable(Exception):
+    """Raised by :func:`read_diary` when the palace is unreachable or
+    the diary collection cannot be queried.
+
+    Distinguishes infrastructure failure (palace missing, chromadb
+    error, import-time problem) from a genuinely empty diary. Callers
+    who care about that distinction can render the two cases
+    differently — typical UX:
+
+      - ``DiaryUnavailable`` raised → "(diary unavailable)"
+      - returns ``[]``               → "(no entries yet)"
+    """
+
+
+def read_diary(
+    agent: str,
+    last_n: int = 5,
+    *,
+    palace_path: str | None = None,
+) -> list[DiaryEntry]:
+    """Return the last ``last_n`` diary entries for ``agent``.
+
+    Reads from ``wing=wing_{agent.lower()} room=diary`` in the palace
+    (matching the persistence convention used by
+    :func:`mempalace.mcp_server.tool_diary_write`), sorts by
+    ``filed_at`` descending, and slices to the most recent ``last_n``.
+
+    Args:
+        agent: Agent name. Lower-cased for the wing key
+            (``"Ves"`` → ``wing_ves``).
+        last_n: Maximum entries to return. Default 5. ``read_diary``
+            never returns more than this even if the palace contains
+            more entries.
+        palace_path: Override the palace location. Defaults to
+            :attr:`MempalaceConfig.palace_path` (which itself respects
+            ``$MEMPALACE_PALACE_PATH`` and the config file).
+
+    Returns:
+        Chronologically-descending list (newest first) of
+        :class:`DiaryEntry`. Empty list when the wing has no diary
+        entries.
+
+    Raises:
+        DiaryUnavailable: when the palace cannot be reached
+            (filesystem missing, chromadb import error) or the
+            collection query fails for any reason. Failure is
+            *infrastructure-level*; an empty palace returns ``[]``
+            without raising.
+
+    Why this API (vs the inline ``col.get`` mirror previously inlined
+    in Vestige's runtime_orientation): keeps the chromadb knowledge —
+    where-filter shape, metadata keys, sort field — encapsulated in
+    mempalace. Schema changes here propagate to consumers without
+    each consumer needing to update their inlined logic.
+
+    Side-effect-free: uses the safe :func:`palace.get_collection`
+    accessor (not :mod:`mempalace.mcp_server`, which performs a
+    ``dup2(stderr, stdout)`` at import time as part of the MCP stdio
+    protocol contract).
+    """
+
+    try:
+        from .palace import get_collection
+    except Exception as exc:
+        logger.debug("read_diary: palace module not importable: %s", exc)
+        raise DiaryUnavailable("palace module not importable") from exc
+
+    if palace_path is None:
+        try:
+            palace_path = MempalaceConfig().palace_path
+        except Exception as exc:
+            logger.debug("read_diary: config not readable: %s", exc)
+            raise DiaryUnavailable("MempalaceConfig not readable") from exc
+
+    try:
+        col = get_collection(palace_path, "mempalace_drawers", create=False)
+    except Exception as exc:
+        logger.debug("read_diary: get_collection failed: %s", exc)
+        raise DiaryUnavailable(f"get_collection failed: {exc}") from exc
+
+    wing = f"wing_{agent.lower()}"
+    try:
+        # limit=10_000 is a generous upper bound; sort-and-slice
+        # happens in-Python because chromadb's get() has no
+        # order-by-metadata. Real diary scales (Ves: ~76 entries
+        # 2026-05-11) are well under this cap.
+        results = col.get(
+            where={"$and": [{"wing": wing}, {"room": "diary"}]},
+            include=["documents", "metadatas"],
+            limit=10_000,
+        )
+    except Exception as exc:
+        logger.debug("read_diary: col.get failed: %s", exc, exc_info=True)
+        raise DiaryUnavailable(f"col.get failed: {exc}") from exc
+
+    documents = results.get("documents") or []
+    metadatas = results.get("metadatas") or []
+    if not documents:
+        return []
+
+    entries: list[DiaryEntry] = []
+    for doc, meta in zip(documents, metadatas):
+        entries.append(
+            DiaryEntry(
+                date=str(meta.get("date", "")),
+                filed_at=str(meta.get("filed_at", "")),
+                topic=str(meta.get("topic", "")),
+                content=doc or "",
+            )
+        )
+    entries.sort(key=lambda e: e.filed_at, reverse=True)
+    return entries[: max(0, last_n)]
 
 
 # ---------------------------------------------------------------------------
