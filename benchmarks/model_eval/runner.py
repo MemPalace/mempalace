@@ -15,6 +15,8 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import os
+import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass, field
@@ -29,6 +31,7 @@ from .metrics import (
     TimingSample,
     VRAMPoller,
     aggregate_timings,
+    embed_text,
     extract_timing,
     gather_host_info,
     strip_thinking_tokens,
@@ -54,6 +57,57 @@ class Result:
     run_date: str
     n_samples: int
     error: Optional[str] = None
+
+
+_EMBED_MODEL = "nomic-embed-text"
+
+# Tasks that score via semantic similarity and require an embedding model.
+_EMBED_TASKS: set[tuple[str, str]] = {
+    ("memory_extraction", "default"),
+    ("room_classification", "open"),
+}
+
+
+def _ensure_embed_model(endpoint: str, model: str = _EMBED_MODEL) -> None:
+    """Verify the embedding model is available; pull it automatically if not.
+
+    Raises RuntimeError with a clear message if the model cannot be made available.
+    """
+    if embed_text("ping", model=model, endpoint=endpoint) is not None:
+        return
+
+    print(f"  Embedding model '{model}' not found — pulling automatically...", file=sys.stderr, flush=True)
+    # Pass OLLAMA_HOST so the pull targets the same endpoint being benchmarked,
+    # not the default localhost:11434.
+    env = {**os.environ, "OLLAMA_HOST": endpoint}
+    try:
+        result = subprocess.run(
+            ["ollama", "pull", model],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"'ollama' not found on PATH. Install Ollama and ensure it is on PATH, "
+            f"then run 'ollama pull {model}' manually."
+        )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Embedding model '{model}' is required for this task but could not be pulled. "
+            f"Run 'ollama pull {model}' manually and retry.\n"
+            f"ollama stderr: {result.stderr.strip()}"
+        )
+
+    if embed_text("ping", model=model, endpoint=endpoint) is None:
+        raise RuntimeError(
+            f"Embedding model '{model}' was pulled but is still not responding on {endpoint}. "
+            f"Check Ollama logs."
+        )
+
+    print(f"  Embedding model '{model}' ready.", file=sys.stderr, flush=True)
 
 
 def load_jsonl(path: Path) -> list[dict]:
@@ -210,6 +264,18 @@ def run(
     if n_samples is not None:
         samples = samples[:n_samples]
         labels = labels[:n_samples]
+
+    if (task, mode) in _EMBED_TASKS:
+        try:
+            _ensure_embed_model(endpoint)
+        except (RuntimeError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+            return Result(
+                model_tag=model_tag, task=task, mode=mode,
+                accuracy=0.0, extras={}, timing=aggregate_timings([]),
+                vram_resident_mb=None, vram_peak_mb=None, host=host,
+                run_date=run_date, n_samples=0,
+                error=f"Embedding model unavailable: {e}",
+            )
 
     try:
         provider = get_provider("ollama", model=model_tag, endpoint=endpoint, timeout=180)
