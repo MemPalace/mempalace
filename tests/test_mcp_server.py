@@ -593,9 +593,9 @@ class TestWriteTools:
 
         assert result1["success"] is True
         assert result2["success"] is True
-        assert (
-            result1["drawer_id"] != result2["drawer_id"]
-        ), "Documents with shared header but different content must have distinct drawer IDs"
+        assert result1["drawer_id"] != result2["drawer_id"], (
+            "Documents with shared header but different content must have distinct drawer IDs"
+        )
 
     def test_delete_drawer(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -1868,3 +1868,463 @@ class TestKGLazyCache:
         with pytest.raises(_sqlite3.ProgrammingError):
             mcp_server._call_kg(lambda kg: kg.query_entity("Alice"))
         assert calls["count"] == 2, "expected exactly one retry beyond the initial attempt"
+
+
+# ── Wing Policy ─────────────────────────────────────────────────────────
+
+
+class TestWingPolicy:
+    """Tests for WingPolicy logic and the distinct enforcement patterns it creates."""
+
+    def _patch_policy(self, monkeypatch, policy):
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "_policy", policy)
+
+    # -- WingPolicy class logic --------------------------------------------
+
+    def test_allowlist_and_blocklist_logic(self):
+        from mempalace.mcp_server import WingPolicy
+
+        # No policy — everything passes, inactive
+        p = WingPolicy()
+        assert p.is_allowed("anything") is True
+        assert p.active is False
+
+        # Allowlist — only listed wings pass
+        p = WingPolicy(allowed_wings=["wing_user", "wing_code"])
+        assert p.is_allowed("wing_user") is True
+        assert p.is_allowed("wing_surveillance") is False
+
+        # Blocklist overrides allowlist
+        p = WingPolicy(
+            allowed_wings=["wing_user", "wing_financial"], blocked_wings=["wing_financial"]
+        )
+        assert p.is_allowed("wing_user") is True
+        assert p.is_allowed("wing_financial") is False
+
+        # denied() shape
+        result = p.denied("wing_financial")
+        assert result["error"] == "access_denied"
+        assert result["wing"] == "wing_financial"
+
+    # -- Soft filter (aggregate queries silently omit blocked wings) -------
+
+    def test_soft_filter_omits_blocked_wings_from_aggregate_queries(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        from mempalace.mcp_server import WingPolicy
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        self._patch_policy(monkeypatch, WingPolicy(blocked_wings=["project"]))
+        from mempalace.mcp_server import tool_status, tool_list_wings, tool_get_taxonomy
+
+        # All three aggregate tools use the same filter pattern
+        assert "project" not in tool_status()["wings"]
+        assert tool_status()["total_drawers"] == 1
+        assert "project" not in tool_list_wings()["wings"]
+        assert "project" not in tool_get_taxonomy()["taxonomy"]
+
+    def test_list_rooms_unfiltered_omits_blocked_wing_rooms(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        # Regression test — this was the bug: list_rooms without a wing arg
+        # didn't filter, so room names from blocked wings would leak.
+        from mempalace.mcp_server import WingPolicy
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        self._patch_policy(monkeypatch, WingPolicy(blocked_wings=["notes"]))
+        from mempalace.mcp_server import tool_list_rooms
+
+        result = tool_list_rooms()
+        assert "planning" not in result["rooms"]  # "planning" is only in "notes"
+        assert "backend" in result["rooms"]
+
+    # -- Hard block (explicit requests to blocked wings → access_denied) ---
+
+    def test_hard_block_on_explicit_wing_request(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        from mempalace.mcp_server import WingPolicy
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        self._patch_policy(monkeypatch, WingPolicy(blocked_wings=["project"]))
+        from mempalace.mcp_server import tool_list_rooms, tool_search, tool_add_drawer
+
+        assert tool_list_rooms(wing="project")["error"] == "access_denied"
+        assert tool_search(query="JWT", wing="project")["error"] == "access_denied"
+
+        _client, _col = _get_collection(palace_path, create=False)
+        del _client
+        assert tool_add_drawer(wing="project", room="r", content="x")["error"] == "access_denied"
+
+    # -- Non-obvious enforcement paths ------------------------------------
+
+    def test_search_post_filter_drops_blocked_results(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        # Unfiltered search — blocked wing hits must be stripped from results,
+        # not just the explicitly-requested-wing guard clause.
+        from mempalace.mcp_server import WingPolicy
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        self._patch_policy(monkeypatch, WingPolicy(blocked_wings=["project"]))
+        from mempalace.mcp_server import tool_search
+
+        result = tool_search(query="authentication database frontend planning", limit=10)
+        assert all(r["wing"] != "project" for r in result["results"])
+
+    def test_check_duplicate_suppresses_blocked_wing_matches(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        # Content existence must not leak through duplicate detection.
+        from mempalace.mcp_server import WingPolicy
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        self._patch_policy(monkeypatch, WingPolicy(blocked_wings=["project"]))
+        from mempalace.mcp_server import tool_check_duplicate
+
+        result = tool_check_duplicate(
+            "The authentication module uses JWT tokens for session management. "
+            "Tokens expire after 24 hours. Refresh tokens are stored in HttpOnly cookies.",
+            threshold=0.5,
+        )
+        assert result["is_duplicate"] is False
+
+    def test_delete_drawer_checks_wing_before_deleting(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        # delete_drawer must look up the drawer's wing from ChromaDB before
+        # acting — the caller only supplies an ID, not a wing. The response
+        # for a blocked-wing ID must match the not-found response so an agent
+        # cannot probe whether known content exists in a blocked wing.
+        from mempalace.mcp_server import WingPolicy
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        self._patch_policy(monkeypatch, WingPolicy(blocked_wings=["project"]))
+        from mempalace.mcp_server import tool_delete_drawer
+
+        blocked = tool_delete_drawer("drawer_proj_backend_aaa")
+        missing = tool_delete_drawer("drawer_does_not_exist_xyz")
+        # Same shape — only the echoed ID differs. An agent cannot tell
+        # "this ID doesn't exist" from "this ID is in a blocked wing".
+        assert blocked == {
+            "success": False,
+            "error": "Drawer not found: drawer_proj_backend_aaa",
+        }
+        assert missing == {
+            "success": False,
+            "error": "Drawer not found: drawer_does_not_exist_xyz",
+        }
+        assert seeded_collection.count() == 4  # nothing deleted
+
+    # -- Drawer family (get/list/update) ----------------------------------
+
+    def test_get_drawer_blocks_id_in_blocked_wing(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        # ID-based lookup must enforce policy AND mirror the not-found
+        # response. Drawer IDs are deterministic on wing+room+content, so a
+        # distinguishable access_denied would let an agent confirm whether a
+        # known piece of content lives in a blocked wing.
+        from mempalace.mcp_server import WingPolicy
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        self._patch_policy(monkeypatch, WingPolicy(blocked_wings=["project"]))
+        from mempalace.mcp_server import tool_get_drawer
+
+        blocked = tool_get_drawer("drawer_proj_backend_aaa")
+        missing = tool_get_drawer("drawer_does_not_exist_xyz")
+        # Same shape — only the echoed ID differs.
+        assert blocked == {"error": "Drawer not found: drawer_proj_backend_aaa"}
+        assert missing == {"error": "Drawer not found: drawer_does_not_exist_xyz"}
+        assert "content" not in blocked  # no payload leaked
+
+    def test_get_drawer_allows_id_in_permitted_wing(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        from mempalace.mcp_server import WingPolicy
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        self._patch_policy(monkeypatch, WingPolicy(blocked_wings=["project"]))
+        from mempalace.mcp_server import tool_get_drawer
+
+        result = tool_get_drawer("drawer_notes_planning_ddd")
+        assert "error" not in result
+        assert result["wing"] == "notes"
+
+    def test_list_drawers_unfiltered_drops_blocked_wings(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        from mempalace.mcp_server import WingPolicy
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        self._patch_policy(monkeypatch, WingPolicy(blocked_wings=["project"]))
+        from mempalace.mcp_server import tool_list_drawers
+
+        result = tool_list_drawers(limit=100)
+        assert all(d["wing"] != "project" for d in result["drawers"])
+        # Only the single notes drawer should remain
+        assert result["count"] == 1
+
+    def test_list_drawers_explicit_blocked_wing_hard_denies(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        from mempalace.mcp_server import WingPolicy
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        self._patch_policy(monkeypatch, WingPolicy(blocked_wings=["project"]))
+        from mempalace.mcp_server import tool_list_drawers
+
+        assert tool_list_drawers(wing="project")["error"] == "access_denied"
+
+    def test_update_drawer_blocks_when_old_wing_blocked(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        # Caller cannot mutate a drawer that lives in a blocked wing — even
+        # if the agent only knows the ID. The response must mirror the
+        # not-found shape (existence-hiding); the new-wing path is checked
+        # in test_update_drawer_blocks_when_target_wing_blocked.
+        from mempalace.mcp_server import WingPolicy
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        self._patch_policy(monkeypatch, WingPolicy(blocked_wings=["project"]))
+        from mempalace.mcp_server import tool_update_drawer
+
+        blocked = tool_update_drawer("drawer_proj_backend_aaa", content="rewritten")
+        missing = tool_update_drawer("drawer_does_not_exist_xyz", content="rewritten")
+        # Same shape — only the echoed ID differs.
+        assert blocked == {
+            "success": False,
+            "error": "Drawer not found: drawer_proj_backend_aaa",
+        }
+        assert missing == {
+            "success": False,
+            "error": "Drawer not found: drawer_does_not_exist_xyz",
+        }
+        # Verify the original content is intact
+        existing = seeded_collection.get(ids=["drawer_proj_backend_aaa"], include=["documents"])
+        assert "JWT" in existing["documents"][0]
+
+    def test_update_drawer_blocks_when_target_wing_blocked(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        # Cannot move a drawer INTO a blocked wing either — that would let an
+        # allowed agent stash data into a wing it has no policy access to.
+        from mempalace.mcp_server import WingPolicy
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        self._patch_policy(monkeypatch, WingPolicy(blocked_wings=["project"]))
+        from mempalace.mcp_server import tool_update_drawer
+
+        result = tool_update_drawer("drawer_notes_planning_ddd", wing="project")
+        assert result["error"] == "access_denied"
+        assert result["wing"] == "project"
+
+    # -- Tunnel family (create/list/delete/follow) ------------------------
+
+    def test_create_tunnel_blocks_when_either_endpoint_blocked(self, monkeypatch):
+        from mempalace.mcp_server import WingPolicy
+
+        self._patch_policy(monkeypatch, WingPolicy(blocked_wings=["project"]))
+        from mempalace.mcp_server import tool_create_tunnel
+
+        # Source side blocked
+        r = tool_create_tunnel(
+            source_wing="project",
+            source_room="backend",
+            target_wing="notes",
+            target_room="planning",
+        )
+        assert r["error"] == "access_denied"
+        assert r["wing"] == "project"
+
+        # Target side blocked
+        r = tool_create_tunnel(
+            source_wing="notes",
+            source_room="planning",
+            target_wing="project",
+            target_room="backend",
+        )
+        assert r["error"] == "access_denied"
+        assert r["wing"] == "project"
+
+    def test_list_tunnels_drops_tunnels_touching_blocked_wings(self, monkeypatch, tmp_dir):
+        # Tunnels are bidirectional — a tunnel with EITHER endpoint in a
+        # blocked wing must be hidden. Otherwise an attacker can enumerate
+        # blocked-wing rooms by listing tunnels.
+        from mempalace.mcp_server import WingPolicy
+        from mempalace import palace_graph as pg
+
+        # Use an isolated tunnel store so the test doesn't pollute the user's palace
+        monkeypatch.setattr(pg, "_TUNNEL_FILE", os.path.join(tmp_dir, "tunnels.json"))
+
+        # Create three tunnels: one fully outside blocked, two touching it
+        pg.create_tunnel("notes", "planning", "user", "diary", label="ok")
+        pg.create_tunnel("project", "backend", "notes", "planning", label="leak_src")
+        pg.create_tunnel("notes", "planning", "project", "backend", label="leak_tgt")
+
+        self._patch_policy(monkeypatch, WingPolicy(blocked_wings=["project"]))
+        from mempalace.mcp_server import tool_list_tunnels
+
+        result = tool_list_tunnels()
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert result[0]["label"] == "ok"
+
+    def test_list_tunnels_explicit_blocked_wing_hard_denies(self, monkeypatch):
+        from mempalace.mcp_server import WingPolicy
+
+        self._patch_policy(monkeypatch, WingPolicy(blocked_wings=["project"]))
+        from mempalace.mcp_server import tool_list_tunnels
+
+        assert tool_list_tunnels(wing="project")["error"] == "access_denied"
+
+    def test_delete_tunnel_silently_no_ops_on_blocked_endpoint(self, monkeypatch, tmp_dir):
+        # Symmetric with the missing-ID branch: we want both "no such tunnel"
+        # and "tunnel touches a blocked wing" to produce the same response so
+        # an agent cannot enumerate blocked-wing tunnels by trying random IDs.
+        from mempalace.mcp_server import WingPolicy
+        from mempalace import palace_graph as pg
+
+        monkeypatch.setattr(pg, "_TUNNEL_FILE", os.path.join(tmp_dir, "tunnels.json"))
+        tunnel = pg.create_tunnel("project", "backend", "notes", "planning", label="x")
+
+        self._patch_policy(monkeypatch, WingPolicy(blocked_wings=["project"]))
+        from mempalace.mcp_server import tool_delete_tunnel
+
+        blocked = tool_delete_tunnel(tunnel["id"])
+        missing = tool_delete_tunnel("tunnel_does_not_exist_xyz")
+        # Same response shape, only the echoed ID differs.
+        assert blocked == {"deleted": tunnel["id"]}
+        assert missing == {"deleted": "tunnel_does_not_exist_xyz"}
+        # The tunnel must still exist on disk despite the cosmetic "deleted" response
+        assert any(t["id"] == tunnel["id"] for t in pg.list_tunnels())
+
+    def test_follow_tunnels_blocks_requested_wing_and_filters_endpoints(
+        self, monkeypatch, tmp_dir, config, palace_path, seeded_collection, kg
+    ):
+        from mempalace.mcp_server import WingPolicy
+        from mempalace import palace_graph as pg
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        monkeypatch.setattr(pg, "_TUNNEL_FILE", os.path.join(tmp_dir, "tunnels.json"))
+
+        # Tunnel from notes/planning to project/backend
+        pg.create_tunnel("notes", "planning", "project", "backend", label="leak")
+        # Another tunnel from notes/planning to user/diary (should pass)
+        pg.create_tunnel("notes", "planning", "user", "diary", label="ok")
+
+        self._patch_policy(monkeypatch, WingPolicy(blocked_wings=["project"]))
+        from mempalace.mcp_server import tool_follow_tunnels
+
+        # Hard-block when starting from a blocked wing
+        r = tool_follow_tunnels(wing="project", room="backend")
+        assert r["error"] == "access_denied"
+
+        # When starting from an allowed wing, blocked-wing endpoints are dropped
+        r = tool_follow_tunnels(wing="notes", room="planning")
+        assert isinstance(r, list)
+        assert all(c.get("connected_wing") != "project" for c in r)
+        assert any(c.get("connected_wing") == "user" for c in r)
+
+    # -- Graph tools (hard-deny under any active policy) ------------------
+
+    def test_traverse_graph_hard_denies_under_active_policy(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        # palace_graph.traverse() is not policy-aware; until it is, any
+        # active policy must hard-deny rather than risk leaking blocked-wing
+        # rooms through graph hops.
+        from mempalace.mcp_server import WingPolicy
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        self._patch_policy(monkeypatch, WingPolicy(blocked_wings=["project"]))
+        from mempalace.mcp_server import tool_traverse_graph
+
+        result = tool_traverse_graph("backend")
+        assert result["error"] == "access_denied"
+        assert result["tool"] == "traverse_graph"
+
+    def test_traverse_graph_works_when_policy_inactive(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        # Default WingPolicy() is inactive — traverse must behave normally.
+        from mempalace.mcp_server import WingPolicy
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        self._patch_policy(monkeypatch, WingPolicy())
+        from mempalace.mcp_server import tool_traverse_graph
+
+        result = tool_traverse_graph("backend")
+        # Should not be a policy denial — the underlying traverse may return
+        # any shape, but it must not surface our access_denied stub.
+        if isinstance(result, dict):
+            assert result.get("error") != "access_denied"
+
+    def test_graph_stats_hard_denies_under_active_policy(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        from mempalace.mcp_server import WingPolicy
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        self._patch_policy(monkeypatch, WingPolicy(allowed_wings=["notes"]))
+        from mempalace.mcp_server import tool_graph_stats
+
+        result = tool_graph_stats()
+        assert result["error"] == "access_denied"
+        assert result["tool"] == "graph_stats"
+
+    def test_graph_stats_works_when_policy_inactive(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        from mempalace.mcp_server import WingPolicy
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        self._patch_policy(monkeypatch, WingPolicy())
+        from mempalace.mcp_server import tool_graph_stats
+
+        result = tool_graph_stats()
+        if isinstance(result, dict):
+            assert result.get("error") != "access_denied"
+
+    # -- Inactive-policy parity (the default no-op guarantee) -------------
+
+    def test_inactive_policy_lets_every_wing_through(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        # The default WingPolicy() must be a true no-op: aggregates show
+        # every wing, ID lookups succeed, and create/delete tunnels work.
+        # This locks in the "no flags = unchanged behavior" guarantee.
+        from mempalace.mcp_server import WingPolicy
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        self._patch_policy(monkeypatch, WingPolicy())
+        from mempalace.mcp_server import (
+            tool_status,
+            tool_list_wings,
+            tool_get_taxonomy,
+            tool_list_drawers,
+            tool_get_drawer,
+            tool_search,
+        )
+
+        # Aggregates show all wings present in the seed
+        assert "project" in tool_list_wings()["wings"]
+        assert "notes" in tool_list_wings()["wings"]
+        assert "project" in tool_get_taxonomy()["taxonomy"]
+        assert tool_status()["total_drawers"] == 4
+
+        # ID-keyed lookup against a "would-be-blocked" wing still works
+        result = tool_get_drawer("drawer_proj_backend_aaa")
+        assert "error" not in result
+        assert result["wing"] == "project"
+
+        # Listing is unfiltered
+        listing = tool_list_drawers(limit=100)
+        assert listing["count"] == 4
+
+        # Search returns hits from all wings
+        hits = tool_search(query="authentication database frontend planning", limit=10)
+        wings_hit = {r["wing"] for r in hits["results"]}
+        assert "project" in wings_hit
