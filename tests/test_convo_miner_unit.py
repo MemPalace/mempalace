@@ -24,6 +24,29 @@ class TestChunkExchanges:
         assert len(chunks) >= 2
         assert all("content" in c and "chunk_index" in c for c in chunks)
 
+    def test_exchange_chunking_preserves_newlines_and_indentation(self):
+        content = (
+            "> show me code\n"
+            "Here is a snippet:\n"
+            "```\n"
+            "  def hello():\n"
+            "    return 123\n"
+            "```\n"
+            "\n"
+            "Done.\n"
+            "\n"
+            "> another question\n"
+            "ok\n"
+            "\n"
+            "> third question\n"
+            "ok\n"
+        )
+        chunks = chunk_exchanges(content)
+        assert len(chunks) >= 1
+        stored = chunks[0]["content"]
+        assert "```\n  def hello():\n    return 123\n```" in stored
+        assert "\n\nDone.\n" in stored or "\n\nDone." in stored
+
     def test_paragraph_fallback(self):
         """Content without '>' lines falls back to paragraph chunking."""
         content = (

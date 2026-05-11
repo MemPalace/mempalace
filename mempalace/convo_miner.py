@@ -126,7 +126,9 @@ def _chunk_by_exchange(lines: list) -> list:
     while i < len(lines):
         line = lines[i]
         if line.strip().startswith(">"):
-            user_turn = line.strip()
+            # Preserve the original user line (including leading/trailing spaces)
+            # while still using strip() for marker detection above.
+            user_turn = line
             i += 1
 
             ai_lines = []
@@ -134,11 +136,11 @@ def _chunk_by_exchange(lines: list) -> list:
                 next_line = lines[i]
                 if next_line.strip().startswith(">") or next_line.strip().startswith("---"):
                     break
-                if next_line.strip():
-                    ai_lines.append(next_line.strip())
+                # Preserve AI response lines verbatim (including indentation and blank lines).
+                ai_lines.append(next_line)
                 i += 1
 
-            ai_response = " ".join(ai_lines)
+            ai_response = "\n".join(ai_lines).rstrip("\n")
             content = f"{user_turn}\n{ai_response}" if ai_response else user_turn
 
             # Split into multiple drawers when the exchange exceeds CHUNK_SIZE
@@ -170,19 +172,20 @@ def _chunk_by_exchange(lines: list) -> list:
 def _chunk_by_paragraph(content: str) -> list:
     """Fallback: chunk by paragraph breaks."""
     chunks = []
-    paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
+    # Preserve paragraph text verbatim; only drop all-whitespace paragraphs.
+    paragraphs = [p for p in content.split("\n\n") if p.strip()]
 
     # If no paragraph breaks and long content, chunk by line groups
     if len(paragraphs) <= 1 and content.count("\n") > 20:
         lines = content.split("\n")
         for i in range(0, len(lines), 25):
-            group = "\n".join(lines[i : i + 25]).strip()
-            if len(group) > MIN_CHUNK_SIZE:
+            group = "\n".join(lines[i : i + 25])
+            if len(group.strip()) > MIN_CHUNK_SIZE:
                 chunks.append({"content": group, "chunk_index": len(chunks)})
         return chunks
 
     for para in paragraphs:
-        if len(para) > MIN_CHUNK_SIZE:
+        if len(para.strip()) > MIN_CHUNK_SIZE:
             chunks.append({"content": para, "chunk_index": len(chunks)})
 
     return chunks
