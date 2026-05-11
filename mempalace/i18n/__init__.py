@@ -288,22 +288,19 @@ def get_closet_regex(languages=("en",)) -> dict:
         languages = ("en",)
     languages = tuple(_canonical_lang(lang) or lang for lang in languages)
 
-    action_pats = []
-    quote_pats = []
+    action_pats: list = []
+    quote_pats: list = []
     stop_words: set = set()
 
-    found_any = False
-    for lang in languages:
-        canonical = _canonical_lang(lang) if lang != _canonical_lang(lang) else lang
-        lang_file = _LANG_DIR / f"{canonical or lang}.json"
+    def _collect(lang_code: str) -> bool:
+        lang_file = _LANG_DIR / f"{lang_code}.json"
         try:
             data = json.loads(lang_file.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
-            continue
+            return False
         regex_sec = data.get("regex", {})
         if not regex_sec:
-            continue
-        found_any = True
+            return False
         if regex_sec.get("action_pattern"):
             try:
                 action_pats.append(_re.compile(regex_sec["action_pattern"], _re.IGNORECASE))
@@ -316,23 +313,14 @@ def get_closet_regex(languages=("en",)) -> dict:
                 pass
         for w in regex_sec.get("stop_words", "").split():
             stop_words.add(w.lower())
+        return True
 
+    found_any = False
+    for lang in languages:
+        if _collect(lang):
+            found_any = True
     if not found_any:
-        en_file = _LANG_DIR / "en.json"
-        data = json.loads(en_file.read_text(encoding="utf-8"))
-        regex_sec = data.get("regex", {})
-        if regex_sec.get("action_pattern"):
-            try:
-                action_pats.append(_re.compile(regex_sec["action_pattern"], _re.IGNORECASE))
-            except _re.error:
-                pass
-        if regex_sec.get("quote_pattern"):
-            try:
-                quote_pats.append(_re.compile(regex_sec["quote_pattern"]))
-            except _re.error:
-                pass
-        for w in regex_sec.get("stop_words", "").split():
-            stop_words.add(w.lower())
+        _collect("en")
 
     return {
         "action_patterns": action_pats,

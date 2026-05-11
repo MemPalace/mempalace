@@ -234,7 +234,9 @@ def build_closet_lines(source_file, drawer_ids, content, wing, room):
     # Extract key phrases via i18n action patterns
     topics = []
     for rx in closet_rx["action_patterns"]:
-        topics.extend(rx.findall(window))
+        for m in rx.finditer(window):
+            t = next((g for g in m.groups() if g), m.group(0))
+            topics.append(t)
     # Also grab section headers if present
     for header in re.findall(r"^#{1,3}\s+(.{5,60})$", window, re.MULTILINE):
         topics.append(header.strip())
@@ -246,7 +248,7 @@ def build_closet_lines(source_file, drawer_ids, content, wing, room):
     for rx in closet_rx["quote_patterns"]:
         for m in rx.finditer(window):
             # quote_pattern may have multiple groups (e.g. Chinese + English quotes)
-            q = next((g for g in m.groups() if g), None)
+            q = next((g for g in m.groups() if g), m.group(0))
             if q and 15 <= len(q) <= 150:
                 quotes.append(q)
 
