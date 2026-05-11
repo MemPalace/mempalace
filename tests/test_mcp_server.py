@@ -787,6 +787,67 @@ class TestWriteTools:
         result = tool_list_drawers(offset=-5)
         assert result["offset"] == 0
 
+    def test_list_drawers_includes_added_by_and_filed_at(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_list_drawers
+
+        result = tool_list_drawers(limit=4)
+        assert result["count"] == 4
+        for d in result["drawers"]:
+            assert "added_by" in d
+            assert "filed_at" in d
+            assert d["added_by"] == "miner"
+            assert d["filed_at"].startswith("2026-01-")
+
+    def test_list_drawers_since_filters_by_filed_at(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_list_drawers
+
+        # Seed has filed_at: 2026-01-01, 2026-01-02, 2026-01-03, 2026-01-04
+        # since="2026-01-03T00:00:00" should yield the 3rd and 4th drawers
+        result = tool_list_drawers(since="2026-01-03T00:00:00")
+        assert result["count"] == 2
+        assert result["total"] == 2
+        filed_dates = sorted(d["filed_at"] for d in result["drawers"])
+        assert filed_dates == ["2026-01-03T00:00:00", "2026-01-04T00:00:00"]
+
+    def test_list_drawers_since_yields_zero_when_window_in_future(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_list_drawers
+
+        result = tool_list_drawers(since="2099-01-01T00:00:00")
+        assert result["count"] == 0
+        assert result["total"] == 0
+        assert result["drawers"] == []
+
+    def test_list_drawers_since_ignores_offset(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_list_drawers
+
+        # offset=99 with since= should still return matches; offset reported as 0
+        result = tool_list_drawers(since="2026-01-01T00:00:00", offset=99)
+        assert result["count"] == 4
+        assert result["offset"] == 0
+
+    def test_list_drawers_since_combines_with_wing_filter(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_list_drawers
+
+        # 3 drawers in wing=project; only 2 of them have filed_at >= 2026-01-02
+        result = tool_list_drawers(wing="project", since="2026-01-02T00:00:00")
+        assert result["count"] == 2
+        assert all(d["wing"] == "project" for d in result["drawers"])
+
     def test_update_drawer_content(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace.mcp_server import tool_update_drawer, tool_get_drawer

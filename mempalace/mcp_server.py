@@ -1115,8 +1115,27 @@ def tool_get_drawer(drawer_id: str):
         return {"error": str(e)}
 
 
-def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offset: int = 0):
-    """List drawers with pagination. Optional wing/room filter."""
+def tool_list_drawers(
+    wing: str = None,
+    room: str = None,
+    limit: int = 20,
+    offset: int = 0,
+    since: str = None,
+):
+    """List drawers with pagination. Optional wing/room filter and time-window.
+
+    `since` is an ISO-8601 datetime string (e.g. "2026-05-11T00:00:00"). When
+    provided, only drawers with ``filed_at >= since`` are returned. ChromaDB
+    `$gte` only accepts numeric operands, so the filter is applied client-side
+    via lexicographic comparison on the stored ISO string. `offset` is ignored
+    when `since` is set — anomaly-detection / time-window queries want
+    newest-in-window, not arbitrary pagination.
+
+    Response shape also includes per-drawer ``added_by`` and ``filed_at``
+    fields, which are needed for provenance / anomaly-detection consumers
+    (e.g. guarding against spoofed agent identities by checking who filed
+    recent drawers in a given wing/room).
+    """
     limit = max(1, min(limit, _MAX_RESULTS))
     offset = max(0, offset)
     try:
@@ -1139,27 +1158,44 @@ def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offse
         elif len(conditions) > 1:
             where = {"$and": conditions}
 
-        kwargs = {"include": ["documents", "metadatas"], "limit": limit, "offset": offset}
-        if where:
-            kwargs["where"] = where
-        result = col.get(**kwargs)
-
-        # Compute total matching drawers for pagination.
-        if where:
-            total_result = col.get(where=where, include=[])
-            total = len(total_result["ids"])
+        if since:
+            kwargs = {"include": ["documents", "metadatas"]}
+            if where:
+                kwargs["where"] = where
+            result = col.get(**kwargs)
+            matched = []
+            for i, did in enumerate(result["ids"]):
+                meta = result["metadatas"][i] or {}
+                if meta.get("filed_at", "") < since:
+                    continue
+                doc = result["documents"][i]
+                matched.append((did, meta, doc))
+            total = len(matched)
+            sliced = matched[:limit]
         else:
-            total = col.count()
+            kwargs = {"include": ["documents", "metadatas"], "limit": limit, "offset": offset}
+            if where:
+                kwargs["where"] = where
+            result = col.get(**kwargs)
+            sliced = [
+                (result["ids"][i], result["metadatas"][i] or {}, result["documents"][i])
+                for i in range(len(result["ids"]))
+            ]
+            if where:
+                total_result = col.get(where=where, include=[])
+                total = len(total_result["ids"])
+            else:
+                total = col.count()
 
         drawers = []
-        for i, did in enumerate(result["ids"]):
-            meta = result["metadatas"][i]
-            doc = result["documents"][i]
+        for did, meta, doc in sliced:
             drawers.append(
                 {
                     "drawer_id": did,
                     "wing": meta.get("wing", ""),
                     "room": meta.get("room", ""),
+                    "added_by": meta.get("added_by", ""),
+                    "filed_at": meta.get("filed_at", ""),
                     "content_preview": doc[:200] + "..." if len(doc) > 200 else doc,
                 }
             )
@@ -1167,7 +1203,7 @@ def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offse
             "drawers": drawers,
             "total": total,
             "count": len(drawers),
-            "offset": offset,
+            "offset": offset if not since else 0,
             "limit": limit,
         }
     except Exception as e:
@@ -2015,7 +2051,7 @@ TOOLS = {
         "handler": tool_get_drawer,
     },
     "mempalace_list_drawers": {
-        "description": "List drawers with pagination. Optional wing/room filter. Returns IDs, wings, rooms, content previews, and total matching count for pagination.",
+        "description": "List drawers with pagination, optional wing/room filter, and optional time-window via `since`. Returns drawer_id, wing, room, added_by, filed_at, content_preview, and total matching count.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -2029,8 +2065,12 @@ TOOLS = {
                 },
                 "offset": {
                     "type": "integer",
-                    "description": "Offset for pagination (default 0)",
+                    "description": "Offset for pagination (default 0). Ignored when `since` is set.",
                     "minimum": 0,
+                },
+                "since": {
+                    "type": "string",
+                    "description": "ISO-8601 datetime — only return drawers with filed_at >= since. Lexicographic comparison on the stored ISO string; works for same-timezone time-window queries.",
                 },
             },
         },
