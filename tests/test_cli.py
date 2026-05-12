@@ -1120,6 +1120,74 @@ def test_cmd_compress_stores_results(mock_config_cls, capsys):
     assert "mempalace_closets" in out
 
 
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_compress_room_filter_scopes_query(mock_config_cls, capsys):
+    """`--room` scopes compress to one room without requiring `--wing`.
+
+    Regression guard: previously `cmd_compress` only honoured `--wing`, so
+    operators of large palaces had no way to recover a partially-failed pass
+    without recompressing every drawer.
+    """
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    args = argparse.Namespace(palace=None, wing=None, room="runbooks", dry_run=True, config=None)
+    mock_col = MagicMock()
+    mock_col.get.side_effect = [
+        {
+            "documents": ["runbook body"],
+            "metadatas": [{"wing": "infra", "room": "runbooks", "source_file": "deploy.md"}],
+            "ids": ["id1"],
+        },
+        {"documents": [], "metadatas": [], "ids": []},
+    ]
+    mock_backend = _mock_backend_for(col=mock_col)
+
+    mock_dialect = MagicMock()
+    mock_dialect.compress.return_value = "compressed"
+    mock_dialect.compression_stats.return_value = {
+        "original_chars": 100,
+        "summary_chars": 30,
+        "original_tokens_est": 25,
+        "summary_tokens_est": 8,
+        "size_ratio": 3.3,
+        "note": "Estimates only.",
+    }
+    mock_dialect_mod = _make_mock_dialect_module(mock_dialect)
+
+    with (
+        patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend),
+        patch.dict("sys.modules", {"mempalace.dialect": mock_dialect_mod}),
+    ):
+        cmd_compress(args)
+
+    # The first batch query must carry a `where` filter scoped to the room.
+    first_call_kwargs = mock_col.get.call_args_list[0].kwargs
+    assert first_call_kwargs.get("where") == {
+        "room": "runbooks"
+    }, f"expected room-only where filter, got {first_call_kwargs.get('where')!r}"
+
+    out = capsys.readouterr().out
+    assert "room 'runbooks'" in out
+    assert "Compressing 1 drawers" in out
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_compress_no_room_filter_processes_all(mock_config_cls, capsys):
+    """When neither --wing nor --room is given, compress queries with no `where`."""
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    args = argparse.Namespace(palace=None, wing=None, room=None, dry_run=True, config=None)
+    mock_col = MagicMock()
+    mock_col.get.return_value = {"documents": [], "metadatas": [], "ids": []}
+    mock_backend = _mock_backend_for(col=mock_col)
+
+    with patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend):
+        cmd_compress(args)
+
+    first_call_kwargs = mock_col.get.call_args_list[0].kwargs
+    assert (
+        "where" not in first_call_kwargs
+    ), f"expected no where filter, got {first_call_kwargs.get('where')!r}"
+
+
 def test_cmd_compress_output_readable_via_get_closets_collection(tmp_path, capsys):
     """End-to-end: cmd_compress output must be readable via the same code
     path palace.py uses (`get_closets_collection`). Regression for #1244."""

@@ -987,7 +987,12 @@ def cmd_mcp(args):
 
 
 def cmd_compress(args):
-    """Compress drawers in a wing using AAAK Dialect."""
+    """Compress drawers using AAAK Dialect.
+
+    Optionally scope to a single wing (``--wing``) and/or single room
+    (``--room``). When neither is supplied every drawer in the palace is
+    compressed (existing behavior).
+    """
     from .backends.chroma import ChromaBackend
     from .dialect import Dialect
 
@@ -1016,8 +1021,18 @@ def cmd_compress(args):
         print("  Run: mempalace init <dir> then mempalace mine <dir>")
         sys.exit(1)
 
-    # Query drawers in batches to avoid SQLite variable limit (~999)
-    where = {"wing": args.wing} if args.wing else None
+    # Query drawers in batches to avoid SQLite variable limit (~999).
+    # ``getattr`` keeps callers that build args manually (older tests,
+    # programmatic invocations) working when ``room`` is absent.
+    room = getattr(args, "room", None)
+    if args.wing and room:
+        where = {"$and": [{"wing": args.wing}, {"room": room}]}
+    elif args.wing:
+        where = {"wing": args.wing}
+    elif room:
+        where = {"room": room}
+    else:
+        where = None
     _BATCH = 500
     docs, metas, ids = [], [], []
     offset = 0
@@ -1046,16 +1061,19 @@ def cmd_compress(args):
         if len(batch_docs) < _BATCH:
             break
 
+    def _scope_label() -> str:
+        parts = []
+        if args.wing:
+            parts.append(f"wing '{args.wing}'")
+        if room:
+            parts.append(f"room '{room}'")
+        return f" in {' / '.join(parts)}" if parts else ""
+
     if not docs:
-        wing_label = f" in wing '{args.wing}'" if args.wing else ""
-        print(f"\n  No drawers found{wing_label}.")
+        print(f"\n  No drawers found{_scope_label()}.")
         return
 
-    print(
-        f"\n  Compressing {len(docs)} drawers"
-        + (f" in wing '{args.wing}'" if args.wing else "")
-        + "..."
-    )
+    print(f"\n  Compressing {len(docs)} drawers{_scope_label()}...")
     print()
 
     total_original = 0
@@ -1336,6 +1354,11 @@ def main():
         "compress", help="Compress drawers using AAAK Dialect (~30x reduction)"
     )
     p_compress.add_argument("--wing", default=None, help="Wing to compress (default: all wings)")
+    p_compress.add_argument(
+        "--room",
+        default=None,
+        help="Room to compress (default: all rooms). Combine with --wing to scope to a single wing/room.",
+    )
     p_compress.add_argument(
         "--dry-run", action="store_true", help="Preview compression without storing"
     )
