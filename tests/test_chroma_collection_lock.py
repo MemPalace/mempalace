@@ -36,9 +36,13 @@ from mempalace.palace import MineAlreadyRunning, mine_palace_lock
 
 
 def _get_mp_context():
-    """Same start-method picker as test_palace_locks.py."""
-    start_method = "spawn" if os.name == "nt" else "fork"
-    return multiprocessing.get_context(start_method)
+    """Same start-method picker as test_palace_locks.py — ``spawn`` everywhere.
+
+    ``fork`` deadlocks under Python 3.13 when the parent is multi-threaded
+    (pytest + chromadb + onnxruntime), and macOS forbids fork-without-exec via
+    CoreFoundation. ``spawn`` is slower (re-imports) but safe.
+    """
+    return multiprocessing.get_context("spawn")
 
 
 # ---------------------------------------------------------------------------

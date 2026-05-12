@@ -428,6 +428,7 @@ def detect_entities(
         {
             "people":   [...entity dicts...],
             "projects": [...entity dicts...],
+            "topics":   [...entity dicts...],
             "uncertain":[...entity dicts...],
             # Only present when corpus_origin reclassifies at least one
             # candidate as an agent persona:

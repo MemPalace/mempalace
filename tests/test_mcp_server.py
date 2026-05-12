@@ -414,6 +414,76 @@ class TestSearchTool:
         result = mcp_server.tool_search(query="JWT", room="../backend")
         assert "error" in result
 
+    def test_search_retries_once_on_hnsw_flush_transient(self, monkeypatch, config, kg):
+        """Issue #1315: post-bulk-mine 'Error finding id' is retried once."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        calls = {"n": 0}
+        reset_calls = {"n": 0}
+
+        def fake_search(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {
+                    "error": "Search error: Error executing plan: Internal error: Error finding id"
+                }
+            return {"results": [{"text": "ok", "wing": "w", "room": "r"}]}
+
+        def fake_reset():
+            reset_calls["n"] += 1
+
+        monkeypatch.setattr(mcp_server, "search_memories", fake_search)
+        monkeypatch.setattr(mcp_server, "_force_chroma_cache_reset", fake_reset)
+        monkeypatch.setattr(mcp_server.time, "sleep", lambda _: None)
+
+        result = mcp_server.tool_search(query="anything")
+
+        assert calls["n"] == 2
+        assert reset_calls["n"] == 1
+        assert "results" in result
+        assert result.get("index_recovered") is True
+
+    def test_search_does_not_retry_on_non_transient_error(self, monkeypatch, config, kg):
+        """Validation / unrelated errors must not trigger the retry path."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        calls = {"n": 0}
+
+        def fake_search(*args, **kwargs):
+            calls["n"] += 1
+            return {"error": "Search error: invalid query syntax"}
+
+        monkeypatch.setattr(mcp_server, "search_memories", fake_search)
+
+        result = mcp_server.tool_search(query="anything")
+
+        assert calls["n"] == 1
+        assert "error" in result
+        assert "index_recovered" not in result
+
+    def test_search_returns_second_error_if_retry_also_fails(self, monkeypatch, config, kg):
+        """If the transient persists past the retry, surface the second error."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        calls = {"n": 0}
+
+        def fake_search(*args, **kwargs):
+            calls["n"] += 1
+            return {"error": "Search error: Error executing plan: Internal error: Error finding id"}
+
+        monkeypatch.setattr(mcp_server, "search_memories", fake_search)
+        monkeypatch.setattr(mcp_server, "_force_chroma_cache_reset", lambda: None)
+        monkeypatch.setattr(mcp_server.time, "sleep", lambda _: None)
+
+        result = mcp_server.tool_search(query="anything")
+
+        assert calls["n"] == 2
+        assert "error" in result
+        assert "index_recovered" not in result
+
     def test_list_drawers_rejects_invalid_wing(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace import mcp_server
@@ -595,6 +665,25 @@ class TestWriteTools:
             threshold=0.99,
         )
         assert result["is_duplicate"] is False
+
+    def test_check_duplicate_short_circuits_when_vector_disabled(self, monkeypatch):
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(
+            mcp_server,
+            "hnsw_capacity_status",
+            lambda *_args, **_kwargs: {"diverged": True, "message": "capacity mismatch"},
+        )
+
+        def fail_get_collection():
+            raise AssertionError("_get_collection must not run when vector search is disabled")
+
+        monkeypatch.setattr(mcp_server, "_get_collection", fail_get_collection)
+        result = mcp_server.tool_check_duplicate("content")
+
+        assert result["is_duplicate"] is False
+        assert result["vector_disabled"] is True
+        assert result["vector_disabled_reason"] == "capacity mismatch"
 
     def test_get_drawer(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -922,6 +1011,195 @@ class TestKGTools:
         # Full ISO-8601 dates still pass.
         result = tool_kg_query(entity="Max", as_of="2026-03-15")
         assert "error" not in result, f"rejected valid date: {result}"
+
+    def test_kg_add_accepts_datetime_valid_from(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        from mempalace import mcp_server
+
+        result = mcp_server.tool_kg_add(
+            "Alice",
+            "works_at",
+            "Acme",
+            valid_from="2026-05-06T14:23:00Z",
+        )
+
+        assert result["success"] is True
+
+        facts = kg.query_entity("Alice", direction="outgoing")
+        fact = next(r for r in facts if r["predicate"] == "works_at" and r["object"] == "Acme")
+
+        assert fact["valid_from"] == "2026-05-06T14:23:00Z"
+
+    def test_kg_add_accepts_datetime_valid_to(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        from mempalace import mcp_server
+
+        result = mcp_server.tool_kg_add(
+            "Alice",
+            "worked_at",
+            "OldCo",
+            valid_from="2026-05-06T14:00:00Z",
+            valid_to="2026-05-06T15:00:00Z",
+        )
+
+        assert result["success"] is True
+
+        facts = kg.query_entity("Alice", direction="outgoing")
+        fact = next(r for r in facts if r["predicate"] == "worked_at" and r["object"] == "OldCo")
+
+        assert fact["valid_from"] == "2026-05-06T14:00:00Z"
+        assert fact["valid_to"] == "2026-05-06T15:00:00Z"
+
+    def test_kg_query_accepts_datetime_as_of(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        kg.add_triple(
+            "Alice",
+            "works_at",
+            "Acme",
+            valid_from="2026-05-06T14:00:00Z",
+        )
+
+        from mempalace import mcp_server
+
+        result = mcp_server.tool_kg_query(
+            "Alice",
+            as_of="2026-05-06T14:23:00Z",
+            direction="outgoing",
+        )
+
+        assert "error" not in result
+        assert result["as_of"] == "2026-05-06T14:23:00Z"
+        assert result["count"] == 1
+        assert result["facts"][0]["object"] == "Acme"
+
+    def test_kg_invalidate_accepts_datetime_ended(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        kg.add_triple(
+            "Alice",
+            "works_at",
+            "Acme",
+            valid_from="2026-05-06T14:00:00Z",
+        )
+
+        from mempalace import mcp_server
+
+        result = mcp_server.tool_kg_invalidate(
+            "Alice",
+            "works_at",
+            "Acme",
+            ended="2026-05-06T14:23:00Z",
+        )
+
+        assert result["success"] is True
+        assert result["ended"] == "2026-05-06T14:23:00Z"
+
+        facts = kg.query_entity("Alice", direction="outgoing")
+        fact = next(r for r in facts if r["predicate"] == "works_at" and r["object"] == "Acme")
+
+        assert fact["valid_to"] == "2026-05-06T14:23:00Z"
+
+    def test_kg_add_rejects_non_canonical_datetimes(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        from mempalace import mcp_server
+
+        invalid_values = [
+            "2026-05-06T14:23:00+02:00",
+            "2026-05-06T14:23:00-05:30",
+            "2026-05-06T14:23:00.123Z",
+            "2026-05-06 14:23:00",
+            "2026-05-06T14:23:00",
+        ]
+
+        for value in invalid_values:
+            result = mcp_server.tool_kg_add(
+                "Alice",
+                "works_at",
+                "Acme",
+                valid_from=value,
+            )
+
+            assert result["success"] is False, value
+            assert "valid_from" in result["error"]
+            assert "YYYY-MM-DDTHH:MM:SSZ" in result["error"]
+
+    def test_kg_query_rejects_non_canonical_datetime_as_of(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        from mempalace import mcp_server
+
+        invalid_values = [
+            "2026-05-06T14:23:00+02:00",
+            "2026-05-06T14:23:00-05:30",
+            "2026-05-06T14:23:00.123Z",
+            "2026-05-06 14:23:00",
+            "2026-05-06T14:23:00",
+        ]
+
+        for value in invalid_values:
+            result = mcp_server.tool_kg_query(
+                "Alice",
+                as_of=value,
+                direction="outgoing",
+            )
+
+            assert "error" in result, value
+            assert "as_of" in result["error"]
+            assert "YYYY-MM-DDTHH:MM:SSZ" in result["error"]
+
+    def test_kg_invalidate_rejects_non_canonical_ended(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        kg.add_triple(
+            "Alice",
+            "works_at",
+            "Acme",
+            valid_from="2026-05-06T14:00:00Z",
+        )
+
+        from mempalace import mcp_server
+
+        invalid_values = [
+            "2026-05-06T14:23:00+02:00",
+            "2026-05-06T14:23:00-05:30",
+            "2026-05-06T14:23:00.123Z",
+            "2026-05-06 14:23:00",
+            "2026-05-06T14:23:00",
+        ]
+
+        for value in invalid_values:
+            result = mcp_server.tool_kg_invalidate(
+                "Alice",
+                "works_at",
+                "Acme",
+                ended=value,
+            )
+
+            assert result["success"] is False, value
+            assert "ended" in result["error"]
+            assert "YYYY-MM-DDTHH:MM:SSZ" in result["error"]
+
+    def test_kg_add_rejects_timezone_offset_datetime(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        from mempalace import mcp_server
+
+        result = mcp_server.tool_kg_add(
+            "Alice",
+            "works_at",
+            "Acme",
+            valid_from="2026-05-06T14:23:00+02:00",
+        )
+
+        assert result["success"] is False
+        assert "valid_from" in result["error"]
+        assert "YYYY-MM-DDTHH:MM:SSZ" in result["error"]
 
 
 # ── Diary Tools ─────────────────────────────────────────────────────────

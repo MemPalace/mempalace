@@ -385,3 +385,17 @@ class TestSearchCLI:
         assert "[2]" in captured.out
         # Second result renders with fallback '?' values instead of crashing
         assert "second doc" in captured.out
+
+    def test_search_handles_none_document_without_crash(self, capsys):
+        mock_col = MagicMock()
+        mock_col.metadata = {"hnsw:space": "cosine"}
+        mock_col.query.return_value = {
+            "documents": [["first doc", None]],
+            "metadatas": [[{"source_file": "a.md", "wing": "w", "room": "r"}, None]],
+            "distances": [[0.1, 0.2]],
+        }
+        with patch("mempalace.searcher.get_collection", return_value=mock_col):
+            search("anything", "/fake/path")
+        captured = capsys.readouterr()
+        assert "[1]" in captured.out
+        assert "[2]" in captured.out

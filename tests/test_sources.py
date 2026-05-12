@@ -1,5 +1,8 @@
 """Tests for the RFC 002 source-adapter scaffolding."""
 
+import sqlite3
+from contextlib import closing
+
 import pytest
 
 from mempalace.sources import (
@@ -362,16 +365,13 @@ def test_knowledge_graph_add_triple_accepts_source_drawer_id_and_adapter_name(tm
         )
         assert triple_id is not None
 
-        import sqlite3
-
-        conn = sqlite3.connect(str(tmp_path / "kg.sqlite3"))
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            "SELECT source_drawer_id, adapter_name FROM triples WHERE id=?", (triple_id,)
-        ).fetchone()
-        assert row["source_drawer_id"] == "abc123_0"
-        assert row["adapter_name"] == "git"
-        conn.close()
+        with closing(sqlite3.connect(str(tmp_path / "kg.sqlite3"))) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT source_drawer_id, adapter_name FROM triples WHERE id=?", (triple_id,)
+            ).fetchone()
+            assert row["source_drawer_id"] == "abc123_0"
+            assert row["adapter_name"] == "git"
     finally:
         kg.close()
 
@@ -380,15 +380,12 @@ def test_knowledge_graph_fresh_schema_includes_new_columns(tmp_path):
     """Brand-new palaces should get source_drawer_id / adapter_name directly
     from CREATE TABLE, not via a post-hoc ALTER. _migrate_schema exists only
     for legacy palaces."""
-    import sqlite3
-
     from mempalace.knowledge_graph import KnowledgeGraph
 
     kg = KnowledgeGraph(db_path=str(tmp_path / "fresh.sqlite3"))
     try:
-        conn = sqlite3.connect(str(tmp_path / "fresh.sqlite3"))
-        cols = {row[1] for row in conn.execute("PRAGMA table_info(triples)")}
-        conn.close()
+        with closing(sqlite3.connect(str(tmp_path / "fresh.sqlite3"))) as conn:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(triples)")}
         assert "source_drawer_id" in cols
         assert "adapter_name" in cols
     finally:
@@ -397,42 +394,38 @@ def test_knowledge_graph_fresh_schema_includes_new_columns(tmp_path):
 
 def test_knowledge_graph_migration_adds_missing_columns_to_old_schema(tmp_path):
     """An old-schema triples table (pre-RFC 002) should auto-migrate on open."""
-    import sqlite3
-
     db_path = tmp_path / "legacy.sqlite3"
-    conn = sqlite3.connect(str(db_path))
-    conn.executescript("""
-        CREATE TABLE entities (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            type TEXT DEFAULT 'unknown',
-            properties TEXT DEFAULT '{}',
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE triples (
-            id TEXT PRIMARY KEY,
-            subject TEXT NOT NULL,
-            predicate TEXT NOT NULL,
-            object TEXT NOT NULL,
-            valid_from TEXT,
-            valid_to TEXT,
-            confidence REAL DEFAULT 1.0,
-            source_closet TEXT,
-            source_file TEXT,
-            extracted_at TEXT DEFAULT CURRENT_TIMESTAMP
-        );
-    """)
-    conn.commit()
-    conn.close()
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.executescript("""
+            CREATE TABLE entities (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                type TEXT DEFAULT 'unknown',
+                properties TEXT DEFAULT '{}',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE triples (
+                id TEXT PRIMARY KEY,
+                subject TEXT NOT NULL,
+                predicate TEXT NOT NULL,
+                object TEXT NOT NULL,
+                valid_from TEXT,
+                valid_to TEXT,
+                confidence REAL DEFAULT 1.0,
+                source_closet TEXT,
+                source_file TEXT,
+                extracted_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        conn.commit()
 
     from mempalace.knowledge_graph import KnowledgeGraph
 
     kg = KnowledgeGraph(db_path=str(db_path))
     try:
         # New columns must be present after _init_db runs the migration.
-        conn = sqlite3.connect(str(db_path))
-        cols = {row[1] for row in conn.execute("PRAGMA table_info(triples)")}
-        conn.close()
+        with closing(sqlite3.connect(str(db_path))) as conn:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(triples)")}
         assert "source_drawer_id" in cols
         assert "adapter_name" in cols
 

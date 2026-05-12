@@ -8,6 +8,7 @@ Stores verbatim chunks as drawers. No summaries. Ever.
 """
 
 import os
+import re
 import sys
 import shlex
 import hashlib
@@ -332,6 +333,28 @@ def load_config(project_dir: str) -> dict:
 # FILE ROUTING — which room does this file belong to?
 # =============================================================================
 
+_TOKEN_SPLIT = re.compile(r"[-_./]+")
+
+
+def _tokens(value: str) -> set:
+    """Split ``value`` into lowercased tokens bounded by ``-``, ``_``, ``.`` or ``/``."""
+    return {t for t in _TOKEN_SPLIT.split(value.lower()) if t}
+
+
+def _name_matches(a: str, b: str) -> bool:
+    """Return True when ``a`` and ``b`` match as equal strings or as
+    separator-bounded tokens of each other.
+
+    Prevents incidental substring collisions (e.g., ``"views" in "interviews"``)
+    that a raw ``in`` check would produce, while preserving the intended
+    match for real tokens (e.g., ``"frontend"`` in ``"frontend-app"``).
+    """
+    a = a.lower()
+    b = b.lower()
+    if a == b:
+        return True
+    return b in _tokens(a) or a in _tokens(b)
+
 
 def detect_room(filepath: Path, content: str, rooms: list, project_path: Path) -> str:
     """
@@ -351,12 +374,12 @@ def detect_room(filepath: Path, content: str, rooms: list, project_path: Path) -
     for part in path_parts[:-1]:  # skip filename itself
         for room in rooms:
             candidates = [room["name"].lower()] + [k.lower() for k in room.get("keywords", [])]
-            if any(part == c or c in part or part in c for c in candidates):
+            if any(_name_matches(part, c) for c in candidates):
                 return room["name"]
 
     # Priority 2: filename matches room name
     for room in rooms:
-        if room["name"].lower() in filename or filename in room["name"].lower():
+        if _name_matches(filename, room["name"]):
             return room["name"]
 
     # Priority 3: keyword scoring from room keywords + name
