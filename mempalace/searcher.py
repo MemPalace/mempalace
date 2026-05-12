@@ -629,6 +629,23 @@ def _bm25_only_via_sqlite(
     }
 
 
+def _chunk_precise_dedup_key(entry: dict):
+    """Stable dedup key for hits crossing the vector / BM25 / contains
+    pools. Uses ``(_source_file_full, _chunk_index)`` so two files
+    sharing a basename in different directories don't collide and a
+    vector hit on chunk N of a source doesn't block another path from
+    contributing chunk M of the same source. Falls back to
+    ``source_file`` only when richer metadata is missing — avoids
+    silently dropping candidates on legacy data while still giving
+    chunk-precise dedup whenever the metadata is present.
+    """
+    full = entry.get("_source_file_full")
+    ci = entry.get("_chunk_index")
+    if full and ci is not None:
+        return (full, ci)
+    return entry.get("source_file")
+
+
 def _merge_bm25_union_candidates(
     hits: list,
     query: str,
@@ -678,19 +695,9 @@ def _merge_bm25_union_candidates(
         logger.debug("candidate_strategy=union: BM25 fetch failed", exc_info=True)
         return
 
-    def _dedup_key(entry: dict):
-        full = entry.get("_source_file_full")
-        ci = entry.get("_chunk_index")
-        if full and ci is not None:
-            return (full, ci)
-        # Fall back to basename only when richer metadata is missing —
-        # avoids silently dropping candidates on legacy data while still
-        # giving chunk-precise dedup whenever the metadata is present.
-        return entry.get("source_file")
-
-    seen = {_dedup_key(h) for h in hits}
+    seen = {_chunk_precise_dedup_key(h) for h in hits}
     for bh in bm25_extra:
-        key = _dedup_key(bh)
+        key = _chunk_precise_dedup_key(bh)
         if not key or key == "?" or key in seen:
             continue
         bh["distance"] = None
@@ -742,10 +749,9 @@ def _merge_contains_union_candidates(
         return
 
     try:
-        if collection_name is not None:
-            drawers_col = get_collection(palace_path, collection_name=collection_name, create=False)
-        else:
-            drawers_col = get_collection(palace_path, create=False)
+        # ``get_collection`` resolves ``collection_name=None`` itself via
+        # ``get_configured_collection_name`` — no need to branch here.
+        drawers_col = get_collection(palace_path, collection_name=collection_name, create=False)
     except Exception:
         logger.debug("candidate_strategy=contains: collection fetch failed", exc_info=True)
         return
@@ -768,14 +774,7 @@ def _merge_contains_union_candidates(
     docs = contains_results.documents or []
     metas = contains_results.metadatas or []
 
-    def _dedup_key(entry: dict):
-        full = entry.get("_source_file_full")
-        ci = entry.get("_chunk_index")
-        if full and ci is not None:
-            return (full, ci)
-        return entry.get("source_file")
-
-    seen = {_dedup_key(h) for h in hits}
+    seen = {_chunk_precise_dedup_key(h) for h in hits}
     for doc, meta in zip(docs, metas):
         if doc is None or meta is None:
             continue
@@ -794,7 +793,7 @@ def _merge_contains_union_candidates(
             "_source_file_full": full_source,
             "_chunk_index": meta.get("chunk_index"),
         }
-        key = _dedup_key(entry)
+        key = _chunk_precise_dedup_key(entry)
         if not key or key == "?" or key in seen:
             continue
         hits.append(entry)
