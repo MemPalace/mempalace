@@ -637,6 +637,7 @@ def _merge_bm25_union_candidates(
     room: str,
     n_results: int,
     max_distance: float = 0.0,
+    collection_name: str = None,
 ) -> None:
     """Append top-K BM25-only candidates from sqlite into ``hits`` in place.
 
@@ -671,6 +672,7 @@ def _merge_bm25_union_candidates(
             room=room,
             n_results=n_results * 3,
             _include_internal=True,
+            collection_name=collection_name,
         ).get("results", [])
     except Exception:
         logger.debug("candidate_strategy=union: BM25 fetch failed", exc_info=True)
@@ -698,12 +700,114 @@ def _merge_bm25_union_candidates(
         seen.add(key)
 
 
+def _merge_contains_union_candidates(
+    hits: list,
+    query: str,
+    palace_path: str,
+    wing: str,
+    room: str,
+    n_results: int,
+    max_distance: float = 0.0,
+    collection_name: str = None,
+) -> None:
+    """Append drawers whose ``documents`` contain ``query`` as a literal
+    substring (Chroma ``where_document={"$contains": query}``) into
+    ``hits`` in place.
+
+    Used by ``search_memories(..., candidate_strategy="contains")`` to
+    catch proper-noun and exact-string matches whose embeddings fall
+    below the vector candidate cutoff. The vector path can over-fetch a
+    larger pool (see ``_OVERFETCH_MAX`` and the short-query widening),
+    but rare or single-token proper-noun queries still produce
+    embeddings too weak to clear the rerank window. A direct substring
+    fetch guarantees those drawers reach BM25 rerank. See issue #1125.
+
+    Dedup is chunk-precise: same key as ``_merge_bm25_union_candidates``
+    so two files sharing a basename in different directories don't
+    collide and a vector hit on chunk N doesn't block contains from
+    contributing chunk M of the same file.
+
+    Contains-only additions carry ``distance=None`` so ``_hybrid_rank``
+    scores them on BM25 contribution alone — mirrors the BM25-only
+    union path.
+
+    Skipped when ``max_distance > 0.0`` for the same reason as the BM25
+    union path: a strict vector-distance threshold has no meaning for
+    candidates that never ran a vector query, and silently injecting
+    them would break the existing ``max_distance`` guarantee.
+    """
+    if max_distance > 0.0:
+        return
+    if not query.strip():
+        return
+
+    try:
+        if collection_name is not None:
+            drawers_col = get_collection(palace_path, collection_name=collection_name, create=False)
+        else:
+            drawers_col = get_collection(palace_path, create=False)
+    except Exception:
+        logger.debug("candidate_strategy=contains: collection fetch failed", exc_info=True)
+        return
+
+    where = build_where_filter(wing, room)
+    get_kwargs = {
+        "where_document": {"$contains": query},
+        "limit": min(n_results * 3, _OVERFETCH_MAX),
+        "include": ["documents", "metadatas"],
+    }
+    if where:
+        get_kwargs["where"] = where
+
+    try:
+        contains_results = drawers_col.get(**get_kwargs)
+    except Exception:
+        logger.debug("candidate_strategy=contains: where_document fetch failed", exc_info=True)
+        return
+
+    docs = contains_results.documents or []
+    metas = contains_results.metadatas or []
+
+    def _dedup_key(entry: dict):
+        full = entry.get("_source_file_full")
+        ci = entry.get("_chunk_index")
+        if full and ci is not None:
+            return (full, ci)
+        return entry.get("source_file")
+
+    seen = {_dedup_key(h) for h in hits}
+    for doc, meta in zip(docs, metas):
+        if doc is None or meta is None:
+            continue
+        full_source = meta.get("source_file", "") or ""
+        entry = {
+            "text": doc,
+            "wing": meta.get("wing", "unknown"),
+            "room": meta.get("room", "unknown"),
+            "source_file": Path(full_source).name if full_source else "?",
+            "created_at": meta.get("filed_at", "unknown"),
+            "similarity": None,
+            "distance": None,
+            "effective_distance": None,
+            "closet_boost": 0.0,
+            "matched_via": "contains",
+            "_source_file_full": full_source,
+            "_chunk_index": meta.get("chunk_index"),
+        }
+        key = _dedup_key(entry)
+        if not key or key == "?" or key in seen:
+            continue
+        hits.append(entry)
+        seen.add(key)
+
+
 # Strategy dispatch — keeps search_memories' branch count under the
 # project's complexity ceiling (C901 max-complexity=25). New strategies
 # register here.
 _CANDIDATE_MERGERS = {
     "vector": None,  # default no-op
     "union": _merge_bm25_union_candidates,
+    "contains": _merge_contains_union_candidates,
 }
 
 
@@ -729,6 +833,7 @@ def _apply_candidate_strategy(
     room: str,
     n_results: int,
     max_distance: float = 0.0,
+    collection_name: str = None,
 ) -> None:
     """Dispatch to the registered merger for ``strategy``.
 
@@ -737,7 +842,16 @@ def _apply_candidate_strategy(
     """
     merger = _CANDIDATE_MERGERS[strategy]
     if merger is not None:
-        merger(hits, query, palace_path, wing, room, n_results, max_distance=max_distance)
+        merger(
+            hits,
+            query,
+            palace_path,
+            wing,
+            room,
+            n_results,
+            max_distance=max_distance,
+            collection_name=collection_name,
+        )
 
 
 def search_memories(
@@ -1019,6 +1133,7 @@ def search_memories(
         room,
         n_results,
         max_distance=max_distance,
+        collection_name=collection_name,
     )
 
     # BM25 hybrid re-rank within the final candidate set, then trim back
