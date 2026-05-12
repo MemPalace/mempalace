@@ -486,3 +486,17 @@ class TestShortQueryOverfetch:
             "10× n_results must clamp to 200 so large n_results requests "
             "do not blow up candidate-fetch latency"
         )
+
+    def test_overfetch_never_below_n_results(self):
+        """Floor: if the caller asks for ``n_results > _OVERFETCH_MAX``,
+        the clamp must not return fewer candidates than requested —
+        otherwise the function returns less than the caller asked for
+        and the contract breaks. Floor at ``n_results``, ceiling at
+        ``_OVERFETCH_MAX``, so the clamp can never be below the floor."""
+        mock_col = self._capturing_collection()
+        with patch("mempalace.searcher.get_collection", return_value=mock_col):
+            search_memories("Bob", "/fake/path", n_results=300)
+        assert self._captured_n_results(mock_col) == 300, (
+            "n_results=300 (above _OVERFETCH_MAX=200): overfetch must "
+            "floor at n_results, not clamp below it"
+        )

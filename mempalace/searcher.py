@@ -31,10 +31,20 @@ class SearchError(Exception):
 
 _TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
 
-# Upper bound on the per-query candidate fetch from the vector index.
-# Short queries widen the over-fetch (see issue #1125) up to this cap so
-# the cost of the underlying ChromaDB ``.query()`` and downstream BM25
-# rerank stays bounded on large ``n_results`` requests.
+# Over-fetch tuning for the vector candidate pool (see issue #1125).
+#
+# Short queries — proper nouns and 1–3 token names — produce weak
+# embeddings relative to longer narrative drawers. The default 3× over-
+# fetch can drop name-bearing drawers below the candidate cutoff before
+# BM25 rerank ever sees them. The wider multiplier kicks in for queries
+# with ``len(_tokenize(query)) <= _SHORT_QUERY_TOKEN_THRESHOLD``.
+#
+# ``_OVERFETCH_MAX`` bounds the candidate fetch so latency stays sane on
+# large ``n_results`` requests; ``n_results`` itself acts as a floor so
+# the clamp never returns fewer candidates than the caller asked for.
+_SHORT_QUERY_TOKEN_THRESHOLD = 3
+_SHORT_QUERY_OVERFETCH_MULTIPLIER = 10
+_DEFAULT_OVERFETCH_MULTIPLIER = 3
 _OVERFETCH_MAX = 200
 
 
@@ -818,9 +828,19 @@ def search_memories(
     # Widen the pool for short queries so rerank can do its job; clamp
     # to 200 so the candidate fetch stays bounded on large n_results
     # requests. See issue #1125.
-    token_count = len(_TOKEN_RE.findall(query))
-    overfetch_multiplier = 10 if token_count <= 3 else 3
-    overfetch_n = min(n_results * overfetch_multiplier, _OVERFETCH_MAX)
+    # ``_tokenize`` handles the ``None``/empty cases that ``_TOKEN_RE.findall``
+    # would raise on, and uses the same regex as BM25 — keep token counting
+    # behaviourally identical to rerank tokenisation.
+    token_count = len(_tokenize(query))
+    overfetch_multiplier = (
+        _SHORT_QUERY_OVERFETCH_MULTIPLIER
+        if token_count <= _SHORT_QUERY_TOKEN_THRESHOLD
+        else _DEFAULT_OVERFETCH_MULTIPLIER
+    )
+    # Floor at ``n_results`` so a large request never returns fewer
+    # candidates than asked for; ceiling at ``_OVERFETCH_MAX`` so the
+    # vector ``.query()`` latency stays bounded.
+    overfetch_n = max(n_results, min(n_results * overfetch_multiplier, _OVERFETCH_MAX))
 
     try:
         dkwargs = {
