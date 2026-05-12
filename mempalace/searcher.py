@@ -31,6 +31,12 @@ class SearchError(Exception):
 
 _TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
 
+# Upper bound on the per-query candidate fetch from the vector index.
+# Short queries widen the over-fetch (see issue #1125) up to this cap so
+# the cost of the underlying ChromaDB ``.query()`` and downstream BM25
+# rerank stays bounded on large ``n_results`` requests.
+_OVERFETCH_MAX = 200
+
 
 def _first_or_empty(results, key: str) -> list:
     """Return the first inner list of a query result field, or [].
@@ -805,10 +811,21 @@ def search_memories(
     # This avoids the "weak-closets regression" where narrative content
     # produces low-signal closets (regex extraction matches few topics)
     # and closet-first routing hides drawers that direct search would find.
+    # Short queries — particularly proper nouns and 1-3 token names —
+    # produce weak embeddings relative to longer narrative drawers. The
+    # default ``n_results * 3`` over-fetch can drop name-bearing drawers
+    # below the candidate cutoff before BM25 rerank ever sees them.
+    # Widen the pool for short queries so rerank can do its job; clamp
+    # to 200 so the candidate fetch stays bounded on large n_results
+    # requests. See issue #1125.
+    token_count = len(_TOKEN_RE.findall(query))
+    overfetch_multiplier = 10 if token_count <= 3 else 3
+    overfetch_n = min(n_results * overfetch_multiplier, _OVERFETCH_MAX)
+
     try:
         dkwargs = {
             "query_texts": [query],
-            "n_results": n_results * 3,  # over-fetch for re-ranking
+            "n_results": overfetch_n,  # over-fetch for re-ranking
             "include": ["documents", "metadatas", "distances"],
         }
         if where:

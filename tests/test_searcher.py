@@ -184,12 +184,11 @@ class TestSearchMemories:
 
         # Invariants on every hit.
         for h in hits:
-            assert (
-                0.0 <= h["similarity"] <= 1.0
-            ), f"similarity out of range: {h['similarity']} for {h['source_file']}"
+            assert 0.0 <= h["similarity"] <= 1.0, (
+                f"similarity out of range: {h['similarity']} for {h['source_file']}"
+            )
             assert 0.0 <= h["effective_distance"] <= 2.0, (
-                f"effective_distance out of range: {h['effective_distance']} "
-                f"for {h['source_file']}"
+                f"effective_distance out of range: {h['effective_distance']} for {h['source_file']}"
             )
 
         # With the clamp, the closet-boosted a.md still ranks ahead of b.md —
@@ -327,9 +326,9 @@ class TestSearchCLI:
         captured = capsys.readouterr()
         first_block, _, _ = captured.out.partition("[2]")
         # Lexical match must rank first
-        assert (
-            "b.md" in first_block
-        ), f"expected lexical match 'b.md' at rank 1, got:\n{captured.out}"
+        assert "b.md" in first_block, (
+            f"expected lexical match 'b.md' at rank 1, got:\n{captured.out}"
+        )
         # Non-zero bm25 reported
         assert "bm25=" in first_block
         assert "bm25=0.0" not in first_block
@@ -399,3 +398,91 @@ class TestSearchCLI:
         captured = capsys.readouterr()
         assert "[1]" in captured.out
         assert "[2]" in captured.out
+
+
+# ── short-query overfetch widening (#1125) ─────────────────────────────
+
+
+class TestShortQueryOverfetch:
+    """Proper-noun and short queries produce weak embeddings relative to
+    longer narrative drawers; the default ``n_results * 3`` over-fetch
+    window can drop name-bearing drawers before BM25 rerank ever sees
+    them. Widen the candidate pool for short queries so the rerank stage
+    can do its job.
+
+    Issue: https://github.com/MemPalace/mempalace/issues/1125
+    """
+
+    def _capturing_collection(self, return_empty=True):
+        mock_col = MagicMock()
+        mock_col.metadata = {"hnsw:space": "cosine"}
+        empty = {"documents": [[]], "metadatas": [[]], "distances": [[]]}
+        mock_col.query.return_value = empty if return_empty else None
+        return mock_col
+
+    def _captured_n_results(self, mock_col):
+        return mock_col.query.call_args.kwargs.get("n_results")
+
+    def test_single_token_query_widens_to_10x(self):
+        mock_col = self._capturing_collection()
+        with patch("mempalace.searcher.get_collection", return_value=mock_col):
+            search_memories("Alice", "/fake/path", n_results=5)
+        assert self._captured_n_results(mock_col) == 50, (
+            "single-token queries must widen over-fetch to 10× n_results"
+        )
+
+    def test_three_token_query_widens_to_10x(self):
+        mock_col = self._capturing_collection()
+        with patch("mempalace.searcher.get_collection", return_value=mock_col):
+            search_memories("Jane Marie Doe", "/fake/path", n_results=5)
+        assert self._captured_n_results(mock_col) == 50, (
+            "three-token queries must still widen — proper-noun full names fit in this band"
+        )
+
+    def test_four_token_query_keeps_3x_overfetch(self):
+        # ``_TOKEN_RE`` matches ``\w{2,}`` so every word here is 1 token.
+        mock_col = self._capturing_collection()
+        with patch("mempalace.searcher.get_collection", return_value=mock_col):
+            search_memories(
+                "configure authentication module users",  # 4 tokens
+                "/fake/path",
+                n_results=5,
+            )
+        assert self._captured_n_results(mock_col) == 15, (
+            "queries with more than 3 tokens must keep the existing 3× window"
+        )
+
+    def test_three_vs_four_token_boundary_is_inclusive(self):
+        """Boundary lock: ``<= 3`` widens, ``> 3`` does not. Same
+        ``n_results`` so any future off-by-one in the comparison flips
+        exactly one of the two assertions."""
+        for tokens, expected in [("alpha beta gamma", 50), ("alpha beta gamma delta", 15)]:
+            mock_col = self._capturing_collection()
+            with patch("mempalace.searcher.get_collection", return_value=mock_col):
+                search_memories(tokens, "/fake/path", n_results=5)
+            assert self._captured_n_results(mock_col) == expected, (
+                f"query={tokens!r} expected n_results={expected}, "
+                f"got {self._captured_n_results(mock_col)}"
+            )
+
+    def test_zero_token_query_uses_widened_overfetch(self):
+        """Empty / whitespace-only / punctuation-only queries produce
+        ``token_count = 0`` (``_TOKEN_RE`` requires ``\\w{2,}``). These fall
+        into the ``<= 3`` band and widen to 10× — documenting the
+        behaviour so a later "guard for empty query" change is a
+        deliberate decision, not an accident."""
+        mock_col = self._capturing_collection()
+        with patch("mempalace.searcher.get_collection", return_value=mock_col):
+            search_memories("??", "/fake/path", n_results=5)
+        assert self._captured_n_results(mock_col) == 50, (
+            "0-token queries route through the wide overfetch path"
+        )
+
+    def test_overfetch_clamped_to_200(self):
+        mock_col = self._capturing_collection()
+        with patch("mempalace.searcher.get_collection", return_value=mock_col):
+            search_memories("Bob", "/fake/path", n_results=25)
+        assert self._captured_n_results(mock_col) == 200, (
+            "10× n_results must clamp to 200 so large n_results requests "
+            "do not blow up candidate-fetch latency"
+        )
