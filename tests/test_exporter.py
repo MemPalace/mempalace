@@ -134,3 +134,104 @@ def test_export_empty_palace():
         assert stats == {"wings": 0, "rooms": 0, "drawers": 0}
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _try_symlink_or_skip(target: str, link: str):
+    """Create a symlink, skipping the test if the runtime forbids it.
+
+    Windows without Developer Mode/admin and some restricted CI sandboxes
+    refuse os.symlink with OSError or NotImplementedError. The exporter
+    hardening is meaningful only where symlinks can be created at all, so
+    skipping is preferable to a hard failure.
+    """
+    import pytest
+
+    try:
+        os.symlink(target, link)
+    except (OSError, NotImplementedError) as e:
+        pytest.skip(f"symlink creation not supported in this environment: {e}")
+
+
+def test_export_refuses_symlinked_output_dir():
+    """A symlink at the output path must not be followed (defense-in-depth)."""
+    import pytest
+
+    tmpdir = tempfile.mkdtemp()
+    try:
+        palace_path = _setup_palace(tmpdir)
+        decoy_target = os.path.join(tmpdir, "decoy_target")
+        os.makedirs(decoy_target)
+        output_dir = os.path.join(tmpdir, "export")
+        _try_symlink_or_skip(decoy_target, output_dir)
+
+        with pytest.raises(ValueError, match="symbolic link"):
+            export_palace(palace_path, output_dir)
+
+        # Decoy target must remain empty — nothing followed the symlink.
+        assert os.listdir(decoy_target) == []
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_export_refuses_symlinked_wing_dir():
+    """A symlink pre-placed at a wing subdirectory must also be refused."""
+    import pytest
+
+    tmpdir = tempfile.mkdtemp()
+    try:
+        palace_path = _setup_palace(tmpdir)
+        decoy_target = os.path.join(tmpdir, "decoy_target")
+        os.makedirs(decoy_target)
+        output_dir = os.path.join(tmpdir, "export")
+        os.makedirs(output_dir)
+        _try_symlink_or_skip(decoy_target, os.path.join(output_dir, "alpha"))
+
+        with pytest.raises(ValueError, match="symbolic link"):
+            export_palace(palace_path, output_dir)
+
+        assert os.listdir(decoy_target) == []
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_export_refuses_symlinked_room_file():
+    """A symlink pre-placed at a room file path must not be followed."""
+    import pytest
+
+    tmpdir = tempfile.mkdtemp()
+    try:
+        palace_path = _setup_palace(tmpdir)
+        decoy_target = os.path.join(tmpdir, "decoy_target.md")
+        Path(decoy_target).write_text("untouched\n", encoding="utf-8")
+        output_dir = os.path.join(tmpdir, "export")
+        os.makedirs(os.path.join(output_dir, "alpha"))
+        _try_symlink_or_skip(decoy_target, os.path.join(output_dir, "alpha", "backend.md"))
+
+        with pytest.raises(ValueError, match="symbolic link"):
+            export_palace(palace_path, output_dir)
+
+        # Decoy file must remain unchanged — open did not follow the symlink.
+        assert Path(decoy_target).read_text(encoding="utf-8") == "untouched\n"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_export_refuses_symlinked_index_file():
+    """A symlink pre-placed at output_dir/index.md must not be followed."""
+    import pytest
+
+    tmpdir = tempfile.mkdtemp()
+    try:
+        palace_path = _setup_palace(tmpdir)
+        decoy_target = os.path.join(tmpdir, "decoy_index.md")
+        Path(decoy_target).write_text("untouched\n", encoding="utf-8")
+        output_dir = os.path.join(tmpdir, "export")
+        os.makedirs(output_dir)
+        _try_symlink_or_skip(decoy_target, os.path.join(output_dir, "index.md"))
+
+        with pytest.raises(ValueError, match="symbolic link"):
+            export_palace(palace_path, output_dir)
+
+        assert Path(decoy_target).read_text(encoding="utf-8") == "untouched\n"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)

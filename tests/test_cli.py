@@ -555,6 +555,45 @@ def test_cmd_mine_include_ignored_comma_split(mock_config_cls):
         assert call_kwargs["include_ignored"] == ["a.txt", "b.txt", "c.txt"]
 
 
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_mine_exits_nonzero_on_lock_holder(mock_config_cls, capsys):
+    """Regression #1264: lock contention must exit non-zero with a clear message.
+
+    Before this fix the CLI silently returned 0 when another writer held
+    the palace lock — operators using nohup/scripts had no way to detect
+    the contention. The new behavior raises MineAlreadyRunning out of
+    miner.mine() and cmd_mine catches it, printing the holder identity
+    to stderr and exiting non-zero.
+    """
+    from mempalace.palace import MineAlreadyRunning
+
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    args = argparse.Namespace(
+        dir="/src",
+        palace=None,
+        mode="projects",
+        wing=None,
+        agent="mempalace",
+        limit=0,
+        dry_run=False,
+        no_gitignore=False,
+        include_ignored=[],
+        extract="exchange",
+    )
+    with patch(
+        "mempalace.miner.mine",
+        side_effect=MineAlreadyRunning(
+            "palace /fake/palace is held by PID 12345 (mempalace mcp_server); wait for it to finish"
+        ),
+    ):
+        with pytest.raises(SystemExit) as excinfo:
+            cmd_mine(args)
+    assert excinfo.value.code == 1
+    captured = capsys.readouterr()
+    assert "PID 12345" in captured.err
+    assert "mcp_server" in captured.err
+
+
 # ── cmd_wakeup ─────────────────────────────────────────────────────────
 
 

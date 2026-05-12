@@ -23,4 +23,4 @@ Behavior:
    `--wing my_research`).
 4. Report back: how many drawers were filed, into which wing/room.
 
-Requires `mempalace` to be installed (`pip install mempalace`).
+Requires `mempalace` to be installed (`uv tool install mempalace` recommended, or `pip install mempalace`).

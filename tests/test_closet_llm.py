@@ -196,9 +196,33 @@ class TestCallLLM:
                 }
             )
 
-        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
-            parsed, usage = _call_llm(cfg, "/tmp/x", "w", "r", "c")
+        with (
+            patch("urllib.request.urlopen", side_effect=fake_urlopen),
+            patch("mempalace.closet_llm.time.sleep"),
+        ):
+            parsed, _ = _call_llm(cfg, "/tmp/x", "w", "r", "c")
         assert parsed is None
+
+    def test_retries_on_json_decode_error(self):
+        cfg = self._make_cfg()
+        call_count = {"n": 0}
+
+        def fake_urlopen(req, timeout=None):
+            call_count["n"] += 1
+            return _FakeResp(
+                {
+                    "choices": [{"message": {"content": "not json at all"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                }
+            )
+
+        with (
+            patch("urllib.request.urlopen", side_effect=fake_urlopen),
+            patch("mempalace.closet_llm.time.sleep"),
+        ):
+            parsed, _ = _call_llm(cfg, "/tmp/x", "w", "r", "c")
+        assert parsed is None
+        assert call_count["n"] == 3
 
 
 # ── regenerate_closets error paths ───────────────────────────────────────

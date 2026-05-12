@@ -8,6 +8,7 @@ Stores verbatim chunks as drawers. No summaries. Ever.
 """
 
 import os
+import re
 import sys
 import shlex
 import hashlib
@@ -21,7 +22,6 @@ from typing import Optional
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
-    MineAlreadyRunning,
     build_closet_lines,
     file_already_mined,
     get_closets_collection,
@@ -332,6 +332,28 @@ def load_config(project_dir: str) -> dict:
 # FILE ROUTING — which room does this file belong to?
 # =============================================================================
 
+_TOKEN_SPLIT = re.compile(r"[-_./]+")
+
+
+def _tokens(value: str) -> set:
+    """Split ``value`` into lowercased tokens bounded by ``-``, ``_``, ``.`` or ``/``."""
+    return {t for t in _TOKEN_SPLIT.split(value.lower()) if t}
+
+
+def _name_matches(a: str, b: str) -> bool:
+    """Return True when ``a`` and ``b`` match as equal strings or as
+    separator-bounded tokens of each other.
+
+    Prevents incidental substring collisions (e.g., ``"views" in "interviews"``)
+    that a raw ``in`` check would produce, while preserving the intended
+    match for real tokens (e.g., ``"frontend"`` in ``"frontend-app"``).
+    """
+    a = a.lower()
+    b = b.lower()
+    if a == b:
+        return True
+    return b in _tokens(a) or a in _tokens(b)
+
 
 def detect_room(filepath: Path, content: str, rooms: list, project_path: Path) -> str:
     """
@@ -351,12 +373,12 @@ def detect_room(filepath: Path, content: str, rooms: list, project_path: Path) -
     for part in path_parts[:-1]:  # skip filename itself
         for room in rooms:
             candidates = [room["name"].lower()] + [k.lower() for k in room.get("keywords", [])]
-            if any(part == c or c in part or part in c for c in candidates):
+            if any(_name_matches(part, c) for c in candidates):
                 return room["name"]
 
     # Priority 2: filename matches room name
     for room in rooms:
-        if room["name"].lower() in filename or filename in room["name"].lower():
+        if _name_matches(filename, room["name"]):
             return room["name"]
 
     # Priority 3: keyword scoring from room keywords + name
@@ -1035,26 +1057,21 @@ def mine(
             files=files,
         )
 
-    try:
-        with mine_palace_lock(palace_path):
-            return _mine_impl(
-                project_dir,
-                palace_path,
-                wing_override=wing_override,
-                agent=agent,
-                limit=limit,
-                dry_run=dry_run,
-                respect_gitignore=respect_gitignore,
-                include_ignored=include_ignored,
-                files=files,
-            )
-    except MineAlreadyRunning:
-        print(
-            f"mempalace: another `mine` is already running against "
-            f"{palace_path} — exiting cleanly.",
-            file=sys.stderr,
+    # MineAlreadyRunning propagates so the CLI can render a clear holder-aware
+    # message and exit non-zero. In-process callers (tests, library users) that
+    # expect to coexist with another writer should handle the exception.
+    with mine_palace_lock(palace_path):
+        return _mine_impl(
+            project_dir,
+            palace_path,
+            wing_override=wing_override,
+            agent=agent,
+            limit=limit,
+            dry_run=dry_run,
+            respect_gitignore=respect_gitignore,
+            include_ignored=include_ignored,
+            files=files,
         )
-        return
 
 
 def _mine_impl(
@@ -1212,30 +1229,29 @@ def _mine_impl(
 
 
 def _cleanup_mine_pid_file() -> None:
-    """Remove the global mine PID file if it currently points at us.
+    """Remove this process's per-target PID slot on exit.
 
-    The PID file (``~/.mempalace/hook_state/mine.pid``, written by the
-    hook in :func:`mempalace.hooks_cli._spawn_mine`) tracks the PID of
-    the most recently spawned mine subprocess so the hook can dedup
-    concurrent auto-ingest fires. When that subprocess exits — cleanly,
-    on error, or via Ctrl-C — it should remove its own entry so the
-    next hook fire isn't briefly fooled by a stale PID before
-    ``_pid_alive`` returns False.
+    Hook-spawned mines receive ``MEMPALACE_MINE_PID_FILE`` in their env
+    pointing at the slot the hook claimed for them
+    (``~/.mempalace/hook_state/mine_pids/mine_<sha>.pid``). When the
+    subprocess exits — cleanly, on error, or via Ctrl-C — it removes its
+    own slot so the next hook fire isn't briefly fooled by a stale PID
+    before ``_pid_alive`` returns False.
 
-    We only delete the file if it claims our own PID; any other PID is
-    left alone (could be an unrelated mine running concurrently from
-    a different worktree / session).
+    Only delete the slot if it claims our own PID; any other PID is left
+    alone (it could belong to an unrelated mine that just claimed the
+    same slot via a stale-reclaim race).
     """
-    try:
-        from .hooks_cli import _MINE_PID_FILE
-    except Exception:
+    pid_file_env = os.environ.get("MEMPALACE_MINE_PID_FILE", "")
+    if not pid_file_env:
         return
     try:
-        if not _MINE_PID_FILE.exists():
+        pid_file = Path(pid_file_env)
+        if not pid_file.exists():
             return
-        recorded = _MINE_PID_FILE.read_text().strip()
+        recorded = pid_file.read_text().strip()
         if recorded and recorded.isdigit() and int(recorded) == os.getpid():
-            _MINE_PID_FILE.unlink()
+            pid_file.unlink()
     except OSError:
         # Best-effort cleanup; never fail the mine over PID bookkeeping.
         pass

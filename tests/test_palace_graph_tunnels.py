@@ -69,6 +69,11 @@ class TestTunnelStorage:
 
 
 class TestExplicitTunnels:
+    def test_normalize_wing_uses_shared_rule_and_trims_empty(self):
+        assert palace_graph._normalize_wing(" Mempalace-Public ") == "mempalace_public"
+        assert palace_graph._normalize_wing("   ") is None
+        assert palace_graph._normalize_wing(None) is None
+
     def test_create_tunnel_deduplicates_reverse_order_and_updates_label(
         self, tmp_path, monkeypatch
     ):

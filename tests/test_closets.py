@@ -23,6 +23,7 @@ Coverage map:
     cross-diary collisions, force=True purges leftover closets.
 """
 
+import hashlib
 import json
 import multiprocessing
 import os
@@ -604,6 +605,84 @@ class TestDiaryIngest:
         ingest_diaries(str(diary_dir), str(palace_dir), force=True)
         result = ingest_diaries(str(diary_dir), str(palace_dir))
         assert result["days_updated"] == 0
+
+    def test_ingest_detects_same_size_content_edit(self, tmp_path):
+        # Regression #925: the prior skip-check compared byte length only, so
+        # any in-place edit preserving total length (typo fix "teh"→"the",
+        # word swap, character reorder) was silently dropped. Content-hash
+        # check must catch the change AND rebuild the searchable closet so
+        # the index does not stay stale while the drawer updates.
+        diary_dir = tmp_path / "diaries"
+        diary_dir.mkdir()
+        diary_file = diary_dir / "2026-04-13.md"
+        # Original has the typo "Teh"; the edit fixes it to "The" — same length.
+        original = "# 2026-04-13\n\n## 10:00 — Test\n\nTeh elaborate jakarta postgres bug.\n"
+        edited = "# 2026-04-13\n\n## 10:00 — Test\n\nThe elaborate jakarta postgres bug.\n"
+        assert len(original) == len(edited), "test setup: edited content must be same length"
+        diary_file.write_text(original)
+        palace_dir = tmp_path / "palace"
+
+        from mempalace.diary_ingest import ingest_diaries
+
+        ingest_diaries(str(diary_dir), str(palace_dir), force=True)
+        diary_file.write_text(edited)
+        result = ingest_diaries(str(diary_dir), str(palace_dir))
+        assert result["days_updated"] == 1, "same-size content edit must trigger re-ingest"
+
+        # Drawer must hold the corrected text.
+        drawers = get_collection(str(palace_dir)).get(where={"source_file": str(diary_file)})
+        joined_drawers = "\n".join(drawers["documents"])
+        assert "The elaborate" in joined_drawers
+        assert "Teh elaborate" not in joined_drawers, "drawer still holds pre-edit content"
+
+        # And the closet (search index) must reflect the edit too — not just the
+        # drawer. Otherwise searches would surface stale text.
+        closets = get_closets_collection(str(palace_dir)).get(
+            where={"source_file": str(diary_file)}
+        )
+        joined_closets = "\n".join(closets["documents"])
+        assert "Teh elaborate" not in joined_closets, "closet index still holds stale content"
+
+    def test_legacy_state_backfills_content_hash(self, tmp_path):
+        # Upgraded users can carry legacy state entries without ``content_hash``.
+        # Same-size skip is preserved for that one run, but the hash must be
+        # recorded so the strict check engages on subsequent runs.
+        diary_dir = tmp_path / "diaries"
+        diary_dir.mkdir()
+        diary_file = diary_dir / "2026-04-13.md"
+        # Write explicit UTF-8 so the round-trip matches how diary_ingest reads.
+        # Windows' default text-mode encoding is cp1252; without this the em
+        # dash would round-trip lossy and the hash assertion below would fail.
+        text = "# 2026-04-13\n\n## 10:00 — Test\n\nUnchanged body content here.\n"
+        diary_file.write_text(text, encoding="utf-8")
+        palace_dir = tmp_path / "palace"
+
+        from mempalace.diary_ingest import _state_file_for, ingest_diaries
+
+        # Simulate a legacy state file: only size + entry_count, no content_hash.
+        state_file = _state_file_for(str(palace_dir), diary_dir.resolve())
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        state_file.write_text(
+            json.dumps(
+                {
+                    f"diary|{diary_file.name}": {
+                        "size": len(text),
+                        "entry_count": 1,
+                        "ingested_at": "2026-04-12T00:00:00+00:00",
+                    }
+                }
+            )
+        )
+
+        # Run with no force — size matches, so this should skip ingest.
+        result = ingest_diaries(str(diary_dir), str(palace_dir))
+        assert result["days_updated"] == 0
+
+        # Hash must have been backfilled into state for the next run's strict check.
+        persisted = json.loads(state_file.read_text())
+        entry = persisted[f"diary|{diary_file.name}"]
+        assert "content_hash" in entry, "legacy skip path must record the hash"
+        assert entry["content_hash"] == hashlib.sha256(text.encode("utf-8")).hexdigest()
 
     def test_state_file_lives_outside_diary_dir(self, tmp_path):
         # Regression: the original implementation wrote

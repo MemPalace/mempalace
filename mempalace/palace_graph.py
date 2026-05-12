@@ -29,7 +29,7 @@ import time
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
-from .config import MempalaceConfig
+from .config import MempalaceConfig, normalize_wing_name
 from .palace import get_collection as _get_palace_collection
 from .palace import mine_lock
 
@@ -46,7 +46,10 @@ def _normalize_wing(wing: str | None) -> str | None:
     """
     if wing is None:
         return None
-    return wing.lower().replace(" ", "_").replace("-", "_")
+    wing = wing.strip()
+    if not wing:
+        return None
+    return normalize_wing_name(wing)
 
 
 # Module-level graph cache with TTL and write-invalidation.

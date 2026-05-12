@@ -2,6 +2,7 @@ import os
 import pickle
 import shutil
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import chromadb
@@ -452,37 +453,33 @@ def test_get_collection_create_true_preserves_existing_metadata(tmp_path):
 def test_fix_blob_seq_ids_converts_blobs_to_integers(tmp_path):
     """Simulate a ChromaDB 0.6.x database with BLOB seq_ids and verify repair."""
     db_path = tmp_path / "chroma.sqlite3"
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("CREATE TABLE embeddings (rowid INTEGER PRIMARY KEY, seq_id)")
-    # Insert BLOB seq_id like ChromaDB 0.6.x would
-    blob_42 = (42).to_bytes(8, byteorder="big")
-    conn.execute("INSERT INTO embeddings (seq_id) VALUES (?)", (blob_42,))
-    conn.commit()
-    conn.close()
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.execute("CREATE TABLE embeddings (rowid INTEGER PRIMARY KEY, seq_id)")
+        # Insert BLOB seq_id like ChromaDB 0.6.x would
+        blob_42 = (42).to_bytes(8, byteorder="big")
+        conn.execute("INSERT INTO embeddings (seq_id) VALUES (?)", (blob_42,))
+        conn.commit()
 
     _fix_blob_seq_ids(str(tmp_path))
 
-    conn = sqlite3.connect(str(db_path))
-    row = conn.execute("SELECT seq_id, typeof(seq_id) FROM embeddings").fetchone()
-    assert row == (42, "integer")
-    conn.close()
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        row = conn.execute("SELECT seq_id, typeof(seq_id) FROM embeddings").fetchone()
+        assert row == (42, "integer")
 
 
 def test_fix_blob_seq_ids_noop_without_blobs(tmp_path):
     """No error when seq_ids are already integers."""
     db_path = tmp_path / "chroma.sqlite3"
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("CREATE TABLE embeddings (rowid INTEGER PRIMARY KEY, seq_id INTEGER)")
-    conn.execute("INSERT INTO embeddings (seq_id) VALUES (42)")
-    conn.commit()
-    conn.close()
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.execute("CREATE TABLE embeddings (rowid INTEGER PRIMARY KEY, seq_id INTEGER)")
+        conn.execute("INSERT INTO embeddings (seq_id) VALUES (42)")
+        conn.commit()
 
     _fix_blob_seq_ids(str(tmp_path))
 
-    conn = sqlite3.connect(str(db_path))
-    row = conn.execute("SELECT seq_id, typeof(seq_id) FROM embeddings").fetchone()
-    assert row == (42, "integer")
-    conn.close()
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        row = conn.execute("SELECT seq_id, typeof(seq_id) FROM embeddings").fetchone()
+        assert row == (42, "integer")
 
 
 def test_fix_blob_seq_ids_noop_without_database(tmp_path):
@@ -499,60 +496,56 @@ def test_fix_blob_seq_ids_does_not_touch_max_seq_id(tmp_path):
     silently suppressed every subsequent embeddings_queue write.
     """
     db_path = tmp_path / "chroma.sqlite3"
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("CREATE TABLE embeddings (rowid INTEGER PRIMARY KEY, seq_id)")
-    conn.execute("CREATE TABLE max_seq_id (rowid INTEGER PRIMARY KEY, seq_id)")
-    sysdb10_blob = b"\x11\x11502607"
-    conn.execute("INSERT INTO max_seq_id (seq_id) VALUES (?)", (sysdb10_blob,))
-    conn.commit()
-    conn.close()
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.execute("CREATE TABLE embeddings (rowid INTEGER PRIMARY KEY, seq_id)")
+        conn.execute("CREATE TABLE max_seq_id (rowid INTEGER PRIMARY KEY, seq_id)")
+        sysdb10_blob = b"\x11\x11502607"
+        conn.execute("INSERT INTO max_seq_id (seq_id) VALUES (?)", (sysdb10_blob,))
+        conn.commit()
 
     _fix_blob_seq_ids(str(tmp_path))
 
-    conn = sqlite3.connect(str(db_path))
-    row = conn.execute("SELECT seq_id, typeof(seq_id) FROM max_seq_id").fetchone()
-    assert row == (sysdb10_blob, "blob")
-    conn.close()
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        row = conn.execute("SELECT seq_id, typeof(seq_id) FROM max_seq_id").fetchone()
+        assert row == (sysdb10_blob, "blob")
 
 
 def test_fix_blob_seq_ids_skips_sysdb10_prefix_in_embeddings(tmp_path):
     """Defense-in-depth: sysdb-10 prefix in embeddings.seq_id is skipped."""
     db_path = tmp_path / "chroma.sqlite3"
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("CREATE TABLE embeddings (rowid INTEGER PRIMARY KEY, seq_id)")
-    sysdb10_blob = b"\x11\x11502607"
-    conn.execute("INSERT INTO embeddings (seq_id) VALUES (?)", (sysdb10_blob,))
-    conn.commit()
-    conn.close()
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.execute("CREATE TABLE embeddings (rowid INTEGER PRIMARY KEY, seq_id)")
+        sysdb10_blob = b"\x11\x11502607"
+        conn.execute("INSERT INTO embeddings (seq_id) VALUES (?)", (sysdb10_blob,))
+        conn.commit()
 
     _fix_blob_seq_ids(str(tmp_path))
 
-    conn = sqlite3.connect(str(db_path))
-    row = conn.execute("SELECT seq_id, typeof(seq_id) FROM embeddings").fetchone()
-    # Still a BLOB — not converted to 1.23e18.
-    assert row == (sysdb10_blob, "blob")
-    conn.close()
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        row = conn.execute("SELECT seq_id, typeof(seq_id) FROM embeddings").fetchone()
+        # Still a BLOB — not converted to 1.23e18.
+        assert row == (sysdb10_blob, "blob")
 
 
 def test_fix_blob_seq_ids_still_converts_legacy_blobs_in_embeddings(tmp_path):
     """Regression guard: pure big-endian u64 BLOBs still convert for genuine 0.6.x."""
     db_path = tmp_path / "chroma.sqlite3"
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("CREATE TABLE embeddings (rowid INTEGER PRIMARY KEY, seq_id)")
-    conn.execute("INSERT INTO embeddings (seq_id) VALUES (?)", ((42).to_bytes(8, "big"),))
-    conn.execute("INSERT INTO embeddings (seq_id) VALUES (?)", (b"\x11\x11502607",))
-    conn.execute("INSERT INTO embeddings (seq_id) VALUES (?)", ((7).to_bytes(8, "big"),))
-    conn.commit()
-    conn.close()
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.execute("CREATE TABLE embeddings (rowid INTEGER PRIMARY KEY, seq_id)")
+        conn.execute("INSERT INTO embeddings (seq_id) VALUES (?)", ((42).to_bytes(8, "big"),))
+        conn.execute("INSERT INTO embeddings (seq_id) VALUES (?)", (b"\x11\x11502607",))
+        conn.execute("INSERT INTO embeddings (seq_id) VALUES (?)", ((7).to_bytes(8, "big"),))
+        conn.commit()
 
     _fix_blob_seq_ids(str(tmp_path))
 
-    conn = sqlite3.connect(str(db_path))
-    rows = conn.execute("SELECT seq_id, typeof(seq_id) FROM embeddings ORDER BY rowid").fetchall()
-    assert rows[0] == (42, "integer")
-    assert rows[1] == (b"\x11\x11502607", "blob")  # sysdb-10 row left alone
-    assert rows[2] == (7, "integer")
-    conn.close()
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        rows = conn.execute(
+            "SELECT seq_id, typeof(seq_id) FROM embeddings ORDER BY rowid"
+        ).fetchall()
+        assert rows[0] == (42, "integer")
+        assert rows[1] == (b"\x11\x11502607", "blob")  # sysdb-10 row left alone
+        assert rows[2] == (7, "integer")
 
 
 def test_fix_blob_seq_ids_writes_marker_after_blob_path(tmp_path):
@@ -560,11 +553,10 @@ def test_fix_blob_seq_ids_writes_marker_after_blob_path(tmp_path):
     from mempalace.backends.chroma import _BLOB_FIX_MARKER
 
     db_path = tmp_path / "chroma.sqlite3"
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("CREATE TABLE embeddings (rowid INTEGER PRIMARY KEY, seq_id)")
-    conn.execute("INSERT INTO embeddings (seq_id) VALUES (?)", ((42).to_bytes(8, "big"),))
-    conn.commit()
-    conn.close()
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.execute("CREATE TABLE embeddings (rowid INTEGER PRIMARY KEY, seq_id)")
+        conn.execute("INSERT INTO embeddings (seq_id) VALUES (?)", ((42).to_bytes(8, "big"),))
+        conn.commit()
 
     marker = tmp_path / _BLOB_FIX_MARKER
     assert not marker.exists()
@@ -585,11 +577,10 @@ def test_fix_blob_seq_ids_writes_marker_when_already_integer(tmp_path):
     from mempalace.backends.chroma import _BLOB_FIX_MARKER
 
     db_path = tmp_path / "chroma.sqlite3"
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("CREATE TABLE embeddings (rowid INTEGER PRIMARY KEY, seq_id INTEGER)")
-    conn.execute("INSERT INTO embeddings (seq_id) VALUES (42)")
-    conn.commit()
-    conn.close()
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.execute("CREATE TABLE embeddings (rowid INTEGER PRIMARY KEY, seq_id INTEGER)")
+        conn.execute("INSERT INTO embeddings (seq_id) VALUES (42)")
+        conn.commit()
 
     marker = tmp_path / _BLOB_FIX_MARKER
     assert not marker.exists()

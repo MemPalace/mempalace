@@ -2,6 +2,7 @@
 
 import os
 import sqlite3
+from contextlib import closing
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -809,63 +810,62 @@ def _seed_poisoned_max_seq_id(
     closets_vec = "seg-closets-vec-0000-1111-2222-333344445555"
     closets_meta = "seg-closets-meta-0000-1111-2222-33334444555"
 
-    conn = sqlite3.connect(db_path)
-    conn.executescript(
-        """
-        CREATE TABLE segments(
-            id TEXT PRIMARY KEY, type TEXT, scope TEXT, collection TEXT
-        );
-        CREATE TABLE max_seq_id(segment_id TEXT PRIMARY KEY, seq_id);
-        CREATE TABLE embeddings(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            segment_id TEXT,
-            embedding_id TEXT,
-            seq_id
-        );
-        CREATE TABLE embeddings_queue(seq_id INTEGER PRIMARY KEY, topic TEXT, id TEXT);
-        CREATE TABLE collection_metadata(collection_id TEXT, key TEXT, str_value TEXT);
-        """
-    )
-    conn.executemany(
-        "INSERT INTO segments VALUES (?, ?, ?, ?)",
-        [
-            (drawers_vec, "urn:vector", "VECTOR", drawers_coll),
-            (drawers_meta, "urn:metadata", "METADATA", drawers_coll),
-            (closets_vec, "urn:vector", "VECTOR", closets_coll),
-            (closets_meta, "urn:metadata", "METADATA", closets_coll),
-        ],
-    )
-    conn.executemany(
-        "INSERT INTO max_seq_id(segment_id, seq_id) VALUES (?, ?)",
-        [
-            (drawers_vec, drawers_vec_poison),
-            (drawers_meta, drawers_meta_poison),
-            (closets_vec, closets_vec_poison),
-            (closets_meta, closets_meta_poison),
-        ],
-    )
-    # Populate embeddings so the collection-MAX heuristic has data to work with.
-    # drawers METADATA owns the max at drawers_meta_max; closets likewise.
-    for i in range(1, drawers_meta_max + 1, max(drawers_meta_max // 5, 1)):
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE segments(
+                id TEXT PRIMARY KEY, type TEXT, scope TEXT, collection TEXT
+            );
+            CREATE TABLE max_seq_id(segment_id TEXT PRIMARY KEY, seq_id);
+            CREATE TABLE embeddings(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                segment_id TEXT,
+                embedding_id TEXT,
+                seq_id
+            );
+            CREATE TABLE embeddings_queue(seq_id INTEGER PRIMARY KEY, topic TEXT, id TEXT);
+            CREATE TABLE collection_metadata(collection_id TEXT, key TEXT, str_value TEXT);
+            """
+        )
+        conn.executemany(
+            "INSERT INTO segments VALUES (?, ?, ?, ?)",
+            [
+                (drawers_vec, "urn:vector", "VECTOR", drawers_coll),
+                (drawers_meta, "urn:metadata", "METADATA", drawers_coll),
+                (closets_vec, "urn:vector", "VECTOR", closets_coll),
+                (closets_meta, "urn:metadata", "METADATA", closets_coll),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO max_seq_id(segment_id, seq_id) VALUES (?, ?)",
+            [
+                (drawers_vec, drawers_vec_poison),
+                (drawers_meta, drawers_meta_poison),
+                (closets_vec, closets_vec_poison),
+                (closets_meta, closets_meta_poison),
+            ],
+        )
+        # Populate embeddings so the collection-MAX heuristic has data to work with.
+        # drawers METADATA owns the max at drawers_meta_max; closets likewise.
+        for i in range(1, drawers_meta_max + 1, max(drawers_meta_max // 5, 1)):
+            conn.execute(
+                "INSERT INTO embeddings(segment_id, embedding_id, seq_id) VALUES (?, ?, ?)",
+                (drawers_meta, f"d-{i}", i),
+            )
         conn.execute(
             "INSERT INTO embeddings(segment_id, embedding_id, seq_id) VALUES (?, ?, ?)",
-            (drawers_meta, f"d-{i}", i),
+            (drawers_meta, "d-max", drawers_meta_max),
         )
-    conn.execute(
-        "INSERT INTO embeddings(segment_id, embedding_id, seq_id) VALUES (?, ?, ?)",
-        (drawers_meta, "d-max", drawers_meta_max),
-    )
-    for i in range(1, closets_meta_max + 1, max(closets_meta_max // 5, 1)):
+        for i in range(1, closets_meta_max + 1, max(closets_meta_max // 5, 1)):
+            conn.execute(
+                "INSERT INTO embeddings(segment_id, embedding_id, seq_id) VALUES (?, ?, ?)",
+                (closets_meta, f"c-{i}", i),
+            )
         conn.execute(
             "INSERT INTO embeddings(segment_id, embedding_id, seq_id) VALUES (?, ?, ?)",
-            (closets_meta, f"c-{i}", i),
+            (closets_meta, "c-max", closets_meta_max),
         )
-    conn.execute(
-        "INSERT INTO embeddings(segment_id, embedding_id, seq_id) VALUES (?, ?, ?)",
-        (closets_meta, "c-max", closets_meta_max),
-    )
-    conn.commit()
-    conn.close()
+        conn.commit()
     return {
         "drawers_vec": drawers_vec,
         "drawers_meta": drawers_meta,

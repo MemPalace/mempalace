@@ -1,0 +1,281 @@
+# Candidate models for evaluation.
+#
+# Pull with: ollama pull <tag>
+# Reference: ollama.com/library/<family>/tags
+#
+# Tiers control orchestrator default selection:
+#   tier1: must-evaluate set (~10 models, balanced size/quantization)
+#   tier2: worth running if time permits
+#   tier3: special cases (FP16 ceilings, QAT comparisons)
+
+candidates:
+  # ── Tier 1: balanced q4_K_M sweep across families ────────────────────
+  - tag: qwen3:4b-instruct-2507-q4_K_M
+    family: qwen3
+    size_b: 4.0
+    variant: instruct
+    quantization: q4_K_M
+    expected_vram_mb: 2500
+    tier: 1
+    notes: "Recommended baseline. Explicit instruct release."
+
+  - tag: qwen3:4b-instruct-2507-q8_0
+    family: qwen3
+    size_b: 4.0
+    variant: instruct
+    quantization: q8_0
+    expected_vram_mb: 4300
+    tier: 1
+    notes: "Higher precision comparator for the q4_K_M baseline."
+
+  # Pure reasoning variants are excluded by policy. MemPalace
+  # classification tasks always run with thinking disabled
+  # (see benchmarks/model_eval/runner.py and the project memory
+  # "no reasoning models for classification"). To benchmark a
+  # hybrid model, use its base tag and the runner forces
+  # think=False on every call.
+
+  - tag: qwen2.5:3b-instruct-q4_K_M
+    family: qwen2.5
+    size_b: 3.0
+    variant: instruct
+    quantization: q4_K_M
+    expected_vram_mb: 1900
+    tier: 1
+    notes: "Strong older comparator. Often punches above its size class."
+
+  - tag: gemma3:4b-it-q4_K_M
+    family: gemma3
+    size_b: 4.0
+    variant: instruct
+    quantization: q4_K_M
+    expected_vram_mb: 3300
+    tier: 1
+    notes: "Top non-Qwen contender at this size."
+
+  - tag: gemma3:4b-it-qat
+    family: gemma3
+    size_b: 4.0
+    variant: instruct
+    quantization: qat
+    expected_vram_mb: 4000
+    tier: 1
+    notes: "Quantization-aware-trained variant. Compare to post-hoc q4_K_M."
+
+  - tag: gemma3:1b-it-q4_K_M
+    family: gemma3
+    size_b: 1.0
+    variant: instruct
+    quantization: q4_K_M
+    expected_vram_mb: 815
+    tier: 1
+    notes: "Smallest credible Gemma."
+
+  - tag: llama3.2:3b-instruct-q4_K_M
+    family: llama3.2
+    size_b: 3.0
+    variant: instruct
+    quantization: q4_K_M
+    expected_vram_mb: 2000
+    tier: 1
+    notes: ""
+
+  - tag: llama3.2:1b-instruct-q4_K_M
+    family: llama3.2
+    size_b: 1.0
+    variant: instruct
+    quantization: q4_K_M
+    expected_vram_mb: 808
+    tier: 1
+    notes: ""
+
+  - tag: phi3.5:3.8b-mini-instruct-q4_K_M
+    family: phi3.5
+    size_b: 3.8
+    variant: instruct
+    quantization: q4_K_M
+    expected_vram_mb: 2400
+    tier: 1
+    notes: ""
+
+  # ── Tier modern: model families missed in the first benchmark pass ──
+  # These existed at the time of the first run but weren't surfaced by
+  # the initial ollama.com search. Held in a separate tier so we can
+  # filter `--candidates modern` for cheap re-runs.
+
+  - tag: qwen3.5:4b-q4_K_M
+    family: qwen3.5
+    size_b: 4.0
+    variant: instruct
+    quantization: q4_K_M
+    expected_vram_mb: 3400
+    tier: modern
+    notes: "Qwen 3.5 4B. Newer generation. Same tag resolves to qwen3.5:4b (default quantization is q4_K_M)."
+
+  - tag: gemma4:e2b-it-q4_K_M
+    family: gemma4
+    size_b: 2.0
+    variant: instruct
+    quantization: q4_K_M
+    expected_vram_mb: 7200
+    tier: modern
+    notes: "Gemma 4 e2b (extended 2B). On-disk 7.2 GB — bigger than its parameter count suggests, likely vision/multimodal layers."
+
+  - tag: gemma4:e4b-it-q4_K_M
+    family: gemma4
+    size_b: 4.0
+    variant: instruct
+    quantization: q4_K_M
+    expected_vram_mb: 9600
+    tier: modern
+    notes: "Gemma 4 e4b (extended 4B). On-disk 9.6 GB."
+
+  - tag: granite4.1:3b-q4_K_M
+    family: granite
+    size_b: 3.0
+    variant: instruct
+    quantization: q4_K_M
+    expected_vram_mb: 2100
+    tier: modern
+    notes: "IBM Granite 4.1 3B. Smaller, focused on enterprise tasks."
+
+  - tag: ministral-3:3b
+    family: mistral
+    size_b: 3.0
+    variant: instruct
+    quantization: default
+    expected_vram_mb: 3000
+    tier: modern
+    notes: "Mistral Ministral 3 3B. No explicit q4_K_M tag; default 3.0 GB."
+
+  # ── Tier 2: smaller sizes for VRAM-constrained users ─────────────────
+  - tag: qwen3:1.7b-q4_K_M
+    family: qwen3
+    size_b: 1.7
+    variant: mixed
+    quantization: q4_K_M
+    expected_vram_mb: 1400
+    tier: 2
+    notes: "qwen3 small. Variant ambiguous in this tag."
+
+  - tag: qwen3:0.6b-q4_K_M
+    family: qwen3
+    size_b: 0.6
+    variant: mixed
+    quantization: q4_K_M
+    expected_vram_mb: 523
+    tier: 2
+    notes: "Edge-device size. Variant ambiguous."
+
+  - tag: qwen2.5:1.5b-instruct-q4_K_M
+    family: qwen2.5
+    size_b: 1.5
+    variant: instruct
+    quantization: q4_K_M
+    expected_vram_mb: 986
+    tier: 2
+    notes: ""
+
+  - tag: qwen2.5:0.5b-instruct-q4_K_M
+    family: qwen2.5
+    size_b: 0.5
+    variant: instruct
+    quantization: q4_K_M
+    expected_vram_mb: 398
+    tier: 2
+    notes: "Smallest viable for any non-trivial task."
+
+  - tag: gemma3:270m-it-q8_0
+    family: gemma3
+    size_b: 0.27
+    variant: instruct
+    quantization: q8_0
+    expected_vram_mb: 292
+    tier: 2
+    notes: "Tiny. Probably fails most tasks but worth a baseline."
+
+  # ── Tier 3: ceilings and special cases ───────────────────────────────
+  - tag: qwen3:4b-instruct-2507-fp16
+    family: qwen3
+    size_b: 4.0
+    variant: instruct
+    quantization: fp16
+    expected_vram_mb: 8100
+    tier: 3
+    notes: "Full-precision ceiling for the leader. Quality target."
+
+  # ── Cloud tier: Ollama-hosted reference and ceiling models ──────────
+  # Cloud models run on Ollama's servers, not locally. No local VRAM
+  # cost. Latency includes network round-trip. Used as accuracy ceiling
+  # to size the gap between local-best and what a 100x bigger model can
+  # do. Inclusion in benchmarks does not imply production use; the
+  # privacy and cost trade-offs make local models the default.
+  - tag: gpt-oss:20b-cloud
+    family: gpt-oss
+    size_b: 20.0
+    variant: instruct
+    quantization: cloud
+    expected_vram_mb: 0
+    tier: cloud
+    cloud: true
+    notes: "Smaller cloud reference. Faster + cheaper than the 120B."
+
+  - tag: gpt-oss:120b-cloud
+    family: gpt-oss
+    size_b: 120.0
+    variant: instruct
+    quantization: cloud
+    expected_vram_mb: 0
+    tier: cloud
+    cloud: true
+    notes: "Mid-tier cloud reference."
+
+  - tag: qwen3-coder:480b-cloud
+    family: qwen3-coder
+    size_b: 480.0
+    variant: coder-tuned
+    quantization: cloud
+    expected_vram_mb: 0
+    tier: cloud
+    cloud: true
+    notes: "Code-tuned variant. May behave differently on natural-language classification."
+
+  - tag: deepseek-v3.1:671b-cloud
+    family: deepseek
+    size_b: 671.0
+    variant: instruct
+    quantization: cloud
+    expected_vram_mb: 0
+    tier: cloud
+    cloud: true
+    notes: "Older DeepSeek generation. Kept for historical comparison."
+
+  - tag: deepseek-v4-flash:cloud
+    family: deepseek
+    size_b: 284.0
+    variant: instruct
+    quantization: cloud
+    expected_vram_mb: 0
+    tier: cloud
+    cloud: true
+    notes: "DeepSeek V4 Flash MoE — 284B total, 13B activated. Newer generation, optimized for speed."
+
+  - tag: deepseek-v4-pro:cloud
+    family: deepseek
+    size_b: 671.0
+    variant: instruct
+    quantization: cloud
+    expected_vram_mb: 0
+    tier: cloud
+    cloud: true
+    notes: "DeepSeek V4 Pro. 1M context, multiple reasoning modes."
+
+  - tag: kimi-k2.6:cloud
+    family: kimi
+    size_b: 1000.0
+    variant: instruct
+    quantization: cloud
+    expected_vram_mb: 0
+    tier: cloud
+    cloud: true
+    notes: "Kimi K2.6 — current Moonshot release. Replaces kimi-k2:1t-cloud which returned HTTP 500 on the first run."
