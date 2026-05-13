@@ -177,7 +177,9 @@ def test_ingest_raises_source_not_found_for_missing_db(adapter, palace_ctx, tmp_
         list(adapter.ingest(source=ref, palace=palace_ctx))
 
 
-def test_ingest_raises_source_not_found_for_db_without_expected_tables(adapter, palace_ctx, tmp_path):
+def test_ingest_raises_source_not_found_for_db_without_expected_tables(
+    adapter, palace_ctx, tmp_path
+):
     path = tmp_path / "bad.db"
     conn = sqlite3.connect(str(path))
     conn.execute("CREATE TABLE other (id INTEGER)")
@@ -209,9 +211,7 @@ def test_source_summary_counts_sessions(adapter, canonical_db):
 
 
 def test_source_summary_for_missing_db(adapter, tmp_path):
-    summary = adapter.source_summary(
-        source=SourceRef(local_path=str(tmp_path / "absent.db"))
-    )
+    summary = adapter.source_summary(source=SourceRef(local_path=str(tmp_path / "absent.db")))
     assert summary.item_count == 0
     assert "not found" in summary.description.lower()
 
@@ -240,9 +240,9 @@ def test_ingest_skips_cancelled_session_with_too_few_turns(adapter, palace_ctx, 
     results = list(adapter.ingest(source=SourceRef(local_path=canonical_db), palace=palace_ctx))
     drawers = [r for r in results if isinstance(r, DrawerRecord)]
     src_files = {d.source_file for d in drawers}
-    assert all("ses_ddd444" not in sf for sf in src_files), (
-        "single-message cancelled session must be skipped"
-    )
+    assert all(
+        "ses_ddd444" not in sf for sf in src_files
+    ), "single-message cancelled session must be skipped"
 
 
 def test_drawer_metadata_carries_universal_and_schema_fields(adapter, palace_ctx, canonical_db):
@@ -264,17 +264,17 @@ def test_drawer_metadata_carries_universal_and_schema_fields(adapter, palace_ctx
     }
     for drawer in drawers:
         meta = drawer.metadata
-        assert universal_keys.issubset(meta.keys()), (
-            f"missing universal keys: {universal_keys - meta.keys()}"
-        )
-        assert schema_keys.issubset(meta.keys()), (
-            f"missing schema keys: {schema_keys - meta.keys()}"
-        )
+        assert universal_keys.issubset(
+            meta.keys()
+        ), f"missing universal keys: {universal_keys - meta.keys()}"
+        assert schema_keys.issubset(
+            meta.keys()
+        ), f"missing schema keys: {schema_keys - meta.keys()}"
         # Flat-scalar invariant — chroma constraint.
         for k, v in meta.items():
-            assert isinstance(v, (str, int, float, bool)), (
-                f"metadata[{k}]={v!r} of type {type(v).__name__} is not flat-scalar"
-            )
+            assert isinstance(
+                v, (str, int, float, bool)
+            ), f"metadata[{k}]={v!r} of type {type(v).__name__} is not flat-scalar"
 
 
 def test_drawer_route_hint_carries_wing(adapter, palace_ctx, canonical_db):
@@ -328,15 +328,10 @@ def test_is_current_uses_version_when_present(adapter):
     item = SourceItemMetadata(source_file="opencode:///x#session=ses_a", version="123")
     assert adapter.is_current(item=item, existing_metadata=None) is False
     assert (
-        adapter.is_current(
-            item=item, existing_metadata={"opencode_session_version": "123"}
-        )
-        is True
+        adapter.is_current(item=item, existing_metadata={"opencode_session_version": "123"}) is True
     )
     assert (
-        adapter.is_current(
-            item=item, existing_metadata={"opencode_session_version": "999"}
-        )
+        adapter.is_current(item=item, existing_metadata={"opencode_session_version": "999"})
         is False
     )
 
@@ -347,9 +342,7 @@ def test_is_current_falls_back_to_presence_when_version_missing(adapter):
     # any other-metadata-present scenario should return True (we assume we
     # already mined this session) — this is safer than always re-extracting.
     assert (
-        adapter.is_current(
-            item=item, existing_metadata={"session_id": "ses_a", "wing": "x"}
-        )
+        adapter.is_current(item=item, existing_metadata={"session_id": "ses_a", "wing": "x"})
         is True
     )
 
@@ -366,8 +359,7 @@ def test_tool_input_and_tool_output_parts_are_skipped(adapter, palace_ctx, canon
     drawers = [
         r
         for r in results
-        if isinstance(r, DrawerRecord)
-        and r.source_file.endswith("#session=ses_aaa111")
+        if isinstance(r, DrawerRecord) and r.source_file.endswith("#session=ses_aaa111")
     ]
     joined = "\n".join(d.content for d in drawers)
     # Sentinels we wrote into tool-input/tool-output parts in the fixture
@@ -378,7 +370,9 @@ def test_tool_input_and_tool_output_parts_are_skipped(adapter, palace_ctx, canon
 def test_tool_echo_lines_are_stripped():
     """A user turn echoing a tool invocation should be dropped before the
     transcript is chunked."""
-    raw = "user\t" + json.dumps({"type": "text", "text": "Called the read tool with the following input"})
+    raw = "user\t" + json.dumps(
+        {"type": "text", "text": "Called the read tool with the following input"}
+    )
     raw += "\nuser\t" + json.dumps({"type": "text", "text": "Actually, what's the answer?"})
     out = src_transforms.opencode_extract_text_parts(raw)
     out = src_transforms.opencode_skip_tool_echo(out)

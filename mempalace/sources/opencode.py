@@ -88,9 +88,7 @@ def _resolve_db(local_path: Optional[str] = None) -> str:
     )
 
 
-def _build_source_bytes_per_session(
-    conn: sqlite3.Connection, session_id: str
-) -> str:
+def _build_source_bytes_per_session(conn: sqlite3.Connection, session_id: str) -> str:
     """Return the canonical ``source bytes`` for one OpenCode session.
 
     The bytes are role-prefixed ``part.data`` JSON values, one per line, in
@@ -114,9 +112,7 @@ def _build_source_bytes_per_session(
     return "\n".join(f"{role or ''}\t{part}" for role, part in rows)
 
 
-def _extract_session_messages(
-    conn: sqlite3.Connection, session_id: str
-) -> List[Tuple[str, str]]:
+def _extract_session_messages(conn: sqlite3.Connection, session_id: str) -> List[Tuple[str, str]]:
     """Walk ``part.data`` for one session and return merged ``(role, text)`` pairs.
 
     Applies the OpenCode-specific transformations in declaration order using
@@ -436,9 +432,7 @@ class OpenCodeSourceAdapter(BaseSourceAdapter):
         """
         tables = {
             r[0]
-            for r in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
+            for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         }
         required = {"session", "message", "part"}
         missing = required - tables
@@ -469,9 +463,7 @@ class OpenCodeSourceAdapter(BaseSourceAdapter):
                 return normalize_wing_name(base)
         return "opencode_general"
 
-    def _route_hint_for(
-        self, source: SourceRef, directory: Optional[str]
-    ) -> Optional[RouteHint]:
+    def _route_hint_for(self, source: SourceRef, directory: Optional[str]) -> Optional[RouteHint]:
         # Same wing precedence as _wing_for (RFC 002 §2.5) so the
         # SourceItemMetadata route_hint matches the DrawerRecord wing
         # when the caller passed options={"wing": ...} — otherwise core
