@@ -19,6 +19,7 @@ from datetime import datetime
 from collections import defaultdict
 from typing import Optional
 
+from .content_hash import ContentHashDB
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
@@ -836,13 +837,17 @@ def process_file(
     agent: str,
     dry_run: bool,
     closets_col=None,
+    hash_db: ContentHashDB = None,
 ) -> tuple:
     """Read, chunk, route, and file one file. Returns (drawer_count, room_name)."""
 
     # Skip if already filed
     source_file = str(filepath)
-    if not dry_run and file_already_mined(collection, source_file, check_mtime=True):
-        return 0, "general"
+    if not dry_run:
+        if file_already_mined(collection, source_file, check_mtime=True):
+            return 0, "general"
+        if hash_db and hash_db.check_and_add(filepath):
+            return 0, "general"
 
     try:
         content = filepath.read_text(encoding="utf-8", errors="replace")
@@ -1121,9 +1126,11 @@ def _mine_impl(
     if not dry_run:
         collection = get_collection(palace_path)
         closets_col = get_closets_collection(palace_path)
+        hash_db = ContentHashDB(os.path.join(palace_path, "content_hashes.db"))
     else:
         collection = None
         closets_col = None
+        hash_db = None
 
     total_drawers = 0
     files_skipped = 0
@@ -1143,6 +1150,7 @@ def _mine_impl(
                     agent=agent,
                     dry_run=dry_run,
                     closets_col=closets_col,
+                    hash_db=hash_db,
                 )
             except KeyboardInterrupt:
                 # Re-raise so the outer handler prints the summary; we
@@ -1185,6 +1193,10 @@ def _mine_impl(
             print(f"    {room:20} {count} files")
         print('\n  Next: mempalace search "what you\'re looking for"')
         print(f"{'=' * 55}\n")
+
+        if not dry_run and hash_db:
+            hash_db.flush()
+            hash_db.close()
     except KeyboardInterrupt:
         # Idempotent re-mine: deterministic drawer IDs mean already-filed
         # drawers upsert to the same row on next run, so partial progress

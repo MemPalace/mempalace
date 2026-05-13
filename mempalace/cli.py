@@ -515,6 +515,18 @@ def cmd_mine(args):
                 dry_run=args.dry_run,
                 extract_mode=args.extract,
             )
+        elif args.mode == "git":
+            from .git_miner import mine_git
+
+            mine_git(
+                repo_dir=args.dir,
+                palace_path=palace_path,
+                wing=args.wing,
+                agent=args.agent,
+                limit=args.limit,
+                dry_run=args.dry_run,
+                branches=args.git_branch,
+            )
         else:
             from .miner import mine
 
@@ -1238,9 +1250,9 @@ def main():
     p_mine.add_argument("dir", help="Directory to mine")
     p_mine.add_argument(
         "--mode",
-        choices=["projects", "convos"],
+        choices=["projects", "convos", "git"],
         default="projects",
-        help="Ingest mode: 'projects' for code/docs (default), 'convos' for chat exports",
+        help="Ingest mode: 'projects' for code/docs (default), 'convos' for chat exports, 'git' for git commits",
     )
     p_mine.add_argument("--wing", default=None, help="Wing name (default: directory name)")
     p_mine.add_argument(
@@ -1279,6 +1291,13 @@ def main():
         choices=["exchange", "general"],
         default="exchange",
         help="Extraction strategy for convos mode: 'exchange' (default) or 'general' (5 memory types)",
+    )
+    p_mine.add_argument(
+        "--branch",
+        action="append",
+        default=[],
+        dest="git_branch",
+        help="Git branch to mine (default: all branches); repeat for multiple",
     )
 
     # sweep
