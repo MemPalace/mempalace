@@ -84,6 +84,7 @@ STOPWORDS = set(_EN["stopwords"])
 PROSE_EXTENSIONS = {
     ".txt",
     ".md",
+    ".org",
     ".rst",
     ".csv",
 }
@@ -91,6 +92,7 @@ PROSE_EXTENSIONS = {
 READABLE_EXTENSIONS = {
     ".txt",
     ".md",
+    ".org",
     ".py",
     ".js",
     ".ts",
@@ -691,7 +693,7 @@ def confirm_entities(detected: dict, yes: bool = False) -> dict:
 def scan_for_detection(project_dir: str, max_files: int = 10) -> list:
     """
     Collect prose file paths for entity detection.
-    Prose only (.txt, .md, .rst, .csv) — code files produce too many false positives.
+    Prose only (.txt, .md, .org, .rst, .csv) — code files produce too many false positives.
     Falls back to all readable files if no prose found.
     """
     project_path = Path(project_dir).expanduser().resolve()
