@@ -32,7 +32,6 @@ from . import transforms as _transforms
 from .base import (
     AdapterClosedError,
     AdapterSchema,
-    AuthRequiredError,  # noqa: F401  (re-exported error type used in docstrings)
     BaseSourceAdapter,
     DrawerRecord,
     FieldSpec,
@@ -304,7 +303,7 @@ class OpenCodeSourceAdapter(BaseSourceAdapter):
                     source_file=src_file,
                     version=str(time_updated or time_created or 0),
                     size_hint=None,
-                    route_hint=self._route_hint_for(directory, ""),
+                    route_hint=self._route_hint_for(source, directory),
                 )
                 if palace.is_skip_requested():
                     continue
@@ -471,13 +470,13 @@ class OpenCodeSourceAdapter(BaseSourceAdapter):
         return "opencode_general"
 
     def _route_hint_for(
-        self, directory: Optional[str], content: str
+        self, source: SourceRef, directory: Optional[str]
     ) -> Optional[RouteHint]:
-        wing = (
-            normalize_wing_name(Path(directory).name)
-            if directory and Path(directory).name
-            else "opencode_general"
-        )
+        # Same wing precedence as _wing_for (RFC 002 §2.5) so the
+        # SourceItemMetadata route_hint matches the DrawerRecord wing
+        # when the caller passed options={"wing": ...} — otherwise core
+        # could make wrong skip/routing decisions on the gap.
+        wing = self._wing_for(source, directory)
         # Room is content-dependent so we leave it None at the lazy-fetch stage;
         # the eager DrawerRecord emit fills it in per chunk.
         return RouteHint(wing=wing, room=None, hall=None)

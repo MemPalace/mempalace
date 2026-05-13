@@ -13,9 +13,10 @@ Covers:
 
 from __future__ import annotations
 
+import importlib.util
 import json
-import os
 import sqlite3
+import sys
 from pathlib import Path
 
 import pytest
@@ -38,12 +39,18 @@ from mempalace.sources.opencode import (
 )
 
 # Fixture builder lives next to the fixture data on purpose so it is
-# discoverable by anyone investigating the .db format.
+# discoverable by anyone investigating the .db format. Loaded via
+# importlib so we don't mutate sys.path at module scope (which would
+# also trip ruff E402 on the import-not-at-top check).
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "opencode" / "sample_session_2026_05_12"
-import sys
-
-sys.path.insert(0, str(FIXTURE_DIR))
-import build_fixture  # noqa: E402  (path-injected fixture builder)
+_fixture_spec = importlib.util.spec_from_file_location(
+    "build_fixture", FIXTURE_DIR / "build_fixture.py"
+)
+build_fixture = importlib.util.module_from_spec(_fixture_spec)
+# Register in sys.modules so dataclass / typing introspection inside
+# build_fixture can resolve back to the module via cls.__module__.
+sys.modules["build_fixture"] = build_fixture
+_fixture_spec.loader.exec_module(build_fixture)
 
 
 # ---------------------------------------------------------------------------
