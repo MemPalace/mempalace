@@ -1,0 +1,9 @@
+===== raw_session =====
+OK wall=64s R@1=1: R@5=5: R@10=0.980 R@30=1.000 NDCG@10=0.905 NDCG@30=0.909
+===== raw_turn =====
+OK wall=429s R@1=1: R@5=5: R@10=0.960 R@30=0.980 NDCG@10=0.885 NDCG@30=0.861
+===== hybrid_v4_session_hw0.0 =====
+OK wall=90s R@1=1: R@5=5: R@10=1.000 R@30=1.000 NDCG@10=0.937 NDCG@30=0.931
+===== hybrid_v4_turn_hw0.0 =====
+OK wall=85s R@1=1: R@5=5: R@10=1.000 R@30=1.000 NDCG@10=0.937 NDCG@30=0.931
+===== hybrid_v4_session_hw0.30 =====

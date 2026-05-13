@@ -37,3 +37,7 @@ venv/
 # ChromaDB local data
 *.sqlite3-journal
 .envrc
+
+# Local benchmark artifacts (large jsonl dumps, per-question stdout)
+benchmarks/c_beta/*.jsonl
+benchmarks/c_beta/*.stdout

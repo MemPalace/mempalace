@@ -1658,11 +1658,31 @@ def build_palace_and_retrieve_hybrid_v4(
         all_turns = [t["content"] for t in session]
         if not user_turns:
             continue
-        corpus_user.append("\n".join(user_turns))
-        corpus_full.append("\n".join(all_turns))
-        corpus_ids.append(sess_id)
-        corpus_timestamps.append(date)
 
+        if granularity == "session":
+            corpus_user.append("\n".join(user_turns))
+            corpus_full.append("\n".join(all_turns))
+            corpus_ids.append(sess_id)
+            corpus_timestamps.append(date)
+        else:
+            # Turn granularity: index each user turn separately.
+            # corpus_full[i] mirrors corpus_user[i] so the assistant-reference
+            # two-pass still has a doc to query (assistant turns are not
+            # indexed as primary docs but their content is preserved via
+            # pref/quoted-phrase boosts at session level).
+            turn_idx = 0
+            for t in session:
+                if t["role"] != "user":
+                    turn_idx += 1
+                    continue
+                corpus_user.append(t["content"])
+                corpus_full.append(t["content"])
+                corpus_ids.append(f"{sess_id}_turn_{turn_idx}")
+                corpus_timestamps.append(date)
+                turn_idx += 1
+
+        # Preferences stay session-aggregated regardless of granularity —
+        # they are synthetic summaries of the whole session.
         prefs = extract_preferences(session)
         if prefs:
             pref_doc = "User has mentioned: " + "; ".join(prefs)
@@ -1713,13 +1733,15 @@ def build_palace_and_retrieve_hybrid_v4(
         seen = set()
         ranked_indices = []
         for idx, _ in scored:
-            if corpus_ids[idx] not in seen:
-                seen.add(corpus_ids[idx])
+            sid = session_id_from_corpus_id(corpus_ids[idx])
+            if sid not in seen:
+                seen.add(sid)
                 ranked_indices.append(idx)
         for i in range(len(corpus_user)):
-            if corpus_ids[i] not in seen:
+            sid = session_id_from_corpus_id(corpus_ids[i])
+            if sid not in seen:
                 ranked_indices.append(i)
-                seen.add(corpus_ids[i])
+                seen.add(sid)
         return ranked_indices, corpus_user, corpus_ids, corpus_timestamps
 
     # -------------------------------------------------------------------------
@@ -1787,19 +1809,33 @@ def build_palace_and_retrieve_hybrid_v4(
 
     scored.sort(key=lambda x: x[1])
 
-    corpus_id_to_user_idx = {cid: i for i, cid in enumerate(corpus_ids)}
-    seen_ids = set()
+    # Map both turn-level corpus_ids and their session keys to a user-doc index.
+    # In session granularity, sess_id == corpus_id, so the inner branch is a no-op.
+    # In turn granularity, the session key resolves to the first turn of that session
+    # so a pref-doc hit (whose meta-id is a plain sess_id) can be remapped.
+    corpus_id_to_user_idx = {}
+    for i, cid in enumerate(corpus_ids):
+        corpus_id_to_user_idx[cid] = i
+        sid = session_id_from_corpus_id(cid)
+        if sid not in corpus_id_to_user_idx:
+            corpus_id_to_user_idx[sid] = i
+
+    seen_sids = set()
     ranked_indices = []
     for idx, _ in scored:
         cid = all_ids_meta[idx]
-        if cid not in seen_ids:
-            seen_ids.add(cid)
-            ranked_indices.append(corpus_id_to_user_idx[cid])
+        sid = session_id_from_corpus_id(cid)
+        if sid in seen_sids:
+            continue
+        seen_sids.add(sid)
+        target = cid if cid in corpus_id_to_user_idx else sid
+        ranked_indices.append(corpus_id_to_user_idx[target])
 
     for i in range(len(corpus_user)):
-        if corpus_ids[i] not in seen_ids:
+        sid = session_id_from_corpus_id(corpus_ids[i])
+        if sid not in seen_sids:
             ranked_indices.append(i)
-            seen_ids.add(corpus_ids[i])
+            seen_sids.add(sid)
 
     return ranked_indices, corpus_user, corpus_ids, corpus_timestamps
 
