@@ -882,7 +882,11 @@ def build_palace_and_retrieve_hybrid_v2(
                     turn_idx += 1
                     continue
                 corpus_user.append(t["content"])
-                corpus_full.append(t["content"])
+                # Pass 2 of the assistant-reference two-pass queries corpus_full
+                # for quoted/assistant content, so it must contain the full
+                # session text even in turn granularity. corpus_user stays the
+                # single user turn so the primary retrieval signal is granular.
+                corpus_full.append("\n".join(all_turns))
                 corpus_ids.append(f"{sess_id}_turn_{turn_idx}")
                 corpus_timestamps.append(date)
                 turn_idx += 1
@@ -1242,7 +1246,11 @@ def build_palace_and_retrieve_hybrid_v3(
                     turn_idx += 1
                     continue
                 corpus_user.append(t["content"])
-                corpus_full.append(t["content"])
+                # Pass 2 of the assistant-reference two-pass queries corpus_full
+                # for quoted/assistant content, so it must contain the full
+                # session text even in turn granularity. corpus_user stays the
+                # single user turn so the primary retrieval signal is granular.
+                corpus_full.append("\n".join(all_turns))
                 corpus_ids.append(f"{sess_id}_turn_{turn_idx}")
                 corpus_timestamps.append(date)
                 turn_idx += 1
@@ -1730,17 +1738,17 @@ def build_palace_and_retrieve_hybrid_v4(
             corpus_timestamps.append(date)
         else:
             # Turn granularity: index each user turn separately.
-            # corpus_full[i] mirrors corpus_user[i] so the assistant-reference
-            # two-pass still has a doc to query (assistant turns are not
-            # indexed as primary docs but their content is preserved via
-            # pref/quoted-phrase boosts at session level).
             turn_idx = 0
             for t in session:
                 if t["role"] != "user":
                     turn_idx += 1
                     continue
                 corpus_user.append(t["content"])
-                corpus_full.append(t["content"])
+                # Pass 2 of the assistant-reference two-pass queries corpus_full
+                # for quoted/assistant content, so it must contain the full
+                # session text even in turn granularity. corpus_user stays the
+                # single user turn so the primary retrieval signal is granular.
+                corpus_full.append("\n".join(all_turns))
                 corpus_ids.append(f"{sess_id}_turn_{turn_idx}")
                 corpus_timestamps.append(date)
                 turn_idx += 1

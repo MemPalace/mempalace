@@ -1,12 +1,24 @@
 #!/usr/bin/env bash
 set -uo pipefail
-DATA=/Users/macmini/Projects/metis-pair/benchmarks/data/longmemeval/longmemeval_s_cleaned.json
+
+# Resolve repo root from this script's location so the sweep is portable.
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
+cd "$REPO_ROOT"
+
+# DATA is a large external corpus (longmemeval_s_cleaned.json) kept outside the
+# repo. Override via env var; default points at a sibling Projects checkout.
+DATA="${DATA:-$HOME/Projects/metis-pair/benchmarks/data/longmemeval/longmemeval_s_cleaned.json}"
+if [[ ! -f "$DATA" ]]; then
+  echo "ERROR: dataset not found at $DATA" >&2
+  echo "Set DATA=/path/to/longmemeval_s_cleaned.json and re-run." >&2
+  exit 2
+fi
+
 SPLIT=benchmarks/lme_split_50_450.json
 OUTDIR=benchmarks/c_beta
 LOG=$OUTDIR/sweep.log
 CSV=$OUTDIR/sweep_results.csv
-
-cd /Users/macmini/Projects/mempalace
 mkdir -p "$OUTDIR"
 : > "$LOG"
 echo "mode,granularity,hybrid_weight,n_questions,wall_sec,recall_at_1,recall_at_5,recall_at_10,recall_at_30,ndcg_at_10,ndcg_at_30,out_file" > "$CSV"
@@ -36,9 +48,11 @@ run() {
   fi
 
   # Parse session-level recall/ndcg from the "SESSION-LEVEL METRICS:" block.
+  # Single-digit @k prints as "Recall@ 1:" (extra space) → value lands in $3.
+  # Double-digit @k prints as "Recall@10:" (no space)   → value lands in $2.
   local r1 r5 r10 r30 n10 n30
-  r1=$(awk  '/SESSION-LEVEL METRICS/{flag=1;next} flag && /Recall@ 1:/  {print $2; exit}' "$stdout")
-  r5=$(awk  '/SESSION-LEVEL METRICS/{flag=1;next} flag && /Recall@ 5:/  {print $2; exit}' "$stdout")
+  r1=$(awk  '/SESSION-LEVEL METRICS/{flag=1;next} flag && /Recall@ 1:/  {print $3; exit}' "$stdout")
+  r5=$(awk  '/SESSION-LEVEL METRICS/{flag=1;next} flag && /Recall@ 5:/  {print $3; exit}' "$stdout")
   r10=$(awk '/SESSION-LEVEL METRICS/{flag=1;next} flag && /Recall@10:/  {print $2; exit}' "$stdout")
   r30=$(awk '/SESSION-LEVEL METRICS/{flag=1;next} flag && /Recall@30:/  {print $2; exit}' "$stdout")
   n10=$(awk '/SESSION-LEVEL METRICS/{flag=1;next} flag && /NDCG@10:/    {print $4; exit}' "$stdout")

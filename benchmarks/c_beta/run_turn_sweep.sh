@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 set -uo pipefail
-cd /Users/macmini/Projects/mempalace
-DATA=/Users/macmini/Projects/metis-pair/benchmarks/data/longmemeval/longmemeval_s_cleaned.json
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
+cd "$REPO_ROOT"
+DATA="${DATA:-$HOME/Projects/metis-pair/benchmarks/data/longmemeval/longmemeval_s_cleaned.json}"
+if [[ ! -f "$DATA" ]]; then
+  echo "ERROR: dataset not found at $DATA" >&2
+  exit 2
+fi
 SPLIT=benchmarks/lme_split_50_450.json
 OUTDIR=benchmarks/c_beta
 LOG=$OUTDIR/turn_sweep.log
