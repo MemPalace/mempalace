@@ -23,6 +23,8 @@ conformance suite can locate and apply them.
 
 from __future__ import annotations
 
+import json as _json
+
 import re
 from typing import Protocol, Union
 
@@ -170,8 +172,6 @@ def speaker_role_assignment(text: str) -> str:
 # its message's ``role`` field as ``"<role>\t<part_json>"``. That format is
 # what ``canonical_source_bytes`` returns to the conformance suite, and is
 # what the chain of transformations below collapses into the drawer content.
-
-import json as _json
 
 
 def opencode_extract_text_parts(text: str) -> str:

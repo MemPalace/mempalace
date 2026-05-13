@@ -20,7 +20,6 @@ branch.
 
 from __future__ import annotations
 
-import json
 import logging
 import sqlite3
 from datetime import datetime, timezone
@@ -307,8 +306,7 @@ class OpenCodeSourceAdapter(BaseSourceAdapter):
                     size_hint=None,
                     route_hint=self._route_hint_for(directory, ""),
                 )
-                if palace._skip_requested:
-                    palace._skip_requested = False
+                if palace.is_skip_requested():
                     continue
 
                 messages = _extract_session_messages(conn, sid)
@@ -334,6 +332,15 @@ class OpenCodeSourceAdapter(BaseSourceAdapter):
                 wing = self._wing_for(source, directory)
                 room = detect_convo_room(transcript)
                 created_iso = _utc_iso(time_created or 0)
+                # Pre-compute once per session so every chunk of the same
+                # session shares the same filed_at timestamp.
+                filed_at = (
+                    datetime.now(timezone.utc)
+                    .replace(microsecond=0)
+                    .isoformat()
+                    .replace("+00:00", "Z")
+                )
+                session_version = str(time_updated or time_created or 0)
                 for chunk in chunks:
                     content = chunk["content"]
                     chunk_index = int(chunk["chunk_index"])
@@ -341,10 +348,7 @@ class OpenCodeSourceAdapter(BaseSourceAdapter):
                         # Universal §5.1 fields
                         "source_file": src_file,
                         "chunk_index": chunk_index,
-                        "filed_at": datetime.now(timezone.utc)
-                        .replace(microsecond=0)
-                        .isoformat()
-                        .replace("+00:00", "Z"),
+                        "filed_at": filed_at,
                         "added_by": "opencode-adapter",
                         "wing": wing,
                         "room": room,
@@ -359,6 +363,9 @@ class OpenCodeSourceAdapter(BaseSourceAdapter):
                         "session_created_at": created_iso,
                         "message_count": len(messages),
                         "opencode_db_path": db_path,
+                        # Required by is_current() for incremental ingest;
+                        # mirrors the SourceItemMetadata.version yielded above.
+                        "opencode_session_version": session_version,
                     }
                     yield DrawerRecord(
                         content=content,
