@@ -143,7 +143,12 @@ def main():
     parser.add_argument("--candidates", default="tier1", help="tier1, tier2, tier3, all, tier<=2, or a specific model tag")
     parser.add_argument("--tasks", default="all", help="all, or comma-separated list (e.g. 'room_classification:closed,calibration')")
     parser.add_argument("--dataset-dir", required=True, type=Path)
-    parser.add_argument("--output", type=Path, required=True)
+    output_group = parser.add_mutually_exclusive_group(required=True)
+    output_group.add_argument("--output", type=Path, default=None,
+                              help="Single CSV output (all languages in one file).")
+    output_group.add_argument("--output-dir", type=Path, default=None,
+                              help="Output directory; writes <dir>/<lang>/YYYY-MM-DD-<host>.csv "
+                                   "per language so results stay grouped by locale.")
     parser.add_argument("--endpoint", default="http://localhost:11434")
     parser.add_argument("--llm-provider", default="ollama",
                         choices=["ollama", "openai-compat", "anthropic"],
@@ -197,27 +202,47 @@ def main():
     n_runs = len(candidates) * len(task_modes) * len(languages)
     print(f"Running {len(candidates)} candidates × {len(task_modes)} task/mode × {len(languages)} languages = {n_runs} runs")
     print(f"Languages: {languages}")
-    print(f"Output: {args.output}")
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
+    # Resolve output path(s). --output-dir writes one CSV per language so results
+    # from long multilingual runs stay grouped by locale and are easier to diff.
+    import socket
+    _host = socket.gethostname()
+    _date = time.strftime("%Y-%m-%d")
+
+    def _csv_path(language: str) -> Path:
+        if args.output_dir:
+            return args.output_dir / language / f"{_date}-{_host}.csv"
+        return args.output
+
+    # Pre-create all output files (headers written before the first run starts).
+    lang_files: dict[str, tuple] = {}
+    seen_paths: set[Path] = set()
+    for lang in languages:
+        p = _csv_path(lang)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if p not in seen_paths:
+            fh = open(p, "w", newline="", encoding="utf-8")
+            w = csv.DictWriter(fh, fieldnames=CSV_COLUMNS)
+            w.writeheader()
+            fh.flush()
+            seen_paths.add(p)
+        else:
+            fh = open(p, "a", newline="", encoding="utf-8")
+            w = csv.DictWriter(fh, fieldnames=CSV_COLUMNS)
+        lang_files[lang] = (fh, w, p)
+        print(f"  {lang} → {p}")
 
     rows = []
     total = n_runs
     i = 0
     start = time.time()
 
-    # Open the CSV once, write header, and flush after each row so a
-    # crash or Ctrl-C preserves partial progress. Long matrix runs (60+
-    # min for the local tier) make this important.
-    with open(args.output, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
-        writer.writeheader()
-        f.flush()
-
+    try:
         for candidate in candidates:
             tag = candidate["tag"]
             for task, mode in task_modes:
                 for language in languages:
+                    fh, writer, out_path = lang_files[language]
                     i += 1
                     print(f"[{i}/{total}] {tag}  {task}  {mode}  lang={language}", flush=True)
                     try:
@@ -243,11 +268,15 @@ def main():
                     row = result_to_row(result)
                     rows.append(row)
                     writer.writerow(row)
-                    f.flush()
+                    fh.flush()
                     print(f"  acc={row['accuracy']}  e2e_p50={row['e2e_p50_ms']}ms  vram={row['vram_resident_mb']}", flush=True)
+    finally:
+        for fh, _, _ in lang_files.values():
+            fh.close()
 
     elapsed = time.time() - start
-    print(f"\nDone in {elapsed/60:.1f}min. Wrote {len(rows)} rows to {args.output}")
+    output_summary = args.output or args.output_dir
+    print(f"\nDone in {elapsed/60:.1f}min. Wrote {len(rows)} rows to {output_summary}")
 
 
 def write_csv(path: Path, rows: list[dict]):

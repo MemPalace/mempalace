@@ -289,7 +289,8 @@ def run(
             error=f"Dataset not found: {dataset_path}",
         )
     samples = load_jsonl(dataset_path)
-    labels = load_jsonl(task_dir / "labels.jsonl")
+    labels_path = task_dir / (f"labels.{language}.jsonl" if language != "en" and (task_dir / f"labels.{language}.jsonl").exists() else "labels.jsonl")
+    labels = load_jsonl(labels_path)
     if len(samples) != len(labels):
         return Result(
             model_tag=model_tag, task=task, mode=mode,
