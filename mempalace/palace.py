@@ -540,9 +540,8 @@ def file_already_mined(collection, source_file: str, check_mtime: bool = False) 
         schema (triggers silent rebuild after a normalization upgrade)
       - `check_mtime=True` and the file's mtime differs from the stored one
 
-    When check_mtime=True (used by project miner), also re-mines on content
-    change. When check_mtime=False (used by convo miner), transcripts are
-    assumed immutable, so only the version gate triggers a rebuild.
+    When check_mtime=True, also re-mines on content change. When
+    check_mtime=False, only the version gate triggers a rebuild.
     """
     try:
         results = collection.get(where={"source_file": source_file}, limit=1)

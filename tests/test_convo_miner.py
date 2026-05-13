@@ -77,6 +77,54 @@ def test_mine_convos_does_not_reprocess_empty_chunk_files(capsys):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_mine_convos_reprocesses_changed_transcript_mtime(capsys):
+    """Growing transcript files must be re-mined instead of treated as immutable."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        convo_path = Path(tmpdir) / "chat.txt"
+        convo_path.write_text(
+            "> First question?\nFirst answer with enough words to create a drawer.\n"
+        )
+        palace_path = os.path.join(tmpdir, "palace")
+
+        mine_convos(tmpdir, palace_path, wing="test")
+        capsys.readouterr()
+
+        resolved = str(Path(tmpdir).resolve() / "chat.txt")
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_collection("mempalace_drawers")
+        initial = col.get(where={"source_file": resolved})
+        assert initial["ids"]
+        assert all("Second answer" not in doc for doc in initial["documents"])
+        first_mtime = os.path.getmtime(convo_path)
+        del col, client
+
+        convo_path.write_text(
+            "> First question?\nFirst answer with enough words to create a drawer.\n"
+            "\n> Second question?\nSecond answer that arrived later in the same transcript.\n"
+        )
+        os.utime(convo_path, (first_mtime + 10, first_mtime + 10))
+
+        mine_convos(tmpdir, palace_path, wing="test")
+        out = capsys.readouterr().out
+        assert "Files skipped (already filed): 0" in out
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_collection("mempalace_drawers")
+        rebuilt = col.get(where={"source_file": resolved})
+        assert any("Second answer" in doc for doc in rebuilt["documents"])
+        stored_mtimes = {
+            float(meta["source_mtime"])
+            for meta in rebuilt["metadatas"]
+            if meta.get("ingest_mode") == "convos"
+        }
+        assert len(stored_mtimes) == 1
+        assert abs(stored_mtimes.pop() - os.path.getmtime(convo_path)) < 0.001
+        del col, client
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def test_mine_convos_rebuilds_stale_drawers_after_schema_bump(capsys):
     """When stored drawers have an older normalize_version, the next mine
     silently purges them and refiles — no manual erase required.
@@ -140,9 +188,9 @@ def test_mine_convos_rebuilds_stale_drawers_after_schema_bump(capsys):
         # Second mine — version gate should trigger rebuild
         mine_convos(tmpdir, palace_path, wing="test")
         out = capsys.readouterr().out
-        assert (
-            "Files skipped (already filed): 0" in out
-        ), "stale drawers should force a rebuild, not a skip"
+        assert "Files skipped (already filed): 0" in out, (
+            "stale drawers should force a rebuild, not a skip"
+        )
 
         client = chromadb.PersistentClient(path=palace_path)
         col = client.get_collection("mempalace_drawers")

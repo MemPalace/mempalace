@@ -69,7 +69,21 @@ MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB — skip files larger than this.
 # use also scales with source size.
 
 
-def _register_file(collection, source_file: str, wing: str, agent: str):
+def _source_mtime(source_file: str) -> float | None:
+    """Return the source file mtime, or None when the file is unavailable."""
+    try:
+        return os.path.getmtime(source_file)
+    except OSError:
+        return None
+
+
+def _register_file(
+    collection,
+    source_file: str,
+    wing: str,
+    agent: str,
+    source_mtime: float | None = None,
+):
     """Write a sentinel so file_already_mined() returns True for 0-chunk files.
 
     Without this, files that normalize to nothing or produce zero chunks are
@@ -77,20 +91,22 @@ def _register_file(collection, source_file: str, wing: str, agent: str):
     ChromaDB on the first pass.
     """
     sentinel_id = f"_reg_{hashlib.sha256(source_file.encode()).hexdigest()[:24]}"
+    metadata = {
+        "wing": wing,
+        "room": "_registry",
+        "source_file": source_file,
+        "added_by": agent,
+        "filed_at": datetime.now().isoformat(),
+        "ingest_mode": "registry",
+        "normalize_version": NORMALIZE_VERSION,
+    }
+    if source_mtime is not None:
+        metadata["source_mtime"] = source_mtime
+
     collection.upsert(
         documents=[f"[registry] {source_file}"],
         ids=[sentinel_id],
-        metadatas=[
-            {
-                "wing": wing,
-                "room": "_registry",
-                "source_file": source_file,
-                "added_by": agent,
-                "filed_at": datetime.now().isoformat(),
-                "ingest_mode": "registry",
-                "normalize_version": NORMALIZE_VERSION,
-            }
-        ],
+        metadatas=[metadata],
     )
 
 
@@ -310,7 +326,16 @@ def scan_convos(convo_dir: str) -> list:
 # =============================================================================
 
 
-def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extract_mode):
+def _file_chunks_locked(
+    collection,
+    source_file,
+    chunks,
+    wing,
+    room,
+    agent,
+    extract_mode,
+    source_mtime=None,
+):
     """Lock the source file, purge stale drawers, and upsert fresh chunks.
 
     Combines the per-file serialization that prevents concurrent agents from
@@ -325,7 +350,7 @@ def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extr
         # Re-check after lock — another agent may have just finished this file
         # at the current schema. A stale-version hit here returns False, so we
         # still fall through to the purge+rebuild path below.
-        if file_already_mined(collection, source_file):
+        if file_already_mined(collection, source_file, check_mtime=True):
             return 0, room_counts_delta, True
 
         # Purge stale drawers first. When the normalize schema bumps,
@@ -352,20 +377,21 @@ def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extr
                 drawer_id = f"drawer_{wing}_{chunk_room}_{hashlib.sha256((source_file + str(chunk['chunk_index'])).encode()).hexdigest()[:24]}"
                 batch_docs.append(chunk["content"])
                 batch_ids.append(drawer_id)
-                batch_metas.append(
-                    {
-                        "wing": wing,
-                        "room": chunk_room,
-                        "hall": _detect_hall_cached(chunk["content"]),
-                        "source_file": source_file,
-                        "chunk_index": chunk["chunk_index"],
-                        "added_by": agent,
-                        "filed_at": filed_at,
-                        "ingest_mode": "convos",
-                        "extract_mode": extract_mode,
-                        "normalize_version": NORMALIZE_VERSION,
-                    }
-                )
+                metadata = {
+                    "wing": wing,
+                    "room": chunk_room,
+                    "hall": _detect_hall_cached(chunk["content"]),
+                    "source_file": source_file,
+                    "chunk_index": chunk["chunk_index"],
+                    "added_by": agent,
+                    "filed_at": filed_at,
+                    "ingest_mode": "convos",
+                    "extract_mode": extract_mode,
+                    "normalize_version": NORMALIZE_VERSION,
+                }
+                if source_mtime is not None:
+                    metadata["source_mtime"] = source_mtime
+                batch_metas.append(metadata)
             try:
                 collection.upsert(
                     documents=batch_docs,
@@ -426,7 +452,9 @@ def mine_convos(
         source_file = str(filepath)
 
         # Skip if already filed
-        if not dry_run and file_already_mined(collection, source_file):
+        source_mtime = _source_mtime(source_file)
+
+        if not dry_run and file_already_mined(collection, source_file, check_mtime=True):
             files_skipped += 1
             continue
 
@@ -435,12 +463,12 @@ def mine_convos(
             content = normalize(str(filepath))
         except (OSError, ValueError):
             if not dry_run:
-                _register_file(collection, source_file, wing, agent)
+                _register_file(collection, source_file, wing, agent, source_mtime)
             continue
 
         if not content or len(content.strip()) < MIN_CHUNK_SIZE:
             if not dry_run:
-                _register_file(collection, source_file, wing, agent)
+                _register_file(collection, source_file, wing, agent, source_mtime)
             continue
 
         # Chunk — either exchange pairs or general extraction
@@ -454,7 +482,7 @@ def mine_convos(
 
         if not chunks:
             if not dry_run:
-                _register_file(collection, source_file, wing, agent)
+                _register_file(collection, source_file, wing, agent, source_mtime)
             continue
 
         # Detect room from content (general mode uses memory_type instead)
@@ -487,7 +515,7 @@ def mine_convos(
         # Lock + purge stale + file fresh chunks. Lock serializes concurrent
         # agents; purge removes pre-v2 drawers so the schema bump applies.
         drawers_added, room_delta, skipped = _file_chunks_locked(
-            collection, source_file, chunks, wing, room, agent, extract_mode
+            collection, source_file, chunks, wing, room, agent, extract_mode, source_mtime
         )
         if skipped:
             files_skipped += 1
