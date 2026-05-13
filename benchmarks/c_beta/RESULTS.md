@@ -58,6 +58,28 @@ as the keyword boost partially compensating for lost surrounding context
 at turn granularity, lexical signal carries more weight when semantic
 context per doc is smaller.
 
+## Follow-up: audit of other modes
+
+After the `hybrid_v4` fix, audited the remaining retrieval functions for
+the same dead-`granularity`-parameter defect:
+
+| function   | granularity branched? | fix                                       |
+|------------|----------------------|--------------------------------------------|
+| raw / aaak / rooms / hybrid / full | yes (pre-existing) | none, already honored the flag |
+| hybrid_v2  | no                    | same per-turn corpus + session-id dedup pattern |
+| hybrid_v3  | no                    | same per-turn corpus + session-id dedup pattern |
+| hybrid_v4  | no                    | (fixed in the primary commit)              |
+| palace     | no                    | explicit `ValueError` on `granularity != "session"`, palace's hall classification, drawers, and preference wing are intrinsically session-keyed; a turn-level rewrite changes the algorithm |
+| diary      | no                    | explicit `ValueError` on `granularity != "session"`, LLM topic layer is computed and cached per `sess_id` |
+
+Smoke tests (5q dev split): hybrid_v2 turn hw=0.30 and hybrid_v3 turn
+hw=0.30 both score 1.000 across R@k / NDCG@k on a small-n smoke set;
+palace turn raises cleanly; palace session is unchanged from baseline.
+
+Full sweep on hybrid_v2/v3 across the matrix was not run, out of scope
+for this PR. Anyone who wants to test the wash hypothesis on those modes
+can now run a turn-granularity sweep against them honestly.
+
 ## Caveats
 
 - 50 q split. R@10 saturates at 0.980 across the turn sweep; NDCG@10
