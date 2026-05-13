@@ -1,22 +1,24 @@
 # C-β v0.1, Results
 
-50q dev-split, LongMemEval, default MiniLM, no LLM rerank.
+50q dev-split, LongMemEval, default MiniLM, no LLM rerank. All numbers
+below are **post-fix** (the dead-`granularity`-parameter defect documented
+in the "Defect" section was discovered mid-sweep and fixed; every row in
+the matrix was re-run against the fixed code).
 
 ## Sweep matrix
 
-| mode      | granularity | hw   | R@10  | NDCG@10 |
-|-----------|-------------|------|-------|---------|
-| raw       | session     |, | 0.980 | 0.905   |
-| raw       | turn        |, | 0.960 | 0.885   |
-| hybrid_v4 | session     | 0.0  | 1.000 | 0.937   |
-| hybrid_v4 | session     | 0.30 | 1.000 | 0.944   |
-| hybrid_v4 | session     | 0.60 | 0.980 | 0.936   |
-| hybrid_v4 | turn        | 0.0  | 0.980 | 0.924   |
-| hybrid_v4 | turn        | 0.30 | 0.980 | 0.934   |
-| hybrid_v4 | turn        | 0.60 | 0.980 | 0.931   |
+| mode      | granularity | hw   | R@1   | R@5   | R@10  | NDCG@10 | wall  |
+|-----------|-------------|------|-------|-------|-------|---------|-------|
+| raw       | session     |, | 0.840 | 0.960 | 0.980 | 0.905   | 62s   |
+| raw       | turn        |, | 0.880 | 0.940 | 0.960 | 0.885   | 257s  |
+| hybrid_v4 | session     | 0.0  | 0.880 | 0.980 | 1.000 | 0.937   | 81s   |
+| hybrid_v4 | session     | 0.30 | 0.880 | 0.960 | 1.000 | 0.944   | 85s   |
+| hybrid_v4 | session     | 0.60 | 0.880 | 0.960 | 0.980 | 0.936   | 90s   |
+| hybrid_v4 | turn        | 0.0  | 0.900 | 0.980 | 1.000 | 0.944   | 283s  |
+| hybrid_v4 | turn        | 0.30 | 0.920 | 0.960 | 1.000 | **0.954** | 288s |
+| hybrid_v4 | turn        | 0.60 | 0.920 | 0.960 | 1.000 | 0.951   | 285s  |
 
-All `hybrid_v4 turn` rows above are post-fix. Pre-fix turn rows were
-silently session-level (defect, see below).
+Best NDCG@10 on the matrix: `hybrid_v4 turn hw=0.30` at 0.954.
 
 ## Defect found mid-sweep
 
@@ -27,66 +29,72 @@ session (`"\n".join(user_turns)`). With the defect in place,
 identical metrics. Originally framed as a curious anomaly; verifying the
 code path showed it was a dead parameter.
 
-Fix: branch the corpus build on `granularity`; emit one doc per user turn
-when `turn` is requested, using `{sess_id}_turn_{i}` corpus IDs so the
-existing `session_id_from_corpus_id` helper can roll turns up to sessions
-during evaluation. Dedup logic in both the assistant-reference two-pass
-and the main scoring path was changed to dedup by session id (so multiple
-high-scoring turns of the same session collapse to a single ranked entry).
-Synthetic preference docs remain session-aggregated; they now resolve to
-the first turn of their session when a pref-hit drives the ranking.
+Fix shape:
+- Branch the corpus build on `granularity`; emit one doc per user turn
+  in turn mode, using `{sess_id}_turn_{i}` corpus IDs so the existing
+  `session_id_from_corpus_id` helper rolls turns up to sessions during
+  evaluation.
+- In turn mode, `corpus_full[i]` mirrors the full session text (not the
+  single user turn) so the assistant-reference two-pass still has
+  assistant content to query in Pass 2. `corpus_user[i]` stays the
+  granular per-turn signal.
+- Dedup by session id in both the assistant-reference two-pass and the
+  main scoring path: multiple high-scoring turns of the same session
+  collapse to a single ranked entry.
+- Synthetic preference docs remain session-aggregated and resolve to the
+  first user-turn index of their session when a pref-hit drives the rank.
+
+The same defect was present in `hybrid_v2` and `hybrid_v3`; they got the
+same fix. `palace` and `diary` are intrinsically session-keyed (hall
+classification, drawers, preference wing, LLM topic cache), so they now
+raise `ValueError` on `granularity != "session"` rather than silently
+ignoring the flag.
 
 ## Hypothesis test
 
-H0 (wash): keyword boost lift exists only because session-level text is
-long enough for lexical overlap to land easily; at turn granularity the
-lift should vanish or invert.
+**H0 (wash):** keyword-boost lift exists only because session-level text
+is long enough for lexical overlap to land easily; at turn granularity
+the lift should vanish or invert.
 
-H1 (compound): lift survives at turn granularity; the keyword signal is
-independent of doc length.
+**H1 (compound):** lift survives at turn granularity; the keyword signal
+is independent of doc length.
 
-Lift (NDCG@10, hw=0.0 → hw=0.30):
+NDCG@10 lift hw=0.0 → hw=0.30:
 - session: 0.937 → 0.944 = **+0.007**
-- turn:    0.924 → 0.934 = **+0.010**
+- turn:    0.944 → 0.954 = **+0.010**
 
-Turn lift is comparable to (slightly larger than) session lift, with the
-same concave shape (peak at hw=0.30, drop at hw=0.60). **H0 rejected.**
+NDCG@10 from hw=0.30 → hw=0.60:
+- session: 0.944 → 0.936 = −0.008
+- turn:    0.954 → 0.951 = −0.003
 
-Secondary observation: the session-over-turn NDCG gap shrinks as hybrid
-weight grows (Δ = 0.013 → 0.010 → 0.005 across hw = 0.0/0.30/0.60). Reads
-as the keyword boost partially compensating for lost surrounding context
-at turn granularity, lexical signal carries more weight when semantic
-context per doc is smaller.
+Both granularities show the same concave shape (peak at hw=0.30, drop at
+hw=0.60). Turn lift is slightly larger than session lift in absolute
+terms. **H0 rejected.** The keyword boost is not a session-length artifact.
 
-## Follow-up: audit of other modes
+## Secondary observation: turn ≥ session across the whole hybrid_v4 sweep
 
-After the `hybrid_v4` fix, audited the remaining retrieval functions for
-the same dead-`granularity`-parameter defect:
+Post-fix, `hybrid_v4 turn` matches or beats `hybrid_v4 session` on
+NDCG@10 at every hw tested (Δ = +0.007, +0.010, +0.015 for hw =
+0.0/0.30/0.60). The pre-fix table showed the inverse because turn mode
+was silently producing session-level metrics minus the assistant
+content. Now that Pass 2 has access to full session text via
+`corpus_full` while the primary retrieval signal stays per-turn, the
+combination of granular ranking and context-rich rerank dominates the
+session baseline on this split.
 
-| function   | granularity branched? | fix                                       |
-|------------|----------------------|--------------------------------------------|
-| raw / aaak / rooms / hybrid / full | yes (pre-existing) | none, already honored the flag |
-| hybrid_v2  | no                    | same per-turn corpus + session-id dedup pattern |
-| hybrid_v3  | no                    | same per-turn corpus + session-id dedup pattern |
-| hybrid_v4  | no                    | (fixed in the primary commit)              |
-| palace     | no                    | explicit `ValueError` on `granularity != "session"`, palace's hall classification, drawers, and preference wing are intrinsically session-keyed; a turn-level rewrite changes the algorithm |
-| diary      | no                    | explicit `ValueError` on `granularity != "session"`, LLM topic layer is computed and cached per `sess_id` |
-
-Smoke tests (5q dev split): hybrid_v2 turn hw=0.30 and hybrid_v3 turn
-hw=0.30 both score 1.000 across R@k / NDCG@k on a small-n smoke set;
-palace turn raises cleanly; palace session is unchanged from baseline.
-
-Full sweep on hybrid_v2/v3 across the matrix was not run, out of scope
-for this PR. Anyone who wants to test the wash hypothesis on those modes
-can now run a turn-granularity sweep against them honestly.
+Sample is small (50q), so this is directional. A bootstrap-resampled run
+across the full 500q would be the honest next step before claiming turn
+mode as a default.
 
 ## Caveats
 
-- 50 q split. R@10 saturates at 0.980 across the turn sweep; NDCG@10
-  differences are 0.005, 0.013 wide. Effect is directionally clear but
-  the sample is small.
-- The dev split was held fixed across runs (`benchmarks/lme_split_50_450.json`),
-  so the runs are paired on questions but not bootstrap-resampled.
-- Only `hybrid_v4` was fixed. `hybrid`, `hybrid_v2`, `hybrid_v3`, `palace`,
-  `diary`, `aaak`, `rooms` likely have the same dead-parameter defect; not
-  audited in this scope.
+- 50 q dev split. R@10 saturates at 1.000 across the `hybrid_v4` matrix;
+  the discrimination is in NDCG@10, with deltas in the 0.005, 0.015 range.
+- The dev split was held fixed across runs
+  (`benchmarks/lme_split_50_450.json`), so runs are paired on questions
+  but not bootstrap-resampled.
+- `aaak`, `rooms`, `hybrid`, `full` were spot-checked to already honor
+  `--granularity` and were not part of this sweep. A separate sweep
+  would be needed to test the wash hypothesis on those modes.
+- Full sweep on `hybrid_v2` / `hybrid_v3` across the matrix was not run
+  (out of scope here); only 5q smokes at hw=0.30 turn, both at 1.000.

@@ -1,9 +1,27 @@
 ===== raw_session =====
-OK wall=64s R@1=1: R@5=5: R@10=0.980 R@30=1.000 NDCG@10=0.905 NDCG@30=0.909
+OK wall=62s R@1=0.840 R@5=0.960 R@10=0.980 R@30=1.000 NDCG@10=0.905 NDCG@30=0.909
 ===== raw_turn =====
-OK wall=429s R@1=1: R@5=5: R@10=0.960 R@30=0.980 NDCG@10=0.885 NDCG@30=0.861
+OK wall=257s R@1=0.880 R@5=0.940 R@10=0.960 R@30=0.980 NDCG@10=0.885 NDCG@30=0.861
 ===== hybrid_v4_session_hw0.0 =====
-OK wall=90s R@1=1: R@5=5: R@10=1.000 R@30=1.000 NDCG@10=0.937 NDCG@30=0.931
+OK wall=81s R@1=0.880 R@5=0.980 R@10=1.000 R@30=1.000 NDCG@10=0.937 NDCG@30=0.931
 ===== hybrid_v4_turn_hw0.0 =====
-OK wall=85s R@1=1: R@5=5: R@10=1.000 R@30=1.000 NDCG@10=0.937 NDCG@30=0.931
+OK wall=283s R@1=0.900 R@5=0.980 R@10=1.000 R@30=1.000 NDCG@10=0.944 NDCG@30=0.938
 ===== hybrid_v4_session_hw0.30 =====
+OK wall=85s R@1=0.880 R@5=0.960 R@10=1.000 R@30=1.000 NDCG@10=0.944 NDCG@30=0.938
+===== hybrid_v4_turn_hw0.30 =====
+OK wall=288s R@1=0.920 R@5=0.960 R@10=1.000 R@30=1.000 NDCG@10=0.954 NDCG@30=0.949
+===== hybrid_v4_session_hw0.60 =====
+OK wall=90s R@1=0.880 R@5=0.960 R@10=0.980 R@30=1.000 NDCG@10=0.936 NDCG@30=0.936
+===== hybrid_v4_turn_hw0.60 =====
+OK wall=285s R@1=0.920 R@5=0.960 R@10=1.000 R@30=1.000 NDCG@10=0.951 NDCG@30=0.951
+===== DONE =====
+
+mode       granularity  hybrid_weight  n_questions  wall_sec  recall_at_1  recall_at_5  recall_at_10  recall_at_30  ndcg_at_10  ndcg_at_30  out_file
+raw        session      NA             50           62        0.840        0.960        0.980         1.000         0.905       0.909       benchmarks/c_beta/raw_session.jsonl
+raw        turn         NA             50           257       0.880        0.940        0.960         0.980         0.885       0.861       benchmarks/c_beta/raw_turn.jsonl
+hybrid_v4  session      0.0            50           81        0.880        0.980        1.000         1.000         0.937       0.931       benchmarks/c_beta/hybrid_v4_session_hw0.0.jsonl
+hybrid_v4  turn         0.0            50           283       0.900        0.980        1.000         1.000         0.944       0.938       benchmarks/c_beta/hybrid_v4_turn_hw0.0.jsonl
+hybrid_v4  session      0.30           50           85        0.880        0.960        1.000         1.000         0.944       0.938       benchmarks/c_beta/hybrid_v4_session_hw0.30.jsonl
+hybrid_v4  turn         0.30           50           288       0.920        0.960        1.000         1.000         0.954       0.949       benchmarks/c_beta/hybrid_v4_turn_hw0.30.jsonl
+hybrid_v4  session      0.60           50           90        0.880        0.960        0.980         1.000         0.936       0.936       benchmarks/c_beta/hybrid_v4_session_hw0.60.jsonl
+hybrid_v4  turn         0.60           50           285       0.920        0.960        1.000         1.000         0.951       0.951       benchmarks/c_beta/hybrid_v4_turn_hw0.60.jsonl
