@@ -238,9 +238,7 @@ CANONICAL_SESSIONS: List[SyntheticSession] = [
             ),
             SyntheticMessage(
                 role="user",
-                parts=[
-                    SyntheticPart(text="And how do I invalidate the query cache after?")
-                ],
+                parts=[SyntheticPart(text="And how do I invalidate the query cache after?")],
             ),
             SyntheticMessage(
                 role="assistant",
