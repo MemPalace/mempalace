@@ -1,8 +1,11 @@
 import json
 from unittest.mock import patch
+import pytest
 
 from mempalace.normalize import (
     _SLACK_PROVENANCE_FOOTER,
+    ChatGPTBranchAmbiguityError,
+    ChatGPTNormalizeError,
     _extract_content,
     _format_tool_result,
     _format_tool_use,
@@ -898,8 +901,241 @@ def test_chatgpt_json_too_few_messages():
             },
         }
     }
+    with pytest.raises(ChatGPTNormalizeError, match="enough messages"):
+        _try_chatgpt_json(data)
+
+
+def test_chatgpt_json_uses_current_node_branch():
+    data = {
+        "current_node": "a_new",
+        "mapping": {
+            "root": {"parent": None, "message": None, "children": ["u1"]},
+            "u1": {
+                "parent": "root",
+                "message": {"author": {"role": "user"}, "content": {"parts": ["Tell me a slogan"]}},
+                "children": ["a_old", "a_new"],
+            },
+            "a_old": {
+                "parent": "u1",
+                "message": {"author": {"role": "assistant"}, "content": {"parts": ["Old answer"]}},
+                "children": [],
+            },
+            "a_new": {
+                "parent": "u1",
+                "message": {
+                    "author": {"role": "assistant"},
+                    "content": {"parts": ["New regenerated answer"]},
+                },
+                "children": [],
+            },
+        },
+    }
+
     result = _try_chatgpt_json(data)
-    assert result is None
+
+    assert "New regenerated answer" in result
+    assert "Old answer" not in result
+
+
+def test_chatgpt_json_without_current_node_rejects_ambiguous_branches():
+    data = {
+        "mapping": {
+            "root": {"parent": None, "message": None, "children": ["u1"]},
+            "u1": {
+                "parent": "root",
+                "message": {"author": {"role": "user"}, "content": {"parts": ["Tell me a slogan"]}},
+                "children": ["a_old", "a_new"],
+            },
+            "a_old": {
+                "parent": "u1",
+                "message": {"author": {"role": "assistant"}, "content": {"parts": ["Old answer"]}},
+                "children": [],
+            },
+            "a_new": {
+                "parent": "u1",
+                "message": {
+                    "author": {"role": "assistant"},
+                    "content": {"parts": ["New regenerated answer"]},
+                },
+                "children": [],
+            },
+        },
+    }
+
+    with pytest.raises(ChatGPTBranchAmbiguityError):
+        _try_chatgpt_json(data)
+
+
+def test_chatgpt_json_with_invalid_current_node_fails_explicitly():
+    data = {
+        "current_node": "missing",
+        "mapping": {
+            "root": {"parent": None, "message": None, "children": ["u1"]},
+            "u1": {
+                "parent": "root",
+                "message": {"author": {"role": "user"}, "content": {"parts": ["Tell me a slogan"]}},
+                "children": ["a1"],
+            },
+            "a1": {
+                "parent": "u1",
+                "message": {
+                    "author": {"role": "assistant"},
+                    "content": {"parts": ["A better answer"]},
+                },
+                "children": [],
+            },
+        },
+    }
+
+    with pytest.raises(ChatGPTNormalizeError, match="current_node"):
+        _try_chatgpt_json(data)
+
+
+def test_chatgpt_json_rejects_current_node_outside_rooted_tree():
+    data = {
+        "current_node": "orphan_a",
+        "mapping": {
+            "root": {"parent": None, "message": None, "children": ["u1"]},
+            "u1": {
+                "parent": "root",
+                "message": {"author": {"role": "user"}, "content": {"parts": ["Real question"]}},
+                "children": ["a1"],
+            },
+            "a1": {
+                "parent": "u1",
+                "message": {"author": {"role": "assistant"}, "content": {"parts": ["Real answer"]}},
+                "children": [],
+            },
+            "orphan_u": {
+                "parent": None,
+                "message": {"author": {"role": "user"}, "content": {"parts": ["Orphan question"]}},
+                "children": ["orphan_a"],
+            },
+            "orphan_a": {
+                "parent": "orphan_u",
+                "message": {
+                    "author": {"role": "assistant"},
+                    "content": {"parts": ["Orphan answer"]},
+                },
+                "children": [],
+            },
+        },
+    }
+
+    with pytest.raises(ChatGPTNormalizeError, match="active conversation path"):
+        _try_chatgpt_json(data)
+
+
+def test_chatgpt_json_rejects_current_node_not_reachable_from_children():
+    data = {
+        "current_node": "hidden_a",
+        "mapping": {
+            "root": {"parent": None, "message": None, "children": ["u1"]},
+            "u1": {
+                "parent": "root",
+                "message": {"author": {"role": "user"}, "content": {"parts": ["Real question"]}},
+                "children": ["a1"],
+            },
+            "a1": {
+                "parent": "u1",
+                "message": {"author": {"role": "assistant"}, "content": {"parts": ["Real answer"]}},
+                "children": [],
+            },
+            "hidden_a": {
+                "parent": "u1",
+                "message": {
+                    "author": {"role": "assistant"},
+                    "content": {"parts": ["Hidden answer"]},
+                },
+                "children": [],
+            },
+        },
+    }
+
+    with pytest.raises(ChatGPTNormalizeError, match="active conversation path"):
+        _try_chatgpt_json(data)
+
+
+def test_chatgpt_json_without_current_node_accepts_single_branch():
+    data = {
+        "mapping": {
+            "root": {"parent": None, "message": None, "children": ["u1"]},
+            "u1": {
+                "parent": "root",
+                "message": {"author": {"role": "user"}, "content": {"parts": ["Tell me a slogan"]}},
+                "children": ["a1"],
+            },
+            "a1": {
+                "parent": "u1",
+                "message": {
+                    "author": {"role": "assistant"},
+                    "content": {"parts": ["A better answer"]},
+                },
+                "children": [],
+            },
+        },
+    }
+
+    result = _try_chatgpt_json(data)
+
+    assert "A better answer" in result
+
+
+def test_chatgpt_json_uses_active_edit_branch_path():
+    data = {
+        "current_node": "a2_new",
+        "mapping": {
+            "root": {"parent": None, "message": None, "children": ["u1"]},
+            "u1": {
+                "parent": "root",
+                "message": {"author": {"role": "user"}, "content": {"parts": ["Draft an email"]}},
+                "children": ["a1"],
+            },
+            "a1": {
+                "parent": "u1",
+                "message": {
+                    "author": {"role": "assistant"},
+                    "content": {"parts": ["Sure, here's a draft."]},
+                },
+                "children": ["u2_old", "u2_new"],
+            },
+            "u2_old": {
+                "parent": "a1",
+                "message": {"author": {"role": "user"}, "content": {"parts": ["Make it formal"]}},
+                "children": ["a2_old"],
+            },
+            "a2_old": {
+                "parent": "u2_old",
+                "message": {
+                    "author": {"role": "assistant"},
+                    "content": {"parts": ["Formal revision"]},
+                },
+                "children": [],
+            },
+            "u2_new": {
+                "parent": "a1",
+                "message": {"author": {"role": "user"}, "content": {"parts": ["Make it warmer"]}},
+                "children": ["a2_new"],
+            },
+            "a2_new": {
+                "parent": "u2_new",
+                "message": {
+                    "author": {"role": "assistant"},
+                    "content": {"parts": ["Warmer revision"]},
+                },
+                "children": [],
+            },
+        },
+    }
+
+    result = _try_chatgpt_json(data)
+
+    assert "Draft an email" in result
+    assert "Sure, here's a draft." in result
+    assert "Make it warmer" in result
+    assert "Warmer revision" in result
+    assert "Make it formal" not in result
+    assert "Formal revision" not in result
 
 
 # ── _try_slack_json ────────────────────────────────────────────────────

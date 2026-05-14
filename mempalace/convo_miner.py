@@ -16,7 +16,7 @@ from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
 
-from .normalize import normalize
+from .normalize import ChatGPTNormalizeError, normalize
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
@@ -306,6 +306,49 @@ def scan_convos(convo_dir: str) -> list:
     return files
 
 
+def _normalize_convo_file(filepath: Path, index: int, total_files: int):
+    """Normalize one conversation file and classify recoverable failures."""
+    try:
+        return normalize(str(filepath)), False
+    except ChatGPTNormalizeError as e:
+        print(f"  ! [{index:4}/{total_files}] {filepath.name[:50]:50} skipped: {e}")
+        return None, True
+    except (OSError, ValueError):
+        return None, False
+
+
+def _chunk_convo_content(content: str, extract_mode: str) -> list:
+    """Chunk normalized conversation content for the selected extraction mode."""
+    if extract_mode == "general":
+        from .general_extractor import extract_memories
+
+        return extract_memories(content)
+    return chunk_exchanges(content)
+
+
+def _room_for_convo_content(content: str, extract_mode: str):
+    """Detect a room unless general extraction assigns rooms per memory."""
+    if extract_mode == "general":
+        return None
+    return detect_convo_room(content)
+
+
+def _record_dry_run_convo_file(filepath: Path, chunks: list, room, extract_mode: str, room_counts):
+    """Print dry-run output and update room counts for one file."""
+    if extract_mode == "general":
+        from collections import Counter
+
+        type_counts = Counter(c.get("memory_type", "general") for c in chunks)
+        types_str = ", ".join(f"{t}:{n}" for t, n in type_counts.most_common())
+        print(f"    [DRY RUN] {filepath.name} → {len(chunks)} memories ({types_str})")
+        for c in chunks:
+            room_counts[c.get("memory_type", "general")] += 1
+    else:
+        print(f"    [DRY RUN] {filepath.name} → room:{room} ({len(chunks)} drawers)")
+        room_counts[room] += 1
+    return len(chunks)
+
+
 # =============================================================================
 # MINE CONVERSATIONS
 # =============================================================================
@@ -428,6 +471,8 @@ def mine_convos(
 
     total_drawers = 0
     files_skipped = 0
+    normalize_failed_files = 0
+    files_processed = 0
     room_counts = defaultdict(int)
 
     for i, filepath in enumerate(files, 1):
@@ -439,12 +484,16 @@ def mine_convos(
             continue
 
         # Normalize format
-        try:
-            content = normalize(str(filepath))
-        except (OSError, ValueError):
+        content, normalize_failed = _normalize_convo_file(filepath, i, len(files))
+        if normalize_failed:
+            normalize_failed_files += 1
+            continue
+        if content is None:
             if not dry_run:
                 _register_file(collection, source_file, wing, agent)
             continue
+
+        files_processed += 1
 
         if not content or len(content.strip()) < MIN_CHUNK_SIZE:
             if not dry_run:
@@ -452,13 +501,7 @@ def mine_convos(
             continue
 
         # Chunk — either exchange pairs or general extraction
-        if extract_mode == "general":
-            from .general_extractor import extract_memories
-
-            chunks = extract_memories(content)
-            # Each chunk already has memory_type; use it as the room name
-        else:
-            chunks = chunk_exchanges(content)
+        chunks = _chunk_convo_content(content, extract_mode)
 
         if not chunks:
             if not dry_run:
@@ -466,27 +509,12 @@ def mine_convos(
             continue
 
         # Detect room from content (general mode uses memory_type instead)
-        if extract_mode != "general":
-            room = detect_convo_room(content)
-        else:
-            room = None  # set per-chunk below
+        room = _room_for_convo_content(content, extract_mode)
 
         if dry_run:
-            if extract_mode == "general":
-                from collections import Counter
-
-                type_counts = Counter(c.get("memory_type", "general") for c in chunks)
-                types_str = ", ".join(f"{t}:{n}" for t, n in type_counts.most_common())
-                print(f"    [DRY RUN] {filepath.name} → {len(chunks)} memories ({types_str})")
-            else:
-                print(f"    [DRY RUN] {filepath.name} → room:{room} ({len(chunks)} drawers)")
-            total_drawers += len(chunks)
-            # Track room counts
-            if extract_mode == "general":
-                for c in chunks:
-                    room_counts[c.get("memory_type", "general")] += 1
-            else:
-                room_counts[room] += 1
+            total_drawers += _record_dry_run_convo_file(
+                filepath, chunks, room, extract_mode, room_counts
+            )
             continue
 
         if extract_mode != "general":
@@ -508,8 +536,10 @@ def mine_convos(
 
     print(f"\n{'=' * 55}")
     print("  Done.")
-    print(f"  Files processed: {len(files) - files_skipped}")
+    print(f"  Files processed: {files_processed}")
     print(f"  Files skipped (already filed): {files_skipped}")
+    if normalize_failed_files:
+        print(f"  Files skipped (invalid ChatGPT exports): {normalize_failed_files}")
     print(f"  Drawers filed: {total_drawers}")
     if room_counts:
         print("\n  By room:")

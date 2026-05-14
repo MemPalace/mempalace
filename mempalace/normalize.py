@@ -110,6 +110,14 @@ def strip_noise(text: str) -> str:
     return text.strip()
 
 
+class ChatGPTNormalizeError(ValueError):
+    """Raised when a ChatGPT export cannot be safely normalized."""
+
+
+class ChatGPTBranchAmbiguityError(ChatGPTNormalizeError):
+    """Raised when a ChatGPT mapping tree has multiple candidate branches."""
+
+
 def normalize(filepath: str) -> str:
     """
     Load a file and normalize to transcript format if it's a chat export.
@@ -407,40 +415,152 @@ def _try_chatgpt_json(data) -> Optional[str]:
     if not isinstance(data, dict) or "mapping" not in data:
         return None
     mapping = data["mapping"]
+    if not isinstance(mapping, dict):
+        raise ChatGPTNormalizeError("Invalid ChatGPT export: mapping must be an object")
+
+    root_id = _find_chatgpt_root_id(mapping)
+    if not root_id:
+        raise ChatGPTNormalizeError("Invalid ChatGPT export: could not find mapping root")
+
+    reachable_ids = _collect_chatgpt_reachable_ids(mapping, root_id)
+    active_node_id = _resolve_chatgpt_active_node_id(data, mapping, root_id)
+    path_ids = _build_chatgpt_path(mapping, active_node_id, root_id, reachable_ids)
+    if not path_ids:
+        raise ChatGPTNormalizeError(
+            "Invalid ChatGPT export: could not resolve active conversation path"
+        )
+
     messages = []
-    # Find root: prefer node with parent=None AND no message (synthetic root)
+    for node_id in path_ids:
+        node = mapping.get(node_id, {})
+        msg = node.get("message")
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("author", {}).get("role", "")
+        text = _extract_chatgpt_text(msg.get("content", {}))
+        if role == "user" and text:
+            messages.append(("user", text))
+        elif role == "assistant" and text:
+            messages.append(("assistant", text))
+    if len(messages) >= 2:
+        return _messages_to_transcript(messages)
+    raise ChatGPTNormalizeError(
+        "Invalid ChatGPT export: active conversation path did not yield enough messages"
+    )
+
+
+def _find_chatgpt_root_id(mapping: dict) -> Optional[str]:
+    """Prefer the synthetic root; fall back to any parent-less node."""
     root_id = None
     fallback_root = None
     for node_id, node in mapping.items():
+        if not isinstance(node, dict):
+            continue
         if node.get("parent") is None:
             if node.get("message") is None:
                 root_id = node_id
                 break
-            elif fallback_root is None:
+            if fallback_root is None:
                 fallback_root = node_id
+    return root_id or fallback_root
+
+
+def _resolve_chatgpt_active_node_id(
+    data: dict, mapping: dict, root_id: Optional[str]
+) -> Optional[str]:
+    """Use the export's active node when available; otherwise require a single path."""
+    if "current_node" in data:
+        current_node = data.get("current_node")
+        if current_node in mapping:
+            return current_node
+        raise ChatGPTNormalizeError(
+            "Invalid ChatGPT export: current_node does not reference a mapping node"
+        )
     if not root_id:
-        root_id = fallback_root
-    if root_id:
-        current_id = root_id
-        visited = set()
-        while current_id and current_id not in visited:
-            visited.add(current_id)
-            node = mapping.get(current_id, {})
-            msg = node.get("message")
-            if msg:
-                role = msg.get("author", {}).get("role", "")
-                content = msg.get("content", {})
-                parts = content.get("parts", []) if isinstance(content, dict) else []
-                text = " ".join(str(p) for p in parts if isinstance(p, str) and p).strip()
-                if role == "user" and text:
-                    messages.append(("user", text))
-                elif role == "assistant" and text:
-                    messages.append(("assistant", text))
-            children = node.get("children", [])
-            current_id = children[0] if children else None
-    if len(messages) >= 2:
-        return _messages_to_transcript(messages)
-    return None
+        return None
+
+    leaf_ids = _collect_chatgpt_leaf_ids(mapping, root_id)
+    if len(leaf_ids) == 1:
+        return leaf_ids[0]
+    if len(leaf_ids) > 1:
+        raise ChatGPTBranchAmbiguityError(
+            "Ambiguous ChatGPT mapping tree: multiple candidate conversation branches without current_node"
+        )
+    return root_id
+
+
+def _collect_chatgpt_leaf_ids(mapping: dict, root_id: str) -> list[str]:
+    """Return reachable leaves from root using only valid child references."""
+    leaf_ids = []
+    for node_id in _collect_chatgpt_reachable_ids(mapping, root_id):
+        node = mapping.get(node_id, {})
+        if not isinstance(node, dict):
+            continue
+        child_ids = [child_id for child_id in node.get("children", []) if child_id in mapping]
+        if not child_ids:
+            leaf_ids.append(node_id)
+
+    return leaf_ids
+
+
+def _collect_chatgpt_reachable_ids(mapping: dict, root_id: str) -> list[str]:
+    """Return nodes reachable from root following children edges only."""
+    reachable_ids = []
+    stack = [root_id]
+    visited = set()
+
+    while stack:
+        node_id = stack.pop()
+        if node_id in visited:
+            continue
+        visited.add(node_id)
+        reachable_ids.append(node_id)
+
+        node = mapping.get(node_id, {})
+        if not isinstance(node, dict):
+            continue
+        child_ids = [child_id for child_id in node.get("children", []) if child_id in mapping]
+        stack.extend(reversed(child_ids))
+
+    return reachable_ids
+
+
+def _build_chatgpt_path(
+    mapping: dict, active_node_id: Optional[str], root_id: Optional[str], reachable_ids: list[str]
+) -> list[str]:
+    """Walk from the active node back to root and return the ordered path."""
+    if not active_node_id or active_node_id not in mapping:
+        return []
+
+    path_ids = []
+    current_id = active_node_id
+    visited = set()
+
+    while current_id and current_id not in visited:
+        visited.add(current_id)
+        path_ids.append(current_id)
+        node = mapping.get(current_id, {})
+        if not isinstance(node, dict):
+            break
+        parent_id = node.get("parent")
+        current_id = parent_id if parent_id in mapping else None
+
+    path_ids.reverse()
+    if root_id and (not path_ids or path_ids[0] != root_id):
+        return []
+    reachable_id_set = set(reachable_ids)
+    if any(node_id not in reachable_id_set for node_id in path_ids):
+        return []
+    return path_ids
+
+
+def _extract_chatgpt_text(content) -> str:
+    """Extract plain text from ChatGPT message content blocks."""
+    if isinstance(content, dict):
+        parts = content.get("parts", [])
+        if isinstance(parts, list):
+            return " ".join(str(part) for part in parts if isinstance(part, str) and part).strip()
+    return ""
 
 
 def _try_slack_json(data) -> Optional[str]:
