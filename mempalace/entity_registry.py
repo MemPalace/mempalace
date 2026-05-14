@@ -16,6 +16,7 @@ Usage:
 """
 
 import json
+import os
 import re
 import urllib.request
 import urllib.parse
@@ -320,10 +321,34 @@ class EntityRegistry:
             self._path.parent.chmod(0o700)
         except (OSError, NotImplementedError):
             pass
-        self._path.write_text(json.dumps(self._data, indent=2), encoding="utf-8")
+        # Atomic write: serialize to a sibling temp file in the same dir
+        # (so os.replace stays on one filesystem), fsync, then rename over
+        # the target. A crash mid-write leaves the previous registry intact
+        # instead of a half-written file or an empty file from the truncate.
+        payload = json.dumps(self._data, indent=2)
+        tmp_path = self._path.with_name(self._path.name + ".tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
         try:
-            self._path.chmod(0o600)
+            tmp_path.chmod(0o600)
         except (OSError, NotImplementedError):
+            pass
+        os.replace(tmp_path, self._path)
+        # On ext4 (and similar) the rename's durability across power loss
+        # requires an additional fsync on the parent directory. Without it,
+        # the kernel can ack the rename and a crash reverts to the state
+        # where the temp file is present and the target is at the old version.
+        try:
+            dir_fd = os.open(str(self._path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            # Windows and some special filesystems reject directory fds — they
+            # have different durability semantics on rename anyway.
             pass
 
     @staticmethod

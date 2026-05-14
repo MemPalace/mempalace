@@ -6,6 +6,10 @@
 > domain — including `mempalace.tech` — is an impostor and may distribute
 > malware. Details and timeline: [docs/HISTORY.md](docs/HISTORY.md).
 
+> [!IMPORTANT]
+> **🚨 Claude Code sessions expire in 30 days w/out auto-save hooks wired!** **[Read this →](https://github.com/MemPalace/mempalace/discussions/1388)**
+
+
 <div align="center">
 
 <img src="assets/mempalace_logo.png" alt="MemPalace" width="240">
@@ -47,10 +51,15 @@ Architecture, concepts, and mining flows:
 
 ## Install
 
+We recommend [`uv`](https://docs.astral.sh/uv/) — `uv tool install` puts
+the `mempalace` CLI in an isolated environment on your PATH:
+
 ```bash
-pip install mempalace
+uv tool install mempalace
 mempalace init ~/projects/myapp
 ```
+
+If you prefer pip, `pip install mempalace` still works.
 
 ## Quickstart
 
@@ -118,9 +127,9 @@ own research page for their published numbers.
 ```bash
 git clone https://github.com/MemPalace/mempalace.git
 cd mempalace
-pip install -e ".[dev]"
+uv sync --extra dev   # or: pip install -e ".[dev]"
 # see benchmarks/README.md for dataset download commands
-python benchmarks/longmemeval_bench.py /path/to/longmemeval_s_cleaned.json
+uv run python benchmarks/longmemeval_bench.py /path/to/longmemeval_s_cleaned.json
 ```
 
 ---
@@ -151,6 +160,10 @@ system prompt:
 Two Claude Code hooks save periodically and before context compression:
 [mempalaceofficial.com/guide/hooks](https://mempalaceofficial.com/guide/hooks.html).
 
+For per-message recall on top of the file-level chunks the hooks produce,
+run `mempalace sweep <transcript-dir>` periodically — it stores one
+verbatim drawer per user/assistant message, idempotent and resume-safe.
+
 ---
 
 ## Requirements
@@ -180,7 +193,7 @@ PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 MIT — see [LICENSE](LICENSE).
 
 <!-- Link Definitions -->
-[version-shield]: https://img.shields.io/badge/version-3.3.0-4dc9f6?style=flat-square&labelColor=0a0e14
+[version-shield]: https://img.shields.io/badge/version-3.3.5-4dc9f6?style=flat-square&labelColor=0a0e14
 [release-link]: https://github.com/MemPalace/mempalace/releases
 [python-shield]: https://img.shields.io/badge/python-3.9+-7dd8f8?style=flat-square&labelColor=0a0e14&logo=python&logoColor=7dd8f8
 [python-link]: https://www.python.org/

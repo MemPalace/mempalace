@@ -1,6 +1,10 @@
 import { onMounted, onBeforeUnmount } from 'vue'
 
 export function useLandingEffects() {
+// Shared cleanup registry — IIFEs push disconnect/removeEventListener thunks
+// here so onBeforeUnmount can tear everything down on SPA nav.
+const cleanups = []
+
 onMounted(() => {
   if (typeof document === 'undefined') return
 
@@ -25,7 +29,7 @@ onMounted(() => {
         if (text != null) msg.textContent = text
       }
 
-      form.addEventListener('submit', async (e) => {
+      const onSubmit = async (e) => {
         e.preventDefault()
         if (form.classList.contains('is-success') || form.classList.contains('is-pending')) return
 
@@ -70,11 +74,17 @@ onMounted(() => {
           button.disabled = false
           input.disabled = false
         }
-      })
+      }
 
-      // Clear error state as soon as the user edits
-      input.addEventListener('input', () => {
+      const onInput = () => {
         if (form.classList.contains('is-error')) setState(null, '')
+      }
+
+      form.addEventListener('submit', onSubmit)
+      input.addEventListener('input', onInput)
+      cleanups.push(() => {
+        form.removeEventListener('submit', onSubmit)
+        input.removeEventListener('input', onInput)
       })
     })
   })()
@@ -102,6 +112,7 @@ onMounted(() => {
       })
     }, { rootMargin: '0px 0px -80px 0px' })
     items.forEach(el => io.observe(el))
+    cleanups.push(() => io.disconnect())
   })()
 
   /* ---------- Forgetting demo ---------- */
@@ -369,17 +380,27 @@ onMounted(() => {
       }
     }
 
-    if (replayBtn) replayBtn.addEventListener('click', () => {
+    const onReplayClick = () => {
       resetAll()
       armObservers()
-    })
+    }
+    if (replayBtn) replayBtn.addEventListener('click', onReplayClick)
 
     armObservers()
+
+    cleanups.push(() => {
+      disconnectObservers()
+      if (replayBtn) replayBtn.removeEventListener('click', onReplayClick)
+    })
   })()
 })
 
 onBeforeUnmount(() => {
   if (typeof document === 'undefined') return
   document.body.classList.remove('mempalace-active')
+  while (cleanups.length) {
+    const fn = cleanups.pop()
+    try { fn() } catch (_) { /* swallow — teardown best-effort */ }
+  }
 })
 }

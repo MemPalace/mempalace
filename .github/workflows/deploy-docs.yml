@@ -23,13 +23,13 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
       - name: Configure GitHub Pages
         id: pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -44,9 +44,10 @@ jobs:
         env:
           DOCS_BASE: ${{ steps.pages.outputs.base_path }}
           DOCS_EDIT_BRANCH: ${{ github.ref_name }}
+          MEMPALACE_DOCS_GA_ID: ${{ vars.MEMPALACE_DOCS_GA_ID }}
         run: bun run docs:build
 
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: website/.vitepress/dist
 
@@ -63,4 +64,4 @@ jobs:
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

@@ -224,7 +224,7 @@ def split_file(filepath, output_dir, dry_run=False):
             print(f"  [{i + 1}/{len(boundaries) - 1}] {name}  ({len(chunk)} lines)")
         else:
             out_path.write_text("".join(chunk), encoding="utf-8")
-            print(f"  ✓ {name}  ({len(chunk)} lines)")
+            print(f"  + {name}  ({len(chunk)} lines)")
 
         written.append(out_path)
 
@@ -290,7 +290,7 @@ def main():
     print(f"  Source:      {src_dir}")
     print(f"  Output:      {output_dir or 'same dir as source'}")
     print(f"  Mega-files:  {len(mega_files)}")
-    print(f"{'─' * 60}\n")
+    print(f"{'-' * 60}\n")
 
     total_written = 0
     for f, n_sessions in mega_files:
@@ -301,11 +301,11 @@ def main():
         if not args.dry_run and written:
             backup = f.with_suffix(".mega_backup")
             f.rename(backup)
-            print(f"  → Original renamed to {backup.name}\n")
+            print(f"  -> Original renamed to {backup.name}\n")
         else:
             print()
 
-    print(f"{'─' * 60}")
+    print(f"{'-' * 60}")
     if args.dry_run:
         print(f"  DRY RUN — would create {total_written} files from {len(mega_files)} mega-files")
     else:

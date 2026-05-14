@@ -11,6 +11,7 @@ Same palace as project mining. Different ingest strategy.
 import os
 import sys
 import hashlib
+import logging
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
@@ -22,7 +23,10 @@ from .palace import (
     file_already_mined,
     get_collection,
     mine_lock,
+    prefetch_mined_set,
 )
+
+logger = logging.getLogger("mempalace_mcp")
 
 
 # Cached hall keywords — avoids re-reading config per drawer
@@ -55,6 +59,7 @@ CONVO_EXTENSIONS = {
 
 MIN_CHUNK_SIZE = 30
 CHUNK_SIZE = 800  # chars per drawer — align with miner.py
+DRAWER_UPSERT_BATCH_SIZE = 1000
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB — skip files larger than this.
 # Matches miner.py at 500 MB. Long Claude Code sessions, multi-year
 # ChatGPT exports, and lifetime Slack dumps routinely exceed 10 MB; the
@@ -330,33 +335,45 @@ def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extr
         try:
             collection.delete(where={"source_file": source_file})
         except Exception:
-            pass
+            logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
 
-        for chunk in chunks:
-            chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
-            if extract_mode == "general":
-                room_counts_delta[chunk_room] += 1
-            drawer_id = f"drawer_{wing}_{chunk_room}_{hashlib.sha256((source_file + str(chunk['chunk_index'])).encode()).hexdigest()[:24]}"
+        # Batch chunks into bounded upserts so large transcripts keep most of
+        # the embedding speedup without one huge Chroma/SQLite request. Keep
+        # one filed_at per source file so all transcript drawers share an
+        # ingest timestamp.
+        filed_at = datetime.now().isoformat()
+        for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
+            batch_docs: list = []
+            batch_ids: list = []
+            batch_metas: list = []
+            for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
+                chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
+                if extract_mode == "general":
+                    room_counts_delta[chunk_room] += 1
+                drawer_id = f"drawer_{wing}_{chunk_room}_{hashlib.sha256((source_file + str(chunk['chunk_index'])).encode()).hexdigest()[:24]}"
+                batch_docs.append(chunk["content"])
+                batch_ids.append(drawer_id)
+                batch_metas.append(
+                    {
+                        "wing": wing,
+                        "room": chunk_room,
+                        "hall": _detect_hall_cached(chunk["content"]),
+                        "source_file": source_file,
+                        "chunk_index": chunk["chunk_index"],
+                        "added_by": agent,
+                        "filed_at": filed_at,
+                        "ingest_mode": "convos",
+                        "extract_mode": extract_mode,
+                        "normalize_version": NORMALIZE_VERSION,
+                    }
+                )
             try:
                 collection.upsert(
-                    documents=[chunk["content"]],
-                    ids=[drawer_id],
-                    metadatas=[
-                        {
-                            "wing": wing,
-                            "room": chunk_room,
-                            "hall": _detect_hall_cached(chunk["content"]),
-                            "source_file": source_file,
-                            "chunk_index": chunk["chunk_index"],
-                            "added_by": agent,
-                            "filed_at": datetime.now().isoformat(),
-                            "ingest_mode": "convos",
-                            "extract_mode": extract_mode,
-                            "normalize_version": NORMALIZE_VERSION,
-                        }
-                    ],
+                    documents=batch_docs,
+                    ids=batch_ids,
+                    metadatas=batch_metas,
                 )
-                drawers_added += 1
+                drawers_added += len(batch_docs)
             except Exception as e:
                 if "already exists" not in str(e).lower():
                     raise
@@ -381,7 +398,9 @@ def mine_convos(
 
     convo_path = Path(convo_dir).expanduser().resolve()
     if not wing:
-        wing = convo_path.name.lower().replace(" ", "_").replace("-", "_")
+        from .config import normalize_wing_name
+
+        wing = normalize_wing_name(convo_path.name)
 
     files = scan_convos(convo_dir)
     if limit > 0:
@@ -400,6 +419,13 @@ def mine_convos(
 
     collection = get_collection(palace_path) if not dry_run else None
 
+    # Bulk pre-fetch already-mined set in one paginated pass instead of
+    # `len(files)` separate WHERE-source_file queries. On a 150k-drawer
+    # palace each per-file query costs ~2s, so a 2000-file sweep used to
+    # spend >1h just deciding to skip. prefetch_mined_set() does the same
+    # decisions in a single scan; loop body becomes an O(1) set check.
+    mined_set: set[str] = prefetch_mined_set(collection) if not dry_run else set()
+
     total_drawers = 0
     files_skipped = 0
     room_counts = defaultdict(int)
@@ -407,8 +433,8 @@ def mine_convos(
     for i, filepath in enumerate(files, 1):
         source_file = str(filepath)
 
-        # Skip if already filed
-        if not dry_run and file_already_mined(collection, source_file):
+        # Skip if already filed at current NORMALIZE_VERSION
+        if not dry_run and source_file in mined_set:
             files_skipped += 1
             continue
 
@@ -478,7 +504,7 @@ def mine_convos(
             room_counts[r] += n
 
         total_drawers += drawers_added
-        print(f"  ✓ [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")
+        print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")
 
     print(f"\n{'=' * 55}")
     print("  Done.")
