@@ -235,6 +235,27 @@ class VRAMPoller:
 # ── Embedding similarity (open-set scoring) ──────────────────────────────
 
 
+# Embedder-specific input prefixes. Some multilingual embedders ship with
+# task prefixes that materially change retrieval quality — embeddinggemma's
+# average non-EN cos-sim moves from ~0.829 to ~0.882 with the sim prefix
+# applied (PR #1483). Keyed by substring so tag variants like
+# "embeddinggemma:300m" or "embeddinggemma:latest" resolve to the same
+# prefix without enumerating every tag. Production applies these inside
+# EmbeddinggemmaONNX; mirrored here for the benchmark code path.
+_EMBED_PREFIXES: dict[str, str] = {
+    "embeddinggemma": "task: sentence similarity | query: ",
+}
+
+
+def _embed_prefix(model: str) -> str:
+    """Return the input prefix for ``model``, or '' if none."""
+    lowered = model.lower()
+    for key, prefix in _EMBED_PREFIXES.items():
+        if key in lowered:
+            return prefix
+    return ""
+
+
 def embed_text(
     text: str,
     model: str = "nomic-embed-text",
@@ -242,7 +263,8 @@ def embed_text(
     timeout: int = 30,
 ) -> Optional[list[float]]:
     """Get an embedding from Ollama's /api/embeddings. Returns None on failure."""
-    body = json.dumps({"model": model, "prompt": text}).encode("utf-8")
+    prompt_text = _embed_prefix(model) + text
+    body = json.dumps({"model": model, "prompt": prompt_text}).encode("utf-8")
     req = Request(
         f"{endpoint}/api/embeddings",
         data=body,
