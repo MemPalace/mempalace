@@ -30,16 +30,49 @@ def test_people_map_missing(tmp_path):
     assert cfg.people_map == {}
 
 
-def test_topic_wings_default(tmp_path):
+def test_wings_default(tmp_path):
     cfg = MempalaceConfig(config_dir=str(tmp_path))
-    assert isinstance(cfg.topic_wings, list)
-    assert "emotions" in cfg.topic_wings
+    assert isinstance(cfg.wings, list)
+    assert "wing_user" in cfg.wings
 
 
-def test_hall_keywords_default(tmp_path):
+def test_halls_default(tmp_path):
     cfg = MempalaceConfig(config_dir=str(tmp_path))
-    assert isinstance(cfg.hall_keywords, dict)
-    assert "technical" in cfg.hall_keywords
+    assert isinstance(cfg.halls, list)
+    assert "hall_facts" in cfg.halls
+
+
+def test_migrate_legacy_topic_wings(tmp_path):
+    """Old topic_wings key is migrated to wings on load."""
+    old_config = {"topic_wings": ["custom_wing_a"], "palace_path": "~/.mempalace/palace"}
+    (tmp_path / "config.json").write_text(json.dumps(old_config), encoding="utf-8")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.wings == ["custom_wing_a"]
+    # Verify persisted back to disk
+    with open(tmp_path / "config.json") as f:
+        data = json.load(f)
+    assert "wings" in data
+    assert "topic_wings" not in data
+
+
+def test_migrate_legacy_hall_keywords(tmp_path):
+    """Old hall_keywords key is migrated to halls on load."""
+    old_config = {"hall_keywords": {"emotions": ["happy"]}}
+    (tmp_path / "config.json").write_text(json.dumps(old_config), encoding="utf-8")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.halls == {"emotions": ["happy"]}
+    with open(tmp_path / "config.json") as f:
+        data = json.load(f)
+    assert "halls" in data
+    assert "hall_keywords" not in data
+
+
+def test_migrate_skips_if_new_key_exists(tmp_path):
+    """Migration does not overwrite if new key already present."""
+    config = {"topic_wings": ["old"], "wings": ["new_wing"]}
+    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.wings == ["new_wing"]
 
 
 def test_init_idempotent(tmp_path):
