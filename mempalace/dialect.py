@@ -450,28 +450,53 @@ class Dialect:
         return detected[:3]
 
     def _extract_topics(self, text: str, max_topics: int = 3) -> List[str]:
-        """Extract key topic words from plain text."""
-        # Tokenize: alphanumeric words, lowercase
-        words = re.findall(r"[a-zA-Z][a-zA-Z_-]{2,}", text)
-        # Count frequency, skip stop words
+        """Extract key topic words from plain text.
+
+        Honors the loaded locale's ``topic_pattern`` and ``stop_words`` from
+        ``self.lang_regex`` when present. Without that, the hardcoded English
+        regex never matches Hangul / Cyrillic / CJK / Devanagari, so non-Latin
+        languages produce English-borrowing-only topics.
+        """
+        # Locale-aware tokenization. Non-Latin scripts (Korean, Russian, …)
+        # need their own character class; ko.json etc. supply one via i18n.
+        pattern = self.lang_regex.get("topic_pattern") or r"[a-zA-Z][a-zA-Z_-]{2,}"
+        words = re.findall(pattern, text)
+        # Merge locale stop words with English defaults. ko.json's stop_words is
+        # a space-separated string; treat empty string as no extras.
+        locale_stops_str = self.lang_regex.get("stop_words") or ""
+        stop_words = _STOP_WORDS | set(locale_stops_str.split())
+        # Min length 2 (was 3): some scripts have meaningful 2-char tokens
+        # (e.g. Korean 토큰, 집합); English noise at len 2 is already in stop_words.
+        min_len = 2
+
         freq = {}
         for w in words:
             w_lower = w.lower()
-            if w_lower in _STOP_WORDS or len(w_lower) < 3:
+            if w_lower in stop_words or len(w_lower) < min_len:
                 continue
             freq[w_lower] = freq.get(w_lower, 0) + 1
 
-        # Also boost words that look like proper nouns or technical terms
+        # Boost. For English locales the Latin capitalization heuristic surfaces
+        # proper nouns and technical terms. For non-English locales the same
+        # heuristic would unfairly favor English borrowings ("Jaccard",
+        # "GraphQL") over locale-script content, so we swap to a small
+        # non-ASCII boost that nudges Hangul / Cyrillic / CJK tokens into
+        # contention without overriding genuine frequency signal.
+        english_locale = self.lang == "en"
         for w in words:
             w_lower = w.lower()
-            if w_lower in _STOP_WORDS:
+            if w_lower not in freq:
                 continue
-            if w[0].isupper() and w_lower in freq:
-                freq[w_lower] += 2
-            # CamelCase or has underscore/hyphen
-            if "_" in w or "-" in w or (any(c.isupper() for c in w[1:])):
-                if w_lower in freq:
+            if english_locale:
+                if w[0].isupper():
                     freq[w_lower] += 2
+                if "_" in w or "-" in w or any(c.isupper() for c in w[1:]):
+                    freq[w_lower] += 2
+            else:
+                if not w[0].isascii():
+                    freq[w_lower] += 1
+                if "_" in w or "-" in w:
+                    freq[w_lower] += 1
 
         ranked = sorted(freq.items(), key=lambda x: -x[1])
         return [w for w, _ in ranked[:max_topics]]

@@ -36,7 +36,7 @@
     "instruction": "Compress to index format. Hyphens between words, pipes between concepts. Drop articles and filler. Keep names and numbers exact."
   },
   "regex": {
-    "topic_pattern": "[A-Z][a-z]{2,}|[A-Za-z][A-Za-z0-9_]{2,}",
+    "topic_pattern": "[a-zA-Z][a-zA-Z_-]{2,}",
     "stop_words": "the this that these those some many most each every other only such very will would could should must shall yeah okay also even then now already still back done make take give know think want need going come find work added saved session summary conversation topics source about once just really actually here there where good great better thank please sorry right wrong true false",
     "quote_pattern": "\"([^\"]{20,200})\"",
     "action_pattern": "(?:built|fixed|wrote|added|pushed|measured|tested|reviewed|created|deleted|updated|configured|deployed|migrated)\\s+[\\w\\s]{3,30}"

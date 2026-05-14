@@ -85,6 +85,75 @@ class TestTopicExtraction:
         assert "graphql" in topic_lower
 
 
+class TestLocaleTopicExtraction:
+    def test_korean_extracts_hangul_topics(self):
+        """ko.json declares a Hangul-aware topic_pattern and stop_words.
+        Dialect(lang='ko') must honor both so Korean text yields Korean topics
+        instead of falling back to English-borrowing-only output (which was
+        the bug before locale regex was wired through _extract_topics)."""
+        d = Dialect(lang="ko")
+        topics = d._extract_topics(
+            "Topic Clustering 파이프라인에서 cosine similarity를 Jaccard로 전환하기로 "
+            "결정했습니다. 토큰 집합의 이산적인 특성 때문에 Jaccard가 더 적합하고, "
+            "짧은 문서에 대한 cosine 결과는 너무 noisy했습니다."
+        )
+        # At least one Hangul token must surface — without locale support,
+        # all topics would be English borrowings (jaccard, cosine, topic).
+        assert any(
+            any("가" <= c <= "힯" for c in t) for t in topics
+        ), f"expected at least one Hangul topic, got {topics!r}"
+
+    def test_korean_stop_words_are_filtered(self):
+        """Locale stop_words from ko.json must be merged with English defaults.
+        때문에 (because / due to) is declared in ko.json's stop_words list and
+        must be filtered out of extracted topics even when frequent."""
+        d = Dialect(lang="ko")
+        topics = d._extract_topics("때문에 때문에 때문에 토큰 토큰")
+        # 때문에 is in ko.json stop_words; 토큰 (token) is not.
+        assert "때문에" not in topics
+        assert "토큰" in topics
+
+    def test_russian_extracts_cyrillic_topics(self):
+        """Dialect(lang='ru') must surface Cyrillic words alongside Latin
+        borrowings. Without ru.json's topic_pattern wired through, Russian
+        text yields English-borrowing-only output."""
+        d = Dialect(lang="ru")
+        topics = d._extract_topics(
+            "Я решил, что мы перейдём с cosine similarity на Jaccard в "
+            "пайплайне topic-clustering. Дискретная природа множеств токенов "
+            "делает Jaccard более подходящей метрикой."
+        )
+        # At least one Cyrillic token must surface — Cyrillic letters live in
+        # the U+0400..U+04FF block (plus the Yo letter Ё / ё).
+        assert any(
+            any("Ѐ" <= c <= "ӿ" for c in t) for t in topics
+        ), f"expected at least one Cyrillic topic, got {topics!r}"
+
+    def test_russian_mid_sentence_lowercase_extracted(self):
+        """ru.json's topic_pattern must match mid-sentence lowercase Cyrillic.
+        Russian only capitalizes sentence-initial words and proper nouns —
+        most content words appear lowercase mid-sentence, so a regex
+        requiring an uppercase first char misses the bulk of the signal."""
+        d = Dialect(lang="ru")
+        topics = d._extract_topics("природа природа природа документов документов токенов")
+        # All three Cyrillic content words are lowercase and non-trivial in
+        # length. At least one must surface in topics; the bug pre-fix is
+        # that the regex requires an uppercase first char and emits [].
+        assert any(
+            t in {"природа", "документов", "токенов"} for t in topics
+        ), f"expected lowercase Cyrillic topic, got {topics!r}"
+
+    def test_russian_stop_words_are_filtered(self):
+        """Locale stop_words from ru.json must be merged with English defaults.
+        'это' (this) is the first entry in ru.json's stop_words list and must
+        be filtered even when it dominates by frequency."""
+        d = Dialect(lang="ru")
+        topics = d._extract_topics("это это это токен токен")
+        # 'это' is in ru.json stop_words; 'токен' (token) is not.
+        assert "это" not in topics
+        assert "токен" in topics
+
+
 class TestKeySentenceExtraction:
     def test_extract_key_sentence(self):
         d = Dialect()
