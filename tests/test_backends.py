@@ -15,6 +15,8 @@ from mempalace.backends import (
 )
 from mempalace.backends.chroma import ChromaBackend, ChromaCollection, _fix_blob_seq_ids
 from mempalace.backends.postgres import (
+    VECTOR_INDEX_CHECK_INTERVAL_ROWS,
+    VECTOR_INDEX_MIN_ROWS,
     PostgresBackend,
     PostgresCollection,
     _metadata_value,
@@ -481,6 +483,120 @@ def test_postgres_estimated_count_uses_catalog_stats_and_local_floor(monkeypatch
 
     assert collection._estimated_count() == 100
     assert events == ["cursor", ("execute", (collection.table_name,))]
+
+
+def test_postgres_lazy_vector_index_create_is_serialized(monkeypatch):
+    events = []
+
+    class FakeCursor:
+        def __init__(self):
+            self.fetchone_results = [None, None]
+
+        def execute(self, sql, params=None):
+            events.append(("execute", str(sql), params))
+
+        def fetchone(self):
+            return self.fetchone_results.pop(0)
+
+    cursor = FakeCursor()
+
+    class FakeConnection:
+        def cursor(self):
+            events.append("cursor")
+            return cursor
+
+    collection = PostgresCollection("postgresql://example")
+    collection._vec_type = "vector"
+    collection._table_am = "heap"
+    collection._index_am = "hnsw"
+    collection._rows_since_index_check = VECTOR_INDEX_CHECK_INTERVAL_ROWS
+    monkeypatch.setattr(PostgresCollection, "_sql", property(lambda self: _FakeSql))
+    monkeypatch.setattr(PostgresCollection, "_get_conn", lambda self: FakeConnection())
+    monkeypatch.setattr(
+        PostgresCollection,
+        "_estimated_count",
+        lambda self: events.append(("estimated_count", None, None)) or VECTOR_INDEX_MIN_ROWS,
+    )
+
+    collection._maybe_create_vector_index(inserted_rows=1)
+
+    executed_sql = [event[1] for event in events if event[0] == "execute"]
+    assert "pg_advisory_lock" in executed_sql[1]
+    assert "CREATE INDEX IF NOT EXISTS" in executed_sql[3]
+    assert "pg_advisory_unlock" in executed_sql[4]
+    assert collection._vector_index_ready is True
+
+
+def test_postgres_lazy_vector_index_accepts_compatible_existing_index(monkeypatch):
+    events = []
+
+    class FakeCursor:
+        def execute(self, sql, params=None):
+            events.append(("execute", str(sql), params))
+
+        def fetchone(self):
+            return (1,)
+
+    class FakeConnection:
+        def cursor(self):
+            events.append("cursor")
+            return FakeCursor()
+
+    collection = PostgresCollection("postgresql://example")
+    collection._vec_type = "vector"
+    collection._table_am = "heap"
+    collection._index_am = "hnsw"
+    collection._rows_since_index_check = VECTOR_INDEX_CHECK_INTERVAL_ROWS
+    monkeypatch.setattr(PostgresCollection, "_get_conn", lambda self: FakeConnection())
+    monkeypatch.setattr(
+        PostgresCollection,
+        "_estimated_count",
+        lambda self: (_ for _ in ()).throw(AssertionError("count must not run")),
+    )
+
+    collection._maybe_create_vector_index(inserted_rows=1)
+
+    assert collection._vector_index_ready is True
+    assert len([event for event in events if event[0] == "execute"]) == 1
+    assert "pg_advisory_lock" not in events[1][1]
+
+
+def test_postgres_lazy_vector_index_unlocks_when_create_fails(monkeypatch):
+    events = []
+
+    class FakeCursor:
+        def __init__(self):
+            self.fetchone_results = [None, None]
+
+        def execute(self, sql, params=None):
+            sql_text = str(sql)
+            events.append(("execute", sql_text, params))
+            if "CREATE INDEX" in sql_text:
+                raise RuntimeError("ddl failed")
+
+        def fetchone(self):
+            return self.fetchone_results.pop(0)
+
+    cursor = FakeCursor()
+
+    class FakeConnection:
+        def cursor(self):
+            return cursor
+
+    collection = PostgresCollection("postgresql://example")
+    collection._vec_type = "vector"
+    collection._table_am = "heap"
+    collection._index_am = "hnsw"
+    collection._rows_since_index_check = VECTOR_INDEX_CHECK_INTERVAL_ROWS
+    monkeypatch.setattr(PostgresCollection, "_sql", property(lambda self: _FakeSql))
+    monkeypatch.setattr(PostgresCollection, "_get_conn", lambda self: FakeConnection())
+    monkeypatch.setattr(PostgresCollection, "_estimated_count", lambda self: VECTOR_INDEX_MIN_ROWS)
+
+    with pytest.raises(RuntimeError, match="ddl failed"):
+        collection._maybe_create_vector_index(inserted_rows=1)
+
+    assert "pg_advisory_unlock" in events[-1][1]
+    assert collection._vector_index_ready is False
 
 
 def test_palace_get_collection_selects_postgres_backend_from_env(monkeypatch):

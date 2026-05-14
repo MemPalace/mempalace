@@ -681,24 +681,67 @@ class PostgresCollection(BaseCollection):
 
         cur = self._get_conn().cursor()
         index_name = f"{self.table_name}_vec_idx"
-        cur.execute("SELECT 1 FROM pg_indexes WHERE indexname = %s", (index_name,))
-        if cur.fetchone():
+        ops = "svec_cosine_ops" if self._vec_type == "svec" else "vector_cosine_ops"
+        if self._vector_index_exists(cur, index_name=index_name, ops=ops):
             self._vector_index_ready = True
             return
 
         if self._estimated_count() < VECTOR_INDEX_MIN_ROWS:
             return
 
-        ops = "svec_cosine_ops" if self._vec_type == "svec" else "vector_cosine_ops"
+        lock_key = f"vec_idx:{self.table_name}:{self._index_am}:{ops}"
         cur.execute(
-            self._sql.SQL("CREATE INDEX {} ON {} USING {} (embedding {})").format(
-                self._sql.Identifier(index_name),
-                self._table_id,
-                self._sql.SQL(self._index_am),
-                self._sql.SQL(ops),
-            )
+            "SELECT pg_advisory_lock(hashtext('mempalace.postgres.vec_idx'), hashtext(%s))",
+            (lock_key,),
         )
-        self._vector_index_ready = True
+        try:
+            if self._vector_index_exists(cur, index_name=index_name, ops=ops):
+                self._vector_index_ready = True
+                return
+            cur.execute(
+                self._sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {} USING {} (embedding {})").format(
+                    self._sql.Identifier(index_name),
+                    self._table_id,
+                    self._sql.SQL(self._index_am),
+                    self._sql.SQL(ops),
+                )
+            )
+            self._vector_index_ready = True
+        finally:
+            cur.execute(
+                "SELECT pg_advisory_unlock(hashtext('mempalace.postgres.vec_idx'), hashtext(%s))",
+                (lock_key,),
+            )
+
+    def _vector_index_exists(self, cur, *, index_name: str, ops: str) -> bool:
+        cur.execute(
+            """
+            SELECT 1
+            FROM pg_indexes
+            WHERE schemaname = 'public'
+              AND tablename = %s
+              AND indexname = %s
+            UNION ALL
+            SELECT 1
+            FROM pg_index i
+            JOIN pg_class idx ON idx.oid = i.indexrelid
+            JOIN pg_class tbl ON tbl.oid = i.indrelid
+            JOIN pg_namespace ns ON ns.oid = tbl.relnamespace
+            JOIN pg_am am ON am.oid = idx.relam
+            JOIN pg_attribute att ON att.attrelid = tbl.oid AND att.attnum = i.indkey[0]
+            JOIN pg_opclass opc ON opc.oid = i.indclass[0]
+            WHERE ns.nspname = 'public'
+              AND tbl.relname = %s
+              AND am.amname = %s
+              AND att.attname = 'embedding'
+              AND opc.opcname = %s
+              AND i.indisready
+              AND i.indisvalid
+            LIMIT 1
+            """,
+            (self.table_name, index_name, self.table_name, self._index_am, ops),
+        )
+        return cur.fetchone() is not None
 
     def _estimated_count(self) -> int:
         cur = self._get_conn().cursor()
