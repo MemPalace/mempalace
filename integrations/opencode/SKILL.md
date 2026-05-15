@@ -85,7 +85,7 @@ Add to your `~/.config/opencode/opencode.json`:
 ```bash
 # Add to opencode.json:
 {
-  "plugin": ["opencode-mempalace-persistence"]
+  "plugins": ["opencode-mempalace-persistence"]
 }
 ```
 
