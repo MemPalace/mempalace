@@ -700,10 +700,7 @@ def _vacuum_and_rebuild_fts5(palace_path: str, progress=print) -> None:
     try:
         with closing(sqlite3.connect(sqlite_path)) as conn:
             tables = {
-                r[0]
-                for r in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                )
+                r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
             }
             if "embedding_fulltext_search" in tables:
                 conn.execute(
