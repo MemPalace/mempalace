@@ -10,6 +10,8 @@ Stores verbatim chunks as drawers. No summaries. Ever.
 import os
 import re
 import sys
+import json
+import time
 import shlex
 import hashlib
 import fnmatch
@@ -89,6 +91,158 @@ MAX_CHUNKS_PER_FILE = 500
 # drawers and therefore more storage, embedding, and processing work —
 # and file reads are not streamed (the whole content is loaded into
 # memory before chunking), so memory use scales with source size too.
+
+
+# =============================================================================
+# EPOCH TRACKING
+# =============================================================================
+#
+# Each mine run stamps every chunk with a mine_epoch — the Unix timestamp
+# (seconds) of the mine run. The current epoch is persisted to
+# {palace}/epoch.json so it survives process restarts. Epochs are guaranteed
+# monotonic: if two mines fire in the same second, the second one is bumped
+# to previous + 1 so comparisons are always strict.
+#
+# Benefits of using Unix time as the epoch value:
+#   - Cross-palace comparable (useful for multi-machine setups or re-imports)
+#   - Survives cmd_purge rebuilds automatically — a new palace's first epoch
+#     is always greater than any old palace's last epoch, because time only
+#     moves forward
+#   - The epoch value IS a timestamp — no separate field needed to know WHEN
+#     a chunk was filed
+#   - Enables time-based retention policies on revision history
+#
+# REVISION SNAPSHOTS
+# ------------------
+# When a file is re-mined, upstream's #521 fix (delete-before-insert) purges
+# all existing chunks for that file before the fresh ones are written. This
+# avoids hnswlib segfaults but also destroys the previous version of the file.
+# _snapshot_revisions() runs just before that delete, capturing the chunks to
+# {palace}/revisions.jsonl so the previous version can still be retrieved.
+#
+# The revisions file is kept bounded by two limits. Each line is ONE
+# chunk snapshot (not one whole-file revision), so a file with N chunks
+# that gets re-mined produces N lines. Truncation runs whenever the line
+# count exceeds MAX_REVISIONS (default 50,000, configurable via
+# MEMPALACE_MAX_REVISIONS env var). When it runs:
+#   1. Lines older than REVISION_RETENTION_SECONDS (default 90 days,
+#      configurable via MEMPALACE_REVISION_RETENTION_DAYS) are dropped.
+#   2. The remainder is then capped at MAX_REVISIONS newest entries.
+# The common path stays append-only; a rewrite happens only on overflow.
+#
+# EPHEMERAL FILES
+# ---------------
+# epoch.json and revisions.jsonl live inside the palace directory but are
+# runtime artifacts, not content. If your palace dir is version-controlled
+# or synced across machines, add these to .gitignore (or equivalent):
+#   /epoch.json
+#   /revisions.jsonl
+# They'll be recreated on the next mine run.
+
+
+# Soft time-based retention for revisions.jsonl (seconds). Configurable via
+# MEMPALACE_REVISION_RETENTION_DAYS env var. Default: 90 days.
+REVISION_RETENTION_SECONDS = int(
+    os.environ.get("MEMPALACE_REVISION_RETENTION_DAYS", "90")
+) * 86400
+
+# Hard safety cap on revisions.jsonl line count. Each line is a single
+# CHUNK snapshot, not a whole-file revision — a file with N chunks that
+# gets re-mined once produces N lines. So 50,000 lines ≈ roughly 1,600
+# file re-mines at 30 chunks/file, ~60 MB on disk. Configurable via
+# MEMPALACE_MAX_REVISIONS env var. When exceeded, truncation runs with
+# (a) time filter first (drops > REVISION_RETENTION_SECONDS old), then
+# (b) newest-N cap at MAX_REVISIONS lines.
+MAX_REVISIONS = int(os.environ.get("MEMPALACE_MAX_REVISIONS", "50000"))
+
+
+def _load_epoch(palace_path: str) -> int:
+    """Load the current mine epoch from the palace. Returns 0 if none exists."""
+    epoch_file = os.path.join(palace_path, "epoch.json")
+    if os.path.exists(epoch_file):
+        try:
+            with open(epoch_file) as f:
+                return json.load(f).get("current", 0)
+        except Exception:
+            return 0
+    return 0
+
+
+def _save_epoch(palace_path: str, epoch: int):
+    """Persist the current mine epoch."""
+    os.makedirs(palace_path, exist_ok=True)
+    epoch_file = os.path.join(palace_path, "epoch.json")
+    with open(epoch_file, "w") as f:
+        json.dump({
+            "current": epoch,
+            "last_mine": datetime.now().isoformat(),
+        }, f)
+
+
+def _snapshot_revisions(palace_path: str, collection, source_file: str, mine_epoch: int):
+    """Save the current chunks for source_file to revisions.jsonl before deletion.
+
+    Captures each chunk's full content and metadata so the previous version
+    can be reconstructed or queried later. Called just before upstream's
+    delete-before-insert purge in process_file() so that the snapshot records
+    exactly what is about to be discarded.
+
+    After appending the new records, enforces a soft cap of MAX_REVISIONS
+    lines via tail truncation (oldest records dropped first). This keeps
+    long-running palaces from growing unbounded. The fast path is a simple
+    append — truncation only rewrites the file when the cap is exceeded.
+    """
+    revisions_path = os.path.join(palace_path, "revisions.jsonl")
+    existing = collection.get(
+        where={"source_file": source_file},
+        include=["documents", "metadatas"],
+    )
+    if not existing.get("ids"):
+        return
+    superseded_at = datetime.now().isoformat()
+    with open(revisions_path, "a") as f:
+        for id_, doc, meta in zip(
+            existing["ids"], existing["documents"], existing["metadatas"]
+        ):
+            record = {
+                "superseded_at": superseded_at,
+                "superseded_by_epoch": mine_epoch,
+                "source_file": meta.get("source_file", ""),
+                "chunk_index": meta.get("chunk_index", 0),
+                "content": doc,
+                "original_epoch": meta.get("mine_epoch", 0),
+                "original_filed_at": meta.get("filed_at", ""),
+                "wing": meta.get("wing", ""),
+                "room": meta.get("room", ""),
+            }
+            f.write(json.dumps(record) + "\n")
+
+    # Tail-truncate if we've exceeded the soft cap. Applies both the time
+    # retention window AND the hard count cap in one rewrite pass. The
+    # fast path (append, above) stays untouched; rewriting only happens
+    # when we're actually over-budget.
+    try:
+        with open(revisions_path, "rb") as f:
+            line_count = sum(1 for _ in f)
+        if line_count > MAX_REVISIONS:
+            cutoff = int(time.time()) - REVISION_RETENTION_SECONDS
+            kept = []
+            with open(revisions_path) as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        rec = json.loads(line)
+                        if rec.get("superseded_by_epoch", 0) >= cutoff:
+                            kept.append(line)
+                    except json.JSONDecodeError:
+                        continue
+            if len(kept) > MAX_REVISIONS:
+                kept = kept[-MAX_REVISIONS:]
+            with open(revisions_path, "w") as f:
+                f.writelines(kept)
+    except Exception:
+        pass  # truncation is best-effort — never break mining over it
 
 
 # =============================================================================
@@ -772,6 +926,7 @@ def _build_drawer_metadata(
     agent: str,
     content: str,
     source_mtime: Optional[float],
+    mine_epoch: int = 0,
 ) -> dict:
     """Build the metadata dict for one drawer without upserting.
 
@@ -787,6 +942,7 @@ def _build_drawer_metadata(
         "added_by": agent,
         "filed_at": datetime.now().isoformat(),
         "normalize_version": NORMALIZE_VERSION,
+        "mine_epoch": mine_epoch,
     }
     if source_mtime is not None:
         metadata["source_mtime"] = source_mtime
@@ -798,7 +954,8 @@ def _build_drawer_metadata(
 
 
 def add_drawer(
-    collection, wing: str, room: str, content: str, source_file: str, chunk_index: int, agent: str
+    collection, wing: str, room: str, content: str, source_file: str,
+    chunk_index: int, agent: str, mine_epoch: int = 0,
 ):
     """Add one drawer to the palace.
 
@@ -812,7 +969,7 @@ def add_drawer(
     except OSError:
         source_mtime = None
     metadata = _build_drawer_metadata(
-        wing, room, source_file, chunk_index, agent, content, source_mtime
+        wing, room, source_file, chunk_index, agent, content, source_mtime, mine_epoch
     )
     collection.upsert(
         documents=[content],
@@ -836,8 +993,15 @@ def process_file(
     agent: str,
     dry_run: bool,
     closets_col=None,
+    palace_path: str = "",
+    mine_epoch: int = 0,
 ) -> tuple:
-    """Read, chunk, route, and file one file. Returns (drawer_count, room_name)."""
+    """Read, chunk, route, and file one file. Returns (drawer_count, room_name).
+
+    When a file is re-mined, its existing chunks are snapshotted to
+    {palace}/revisions.jsonl before the delete-before-insert purge, preserving
+    a queryable history of what the file used to contain.
+    """
 
     # Skip if already filed
     source_file = str(filepath)
@@ -874,6 +1038,18 @@ def process_file(
         # Re-check after acquiring lock — another agent may have just finished
         if file_already_mined(collection, source_file, check_mtime=True):
             return 0, room
+
+        # Snapshot the current chunks to revisions.jsonl before they get
+        # purged below. Captures exactly what is about to be discarded so a
+        # later query can reconstruct the previous version. Best-effort —
+        # never fail mining over a snapshot error.
+        if palace_path:
+            try:
+                _snapshot_revisions(palace_path, collection, source_file, mine_epoch)
+            except Exception:
+                logger.debug(
+                    "Revision snapshot failed for %s", source_file, exc_info=True
+                )
 
         # Purge stale drawers for this file before re-inserting the fresh chunks.
         # Converts modified-file re-mines from upsert-over-existing-IDs (which hits
@@ -912,6 +1088,7 @@ def process_file(
                         agent,
                         chunk["content"],
                         source_mtime,
+                        mine_epoch,
                     )
                 )
             collection.upsert(
@@ -941,6 +1118,7 @@ def process_file(
                 "drawer_count": drawers_added,
                 "filed_at": datetime.now().isoformat(),
                 "normalize_version": NORMALIZE_VERSION,
+                "mine_epoch": mine_epoch,
             }
             if entities:
                 closet_meta["entities"] = entities
@@ -1102,6 +1280,18 @@ def _mine_impl(
 
     from .embedding import describe_device
 
+    # Compute the mine epoch for this run. Epoch is int(time.time()) — the
+    # Unix timestamp (seconds) of the mine run. If two mines fire in the
+    # same second we bump to previous + 1 to preserve strict monotonicity.
+    # Every chunk filed below carries this epoch in its metadata, and
+    # revisions.jsonl records use it as the "superseded_by_epoch" marker.
+    if not dry_run:
+        previous = _load_epoch(palace_path)
+        mine_epoch = max(int(time.time()), previous + 1)
+        _save_epoch(palace_path, mine_epoch)
+    else:
+        mine_epoch = 0
+
     print(f"\n{'=' * 55}")
     print("  MemPalace Mine")
     print(f"{'=' * 55}")
@@ -1110,6 +1300,8 @@ def _mine_impl(
     print(f"  Files:   {len(files)}")
     print(f"  Palace:  {palace_path}")
     print(f"  Device:  {describe_device()}")
+    if not dry_run:
+        print(f"  Epoch:   {mine_epoch}")
     if dry_run:
         print("  DRY RUN — nothing will be filed")
     if not respect_gitignore:
@@ -1143,6 +1335,8 @@ def _mine_impl(
                     agent=agent,
                     dry_run=dry_run,
                     closets_col=closets_col,
+                    palace_path=palace_path,
+                    mine_epoch=mine_epoch,
                 )
             except KeyboardInterrupt:
                 # Re-raise so the outer handler prints the summary; we
@@ -1306,8 +1500,13 @@ def status(palace_path: str):
             wing_rooms[m.get("wing", "?")][m.get("room", "?")] += 1
         offset += len(batch)
 
+    # Show current epoch if one is tracked
+    epoch = _load_epoch(palace_path)
+
     print(f"\n{'=' * 55}")
     print(f"  MemPalace Status — {total} drawers")
+    if epoch > 0:
+        print(f"  Current epoch: {epoch}")
     print(f"{'=' * 55}\n")
     for wing, rooms in sorted(wing_rooms.items()):
         print(f"  WING: {wing}")
