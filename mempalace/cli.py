@@ -514,6 +514,7 @@ def cmd_mine(args):
                 limit=args.limit,
                 dry_run=args.dry_run,
                 extract_mode=args.extract,
+                include_assistant=getattr(args, "include_assistant", False),
             )
         else:
             from .miner import mine
@@ -1279,6 +1280,12 @@ def main():
         choices=["exchange", "general"],
         default="exchange",
         help="Extraction strategy for convos mode: 'exchange' (default) or 'general' (5 memory types)",
+    )
+    p_mine.add_argument(
+        "--include-assistant",
+        action="store_true",
+        dest="include_assistant",
+        help="Also index each assistant turn as a standalone drawer with turn_role=assistant metadata (convos mode only). Expects Claude export format: user turns begin with '>'; all other non-separator lines are treated as assistant content.",
     )
 
     # sweep
