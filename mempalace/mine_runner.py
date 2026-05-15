@@ -203,7 +203,9 @@ def discover_targets(scan_root: str = DEFAULT_SCAN_ROOT) -> list[Path]:
         return []
     targets: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in DISCOVERY_SKIP_DIRS and not d.startswith(".")]
+        dirnames[:] = [
+            d for d in dirnames if d not in DISCOVERY_SKIP_DIRS and not d.startswith(".")
+        ]
         if "mempalace.yaml" in filenames or "mempal.yaml" in filenames:
             targets.append(Path(dirpath))
             dirnames[:] = []  # project boundary
@@ -239,7 +241,6 @@ def _mine_one_target(target: Path, palace_path: str, heartbeat_cb=None) -> dict:
         load_config,
         scan_project,
         process_file,
-        NORMALIZE_VERSION,
         MAX_FILE_SIZE,
     )
     from .palace import (
@@ -326,10 +327,10 @@ def _mine_one_target(target: Path, palace_path: str, heartbeat_cb=None) -> dict:
     return {
         "path": str(target),
         "wing": wing,
-        "added":     {"files": added_files,    "drawers": added_drawers},
-        "updated":   {"files": updated_files,  "drawers": updated_drawers},
+        "added": {"files": added_files, "drawers": added_drawers},
+        "updated": {"files": updated_files, "drawers": updated_drawers},
         "unchanged": {"files": unchanged_files},
-        "skipped":   {"files": skipped_files},
+        "skipped": {"files": skipped_files},
         "files_total": len(files),
     }
 
@@ -372,12 +373,16 @@ def run_mine(
 
     target_results: list[dict] = []
     errors: list[dict] = []
-    wings_agg: dict[str, dict[str, int]] = defaultdict(lambda: {
-        "added_files": 0, "added_drawers": 0,
-        "updated_files": 0, "updated_drawers": 0,
-        "unchanged_files": 0,
-        "skipped_files": 0,
-    })
+    wings_agg: dict[str, dict[str, int]] = defaultdict(
+        lambda: {
+            "added_files": 0,
+            "added_drawers": 0,
+            "updated_files": 0,
+            "updated_drawers": 0,
+            "unchanged_files": 0,
+            "skipped_files": 0,
+        }
+    )
 
     try:
         with mine_palace_lock(palace_path):
@@ -385,39 +390,42 @@ def run_mine(
                 try:
                     buf = io.StringIO()
                     with _redirect_stdout(buf):
-                        tr = _mine_one_target(t, palace_path=palace_path,
-                                               heartbeat_cb=heartbeat_cb)
+                        tr = _mine_one_target(t, palace_path=palace_path, heartbeat_cb=heartbeat_cb)
                     target_results.append(tr)
                     w = wings_agg[tr["wing"]]
-                    w["added_files"]     += tr["added"]["files"]
-                    w["added_drawers"]   += tr["added"]["drawers"]
-                    w["updated_files"]   += tr["updated"]["files"]
+                    w["added_files"] += tr["added"]["files"]
+                    w["added_drawers"] += tr["added"]["drawers"]
+                    w["updated_files"] += tr["updated"]["files"]
                     w["updated_drawers"] += tr["updated"]["drawers"]
                     w["unchanged_files"] += tr["unchanged"]["files"]
-                    w["skipped_files"]   += tr["skipped"]["files"]
+                    w["skipped_files"] += tr["skipped"]["files"]
                 except Exception as e:
-                    errors.append({
-                        "path": str(t),
-                        "error": f"{type(e).__name__}: {e}",
-                        "traceback": traceback.format_exc(),
-                    })
+                    errors.append(
+                        {
+                            "path": str(t),
+                            "error": f"{type(e).__name__}: {e}",
+                            "traceback": traceback.format_exc(),
+                        }
+                    )
     except MineAlreadyRunning as e:
         return {
             "status": "already_running_palace_lock",
             "error": str(e),
-            "note": ("Another process holds palace.mine_palace_lock — "
-                     "could be a CLI `mempalace mine`, the hooks pre-commit, "
-                     "or a previously-spawned MCP job. Re-run after it finishes."),
+            "note": (
+                "Another process holds palace.mine_palace_lock — "
+                "could be a CLI `mempalace mine`, the hooks pre-commit, "
+                "or a previously-spawned MCP job. Re-run after it finishes."
+            ),
         }
 
     def _sum(key, sub):
         return sum(tr[key][sub] for tr in target_results) if target_results else 0
 
     return {
-        "added":     {"files": _sum("added",     "files"), "drawers": _sum("added",     "drawers")},
-        "updated":   {"files": _sum("updated",   "files"), "drawers": _sum("updated",   "drawers")},
+        "added": {"files": _sum("added", "files"), "drawers": _sum("added", "drawers")},
+        "updated": {"files": _sum("updated", "files"), "drawers": _sum("updated", "drawers")},
         "unchanged": {"files": _sum("unchanged", "files")},
-        "skipped":   {"files": _sum("skipped",   "files")},
+        "skipped": {"files": _sum("skipped", "files")},
         "targets": target_results,
         "wings": dict(wings_agg),
         "duration_seconds": round(time.monotonic() - started, 2),
