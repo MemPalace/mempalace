@@ -35,6 +35,7 @@ import shutil
 import sqlite3
 import time
 from collections import defaultdict
+from contextlib import closing
 from datetime import datetime
 import re
 from typing import Callable, Iterator, Optional
@@ -680,6 +681,43 @@ class _DefaultProgress:
         return f" (elapsed {_format_eta(elapsed)}, rate {rate:.1f}/s, ETA {_format_eta(eta)})"
 
 
+def _vacuum_and_rebuild_fts5(palace_path: str, progress=print) -> None:
+    """VACUUM the palace SQLite file and rebuild the FTS5 index if present.
+
+    Repeated ``repair --yes`` runs delete and recreate the drawers collection,
+    leaving freed SQLite pages unreclaimable without an explicit VACUUM.  The
+    FTS5 virtual table (``embedding_fulltext_search``) can also become
+    internally inconsistent after multiple collection deletes; the rebuild
+    command fixes it atomically without touching any row data.
+
+    Failures are non-fatal: a warning is printed and the caller continues.
+    The repair itself succeeded at this point — VACUUM/FTS5 are best-effort
+    cleanup, not correctness requirements.
+    """
+    sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.exists(sqlite_path):
+        return
+    try:
+        with closing(sqlite3.connect(sqlite_path)) as conn:
+            tables = {
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            if "embedding_fulltext_search" in tables:
+                conn.execute(
+                    "INSERT INTO embedding_fulltext_search"
+                    "(embedding_fulltext_search) VALUES('rebuild')"
+                )
+                conn.commit()
+                progress("  FTS5 index rebuilt.")
+            conn.execute("VACUUM")
+            progress("  SQLite VACUUM complete.")
+    except Exception as exc:
+        progress(f"  Warning: post-repair cleanup failed (non-fatal): {exc}")
+
+
 def rebuild_index(
     palace_path=None,
     confirm_truncation_ok: bool = False,
@@ -812,6 +850,8 @@ def rebuild_index(
         else:
             print("  Live collection was not replaced; leaving the original palace untouched.")
         raise
+
+    _vacuum_and_rebuild_fts5(palace_path, progress=progress)
 
     print(f"\n  Repair complete. {filed} drawers rebuilt.")
     print("  HNSW index is now clean with cosine distance metric.")

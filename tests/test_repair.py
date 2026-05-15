@@ -1760,3 +1760,77 @@ def test_rebuild_from_sqlite_honors_configured_drawer_collection_name(tmp_path, 
         )
     except Exception:
         pass  # Expected: collection wasn't created.
+
+
+# ── _vacuum_and_rebuild_fts5 ──────────────────────────────────────────
+
+
+def test_vacuum_and_rebuild_fts5_vacuums_and_rebuilds(tmp_path):
+    """VACUUM runs and FTS5 index is rebuilt when the table is present."""
+    sqlite_path = tmp_path / "chroma.sqlite3"
+    with closing(sqlite3.connect(str(sqlite_path))) as conn:
+        conn.execute(
+            "CREATE VIRTUAL TABLE embedding_fulltext_search"
+            " USING fts5(string_value, tokenize='unicode61')"
+        )
+        conn.execute(
+            "INSERT INTO embedding_fulltext_search(string_value) VALUES('hello world')"
+        )
+        conn.commit()
+
+    repair._vacuum_and_rebuild_fts5(str(tmp_path))
+
+    with closing(sqlite3.connect(str(sqlite_path))) as conn:
+        result = conn.execute("PRAGMA integrity_check").fetchall()
+    assert result == [("ok",)]
+
+
+def test_vacuum_and_rebuild_fts5_no_fts5_table(tmp_path):
+    """VACUUM runs without error when embedding_fulltext_search is absent."""
+    sqlite_path = tmp_path / "chroma.sqlite3"
+    with closing(sqlite3.connect(str(sqlite_path))) as conn:
+        conn.execute("CREATE TABLE dummy (id INTEGER PRIMARY KEY)")
+        conn.commit()
+
+    # Must not raise even without the FTS5 table.
+    repair._vacuum_and_rebuild_fts5(str(tmp_path))
+
+    with closing(sqlite3.connect(str(sqlite_path))) as conn:
+        result = conn.execute("PRAGMA integrity_check").fetchall()
+    assert result == [("ok",)]
+
+
+def test_vacuum_and_rebuild_fts5_missing_sqlite(tmp_path):
+    """Silently skips when chroma.sqlite3 does not exist."""
+    repair._vacuum_and_rebuild_fts5(str(tmp_path))  # no file — must not raise
+
+
+@patch("mempalace.repair.shutil")
+@patch("mempalace.repair.ChromaBackend")
+def test_rebuild_index_calls_vacuum(mock_backend_cls, mock_shutil, tmp_path):
+    """rebuild_index calls _vacuum_and_rebuild_fts5 on success."""
+    sqlite_path = tmp_path / "chroma.sqlite3"
+    with closing(sqlite3.connect(str(sqlite_path))) as conn:
+        conn.execute("CREATE TABLE dummy(id INTEGER PRIMARY KEY)")
+        conn.commit()
+
+    mock_col = MagicMock()
+    mock_col.count.return_value = 1
+    mock_col.get.return_value = {
+        "ids": ["id1"],
+        "documents": ["doc1"],
+        "metadatas": [{"wing": "a"}],
+    }
+    mock_new_col = MagicMock()
+    mock_new_col.count.return_value = 1
+    mock_temp_col = MagicMock()
+    mock_temp_col.count.return_value = 1
+    mock_backend = _install_mock_backend(mock_backend_cls, mock_col)
+    mock_backend.create_collection.side_effect = [mock_temp_col, mock_new_col]
+
+    with patch.object(repair, "_vacuum_and_rebuild_fts5") as mock_vacuum:
+        repair.rebuild_index(palace_path=str(tmp_path))
+        mock_vacuum.assert_called_once()
+        args, kwargs = mock_vacuum.call_args
+        assert args[0] == str(tmp_path)
+        assert "progress" in kwargs
