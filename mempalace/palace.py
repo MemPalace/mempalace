@@ -14,6 +14,7 @@ import threading
 from typing import Optional
 
 from .backends.chroma import ChromaBackend
+from .backends.registry import get_backend, resolve_backend_for_palace
 
 logger = logging.getLogger("mempalace_mcp")
 
@@ -45,6 +46,37 @@ SKIP_DIRS = {
 
 _DEFAULT_BACKEND = ChromaBackend()
 
+
+def _select_backend(palace_path: Optional[str] = None):
+    """Resolve which backend to use for a palace operation.
+
+    Honours :func:`resolve_backend_for_palace` (RFC 001 §3.3):
+    1. ``MEMPALACE_BACKEND`` env var
+    2. Per-palace auto-detect by on-disk artifacts (``sqlite_vec.db`` vs
+       ``chroma.sqlite3``)
+    3. Default — falls through to the singleton ``ChromaBackend`` so callers
+       that never set a backend keep current behaviour exactly.
+
+    Caching: ``ChromaBackend`` keeps its own per-process client cache, so
+    returning the singleton preserves it. Non-default backends are resolved
+    through the registry, which caches one instance per backend name.
+    """
+    env_value = os.environ.get("MEMPALACE_BACKEND")
+    try:
+        name = resolve_backend_for_palace(
+            env_value=env_value, palace_path=palace_path
+        )
+    except Exception:
+        logger.exception("resolve_backend_for_palace failed; using default chroma")
+        return _DEFAULT_BACKEND
+    if name == "chroma":
+        return _DEFAULT_BACKEND
+    try:
+        return get_backend(name)
+    except Exception:
+        logger.exception("backend %r unavailable; using default chroma", name)
+        return _DEFAULT_BACKEND
+
 # Schema version for drawer normalization. Bump when the normalization
 # pipeline changes in a way that existing drawers should be rebuilt to pick up
 # (e.g., new noise-stripping rules). `file_already_mined` treats drawers with
@@ -66,7 +98,8 @@ def get_collection(
         from .config import get_configured_collection_name
 
         collection_name = get_configured_collection_name()
-    return _DEFAULT_BACKEND.get_collection(
+    backend = _select_backend(palace_path)
+    return backend.get_collection(
         palace_path,
         collection_name=collection_name,
         create=create,
