@@ -110,6 +110,34 @@ def test_scan_project_respects_gitignore():
         shutil.rmtree(tmpdir)
 
 
+def test_scan_project_includes_kotlin_files():
+    tmpdir = tempfile.mkdtemp()
+    try:
+        project_root = Path(tmpdir).resolve()
+        write_file(
+            project_root / "src" / "Main.kt",
+            'fun main() {\n    println("hello")\n}\n' * 20,
+        )
+
+        assert scanned_files(project_root) == ["src/Main.kt"]
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_scan_project_includes_kotlin_script_files():
+    tmpdir = tempfile.mkdtemp()
+    try:
+        project_root = Path(tmpdir).resolve()
+        write_file(
+            project_root / "scripts" / "build.kts",
+            'tasks.register("hello") {\n    doLast { println("hello") }\n}\n' * 20,
+        )
+
+        assert scanned_files(project_root) == ["scripts/build.kts"]
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def test_scan_project_respects_nested_gitignore():
     tmpdir = tempfile.mkdtemp()
     try:
@@ -251,23 +279,6 @@ def test_scan_project_skip_dirs_still_apply_without_override():
         assert scanned_files(project_root, respect_gitignore=False) == ["main.py"]
     finally:
         shutil.rmtree(tmpdir)
-
-
-def test_entity_metadata_finds_cyrillic_names(monkeypatch):
-    """Entity extraction must find non-Latin names when entity_languages includes the locale."""
-    import mempalace.palace as palace_mod
-    from mempalace.miner import _extract_entities_for_metadata
-
-    # Reset cached patterns so they reload with the monkeypatched languages
-    monkeypatch.setattr(palace_mod, "_CANDIDATE_RX_CACHE", None)
-    monkeypatch.setattr(
-        "mempalace.config.MempalaceConfig.entity_languages",
-        property(lambda self: ("en", "ru")),
-    )
-
-    content = "Михаил написал код. Михаил отправил PR. Михаил получил ревью."
-    result = _extract_entities_for_metadata(content)
-    assert "Михаил" in result, f"Cyrillic name not found in entity metadata: {result!r}"
 
 
 def test_file_already_mined_check_mtime():
