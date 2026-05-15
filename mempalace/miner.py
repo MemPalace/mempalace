@@ -103,20 +103,16 @@ class GitignoreMatcher:
         self.base_dir = base_dir
         self.rules = rules
 
-    @classmethod
-    def from_dir(cls, dir_path: Path):
-        gitignore_path = dir_path / ".gitignore"
-        if not gitignore_path.is_file():
-            return None
+    @staticmethod
+    def _parse_rules(lines):
+        """Parse an iterable of raw pattern strings into a list of rule dicts.
 
-        try:
-            lines = gitignore_path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except Exception:
-            return None
-
+        Shared by :meth:`from_dir` and :meth:`from_patterns` so both paths
+        stay in sync with the gitignore parsing semantics.
+        """
         rules = []
         for raw_line in lines:
-            line = raw_line.strip()
+            line = str(raw_line).strip()
             if not line:
                 continue
 
@@ -148,11 +144,45 @@ class GitignoreMatcher:
                     "negated": negated,
                 }
             )
+        return rules
 
-        if not rules:
+    @classmethod
+    def from_dir(cls, dir_path: Path):
+        gitignore_path = dir_path / ".gitignore"
+        if not gitignore_path.is_file():
             return None
 
+        try:
+            lines = gitignore_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            return None
+
+        rules = cls._parse_rules(lines)
+        if not rules:
+            return None
         return cls(dir_path, rules)
+
+    @classmethod
+    def from_patterns(cls, base_dir: Path, patterns):
+        """Create a matcher from an explicit list of gitignore-inspired pattern strings.
+
+        Supports a gitignore-inspired subset of pattern syntax for
+        ``exclude_patterns`` in ``mempalace.yaml``.  Patterns are parsed by
+        the same rule parser used for ``.gitignore`` files, so familiar
+        constructs (trailing ``/`` for dir-only, leading ``/`` for anchoring,
+        ``!`` negation, ``**`` globs) work as expected.  Full gitignore
+        semantics are not guaranteed for every edge case.
+
+        ``patterns`` must be a list of strings.  A single string is coerced
+        to a one-element list for convenience.  Non-string entries are
+        converted via ``str()``.
+        """
+        if isinstance(patterns, str):
+            patterns = [patterns]
+        rules = cls._parse_rules(patterns)
+        if not rules:
+            return None
+        return cls(base_dir, rules)
 
     def matches(self, path: Path, is_dir: bool = None):
         try:
@@ -959,6 +989,7 @@ def scan_project(
     project_dir: str,
     respect_gitignore: bool = True,
     include_ignored: list = None,
+    exclude_patterns: list = None,
 ) -> list:
     """Return list of all readable file paths."""
     project_path = Path(project_dir).expanduser().resolve()
@@ -966,6 +997,7 @@ def scan_project(
     active_matchers = []
     matcher_cache = {}
     include_paths = normalize_include_paths(include_ignored)
+    exclude_matcher = GitignoreMatcher.from_patterns(project_path, exclude_patterns or [])
 
     for root, dirs, filenames in os.walk(project_path):
         root_path = Path(root)
@@ -993,6 +1025,13 @@ def scan_project(
                 if is_force_included(root_path / d, project_path, include_paths)
                 or not is_gitignored(root_path / d, active_matchers, is_dir=True)
             ]
+        if exclude_matcher:
+            dirs[:] = [
+                d
+                for d in dirs
+                if is_force_included(root_path / d, project_path, include_paths)
+                or exclude_matcher.matches(root_path / d, is_dir=True) is not True
+            ]
 
         for filename in filenames:
             filepath = root_path / filename
@@ -1006,6 +1045,13 @@ def scan_project(
             if respect_gitignore and active_matchers and not force_include:
                 if is_gitignored(filepath, active_matchers, is_dir=False):
                     continue
+            # Skip files matching project-level exclude_patterns (mempalace.yaml).
+            # force_include paths bypass this check so callers can selectively
+            # re-include files that would otherwise be excluded.
+            if not force_include and exclude_matcher and exclude_matcher.matches(
+                filepath, is_dir=False
+            ):
+                continue
             # Skip symlinks — prevents following links to /dev/urandom, etc.
             if filepath.is_symlink():
                 continue
@@ -1090,13 +1136,28 @@ def _mine_impl(
 
     wing = wing_override or config["wing"]
     rooms = config.get("rooms", [{"name": "general", "description": "All project files"}])
+    exclude_patterns = config.get("exclude_patterns", [])
 
     if files is None:
         files = scan_project(
             project_dir,
             respect_gitignore=respect_gitignore,
             include_ignored=include_ignored,
+            exclude_patterns=exclude_patterns,
         )
+    elif exclude_patterns:
+        # The caller provided a pre-scanned file list, so scan_project never ran.
+        # Apply exclude_patterns here so that callers reusing a scan still get
+        # the same per-project exclusions.  force_include paths are preserved.
+        include_paths = normalize_include_paths(include_ignored)
+        exclude_matcher = GitignoreMatcher.from_patterns(project_path, exclude_patterns)
+        if exclude_matcher is not None:
+            files = [
+                file_path
+                for file_path in files
+                if is_force_included(file_path, project_path, include_paths)
+                or exclude_matcher.matches(file_path, is_dir=False) is not True
+            ]
     if limit > 0:
         files = files[:limit]
 
