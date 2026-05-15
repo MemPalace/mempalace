@@ -511,8 +511,7 @@ def palace_write_lock(palace_path: str, *, operation: str = "write", blocking: b
                         raise
                     holder = _read_lock_holder(lf)
                     raise PalaceWriteAlreadyRunning(
-                        f"palace {resolved} is held by {holder}; "
-                        f"refusing `{operation}`"
+                        f"palace {resolved} is held by {holder}; refusing `{operation}`"
                     ) from exc
         else:
             import fcntl
@@ -524,8 +523,7 @@ def palace_write_lock(palace_path: str, *, operation: str = "write", blocking: b
             except BlockingIOError as exc:
                 holder = _read_lock_holder(lf)
                 raise PalaceWriteAlreadyRunning(
-                    f"palace {resolved} is held by {holder}; "
-                    f"refusing `{operation}`"
+                    f"palace {resolved} is held by {holder}; refusing `{operation}`"
                 ) from exc
         # Record our own identity for any later contender's diagnostic message.
         _write_lock_holder(lf)

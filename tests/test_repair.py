@@ -90,9 +90,7 @@ def test_extract_drawers_preserves_valid_metadata():
         "documents": ["doc1", "doc2"],
         "metadatas": [{"wing": "a", "room": "1"}, {"wing": "b", "room": "2"}],
     }
-    all_ids, all_docs, all_metas, embeddings = repair._extract_drawers(
-        col, total=2, batch_size=2
-    )
+    all_ids, all_docs, all_metas, embeddings = repair._extract_drawers(col, total=2, batch_size=2)
     assert all_ids == ["id1", "id2"]
     assert all_docs == ["doc1", "doc2"]
     assert all_metas == [{"wing": "a", "room": "1"}, {"wing": "b", "room": "2"}]
@@ -150,9 +148,7 @@ def test_extract_drawers_sanitization_preserves_alignment():
         "documents": ["d1", "d2", "d3", "d4"],
         "metadatas": [None, {"k": "v"}, {}, None],
     }
-    all_ids, all_docs, all_metas, embeddings = repair._extract_drawers(
-        col, total=4, batch_size=4
-    )
+    all_ids, all_docs, all_metas, embeddings = repair._extract_drawers(col, total=4, batch_size=4)
     assert len(all_ids) == len(all_docs) == len(all_metas) == 4
     assert all_ids == ["id1", "id2", "id3", "id4"]
     assert all_metas[0] == {"_repaired_empty_meta": True}
@@ -170,9 +166,7 @@ def test_extract_drawers_multiple_batches():
         {"ids": ["id3"], "documents": ["d3"], "metadatas": [{}]},
         {"ids": [], "documents": [], "metadatas": []},
     ]
-    all_ids, all_docs, all_metas, embeddings = repair._extract_drawers(
-        col, total=3, batch_size=2
-    )
+    all_ids, all_docs, all_metas, embeddings = repair._extract_drawers(col, total=3, batch_size=2)
     assert all_ids == ["id1", "id2", "id3"]
     assert all_metas == [{"a": 1}, {"_repaired_empty_meta": True}, {"_repaired_empty_meta": True}]
     assert embeddings is None

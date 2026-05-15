@@ -1210,7 +1210,9 @@ def rebuild_index(
                 e = RebuildCollectionError(str(exc), live_replaced=False)
                 progress(f"\n  ERROR during rebuild: {e}")
                 progress("  Rebuild aborted before completion.")
-                progress("  Live collection was not replaced; leaving the original palace untouched.")
+                progress(
+                    "  Live collection was not replaced; leaving the original palace untouched."
+                )
                 raise e
 
             progress("  Rebuilding collection with hnsw:space=cosine...")
