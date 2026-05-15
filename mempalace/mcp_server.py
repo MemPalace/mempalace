@@ -1051,6 +1051,63 @@ def tool_delete_drawer(drawer_id: str):
         return {"success": False, "error": str(e)}
 
 
+def tool_mine(
+    mode: str = "incremental",
+    wait: bool = True,
+    project_dir: str = None,
+    scan_root: str = None,
+):
+    """
+    Mine projects into the palace.
+
+    mode="incremental", wait=True (default): synchronous run, returns full
+        diff (added/updated/unchanged/skipped + per-wing breakdown).
+    mode="full", wait=False: spawns a detached background process and
+        returns {"status": "spawned", "job_id": ...}. Poll with
+        mempalace_mine_status(job_id).
+
+    If another mine is already running, returns a structured
+    already_running response (either MCP-side runner lock OR upstream
+    palace lock — both surface as 'already_running'-style payloads).
+
+    project_dir: mine exactly one folder (must contain mempalace.yaml).
+    scan_root:   auto-discover all mempalace.yaml under this root
+                 (default: ~/Claude). Ignored if project_dir is set.
+
+    Orphan handling is intentionally NOT in this tool — call
+    mempalace_sync for that. Drawer-level mtime detection is reused
+    from upstream's bulk_check_mined().
+    """
+    import uuid as _uuid
+    from . import mine_runner
+
+    # Default sync/async wiring from mode, but explicit wait wins
+    if mode == "full" and wait is True:
+        wait = False
+    # incremental + wait=False is also valid (background incremental)
+
+    if wait:
+        job_id = str(_uuid.uuid4())
+        return mine_runner.run_with_lock(
+            job_id=job_id,
+            mode=mode,
+            project_dir=project_dir,
+            scan_root=scan_root,
+        )
+    else:
+        return mine_runner.spawn_background(
+            mode=mode,
+            project_dir=project_dir,
+            scan_root=scan_root,
+        )
+
+
+def tool_mine_status(job_id: str):
+    """Read the current state of a background mine job by job_id."""
+    from . import mine_runner
+    return mine_runner.read_status(job_id)
+
+
 def tool_sync(project_dir: str = None, wing: str = None, apply: bool = False):
     """Prune drawers whose source files are gitignored, missing, or moved (#1252)."""
     global _metadata_cache
@@ -1985,6 +2042,59 @@ TOOLS = {
             "required": ["drawer_id"],
         },
         "handler": tool_delete_drawer,
+    },
+    "mempalace_mine": {
+        "description": (
+            "Mine project files into the palace. Returns a structured diff: "
+            "added/updated/unchanged/skipped (each {files,drawers} except unchanged/skipped which are {files}). "
+            "mode='incremental' (wait=true default) runs synchronously. "
+            "mode='full' (wait=false default) spawns a detached background job and returns "
+            "{status:'spawned', job_id:...}; poll with mempalace_mine_status. "
+            "If another mine is already running (MCP-side or palace lock), returns a structured "
+            "already_running response. "
+            "Storage layer reuses develop's source_mtime metadata + bulk_check_mined() batch "
+            "lookup. Orphan handling is delegated to mempalace_sync — this tool does not "
+            "delete drawers for missing source files."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["incremental", "full"],
+                    "description": "incremental (sync, fast daily) or full (async background). Default: incremental.",
+                },
+                "wait": {
+                    "type": "boolean",
+                    "description": "true: block and return diff. false: spawn background job, return job_id. Default follows mode (true for incremental, false for full).",
+                },
+                "project_dir": {
+                    "type": "string",
+                    "description": "Mine exactly one folder (must contain mempalace.yaml). Optional.",
+                },
+                "scan_root": {
+                    "type": "string",
+                    "description": "Auto-discover all mempalace.yaml under this root. Default: ~/Claude. Ignored if project_dir is set.",
+                },
+            },
+        },
+        "handler": tool_mine,
+    },
+    "mempalace_mine_status": {
+        "description": (
+            "Read the state of a background mine job started with mempalace_mine(wait=false). "
+            "Returns status (queued/running/done/failed/stale), started_at/finished_at, heartbeat, "
+            "and the full result dict if status=done. Reports 'stale' when status=running but the "
+            "heartbeat is older than 5 minutes — the mining process likely died (sleep, crash, kill)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string", "description": "UUID returned by mempalace_mine"},
+            },
+            "required": ["job_id"],
+        },
+        "handler": tool_mine_status,
     },
     "mempalace_sync": {
         "description": "Prune drawers whose source files are gitignored, deleted, or moved. Returns dry-run report by default; pass apply=true to commit deletions.",
