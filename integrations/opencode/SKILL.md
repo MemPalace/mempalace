@@ -99,7 +99,7 @@ Create `~/.config/opencode/AGENTS.md`:
 Before answering, search MemPalace using the MCP tools.
 
 1. Call `mempalace_search` with the user's question as query.
-2. Call `mempalace_kg_query` for entity "user" and filter by keywords.
+2. Call `mempalace_kg_query` for entity "user" to retrieve relevant facts.
 3. Use relevant context in your response.
 ```
 
