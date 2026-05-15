@@ -59,7 +59,7 @@ OpenCode chat.message hook
 ### 1. Install MemPalace
 
 ```bash
-pip install mempalace
+python3 -m pip install mempalace
 # or
 uv tool install mempalace
 ```
