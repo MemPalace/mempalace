@@ -37,6 +37,7 @@ logger = logging.getLogger("mempalace_mcp")
 READABLE_EXTENSIONS = {
     ".txt",
     ".md",
+    ".adoc",
     ".py",
     ".js",
     ".ts",
@@ -441,6 +442,84 @@ def chunk_text(content: str, source_file: str) -> list:
             chunk_index += 1
 
         start = end - CHUNK_OVERLAP if end < len(content) else end
+
+    return chunks
+
+
+_ADOC_BLOCK_DELIM_RE = re.compile(r"^(-{4,}|={4,}|\.{4,}|\+{4,}|\*{4,})$")
+_ADOC_ATTR_DEF_RE = re.compile(r"^:[a-zA-Z_][\w-]*:(\s|$)")
+_ADOC_BLOCK_ATTR_RE = re.compile(r"^\[.+\]\s*$")
+_ADOC_DIRECTIVE_RE = re.compile(r"^(include|ifdef|ifndef|endif|ifeval)::")
+_ADOC_CALLOUT_RE = re.compile(r"\s*<\d+>\s*$")
+_ADOC_BTN_RE = re.compile(r"btn:\[([^\]]+)\]")
+_ADOC_MENU_RE = re.compile(r"menu:([^\[]+)\[([^\]]+)\]")
+_ADOC_PASS_RE = re.compile(r"pass:[a-z,]*\[[^\]]*\]")
+_ADOC_SECTION_RE = re.compile(r"^(={2,})\s+\S", re.MULTILINE)
+
+
+def preprocess_adoc(content: str) -> str:
+    """Strip AsciiDoc structural markup that adds noise to embeddings."""
+    lines = content.split("\n")
+    cleaned = []
+    for line in lines:
+        stripped = line.strip()
+        if _ADOC_BLOCK_DELIM_RE.match(stripped):
+            continue
+        if _ADOC_ATTR_DEF_RE.match(stripped):
+            continue
+        if _ADOC_BLOCK_ATTR_RE.match(stripped) and not stripped.startswith("[["):
+            continue
+        if _ADOC_DIRECTIVE_RE.match(stripped):
+            continue
+        line = _ADOC_CALLOUT_RE.sub("", line)
+        line = _ADOC_BTN_RE.sub(r"\1", line)
+        line = _ADOC_MENU_RE.sub(r"\1 > \2", line)
+        line = _ADOC_PASS_RE.sub("", line)
+        cleaned.append(line)
+    return "\n".join(cleaned)
+
+
+def chunk_adoc(content: str, source_file: str) -> list:
+    """
+    Split AsciiDoc content into chunks on section header boundaries.
+    Falls back to chunk_text() when no headers are found or for
+    oversized sections.
+    """
+    content = content.strip()
+    if not content:
+        return []
+
+    # Find all section header positions
+    headers = list(_ADOC_SECTION_RE.finditer(content))
+    if not headers:
+        return chunk_text(content, source_file)
+
+    # Build sections: content between consecutive headers
+    sections = []
+    # Preamble before first header
+    if headers[0].start() > 0:
+        sections.append(content[: headers[0].start()])
+    for i, match in enumerate(headers):
+        start = match.start()
+        end = headers[i + 1].start() if i + 1 < len(headers) else len(content)
+        sections.append(content[start:end])
+
+    chunks = []
+    chunk_index = 0
+    for section in sections:
+        section = section.strip()
+        if not section:
+            continue
+        if len(section) <= CHUNK_SIZE:
+            chunks.append({"content": section, "chunk_index": chunk_index})
+            chunk_index += 1
+        else:
+            # Sub-chunk oversized sections using paragraph-boundary logic
+            sub_chunks = chunk_text(section, source_file)
+            for sc in sub_chunks:
+                sc["chunk_index"] = chunk_index
+                chunks.append(sc)
+                chunk_index += 1
 
     return chunks
 
@@ -853,8 +932,12 @@ def process_file(
     if len(content) < MIN_CHUNK_SIZE:
         return 0, "general"
 
+    is_adoc = filepath.suffix.lower() == ".adoc"
+    if is_adoc:
+        content = preprocess_adoc(content)
+
     room = detect_room(filepath, content, rooms, project_path)
-    chunks = chunk_text(content, source_file)
+    chunks = chunk_adoc(content, source_file) if is_adoc else chunk_text(content, source_file)
 
     if len(chunks) > MAX_CHUNKS_PER_FILE:
         print(

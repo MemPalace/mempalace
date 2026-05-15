@@ -91,6 +91,7 @@ PROSE_EXTENSIONS = {
 READABLE_EXTENSIONS = {
     ".txt",
     ".md",
+    ".adoc",
     ".py",
     ".js",
     ".ts",

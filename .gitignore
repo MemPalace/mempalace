@@ -9,6 +9,9 @@ mempal.yaml
 .claude/
 .codex/
 .codex
+.evolve/
+.evolve
+docs/superpowers
 
 # Environment
 .env
