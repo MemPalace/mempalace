@@ -102,6 +102,56 @@ class TestSearchMemories:
             create=False,
         )
 
+    def test_search_memories_accepts_explicit_candidate_strategy(self):
+        """Regression: ``candidate_strategy`` must remain in the API
+        signature so callers can opt into the BM25-union candidate pool
+        without hitting a ``NameError`` inside ``search_memories``."""
+        mock_col = MagicMock()
+        mock_col.query.return_value = {
+            "documents": [[]],
+            "metadatas": [[]],
+            "distances": [[]],
+            "ids": [[]],
+        }
+
+        with (
+            patch("mempalace.searcher.get_collection", return_value=mock_col),
+            patch("mempalace.searcher.get_closets_collection", return_value=mock_col),
+        ):
+            result = search_memories(
+                "test",
+                "/fake/path",
+                candidate_strategy="union",
+            )
+
+        assert result["results"] == []
+
+    def test_search_memories_preserves_candidate_strategy_positional_order(self):
+        mock_col = MagicMock()
+        mock_col.query.return_value = {
+            "documents": [[]],
+            "metadatas": [[]],
+            "distances": [[]],
+            "ids": [[]],
+        }
+
+        with (
+            patch("mempalace.searcher.get_collection", return_value=mock_col),
+            patch("mempalace.searcher.get_closets_collection", return_value=mock_col),
+        ):
+            result = search_memories(
+                "test",
+                "/fake/path",
+                None,
+                None,
+                5,
+                0.0,
+                False,
+                "union",
+            )
+
+        assert result["results"] == []
+
     def test_search_memories_filters_in_result(self, palace_path, seeded_collection):
         result = search_memories("test", palace_path, wing="project", room="backend")
         assert result["filters"]["wing"] == "project"
@@ -187,10 +237,9 @@ class TestSearchMemories:
             assert (
                 0.0 <= h["similarity"] <= 1.0
             ), f"similarity out of range: {h['similarity']} for {h['source_file']}"
-            assert 0.0 <= h["effective_distance"] <= 2.0, (
-                f"effective_distance out of range: {h['effective_distance']} "
-                f"for {h['source_file']}"
-            )
+            assert (
+                0.0 <= h["effective_distance"] <= 2.0
+            ), f"effective_distance out of range: {h['effective_distance']} for {h['source_file']}"
 
         # With the clamp, the closet-boosted a.md still ranks ahead of b.md —
         # the boost still wins, but it no longer flips the ranking.

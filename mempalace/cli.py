@@ -27,6 +27,8 @@ Examples:
     mempalace search "pricing discussion" --wing my_app --room costs
 """
 
+from __future__ import annotations
+
 import os
 import sys
 import shlex
@@ -49,6 +51,50 @@ _PASS_ZERO_PER_FILE_CAP = 100_000  # 100KB per file is generous for prose
 _PASS_ZERO_TOTAL_CAP = 5_000_000  # 5MB total ceiling — bounds memory
 _PASS_ZERO_LLM_PER_SAMPLE = 2_000  # for Tier 2 LLM call only
 _PASS_ZERO_LLM_MAX_SAMPLES = 20  # caps the LLM-tier sample count
+
+
+def _confirm_from_sqlite_rebuild(
+    *,
+    palace_path: str,
+    source_path: str,
+    archive_existing: bool,
+    assume_yes: bool,
+) -> bool:
+    """Confirm from-SQLite repair with wording that matches archive semantics."""
+    normalized_palace = os.path.realpath(os.path.abspath(os.path.expanduser(palace_path)))
+    normalized_source = os.path.realpath(os.path.abspath(os.path.expanduser(source_path)))
+    same_path = normalized_source == normalized_palace
+    if assume_yes:
+        return True
+
+    print(f"\n  Rebuild from SQLite will write to: {palace_path}")
+    if same_path and archive_existing:
+        print(
+            "  The existing palace directory will be renamed to "
+            "<palace>.pre-rebuild-<timestamp> before the new palace is created."
+        )
+        print("  This mode does not copy a backup before the rename.")
+    elif same_path:
+        print(
+            "  Source and destination are the same path. Pass --archive-existing "
+            "to rename the existing palace before rebuilding."
+        )
+        return False
+    else:
+        print(
+            "  The destination path already exists. Move it aside or choose a "
+            "different --palace path before rebuilding."
+        )
+        return False
+    try:
+        answer = input("  Continue? [y/N]: ").strip().lower()
+    except EOFError:
+        print("  Aborted. Re-run with --yes to confirm destructive changes.")
+        return False
+    if answer not in {"y", "yes"}:
+        print("  Aborted.")
+        return False
+    return True
 
 
 def _gather_origin_samples(project_dir) -> list:
@@ -734,7 +780,98 @@ def cmd_repair_status(args):
     from .repair import status as repair_status
 
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
-    repair_status(palace_path=palace_path)
+    repair_status(
+        palace_path=palace_path,
+        cleanup_temp=getattr(args, "cleanup_temp", False),
+        assume_yes=getattr(args, "yes", False),
+    )
+
+
+def _reject_unsupported_audit_content(args) -> None:
+    if getattr(args, "audit_content", False):
+        print("  --audit-content is only supported with --mode from-sqlite.")
+        sys.exit(1)
+
+
+def _acquire_repair_write_lock(palace_path: str):
+    from .palace import PalaceWriteAlreadyRunning, palace_write_lock
+
+    try:
+        repair_lock = palace_write_lock(palace_path, operation="repair")
+        repair_lock.__enter__()
+        return repair_lock
+    except PalaceWriteAlreadyRunning as exc:
+        print(f"\n  ABORT: {exc}")
+        sys.exit(1)
+
+
+def _delete_repair_temp_if_known(backend, palace_path: str, temp_name: str | None) -> None:
+    if temp_name is None:
+        return
+    try:
+        backend.delete_collection(palace_path, temp_name)
+    except Exception:
+        pass
+
+
+def _cmd_repair_from_sqlite(args, palace_path: str, collection_name: str) -> None:
+    from .repair import RebuildPartialError, rebuild_from_sqlite
+
+    source_path = getattr(args, "source", None)
+    source_path = os.path.abspath(os.path.expanduser(source_path)) if source_path else palace_path
+    archive_existing = getattr(args, "archive_existing", False)
+
+    # Gate any path that touches the user's existing palace dir
+    # behind confirm_destructive_action. The legacy mode already
+    # gates; from-sqlite needs the same protection because:
+    # (a) --archive-existing renames the existing palace,
+    # (b) --source PATH writes into --palace dir which the user
+    #     may not realize is also a palace.
+    # No prompt when source != dest AND dest does not exist (pure
+    # extract-into-fresh-dir case is non-destructive to existing
+    # palaces).
+    is_destructive_to_dest = source_path == palace_path or os.path.exists(palace_path)
+    if is_destructive_to_dest and not _confirm_from_sqlite_rebuild(
+        palace_path=palace_path,
+        source_path=source_path,
+        archive_existing=archive_existing,
+        assume_yes=getattr(args, "yes", False),
+    ):
+        sys.exit(1)
+
+    try:
+        rebuild_kwargs = {
+            "source_palace": source_path,
+            "dest_palace": palace_path,
+            "archive_existing_dest": archive_existing,
+            "collection_name": collection_name,
+            "reembed": getattr(args, "reembed", False),
+            "batch_size": getattr(args, "batch_size", None) or 5000,
+        }
+        if hasattr(args, "audit_content"):
+            rebuild_kwargs["audit_content"] = getattr(args, "audit_content", False)
+        counts = rebuild_from_sqlite(**rebuild_kwargs)
+        if counts == {}:
+            sys.exit(1)
+        primary_count = counts.get(collection_name)
+        if (
+            primary_count is not None
+            and primary_count <= 0
+            and any(count > 0 for count in counts.values())
+        ):
+            sys.exit(1)
+    except RebuildPartialError as exc:
+        # The error itself was already printed by rebuild_from_sqlite
+        # with recovery instructions; surface a non-zero exit so
+        # scripts and CI gates see the failure.
+        print(
+            "\n  Rebuild partial — see message above. "
+            f"Failed in collection: {exc.failed_collection}"
+        )
+        sys.exit(1)
+    except Exception as exc:  # noqa: BLE001 - filesystem/setup failures are user-facing here
+        print(f"\n  Rebuild failed: {exc}")
+        sys.exit(1)
 
 
 def cmd_repair(args):
@@ -746,9 +883,10 @@ def cmd_repair(args):
         RebuildCollectionError,
         TruncationDetected,
         _close_chroma_handles,
-        _extract_drawers,
-        _rebuild_collection_via_temp,
+        _stage_collection_from_source,
+        _swap_temp_collection_into_live,
         check_extraction_safety,
+        sqlite_drawer_count,
         maybe_repair_poisoned_max_seq_id_before_rebuild,
         print_sqlite_integrity_abort,
         sqlite_integrity_errors,
@@ -760,7 +898,12 @@ def cmd_repair(args):
         os.path.expanduser(args.palace) if args.palace else config.palace_path
     )
 
-    if getattr(args, "mode", "legacy") == "max-seq-id":
+    mode = getattr(args, "mode", "legacy")
+
+    if mode != "from-sqlite":
+        _reject_unsupported_audit_content(args)
+
+    if mode == "max-seq-id":
         from .repair import repair_max_seq_id
 
         repair_max_seq_id(
@@ -773,55 +916,8 @@ def cmd_repair(args):
         )
         return
 
-    if getattr(args, "mode", "legacy") == "from-sqlite":
-        from .migrate import confirm_destructive_action
-        from .repair import RebuildPartialError, rebuild_from_sqlite
-
-        source_path = getattr(args, "source", None)
-        source_path = (
-            os.path.abspath(os.path.expanduser(source_path)) if source_path else palace_path
-        )
-        archive_existing = getattr(args, "archive_existing", False)
-
-        # Gate any path that touches the user's existing palace dir
-        # behind confirm_destructive_action. The legacy mode already
-        # gates; from-sqlite needs the same protection because:
-        # (a) --archive-existing renames the existing palace,
-        # (b) --source PATH writes into --palace dir which the user
-        #     may not realize is also a palace.
-        # No prompt when source != dest AND dest does not exist (pure
-        # extract-into-fresh-dir case is non-destructive to existing
-        # palaces).
-        is_destructive_to_dest = source_path == palace_path or os.path.exists(palace_path)
-        if is_destructive_to_dest and not confirm_destructive_action(
-            "Rebuild from SQLite", palace_path, assume_yes=getattr(args, "yes", False)
-        ):
-            return
-
-        try:
-            counts = rebuild_from_sqlite(
-                source_palace=source_path,
-                dest_palace=palace_path,
-                archive_existing_dest=archive_existing,
-            )
-        except RebuildPartialError as exc:
-            # The error itself was already printed by rebuild_from_sqlite
-            # with recovery instructions; surface a non-zero exit so
-            # scripts and CI gates see the failure.
-            print(
-                "\n  Rebuild partial — see message above. "
-                f"Failed in collection: {exc.failed_collection}"
-            )
-            sys.exit(1)
-        # An empty counts dict is rebuild_from_sqlite's documented signal
-        # for a validation refusal (missing source, existing dest,
-        # in-place without --archive-existing). The library already
-        # printed an actionable message; exit non-zero so unattended
-        # scripts/CI distinguish "invalid inputs" from a successful
-        # rebuild that legitimately found zero rows (which still returns
-        # a populated dict with 0-valued counts).
-        if not counts:
-            sys.exit(1)
+    if mode == "from-sqlite":
+        _cmd_repair_from_sqlite(args, palace_path, collection_name)
         return
 
     db_path = os.path.join(palace_path, "chroma.sqlite3")
@@ -859,19 +955,13 @@ def cmd_repair(args):
     print(f"{'=' * 55}\n")
     print(f"  Palace: {palace_path}")
 
-    backend = ChromaBackend()
-
-    # Try to read existing drawers
-    try:
-        col = backend.get_collection(palace_path, collection_name)
-        total = col.count()
+    total = sqlite_drawer_count(palace_path, collection_name)
+    if total is None:
+        print("  Drawers found: (unreadable before repair lock)")
+    else:
         print(f"  Drawers found: {total}")
-    except Exception as e:
-        print(f"  Error reading palace: {e}")
-        print("  Cannot recover — palace may need to be re-mined from source files.")
-        return
 
-    if total == 0:
+    if total is not None and total == 0:
         print("  Nothing to repair.")
         return
 
@@ -880,75 +970,130 @@ def cmd_repair(args):
     ):
         return
 
-    # Extract all drawers in batches
-    print("\n  Extracting drawers...")
-    batch_size = 5000
-    all_ids, all_docs, all_metas = _extract_drawers(col, total, batch_size)
-    print(f"  Extracted {len(all_ids)} drawers")
+    repair_lock = _acquire_repair_write_lock(palace_path)
+    lock_released = False
 
-    # ── #1208 guard ──────────────────────────────────────────────────
-    # Cross-check against the SQLite ground truth before doing anything
-    # destructive. Catches the user-reported case where chromadb's
-    # collection-layer get() silently caps at 10,000 rows even on much
-    # larger palaces (e.g. after manual HNSW quarantine). Override with
-    # --confirm-truncation-ok only after independently verifying the
-    # extraction count is real.
+    def _release_repair_lock() -> None:
+        nonlocal lock_released
+        if not lock_released:
+            repair_lock.__exit__(None, None, None)
+            lock_released = True
+
+    backend = None
+
     try:
-        check_extraction_safety(
-            palace_path,
-            len(all_ids),
-            confirm_truncation_ok=getattr(args, "confirm_truncation_ok", False),
-            collection_name=collection_name,
-        )
-    except TruncationDetected as e:
-        print(e.message)
-        return
-
-    palace_path = os.path.normpath(palace_path)
-    backup_path = palace_path + ".backup"
-    if os.path.exists(backup_path):
-        if not contains_palace_database(backup_path):
-            print(
-                "  Backup validation failed: backup path exists but does not contain chroma.sqlite3. "
-                f"Please remove or rename: {backup_path}"
-            )
+        backend = ChromaBackend()
+        col = backend.get_collection(palace_path, collection_name)
+        total = col.count()
+        if total == 0:
+            print("  Nothing to repair.")
             return
-        shutil.rmtree(backup_path)
-    print(f"  Backing up to {backup_path}...")
-    shutil.copytree(palace_path, backup_path)
-
-    try:
-        filed = _rebuild_collection_via_temp(
-            backend,
-            palace_path,
-            all_ids,
-            all_docs,
-            all_metas,
-            batch_size,
-            collection_name=collection_name,
-            progress=print,
-        )
-    except RebuildCollectionError as e:
-        print(f"  Repair failed: {e}")
-        if getattr(e, "live_replaced", False):
-            print("  Live collection was already replaced; restoring from backup...")
-            try:
-                _close_chroma_handles(palace_path, backend=backend)
-                if os.path.exists(palace_path):
-                    shutil.rmtree(palace_path)
-                shutil.copytree(backup_path, palace_path)
-                print(f"  Restore complete from backup: {backup_path}")
-            except Exception as restore_error:
-                print(f"  Automatic restore failed: {restore_error}")
-                print("  Manual recovery required:")
-                print(f"    1. Remove or rename the broken directory: {palace_path}")
-                print(f"    2. Restore the backup directory to: {palace_path}")
-                print(f"       Backup location: {backup_path}")
+    except Exception as e:
+        print(f"  Error reading palace after acquiring repair lock: {e}")
+        _release_repair_lock()
         sys.exit(1)
 
-    print(f"\n  Repair complete. {filed} drawers rebuilt.")
-    print(f"  Backup saved at {backup_path}")
-    print(f"\n{'=' * 55}\n")
+    try:
+        palace_path = os.path.normpath(palace_path)
+        backup_path = palace_path + ".backup"
+        if os.path.exists(backup_path):
+            if not contains_palace_database(backup_path):
+                print(
+                    "  Backup validation failed: backup path exists but does not contain chroma.sqlite3. "
+                    f"Please remove or rename: {backup_path}"
+                )
+                return
+            shutil.rmtree(backup_path)
+        print(f"  Backing up to {backup_path}...")
+        shutil.copytree(palace_path, backup_path)
+
+        # Stage drawers in batches after backup creation. Keep batches bounded
+        # without letting failed backup validation leave a temp collection behind.
+        print("\n  Extracting drawers...")
+        batch_size = 5000
+        reembed = getattr(args, "reembed", False)
+        temp_name = None
+        try:
+            temp_col, temp_name, extracted = _stage_collection_from_source(
+                backend,
+                palace_path,
+                col,
+                total,
+                batch_size,
+                collection_name,
+                include_embeddings=not reembed,
+                progress=print,
+            )
+            print(f"  Extracted {extracted} drawers")
+
+            # ── #1208 guard ──────────────────────────────────────────────
+            # Cross-check against SQLite ground truth before live swap.
+            check_extraction_safety(
+                palace_path,
+                extracted,
+                confirm_truncation_ok=getattr(args, "confirm_truncation_ok", False),
+                collection_name=collection_name,
+            )
+        except TruncationDetected as e:
+            print(e.message)
+            _delete_repair_temp_if_known(backend, palace_path, temp_name)
+            return
+        except Exception as exc:
+            _delete_repair_temp_if_known(backend, palace_path, temp_name)
+            print(f"  Repair failed: {exc}")
+            print("  Live collection was not replaced; leaving the original palace untouched.")
+            print(
+                "  The Chroma collection path could not complete staging. Try the SQLite "
+                "recovery path instead:"
+            )
+            print(
+                "    mempalace "
+                f"--palace {shlex.quote(palace_path)} repair "
+                "--mode from-sqlite --archive-existing --yes"
+            )
+            sys.exit(1)
+
+        try:
+            filed = _swap_temp_collection_into_live(
+                backend,
+                palace_path,
+                temp_col,
+                temp_name,
+                collection_name,
+                extracted,
+                progress=print,
+            )
+        except Exception as exc:
+            e = (
+                exc
+                if isinstance(exc, RebuildCollectionError)
+                else RebuildCollectionError(str(exc), live_replaced=False)
+            )
+            print(f"  Repair failed: {e}")
+            if getattr(e, "live_replaced", False):
+                print("  Live collection was already replaced; restoring from backup...")
+                try:
+                    _close_chroma_handles(palace_path, backend=backend)
+                    _delete_repair_temp_if_known(backend, palace_path, temp_name)
+                    if os.path.exists(palace_path):
+                        shutil.rmtree(palace_path)
+                    shutil.copytree(backup_path, palace_path)
+                    print(f"  Restore complete from backup: {backup_path}")
+                except Exception as restore_error:
+                    print(f"  Automatic restore failed: {restore_error}")
+                    print("  Manual recovery required:")
+                    print(f"    1. Remove or rename the broken directory: {palace_path}")
+                    print(f"    2. Restore the backup directory to: {palace_path}")
+                    print(f"       Backup location: {backup_path}")
+            sys.exit(1)
+
+        print(f"\n  Repair complete. {filed} drawers rebuilt.")
+        print(f"  Backup saved at {backup_path}")
+        print(f"\n{'=' * 55}\n")
+    finally:
+        if backend is not None:
+            backend.close()
+        _release_repair_lock()
 
 
 def cmd_hook(args):
@@ -1436,6 +1581,28 @@ def main():
         ),
     )
     p_repair.add_argument(
+        "--reembed",
+        action="store_true",
+        help=(
+            "Regenerate embeddings during repair instead of reusing existing stored vectors. "
+            "Default repair rebuilds the index while preserving existing embeddings."
+        ),
+    )
+    p_repair.add_argument(
+        "--batch-size",
+        type=int,
+        default=5000,
+        help=(
+            "Rows per upsert batch for --mode from-sqlite (default: 5000). "
+            "The measured default keeps repair streaming while preserving rebuild throughput."
+        ),
+    )
+    p_repair.add_argument(
+        "--audit-content",
+        action="store_true",
+        help="After repair, compare full document content byte-for-byte (slower).",
+    )
+    p_repair.add_argument(
         "--mode",
         choices=["legacy", "max-seq-id", "from-sqlite"],
         default="legacy",
@@ -1490,9 +1657,19 @@ def main():
     )
 
     # repair-status — read-only HNSW capacity health check (#1222)
-    sub.add_parser(
+    p_repair_status = sub.add_parser(
         "repair-status",
-        help="Compare sqlite vs HNSW element counts (read-only; never opens a chromadb client)",
+        help="Compare sqlite vs HNSW element counts and report repair artifacts",
+    )
+    p_repair_status.add_argument(
+        "--cleanup-temp",
+        action="store_true",
+        help="Delete stale internal repair temp collections reported by status",
+    )
+    p_repair_status.add_argument(
+        "--yes",
+        action="store_true",
+        help="Required with --cleanup-temp to confirm deletion",
     )
 
     # mcp

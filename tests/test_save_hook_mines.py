@@ -112,9 +112,7 @@ class TestShellHookTranscriptValidation:
             end = src.index("\n}\n", start) + 2
             func_src = src[start:end]
             script = tmp_path / "v.sh"
-            script.write_text(
-                f"{func_src}\n" 'is_valid_transcript_path "$1" && echo OK || echo NO\n'
-            )
+            script.write_text(f'{func_src}\nis_valid_transcript_path "$1" && echo OK || echo NO\n')
 
             def run(arg: str) -> str:
                 return subprocess.run(

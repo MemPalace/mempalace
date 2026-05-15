@@ -56,6 +56,7 @@ from typing import Optional  # noqa: E402
 
 from .config import (  # noqa: E402
     MempalaceConfig,
+    DEFAULT_COLLECTION_NAME,
     sanitize_kg_value,
     sanitize_name,
     sanitize_content,
@@ -82,6 +83,7 @@ from .palace_graph import (  # noqa: E402
     delete_tunnel,
     follow_tunnels,
 )
+from .palace import PalaceWriteAlreadyRunning, palace_write_lock  # noqa: E402
 
 from .knowledge_graph import KnowledgeGraph, DEFAULT_KG_PATH  # noqa: E402
 
@@ -225,6 +227,17 @@ _vector_disabled_reason = ""
 _vector_capacity_status: Optional[dict] = None
 
 
+def _collection_name() -> str:
+    """Return the configured drawer collection name with a safe default.
+
+    Some tests and embedding callers swap ``_config`` for a tiny stand-in
+    that only exposes ``palace_path``. Fallback/status paths should keep
+    working in that setup instead of assuming the full ``MempalaceConfig``
+    surface is present.
+    """
+    return getattr(_config, "collection_name", DEFAULT_COLLECTION_NAME)
+
+
 def _refresh_vector_disabled_flag() -> None:
     """Re-run the HNSW capacity probe and update the module-level flag.
 
@@ -235,7 +248,7 @@ def _refresh_vector_disabled_flag() -> None:
     """
     global _vector_disabled, _vector_disabled_reason, _vector_capacity_status
     try:
-        info = hnsw_capacity_status(_config.palace_path, _config.collection_name)
+        info = hnsw_capacity_status(_config.palace_path, _collection_name())
     except Exception:
         logger.debug("HNSW capacity probe raised", exc_info=True)
         return
@@ -465,6 +478,21 @@ def _no_palace():
     }
 
 
+def _write_lock_refused(exc: PalaceWriteAlreadyRunning) -> dict:
+    return {
+        "success": False,
+        "error": str(exc),
+        "code": "palace_write_lock_active",
+    }
+
+
+def _write_lock_error(exc: PalaceWriteAlreadyRunning) -> dict:
+    return {
+        "error": str(exc),
+        "code": "palace_write_lock_active",
+    }
+
+
 # ==================== HELPERS ====================
 
 
@@ -532,7 +560,7 @@ def _tool_status_via_sqlite() -> dict:
     db_path = os.path.join(_config.palace_path, "chroma.sqlite3")
     if not os.path.isfile(db_path):
         return _no_palace()
-    collection_name = _config.collection_name
+    collection_name = _collection_name()
 
     wings: dict = {}
     rooms: dict = {}
@@ -911,15 +939,19 @@ def tool_create_tunnel(
         target_room = sanitize_name(target_room, "target_room")
     except ValueError as e:
         return {"error": str(e)}
-    return create_tunnel(
-        source_wing,
-        source_room,
-        target_wing,
-        target_room,
-        label=label,
-        source_drawer_id=source_drawer_id,
-        target_drawer_id=target_drawer_id,
-    )
+    try:
+        with palace_write_lock(_config.palace_path, operation="mcp create_tunnel", blocking=True):
+            return create_tunnel(
+                source_wing,
+                source_room,
+                target_wing,
+                target_room,
+                label=label,
+                source_drawer_id=source_drawer_id,
+                target_drawer_id=target_drawer_id,
+            )
+    except PalaceWriteAlreadyRunning as exc:
+        return _write_lock_error(exc)
 
 
 def tool_list_tunnels(wing: str = None):
@@ -935,7 +967,11 @@ def tool_delete_tunnel(tunnel_id: str):
     """Delete an explicit tunnel by its ID."""
     if not tunnel_id or not isinstance(tunnel_id, str):
         return {"error": "tunnel_id is required"}
-    return delete_tunnel(tunnel_id)
+    try:
+        with palace_write_lock(_config.palace_path, operation="mcp delete_tunnel", blocking=True):
+            return delete_tunnel(tunnel_id)
+    except PalaceWriteAlreadyRunning as exc:
+        return _write_lock_error(exc)
 
 
 def tool_follow_tunnels(wing: str, room: str):
@@ -964,10 +1000,6 @@ def tool_add_drawer(
     except ValueError as e:
         return {"success": False, "error": str(e)}
 
-    col = _get_collection(create=True)
-    if not col:
-        return _no_palace()
-
     drawer_id = (
         f"drawer_{wing}_{room}_{hashlib.sha256((wing + room + content).encode()).hexdigest()[:24]}"
     )
@@ -984,38 +1016,45 @@ def tool_add_drawer(
         },
     )
 
-    # Idempotency: if the deterministic ID already exists, return success as a no-op.
     try:
-        existing = col.get(ids=[drawer_id], include=[])
-        if existing.ids:
-            return {"success": True, "reason": "already_exists", "drawer_id": drawer_id}
-    except Exception:
-        logger.debug("Idempotency pre-check failed for %s", drawer_id, exc_info=True)
+        with palace_write_lock(_config.palace_path, operation="mcp add_drawer", blocking=True):
+            col = _get_collection(create=True)
+            if not col:
+                return _no_palace()
 
-    try:
-        col.upsert(
-            ids=[drawer_id],
-            documents=[content],
-            metadatas=[
-                {
-                    "wing": wing,
-                    "room": room,
-                    "source_file": source_file or "",
-                    "chunk_index": 0,
-                    "added_by": added_by,
-                    "filed_at": datetime.now().isoformat(),
-                }
-            ],
-        )
-        inserted = col.get(ids=[drawer_id], include=[])
-        if not inserted.ids:
-            raise RuntimeError(
-                "Drawer write was acknowledged but the new ID is not readable. "
-                "The palace index may be stale; run reconnect or repair."
+            # Idempotency: if the deterministic ID already exists, return success as a no-op.
+            try:
+                existing = col.get(ids=[drawer_id], include=[])
+                if existing.ids:
+                    return {"success": True, "reason": "already_exists", "drawer_id": drawer_id}
+            except Exception:
+                pass
+
+            col.upsert(
+                ids=[drawer_id],
+                documents=[content],
+                metadatas=[
+                    {
+                        "wing": wing,
+                        "room": room,
+                        "source_file": source_file or "",
+                        "chunk_index": 0,
+                        "added_by": added_by,
+                        "filed_at": datetime.now().isoformat(),
+                    }
+                ],
             )
-        _metadata_cache = None
-        logger.info(f"Filed drawer: {drawer_id} → {wing}/{room}")
-        return {"success": True, "drawer_id": drawer_id, "wing": wing, "room": room}
+            inserted = col.get(ids=[drawer_id], include=[])
+            if not inserted.ids:
+                raise RuntimeError(
+                    "Drawer write was acknowledged but the new ID is not readable. "
+                    "The palace index may be stale; run reconnect or repair."
+                )
+            _metadata_cache = None
+            logger.info(f"Filed drawer: {drawer_id} → {wing}/{room}")
+            return {"success": True, "drawer_id": drawer_id, "wing": wing, "room": room}
+    except PalaceWriteAlreadyRunning as exc:
+        return _write_lock_refused(exc)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -1023,30 +1062,35 @@ def tool_add_drawer(
 def tool_delete_drawer(drawer_id: str):
     """Delete a single drawer by ID."""
     global _metadata_cache
-    col = _get_collection()
-    if not col:
-        return _no_palace()
-    existing = col.get(ids=[drawer_id])
-    if not existing["ids"]:
-        return {"success": False, "error": f"Drawer not found: {drawer_id}"}
-
-    # Log the deletion with the content being removed for audit trail
-    deleted_content = existing.get("documents", [""])[0] if existing.get("documents") else ""
-    deleted_meta = existing.get("metadatas", [{}])[0] if existing.get("metadatas") else {}
-    _wal_log(
-        "delete_drawer",
-        {
-            "drawer_id": drawer_id,
-            "deleted_meta": deleted_meta,
-            "content_preview": deleted_content[:200],
-        },
-    )
-
     try:
-        col.delete(ids=[drawer_id])
-        _metadata_cache = None
-        logger.info(f"Deleted drawer: {drawer_id}")
-        return {"success": True, "drawer_id": drawer_id}
+        with palace_write_lock(_config.palace_path, operation="mcp delete_drawer", blocking=True):
+            col = _get_collection()
+            if not col:
+                return _no_palace()
+            existing = col.get(ids=[drawer_id])
+            if not existing["ids"]:
+                return {"success": False, "error": f"Drawer not found: {drawer_id}"}
+
+            # Log the deletion with the content being removed for audit trail
+            deleted_content = (
+                existing.get("documents", [""])[0] if existing.get("documents") else ""
+            )
+            deleted_meta = existing.get("metadatas", [{}])[0] if existing.get("metadatas") else {}
+            _wal_log(
+                "delete_drawer",
+                {
+                    "drawer_id": drawer_id,
+                    "deleted_meta": deleted_meta,
+                    "content_preview": deleted_content[:200],
+                },
+            )
+
+            col.delete(ids=[drawer_id])
+            _metadata_cache = None
+            logger.info(f"Deleted drawer: {drawer_id}")
+            return {"success": True, "drawer_id": drawer_id}
+    except PalaceWriteAlreadyRunning as exc:
+        return _write_lock_refused(exc)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -1182,64 +1226,67 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
     if content is None and wing is None and room is None:
         return {"success": True, "drawer_id": drawer_id, "noop": True}
 
-    col = _get_collection()
-    if not col:
-        return _no_palace()
     try:
-        existing = col.get(ids=[drawer_id], include=["documents", "metadatas"])
-        if not existing["ids"]:
-            return {"success": False, "error": f"Drawer not found: {drawer_id}"}
+        with palace_write_lock(_config.palace_path, operation="mcp update_drawer", blocking=True):
+            col = _get_collection()
+            if not col:
+                return _no_palace()
+            existing = col.get(ids=[drawer_id], include=["documents", "metadatas"])
+            if not existing["ids"]:
+                return {"success": False, "error": f"Drawer not found: {drawer_id}"}
 
-        old_meta = existing["metadatas"][0]
-        old_doc = existing["documents"][0]
+            old_meta = existing["metadatas"][0]
+            old_doc = existing["documents"][0]
 
-        new_doc = old_doc
-        if content is not None:
-            try:
-                new_doc = sanitize_content(content)
-            except ValueError as e:
-                return {"success": False, "error": str(e)}
+            new_doc = old_doc
+            if content is not None:
+                try:
+                    new_doc = sanitize_content(content)
+                except ValueError as e:
+                    return {"success": False, "error": str(e)}
 
-        new_meta = dict(old_meta)
-        if wing is not None:
-            try:
-                new_meta["wing"] = sanitize_name(wing, "wing")
-            except ValueError as e:
-                return {"success": False, "error": str(e)}
-        if room is not None:
-            try:
-                new_meta["room"] = sanitize_name(room, "room")
-            except ValueError as e:
-                return {"success": False, "error": str(e)}
+            new_meta = dict(old_meta)
+            if wing is not None:
+                try:
+                    new_meta["wing"] = sanitize_name(wing, "wing")
+                except ValueError as e:
+                    return {"success": False, "error": str(e)}
+            if room is not None:
+                try:
+                    new_meta["room"] = sanitize_name(room, "room")
+                except ValueError as e:
+                    return {"success": False, "error": str(e)}
 
-        _wal_log(
-            "update_drawer",
-            {
+            _wal_log(
+                "update_drawer",
+                {
+                    "drawer_id": drawer_id,
+                    "old_wing": old_meta.get("wing", ""),
+                    "old_room": old_meta.get("room", ""),
+                    "new_wing": new_meta.get("wing", ""),
+                    "new_room": new_meta.get("room", ""),
+                    "content_changed": content is not None,
+                    "content_preview": new_doc[:200] if content is not None else None,
+                },
+            )
+
+            update_kwargs = {"ids": [drawer_id]}
+            if content is not None:
+                update_kwargs["documents"] = [new_doc]
+            update_kwargs["metadatas"] = [new_meta]
+            col.update(**update_kwargs)
+
+            _metadata_cache = None
+
+            logger.info(f"Updated drawer: {drawer_id}")
+            return {
+                "success": True,
                 "drawer_id": drawer_id,
-                "old_wing": old_meta.get("wing", ""),
-                "old_room": old_meta.get("room", ""),
-                "new_wing": new_meta.get("wing", ""),
-                "new_room": new_meta.get("room", ""),
-                "content_changed": content is not None,
-                "content_preview": new_doc[:200] if content is not None else None,
-            },
-        )
-
-        update_kwargs = {"ids": [drawer_id]}
-        if content is not None:
-            update_kwargs["documents"] = [new_doc]
-        update_kwargs["metadatas"] = [new_meta]
-        col.update(**update_kwargs)
-
-        _metadata_cache = None
-
-        logger.info(f"Updated drawer: {drawer_id}")
-        return {
-            "success": True,
-            "drawer_id": drawer_id,
-            "wing": new_meta.get("wing", ""),
-            "room": new_meta.get("room", ""),
-        }
+                "wing": new_meta.get("wing", ""),
+                "room": new_meta.get("room", ""),
+            }
+    except PalaceWriteAlreadyRunning as exc:
+        return _write_lock_refused(exc)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -1290,33 +1337,40 @@ def tool_kg_add(
     except ValueError as e:
         return {"success": False, "error": str(e)}
 
-    _wal_log(
-        "kg_add",
-        {
-            "subject": subject,
-            "predicate": predicate,
-            "object": object,
-            "valid_from": valid_from,
-            "valid_to": valid_to,
-            "source_closet": source_closet,
-            "source_file": source_file,
-            "source_drawer_id": source_drawer_id,
-        },
-    )
-
-    triple_id = _call_kg(
-        lambda kg: kg.add_triple(
-            subject,
-            predicate,
-            object,
-            valid_from=valid_from,
-            valid_to=valid_to,
-            source_closet=source_closet,
-            source_file=source_file,
-            source_drawer_id=source_drawer_id,
-        )
-    )
-    return {"success": True, "triple_id": triple_id, "fact": f"{subject} → {predicate} → {object}"}
+    try:
+        with palace_write_lock(_config.palace_path, operation="mcp kg_add", blocking=True):
+            _wal_log(
+                "kg_add",
+                {
+                    "subject": subject,
+                    "predicate": predicate,
+                    "object": object,
+                    "valid_from": valid_from,
+                    "valid_to": valid_to,
+                    "source_closet": source_closet,
+                    "source_file": source_file,
+                    "source_drawer_id": source_drawer_id,
+                },
+            )
+            triple_id = _call_kg(
+                lambda kg: kg.add_triple(
+                    subject,
+                    predicate,
+                    object,
+                    valid_from=valid_from,
+                    valid_to=valid_to,
+                    source_closet=source_closet,
+                    source_file=source_file,
+                    source_drawer_id=source_drawer_id,
+                )
+            )
+            return {
+                "success": True,
+                "triple_id": triple_id,
+                "fact": f"{subject} → {predicate} → {object}",
+            }
+    except PalaceWriteAlreadyRunning as exc:
+        return _write_lock_refused(exc)
 
 
 def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = None):
@@ -1338,23 +1392,25 @@ def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = N
         return {"success": False, "error": str(e)}
 
     resolved_ended = ended or date.today().isoformat()
-
-    _wal_log(
-        "kg_invalidate",
-        {
-            "subject": subject,
-            "predicate": predicate,
-            "object": object,
-            "ended": resolved_ended,
-        },
-    )
-
-    _call_kg(lambda kg: kg.invalidate(subject, predicate, object, ended=resolved_ended))
-    return {
-        "success": True,
-        "fact": f"{subject} → {predicate} → {object}",
-        "ended": resolved_ended,
-    }
+    try:
+        with palace_write_lock(_config.palace_path, operation="mcp kg_invalidate", blocking=True):
+            _wal_log(
+                "kg_invalidate",
+                {
+                    "subject": subject,
+                    "predicate": predicate,
+                    "object": object,
+                    "ended": resolved_ended,
+                },
+            )
+            _call_kg(lambda kg: kg.invalidate(subject, predicate, object, ended=resolved_ended))
+            return {
+                "success": True,
+                "fact": f"{subject} → {predicate} → {object}",
+                "ended": resolved_ended,
+            }
+    except PalaceWriteAlreadyRunning as exc:
+        return _write_lock_refused(exc)
 
 
 def tool_kg_timeline(entity: str = None):
@@ -1400,10 +1456,6 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
     else:
         wing = f"wing_{agent_name.replace(' ', '_')}"
     room = "diary"
-    col = _get_collection(create=True)
-    if not col:
-        return _no_palace()
-
     now = datetime.now()
     entry_id = (
         f"diary_{wing}_{now.strftime('%Y%m%d_%H%M%S%f')}_"
@@ -1421,34 +1473,41 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
     )
 
     try:
-        # TODO: Future versions should expand AAAK before embedding to improve
-        # semantic search quality. For now, store raw AAAK in metadata so it's
-        # preserved, and keep the document as-is for embedding (even though
-        # compressed AAAK degrades embedding quality).
-        col.add(
-            ids=[entry_id],
-            documents=[entry],
-            metadatas=[
-                {
-                    "wing": wing,
-                    "room": room,
-                    "hall": "hall_diary",
-                    "topic": topic,
-                    "type": "diary_entry",
-                    "agent": agent_name,
-                    "filed_at": now.isoformat(),
-                    "date": now.strftime("%Y-%m-%d"),
-                }
-            ],
-        )
-        logger.info(f"Diary entry: {entry_id} → {wing}/diary/{topic}")
-        return {
-            "success": True,
-            "entry_id": entry_id,
-            "agent": agent_name,
-            "topic": topic,
-            "timestamp": now.isoformat(),
-        }
+        with palace_write_lock(_config.palace_path, operation="mcp diary_write", blocking=True):
+            col = _get_collection(create=True)
+            if not col:
+                return _no_palace()
+
+            # TODO: Future versions should expand AAAK before embedding to improve
+            # semantic search quality. For now, store raw AAAK in metadata so it's
+            # preserved, and keep the document as-is for embedding (even though
+            # compressed AAAK degrades embedding quality).
+            col.add(
+                ids=[entry_id],
+                documents=[entry],
+                metadatas=[
+                    {
+                        "wing": wing,
+                        "room": room,
+                        "hall": "hall_diary",
+                        "topic": topic,
+                        "type": "diary_entry",
+                        "agent": agent_name,
+                        "filed_at": now.isoformat(),
+                        "date": now.strftime("%Y-%m-%d"),
+                    }
+                ],
+            )
+            logger.info(f"Diary entry: {entry_id} → {wing}/diary/{topic}")
+            return {
+                "success": True,
+                "entry_id": entry_id,
+                "agent": agent_name,
+                "topic": topic,
+                "timestamp": now.isoformat(),
+            }
+    except PalaceWriteAlreadyRunning as exc:
+        return _write_lock_refused(exc)
     except Exception as e:
         return {"success": False, "error": str(e)}
 

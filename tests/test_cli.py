@@ -7,17 +7,19 @@ import sqlite3
 import subprocess
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import ANY, MagicMock, call, patch
 
 import pytest
 
 from mempalace.cli import (
+    _confirm_from_sqlite_rebuild,
     cmd_compress,
     cmd_hook,
     cmd_init,
     cmd_instructions,
     cmd_mine,
     cmd_repair,
+    cmd_repair_status,
     cmd_search,
     cmd_split,
     cmd_status,
@@ -89,6 +91,75 @@ def test_cli_main_strips_leaked_pythonpath_from_env():
 
 
 # ── cmd_status ─────────────────────────────────────────────────────────
+
+
+def test_confirm_from_sqlite_archive_prompt_names_rename(capsys):
+    with patch("builtins.input", return_value="y"):
+        confirmed = _confirm_from_sqlite_rebuild(
+            palace_path="/palace",
+            source_path="/palace",
+            archive_existing=True,
+            assume_yes=False,
+        )
+
+    out = capsys.readouterr().out
+    assert confirmed is True
+    assert "renamed to <palace>.pre-rebuild-<timestamp>" in out
+    assert "does not copy a backup before the rename" in out
+    assert "A backup will be created first" not in out
+
+
+def test_confirm_from_sqlite_same_path_without_archive_does_not_prompt(capsys):
+    with patch("builtins.input") as input_mock:
+        confirmed = _confirm_from_sqlite_rebuild(
+            palace_path="/palace",
+            source_path="/palace",
+            archive_existing=False,
+            assume_yes=False,
+        )
+
+    out = capsys.readouterr().out
+    assert confirmed is False
+    assert "Pass --archive-existing" in out
+    input_mock.assert_not_called()
+
+
+def test_confirm_from_sqlite_canonicalizes_same_path(tmp_path, capsys):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    original_cwd = Path.cwd()
+    os.chdir(tmp_path)
+
+    try:
+        with patch("builtins.input", return_value="y"):
+            confirmed = _confirm_from_sqlite_rebuild(
+                palace_path="palace",
+                source_path=str(palace.resolve()),
+                archive_existing=True,
+                assume_yes=False,
+            )
+    finally:
+        os.chdir(original_cwd)
+
+    out = capsys.readouterr().out
+    assert confirmed is True
+    assert "renamed to <palace>.pre-rebuild-<timestamp>" in out
+    assert "destination path already exists" not in out
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_status_forwards_cleanup_flags(mock_config_cls, tmp_path):
+    mock_config_cls.return_value.palace_path = str(tmp_path)
+    args = argparse.Namespace(palace=None, cleanup_temp=True, yes=True)
+
+    with patch("mempalace.repair.status") as repair_status:
+        cmd_repair_status(args)
+
+    repair_status.assert_called_once_with(
+        palace_path=str(tmp_path),
+        cleanup_temp=True,
+        assume_yes=True,
+    )
 
 
 @patch("mempalace.cli.MempalaceConfig")
@@ -881,13 +952,18 @@ def test_cmd_repair_error_reading(mock_config_cls, tmp_path, capsys):
     sqlite3.connect(str(palace_dir / "chroma.sqlite3")).close()
     mock_config_cls.return_value.palace_path = str(palace_dir)
     mock_config_cls.return_value.collection_name = "mempalace_drawers"
-    args = argparse.Namespace(palace=None)
+    args = argparse.Namespace(palace=None, yes=True)
     mock_backend = MagicMock()
     mock_backend.get_collection.side_effect = Exception("corrupt db")
-    with patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend):
-        cmd_repair(args)
+    with (
+        patch("mempalace.repair.sqlite_integrity_errors", return_value=[]),
+        patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend),
+    ):
+        with pytest.raises(SystemExit) as excinfo:
+            cmd_repair(args)
     out = capsys.readouterr().out
-    assert "Error reading palace" in out
+    assert excinfo.value.code == 1
+    assert "Error reading palace after acquiring repair lock" in out
 
 
 @patch("mempalace.cli.MempalaceConfig")
@@ -901,10 +977,14 @@ def test_cmd_repair_zero_drawers(mock_config_cls, tmp_path, capsys):
     mock_col = MagicMock()
     mock_col.count.return_value = 0
     mock_backend = _mock_backend_for(col=mock_col)
-    with patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend):
+    with (
+        patch("mempalace.repair.sqlite_drawer_count", return_value=0),
+        patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend),
+    ):
         cmd_repair(args)
     out = capsys.readouterr().out
     assert "Nothing to repair" in out
+    mock_backend.get_collection.assert_not_called()
 
 
 @patch("mempalace.cli.MempalaceConfig")
@@ -921,26 +1001,25 @@ def test_cmd_repair_success(mock_config_cls, tmp_path, capsys):
         "ids": ["id1", "id2"],
         "documents": ["doc1", "doc2"],
         "metadatas": [{"wing": "a"}, {"wing": "b"}],
+        "embeddings": [[0.1, 0.2], [0.3, 0.4]],
     }
     mock_temp_col = MagicMock()
     mock_temp_col.count.return_value = 2
-    mock_new_col = MagicMock()
-    mock_new_col.count.return_value = 2
-    mock_backend = _mock_backend_for(col=mock_col, new_col=mock_new_col)
-    mock_backend.create_collection.side_effect = [mock_temp_col, mock_new_col]
+    mock_backend = _mock_backend_for(col=mock_col)
+    mock_backend.create_collection.return_value = mock_temp_col
     with patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend):
         cmd_repair(args)
     out = capsys.readouterr().out
     assert "Repair complete" in out
     assert "2 drawers rebuilt" in out
     assert mock_backend.delete_collection.call_args_list == [
-        call(str(palace_dir), "mempalace_drawers__repair_tmp"),
+        call(str(palace_dir), ANY),
         call(str(palace_dir), "mempalace_drawers"),
-        call(str(palace_dir), "mempalace_drawers__repair_tmp"),
+        call(str(palace_dir), ANY),
     ]
     mock_temp_col.upsert.assert_called_once()
-    mock_new_col.upsert.assert_called_once()
-    mock_new_col.add.assert_not_called()
+    mock_temp_col.modify.assert_called_once_with(name="mempalace_drawers")
+    mock_temp_col.add.assert_not_called()
 
 
 @patch("mempalace.cli.MempalaceConfig")
@@ -957,29 +1036,29 @@ def test_cmd_repair_uses_configured_collection(mock_config_cls, tmp_path, capsys
         "ids": ["id1", "id2"],
         "documents": ["doc1", "doc2"],
         "metadatas": [{"wing": "a"}, {"wing": "b"}],
+        "embeddings": [[0.1, 0.2], [0.3, 0.4]],
     }
     mock_temp_col = MagicMock()
     mock_temp_col.count.return_value = 2
-    mock_new_col = MagicMock()
-    mock_new_col.count.return_value = 2
-    mock_backend = _mock_backend_for(col=mock_col, new_col=mock_new_col)
-    mock_backend.create_collection.side_effect = [mock_temp_col, mock_new_col]
+    mock_backend = _mock_backend_for(col=mock_col)
+    mock_backend.create_collection.return_value = mock_temp_col
 
     with patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend):
         cmd_repair(args)
 
     out = capsys.readouterr().out
     assert "Repair complete" in out
-    mock_backend.get_collection.assert_called_once_with(str(palace_dir), "custom_drawers")
-    assert mock_backend.create_collection.call_args_list == [
-        call(str(palace_dir), "custom_drawers__repair_tmp"),
+    assert mock_backend.get_collection.call_args_list == [
+        call(str(palace_dir), "custom_drawers"),
         call(str(palace_dir), "custom_drawers"),
     ]
+    assert mock_backend.create_collection.call_args_list == [call(str(palace_dir), ANY)]
     assert mock_backend.delete_collection.call_args_list == [
-        call(str(palace_dir), "custom_drawers__repair_tmp"),
+        call(str(palace_dir), ANY),
         call(str(palace_dir), "custom_drawers"),
-        call(str(palace_dir), "custom_drawers__repair_tmp"),
+        call(str(palace_dir), ANY),
     ]
+    mock_temp_col.modify.assert_called_once_with(name="custom_drawers")
 
 
 @patch("mempalace.cli.MempalaceConfig")
@@ -996,12 +1075,17 @@ def test_cmd_repair_restores_backup_on_live_rebuild_failure(mock_config_cls, tmp
         "ids": ["id1", "id2"],
         "documents": ["doc1", "doc2"],
         "metadatas": [{"wing": "a"}, {"wing": "b"}],
+        "embeddings": [[0.1, 0.2], [0.3, 0.4]],
     }
     mock_temp_col = MagicMock()
     mock_temp_col.count.return_value = 2
+    mock_temp_col.modify.side_effect = RuntimeError("live rename failed")
     mock_backend = _mock_backend_for(col=mock_col)
-    mock_backend.create_collection.side_effect = [mock_temp_col, RuntimeError("live build failed")]
-    with patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend):
+    mock_backend.create_collection.return_value = mock_temp_col
+    with (
+        patch("mempalace.repair.sqlite_integrity_errors", return_value=[]),
+        patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend),
+    ):
         with pytest.raises(SystemExit) as excinfo:
             cmd_repair(args)
     out = capsys.readouterr().out
@@ -1010,10 +1094,254 @@ def test_cmd_repair_restores_backup_on_live_rebuild_failure(mock_config_cls, tmp
     assert "restoring from backup" in out
     mock_backend.close_palace.assert_called_once_with(str(palace_dir))
     assert mock_backend.delete_collection.call_args_list == [
-        call(str(palace_dir), "mempalace_drawers__repair_tmp"),
+        call(str(palace_dir), ANY),
         call(str(palace_dir), "mempalace_drawers"),
-        call(str(palace_dir), "mempalace_drawers__repair_tmp"),
+        call(str(palace_dir), ANY),
     ]
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_pre_swap_delete_failure_does_not_restore_backup(
+    mock_config_cls, tmp_path, capsys
+):
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    sqlite3.connect(str(palace_dir / "chroma.sqlite3")).close()
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
+    args = argparse.Namespace(palace=None, yes=True)
+    mock_col = MagicMock()
+    mock_col.count.return_value = 2
+    mock_col.get.return_value = {
+        "ids": ["id1", "id2"],
+        "documents": ["doc1", "doc2"],
+        "metadatas": [{"wing": "a"}, {"wing": "b"}],
+        "embeddings": [[0.1, 0.2], [0.3, 0.4]],
+    }
+    mock_temp_col = MagicMock()
+    mock_temp_col.count.return_value = 2
+    mock_backend = _mock_backend_for(col=mock_col)
+    mock_backend.create_collection.return_value = mock_temp_col
+    mock_backend.delete_collection.side_effect = [
+        None,
+        RuntimeError("delete failed before live replacement"),
+    ]
+
+    with (
+        patch("mempalace.repair.sqlite_integrity_errors", return_value=[]),
+        patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend),
+    ):
+        with pytest.raises(SystemExit) as excinfo:
+            cmd_repair(args)
+
+    out = capsys.readouterr().out
+    assert excinfo.value.code == 1
+    assert "Repair failed" in out
+    assert "restoring from backup" not in out
+    mock_backend.close_palace.assert_not_called()
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_staging_failure_suggests_sqlite_recovery(mock_config_cls, tmp_path, capsys):
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    sqlite3.connect(str(palace_dir / "chroma.sqlite3")).close()
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
+    args = argparse.Namespace(palace=None, yes=True)
+    mock_col = MagicMock()
+    mock_col.count.return_value = 2
+    mock_col.get.side_effect = RuntimeError(
+        "Error executing plan: Internal error: Error finding id"
+    )
+    mock_temp_col = MagicMock()
+    mock_backend = _mock_backend_for(col=mock_col)
+    mock_backend.create_collection.return_value = mock_temp_col
+
+    with (
+        patch("mempalace.repair.sqlite_integrity_errors", return_value=[]),
+        patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend),
+    ):
+        with pytest.raises(SystemExit) as excinfo:
+            cmd_repair(args)
+
+    out = capsys.readouterr().out
+    assert excinfo.value.code == 1
+    assert "Live collection was not replaced" in out
+    assert (
+        f"mempalace --palace {shlex.quote(str(palace_dir))} repair --mode from-sqlite --archive-existing --yes"
+    ) in out
+    assert mock_backend.delete_collection.call_args_list == [
+        call(str(palace_dir), ANY),
+        call(str(palace_dir), ANY),
+    ]
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_refuses_when_write_lock_active(mock_config_cls, tmp_path, capsys):
+    from mempalace.palace import PalaceWriteAlreadyRunning
+
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    sqlite3.connect(str(palace_dir / "chroma.sqlite3")).close()
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
+    args = argparse.Namespace(palace=None, yes=True)
+
+    with (
+        patch("mempalace.repair.sqlite_integrity_errors", return_value=[]),
+        patch("mempalace.palace.palace_write_lock", side_effect=PalaceWriteAlreadyRunning("busy")),
+        patch("mempalace.backends.chroma.ChromaBackend") as backend_cls,
+        pytest.raises(SystemExit) as excinfo,
+    ):
+        cmd_repair(args)
+
+    out = capsys.readouterr().out
+    assert excinfo.value.code == 1
+    assert "ABORT: busy" in out
+    backend_cls.assert_not_called()
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_does_not_take_write_lock_when_confirmation_aborts(mock_config_cls, tmp_path):
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    sqlite3.connect(str(palace_dir / "chroma.sqlite3")).close()
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
+    args = argparse.Namespace(palace=None, yes=False)
+    lock = MagicMock()
+    mock_col = MagicMock()
+    mock_col.count.return_value = 1
+    mock_backend = _mock_backend_for(col=mock_col)
+
+    with (
+        patch("mempalace.repair.sqlite_integrity_errors", return_value=[]),
+        patch("mempalace.palace.palace_write_lock", return_value=lock),
+        patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend),
+        patch("builtins.input", return_value="n"),
+    ):
+        cmd_repair(args)
+
+    lock.__enter__.assert_not_called()
+    lock.__exit__.assert_not_called()
+    mock_backend.create_collection.assert_not_called()
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_releases_write_lock_on_backup_failure(mock_config_cls, tmp_path):
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    sqlite3.connect(str(palace_dir / "chroma.sqlite3")).close()
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
+    args = argparse.Namespace(palace=None, yes=True)
+    lock = MagicMock()
+    mock_col = MagicMock()
+    mock_col.count.return_value = 1
+    mock_backend = _mock_backend_for(col=mock_col)
+
+    with (
+        patch("mempalace.repair.sqlite_integrity_errors", return_value=[]),
+        patch("mempalace.palace.palace_write_lock", return_value=lock),
+        patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend),
+        patch("shutil.copytree", side_effect=OSError("copy failed")),
+        pytest.raises(OSError, match="copy failed"),
+    ):
+        cmd_repair(args)
+
+    lock.__enter__.assert_called_once_with()
+    lock.__exit__.assert_called_once_with(None, None, None)
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_releases_write_lock_when_backend_init_fails(mock_config_cls, tmp_path):
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    sqlite3.connect(str(palace_dir / "chroma.sqlite3")).close()
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
+    args = argparse.Namespace(palace=None, yes=True)
+    lock = MagicMock()
+
+    with (
+        patch("mempalace.repair.sqlite_integrity_errors", return_value=[]),
+        patch("mempalace.palace.palace_write_lock", return_value=lock),
+        patch("mempalace.backends.chroma.ChromaBackend", side_effect=RuntimeError("init failed")),
+        pytest.raises(SystemExit) as excinfo,
+    ):
+        cmd_repair(args)
+
+    assert excinfo.value.code == 1
+    lock.__enter__.assert_called_once_with()
+    lock.__exit__.assert_called_once_with(None, None, None)
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_forwards_audit_content_when_present(mock_config_cls, tmp_path):
+    source = tmp_path / "source"
+    dest = tmp_path / "dest"
+    mock_config_cls.return_value.palace_path = str(dest)
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
+    args = argparse.Namespace(
+        palace=None,
+        mode="from-sqlite",
+        source=str(source),
+        archive_existing=False,
+        reembed=False,
+        batch_size=5000,
+        audit_content=True,
+        yes=True,
+    )
+
+    with patch(
+        "mempalace.repair.rebuild_from_sqlite", return_value={"mempalace_drawers": 1}
+    ) as rebuild:
+        cmd_repair(args)
+
+    assert rebuild.call_args.kwargs["audit_content"] is True
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_rejects_audit_content_outside_from_sqlite(mock_config_cls, tmp_path, capsys):
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
+    args = argparse.Namespace(
+        palace=None,
+        mode="legacy",
+        audit_content=True,
+        yes=True,
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        cmd_repair(args)
+
+    assert excinfo.value.code == 1
+    assert "--audit-content is only supported with --mode from-sqlite" in capsys.readouterr().out
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_rejects_audit_content_in_max_seq_id_mode(mock_config_cls, tmp_path, capsys):
+    mock_config_cls.return_value.palace_path = str(tmp_path / "palace")
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
+    args = argparse.Namespace(
+        palace=None,
+        mode="max-seq-id",
+        audit_content=True,
+        segment=None,
+        from_sidecar=None,
+        backup=True,
+        dry_run=False,
+        yes=True,
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        cmd_repair(args)
+
+    assert excinfo.value.code == 1
+    assert "--audit-content is only supported with --mode from-sqlite" in capsys.readouterr().out
 
 
 @patch("mempalace.cli.MempalaceConfig")
@@ -1035,6 +1363,146 @@ def test_cmd_repair_aborts_without_confirmation(mock_config_cls, tmp_path, capsy
     out = capsys.readouterr().out
     assert "Aborted." in out
     mock_backend.create_collection.assert_not_called()
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_from_sqlite_uses_configured_collection(mock_config_cls, tmp_path):
+    source = tmp_path / "source"
+    dest = tmp_path / "dest"
+    mock_config_cls.return_value.palace_path = str(dest)
+    mock_config_cls.return_value.collection_name = "custom_drawers"
+    args = argparse.Namespace(
+        palace=None,
+        mode="from-sqlite",
+        source=str(source),
+        archive_existing=False,
+        reembed=False,
+        batch_size=5000,
+        yes=True,
+    )
+
+    with patch(
+        "mempalace.repair.rebuild_from_sqlite", return_value={"custom_drawers": 1}
+    ) as rebuild:
+        cmd_repair(args)
+
+    rebuild.assert_called_once_with(
+        source_palace=str(source),
+        dest_palace=str(dest),
+        archive_existing_dest=False,
+        collection_name="custom_drawers",
+        reembed=False,
+        batch_size=5000,
+    )
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_from_sqlite_empty_result_exits_nonzero(mock_config_cls, tmp_path):
+    source = tmp_path / "source"
+    dest = tmp_path / "dest"
+    mock_config_cls.return_value.palace_path = str(dest)
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
+    args = argparse.Namespace(
+        palace=None,
+        mode="from-sqlite",
+        source=str(source),
+        archive_existing=False,
+        reembed=False,
+        batch_size=5000,
+        yes=True,
+    )
+
+    with (
+        patch("mempalace.repair.rebuild_from_sqlite", return_value={}),
+        pytest.raises(SystemExit) as excinfo,
+    ):
+        cmd_repair(args)
+
+    assert excinfo.value.code == 1
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_from_sqlite_zero_primary_collection_exits_nonzero(mock_config_cls, tmp_path):
+    source = tmp_path / "source"
+    dest = tmp_path / "dest"
+    mock_config_cls.return_value.palace_path = str(dest)
+    mock_config_cls.return_value.collection_name = "custom_drawers"
+    args = argparse.Namespace(
+        palace=None,
+        mode="from-sqlite",
+        source=str(source),
+        archive_existing=False,
+        reembed=False,
+        batch_size=5000,
+        yes=True,
+    )
+
+    with (
+        patch(
+            "mempalace.repair.rebuild_from_sqlite",
+            return_value={"custom_drawers": 0, "mempalace_closets": 1},
+        ),
+        pytest.raises(SystemExit) as excinfo,
+    ):
+        cmd_repair(args)
+
+    assert excinfo.value.code == 1
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_from_sqlite_refused_preflight_exits_nonzero(mock_config_cls, tmp_path, capsys):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    (palace / "chroma.sqlite3").write_text("db")
+    mock_config_cls.return_value.palace_path = str(palace)
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
+    args = argparse.Namespace(
+        palace=None,
+        mode="from-sqlite",
+        source=None,
+        archive_existing=False,
+        reembed=False,
+        batch_size=5000,
+        yes=False,
+    )
+
+    with (
+        patch("mempalace.repair.rebuild_from_sqlite") as rebuild,
+        pytest.raises(SystemExit) as excinfo,
+    ):
+        cmd_repair(args)
+
+    out = capsys.readouterr().out
+    assert excinfo.value.code == 1
+    assert "Pass --archive-existing" in out
+    rebuild.assert_not_called()
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_from_sqlite_setup_exception_exits_nonzero(mock_config_cls, tmp_path, capsys):
+    source = tmp_path / "source"
+    dest = tmp_path / "dest"
+    mock_config_cls.return_value.palace_path = str(dest)
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
+    args = argparse.Namespace(
+        palace=None,
+        mode="from-sqlite",
+        source=str(source),
+        archive_existing=False,
+        reembed=False,
+        batch_size=5000,
+        yes=True,
+    )
+
+    with (
+        patch("mempalace.repair.rebuild_from_sqlite", side_effect=OSError("move failed")),
+        pytest.raises(SystemExit) as excinfo,
+    ):
+        cmd_repair(args)
+
+    out = capsys.readouterr().out
+    assert excinfo.value.code == 1
+    assert "Rebuild failed: move failed" in out
 
 
 # ── cmd_compress ───────────────────────────────────────────────────────
@@ -1350,4 +1818,30 @@ def test_cmd_repair_from_sqlite_success_does_not_exit(mock_config_cls, tmp_path)
     fake_counts = {"mempalace_drawers": 0, "mempalace_closets": 0}
     with patch("mempalace.repair.rebuild_from_sqlite", return_value=fake_counts):
         # Should return cleanly; no SystemExit raised.
+        cmd_repair(args)
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_from_sqlite_empty_custom_primary_success_does_not_exit(
+    mock_config_cls, tmp_path
+):
+    """A legitimately empty rebuild must also succeed when the configured
+    primary drawers collection uses a non-default name."""
+    source = tmp_path / "source"
+    dest = tmp_path / "dest"
+    mock_config_cls.return_value.palace_path = str(dest)
+    mock_config_cls.return_value.collection_name = "custom_drawers"
+
+    args = argparse.Namespace(
+        palace=None,
+        mode="from-sqlite",
+        source=str(source),
+        archive_existing=False,
+        reembed=False,
+        batch_size=5000,
+        yes=True,
+    )
+
+    fake_counts = {"custom_drawers": 0, "mempalace_closets": 0}
+    with patch("mempalace.repair.rebuild_from_sqlite", return_value=fake_counts):
         cmd_repair(args)

@@ -70,7 +70,7 @@ def main():
     ]
     out.write("\n".join(header))
     for ts, role, text in turns:
-        out.write(f"\n[{ts}] {role.upper()}\n{text}\n\n{'-'*72}\n")
+        out.write(f"\n[{ts}] {role.upper()}\n{text}\n\n{'-' * 72}\n")
     if out is not sys.stdout:
         out.close()
         print(f"Wrote {len(turns)} turns to {sys.argv[2]}")

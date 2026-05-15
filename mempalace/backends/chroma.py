@@ -860,7 +860,7 @@ class ChromaCollection(BaseCollection):
     """Thin adapter translating ChromaDB dict returns into typed results.
 
     When ``palace_path`` is set, all write methods (``add``, ``upsert``,
-    ``update``, ``delete``) acquire ``mine_palace_lock(palace_path)`` for the
+    ``modify``, ``update``, ``delete``) acquire ``mine_palace_lock(palace_path)`` for the
     duration of the underlying chromadb call. This serializes MCP and other
     direct-backend writers against ``mempalace mine`` and against each other,
     closing the race between concurrent writers that triggers ChromaDB's
@@ -937,6 +937,17 @@ class ChromaCollection(BaseCollection):
             kwargs["embeddings"] = embeddings
         with self._write_lock():
             self._collection.upsert(**kwargs)
+
+    def modify(self, *, name=None, metadata=None, configuration=None):
+        kwargs: dict[str, Any] = {}
+        if name is not None:
+            kwargs["name"] = name
+        if metadata is not None:
+            kwargs["metadata"] = metadata
+        if configuration is not None:
+            kwargs["configuration"] = configuration
+        with self._write_lock():
+            self._collection.modify(**kwargs)
 
     def update(
         self,
@@ -1231,14 +1242,7 @@ class ChromaBackend(BaseBackend):
         )
 
         if cached is None or inode_changed or mtime_changed or mtime_appeared:
-            # An inode swap means we are reopening a different physical DB
-            # (post-restore, fresh palace at the same path, etc.); drop the
-            # per-process gate so the quarantine pre-checks run again
-            # against the new disk state instead of trusting cached "we
-            # already cleaned this path" credit from the prior inode.
-            if inode_changed:
-                ChromaBackend._quarantined_paths.discard(palace_path)
-            ChromaBackend._prepare_palace_for_open(palace_path)
+            ChromaBackend._prepare_palace_for_open(palace_path, reset_quarantine=inode_changed)
             cached = chromadb.PersistentClient(path=palace_path)
             self._clients[palace_path] = cached
             # Re-stat after the client constructor runs: chromadb creates
@@ -1251,31 +1255,32 @@ class ChromaBackend(BaseBackend):
     # Public static helpers (legacy; prefer :meth:`get_collection`)
     # ------------------------------------------------------------------
 
-    # Per-process record of palaces that have already had the cold-start
-    # quarantine invoked at least once. The proactive HNSW checks are a
-    # *cold-start* protection — they catch segments that arrive stale relative
-    # to ``chroma.sqlite3`` or invalid on disk (e.g. cross-machine replication,
-    # partial restore, crashed-mid-write). Once a long-running process has
-    # opened the palace cleanly, re-firing the stale check on every reconnect
-    # is a *runtime thrash*: the daemon's own writes bump sqlite mtime but HNSW
-    # flushes batch on chromadb's internal cadence, so the mtime gap naturally
-    # exceeds the threshold under steady write load even though nothing is
-    # corrupt.
+    # Per-process record of palaces that have already had stale-HNSW mtime
+    # quarantine invoked at least once. Stale quarantine is a *cold-start*
+    # protection — it catches segments that arrive stale relative to
+    # ``chroma.sqlite3`` (e.g. cross-machine replication, partial restore,
+    # crashed-mid-write). Once a long-running process has opened the palace
+    # cleanly, re-firing the stale check on every reconnect is a *runtime
+    # thrash*: the daemon's own writes bump sqlite mtime but HNSW flushes batch
+    # on chromadb's internal cadence, so the mtime gap naturally exceeds the
+    # threshold under steady write load even though nothing is corrupt.
+    # Invalid metadata quarantine is cheaper and deterministic, so it runs on
+    # every client open/reconnect and is not gated by this set.
     # Real runtime drift is still handled — palace-daemon's ``_auto_repair``
     # calls :func:`quarantine_stale_hnsw` directly on observed HNSW errors,
     # which bypasses this gate.
     #
     # Thread-safety: this set is mutated without a lock. Two concurrent
-    # ``make_client()`` calls for the same palace can both pass the
-    # membership check and both invoke the cold-start quarantine. That's
-    # safe because the functions are idempotent (mtime checks + timestamped
-    # rename of distinct directories), so the worst-case race produces one
-    # redundant rename attempt that no-ops. Idempotency is the safety
-    # property; locking would add cost without correctness gain.
+    # ``make_client()`` calls for the same palace can both pass the membership
+    # check and both invoke stale quarantine. That's safe because the function
+    # is idempotent (mtime checks + timestamped rename of distinct directories),
+    # so the worst-case race produces one redundant rename attempt that no-ops.
+    # Idempotency is the safety property; locking would add cost without
+    # correctness gain.
     _quarantined_paths: set[str] = set()
 
     @staticmethod
-    def _prepare_palace_for_open(palace_path: str) -> None:
+    def _prepare_palace_for_open(palace_path: str, *, reset_quarantine: bool = False) -> None:
         """Run the pre-open safety pass shared by :meth:`make_client` and
         :meth:`_client`.
 
@@ -1283,24 +1288,23 @@ class ChromaBackend(BaseBackend):
 
         1. ``_fix_blob_seq_ids`` — repairs the BLOB seq_id quirk that bites
            certain chromadb migrations.
-        2. ``quarantine_invalid_hnsw_metadata`` — renames aside any HNSW
-           ``index_metadata.pickle`` that fails to load, so chromadb opens
-           against an empty index instead of crashing on the unloadable
-           pickle (#1266 / PR #1285).
-        3. ``quarantine_stale_hnsw`` — also gated by :attr:`_quarantined_paths`
-           so it fires once per palace per process. This is the SIGSEGV
-           prevention path for stale HNSW segments (see #1121, #1132, #1263);
-           wiring it through this helper means CLI mining, search, repair,
-           and status all benefit, not just the legacy ``make_client``
-           callers.
+        2. ``quarantine_invalid_hnsw_metadata`` — runs on every open so
+           reconnect paths still quarantine newly-corrupted metadata files.
+        3. ``quarantine_stale_hnsw`` — gated by :attr:`_quarantined_paths`
+           so it fires once per palace per process unless the underlying
+           sqlite inode changes. This keeps reconnect paths cheap while still
+           re-running the stale-segment preflight after an on-disk palace
+           replacement.
 
         Idempotent: safe to call from any code path that is about to open or
         re-open a palace. The ``_quarantined_paths`` gate prevents thrash on
         hot paths (e.g. ``_client()`` is called on every backend operation).
         """
         _fix_blob_seq_ids(palace_path)
+        quarantine_invalid_hnsw_metadata(palace_path)
+        if reset_quarantine:
+            ChromaBackend._quarantined_paths.discard(palace_path)
         if palace_path not in ChromaBackend._quarantined_paths:
-            quarantine_invalid_hnsw_metadata(palace_path)
             quarantine_stale_hnsw(palace_path)
             ChromaBackend._quarantined_paths.add(palace_path)
 
@@ -1312,9 +1316,10 @@ class ChromaBackend(BaseBackend):
         own client cache. New code should obtain a collection through
         :meth:`get_collection` which manages caching internally.
 
-        Quarantines HNSW segments **once per palace per process**. See
-        :attr:`_quarantined_paths` for the rationale (cold-start protection
-        vs. runtime thrash on steady-write daemons).
+        Runs invalid-metadata quarantine on every call, but only runs stale-HNSW
+        mtime quarantine once per palace per process. See
+        :attr:`_quarantined_paths` for the stale-quarantine rationale
+        (cold-start protection vs. runtime thrash on steady-write daemons).
         """
         ChromaBackend._prepare_palace_for_open(palace_path)
         return chromadb.PersistentClient(path=palace_path)
