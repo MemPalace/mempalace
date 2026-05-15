@@ -321,10 +321,7 @@ def test_migrate_restores_palace_on_swap_failure(tmp_path, capsys):
     fail_state = {"swap_in_failed": False}
 
     def selective_replace(src, dst):
-        if (
-            os.fspath(dst) == os.fspath(palace_dir)
-            and not fail_state["swap_in_failed"]
-        ):
+        if os.fspath(dst) == os.fspath(palace_dir) and not fail_state["swap_in_failed"]:
             fail_state["swap_in_failed"] = True
             raise OSError(errno.EXDEV, "Invalid cross-device link")
         return real_os_replace(src, dst)
