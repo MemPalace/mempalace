@@ -4,6 +4,11 @@ MemPalace configuration system.
 Priority: env vars > config file (~/.mempalace/config.json) > defaults
 """
 
+# Defer annotation evaluation so PEP 604 union syntax (e.g. ``str | None``)
+# in function signatures works on Python 3.9 — the union types only became
+# evaluatable at module-import time in 3.10.
+from __future__ import annotations
+
 import json
 import os
 import re
@@ -29,6 +34,52 @@ def normalize_wing_name(name: str) -> str:
     mine time regardless of the source dirname.
     """
     return name.lower().replace(" ", "_").replace("-", "_")
+
+
+def session_wing_override() -> str | None:
+    """Return the ``MEMPALACE_WING`` env var (normalized) if set, else ``None``.
+
+    Lets a session declare its wing explicitly, overriding the wing that
+    would otherwise be derived from the transcript path (via the Stop
+    hook's :func:`hooks_cli._wing_from_transcript_path`) or the convo-mine
+    directory name (via :func:`convo_miner.mine`'s default).
+
+    Useful when:
+
+    * The Claude Code transcript directory is an encoded path
+      (``-home-<user>-projects-<name>``) whose dash-separated slicing
+      yields an unhelpful wing (last token only — see #1410 / PR #1424).
+    * The user wants a single session's diary entries and auto-mined
+      chunks to land in a wing of their choice without renaming
+      directories or passing ``--wing`` on every CLI invocation.
+
+    Env name (``MEMPALACE_WING``) follows the ``MEMPALACE_*`` convention
+    used elsewhere in ``config.py``; the older ``MEMPAL_WING`` form is
+    accepted for symmetry with ``MEMPAL_DIR`` / ``MEMPAL_PYTHON``.
+
+    An explicit ``--wing`` CLI flag still wins — this override is the
+    fallback when no explicit wing is passed.
+
+    The raw env value is validated through :func:`sanitize_name` before
+    normalization so a malformed value (path traversal segments, null
+    bytes, over-length input, characters outside the wing/room slug
+    charset) does not silently produce an unsafe wing slug. Invalid
+    values fall back to ``None`` so the system continues with auto-
+    derivation rather than failing the hook fire.
+    """
+    env = os.environ.get("MEMPALACE_WING") or os.environ.get("MEMPAL_WING") or ""
+    env = env.strip()
+    if not env:
+        return None
+    try:
+        sanitize_name(env, field_name="MEMPALACE_WING")
+    except ValueError:
+        # Bad env value disables the override silently — the system
+        # falls back to auto-derivation. A noisy raise here would crash
+        # every hook fire until the user unsets the var, which is worse
+        # UX than ignoring the invalid override.
+        return None
+    return normalize_wing_name(env)
 
 
 def sanitize_name(value: str, field_name: str = "name") -> str:

@@ -398,9 +398,14 @@ def mine_convos(
 
     convo_path = Path(convo_dir).expanduser().resolve()
     if not wing:
-        from .config import normalize_wing_name
+        from .config import normalize_wing_name, session_wing_override
 
-        wing = normalize_wing_name(convo_path.name)
+        # Explicit --wing flag wins; otherwise MEMPALACE_WING env var
+        # overrides the path-derived default. The encoded transcript
+        # folder name (e.g. ``-home-user-projects-foo``) makes a poor
+        # wing slug; this lets a user override without renaming dirs.
+        override = session_wing_override()
+        wing = override if override else normalize_wing_name(convo_path.name)
 
     files = scan_convos(convo_dir)
     if limit > 0:
