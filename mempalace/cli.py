@@ -34,6 +34,7 @@ import argparse
 from pathlib import Path
 
 from .config import MempalaceConfig
+from .compat import ensure_palace_safe
 from .corpus_origin import detect_origin_heuristic, detect_origin_llm
 from .llm_client import LLMError, get_provider
 from .version import __version__
@@ -678,6 +679,7 @@ def cmd_wakeup(args):
     from .layers import MemoryStack
 
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    ensure_palace_safe(palace_path)
     stack = MemoryStack(palace_path=palace_path)
 
     text = stack.wake_up(wing=args.wing)
@@ -726,6 +728,7 @@ def cmd_status(args):
     from .miner import status
 
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    ensure_palace_safe(palace_path)
     status(palace_path=palace_path)
 
 
@@ -734,6 +737,7 @@ def cmd_repair_status(args):
     from .repair import status as repair_status
 
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    ensure_palace_safe(palace_path)
     repair_status(palace_path=palace_path)
 
 
@@ -992,6 +996,7 @@ def cmd_compress(args):
     from .dialect import Dialect
 
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    ensure_palace_safe(palace_path)
 
     # Load dialect (with optional entity config)
     config_path = args.config

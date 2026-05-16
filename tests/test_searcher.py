@@ -5,10 +5,12 @@ Uses the real ChromaDB fixtures from conftest.py for integration tests,
 plus mock-based tests for error paths.
 """
 
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from mempalace.compat import meta_path
 from mempalace.searcher import SearchError, search, search_memories
 
 
@@ -52,6 +54,16 @@ class TestSearchMemories:
         assert "similarity" in hit
         assert isinstance(hit["similarity"], float)
         assert "created_at" in hit
+
+    def test_mismatched_chroma_major_raises(self, palace_path, seeded_collection):
+        path = meta_path(palace_path)
+        path.write_text(json.dumps({
+            "mempalace_version": "0.0.0",
+            "chromadb_version": "999.0.0",
+            "chromadb_major": 999,
+        }))
+        with pytest.raises(RuntimeError, match="Refusing to proceed"):
+            search_memories("anything", palace_path)
 
     def test_created_at_contains_filed_at(self, palace_path, seeded_collection):
         """created_at surfaces the filed_at metadata from the drawer."""

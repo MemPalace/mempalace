@@ -11,9 +11,11 @@ import os
 import re
 import sys
 import threading
+from pathlib import Path
 from typing import Optional
 
 from .backends.chroma import ChromaBackend
+from .compat import ensure_palace_safe, read_palace_metadata, write_palace_metadata
 
 logger = logging.getLogger("mempalace_mcp")
 
@@ -45,6 +47,17 @@ SKIP_DIRS = {
 
 _DEFAULT_BACKEND = ChromaBackend()
 
+
+def _has_existing_palace_payload(palace_path: str) -> bool:
+    path = Path(palace_path).expanduser()
+    if not path.exists() or not path.is_dir():
+        return False
+    for child in path.iterdir():
+        if child.name == "mempalace_meta.json":
+            continue
+        return True
+    return False
+
 # Schema version for drawer normalization. Bump when the normalization
 # pipeline changes in a way that existing drawers should be rebuilt to pick up
 # (e.g., new noise-stripping rules). `file_already_mined` treats drawers with
@@ -66,11 +79,21 @@ def get_collection(
         from .config import get_configured_collection_name
 
         collection_name = get_configured_collection_name()
-    return _DEFAULT_BACKEND.get_collection(
+
+    palace_dir = Path(palace_path).expanduser()
+    if create and read_palace_metadata(palace_path) is None and not _has_existing_palace_payload(palace_path):
+        write_palace_metadata(palace_path)
+    elif palace_dir.exists():
+        ensure_palace_safe(palace_path)
+
+    collection = _DEFAULT_BACKEND.get_collection(
         palace_path,
         collection_name=collection_name,
         create=create,
     )
+    if create:
+        write_palace_metadata(palace_path)
+    return collection
 
 
 def get_closets_collection(palace_path: str, create: bool = True):
