@@ -8,12 +8,14 @@ from pathlib import Path
 import chromadb
 import pytest
 
+from mempalace import palace
 from mempalace.backends import (
     GetResult,
     PalaceRef,
     QueryResult,
     UnsupportedFilterError,
     available_backends,
+    get_backend_class,
     get_backend,
 )
 from mempalace.backends.chroma import (
@@ -25,6 +27,15 @@ from mempalace.backends.chroma import (
     _segment_appears_healthy,
     quarantine_invalid_hnsw_metadata,
     quarantine_stale_hnsw,
+)
+from mempalace.backends.postgres import (
+    VECTOR_INDEX_CHECK_INTERVAL_ROWS,
+    VECTOR_INDEX_MIN_ROWS,
+    PostgresBackend,
+    PostgresCollection,
+    _metadata_value,
+    _parse_vector_literal,
+    _vec_literal,
 )
 
 
@@ -69,6 +80,28 @@ class _FakeCollection:
     def count(self):
         self.calls.append(("count", {}))
         return self._count_value
+
+
+class _FakeComposable(str):
+    def format(self, *args):
+        return _FakeComposable(str.format(self, *(str(arg) for arg in args)))
+
+    def join(self, items):
+        return _FakeComposable(str(self).join(str(item) for item in items))
+
+
+class _FakeSql:
+    @staticmethod
+    def SQL(value):
+        return _FakeComposable(value)
+
+    @staticmethod
+    def Identifier(value):
+        return _FakeComposable(f'"{value}"')
+
+    @staticmethod
+    def Placeholder():
+        return _FakeComposable("%s")
 
 
 def test_chroma_collection_returns_typed_query_result():
@@ -154,6 +187,13 @@ def test_registry_exposes_chroma_by_default():
     assert isinstance(get_backend("chroma"), ChromaBackend)
 
 
+def test_registry_exposes_postgres_by_default():
+    names = available_backends()
+    assert "postgres" in names
+    assert get_backend_class("postgres") is PostgresBackend
+    assert isinstance(get_backend("postgres"), PostgresBackend)
+
+
 def test_registry_unknown_backend_raises():
     with pytest.raises(KeyError):
         get_backend("no-such-backend-exists")
@@ -170,6 +210,428 @@ def test_resolve_backend_priority_order(tmp_path):
     assert resolve_backend_for_palace(env_value="qdrant", default="chroma") == "qdrant"
     # falls back to default
     assert resolve_backend_for_palace() == "chroma"
+
+
+def test_vec_literal_formats_postgres_vector_literal():
+    assert _vec_literal([1.0, 0.5, -0.25]) == "[1.00000000,0.50000000,-0.25000000]"
+
+
+def test_parse_vector_literal_accepts_pgvector_text():
+    assert _parse_vector_literal("[1,0.5,-0.25]") == [1.0, 0.5, -0.25]
+    assert _parse_vector_literal([]) == []
+    assert _parse_vector_literal("") == []
+
+
+def test_metadata_value_normalizes_bools_to_chroma_style_strings():
+    assert _metadata_value(True) == "true"
+    assert _metadata_value(False) == "false"
+    assert _metadata_value(7) == "7"
+
+
+def test_postgres_backend_requires_dsn(monkeypatch):
+    monkeypatch.delenv("MEMPALACE_POSTGRES_DSN", raising=False)
+    monkeypatch.delenv("MEMPALACE_PG_DSN", raising=False)
+    backend = PostgresBackend()
+
+    with pytest.raises(RuntimeError, match="no DSN"):
+        backend.get_collection(
+            palace=PalaceRef(id="/tmp/palace", local_path="/tmp/palace"),
+            collection_name="mempalace_drawers",
+            create=False,
+        )
+
+
+def test_postgres_backend_create_false_does_not_setup_missing_table(monkeypatch):
+    calls = []
+
+    class FakeCollection:
+        def __init__(self, dsn, table_name):
+            calls.append(("init", dsn, table_name))
+
+        def _open(self, *, create):
+            calls.append(("open", create))
+            raise FileNotFoundError("missing")
+
+    import mempalace.backends.postgres as postgres_mod
+
+    monkeypatch.setattr(postgres_mod, "PostgresCollection", FakeCollection)
+    backend = PostgresBackend("postgresql://example")
+
+    with pytest.raises(FileNotFoundError):
+        backend.get_collection(
+            palace=PalaceRef(id="/ignored", local_path="/ignored"),
+            collection_name="mempalace_drawers",
+            create=False,
+        )
+
+    assert calls == [("init", "postgresql://example", "mempalace_drawers"), ("open", False)]
+
+
+def test_postgres_backend_create_true_sets_up_collection(monkeypatch):
+    calls = []
+
+    class FakeCollection:
+        def __init__(self, dsn, table_name):
+            self.dsn = dsn
+            self.table_name = table_name
+            calls.append(("init", dsn, table_name))
+
+        def _open(self, *, create):
+            calls.append(("open", create))
+
+        def _ensure_setup(self, *, create):
+            calls.append(("ensure", create))
+
+        def close(self):
+            calls.append(("close", self.table_name))
+
+    import mempalace.backends.postgres as postgres_mod
+
+    monkeypatch.setattr(postgres_mod, "PostgresCollection", FakeCollection)
+    backend = PostgresBackend("postgresql://example")
+    collection = backend.get_collection(
+        palace=PalaceRef(id="/ignored", local_path="/ignored"),
+        collection_name="mempalace_drawers",
+        create=True,
+    )
+
+    assert collection.table_name == "mempalace_drawers"
+    assert calls == [("init", "postgresql://example", "mempalace_drawers"), ("open", True)]
+
+    backend.get_collection(
+        palace=PalaceRef(id="/ignored", local_path="/ignored"),
+        collection_name="mempalace_drawers",
+        create=True,
+    )
+    assert calls[-1] == ("ensure", True)
+
+
+def test_postgres_collection_validates_add_lengths(monkeypatch):
+    collection = PostgresCollection("postgresql://example")
+    monkeypatch.setattr(PostgresCollection, "_ensure_setup", lambda self, **kwargs: None)
+
+    with pytest.raises(ValueError, match="documents and ids"):
+        collection.add(documents=["doc"], ids=[])
+    with pytest.raises(ValueError, match="metadatas and documents"):
+        collection.add(documents=["doc"], ids=["id"], metadatas=[])
+    with pytest.raises(ValueError, match="embeddings and documents"):
+        collection.add(documents=["doc"], ids=["id"], embeddings=[])
+
+
+def test_postgres_query_validates_input_before_loading_driver():
+    collection = PostgresCollection("postgresql://example")
+
+    with pytest.raises(ValueError, match="exactly one"):
+        collection.query()
+    with pytest.raises(ValueError, match="exactly one"):
+        collection.query(query_texts=["q"], query_embeddings=[[0.1]])
+    with pytest.raises(ValueError, match="non-empty"):
+        collection.query(query_embeddings=[])
+    with pytest.raises(ValueError, match="positive"):
+        collection.query(query_embeddings=[[0.1]], n_results=0)
+    with pytest.raises(UnsupportedFilterError, match="where_document"):
+        collection.query(query_embeddings=[[0.1]], where_document={"$contains": "x"})
+
+
+def test_postgres_get_and_delete_reject_empty_ids_before_loading_driver():
+    collection = PostgresCollection("postgresql://example")
+
+    with pytest.raises(ValueError, match="non-empty list in get"):
+        collection.get(ids=[])
+    with pytest.raises(UnsupportedFilterError, match="where_document"):
+        collection.get(where_document={"$contains": "x"})
+    with pytest.raises(ValueError, match="non-empty list in delete"):
+        collection.delete(ids=[])
+
+
+def test_postgres_where_supports_required_operators_without_psycopg2(monkeypatch):
+    collection = PostgresCollection("postgresql://example")
+    monkeypatch.setattr(PostgresCollection, "_sql", property(lambda self: _FakeSql))
+
+    clause, params = collection._where_to_sql({"$or": [{"wing": "a"}, {"room": {"$ne": "b"}}]})
+    assert str(clause) == '("wing" = %s) OR ("room" <> %s)'
+    assert params == ["a", "b"]
+
+    clause, params = collection._where_to_sql({"source_file": {"$in": ["a.py", "b.py"]}})
+    assert str(clause) == "metadata->>%s IN (%s, %s)"
+    assert params == ["source_file", "a.py", "b.py"]
+
+
+def test_postgres_where_rejects_unsupported_filters_without_psycopg2(monkeypatch):
+    collection = PostgresCollection("postgresql://example")
+    monkeypatch.setattr(PostgresCollection, "_sql", property(lambda self: _FakeSql))
+
+    with pytest.raises(UnsupportedFilterError, match="where operator"):
+        collection._where_to_sql({"$gt": 3})
+    with pytest.raises(UnsupportedFilterError, match="field operator"):
+        collection._where_to_sql({"source_mtime": {"$gt": 1}})
+
+
+def test_postgres_upsert_uses_batch_on_conflict_without_delete(monkeypatch):
+    events = []
+
+    class FakeCursor:
+        def execute(self, sql, params=None):
+            events.append(("execute", str(sql), params))
+
+    class FakeConnection:
+        def cursor(self):
+            events.append("cursor")
+            return FakeCursor()
+
+    collection = PostgresCollection("postgresql://example")
+    collection._vec_type = "vector"
+    collection._table_am = "heap"
+    collection._index_am = "hnsw"
+    collection._setup_done = True
+
+    monkeypatch.setattr(PostgresCollection, "_sql", property(lambda self: _FakeSql))
+    monkeypatch.setattr(PostgresCollection, "_get_conn", lambda self: FakeConnection())
+    monkeypatch.setattr(
+        PostgresCollection,
+        "_maybe_create_vector_index",
+        lambda self, **kwargs: events.append(("index", kwargs)),
+    )
+    monkeypatch.setattr(
+        PostgresCollection,
+        "delete",
+        lambda self, **kwargs: (_ for _ in ()).throw(AssertionError("delete must not run")),
+    )
+
+    collection.upsert(
+        documents=["doc1", "doc2"],
+        ids=["same", "same"],
+        metadatas=[{"wing": "w", "room": "r"}, {"wing": "w2", "room": "r2"}],
+        embeddings=[[0.1], [0.2]],
+    )
+
+    assert events[0] == "cursor"
+    assert "FROM unnest(" in events[1][1]
+    assert "ON CONFLICT (id) DO UPDATE" in events[1][1]
+    assert events[1][2][0] == ["same"]
+    assert events[2] == ("index", {"inserted_rows": 1})
+
+
+def test_postgres_query_returns_typed_result_with_outer_shape(monkeypatch):
+    events = []
+
+    class FakeCursor:
+        def execute(self, sql, params=None):
+            events.append(("execute", str(sql), params))
+
+        def fetchall(self):
+            return [("id1", "doc1", "wing1", "room1", {"source_file": "a.py"}, 0.25, "[0.1,0.2]")]
+
+    class FakeConnection:
+        def cursor(self):
+            return FakeCursor()
+
+    collection = PostgresCollection("postgresql://example")
+    collection._vec_type = "vector"
+    collection._table_am = "heap"
+    collection._setup_done = True
+    monkeypatch.setattr(PostgresCollection, "_sql", property(lambda self: _FakeSql))
+    monkeypatch.setattr(PostgresCollection, "_get_conn", lambda self: FakeConnection())
+
+    result = collection.query(query_embeddings=[[0.1], [0.2]], include=["embeddings"])
+
+    assert isinstance(result, QueryResult)
+    assert result.ids == [["id1"], ["id1"]]
+    assert result.documents == [[], []]
+    assert result.metadatas == [[], []]
+    assert result.distances == [[], []]
+    assert result.embeddings == [[[0.1, 0.2]], [[0.1, 0.2]]]
+    assert len(events) == 2
+    assert "embedding::text" in events[0][1]
+
+
+def test_postgres_get_returns_typed_result_with_embeddings(monkeypatch):
+    class FakeCursor:
+        def execute(self, sql, params=None):
+            self.sql = str(sql)
+            self.params = params
+
+        def fetchall(self):
+            return [("id1", "doc1", "wing1", "room1", {"source_file": "a.py"}, "[0.1,0.2]")]
+
+    cursor = FakeCursor()
+
+    class FakeConnection:
+        def cursor(self):
+            return cursor
+
+    collection = PostgresCollection("postgresql://example")
+    collection._setup_done = True
+    monkeypatch.setattr(PostgresCollection, "_sql", property(lambda self: _FakeSql))
+    monkeypatch.setattr(PostgresCollection, "_get_conn", lambda self: FakeConnection())
+
+    result = collection.get(ids=["id1"], include=["documents", "metadatas", "embeddings"])
+
+    assert isinstance(result, GetResult)
+    assert result.ids == ["id1"]
+    assert result.documents == ["doc1"]
+    assert result.metadatas == [{"source_file": "a.py", "wing": "wing1", "room": "room1"}]
+    assert result.embeddings == [[0.1, 0.2]]
+    assert "embedding::text" in cursor.sql
+    assert cursor.params == ["id1"]
+
+
+def test_postgres_estimated_count_uses_catalog_stats_and_local_floor(monkeypatch):
+    events = []
+
+    class FakeCursor:
+        def execute(self, sql, params=None):
+            events.append(("execute", params))
+
+        def fetchone(self):
+            return (42,)
+
+    class FakeConnection:
+        def cursor(self):
+            events.append("cursor")
+            return FakeCursor()
+
+    collection = PostgresCollection("postgresql://example")
+    collection._local_row_estimate = 100
+    monkeypatch.setattr(PostgresCollection, "_get_conn", lambda self: FakeConnection())
+
+    assert collection._estimated_count() == 100
+    assert events == ["cursor", ("execute", (collection.table_name,))]
+
+
+def test_postgres_lazy_vector_index_create_is_serialized(monkeypatch):
+    events = []
+
+    class FakeCursor:
+        def __init__(self):
+            self.fetchone_results = [None, None]
+
+        def execute(self, sql, params=None):
+            events.append(("execute", str(sql), params))
+
+        def fetchone(self):
+            return self.fetchone_results.pop(0)
+
+    cursor = FakeCursor()
+
+    class FakeConnection:
+        def cursor(self):
+            events.append("cursor")
+            return cursor
+
+    collection = PostgresCollection("postgresql://example")
+    collection._vec_type = "vector"
+    collection._table_am = "heap"
+    collection._index_am = "hnsw"
+    collection._rows_since_index_check = VECTOR_INDEX_CHECK_INTERVAL_ROWS
+    monkeypatch.setattr(PostgresCollection, "_sql", property(lambda self: _FakeSql))
+    monkeypatch.setattr(PostgresCollection, "_get_conn", lambda self: FakeConnection())
+    monkeypatch.setattr(
+        PostgresCollection,
+        "_estimated_count",
+        lambda self: events.append(("estimated_count", None, None)) or VECTOR_INDEX_MIN_ROWS,
+    )
+
+    collection._maybe_create_vector_index(inserted_rows=1)
+
+    executed_sql = [event[1] for event in events if event[0] == "execute"]
+    assert "pg_advisory_lock" in executed_sql[1]
+    assert "CREATE INDEX IF NOT EXISTS" in executed_sql[3]
+    assert "pg_advisory_unlock" in executed_sql[4]
+    assert collection._vector_index_ready is True
+
+
+def test_postgres_lazy_vector_index_accepts_compatible_existing_index(monkeypatch):
+    events = []
+
+    class FakeCursor:
+        def execute(self, sql, params=None):
+            events.append(("execute", str(sql), params))
+
+        def fetchone(self):
+            return (1,)
+
+    class FakeConnection:
+        def cursor(self):
+            events.append("cursor")
+            return FakeCursor()
+
+    collection = PostgresCollection("postgresql://example")
+    collection._vec_type = "vector"
+    collection._table_am = "heap"
+    collection._index_am = "hnsw"
+    collection._rows_since_index_check = VECTOR_INDEX_CHECK_INTERVAL_ROWS
+    monkeypatch.setattr(PostgresCollection, "_get_conn", lambda self: FakeConnection())
+    monkeypatch.setattr(
+        PostgresCollection,
+        "_estimated_count",
+        lambda self: (_ for _ in ()).throw(AssertionError("count must not run")),
+    )
+
+    collection._maybe_create_vector_index(inserted_rows=1)
+
+    assert collection._vector_index_ready is True
+    assert len([event for event in events if event[0] == "execute"]) == 1
+    assert "pg_advisory_lock" not in events[1][1]
+
+
+def test_postgres_lazy_vector_index_unlocks_when_create_fails(monkeypatch):
+    events = []
+
+    class FakeCursor:
+        def __init__(self):
+            self.fetchone_results = [None, None]
+
+        def execute(self, sql, params=None):
+            sql_text = str(sql)
+            events.append(("execute", sql_text, params))
+            if "CREATE INDEX" in sql_text:
+                raise RuntimeError("ddl failed")
+
+        def fetchone(self):
+            return self.fetchone_results.pop(0)
+
+    cursor = FakeCursor()
+
+    class FakeConnection:
+        def cursor(self):
+            return cursor
+
+    collection = PostgresCollection("postgresql://example")
+    collection._vec_type = "vector"
+    collection._table_am = "heap"
+    collection._index_am = "hnsw"
+    collection._rows_since_index_check = VECTOR_INDEX_CHECK_INTERVAL_ROWS
+    monkeypatch.setattr(PostgresCollection, "_sql", property(lambda self: _FakeSql))
+    monkeypatch.setattr(PostgresCollection, "_get_conn", lambda self: FakeConnection())
+    monkeypatch.setattr(PostgresCollection, "_estimated_count", lambda self: VECTOR_INDEX_MIN_ROWS)
+
+    with pytest.raises(RuntimeError, match="ddl failed"):
+        collection._maybe_create_vector_index(inserted_rows=1)
+
+    assert "pg_advisory_unlock" in events[-1][1]
+    assert collection._vector_index_ready is False
+
+
+def test_palace_get_collection_selects_postgres_backend_from_env(monkeypatch):
+    calls = []
+
+    class FakeBackend:
+        def get_collection(self, *, palace, collection_name, create, options=None):
+            calls.append((palace, collection_name, create, options))
+            return "postgres-collection"
+
+    monkeypatch.setenv("MEMPALACE_BACKEND", "postgres")
+    monkeypatch.setenv("MEMPALACE_POSTGRES_DSN", "postgresql://example")
+    monkeypatch.setattr(palace, "get_backend", lambda name: FakeBackend())
+
+    result = palace.get_collection("/ignored", create=True)
+
+    assert result == "postgres-collection"
+    assert calls[0][0] == PalaceRef(id="/ignored", local_path="/ignored")
+    assert calls[0][1] == "mempalace_drawers"
+    assert calls[0][2] is True
+    assert calls[0][3] == {"dsn": "postgresql://example"}
 
 
 def test_chroma_detect_matches_palace_with_chroma_sqlite(tmp_path):
@@ -821,9 +1283,9 @@ def test_make_client_quarantines_only_on_first_call_per_palace(tmp_path, monkeyp
     ChromaBackend.make_client(palace_path)
     ChromaBackend.make_client(palace_path)
 
-    assert calls == [
-        palace_path
-    ], "quarantine_stale_hnsw should fire once per palace per process, not on every reconnect"
+    assert calls == [palace_path], (
+        "quarantine_stale_hnsw should fire once per palace per process, not on every reconnect"
+    )
 
 
 def test_make_client_gates_invalid_metadata_on_first_call(tmp_path, monkeypatch):
@@ -939,9 +1401,9 @@ def test_client_quarantines_only_on_first_call_per_palace(tmp_path, monkeypatch)
     finally:
         backend.close()
 
-    assert (
-        calls == [palace_path]
-    ), "quarantine_stale_hnsw should fire once per palace per process from _client(), not on every call"
+    assert calls == [palace_path], (
+        "quarantine_stale_hnsw should fire once per palace per process from _client(), not on every call"
+    )
 
 
 # ── _pin_hnsw_threads (per-process retrofit, separate from this PR's gate) ──
@@ -1240,19 +1702,23 @@ def test_palace_get_collection_uses_configured_collection_name(monkeypatch):
 
     captured = {}
 
-    def fake_get_collection(palace_path, collection_name=None, create=False):
-        captured["palace_path"] = palace_path
-        captured["collection_name"] = collection_name
-        captured["create"] = create
-        return object()
+    class FakeBackend:
+        def get_collection(self, *, palace, collection_name, create, options=None):
+            captured["palace"] = palace
+            captured["options"] = options
+            captured["collection_name"] = collection_name
+            captured["create"] = create
+            return object()
 
-    monkeypatch.setattr(palace._DEFAULT_BACKEND, "get_collection", fake_get_collection)
-    monkeypatch.setattr("mempalace.config.get_configured_collection_name", lambda: "custom_drawers")
+    monkeypatch.setattr(palace, "get_backend", lambda name: FakeBackend())
+    monkeypatch.setenv("MEMPALACE_COLLECTION_NAME", "custom_drawers")
+    monkeypatch.delenv("MEMPALACE_BACKEND", raising=False)
 
     palace.get_collection("/palace", create=False)
 
     assert captured == {
-        "palace_path": "/palace",
+        "palace": PalaceRef(id="/palace", local_path="/palace"),
+        "options": None,
         "collection_name": "custom_drawers",
         "create": False,
     }

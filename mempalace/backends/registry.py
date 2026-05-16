@@ -178,12 +178,15 @@ def resolve_backend_for_palace(
 
 
 def _register_builtins() -> None:
-    """Register chroma as the in-tree default."""
+    """Register in-tree backends."""
     from .chroma import ChromaBackend
+    from .postgres import PostgresBackend
 
     # Use setdefault semantics so a caller that pre-registered for tests wins.
     if "chroma" not in _registry:
         _registry["chroma"] = ChromaBackend
+    if "postgres" not in _registry:
+        _registry["postgres"] = PostgresBackend
 
 
 _register_builtins()

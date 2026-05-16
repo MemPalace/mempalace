@@ -81,3 +81,33 @@ def test_collection_name_from_config(tmp_path):
     )
     cfg = MempalaceConfig(config_dir=str(tmp_path))
     assert cfg.collection_name == "custom_col"
+
+
+def test_collection_name_from_env_overrides_config(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps({"collection_name": "custom_col"}), encoding="utf-8"
+    )
+    os.environ["MEMPALACE_COLLECTION_NAME"] = "env_col"
+    try:
+        cfg = MempalaceConfig(config_dir=str(tmp_path))
+        assert cfg.collection_name == "env_col"
+    finally:
+        del os.environ["MEMPALACE_COLLECTION_NAME"]
+
+
+def test_backend_and_postgres_dsn_from_env(tmp_path):
+    os.environ["MEMPALACE_BACKEND"] = "pg"
+    os.environ["MEMPALACE_POSTGRES_DSN"] = "postgresql://example"
+    try:
+        cfg = MempalaceConfig(config_dir=str(tmp_path))
+        assert cfg.backend == "postgres"
+        assert cfg.postgres_dsn == "postgresql://example"
+    finally:
+        del os.environ["MEMPALACE_BACKEND"]
+        del os.environ["MEMPALACE_POSTGRES_DSN"]
+
+
+def test_backend_override_is_none_without_explicit_config(tmp_path):
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.backend == "chroma"
+    assert cfg.backend_override is None

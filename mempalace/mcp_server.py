@@ -185,7 +185,7 @@ def _is_transient_index_error(result) -> bool:
 def _force_chroma_cache_reset() -> None:
     # Drop both the MCP-local client cache and the shared backend's
     # per-palace cache so the next call rebuilds against the post-flush
-    # state. Without clearing _DEFAULT_BACKEND._clients the retry
+    # state. Without clearing ChromaBackend._clients the retry
     # would just hit the same stale handle, since tool_search routes
     # via search_memories -> palace.get_collection -> backend cache.
     global \
@@ -202,10 +202,9 @@ def _force_chroma_cache_reset() -> None:
     _metadata_cache = None
     _metadata_cache_time = 0
     try:
-        from .palace import _DEFAULT_BACKEND
+        from .palace import get_backend
 
-        _DEFAULT_BACKEND._clients.pop(_config.palace_path, None)
-        _DEFAULT_BACKEND._freshness.pop(_config.palace_path, None)
+        get_backend("chroma").close_palace(_config.palace_path)
     except Exception:
         pass
 
@@ -1619,7 +1618,14 @@ def tool_reconnect():
 
     close_errors = []
     try:
-        palace_module._DEFAULT_BACKEND.close_palace(_config.palace_path)
+        backend_name = palace_module.resolve_backend_for_palace(
+            config_value=_config.backend_override,
+            palace_path=_config.palace_path,
+            default="chroma",
+        )
+        palace_module.get_backend(backend_name).close_palace(
+            palace_module.PalaceRef(id=_config.palace_path, local_path=_config.palace_path)
+        )
     except Exception as exc:
         logger.debug("Failed to close shared palace backend during reconnect", exc_info=True)
         close_errors.append(f"backend close_palace failed: {exc}")

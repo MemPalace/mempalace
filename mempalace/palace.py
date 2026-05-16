@@ -13,7 +13,8 @@ import sys
 import threading
 from typing import Optional
 
-from .backends.chroma import ChromaBackend
+from .backends import PalaceRef, get_backend, resolve_backend_for_palace
+from .config import MempalaceConfig
 
 logger = logging.getLogger("mempalace_mcp")
 
@@ -43,8 +44,6 @@ SKIP_DIRS = {
     "target",
 }
 
-_DEFAULT_BACKEND = ChromaBackend()
-
 # Schema version for drawer normalization. Bump when the normalization
 # pipeline changes in a way that existing drawers should be rebuilt to pick up
 # (e.g., new noise-stripping rules). `file_already_mined` treats drawers with
@@ -62,14 +61,24 @@ def get_collection(
     create: bool = True,
 ):
     """Get the palace collection through the backend layer."""
+    config = MempalaceConfig()
     if collection_name is None:
-        from .config import get_configured_collection_name
+        collection_name = config.collection_name
 
-        collection_name = get_configured_collection_name()
-    return _DEFAULT_BACKEND.get_collection(
-        palace_path,
+    backend_name = resolve_backend_for_palace(
+        config_value=config.backend_override,
+        palace_path=palace_path,
+        default="chroma",
+    )
+    options = None
+    if backend_name == "postgres":
+        options = {"dsn": config.postgres_dsn} if config.postgres_dsn else None
+
+    return get_backend(backend_name).get_collection(
+        palace=PalaceRef(id=palace_path, local_path=palace_path),
         collection_name=collection_name,
         create=create,
+        options=options,
     )
 
 

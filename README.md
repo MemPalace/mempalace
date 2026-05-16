@@ -38,7 +38,9 @@ can be scoped rather than run against a flat corpus.
 The retrieval layer is pluggable. The current default is ChromaDB; the
 interface is defined in [`mempalace/backends/base.py`](mempalace/backends/base.py)
 and alternative backends can be dropped in without touching the rest of
-the system.
+the system. An optional PostgreSQL backend is available for server-mode
+deployments with `pgvector` or `pg_sorted_heap`; see
+[`docs/postgres_backend.md`](docs/postgres_backend.md).
 
 Nothing leaves your machine unless you opt in.
 
@@ -177,6 +179,7 @@ No API key is required for the core benchmark path.
 - Getting started → [mempalaceofficial.com/guide/getting-started](https://mempalaceofficial.com/guide/getting-started.html)
 - CLI reference → [mempalaceofficial.com/reference/cli](https://mempalaceofficial.com/reference/cli.html)
 - Python API → [mempalaceofficial.com/reference/python-api](https://mempalaceofficial.com/reference/python-api.html)
+- PostgreSQL backend → [docs/postgres_backend.md](docs/postgres_backend.md)
 - Full benchmark methodology → [benchmarks/BENCHMARKS.md](benchmarks/BENCHMARKS.md)
 - Release notes → [CHANGELOG.md](CHANGELOG.md)
 - Corrections and public notices → [docs/HISTORY.md](docs/HISTORY.md)

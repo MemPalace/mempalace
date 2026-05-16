@@ -12,6 +12,7 @@ Public surface:
 * Registry: :func:`get_backend`, :func:`register`, :func:`available_backends`,
   :func:`resolve_backend_for_palace`.
 * In-tree Chroma default: :class:`ChromaBackend`, :class:`ChromaCollection`.
+* Optional PostgreSQL backend: :class:`PostgresBackend`, :class:`PostgresCollection`.
 """
 
 from .base import (
@@ -29,6 +30,7 @@ from .base import (
     UnsupportedFilterError,
 )
 from .chroma import ChromaBackend, ChromaCollection
+from .postgres import PostgresBackend, PostgresCollection
 from .registry import (
     available_backends,
     get_backend,
@@ -52,6 +54,8 @@ __all__ = [
     "HealthStatus",
     "PalaceNotFoundError",
     "PalaceRef",
+    "PostgresBackend",
+    "PostgresCollection",
     "QueryResult",
     "UnsupportedFilterError",
     "available_backends",

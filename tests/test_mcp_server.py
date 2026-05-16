@@ -650,9 +650,9 @@ class TestWriteTools:
 
         assert result1["success"] is True
         assert result2["success"] is True
-        assert (
-            result1["drawer_id"] != result2["drawer_id"]
-        ), "Documents with shared header but different content must have distinct drawer IDs"
+        assert result1["drawer_id"] != result2["drawer_id"], (
+            "Documents with shared header but different content must have distinct drawer IDs"
+        )
 
     def test_delete_drawer(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -1520,7 +1520,12 @@ class TestCacheInvalidation:
         from mempalace import mcp_server, palace
 
         close_palace = MagicMock()
-        monkeypatch.setattr(palace._DEFAULT_BACKEND, "close_palace", close_palace)
+
+        class _FakeBackend:
+            def close_palace(self, palace_ref):
+                close_palace(palace_ref)
+
+        monkeypatch.setattr(palace, "get_backend", lambda name: _FakeBackend())
 
         class _FakeCol:
             def count(self):
@@ -1530,7 +1535,9 @@ class TestCacheInvalidation:
 
         result = mcp_server.tool_reconnect()
         assert result["success"] is True
-        close_palace.assert_called_once_with(config.palace_path)
+        close_palace.assert_called_once_with(
+            palace.PalaceRef(id=config.palace_path, local_path=config.palace_path)
+        )
 
     def test_get_collection_create_true_avoids_get_or_create_on_reopen(
         self, monkeypatch, config, palace_path, kg
@@ -1617,9 +1624,9 @@ class TestCacheInvalidation:
         all_calls = captured["get"] + captured["create"]
         assert all_calls, "expected get_collection or create_collection to be called"
         for kwargs in all_calls:
-            assert (
-                "embedding_function" in kwargs
-            ), f"missing embedding_function= in chromadb call: {kwargs}"
+            assert "embedding_function" in kwargs, (
+                f"missing embedding_function= in chromadb call: {kwargs}"
+            )
             assert kwargs["embedding_function"] is not None
 
         # Same expectation on the create=False (cache-miss) reopen path.

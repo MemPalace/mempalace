@@ -181,6 +181,7 @@ def sanitize_content(value: str, max_length: int = 100_000) -> str:
 
 DEFAULT_PALACE_PATH = os.path.expanduser("~/.mempalace/palace")
 DEFAULT_COLLECTION_NAME = "mempalace_drawers"
+DEFAULT_BACKEND = "chroma"
 
 
 @lru_cache(maxsize=1)
@@ -249,6 +250,16 @@ DEFAULT_HALL_KEYWORDS = {
 }
 
 
+def _normalize_backend_name(raw):
+    backend = str(raw).strip().lower()
+    aliases = {
+        "chromadb": "chroma",
+        "pg": "postgres",
+        "postgresql": "postgres",
+    }
+    return aliases.get(backend, backend)
+
+
 class MempalaceConfig:
     """Configuration manager for MemPalace.
 
@@ -289,8 +300,36 @@ class MempalaceConfig:
 
     @property
     def collection_name(self):
-        """ChromaDB collection name."""
+        """Storage collection name."""
+        env_val = os.environ.get("MEMPALACE_COLLECTION_NAME")
+        if env_val:
+            return env_val
         return self._file_config.get("collection_name", DEFAULT_COLLECTION_NAME)
+
+    @property
+    def backend(self):
+        """Storage backend name.
+
+        Chroma remains the default. PostgreSQL must be explicitly enabled with
+        MEMPALACE_BACKEND=postgres or config.json {"backend": "postgres"}.
+        """
+        return self.backend_override or DEFAULT_BACKEND
+
+    @property
+    def backend_override(self):
+        """Explicit backend selection from env/config, or None for auto/default resolution."""
+        raw = os.environ.get("MEMPALACE_BACKEND") or self._file_config.get("backend")
+        if raw:
+            return _normalize_backend_name(raw)
+        return None
+
+    @property
+    def postgres_dsn(self):
+        """PostgreSQL DSN for the optional PostgreSQL backend."""
+        env_val = os.environ.get("MEMPALACE_POSTGRES_DSN") or os.environ.get("MEMPALACE_PG_DSN")
+        if env_val:
+            return env_val
+        return self._file_config.get("postgres_dsn") or self._file_config.get("pg_dsn")
 
     @property
     def people_map(self):
@@ -540,6 +579,7 @@ class MempalaceConfig:
             default_config = {
                 "palace_path": DEFAULT_PALACE_PATH,
                 "collection_name": DEFAULT_COLLECTION_NAME,
+                "backend": DEFAULT_BACKEND,
                 "topic_wings": DEFAULT_TOPIC_WINGS,
                 "hall_keywords": DEFAULT_HALL_KEYWORDS,
             }
