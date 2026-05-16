@@ -288,7 +288,6 @@ def _ensure_secure_wal_permissions():
         pass
 
 
-_ensure_secure_wal_permissions()
 # Atomically create WAL file with restricted permissions (no TOCTOU race).
 # os.open with O_CREAT|O_WRONLY and mode 0o600 creates the file if absent
 # or opens it if present, both in a single syscall.
@@ -325,7 +324,6 @@ def _wal_log(operation: str, params: dict, result: dict = None):
         fd = os.open(str(_WAL_FILE), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         with os.fdopen(fd, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, default=str) + "\n")
-        _ensure_secure_wal_permissions()
     except Exception as e:
         logger.error(f"WAL write failed: {e}")
 

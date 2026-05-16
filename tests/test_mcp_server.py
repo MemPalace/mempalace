@@ -62,7 +62,7 @@ class TestWalPermissions:
         assert (wal_dir, 0o700) in calls
         assert (wal_file, 0o600) in calls
 
-    def test_wal_log_hardens_before_and_after_append(self, tmp_path, monkeypatch):
+    def test_wal_log_hardens_before_append(self, tmp_path, monkeypatch):
         from mempalace import mcp_server
 
         wal_file = tmp_path / "write_log.jsonl"
@@ -76,7 +76,7 @@ class TestWalPermissions:
 
         mcp_server._wal_log("test_operation", {"content": "secret", "safe": "ok"})
 
-        assert calls == ["secure", "secure"]
+        assert calls == ["secure"]
         entry = json.loads(wal_file.read_text(encoding="utf-8"))
         assert entry["operation"] == "test_operation"
         assert entry["params"]["content"] == "[REDACTED 6 chars]"
