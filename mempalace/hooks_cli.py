@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -332,6 +333,173 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+# -- Failure circuit breaker (#1518 cascade prevention) ---------------------
+#
+# Per-target PID slots + O_EXCL claims (above) defeat *concurrent* re-fires
+# of the same target. They do not defeat a *serial* cascade: if a mine
+# subprocess crashes (e.g. the import of chromadb + a heavy embedding
+# backend pushes commit charge past the system limit on Windows, OOM
+# killer fires on Linux, or the 60s ``_mine_sync`` timeout trips), the
+# slot becomes stale and the very next hook fire happily reclaims it and
+# spawns a fresh mine that crashes the same way. Twelve cascaded mines in
+# under an hour have been observed in the wild on Windows, each reserving
+# 320-352 GB of virtual address space before dying.
+#
+# The breaker watches for "PID died before plausibly completing real work"
+# (default: faster than 30 seconds since spawn) and treats that as a
+# failure. After N consecutive failures it imposes an exponential cooldown
+# during which both ``_maybe_auto_ingest`` and ``_mine_sync`` short-circuit
+# without spawning anything. A spawn that survives the threshold resets
+# the counter.
+#
+# Heuristic note: we do not currently capture exit codes (the hook is a
+# new process per fire; no Popen handle survives), so runtime is the only
+# signal available without a wrapper shim. The 30s default is generous
+# enough that a real mine completing quickly on a tiny corpus may be
+# misclassified as a failure once, which only delays the *next* spawn by
+# 60s — a harmless trade for stopping a runaway cascade dead.
+_MINE_FAIL_FILE = STATE_DIR / "mine.failures.json"
+_COOLDOWN_LADDER_SEC = (60, 300, 1800)  # 1 min, 5 min, 30 min
+
+
+def _success_threshold_sec() -> float:
+    try:
+        return float(os.environ.get("MEMPALACE_HOOK_SUCCESS_THRESHOLD_SEC", "30"))
+    except (TypeError, ValueError):
+        return 30.0
+
+
+def _read_failure_state() -> dict:
+    try:
+        data = json.loads(_MINE_FAIL_FILE.read_text())
+    except (OSError, ValueError):
+        return {"consecutive": 0, "cooldown_until": 0}
+    if not isinstance(data, dict):
+        return {"consecutive": 0, "cooldown_until": 0}
+    return {
+        "consecutive": int(data.get("consecutive", 0)),
+        "cooldown_until": float(data.get("cooldown_until", 0) or 0),
+    }
+
+
+def _write_failure_state(state: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        _MINE_FAIL_FILE.write_text(json.dumps(state))
+    except OSError:
+        pass
+
+
+def _record_failure() -> None:
+    state = _read_failure_state()
+    state["consecutive"] = min(state["consecutive"] + 1, len(_COOLDOWN_LADDER_SEC))
+    delay = _COOLDOWN_LADDER_SEC[state["consecutive"] - 1]
+    state["cooldown_until"] = time.time() + delay
+    _write_failure_state(state)
+    _log(
+        f"mine failure {state['consecutive']}/{len(_COOLDOWN_LADDER_SEC)} recorded; "
+        f"cooldown {delay}s"
+    )
+
+
+def _record_success() -> None:
+    if _MINE_FAIL_FILE.exists():
+        try:
+            _MINE_FAIL_FILE.unlink()
+        except OSError:
+            pass
+
+
+def _in_cooldown() -> bool:
+    state = _read_failure_state()
+    return time.time() < state["cooldown_until"]
+
+
+def _reap_finished_mines() -> None:
+    """Inspect per-target PID slots; classify each finished spawn as
+    success or failure based on how long it ran.
+
+    Runs at the head of ``_maybe_auto_ingest`` / ``_mine_sync`` so the
+    classification reflects the state of the *previous* fire(s) before
+    deciding whether to spawn again. Live PIDs are left alone.
+    """
+    if not _MINE_PID_DIR.exists():
+        return
+    threshold = _success_threshold_sec()
+    now = time.time()
+    for slot in _MINE_PID_DIR.glob("mine_*.pid"):
+        try:
+            recorded = slot.read_text().strip()
+            mtime = slot.stat().st_mtime
+        except OSError:
+            continue
+        if not recorded.isdigit():
+            continue
+        pid = int(recorded)
+        if _pid_alive(pid):
+            continue
+        # Dead PID — classify and release the slot.
+        runtime = now - mtime
+        if runtime < threshold:
+            _record_failure()
+        else:
+            _record_success()
+        try:
+            slot.unlink()
+        except OSError:
+            pass
+
+
+def _commit_pressure_high() -> bool:
+    """Return True when the system is close enough to its commit-charge
+    ceiling that spawning another heavy mine would risk pushing it over.
+
+    Only meaningful on Windows, where commit charge (RAM + pagefile) is a
+    hard ceiling: once exhausted, *any* process VirtualAlloc fails — not
+    just the offender — which can wedge the desktop session. On POSIX,
+    overcommit and an OOM killer give a much softer failure mode, so we
+    skip this check there.
+
+    Tunable via ``MEMPALACE_COMMIT_GUARD_RATIO`` (default 0.85). Set
+    ``MEMPALACE_HOOK_DISABLE_COMMIT_GUARD=1`` to opt out entirely.
+    """
+    if sys.platform != "win32":
+        return False
+    if os.environ.get("MEMPALACE_HOOK_DISABLE_COMMIT_GUARD") in ("1", "true", "True"):
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", wintypes.DWORD),
+                ("dwMemoryLoad", wintypes.DWORD),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        stat = MEMORYSTATUSEX()
+        stat.dwLength = ctypes.sizeof(stat)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+            return False
+        if stat.ullTotalPageFile == 0:
+            return False
+        used_ratio = 1.0 - (stat.ullAvailPageFile / stat.ullTotalPageFile)
+    except (OSError, AttributeError, ZeroDivisionError):
+        return False
+    try:
+        threshold = float(os.environ.get("MEMPALACE_COMMIT_GUARD_RATIO", "0.85"))
+    except (TypeError, ValueError):
+        threshold = 0.85
+    return used_ratio > threshold
+
+
 def _mine_already_running(cmd: list[str]) -> bool:
     """Return True if a previous mine for ``cmd``'s target is still alive."""
     pid_file = _pid_file_for_cmd(cmd)
@@ -436,9 +604,20 @@ def _maybe_auto_ingest():
     target gets its own PID slot, so distinct targets never block each
     other but a re-fire of the same target while the previous one is
     still running is silently skipped.
+
+    A failure circuit breaker (#1518) and Windows commit-charge guard
+    short-circuit the spawn when the previous mine(s) died young or
+    when system commit charge is already near its hard ceiling.
     """
     targets = _get_mine_targets()
     if not targets:
+        return
+    _reap_finished_mines()
+    if _in_cooldown():
+        _log("Skipping auto-ingest: previous mines failed; cooldown active")
+        return
+    if _commit_pressure_high():
+        _log("Skipping auto-ingest: system commit pressure too high")
         return
     for mine_dir, mode in targets:
         try:
@@ -453,9 +632,19 @@ def _mine_sync():
     Transcript convos are ingested separately via ``_ingest_transcript``
     in ``hook_precompact`` — keeping them out of this function avoids
     timeout stacking against the harness 30s ceiling (#1231 review).
+
+    Honors the same failure circuit breaker and Windows commit-charge
+    guard as ``_maybe_auto_ingest`` (#1518).
     """
     targets = _get_mine_targets()
     if not targets:
+        return
+    _reap_finished_mines()
+    if _in_cooldown():
+        _log("Skipping mine_sync: previous mines failed; cooldown active")
+        return
+    if _commit_pressure_high():
+        _log("Skipping mine_sync: system commit pressure too high")
         return
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     log_path = STATE_DIR / "hook.log"
