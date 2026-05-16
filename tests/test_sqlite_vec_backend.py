@@ -424,8 +424,11 @@ def test_two_collections_isolated_in_same_palace(backend, palace_dir):
 
 def test_translate_where_eq():
     sql, params = _translate_where({"wing": "x"})
+    # json_extract(metadata_json, '$.wing') is rendered as
+    # json_extract(metadata_json, ?), with '$.wing' bound as a parameter.
+    assert "json_extract" in sql
     assert "= ?" in sql
-    assert params == ["x"]
+    assert params == ["$.wing", "x"]
 
 
 def test_translate_where_and_or_combination():
@@ -434,11 +437,24 @@ def test_translate_where_and_or_combination():
     )
     assert "AND" in sql
     assert "OR" in sql
-    # Order is implementation-defined; only the multiset of params matters.
-    assert len(params) == 3
+    # Each json_extract emission adds one path param plus the comparison value.
+    # Three field accesses (wing, score, score) → three path params.
+    assert params.count("$.wing") == 1
+    assert params.count("$.score") == 2
     assert "x" in params
     assert 1 in params
     assert 2 in params
+
+
+def test_translate_where_field_name_rejects_injection():
+    from mempalace.backends.sqlite_vec import _FIELD_NAME_RE  # type: ignore
+    assert _FIELD_NAME_RE.match("wing")
+    assert _FIELD_NAME_RE.match("tenant_id")
+    assert not _FIELD_NAME_RE.match("wing'; DROP TABLE items--")
+    assert not _FIELD_NAME_RE.match("wing.nested")
+    assert not _FIELD_NAME_RE.match("$wing")
+    with pytest.raises(UnsupportedFilterError, match="metadata field"):
+        _translate_where({"wing'; DROP TABLE items--": "x"})
 
 
 def test_translate_where_in_empty_list_raises():
@@ -463,6 +479,28 @@ def test_translate_where_document_other_op_raises():
 
 
 def test_sanitize_table_suffix_handles_special_chars():
-    assert _sanitize_table_suffix("hello-world") == "hello_world"
+    # Short cleanly-sanitised names round-trip unchanged.
+    assert _sanitize_table_suffix("hello_world") == "hello_world"
+    # Names that required substitution get a hash suffix to keep distinct
+    # originals distinguishable post-sanitisation.
+    s_dash = _sanitize_table_suffix("hello-world")
+    assert s_dash.startswith("hello_world_") and len(s_dash) == len("hello_world_") + 8
     assert _sanitize_table_suffix("123abc").startswith("c_")
-    assert _sanitize_table_suffix("") == "_anon"
+    # Empty input still produces a usable identifier (with stable hash suffix).
+    empty = _sanitize_table_suffix("")
+    assert empty.startswith("_anon_") and len(empty) == len("_anon_") + 8
+
+
+def test_sanitize_table_suffix_distinguishes_long_prefixes():
+    a = _sanitize_table_suffix("a" * 45 + "_one")
+    b = _sanitize_table_suffix("a" * 45 + "_two")
+    assert a != b, "long collection names with identical 40-char prefixes must differ"
+
+
+def test_pack_vec_uses_little_endian():
+    import struct
+    from mempalace.backends.sqlite_vec import _pack_vec, _unpack_vec  # type: ignore
+    blob = _pack_vec([1.0, 2.0, 3.0])
+    # Little-endian float32 of [1, 2, 3].
+    assert blob == struct.pack("<3f", 1.0, 2.0, 3.0)
+    assert _unpack_vec(blob) == [1.0, 2.0, 3.0]

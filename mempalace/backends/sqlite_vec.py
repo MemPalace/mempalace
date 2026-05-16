@@ -16,15 +16,19 @@ $and, $or, $contains, $gt, $gte, $lt, $lte) via SQLite json_extract.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import re
 import sqlite3
 import struct
+import threading
 from typing import Any, ClassVar, Optional
 
-import sqlite_vec as _sqlite_vec_ext
+# ``sqlite_vec`` is an optional dependency: imported lazily inside ``_open_db``
+# so the registry can advertise this backend (``available_backends()``) on
+# every install without crashing default-Chroma users at import time.
 
 from .base import (
     BackendClosedError,
@@ -55,24 +59,42 @@ _SUPPORTED_OPERATORS = _REQUIRED_OPERATORS | _OPTIONAL_OPERATORS
 
 
 def _sanitize_table_suffix(name: str) -> str:
-    """Sanitize collection name into safe SQL identifier suffix."""
-    sanitized = re.sub(r"[^a-zA-Z0-9_]", "_", name)
-    if not sanitized:
-        sanitized = "_anon"
-    elif sanitized[0].isdigit():
+    """Sanitize a collection name into a safe SQL identifier suffix.
+
+    When the input is already a clean ``[a-zA-Z_][a-zA-Z0-9_]*`` token of at
+    most 40 characters, the original name is used verbatim. Otherwise a short
+    hash of the original name is appended so that two collections whose first
+    40 sanitised characters collide still get distinct virtual-table names
+    (review feedback on PR #1525).
+    """
+    needs_hash = len(name) > 40 or not _FIELD_NAME_RE.match(name)
+    sanitized = re.sub(r"[^a-zA-Z0-9_]", "_", name) or "_anon"
+    if sanitized[0].isdigit():
         sanitized = f"c_{sanitized}"
-    return sanitized[:48]
+    if not needs_hash:
+        return sanitized[:48]
+    digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
+    return f"{sanitized[:40]}_{digest}"
+
+
+# Field names valid for direct identifier use in SQL. Everything else routes
+# through ``json_extract`` with a parameter-bound path (review feedback on
+# PR #1525: f-string interpolation of metadata keys is SQL-injection-shaped).
+_FIELD_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 
 def _pack_vec(values) -> bytes:
+    # ``sqlite-vec`` consumes 32-bit floats in little-endian regardless of
+    # host architecture; pin the format prefix so a palace remains portable
+    # across machines (review feedback on PR #1525).
     if not isinstance(values, (list, tuple)):
         values = list(values)
-    return struct.pack(f"{len(values)}f", *values)
+    return struct.pack(f"<{len(values)}f", *values)
 
 
 def _unpack_vec(blob: bytes) -> list[float]:
     n = len(blob) // 4
-    return list(struct.unpack(f"{n}f", blob))
+    return list(struct.unpack(f"<{n}f", blob))
 
 
 # ---------------------------------------------------------------------------
@@ -133,23 +155,46 @@ def _translate_node(node: Any, *, alias: str) -> tuple[str, list[Any]]:
     return " AND ".join(parts), all_params
 
 
-def _field_expr(field: str, *, alias: str) -> str:
-    """Return SQL expression for accessing field — either column or json_extract."""
+def _field_expr(field: str, *, alias: str) -> tuple[str, list[Any]]:
+    """Return SQL expression for accessing a field plus any params it needs.
+
+    ``document`` and ``id`` resolve to identifier columns. Anything else
+    routes through ``json_extract(metadata_json, ?)`` with the JSON path
+    bound as a parameter — never interpolated into the SQL string — to
+    foreclose SQL injection through user-supplied where keys (review
+    feedback on PR #1525).
+    """
     if field == "document":
-        return f"{alias}.document"
+        return f"{alias}.document", []
     if field == "id":
-        return f"{alias}.id"
-    # Default: read from metadata_json
-    return f"json_extract({alias}.metadata_json, '$.{field}')"
+        return f"{alias}.id", []
+    if not _FIELD_NAME_RE.match(field):
+        raise UnsupportedFilterError(
+            f"metadata field {field!r} must match [a-zA-Z_][a-zA-Z0-9_]* "
+            "(nested JSON paths not supported)"
+        )
+    return f"json_extract({alias}.metadata_json, ?)", [f"$.{field}"]
 
 
 def _translate_field(field: str, value: Any, *, alias: str) -> tuple[str, list[Any]]:
-    """Translate {field: value-or-operator-dict} pair."""
-    expr = _field_expr(field, alias=alias)
+    """Translate {field: value-or-operator-dict} pair.
+
+    Every emission of the field expression is paired with its parameters
+    (currently empty for column accesses, ``['$.field']`` for json_extract)
+    so the placeholder order stays consistent with the resulting SQL.
+    """
+    expr, expr_params = _field_expr(field, alias=alias)
+
+    def emit(template: str, *values: Any) -> tuple[str, list[Any]]:
+        """Replace one or two ``{expr}`` markers; emit ``expr_params`` per copy."""
+        copies = template.count("{expr}")
+        rendered = template.replace("{expr}", expr)
+        return rendered, list(expr_params) * copies + list(values)
 
     # Plain scalar → $eq
     if not isinstance(value, dict):
-        return f"{expr} = ?", [value]
+        sql, params = emit("{expr} = ?", value)
+        return sql, params
 
     # Operator dict
     parts: list[str] = []
@@ -158,38 +203,31 @@ def _translate_field(field: str, value: Any, *, alias: str) -> tuple[str, list[A
         if op not in _SUPPORTED_OPERATORS:
             raise UnsupportedFilterError(f"operator {op!r} not supported by sqlite-vec backend")
         if op == "$eq":
-            parts.append(f"{expr} = ?")
-            params.append(op_val)
+            sql, p = emit("{expr} = ?", op_val)
         elif op == "$ne":
-            parts.append(f"({expr} IS NULL OR {expr} != ?)")
-            params.append(op_val)
+            sql, p = emit("({expr} IS NULL OR {expr} != ?)", op_val)
         elif op == "$in":
             if not isinstance(op_val, (list, tuple)) or not op_val:
                 raise UnsupportedFilterError("$in requires non-empty list")
             placeholders = ",".join("?" for _ in op_val)
-            parts.append(f"{expr} IN ({placeholders})")
-            params.extend(op_val)
+            sql, p = emit(f"{{expr}} IN ({placeholders})", *op_val)
         elif op == "$nin":
             if not isinstance(op_val, (list, tuple)) or not op_val:
                 raise UnsupportedFilterError("$nin requires non-empty list")
             placeholders = ",".join("?" for _ in op_val)
-            parts.append(f"({expr} IS NULL OR {expr} NOT IN ({placeholders}))")
-            params.extend(op_val)
+            sql, p = emit(f"({{expr}} IS NULL OR {{expr}} NOT IN ({placeholders}))", *op_val)
         elif op == "$contains":
-            parts.append(f"{expr} LIKE ?")
-            params.append(f"%{op_val}%")
+            sql, p = emit("{expr} LIKE ?", f"%{op_val}%")
         elif op == "$gt":
-            parts.append(f"{expr} > ?")
-            params.append(op_val)
+            sql, p = emit("{expr} > ?", op_val)
         elif op == "$gte":
-            parts.append(f"{expr} >= ?")
-            params.append(op_val)
+            sql, p = emit("{expr} >= ?", op_val)
         elif op == "$lt":
-            parts.append(f"{expr} < ?")
-            params.append(op_val)
+            sql, p = emit("{expr} < ?", op_val)
         elif op == "$lte":
-            parts.append(f"{expr} <= ?")
-            params.append(op_val)
+            sql, p = emit("{expr} <= ?", op_val)
+        parts.append(sql)
+        params.extend(p)
     return " AND ".join(parts), params
 
 
@@ -661,8 +699,12 @@ class SQLiteVecBackend(BaseBackend):
           and by callers that pre-embed at a different layer.
         * callable — use as-is (typically a Chroma-style ``EmbeddingFunction``).
         """
-        # palace_path -> sqlite3.Connection (long-lived per palace)
+        # palace_path -> sqlite3.Connection (long-lived per palace).
+        # Connection map is shared across get_collection calls; concurrent
+        # opens of distinct palaces are common, so guard with a lock to
+        # prevent duplicate cache entries / extension-load races.
         self._connections: dict[str, sqlite3.Connection] = {}
+        self._connections_lock = threading.Lock()
         self._closed = False
         self._embedder = embedder
         self._embedder_resolved = embedder is False or callable(embedder)
@@ -684,50 +726,71 @@ class SQLiteVecBackend(BaseBackend):
     def _open_db(self, palace_path: str) -> sqlite3.Connection:
         if self._closed:
             raise BackendClosedError("backend closed")
+
+        # Double-checked locking: a hot-path get_collection should not pay
+        # the lock cost once the connection exists, but the open path must
+        # serialise so two concurrent get_collection calls don't both create
+        # the same connection and leak one.
         cached = self._connections.get(palace_path)
         if cached is not None:
             return cached
+        with self._connections_lock:
+            cached = self._connections.get(palace_path)
+            if cached is not None:
+                return cached
 
-        os.makedirs(palace_path, exist_ok=True)
-        db_path = os.path.join(palace_path, DB_FILENAME)
-        db = sqlite3.connect(db_path, check_same_thread=False)
-        db.enable_load_extension(True)
-        _sqlite_vec_ext.load(db)
-        db.enable_load_extension(False)
+            # Lazy import: ``sqlite_vec`` is declared as an optional extra so
+            # default-Chroma installs don't pay for it. Resolving the import
+            # only when an actual sqlite-vec palace is being opened keeps the
+            # registry's eager registration safe across both install shapes.
+            try:
+                import sqlite_vec as _sqlite_vec_ext  # noqa: PLC0415
+            except ImportError as exc:
+                raise BackendClosedError(
+                    "sqlite-vec backend requires the optional `sqlite-vec` package; "
+                    "install with `pip install mempalace[sqlite-vec]`"
+                ) from exc
 
-        # Bootstrap schema
-        db.execute("PRAGMA journal_mode=WAL")
-        db.execute("PRAGMA foreign_keys=ON")
-        db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS collections (
-                name TEXT PRIMARY KEY,
-                dimension INT NOT NULL,
-                embedder_name TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            os.makedirs(palace_path, exist_ok=True)
+            db_path = os.path.join(palace_path, DB_FILENAME)
+            db = sqlite3.connect(db_path, check_same_thread=False)
+            db.enable_load_extension(True)
+            _sqlite_vec_ext.load(db)
+            db.enable_load_extension(False)
+
+            # Bootstrap schema
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA foreign_keys=ON")
+            db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS collections (
+                    name TEXT PRIMARY KEY,
+                    dimension INT NOT NULL,
+                    embedder_name TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+                """
             )
-            """
-        )
-        db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS items (
-                rowid INTEGER PRIMARY KEY AUTOINCREMENT,
-                collection TEXT NOT NULL,
-                id TEXT NOT NULL,
-                document TEXT,
-                metadata_json TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(collection, id),
-                FOREIGN KEY (collection) REFERENCES collections(name) ON DELETE CASCADE
+            db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS items (
+                    rowid INTEGER PRIMARY KEY AUTOINCREMENT,
+                    collection TEXT NOT NULL,
+                    id TEXT NOT NULL,
+                    document TEXT,
+                    metadata_json TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(collection, id),
+                    FOREIGN KEY (collection) REFERENCES collections(name) ON DELETE CASCADE
+                )
+                """
             )
-            """
-        )
-        db.execute("CREATE INDEX IF NOT EXISTS idx_items_collection ON items(collection)")
-        db.commit()
+            db.execute("CREATE INDEX IF NOT EXISTS idx_items_collection ON items(collection)")
+            db.commit()
 
-        self._connections[palace_path] = db
-        return db
+            self._connections[palace_path] = db
+            return db
 
     def get_collection(self, *args, **kwargs) -> BaseCollection:
         if self._closed:
