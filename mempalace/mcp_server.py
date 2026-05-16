@@ -266,11 +266,28 @@ def _refresh_vector_disabled_flag() -> None:
 
 _WAL_DIR = Path(os.path.expanduser("~/.mempalace/wal"))
 _WAL_DIR.mkdir(parents=True, exist_ok=True)
-try:
-    _WAL_DIR.chmod(0o700)
-except (OSError, NotImplementedError):
-    pass
 _WAL_FILE = _WAL_DIR / "write_log.jsonl"
+
+
+def _ensure_secure_wal_permissions():
+    """Best-effort WAL permission hardening.
+
+    ``os.open(..., mode=0o600)`` only controls newly created files. If an
+    existing WAL file drifts to broader permissions, re-apply the intended
+    mode before each append. Windows may not fully honor POSIX modes, so this
+    stays best-effort and non-fatal.
+    """
+    try:
+        _WAL_DIR.chmod(0o700)
+    except (OSError, NotImplementedError):
+        pass
+    try:
+        if _WAL_FILE.exists():
+            _WAL_FILE.chmod(0o600)
+    except (OSError, NotImplementedError):
+        pass
+
+
 # Atomically create WAL file with restricted permissions (no TOCTOU race).
 # os.open with O_CREAT|O_WRONLY and mode 0o600 creates the file if absent
 # or opens it if present, both in a single syscall.
@@ -279,6 +296,7 @@ try:
     os.close(_fd)
 except (OSError, NotImplementedError):
     pass
+_ensure_secure_wal_permissions()
 
 # Keys whose values should be redacted in WAL entries to avoid logging sensitive content
 _WAL_REDACT_KEYS = frozenset(
@@ -302,6 +320,7 @@ def _wal_log(operation: str, params: dict, result: dict = None):
         "result": result,
     }
     try:
+        _ensure_secure_wal_permissions()
         fd = os.open(str(_WAL_FILE), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         with os.fdopen(fd, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, default=str) + "\n")

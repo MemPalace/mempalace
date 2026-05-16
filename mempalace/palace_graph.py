@@ -338,6 +338,19 @@ def _fuzzy_match(query: str, nodes: dict, n: int = 5):
 _TUNNEL_FILE = os.path.join(os.path.expanduser("~"), ".mempalace", "tunnels.json")
 
 
+def _ensure_secure_tunnel_permissions():
+    """Best-effort permission hardening for explicit tunnel storage."""
+    try:
+        os.chmod(os.path.dirname(_TUNNEL_FILE), 0o700)
+    except (OSError, NotImplementedError):
+        pass
+    try:
+        if os.path.exists(_TUNNEL_FILE):
+            os.chmod(_TUNNEL_FILE, 0o600)
+    except (OSError, NotImplementedError):
+        pass
+
+
 def _load_tunnels():
     """Load explicit tunnels from disk.
 
@@ -346,6 +359,7 @@ def _load_tunnels():
     """
     if not os.path.exists(_TUNNEL_FILE):
         return []
+    _ensure_secure_tunnel_permissions()
     try:
         with open(_TUNNEL_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -367,15 +381,18 @@ def _save_tunnels(tunnels):
     shared Linux/multi-user systems. Matches the file-permission pattern
     established by #814 for the other sensitive palace files.
     """
-    parent = os.path.dirname(_TUNNEL_FILE)
-    os.makedirs(parent, exist_ok=True)
-    try:
-        os.chmod(parent, 0o700)
-    except (OSError, NotImplementedError):
-        # Windows / unsupported filesystems — tolerate.
-        pass
+    os.makedirs(os.path.dirname(_TUNNEL_FILE), exist_ok=True)
+    _ensure_secure_tunnel_permissions()
     tmp_path = _TUNNEL_FILE + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    except (AttributeError, OSError, NotImplementedError):
+        try:
+            os.chmod(tmp_path, 0o600)
+        except (OSError, NotImplementedError):
+            pass
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(tunnels, f, indent=2)
         f.flush()
         try:
@@ -384,10 +401,6 @@ def _save_tunnels(tunnels):
             # Not all filesystems (or Windows file handles) support fsync — tolerate.
             pass
     os.replace(tmp_path, _TUNNEL_FILE)
-    try:
-        os.chmod(_TUNNEL_FILE, 0o600)
-    except (OSError, NotImplementedError):
-        pass
 
 
 def _endpoint_key(wing: str, room: str) -> str:
