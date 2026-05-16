@@ -19,13 +19,14 @@ from datetime import datetime
 from collections import defaultdict
 from typing import Optional
 
+from .vector_store import get_collection as _get_vector_store_collection
+
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
     build_closet_lines,
     file_already_mined,
     get_closets_collection,
-    get_collection,
     mine_lock,
     mine_palace_lock,
     purge_file_closets,
@@ -489,7 +490,7 @@ def chunk_text(
 
 
 # =============================================================================
-# PALACE — ChromaDB operations
+# PALACE — vector store operations
 # =============================================================================
 
 
@@ -1188,7 +1189,7 @@ def _mine_impl(
     print(f"{'-' * 55}\n")
 
     if not dry_run:
-        collection = get_collection(palace_path)
+        collection = _get_vector_store_collection(palace_path, create=True)
         closets_col = get_closets_collection(palace_path)
     else:
         collection = None
@@ -1356,7 +1357,7 @@ def _compute_topic_tunnels_for_wing(wing: str) -> int:
 def status(palace_path: str):
     """Show what's been filed in the palace."""
     try:
-        col = get_collection(palace_path, create=False)
+        col = _get_vector_store_collection(palace_path)
     except Exception:
         print(f"\n  No palace found at {palace_path}")
         print("  Run: mempalace init <dir> then mempalace mine <dir>")

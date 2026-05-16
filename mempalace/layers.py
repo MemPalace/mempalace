@@ -8,11 +8,11 @@ Load only what you need, when you need it.
     Layer 0: Identity       (~100 tokens)   — Always loaded. "Who am I?"
     Layer 1: Essential Story (~500-800)      — Always loaded. Top moments from the palace.
     Layer 2: On-Demand      (~200-500 each)  — Loaded when a topic/wing comes up.
-    Layer 3: Deep Search    (unlimited)      — Full ChromaDB semantic search.
+    Layer 3: Deep Search    (unlimited)      — Full semantic search.
 
 Wake-up cost: ~600-900 tokens (L0+L1). Leaves 95%+ of context free.
 
-Reads directly from ChromaDB (mempalace_drawers)
+Reads from the configured vector store (mempalace_drawers)
 and ~/.mempalace/identity.txt.
 """
 
@@ -22,7 +22,7 @@ from pathlib import Path
 from collections import defaultdict
 
 from .config import MempalaceConfig
-from .palace import get_collection as _get_collection
+from .vector_store import get_collection as _get_collection
 from .searcher import _first_or_empty, build_where_filter
 
 
@@ -90,9 +90,9 @@ class Layer1:
         self.wing = wing
 
     def generate(self) -> str:
-        """Pull top drawers from ChromaDB and format as compact L1 text."""
+        """Pull top drawers from the vector store and format as compact L1 text."""
         try:
-            col = _get_collection(self.palace_path, create=False)
+            col = _get_collection(self.palace_path)
         except Exception:
             return "## L1 — No palace found. Run: mempalace mine <dir>"
 
@@ -188,7 +188,7 @@ class Layer2:
     """
     ~200-500 tokens per retrieval.
     Loaded when a specific topic or wing comes up in conversation.
-    Queries ChromaDB with a wing/room filter.
+    Queries the vector store with a wing/room filter.
     """
 
     def __init__(self, palace_path: str = None):
@@ -198,7 +198,7 @@ class Layer2:
     def retrieve(self, wing: str = None, room: str = None, n_results: int = 10) -> str:
         """Retrieve drawers filtered by wing and/or room."""
         try:
-            col = _get_collection(self.palace_path, create=False)
+            col = _get_collection(self.palace_path)
         except Exception:
             return "No palace found."
 
@@ -240,7 +240,7 @@ class Layer2:
 
 
 # ---------------------------------------------------------------------------
-# Layer 3 — Deep Search (full semantic search via ChromaDB)
+# Layer 3 — Deep Search (full semantic search)
 # ---------------------------------------------------------------------------
 
 
@@ -257,7 +257,7 @@ class Layer3:
     def search(self, query: str, wing: str = None, room: str = None, n_results: int = 5) -> str:
         """Semantic search, returns compact result text."""
         try:
-            col = _get_collection(self.palace_path, create=False)
+            col = _get_collection(self.palace_path)
         except Exception:
             return "No palace found."
 
@@ -308,7 +308,7 @@ class Layer3:
     ) -> list:
         """Return raw dicts instead of formatted text."""
         try:
-            col = _get_collection(self.palace_path, create=False)
+            col = _get_collection(self.palace_path)
         except Exception:
             return []
 
@@ -423,15 +423,14 @@ class MemoryStack:
                 "description": "Wing/room filtered retrieval",
             },
             "L3_deep_search": {
-                "description": "Full semantic search via ChromaDB",
+                "description": "Full semantic search",
             },
         }
 
         # Count drawers
         try:
-            col = _get_collection(self.palace_path, create=False)
-            count = col.count()
-            result["total_drawers"] = count
+            col = _get_collection(self.palace_path)
+            result["total_drawers"] = col.count()
         except Exception:
             result["total_drawers"] = 0
 

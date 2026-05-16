@@ -12,7 +12,7 @@ Enables queries like:
   "Find all rooms connected to riley-college-apps"
   "What topics bridge wing_hardware and wing_myproject?"
 
-No external graph DB needed — built from ChromaDB metadata.
+No external graph DB needed — built from vector store metadata.
 """
 
 # PEP 604 (``str | None``) needs 3.10+ at runtime; the project still
@@ -30,7 +30,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
 from .config import MempalaceConfig, normalize_wing_name
-from .palace import get_collection as _get_palace_collection
+from .vector_store import get_collection as _get_vector_store
 from .palace import mine_lock
 
 logger = logging.getLogger("mempalace_graph")
@@ -73,18 +73,14 @@ def invalidate_graph_cache():
 def _get_collection(config=None):
     config = config or MempalaceConfig()
     try:
-        return _get_palace_collection(
-            config.palace_path,
-            collection_name=config.collection_name,
-            create=False,
-        )
+        return _get_vector_store(config.palace_path, config=config)
     except Exception:
         return None
 
 
 def build_graph(col=None, config=None):
     """
-    Build the palace graph from ChromaDB metadata.
+    Build the palace graph from vector store metadata.
 
     Returns cached result if fresh (within TTL). Cache is invalidated
     on writes via invalidate_graph_cache(). Thread-safe via _graph_cache_lock.

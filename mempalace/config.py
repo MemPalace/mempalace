@@ -289,8 +289,42 @@ class MempalaceConfig:
 
     @property
     def collection_name(self):
-        """ChromaDB collection name."""
+        """Vector store collection name."""
         return self._file_config.get("collection_name", DEFAULT_COLLECTION_NAME)
+
+    @property
+    def vector_backend(self):
+        """Vector store backend: 'chroma' (default) or 'qdrant'."""
+        env_val = os.environ.get("MEMPALACE_VECTOR_BACKEND")
+        if env_val:
+            return env_val.lower()
+        return self._file_config.get("vector_backend", "chroma")
+
+    @property
+    def qdrant_url(self):
+        """Qdrant server URL."""
+        env_val = os.environ.get("MEMPALACE_QDRANT_URL")
+        if env_val:
+            return env_val
+        return self._file_config.get("qdrant_url", None)
+
+    @property
+    def qdrant_api_key(self):
+        """Qdrant API key."""
+        env_val = os.environ.get("MEMPALACE_QDRANT_API_KEY")
+        if env_val:
+            return env_val
+        return self._file_config.get("qdrant_api_key", None)
+
+    @property
+    def qdrant_embedding_model(self):
+        """fastembed model name for Qdrant embeddings."""
+        env_val = os.environ.get("MEMPALACE_QDRANT_EMBEDDING_MODEL")
+        if env_val:
+            return env_val
+        return self._file_config.get(
+            "qdrant_embedding_model", "sentence-transformers/all-MiniLM-L6-v2"
+        )
 
     @property
     def people_map(self):

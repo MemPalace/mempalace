@@ -17,11 +17,11 @@ from datetime import datetime
 from collections import defaultdict
 
 from .normalize import normalize
+from .vector_store import get_collection as _get_vector_store_collection
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
     file_already_mined,
-    get_collection,
     mine_lock,
     prefetch_mined_set,
 )
@@ -471,7 +471,7 @@ def mine_convos(
         print("  DRY RUN — nothing will be filed")
     print(f"{'-' * 55}\n")
 
-    collection = get_collection(palace_path) if not dry_run else None
+    collection = _get_vector_store_collection(palace_path, create=True) if not dry_run else None
 
     # Bulk pre-fetch already-mined set in one paginated pass instead of
     # `len(files)` separate WHERE-source_file queries. On a 150k-drawer
