@@ -854,19 +854,26 @@ def _resolve_wing(convo_path: Path, wing: Optional[str]) -> str:
 
       1. Explicit ``wing`` argument from the user — always wins, even on
          an AI-tool path. Empty string is treated as "no wing".
-      2. AI-tool path detection — defaults to ``wing_api`` so Claude
+      2. ``MEMPALACE_WING`` (or legacy ``MEMPAL_WING``) env var — explicit
+         user-controlled session override that beats path-based defaults
+         on multi-machine / multi-screen workflows where the transcript
+         folder name doesn't reflect the canonical wing.
+      3. AI-tool path detection — defaults to ``wing_api`` so Claude
          Code / Codex / Gemini conversations group under a single wing
          dedicated to API-sourced content.
-      3. Basename fallback — sanitized via ``config.normalize_wing_name``
+      4. Basename fallback — sanitized via ``config.normalize_wing_name``
          (lowercase, spaces/hyphens collapsed to underscores). Shared
          single source of truth with ``cmd_init``,
          ``room_detector_local``, and ``miner.load_config`` so all
          wing-slug producers stay in sync (per #1194 consolidation).
     """
-    from .config import normalize_wing_name
+    from .config import normalize_wing_name, session_wing_override
 
     if wing:
         return wing
+    override = session_wing_override()
+    if override:
+        return override
     if _is_ai_tool_path(convo_path):
         return "wing_api"
     return normalize_wing_name(convo_path.name)
