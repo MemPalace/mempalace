@@ -178,12 +178,22 @@ def resolve_backend_for_palace(
 
 
 def _register_builtins() -> None:
-    """Register chroma as the in-tree default."""
+    """Register chroma + sqlite-vec as in-tree backends.
+
+    sqlite-vec is registered eagerly so it appears in
+    ``available_backends()``; the import is light (no network, no DB I/O).
+    The first ``get_backend('sqlite-vec')`` call inside
+    :class:`~mempalace.backends.sqlite_vec.SQLiteVecBackend` is what loads
+    the sqlite-vec extension into a per-palace connection.
+    """
     from .chroma import ChromaBackend
+    from .sqlite_vec import SQLiteVecBackend
 
     # Use setdefault semantics so a caller that pre-registered for tests wins.
     if "chroma" not in _registry:
         _registry["chroma"] = ChromaBackend
+    if "sqlite-vec" not in _registry:
+        _registry["sqlite-vec"] = SQLiteVecBackend
 
 
 _register_builtins()

@@ -43,6 +43,7 @@ mempalace-mcp = "mempalace.mcp_server:main"
 
 [project.entry-points."mempalace.backends"]
 chroma = "mempalace.backends.chroma:ChromaBackend"
+sqlite-vec = "mempalace.backends.sqlite_vec:SQLiteVecBackend"
 
 # RFC 002 source-adapter entry-point group. Core publishes no first-party
 # adapters under this group yet; ``miner.py`` and ``convo_miner.py`` migrate
@@ -53,6 +54,10 @@ chroma = "mempalace.backends.chroma:ChromaBackend"
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "pytest-cov>=4.0", "ruff>=0.4.0", "psutil>=5.9"]
 spellcheck = ["autocorrect>=2.0"]
+# Alternative vector backend — opt in with `pip install mempalace[sqlite-vec]`
+# then set MEMPALACE_BACKEND=sqlite-vec. See mempalace/backends/sqlite_vec.py
+# for schema and trade-offs vs the default Chroma backend.
+sqlite-vec = ["sqlite-vec>=0.1.6"]
 # Hardware acceleration for the ONNX embedding model. Install exactly one:
 #   pip install mempalace[gpu]       — NVIDIA CUDA
 #   pip install mempalace[dml]       — DirectML (Windows AMD/Intel/NVIDIA)
