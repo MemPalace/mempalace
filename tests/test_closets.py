@@ -12,7 +12,6 @@ Coverage map:
   * purge_file_closets — scoped to source_file.
   * Project-miner end-to-end rebuild — re-mining with fewer topics fully
     purges leftover numbered closets from a larger prior run.
-  * _extract_drawer_ids_from_closet — pointer parsing + dedup.
   * search_memories hybrid path — drawer query always the floor,
     closets boost matching source_file, matched_via reflects both signals,
     no whole-file glue, max_distance enforcement.
@@ -55,8 +54,6 @@ from mempalace.palace_graph import (
 )
 from mempalace.searcher import (
     _bm25_scores,
-    _expand_with_neighbors,
-    _extract_drawer_ids_from_closet,
     _hybrid_rank,
     search_memories,
 )
@@ -140,9 +137,9 @@ class TestMineLock:
         # Sort by entry time and verify the second entry is after the first exit.
         intervals.sort(key=lambda iv: iv[1])
         (_, enter_a, exit_a), (_, enter_b, exit_b) = intervals
-        assert (
-            enter_a < exit_a <= enter_b < exit_b
-        ), f"critical sections overlapped — lock failed to serialize: {intervals}"
+        assert enter_a < exit_a <= enter_b < exit_b, (
+            f"critical sections overlapped — lock failed to serialize: {intervals}"
+        )
 
 
 # ── build_closet_lines ─────────────────────────────────────────────────
@@ -315,35 +312,15 @@ class TestMinerClosetRebuild:
         second_docs = "\n".join(second_pass["documents"]).lower()
         assert "only topic now" in second_docs
         for i in range(15):
-            assert (
-                f"topic {i}\n" not in second_docs
-            ), f"stale 'Topic {i}' from first mine survived the rebuild"
+            assert f"topic {i}\n" not in second_docs, (
+                f"stale 'Topic {i}' from first mine survived the rebuild"
+            )
         # Numbered closets that existed only in the larger first run must be gone.
         leftover = first_ids - set(second_pass["ids"])
         for stale_id in leftover:
-            assert not col.get(ids=[stale_id])[
-                "ids"
-            ], f"orphan closet {stale_id} from larger first run survived purge"
-
-
-# ── _extract_drawer_ids_from_closet ───────────────────────────────────
-
-
-class TestExtractDrawerIds:
-    def test_parses_single_pointer(self):
-        assert _extract_drawer_ids_from_closet("topic|;|→drawer_x") == ["drawer_x"]
-
-    def test_parses_multiple_pointers_per_line(self):
-        line = "topic|ent|→drawer_a,drawer_b,drawer_c"
-        assert _extract_drawer_ids_from_closet(line) == ["drawer_a", "drawer_b", "drawer_c"]
-
-    def test_dedupes_across_lines(self):
-        doc = "one|;|→drawer_a,drawer_b\ntwo|;|→drawer_b,drawer_c"
-        assert _extract_drawer_ids_from_closet(doc) == ["drawer_a", "drawer_b", "drawer_c"]
-
-    def test_empty_doc_returns_empty(self):
-        assert _extract_drawer_ids_from_closet("") == []
-        assert _extract_drawer_ids_from_closet("no arrows here") == []
+            assert not col.get(ids=[stale_id])["ids"], (
+                f"orphan closet {stale_id} from larger first run survived purge"
+            )
 
 
 # ── search_memories closet-first path ────────────────────────────────
@@ -702,9 +679,9 @@ class TestDiaryIngest:
 
         # No state file inside the user's diary dir.
         for entry in diary_dir.iterdir():
-            assert (
-                "diary_ingest" not in entry.name
-            ), f"state file leaked into user diary dir: {entry}"
+            assert "diary_ingest" not in entry.name, (
+                f"state file leaked into user diary dir: {entry}"
+            )
 
         # State file does exist under ~/.mempalace/state/.
         state_path = _state_file_for(str(palace_dir), diary_dir.resolve())
@@ -905,7 +882,7 @@ class TestTunnels:
         assert not errors, f"worker raised: {errors}"
         tunnels = list_tunnels()
         assert len(tunnels) == 5, (
-            f"expected 5 concurrent tunnels, got {len(tunnels)} — " "write race dropped some"
+            f"expected 5 concurrent tunnels, got {len(tunnels)} — write race dropped some"
         )
 
     def test_created_at_is_timezone_aware(self):
@@ -919,97 +896,12 @@ class TestTunnels:
 #
 # When a closet hit lands on a drawer whose chunk boundary clips a thought
 # (matched chunk says "here's a breakdown:" and the breakdown lives in the
-# next chunk), the closet path now expands to ±1 neighbor chunks from the
-# same source file. These tests pin that behavior end-to-end and at the
-# helper level.
+# next chunk), the closet path expands across the source's chunks to pick
+# the keyword-best one plus its immediate neighbors. This test pins that
+# behavior end-to-end through search_memories.
 
 
 class TestDrawerGrepExpansion:
-    def _seed_source_file(self, palace_path, source: str, n_chunks: int):
-        """Helper: put N sequential drawers for a single source file into
-        the palace and return the drawer IDs keyed by chunk_index."""
-        col = get_collection(palace_path)
-        ids = [f"drawer_test_room_{source.replace('/', '_')}_{i:03d}" for i in range(n_chunks)]
-        docs = [f"chunk_{i} content about topic alpha" for i in range(n_chunks)]
-        metas = [
-            {
-                "wing": "test",
-                "room": "room",
-                "source_file": source,
-                "chunk_index": i,
-                "filed_at": "2026-04-13T00:00:00",
-            }
-            for i in range(n_chunks)
-        ]
-        col.upsert(ids=ids, documents=docs, metadatas=metas)
-        return col, {i: ids[i] for i in range(n_chunks)}
-
-    def test_expand_returns_matched_plus_neighbors(self, palace_path):
-        col, by_idx = self._seed_source_file(palace_path, "/proj/doc.md", n_chunks=5)
-        matched_meta = {"source_file": "/proj/doc.md", "chunk_index": 2}
-        matched_doc = "chunk_2 content about topic alpha"
-
-        out = _expand_with_neighbors(col, matched_doc, matched_meta, radius=1)
-        assert out["drawer_index"] == 2
-        assert out["total_drawers"] == 5
-        # Expect chunks 1, 2, 3 joined in chunk_index order.
-        text = out["text"]
-        assert "chunk_1" in text
-        assert "chunk_2" in text
-        assert "chunk_3" in text
-        # No leakage of non-neighbors.
-        assert "chunk_0" not in text
-        assert "chunk_4" not in text
-        # Ordering preserved — chunk_1 before chunk_2 before chunk_3.
-        assert text.index("chunk_1") < text.index("chunk_2") < text.index("chunk_3")
-
-    def test_expand_at_start_of_file_only_has_next_neighbor(self, palace_path):
-        col, _ = self._seed_source_file(palace_path, "/proj/edge_start.md", n_chunks=3)
-        out = _expand_with_neighbors(
-            col,
-            "chunk_0 content",
-            {"source_file": "/proj/edge_start.md", "chunk_index": 0},
-        )
-        assert out["drawer_index"] == 0
-        assert out["total_drawers"] == 3
-        assert "chunk_0" in out["text"]
-        assert "chunk_1" in out["text"]
-        # No chunk_-1 could exist; the expansion must not invent one.
-        assert "chunk_-1" not in out["text"]
-
-    def test_expand_at_end_of_file_only_has_prev_neighbor(self, palace_path):
-        col, _ = self._seed_source_file(palace_path, "/proj/edge_end.md", n_chunks=3)
-        out = _expand_with_neighbors(
-            col,
-            "chunk_2 content",
-            {"source_file": "/proj/edge_end.md", "chunk_index": 2},
-        )
-        assert out["drawer_index"] == 2
-        assert out["total_drawers"] == 3
-        assert "chunk_1" in out["text"]
-        assert "chunk_2" in out["text"]
-        # No chunk_3 exists.
-        assert "chunk_3" not in out["text"]
-
-    def test_expand_single_drawer_file_returns_just_matched(self, palace_path):
-        col, _ = self._seed_source_file(palace_path, "/proj/lone.md", n_chunks=1)
-        out = _expand_with_neighbors(
-            col,
-            "chunk_0 content",
-            {"source_file": "/proj/lone.md", "chunk_index": 0},
-        )
-        assert out["drawer_index"] == 0
-        assert out["total_drawers"] == 1
-        assert out["text"] == "chunk_0 content about topic alpha"
-
-    def test_expand_falls_back_when_metadata_missing(self, palace_path):
-        col = get_collection(palace_path)
-        # No source_file / chunk_index in meta — degrade gracefully.
-        out = _expand_with_neighbors(col, "matched doc", {})
-        assert out["text"] == "matched doc"
-        assert out["drawer_index"] is None
-        assert out["total_drawers"] is None
-
     def test_hybrid_search_enrichment_populates_drawer_index_and_total(self, palace_path):
         """End-to-end: when a closet boosts a source with many drawers, the
         enrichment step runs drawer-grep across all chunks of that source
