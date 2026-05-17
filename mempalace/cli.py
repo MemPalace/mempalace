@@ -972,17 +972,26 @@ def cmd_instructions(args):
 def cmd_mcp(args):
     """Show how to wire MemPalace into MCP-capable hosts."""
     base_server_cmd = "mempalace-mcp"
+    remote_server_cmd = "mempalace-mcp-http"
 
     if args.palace:
         resolved_palace = str(Path(args.palace).expanduser())
         server_cmd = f"{base_server_cmd} --palace {shlex.quote(resolved_palace)}"
+        remote_cmd = f"{remote_server_cmd} --palace {shlex.quote(resolved_palace)}"
     else:
         server_cmd = base_server_cmd
+        remote_cmd = remote_server_cmd
 
     print("MemPalace MCP quick setup:")
     print(f"  claude mcp add mempalace -- {server_cmd}")
     print("\nRun the server directly:")
     print(f"  {server_cmd}")
+    print("\nRemote HTTP setup for ChatGPT / Responses API:")
+    print('  pip install "mempalace[mcp-http]"')
+    print(f"  {remote_cmd} --host 0.0.0.0 --port 8000")
+    print("  Streamable HTTP URL: http://YOUR-HOST:8000/mcp")
+    print("  SSE URL: http://YOUR-HOST:8000/sse")
+    print("  Note: ChatGPT needs a URL it can reach; localhost alone is not enough.")
 
     if not args.palace:
         print("\nOptional custom palace:")

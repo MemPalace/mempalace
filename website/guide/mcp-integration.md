@@ -12,7 +12,7 @@ MemPalace includes a setup helper that prints the exact configuration commands f
 mempalace mcp
 ```
 
-### Manual Connection
+### Local stdio clients
 
 ```bash
 claude mcp add mempalace -- python -m mempalace.mcp_server
@@ -30,13 +30,69 @@ Now your AI has all 29 tools available. Ask it anything:
 
 Claude calls `mempalace_search` automatically, gets verbatim results, and answers you.
 
+### Remote HTTP clients
+
+For remote clients such as ChatGPT Developer Mode, install the optional HTTP transport:
+
+```bash
+pip install "mempalace[mcp-http]"
+```
+
+Run the remote server:
+
+```bash
+mempalace-mcp-http --host 0.0.0.0 --port 8000
+```
+
+Default endpoints:
+
+- Streamable HTTP: `http://HOST:8000/mcp`
+- SSE: `http://HOST:8000/sse`
+
+For a public remote endpoint, put the server behind a tunnel or reverse proxy and use HTTPS. ChatGPT needs a URL it can reach directly; `localhost` alone is not enough.
+
+### Remote HTTP with OAuth
+
+To enable OAuth on the remote MCP server:
+
+```bash
+python3 - <<'PY' > ~/.mempalace/mcp_http_auth_secret
+import secrets
+print(secrets.token_urlsafe(32))
+PY
+chmod 600 ~/.mempalace/mcp_http_auth_secret
+
+mempalace-mcp-http \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --oauth-issuer-url https://mempalace.example.com
+```
+
+OAuth state is persisted locally at `~/.mempalace/mcp_http_oauth.json`.
+The operator secret used on the consent screen is read from
+`~/.mempalace/mcp_http_auth_secret` unless `MEMPALACE_MCP_AUTH_SECRET`
+is set.
+
+### ChatGPT Developer Mode
+
+ChatGPT supports remote MCP servers over Streamable HTTP and HTTP/SSE.
+In ChatGPT:
+
+1. Enable Developer Mode in Settings.
+2. Create an app.
+3. Paste your remote MCP URL, usually `https://mempalace.example.com/mcp`.
+4. Choose `OAuth` if you started the server with `--oauth-issuer-url`, otherwise `No Authentication`.
+5. Complete the consent flow.
+
+Read-only tools advertise `readOnlyHint`, so ChatGPT can distinguish palace reads from write actions.
+
 ## Compatible Tools
 
 MemPalace works with any tool that supports MCP:
 
 - **Claude Code** — native via plugin or manual MCP
 - **OpenClaw** — via official skill, see [OpenClaw Skill](/guide/openclaw)
-- **ChatGPT** — via MCP bridge
+- **ChatGPT** — native remote MCP app via Developer Mode
 - **Cursor** — native MCP support
 - **Gemini CLI** — see [Gemini CLI guide](/guide/gemini-cli)
 

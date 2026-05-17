@@ -33,14 +33,16 @@ import sys
 # restore the real stdout in main() before entering the protocol loop.
 _REAL_STDOUT = sys.stdout
 _REAL_STDOUT_FD = None
-try:
-    _REAL_STDOUT_FD = os.dup(1)
-    os.dup2(2, 1)
-except (OSError, AttributeError):
-    # Environments without fd-level stdio (embedded interpreters, some test
-    # harnesses). The Python-level redirect below still applies.
-    pass
-sys.stdout = sys.stderr
+_STDIO_REDIRECT_DISABLED = os.environ.get("MEMPALACE_DISABLE_STDIO_REDIRECT") == "1"
+if not _STDIO_REDIRECT_DISABLED:
+    try:
+        _REAL_STDOUT_FD = os.dup(1)
+        os.dup2(2, 1)
+    except (OSError, AttributeError):
+        # Environments without fd-level stdio (embedded interpreters, some test
+        # harnesses). The Python-level redirect below still applies.
+        pass
+    sys.stdout = sys.stderr
 
 import argparse  # noqa: E402  (deferred until after stdio protection above)
 import json  # noqa: E402

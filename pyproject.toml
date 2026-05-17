@@ -40,6 +40,7 @@ Repository = "https://github.com/MemPalace/mempalace"
 [project.scripts]
 mempalace = "mempalace.cli:main"
 mempalace-mcp = "mempalace.mcp_server:main"
+mempalace-mcp-http = "mempalace.mcp_http_server:main"
 
 [project.entry-points."mempalace.backends"]
 chroma = "mempalace.backends.chroma:ChromaBackend"
@@ -61,6 +62,7 @@ spellcheck = ["autocorrect>=2.0"]
 gpu = ["onnxruntime-gpu>=1.16"]
 dml = ["onnxruntime-directml>=1.16"]
 coreml = ["onnxruntime>=1.16"]
+mcp-http = ["mcp>=1.27.0,<2; python_version >= '3.10'"]
 
 [dependency-groups]
 dev = ["pytest>=7.0", "pytest-cov>=4.0", "ruff>=0.4.0", "psutil>=5.9"]

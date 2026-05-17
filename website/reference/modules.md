@@ -10,6 +10,7 @@ mempalace/
 ├── mempalace/                 ← core package
 │   ├── cli.py                 ← CLI entry point
 │   ├── mcp_server.py          ← MCP server (29 tools)
+│   ├── mcp_http_server.py     ← remote MCP server over Streamable HTTP / SSE + OAuth
 │   ├── knowledge_graph.py     ← temporal entity graph
 │   ├── palace_graph.py        ← room navigation graph
 │   ├── dialect.py             ← AAAK compression
@@ -57,6 +58,13 @@ Argparse-based CLI with subcommands: `init`, `mine`, `split`, `search`, `compres
 ### `mcp_server.py` — MCP Server
 
 JSON-RPC over stdin/stdout. Implements the MCP protocol with 29 tools covering palace read/write, drawer CRUD, knowledge graph, navigation, tunnels, agent diary, and system operations. Includes the Memory Protocol and AAAK Spec in status responses.
+
+### `mcp_http_server.py` — Remote MCP Server
+
+Remote MCP transport built on the Python MCP SDK. Re-exports the same
+MemPalace tool registry over Streamable HTTP or SSE, supports optional
+OAuth, persists OAuth state locally, and marks read-only tools with
+`readOnlyHint` for remote clients such as ChatGPT Developer Mode.
 
 ### `searcher.py` — Semantic Search
 

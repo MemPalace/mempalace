@@ -146,6 +146,27 @@ cross-wing navigation, drawer management, and agent diaries. Installation
 and the full tool list:
 [mempalaceofficial.com/reference/mcp-tools](https://mempalaceofficial.com/reference/mcp-tools.html).
 
+For local MCP clients (Claude Code, Codex, Cursor, Gemini CLI), use the
+existing stdio server:
+
+```bash
+mempalace mcp
+```
+
+For remote MCP clients such as ChatGPT Developer Mode, MemPalace also
+ships an HTTP server with Streamable HTTP / SSE transport and optional
+OAuth:
+
+```bash
+pip install "mempalace[mcp-http]"
+mempalace-mcp-http --host 0.0.0.0 --port 8000
+```
+
+Use `mempalace-mcp-http --oauth-issuer-url https://your-public-hostname`
+to turn on OAuth and persistent token storage for the remote endpoint.
+Setup details:
+[mempalaceofficial.com/guide/mcp-integration](https://mempalaceofficial.com/guide/mcp-integration.html).
+
 ## Agents
 
 Each specialist agent gets its own wing and diary in the palace.
@@ -175,6 +196,7 @@ No API key is required for the core benchmark path.
 ## Docs
 
 - Getting started → [mempalaceofficial.com/guide/getting-started](https://mempalaceofficial.com/guide/getting-started.html)
+- MCP integration → [mempalaceofficial.com/guide/mcp-integration](https://mempalaceofficial.com/guide/mcp-integration.html)
 - CLI reference → [mempalaceofficial.com/reference/cli](https://mempalaceofficial.com/reference/cli.html)
 - Python API → [mempalaceofficial.com/reference/python-api](https://mempalaceofficial.com/reference/python-api.html)
 - Full benchmark methodology → [benchmarks/BENCHMARKS.md](benchmarks/BENCHMARKS.md)

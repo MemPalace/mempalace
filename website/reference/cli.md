@@ -136,11 +136,23 @@ Creates a backup at `<palace_path>.backup` before rebuilding.
 
 ## `mempalace mcp`
 
-Helper command that outputs setup syntax (like `claude mcp add...`) to connect MemPalace to your AI client, automatically handling paths.
+Helper command that outputs setup syntax for both the local stdio MCP
+server and the remote HTTP MCP server, automatically handling paths.
 
 ```bash
 mempalace mcp
 mempalace mcp --palace ~/.custom-palace
+```
+
+The helper prints:
+
+- local stdio setup such as `claude mcp add mempalace -- mempalace-mcp`
+- remote HTTP startup such as `mempalace-mcp-http --host 0.0.0.0 --port 8000`
+
+Install the optional remote transport with:
+
+```bash
+pip install "mempalace[mcp-http]"
 ```
 
 ## `mempalace hook`

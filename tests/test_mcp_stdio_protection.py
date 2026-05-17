@@ -13,6 +13,16 @@ stdout in main() before entering the protocol loop.
 import subprocess
 import sys
 import textwrap
+import site
+
+
+def _subprocess_env():
+    env = dict(__import__("os").environ)
+    user_site = site.getusersitepackages()
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = f"{user_site}:{existing}" if existing else user_site
+    env.pop("MEMPALACE_DISABLE_STDIO_REDIRECT", None)
+    return env
 
 
 def test_module_import_redirects_stdout_to_stderr():
@@ -36,6 +46,7 @@ def test_module_import_redirects_stdout_to_stderr():
     result = subprocess.run(
         [sys.executable, "-c", code],
         capture_output=True,
+        env=_subprocess_env(),
         timeout=60,
     )
     assert result.returncode == 0, f"stdout: {result.stdout!r}\nstderr: {result.stderr!r}"
@@ -62,6 +73,7 @@ def test_restore_stdout_returns_real_stdout():
     result = subprocess.run(
         [sys.executable, "-c", code],
         capture_output=True,
+        env=_subprocess_env(),
         timeout=60,
     )
     assert result.returncode == 0, f"stdout: {result.stdout!r}\nstderr: {result.stderr!r}"
@@ -76,8 +88,30 @@ def test_mcp_server_no_stdout_noise_on_clean_exit():
         [sys.executable, "-m", "mempalace.mcp_server"],
         input=b"",
         capture_output=True,
+        env=_subprocess_env(),
         timeout=60,
     )
     assert (
         proc.stdout == b""
     ), f"stdout must be empty before the first JSON-RPC response, but got: {proc.stdout!r}"
+
+
+def test_module_import_can_disable_stdout_redirect_via_env():
+    code = textwrap.dedent(
+        """
+        import os
+        import sys
+        os.environ["MEMPALACE_DISABLE_STDIO_REDIRECT"] = "1"
+        from mempalace import mcp_server
+        assert sys.stdout is not sys.stderr
+        assert mcp_server._STDIO_REDIRECT_DISABLED is True
+        print("OK", file=sys.stderr)
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        env=_subprocess_env(),
+        timeout=60,
+    )
+    assert result.returncode == 0, f"stdout: {result.stdout!r}\nstderr: {result.stderr!r}"
