@@ -1167,6 +1167,17 @@ def _mine_impl(
             include_ignored=include_ignored,
         )
     if limit > 0:
+        # `--limit N` bounds NEW work, not WALK. Without this pre-filter,
+        # `--limit` truncates the file list before `process_file`'s
+        # `file_already_mined` skip, so a mine on a corpus where the first-N
+        # walk-order files are all already-mined produces 0 new drawers
+        # despite the budget being intact. See #1535.
+        if not dry_run:
+            mined_col = get_collection(palace_path)
+            files = [
+                f for f in files
+                if not file_already_mined(mined_col, str(f), check_mtime=True)
+            ]
         files = files[:limit]
 
     from .embedding import describe_device
