@@ -714,11 +714,15 @@ def test_search_memories_vector_disabled_uses_resolved_stop_words(monkeypatch, t
     assert captured["stop_words"] == frozenset({"de", "es"})
 
 
-def test_search_cli_threads_resolved_stop_words_to_hybrid_rank(monkeypatch):
+def test_search_cli_threads_resolved_stop_words_to_hybrid_rank(monkeypatch, tmp_path):
     """The `mempalace search ...` CLI handler must resolve stop_words and
     pass them to `_hybrid_rank`, matching the MCP `search_memories` path so
     `MEMPALACE_LANG` filtering works for CLI users too."""
     from mempalace import searcher
+
+    # Satisfy the State-A/B filesystem-first checks added in #1498 so
+    # `search()` reaches the `_hybrid_rank` call this test exercises.
+    (tmp_path / "chroma.sqlite3").touch()
 
     captured = {}
 
@@ -742,6 +746,6 @@ def test_search_cli_threads_resolved_stop_words_to_hybrid_rank(monkeypatch):
     monkeypatch.setattr(searcher, "_resolve_stop_words", lambda lang: frozenset({"the"}))
     monkeypatch.setattr(searcher, "_hybrid_rank", _hybrid_spy)
 
-    searcher.search(query="cat", palace_path="/tmp/nonexistent")
+    searcher.search(query="cat", palace_path=str(tmp_path))
 
     assert captured["stop_words"] == frozenset({"the"})
