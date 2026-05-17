@@ -431,6 +431,88 @@ class AnthropicProvider(LLMProvider):
         return LLMResponse(text=text, model=self.model, provider=self.name, raw=data)
 
 
+# ==================== LITELLM ====================
+
+
+class LiteLLMProvider(LLMProvider):
+    """Routes to 100+ LLM providers via the litellm SDK.
+
+    Uses the litellm model string format (e.g. ``anthropic/claude-sonnet-4-5``,
+    ``openai/gpt-4o``, ``bedrock/anthropic.claude-v2``, ``vertex_ai/gemini-pro``).
+    Provider-specific API keys are read from environment variables automatically
+    (e.g. ``ANTHROPIC_API_KEY``, ``OPENAI_API_KEY``).
+
+    See https://docs.litellm.ai/docs/providers for supported providers.
+    """
+
+    name = "litellm"
+
+    def __init__(
+        self,
+        model: str,
+        api_key: Optional[str] = None,
+        endpoint: Optional[str] = None,
+        timeout: int = 120,
+        **_: object,
+    ):
+        super().__init__(
+            model=model,
+            endpoint=endpoint,
+            api_key=api_key,
+            timeout=timeout,
+        )
+
+    def check_available(self) -> tuple[bool, str]:
+        try:
+            import litellm  # noqa: F401
+        except ImportError:
+            return False, "litellm not installed. Install with: pip install litellm"
+        return True, "ok"
+
+    def classify(
+        self,
+        system: str,
+        user: str,
+        json_mode: bool = True,
+        think: Optional[bool] = None,  # noqa: ARG002
+    ) -> LLMResponse:
+        import litellm
+
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+
+        kwargs: dict = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0.1,
+            "stream": False,
+        }
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+        if self.api_key:
+            kwargs["api_key"] = self.api_key
+
+        try:
+            response = litellm.completion(**kwargs)
+        except Exception as e:
+            raise LLMError(f"LiteLLM error (model={self.model}): {e}") from e
+
+        try:
+            text = response.choices[0].message.content
+        except (AttributeError, IndexError, TypeError) as e:
+            raise LLMError(f"Unexpected response shape: {e}") from e
+        if not text:
+            raise LLMError(f"Empty response from LiteLLM (model={self.model})")
+        return LLMResponse(
+            text=text,
+            model=response.model or self.model,
+            provider=self.name,
+            raw=response.model_dump(mode="json"),
+        )
+
+
 # ==================== FACTORY ====================
 
 
@@ -438,6 +520,7 @@ PROVIDERS: dict[str, type[LLMProvider]] = {
     "ollama": OllamaProvider,
     "openai-compat": OpenAICompatProvider,
     "anthropic": AnthropicProvider,
+    "litellm": LiteLLMProvider,
 }
 
 

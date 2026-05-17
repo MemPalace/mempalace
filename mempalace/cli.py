@@ -1220,7 +1220,7 @@ def main():
     p_init.add_argument(
         "--llm-provider",
         default="ollama",
-        choices=["ollama", "openai-compat", "anthropic"],
+        choices=["ollama", "openai-compat", "anthropic", "litellm"],
         help="LLM provider (default: ollama). Pass --no-llm to disable LLM-assisted refinement entirely.",
     )
     p_init.add_argument(
