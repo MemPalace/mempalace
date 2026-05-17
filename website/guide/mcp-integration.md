@@ -1,6 +1,6 @@
 # MCP Integration
 
-MemPalace provides 29 tools through the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/), giving any MCP-compatible AI full read/write access to your palace.
+MemPalace provides 30 tools through the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/), giving any MCP-compatible AI full read/write access to your palace.
 
 ## Setup
 
@@ -24,7 +24,7 @@ claude mcp add mempalace -- python -m mempalace.mcp_server
 claude mcp add mempalace -- python -m mempalace.mcp_server --palace /path/to/palace
 ```
 
-Now your AI has all 29 tools available. Ask it anything:
+Now your AI has all 30 tools available. Ask it anything:
 
 > *"What did we decide about auth last month?"*
 
@@ -42,7 +42,7 @@ MemPalace works with any tool that supports MCP:
 
 ## Memory Protocol
 
-When the AI first calls `mempalace_status`, it receives the **Memory Protocol** — a behavior guide that teaches it to:
+When the MCP client connects, MemPalace sends Layer 0 identity and Layer 1 essential story in the server instructions. When the AI first calls `mempalace_status`, it receives the same wake-up context plus the **Memory Protocol** — a behavior guide that teaches it to:
 
 1. **On wake-up**: Call `mempalace_status` to load the palace overview
 2. **Before responding** about any person, project, or past event: search first, never guess
@@ -58,7 +58,8 @@ This protocol is what turns storage into memory — the AI knows to verify befor
 
 | Tool | What |
 |------|------|
-| `mempalace_status` | Palace overview + AAAK spec + memory protocol |
+| `mempalace_status` | Palace overview + AAAK spec + memory protocol + Layer 0/1 wake-up |
+| `mempalace_wake_up` | Layer 0 identity + Layer 1 essential story |
 | `mempalace_list_wings` | Wings with counts |
 | `mempalace_list_rooms` | Rooms within a wing |
 | `mempalace_get_taxonomy` | Full wing → room → count tree |

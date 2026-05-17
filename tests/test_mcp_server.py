@@ -463,11 +463,29 @@ class TestColdStartDiagnostics:
 
 class TestHandleRequest:
     def test_initialize(self):
-        from mempalace.mcp_server import handle_request
+        from mempalace import mcp_server
 
-        resp = handle_request({"method": "initialize", "id": 1, "params": {}})
+        monkeypatch_context = "L0 identity\n\nL1 story"
+        original = mcp_server._build_wake_up_context
+        mcp_server._build_wake_up_context = lambda wing=None: monkeypatch_context
+        try:
+            resp = mcp_server.handle_request({"method": "initialize", "id": 1, "params": {}})
+        finally:
+            mcp_server._build_wake_up_context = original
         assert resp["result"]["serverInfo"]["name"] == "mempalace"
         assert resp["id"] == 1
+        assert "instructions" in resp["result"]
+        assert "MemPalace Wake-Up Context" in resp["result"]["instructions"]
+
+    def test_initialize_instructions_include_wake_up_context(self, monkeypatch):
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "_build_wake_up_context", lambda wing=None: "L0\n\nL1")
+
+        resp = mcp_server.handle_request({"method": "initialize", "id": 1, "params": {}})
+
+        assert "IMPORTANT" in resp["result"]["instructions"]
+        assert "L0\n\nL1" in resp["result"]["instructions"]
 
     def test_initialize_negotiates_client_version(self):
         from mempalace.mcp_server import handle_request
@@ -533,6 +551,7 @@ class TestHandleRequest:
         tools = resp["result"]["tools"]
         names = {t["name"] for t in tools}
         assert "mempalace_status" in names
+        assert "mempalace_wake_up" in names
         assert "mempalace_search" in names
         assert "mempalace_add_drawer" in names
         assert "mempalace_kg_add" in names
@@ -651,6 +670,24 @@ class TestHandleRequest:
         assert "result" in resp
         content = json.loads(resp["result"]["content"][0]["text"])
         assert "total_drawers" in content
+
+    def test_tools_call_dispatches_wake_up(self, monkeypatch):
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "_build_wake_up_context", lambda wing=None: f"wake:{wing}")
+
+        resp = mcp_server.handle_request(
+            {
+                "method": "tools/call",
+                "id": 6,
+                "params": {"name": "mempalace_wake_up", "arguments": {"wing": "project"}},
+            }
+        )
+
+        assert "error" not in resp
+        content = json.loads(resp["result"]["content"][0]["text"])
+        assert content["context"] == "wake:project"
+        assert content["wing"] == "project"
 
 
 # ── Read Tools ──────────────────────────────────────────────────────────

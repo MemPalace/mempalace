@@ -568,6 +568,54 @@ def _no_palace():
 # ==================== HELPERS ====================
 
 
+def _build_wake_up_context(wing: str = None) -> str:
+    """Return Layer 0 + Layer 1 context for MCP clients.
+
+    This is the MCP equivalent of ``mempalace wake-up``.  It is intentionally
+    best-effort: initialization must never fail just because the palace has
+    not been created yet or a client is connecting before first mine.
+    """
+    try:
+        _refresh_vector_disabled_flag()
+        from .layers import MemoryStack
+
+        if _vector_disabled:
+            identity = MemoryStack(palace_path=_config.palace_path).l0.render()
+            return "\n\n".join(
+                [
+                    identity,
+                    "## L1 - Essential Story\n"
+                    "Unavailable because vector search is disabled for this palace. "
+                    f"Reason: {_vector_disabled_reason or 'HNSW capacity divergence'}. "
+                    "Run `mempalace repair` to restore Layer 1 generation.",
+                ]
+            )
+
+        return MemoryStack(palace_path=_config.palace_path).wake_up(wing=wing)
+    except Exception as exc:
+        logger.debug("Failed to build wake-up context", exc_info=True)
+        return f"## MemPalace Wake-Up\nLayer context unavailable: {exc}"
+
+
+def _build_server_instructions() -> str:
+    """Instructions sent during MCP initialize.
+
+    MCP clients such as VS Code/Copilot can load this as background context
+    before the model decides whether to call tools.  Without it, Layer 0/1 only
+    existed behind the CLI, so MCP clients had no automatic wake-up path.
+    """
+    wake_up = _build_wake_up_context()
+    return "\n\n".join(
+        [
+            PALACE_PROTOCOL,
+            "## MemPalace Wake-Up Context\n"
+            "The following is Layer 0 (Identity) and Layer 1 (Essential Story). "
+            "Treat it as background memory for this MCP session.",
+            wake_up,
+        ]
+    )
+
+
 def _fetch_all_metadata(col, where=None):
     """Paginate col.get() to avoid the 10K silent truncation limit."""
     total = col.count()
@@ -678,6 +726,7 @@ def _tool_status_via_sqlite() -> dict:
         "rooms": rooms,
         "protocol": PALACE_PROTOCOL,
         "aaak_dialect": AAAK_SPEC,
+        "wake_up_context": _build_wake_up_context(),
         "vector_disabled": True,
         "vector_disabled_reason": _vector_disabled_reason,
     }
@@ -716,6 +765,7 @@ def tool_status():
         "rooms": rooms,
         "protocol": PALACE_PROTOCOL,
         "aaak_dialect": AAAK_SPEC,
+        "wake_up_context": _build_wake_up_context(),
     }
     try:
         all_meta = _get_cached_metadata(col)
@@ -957,6 +1007,20 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
 def tool_get_aaak_spec():
     """Return the AAAK dialect specification."""
     return {"aaak_spec": AAAK_SPEC}
+
+
+def tool_wake_up(wing: str = None):
+    """Return Layer 0 identity + Layer 1 essential story."""
+    try:
+        wing = _sanitize_optional_name(wing, "wing")
+    except ValueError as e:
+        return {"error": str(e)}
+    context = _build_wake_up_context(wing=wing)
+    return {
+        "context": context,
+        "tokens_estimate": len(context) // 4,
+        "wing": wing,
+    }
 
 
 def tool_traverse_graph(start_room: str, max_hops: int = 2):
@@ -1797,6 +1861,19 @@ TOOLS = {
         "input_schema": {"type": "object", "properties": {}},
         "handler": tool_status,
     },
+    "mempalace_wake_up": {
+        "description": "Load Layer 0 identity and Layer 1 essential story as bounded startup context. Call this at the start of a session if the client did not auto-load MCP server instructions.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "wing": {
+                    "type": "string",
+                    "description": "Optional project/wing filter for Layer 1",
+                },
+            },
+        },
+        "handler": tool_wake_up,
+    },
     "mempalace_list_wings": {
         "description": "List all wings with drawer counts",
         "input_schema": {"type": "object", "properties": {}},
@@ -2290,6 +2367,7 @@ def handle_request(request):
                 "protocolVersion": negotiated,
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "mempalace", "version": __version__},
+                "instructions": _build_server_instructions(),
             },
         }
     elif method == "ping":

@@ -18,7 +18,8 @@ claude mcp add mempalace -- mempalace-mcp
 
 The server exposes the full MemPalace MCP toolset. Common entry points include:
 
-- **mempalace_status** — palace stats (wings, rooms, drawer counts)
+- **mempalace_status** — palace stats (wings, rooms, drawer counts) plus Layer 0/1 wake-up context
+- **mempalace_wake_up** — explicit Layer 0 identity + Layer 1 essential story
 - **mempalace_search** — semantic search across all memories
 - **mempalace_list_wings** — list all projects in the palace
 

@@ -6,7 +6,7 @@ Detailed parameter schemas for all 30 MCP tools.
 
 ### `mempalace_status`
 
-Palace overview: total drawers, wing and room counts, AAAK spec, and memory protocol.
+Palace overview: total drawers, wing and room counts, AAAK spec, memory protocol, and Layer 0/1 wake-up context.
 
 **Parameters:** None
 

@@ -16,7 +16,7 @@ The Python package that powers MemPalace. All modules, all logic.
 | `dialect.py` | AAAK compression — entity codes, emotion markers, 30x lossless ratio |
 | `knowledge_graph.py` | Temporal entity-relationship graph — SQLite, time-filtered queries, fact invalidation |
 | `palace_graph.py` | Room-based navigation graph — BFS traversal, tunnel detection across wings |
-| `mcp_server.py` | MCP server — 19 tools, AAAK auto-teach, Palace Protocol, agent diary |
+| `mcp_server.py` | MCP server — 30 tools, Layer 0/1 wake-up, AAAK auto-teach, Palace Protocol, agent diary |
 | `onboarding.py` | Guided first-run setup — asks about people/projects, generates AAAK bootstrap + wing config |
 | `entity_registry.py` | Entity code registry — maps names to AAAK codes, handles ambiguous names |
 | `entity_detector.py` | Auto-detect people and projects from file content |
