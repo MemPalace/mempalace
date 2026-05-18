@@ -2,32 +2,68 @@ import os
 import tempfile
 import shutil
 from pathlib import Path
+from unittest.mock import patch
 
 import chromadb
 
 from mempalace.convo_miner import mine_convos
 from mempalace.palace import file_already_mined
+from mempalace.backends.chroma import ChromaCollection
+
+
+class LocalTestEmbeddingFunction:
+    """Small deterministic embedding function for offline convo mining tests."""
+
+    def __call__(self, input):
+        embeddings = []
+        for text in input:
+            lowered = text.lower()
+            embeddings.append(
+                [
+                    float(lowered.count("memory")),
+                    float(lowered.count("persistence")),
+                    float(lowered.count("continuity")),
+                    float(lowered.count("structured")),
+                    float(len(lowered.split())),
+                    float(len(lowered)),
+                ]
+            )
+        return embeddings
+
+
+def _get_offline_collection(palace_path):
+    client = chromadb.PersistentClient(path=palace_path)
+    collection = client.get_or_create_collection(
+        "mempalace_drawers",
+        embedding_function=LocalTestEmbeddingFunction(),
+    )
+    return ChromaCollection(collection)
 
 
 def test_convo_mining():
     tmpdir = tempfile.mkdtemp()
-    with open(os.path.join(tmpdir, "chat.txt"), "w") as f:
-        f.write(
-            "> What is memory?\nMemory is persistence.\n\n> Why does it matter?\nIt enables continuity.\n\n> How do we build it?\nWith structured storage.\n"
+    try:
+        with open(os.path.join(tmpdir, "chat.txt"), "w") as f:
+            f.write(
+                "> What is memory?\nMemory is persistence.\n\n> Why does it matter?\nIt enables continuity.\n\n> How do we build it?\nWith structured storage.\n"
+            )
+
+        palace_path = os.path.join(tmpdir, "palace")
+        with patch("mempalace.convo_miner.get_collection", side_effect=_get_offline_collection):
+            mine_convos(tmpdir, palace_path, wing="test_convos")
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_collection(
+            "mempalace_drawers",
+            embedding_function=LocalTestEmbeddingFunction(),
         )
+        assert col.count() >= 2
 
-    palace_path = os.path.join(tmpdir, "palace")
-    mine_convos(tmpdir, palace_path, wing="test_convos")
-
-    client = chromadb.PersistentClient(path=palace_path)
-    col = client.get_collection("mempalace_drawers")
-    assert col.count() >= 2
-
-    # Verify search works
-    results = col.query(query_texts=["memory persistence"], n_results=1)
-    assert len(results["documents"][0]) > 0
-
-    shutil.rmtree(tmpdir, ignore_errors=True)
+        # Verify search works without network-backed embeddings.
+        results = col.query(query_texts=["memory persistence"], n_results=1)
+        assert len(results["documents"][0]) > 0
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def test_mine_convos_does_not_reprocess_short_files(capsys):
