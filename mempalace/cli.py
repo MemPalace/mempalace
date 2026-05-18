@@ -489,6 +489,9 @@ def cmd_mine(args):
     include_ignored = []
     for raw in args.include_ignored or []:
         include_ignored.extend(part.strip() for part in raw.split(",") if part.strip())
+    exclude_paths = []
+    for raw in getattr(args, "exclude", None) or []:
+        exclude_paths.extend(part.strip() for part in raw.split(",") if part.strip())
 
     # --redetect-origin re-runs corpus_origin on the current corpus state
     # and overwrites <palace>/.mempalace/origin.json before mining proceeds.
@@ -527,6 +530,7 @@ def cmd_mine(args):
                 dry_run=args.dry_run,
                 respect_gitignore=not args.no_gitignore,
                 include_ignored=include_ignored,
+                exclude_paths=getattr(args, "exclude", None),
             )
     except MineAlreadyRunning as exc:
         # A live MCP server or another mine is already writing to this
@@ -1275,6 +1279,12 @@ def main():
         action="append",
         default=[],
         help="Always scan these project-relative paths even if ignored; repeat or pass comma-separated paths",
+    )
+    p_mine.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        help="Exclude these project-relative paths from mining; repeat or pass comma-separated paths. Merged with 'exclude' list in mempalace.yaml",
     )
     p_mine.add_argument(
         "--agent",
