@@ -43,15 +43,23 @@ def _isolated_existing_palace_root(monkeypatch, tmp_path):
 
     Defaulting every test to a per-test palace root that exists makes
     them robust on their own and protects future tests from the same
-    trap. Tests that exercise the absent-root kill-switch path call
+    trap. ``_MINE_PID_DIR`` is patched too: it is derived from
+    ``STATE_DIR`` *at module import* (hooks_cli.py:277), so patching
+    ``STATE_DIR`` alone would leave mine-spawning tests writing PID files
+    under the import-time location instead of the per-test root. The
+    state dir is created so the docstring's "existing" promise holds.
+
+    Tests that exercise the absent-root kill-switch path call
     ``_redirect_palace_root`` (or set their own PALACE_ROOT) *after* this
     fixture; ``monkeypatch``'s last-write-wins means they keep their
     absent/file root and teardown still restores the real module value.
     """
     root = tmp_path / ".mempalace"
-    root.mkdir(exist_ok=True)
+    state_dir = root / "hook_state"
+    state_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(hooks_cli_mod, "PALACE_ROOT", root)
-    monkeypatch.setattr(hooks_cli_mod, "STATE_DIR", root / "hook_state")
+    monkeypatch.setattr(hooks_cli_mod, "STATE_DIR", state_dir)
+    monkeypatch.setattr(hooks_cli_mod, "_MINE_PID_DIR", state_dir / "mine_pids")
     monkeypatch.setattr(hooks_cli_mod, "_state_dir_initialized", False)
     return root
 
