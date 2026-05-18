@@ -20,6 +20,7 @@ from .normalize import normalize
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
+    _metadata_matches_extract_mode,
     file_already_mined,
     get_collection,
     mine_lock,
@@ -70,14 +71,15 @@ MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB — skip files larger than this.
 # use also scales with source size.
 
 
-def _register_file(collection, source_file: str, wing: str, agent: str):
+def _register_file(collection, source_file: str, wing: str, agent: str, extract_mode: str):
     """Write a sentinel so file_already_mined() returns True for 0-chunk files.
 
     Without this, files that normalize to nothing or produce zero chunks are
     re-read and re-processed on every mine run because nothing was written to
     ChromaDB on the first pass.
     """
-    sentinel_id = f"_reg_{hashlib.sha256(source_file.encode()).hexdigest()[:24]}"
+    sentinel_key = f"{source_file}:{extract_mode}"
+    sentinel_id = f"_reg_{hashlib.sha256(sentinel_key.encode()).hexdigest()[:24]}"
     collection.upsert(
         documents=[f"[registry] {source_file}"],
         ids=[sentinel_id],
@@ -89,10 +91,38 @@ def _register_file(collection, source_file: str, wing: str, agent: str):
                 "added_by": agent,
                 "filed_at": datetime.now().isoformat(),
                 "ingest_mode": "registry",
+                "extract_mode": extract_mode,
                 "normalize_version": NORMALIZE_VERSION,
             }
         ],
     )
+
+
+def _source_file_delete_ids(collection, source_file: str, extract_mode: str) -> list[str]:
+    """Collect drawer IDs for one source file and extraction mode.
+
+    Legacy conversation drawers did not carry extract_mode; treat those as
+    exchange-mode rows so schema rebuilds can still clean them up without
+    deleting newer general-mode drawers for the same transcript.
+    """
+    ids: list[str] = []
+    offset = 0
+    while True:
+        batch = collection.get(
+            where={"source_file": source_file},
+            limit=1000,
+            offset=offset,
+            include=["metadatas"],
+        )
+        batch_ids = batch.get("ids") or []
+        metadatas = batch.get("metadatas") or []
+        for drawer_id, meta in zip(batch_ids, metadatas):
+            if _metadata_matches_extract_mode(meta or {}, extract_mode):
+                ids.append(drawer_id)
+        if not batch_ids:
+            break
+        offset += len(batch_ids)
+    return ids
 
 
 # =============================================================================
@@ -358,14 +388,16 @@ def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extr
         # Re-check after lock — another agent may have just finished this file
         # at the current schema. A stale-version hit here returns False, so we
         # still fall through to the purge+rebuild path below.
-        if file_already_mined(collection, source_file):
+        if file_already_mined(collection, source_file, extract_mode=extract_mode):
             return 0, room_counts_delta, True
 
         # Purge stale drawers first. When the normalize schema bumps,
         # file_already_mined() returned False for pre-v2 drawers — clean
         # them out so the source doesn't end up with mixed old/new drawers.
         try:
-            collection.delete(where={"source_file": source_file})
+            delete_ids = _source_file_delete_ids(collection, source_file, extract_mode)
+            if delete_ids:
+                collection.delete(ids=delete_ids)
         except Exception:
             logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
 
@@ -382,7 +414,11 @@ def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extr
                 chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
                 if extract_mode == "general":
                     room_counts_delta[chunk_room] += 1
-                drawer_id = f"drawer_{wing}_{chunk_room}_{hashlib.sha256((source_file + str(chunk['chunk_index'])).encode()).hexdigest()[:24]}"
+                drawer_key = f"{source_file}:{extract_mode}:{chunk['chunk_index']}"
+                drawer_id = (
+                    f"drawer_{wing}_{chunk_room}_"
+                    f"{hashlib.sha256(drawer_key.encode()).hexdigest()[:24]}"
+                )
                 batch_docs.append(chunk["content"])
                 batch_ids.append(drawer_id)
                 batch_metas.append(
@@ -478,7 +514,9 @@ def mine_convos(
     # palace each per-file query costs ~2s, so a 2000-file sweep used to
     # spend >1h just deciding to skip. prefetch_mined_set() does the same
     # decisions in a single scan; loop body becomes an O(1) set check.
-    mined_set: set[str] = prefetch_mined_set(collection) if not dry_run else set()
+    mined_set: set[str] = (
+        prefetch_mined_set(collection, extract_mode=extract_mode) if not dry_run else set()
+    )
 
     total_drawers = 0
     files_skipped = 0
@@ -497,12 +535,12 @@ def mine_convos(
             content = normalize(str(filepath))
         except (OSError, ValueError):
             if not dry_run:
-                _register_file(collection, source_file, wing, agent)
+                _register_file(collection, source_file, wing, agent, extract_mode)
             continue
 
         if not content or len(content.strip()) < cfg_min_chunk_size:
             if not dry_run:
-                _register_file(collection, source_file, wing, agent)
+                _register_file(collection, source_file, wing, agent, extract_mode)
             continue
 
         # Chunk — either exchange pairs or general extraction
@@ -520,7 +558,7 @@ def mine_convos(
 
         if not chunks:
             if not dry_run:
-                _register_file(collection, source_file, wing, agent)
+                _register_file(collection, source_file, wing, agent, extract_mode)
             continue
 
         # Detect room from content (general mode uses memory_type instead)

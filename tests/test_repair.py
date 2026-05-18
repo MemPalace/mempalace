@@ -538,9 +538,104 @@ def test_rebuild_index_default_uses_configured_collection(mock_backend_cls, mock
     ]
 
 
+def test_status_returns_uninitialized_when_db_missing(tmp_path, capsys):
+    """repair.status on a palace dir without chroma.sqlite3 returns a
+    structured status (no chromadb client opened, per the design that
+    repair-status must work even on corrupted palaces — #1498)."""
+    # tmp_path exists, no chroma.sqlite3
+    result = repair.status(palace_path=str(tmp_path))
+
+    assert result["status"] == "uninitialized"
+    assert "no chroma.sqlite3" in result["message"]
+    captured = capsys.readouterr()
+    assert "has no chroma.sqlite3 yet" in captured.out + captured.err
+
+
+def test_status_returns_empty_when_db_present_no_drawers(tmp_path, capsys):
+    """repair.status on a palace with chroma.sqlite3 but zero drawer rows
+    returns a structured 'empty' status, distinguishable from 'unknown' /
+    'uninitialized' (#1498). Mocks sqlite_drawer_count to assert the
+    return-shape contract; see the real-disk sibling below for the
+    no-chromadb-client invariant."""
+    (tmp_path / "chroma.sqlite3").touch()
+    with patch("mempalace.repair.sqlite_drawer_count", return_value=0):
+        result = repair.status(palace_path=str(tmp_path))
+
+    assert result["status"] == "empty"
+    assert "no drawers yet" in result["message"]
+    captured = capsys.readouterr()
+    assert "initialized but empty" in captured.out + captured.err
+
+
+def test_status_empty_palace_never_opens_chromadb_client(tmp_path):
+    """Design invariant from #1498: repair.status on an initialized-but-empty
+    palace must NOT open a chromadb client. Opening would materialize HNSW
+    segment state files on disk, breaking the promise that repair-status is
+    safe to run on corrupted palaces.
+
+    Real-disk sibling of test_status_returns_empty_when_db_present_no_drawers:
+    bootstrap a real chroma.sqlite3 via PersistentClient (creates the DB
+    file but no collection), then assert repair.status returns 'empty' and
+    no chromadb segment artifacts appeared in the dir."""
+    import chromadb
+
+    chromadb.PersistentClient(path=str(tmp_path))
+    before = sorted(p.name for p in tmp_path.iterdir())
+
+    result = repair.status(palace_path=str(tmp_path))
+
+    after = sorted(p.name for p in tmp_path.iterdir())
+    assert result["status"] == "empty", result
+    # repair.status must not create new files; chromadb writes HNSW segment
+    # state and *.bin payloads on collection open — none of those should
+    # appear here.
+    assert before == after, f"repair.status mutated palace on disk: before={before} after={after}"
+
+
+def test_status_falls_through_to_capacity_when_sqlite_count_unreadable(tmp_path):
+    """When sqlite_drawer_count returns None (schema drift / locked file),
+    repair.status must fall through to hnsw_capacity_status instead of
+    short-circuiting on 'empty' (#1498)."""
+    (tmp_path / "chroma.sqlite3").touch()
+    with (
+        patch("mempalace.repair.sqlite_drawer_count", return_value=None),
+        patch("mempalace.repair.hnsw_capacity_status") as capacity_status,
+    ):
+        capacity_status.side_effect = [
+            {
+                "sqlite_count": None,
+                "hnsw_count": None,
+                "divergence": None,
+                "diverged": False,
+                "status": "unknown",
+                "message": "",
+            },
+            {
+                "sqlite_count": None,
+                "hnsw_count": None,
+                "divergence": None,
+                "diverged": False,
+                "status": "unknown",
+                "message": "",
+            },
+        ]
+        result = repair.status(palace_path=str(tmp_path))
+
+    # Did not short-circuit on 'empty': fell through to capacity check.
+    # The healthy/fall-through path returns {drawers, closets} dicts, no top-level "status" key.
+    assert "status" not in result or result["status"] != "empty"
+    assert "drawers" in result and "closets" in result
+    assert capacity_status.called
+
+
 def test_status_default_uses_configured_drawer_collection(tmp_path):
+    # Provide the on-disk preconditions the stratified state helper (#1498)
+    # checks before reaching the capacity probe: chroma.sqlite3 file exists
+    # and sqlite_drawer_count returns a positive number (palace not empty).
+    (tmp_path / "chroma.sqlite3").touch()
     with (
         patch("mempalace.repair._drawers_collection_name", return_value="custom_drawers"),
+        patch("mempalace.repair.sqlite_drawer_count", return_value=1),
         patch("mempalace.repair.hnsw_capacity_status") as capacity_status,
     ):
         capacity_status.side_effect = [

@@ -22,6 +22,7 @@ from typing import Optional
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
+    _open_collection_or_explain,
     build_closet_lines,
     file_already_mined,
     get_closets_collection,
@@ -1487,11 +1488,8 @@ def _compute_topic_tunnels_for_wing(wing: str) -> int:
 
 def status(palace_path: str):
     """Show what's been filed in the palace."""
-    try:
-        col = get_collection(palace_path, create=False)
-    except Exception:
-        print(f"\n  No palace found at {palace_path}")
-        print("  Run: mempalace init <dir> then mempalace mine <dir>")
+    col = _open_collection_or_explain(palace_path)
+    if col is None:
         return
 
     # Count by wing and room — paginate to avoid SQLite "too many SQL

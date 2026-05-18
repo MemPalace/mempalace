@@ -239,7 +239,7 @@ class TestFileChunksLocked:
         col = FakeCol()
         monkeypatch.setattr(convo_miner, "DRAWER_UPSERT_BATCH_SIZE", 2)
         monkeypatch.setattr(
-            convo_miner, "file_already_mined", lambda collection, source_file: False
+            convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
         )
         monkeypatch.setattr(convo_miner, "mine_lock", lambda source_file: contextlib.nullcontext())
         monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda content: "conversations")

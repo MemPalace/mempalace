@@ -16,6 +16,7 @@ import re
 import sqlite3
 from pathlib import Path
 
+from .backends import CollectionNotInitializedError, PalaceNotFoundError
 from .palace import get_closets_collection, get_collection
 
 # Closet pointer line format: "topic|entities|→drawer_id_a,drawer_id_b"
@@ -295,9 +296,29 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
     Search the palace. Returns verbatim drawer content.
     Optionally filter by wing (project) or room (aspect).
     """
+    # Filesystem-first checks distinguish State A / State B before reaching
+    # chromadb. PersistentClient lazily creates chroma.sqlite3 on first open
+    # of an empty palace dir, so without these checks State B collapses into
+    # the "initialized but empty" State C message and mutates the dir as a
+    # side effect of a read-only search call (#1498).
+    if not os.path.isdir(palace_path):
+        print(f"\n  No palace found at {palace_path}")
+        print("  Run: mempalace init <dir> then mempalace mine <dir>")
+        raise SearchError(f"No palace found at {palace_path}")
+    if not os.path.isfile(os.path.join(palace_path, "chroma.sqlite3")):
+        print(f"\n  Palace dir at {palace_path} exists but has no chroma.sqlite3 yet.")
+        print("  Run: mempalace mine <dir>")
+        raise SearchError(f"No palace database at {palace_path}")
     try:
         col = get_collection(palace_path, create=False)
-    except Exception as e:
+    except CollectionNotInitializedError as e:
+        # State C from #1498: palace initialized but never mined.
+        print(f"\n  Palace at {palace_path} is initialized but empty (no drawers yet).")
+        print("  Run: mempalace mine <dir>")
+        raise SearchError(f"Palace at {palace_path} is initialized but empty") from e
+    except PalaceNotFoundError as e:
+        # Backend filesystem-race fallback: dir was deleted between our
+        # check above and the backend call. Same message as State A.
         print(f"\n  No palace found at {palace_path}")
         print("  Run: mempalace init <dir> then mempalace mine <dir>")
         raise SearchError(f"No palace found at {palace_path}") from e

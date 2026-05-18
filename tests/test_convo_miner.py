@@ -77,6 +77,38 @@ def test_mine_convos_does_not_reprocess_empty_chunk_files(capsys):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_mine_convos_allows_general_after_exchange(capsys):
+    """A transcript mined as exchange can later be mined as general memories."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        convo_path = Path(tmpdir) / "chat.txt"
+        convo_path.write_text(
+            "> What did we decide?\n"
+            "We decided to use SQLite because it keeps the local setup simple.\n\n"
+            "> What broke?\n"
+            "The search failed because the old index was stale, and the fix was rebuild.\n"
+        )
+        palace_path = os.path.join(tmpdir, "palace")
+
+        mine_convos(tmpdir, palace_path, wing="test", extract_mode="exchange")
+        capsys.readouterr()
+        mine_convos(tmpdir, palace_path, wing="test", extract_mode="general")
+        out = capsys.readouterr().out
+
+        assert "Files skipped (already filed): 0" in out
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_collection("mempalace_drawers")
+        resolved = str(Path(tmpdir).resolve() / "chat.txt")
+        rows = col.get(where={"source_file": resolved}, include=["metadatas"])
+        modes = {meta.get("extract_mode") for meta in rows["metadatas"]}
+        assert {"exchange", "general"} <= modes
+        assert any(drawer_id.startswith("drawer_test_decision_") for drawer_id in rows["ids"])
+        del col, client
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def test_mine_convos_rebuilds_stale_drawers_after_schema_bump(capsys):
     """When stored drawers have an older normalize_version, the next mine
     silently purges them and refiles — no manual erase required.

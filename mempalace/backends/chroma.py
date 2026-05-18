@@ -16,6 +16,7 @@ from chromadb.errors import NotFoundError as _ChromaNotFoundError
 from .base import (
     BaseBackend,
     BaseCollection,
+    CollectionNotInitializedError,
     GetResult,
     HealthStatus,
     PalaceNotFoundError,
@@ -1380,7 +1381,10 @@ class ChromaBackend(BaseBackend):
                     **ef_kwargs,
                 )
         else:
-            collection = client.get_collection(collection_name, **ef_kwargs)
+            try:
+                collection = client.get_collection(collection_name, **ef_kwargs)
+            except _ChromaNotFoundError as e:
+                raise CollectionNotInitializedError(palace_path) from e
         _pin_hnsw_threads(collection)
         return ChromaCollection(collection, palace_path=palace_path)
 

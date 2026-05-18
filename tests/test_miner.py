@@ -10,7 +10,7 @@ import pytest
 import yaml
 
 from mempalace.miner import detect_room, load_config, mine, scan_project, status
-from mempalace.palace import NORMALIZE_VERSION, file_already_mined
+from mempalace.palace import NORMALIZE_VERSION, file_already_mined, prefetch_mined_set
 
 
 def write_file(path: Path, content: str):
@@ -406,6 +406,82 @@ def test_file_already_mined_check_mtime():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_file_already_mined_scopes_convo_extract_mode():
+    tmpdir = tempfile.mkdtemp()
+    try:
+        palace_path = os.path.join(tmpdir, "palace")
+        os.makedirs(palace_path)
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection(
+            "mempalace_drawers", metadata={"hnsw:space": "cosine"}
+        )
+
+        source_file = os.path.join(tmpdir, "chat.jsonl")
+        col.add(
+            ids=["exchange"],
+            documents=["exchange drawer"],
+            metadatas=[
+                {
+                    "source_file": source_file,
+                    "extract_mode": "exchange",
+                    "normalize_version": NORMALIZE_VERSION,
+                }
+            ],
+        )
+
+        assert file_already_mined(col, source_file, extract_mode="exchange") is True
+        assert file_already_mined(col, source_file, extract_mode="general") is False
+        assert source_file in prefetch_mined_set(col, extract_mode="exchange")
+        assert source_file not in prefetch_mined_set(col, extract_mode="general")
+
+        col.add(
+            ids=["general"],
+            documents=["general drawer"],
+            metadatas=[
+                {
+                    "source_file": source_file,
+                    "extract_mode": "general",
+                    "normalize_version": NORMALIZE_VERSION,
+                }
+            ],
+        )
+
+        assert file_already_mined(col, source_file, extract_mode="general") is True
+        assert source_file in prefetch_mined_set(col, extract_mode="general")
+    finally:
+        del col, client
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_file_already_mined_extract_mode_paginates_large_sources():
+    source_file = "/tmp/long-chat.jsonl"
+    metadatas = [
+        {
+            "source_file": source_file,
+            "extract_mode": "exchange",
+            "normalize_version": NORMALIZE_VERSION,
+        }
+        for _ in range(1000)
+    ]
+    metadatas.append(
+        {
+            "source_file": source_file,
+            "extract_mode": "general",
+            "normalize_version": NORMALIZE_VERSION,
+        }
+    )
+
+    class FakeCollection:
+        def get(self, where=None, limit=1, offset=0, include=None):
+            batch = metadatas[offset : offset + limit]
+            return {
+                "ids": [f"id-{i}" for i in range(offset, offset + len(batch))],
+                "metadatas": batch,
+            }
+
+    assert file_already_mined(FakeCollection(), source_file, extract_mode="general") is True
+
+
 def test_mine_dry_run_with_tiny_file_no_crash():
     """Dry-run must not crash when process_file returns 0 drawers (room was None)."""
     tmpdir = tempfile.mkdtemp()
@@ -442,6 +518,41 @@ def test_status_missing_palace_does_not_create_empty_collection(tmp_path, capsys
     assert not palace_path.exists()
 
 
+def test_status_initialized_but_empty_palace_reports_empty(tmp_path, capsys):
+    """State C from #1498: palace dir + chroma.sqlite3 exist but no drawers
+    have been mined yet. status() must print the 'initialized but empty'
+    message and suggest `mempalace mine`, not the misleading 'No palace
+    found' / 'Run init' message."""
+    import chromadb
+
+    palace_path = tmp_path / "empty-palace"
+    palace_path.mkdir()
+    chromadb.PersistentClient(path=str(palace_path))  # creates chroma.sqlite3
+    assert (palace_path / "chroma.sqlite3").is_file()
+
+    status(str(palace_path))
+
+    out = capsys.readouterr().out
+    assert "initialized but empty" in out
+    assert "mempalace mine" in out
+    assert "No palace found" not in out
+
+
+def test_status_palace_dir_without_db_reports_uninitialized(tmp_path, capsys):
+    """State B from #1498: palace dir exists but chroma.sqlite3 is absent.
+    Helper must short-circuit before invoking chromadb (which would lazily
+    create the DB file as a side effect of a read-only inspection)."""
+    palace_path = tmp_path / "no-db-palace"
+    palace_path.mkdir()
+
+    status(str(palace_path))
+
+    out = capsys.readouterr().out
+    assert "has no chroma.sqlite3 yet" in out
+    # Side-effect check: chromadb was never touched.
+    assert list(palace_path.iterdir()) == []
+
+
 def test_status_handles_none_metadata_without_crash(tmp_path, capsys):
     """status must not crash when col.get returns a None entry in metadatas.
 
@@ -462,7 +573,7 @@ def test_status_handles_none_metadata_without_crash(tmp_path, capsys):
                 "metadatas": [{"wing": "proj", "room": "r"}, None],
             }
 
-    with patch("mempalace.miner.get_collection", return_value=FakeCol()):
+    with patch("mempalace.miner._open_collection_or_explain", return_value=FakeCol()):
         status(str(tmp_path))
 
     out = capsys.readouterr().out
