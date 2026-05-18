@@ -344,6 +344,25 @@ def _mine_already_running(cmd: list[str]) -> bool:
     return _pid_alive(int(recorded))
 
 
+def _create_mine_slot_with_placeholder(pid_file: Path) -> Path:
+    """Atomically create a mine PID slot and write this hook PID into it."""
+    fd = os.open(str(pid_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="ascii") as f:
+            f.write(str(os.getpid()))
+    except OSError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            pid_file.unlink()
+        except OSError:
+            pass
+        raise
+    return pid_file
+
+
 def _claim_mine_slot(cmd: list[str]) -> Optional[Path]:
     """Atomically reserve the per-target PID slot for ``cmd``.
 
@@ -359,17 +378,14 @@ def _claim_mine_slot(cmd: list[str]) -> Optional[Path]:
     pid_file = _pid_file_for_cmd(cmd)
     pid_file.parent.mkdir(parents=True, exist_ok=True)
     try:
-        fd = os.open(str(pid_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        try:
-            os.write(fd, str(os.getpid()).encode("ascii"))
-        finally:
-            os.close(fd)
-        return pid_file
+        return _create_mine_slot_with_placeholder(pid_file)
     except FileExistsError:
         pass
+
     # Slot exists. If the holder is alive, defer.
     if _mine_already_running(cmd):
         return None
+
     # Stale entry; reclaim. The unlink+create is racy against another hook
     # firing right now, but the second create's O_EXCL will fail and that
     # caller will see the live PID via the next round.
@@ -379,13 +395,9 @@ def _claim_mine_slot(cmd: list[str]) -> Optional[Path]:
         pass
     except OSError:
         return None
+
     try:
-        fd = os.open(str(pid_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        try:
-            os.write(fd, str(os.getpid()).encode("ascii"))
-        finally:
-            os.close(fd)
-        return pid_file
+        return _create_mine_slot_with_placeholder(pid_file)
     except FileExistsError:
         return None
 
