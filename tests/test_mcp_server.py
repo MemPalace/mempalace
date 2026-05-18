@@ -1386,6 +1386,28 @@ class TestWriteTools:
         assert len(mcp_server.tool_list_tunnels(wing="my-wing")) == 1
         assert len(mcp_server.tool_list_tunnels(wing="my_wing")) == 1
 
+    def test_tool_create_tunnel_surfaces_value_error(self, monkeypatch):
+        """Regression for #1473: a ValueError from create_tunnel (e.g. a
+        missing room) must be returned to the caller as a clear error,
+        not escape and get wrapped as the opaque 'Internal tool error'."""
+        from mempalace import mcp_server
+
+        msg = "Target room 'does-not-exist-probe' does not exist in wing 'wing_minerva'"
+
+        def _raise(*args, **kwargs):
+            raise ValueError(msg)
+
+        monkeypatch.setattr(mcp_server, "create_tunnel", _raise)
+
+        result = mcp_server.tool_create_tunnel(
+            source_wing="wing_minerva",
+            source_room="fx-invariants",
+            target_wing="wing_minerva",
+            target_room="does-not-exist-probe",
+        )
+
+        assert result == {"error": msg}
+
 
 # ── KG Tools ────────────────────────────────────────────────────────────
 

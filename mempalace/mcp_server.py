@@ -1033,15 +1033,22 @@ def tool_create_tunnel(
         target_room = sanitize_name(target_room, "target_room")
     except ValueError as e:
         return {"error": str(e)}
-    return create_tunnel(
-        source_wing,
-        source_room,
-        target_wing,
-        target_room,
-        label=label,
-        source_drawer_id=source_drawer_id,
-        target_drawer_id=target_drawer_id,
-    )
+    # create_tunnel raises ValueError for invalid/missing endpoints
+    # (empty/non-string names, and room-existence checks). Surface the
+    # real reason instead of letting it escape and be wrapped as the
+    # opaque "Internal tool error" (#1473), mirroring sibling tools.
+    try:
+        return create_tunnel(
+            source_wing,
+            source_room,
+            target_wing,
+            target_room,
+            label=label,
+            source_drawer_id=source_drawer_id,
+            target_drawer_id=target_drawer_id,
+        )
+    except ValueError as e:
+        return {"error": str(e)}
 
 
 def tool_list_tunnels(wing: str = None):
