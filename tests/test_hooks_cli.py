@@ -179,6 +179,7 @@ def _capture_hook_output(hook_fn, data, harness="claude-code", state_dir=None):
         palace_root.mkdir(parents=True, exist_ok=True)
         patches.append(patch("mempalace.hooks_cli.PALACE_ROOT", palace_root))
         patches.append(patch("mempalace.hooks_cli.STATE_DIR", state_dir))
+        patches.append(patch("mempalace.hooks_cli._MINE_PID_DIR", state_dir / "mine_pids"))
     # Mock MempalaceConfig so tests don't depend on user's ~/.mempalace/config.json
     mock_config = MagicMock()
     type(mock_config).hook_silent_save = PropertyMock(return_value=True)
@@ -189,6 +190,43 @@ def _capture_hook_output(hook_fn, data, harness="claude-code", state_dir=None):
             stack.enter_context(p)
         hook_fn(data, harness)
     return json.loads(buf.getvalue())
+
+
+def test_capture_hook_output_patches_mine_pid_dir_for_auto_ingest(
+    tmp_path, monkeypatch
+):
+    """Regression #1510: helper should isolate background mine PID files too."""
+    state_dir = tmp_path / "hook_state"
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
+    )
+
+    monkeypatch.setenv("MEMPAL_DIR", str(project_dir))
+
+    with (
+        patch(
+            "mempalace.hooks_cli._save_diary_direct",
+            return_value={"count": SAVE_INTERVAL, "themes": []},
+        ),
+        patch("mempalace.hooks_cli._ingest_transcript"),
+        patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen,
+    ):
+        mock_popen.return_value.pid = 12345
+
+        result = _capture_hook_output(
+            hook_stop,
+            {"session_id": "test", "stop_hook_active": False, "transcript_path": str(transcript)},
+            state_dir=state_dir,
+        )
+
+    assert "systemMessage" in result
+    assert (state_dir / "mine_pids").is_dir()
+    assert list((state_dir / "mine_pids").glob("mine_*.pid"))
 
 
 def test_capture_hook_output_sets_up_palace_root(tmp_path):
