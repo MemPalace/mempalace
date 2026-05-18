@@ -93,6 +93,12 @@ EMOTION_CODES = {
     "surprise": "surprise",
 }
 
+# Reverse map: emotion code -> readable word (for AAAK expansion)
+_REVERSE_EMOTIONS = {}
+for _word, _code in EMOTION_CODES.items():
+    if _code not in _REVERSE_EMOTIONS:
+        _REVERSE_EMOTIONS[_code] = _word
+
 # Keywords that signal emotions in plain text
 _EMOTION_SIGNALS = {
     "decided": "determ",
@@ -947,6 +953,107 @@ class Dialect:
                 }
 
         return result
+
+    def expand(self, dialect_text: str) -> str:
+        """Expand AAAK Dialect back into natural-language fragments for embedding.
+
+        This is NOT a lossless reconstruction — the original text is gone.
+        It reassembles the structured fields (entities, topics, key sentence,
+        emotions) into a readable string that embeds well in vector space.
+
+        Args:
+            dialect_text: AAAK-formatted string (from compress() or encode_file())
+
+        Returns:
+            A natural-language string suitable for semantic embedding.
+        """
+        parsed = self.decode(dialect_text)
+
+        parts = []
+
+        # Header: wing, room, date, file title
+        header = parsed.get("header", {})
+        for key in ("entities", "title", "date"):
+            val = header.get(key, "").strip()
+            if val and val != "?":
+                parts.append(val)
+
+        # Reverse entity code map for expansion
+        code_to_name = {}
+        for name, code in self.entity_codes.items():
+            if not name.islower() and code not in code_to_name:
+                code_to_name[code] = name
+
+        # Zettels: extract entity names, topics, key quote, emotions
+        for zettel_line in parsed.get("zettels", []):
+            fields = zettel_line.split("|")
+            for field in fields:
+                field = field.strip()
+                if not field:
+                    continue
+
+                # Entity field (starts with digit + colon, e.g. "0:ALC+BOB")
+                if field and field[0].isdigit() and ":" in field:
+                    codes = field.split(":", 1)[1]
+                    for code in codes.split("+"):
+                        code = code.strip()
+                        if code and code != "???":
+                            expanded = code_to_name.get(code, code)
+                            parts.append(expanded)
+
+                # Quoted key sentence
+                elif field.startswith('"') and field.endswith('"'):
+                    parts.append(field.strip('"'))
+
+                # Emotion codes
+                elif field in _REVERSE_EMOTIONS:
+                    parts.append(_REVERSE_EMOTIONS[field])
+
+                # Combined emotions/flags (e.g. "determ+hope", "DECISION+PIVOT")
+                # Require at least one known emotion code to avoid misclassifying
+                # topics like "TCP+UDP" as emotions.
+                elif "+" in field and any(
+                    f.strip() in _REVERSE_EMOTIONS for f in field.split("+")
+                ):
+                    for f in field.split("+"):
+                        f = f.strip()
+                        if f in _REVERSE_EMOTIONS:
+                            parts.append(_REVERSE_EMOTIONS[f])
+                        elif f.isupper():
+                            parts.append(f.lower())
+
+                # Topic keywords (underscored or plain)
+                else:
+                    parts.append(field.replace("_", " "))
+
+        # Arc line
+        arc = parsed.get("arc", "")
+        if arc:
+            for emotion in arc.split("->"):
+                emotion = emotion.strip()
+                if emotion in _REVERSE_EMOTIONS:
+                    parts.append(_REVERSE_EMOTIONS[emotion])
+
+        return " ".join(parts)
+
+    @staticmethod
+    def looks_like_aaak(text: str) -> bool:
+        """Check if text looks like AAAK Dialect format.
+
+        Heuristic: AAAK lines contain pipe separators and the first
+        field of at least one line has a colon (e.g. "0:ALC+BOB|...").
+        """
+        if "|" not in text:
+            return False
+        for line in text.strip().split("\n"):
+            line = line.strip()
+            if not line or line.startswith("ARC:") or line.startswith("T:"):
+                continue
+            if "|" in line:
+                first_field = line.split("|")[0]
+                if ":" in first_field and first_field[0].isdigit():
+                    return True
+        return False
 
     # === STATS ===
 
