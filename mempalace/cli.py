@@ -955,6 +955,55 @@ def cmd_repair(args):
     print(f"\n{'=' * 55}\n")
 
 
+def cmd_scan(args):
+    """Scan palace drawers for sensitive content."""
+    import chromadb
+    from .scanner import scan_content, format_warnings
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    try:
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_collection("mempalace_drawers")
+    except Exception:
+        print(f"\n  No palace found at {palace_path}")
+        return
+
+    total_count = col.count()
+    flagged_drawers = 0
+    total_findings = 0
+    total_scanned = 0
+    batch_size = 500
+
+    print(f"\n  Scanning {total_count} drawers for sensitive content...\n")
+
+    while total_scanned < total_count:
+        kwargs = {
+            "include": ["documents", "metadatas"],
+            "limit": batch_size,
+            "offset": total_scanned,
+        }
+        if args.wing:
+            kwargs["where"] = {"wing": args.wing}
+        data = col.get(**kwargs)
+        if not data["ids"]:
+            break
+
+        for drawer_id, doc, meta in zip(data["ids"], data["documents"], data["metadatas"]):
+            findings = scan_content(doc)
+            if findings:
+                flagged_drawers += 1
+                total_findings += len(findings)
+                wing = meta.get("wing", "?")
+                room = meta.get("room", "?")
+                print(f"  {drawer_id}  ({wing}/{room})")
+                print(f"    {format_warnings(findings)}")
+
+        total_scanned += len(data["ids"])
+
+    print(f"\n  Scanned {total_scanned} drawers, "
+          f"found {total_findings} sensitive patterns in {flagged_drawers} drawers.\n")
+
+
 def cmd_hook(args):
     """Run hook logic: reads JSON from stdin, outputs JSON to stdout."""
     from .hooks_cli import run_hook
@@ -1421,6 +1470,10 @@ def main():
     for instr_name in ["init", "search", "mine", "help", "status"]:
         instructions_sub.add_parser(instr_name, help=f"Output {instr_name} instructions")
 
+    # scan
+    p_scan = sub.add_parser("scan", help="Scan palace drawers for sensitive content (API keys, tokens, passwords)")
+    p_scan.add_argument("--wing", default=None, help="Only scan drawers in this wing")
+
     # repair
     p_repair = sub.add_parser(
         "repair",
@@ -1558,6 +1611,7 @@ def main():
         "mcp": cmd_mcp,
         "compress": cmd_compress,
         "wake-up": cmd_wakeup,
+        "scan": cmd_scan,
         "repair": cmd_repair,
         "repair-status": cmd_repair_status,
         "migrate": cmd_migrate,

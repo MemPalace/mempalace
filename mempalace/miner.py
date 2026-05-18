@@ -35,6 +35,8 @@ from .palace import (
 
 logger = logging.getLogger("mempalace_mcp")
 
+from .scanner import scan_content, format_warnings
+
 READABLE_EXTENSIONS = {
     ".txt",
     ".md",
@@ -900,6 +902,13 @@ def process_file(
     content = content.strip()
     if len(content) < effective_min:
         return 0, "general"
+
+    findings = scan_content(content)
+    if findings:
+        print(
+            f"  ⚠ {filepath.name}: {format_warnings(findings)}",
+            file=sys.stderr,
+        )
 
     room = detect_room(filepath, content, rooms, project_path)
     chunks = chunk_text(
