@@ -192,9 +192,7 @@ def _capture_hook_output(hook_fn, data, harness="claude-code", state_dir=None):
     return json.loads(buf.getvalue())
 
 
-def test_capture_hook_output_patches_mine_pid_dir_for_auto_ingest(
-    tmp_path, monkeypatch
-):
+def test_capture_hook_output_patches_mine_pid_dir_for_auto_ingest(tmp_path, monkeypatch):
     """Regression #1510: helper should isolate background mine PID files too."""
     state_dir = tmp_path / "hook_state"
     project_dir = tmp_path / "project"
@@ -906,9 +904,9 @@ def test_spawn_mine_releases_slot_on_oserror(tmp_path):
             with patch("mempalace.hooks_cli.subprocess.Popen", side_effect=OSError("spawn fail")):
                 with pytest.raises(OSError):
                     _spawn_mine(cmd)
-                assert (
-                    not pid_file.exists()
-                ), "slot must be released so the next hook fire isn't permanently blocked"
+                assert not pid_file.exists(), (
+                    "slot must be released so the next hook fire isn't permanently blocked"
+                )
 
 
 def test_spawn_mine_passes_pid_file_env_var(tmp_path):
