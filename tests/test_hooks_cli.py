@@ -904,9 +904,9 @@ def test_spawn_mine_releases_slot_on_oserror(tmp_path):
             with patch("mempalace.hooks_cli.subprocess.Popen", side_effect=OSError("spawn fail")):
                 with pytest.raises(OSError):
                     _spawn_mine(cmd)
-                assert not pid_file.exists(), (
-                    "slot must be released so the next hook fire isn't permanently blocked"
-                )
+                assert (
+                    not pid_file.exists()
+                ), "slot must be released so the next hook fire isn't permanently blocked"
 
 
 def test_spawn_mine_passes_pid_file_env_var(tmp_path):
