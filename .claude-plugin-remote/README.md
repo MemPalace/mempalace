@@ -1,5 +1,22 @@
 # mempalace-remote
 
+> [!CAUTION]
+> ## ⚠ DO NOT USE — known-broken architecture
+>
+> This plugin's design **amplifies** a known palace-destruction class in MemPalace rather than mitigating it. Empirically demonstrated against a real ~100K-drawer palace; see upstream issues [#1533](https://github.com/MemPalace/mempalace/issues/1533) and [#1545](https://github.com/MemPalace/mempalace/issues/1545).
+>
+> **Why it's broken.** This plugin still spawns a fresh `mempalace-mcp` process on the central host every time a Claude Code session opens. With multiple remote clients (and/or local sessions on the central host) running in parallel, the central host ends up with N concurrent `mempalace.mcp_server` processes — exactly the multi-writer race that destroys ChromaDB HNSW state under sustained multi-session use:
+>
+> 1. ChromaDB's `quarantine_stale_hnsw()` fires on every fresh `make_client()` cold-start. Any new Claude Code session anywhere in the fleet can silently invalidate all other live MCP-server processes' in-memory state.
+> 2. Once invalidated, the next write from any "stale" process persists its outdated view over the on-disk segment files, zeroing `data_level0.bin` / deleting `index_metadata.pickle`.
+> 3. Steady-state Claude Code use with multiple long-running sessions is sufficient to trigger this. No rebuild, no manual swap, no operator action required.
+>
+> Adding SSH proxies on top of this architecture doesn't help — it just gives more clients a way to spawn yet more concurrent MCP processes on the central host.
+>
+> **What to use instead.** A single-process gateway that owns the palace and serves all clients via HTTP/MCP. [`rboarescu/palace-daemon`](https://github.com/rboarescu/palace-daemon) is one such implementation (systemd service, semaphore-based concurrency control, single-writer guarantees). The MemPalace project itself may eventually grow this pattern (see [HttpChromaBackend + Postgres KG, #1337](https://github.com/MemPalace/mempalace/pull/1337) for a related effort).
+>
+> This PR (#1190) is left open as the documentation of *what doesn't work and why* — converting to draft until the architecture is reworked or replaced.
+
 Use a MemPalace install on a **central host** from a **remote client** machine, over SSH.
 
 The default `mempalace` plugin runs the MCP server and auto-save hooks against a local mempalace install. On a remote machine that doesn't have mempalace installed (or shouldn't have its own palace), `mempalace-remote` proxies the same MCP tools and Stop / PreCompact hooks to a host that does, so all clients share one canonical palace.
