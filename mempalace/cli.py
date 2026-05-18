@@ -38,6 +38,11 @@ from .corpus_origin import detect_origin_heuristic, detect_origin_llm
 from .llm_client import LLMError, get_provider
 from .version import __version__
 
+def resolve_palace(args):
+    if getattr(args, "palace", None):
+        return os.path.expanduser(args.palace)
+    config = MempalaceConfig()
+    return config.palace_path
 
 _MEMPALACE_PROJECT_FILES = ("mempalace.yaml", "entities.json")
 
@@ -226,7 +231,18 @@ def _ensure_mempalace_files_gitignored(project_dir) -> bool:
 
 
 def cmd_init(args):
+
+    # Ensure target directory exists (create if missing)
+    path = str(Path(args.dir).expanduser())
+    if not os.path.exists(path):
+        os.makedirs(path, exist_ok=True)
+        print(f"  Created directory: {path}")
+
+    # Normalize args.dir to absolute path
+    args.dir = str(Path(path).resolve())
+
     import json
+    from .entity_detector import scan_for_detection, detect_entities, confirm_entities
     from pathlib import Path
     from .entity_detector import confirm_entities
     from .project_scanner import discover_entities
@@ -377,6 +393,12 @@ def cmd_init(args):
 
     # Pass 2: detect rooms from folder structure
     detect_rooms_local(project_dir=args.dir, yes=getattr(args, "yes", False))
+    # Respect custom palace path via environment (since config property is read-only)
+    if getattr(args, "palace", None):
+        os.environ["MEMPALACE_PALACE"] = os.path.expanduser(args.palace)
+
+    config = MempalaceConfig()
+    config.init()
     cfg.init()
 
     # Pass 3: protect git repos from accidentally committing per-project files
@@ -485,7 +507,7 @@ def _maybe_run_mine_after_init(args, cfg) -> None:
 
 
 def cmd_mine(args):
-    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    palace_path = resolve_palace(args)
     include_ignored = []
     for raw in args.include_ignored or []:
         include_ignored.extend(part.strip() for part in raw.split(",") if part.strip())
@@ -664,7 +686,7 @@ def cmd_sync(args):
 def cmd_search(args):
     from .searcher import search, SearchError
 
-    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    palace_path = resolve_palace(args)
     try:
         search(
             query=args.query,
@@ -681,7 +703,7 @@ def cmd_wakeup(args):
     """Show L0 (identity) + L1 (essential story) — the wake-up context."""
     from .layers import MemoryStack
 
-    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    palace_path = resolve_palace(args)
     stack = MemoryStack(palace_path=palace_path)
 
     text = stack.wake_up(wing=args.wing)
@@ -718,7 +740,7 @@ def cmd_migrate(args):
     """Migrate palace from a different ChromaDB version."""
     from .migrate import migrate
 
-    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    palace_path = resolve_palace(args)
     migrate(
         palace_path=palace_path,
         dry_run=args.dry_run,
@@ -729,7 +751,7 @@ def cmd_migrate(args):
 def cmd_status(args):
     from .miner import status
 
-    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    palace_path = resolve_palace(args)
     status(palace_path=palace_path)
 
 
@@ -995,7 +1017,7 @@ def cmd_compress(args):
     from .dialect import Dialect
     from .palace import get_closets_collection
 
-    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    palace_path = resolve_palace(args)
 
     # Load dialect (with optional entity config)
     config_path = args.config
@@ -1255,6 +1277,12 @@ def main():
         ),
     )
 
+    p_init.add_argument(
+        "--palace",
+        default=None,
+        help="Custom palace location"
+    )
+
     # mine
     p_mine = sub.add_parser("mine", help="Mine files into the palace")
     p_mine.add_argument("dir", help="Directory to mine")
@@ -1301,6 +1329,11 @@ def main():
         choices=["exchange", "general"],
         default="exchange",
         help="Extraction strategy for convos mode: 'exchange' (default) or 'general' (5 memory types)",
+    )
+    p_mine.add_argument(
+        "--palace",
+        default=None,
+        help="Custom palace location"
     )
 
     # sweep
@@ -1352,6 +1385,11 @@ def main():
     p_search.add_argument("--wing", default=None, help="Limit to one project")
     p_search.add_argument("--room", default=None, help="Limit to one room")
     p_search.add_argument("--results", type=int, default=5, help="Number of results")
+    p_search.add_argument(
+        "--palace",
+        default=None,
+        help="Custom palace location"
+    )
 
     # compress
     p_compress = sub.add_parser(
@@ -1364,10 +1402,20 @@ def main():
     p_compress.add_argument(
         "--config", default=None, help="Entity config JSON (e.g. entities.json)"
     )
+    p_compress.add_argument(
+        "--palace",
+        default=None,
+        help="Custom palace location"
+    )
 
     # wake-up
     p_wakeup = sub.add_parser("wake-up", help="Show L0 + L1 wake-up context (~600-900 tokens)")
     p_wakeup.add_argument("--wing", default=None, help="Wake-up for a specific project/wing")
+    p_wakeup.add_argument(
+        "--palace",
+        default=None,
+        help="Custom palace location"
+    )
 
     # split
     p_split = sub.add_parser(
@@ -1509,6 +1557,13 @@ def main():
     )
 
     # status
+    p_status = sub.add_parser("status", help="Show what's been filed")
+    p_status.add_argument(
+        "--palace",
+        default=None,
+        help="Custom palace location"
+    )
+
     # migrate
     p_migrate = sub.add_parser(
         "migrate",
@@ -1522,8 +1577,11 @@ def main():
     p_migrate.add_argument(
         "--yes", action="store_true", help="Skip confirmation for destructive changes"
     )
-
-    sub.add_parser("status", help="Show what's been filed")
+    p_migrate.add_argument(
+        "--palace",
+        default=None,
+        help="Custom palace location"
+    )
 
     args = parser.parse_args()
 
