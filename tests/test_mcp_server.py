@@ -63,12 +63,12 @@ def test_mcp_main_strips_leaked_pythonpath_from_env():
     )
     diag = f"rc={result.returncode}; stdout={result.stdout!r}; stderr={result.stderr!r}"
     assert result.returncode == 0, f"subprocess failed: {diag}"
-    assert (
-        f"ENV_MID: {expected_env!r}" in result.stderr
-    ), f"package import unexpectedly stripped env (regression in __init__.py): {diag}"
-    assert (
-        "SENTINEL_IN_PATH: False" in result.stderr
-    ), f"package import did not filter sys.path (regression in __init__.py): {diag}"
+    assert f"ENV_MID: {expected_env!r}" in result.stderr, (
+        f"package import unexpectedly stripped env (regression in __init__.py): {diag}"
+    )
+    assert "SENTINEL_IN_PATH: False" in result.stderr, (
+        f"package import did not filter sys.path (regression in __init__.py): {diag}"
+    )
     assert "ENV_AFTER: None" in result.stderr, f"MCP server did not strip PYTHONPATH: {diag}"
 
 
@@ -250,9 +250,9 @@ class TestColdStartDiagnostics:
         )
         assert result.returncode == 0, f"stderr={result.stderr!r}"
         assert not marker.exists(), f"warmup ran for explicit-falsy value {value!r}"
-        assert (
-            "not recognized" not in result.stderr
-        ), f"explicit-falsy {value!r} should not log a warning; stderr={result.stderr!r}"
+        assert "not recognized" not in result.stderr, (
+            f"explicit-falsy {value!r} should not log a warning; stderr={result.stderr!r}"
+        )
 
     @pytest.mark.parametrize("value", ["tru", "maybe", "ENABLED", "2"])
     def test_eager_warmup_unrecognized_value_warns_and_skips_collection_open(self, tmp_path, value):
@@ -298,9 +298,9 @@ class TestColdStartDiagnostics:
             extra_code=extra,
         )
         assert result.returncode == 0, f"stderr={result.stderr!r}"
-        assert (
-            open_marker.exists()
-        ), f"_get_collection not called for {value!r}; stderr={result.stderr!r}"
+        assert open_marker.exists(), (
+            f"_get_collection not called for {value!r}; stderr={result.stderr!r}"
+        )
         assert query_marker.exists(), (
             f"col.query not invoked for {value!r} — warmup is a no-op "
             f"(would let cold-load hit first MCP call); stderr={result.stderr!r}"
@@ -1134,9 +1134,9 @@ class TestWriteTools:
 
         assert result1["success"] is True
         assert result2["success"] is True
-        assert (
-            result1["drawer_id"] != result2["drawer_id"]
-        ), "Documents with shared header but different content must have distinct drawer IDs"
+        assert result1["drawer_id"] != result2["drawer_id"], (
+            "Documents with shared header but different content must have distinct drawer IDs"
+        )
 
     def test_delete_drawer(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -2121,9 +2121,9 @@ class TestCacheInvalidation:
         all_calls = captured["get"] + captured["create"]
         assert all_calls, "expected get_collection or create_collection to be called"
         for kwargs in all_calls:
-            assert (
-                "embedding_function" in kwargs
-            ), f"missing embedding_function= in chromadb call: {kwargs}"
+            assert "embedding_function" in kwargs, (
+                f"missing embedding_function= in chromadb call: {kwargs}"
+            )
             assert kwargs["embedding_function"] is not None
 
         # Same expectation on the create=False (cache-miss) reopen path.
@@ -2353,6 +2353,25 @@ class TestKGLazyCache:
 
         assert mcp_server._kg_by_path == {}
 
+    def test_tool_create_tunnel_returns_create_tunnel_value_error_as_json(self, monkeypatch):
+        import mempalace.mcp_server as ms
+
+        message = "Target room 'missing' does not exist in wing 'wing_real'"
+
+        def raise_value_error(*args, **kwargs):
+            raise ValueError(message)
+
+        monkeypatch.setattr(ms, "create_tunnel", raise_value_error)
+
+        result = ms.tool_create_tunnel(
+            "wing_real",
+            "real_room",
+            "wing_real",
+            "missing",
+        )
+
+        assert result == {"error": message}
+
     def test_call_kg_retries_after_concurrent_close(self, monkeypatch):
         """A KG closed mid-handler must trigger a one-shot retry with a fresh
         instance — not surface a -32000 to the MCP client."""
@@ -2561,9 +2580,9 @@ class TestKGLazyCache:
 
         result = mcp_server._canonicalize_kg_path("/some/Path/KG.sqlite3")
 
-        assert (
-            result == "<NC:<RP:/some/Path/KG.sqlite3>>"
-        ), f"expected normcase(realpath(p)) composition, got {result!r}"
+        assert result == "<NC:<RP:/some/Path/KG.sqlite3>>", (
+            f"expected normcase(realpath(p)) composition, got {result!r}"
+        )
 
     def test_get_kg_dedupes_symlink_alias_end_to_end(self, tmp_path, monkeypatch):
         """End-to-end: two ``_get_kg()`` calls via different symlink layers
