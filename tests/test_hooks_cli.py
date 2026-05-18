@@ -174,6 +174,10 @@ def _capture_hook_output(hook_fn, data, harness="claude-code", state_dir=None):
     buf = io.StringIO()
     patches = [patch("mempalace.hooks_cli._output", side_effect=lambda d: buf.write(json.dumps(d)))]
     if state_dir:
+        state_dir = Path(state_dir)
+        palace_root = state_dir / ".mempalace"
+        palace_root.mkdir(parents=True, exist_ok=True)
+        patches.append(patch("mempalace.hooks_cli.PALACE_ROOT", palace_root))
         patches.append(patch("mempalace.hooks_cli.STATE_DIR", state_dir))
     # Mock MempalaceConfig so tests don't depend on user's ~/.mempalace/config.json
     mock_config = MagicMock()
@@ -185,6 +189,20 @@ def _capture_hook_output(hook_fn, data, harness="claude-code", state_dir=None):
             stack.enter_context(p)
         hook_fn(data, harness)
     return json.loads(buf.getvalue())
+
+
+def test_capture_hook_output_sets_up_palace_root(tmp_path):
+    """Regression #1510: hook tests should not depend on test_cli.py side effects."""
+    state_dir = tmp_path / "hook_state"
+
+    result = _capture_hook_output(
+        hook_stop,
+        {"session_id": "test", "stop_hook_active": False, "transcript_path": ""},
+        state_dir=state_dir,
+    )
+
+    assert result == {}
+    assert (state_dir / ".mempalace").is_dir()
 
 
 def test_stop_hook_passthrough_when_active(tmp_path):
