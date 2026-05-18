@@ -181,6 +181,36 @@ No API key is required for the core benchmark path.
 - Release notes → [CHANGELOG.md](CHANGELOG.md)
 - Corrections and public notices → [docs/HISTORY.md](docs/HISTORY.md)
 
+### Nix
+
+A Nix flake is provided for reproducible builds and development.
+
+If you don't have Nix installed, the [Determinate Nix Installer](https://determinate.systems/nix-installer/) is the easiest way to get started (flakes work out of the box):
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix | sh -s -- install
+```
+
+Then:
+
+```bash
+# Run directly without installing
+nix run github:milla-jovovich/mempalace -- search "why did we switch to GraphQL"
+
+# Install into your profile
+nix profile install github:milla-jovovich/mempalace
+
+# Development shell with all dependencies (Python, uv, ruff, pytest)
+nix develop
+
+# Run tests (one-liner)
+nix develop --command python -m pytest tests/
+
+# Build the package & run the result
+nix build
+./result/bin/mempalace --help
+```
+
 ## Contributing
 
 PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
