@@ -20,6 +20,7 @@ from .normalize import normalize
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
+    _metadata_matches_extract_mode,
     file_already_mined,
     get_collection,
     mine_lock,
@@ -70,14 +71,15 @@ MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB — skip files larger than this.
 # use also scales with source size.
 
 
-def _register_file(collection, source_file: str, wing: str, agent: str):
+def _register_file(collection, source_file: str, wing: str, agent: str, extract_mode: str):
     """Write a sentinel so file_already_mined() returns True for 0-chunk files.
 
     Without this, files that normalize to nothing or produce zero chunks are
     re-read and re-processed on every mine run because nothing was written to
     ChromaDB on the first pass.
     """
-    sentinel_id = f"_reg_{hashlib.sha256(source_file.encode()).hexdigest()[:24]}"
+    sentinel_key = f"{source_file}:{extract_mode}"
+    sentinel_id = f"_reg_{hashlib.sha256(sentinel_key.encode()).hexdigest()[:24]}"
     collection.upsert(
         documents=[f"[registry] {source_file}"],
         ids=[sentinel_id],
@@ -89,10 +91,38 @@ def _register_file(collection, source_file: str, wing: str, agent: str):
                 "added_by": agent,
                 "filed_at": datetime.now().isoformat(),
                 "ingest_mode": "registry",
+                "extract_mode": extract_mode,
                 "normalize_version": NORMALIZE_VERSION,
             }
         ],
     )
+
+
+def _source_file_delete_ids(collection, source_file: str, extract_mode: str) -> list[str]:
+    """Collect drawer IDs for one source file and extraction mode.
+
+    Legacy conversation drawers did not carry extract_mode; treat those as
+    exchange-mode rows so schema rebuilds can still clean them up without
+    deleting newer general-mode drawers for the same transcript.
+    """
+    ids: list[str] = []
+    offset = 0
+    while True:
+        batch = collection.get(
+            where={"source_file": source_file},
+            limit=1000,
+            offset=offset,
+            include=["metadatas"],
+        )
+        batch_ids = batch.get("ids") or []
+        metadatas = batch.get("metadatas") or []
+        for drawer_id, meta in zip(batch_ids, metadatas):
+            if _metadata_matches_extract_mode(meta or {}, extract_mode):
+                ids.append(drawer_id)
+        if not batch_ids:
+            break
+        offset += len(batch_ids)
+    return ids
 
 
 # =============================================================================
@@ -100,25 +130,47 @@ def _register_file(collection, source_file: str, wing: str, agent: str):
 # =============================================================================
 
 
-def chunk_exchanges(content: str) -> list:
+def chunk_exchanges(
+    content: str,
+    chunk_size: int = None,
+    min_chunk_size: int = None,
+) -> list:
     """
     Chunk by exchange pair: one > turn + AI response = one unit.
     Falls back to paragraph chunking if no > markers.
+
+    Optional params override module-level defaults when provided.
+
+    Raises ``ValueError`` if ``chunk_size`` is not a positive integer or
+    ``min_chunk_size`` is negative. A non-positive ``chunk_size`` would
+    cause ``_chunk_by_exchange`` below to loop forever — ``content[:0]``
+    is empty, ``content[0:]`` is the whole string, and the remainder
+    never shrinks.
     """
+    if chunk_size is None:
+        chunk_size = CHUNK_SIZE
+    if min_chunk_size is None:
+        min_chunk_size = MIN_CHUNK_SIZE
+
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be > 0, got {chunk_size}")
+    if min_chunk_size < 0:
+        raise ValueError(f"min_chunk_size must be >= 0, got {min_chunk_size}")
+
     lines = content.split("\n")
     quote_lines = sum(1 for line in lines if line.strip().startswith(">"))
 
     if quote_lines >= 3:
-        return _chunk_by_exchange(lines)
+        return _chunk_by_exchange(lines, chunk_size, min_chunk_size)
     else:
-        return _chunk_by_paragraph(content)
+        return _chunk_by_paragraph(content, min_chunk_size)
 
 
-def _chunk_by_exchange(lines: list) -> list:
+def _chunk_by_exchange(lines: list, chunk_size: int, min_chunk_size: int) -> list:
     """One user turn (>) + the AI response that follows = one or more chunks.
 
     The full AI response is preserved verbatim.  When the combined
-    user-turn + response exceeds CHUNK_SIZE the response is split across
+    user-turn + response exceeds chunk_size the response is split across
     consecutive drawers so nothing is silently discarded.
     """
     chunks = []
@@ -142,20 +194,20 @@ def _chunk_by_exchange(lines: list) -> list:
             ai_response = " ".join(ai_lines)
             content = f"{user_turn}\n{ai_response}" if ai_response else user_turn
 
-            # Split into multiple drawers when the exchange exceeds CHUNK_SIZE
-            if len(content) > CHUNK_SIZE:
+            # Split into multiple drawers when the exchange exceeds chunk_size
+            if len(content) > chunk_size:
                 # First chunk: user turn + as much response as fits
-                first_part = content[:CHUNK_SIZE]
-                if len(first_part.strip()) > MIN_CHUNK_SIZE:
+                first_part = content[:chunk_size]
+                if len(first_part.strip()) > min_chunk_size:
                     chunks.append({"content": first_part, "chunk_index": len(chunks)})
-                # Remaining response in CHUNK_SIZE-sized continuation drawers
-                remainder = content[CHUNK_SIZE:]
+                # Remaining response in chunk_size-sized continuation drawers
+                remainder = content[chunk_size:]
                 while remainder:
-                    part = remainder[:CHUNK_SIZE]
-                    remainder = remainder[CHUNK_SIZE:]
-                    if len(part.strip()) > MIN_CHUNK_SIZE:
+                    part = remainder[:chunk_size]
+                    remainder = remainder[chunk_size:]
+                    if len(part.strip()) > min_chunk_size:
                         chunks.append({"content": part, "chunk_index": len(chunks)})
-            elif len(content.strip()) > MIN_CHUNK_SIZE:
+            elif len(content.strip()) > min_chunk_size:
                 chunks.append(
                     {
                         "content": content,
@@ -168,7 +220,7 @@ def _chunk_by_exchange(lines: list) -> list:
     return chunks
 
 
-def _chunk_by_paragraph(content: str) -> list:
+def _chunk_by_paragraph(content: str, min_chunk_size: int) -> list:
     """Fallback: chunk by paragraph breaks."""
     chunks = []
     paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
@@ -178,12 +230,12 @@ def _chunk_by_paragraph(content: str) -> list:
         lines = content.split("\n")
         for i in range(0, len(lines), 25):
             group = "\n".join(lines[i : i + 25]).strip()
-            if len(group) > MIN_CHUNK_SIZE:
+            if len(group) > min_chunk_size:
                 chunks.append({"content": group, "chunk_index": len(chunks)})
         return chunks
 
     for para in paragraphs:
-        if len(para) > MIN_CHUNK_SIZE:
+        if len(para) > min_chunk_size:
             chunks.append({"content": para, "chunk_index": len(chunks)})
 
     return chunks
@@ -284,7 +336,12 @@ def detect_convo_room(content: str) -> str:
 
 
 def scan_convos(convo_dir: str) -> list:
-    """Find all potential conversation files."""
+    """Find all potential conversation files.
+
+    Skips symlinks and oversized files. Each skipped symlink is logged to
+    ``sys.stderr`` with a ``  SKIP: <relative-path> (symlink)`` line so the
+    caller can tell why an apparent conversation directory yielded no files.
+    """
     convo_path = Path(convo_dir).expanduser().resolve()
     files = []
     for root, dirs, filenames in os.walk(convo_path):
@@ -296,6 +353,11 @@ def scan_convos(convo_dir: str) -> list:
             if filepath.suffix.lower() in CONVO_EXTENSIONS:
                 # Skip symlinks and oversized files
                 if filepath.is_symlink():
+                    rel = filepath.relative_to(convo_path).as_posix()
+                    try:
+                        print(f"  SKIP: {rel} (symlink)", file=sys.stderr)
+                    except OSError:
+                        pass
                     continue
                 try:
                     if filepath.stat().st_size > MAX_FILE_SIZE:
@@ -326,14 +388,16 @@ def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extr
         # Re-check after lock — another agent may have just finished this file
         # at the current schema. A stale-version hit here returns False, so we
         # still fall through to the purge+rebuild path below.
-        if file_already_mined(collection, source_file):
+        if file_already_mined(collection, source_file, extract_mode=extract_mode):
             return 0, room_counts_delta, True
 
         # Purge stale drawers first. When the normalize schema bumps,
         # file_already_mined() returned False for pre-v2 drawers — clean
         # them out so the source doesn't end up with mixed old/new drawers.
         try:
-            collection.delete(where={"source_file": source_file})
+            delete_ids = _source_file_delete_ids(collection, source_file, extract_mode)
+            if delete_ids:
+                collection.delete(ids=delete_ids)
         except Exception:
             logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
 
@@ -350,7 +414,11 @@ def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extr
                 chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
                 if extract_mode == "general":
                     room_counts_delta[chunk_room] += 1
-                drawer_id = f"drawer_{wing}_{chunk_room}_{hashlib.sha256((source_file + str(chunk['chunk_index'])).encode()).hexdigest()[:24]}"
+                drawer_key = f"{source_file}:{extract_mode}:{chunk['chunk_index']}"
+                drawer_id = (
+                    f"drawer_{wing}_{chunk_room}_"
+                    f"{hashlib.sha256(drawer_key.encode()).hexdigest()[:24]}"
+                )
                 batch_docs.append(chunk["content"])
                 batch_ids.append(drawer_id)
                 batch_metas.append(
@@ -394,7 +462,29 @@ def mine_convos(
     extract_mode:
         "exchange" — default exchange-pair chunking (Q+A = one unit)
         "general"  — general extractor: decisions, preferences, milestones, problems, emotions
+
+    Chunking parameters (chunk_size, min_chunk_size) are read from
+    MempalaceConfig so `config.json` governs both this path and the
+    project-file miner in `miner.py`. `min_chunk_size` preserves
+    convo_miner's lower default (30 — more permissive than the 50-char
+    project default, so short conversation exchanges are not dropped)
+    when not explicitly set in config.json, so a user who never touches
+    chunking keeps the existing behavior.
     """
+    from .config import MempalaceConfig
+
+    palace_config = MempalaceConfig()
+    cfg_chunk_size = palace_config.chunk_size
+    # Only override convo_miner's MIN_CHUNK_SIZE when the user has set
+    # min_chunk_size explicitly. min_chunk_size_explicit returns the
+    # validated value or None — None keeps convo's lower 30-char floor
+    # (more permissive than the 50-char project default, so short
+    # exchanges aren't dropped). Using the validated accessor (not raw
+    # _file_config) means a
+    # garbage/negative/bool config value can't TypeError the length gate
+    # below or ValueError out of chunk_exchanges and abort convo ingest.
+    explicit_min = palace_config.min_chunk_size_explicit
+    cfg_min_chunk_size = explicit_min if explicit_min is not None else MIN_CHUNK_SIZE
 
     convo_path = Path(convo_dir).expanduser().resolve()
     if not wing:
@@ -424,7 +514,9 @@ def mine_convos(
     # palace each per-file query costs ~2s, so a 2000-file sweep used to
     # spend >1h just deciding to skip. prefetch_mined_set() does the same
     # decisions in a single scan; loop body becomes an O(1) set check.
-    mined_set: set[str] = prefetch_mined_set(collection) if not dry_run else set()
+    mined_set: set[str] = (
+        prefetch_mined_set(collection, extract_mode=extract_mode) if not dry_run else set()
+    )
 
     total_drawers = 0
     files_skipped = 0
@@ -443,12 +535,12 @@ def mine_convos(
             content = normalize(str(filepath))
         except (OSError, ValueError):
             if not dry_run:
-                _register_file(collection, source_file, wing, agent)
+                _register_file(collection, source_file, wing, agent, extract_mode)
             continue
 
-        if not content or len(content.strip()) < MIN_CHUNK_SIZE:
+        if not content or len(content.strip()) < cfg_min_chunk_size:
             if not dry_run:
-                _register_file(collection, source_file, wing, agent)
+                _register_file(collection, source_file, wing, agent, extract_mode)
             continue
 
         # Chunk — either exchange pairs or general extraction
@@ -458,11 +550,15 @@ def mine_convos(
             chunks = extract_memories(content)
             # Each chunk already has memory_type; use it as the room name
         else:
-            chunks = chunk_exchanges(content)
+            chunks = chunk_exchanges(
+                content,
+                chunk_size=cfg_chunk_size,
+                min_chunk_size=cfg_min_chunk_size,
+            )
 
         if not chunks:
             if not dry_run:
-                _register_file(collection, source_file, wing, agent)
+                _register_file(collection, source_file, wing, agent, extract_mode)
             continue
 
         # Detect room from content (general mode uses memory_type instead)

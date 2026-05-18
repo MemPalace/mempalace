@@ -670,36 +670,124 @@ def _parse_harness_input(data: dict, harness: str) -> dict:
     }
 
 
+# Common parent-dir tokens stripped from the encoded folder when no
+# explicit ``-Projects-`` segment is present. Order matters: only the
+# first match strips. These cover the bulk of Unix layouts; cwd-from-JSONL
+# (the primary path) handles the long tail correctly without heuristics.
+_ENCODED_PARENT_PREFIXES = (
+    "git-",
+    "dev-",
+    "projects-",
+    "Projects-",
+    "src-",
+    "code-",
+    "work-",
+    "Documents-",
+)
+
+
+def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
+    """Read ``cwd`` from the first JSONL line that records it.
+
+    Claude Code stores the absolute working directory on most message
+    types (tool_use, tool_result, user/assistant turns), but not all
+    (e.g. queue-operation lines lack it). Scan up to 200 lines to find
+    the first record that includes a non-empty cwd, then derive the
+    wing from its leaf path segment. Returns ``None`` if the file is
+    unreadable, empty, or contains no cwd.
+    """
+    try:
+        path = Path(transcript_path).expanduser()
+        if not path.is_file():
+            return None
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i >= 200:
+                    break
+                line = line.strip()
+                if not line or '"cwd"' not in line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                cwd = data.get("cwd")
+                if not cwd or not isinstance(cwd, str):
+                    continue
+                cwd_norm = cwd.replace("\\", "/").rstrip("/")
+                if not cwd_norm:
+                    continue
+                project = cwd_norm.rsplit("/", 1)[-1]
+                if project:
+                    slug = project.lower().replace(" ", "_").replace("-", "_")
+                    return f"wing_{slug}"
+    except OSError:
+        pass
+    return None
+
+
 def _wing_from_transcript_path(transcript_path: str) -> str:
     """Derive a project wing name from a Claude Code transcript path.
 
-    Claude Code encodes the project's source directory by replacing path
-    separators with dashes, producing folders like:
-        ~/.claude/projects/-home-<user>-Projects-<project>/session.jsonl
-        ~/.claude/projects/-home-<user>-dev-<parent>-<project>/session.jsonl
-        ~/.claude/projects/-Users-<user>-<folder>-<project>/session.jsonl
+    Strategy (in priority order):
 
-    The project directory name is the final dash-separated token of the
-    encoded folder. Returns ``wing_<project>`` (lowercased, spaces → ``_``).
-    Falls back to ``wing_sessions`` if the path does not match a Claude Code
-    project-folder layout.
+    1. PRIMARY — Read ``cwd`` from the JSONL transcript. Claude Code records
+       the absolute working directory on most message types, so the project
+       name is whatever the leaf path segment of cwd is. This is the
+       canonical answer when present.
+
+    2. FALLBACK — Decode the encoded folder under ``.claude/projects/``.
+       Claude Code flattens path separators to dashes (``/Users/me/code/foo``
+       → ``-Users-me-code-foo``), so the original directory boundaries are
+       lost. We strip the platform user-home prefix (``Users-<user>-`` or
+       ``home-<user>-``) and one common parent-dir token (``git-``, ``dev-``,
+       ``projects-``, etc.), then convert the remaining dashes to
+       underscores. Unlike the previous "last token only" heuristic, this
+       never silently truncates a hyphenated project folder name like
+       ``claude-code``, ``react-native``, or ``customer-portal``.
+
+    3. LEGACY — Match an explicit ``-Projects-<name>`` segment for
+       transcripts not under the standard Claude Code projects dir.
+
+    4. DEFAULT — ``wing_sessions``.
+
+    Closes #1410.
     """
+    # 1. Primary — cwd from JSONL is the canonical source of truth
+    cwd_wing = _wing_from_jsonl_cwd(transcript_path)
+    if cwd_wing:
+        return cwd_wing
+
     # Normalize path separators for cross-platform (Windows backslashes)
     normalized = transcript_path.replace("\\", "/")
-    # Primary: pull the encoded project folder out of ``.claude/projects/``
-    # and take its last dash-separated token.
+
+    # 2. Fallback — encoded project folder under .claude/projects/
     match = re.search(r"/\.claude/projects/-([^/]+)", normalized)
     if match:
         encoded = match.group(1)
-        project = encoded.rsplit("-", 1)[-1]
+        # Strip platform user-home prefix so the wing isn't dominated by
+        # /Users/<user>/ or /home/<user>/.
+        m = re.match(r"(?:Users|home)-[^-]+-(.+)", encoded)
+        if m:
+            encoded = m.group(1)
+        # Strip one common parent-dir token if present, keeping the rest as
+        # the project path. Hyphens become underscores to preserve
+        # uniqueness for hyphenated project folder names.
+        for prefix in _ENCODED_PARENT_PREFIXES:
+            if encoded.startswith(prefix):
+                encoded = encoded[len(prefix) :]
+                break
+        project = encoded.lower().replace(" ", "_").replace("-", "_")
         if project:
-            return f"wing_{project.lower().replace(' ', '_')}"
-    # Legacy fallback: explicit ``-Projects-<name>`` segment, useful for
-    # transcripts not under the standard Claude Code projects dir.
+            return f"wing_{project}"
+
+    # 3. Legacy — explicit -Projects-<name> segment
     match = re.search(r"-Projects-([^/]+?)(?:/|$)", normalized)
     if match:
-        project = match.group(1).lower().replace(" ", "_")
+        project = match.group(1).lower().replace(" ", "_").replace("-", "_")
         return f"wing_{project}"
+
+    # 4. Default
     return "wing_sessions"
 
 

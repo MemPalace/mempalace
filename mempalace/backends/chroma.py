@@ -16,6 +16,7 @@ from chromadb.errors import NotFoundError as _ChromaNotFoundError
 from .base import (
     BaseBackend,
     BaseCollection,
+    CollectionNotInitializedError,
     GetResult,
     HealthStatus,
     PalaceNotFoundError,
@@ -70,8 +71,34 @@ def _hnsw_link_to_data_ratio(seg_dir: str) -> Optional[float]:
     return link_size / data_size
 
 
+def _hnsw_link_lists_is_usable_for_payload(seg_dir: str) -> bool:
+    """Return False when a non-trivial HNSW payload lacks usable link lists.
+
+    A missing or empty link_lists.bin is acceptable only for a fresh/empty
+    segment. Once data_level0.bin has real payload, a zero-byte link_lists.bin
+    is not a harmless async-flush shape: ChromaDB can later hand the broken
+    graph to hnswlib and crash in native code.
+    """
+    data_path = os.path.join(seg_dir, "data_level0.bin")
+    link_path = os.path.join(seg_dir, "link_lists.bin")
+
+    try:
+        if not os.path.isfile(data_path):
+            return True
+
+        data_size = os.path.getsize(data_path)
+        if data_size <= _HNSW_MISSING_METADATA_DATA_FLOOR:
+            return True
+
+        return os.path.isfile(link_path) and os.path.getsize(link_path) > 0
+    except OSError:
+        return False
+
+
 def _hnsw_payload_appears_sane(seg_dir: str) -> bool:
     """Return False when HNSW payload files are structurally implausible."""
+    if not _hnsw_link_lists_is_usable_for_payload(seg_dir):
+        return False
 
     ratio = _hnsw_link_to_data_ratio(seg_dir)
     return ratio is None or ratio <= _HNSW_LINK_TO_DATA_MAX_RATIO
@@ -1354,7 +1381,10 @@ class ChromaBackend(BaseBackend):
                     **ef_kwargs,
                 )
         else:
-            collection = client.get_collection(collection_name, **ef_kwargs)
+            try:
+                collection = client.get_collection(collection_name, **ef_kwargs)
+            except _ChromaNotFoundError as e:
+                raise CollectionNotInitializedError(palace_path) from e
         _pin_hnsw_threads(collection)
         return ChromaCollection(collection, palace_path=palace_path)
 

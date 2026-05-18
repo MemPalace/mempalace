@@ -73,6 +73,10 @@ class TestExplicitTunnels:
         assert palace_graph._normalize_wing(" Mempalace-Public ") == "mempalace_public"
         assert palace_graph._normalize_wing("   ") is None
         assert palace_graph._normalize_wing(None) is None
+        # Non-string inputs (corrupt or hand-edited tunnels.json) return None
+        # instead of raising — keeps read-path filters robust to bad records.
+        assert palace_graph._normalize_wing(42) is None
+        assert palace_graph._normalize_wing(["x"]) is None
 
     def test_create_tunnel_deduplicates_reverse_order_and_updates_label(
         self, tmp_path, monkeypatch
@@ -287,6 +291,17 @@ class TestTopicTunnels:
         assert palace_graph.topic_tunnels_for_wing("wing_missing", topics_by_wing) == []
         assert palace_graph.list_tunnels() == []
 
+    def test_topic_tunnels_for_wing_matches_across_slug_forms(self, tmp_path, monkeypatch):
+        """The wing arg and ``topics_by_wing`` keys may carry different slug
+        forms (hyphen vs underscore). ``topic_tunnels_for_wing`` resolves
+        the lookup through ``normalize_wing_name`` so a caller passing
+        ``"my-wing"`` against a registry keyed by ``"my_wing"`` still wires
+        up the topic tunnels."""
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        topics_by_wing = {"my_wing": ["Angular"], "wing_people": ["Angular"]}
+        created = palace_graph.topic_tunnels_for_wing("my-wing", topics_by_wing)
+        assert len(created) == 1
+
     def test_compute_topic_tunnels_dedupe_on_recompute(self, tmp_path, monkeypatch):
         _use_tmp_tunnel_file(monkeypatch, tmp_path)
         topics_by_wing = {
@@ -335,13 +350,39 @@ class TestTopicTunnels:
         kinds = sorted(t["kind"] for t in tunnels)
         assert kinds == ["explicit", "topic"]
 
+    def test_compute_topic_tunnels_normalizes_wing_keys(self, tmp_path, monkeypatch):
+        """Auto-generated topic tunnels canonicalize the wing slug so two
+        mining runs with mixed forms (``my-wing`` then ``my_wing``) produce
+        a single deduped record. Only user-issued ``create_tunnel`` calls
+        preserve verbatim slugs (#1504); the topic-tunnel auto-generator
+        owns its own slugs and stays canonical."""
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+
+        palace_graph.compute_topic_tunnels(
+            {"my-wing": ["Angular"], "wing_people": ["Angular"]}, min_count=1
+        )
+        palace_graph.compute_topic_tunnels(
+            {"my_wing": ["Angular"], "wing_people": ["Angular"]}, min_count=1
+        )
+
+        tunnels = palace_graph.list_tunnels()
+        assert len(tunnels) == 1
+        stored_wings = {tunnels[0]["source"]["wing"], tunnels[0]["target"]["wing"]}
+        assert stored_wings == {"my_wing", "wing_people"}
+
 
 class TestHyphenatedWingNormalization:
-    """Wing names with hyphens or spaces are normalized to underscores on init.
+    """Wing names may reach ``tunnels.json`` in either form:
 
-    Tunnel helpers must apply the same normalization at lookup time so that
-    ``mempalace-public`` resolves to ``mempalace_public`` and matches the
-    metadata written by ``room_detector_local.py``.
+    * ``mempalace mine`` without ``--wing`` derives the slug from the dir
+      name through ``normalize_wing_name`` → stored as ``mempalace_public``.
+    * ``mempalace mine --wing my-wing`` (or any explicit slug) is stored
+      verbatim by ``create_tunnel`` (regression #1504) → ``my-wing``.
+
+    Read-path helpers (``list_tunnels`` / ``follow_tunnels``) must accept
+    queries in either form and match both storage forms — normalization
+    is applied on both the stored value and the query key at comparison
+    time, never at write time.
     """
 
     def test_list_tunnels_filters_hyphenated_wing(self, tmp_path, monkeypatch):
@@ -363,14 +404,18 @@ class TestHyphenatedWingNormalization:
         assert len(by_under) == 1
         assert by_hyphen[0]["connected_wing"] == "wing_people"
 
-    def test_create_tunnel_normalizes_wing_names(self, tmp_path, monkeypatch):
+    def test_create_tunnel_preserves_hyphenated_wing_names(self, tmp_path, monkeypatch):
+        """Regression for #1504: wings created via ``mempalace mine --wing my-wing``
+        keep the hyphen in metadata, so ``create_tunnel`` must store the slug
+        verbatim. Read-path normalization in ``list_tunnels``/``follow_tunnels``
+        keeps both query forms working."""
         _use_tmp_tunnel_file(monkeypatch, tmp_path)
 
         t = palace_graph.create_tunnel("my-project", "src", "your-project", "dst", label="cross")
-        assert t["source"]["wing"] == "my_project"
-        assert t["target"]["wing"] == "your_project"
-        assert len(palace_graph.list_tunnels("my_project")) == 1
+        assert t["source"]["wing"] == "my-project"
+        assert t["target"]["wing"] == "your-project"
         assert len(palace_graph.list_tunnels("my-project")) == 1
+        assert len(palace_graph.list_tunnels("my_project")) == 1
 
     def test_find_tunnels_warns_on_empty_result(self, tmp_path, monkeypatch, caplog):
         _use_tmp_tunnel_file(monkeypatch, tmp_path)
@@ -379,3 +424,60 @@ class TestHyphenatedWingNormalization:
             result = palace_graph.find_tunnels("nonexistent-wing")
         assert result == []
         assert "No tunnels found" in caplog.text
+
+    def test_read_path_skips_records_with_null_endpoints(self, tmp_path, monkeypatch):
+        """A hand-edited ``tunnels.json`` may carry ``"source": null`` or
+        ``"target": null``. The read-path filters must skip such rows
+        instead of crashing the whole iteration with ``AttributeError``."""
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        palace_graph._save_tunnels(
+            [
+                {
+                    "id": "broken",
+                    "source": None,
+                    "target": None,
+                    "label": "corrupt",
+                    "kind": "explicit",
+                    "created_at": "2026-05-01T00:00:00+00:00",
+                },
+                {
+                    "id": "ok",
+                    "source": {"wing": "wing_a", "room": "r1"},
+                    "target": {"wing": "wing_b", "room": "r2"},
+                    "label": "good",
+                    "kind": "explicit",
+                    "created_at": "2026-05-02T00:00:00+00:00",
+                },
+            ]
+        )
+
+        # Both filters must skip the broken record and return the good one.
+        assert {t["id"] for t in palace_graph.list_tunnels("wing_a")} == {"ok"}
+        connections = palace_graph.follow_tunnels("wing_a", "r1")
+        assert [c["tunnel_id"] for c in connections] == ["ok"]
+
+    def test_pre_1504_underscore_tunnels_remain_findable(self, tmp_path, monkeypatch):
+        """A ``tunnels.json`` written before #1504 stored wings in normalized
+        underscore form (the write-path normalization is now gone). Read-path
+        queries with either hyphen or underscore must still find those
+        records after the fix."""
+        tunnel_file = _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        palace_graph._save_tunnels(
+            [
+                {
+                    "id": "pre_1504_record",
+                    "source": {"wing": "mempalace_public", "room": "auth"},
+                    "target": {"wing": "wing_people", "room": "users"},
+                    "label": "pre-#1504 record",
+                    "kind": "explicit",
+                    "created_at": "2026-05-10T00:00:00+00:00",
+                }
+            ]
+        )
+        assert tunnel_file.exists()
+
+        assert len(palace_graph.list_tunnels("mempalace_public")) == 1
+        assert len(palace_graph.list_tunnels("mempalace-public")) == 1
+
+        assert len(palace_graph.follow_tunnels("mempalace_public", "auth")) == 1
+        assert len(palace_graph.follow_tunnels("mempalace-public", "auth")) == 1

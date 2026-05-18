@@ -1,6 +1,9 @@
 """Unit tests for convo_miner pure functions (no chromadb needed)."""
 
 import contextlib
+import sys
+
+import pytest
 
 from mempalace.convo_miner import (
     _file_chunks_locked,
@@ -48,6 +51,39 @@ class TestChunkExchanges:
     def test_short_content_skipped(self):
         chunks = chunk_exchanges("> hi\nbye")
         # Too short to produce chunks (below MIN_CHUNK_SIZE)
+        assert isinstance(chunks, list)
+
+    def test_chunk_size_zero_raises_valueerror(self):
+        """Reject chunk_size == 0 explicitly.
+
+        Without this guard, `_chunk_by_exchange` enters an infinite loop:
+        content[:0] is empty, content[0:] is the whole string, and the
+        remainder never shrinks.
+        """
+        content = (
+            "> What is memory?\nMemory is persistence.\n\n" * 4  # force the split branch
+        )
+        with pytest.raises(ValueError, match="chunk_size must be > 0"):
+            chunk_exchanges(content, chunk_size=0)
+
+    def test_chunk_size_negative_raises_valueerror(self):
+        """Reject chunk_size < 0. Negative slicing would also loop forever
+        (content[:-1] → all but last, remainder[-1:] → last char repeated)."""
+        content = "> hi\nsome response text here that is long enough to chunk\n\n" * 4
+        with pytest.raises(ValueError, match="chunk_size must be > 0"):
+            chunk_exchanges(content, chunk_size=-10)
+
+    def test_min_chunk_size_negative_raises_valueerror(self):
+        """Reject min_chunk_size < 0. A negative threshold silently
+        breaks the `if len(part.strip()) > min_chunk_size` gate — every
+        chunk including empty ones gets appended."""
+        with pytest.raises(ValueError, match="min_chunk_size must be >= 0"):
+            chunk_exchanges("> hi\nbye", min_chunk_size=-1)
+
+    def test_min_chunk_size_zero_allowed(self):
+        """min_chunk_size == 0 is legal — means 'accept any non-empty chunk'."""
+        content = "> What is memory?\nMemory is persistence of information.\n" * 3
+        chunks = chunk_exchanges(content, min_chunk_size=0)
         assert isinstance(chunks, list)
 
     def test_long_ai_response_not_truncated(self):
@@ -115,6 +151,75 @@ class TestScanConvos:
         files = scan_convos(str(tmp_path))
         assert files == []
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="symlink creation requires elevated privileges on Windows",
+    )
+    def test_scan_convos_logs_skipped_symlinks(self, tmp_path, capsys):
+        real_target = tmp_path / "outside" / "real.jsonl"
+        real_target.parent.mkdir()
+        real_target.write_text('{"role":"user","content":"hi"}\n', encoding="utf-8")
+        link_root = tmp_path / "link_root"
+        link_root.mkdir()
+        (link_root / "link.jsonl").symlink_to(real_target)
+        (link_root / "regular.jsonl").write_text(
+            '{"role":"user","content":"hello"}\n', encoding="utf-8"
+        )
+
+        files = scan_convos(str(link_root))
+
+        names = {f.name for f in files}
+        assert "link.jsonl" not in names
+        assert "regular.jsonl" in names
+        err = capsys.readouterr().err
+        assert err.count("SKIP:") == 1
+        assert "  SKIP:" in err
+        assert "link.jsonl" in err
+        assert "(symlink)" in err
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="symlink creation requires elevated privileges on Windows",
+    )
+    def test_scan_convos_logs_dangling_symlink(self, tmp_path, capsys):
+        real_target = tmp_path / "outside" / "ghost.jsonl"
+        real_target.parent.mkdir()
+        real_target.touch()
+        link_root = tmp_path / "link_root"
+        link_root.mkdir()
+        (link_root / "dangling.jsonl").symlink_to(real_target)
+        real_target.unlink()  # target deleted, link dangles
+
+        files = scan_convos(str(link_root))
+
+        assert files == []
+        err = capsys.readouterr().err
+        assert err.count("SKIP:") == 1
+        assert "dangling.jsonl" in err
+        assert "(symlink)" in err
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="symlink creation requires elevated privileges on Windows",
+    )
+    def test_scan_convos_logs_nested_symlink_with_relative_path(self, tmp_path, capsys):
+        real_target = tmp_path / "outside" / "real.jsonl"
+        real_target.parent.mkdir()
+        real_target.write_text('{"x":1}\n', encoding="utf-8")
+        link_root = tmp_path / "link_root"
+        subdir = link_root / "deep" / "subdir"
+        subdir.mkdir(parents=True)
+        (subdir / "nested.jsonl").symlink_to(real_target)
+
+        files = scan_convos(str(link_root))
+
+        assert files == []
+        err = capsys.readouterr().err
+        # Forward slash even on Windows (as_posix) and full relative path,
+        # not just the leaf — proves relative_to(convo_path) over .name.
+        assert "deep/subdir/nested.jsonl" in err
+        assert "(symlink)" in err
+
 
 class TestFileChunksLocked:
     def test_uses_bounded_upsert_batches(self, monkeypatch):
@@ -134,7 +239,7 @@ class TestFileChunksLocked:
         col = FakeCol()
         monkeypatch.setattr(convo_miner, "DRAWER_UPSERT_BATCH_SIZE", 2)
         monkeypatch.setattr(
-            convo_miner, "file_already_mined", lambda collection, source_file: False
+            convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
         )
         monkeypatch.setattr(convo_miner, "mine_lock", lambda source_file: contextlib.nullcontext())
         monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda content: "conversations")

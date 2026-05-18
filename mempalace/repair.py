@@ -1222,6 +1222,21 @@ def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
         print("  No palace found.\n")
         return {"status": "unknown", "message": "no palace at path"}
 
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        print(f"  Palace dir at {palace_path} exists but has no chroma.sqlite3 yet.\n")
+        return {"status": "uninitialized", "message": "palace has no chroma.sqlite3 yet"}
+
+    # Cheap collection-existence check via sqlite. By design this function
+    # never opens a chromadb client (see the docstring); sqlite_drawer_count
+    # reads chroma.sqlite3 directly and returns None on any schema/lock error
+    # (chromadb version drift, missing tables, locked file). None means fall
+    # through and let hnsw_capacity_status report "unknown".
+    drawer_row_count = sqlite_drawer_count(palace_path, collection_name)
+    if isinstance(drawer_row_count, int) and drawer_row_count == 0:
+        print("  Palace is initialized but empty (no drawers yet).\n")
+        return {"status": "empty", "message": "palace has no drawers yet"}
+
     drawers = hnsw_capacity_status(palace_path, collection_name)
     closets = hnsw_capacity_status(palace_path, CLOSETS_COLLECTION_NAME)
 

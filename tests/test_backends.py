@@ -9,7 +9,9 @@ import chromadb
 import pytest
 
 from mempalace.backends import (
+    CollectionNotInitializedError,
     GetResult,
+    PalaceNotFoundError,
     PalaceRef,
     QueryResult,
     UnsupportedFilterError,
@@ -991,6 +993,43 @@ def test_get_collection_applies_retrofit_on_existing_palace(tmp_path):
     )
 
     assert wrapper._collection.configuration_json["hnsw"]["num_threads"] == 1
+
+
+def test_get_collection_raises_palace_not_found_when_dir_missing(tmp_path):
+    """create=False on a missing dir raises PalaceNotFoundError, not the
+    new CollectionNotInitializedError. The two states must be distinguishable
+    so callers can render state-specific messages (#1498)."""
+    missing = tmp_path / "no-such-dir"
+    with pytest.raises(PalaceNotFoundError) as excinfo:
+        ChromaBackend().get_collection(
+            str(missing),
+            collection_name="mempalace_drawers",
+            create=False,
+        )
+    # Must be the parent class, not the new subclass: dir is genuinely absent.
+    assert not isinstance(excinfo.value, CollectionNotInitializedError)
+
+
+def test_get_collection_raises_collection_not_initialized_on_empty_palace(tmp_path):
+    """When the palace dir + DB exist but the collection has never been
+    created, ChromaBackend.get_collection(create=False) raises the new
+    CollectionNotInitializedError instead of leaking chromadb.NotFoundError
+    (#1498)."""
+    palace_path = tmp_path / "palace"
+    palace_path.mkdir()
+    # PersistentClient lazily creates chroma.sqlite3 — no collection yet.
+    chromadb.PersistentClient(path=str(palace_path))
+    assert (palace_path / "chroma.sqlite3").is_file()
+
+    with pytest.raises(CollectionNotInitializedError) as excinfo:
+        ChromaBackend().get_collection(
+            str(palace_path),
+            collection_name="mempalace_drawers",
+            create=False,
+        )
+    # Backward-compat: subclass of PalaceNotFoundError (and FileNotFoundError).
+    assert isinstance(excinfo.value, PalaceNotFoundError)
+    assert isinstance(excinfo.value, FileNotFoundError)
 
 
 def test_quarantine_invalid_hnsw_metadata_renames_missing_dimensionality(tmp_path):
