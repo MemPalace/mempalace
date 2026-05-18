@@ -1026,22 +1026,27 @@ def tool_create_tunnel(
     Example: an API design discussion in project_api connects to the
     database schema in project_database.
     """
+    # sanitize_name and create_tunnel both raise ValueError for invalid or
+    # missing endpoints (empty/non-string names, and create_tunnel's
+    # room-existence checks). Catch both so the real reason is surfaced
+    # instead of escaping and being wrapped as the opaque "Internal tool
+    # error" (#1473), mirroring sibling tools.
     try:
         source_wing = sanitize_name(source_wing, "source_wing")
         source_room = sanitize_name(source_room, "source_room")
         target_wing = sanitize_name(target_wing, "target_wing")
         target_room = sanitize_name(target_room, "target_room")
+        return create_tunnel(
+            source_wing,
+            source_room,
+            target_wing,
+            target_room,
+            label=label,
+            source_drawer_id=source_drawer_id,
+            target_drawer_id=target_drawer_id,
+        )
     except ValueError as e:
         return {"error": str(e)}
-    return create_tunnel(
-        source_wing,
-        source_room,
-        target_wing,
-        target_room,
-        label=label,
-        source_drawer_id=source_drawer_id,
-        target_drawer_id=target_drawer_id,
-    )
 
 
 def tool_list_tunnels(wing: str = None):

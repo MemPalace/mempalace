@@ -317,9 +317,9 @@ def test_read_path_does_not_acquire_lock(tmp_path, monkeypatch):
             if method is None:
                 continue
             src = inspect.getsource(method)
-            assert (
-                "_write_lock" not in src
-            ), f"{read_attr} must NOT acquire the write lock (read path)"
+            assert "_write_lock" not in src, (
+                f"{read_attr} must NOT acquire the write lock (read path)"
+            )
     finally:
         open(release, "w").close()
         holder.join(timeout=5)

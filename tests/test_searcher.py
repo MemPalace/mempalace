@@ -184,12 +184,11 @@ class TestSearchMemories:
 
         # Invariants on every hit.
         for h in hits:
-            assert (
-                0.0 <= h["similarity"] <= 1.0
-            ), f"similarity out of range: {h['similarity']} for {h['source_file']}"
+            assert 0.0 <= h["similarity"] <= 1.0, (
+                f"similarity out of range: {h['similarity']} for {h['source_file']}"
+            )
             assert 0.0 <= h["effective_distance"] <= 2.0, (
-                f"effective_distance out of range: {h['effective_distance']} "
-                f"for {h['source_file']}"
+                f"effective_distance out of range: {h['effective_distance']} for {h['source_file']}"
             )
 
         # With the clamp, the closet-boosted a.md still ranks ahead of b.md —
@@ -338,9 +337,9 @@ class TestSearchCLI:
         captured = capsys.readouterr()
         first_block, _, _ = captured.out.partition("[2]")
         # Lexical match must rank first
-        assert (
-            "b.md" in first_block
-        ), f"expected lexical match 'b.md' at rank 1, got:\n{captured.out}"
+        assert "b.md" in first_block, (
+            f"expected lexical match 'b.md' at rank 1, got:\n{captured.out}"
+        )
         # Non-zero bm25 reported
         assert "bm25=" in first_block
         assert "bm25=0.0" not in first_block

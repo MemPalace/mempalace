@@ -51,23 +51,23 @@ def test_plugin_hook_timeout_within_bounds(hook_config: dict, event: str) -> Non
     )
     for entry in entries:
         sub_hooks = entry.get("hooks")
-        assert (
-            isinstance(sub_hooks, list) and sub_hooks
-        ), f"{event} entry missing non-empty 'hooks' array"
-        assert (
-            len(sub_hooks) == 1
-        ), f"{event} entry expected exactly one hook command, found {len(sub_hooks)}"
+        assert isinstance(sub_hooks, list) and sub_hooks, (
+            f"{event} entry missing non-empty 'hooks' array"
+        )
+        assert len(sub_hooks) == 1, (
+            f"{event} entry expected exactly one hook command, found {len(sub_hooks)}"
+        )
         for hook in sub_hooks:
-            assert (
-                hook.get("type") == "command"
-            ), f"unexpected hook type for {event}: {hook.get('type')!r}"
+            assert hook.get("type") == "command", (
+                f"unexpected hook type for {event}: {hook.get('type')!r}"
+            )
             assert "timeout" in hook, f"{event} hook missing 'timeout' key"
             timeout = hook["timeout"]
             # bool subclasses int, so reject it explicitly: True == 1 must fail.
             is_real_int = isinstance(timeout, int) and not isinstance(timeout, bool)
-            assert (
-                is_real_int and floor <= timeout <= ceiling
-            ), f"{event} hook timeout must be an int in [{floor}, {ceiling}]s; got {timeout!r}"
+            assert is_real_int and floor <= timeout <= ceiling, (
+                f"{event} hook timeout must be an int in [{floor}, {ceiling}]s; got {timeout!r}"
+            )
 
 
 def test_no_unbounded_events_in_plugin_config(hook_config: dict) -> None:

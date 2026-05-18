@@ -65,15 +65,15 @@ def test_init_filters_sys_path_from_leaked_pythonpath(pythonpath):
     out = result.stdout
     # Env must be preserved verbatim: embedded callers may need it.
     expected_env = repr(pythonpath) if pythonpath is not None else repr(None)
-    assert (
-        f"ENV: {expected_env}" in out
-    ), f"PYTHONPATH should be preserved by package import: {diag}"
+    assert f"ENV: {expected_env}" in out, (
+        f"PYTHONPATH should be preserved by package import: {diag}"
+    )
     assert "SENTINEL_IN_PATH: False" in out, f"sentinel-prefix leak: {diag}"
     # Filter must not over-strip: the mempalace package itself must remain
     # importable, so its parent directory must survive on sys.path.
-    assert (
-        "MEMPALACE_PARENT_PRESENT: True" in out
-    ), f"filter over-stripped sys.path (mempalace parent gone): {diag}"
+    assert "MEMPALACE_PARENT_PRESENT: True" in out, (
+        f"filter over-stripped sys.path (mempalace parent gone): {diag}"
+    )
 
 
 def test_init_preserves_cwd_marker_when_pythonpath_collides():
@@ -94,7 +94,7 @@ def test_init_preserves_cwd_marker_when_pythonpath_collides():
         text=True,
         check=False,
     )
-    diag = f"rc={result.returncode}; stdout={result.stdout!r}; " f"stderr={result.stderr!r}"
+    diag = f"rc={result.returncode}; stdout={result.stdout!r}; stderr={result.stderr!r}"
     assert result.returncode == 0, f"subprocess failed: {diag}"
     assert "CWD_IN_PATH: True" in result.stdout, f"cwd marker dropped: {diag}"
     assert "DOT_IN_PATH: False" in result.stdout, f"dot leak survived: {diag}"

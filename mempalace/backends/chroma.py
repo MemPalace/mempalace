@@ -671,20 +671,59 @@ def _valid_dimensionality(value: object) -> bool:
     return isinstance(value, Integral) and not isinstance(value, bool) and int(value) > 0
 
 
-def _persisted_metadata_fields(obj: object) -> tuple[object, object]:
+def _persisted_metadata_value(obj: object, name: str) -> object:
     if isinstance(obj, dict):
-        return obj.get("dimensionality"), obj.get("id_to_label")
-    return getattr(obj, "dimensionality", None), getattr(obj, "id_to_label", None)
+        return obj.get(name)
+    return getattr(obj, name, None)
+
+
+def _persisted_metadata_fields(obj: object) -> tuple[object, object]:
+    return _persisted_metadata_value(obj, "dimensionality"), _persisted_metadata_value(
+        obj, "id_to_label"
+    )
+
+
+def _missing_dimensionality_appears_recoverable(
+    persisted: object, id_to_label: dict, seg_dir: str
+) -> bool:
+    total = _persisted_metadata_value(persisted, "total_elements_added")
+    label_to_id = _persisted_metadata_value(persisted, "label_to_id")
+    data_path = os.path.join(seg_dir, "data_level0.bin")
+    link_path = os.path.join(seg_dir, "link_lists.bin")
+
+    if not isinstance(total, Integral) or isinstance(total, bool):
+        return False
+    if not isinstance(label_to_id, dict):
+        return False
+    try:
+        if not (
+            os.path.isfile(data_path)
+            and os.path.isfile(link_path)
+            and os.path.getsize(data_path) > _HNSW_MISSING_METADATA_DATA_FLOOR
+        ):
+            return False
+    except OSError:
+        return False
+    if not _hnsw_payload_appears_sane(seg_dir):
+        return False
+
+    label_count = len(id_to_label)
+    if int(total) != label_count or len(label_to_id) != label_count:
+        return False
+    try:
+        return all(label_to_id.get(label) == item_id for item_id, label in id_to_label.items())
+    except TypeError:
+        return False
 
 
 def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
     """Quarantine segment dirs whose ``index_metadata.pickle`` is unreadable or invalid.
 
     Chroma's persisted HNSW metadata is untrusted disk state. If a segment has
-    labels but no valid positive dimensionality, current Chroma versions can
-    accept the pickle and crash later in the Rust loader. We rename the entire
-    segment out of the way before ``PersistentClient`` opens so Chroma can
-    rebuild cleanly instead of touching known-bad metadata.
+    labels but invalid or partial metadata, current Chroma versions can accept
+    the pickle and crash later in the Rust loader. We rename the entire segment
+    out of the way before ``PersistentClient`` opens so Chroma can rebuild
+    cleanly instead of touching known-bad metadata.
     """
     try:
         entries = os.listdir(palace_path)
@@ -735,7 +774,22 @@ def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
                     reason = f"invalid id_to_label type {type(id_to_label).__name__}"
                 else:
                     has_labels = bool(id_to_label)
-                    if has_labels and not _valid_dimensionality(dimensionality):
+                    if (
+                        has_labels
+                        and dimensionality is None
+                        and not _missing_dimensionality_appears_recoverable(
+                            persisted, id_to_label, seg_dir
+                        )
+                    ):
+                        reason = (
+                            "labels present but dimensionality is missing or invalid "
+                            f"({dimensionality!r})"
+                        )
+                    elif (
+                        has_labels
+                        and dimensionality is not None
+                        and not _valid_dimensionality(dimensionality)
+                    ):
                         reason = (
                             "labels present but dimensionality is missing or invalid "
                             f"({dimensionality!r})"

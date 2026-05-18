@@ -140,9 +140,9 @@ class TestMineLock:
         # Sort by entry time and verify the second entry is after the first exit.
         intervals.sort(key=lambda iv: iv[1])
         (_, enter_a, exit_a), (_, enter_b, exit_b) = intervals
-        assert (
-            enter_a < exit_a <= enter_b < exit_b
-        ), f"critical sections overlapped — lock failed to serialize: {intervals}"
+        assert enter_a < exit_a <= enter_b < exit_b, (
+            f"critical sections overlapped — lock failed to serialize: {intervals}"
+        )
 
 
 # ── build_closet_lines ─────────────────────────────────────────────────
@@ -315,15 +315,15 @@ class TestMinerClosetRebuild:
         second_docs = "\n".join(second_pass["documents"]).lower()
         assert "only topic now" in second_docs
         for i in range(15):
-            assert (
-                f"topic {i}\n" not in second_docs
-            ), f"stale 'Topic {i}' from first mine survived the rebuild"
+            assert f"topic {i}\n" not in second_docs, (
+                f"stale 'Topic {i}' from first mine survived the rebuild"
+            )
         # Numbered closets that existed only in the larger first run must be gone.
         leftover = first_ids - set(second_pass["ids"])
         for stale_id in leftover:
-            assert not col.get(ids=[stale_id])[
-                "ids"
-            ], f"orphan closet {stale_id} from larger first run survived purge"
+            assert not col.get(ids=[stale_id])["ids"], (
+                f"orphan closet {stale_id} from larger first run survived purge"
+            )
 
 
 # ── _extract_drawer_ids_from_closet ───────────────────────────────────
@@ -702,9 +702,9 @@ class TestDiaryIngest:
 
         # No state file inside the user's diary dir.
         for entry in diary_dir.iterdir():
-            assert (
-                "diary_ingest" not in entry.name
-            ), f"state file leaked into user diary dir: {entry}"
+            assert "diary_ingest" not in entry.name, (
+                f"state file leaked into user diary dir: {entry}"
+            )
 
         # State file does exist under ~/.mempalace/state/.
         state_path = _state_file_for(str(palace_dir), diary_dir.resolve())
@@ -905,7 +905,7 @@ class TestTunnels:
         assert not errors, f"worker raised: {errors}"
         tunnels = list_tunnels()
         assert len(tunnels) == 5, (
-            f"expected 5 concurrent tunnels, got {len(tunnels)} — " "write race dropped some"
+            f"expected 5 concurrent tunnels, got {len(tunnels)} — write race dropped some"
         )
 
     def test_created_at_is_timezone_aware(self):

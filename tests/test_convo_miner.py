@@ -172,9 +172,9 @@ def test_mine_convos_rebuilds_stale_drawers_after_schema_bump(capsys):
         # Second mine — version gate should trigger rebuild
         mine_convos(tmpdir, palace_path, wing="test")
         out = capsys.readouterr().out
-        assert (
-            "Files skipped (already filed): 0" in out
-        ), "stale drawers should force a rebuild, not a skip"
+        assert "Files skipped (already filed): 0" in out, (
+            "stale drawers should force a rebuild, not a skip"
+        )
 
         client = chromadb.PersistentClient(path=palace_path)
         col = client.get_collection("mempalace_drawers")

@@ -199,9 +199,9 @@ def test_reentrant_same_thread_passes_through(tmp_path, monkeypatch):
         child = ctx.Process(target=_try_acquire_expect_busy, args=(palace, result_q))
         try:
             child.start()
-            assert (
-                result_q.get(timeout=10) == "busy"
-            ), "outer lock should still be held by parent after inner re-entrant exit"
+            assert result_q.get(timeout=10) == "busy", (
+                "outer lock should still be held by parent after inner re-entrant exit"
+            )
             child.join(timeout=5)
             assert child.exitcode == 0
         finally:
@@ -267,9 +267,9 @@ def test_lock_failure_message_names_holder(tmp_path, monkeypatch):
                 pytest.fail("second acquire of same palace should have raised")
 
         msg = str(excinfo.value)
-        assert (
-            f"PID {holder_pid}" in msg
-        ), f"lock-failure message must name the holder PID; got: {msg!r}"
+        assert f"PID {holder_pid}" in msg, (
+            f"lock-failure message must name the holder PID; got: {msg!r}"
+        )
     finally:
         open(release, "w").close()
         holder.join(timeout=5)

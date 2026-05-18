@@ -51,7 +51,7 @@ chroma = "mempalace.backends.chroma:ChromaBackend"
 [project.entry-points."mempalace.sources"]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "pytest-cov>=4.0", "ruff>=0.4.0", "psutil>=5.9"]
+dev = ["pytest>=7.0", "pytest-cov>=4.0", "ruff==0.15.9", "psutil>=5.9"]
 spellcheck = ["autocorrect>=2.0"]
 # Hardware acceleration for the ONNX embedding model. Install exactly one:
 #   pip install mempalace[gpu]       — NVIDIA CUDA
@@ -63,7 +63,7 @@ dml = ["onnxruntime-directml>=1.16"]
 coreml = ["onnxruntime>=1.16"]
 
 [dependency-groups]
-dev = ["pytest>=7.0", "pytest-cov>=4.0", "ruff>=0.4.0", "psutil>=5.9"]
+dev = ["pytest>=7.0", "pytest-cov>=4.0", "ruff==0.15.9", "psutil>=5.9"]
 
 [build-system]
 requires = ["hatchling"]

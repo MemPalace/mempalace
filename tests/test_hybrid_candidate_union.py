@@ -79,8 +79,7 @@ class TestCandidateUnion:
         result = search_memories(_NARRATIVE_QUERY, palace, n_results=5, candidate_strategy="union")
         ids = [h["source_file"] for h in result["results"]]
         assert "brand_voice_D4.md" in ids, (
-            "union mode must surface BM25-strong docs even when vector signal "
-            f"is weak; got {ids}"
+            f"union mode must surface BM25-strong docs even when vector signal is weak; got {ids}"
         )
 
     def test_union_preserves_vector_hits(self, tmp_path):
@@ -138,9 +137,9 @@ class TestCandidateUnion:
         # 4-doc corpus, n_results=2 → union pool can grow to ~8 candidates,
         # rerank reorders them, but final list must respect the cap.
         result = search_memories(_NARRATIVE_QUERY, palace, n_results=2, candidate_strategy="union")
-        assert (
-            len(result["results"]) <= 2
-        ), f"union must trim to n_results=2; got {len(result['results'])} results"
+        assert len(result["results"]) <= 2, (
+            f"union must trim to n_results=2; got {len(result['results'])} results"
+        )
 
     def test_union_skipped_when_max_distance_set(self, tmp_path):
         """``max_distance`` is a vector-distance threshold; BM25-only

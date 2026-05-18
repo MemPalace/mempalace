@@ -98,12 +98,12 @@ class TestNoBash4OnlyBuiltins:
     @_BOTH_HOOKS
     def test_no_mapfile(self, hook):
         code = _hook_src_no_comments(hook)
-        assert (
-            "mapfile" not in code
-        ), f"{hook.name} uses mapfile, unavailable on macOS /bin/bash 3.2 (#1440)"
-        assert (
-            "readarray" not in code
-        ), f"{hook.name} uses readarray, unavailable on macOS /bin/bash 3.2 (#1440)"
+        assert "mapfile" not in code, (
+            f"{hook.name} uses mapfile, unavailable on macOS /bin/bash 3.2 (#1440)"
+        )
+        assert "readarray" not in code, (
+            f"{hook.name} uses readarray, unavailable on macOS /bin/bash 3.2 (#1440)"
+        )
 
     @_BOTH_HOOKS
     def test_sed_extraction_present(self, hook):
@@ -115,9 +115,9 @@ class TestNoBash4OnlyBuiltins:
         # method back to ``mapfile`` while keeping the old commentary.
         src = _hook_src_no_comments(hook)
         # Each hook reads at least two values via ``sed -n 'Np'`` (sentinel + session_id).
-        assert (
-            src.count("sed -n '") >= 2
-        ), f"{hook.name} must use sed -n 'Np' for POSIX-portable line extraction"
+        assert src.count("sed -n '") >= 2, (
+            f"{hook.name} must use sed -n 'Np' for POSIX-portable line extraction"
+        )
 
     @_BOTH_HOOKS
     def test_bash_syntax_clean(self, hook):
@@ -150,9 +150,9 @@ class TestSessionIdExtraction:
         assert "WARN: input parse failed" not in log
         state_dir = tmp_path / ".mempalace" / "hook_state"
         assert not (state_dir / "last_input.log").exists()
-        assert not (
-            state_dir / "last_python_err.log"
-        ).exists(), "successful parse must leave no last_python_err.log behind"
+        assert not (state_dir / "last_python_err.log").exists(), (
+            "successful parse must leave no last_python_err.log behind"
+        )
 
     def test_precompact_hook_extracts_session_id(self, tmp_path):
         out, _ = _run_hook(
@@ -166,9 +166,9 @@ class TestSessionIdExtraction:
         assert "WARN: input parse failed" not in log
         state_dir = tmp_path / ".mempalace" / "hook_state"
         assert not (state_dir / "last_input.log").exists()
-        assert not (
-            state_dir / "last_python_err.log"
-        ).exists(), "successful parse must leave no last_python_err.log behind"
+        assert not (state_dir / "last_python_err.log").exists(), (
+            "successful parse must leave no last_python_err.log behind"
+        )
 
 
 class TestFailLoudGuard:
@@ -214,9 +214,9 @@ class TestFailLoudGuard:
             tmp_path,
         )
         state_dir = tmp_path / ".mempalace" / "hook_state"
-        assert not (
-            state_dir / "last_input.log"
-        ).exists(), "unicode-only session_id sanitized to empty must NOT trip the guard"
+        assert not (state_dir / "last_input.log").exists(), (
+            "unicode-only session_id sanitized to empty must NOT trip the guard"
+        )
 
     @_BOTH_HOOKS
     def test_literal_unknown_session_id_does_not_trip_guard(self, hook, tmp_path):
@@ -231,9 +231,9 @@ class TestFailLoudGuard:
             tmp_path,
         )
         state_dir = tmp_path / ".mempalace" / "hook_state"
-        assert not (
-            state_dir / "last_input.log"
-        ).exists(), "literal session_id='unknown' must NOT trip the guard"
+        assert not (state_dir / "last_input.log").exists(), (
+            "literal session_id='unknown' must NOT trip the guard"
+        )
 
     @_BOTH_HOOKS
     def test_dump_is_bounded_and_overwritten(self, hook, tmp_path):
@@ -251,9 +251,9 @@ class TestFailLoudGuard:
         big_payload = "x" * 4097
         _run_hook(hook, big_payload, tmp_path)
         last_input = tmp_path / ".mempalace" / "hook_state" / "last_input.log"
-        assert (
-            last_input.stat().st_size == 4096
-        ), f"cap must be exactly 4096 bytes; got {last_input.stat().st_size}"
+        assert last_input.stat().st_size == 4096, (
+            f"cap must be exactly 4096 bytes; got {last_input.stat().st_size}"
+        )
         # Second failure with a smaller payload (also not valid JSON, so the
         # guard fires) overwrites the first; the file shrinks instead of
         # accumulating.
@@ -310,9 +310,9 @@ class TestFailLoudGuard:
         # Python's json.load raises JSONDecodeError with a recognizable
         # traceback. Don't pin the exact message (it varies by Python
         # version) but assert at least one canonical marker is present.
-        assert (
-            "Traceback" in contents or "json" in contents.lower()
-        ), f"expected Python traceback or json error, got: {contents!r}"
+        assert "Traceback" in contents or "json" in contents.lower(), (
+            f"expected Python traceback or json error, got: {contents!r}"
+        )
 
     @_BOTH_HOOKS
     def test_python_stderr_log_is_not_world_readable_on_failure(self, hook, tmp_path):

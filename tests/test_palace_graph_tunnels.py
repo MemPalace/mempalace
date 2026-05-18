@@ -63,9 +63,9 @@ class TestTunnelStorage:
         assert file_mode == 0o600, f"tunnels.json mode is {oct(file_mode)}, expected 0o600"
 
         parent_mode = stat.S_IMODE(os.stat(tunnel_file.parent).st_mode)
-        assert (
-            parent_mode == 0o700
-        ), f"tunnels.json parent dir mode is {oct(parent_mode)}, expected 0o700"
+        assert parent_mode == 0o700, (
+            f"tunnels.json parent dir mode is {oct(parent_mode)}, expected 0o700"
+        )
 
 
 class TestExplicitTunnels:

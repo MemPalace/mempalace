@@ -22,8 +22,10 @@ import errno
 import os
 import shutil
 import sqlite3
+import tempfile
 import uuid
 from collections import defaultdict
+from contextlib import closing
 from datetime import datetime
 
 
@@ -52,61 +54,65 @@ def extract_drawers_from_sqlite(db_path: str) -> list:
 
     Works regardless of which ChromaDB version created the database.
     Returns list of dicts with 'id', 'document', and 'metadata' keys.
+
+    The connection is wrapped in ``contextlib.closing`` so an exception
+    during extraction does not leak the SQLite handle. On Windows that
+    would leave a file lock on ``chroma.sqlite3`` and prevent the rest
+    of the migration from touching the palace directory.
     """
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.row_factory = sqlite3.Row
 
-    # Get all embedding IDs and their documents
-    rows = conn.execute(
-        """
-        SELECT e.embedding_id,
-               MAX(CASE WHEN em.key = 'chroma:document' THEN em.string_value END) as document
-        FROM embeddings e
-        JOIN embedding_metadata em ON em.id = e.id
-        GROUP BY e.embedding_id
-    """
-    ).fetchall()
-
-    drawers = []
-    for row in rows:
-        embedding_id = row["embedding_id"]
-        document = row["document"]
-        if not document:
-            continue
-
-        # Get metadata for this embedding
-        meta_rows = conn.execute(
+        # Get all embedding IDs and their documents
+        rows = conn.execute(
             """
-            SELECT em.key, em.string_value, em.int_value, em.float_value, em.bool_value
-            FROM embedding_metadata em
-            JOIN embeddings e ON e.id = em.id
-            WHERE e.embedding_id = ?
-              AND em.key NOT LIKE 'chroma:%'
-        """,
-            (embedding_id,),
+            SELECT e.embedding_id,
+                   MAX(CASE WHEN em.key = 'chroma:document' THEN em.string_value END) as document
+            FROM embeddings e
+            JOIN embedding_metadata em ON em.id = e.id
+            GROUP BY e.embedding_id
+        """
         ).fetchall()
 
-        metadata = {}
-        for mr in meta_rows:
-            key = mr["key"]
-            if mr["string_value"] is not None:
-                metadata[key] = mr["string_value"]
-            elif mr["int_value"] is not None:
-                metadata[key] = mr["int_value"]
-            elif mr["float_value"] is not None:
-                metadata[key] = mr["float_value"]
-            elif mr["bool_value"] is not None:
-                metadata[key] = bool(mr["bool_value"])
+        drawers = []
+        for row in rows:
+            embedding_id = row["embedding_id"]
+            document = row["document"]
+            if not document:
+                continue
 
-        drawers.append(
-            {
-                "id": embedding_id,
-                "document": document,
-                "metadata": metadata,
-            }
-        )
+            # Get metadata for this embedding
+            meta_rows = conn.execute(
+                """
+                SELECT em.key, em.string_value, em.int_value, em.float_value, em.bool_value
+                FROM embedding_metadata em
+                JOIN embeddings e ON e.id = em.id
+                WHERE e.embedding_id = ?
+                  AND em.key NOT LIKE 'chroma:%'
+            """,
+                (embedding_id,),
+            ).fetchall()
 
-    conn.close()
+            metadata = {}
+            for mr in meta_rows:
+                key = mr["key"]
+                if mr["string_value"] is not None:
+                    metadata[key] = mr["string_value"]
+                elif mr["int_value"] is not None:
+                    metadata[key] = mr["int_value"]
+                elif mr["float_value"] is not None:
+                    metadata[key] = mr["float_value"]
+                elif mr["bool_value"] is not None:
+                    metadata[key] = bool(mr["bool_value"])
+
+            drawers.append(
+                {
+                    "id": embedding_id,
+                    "document": document,
+                    "metadata": metadata,
+                }
+            )
+
     return drawers
 
 
@@ -287,53 +293,63 @@ def migrate(palace_path: str, dry_run: bool = False, confirm: bool = False):
     print(f"\n  Backing up to {backup_path}...")
     shutil.copytree(palace_path, backup_path)
 
-    # Build fresh palace in a temp directory (avoids chromadb reading old state)
-    import tempfile
-
+    # Build fresh palace in a temp directory (avoids chromadb reading old state).
+    # Wrap the whole import-and-swap dance in try/finally so the temp dir is
+    # cleaned up if any of the chromadb writes, the verify count, or the
+    # rename fails — without try/finally a crashed migration leaves a partial
+    # palace dir under the system temp root that the user has to find by hand.
     temp_palace = tempfile.mkdtemp(prefix="mempalace_migrate_")
-    print(f"  Creating fresh palace in {temp_palace}...")
-    fresh_backend = ChromaBackend()
-    col = fresh_backend.get_or_create_collection(temp_palace, "mempalace_drawers")
-
-    # Re-import in batches
-    batch_size = 500
-    imported = 0
-    for i in range(0, len(drawers), batch_size):
-        batch = drawers[i : i + batch_size]
-        col.add(
-            ids=[d["id"] for d in batch],
-            documents=[d["document"] for d in batch],
-            metadatas=[d["metadata"] for d in batch],
-        )
-        imported += len(batch)
-        print(f"  Imported {imported}/{len(drawers)} drawers...")
-
-    # Verify before swapping
-    final_count = col.count()
-    del col
-    del fresh_backend
-
-    # Swap: rename old palace aside, then move new one into place.
-    # This avoids a window where both old and new are missing.
-    print("  Swapping old palace for migrated version...")
-    stale_path = palace_path + ".old"
-    if os.path.exists(stale_path):
-        shutil.rmtree(stale_path)
-    os.replace(palace_path, stale_path)
     try:
-        os.replace(temp_palace, palace_path)
-    except OSError as e:
-        # EXDEV = temp lives on a different filesystem; fall back to copy+delete.
-        # Anything else is a real error — don't mask it with shutil.move.
-        if getattr(e, "errno", None) != errno.EXDEV:
-            _restore_stale_palace(palace_path, stale_path)
-            raise
+        print(f"  Creating fresh palace in {temp_palace}...")
+        fresh_backend = ChromaBackend()
+        col = fresh_backend.get_or_create_collection(temp_palace, "mempalace_drawers")
+
+        # Re-import in batches
+        batch_size = 500
+        imported = 0
+        for i in range(0, len(drawers), batch_size):
+            batch = drawers[i : i + batch_size]
+            col.add(
+                ids=[d["id"] for d in batch],
+                documents=[d["document"] for d in batch],
+                metadatas=[d["metadata"] for d in batch],
+            )
+            imported += len(batch)
+            print(f"  Imported {imported}/{len(drawers)} drawers...")
+
+        # Verify before swapping
+        final_count = col.count()
+        del col
+        del fresh_backend
+
+        # Swap: rename old palace aside, then move new one into place.
+        # This avoids a window where both old and new are missing.
+        print("  Swapping old palace for migrated version...")
+        stale_path = palace_path + ".old"
+        if os.path.exists(stale_path):
+            shutil.rmtree(stale_path)
+        os.replace(palace_path, stale_path)
         try:
-            shutil.move(temp_palace, palace_path)
-        except Exception:
-            _restore_stale_palace(palace_path, stale_path)
-            raise
-    shutil.rmtree(stale_path, ignore_errors=True)
+            os.replace(temp_palace, palace_path)
+        except OSError as e:
+            # EXDEV = temp lives on a different filesystem; fall back to copy+delete.
+            # Anything else is a real error — don't mask it with shutil.move.
+            if getattr(e, "errno", None) != errno.EXDEV:
+                _restore_stale_palace(palace_path, stale_path)
+                raise
+            try:
+                shutil.move(temp_palace, palace_path)
+            except Exception:
+                _restore_stale_palace(palace_path, stale_path)
+                raise
+        shutil.rmtree(stale_path, ignore_errors=True)
+    finally:
+        # On the happy path os.replace/shutil.move consumed temp_palace, so
+        # the directory no longer exists at the temp location — the existence
+        # guard makes this a no-op then. On any failure path it actually
+        # removes the orphan.
+        if os.path.exists(temp_palace):
+            shutil.rmtree(temp_palace, ignore_errors=True)
 
     print("\n  Migration complete.")
     print(f"  Drawers migrated: {final_count}")
