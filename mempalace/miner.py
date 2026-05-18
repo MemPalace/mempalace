@@ -1224,7 +1224,7 @@ def _mine_impl(
                 raise
             files_processed = i
             last_file = filepath.name
-            if drawers == 0 and not dry_run:
+            if drawers == 0:
                 files_skipped += 1
             else:
                 total_drawers += drawers
