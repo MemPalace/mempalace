@@ -331,11 +331,26 @@ def _fuzzy_match(query: str, nodes: dict, n: int = 5):
 # Explicit tunnels are created by agents when they notice a connection
 # between two specific drawers or rooms in different wings/projects.
 #
-# Stored as a JSON file at ~/.mempalace/tunnels.json so they persist
-# across palace rebuilds (not in ChromaDB which can be recreated).
+# Stored as a JSON file inside the configured palace path so they persist
+# across palace rebuilds (not in ChromaDB which can be recreated) and follow
+# the same isolation boundary as drawers.
 
 
-_TUNNEL_FILE = os.path.join(os.path.expanduser("~"), ".mempalace", "tunnels.json")
+_TUNNEL_FILE = None
+
+
+def _tunnel_file(config=None):
+    """Return the explicit-tunnel store path for the active palace.
+
+    Tests and advanced embedders may still monkeypatch ``_TUNNEL_FILE`` to a
+    concrete path. In normal use, derive the file from ``MempalaceConfig`` so
+    ``MEMPALACE_PALACE_PATH`` / config ``palace_path`` isolate tunnels the
+    same way they isolate Chroma drawers.
+    """
+    if _TUNNEL_FILE is not None:
+        return _TUNNEL_FILE
+    config = config or MempalaceConfig()
+    return os.path.join(config.palace_path, "tunnels.json")
 
 
 def _load_tunnels():
@@ -344,10 +359,11 @@ def _load_tunnels():
     Returns an empty list if the file is missing or corrupt (e.g. truncated
     by a crash mid-write on a system that lacks atomic-rename semantics).
     """
-    if not os.path.exists(_TUNNEL_FILE):
+    tunnel_file = _tunnel_file()
+    if not os.path.exists(tunnel_file):
         return []
     try:
-        with open(_TUNNEL_FILE, "r", encoding="utf-8") as f:
+        with open(tunnel_file, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception:
         return []
@@ -367,14 +383,15 @@ def _save_tunnels(tunnels):
     shared Linux/multi-user systems. Matches the file-permission pattern
     established by #814 for the other sensitive palace files.
     """
-    parent = os.path.dirname(_TUNNEL_FILE)
+    tunnel_file = _tunnel_file()
+    parent = os.path.dirname(tunnel_file)
     os.makedirs(parent, exist_ok=True)
     try:
         os.chmod(parent, 0o700)
     except (OSError, NotImplementedError):
         # Windows / unsupported filesystems — tolerate.
         pass
-    tmp_path = _TUNNEL_FILE + ".tmp"
+    tmp_path = tunnel_file + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(tunnels, f, indent=2)
         f.flush()
@@ -383,9 +400,9 @@ def _save_tunnels(tunnels):
         except OSError:
             # Not all filesystems (or Windows file handles) support fsync — tolerate.
             pass
-    os.replace(tmp_path, _TUNNEL_FILE)
+    os.replace(tmp_path, tunnel_file)
     try:
-        os.chmod(_TUNNEL_FILE, 0o600)
+        os.chmod(tunnel_file, 0o600)
     except (OSError, NotImplementedError):
         pass
 
@@ -417,6 +434,27 @@ def _require_name(value: str, field: str) -> str:
     return value.strip()
 
 
+def _check_room_exists(wing: str, room: str, col, kind: str = "explicit") -> bool:
+    """Validate that a tunnel endpoint resolves to a real Chroma room.
+
+    Explicit tunnels are user/agent-created links between real rooms, so a
+    validation outage must fail loud instead of persisting a phantom tunnel.
+    Topic tunnels intentionally use synthetic ``topic:<name>`` rooms and may
+    be created without Chroma validation.
+    """
+    if col is None:
+        if kind == "explicit":
+            raise ValueError(f"Cannot validate room existence for {wing}/{room}: ChromaDB unreachable")
+        return True
+    try:
+        results = col.get(where={"$and": [{"wing": wing}, {"room": room}]}, limit=1, include=[])
+    except Exception as exc:
+        if kind == "explicit":
+            raise ValueError(f"Room validation query failed for {wing}/{room}: {exc}") from exc
+        return True
+    return len(results.get("ids", [])) > 0
+
+
 def create_tunnel(
     source_wing: str,
     source_room: str,
@@ -426,6 +464,8 @@ def create_tunnel(
     source_drawer_id: str = None,
     target_drawer_id: str = None,
     kind: str = "explicit",
+    col=None,
+    config=None,
 ):
     """Create an explicit (symmetric) tunnel between two locations in the palace.
 
@@ -466,6 +506,12 @@ def create_tunnel(
     source_wing = _normalize_wing(source_wing)
     target_wing = _normalize_wing(target_wing)
 
+    if kind == "explicit":
+        validation_col = col if col is not None else _get_collection(config)
+        for wing, room in ((source_wing, source_room), (target_wing, target_room)):
+            if not _check_room_exists(wing, room, validation_col, kind=kind):
+                raise ValueError(f"Room not found for explicit tunnel endpoint: {wing}/{room}")
+
     tunnel_id = _canonical_tunnel_id(source_wing, source_room, target_wing, target_room)
 
     tunnel = {
@@ -484,7 +530,8 @@ def create_tunnel(
     # Serialize the load → mutate → save cycle. Without this, two concurrent
     # create_tunnel calls can both read the same snapshot and the later
     # writer silently drops the earlier writer's tunnel.
-    with mine_lock(_TUNNEL_FILE):
+    tunnel_file = _tunnel_file(config)
+    with mine_lock(tunnel_file):
         tunnels = _load_tunnels()
         for existing in tunnels:
             if existing.get("id") == tunnel_id:
@@ -519,7 +566,8 @@ def list_tunnels(wing: str = None):
 
 def delete_tunnel(tunnel_id: str):
     """Delete an explicit tunnel by ID. Returns ``{"deleted": <id>}``."""
-    with mine_lock(_TUNNEL_FILE):
+    tunnel_file = _tunnel_file()
+    with mine_lock(tunnel_file):
         tunnels = _load_tunnels()
         tunnels = [t for t in tunnels if t.get("id") != tunnel_id]
         _save_tunnels(tunnels)

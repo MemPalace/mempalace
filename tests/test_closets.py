@@ -763,13 +763,17 @@ class TestTunnels:
         import mempalace.palace_graph as pg
 
         self._orig = pg._TUNNEL_FILE
+        self._orig_get_collection = pg._get_collection
         self._tmpdir = tempfile.mkdtemp()
         pg._TUNNEL_FILE = os.path.join(self._tmpdir, "tunnels.json")
+        col = type("AlwaysExistsCollection", (), {"get": lambda self, **kwargs: {"ids": ["exists"]}})()
+        pg._get_collection = lambda config=None: col
 
     def teardown_method(self):
         import mempalace.palace_graph as pg
 
         pg._TUNNEL_FILE = self._orig
+        pg._get_collection = self._orig_get_collection
         import shutil
 
         shutil.rmtree(self._tmpdir, ignore_errors=True)

@@ -11,9 +11,31 @@ with patch.dict("sys.modules", {"chromadb": MagicMock()}):
     import mempalace.palace_graph as palace_graph
 
 
+def _collection_with_rooms(*rooms):
+    existing = set(rooms)
+    col = MagicMock()
+
+    def fake_get(*args, where=None, **kwargs):
+        clauses = where.get("$and", []) if isinstance(where, dict) else []
+        wanted = {k: v for clause in clauses for k, v in clause.items()}
+        room_key = (wanted.get("wing"), wanted.get("room"))
+        return {"ids": [f"{room_key[0]}:{room_key[1]}"] if room_key in existing else []}
+
+    col.get.side_effect = fake_get
+    return col
+
+
+def _collection_all_rooms_exist():
+    col = MagicMock()
+    col.count.return_value = 0
+    col.get.return_value = {"ids": ["exists"]}
+    return col
+
+
 def _use_tmp_tunnel_file(monkeypatch, tmp_path):
     tunnel_file = tmp_path / "tunnels.json"
     monkeypatch.setattr(palace_graph, "_TUNNEL_FILE", str(tunnel_file))
+    monkeypatch.setattr(palace_graph, "_get_collection", lambda config=None: _collection_all_rooms_exist())
     return tunnel_file
 
 
@@ -97,6 +119,55 @@ class TestExplicitTunnels:
 
         with pytest.raises(ValueError):
             palace_graph.create_tunnel("", "auth", "wing_people", "users")
+
+    def test_create_tunnel_rejects_missing_target_room(self, tmp_path, monkeypatch):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            palace_graph,
+            "_get_collection",
+            lambda config=None: _collection_with_rooms(("wing_code", "auth")),
+        )
+
+        with pytest.raises(ValueError, match="Room not found.*wing_people/users"):
+            palace_graph.create_tunnel("wing_code", "auth", "wing_people", "users")
+
+        assert palace_graph.list_tunnels() == []
+
+    def test_create_tunnel_fails_loud_when_validation_unavailable(self, tmp_path, monkeypatch):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        monkeypatch.setattr(palace_graph, "_get_collection", lambda config=None: None)
+
+        with pytest.raises(ValueError, match="Cannot validate room existence.*ChromaDB unreachable"):
+            palace_graph.create_tunnel("wing_code", "auth", "wing_people", "users")
+
+        assert palace_graph.list_tunnels() == []
+
+    def test_topic_tunnels_can_synthesize_rooms_when_validation_unavailable(
+        self, tmp_path, monkeypatch
+    ):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        monkeypatch.setattr(palace_graph, "_get_collection", lambda config=None: None)
+
+        tunnel = palace_graph.create_tunnel(
+            "wing_code",
+            "topic:OpenAPI",
+            "wing_people",
+            "topic:OpenAPI",
+            kind="topic",
+        )
+
+        assert palace_graph.list_tunnels() == [tunnel]
+
+    def test_tunnels_json_follows_configured_palace_path(self, tmp_path, monkeypatch):
+        palace_path = tmp_path / "configured-palace"
+        monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(palace_path))
+        monkeypatch.setattr(palace_graph, "_TUNNEL_FILE", None)
+        monkeypatch.setattr(palace_graph, "_get_collection", lambda config=None: _collection_all_rooms_exist())
+
+        tunnel = palace_graph.create_tunnel("wing_code", "auth", "wing_people", "users")
+
+        assert (palace_path / "tunnels.json").exists()
+        assert palace_graph.list_tunnels() == [tunnel]
 
     def test_list_tunnels_filters_by_either_side(self, tmp_path, monkeypatch):
         _use_tmp_tunnel_file(monkeypatch, tmp_path)
