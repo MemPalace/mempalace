@@ -126,7 +126,7 @@ own research page for their published numbers.
 git clone https://github.com/MemPalace/mempalace.git
 cd mempalace
 uv sync --extra dev   # or: pip install -e ".[dev]"
-# see benchmarks/README.md for dataset download commands
+# see benchmarks/BENCHMARKS.md for dataset download commands
 uv run python benchmarks/longmemeval_bench.py /path/to/longmemeval_s_cleaned.json
 ```
 
