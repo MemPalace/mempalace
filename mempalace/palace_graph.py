@@ -335,30 +335,41 @@ def _fuzzy_match(query: str, nodes: dict, n: int = 5):
 # Explicit tunnels are created by agents when they notice a connection
 # between two specific drawers or rooms in different wings/projects.
 #
-# Stored as a JSON file at ~/.mempalace/tunnels.json so they persist
+# Stored as tunnels.json under the configured palace_path so they persist
 # across palace rebuilds (not in ChromaDB which can be recreated).
 
 
-_TUNNEL_FILE = os.path.join(os.path.expanduser("~"), ".mempalace", "tunnels.json")
+# Explicit tunnel file path override for tests / legacy callers. When left
+# unset, resolve tunnels.json under MempalaceConfig().palace_path so all
+# sessions sharing a palace use the same tunnel store even with different HOME.
+_TUNNEL_FILE = None
 
 
-def _load_tunnels():
+def _tunnel_file(config=None):
+    if _TUNNEL_FILE:
+        return _TUNNEL_FILE
+    config = config or MempalaceConfig()
+    return os.path.join(config.palace_path, "tunnels.json")
+
+
+def _load_tunnels(config=None):
     """Load explicit tunnels from disk.
 
     Returns an empty list if the file is missing or corrupt (e.g. truncated
     by a crash mid-write on a system that lacks atomic-rename semantics).
     """
-    if not os.path.exists(_TUNNEL_FILE):
+    tunnel_file = _tunnel_file(config)
+    if not os.path.exists(tunnel_file):
         return []
     try:
-        with open(_TUNNEL_FILE, "r", encoding="utf-8") as f:
+        with open(tunnel_file, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception:
         return []
     return data if isinstance(data, list) else []
 
 
-def _save_tunnels(tunnels):
+def _save_tunnels(tunnels, config=None):
     """Persist explicit tunnels atomically.
 
     Writes to ``tunnels.json.tmp`` then ``os.replace``s it into place, so
@@ -371,14 +382,15 @@ def _save_tunnels(tunnels):
     shared Linux/multi-user systems. Matches the file-permission pattern
     established by #814 for the other sensitive palace files.
     """
-    parent = os.path.dirname(_TUNNEL_FILE)
+    tunnel_file = _tunnel_file(config)
+    parent = os.path.dirname(tunnel_file)
     os.makedirs(parent, exist_ok=True)
     try:
         os.chmod(parent, 0o700)
     except (OSError, NotImplementedError):
         # Windows / unsupported filesystems — tolerate.
         pass
-    tmp_path = _TUNNEL_FILE + ".tmp"
+    tmp_path = tunnel_file + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(tunnels, f, indent=2)
         f.flush()
@@ -387,9 +399,9 @@ def _save_tunnels(tunnels):
         except OSError:
             # Not all filesystems (or Windows file handles) support fsync — tolerate.
             pass
-    os.replace(tmp_path, _TUNNEL_FILE)
+    os.replace(tmp_path, tunnel_file)
     try:
-        os.chmod(_TUNNEL_FILE, 0o600)
+        os.chmod(tunnel_file, 0o600)
     except (OSError, NotImplementedError):
         pass
 
@@ -421,6 +433,31 @@ def _require_name(value: str, field: str) -> str:
     return value.strip()
 
 
+def _check_room_exists(wing: str, room: str, col, kind: str = "explicit") -> bool:
+    """Return whether a real palace room exists.
+
+    Explicit tunnels point at real rooms and must fail loud if the palace
+    collection cannot be queried. Topic tunnels intentionally use synthetic
+    ``topic:<name>`` room identifiers, so they tolerate unavailable validation.
+    """
+    if col is None:
+        if kind == "explicit":
+            raise ValueError(f"Cannot validate room existence for {wing}/{room}: ChromaDB unreachable")
+        return True
+
+    try:
+        results = col.get(
+            where={"$and": [{"wing": wing}, {"room": room}]},
+            limit=1,
+            include=[],
+        )
+        return len(results["ids"]) > 0
+    except Exception as exc:
+        if kind == "explicit":
+            raise ValueError(f"Room validation query failed for {wing}/{room}: {exc}") from exc
+        return True
+
+
 def create_tunnel(
     source_wing: str,
     source_room: str,
@@ -430,6 +467,8 @@ def create_tunnel(
     source_drawer_id: str = None,
     target_drawer_id: str = None,
     kind: str = "explicit",
+    col=None,
+    config=None,
 ):
     """Create an explicit (symmetric) tunnel between two locations in the palace.
 
@@ -461,7 +500,8 @@ def create_tunnel(
         The stored tunnel dict.
 
     Raises:
-        ValueError: if any wing or room is empty or non-string.
+        ValueError: if any wing or room is empty or non-string, or if an
+            explicit tunnel endpoint does not exist / cannot be validated.
 
     Note:
         Wing slugs are stored verbatim — passing ``"my-wing"`` and ``"my_wing"``
@@ -474,6 +514,13 @@ def create_tunnel(
     source_room = _require_name(source_room, "source_room")
     target_wing = _require_name(target_wing, "target_wing")
     target_room = _require_name(target_room, "target_room")
+
+    if kind == "explicit" and col is None:
+        col = _get_collection(config)
+    if not _check_room_exists(source_wing, source_room, col, kind=kind):
+        raise ValueError(f"source room not found: {source_wing}/{source_room}")
+    if not _check_room_exists(target_wing, target_room, col, kind=kind):
+        raise ValueError(f"target room not found: {target_wing}/{target_room}")
 
     tunnel_id = _canonical_tunnel_id(source_wing, source_room, target_wing, target_room)
 
@@ -493,8 +540,9 @@ def create_tunnel(
     # Serialize the load → mutate → save cycle. Without this, two concurrent
     # create_tunnel calls can both read the same snapshot and the later
     # writer silently drops the earlier writer's tunnel.
-    with mine_lock(_TUNNEL_FILE):
-        tunnels = _load_tunnels()
+    tunnel_file = _tunnel_file(config)
+    with mine_lock(tunnel_file):
+        tunnels = _load_tunnels(config)
         for existing in tunnels:
             if existing.get("id") == tunnel_id:
                 # Preserve original creation timestamp on label updates.
@@ -502,10 +550,10 @@ def create_tunnel(
                 tunnel["updated_at"] = datetime.now(timezone.utc).isoformat()
                 existing.clear()
                 existing.update(tunnel)
-                _save_tunnels(tunnels)
+                _save_tunnels(tunnels, config)
                 return existing
         tunnels.append(tunnel)
-        _save_tunnels(tunnels)
+        _save_tunnels(tunnels, config)
     return tunnel
 
 
@@ -535,7 +583,8 @@ def list_tunnels(wing: str = None):
 
 def delete_tunnel(tunnel_id: str):
     """Delete an explicit tunnel by ID. Returns ``{"deleted": <id>}``."""
-    with mine_lock(_TUNNEL_FILE):
+    tunnel_file = _tunnel_file()
+    with mine_lock(tunnel_file):
         tunnels = _load_tunnels()
         tunnels = [t for t in tunnels if t.get("id") != tunnel_id]
         _save_tunnels(tunnels)

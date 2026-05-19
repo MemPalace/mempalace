@@ -14,10 +14,49 @@ with patch.dict("sys.modules", {"chromadb": MagicMock()}):
 def _use_tmp_tunnel_file(monkeypatch, tmp_path):
     tunnel_file = tmp_path / "tunnels.json"
     monkeypatch.setattr(palace_graph, "_TUNNEL_FILE", str(tunnel_file))
+    permissive_col = MagicMock()
+    permissive_col.get.return_value = {"ids": ["exists"]}
+    permissive_col.count.return_value = 0
+    monkeypatch.setattr(palace_graph, "_get_collection", lambda config=None: permissive_col)
     return tunnel_file
 
 
+def _collection_with_rooms(*rooms):
+    room_set = set(rooms)
+    col = MagicMock()
+
+    def get(where=None, **kwargs):
+        clauses = (where or {}).get("$and", [])
+        wing = next((c.get("wing") for c in clauses if "wing" in c), None)
+        room = next((c.get("room") for c in clauses if "room" in c), None)
+        return {"ids": [f"{wing}/{room}"] if (wing, room) in room_set else []}
+
+    col.get.side_effect = get
+    return col
+
+
 class TestTunnelStorage:
+    def test_default_tunnel_file_follows_palace_path_env(self, tmp_path, monkeypatch):
+        """Regression: tunnels.json must live under configured palace_path,
+        not the process HOME, so isolated profiles read/write the same palace."""
+        monkeypatch.setattr(palace_graph, "_TUNNEL_FILE", None)
+        monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(tmp_path / "palace"))
+
+        palace_graph._save_tunnels(
+            [
+                {
+                    "id": "x",
+                    "source": {"wing": "a", "room": "r1"},
+                    "target": {"wing": "b", "room": "r2"},
+                    "label": "",
+                }
+            ]
+        )
+
+        configured_file = tmp_path / "palace" / "tunnels.json"
+        assert configured_file.exists()
+        assert palace_graph._load_tunnels()[0]["id"] == "x"
+
     def test_load_tunnels_missing_file_returns_empty_list(self, tmp_path, monkeypatch):
         _use_tmp_tunnel_file(monkeypatch, tmp_path)
         assert palace_graph._load_tunnels() == []
@@ -101,6 +140,42 @@ class TestExplicitTunnels:
 
         with pytest.raises(ValueError):
             palace_graph.create_tunnel("", "auth", "wing_people", "users")
+
+    def test_create_tunnel_rejects_missing_explicit_target_room(self, tmp_path, monkeypatch):
+        """Regression for t_57948419: explicit tunnels must not report
+        success when the requested target room is absent from the palace."""
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        col = _collection_with_rooms(("wing_code", "auth"))
+        monkeypatch.setattr(palace_graph, "_get_collection", lambda config=None: col)
+
+        with pytest.raises(ValueError, match="target room not found"):
+            palace_graph.create_tunnel("wing_code", "auth", "wing_people", "missing")
+
+        assert palace_graph.list_tunnels() == []
+
+    def test_create_tunnel_explicit_fails_when_room_validation_unavailable(
+        self, tmp_path, monkeypatch
+    ):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        monkeypatch.setattr(palace_graph, "_get_collection", lambda config=None: None)
+
+        with pytest.raises(ValueError, match="Cannot validate room existence"):
+            palace_graph.create_tunnel("wing_code", "auth", "wing_people", "users")
+
+        assert palace_graph.list_tunnels() == []
+
+    def test_create_tunnel_topic_allows_synthetic_rooms_when_validation_unavailable(
+        self, tmp_path, monkeypatch
+    ):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        monkeypatch.setattr(palace_graph, "_get_collection", lambda config=None: None)
+
+        tunnel = palace_graph.create_tunnel(
+            "wing_code", "topic:Redis", "wing_ops", "topic:Redis", kind="topic"
+        )
+
+        assert tunnel["kind"] == "topic"
+        assert len(palace_graph.list_tunnels()) == 1
 
     def test_list_tunnels_filters_by_either_side(self, tmp_path, monkeypatch):
         _use_tmp_tunnel_file(monkeypatch, tmp_path)
