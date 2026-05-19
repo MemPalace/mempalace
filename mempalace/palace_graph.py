@@ -442,7 +442,9 @@ def _check_room_exists(wing: str, room: str, col, kind: str = "explicit") -> boo
     """
     if col is None:
         if kind == "explicit":
-            raise ValueError(f"Cannot validate room existence for {wing}/{room}: ChromaDB unreachable")
+            raise ValueError(
+                f"Cannot validate room existence for {wing}/{room}: ChromaDB unreachable"
+            )
         return True
 
     try:
