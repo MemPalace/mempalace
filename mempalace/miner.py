@@ -106,7 +106,7 @@ MAX_CHUNKS_PER_FILE = 50_000
 # memory before chunking), so memory use scales with source size too.
 
 
-def _resolve_max_chunks_per_file(override: int | None = None) -> int:
+def _resolve_max_chunks_per_file(override: Optional[int] = None) -> int:
     """Resolve the effective per-file chunk cap.
 
     Precedence: ``override`` (CLI flag) > ``MEMPALACE_MAX_CHUNKS_PER_FILE``
@@ -932,7 +932,7 @@ def process_file(
     chunk_size: int = None,
     chunk_overlap: int = None,
     min_chunk_size: int = None,
-    max_chunks_per_file: int | None = None,
+    max_chunks_per_file: Optional[int] = None,
 ) -> tuple:
     """Read, chunk, route, and file one file.
 
@@ -1164,7 +1164,7 @@ def mine(
     respect_gitignore: bool = True,
     include_ignored: list = None,
     files: list = None,
-    max_chunks_per_file: int | None = None,
+    max_chunks_per_file: Optional[int] = None,
 ):
     """Mine a project directory into the palace.
 
@@ -1221,7 +1221,7 @@ def _mine_impl(
     respect_gitignore: bool = True,
     include_ignored: list = None,
     files: list = None,
-    max_chunks_per_file: int | None = None,
+    max_chunks_per_file: Optional[int] = None,
 ):
     from .config import MempalaceConfig
 
