@@ -59,9 +59,9 @@ OpenCode chat.message hook
 ### 1. Install MemPalace
 
 ```bash
-python3 -m pip install mempalace
-# or
 uv tool install mempalace
+# or
+python3 -m pip install mempalace
 ```
 
 ### 2. Configure MCP server
