@@ -314,7 +314,14 @@ def _mine_one_target(target: Path, palace_path: str, heartbeat_cb=None) -> dict:
             skipped_files += 1
             continue
 
-        if was_in_palace:
+        if drawers == 0:
+            # process_file walked the file but wrote nothing — too small
+            # (< MIN_CHUNK_SIZE), unreadable, or already idempotent via
+            # deterministic IDs. Classify as skipped so the diff counts
+            # reflect what actually changed in the palace, not what was
+            # touched on disk.
+            skipped_files += 1
+        elif was_in_palace:
             updated_files += 1
             updated_drawers += drawers
         else:
