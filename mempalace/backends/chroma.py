@@ -1110,20 +1110,18 @@ class ChromaBackend(BaseBackend):
 
     @staticmethod
     def _resolve_embedding_function():
-        """Return the EF for the user's ``embedding_device`` setting.
+        """Back-compat shim — delegates to :func:`mempalace.embedding.resolve_embedding_function`.
 
         Both ``get_collection`` and ``get_or_create_collection`` must receive
         the EF explicitly — ChromaDB 1.x does not persist it with the
         collection, so a reader that omits the argument silently gets the
         library default and its queries won't match the writer's vectors.
+        New code should call ``resolve_embedding_function`` directly so it
+        does not have to import the chroma backend purely to embed.
         """
-        try:
-            from ..embedding import get_embedding_function
+        from ..embedding import resolve_embedding_function
 
-            return get_embedding_function()
-        except Exception:
-            logger.exception("Failed to build embedding function; using chromadb default")
-            return None
+        return resolve_embedding_function()
 
     # ------------------------------------------------------------------
     # Internal helpers

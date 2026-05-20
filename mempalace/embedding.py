@@ -141,6 +141,23 @@ def get_embedding_function(device: Optional[str] = None):
     return ef
 
 
+def resolve_embedding_function(device: Optional[str] = None):
+    """Return the EF for the requested device, or ``None`` on failure.
+
+    Backend-neutral counterpart to the deprecated
+    ``ChromaBackend._resolve_embedding_function`` — non-chroma backends
+    (e.g. ``RuvectorPostgresBackend``) and the MCP server route through
+    here so they do not have to import the chroma backend just to embed.
+    Wraps :func:`get_embedding_function` with the
+    log-and-return-``None``-on-failure contract callers already depend on.
+    """
+    try:
+        return get_embedding_function(device)
+    except Exception:
+        logger.exception("Failed to build embedding function; using chromadb default")
+        return None
+
+
 def describe_device(device: Optional[str] = None) -> str:
     """Return a short human-readable label for the resolved device.
 
