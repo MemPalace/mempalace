@@ -642,7 +642,7 @@ def test_process_file_uses_bounded_upsert_batches(tmp_path, monkeypatch):
     monkeypatch.setattr(miner, "detect_hall", lambda content: "code")
     monkeypatch.setattr(miner, "_extract_entities_for_metadata", lambda content: "")
 
-    drawers, room = miner.process_file(
+    drawers, room, skip_reason = miner.process_file(
         source,
         tmp_path,
         col,
@@ -654,6 +654,7 @@ def test_process_file_uses_bounded_upsert_batches(tmp_path, monkeypatch):
 
     assert drawers == 5
     assert room == "general"
+    assert skip_reason is None
     assert col.batch_sizes == [2, 2, 1]
 
 
@@ -969,7 +970,7 @@ def test_mine_keyboard_interrupt_prints_summary_and_exits_130(tmp_path, capsys):
         call_count["n"] += 1
         if call_count["n"] == 2:
             raise KeyboardInterrupt
-        return (1, "general")
+        return (1, "general", None)
 
     with patch("mempalace.miner.process_file", side_effect=fake_process_file):
         with pytest.raises(SystemExit) as exc_info:
@@ -1022,16 +1023,18 @@ def test_skip_filenames_includes_lockfiles():
     assert "yarn.lock" in miner.SKIP_FILENAMES
 
 
-def test_process_file_skips_when_chunks_exceed_max(tmp_path, monkeypatch):
-    """A file producing more than MAX_CHUNKS_PER_FILE chunks must be skipped
-    with a clear message and zero upserts. Generated artifacts (CSVs, lock
-    files not in SKIP_FILENAMES) hit this — the cap is what prevents ONNX
-    bad_alloc on Windows when the embedder is asked to swallow thousands of
-    chunks in one batch (#1296)."""
+def test_process_file_skips_when_chunks_exceed_max(tmp_path, monkeypatch, capsys):
+    """A file exceeding the per-file chunk cap is skipped with a tagged
+    return and a stderr/stdout message pointing at the config override. The
+    cap is the rail against pathological artifacts (CSVs, lockfiles not in
+    SKIP_FILENAMES) and against ONNX bad_alloc on Windows (#1296); #1455
+    raised the default and made the cap configurable so legitimate
+    long-form content is not silently dropped."""
     from unittest.mock import MagicMock
 
     from mempalace import miner
 
+    monkeypatch.delenv("MEMPALACE_MAX_CHUNKS_PER_FILE", raising=False)
     monkeypatch.setattr(miner, "MAX_CHUNKS_PER_FILE", 5)
     over_cap = [{"content": f"chunk {i}", "chunk_index": i} for i in range(7)]
     monkeypatch.setattr(miner, "chunk_text", lambda content, source_file, **kwargs: over_cap)
@@ -1041,7 +1044,7 @@ def test_process_file_skips_when_chunks_exceed_max(tmp_path, monkeypatch):
     col = MagicMock()
     col.get.return_value = {"ids": []}
 
-    drawers, room = miner.process_file(
+    drawers, room, skip_reason = miner.process_file(
         source,
         tmp_path,
         col,
@@ -1052,7 +1055,274 @@ def test_process_file_skips_when_chunks_exceed_max(tmp_path, monkeypatch):
     )
 
     assert drawers == 0
+    assert skip_reason == "chunk_cap"
     col.upsert.assert_not_called()
+    captured = capsys.readouterr()
+    # Skip notice goes to stderr to match the existing symlink-skip
+    # convention in ``scan_project`` so log piping stays coherent.
+    assert "[skip]" in captured.err
+    assert "--max-chunks-per-file" in captured.err
+    assert "MEMPALACE_MAX_CHUNKS_PER_FILE" in captured.err
+    assert "[skip]" not in captured.out
+
+
+def test_resolve_max_chunks_default_when_no_override_no_env(monkeypatch):
+    """With no override and no env var, the module-level default applies."""
+    from mempalace import miner
+
+    monkeypatch.delenv("MEMPALACE_MAX_CHUNKS_PER_FILE", raising=False)
+    assert miner._resolve_max_chunks_per_file(None) == miner.MAX_CHUNKS_PER_FILE
+
+
+def test_resolve_max_chunks_env_var_wins_over_default(monkeypatch):
+    """A numeric env var overrides the module default."""
+    from mempalace import miner
+
+    monkeypatch.setenv("MEMPALACE_MAX_CHUNKS_PER_FILE", "777")
+    assert miner._resolve_max_chunks_per_file(None) == 777
+
+
+def test_resolve_max_chunks_override_wins_over_env(monkeypatch):
+    """An explicit override (CLI flag plumbed in) wins over the env var."""
+    from mempalace import miner
+
+    monkeypatch.setenv("MEMPALACE_MAX_CHUNKS_PER_FILE", "777")
+    assert miner._resolve_max_chunks_per_file(123) == 123
+
+
+def test_resolve_max_chunks_sentinel_zero_disables(monkeypatch):
+    """Sentinel ``0`` from override or env means "no cap"."""
+    from mempalace import miner
+
+    monkeypatch.delenv("MEMPALACE_MAX_CHUNKS_PER_FILE", raising=False)
+    assert miner._resolve_max_chunks_per_file(0) == 0
+
+    monkeypatch.setenv("MEMPALACE_MAX_CHUNKS_PER_FILE", "0")
+    assert miner._resolve_max_chunks_per_file(None) == 0
+
+
+def test_resolve_max_chunks_invalid_env_falls_back_to_default(monkeypatch, capsys):
+    """A non-integer env value warns and uses the module default. This
+    keeps a misconfigured shell from silently dropping content."""
+    from mempalace import miner
+
+    monkeypatch.setenv("MEMPALACE_MAX_CHUNKS_PER_FILE", "banana")
+    assert miner._resolve_max_chunks_per_file(None) == miner.MAX_CHUNKS_PER_FILE
+    err = capsys.readouterr().err
+    assert "MEMPALACE_MAX_CHUNKS_PER_FILE" in err
+    assert "banana" in err
+
+
+def test_resolve_max_chunks_negative_env_falls_back_to_default(monkeypatch, capsys):
+    """A negative env value warns and uses the module default."""
+    from mempalace import miner
+
+    monkeypatch.setenv("MEMPALACE_MAX_CHUNKS_PER_FILE", "-5")
+    assert miner._resolve_max_chunks_per_file(None) == miner.MAX_CHUNKS_PER_FILE
+    err = capsys.readouterr().err
+    assert "MEMPALACE_MAX_CHUNKS_PER_FILE" in err
+    assert "-5" in err
+
+
+def test_process_file_sentinel_zero_disables_cap(tmp_path, monkeypatch):
+    """With ``max_chunks_per_file=0`` even a pathologically large chunk
+    count is processed (no skip)."""
+    from unittest.mock import MagicMock
+
+    from mempalace import miner
+
+    monkeypatch.delenv("MEMPALACE_MAX_CHUNKS_PER_FILE", raising=False)
+    monkeypatch.setattr(miner, "MAX_CHUNKS_PER_FILE", 5)
+    big = [{"content": f"chunk {i}", "chunk_index": i} for i in range(20)]
+    monkeypatch.setattr(miner, "chunk_text", lambda content, source_file, **kwargs: big)
+    monkeypatch.setattr(miner, "detect_room", lambda *a, **k: "general")
+    monkeypatch.setattr(miner, "_extract_entities_for_metadata", lambda content: "")
+    monkeypatch.setattr(miner, "build_closet_lines", lambda *a, **k: [])
+    monkeypatch.setattr(miner, "purge_file_closets", lambda *a, **k: None)
+    monkeypatch.setattr(miner, "upsert_closet_lines", lambda *a, **k: None)
+
+    source = tmp_path / "huge.csv"
+    source.write_text("payload\n" * 500, encoding="utf-8")
+    col = MagicMock()
+    col.get.return_value = {"ids": []}
+
+    drawers, _room, skip_reason = miner.process_file(
+        source,
+        tmp_path,
+        col,
+        "wing",
+        [{"name": "general", "description": "General"}],
+        "agent",
+        False,
+        max_chunks_per_file=0,
+    )
+
+    assert drawers == 20
+    assert skip_reason is None
+    col.upsert.assert_called()
+
+
+def test_mine_summary_separates_chunk_cap_skips(tmp_path, monkeypatch, capsys):
+    """Summary distinguishes residual skips from "chunk cap" skips so a
+    user can see immediately that legitimate content was dropped (#1455).
+    The chunk-cap summary line appears only when count > 0."""
+    from unittest.mock import patch
+
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=3)
+    palace_path = project_root / "palace"
+
+    seq = iter(
+        [
+            (5, "general", None),
+            (0, "general", "chunk_cap"),
+            (0, "general", None),
+        ]
+    )
+
+    def fake_process_file(*args, **kwargs):
+        return next(seq)
+
+    with patch("mempalace.miner.process_file", side_effect=fake_process_file):
+        mine(str(project_root), str(palace_path))
+
+    out = capsys.readouterr().out
+    assert "Files skipped (already filed or other): 1" in out
+    assert "Files skipped (chunk cap" in out
+    assert "--max-chunks-per-file" in out
+
+
+def test_mine_summary_omits_chunk_cap_line_when_zero(tmp_path, monkeypatch, capsys):
+    """When no file hits the chunk cap, the chunk-cap summary line is not
+    printed at all, which keeps the happy-path output unchanged."""
+    from unittest.mock import patch
+
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=2)
+    palace_path = project_root / "palace"
+
+    def fake_process_file(*args, **kwargs):
+        return (3, "general", None)
+
+    with patch("mempalace.miner.process_file", side_effect=fake_process_file):
+        mine(str(project_root), str(palace_path))
+
+    out = capsys.readouterr().out
+    assert "Files skipped (already filed or other): 0" in out
+    assert "chunk cap" not in out
+
+
+def test_resolve_max_chunks_negative_override_falls_back_to_default(monkeypatch, capsys):
+    """A negative CLI override warns and falls back to the module default.
+    Symmetric with the env-var path so ``--max-chunks-per-file=-500`` (a
+    typo meaning "no, don't lower it that much") does not silently
+    disable the cap and OOM the embedder on the original lockfile."""
+    from mempalace import miner
+
+    monkeypatch.delenv("MEMPALACE_MAX_CHUNKS_PER_FILE", raising=False)
+    assert miner._resolve_max_chunks_per_file(-5) == miner.MAX_CHUNKS_PER_FILE
+    err = capsys.readouterr().err
+    assert "--max-chunks-per-file" in err
+    assert "-5" in err
+
+
+def test_resolve_max_chunks_reads_module_attribute_at_call_time(monkeypatch):
+    """The resolver reads ``miner.MAX_CHUNKS_PER_FILE`` lazily, so a
+    monkeypatch landed at test setup is honored. Regression guard against
+    a future refactor that captures the import-time default."""
+    from mempalace import miner
+
+    monkeypatch.delenv("MEMPALACE_MAX_CHUNKS_PER_FILE", raising=False)
+    monkeypatch.setattr(miner, "MAX_CHUNKS_PER_FILE", 7)
+    assert miner._resolve_max_chunks_per_file(None) == 7
+
+
+def test_process_file_chunk_cap_under_dry_run(tmp_path, monkeypatch):
+    """Dry-run is the natural audit path for #1455; chunk-cap drops must
+    return a tagged skip_reason there too so the summary counter can fire."""
+    from unittest.mock import MagicMock
+
+    from mempalace import miner
+
+    monkeypatch.delenv("MEMPALACE_MAX_CHUNKS_PER_FILE", raising=False)
+    monkeypatch.setattr(miner, "MAX_CHUNKS_PER_FILE", 5)
+    over_cap = [{"content": f"chunk {i}", "chunk_index": i} for i in range(7)]
+    monkeypatch.setattr(miner, "chunk_text", lambda content, source_file, **kwargs: over_cap)
+
+    source = tmp_path / "big.csv"
+    source.write_text("payload\n" * 200, encoding="utf-8")
+    col = MagicMock()
+    col.get.return_value = {"ids": []}
+
+    drawers, _room, skip_reason = miner.process_file(
+        source,
+        tmp_path,
+        col,
+        "wing",
+        [{"name": "general", "description": "General"}],
+        "agent",
+        True,  # dry_run
+    )
+
+    assert drawers == 0
+    assert skip_reason == "chunk_cap"
+
+
+def test_mine_dry_run_summary_counts_chunk_cap_drops(tmp_path, capsys):
+    """The summary under dry-run also splits out chunk-cap skips. Without
+    this a reporter running ``--dry-run`` to validate the new default
+    against their corpus would see "Files processed: N / Files skipped: 0"
+    even when chunk-cap drops occurred, which is exactly the silent-drop
+    UX bug that #1455 is fixing."""
+    from unittest.mock import patch
+
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=3)
+    palace_path = project_root / "palace"
+
+    seq = iter(
+        [
+            (5, "general", None),
+            (0, "general", "chunk_cap"),
+            (4, "general", None),
+        ]
+    )
+
+    def fake_process_file(*args, **kwargs):
+        return next(seq)
+
+    with patch("mempalace.miner.process_file", side_effect=fake_process_file):
+        mine(str(project_root), str(palace_path), dry_run=True)
+
+    out = capsys.readouterr().out
+    assert "Files skipped (chunk cap" in out
+    assert "1 (raise via" in out
+
+
+def test_mine_plumbs_max_chunks_per_file_to_process_file(tmp_path):
+    """``mine(max_chunks_per_file=0)`` reaches ``process_file`` as kwarg=0,
+    enabling the sentinel-disable path end-to-end. Guards the wiring
+    ``cmd_mine -> mine -> _mine_impl -> process_file``."""
+    from unittest.mock import patch
+
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=1)
+    palace_path = project_root / "palace"
+
+    captured = {}
+
+    def fake_process_file(*args, **kwargs):
+        captured["max_chunks_per_file"] = kwargs.get("max_chunks_per_file")
+        return (1, "general", None)
+
+    with patch("mempalace.miner.process_file", side_effect=fake_process_file):
+        mine(str(project_root), str(palace_path), max_chunks_per_file=0)
+
+    assert captured["max_chunks_per_file"] == 0
 
 
 def test_mine_arbitrary_exception_prints_summary_and_reraises(tmp_path, capsys):
@@ -1074,7 +1344,7 @@ def test_mine_arbitrary_exception_prints_summary_and_reraises(tmp_path, capsys):
         call_count["n"] += 1
         if call_count["n"] == 2:
             raise RuntimeError("simulated ONNX bad_alloc")
-        return (1, "general")
+        return (1, "general", None)
 
     with patch("mempalace.miner.process_file", side_effect=fake_process_file):
         with pytest.raises(RuntimeError, match="simulated ONNX bad_alloc"):

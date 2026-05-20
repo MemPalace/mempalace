@@ -527,6 +527,7 @@ def cmd_mine(args):
                 dry_run=args.dry_run,
                 respect_gitignore=not args.no_gitignore,
                 include_ignored=include_ignored,
+                max_chunks_per_file=getattr(args, "max_chunks_per_file", None),
             )
     except MineAlreadyRunning as exc:
         # A live MCP server or another mine is already writing to this
@@ -1301,6 +1302,20 @@ def main():
         choices=["exchange", "general"],
         default="exchange",
         help="Extraction strategy for convos mode: 'exchange' (default) or 'general' (5 memory types)",
+    )
+    from . import miner as _miner_for_default
+
+    p_mine.add_argument(
+        "--max-chunks-per-file",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            f"Per-file chunk cap; files producing more chunks are skipped with a "
+            f"summary counter. Default {_miner_for_default.MAX_CHUNKS_PER_FILE} "
+            f"(or MEMPALACE_MAX_CHUNKS_PER_FILE). Set 0 to disable. Lower this on "
+            f"Windows if you hit ONNX bad_alloc (#1455)."
+        ),
     )
 
     # sweep
