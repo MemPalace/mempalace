@@ -562,3 +562,71 @@ def test_miner_constants_alias_config_defaults():
     assert CHUNK_SIZE == DEFAULT_CHUNK_SIZE == 800
     assert CHUNK_OVERLAP == DEFAULT_CHUNK_OVERLAP == 100
     assert MIN_CHUNK_SIZE == DEFAULT_MIN_CHUNK_SIZE == 50
+
+
+# ── chunk_content ──────────────────────────────────────────────────────
+
+
+def test_chunk_content_short_returns_single_element():
+    from mempalace.config import chunk_content
+
+    result = chunk_content("hello")
+    assert result == ["hello"]
+
+
+def test_chunk_content_at_boundary_returns_single_element():
+    from mempalace.config import chunk_content, DEFAULT_CHUNK_SIZE
+
+    text = "x" * DEFAULT_CHUNK_SIZE
+    result = chunk_content(text)
+    assert len(result) == 1
+    assert result == [text]
+
+
+def test_chunk_content_one_char_over_boundary_splits():
+    from mempalace.config import chunk_content, DEFAULT_CHUNK_SIZE
+
+    text = "x" * (DEFAULT_CHUNK_SIZE + 1)
+    result = chunk_content(text)
+    assert len(result) == 2
+    assert len(result[0]) == DEFAULT_CHUNK_SIZE
+    assert len(result[1]) == 1
+
+
+def test_chunk_content_large_splits_many():
+    from mempalace.config import chunk_content, DEFAULT_CHUNK_SIZE
+
+    text = "x" * (DEFAULT_CHUNK_SIZE * 3 + 42)
+    result = chunk_content(text)
+    assert len(result) == 4
+    assert all(len(c) <= DEFAULT_CHUNK_SIZE for c in result)
+    assert "".join(result) == text
+
+
+def test_chunk_content_custom_chunk_size():
+    from mempalace.config import chunk_content
+
+    text = "abcdefghij"
+    result = chunk_content(text, chunk_size=3)
+    assert result == ["abc", "def", "ghi", "j"]
+
+
+def test_chunk_content_zero_chunk_size_raises():
+    from mempalace.config import chunk_content
+
+    with pytest.raises(ValueError, match="must be > 0"):
+        chunk_content("hello", chunk_size=0)
+
+
+def test_chunk_content_negative_chunk_size_raises():
+    from mempalace.config import chunk_content
+
+    with pytest.raises(ValueError, match="must be > 0"):
+        chunk_content("hello", chunk_size=-1)
+
+
+def test_chunk_content_empty_string_returns_single_element():
+    from mempalace.config import chunk_content
+
+    result = chunk_content("")
+    assert result == [""]

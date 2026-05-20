@@ -56,6 +56,7 @@ from typing import Optional  # noqa: E402
 
 from .config import (  # noqa: E402
     MempalaceConfig,
+    chunk_content,
     sanitize_kg_value,
     sanitize_name,
     sanitize_content,
@@ -1116,54 +1117,87 @@ def tool_add_drawer(
     if not col:
         return _no_palace()
 
-    drawer_id = (
+    # base_id is deterministic from the full content — idempotency
+    # depends on this.
+    base_id = (
         f"drawer_{wing}_{room}_{hashlib.sha256((wing + room + content).encode()).hexdigest()[:24]}"
     )
+
+    chunks = chunk_content(content)
+    is_chunked = len(chunks) > 1
 
     _wal_log(
         "add_drawer",
         {
-            "drawer_id": drawer_id,
+            "drawer_id": base_id,
             "wing": wing,
             "room": room,
             "added_by": added_by,
             "content_length": len(content),
             "content_preview": content[:200],
+            "num_chunks": len(chunks),
         },
     )
 
-    # Idempotency: if the deterministic ID already exists, return success as a no-op.
+    # Idempotency: probe the first chunk (batched upsert is all-or-nothing).
+    first_id = f"{base_id}_chunk_000" if is_chunked else base_id
     try:
-        existing = col.get(ids=[drawer_id], include=[])
+        existing = col.get(ids=[first_id], include=[])
         if existing.ids:
-            return {"success": True, "reason": "already_exists", "drawer_id": drawer_id}
+            return {"success": True, "reason": "already_exists", "drawer_id": base_id}
     except Exception:
-        logger.debug("Idempotency pre-check failed for %s", drawer_id, exc_info=True)
+        logger.debug("Idempotency pre-check failed for %s", base_id, exc_info=True)
 
     try:
-        col.upsert(
-            ids=[drawer_id],
-            documents=[content],
-            metadatas=[
-                {
-                    "wing": wing,
-                    "room": room,
-                    "source_file": source_file or "",
-                    "chunk_index": 0,
-                    "added_by": added_by,
-                    "filed_at": datetime.now().isoformat(),
-                }
-            ],
-        )
-        inserted = col.get(ids=[drawer_id], include=[])
+        now_iso = datetime.now().isoformat()
+        if is_chunked:
+            ids = []
+            docs = []
+            metas = []
+            for i, chunk_text in enumerate(chunks):
+                chunk_id = f"{base_id}_chunk_{i:03d}"
+                ids.append(chunk_id)
+                docs.append(chunk_text)
+                metas.append(
+                    {
+                        "wing": wing,
+                        "room": room,
+                        "source_file": source_file or "",
+                        "chunk_index": i,
+                        "total_chunks": len(chunks),
+                        "parent_drawer_id": base_id,
+                        "added_by": added_by,
+                        "filed_at": now_iso,
+                    }
+                )
+            col.upsert(ids=ids, documents=docs, metadatas=metas)
+        else:
+            col.upsert(
+                ids=[base_id],
+                documents=[content],
+                metadatas=[
+                    {
+                        "wing": wing,
+                        "room": room,
+                        "source_file": source_file or "",
+                        "chunk_index": 0,
+                        "added_by": added_by,
+                        "filed_at": now_iso,
+                    }
+                ],
+            )
+        inserted = col.get(ids=[first_id], include=[])
         if not inserted.ids:
             raise RuntimeError(
                 "Drawer write was acknowledged but the new ID is not readable. "
                 "The palace index may be stale; run reconnect or repair."
             )
         _metadata_cache = None
-        logger.info(f"Filed drawer: {drawer_id} → {wing}/{room}")
-        return {"success": True, "drawer_id": drawer_id, "wing": wing, "room": room}
+        logger.info(
+            f"Filed drawer: {base_id} → {wing}/{room}"
+            + (f" ({len(chunks)} chunks)" if is_chunked else "")
+        )
+        return {"success": True, "drawer_id": base_id, "wing": wing, "room": room}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -1559,18 +1593,22 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
         return _no_palace()
 
     now = datetime.now()
-    entry_id = (
+    base_entry_id = (
         f"diary_{wing}_{now.strftime('%Y%m%d_%H%M%S%f')}_"
         f"{hashlib.sha256(entry.encode()).hexdigest()[:12]}"
     )
+
+    chunks = chunk_content(entry)
+    is_chunked = len(chunks) > 1
 
     _wal_log(
         "diary_write",
         {
             "agent_name": agent_name,
             "topic": topic,
-            "entry_id": entry_id,
+            "entry_id": base_entry_id,
             "entry_preview": entry[:200],
+            "num_chunks": len(chunks),
         },
     )
 
@@ -1579,29 +1617,59 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
         # semantic search quality. For now, store raw AAAK in metadata so it's
         # preserved, and keep the document as-is for embedding (even though
         # compressed AAAK degrades embedding quality).
-        col.add(
-            ids=[entry_id],
-            documents=[entry],
-            metadatas=[
-                {
-                    "wing": wing,
-                    "room": room,
-                    "hall": "hall_diary",
-                    "topic": topic,
-                    "type": "diary_entry",
-                    "agent": agent_name,
-                    "filed_at": now.isoformat(),
-                    "date": now.strftime("%Y-%m-%d"),
-                }
-            ],
+        now_iso = now.isoformat()
+        now_date = now.strftime("%Y-%m-%d")
+        if is_chunked:
+            ids = []
+            docs = []
+            metas = []
+            for i, chunk_text in enumerate(chunks):
+                chunk_id = f"{base_entry_id}_chunk_{i:03d}"
+                ids.append(chunk_id)
+                docs.append(chunk_text)
+                metas.append(
+                    {
+                        "wing": wing,
+                        "room": room,
+                        "hall": "hall_diary",
+                        "topic": topic,
+                        "type": "diary_entry",
+                        "agent": agent_name,
+                        "chunk_index": i,
+                        "total_chunks": len(chunks),
+                        "parent_entry_id": base_entry_id,
+                        "filed_at": now_iso,
+                        "date": now_date,
+                    }
+                )
+            col.add(ids=ids, documents=docs, metadatas=metas)
+        else:
+            col.add(
+                ids=[base_entry_id],
+                documents=[entry],
+                metadatas=[
+                    {
+                        "wing": wing,
+                        "room": room,
+                        "hall": "hall_diary",
+                        "topic": topic,
+                        "type": "diary_entry",
+                        "agent": agent_name,
+                        "filed_at": now_iso,
+                        "date": now_date,
+                    }
+                ],
+            )
+        logger.info(
+            f"Diary entry: {base_entry_id} → {wing}/diary/{topic}"
+            + (f" ({len(chunks)} chunks)" if is_chunked else "")
         )
-        logger.info(f"Diary entry: {entry_id} → {wing}/diary/{topic}")
         return {
             "success": True,
-            "entry_id": entry_id,
+            "entry_id": base_entry_id,
             "agent": agent_name,
             "topic": topic,
-            "timestamp": now.isoformat(),
+            "timestamp": now_iso,
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
