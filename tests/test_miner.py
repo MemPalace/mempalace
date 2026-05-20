@@ -1152,3 +1152,79 @@ def test_mine_does_not_remove_other_processes_pid_file(tmp_path):
 
     assert pid_file.exists(), "Foreign PID entries must not be removed"
     assert pid_file.read_text().strip() == str(other_pid)
+
+
+def test_mine_dry_run_reports_already_filed_files_as_skipped(tmp_path, capsys):
+    """Dry-run output must reflect what the real run will do.
+
+    Previously the skip check (file_already_mined) was guarded by
+    ``not dry_run``, so dry-run reported every already-filed file as
+    if it would be re-processed. That made dedup look broken and
+    overstated what work the real run would do.
+    """
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=2)
+    palace_path = project_root / "palace"
+
+    # Real mine to fill the palace, then discard its output.
+    mine(str(project_root), str(palace_path))
+    capsys.readouterr()
+
+    # Dry-run on the unchanged corpus — every file should now skip.
+    mine(str(project_root), str(palace_path), dry_run=True)
+    out = capsys.readouterr().out
+
+    assert out.count("SKIP (already filed, mtime unchanged)") == 2
+    assert "Files skipped (already filed): 2" in out
+    assert "Files processed: 0" in out
+    assert "Drawers filed: 0" in out
+
+
+def test_mine_dry_run_on_empty_palace_still_reports_new_files(tmp_path, capsys):
+    """Dry-run against a never-mined palace must not crash and must
+    list each file as a would-be ingest.
+
+    Guards the read-only ``get_collection(create=False)`` fallback
+    that the dry-run path uses to find already-filed entries.
+    """
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=1)
+    palace_path = project_root / "palace"  # does not exist yet
+
+    mine(str(project_root), str(palace_path), dry_run=True)
+    out = capsys.readouterr().out
+
+    assert "-> room:" in out
+    assert "SKIP" not in out
+    assert "Files skipped (already filed): 0" in out
+
+
+def test_mine_dry_run_reports_modified_files_as_processed(tmp_path, capsys):
+    """Dry-run on a file whose mtime changed must NOT report as skipped.
+
+    Ensures the skip check honors the same mtime gate the real run
+    uses, so a re-mine after editing a file shows up as work to do.
+    """
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=1)
+    palace_path = project_root / "palace"
+
+    mine(str(project_root), str(palace_path))
+    capsys.readouterr()
+
+    # Touch + rewrite the file so both content and mtime change.
+    target = project_root / "f0.py"
+    target.write_text("def fn_0_v2():\n    print('updated')\n" * 20)
+    # Belt-and-braces in case the rewrite happens within mtime resolution.
+    new_mtime = target.stat().st_mtime + 5
+    os.utime(target, (new_mtime, new_mtime))
+
+    mine(str(project_root), str(palace_path), dry_run=True)
+    out = capsys.readouterr().out
+
+    assert "SKIP" not in out
+    assert "-> room:" in out
+    assert "Files skipped (already filed): 0" in out
