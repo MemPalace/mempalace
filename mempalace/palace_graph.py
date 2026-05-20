@@ -440,6 +440,8 @@ def _check_room_exists(wing: str, room: str, col, kind: str = "explicit") -> boo
     collection cannot be queried. Topic tunnels intentionally use synthetic
     ``topic:<name>`` room identifiers, so they tolerate unavailable validation.
     """
+    if kind == "topic":
+        return True
     if col is None:
         if kind == "explicit":
             raise ValueError(

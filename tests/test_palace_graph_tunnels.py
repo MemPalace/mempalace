@@ -177,6 +177,25 @@ class TestExplicitTunnels:
         assert tunnel["kind"] == "topic"
         assert len(palace_graph.list_tunnels()) == 1
 
+    def test_create_tunnel_topic_allows_synthetic_rooms_when_collection_available(
+        self, tmp_path, monkeypatch
+    ):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        col = _collection_with_rooms(("wing_code", "real-room"))
+        monkeypatch.setattr(palace_graph, "_get_collection", lambda config=None: col)
+
+        tunnel = palace_graph.create_tunnel(
+            "wing_code",
+            "topic:Redis",
+            "wing_ops",
+            "topic:Redis",
+            kind="topic",
+            col=col,
+        )
+
+        assert tunnel["kind"] == "topic"
+        assert len(palace_graph.list_tunnels()) == 1
+
     def test_list_tunnels_filters_by_either_side(self, tmp_path, monkeypatch):
         _use_tmp_tunnel_file(monkeypatch, tmp_path)
 
