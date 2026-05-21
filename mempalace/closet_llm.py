@@ -47,6 +47,7 @@ import urllib.error
 from datetime import datetime
 from typing import Optional
 
+from .llm_client import USER_AGENT
 from .palace import (
     NORMALIZE_VERSION,
     get_closets_collection,
@@ -152,7 +153,7 @@ def _call_llm(cfg: LLMConfig, source_file: str, wing: str, room: str, content: s
         }
     ).encode("utf-8")
 
-    headers = {"Content-Type": "application/json"}
+    headers = {"User-Agent": USER_AGENT, "Content-Type": "application/json"}
     if cfg.key:
         headers["Authorization"] = f"Bearer {cfg.key}"
 

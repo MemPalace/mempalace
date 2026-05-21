@@ -39,6 +39,8 @@ from pathlib import Path
 from collections import defaultdict
 from datetime import datetime
 
+from mempalace.llm_client import USER_AGENT
+
 import chromadb
 
 # Add mempal to path
@@ -2420,6 +2422,7 @@ def diary_ingest_session(session, sess_id, api_key, model="claude-haiku-4-5-2025
         "https://api.anthropic.com/v1/messages",
         data=payload,
         headers={
+            "user-agent": USER_AGENT,
             "x-api-key": api_key,
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
@@ -2851,6 +2854,7 @@ def llm_rerank(
             "content-type": "application/json",
         }
 
+    headers["user-agent"] = USER_AGENT
     req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
 
     import socket as _socket

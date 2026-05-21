@@ -34,6 +34,8 @@ from datetime import datetime
 
 import chromadb
 
+from mempalace.llm_client import USER_AGENT
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 HF_BASE = "https://huggingface.co/datasets/Salesforce/ConvoMem/resolve/main/core_benchmark/evidence_questions"
@@ -93,7 +95,7 @@ def discover_files(category, cache_dir):
             return json.load(f)
 
     try:
-        req = urllib.request.Request(api_url)
+        req = urllib.request.Request(api_url, headers={"User-Agent": USER_AGENT})
         with urllib.request.urlopen(req, timeout=15) as resp:
             files = json.loads(resp.read())
             paths = [
