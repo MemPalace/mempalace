@@ -738,14 +738,24 @@ class TestDiaryIngest:
         ingest_diaries(str(work_dir), str(palace_dir), wing="work", force=True)
 
         col = get_collection(str(palace_dir))
+
+        # The old single-drawer ID must be absent (per-entry storage
+        # replaced the whole-file draw in #1539).
         personal_id = _diary_drawer_id("personal", "2026-04-13")
         work_id = _diary_drawer_id("work", "2026-04-13")
         assert personal_id != work_id
+        assert col.get(ids=[personal_id])["ids"] == []
+        assert col.get(ids=[work_id])["ids"] == []
 
-        personal = col.get(ids=[personal_id])
-        work = col.get(ids=[work_id])
-        assert personal["ids"] == [personal_id]
-        assert work["ids"] == [work_id]
+        # New per-entry IDs: one drawer per entry, wing-scoped.
+        personal_entry_id = "diary_personal_2026-04-13_0000"
+        work_entry_id = "diary_work_2026-04-13_0000"
+        assert personal_entry_id != work_entry_id
+
+        personal = col.get(ids=[personal_entry_id])
+        work = col.get(ids=[work_entry_id])
+        assert personal["ids"] == [personal_entry_id]
+        assert work["ids"] == [work_entry_id]
         assert "Personal-only marker." in personal["documents"][0]
         assert "Work-only marker." in work["documents"][0]
 

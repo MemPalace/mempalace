@@ -10,6 +10,7 @@ import re
 from datetime import date, datetime
 from functools import lru_cache
 from pathlib import Path
+from typing import Optional
 
 
 # ── Input validation ──────────────────────────────────────────────────────────
@@ -197,6 +198,33 @@ def get_configured_collection_name() -> str:
 DEFAULT_CHUNK_SIZE = 800
 DEFAULT_CHUNK_OVERLAP = 100
 DEFAULT_MIN_CHUNK_SIZE = 50
+
+
+def chunk_content(content: str, chunk_size: Optional[int] = None) -> list[str]:
+    """Split *content* into bounded slices safe for embedding model upsert.
+
+    ChromaDB's ONNX embedding models have a quadratic attention budget —
+    passing documents longer than ~800 characters can trigger
+    ``RuntimeError: Invalid buffer size``.  Callers that feed unbounded
+    user input to ``collection.upsert(documents=[...])`` or
+    ``collection.add(documents=[...])`` should route through this helper
+    first so no single document exceeds the safe ceiling.
+
+    When ``chunk_size`` is *None* (the default), ``DEFAULT_CHUNK_SIZE``
+    is used.  A ``chunk_size`` of ``0`` or less raises ``ValueError``.
+
+    Returns a list with at least one element.  Content shorter than or
+    equal to *chunk_size* returns a single-element list (the original
+    string unchanged).
+    """
+    if chunk_size is None:
+        chunk_size = DEFAULT_CHUNK_SIZE
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be > 0, got {chunk_size}")
+    if len(content) <= chunk_size:
+        return [content]
+    return [content[i : i + chunk_size] for i in range(0, len(content), chunk_size)]
+
 
 DEFAULT_TOPIC_WINGS = [
     "emotions",

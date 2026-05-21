@@ -18,11 +18,14 @@ Usage:
 
 import hashlib
 import json
+import logging
 import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
+from .config import chunk_content, MempalaceConfig
 from .miner import _extract_entities_for_metadata
 from .palace import (
     build_closet_lines,
@@ -34,6 +37,8 @@ from .palace import (
 )
 
 DIARY_ENTRY_RE = re.compile(r"^## .+", re.MULTILINE)
+
+logger = logging.getLogger(__name__)
 
 
 def _state_file_for(palace_path: str, diary_dir: Path) -> Path:
@@ -72,6 +77,81 @@ def _diary_closet_id_base(wing: str, date_str: str) -> str:
     return f"closet_diary_{suffix}"
 
 
+def _upsert_entry_drawers(
+    drawers_col,
+    entries: list,
+    wing: str,
+    date_str: str,
+    source_file: str,
+    now_iso: str,
+    entities: Optional[str] = None,
+    entry_offset: int = 0,
+    chunk_size: Optional[int] = None,
+) -> tuple[list[str], list[list[str]]]:
+    """Write one drawer per diary entry, chunking any that exceed the safe
+    embedding size.
+
+    Returns (all_ids, per_entry_ids) where *all_ids* is the flat list of
+    every drawer ID written and *per_entry_ids* is one sub-list per entry
+    (matching *entries* order).  Callers use *per_entry_ids* for closet
+    linkage so AAAK pointers always reference real drawer IDs."""
+    batch_ids: list[str] = []
+    batch_docs: list[str] = []
+    batch_metas: list[dict] = []
+    per_entry_ids: list[list[str]] = []
+
+    for entry_idx, (header, body) in enumerate(entries):
+        logical_idx = entry_offset + entry_idx
+        entry_text = f"{header}\n{body}".strip()
+        if not entry_text:
+            per_entry_ids.append([])
+            continue
+
+        chunks = chunk_content(entry_text, chunk_size)
+        is_chunked = len(chunks) > 1
+        entry_dids: list[str] = []
+        for chunk_idx, chunk_text in enumerate(chunks):
+            drawer_id = f"diary_{wing}_{date_str}_{logical_idx:04d}"
+            if is_chunked:
+                drawer_id += f"_chunk_{chunk_idx:03d}"
+            batch_ids.append(drawer_id)
+            batch_docs.append(chunk_text)
+            entry_dids.append(drawer_id)
+
+            meta = {
+                "date": date_str,
+                "wing": wing,
+                "room": "daily",
+                "source_file": source_file,
+                "source_session": "daily_diary",
+                "filed_at": now_iso,
+                "entry_header": header,
+            }
+            if is_chunked:
+                meta["chunk_index"] = chunk_idx
+                meta["total_chunks"] = len(chunks)
+                meta["parent_entry_idx"] = logical_idx
+            if entities:
+                meta["entities"] = entities
+            batch_metas.append(meta)
+
+        per_entry_ids.append(entry_dids)
+
+    if batch_ids:
+        try:
+            drawers_col.upsert(
+                ids=batch_ids,
+                documents=batch_docs,
+                metadatas=batch_metas,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to upsert diary drawers for %s (%d drawers)",
+                source_file, len(batch_ids), exc_info=True,
+            )
+    return batch_ids, per_entry_ids
+
+
 def ingest_diaries(
     diary_dir,
     palace_path,
@@ -103,6 +183,12 @@ def ingest_diaries(
             state = json.loads(state_file.read_text())
         except Exception:
             state = {}
+
+    try:
+        config = MempalaceConfig()
+        cfg_chunk_size = config.chunk_size
+    except Exception:
+        cfg_chunk_size = None
 
     drawers_col = get_collection(palace_path)
     closets_col = get_closets_collection(palace_path)
@@ -144,40 +230,50 @@ def ingest_diaries(
         content_changed = prev_hash is not None and curr_hash != prev_hash
 
         now_iso = datetime.now(timezone.utc).isoformat()
-        drawer_id = _diary_drawer_id(wing, date_str)
         entities = _extract_entities_for_metadata(text)
         source_file = str(diary_path)
+        entries = _split_entries(text)
 
         # Serialize per source — two terminals running ingest at once must
         # not interleave the upsert + closet-rebuild.
         with mine_lock(source_file):
-            drawer_meta = {
-                "date": date_str,
-                "wing": wing,
-                "room": "daily",
-                "source_file": source_file,
-                "source_session": "daily_diary",
-                "filed_at": now_iso,
-            }
-            if entities:
-                drawer_meta["entities"] = entities
-            drawers_col.upsert(
-                documents=[text],
-                ids=[drawer_id],
-                metadatas=[drawer_meta],
-            )
-
-            entries = _split_entries(text)
             prev_entry_count = state.get(state_key, {}).get("entry_count", 0)
             full_rebuild = force or content_changed
             new_entries = entries if full_rebuild else entries[prev_entry_count:]
 
+            # --- Drawers: one per diary entry, chunked if oversized ---
+            old_single_drawer_id = _diary_drawer_id(wing, date_str)
+            prev_drawer_ids = state.get(state_key, {}).get("drawer_ids", [])
+
+            # Purge old drawers on full rebuild.  The pre-#1539 code stored
+            # the whole file as one drawer; later writes store per-entry
+            # drawers.  Delete both styles so stale chunks don't accumulate.
+            if full_rebuild:
+                all_stale = [old_single_drawer_id] + prev_drawer_ids
+                try:
+                    drawers_col.delete(ids=all_stale)
+                except Exception:
+                    logger.debug(
+                        "Stale-drawer purge skipped for %s", source_file,
+                        exc_info=True,
+                    )
+
+            entry_offset = 0 if full_rebuild else prev_entry_count
+            new_drawer_ids, per_entry_drawer_ids = _upsert_entry_drawers(
+                drawers_col, new_entries, wing, date_str,
+                source_file, now_iso, entities,
+                entry_offset=entry_offset,
+                chunk_size=cfg_chunk_size,
+            )
+
+            # --- Closets: point at real drawer IDs (incl. _chunk_NNN) ---
             if new_entries:
                 all_lines = []
-                for header, body in new_entries:
+                for entry_idx, (header, body) in enumerate(new_entries):
                     entry_text = f"{header}\n{body}"
                     entry_lines = build_closet_lines(
-                        source_file, [drawer_id], entry_text, wing, "daily"
+                        source_file, per_entry_drawer_ids[entry_idx],
+                        entry_text, wing, "daily",
                     )
                     all_lines.extend(entry_lines)
 
@@ -196,13 +292,18 @@ def ingest_diaries(
                     # wipe leftover closets from a prior run before re-writing.
                     if full_rebuild:
                         purge_file_closets(closets_col, source_file)
-                    n = upsert_closet_lines(closets_col, closet_id_base, all_lines, closet_meta)
+                    n = upsert_closet_lines(
+                        closets_col, closet_id_base, all_lines, closet_meta
+                    )
                     closets_created += n
 
             state[state_key] = {
                 "size": curr_size,
                 "content_hash": curr_hash,
                 "entry_count": len(entries),
+                "drawer_ids": new_drawer_ids
+                if full_rebuild
+                else prev_drawer_ids + new_drawer_ids,
                 "ingested_at": now_iso,
             }
         days_updated += 1

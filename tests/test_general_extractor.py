@@ -246,3 +246,28 @@ def test_positive_words():
 def test_negative_words():
     assert "bug" in NEGATIVE_WORDS
     assert "crash" in NEGATIVE_WORDS
+
+
+# ── oversized paragraph chunking (#1539) ───────────────────────────────
+
+
+def test_extract_memories_chunks_oversized_paragraph():
+    """A single massive paragraph over the chunk ceiling must be split
+    into multiple memories sharing the same memory_type."""
+    # Build a paragraph long enough to trigger chunking but short enough
+    # to still classify as a "decision" (the markers fire on substrings).
+    filler = " " + ("padding " * 200)  # pushes past 800 chars
+    text = f"We decided to go with PostgreSQL{filler}."
+    result = extract_memories(text)
+    assert len(result) >= 2, (
+        f"oversized paragraph should produce multiple chunks, got {len(result)}"
+    )
+    mem_types = {m["memory_type"] for m in result}
+    assert len(mem_types) == 1, "all chunks must share the same memory_type"
+    assert "decision" in mem_types
+    # Chunk indexes should be sequential starting from 0.
+    indexes = [m["chunk_index"] for m in result]
+    assert indexes == list(range(len(result)))
+    # Reassemble must match the original (stripped).
+    reassembled = "".join(m["content"] for m in result)
+    assert reassembled == text.strip()

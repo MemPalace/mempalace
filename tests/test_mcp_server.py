@@ -1138,6 +1138,42 @@ class TestWriteTools:
             "Documents with shared header but different content must have distinct drawer IDs"
         )
 
+    def test_add_drawer_chunked_large_content(self, monkeypatch, config, palace_path, kg):
+        """Content over DEFAULT_CHUNK_SIZE is split into multiple chunks (#1539)."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_add_drawer
+
+        content = ("x" * 900) + " END_MARKER"
+        result = tool_add_drawer(wing="w", room="r", content=content)
+        assert result["success"] is True
+        base_id = result["drawer_id"]
+
+        # At least two chunks must exist.
+        chunk0 = _col.get(ids=[f"{base_id}_chunk_000"])
+        chunk1 = _col.get(ids=[f"{base_id}_chunk_001"])
+        assert chunk0["ids"] == [f"{base_id}_chunk_000"]
+        assert chunk1["ids"] == [f"{base_id}_chunk_001"]
+        # Reassembly must match original.
+        reassembled = chunk0["documents"][0] + chunk1["documents"][0]
+        assert reassembled == content
+
+    def test_add_drawer_chunked_idempotent(self, monkeypatch, config, palace_path, kg):
+        """Duplicate detection works when content was chunked."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_add_drawer
+
+        content = ("A" * 900) + " UNIQUE_END"
+        r1 = tool_add_drawer(wing="w", room="r", content=content)
+        assert r1["success"] is True
+        r2 = tool_add_drawer(wing="w", room="r", content=content)
+        assert r2["success"] is True
+        assert r2["reason"] == "already_exists"
+        assert r2["drawer_id"] == r1["drawer_id"]
+
     def test_delete_drawer(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace.mcp_server import tool_delete_drawer
@@ -1937,6 +1973,26 @@ class TestDiaryTools:
         # default wing is derived from that lowercase form too.
         assert w1["agent"] == "claude"
         assert w2["agent"] == "claude"
+
+    def test_diary_write_chunked_large_entry(self, monkeypatch, config, palace_path, kg):
+        """Entries over DEFAULT_CHUNK_SIZE are split into chunks (#1539)."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_diary_write
+
+        entry = ("Z" * 900) + " TRAILER"
+        result = tool_diary_write(agent_name="Tester", entry=entry, topic="chunk")
+        assert result["success"] is True
+        base_id = result["entry_id"]
+
+        # Chunks stored with the parent_entry_id link.
+        chunk0 = _col.get(ids=[f"{base_id}_chunk_000"])
+        chunk1 = _col.get(ids=[f"{base_id}_chunk_001"])
+        assert chunk0["ids"] == [f"{base_id}_chunk_000"]
+        assert chunk1["ids"] == [f"{base_id}_chunk_001"]
+        reassembled = chunk0["documents"][0] + chunk1["documents"][0]
+        assert reassembled == entry
 
 
 # ── Cache Invalidation (inode/mtime) ──────────────────────────────────

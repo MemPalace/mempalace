@@ -22,6 +22,11 @@ Usage:
 import re
 from typing import List, Dict, Tuple
 
+# Must stay in sync with mempalace.config.DEFAULT_CHUNK_SIZE.
+# ChromaDB's ONNX embedding model crashes on documents longer than
+# ~800 chars (RuntimeError: Invalid buffer size).
+_GENERAL_CHUNK_SIZE = 800
+
 
 # =============================================================================
 # MARKER SETS — One per memory type
@@ -418,7 +423,24 @@ def extract_memories(text: str, min_confidence: float = 0.3) -> List[Dict]:
             }
         )
 
-    return memories
+    # Split any oversized paragraphs so no single document exceeds the
+    # ONNX embedding model's attention budget.  Each chunk inherits the
+    # parent's memory_type.
+    chunked = []
+    for mem in memories:
+        text = mem["content"]
+        if len(text) <= _GENERAL_CHUNK_SIZE:
+            chunked.append(mem)
+        else:
+            for i in range(0, len(text), _GENERAL_CHUNK_SIZE):
+                chunked.append(
+                    {
+                        "content": text[i : i + _GENERAL_CHUNK_SIZE],
+                        "memory_type": mem["memory_type"],
+                        "chunk_index": len(chunked),
+                    }
+                )
+    return chunked
 
 
 def _split_into_segments(text: str) -> List[str]:
