@@ -79,12 +79,12 @@ def test_cli_main_strips_leaked_pythonpath_from_env():
     )
     diag = f"rc={result.returncode}; stdout={result.stdout!r}; stderr={result.stderr!r}"
     assert result.returncode == 0, f"subprocess failed: {diag}"
-    assert (
-        f"ENV_MID: {expected_env!r}" in result.stdout
-    ), f"package import unexpectedly stripped env (regression in __init__.py): {diag}"
-    assert (
-        "SENTINEL_IN_PATH: False" in result.stdout
-    ), f"package import did not filter sys.path (regression in __init__.py): {diag}"
+    assert f"ENV_MID: {expected_env!r}" in result.stdout, (
+        f"package import unexpectedly stripped env (regression in __init__.py): {diag}"
+    )
+    assert "SENTINEL_IN_PATH: False" in result.stdout, (
+        f"package import did not filter sys.path (regression in __init__.py): {diag}"
+    )
     assert "ENV_AFTER: None" in result.stdout, f"CLI did not strip PYTHONPATH: {diag}"
 
 
