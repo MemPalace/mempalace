@@ -568,6 +568,8 @@ def test_entity_metadata_matches_known_names_case_insensitively(monkeypatch):
 
 
 def test_scan_project_skips_oversized_files(tmp_path, capsys, monkeypatch):
+    import re
+
     import mempalace.miner as miner_mod
 
     monkeypatch.setattr(miner_mod, "MAX_FILE_SIZE", 100)
@@ -580,9 +582,45 @@ def test_scan_project_skips_oversized_files(tmp_path, capsys, monkeypatch):
     assert "small.py" in names
     assert "big.py" not in names
 
-    captured = capsys.readouterr()
-    assert "SKIP: big.py" in captured.out
-    assert "exceeds" in captured.out
+    err = capsys.readouterr().err
+    # SKIP message goes to stderr, matching the existing
+    # `SKIP: <rel> (symlink)` line in the same function.
+    assert "SKIP: big.py" in err
+    # Validate the full template shape so a regression to bare-substring
+    # output (or a drop of the MB suffix) trips the test instead of
+    # silently passing.
+    assert re.search(r"SKIP: big\.py \(\d+\.\d+ MB\) exceeds \d+ MB limit", err), err
+
+
+def test_scan_project_skips_unreadable_files(tmp_path, capsys, monkeypatch):
+    from pathlib import Path
+
+    # Two real files; the unreadable one will have stat() raise.
+    write_file(tmp_path / "readable.py", "x = 1\n")
+    unreadable = tmp_path / "unreadable.py"
+    write_file(unreadable, "x = 1\n")
+
+    real_stat = Path.stat
+
+    def selective_stat(self, *args, **kwargs):
+        # On Py 3.10+, Path.is_symlink() routes through lstat ->
+        # stat(follow_symlinks=False). Only raise for the follow-symlinks
+        # call that the actual size-check makes, otherwise the test
+        # never reaches the size-check arm we want to exercise.
+        if self.name == "unreadable.py" and kwargs.get("follow_symlinks", True):
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", selective_stat)
+
+    files = scan_project(str(tmp_path))
+    names = [f.name for f in files]
+    assert "readable.py" in names
+    assert "unreadable.py" not in names
+
+    err = capsys.readouterr().err
+    assert "SKIP: unreadable.py" in err
+    assert "stat error" in err
 
 
 def test_file_already_mined_check_mtime():
