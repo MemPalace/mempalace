@@ -17,6 +17,7 @@ from mempalace.closet_llm import (
     _parsed_to_closet_lines,
     regenerate_closets,
 )
+from mempalace.llm_client import USER_AGENT
 
 
 # ── LLMConfig ─────────────────────────────────────────────────────────────
@@ -168,6 +169,28 @@ class TestCallLLM:
             _call_llm(cfg, "/tmp/x", "w", "r", "c")
 
         assert "authorization" not in captured_headers
+
+    def test_sends_user_agent_header(self):
+        """#1570: closet regeneration POSTs through the same OpenAI-compat
+        path as the main LLM client. Cloudflare-fronted endpoints WAF-block
+        ``Python-urllib/*`` before auth, so set the explicit MemPalace UA
+        for parity with ``mempalace.llm_client._http_post_json``."""
+        cfg = LLMConfig(endpoint="http://localhost:11434/v1", model="llama3:8b")
+        captured_headers = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured_headers.update({k.lower(): v for k, v in req.header_items()})
+            return _FakeResp(
+                {
+                    "choices": [{"message": {"content": '{"topics":[],"quotes":[],"summary":""}'}}],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+                }
+            )
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            _call_llm(cfg, "/tmp/x", "w", "r", "c")
+
+        assert captured_headers.get("user-agent") == USER_AGENT
 
     def test_strips_code_fences(self):
         cfg = self._make_cfg()
