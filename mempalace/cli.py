@@ -2,9 +2,10 @@
 """
 MemPalace — Give your AI a memory. No API key required.
 
-Two ways to ingest:
-  Projects:      mempalace mine ~/projects/my_app          (code, docs, notes)
-  Conversations: mempalace mine <convo-dir> --mode convos     (Claude Code, Claude.ai, ChatGPT, Slack exports)
+Three ways to ingest:
+  Projects:      mempalace mine ~/projects/my_app                  (code, docs, notes)
+  Conversations: mempalace mine <convo-dir> --mode convos          (Claude Code, Claude.ai, ChatGPT, Slack exports)
+  Documents:     mempalace mine <docs-dir> --mode extract          (PDF, DOCX, PPTX, XLSX, RTF, EPUB — requires mempalace[extract])
 
 Same palace. Same search. Different ingest strategies.
 
@@ -13,6 +14,7 @@ Commands:
     mempalace split <dir>                 Split concatenated mega-files into per-session files
     mempalace mine <dir>                  Mine project files (default)
     mempalace mine <dir> --mode convos    Mine conversation exports
+    mempalace mine <dir> --mode extract   Mine binary office documents (PDF/DOCX/etc.)
     mempalace search "query"              Find anything, exact words
     mempalace mcp                         Show MCP setup command
     mempalace wake-up                     Show L0 + L1 wake-up context
@@ -514,6 +516,17 @@ def cmd_mine(args):
                 limit=args.limit,
                 dry_run=args.dry_run,
                 extract_mode=args.extract,
+            )
+        elif args.mode == "extract":
+            from .format_miner import mine_formats
+
+            mine_formats(
+                format_dir=args.dir,
+                palace_path=palace_path,
+                wing=args.wing,
+                agent=args.agent,
+                limit=args.limit,
+                dry_run=args.dry_run,
             )
         else:
             from .miner import mine
@@ -1261,9 +1274,13 @@ def main():
     p_mine.add_argument("dir", help="Directory to mine")
     p_mine.add_argument(
         "--mode",
-        choices=["projects", "convos"],
+        choices=["projects", "convos", "extract"],
         default="projects",
-        help="Ingest mode: 'projects' for code/docs (default), 'convos' for chat exports",
+        help=(
+            "Ingest mode: 'projects' for code/docs (default), 'convos' for chat "
+            "exports, 'extract' for office documents (PDF/DOCX/RTF/etc., requires "
+            "mempalace[extract])"
+        ),
     )
     p_mine.add_argument("--wing", default=None, help="Wing name (default: directory name)")
     p_mine.add_argument(
