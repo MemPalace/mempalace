@@ -1511,9 +1511,9 @@ def test_rebuild_index_runs_sqlite_preflight_before_chromadb_open(tmp_path, caps
     PAGE = 4096
     CORRUPT_BYTES = 16384  # 4 pages
     HEADER_GUARD = PAGE * 2  # leave header + root pages intact
-    assert (
-        pre_size >= HEADER_GUARD + CORRUPT_BYTES
-    ), f"sqlite db too small to mangle without truncating: {pre_size} bytes"
+    assert pre_size >= HEADER_GUARD + CORRUPT_BYTES, (
+        f"sqlite db too small to mangle without truncating: {pre_size} bytes"
+    )
     # Round (pre_size - CORRUPT_BYTES) down to a page boundary so we
     # mangle whole pages. Cap at offset 40960 (page 10) for stable
     # diagnostics across SQLite versions that may grow the file.
@@ -2218,9 +2218,9 @@ def test_rebuild_hnsw_rollback_on_build_failure(synthetic_segment, monkeypatch):
     assert os.path.isdir(seg_dir), "live segment dir must survive a failed build"
     assert sorted(os.listdir(seg_dir)) == pre_contents
     for name in pre_contents:
-        assert (
-            os.path.getsize(os.path.join(seg_dir, name)) == pre_sizes[name]
-        ), f"{name} was modified despite rollback"
+        assert os.path.getsize(os.path.join(seg_dir, name)) == pre_sizes[name], (
+            f"{name} was modified despite rollback"
+        )
     # No stray .old-* dirs left around
     assert not any(n.startswith(segment + ".old-") for n in os.listdir(palace))
 
@@ -2402,6 +2402,7 @@ def test_status_suggests_hnsw_segment_mode_when_diverged(tmp_path, monkeypatch, 
     """
     palace = tmp_path / "palace"
     palace.mkdir()
+    (palace / "chroma.sqlite3").write_text("db")
     seg_uuid = "deadbeef-1111-2222-3333-444455556666"
 
     def _fake_status(_palace, collection):
@@ -2426,6 +2427,7 @@ def test_status_suggests_hnsw_segment_mode_when_diverged(tmp_path, monkeypatch, 
         }
 
     monkeypatch.setattr(repair, "hnsw_capacity_status", _fake_status)
+    monkeypatch.setattr(repair, "sqlite_drawer_count", lambda *a, **k: 200_000)
     result = repair.status(palace_path=str(palace))
     out = capsys.readouterr().out
 
