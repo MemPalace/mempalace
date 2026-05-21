@@ -5,6 +5,7 @@ from pathlib import Path
 
 import chromadb
 
+from mempalace.backends.chroma import CHROMA_SETTINGS
 from mempalace.convo_miner import mine_convos
 from mempalace.palace import file_already_mined
 
@@ -19,7 +20,7 @@ def test_convo_mining():
     palace_path = os.path.join(tmpdir, "palace")
     mine_convos(tmpdir, palace_path, wing="test_convos")
 
-    client = chromadb.PersistentClient(path=palace_path)
+    client = chromadb.PersistentClient(settings=CHROMA_SETTINGS, path=palace_path)
     col = client.get_collection("mempalace_drawers")
     assert col.count() >= 2
 
@@ -46,7 +47,7 @@ def test_mine_convos_does_not_reprocess_short_files(capsys):
 
         # Verify sentinel was written (resolve path -- macOS /var -> /private/var)
         resolved_file = str(Path(tmpdir).resolve() / "tiny.txt")
-        client = chromadb.PersistentClient(path=palace_path)
+        client = chromadb.PersistentClient(settings=CHROMA_SETTINGS, path=palace_path)
         col = client.get_collection("mempalace_drawers")
         assert file_already_mined(col, resolved_file)
 
@@ -97,7 +98,7 @@ def test_mine_convos_allows_general_after_exchange(capsys):
 
         assert "Files skipped (already filed): 0" in out
 
-        client = chromadb.PersistentClient(path=palace_path)
+        client = chromadb.PersistentClient(settings=CHROMA_SETTINGS, path=palace_path)
         col = client.get_collection("mempalace_drawers")
         resolved = str(Path(tmpdir).resolve() / "chat.txt")
         rows = col.get(where={"source_file": resolved}, include=["metadatas"])
@@ -132,7 +133,7 @@ def test_mine_convos_rebuilds_stale_drawers_after_schema_bump(capsys):
         mine_convos(tmpdir, palace_path, wing="test")
         capsys.readouterr()
 
-        client = chromadb.PersistentClient(path=palace_path)
+        client = chromadb.PersistentClient(settings=CHROMA_SETTINGS, path=palace_path)
         col = client.get_collection("mempalace_drawers")
         resolved = str(Path(tmpdir).resolve() / "chat.txt")
         first_pass = col.get(where={"source_file": resolved})
@@ -176,7 +177,7 @@ def test_mine_convos_rebuilds_stale_drawers_after_schema_bump(capsys):
             "stale drawers should force a rebuild, not a skip"
         )
 
-        client = chromadb.PersistentClient(path=palace_path)
+        client = chromadb.PersistentClient(settings=CHROMA_SETTINGS, path=palace_path)
         col = client.get_collection("mempalace_drawers")
         rebuilt = col.get(where={"source_file": resolved})
         # Orphan is gone

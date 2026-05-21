@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import chromadb
+from chromadb.config import Settings
 from chromadb.errors import NotFoundError as _ChromaNotFoundError
 
 from .base import (
@@ -25,6 +26,10 @@ from .base import (
     UnsupportedFilterError,
     _IncludeSpec,
 )
+
+#: Shared ChromaDB settings that silence the posthog telemetry spam
+#: (see https://github.com/MemPalace/mempalace/issues/458).
+CHROMA_SETTINGS = Settings(anonymized_telemetry=False)
 
 logger = logging.getLogger(__name__)
 
@@ -1294,7 +1299,7 @@ class ChromaBackend(BaseBackend):
             if inode_changed:
                 ChromaBackend._quarantined_paths.discard(palace_path)
             ChromaBackend._prepare_palace_for_open(palace_path)
-            cached = chromadb.PersistentClient(path=palace_path)
+            cached = chromadb.PersistentClient(path=palace_path, settings=CHROMA_SETTINGS)
             self._clients[palace_path] = cached
             # Re-stat after the client constructor runs: chromadb creates
             # chroma.sqlite3 lazily, so the stat captured before the call
@@ -1372,7 +1377,7 @@ class ChromaBackend(BaseBackend):
         vs. runtime thrash on steady-write daemons).
         """
         ChromaBackend._prepare_palace_for_open(palace_path)
-        return chromadb.PersistentClient(path=palace_path)
+        return chromadb.PersistentClient(path=palace_path, settings=CHROMA_SETTINGS)
 
     @staticmethod
     def backend_version() -> str:

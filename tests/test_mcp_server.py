@@ -89,8 +89,9 @@ def _get_collection(palace_path, create=False):
     when they are done.
     """
     import chromadb
+    from mempalace.backends.chroma import CHROMA_SETTINGS
 
-    client = chromadb.PersistentClient(path=palace_path)
+    client = chromadb.PersistentClient(path=palace_path, settings=CHROMA_SETTINGS)
     if create:
         return (
             client,
@@ -665,10 +666,11 @@ class TestReadTools:
         should return total_drawers: 0, not 'No palace found'.
         """
         import chromadb
+        from mempalace.backends.chroma import CHROMA_SETTINGS
 
         _patch_mcp_server(monkeypatch, config, kg)
         # Create the DB file (init does this) but NOT the collection
-        client = chromadb.PersistentClient(path=palace_path)
+        client = chromadb.PersistentClient(path=palace_path, settings=CHROMA_SETTINGS)
         del client
         from mempalace.mcp_server import tool_status
 
