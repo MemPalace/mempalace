@@ -1,0 +1,75 @@
+// MemPalace OTel baseline verification queries (Dynatrace DQL).
+// Run after pointing a `mempalace-mcp` server with the [observability]
+// extra and OTEL_EXPORTER_OTLP_ENDPOINT at your tenant for ≥ 5 minutes
+// of typical traffic. Mirrors the kagent §1.2 empirical-verification
+// pattern from ISI-1068.
+
+// ─────────────────────────────────────────────────────────────────────
+// 1. Are MemPalace spans landing at all?
+//    Expected: at least one row, k8s.workload.name OR service.name
+//    contains "mempalace", and memory.sut.name = "mempalace".
+// ─────────────────────────────────────────────────────────────────────
+fetch spans, from:now() - 1h
+| filter matchesValue(memory.sut.name, "mempalace")
+| summarize span_count = count(), by:{span.name}
+| sort span_count desc
+
+// ─────────────────────────────────────────────────────────────────────
+// 2. Are all three operation kinds present?
+//    Expected: rows for read, write, invalidate.
+//    A missing operation = a gap in tool exercise during the window,
+//    not a code bug. Re-run after exercising the missing kind.
+// ─────────────────────────────────────────────────────────────────────
+fetch spans, from:now() - 1h
+| filter matchesValue(memory.sut.name, "mempalace")
+| filter isNotNull(memory.operation)
+| summarize calls = count(), by:{memory.operation}
+| sort calls desc
+
+// ─────────────────────────────────────────────────────────────────────
+// 3. Per-tool span breakdown.
+//    Expected: `memory.tool` attribute populated for every span;
+//    distribution roughly tracks the kinds of MCP calls you exercised.
+// ─────────────────────────────────────────────────────────────────────
+fetch spans, from:now() - 1h
+| filter matchesValue(memory.sut.name, "mempalace")
+| filter isNotNull(memory.tool)
+| summarize calls = count(), p95_ms = percentile(duration / 1000000, 95), by:{memory.tool}
+| sort calls desc
+
+// ─────────────────────────────────────────────────────────────────────
+// 4. Resource attribute sanity check.
+//    Expected: exactly one row, with sut.name=mempalace and
+//    sut.architecture=mcp. service.name defaults to "mempalace-mcp"
+//    unless OTEL_SERVICE_NAME is overridden.
+// ─────────────────────────────────────────────────────────────────────
+fetch spans, from:now() - 1h
+| filter matchesValue(memory.sut.name, "mempalace")
+| summarize count(), by:{memory.sut.name, memory.sut.architecture, service.name, service.version}
+
+// ─────────────────────────────────────────────────────────────────────
+// 5. Recall metric — drawers returned per search.
+//    Expected: a histogram series with non-zero counts after running
+//    `mempalace_search`. Single-digit medians are normal; tails > 20
+//    suggest either over-fetching or a very wide n_results setting.
+// ─────────────────────────────────────────────────────────────────────
+timeseries
+    avg_results = avg(memory_recall_results_count),
+    p95_results = percentile(memory_recall_results_count, 95),
+    interval:5m,
+    from:now() - 1h
+| filter matchesValue(memory.sut.name, "mempalace")
+
+// ─────────────────────────────────────────────────────────────────────
+// 6. Recall quality — top-1 cosine similarity.
+//    Expected: a histogram series in [0, 1]. Median in the 0.4–0.8
+//    range is healthy on real palaces. A flat median near 0 means
+//    queries are landing on cold storage; near 1.0 means the corpus
+//    is shadowing the queries (collapse).
+// ─────────────────────────────────────────────────────────────────────
+timeseries
+    median_top_sim = percentile(memory_recall_top_similarity, 50),
+    p10_top_sim = percentile(memory_recall_top_similarity, 10),
+    interval:5m,
+    from:now() - 1h
+| filter matchesValue(memory.sut.name, "mempalace")

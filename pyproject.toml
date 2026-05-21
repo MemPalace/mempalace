@@ -112,6 +112,14 @@ milvus = [
 # MEMPALACE_BACKEND=pgvector / --backend pgvector; never required for the
 # default (Chroma) install.
 pgvector = ["psycopg[binary]>=3.1"]
+# OpenTelemetry traces + metrics for the MCP server. Opt-in; nothing is
+# imported or initialized unless ``OTEL_EXPORTER_OTLP_ENDPOINT`` is set
+# at runtime. See docs/observability.md.
+observability = [
+    "opentelemetry-api>=1.25",
+    "opentelemetry-sdk>=1.25",
+    "opentelemetry-exporter-otlp>=1.25",
+]
 # Hardware acceleration for the ONNX embedding model. Install exactly one:
 #   pip install mempalace[gpu]       — NVIDIA CUDA
 #   pip install mempalace[dml]       — DirectML (Windows AMD/Intel/NVIDIA)
