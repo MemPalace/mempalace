@@ -191,6 +191,31 @@ def _extract_drawer_ids_from_closet(closet_doc: str) -> list:
     return list(seen.keys())
 
 
+def _scoped_source_filter(source_file: str, parent_drawer_id=None) -> dict:
+    """Build a Chroma ``where`` clause that scopes a query to ``source_file``,
+    additionally constrained by ``parent_drawer_id`` when one is supplied.
+
+    Two unrelated oversized ``tool_add_drawer`` writes (chunked path from
+    #1539) can pass the same ``source_file`` (e.g. two pastes tagged
+    ``"chat.log"``); each call stores its own ``parent_drawer_id`` group
+    of chunks but the bare ``source_file`` filter pulls chunks from both
+    groups as if they were siblings (#1580). When the matched chunk
+    carries a ``parent_drawer_id`` the filter narrows to that logical
+    group. Otherwise (pre-#1539 drawers, single-chunk writes, and
+    ``diary_ingest`` drawers grouped by real file path) the original
+    file-global shape is preserved. Mirrors the conditional-``$and``
+    precedent in ``build_where_filter``.
+    """
+    if parent_drawer_id:
+        return {
+            "$and": [
+                {"source_file": source_file},
+                {"parent_drawer_id": parent_drawer_id},
+            ]
+        }
+    return {"source_file": source_file}
+
+
 def _expand_with_neighbors(drawers_col, matched_doc: str, matched_meta: dict, radius: int = 1):
     """Expand a matched drawer with its ±radius sibling chunks in the same source file.
 
@@ -214,15 +239,20 @@ def _expand_with_neighbors(drawers_col, matched_doc: str, matched_meta: dict, ra
     if not src or not isinstance(chunk_idx, int):
         return {"text": matched_doc, "drawer_index": chunk_idx, "total_drawers": None}
 
+    # Narrow by ``parent_drawer_id`` when present so chunks from unrelated
+    # logical drawers sharing ``source_file`` do not stitch (#1580). See
+    # ``_scoped_source_filter`` for the contract.
+    parent_id = matched_meta.get("parent_drawer_id")
     target_indexes = [chunk_idx + offset for offset in range(-radius, radius + 1)]
+    neighbor_clauses = [
+        {"source_file": src},
+        {"chunk_index": {"$in": target_indexes}},
+    ]
+    if parent_id:
+        neighbor_clauses.append({"parent_drawer_id": parent_id})
     try:
         neighbors = drawers_col.get(
-            where={
-                "$and": [
-                    {"source_file": src},
-                    {"chunk_index": {"$in": target_indexes}},
-                ]
-            },
+            where={"$and": neighbor_clauses},
             include=["documents", "metadatas"],
         )
     except Exception:
@@ -240,10 +270,16 @@ def _expand_with_neighbors(drawers_col, matched_doc: str, matched_meta: dict, ra
     else:
         combined_text = "\n\n".join(doc for _, doc in indexed_docs)
 
-    # Cheap total_drawers lookup: metadata-only scan of the source file.
+    # Cheap total_drawers lookup. When ``parent_drawer_id`` is present the
+    # count is scoped to that group so the returned number matches the
+    # text the caller gets back. Without a parent id, the legacy
+    # file-global count is preserved.
     total_drawers = None
     try:
-        all_meta = drawers_col.get(where={"source_file": src}, include=["metadatas"])
+        all_meta = drawers_col.get(
+            where=_scoped_source_filter(src, parent_id),
+            include=["metadatas"],
+        )
         total_drawers = len(all_meta.ids) if all_meta.ids else None
     except Exception:
         logger.debug("total_drawers lookup failed for %s", src, exc_info=True)
@@ -919,6 +955,7 @@ def search_memories(
             "_sort_key": effective_dist,
             "_source_file_full": source,
             "_chunk_index": meta.get("chunk_index"),
+            "_parent_drawer_id": meta.get("parent_drawer_id"),
         }
         if closet_preview:
             entry["closet_preview"] = closet_preview
@@ -939,9 +976,11 @@ def search_memories(
         full_source = h.get("_source_file_full") or ""
         if not full_source:
             continue
+        # Narrow by ``parent_drawer_id`` when present so unrelated
+        # chunked drawers sharing ``source_file`` do not stitch (#1580).
         try:
             source_drawers = drawers_col.get(
-                where={"source_file": full_source},
+                where=_scoped_source_filter(full_source, h.get("_parent_drawer_id")),
                 include=["documents", "metadatas"],
             )
         except Exception:
@@ -1010,6 +1049,7 @@ def search_memories(
         h.pop("_sort_key", None)
         h.pop("_source_file_full", None)
         h.pop("_chunk_index", None)
+        h.pop("_parent_drawer_id", None)
 
     return {
         "query": query,
