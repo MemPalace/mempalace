@@ -126,6 +126,19 @@ def create_reference_schema() -> dict:
         ref_db = os.path.join(tmp_dir, "chroma.sqlite3")
         return snapshot_schema(ref_db)
     finally:
+        # Drop chromadb's singleton client cache so mmap'd segment files
+        # are released. Windows cannot remove a file with an open handle,
+        # so without this the rmtree silently fails and the temp dir
+        # leaks (caught by test_migrate_cleans_temp_palace_on_chromadb_failure).
+        try:
+            from chromadb.api.client import SharedSystemClient
+
+            SharedSystemClient.clear_system_cache()
+        except Exception:
+            pass
+        import gc
+
+        gc.collect()
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
