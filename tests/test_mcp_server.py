@@ -1372,6 +1372,9 @@ class TestWriteTools:
         from mempalace import mcp_server, palace_graph
 
         monkeypatch.setattr(palace_graph, "_TUNNEL_FILE", str(tmp_path / "tunnels.json"))
+        col = MagicMock()
+        col.get.return_value = {"ids": ["exists"]}
+        monkeypatch.setattr(palace_graph, "_get_collection", lambda config=None: col)
 
         t = mcp_server.tool_create_tunnel(
             source_wing="other-wing",
