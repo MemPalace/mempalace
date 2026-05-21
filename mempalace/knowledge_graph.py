@@ -35,18 +35,67 @@ Usage:
     kg.invalidate("Max", "has_issue", "sports_injury", ended="2026-02-15")
 """
 
+import functools
 import hashlib
 import json
+import logging
 import os
+import random
 import sqlite3
 import threading
+import time
 from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 from .config import sanitize_iso_temporal
 
+logger = logging.getLogger(__name__)
 
 DEFAULT_KG_PATH = os.path.expanduser("~/.mempalace/knowledge_graph.sqlite3")
+
+
+def _sqlite_retry(max_retries=5, base_delay=0.1, max_delay=5.0):
+    """Retry on ``sqlite3.OperationalError`` caused by database locking.
+
+    When multiple processes (e.g. separate mcp-proxy SSE connections) share the
+    same SQLite file, the built-in ``busy_timeout`` handles most contention.
+    This decorator is the safety-net for the rare case where ``busy_timeout``
+    expires (e.g. during a long WAL checkpoint).
+
+    Only errors containing "locked" or "busy" are retried — other
+    ``OperationalError`` variants (corrupt DB, disk full) propagate
+    immediately.
+    """
+
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exc = None
+            for attempt in range(max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except sqlite3.OperationalError as exc:
+                    msg = str(exc).lower()
+                    if "locked" not in msg and "busy" not in msg:
+                        raise
+                    last_exc = exc
+                    if attempt < max_retries:
+                        delay = min(base_delay * (2**attempt), max_delay)
+                        jitter = delay * 0.5 * random.random()
+                        sleep_time = delay + jitter
+                        logger.warning(
+                            "SQLite locked (attempt %d/%d), retrying in %.2fs: %s",
+                            attempt + 1,
+                            max_retries,
+                            sleep_time,
+                            func.__name__,
+                        )
+                        time.sleep(sleep_time)
+            raise last_exc
+
+        return wrapper
+
+    return decorator
 
 
 def _is_date_only_temporal(value: str) -> bool:
@@ -195,8 +244,10 @@ class KnowledgeGraph:
 
     def _conn(self):
         if self._connection is None:
-            self._connection = sqlite3.connect(self.db_path, timeout=10, check_same_thread=False)
+            self._connection = sqlite3.connect(self.db_path, timeout=60, check_same_thread=False)
             self._connection.execute("PRAGMA journal_mode=WAL")
+            self._connection.execute("PRAGMA wal_autocheckpoint=1000")
+            self._connection.execute("PRAGMA journal_size_limit=67108864")
             self._connection.row_factory = sqlite3.Row
         return self._connection
 
@@ -206,6 +257,13 @@ class KnowledgeGraph:
             if self._connection is not None:
                 self._connection.close()
                 self._connection = None
+
+    def __del__(self):
+        try:
+            if self._connection is not None:
+                self._connection.close()
+        except Exception:
+            pass
 
     def __enter__(self):
         """Allow KnowledgeGraph to be used as a context manager."""
@@ -221,19 +279,26 @@ class KnowledgeGraph:
 
     # ── Write operations ──────────────────────────────────────────────────
 
+    @_sqlite_retry()
     def add_entity(self, name: str, entity_type: str = "unknown", properties: dict = None):
         """Add or update an entity node."""
         eid = self._entity_id(name)
         props = json.dumps(properties or {})
         with self._lock:
             conn = self._conn()
-            with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
                 conn.execute(
                     "INSERT OR REPLACE INTO entities (id, name, type, properties) VALUES (?, ?, ?, ?)",
                     (eid, name, entity_type, props),
                 )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
         return eid
 
+    @_sqlite_retry()
     def add_triple(
         self,
         subject: str,
@@ -284,7 +349,8 @@ class KnowledgeGraph:
         # Auto-create entities if they don't exist
         with self._lock:
             conn = self._conn()
-            with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
                 conn.execute(
                     "INSERT OR IGNORE INTO entities (id, name) VALUES (?, ?)",
                     (sub_id, subject),
@@ -300,6 +366,7 @@ class KnowledgeGraph:
                     (sub_id, pred, obj_id),
                 ).fetchone()
                 if existing:
+                    conn.commit()
                     return existing["id"]  # Already exists and still valid
 
                 triple_id = f"t_{sub_id}_{pred}_{obj_id}_{hashlib.sha256(f'{valid_from}{datetime.now().isoformat()}'.encode()).hexdigest()[:12]}"
@@ -323,8 +390,13 @@ class KnowledgeGraph:
                         adapter_name,
                     ),
                 )
-                return triple_id
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return triple_id
 
+    @_sqlite_retry()
     def invalidate(self, subject: str, predicate: str, obj: str, ended: str = None):
         """Mark a relationship as no longer valid (set valid_to date/time)."""
         sub_id = self._entity_id(subject)
@@ -334,7 +406,8 @@ class KnowledgeGraph:
 
         with self._lock:
             conn = self._conn()
-            with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
                 rows = conn.execute(
                     "SELECT id, valid_from FROM triples "
                     "WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
@@ -356,9 +429,14 @@ class KnowledgeGraph:
                     "WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
                     (ended, sub_id, pred, obj_id),
                 )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
 
     # ── Query operations ──────────────────────────────────────────────────
 
+    @_sqlite_retry()
     def query_entity(self, name: str, as_of: str = None, direction: str = "outgoing"):
         """
         Get all relationships for an entity.
@@ -424,6 +502,7 @@ class KnowledgeGraph:
 
         return results
 
+    @_sqlite_retry()
     def query_relationship(self, predicate: str, as_of: str = None):
         """Get all triples with a given relationship type."""
         as_of = sanitize_iso_temporal(as_of, "as_of")
@@ -459,6 +538,7 @@ class KnowledgeGraph:
                 )
         return results
 
+    @_sqlite_retry()
     def timeline(self, entity_name: str = None):
         """Get all facts in chronological order, optionally filtered by entity."""
         with self._lock:
@@ -501,6 +581,7 @@ class KnowledgeGraph:
 
     # ── Stats ─────────────────────────────────────────────────────────────
 
+    @_sqlite_retry()
     def stats(self):
         with self._lock:
             conn = self._conn()

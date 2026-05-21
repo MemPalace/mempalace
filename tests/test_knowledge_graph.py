@@ -2,12 +2,18 @@
 test_knowledge_graph.py — Tests for the temporal knowledge graph.
 
 Covers: entity CRUD, triple CRUD, temporal queries, invalidation,
-timeline, stats, and edge cases (duplicate triples, ID collisions).
+timeline, stats, and edge cases (duplicate triples, ID collisions),
+multi-process locking, retry decorator, and connection pragmas.
 """
 
-import pytest
+import multiprocessing
+import os
 import sqlite3
-from mempalace.knowledge_graph import KnowledgeGraph
+import tempfile
+
+import pytest
+
+from mempalace.knowledge_graph import KnowledgeGraph, _sqlite_retry
 
 
 class TestEntityOperations:
@@ -173,6 +179,169 @@ class TestStats:
         assert stats["triples"] == 5
         assert stats["current_facts"] == 4  # 1 expired (Acme Corp)
         assert stats["expired_facts"] == 1
+
+
+# ── Retry decorator tests ────────────────────────────────────────────
+
+
+class TestSQLiteRetryDecorator:
+    def test_retry_succeeds_on_second_attempt(self):
+        call_count = 0
+
+        @_sqlite_retry(max_retries=3, base_delay=0.01)
+        def flaky():
+            nonlocal call_count
+            call_count += 1
+            if call_count < 2:
+                raise sqlite3.OperationalError("database is locked")
+            return "ok"
+
+        assert flaky() == "ok"
+        assert call_count == 2
+
+    def test_retry_raises_after_max_retries(self):
+        @_sqlite_retry(max_retries=2, base_delay=0.01)
+        def always_locked():
+            raise sqlite3.OperationalError("database is locked")
+
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            always_locked()
+
+    def test_no_retry_on_non_lock_error(self):
+        call_count = 0
+
+        @_sqlite_retry(max_retries=3, base_delay=0.01)
+        def disk_error():
+            nonlocal call_count
+            call_count += 1
+            raise sqlite3.OperationalError("disk I/O error")
+
+        with pytest.raises(sqlite3.OperationalError, match="disk I/O"):
+            disk_error()
+        assert call_count == 1  # no retry
+
+    def test_no_retry_on_other_exception_types(self):
+        call_count = 0
+
+        @_sqlite_retry(max_retries=3, base_delay=0.01)
+        def value_error():
+            nonlocal call_count
+            call_count += 1
+            raise ValueError("bad value")
+
+        with pytest.raises(ValueError):
+            value_error()
+        assert call_count == 1
+
+    def test_retry_on_busy_error(self):
+        """The 'database is busy' variant should also be retried."""
+        call_count = 0
+
+        @_sqlite_retry(max_retries=3, base_delay=0.01)
+        def busy_then_ok():
+            nonlocal call_count
+            call_count += 1
+            if call_count < 2:
+                raise sqlite3.OperationalError("database is busy")
+            return "ok"
+
+        assert busy_then_ok() == "ok"
+        assert call_count == 2
+
+
+# ── Connection pragma tests ──────────────────────────────────────────
+
+
+class TestConnectionPragmas:
+    def test_wal_autocheckpoint(self, kg):
+        conn = kg._conn()
+        result = conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0]
+        assert result == 1000
+
+    def test_journal_size_limit(self, kg):
+        conn = kg._conn()
+        result = conn.execute("PRAGMA journal_size_limit").fetchone()[0]
+        assert result == 67108864
+
+    def test_journal_mode_is_wal(self, kg):
+        conn = kg._conn()
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        assert mode == "wal"
+
+
+# ── Multi-process locking test ───────────────────────────────────────
+
+
+def _worker_write_triples(db_path, worker_id, count, error_list):
+    """Worker function for multi-process test. Runs in a separate process."""
+    try:
+        kg = KnowledgeGraph(db_path=db_path)
+        for i in range(count):
+            kg.add_triple(f"worker_{worker_id}", "wrote", f"item_{worker_id}_{i}")
+        kg.close()
+    except Exception as e:
+        error_list.append(f"worker_{worker_id}: {e}")
+
+
+class TestMultiProcessLocking:
+    @pytest.mark.slow
+    def test_concurrent_process_writes(self):
+        """Spawn N processes all writing to the same KG file simultaneously."""
+        with tempfile.TemporaryDirectory(prefix="mempalace_mp_") as tmp:
+            db_path = os.path.join(tmp, "test_mp.sqlite3")
+            num_workers = 4
+            triples_per_worker = 20
+
+            manager = multiprocessing.Manager()
+            errors = manager.list()
+
+            processes = []
+            for wid in range(num_workers):
+                p = multiprocessing.Process(
+                    target=_worker_write_triples,
+                    args=(db_path, wid, triples_per_worker, errors),
+                )
+                processes.append(p)
+
+            for p in processes:
+                p.start()
+            for p in processes:
+                p.join(timeout=120)
+
+            assert list(errors) == [], f"Worker errors: {list(errors)}"
+
+            # Verify all triples were written
+            kg = KnowledgeGraph(db_path=db_path)
+            stats = kg.stats()
+            expected_triples = num_workers * triples_per_worker
+            assert (
+                stats["triples"] == expected_triples
+            ), f"Expected {expected_triples} triples, got {stats['triples']}"
+            kg.close()
+
+
+class TestGarbageCollection:
+    def test_instance_is_garbage_collected_after_close(self):
+        """Regression: atexit.register(self.close) previously held a strong
+        reference to every KnowledgeGraph instance, leaking short-lived ones
+        (e.g. fact_checker) until process exit. Verify that a dropped,
+        closed instance is reclaimable by the GC.
+        """
+        import gc
+        import weakref
+
+        with tempfile.TemporaryDirectory(prefix="mempalace_gc_") as tmp:
+            db_path = os.path.join(tmp, "gc.sqlite3")
+            kg = KnowledgeGraph(db_path=db_path)
+            kg.add_triple("alice", "knows", "bob")
+            ref = weakref.ref(kg)
+            kg.close()
+            del kg
+            gc.collect()
+            assert ref() is None, (
+                "KnowledgeGraph was retained after close() — something "
+                "(likely atexit) is still holding a strong reference."
+            )
 
 
 class TestTemporalDateTimeCompatibility:

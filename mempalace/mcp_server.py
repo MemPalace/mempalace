@@ -286,10 +286,33 @@ def _call_kg(op):
             raise
 
 
+# Clean WAL checkpoint on shutdown for the long-lived KGs. Registered at
+# module level (not in KnowledgeGraph.__init__) so it only applies to the
+# server-owned cache — not to any short-lived KG instances constructed
+# elsewhere — and therefore doesn't retain those instances via the atexit
+# registry.
+import atexit as _atexit  # noqa: E402
+
+
+def _close_cached_kgs() -> None:
+    with _kg_cache_lock:
+        for kg in _kg_by_path.values():
+            try:
+                kg.close()
+            except Exception:
+                pass
+        _kg_by_path.clear()
+
+
+_atexit.register(_close_cached_kgs)
+
+
 _client_cache = None
 _collection_cache = None
 _palace_db_inode = 0  # inode of chroma.sqlite3 at cache time
 _palace_db_mtime = 0.0  # mtime of chroma.sqlite3 at cache time
+_last_mtime_check = 0.0  # monotonic timestamp of last inode/mtime check
+_MTIME_CHECK_INTERVAL = 5.0  # seconds — don't re-stat chroma.sqlite3 more often than this
 
 
 def _is_transient_index_error(result) -> bool:
@@ -440,6 +463,13 @@ def _get_client():
     inode check alone misses in-place modifications that invalidate the
     in-memory HNSW index.
 
+    Mtime checks are rate-limited to once per ``_MTIME_CHECK_INTERVAL``
+    seconds to avoid constant ``PersistentClient`` recreation when multiple
+    mcp-proxy processes write to the same database concurrently.  Each
+    reconnect reloads the full HNSW index from disk — expensive for large
+    palaces.  The explicit ``tool_reconnect`` tool and ``_refresh_db_mtime``
+    helper handle the cases that the cooldown intentionally skips.
+
     Note: FAT/exFAT may return 0 for st_ino — the ``current_inode != 0``
     guard skips reconnect detection on those filesystems (safe fallback).
     """
@@ -449,8 +479,46 @@ def _get_client():
         _palace_db_inode, \
         _palace_db_mtime, \
         _metadata_cache, \
-        _metadata_cache_time
+        _metadata_cache_time, \
+        _last_mtime_check
+
+    # First call — no client yet, must create one.
+    if _client_cache is None:
+        db_path = os.path.join(_config.palace_path, "chroma.sqlite3")
+        try:
+            st = os.stat(db_path)
+            _palace_db_inode = st.st_ino
+            _palace_db_mtime = st.st_mtime
+        except OSError:
+            _palace_db_inode = 0
+            _palace_db_mtime = 0.0
+        _refresh_vector_disabled_flag()
+        _client_cache = ChromaBackend.make_client(_config.palace_path)
+        _collection_cache = None
+        _metadata_cache = None
+        _metadata_cache_time = 0
+        _last_mtime_check = time.monotonic()
+        return _client_cache
+
     db_path = os.path.join(_config.palace_path, "chroma.sqlite3")
+
+    # Safety-critical: if the DB file disappeared (e.g. during rebuild),
+    # always invalidate immediately — don't wait for the cooldown.
+    if not os.path.isfile(db_path) and _collection_cache is not None:
+        _client_cache = None
+        _collection_cache = None
+        _palace_db_inode = 0
+        _palace_db_mtime = 0.0
+        _last_mtime_check = 0.0
+        return _get_client()  # recurse once to create fresh client
+
+    # Rate-limit inode/mtime checks to avoid expensive reconnects when
+    # multiple mcp-proxy processes write concurrently.
+    now = time.monotonic()
+    if (now - _last_mtime_check) < _MTIME_CHECK_INTERVAL:
+        return _client_cache
+    _last_mtime_check = now
+
     try:
         st = os.stat(db_path)
         current_inode = st.st_ino
@@ -459,21 +527,10 @@ def _get_client():
         current_inode = 0
         current_mtime = 0.0
 
-    # If the DB file disappeared (e.g. during rebuild) but we have a cached
-    # collection, invalidate so we don't serve stale data.  Without this,
-    # both stored and current values are 0 on the first call after deletion,
-    # making inode_changed and mtime_changed both False.
-    if not os.path.isfile(db_path) and _collection_cache is not None:
-        _client_cache = None
-        _collection_cache = None
-        _palace_db_inode = 0
-        _palace_db_mtime = 0.0
-        # Fall through to normal reconnect which will handle missing DB
-
     inode_changed = current_inode != 0 and current_inode != _palace_db_inode
     mtime_changed = current_mtime != 0.0 and abs(current_mtime - _palace_db_mtime) > 0.01
 
-    if _client_cache is None or inode_changed or mtime_changed:
+    if inode_changed or mtime_changed:
         # Run the HNSW capacity probe BEFORE chromadb opens the segment —
         # if the index is severely undersized, segment load can segfault
         # the whole MCP server (#1222). The probe is pure sqlite +
@@ -577,6 +634,22 @@ def _get_collection(create=False):
                 _metadata_cache = None
                 _metadata_cache_time = 0
     return None
+
+
+def _refresh_db_mtime():
+    """Update the stored mtime after a write so our own changes don't trigger a reconnect.
+
+    Without this, every write changes chroma.sqlite3's mtime.  The next call
+    to ``_get_client()`` (after the cooldown) would see a stale stored mtime,
+    recreate the ``PersistentClient``, and reload the entire HNSW index — even
+    though this process already has the data in memory.
+    """
+    global _palace_db_mtime
+    db_path = os.path.join(_config.palace_path, "chroma.sqlite3")
+    try:
+        _palace_db_mtime = os.stat(db_path).st_mtime
+    except OSError:
+        pass
 
 
 def _no_palace():
@@ -1155,6 +1228,7 @@ def tool_add_drawer(
                 }
             ],
         )
+        _refresh_db_mtime()
         inserted = col.get(ids=[drawer_id], include=[])
         if not inserted.ids:
             raise RuntimeError(
@@ -1194,6 +1268,7 @@ def tool_delete_drawer(drawer_id: str):
 
     try:
         col.delete(ids=[drawer_id])
+        _refresh_db_mtime()
         _metadata_cache = None
         logger.info(f"Deleted drawer: {drawer_id}")
         return {"success": True, "drawer_id": drawer_id}
@@ -1385,6 +1460,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
         update_kwargs["metadatas"] = [new_meta]
         col.update(**update_kwargs)
 
+        _refresh_db_mtime()
         _metadata_cache = None
 
         logger.info(f"Updated drawer: {drawer_id}")
@@ -1595,6 +1671,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
                 }
             ],
         )
+        _refresh_db_mtime()
         logger.info(f"Diary entry: {entry_id} → {wing}/diary/{topic}")
         return {
             "success": True,
@@ -1768,6 +1845,7 @@ def tool_reconnect():
         _collection_cache, \
         _palace_db_inode, \
         _palace_db_mtime, \
+        _last_mtime_check, \
         _vector_disabled, \
         _vector_disabled_reason
     from . import palace as palace_module
@@ -1798,6 +1876,7 @@ def tool_reconnect():
     _collection_cache = None
     _palace_db_inode = 0
     _palace_db_mtime = 0.0
+    _last_mtime_check = 0.0
     # Force probe re-run on next _get_client by clearing the flag now;
     # _refresh_vector_disabled_flag will re-set it if the divergence
     # still applies after the reconnect.
