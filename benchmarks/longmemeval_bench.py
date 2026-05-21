@@ -868,11 +868,28 @@ def build_palace_and_retrieve_hybrid_v2(
     for session, sess_id, date in zip(sessions, session_ids, dates):
         user_turns = [t["content"] for t in session if t["role"] == "user"]
         all_turns = [t["content"] for t in session]
-        if user_turns:
+        if not user_turns:
+            continue
+        if granularity == "session":
             corpus_user.append("\n".join(user_turns))
             corpus_full.append("\n".join(all_turns))
             corpus_ids.append(sess_id)
             corpus_timestamps.append(date)
+        else:
+            turn_idx = 0
+            for t in session:
+                if t["role"] != "user":
+                    turn_idx += 1
+                    continue
+                corpus_user.append(t["content"])
+                # Pass 2 of the assistant-reference two-pass queries corpus_full
+                # for quoted/assistant content, so it must contain the full
+                # session text even in turn granularity. corpus_user stays the
+                # single user turn so the primary retrieval signal is granular.
+                corpus_full.append("\n".join(all_turns))
+                corpus_ids.append(f"{sess_id}_turn_{turn_idx}")
+                corpus_timestamps.append(date)
+                turn_idx += 1
 
     if not corpus_user:
         return [], corpus_user, corpus_ids, corpus_timestamps
@@ -914,10 +931,22 @@ def build_palace_and_retrieve_hybrid_v2(
             n_results=min(n_results, len(top_corpus_full)),
             include=["distances", "metadatas"],
         )
-        # Build final rankings: two-pass top sessions first, then rest
+        # Build final rankings: two-pass top sessions first, then rest.
+        # Dedup by session id so turn-granularity entries from the same
+        # session collapse to one rank.
         two_pass_order = [top_indices[int(rid.split("_")[1])] for rid in results2["ids"][0]]
-        seen = set(two_pass_order)
-        ranked_indices = two_pass_order + [i for i in range(len(corpus_user)) if i not in seen]
+        seen_sids = set()
+        ranked_indices = []
+        for idx in two_pass_order:
+            sid = session_id_from_corpus_id(corpus_ids[idx])
+            if sid not in seen_sids:
+                seen_sids.add(sid)
+                ranked_indices.append(idx)
+        for i in range(len(corpus_user)):
+            sid = session_id_from_corpus_id(corpus_ids[i])
+            if sid not in seen_sids:
+                seen_sids.add(sid)
+                ranked_indices.append(i)
         return ranked_indices, corpus_user, corpus_ids, corpus_timestamps
 
     # -------------------------------------------------------------------------
@@ -976,11 +1005,17 @@ def build_palace_and_retrieve_hybrid_v2(
         scored.append((idx, fused_dist))
 
     scored.sort(key=lambda x: x[1])
-    ranked_indices = [idx for idx, _ in scored]
-
-    seen = set(ranked_indices)
+    seen_sids = set()
+    ranked_indices = []
+    for idx, _ in scored:
+        sid = session_id_from_corpus_id(corpus_ids[idx])
+        if sid not in seen_sids:
+            seen_sids.add(sid)
+            ranked_indices.append(idx)
     for i in range(len(corpus_user)):
-        if i not in seen:
+        sid = session_id_from_corpus_id(corpus_ids[i])
+        if sid not in seen_sids:
+            seen_sids.add(sid)
             ranked_indices.append(i)
 
     return ranked_indices, corpus_user, corpus_ids, corpus_timestamps
@@ -1199,12 +1234,28 @@ def build_palace_and_retrieve_hybrid_v3(
         all_turns = [t["content"] for t in session]
         if not user_turns:
             continue
-        corpus_user.append("\n".join(user_turns))
-        corpus_full.append("\n".join(all_turns))
-        corpus_ids.append(sess_id)
-        corpus_timestamps.append(date)
+        if granularity == "session":
+            corpus_user.append("\n".join(user_turns))
+            corpus_full.append("\n".join(all_turns))
+            corpus_ids.append(sess_id)
+            corpus_timestamps.append(date)
+        else:
+            turn_idx = 0
+            for t in session:
+                if t["role"] != "user":
+                    turn_idx += 1
+                    continue
+                corpus_user.append(t["content"])
+                # Pass 2 of the assistant-reference two-pass queries corpus_full
+                # for quoted/assistant content, so it must contain the full
+                # session text even in turn granularity. corpus_user stays the
+                # single user turn so the primary retrieval signal is granular.
+                corpus_full.append("\n".join(all_turns))
+                corpus_ids.append(f"{sess_id}_turn_{turn_idx}")
+                corpus_timestamps.append(date)
+                turn_idx += 1
 
-        # Extract preferences and build synthetic document
+        # Preferences stay session-aggregated regardless of granularity.
         prefs = extract_preferences(session)
         if prefs:
             pref_doc = "User has mentioned: " + "; ".join(prefs)
@@ -1251,8 +1302,18 @@ def build_palace_and_retrieve_hybrid_v3(
             include=["distances", "metadatas"],
         )
         two_pass_order = [top_indices[int(rid.split("_")[1])] for rid in results2["ids"][0]]
-        seen = set(two_pass_order)
-        ranked_indices = two_pass_order + [i for i in range(len(corpus_user)) if i not in seen]
+        seen_sids = set()
+        ranked_indices = []
+        for idx in two_pass_order:
+            sid = session_id_from_corpus_id(corpus_ids[idx])
+            if sid not in seen_sids:
+                seen_sids.add(sid)
+                ranked_indices.append(idx)
+        for i in range(len(corpus_user)):
+            sid = session_id_from_corpus_id(corpus_ids[i])
+            if sid not in seen_sids:
+                seen_sids.add(sid)
+                ranked_indices.append(i)
         return ranked_indices, corpus_user, corpus_ids, corpus_timestamps
 
     # -------------------------------------------------------------------------
@@ -1315,23 +1376,34 @@ def build_palace_and_retrieve_hybrid_v3(
 
     scored.sort(key=lambda x: x[1])
 
-    # Map back to corpus_user indices via corpus_id — deduplicate at session level
-    # A pref doc and its session doc both map to the same corpus_id.
-    # Keep whichever ranks first; map back to corpus_user index for evaluation.
-    corpus_id_to_user_idx = {cid: i for i, cid in enumerate(corpus_ids)}
-    seen_ids = set()
+    # Map both turn-level corpus_ids and their session keys to a user-doc idx,
+    # so pref-doc hits (whose meta-id is a plain sess_id) can be resolved in
+    # both granularities. In session mode sid == cid so the inner branch is
+    # a no-op.
+    corpus_id_to_user_idx = {}
+    for i, cid in enumerate(corpus_ids):
+        corpus_id_to_user_idx[cid] = i
+        sid = session_id_from_corpus_id(cid)
+        if sid not in corpus_id_to_user_idx:
+            corpus_id_to_user_idx[sid] = i
+
+    seen_sids = set()
     ranked_indices = []
     for idx, _ in scored:
         cid = all_ids_meta[idx]
-        if cid not in seen_ids:
-            seen_ids.add(cid)
-            ranked_indices.append(corpus_id_to_user_idx[cid])
+        sid = session_id_from_corpus_id(cid)
+        if sid in seen_sids:
+            continue
+        seen_sids.add(sid)
+        target = cid if cid in corpus_id_to_user_idx else sid
+        ranked_indices.append(corpus_id_to_user_idx[target])
 
     # Fill in any sessions not yet ranked
     for i in range(len(corpus_user)):
-        if corpus_ids[i] not in seen_ids:
+        sid = session_id_from_corpus_id(corpus_ids[i])
+        if sid not in seen_sids:
             ranked_indices.append(i)
-            seen_ids.add(corpus_ids[i])
+            seen_sids.add(sid)
 
     return ranked_indices, corpus_user, corpus_ids, corpus_timestamps
 
@@ -1658,11 +1730,31 @@ def build_palace_and_retrieve_hybrid_v4(
         all_turns = [t["content"] for t in session]
         if not user_turns:
             continue
-        corpus_user.append("\n".join(user_turns))
-        corpus_full.append("\n".join(all_turns))
-        corpus_ids.append(sess_id)
-        corpus_timestamps.append(date)
 
+        if granularity == "session":
+            corpus_user.append("\n".join(user_turns))
+            corpus_full.append("\n".join(all_turns))
+            corpus_ids.append(sess_id)
+            corpus_timestamps.append(date)
+        else:
+            # Turn granularity: index each user turn separately.
+            turn_idx = 0
+            for t in session:
+                if t["role"] != "user":
+                    turn_idx += 1
+                    continue
+                corpus_user.append(t["content"])
+                # Pass 2 of the assistant-reference two-pass queries corpus_full
+                # for quoted/assistant content, so it must contain the full
+                # session text even in turn granularity. corpus_user stays the
+                # single user turn so the primary retrieval signal is granular.
+                corpus_full.append("\n".join(all_turns))
+                corpus_ids.append(f"{sess_id}_turn_{turn_idx}")
+                corpus_timestamps.append(date)
+                turn_idx += 1
+
+        # Preferences stay session-aggregated regardless of granularity —
+        # they are synthetic summaries of the whole session.
         prefs = extract_preferences(session)
         if prefs:
             pref_doc = "User has mentioned: " + "; ".join(prefs)
@@ -1713,13 +1805,15 @@ def build_palace_and_retrieve_hybrid_v4(
         seen = set()
         ranked_indices = []
         for idx, _ in scored:
-            if corpus_ids[idx] not in seen:
-                seen.add(corpus_ids[idx])
+            sid = session_id_from_corpus_id(corpus_ids[idx])
+            if sid not in seen:
+                seen.add(sid)
                 ranked_indices.append(idx)
         for i in range(len(corpus_user)):
-            if corpus_ids[i] not in seen:
+            sid = session_id_from_corpus_id(corpus_ids[i])
+            if sid not in seen:
                 ranked_indices.append(i)
-                seen.add(corpus_ids[i])
+                seen.add(sid)
         return ranked_indices, corpus_user, corpus_ids, corpus_timestamps
 
     # -------------------------------------------------------------------------
@@ -1787,19 +1881,33 @@ def build_palace_and_retrieve_hybrid_v4(
 
     scored.sort(key=lambda x: x[1])
 
-    corpus_id_to_user_idx = {cid: i for i, cid in enumerate(corpus_ids)}
-    seen_ids = set()
+    # Map both turn-level corpus_ids and their session keys to a user-doc index.
+    # In session granularity, sess_id == corpus_id, so the inner branch is a no-op.
+    # In turn granularity, the session key resolves to the first turn of that session
+    # so a pref-doc hit (whose meta-id is a plain sess_id) can be remapped.
+    corpus_id_to_user_idx = {}
+    for i, cid in enumerate(corpus_ids):
+        corpus_id_to_user_idx[cid] = i
+        sid = session_id_from_corpus_id(cid)
+        if sid not in corpus_id_to_user_idx:
+            corpus_id_to_user_idx[sid] = i
+
+    seen_sids = set()
     ranked_indices = []
     for idx, _ in scored:
         cid = all_ids_meta[idx]
-        if cid not in seen_ids:
-            seen_ids.add(cid)
-            ranked_indices.append(corpus_id_to_user_idx[cid])
+        sid = session_id_from_corpus_id(cid)
+        if sid in seen_sids:
+            continue
+        seen_sids.add(sid)
+        target = cid if cid in corpus_id_to_user_idx else sid
+        ranked_indices.append(corpus_id_to_user_idx[target])
 
     for i in range(len(corpus_user)):
-        if corpus_ids[i] not in seen_ids:
+        sid = session_id_from_corpus_id(corpus_ids[i])
+        if sid not in seen_sids:
             ranked_indices.append(i)
-            seen_ids.add(corpus_ids[i])
+            seen_sids.add(sid)
 
     return ranked_indices, corpus_user, corpus_ids, corpus_timestamps
 
@@ -2020,7 +2128,17 @@ def build_palace_and_retrieve_palace(
       3. PASS 2 (fallback): search full haystack with hall-aware scoring
          Sessions in the primary hall get a 25% distance bonus
       4. For assistant-reference questions: open drawers within top sessions
+
+    Granularity: palace mode is intrinsically session-level — hall classification,
+    closets, drawers, and the preference wing are all session-keyed. Turn-level
+    palace retrieval is not supported; pass granularity="session".
     """
+    if granularity != "session":
+        raise ValueError(
+            "palace mode only supports granularity='session' "
+            "(hall classification, drawers, and the preference wing are session-keyed)."
+        )
+
     import re as _re
     from datetime import datetime, timedelta
 
@@ -2469,7 +2587,17 @@ def build_palace_and_retrieve_diary(
     diary_cache: dict mapping sess_id → {"topics": [...], "summary": "..."}
                  Pre-populated before the benchmark loop to avoid redundant API calls.
                  Pass the same dict across all questions — it grows as new sessions appear.
+
+    Granularity: diary mode is intrinsically session-level — the LLM topic
+    layer is computed per session and keyed by sess_id. Turn-level diary
+    retrieval is not supported; pass granularity="session".
     """
+    if granularity != "session":
+        raise ValueError(
+            "diary mode only supports granularity='session' "
+            "(LLM topic layer is session-keyed and cached per sess_id)."
+        )
+
     import re as _re
     from datetime import datetime, timedelta
 

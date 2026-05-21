@@ -1,0 +1,7 @@
+===== hybrid_v4_turn_fixed_hw0.0 =====
+OK wall=295s R@10=0.980 NDCG@10=0.924
+===== hybrid_v4_turn_fixed_hw0.30 =====
+OK wall=305s R@10=0.980 NDCG@10=0.934
+===== hybrid_v4_turn_fixed_hw0.60 =====
+OK wall=299s R@10=0.980 NDCG@10=0.931
+DONE

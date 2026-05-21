@@ -1,0 +1,9 @@
+mode,granularity,hybrid_weight,n_questions,wall_sec,recall_at_1,recall_at_5,recall_at_10,recall_at_30,ndcg_at_10,ndcg_at_30,out_file
+raw,session,NA,50,62,0.840,0.960,0.980,1.000,0.905,0.909,benchmarks/c_beta/raw_session.jsonl
+raw,turn,NA,50,257,0.880,0.940,0.960,0.980,0.885,0.861,benchmarks/c_beta/raw_turn.jsonl
+hybrid_v4,session,0.0,50,81,0.880,0.980,1.000,1.000,0.937,0.931,benchmarks/c_beta/hybrid_v4_session_hw0.0.jsonl
+hybrid_v4,turn,0.0,50,283,0.900,0.980,1.000,1.000,0.944,0.938,benchmarks/c_beta/hybrid_v4_turn_hw0.0.jsonl
+hybrid_v4,session,0.30,50,85,0.880,0.960,1.000,1.000,0.944,0.938,benchmarks/c_beta/hybrid_v4_session_hw0.30.jsonl
+hybrid_v4,turn,0.30,50,288,0.920,0.960,1.000,1.000,0.954,0.949,benchmarks/c_beta/hybrid_v4_turn_hw0.30.jsonl
+hybrid_v4,session,0.60,50,90,0.880,0.960,0.980,1.000,0.936,0.936,benchmarks/c_beta/hybrid_v4_session_hw0.60.jsonl
+hybrid_v4,turn,0.60,50,285,0.920,0.960,1.000,1.000,0.951,0.951,benchmarks/c_beta/hybrid_v4_turn_hw0.60.jsonl
