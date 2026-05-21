@@ -3,7 +3,7 @@
   "mcp": {
     "mempalace": {
       "type": "local",
-      "command": ["mempalace-mcp"],
+      "command": ["python", "-m", "mempalace.mcp_server"],
       "enabled": true
     }
   }
