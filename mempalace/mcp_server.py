@@ -1123,7 +1123,7 @@ def tool_add_drawer(
         f"drawer_{wing}_{room}_{hashlib.sha256((wing + room + content).encode()).hexdigest()[:24]}"
     )
 
-    chunks = chunk_content(content)
+    chunks = chunk_content(content, _config.chunk_size)
     is_chunked = len(chunks) > 1
 
     _wal_log(
@@ -1598,7 +1598,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
         f"{hashlib.sha256(entry.encode()).hexdigest()[:12]}"
     )
 
-    chunks = chunk_content(entry)
+    chunks = chunk_content(entry, _config.chunk_size)
     is_chunked = len(chunks) > 1
 
     _wal_log(

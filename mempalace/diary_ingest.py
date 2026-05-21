@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from .config import chunk_content
+from .config import chunk_content, MempalaceConfig
 from .miner import _extract_entities_for_metadata
 from .palace import (
     build_closet_lines,
@@ -86,27 +86,37 @@ def _upsert_entry_drawers(
     now_iso: str,
     entities: Optional[str] = None,
     entry_offset: int = 0,
-) -> list[str]:
+    chunk_size: Optional[int] = None,
+) -> tuple[list[str], list[list[str]]]:
     """Write one drawer per diary entry, chunking any that exceed the safe
-    embedding size.  Returns the list of drawer IDs written."""
+    embedding size.
+
+    Returns (all_ids, per_entry_ids) where *all_ids* is the flat list of
+    every drawer ID written and *per_entry_ids* is one sub-list per entry
+    (matching *entries* order).  Callers use *per_entry_ids* for closet
+    linkage so AAAK pointers always reference real drawer IDs."""
     batch_ids: list[str] = []
     batch_docs: list[str] = []
     batch_metas: list[dict] = []
+    per_entry_ids: list[list[str]] = []
 
     for entry_idx, (header, body) in enumerate(entries):
         logical_idx = entry_offset + entry_idx
         entry_text = f"{header}\n{body}".strip()
         if not entry_text:
+            per_entry_ids.append([])
             continue
 
-        chunks = chunk_content(entry_text)
+        chunks = chunk_content(entry_text, chunk_size)
         is_chunked = len(chunks) > 1
+        entry_dids: list[str] = []
         for chunk_idx, chunk_text in enumerate(chunks):
             drawer_id = f"diary_{wing}_{date_str}_{logical_idx:04d}"
             if is_chunked:
                 drawer_id += f"_chunk_{chunk_idx:03d}"
             batch_ids.append(drawer_id)
             batch_docs.append(chunk_text)
+            entry_dids.append(drawer_id)
 
             meta = {
                 "date": date_str,
@@ -125,6 +135,8 @@ def _upsert_entry_drawers(
                 meta["entities"] = entities
             batch_metas.append(meta)
 
+        per_entry_ids.append(entry_dids)
+
     if batch_ids:
         try:
             drawers_col.upsert(
@@ -137,7 +149,7 @@ def _upsert_entry_drawers(
                 "Failed to upsert diary drawers for %s (%d drawers)",
                 source_file, len(batch_ids), exc_info=True,
             )
-    return batch_ids
+    return batch_ids, per_entry_ids
 
 
 def ingest_diaries(
@@ -171,6 +183,12 @@ def ingest_diaries(
             state = json.loads(state_file.read_text())
         except Exception:
             state = {}
+
+    try:
+        config = MempalaceConfig()
+        cfg_chunk_size = config.chunk_size
+    except Exception:
+        cfg_chunk_size = None
 
     drawers_col = get_collection(palace_path)
     closets_col = get_closets_collection(palace_path)
@@ -241,21 +259,21 @@ def ingest_diaries(
                     )
 
             entry_offset = 0 if full_rebuild else prev_entry_count
-            new_drawer_ids = _upsert_entry_drawers(
+            new_drawer_ids, per_entry_drawer_ids = _upsert_entry_drawers(
                 drawers_col, new_entries, wing, date_str,
                 source_file, now_iso, entities,
                 entry_offset=entry_offset,
+                chunk_size=cfg_chunk_size,
             )
 
-            # --- Closets: unchanged (already entry-based) ---
+            # --- Closets: point at real drawer IDs (incl. _chunk_NNN) ---
             if new_entries:
                 all_lines = []
                 for entry_idx, (header, body) in enumerate(new_entries):
-                    logical_idx = entry_idx if full_rebuild else prev_entry_count + entry_idx
                     entry_text = f"{header}\n{body}"
-                    entry_drawer_id = f"diary_{wing}_{date_str}_{logical_idx:04d}"
                     entry_lines = build_closet_lines(
-                        source_file, [entry_drawer_id], entry_text, wing, "daily"
+                        source_file, per_entry_drawer_ids[entry_idx],
+                        entry_text, wing, "daily",
                     )
                     all_lines.extend(entry_lines)
 
