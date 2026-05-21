@@ -1511,9 +1511,9 @@ def test_rebuild_index_runs_sqlite_preflight_before_chromadb_open(tmp_path, caps
     PAGE = 4096
     CORRUPT_BYTES = 16384  # 4 pages
     HEADER_GUARD = PAGE * 2  # leave header + root pages intact
-    assert pre_size >= HEADER_GUARD + CORRUPT_BYTES, (
-        f"sqlite db too small to mangle without truncating: {pre_size} bytes"
-    )
+    assert (
+        pre_size >= HEADER_GUARD + CORRUPT_BYTES
+    ), f"sqlite db too small to mangle without truncating: {pre_size} bytes"
     # Round (pre_size - CORRUPT_BYTES) down to a page boundary so we
     # mangle whole pages. Cap at offset 40960 (page 10) for stable
     # diagnostics across SQLite versions that may grow the file.
