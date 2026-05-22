@@ -1718,6 +1718,11 @@ class TestDrawerGrepExpansion:
             "neighbor enrichment leaked group B's chunks through the shared "
             "source_file key (see #1580)"
         )
+        # total_drawers on the enriched hit is scoped to the matched
+        # parent group (2 chunks in group A), not the full source_file
+        # row count (4 across both groups). Pins the scoping contract on
+        # the live enrichment path, not just the helper.
+        assert top["total_drawers"] == 2
         # Internal scoring-loop keys must be scrubbed before results are
         # returned to MCP callers. ``_parent_drawer_id`` is added during
         # the #1580 fix and popped in the final cleanup loop alongside
@@ -1727,3 +1732,90 @@ class TestDrawerGrepExpansion:
             assert "_source_file_full" not in h
             assert "_chunk_index" not in h
             assert "_sort_key" not in h
+
+    def test_expand_isolates_asymmetric_groups_under_shared_source_file(self, palace_path):
+        """Asymmetric coverage: group A has 1 chunk, group B has 3 chunks
+        under the shared ``source_file``. Catches a regression where
+        ``total_drawers`` accidentally drifts back to the unscoped
+        file-global count (4) when one group dominates the row mix.
+        """
+        col = get_collection(palace_path)
+        source = "asym.log"
+        col.upsert(
+            ids=["drawer_solo_chunk_000000"],
+            documents=["solo-A-chunk-0 content"],
+            metadatas=[
+                {
+                    "wing": "w",
+                    "room": "r",
+                    "source_file": source,
+                    "chunk_index": 0,
+                    "parent_drawer_id": "drawer_solo",
+                    "filed_at": "2026-04-13T00:00:00",
+                }
+            ],
+        )
+        col.upsert(
+            ids=[
+                "drawer_trio_chunk_000000",
+                "drawer_trio_chunk_000001",
+                "drawer_trio_chunk_000002",
+            ],
+            documents=[
+                "trio-B-chunk-0 content",
+                "trio-B-chunk-1 content",
+                "trio-B-chunk-2 content",
+            ],
+            metadatas=[
+                {
+                    "wing": "w",
+                    "room": "r",
+                    "source_file": source,
+                    "chunk_index": i,
+                    "parent_drawer_id": "drawer_trio",
+                    "filed_at": "2026-04-13T00:00:00",
+                }
+                for i in range(3)
+            ],
+        )
+
+        out = _expand_with_neighbors(
+            col,
+            "solo-A-chunk-0 content",
+            {
+                "source_file": source,
+                "chunk_index": 0,
+                "parent_drawer_id": "drawer_solo",
+            },
+            radius=1,
+        )
+        # Singleton group A: text is the matched chunk, total_drawers == 1.
+        assert "solo-A-chunk-0" in out["text"]
+        assert "trio-B-chunk" not in out["text"]
+        assert out["total_drawers"] == 1
+        assert out["drawer_index"] == 0
+
+    def test_expand_empty_string_parent_drawer_id_treated_as_absent(self, palace_path):
+        """Contract pin: an empty-string ``parent_drawer_id`` value
+        degrades to the 2-clause file-global filter (matches the
+        ``if not src`` empty-string handling for ``source_file`` at
+        ``searcher.py:239``). Writers in the codebase never emit an
+        empty parent id, but pinning the contract guards against a
+        future migration that does and avoids a silent narrow-then-
+        miss surprise.
+        """
+        col, _ = self._seed_source_file(palace_path, "/proj/empty_parent.md", n_chunks=3)
+        matched_meta = {
+            "source_file": "/proj/empty_parent.md",
+            "chunk_index": 1,
+            "parent_drawer_id": "",
+        }
+        out = _expand_with_neighbors(
+            col, "chunk_1 content about topic alpha", matched_meta, radius=1
+        )
+        # Empty parent_drawer_id is treated as absent; full file-global
+        # neighborhood is returned. Mirrors backwards-compat behavior.
+        assert out["total_drawers"] == 3
+        assert "chunk_0" in out["text"]
+        assert "chunk_1" in out["text"]
+        assert "chunk_2" in out["text"]
