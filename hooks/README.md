@@ -108,9 +108,7 @@ flowchart TD
     A([Context window getting full]) --> B[Claude Code fires PreCompact]
     B --> C["Find transcript (from input or session_id lookup)"]
     C --> D["Auto-mine transcript → palace (tool output captured)"]
-    D --> E["Block: save tool output verbatim..."]
-    E --> F[AI saves everything]
-    F --> G([Compaction proceeds])
+    D --> G([Compaction proceeds])
 ```
 
 No counting needed — compaction always warrants a save. The auto-mine captures raw tool output before the AI gets a chance to summarize it away.
