@@ -73,3 +73,36 @@ timeseries
     interval:5m,
     from:now() - 1h
 | filter matchesValue(memory.sut.name, "mempalace")
+
+// ─────────────────────────────────────────────────────────────────────
+// 7. Logs landing with trace correlation.
+//    Expected: log records emitted by the ``mempalace`` logger tree
+//    show up with their trace_id + span_id populated. The dispatch
+//    wrapper always emits one record per call of the shape
+//      "memory.dispatch tool=... operation=..."
+//    so you can confirm the logs pillar end-to-end by counting those.
+// ─────────────────────────────────────────────────────────────────────
+fetch logs, from:now() - 1h
+| filter matchesValue(memory.sut.name, "mempalace")
+| filter contains(content, "memory.dispatch")
+| summarize log_count = count(), by:{memory.operation, memory.tool}
+| sort log_count desc
+
+// ─────────────────────────────────────────────────────────────────────
+// 8. End-to-end trace fan-out — agent → MCP → MemPalace under one id.
+//    When an MCP client injects W3C tracecontext into
+//    ``params._meta.traceparent``, MemPalace starts the
+//    ``memory.<op>`` span as a child of that remote parent. This query
+//    surfaces traces that contain BOTH a non-mempalace service.name
+//    (the agent) AND a mempalace span — i.e. true end-to-end traces.
+// ─────────────────────────────────────────────────────────────────────
+fetch spans, from:now() - 1h
+| filter isNotNull(trace.id)
+| summarize
+    services = collectDistinct(service.name),
+    has_mempalace_span = countIf(matchesValue(memory.sut.name, "mempalace")) > 0,
+    span_count = count(),
+    by:{trace.id}
+| filter has_mempalace_span and arraySize(services) > 1
+| sort span_count desc
+| limit 20

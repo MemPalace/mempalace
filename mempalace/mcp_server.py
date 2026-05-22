@@ -4859,10 +4859,27 @@ def handle_request(request):
         # (see ``mempalace.telemetry``). Argument values are NEVER attached
         # to the span — only the tool name and operation kind — to keep
         # raw memory content out of the trace pipeline.
-        from .telemetry import memory_operation
+        #
+        # Trace context propagation: ``params._meta`` MAY carry W3C
+        # tracecontext headers (``traceparent`` / ``tracestate``) injected
+        # by the MCP client. We extract them into an OTel Context so the
+        # ``memory.<op>`` span starts as a child of the remote parent —
+        # an agent + MemPalace then share one trace.
+        from .telemetry import (
+            extract_trace_context,
+            memory_operation,
+            operation_for_tool,
+        )
+
+        parent_ctx = extract_trace_context(params.get("_meta"))
 
         try:
-            with memory_operation(tool_name):
+            with memory_operation(tool_name, parent_context=parent_ctx):
+                logger.info(
+                    "memory.dispatch tool=%s operation=%s",
+                    tool_name,
+                    operation_for_tool(tool_name),
+                )
                 result = _decorate_mcp_tool_result(tool_name, TOOLS[tool_name]["handler"](**tool_args))
 
             return {

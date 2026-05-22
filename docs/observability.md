@@ -1,8 +1,10 @@
 # Observability — MemPalace OpenTelemetry integration
 
 MemPalace ships an opt-in OpenTelemetry instrumentation for the MCP
-server. It emits **traces** for every tool dispatch and **metrics** for
-recall quality, mapped to the working draft `memory-semconv v0.1.0`
+server. It emits all three pillars — **traces**, **metrics**, and
+**logs** — and accepts W3C tracecontext propagation from MCP clients
+so an agent's call and MemPalace's handling appear in one end-to-end
+trace. Mapped to the working draft `memory-semconv v0.1.0`
 conventions. **No telemetry is produced by default** — it activates
 only when both of these are true:
 
@@ -46,6 +48,88 @@ Span attributes:
 |--------------------------------|-----------|----------|--------------------------------------------|
 | `memory_recall_results_count`  | histogram | drawers  | Every `search_memories` call                |
 | `memory_recall_top_similarity` | histogram | 0..1     | Every non-empty `search_memories` result    |
+
+### Logs
+
+Standard Python `logging` records emitted by the `mempalace` logger
+tree (and its children) are bridged to OTel logs via `LoggingHandler`
+and exported over OTLP. Each record carries the active span's
+`trace_id` + `span_id`, so log lines correlate with the span tree in
+any OTLP-compatible backend (filter by `trace_id` to pull every log
+line tied to a single tool dispatch).
+
+The dispatch wrapper always emits one structured log record per call:
+
+    memory.dispatch tool=<tool_name> operation=<read|write|invalidate>
+
+Handlers can add their own `logger.info(...)` calls and they will land
+on the same span. **PII discipline still applies**: never log raw
+drawer content, search queries, or KG subjects/predicates/objects.
+
+> The OTel `LoggingHandler` writes only to OTLP; the stdio protection
+> in `mcp_server.py` (stdout → stderr fd-level redirect) is unaffected.
+> Handlers are attached to the `mempalace` logger, not the root, so
+> third-party libraries (chromadb, posthog) keep their existing
+> stderr-only behavior.
+
+### Trace context propagation (end-to-end agent → MCP → MemPalace)
+
+MCP clients that already own an active OTel trace SHOULD inject W3C
+tracecontext headers into the `_meta` field of every `tools/call`
+request:
+
+```jsonc
+{
+  "method": "tools/call",
+  "params": {
+    "name": "mempalace_search",
+    "arguments": { /* … */ },
+    "_meta": {
+      "traceparent": "00-<trace-id>-<parent-span-id>-01",
+      "tracestate":  "vendor=opaque-value"           /* optional */
+    }
+  }
+}
+```
+
+MemPalace extracts those headers via the standard
+`TraceContextTextMapPropagator`, builds an OTel `Context`, and starts
+the `memory.<op>` span as a child of the remote parent. The resulting
+trace contains both the agent's outbound MCP call and MemPalace's
+internal handling under one `trace_id`.
+
+When `_meta` is missing or malformed, the span still starts — just as
+a new trace. The call is observable either way; only end-to-end
+correlation is lost.
+
+**Reference client snippet (Python)** — for SDK authors wiring their
+own MCP client:
+
+```python
+from opentelemetry import trace
+from opentelemetry.trace.propagation.tracecontext import (
+    TraceContextTextMapPropagator,
+)
+
+tracer = trace.get_tracer("my-agent")
+propagator = TraceContextTextMapPropagator()
+
+with tracer.start_as_current_span("agent.mcp.tools_call") as span:
+    span.set_attribute("mcp.tool", "mempalace_search")
+    headers: dict[str, str] = {}
+    propagator.inject(carrier=headers)            # fills traceparent
+    rpc = {
+        "jsonrpc": "2.0",
+        "id": next_id(),
+        "method": "tools/call",
+        "params": {
+            "name": "mempalace_search",
+            "arguments": {"query": "..."},
+            "_meta": headers,
+        },
+    }
+    send_to_mcp_server(rpc)
+```
 
 ### Resource attributes
 
@@ -95,6 +179,9 @@ The reference verification DQL queries live in
 2. Span attributes include `memory.operation` + `memory.tool`.
 3. Resource attributes include `memory.sut.name=mempalace`.
 4. The recall metrics surface as histograms.
+5. Logs land with `trace_id` populated and join cleanly back to spans.
+6. End-to-end traces from a client carry both the agent's parent
+   span and MemPalace's child span under a single `trace_id`.
 
 Run them in Dynatrace Notebook after pointing a MemPalace MCP server
 at your tenant for a few minutes of typical traffic.

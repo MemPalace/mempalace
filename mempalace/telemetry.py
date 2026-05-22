@@ -5,14 +5,31 @@ environment. When disabled, every public function in this module is a
 no-op — no SDK imports, no resource allocation, no exporter spin-up — so
 the default install path is unaffected.
 
-When enabled, emits the ``memory.*`` span set described in the
-``memory-semconv v0.1.0`` working draft:
+When enabled, MemPalace emits all three pillars of telemetry — traces,
+metrics, and logs — mapped to the ``memory-semconv v0.1.0`` working
+draft:
 
     memory.read         — non-mutating queries (search, kg_query, …)
     memory.write        — mutating writes (add_drawer, kg_add, …)
     memory.invalidate   — explicit fact retraction (kg_invalidate)
     memory.embed        — embedding-vector computation (search-time)
     memory.consolidate  — background dedup/sweep (not emitted from MCP)
+
+Trace context propagation
+-------------------------
+The MCP dispatch wrapper inspects each incoming ``tools/call`` request
+for a ``_meta`` object containing W3C tracecontext headers
+(``traceparent``, optionally ``tracestate``). When present, the
+``memory.<op>`` span is started as a child of that remote parent,
+producing a single end-to-end trace that spans the agent's MCP client
+and MemPalace's internal handling.
+
+Logs
+----
+Standard Python ``logging`` records emitted while a ``memory_operation``
+span is active are captured by an OTel ``LoggingHandler`` and exported
+via OTLP. Each log record carries the active span's trace_id/span_id so
+log lines correlate with the span tree in any OTLP-compatible backend.
 
 Resource attributes always set on the provider when enabled:
 
@@ -108,6 +125,16 @@ _TRACER: Any = None
 _METER: Any = None
 _RECALL_RESULTS_HISTOGRAM: Any = None
 _RECALL_TOP_SIMILARITY_GAUGE: Any = None
+# Logs pillar — the LoggingHandler is attached to the ``mempalace``
+# logger tree so any ``logger.info(...)`` emitted by MemPalace code
+# inside an active span produces an OTLP log record carrying the
+# trace_id + span_id of that span. ``_LOG_PROVIDER`` is retained so
+# ``init_telemetry`` is idempotent and so shutdown can flush it.
+_LOG_PROVIDER: Any = None
+_LOG_HANDLER: Any = None
+# W3C tracecontext propagator instance — re-used for every dispatch
+# extraction. None when telemetry is disabled.
+_PROPAGATOR: Any = None
 
 
 def is_enabled() -> bool:
@@ -130,6 +157,7 @@ def init_telemetry() -> bool:
     """
     global _ENABLED, _TRACER, _METER
     global _RECALL_RESULTS_HISTOGRAM, _RECALL_TOP_SIMILARITY_GAUGE
+    global _LOG_PROVIDER, _LOG_HANDLER, _PROPAGATOR
 
     if _ENABLED:
         return True
@@ -140,17 +168,26 @@ def init_telemetry() -> bool:
 
     try:
         from opentelemetry import metrics, trace
+        from opentelemetry._logs import set_logger_provider
+        from opentelemetry.exporter.otlp.proto.http._log_exporter import (
+            OTLPLogExporter,
+        )
         from opentelemetry.exporter.otlp.proto.http.metric_exporter import (
             OTLPMetricExporter,
         )
         from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
             OTLPSpanExporter,
         )
+        from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+        from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
         from opentelemetry.sdk.metrics import MeterProvider
         from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
         from opentelemetry.sdk.resources import Resource
         from opentelemetry.sdk.trace import TracerProvider
         from opentelemetry.sdk.trace.export import BatchSpanProcessor
+        from opentelemetry.trace.propagation.tracecontext import (
+            TraceContextTextMapPropagator,
+        )
     except ImportError as exc:
         logger.warning(
             "OTEL_EXPORTER_OTLP_ENDPOINT is set but the OpenTelemetry SDK is "
@@ -178,6 +215,24 @@ def init_telemetry() -> bool:
     meter_provider = MeterProvider(resource=resource, metric_readers=[reader])
     metrics.set_meter_provider(meter_provider)
 
+    log_provider = LoggerProvider(resource=resource)
+    log_provider.add_log_record_processor(BatchLogRecordProcessor(OTLPLogExporter()))
+    set_logger_provider(log_provider)
+    # Bridge stdlib ``logging`` → OTel logs. Attaching to the ``mempalace``
+    # logger (not root) keeps the MCP stdio protection intact: chromadb
+    # / posthog stay on stderr, only MemPalace-owned loggers fan out to
+    # OTLP. LoggingHandler does NOT write to stdout/stderr itself.
+    handler = LoggingHandler(level=logging.INFO, logger_provider=log_provider)
+    mempalace_logger = logging.getLogger("mempalace")
+    mempalace_logger.addHandler(handler)
+    # Ensure INFO records propagate to the OTel handler even if the app
+    # hasn't configured a level. Existing stderr handlers keep their own
+    # levels — this only opens the gate for our handler.
+    if mempalace_logger.level == logging.NOTSET or mempalace_logger.level > logging.INFO:
+        mempalace_logger.setLevel(logging.INFO)
+    _LOG_PROVIDER = log_provider
+    _LOG_HANDLER = handler
+
     _TRACER = trace.get_tracer("mempalace", __version__)
     _METER = metrics.get_meter("mempalace", __version__)
     _RECALL_RESULTS_HISTOGRAM = _METER.create_histogram(
@@ -191,9 +246,67 @@ def init_telemetry() -> bool:
         unit="1",
     )
 
+    _PROPAGATOR = TraceContextTextMapPropagator()
+
     _ENABLED = True
     logger.info("MemPalace telemetry initialized → %s", endpoint)
     return True
+
+
+# --- Trace context propagation -----------------------------------------
+# Memory clients (an agent, a sub-agent, an orchestrator) that already
+# own an active trace SHOULD inject W3C tracecontext headers into the
+# MCP ``params._meta`` field of every ``tools/call`` request:
+#
+#     {
+#       "method": "tools/call",
+#       "params": {
+#         "name": "mempalace_search",
+#         "arguments": {...},
+#         "_meta": {
+#           "traceparent": "00-<trace-id>-<parent-span-id>-01",
+#           "tracestate":  "vendor=value"            (optional)
+#         }
+#       }
+#     }
+#
+# MemPalace extracts that header set, builds an OTel Context from it,
+# and starts the ``memory.<op>`` span as a child of the remote parent
+# so the entire call chain (agent → MCP → MemPalace) lands in one
+# trace. When ``_meta`` is missing or malformed, the span starts a
+# new trace — the call is still observable, just not end-to-end
+# correlated.
+
+# Sentinel for "no parent context available." Kept distinct from
+# ``None`` so callers can pass ``None`` explicitly without us trying
+# to interpret it as a propagator carrier.
+_NO_PARENT_CONTEXT = object()
+
+
+def extract_trace_context(meta: Optional[Any]) -> Any:
+    """Build an OTel ``Context`` from an MCP ``_meta`` header map.
+
+    Accepts the raw ``params._meta`` value (must be a dict for a hit;
+    anything else is treated as absent). Returns:
+
+      * an OTel ``Context`` when telemetry is on AND ``meta`` contains
+        a parseable ``traceparent``
+      * ``_NO_PARENT_CONTEXT`` otherwise (signalling "start a new
+        trace") — never raises.
+
+    The function is a no-op when telemetry is disabled.
+    """
+    if not _ENABLED or _PROPAGATOR is None:
+        return _NO_PARENT_CONTEXT
+    if not isinstance(meta, dict) or "traceparent" not in meta:
+        return _NO_PARENT_CONTEXT
+    try:
+        return _PROPAGATOR.extract(carrier=meta)
+    except Exception:
+        # Malformed header should never crash dispatch — fall back to a
+        # new trace and log at debug.
+        logger.debug("telemetry: failed to extract trace context", exc_info=True)
+        return _NO_PARENT_CONTEXT
 
 
 # --- Span emission -----------------------------------------------------
@@ -203,6 +316,7 @@ def init_telemetry() -> bool:
 def memory_operation(
     tool_name: str,
     operation: Optional[str] = None,
+    parent_context: Any = _NO_PARENT_CONTEXT,
     **attributes: Any,
 ) -> Iterator[Any]:
     """Context manager that emits a ``memory.<operation>`` span.
@@ -214,6 +328,11 @@ def memory_operation(
       * ``memory.tool`` = ``tool_name``
       * any ``attributes`` passed in (must already be PII-clean —
         callers MUST NOT pass raw user content here)
+
+    ``parent_context`` accepts the value returned by
+    ``extract_trace_context``. When it points at a remote parent,
+    the new span is started under that parent so the agent's call
+    and MemPalace's handling share one trace_id.
 
     Yields the underlying span object (real or no-op) so the caller can
     add metric-derived attributes after the call returns (e.g.
@@ -232,7 +351,13 @@ def memory_operation(
     }
     span_attrs.update({k: v for k, v in attributes.items() if v is not None})
 
-    with _TRACER.start_as_current_span(span_name, attributes=span_attrs) as span:
+    ctx_kwargs: dict[str, Any] = {}
+    if parent_context is not _NO_PARENT_CONTEXT and parent_context is not None:
+        ctx_kwargs["context"] = parent_context
+
+    with _TRACER.start_as_current_span(
+        span_name, attributes=span_attrs, **ctx_kwargs
+    ) as span:
         try:
             yield span
         except Exception as exc:
