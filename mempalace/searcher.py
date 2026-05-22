@@ -17,7 +17,6 @@ import sqlite3
 from pathlib import Path
 from typing import Optional
 
-from .backends import CollectionNotInitializedError, PalaceNotFoundError
 from .palace import get_closets_collection, get_collection
 
 # Closet pointer line format: "topic|entities|→drawer_id_a,drawer_id_b"
