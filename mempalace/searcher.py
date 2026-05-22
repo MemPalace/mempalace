@@ -16,6 +16,7 @@ import re
 import sqlite3
 from pathlib import Path
 
+from .backends import CollectionNotInitializedError, PalaceNotFoundError
 from .palace import get_closets_collection, get_collection
 
 # Closet pointer line format: "topic|entities|→drawer_id_a,drawer_id_b"
@@ -295,9 +296,29 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
     Search the palace. Returns verbatim drawer content.
     Optionally filter by wing (project) or room (aspect).
     """
+    # Filesystem-first checks distinguish State A / State B before reaching
+    # chromadb. PersistentClient lazily creates chroma.sqlite3 on first open
+    # of an empty palace dir, so without these checks State B collapses into
+    # the "initialized but empty" State C message and mutates the dir as a
+    # side effect of a read-only search call (#1498).
+    if not os.path.isdir(palace_path):
+        print(f"\n  No palace found at {palace_path}")
+        print("  Run: mempalace init <dir> then mempalace mine <dir>")
+        raise SearchError(f"No palace found at {palace_path}")
+    if not os.path.isfile(os.path.join(palace_path, "chroma.sqlite3")):
+        print(f"\n  Palace dir at {palace_path} exists but has no chroma.sqlite3 yet.")
+        print("  Run: mempalace mine <dir>")
+        raise SearchError(f"No palace database at {palace_path}")
     try:
         col = get_collection(palace_path, create=False)
-    except Exception as e:
+    except CollectionNotInitializedError as e:
+        # State C from #1498: palace initialized but never mined.
+        print(f"\n  Palace at {palace_path} is initialized but empty (no drawers yet).")
+        print("  Run: mempalace mine <dir>")
+        raise SearchError(f"Palace at {palace_path} is initialized but empty") from e
+    except PalaceNotFoundError as e:
+        # Backend filesystem-race fallback: dir was deleted between our
+        # check above and the backend call. Same message as State A.
         print(f"\n  No palace found at {palace_path}")
         print("  Run: mempalace init <dir> then mempalace mine <dir>")
         raise SearchError(f"No palace found at {palace_path}") from e
@@ -996,3 +1017,61 @@ def search_memories(
         "total_before_filter": len(_first_or_empty(drawer_results, "documents")),
         "results": hits,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Virtual line numbering — read-time grid for drawers (3.3.6).
+#
+# Drawers are stored verbatim on disk. The reader applies a line-number grid
+# at read time so any drawer — numbered or not — can be sectioned by a closet
+# pointer like ``→2026-01-18:L55-L72`` without rewriting the corpus. Pure
+# functions, no I/O. Source drawer text is never mutated.
+# See docs/virtual-line-numbering.md for the full design rationale.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# A line is "already numbered" iff it starts with [<digits>].
+_ALREADY_NUMBERED_RE = re.compile(r"^\[\d+\]")
+
+
+def render_with_line_numbers(text: "str | None", start_line: int = 1) -> str:
+    """Prefix each line of ``text`` with ``[N] `` for read-time grid display.
+
+    Lines that already begin with ``[<digits>]`` pass through unchanged,
+    but the counter still advances on them so callers can rely on positional
+    alignment with the original line indices.
+
+    ``None`` is treated as empty string. Pure function.
+    """
+    if not text:
+        return ""
+    out = []
+    for i, line in enumerate(text.split("\n"), start=start_line):
+        if _ALREADY_NUMBERED_RE.match(line):
+            out.append(line)
+        else:
+            out.append(f"[{i}] {line}")
+    return "\n".join(out)
+
+
+def extract_line_range(text: str, line_start: int, line_end: int) -> str:
+    """Return the 1-indexed inclusive slice ``[line_start, line_end]`` rendered with line numbers.
+
+    This is the closet-pointer read path. A pointer like ``→2026-01-18:L55-L72``
+    resolves by opening the day-drawer and calling ``extract_line_range(drawer_text, 55, 72)``.
+    Out-of-bounds ranges are clamped. Invalid ranges return ``""``.
+    """
+    if not text:
+        return ""
+    if line_end < line_start:
+        return ""
+
+    lines = text.split("\n")
+    effective_start = max(1, line_start)
+    effective_end = min(len(lines), line_end)
+
+    if effective_start > effective_end:
+        return ""
+
+    section = "\n".join(lines[effective_start - 1 : effective_end])
+    return render_with_line_numbers(section, start_line=effective_start)

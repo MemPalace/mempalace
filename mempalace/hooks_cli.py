@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -281,6 +282,31 @@ _MINE_PID_DIR = STATE_DIR / "mine_pids"
 # own slot on exit without scanning the whole directory.
 _MINE_PID_FILE_ENV = "MEMPALACE_MINE_PID_FILE"
 
+# Maximum wall-clock hours a mine subprocess is allowed to run before its
+# PID slot is treated as stale (even if the process is still alive).  A
+# wedged mine — e.g. one that is blocking indefinitely on ChromaDB
+# cold-init under concurrent Windows load (#1552) — would otherwise hold
+# its slot forever.  Set MEMPALACE_MINE_TIMEOUT_HOURS=0 to disable the
+# timeout (slots are reclaimed only when the PID is dead).
+_MINE_TIMEOUT_HOURS_ENV = "MEMPALACE_MINE_TIMEOUT_HOURS"
+_MINE_TIMEOUT_HOURS_DEFAULT = 2.0
+
+
+def _mine_slot_timeout_secs() -> float:
+    """Return the configured mine-slot timeout in seconds.
+
+    Reads ``MEMPALACE_MINE_TIMEOUT_HOURS`` from the environment (float).
+    Returns 0 if the env var is set to 0 or is not parseable.
+    """
+    raw = os.environ.get(_MINE_TIMEOUT_HOURS_ENV, "")
+    if raw:
+        try:
+            hours = float(raw)
+            return max(0.0, hours) * 3600
+        except ValueError:
+            return 0.0
+    return _MINE_TIMEOUT_HOURS_DEFAULT * 3600
+
 
 def _pid_file_for_cmd(cmd: list[str]) -> Path:
     """Return the per-target PID file path for a mine subcommand.
@@ -333,15 +359,70 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _mine_already_running(cmd: list[str]) -> bool:
-    """Return True if a previous mine for ``cmd``'s target is still alive."""
+    """Return True if a previous mine for ``cmd``'s target is still alive.
+
+    The PID file format is ``{pid} {unix_timestamp}`` (timestamp added in
+    #1552 to detect wedged subprocesses).  Old-format files (bare ``{pid}``)
+    use the PID file's mtime as the approximate start time so a still-running
+    pre-upgrade mine is not immediately misclassified as stale.
+
+    A process is considered stale (and this function returns False) when:
+    - the PID is dead, OR
+    - the configured mine timeout is > 0 AND the process has been running
+      longer than the timeout.
+    """
     pid_file = _pid_file_for_cmd(cmd)
     try:
         recorded = pid_file.read_text().strip()
     except OSError:
         return False
-    if not recorded.isdigit():
+    if not recorded:
         return False
-    return _pid_alive(int(recorded))
+    parts = recorded.split(None, 1)
+    if not parts[0].isdigit():
+        return False
+    pid = int(parts[0])
+    if not _pid_alive(pid):
+        return False
+    timeout_secs = _mine_slot_timeout_secs()
+    if timeout_secs > 0:
+        if len(parts) > 1 and parts[1]:
+            try:
+                start_ts = float(parts[1])
+            except ValueError:
+                return False
+        else:
+            try:
+                start_ts = pid_file.stat().st_mtime
+            except OSError:
+                return True
+        if time.time() - start_ts > timeout_secs:
+            return False
+    return True
+
+
+def _create_mine_slot_with_placeholder(pid_file: Path) -> Path:
+    """Atomically create a mine PID slot and write this hook PID into it.
+
+    The slot body is ``{pid} {unix_timestamp}`` so that stale-by-age
+    detection in ``_mine_already_running`` can determine how long the
+    recorded process has been running (#1552).
+    """
+    fd = os.open(str(pid_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="ascii") as f:
+            f.write(f"{os.getpid()} {int(time.time())}")
+    except OSError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            pid_file.unlink()
+        except OSError:
+            pass
+        raise
+    return pid_file
 
 
 def _claim_mine_slot(cmd: list[str]) -> Optional[Path]:
@@ -359,14 +440,14 @@ def _claim_mine_slot(cmd: list[str]) -> Optional[Path]:
     pid_file = _pid_file_for_cmd(cmd)
     pid_file.parent.mkdir(parents=True, exist_ok=True)
     try:
-        fd = os.open(str(pid_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        os.close(fd)
-        return pid_file
+        return _create_mine_slot_with_placeholder(pid_file)
     except FileExistsError:
         pass
+
     # Slot exists. If the holder is alive, defer.
     if _mine_already_running(cmd):
         return None
+
     # Stale entry; reclaim. The unlink+create is racy against another hook
     # firing right now, but the second create's O_EXCL will fail and that
     # caller will see the live PID via the next round.
@@ -376,10 +457,9 @@ def _claim_mine_slot(cmd: list[str]) -> Optional[Path]:
         pass
     except OSError:
         return None
+
     try:
-        fd = os.open(str(pid_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        os.close(fd)
-        return pid_file
+        return _create_mine_slot_with_placeholder(pid_file)
     except FileExistsError:
         return None
 
@@ -419,7 +499,7 @@ def _spawn_mine(cmd: list) -> None:
                 pass
             raise
     try:
-        pid_file.write_text(str(proc.pid))
+        pid_file.write_text(f"{proc.pid} {int(time.time())}")
     except OSError:
         pass
 

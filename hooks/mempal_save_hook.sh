@@ -83,27 +83,103 @@ fi
 INPUT=$(cat)
 
 # Parse all fields in a single Python call (3x faster than separate invocations)
-# without invoking ``eval`` on generated code: Python prints one sanitized
-# value per line, the shell reads them via ``mapfile`` and does plain
-# variable assignment — same data, smaller blast radius if the sanitizer
-# is ever bypassed (#1231 review).
-mapfile -t _mempal_parsed < <(echo "$INPUT" | "$MEMPAL_PYTHON_BIN" -c "
+# without invoking ``eval`` on generated code: Python prints a parse-success
+# sentinel followed by one sanitized value per line, the shell reads each
+# line via ``sed -n 'Np'`` and does plain variable assignment. Same data,
+# smaller blast radius if the sanitizer is ever bypassed (#1231 review).
+#
+# Why ``sed -n 'Np'`` and not ``mapfile`` / ``readarray``: macOS ships
+# GNU bash 3.2.57 (frozen at Apple's GPLv3 cutoff in 2006), and both
+# array-read builtins only landed in bash 4.0 (2009). On a stock macOS
+# the previous ``mapfile`` form errored, every value fell back to its
+# default, and the hook silently produced zero saves (#1440).
+#
+# The leading ``__MEMPAL_PARSE_OK__`` sentinel lets the defense-in-depth
+# guard below distinguish "Python parsed cleanly, user set session_id to
+# the literal string 'unknown'" or "session_id was non-ASCII and got
+# sanitized to empty" from the actual failure mode ("Python crashed,
+# nothing was printed"). Without the sentinel the guard false-fires
+# every Stop hook for users on i18n harnesses or unusual harness configs.
+# Python stderr is captured to last_python_err.log so the guard below can
+# distinguish "bad user input" (JSONDecodeError) from "broken interpreter
+# / future regression in this inline script" (ImportError, SyntaxError,
+# ModuleNotFoundError). Without the stderr capture, last_input.log shows
+# a valid payload while the actual root cause stays hidden.
+#
+# Two extra hardenings inside the command-substitution subshell:
+#
+#   * ``umask 077`` so the ``2>$STATE_DIR/last_python_err.log`` redirect
+#     creates the file at mode 0600 atomically. Without it, the file
+#     appeared briefly at the parent process's umask (often 0644) before
+#     the explicit ``chmod 600`` below closed it — a small TOCTOU window
+#     where another local user on a shared box could read the traceback,
+#     which can echo back the user's home + project layout.
+#
+#   * ``printf '%s'`` in place of ``echo``. ``echo`` is unreliable for
+#     arbitrary payloads: it interprets ``-n``/``-e``/``-E`` as flags,
+#     handles backslashes inconsistently across builtin vs /bin/echo,
+#     and depends on the ``xpg_echo`` shopt on bash. JSON typically
+#     starts with ``{`` so the failure mode is latent, but flipping to
+#     ``printf '%s'`` removes the class of bug entirely.
+_mempal_parsed=$(
+    umask 077
+    printf '%s' "$INPUT" | "$MEMPAL_PYTHON_BIN" -c "
 import sys, json, re
 data = json.load(sys.stdin)
-sid = data.get('session_id', 'unknown')
+sid = data.get('session_id', '')
 sha_raw = data.get('stop_hook_active', False)
 tp = data.get('transcript_path', '')
-# Shell-safe output — only allow alphanumeric, underscore, hyphen, slash, dot, tilde
+# Shell-safe output: only allow alphanumeric, underscore, hyphen, slash, dot, tilde
 safe = lambda s: re.sub(r'[^a-zA-Z0-9_/.\-~]', '', str(s))
 # Coerce stop_hook_active to strict boolean string
 sha = 'True' if sha_raw is True or str(sha_raw).lower() in ('true', '1', 'yes') else 'False'
+print('__MEMPAL_PARSE_OK__')
 print(safe(sid))
 print(sha)
 print(safe(tp))
-" 2>/dev/null)
-SESSION_ID="${_mempal_parsed[0]:-unknown}"
-STOP_HOOK_ACTIVE="${_mempal_parsed[1]:-False}"
-TRANSCRIPT_PATH="${_mempal_parsed[2]:-}"
+" 2>"$STATE_DIR/last_python_err.log"
+)
+# The 2> redirect creates the file even when stderr is empty (success).
+# Remove the empty file so the state directory stays clean on the happy
+# path; on failure, lock the file's permissions to 600 to mirror
+# last_input.log's privacy contract (the traceback can reveal absolute
+# paths inside the user's home).
+if [ -s "$STATE_DIR/last_python_err.log" ]; then
+    chmod 600 "$STATE_DIR/last_python_err.log" 2>/dev/null
+else
+    rm -f "$STATE_DIR/last_python_err.log"
+fi
+_MEMPAL_PARSE_MARKER=$(printf '%s\n' "$_mempal_parsed" | sed -n '1p')
+SESSION_ID=$(printf '%s\n' "$_mempal_parsed" | sed -n '2p')
+STOP_HOOK_ACTIVE=$(printf '%s\n' "$_mempal_parsed" | sed -n '3p')
+TRANSCRIPT_PATH=$(printf '%s\n' "$_mempal_parsed" | sed -n '4p')
+SESSION_ID="${SESSION_ID:-unknown}"
+STOP_HOOK_ACTIVE="${STOP_HOOK_ACTIVE:-False}"
+TRANSCRIPT_PATH="${TRANSCRIPT_PATH:-}"
+
+# Defense-in-depth: if INPUT was non-empty but Python never reached the
+# print() calls (sentinel missing), parsing silently failed. Surface the
+# raw payload so the next debugger does not lose a day to hook.log lines
+# that say "Session unknown". Bounded to 4 KB and overwritten on each
+# failure (not appended) to keep ~/.mempalace/hook_state/ from growing
+# unbounded under a repeating misconfiguration. chmod 600 so the dump,
+# which mirrors the Claude Code Stop payload (includes transcript_path
+# revealing the user's home + project layout), is not world-readable.
+if [ -n "$INPUT" ] && [ "$_MEMPAL_PARSE_MARKER" != "__MEMPAL_PARSE_OK__" ]; then
+    echo "[$(date '+%H:%M:%S')] WARN: input parse failed (sentinel missing); see $STATE_DIR/last_input.log and $STATE_DIR/last_python_err.log" >> "$STATE_DIR/hook.log"
+    # ``head -c 4096`` caps at exactly 4096 BYTES regardless of locale.
+    # Bash's ``${INPUT:0:4096}`` would count characters under a UTF-8
+    # locale, letting a CJK/emoji payload silently exceed the cap by up
+    # to 4x. ``set -o pipefail`` is not enabled in this script, so the
+    # natural ``head``-closes-stdin / SIGPIPE-on-printf interaction is
+    # silently absorbed by bash (the canonical way to read N bytes from
+    # a string in shell). The ``umask 077`` subshell creates
+    # last_input.log at mode 0600 atomically — the ``chmod 600`` below
+    # stays as a belt-and-suspenders guard if a future edit drops the
+    # umask line.
+    ( umask 077 && printf '%s' "$INPUT" | head -c 4096 > "$STATE_DIR/last_input.log" )
+    chmod 600 "$STATE_DIR/last_input.log" 2>/dev/null
+fi
 
 # Expand ~ in path
 TRANSCRIPT_PATH="${TRANSCRIPT_PATH/#\~/$HOME}"

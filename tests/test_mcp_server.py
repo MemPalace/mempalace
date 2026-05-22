@@ -9,10 +9,67 @@ via monkeypatch to avoid touching real data.
 from datetime import datetime
 import json
 import os
+import subprocess
 import sys
 from unittest.mock import MagicMock
 
 import pytest
+
+
+# ── MCP entry point: PYTHONPATH stripping ────────────────────────────────
+
+
+_MCP_LEAK_PREFIX = "/__mempalace_mcp_leak_sentinel__"
+
+
+def test_mcp_main_strips_leaked_pythonpath_from_env():
+    """mempalace.mcp_server:main must drop PYTHONPATH from the process env
+    so any subprocess this server spawns starts clean. Mirrors the
+    sys.path-filter test in test_init.py but for the env half of the
+    split fix. See #1423.
+
+    Three assertions cover the full split contract:
+    - ENV_MID (after import, before main) is preserved verbatim:
+      regression detector for someone moving the env pop back into
+      __init__.py.
+    - SENTINEL_IN_PATH is False at import time: package-level sys.path
+      filter half of the split actually ran.
+    - ENV_AFTER (after main) is None: MCP entry-point env strip ran.
+
+    The main loop reads JSON-RPC lines from stdin until EOF; closing
+    stdin makes readline() return '' and exits the loop cleanly, which
+    lets us observe the post-main env state. Probes go to stderr because
+    mcp_server redirects stdout at import time for clean JSON-RPC."""
+    expected_env = f"{_MCP_LEAK_PREFIX}/a{os.pathsep}{_MCP_LEAK_PREFIX}/b"
+    env = os.environ.copy()
+    env["PYTHONPATH"] = expected_env
+    code = (
+        "import os, sys\n"
+        "from mempalace.mcp_server import main\n"
+        f"prefix = {_MCP_LEAK_PREFIX!r}\n"
+        "sys.stderr.write('ENV_MID: ' + repr(os.environ.get('PYTHONPATH')) + '\\n')\n"
+        "sys.stderr.write('SENTINEL_IN_PATH: ' + repr(any(prefix in (p or '') for p in sys.path)) + '\\n')\n"
+        "main()\n"
+        "sys.stderr.write('ENV_AFTER: ' + repr(os.environ.get('PYTHONPATH')) + '\\n')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        input="",  # empty stdin → readline() returns '' → loop breaks
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    diag = f"rc={result.returncode}; stdout={result.stdout!r}; stderr={result.stderr!r}"
+    assert result.returncode == 0, f"subprocess failed: {diag}"
+    assert f"ENV_MID: {expected_env!r}" in result.stderr, (
+        f"package import unexpectedly stripped env (regression in __init__.py): {diag}"
+    )
+    assert "SENTINEL_IN_PATH: False" in result.stderr, (
+        f"package import did not filter sys.path (regression in __init__.py): {diag}"
+    )
+    assert "ENV_AFTER: None" in result.stderr, f"MCP server did not strip PYTHONPATH: {diag}"
 
 
 def _patch_mcp_server(monkeypatch, config, kg):
@@ -20,7 +77,9 @@ def _patch_mcp_server(monkeypatch, config, kg):
     from mempalace import mcp_server
 
     monkeypatch.setattr(mcp_server, "_config", config)
-    monkeypatch.setattr(mcp_server, "_get_kg", lambda: kg)
+    # Accept varargs because production ``_get_kg`` now takes an optional
+    # canonical_path; ``_call_kg`` passes the captured key through.
+    monkeypatch.setattr(mcp_server, "_get_kg", lambda *a, **kw: kg)
 
 
 def _get_collection(palace_path, create=False):
@@ -38,6 +97,365 @@ def _get_collection(palace_path, create=False):
             client.get_or_create_collection("mempalace_drawers", metadata={"hnsw:space": "cosine"}),
         )
     return client, client.get_collection("mempalace_drawers")
+
+
+# ── Cold-start diagnostics (#1495) ──────────────────────────────────────
+
+
+class TestColdStartDiagnostics:
+    """``MEMPALACE_LOG_FILE`` + ``MEMPALACE_EAGER_WARMUP`` (#1495).
+
+    Each test runs ``main()`` in a fresh ``subprocess`` because
+
+    * ``_init_logging`` uses ``logging.basicConfig(force=True)`` which
+      would otherwise reset pytest's ``caplog`` handlers across cases,
+    * ``ChromaBackend._resolve_embedding_function`` is a class-level
+      attribute that test monkeypatching mutates globally,
+    * The whole point of the new env vars is process-startup behaviour
+      and must be exercised under a real ``main()`` boot path.
+
+    Pattern mirrors ``test_mcp_main_strips_leaked_pythonpath_from_env``.
+    ``_run_main`` injects ``extra_code`` as a hard-coded ``-c`` source
+    fragment from this file only (no untrusted input flows in); the
+    subprocess argv form ``[sys.executable, "-c", code]`` avoids shell
+    interpretation entirely.
+    """
+
+    @staticmethod
+    def _run_main(env_overrides: dict, extra_code: str = "", timeout: int = 30):
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k not in env_overrides or env_overrides[k] is not None
+        }
+        for k, v in env_overrides.items():
+            if v is None:
+                env.pop(k, None)
+            else:
+                env[k] = v
+        code = extra_code + "from mempalace.mcp_server import main\nmain()\n"
+        return subprocess.run(
+            [sys.executable, "-c", code],
+            env=env,
+            input="",  # empty stdin → readline() returns '' → loop breaks immediately
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+
+    def test_log_file_unset_attaches_only_stream_handler(self, tmp_path):
+        marker = tmp_path / "handlers.txt"
+        env_overrides = {"MEMPALACE_LOG_FILE": None}
+        extra = (
+            "import logging, pathlib\n"
+            "from mempalace import mcp_server  # noqa: F401 — triggers _init_logging()\n"
+            f"pathlib.Path({str(marker)!r}).write_text("
+            "','.join(type(h).__name__ for h in logging.getLogger().handlers)"
+            ")\n"
+            "raise SystemExit(0)\n"
+        )
+        result = self._run_main(env_overrides, extra_code=extra)
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
+        assert marker.read_text().split(",") == ["StreamHandler"], marker.read_text()
+
+    def test_log_file_empty_string_attaches_only_stream_handler(self, tmp_path):
+        marker = tmp_path / "handlers.txt"
+        env_overrides = {"MEMPALACE_LOG_FILE": "   "}  # whitespace counts as unset after .strip()
+        extra = (
+            "import logging, pathlib\n"
+            "from mempalace import mcp_server  # noqa: F401\n"
+            f"pathlib.Path({str(marker)!r}).write_text("
+            "','.join(type(h).__name__ for h in logging.getLogger().handlers)"
+            ")\n"
+            "raise SystemExit(0)\n"
+        )
+        result = self._run_main(env_overrides, extra_code=extra)
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
+        assert marker.read_text().split(",") == ["StreamHandler"], marker.read_text()
+
+    def test_log_file_set_attaches_file_handler_and_persists_startup_line(self, tmp_path):
+        log_path = tmp_path / "mcp.log"
+        result = self._run_main({"MEMPALACE_LOG_FILE": str(log_path)})
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
+        assert log_path.exists(), f"log file missing; stderr={result.stderr!r}"
+        body = log_path.read_text(encoding="utf-8")
+        assert "MemPalace MCP Server starting" in body, body
+
+    def test_log_file_invalid_path_falls_back_to_stderr_with_warning(self, tmp_path):
+        # Unique directory name we can grep for cross-platform without
+        # depending on path-separator formatting in the %r warning value.
+        missing_dir = "missing_dir_for_1495"
+        bad_path = tmp_path / missing_dir / "mcp.log"
+        result = self._run_main({"MEMPALACE_LOG_FILE": str(bad_path)})
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
+        # Invalid path must NOT crash the server, must surface a warning, must
+        # NOT create the file (the missing-directory ancestor is the failure).
+        # Warning must name MEMPALACE_LOG_FILE so the operator knows the source.
+        assert "could not be opened" in result.stderr, result.stderr
+        assert "MEMPALACE_LOG_FILE" in result.stderr, result.stderr
+        assert missing_dir in result.stderr, result.stderr
+        assert not bad_path.exists()
+
+    @staticmethod
+    def _make_fake_palace(tmp_path):
+        """Create just enough on disk for ``_maybe_eager_warmup_embedder``'s
+        fresh-install pre-check to pass (``chroma.sqlite3`` exists).
+
+        Returns the palace dir as a string. The file is empty — production
+        code must not read its bytes during pre-check; only its existence
+        gates whether warmup proceeds to the chromadb client open.
+        """
+        palace = tmp_path / "palace"
+        palace.mkdir()
+        (palace / "chroma.sqlite3").touch()
+        return str(palace)
+
+    @staticmethod
+    def _spy_get_collection_extra(marker_path, return_expr="None"):
+        """Render an ``extra_code`` fragment that monkeypatches ``_get_collection``.
+
+        ``marker_path`` records that the spy fired; ``return_expr`` is a Python
+        expression evaluated inside the subprocess for the call's return value
+        (e.g. ``"None"`` or ``"_FakeCol()"``).
+        """
+        return (
+            "import pathlib\n"
+            "from mempalace import mcp_server\n"
+            "def _spy_get_collection(create=False):\n"
+            f"    pathlib.Path({str(marker_path)!r}).write_text('called')\n"
+            f"    return {return_expr}\n"
+            "mcp_server._get_collection = _spy_get_collection\n"
+        )
+
+    def test_eager_warmup_off_by_default_does_not_open_collection(self, tmp_path):
+        marker = tmp_path / "called.txt"
+        palace = self._make_fake_palace(tmp_path)
+        result = self._run_main(
+            {"MEMPALACE_EAGER_WARMUP": None, "MEMPALACE_PALACE_PATH": palace},
+            extra_code=self._spy_get_collection_extra(marker),
+        )
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
+        assert not marker.exists(), "warmup ran despite env var being unset"
+
+    @pytest.mark.parametrize("value", ["0", "false", "no", "off", "FALSE"])
+    def test_eager_warmup_explicit_falsy_skips_collection_open_without_warning(
+        self, tmp_path, value
+    ):
+        marker = tmp_path / "called.txt"
+        palace = self._make_fake_palace(tmp_path)
+        result = self._run_main(
+            {"MEMPALACE_EAGER_WARMUP": value, "MEMPALACE_PALACE_PATH": palace},
+            extra_code=self._spy_get_collection_extra(marker),
+        )
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
+        assert not marker.exists(), f"warmup ran for explicit-falsy value {value!r}"
+        assert "not recognized" not in result.stderr, (
+            f"explicit-falsy {value!r} should not log a warning; stderr={result.stderr!r}"
+        )
+
+    @pytest.mark.parametrize("value", ["tru", "maybe", "ENABLED", "2"])
+    def test_eager_warmup_unrecognized_value_warns_and_skips_collection_open(self, tmp_path, value):
+        marker = tmp_path / "called.txt"
+        palace = self._make_fake_palace(tmp_path)
+        result = self._run_main(
+            {"MEMPALACE_EAGER_WARMUP": value, "MEMPALACE_PALACE_PATH": palace},
+            extra_code=self._spy_get_collection_extra(marker),
+        )
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
+        assert not marker.exists(), f"warmup ran despite unrecognized value {value!r}"
+        assert "not recognized" in result.stderr, result.stderr
+
+    @pytest.mark.parametrize("value", ["1", "true", "YES", "On"])
+    def test_eager_warmup_truthy_opens_collection_and_invokes_query(self, tmp_path, value):
+        """C1 (#1495): warmup must call ``col.query(...)`` — not just open the collection.
+
+        ChromaDB's ``ONNXMiniLM_L6_V2.__init__`` only imports ``onnxruntime``;
+        ``InferenceSession`` and model download happen inside ``__call__``,
+        which the chromadb query path drives. Pinning both call sites here
+        prevents a regression to a no-op resolver-only warmup (the same
+        failure mode silent-failure-hunter flagged in initial review).
+        Reporter's #1495 proposal: same path covers HNSW cold-load too.
+        """
+        open_marker = tmp_path / "open_called.txt"
+        query_marker = tmp_path / "query_called.txt"
+        palace = self._make_fake_palace(tmp_path)
+        extra = (
+            "import pathlib\n"
+            "from mempalace import mcp_server\n"
+            "class _FakeCol:\n"
+            "    def query(self, **kwargs):\n"
+            f"        pathlib.Path({str(query_marker)!r}).write_text(repr(kwargs))\n"
+            "        return {'ids': [[]], 'distances': [[]], 'documents': [[]]}\n"
+            "_fake_col = _FakeCol()\n"
+            "def _spy_get_collection(create=False):\n"
+            f"    pathlib.Path({str(open_marker)!r}).write_text('open')\n"
+            "    return _fake_col\n"
+            "mcp_server._get_collection = _spy_get_collection\n"
+        )
+        result = self._run_main(
+            {"MEMPALACE_EAGER_WARMUP": value, "MEMPALACE_PALACE_PATH": palace},
+            extra_code=extra,
+        )
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
+        assert open_marker.exists(), (
+            f"_get_collection not called for {value!r}; stderr={result.stderr!r}"
+        )
+        assert query_marker.exists(), (
+            f"col.query not invoked for {value!r} — warmup is a no-op "
+            f"(would let cold-load hit first MCP call); stderr={result.stderr!r}"
+        )
+        # query was called with the sentinel probe text and n_results=1.
+        kwargs_repr = query_marker.read_text()
+        assert "__mempalace_warmup_probe__" in kwargs_repr, kwargs_repr
+        assert "n_results" in kwargs_repr and "1" in kwargs_repr, kwargs_repr
+        # Success path logs embedder + HNSW readiness + palace + device for ops.
+        assert "embedder + HNSW ready" in result.stderr, result.stderr
+        assert f"palace={palace}" in result.stderr, result.stderr
+
+    def test_eager_warmup_fresh_install_skips_without_creating_palace(self, tmp_path):
+        """Real integration test (no monkeypatch): an empty palace dir with no
+        ``chroma.sqlite3`` must trigger the pre-check skip path BEFORE any
+        chromadb call materializes the palace scaffold on disk.
+
+        This pins three behaviours simultaneously:
+
+        1. ``returncode == 0`` — fresh install does not crash the server.
+        2. ``chroma.sqlite3`` is NOT created — warmup respects the
+           "no on-disk state before ``mempalace init``" contract from
+           CLAUDE.md ("Incremental only"). A regression that drops the
+           pre-check would let chromadb's ``PersistentClient(path=...)``
+           materialize the palace dir.
+        3. ``"nothing to warm"`` lands in stderr — the documented INFO
+           message actually fires (the previous test that asserted this
+           via a monkeypatched ``_get_collection`` was tautological because
+           the real ``_get_collection`` swallows ``NotFoundError`` into
+           ``return None`` and silently materializes the palace).
+        4. No chromadb retry tracebacks ("attempt N/2 failed") leak into
+           stderr — those are the noise this PR exists to reduce.
+        """
+        palace = tmp_path / "fresh_palace"
+        palace.mkdir()
+        # Confirm precondition: no chroma.sqlite3 exists before main().
+        db_path = palace / "chroma.sqlite3"
+        assert not db_path.exists()
+        result = self._run_main(
+            {"MEMPALACE_EAGER_WARMUP": "1", "MEMPALACE_PALACE_PATH": str(palace)},
+        )
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
+        assert "nothing to warm" in result.stderr, result.stderr
+        assert "collection open failed" not in result.stderr, result.stderr
+        assert "warmup query failed" not in result.stderr, result.stderr
+        assert "embedder + HNSW ready" not in result.stderr, result.stderr
+        assert "attempt 1/2 failed" not in result.stderr, result.stderr
+        assert "attempt 2/2 failed" not in result.stderr, result.stderr
+        # Pin the no-side-effect contract: the warmup MUST NOT create the
+        # palace scaffold on disk before the user runs ``mempalace init``.
+        assert not db_path.exists(), (
+            f"warmup materialized chroma.sqlite3 in a fresh palace dir "
+            f"(violates 'Incremental only' from CLAUDE.md); stderr={result.stderr!r}"
+        )
+
+    def test_eager_warmup_collection_returning_none_surfaces_warning(self, tmp_path):
+        """_get_collection retries internally and returns None on persistent
+        failure (mcp_server.py:373). Warmup must not log a misleading
+        success line in that case."""
+        palace = self._make_fake_palace(tmp_path)
+        extra = self._spy_get_collection_extra(tmp_path / "called.txt", return_expr="None")
+        result = self._run_main(
+            {"MEMPALACE_EAGER_WARMUP": "1", "MEMPALACE_PALACE_PATH": palace},
+            extra_code=extra,
+        )
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
+        assert "_get_collection returned None" in result.stderr, result.stderr
+        assert "embedder + HNSW ready" not in result.stderr, result.stderr
+
+    def test_eager_warmup_collection_open_failure_logs_and_does_not_block_server(self, tmp_path):
+        palace = self._make_fake_palace(tmp_path)
+        extra = (
+            "from mempalace import mcp_server\n"
+            "def _boom(create=False):\n"
+            "    raise RuntimeError('synthetic-collection-open-fail-1495')\n"
+            "mcp_server._get_collection = _boom\n"
+        )
+        result = self._run_main(
+            {"MEMPALACE_EAGER_WARMUP": "1", "MEMPALACE_PALACE_PATH": palace},
+            extra_code=extra,
+        )
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
+        assert "collection open failed" in result.stderr, result.stderr
+        assert "synthetic-collection-open-fail-1495" in result.stderr, result.stderr
+        # palace + error class included in the diagnostic
+        assert f"palace={palace}" in result.stderr, result.stderr
+        assert "error=RuntimeError" in result.stderr, result.stderr
+
+    def test_eager_warmup_query_failure_logs_and_persists_to_log_file(self, tmp_path):
+        """Query may raise (broken HNSW, network failure during ONNX download,
+        runtime decoder error). Server stays up and the diagnostic lands in
+        both stderr AND ``MEMPALACE_LOG_FILE`` — the latter is the whole
+        point of #1495 for ops debugging the original -32000."""
+        palace = self._make_fake_palace(tmp_path)
+        log_path = tmp_path / "mcp.log"
+        extra = (
+            "from mempalace import mcp_server\n"
+            "class _BadCol:\n"
+            "    def query(self, **kwargs):\n"
+            "        raise RuntimeError('synthetic-query-fail-1495')\n"
+            "mcp_server._get_collection = lambda create=False: _BadCol()\n"
+        )
+        result = self._run_main(
+            {
+                "MEMPALACE_EAGER_WARMUP": "1",
+                "MEMPALACE_PALACE_PATH": palace,
+                "MEMPALACE_LOG_FILE": str(log_path),
+            },
+            extra_code=extra,
+        )
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
+        assert "warmup query failed" in result.stderr, result.stderr
+        assert "synthetic-query-fail-1495" in result.stderr, result.stderr
+        assert f"palace={palace}" in result.stderr, result.stderr
+        assert "error=RuntimeError" in result.stderr, result.stderr
+        assert log_path.exists(), f"log file not created; stderr={result.stderr!r}"
+        body = log_path.read_text(encoding="utf-8")
+        assert "warmup query failed" in body, body
+        assert "synthetic-query-fail-1495" in body, body
+
+    def test_log_file_path_with_embedded_newline_does_not_crash(self, tmp_path):
+        """``MEMPALACE_LOG_FILE`` containing a newline (rare misconfig from
+        a YAML/env file copy-paste) must fall through the (OSError, ValueError)
+        catch rather than escape as an unhandled exception at import time."""
+        # Embedding \n inside a path component triggers ValueError on POSIX
+        # ("embedded null byte" raises on OS-level open) or OSError depending
+        # on platform — both should land in the fail-soft branch.
+        bad_path = str(tmp_path / "with\nnewline" / "mcp.log")
+        result = self._run_main({"MEMPALACE_LOG_FILE": bad_path})
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
+        # Server proceeds with stderr-only and surfaces the env-var-named
+        # warning so ops can correlate the misconfig.
+        assert "could not be opened" in result.stderr, result.stderr
+        assert "MEMPALACE_LOG_FILE" in result.stderr, result.stderr
+
+    def test_log_file_invalid_path_failure_surfaces_before_first_log_record(self, tmp_path):
+        """Behavioural pin: ``delay=True`` MUST NOT be used on the FileHandler.
+
+        With ``delay=True`` an invalid path raises inside ``emit()`` at runtime,
+        unhandled, defeating the fail-soft contract documented in ``_init_logging``.
+        This test pins the eager-open semantics by checking that the warning lands
+        BEFORE the ``MemPalace MCP Server starting...`` banner — proving that
+        ``FileHandler.__init__`` raised and was caught at module import."""
+        bad_path = tmp_path / "regression_pin_dir" / "mcp.log"
+        result = self._run_main({"MEMPALACE_LOG_FILE": str(bad_path)})
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
+        warning_pos = result.stderr.find("could not be opened")
+        banner_pos = result.stderr.find("MemPalace MCP Server starting")
+        assert warning_pos != -1, f"warning missing; stderr={result.stderr!r}"
+        assert banner_pos != -1, f"banner missing; stderr={result.stderr!r}"
+        assert warning_pos < banner_pos, (
+            f"warning at {warning_pos} must precede banner at {banner_pos} — "
+            f"if banner is first, FileHandler was opened lazily (delay=True regression). "
+            f"stderr={result.stderr!r}"
+        )
 
 
 # ── Protocol Layer ──────────────────────────────────────────────────────
@@ -351,6 +769,129 @@ class TestReadTools:
         assert "error" in result
 
 
+# ── Regression: None-metadata safety (issue #1426) ──────────────────────
+
+
+class TestNoneMetadataSafety:
+    """Regression coverage for issue #1426.
+
+    ChromaDB's ``col.get()`` / ``col.query()`` can return ``None`` for the
+    metadata cell of a partially-flushed row or any row written without
+    metadata in older formats. Before the ``_safe_meta`` boundary helper,
+    indexing the result yielded ``None``, the next ``.get(...)`` raised
+    ``AttributeError: 'NoneType' object has no attribute 'get'``, and the
+    handler crashed before the ``DELETE FROM embeddings_queue`` cleanup
+    step — so the queue grew without bound while writes kept appearing
+    successful.
+
+    Each test simulates Chroma returning ``None`` in the metadatas list
+    via a stub collection — Chroma's own write path rejects ``None`` at
+    insert time, so we can't reproduce the upstream state by writing
+    bad data through the real backend. Mocking ``_get_collection`` lets
+    us assert the handler tolerates the failure mode that actually shows
+    up in the wild.
+    """
+
+    def test_safe_meta_helper_coerces_none_to_empty_dict(self):
+        from mempalace.mcp_server import _safe_meta
+
+        assert _safe_meta(None) == {}
+        assert _safe_meta({}) == {}
+        assert _safe_meta({"wing": "x"}) == {"wing": "x"}
+        # Defensive against other non-dict types Chroma might return on
+        # malformed rows — coerce, don't crash.
+        assert _safe_meta("not a dict") == {}
+        assert _safe_meta(["wing", "x"]) == {}
+
+    def test_get_drawer_tolerates_none_metadata(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from unittest.mock import MagicMock
+
+        from mempalace import mcp_server
+
+        stub_col = MagicMock()
+        stub_col.get.return_value = {
+            "ids": ["drawer_none_meta"],
+            "documents": ["verbatim body"],
+            "metadatas": [None],
+        }
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: stub_col)
+
+        result = mcp_server.tool_get_drawer("drawer_none_meta")
+        assert "error" not in result
+        assert result["drawer_id"] == "drawer_none_meta"
+        # Missing metadata reduces to empty defaults — no crash, no leak.
+        assert result["wing"] == ""
+        assert result["room"] == ""
+        assert result["content"] == "verbatim body"
+
+    def test_list_drawers_tolerates_none_metadata(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from unittest.mock import MagicMock
+
+        from mempalace import mcp_server
+
+        stub_col = MagicMock()
+        stub_col.get.return_value = {
+            "ids": ["drawer_a", "drawer_b"],
+            "documents": ["body a", "body b"],
+            "metadatas": [None, {"wing": "ok", "room": "fine"}],
+        }
+        stub_col.count.return_value = 2
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: stub_col)
+
+        result = mcp_server.tool_list_drawers()
+        assert result["count"] == 2
+        assert result["drawers"][0]["wing"] == ""
+        assert result["drawers"][0]["room"] == ""
+        assert result["drawers"][1]["wing"] == "ok"
+        assert result["drawers"][1]["room"] == "fine"
+
+    def test_update_drawer_tolerates_none_metadata(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from unittest.mock import MagicMock
+
+        from mempalace import mcp_server
+
+        stub_col = MagicMock()
+        stub_col.get.return_value = {
+            "ids": ["drawer_none_meta"],
+            "documents": ["old body"],
+            "metadatas": [None],
+        }
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: stub_col)
+
+        result = mcp_server.tool_update_drawer("drawer_none_meta", wing="recovered")
+        # Should succeed: old_meta is coerced to {}, new wing slots in cleanly.
+        assert result.get("success") is True
+        # Confirm the update call carried the new wing without inheriting None.
+        update_call = stub_col.update.call_args
+        assert update_call is not None
+        new_meta = update_call.kwargs["metadatas"][0]
+        assert new_meta["wing"] == "recovered"
+
+    def test_delete_drawer_audit_log_tolerates_none_metadata(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from unittest.mock import MagicMock
+
+        from mempalace import mcp_server
+
+        stub_col = MagicMock()
+        stub_col.get.return_value = {
+            "ids": ["drawer_none_meta"],
+            "documents": ["doomed body"],
+            "metadatas": [None],
+        }
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: stub_col)
+
+        # Should reach the delete call without AttributeError on the audit-log path.
+        result = mcp_server.tool_delete_drawer("drawer_none_meta")
+        assert result["success"] is True
+        stub_col.delete.assert_called_once_with(ids=["drawer_none_meta"])
+
+
 # ── Search Tool ─────────────────────────────────────────────────────────
 
 
@@ -593,9 +1134,9 @@ class TestWriteTools:
 
         assert result1["success"] is True
         assert result2["success"] is True
-        assert (
-            result1["drawer_id"] != result2["drawer_id"]
-        ), "Documents with shared header but different content must have distinct drawer IDs"
+        assert result1["drawer_id"] != result2["drawer_id"], (
+            "Documents with shared header but different content must have distinct drawer IDs"
+        )
 
     def test_delete_drawer(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -824,6 +1365,207 @@ class TestWriteTools:
         result = tool_update_drawer("drawer_proj_backend_aaa")
         assert result["success"] is True
         assert result.get("noop") is True
+
+    def test_tool_create_tunnel_preserves_hyphenated_wings(self, monkeypatch, tmp_path):
+        """Regression for #1504: ``tool_create_tunnel`` stores the wing slug
+        verbatim, and both hyphen and underscore queries find the result."""
+        from mempalace import mcp_server, palace_graph
+
+        tunnel_file = tmp_path / "tunnels.json"
+        monkeypatch.setattr(palace_graph, "_get_tunnel_file", lambda *a, **kw: str(tunnel_file))
+        monkeypatch.setattr(
+            palace_graph,
+            "_legacy_tunnel_file",
+            lambda: str(tmp_path / "legacy-tunnels.json"),
+        )
+        monkeypatch.setattr(palace_graph, "_get_collection", lambda *a, **kw: None)
+
+        t = mcp_server.tool_create_tunnel(
+            source_wing="other-wing",
+            source_room="r1",
+            target_wing="my-wing",
+            target_room="r2",
+            label="hyphen preservation",
+        )
+
+        assert t["source"]["wing"] == "other-wing"
+        assert t["target"]["wing"] == "my-wing"
+        assert len(mcp_server.tool_list_tunnels(wing="my-wing")) == 1
+        assert len(mcp_server.tool_list_tunnels(wing="my_wing")) == 1
+
+    def test_tool_create_tunnel_surfaces_value_error(self, monkeypatch):
+        """Regression for #1473: a ValueError from create_tunnel (e.g. a
+        missing room) must be returned to the caller as a clear error,
+        not escape and get wrapped as the opaque 'Internal tool error'."""
+        from mempalace import mcp_server
+
+        msg = "Target room 'does-not-exist-probe' does not exist in wing 'wing_minerva'"
+
+        def _raise(*args, **kwargs):
+            raise ValueError(msg)
+
+        monkeypatch.setattr(mcp_server, "create_tunnel", _raise)
+
+        result = mcp_server.tool_create_tunnel(
+            source_wing="wing_minerva",
+            source_room="fx-invariants",
+            target_wing="wing_minerva",
+            target_room="does-not-exist-probe",
+        )
+
+        assert result == {"error": msg}
+
+    def test_add_drawer_normal_content_single_drawer(self, monkeypatch, config, palace_path, kg):
+        """Regression catch: content below CHUNK_SIZE produces exactly
+        one drawer with ``chunks == 1``. Pre-#1539 contract preserved."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_add_drawer
+
+        result = tool_add_drawer(wing="w", room="r", content="Short content well under chunk_size.")
+        assert result["success"] is True
+        assert result["chunks"] == 1
+        assert "chunk_ids" not in result
+        _client2, col = _get_collection(palace_path)
+        del _client2
+        assert col.count() == 1
+        assert col.get()["ids"] == [result["drawer_id"]]
+
+    def test_add_drawer_oversized_content_chunked(self, monkeypatch, config, palace_path, kg):
+        """Regression for #1539: content far above chunk_size must be
+        sliced into bounded per-chunk drawers, each linked by a
+        ``parent_drawer_id`` metadata field. No stored document may
+        exceed the configured chunk_size."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_add_drawer
+
+        oversized = "X" * 10000
+        result = tool_add_drawer(wing="w", room="r", content=oversized)
+        assert result["success"] is True
+        assert result["chunks"] > 1
+        assert "chunk_ids" in result and len(result["chunk_ids"]) == result["chunks"]
+
+        _client2, col = _get_collection(palace_path)
+        del _client2
+        stored = col.get()
+        max_doc = max(len(d) for d in stored["documents"])
+        assert max_doc <= config.chunk_size, (
+            f"no stored document may exceed chunk_size={config.chunk_size}; got max={max_doc}"
+        )
+        # Chroma does not guarantee insertion order on a bare ``get()``;
+        # sort by ``chunk_index`` before joining so the verbatim check
+        # is deterministic.
+        ordered = sorted(
+            zip(stored["metadatas"], stored["documents"]),
+            key=lambda pair: pair[0]["chunk_index"],
+        )
+        assert "".join(doc for _meta, doc in ordered) == oversized
+        parent_ids = {m.get("parent_drawer_id") for m in stored["metadatas"]}
+        assert parent_ids == {result["drawer_id"]}, (
+            f"all chunks must share one parent_drawer_id; got {parent_ids}"
+        )
+
+    def test_add_drawer_oversized_idempotency_skips_duplicate_chunk_writes(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """Re-calling with identical oversized content must not duplicate
+        any drawer. Idempotency on the chunked path probes the last
+        chunk id (its presence implies the whole batch committed) and
+        also the legacy logical drawer_id so a pre-#1539 single-row
+        write under the same logical id does not get co-resident chunk
+        siblings on the next call."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_add_drawer
+
+        oversized = "Y" * 5000
+        r1 = tool_add_drawer(wing="w", room="r", content=oversized)
+        assert r1["success"] is True and r1["chunks"] > 1
+        r2 = tool_add_drawer(wing="w", room="r", content=oversized)
+        assert r2["success"] is True
+        assert r2.get("reason") == "already_exists"
+
+        _client2, col = _get_collection(palace_path)
+        del _client2
+        assert col.count() == r1["chunks"]
+        # The probe must succeed against the last chunk id (atomicity
+        # signal), and no row must be stored under the logical id.
+        last_chunk = r1["chunk_ids"][-1]
+        assert col.get(ids=[last_chunk])["ids"] == [last_chunk]
+        assert col.get(ids=[r1["drawer_id"]])["ids"] == []
+
+    def test_add_drawer_chunk_metadata_carries_parent_link(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """Every chunk produced from oversized content must carry both
+        ``chunk_index`` (0..N-1) and ``parent_drawer_id`` matching the
+        logical group handle returned to the caller."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_add_drawer
+
+        result = tool_add_drawer(wing="w", room="r", content="Q" * 3500)
+        assert result["success"] is True and result["chunks"] > 1
+
+        _client2, col = _get_collection(palace_path)
+        del _client2
+        stored = col.get()
+        indices = sorted(m["chunk_index"] for m in stored["metadatas"])
+        assert indices == list(range(len(indices)))
+        for meta in stored["metadatas"]:
+            assert meta.get("parent_drawer_id") == result["drawer_id"]
+
+    def test_add_drawer_boundary_exact_chunk_size_stays_single(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """The ``<= chunk_size`` predicate must include the boundary:
+        content of exactly chunk_size chars stays a single drawer, not
+        an off-by-one chunked write."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_add_drawer
+
+        boundary = "Z" * config.chunk_size
+        result = tool_add_drawer(wing="w", room="r", content=boundary)
+        assert result["success"] is True
+        assert result["chunks"] == 1
+        assert "chunk_ids" not in result
+
+    def test_add_drawer_chunked_logical_id_not_fetchable_directly(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """Documented contract on the chunked path: ``tool_get_drawer``
+        and ``tool_delete_drawer`` against the returned logical
+        ``drawer_id`` report ``not found`` because no row is stored
+        under that id. Callers must iterate ``chunk_ids`` or query by
+        ``parent_drawer_id`` metadata."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_add_drawer, tool_delete_drawer, tool_get_drawer
+
+        result = tool_add_drawer(wing="w", room="r", content="P" * 4000)
+        assert result["success"] is True and result["chunks"] > 1
+
+        # tool_get_drawer against logical id: not found.
+        got_logical = tool_get_drawer(result["drawer_id"])
+        assert "error" in got_logical and "not found" in got_logical["error"].lower()
+
+        # tool_get_drawer against the first chunk id: found, full content slice.
+        got_chunk = tool_get_drawer(result["chunk_ids"][0])
+        assert got_chunk["content"] == "P" * config.chunk_size
+        assert got_chunk["metadata"]["parent_drawer_id"] == result["drawer_id"]
+
+        # tool_delete_drawer against logical id: also not found.
+        deleted_logical = tool_delete_drawer(result["drawer_id"])
+        assert deleted_logical["success"] is False
+        assert "not found" in deleted_logical["error"].lower()
 
 
 # ── KG Tools ────────────────────────────────────────────────────────────
@@ -1355,6 +2097,81 @@ class TestDiaryTools:
         assert w1["agent"] == "claude"
         assert w2["agent"] == "claude"
 
+    # ── #1539: oversized-entry chunking ────────────────────────────
+
+    def test_diary_write_normal_entry_single_drawer(self, monkeypatch, config, palace_path, kg):
+        """Regression catch: a normal entry (< CHUNK_SIZE) must produce
+        exactly one drawer with ``chunks == 1`` in the result. Existing
+        pre-#1539 behaviour preserved for the common path."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_diary_write
+
+        r = tool_diary_write(
+            agent_name="TestAgent",
+            entry="A normal-length entry that fits comfortably under chunk_size.",
+            topic="general",
+        )
+        assert r["success"] is True
+        assert r["chunks"] == 1
+        _client2, col = _get_collection(palace_path)
+        del _client2
+        assert col.count() == 1
+
+    def test_diary_write_oversized_entry_chunked(self, monkeypatch, config, palace_path, kg):
+        """Regression for #1539: an entry far above CHUNK_SIZE must be
+        sliced into bounded per-chunk drawers, each linked by a
+        ``parent_entry_id`` metadata field. No single document stored
+        may exceed CHUNK_SIZE."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_diary_write
+
+        # 5000 chars: well above CHUNK_SIZE=800. Expected chunks: ceil(5000/800) = 7.
+        oversized = "Z" * 5000
+        r = tool_diary_write(agent_name="TestAgent", entry=oversized, topic="general")
+
+        assert r["success"] is True
+        assert r["chunks"] > 1, f"oversized entry must produce >1 chunks; got {r['chunks']}"
+        assert "chunk_ids" in r and len(r["chunk_ids"]) == r["chunks"]
+
+        _client2, col = _get_collection(palace_path)
+        del _client2
+        stored = col.get()
+        assert all(len(d) <= 800 for d in stored["documents"]), (
+            f"no stored document may exceed CHUNK_SIZE=800; "
+            f"got max={max(len(d) for d in stored['documents'])}"
+        )
+        joined = "".join(stored["documents"])
+        assert joined == oversized, "joined chunks must equal original entry verbatim"
+
+        parent_ids = {m.get("parent_entry_id") for m in stored["metadatas"]}
+        assert len(parent_ids) == 1 and None not in parent_ids, (
+            f"all chunks must share one parent_entry_id; got {parent_ids}"
+        )
+
+    def test_diary_write_chunk_index_metadata(self, monkeypatch, config, palace_path, kg):
+        """Regression for #1539: each oversized-entry chunk must carry a
+        ``chunk_index`` metadata field that runs 0, 1, 2, ... in order."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_diary_write
+
+        oversized = "Q" * 3500  # ~5 chunks at CHUNK_SIZE=800
+        r = tool_diary_write(agent_name="TestAgent", entry=oversized, topic="general")
+        assert r["success"] is True and r["chunks"] > 1
+
+        _client2, col = _get_collection(palace_path)
+        del _client2
+        stored = col.get()
+        indices = sorted(m["chunk_index"] for m in stored["metadatas"])
+        assert indices == list(range(len(indices))), (
+            f"chunk_index must be 0..N-1 contiguous; got {indices}"
+        )
+
 
 # ── Cache Invalidation (inode/mtime) ──────────────────────────────────
 
@@ -1560,9 +2377,9 @@ class TestCacheInvalidation:
         all_calls = captured["get"] + captured["create"]
         assert all_calls, "expected get_collection or create_collection to be called"
         for kwargs in all_calls:
-            assert (
-                "embedding_function" in kwargs
-            ), f"missing embedding_function= in chromadb call: {kwargs}"
+            assert "embedding_function" in kwargs, (
+                f"missing embedding_function= in chromadb call: {kwargs}"
+            )
             assert kwargs["embedding_function"] is not None
 
         # Same expectation on the create=False (cache-miss) reopen path.
@@ -1734,6 +2551,115 @@ class TestKGLazyCache:
         query_a = mcp_server.tool_kg_query(entity="alice_secret")
         assert query_a.get("count", 0) >= 1, f"tenant A lost its own fact: {query_a}"
 
+
+# ── Structured error codes + MineAlreadyRunning (#1552) ─────────────────
+
+
+class TestStructuredErrors:
+    """Verify that _internal_tool_error and MineAlreadyRunning return
+    machine-readable structured data (#1552)."""
+
+    def test_internal_tool_error_without_exc_has_no_data_field(self):
+        """Backward-compat: callers that omit exc still get a valid error dict."""
+        from mempalace.mcp_server import _internal_tool_error
+
+        try:
+            raise ValueError("test error")
+        except ValueError:
+            resp = _internal_tool_error("req-1", "mempalace_search")
+
+        assert resp["jsonrpc"] == "2.0"
+        assert resp["id"] == "req-1"
+        err = resp["error"]
+        assert err["code"] == -32000
+        assert err["message"] == "Internal tool error"
+        assert "data" not in err
+
+    def test_internal_tool_error_with_exc_includes_structured_data(self):
+        """When exc is supplied, the error body must include data.error_class
+        and data.message so callers can distinguish error types (#1552)."""
+        from mempalace.mcp_server import _internal_tool_error
+
+        exc = RuntimeError("chromadb cold init wedge")
+        try:
+            raise exc
+        except RuntimeError:
+            resp = _internal_tool_error("req-2", "mempalace_add_drawer", exc)
+
+        err = resp["error"]
+        assert err["code"] == -32000
+        assert "data" in err
+        assert err["data"]["error_class"] == "RuntimeError"
+        assert "chromadb cold init wedge" in err["data"]["message"]
+
+    def test_internal_tool_error_exception_dispatch_passes_exc(self, monkeypatch):
+        """handle_request's Exception branch must pass exc to _internal_tool_error."""
+        from mempalace import mcp_server
+
+        captured = {}
+
+        def fake_handler(**kwargs):
+            raise OSError("fake disk error")
+
+        fake_tool_entry = {
+            "handler": fake_handler,
+            "input_schema": {"type": "object", "properties": {}},
+        }
+        monkeypatch.setattr(
+            mcp_server,
+            "TOOLS",
+            {"mempalace_fake": fake_tool_entry},
+        )
+
+        original = mcp_server._internal_tool_error
+
+        def spy_error(req_id, tool_name, exc=None):
+            captured["exc"] = exc
+            return original(req_id, tool_name, exc)
+
+        monkeypatch.setattr(mcp_server, "_internal_tool_error", spy_error)
+
+        req = {
+            "jsonrpc": "2.0",
+            "id": "r1",
+            "method": "tools/call",
+            "params": {"name": "mempalace_fake", "arguments": {}},
+        }
+        resp = mcp_server.handle_request(req)
+        assert resp["error"]["code"] == -32000
+        assert isinstance(captured.get("exc"), OSError)
+        assert "data" in resp["error"]
+        assert resp["error"]["data"]["error_class"] == "OSError"
+
+    def test_tool_sync_mine_already_running_returns_error_class(self, monkeypatch, tmp_path):
+        """tool_sync MineAlreadyRunning path returns error_class: LockHeldByOtherProcess."""
+        from mempalace import mcp_server
+        from mempalace.palace import MineAlreadyRunning
+
+        cfg = MagicMock()
+        cfg.palace_path = str(tmp_path / "palace")
+        monkeypatch.setattr(mcp_server, "_config", cfg)
+        monkeypatch.setattr(mcp_server, "_get_kg", lambda *a, **kw: MagicMock())
+
+        def _raise_locked(*args, **kwargs):
+            raise MineAlreadyRunning("pid=12345")
+
+        import mempalace.sync as sync_mod
+
+        monkeypatch.setattr(sync_mod, "sync_palace", _raise_locked, raising=False)
+
+        result = mcp_server.tool_sync()
+        assert result["success"] is False
+        assert "another mine is in progress" in result["error"]
+        assert result.get("error_class") == "LockHeldByOtherProcess"
+
+    def test_mcp_idle_timeout_invalid_env_disables_watchdog(self, monkeypatch):
+        """Invalid MEMPALACE_MCP_IDLE_HOURS disables idle auto-exit."""
+        from mempalace import mcp_server
+
+        monkeypatch.setenv("MEMPALACE_MCP_IDLE_HOURS", "not-a-float")
+        assert mcp_server._mcp_idle_timeout_secs() == 0.0
+
     def test_cache_thread_safe(self, tmp_path, monkeypatch):
         """Concurrent _get_kg() for the same path yields one instance."""
         import concurrent.futures
@@ -1810,7 +2736,7 @@ class TestKGLazyCache:
             def query_entity(self, entity, **kwargs):
                 return [{"entity": entity}]
 
-        cache = {os.path.abspath(path): _ClosedKG()}
+        cache = {mcp_server._canonicalize_kg_path(path): _ClosedKG()}
         monkeypatch.setattr(mcp_server, "_kg_by_path", cache)
 
         # Second _get_kg() call (after the cache eviction) constructs a new
@@ -1820,7 +2746,7 @@ class TestKGLazyCache:
         result = mcp_server._call_kg(lambda kg: kg.query_entity("Alice"))
         assert result == [{"entity": "Alice"}]
         # The closed instance must be evicted; the fresh one must be cached.
-        assert isinstance(cache[os.path.abspath(path)], _FreshKG)
+        assert isinstance(cache[mcp_server._canonicalize_kg_path(path)], _FreshKG)
 
     def test_call_kg_does_not_retry_on_other_errors(self, monkeypatch):
         """Non-ProgrammingError exceptions must propagate without retry —
@@ -1837,7 +2763,9 @@ class TestKGLazyCache:
                 calls["count"] += 1
                 raise ValueError("bad input")
 
-        monkeypatch.setattr(mcp_server, "_kg_by_path", {os.path.abspath(path): _FailingKG()})
+        monkeypatch.setattr(
+            mcp_server, "_kg_by_path", {mcp_server._canonicalize_kg_path(path): _FailingKG()}
+        )
         monkeypatch.setattr(mcp_server, "KnowledgeGraph", lambda **_: _FailingKG())
 
         with pytest.raises(ValueError, match="bad input"):
@@ -1868,6 +2796,175 @@ class TestKGLazyCache:
         with pytest.raises(_sqlite3.ProgrammingError):
             mcp_server._call_kg(lambda kg: kg.query_entity("Alice"))
         assert calls["count"] == 2, "expected exactly one retry beyond the initial attempt"
+
+    def test_call_kg_passes_captured_path_through_resolve_drift(self, monkeypatch):
+        """``_call_kg`` must thread its captured canonical path through
+        ``_get_kg`` so insertion and eviction agree on the cache key even
+        when FS or env state would otherwise drift between attempts. The
+        end-to-end invariant: after the retry, the closed handle that was
+        cached under the captured path is gone (evicted) and the cache no
+        longer holds it under the stale key.
+        """
+        import sqlite3 as _sqlite3
+        from mempalace import mcp_server
+
+        class _ClosedKG:
+            def query_entity(self, entity, **kwargs):
+                raise _sqlite3.ProgrammingError("Cannot operate on a closed database")
+
+        class _FreshKG:
+            def query_entity(self, entity, **kwargs):
+                return [{"entity": entity}]
+
+        # _resolve_kg_path returns shifting values (env rotation between
+        # attempts). _canonicalize_kg_path is identity so paths flow
+        # through verbatim.
+        resolved_seq = iter(["/path/v1", "/path/v2", "/path/v3"])
+        monkeypatch.setattr(mcp_server, "_resolve_kg_path", lambda: next(resolved_seq))
+        monkeypatch.setattr(mcp_server, "_canonicalize_kg_path", lambda p: p)
+
+        closed = _ClosedKG()
+        cache = {"/path/v1": closed}
+        monkeypatch.setattr(mcp_server, "_kg_by_path", cache)
+
+        get_kg_args: list = []
+
+        def spy_get_kg(canonical_path=None):
+            get_kg_args.append(canonical_path)
+            return cache.get(canonical_path) if canonical_path in cache else _FreshKG()
+
+        monkeypatch.setattr(mcp_server, "_get_kg", spy_get_kg)
+
+        result = mcp_server._call_kg(lambda kg: kg.query_entity("Alice"))
+
+        assert result == [{"entity": "Alice"}]
+        # Both _get_kg calls received the captured path "/path/v1" rather
+        # than the drifted "/path/v2". Without pass-through, the second
+        # call would have used "/path/v2" and the closed handle at
+        # "/path/v1" would never have been evicted.
+        assert get_kg_args == ["/path/v1", "/path/v1"], (
+            f"expected both _get_kg calls to receive captured '/path/v1', "
+            f"got {get_kg_args} -- captured-path pass-through broken"
+        )
+        # Eviction landed under the captured key: the closed handle is
+        # gone from the cache. With drift the closed handle would still
+        # be at "/path/v1" because eviction would have probed "/path/v2".
+        assert "/path/v1" not in cache, (
+            f"closed handle leaked under captured key after retry; "
+            f"cache state: {[(k, type(v).__name__) for k, v in cache.items()]}"
+        )
+
+    def test_call_kg_oserror_at_top_propagates_unmasked(self, monkeypatch):
+        """``OSError`` from ``_canonicalize_kg_path`` at the top of
+        ``_call_kg`` (e.g. transient Windows realpath hiccup on a stale
+        junction) must propagate unchanged. The fix-rationale invariant:
+        capturing the canonical path before the retry loop means an FS
+        error surfaces cleanly to the dispatcher's exception envelope
+        instead of getting raised inside the ``except`` branch where it
+        would mask a ``sqlite3.ProgrammingError``.
+        """
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "_resolve_kg_path", lambda: "/fake/path")
+        monkeypatch.setattr(
+            mcp_server,
+            "_canonicalize_kg_path",
+            lambda p: (_ for _ in ()).throw(OSError("simulated realpath failure")),
+        )
+
+        op_calls = {"n": 0}
+
+        def op(kg):
+            op_calls["n"] += 1
+            return None
+
+        with pytest.raises(OSError, match="simulated realpath failure"):
+            mcp_server._call_kg(op)
+        assert op_calls["n"] == 0, "op must not run if canonicalize fails at top"
+
+    def test_canonicalize_kg_path_collapses_symlink_alias(self, tmp_path):
+        """A symlink layer over the palace directory must collapse to one
+        cache key — otherwise two tenants pointing at /srv/A and
+        /srv/link-to-A open duplicate sqlite3.Connections over the same
+        file."""
+        if sys.platform == "win32":
+            pytest.skip("symlink creation requires admin privileges on Windows runners")
+
+        from mempalace import mcp_server
+
+        target = tmp_path / "real"
+        target.mkdir()
+        link = tmp_path / "link"
+        link.symlink_to(target)
+
+        real_db = str(target / "knowledge_graph.sqlite3")
+        link_db = str(link / "knowledge_graph.sqlite3")
+
+        assert mcp_server._canonicalize_kg_path(real_db) == mcp_server._canonicalize_kg_path(
+            link_db
+        )
+
+    def test_canonicalize_kg_path_routes_through_normcase(self, monkeypatch):
+        """``_canonicalize_kg_path`` must apply ``os.path.normcase`` so the
+        cache key collapses Windows drive-letter casing
+        (``C:\\palace`` vs ``c:\\palace``). On POSIX runners normcase is a
+        no-op, so we patch both ``realpath`` and ``normcase`` with sentinel
+        wrappers and assert the helper composes them as
+        ``normcase(realpath(p))`` -- swapping the order would leave Windows
+        symlinks under the original case, defeating the dedup.
+        """
+        from mempalace import mcp_server
+
+        def fake_realpath(p: str) -> str:
+            return f"<RP:{p}>"
+
+        def fake_normcase(p: str) -> str:
+            return f"<NC:{p}>"
+
+        monkeypatch.setattr(os.path, "realpath", fake_realpath)
+        monkeypatch.setattr(os.path, "normcase", fake_normcase)
+
+        result = mcp_server._canonicalize_kg_path("/some/Path/KG.sqlite3")
+
+        assert result == "<NC:<RP:/some/Path/KG.sqlite3>>", (
+            f"expected normcase(realpath(p)) composition, got {result!r}"
+        )
+
+    def test_get_kg_dedupes_symlink_alias_end_to_end(self, tmp_path, monkeypatch):
+        """End-to-end: two ``_get_kg()`` calls via different symlink layers
+        return the same cached instance and construct only one
+        ``KnowledgeGraph``."""
+        if sys.platform == "win32":
+            pytest.skip("symlink creation requires admin privileges on Windows runners")
+
+        from mempalace import mcp_server
+
+        target = tmp_path / "real"
+        target.mkdir()
+        link = tmp_path / "link"
+        link.symlink_to(target)
+
+        real_db = str(target / "knowledge_graph.sqlite3")
+        link_db = str(link / "knowledge_graph.sqlite3")
+
+        constructed: list = []
+
+        class _StubKG:
+            def __init__(self, db_path=None):
+                constructed.append(db_path)
+
+        monkeypatch.setattr(mcp_server, "_kg_by_path", {})
+        monkeypatch.setattr(mcp_server, "KnowledgeGraph", _StubKG)
+
+        paths = iter([real_db, link_db])
+        monkeypatch.setattr(mcp_server, "_resolve_kg_path", lambda: next(paths))
+
+        kg1 = mcp_server._get_kg()
+        kg2 = mcp_server._get_kg()
+
+        assert kg1 is kg2, "symlink alias must hit the cached KG, not construct a duplicate"
+        assert len(constructed) == 1, f"expected 1 KG construction, got {len(constructed)}"
+        assert len(mcp_server._kg_by_path) == 1
 
 
 # ── Param-shape diagnostics on tools/call dispatch (#1351) ──────────────
@@ -2009,3 +3106,105 @@ class TestParamShapeDiagnostics:
         assert resp["error"]["message"] == "Internal tool error"
         assert "'foo'" not in resp["error"]["message"]
         assert "some_helper" not in resp["error"]["message"]
+
+
+class TestUnknownParamName:
+    """A kwarg not in the tool schema (wrong parameter *name*, e.g. text=
+    instead of content=) should surface as JSON-RPC -32602 naming the
+    offending kwarg, instead of being silently dropped and resurfacing
+    indirectly as a later "Missing required 'X'". Symmetric with the
+    missing-required path in TestParamShapeDiagnostics. The internal
+    wait_for_previous transport kwarg must never be flagged, and
+    **kwargs pass-through handlers must keep accepting unknown kwargs.
+    """
+
+    def test_unknown_param_returns_32602_naming_the_wrong_kwarg(self):
+        from mempalace.mcp_server import handle_request
+
+        resp = handle_request(
+            {
+                "method": "tools/call",
+                "id": 7,
+                "params": {
+                    "name": "mempalace_add_drawer",
+                    "arguments": {"wing": "w", "room": "r", "text": "hello"},
+                },
+            }
+        )
+        assert resp["error"]["code"] == -32602
+        message = resp["error"]["message"]
+        assert "'text'" in message
+        assert "Unknown parameter" in message
+        assert "mempalace_add_drawer" in message
+        # Names the actual wrong kwarg, not the indirect missing-required symptom.
+        assert "Missing required" not in message
+
+    def test_two_unknown_params_list_both_names(self):
+        from mempalace.mcp_server import handle_request
+
+        resp = handle_request(
+            {
+                "method": "tools/call",
+                "id": 8,
+                "params": {
+                    "name": "mempalace_add_drawer",
+                    "arguments": {"wing": "w", "room": "r", "text": "a", "bogus": "b"},
+                },
+            }
+        )
+        assert resp["error"]["code"] == -32602
+        message = resp["error"]["message"]
+        assert "parameters" in message
+        assert "'text'" in message
+        assert "'bogus'" in message
+
+    def test_wait_for_previous_not_flagged_as_unknown(self, monkeypatch):
+        """wait_for_previous is an internal transport kwarg in no tool schema;
+        it is popped before dispatch and must not trip the unknown-param check
+        for a normal (non-**kwargs) handler.
+        """
+        from mempalace import mcp_server
+
+        def stub(agent_name, entry, topic="general"):
+            return {"ok": True, "agent": agent_name}
+
+        monkeypatch.setitem(mcp_server.TOOLS["mempalace_diary_write"], "handler", stub)
+
+        resp = mcp_server.handle_request(
+            {
+                "method": "tools/call",
+                "id": 9,
+                "params": {
+                    "name": "mempalace_diary_write",
+                    "arguments": {
+                        "agent_name": "x",
+                        "entry": "y",
+                        "wait_for_previous": True,
+                    },
+                },
+            }
+        )
+        assert "error" not in resp
+        assert "result" in resp
+
+    def test_kwargs_passthrough_handler_keeps_accepting_unknown(self, monkeypatch):
+        """Handlers that explicitly accept **kwargs (per #684) bypass the
+        schema filter entirely, so an unknown kwarg must still pass through
+        rather than being rejected as -32602.
+        """
+        from mempalace import mcp_server
+
+        def passthrough(**kwargs):
+            return {"ok": True, "got": sorted(kwargs)}
+
+        monkeypatch.setitem(mcp_server.TOOLS["mempalace_status"], "handler", passthrough)
+
+        resp = mcp_server.handle_request(
+            {
+                "method": "tools/call",
+                "id": 10,
+                "params": {"name": "mempalace_status", "arguments": {"bogus": 1}},
+            }
+        )
+        assert "error" not in resp
+        assert "result" in resp

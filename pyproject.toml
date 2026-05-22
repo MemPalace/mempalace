@@ -51,7 +51,7 @@ chroma = "mempalace.backends.chroma:ChromaBackend"
 [project.entry-points."mempalace.sources"]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "pytest-cov>=4.0", "ruff>=0.4.0", "psutil>=5.9"]
+dev = ["pytest>=7.0", "pytest-cov>=4.0", "ruff==0.15.9", "psutil>=5.9"]
 spellcheck = ["autocorrect>=2.0"]
 # Hardware acceleration for the ONNX embedding model. Install exactly one:
 #   pip install mempalace[gpu]       — NVIDIA CUDA
@@ -61,9 +61,24 @@ spellcheck = ["autocorrect>=2.0"]
 gpu = ["onnxruntime-gpu>=1.16"]
 dml = ["onnxruntime-directml>=1.16"]
 coreml = ["onnxruntime>=1.16"]
+# Binary-format extraction for `mempalace mine --mode extract`. Per-format
+# transformer routing: striprtf for .rtf, MarkItDown for .pdf/.docx/.pptx/
+# .xlsx/.epub. MarkItDown requires Python ≥ 3.10 (env marker ensures it
+# only installs where supported; Python 3.9 users still get RTF coverage).
+extract = [
+    "striprtf>=0.0.27",
+    # Per PR #1555 review (Igor): bare ``markitdown`` is enough to import
+    # but not enough to convert — actual PDF/DOCX/PPTX/XLSX extraction
+    # needs MarkItDown's per-format sub-extras, which pull pdfminer-six,
+    # mammoth, python-pptx, openpyxl, etc. EPUB is handled by base
+    # markitdown (EpubConverter uses beautifulsoup4, a base requirement),
+    # so no [epub] sub-extra is needed (and none exists in 0.1.5). RTF is
+    # covered by striprtf above.
+    "markitdown[docx,pdf,pptx,xlsx]>=0.1.5; python_version >= '3.10'",
+]
 
 [dependency-groups]
-dev = ["pytest>=7.0", "pytest-cov>=4.0", "ruff>=0.4.0", "psutil>=5.9"]
+dev = ["pytest>=7.0", "pytest-cov>=4.0", "ruff==0.15.9", "psutil>=5.9"]
 
 [build-system]
 requires = ["hatchling"]

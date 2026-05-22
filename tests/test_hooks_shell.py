@@ -123,13 +123,13 @@ class TestMempalPythonOverride:
             {"session_id": "abc", "stop_hook_active": False, "transcript_path": ""},
             env_overrides={"MEMPAL_PYTHON": str(fake), "HOME": str(tmp_path)},
         )
-        assert (
-            result.returncode == 0
-        ), f"hook exited non-zero: stderr={result.stderr!r} stdout={result.stdout!r}"
+        assert result.returncode == 0, (
+            f"hook exited non-zero: stderr={result.stderr!r} stdout={result.stdout!r}"
+        )
         invocations = marker.read_text().splitlines() if marker.exists() else []
-        assert (
-            "override_python" in invocations
-        ), f"MEMPAL_PYTHON override was not used. Marker log: {invocations!r}"
+        assert "override_python" in invocations, (
+            f"MEMPAL_PYTHON override was not used. Marker log: {invocations!r}"
+        )
 
     def test_ignores_override_when_not_executable(self, tmp_path):
         """If MEMPAL_PYTHON is set but the file isn't executable, the
@@ -143,9 +143,9 @@ class TestMempalPythonOverride:
             {"session_id": "abc", "stop_hook_active": False, "transcript_path": ""},
             env_overrides={"MEMPAL_PYTHON": str(bogus), "HOME": str(tmp_path)},
         )
-        assert (
-            result.returncode == 0
-        ), f"hook crashed on non-executable MEMPAL_PYTHON: {result.stderr!r}"
+        assert result.returncode == 0, (
+            f"hook crashed on non-executable MEMPAL_PYTHON: {result.stderr!r}"
+        )
 
     def test_falls_back_to_path_when_unset(self, tmp_path):
         """With MEMPAL_PYTHON unset, the hook uses whatever ``python3``
@@ -165,6 +165,6 @@ class TestMempalPythonOverride:
         )
         assert result.returncode == 0
         invocations = marker.read_text().splitlines() if marker.exists() else []
-        assert (
-            "python3" in invocations
-        ), f"fallback-to-PATH did not use the shimmed python3. Marker log: {invocations!r}"
+        assert "python3" in invocations, (
+            f"fallback-to-PATH did not use the shimmed python3. Marker log: {invocations!r}"
+        )

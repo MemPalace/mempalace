@@ -155,7 +155,7 @@ def test_direct_address_key_is_singular_string_for_all_locales():
         )
         if "direct_address_pattern" in section:
             val = section["direct_address_pattern"]
-            assert isinstance(
-                val, str
-            ), f"{lang}: 'direct_address_pattern' must be str, got {type(val).__name__}"
+            assert isinstance(val, str), (
+                f"{lang}: 'direct_address_pattern' must be str, got {type(val).__name__}"
+            )
             assert val, f"{lang}: 'direct_address_pattern' is empty"

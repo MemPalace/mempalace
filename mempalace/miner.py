@@ -22,6 +22,7 @@ from typing import Optional
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
+    _open_collection_or_explain,
     build_closet_lines,
     file_already_mined,
     get_closets_collection,
@@ -31,6 +32,12 @@ from .palace import (
     purge_file_closets,
     upsert_closet_lines,
 )
+
+# Module-level import so tests can patch it as
+# ``mempalace.miner.compute_hallways_for_wing``. The integration call
+# lives at the end of _mine_impl, alongside the existing
+# ``_compute_topic_tunnels_for_wing`` post-mine block.
+from .hallways import compute_hallways_for_wing
 
 logger = logging.getLogger("mempalace_mcp")
 
@@ -70,18 +77,32 @@ SKIP_FILENAMES = {
     "yarn.lock",
 }
 
-CHUNK_SIZE = 800  # chars per drawer
-CHUNK_OVERLAP = 100  # overlap between chunks
-MIN_CHUNK_SIZE = 50  # skip tiny chunks
+# Re-export the shared defaults from ``config`` so legacy callers that
+# import ``CHUNK_SIZE`` / ``CHUNK_OVERLAP`` / ``MIN_CHUNK_SIZE`` from
+# ``mempalace.miner`` keep working unchanged. Single source of truth
+# lives in ``config.DEFAULT_CHUNK_*``.
+from .config import (  # noqa: E402  (kept here for the legacy alias)
+    DEFAULT_CHUNK_SIZE as CHUNK_SIZE,
+    DEFAULT_CHUNK_OVERLAP as CHUNK_OVERLAP,
+    DEFAULT_MIN_CHUNK_SIZE as MIN_CHUNK_SIZE,
+)
+
 DRAWER_UPSERT_BATCH_SIZE = 1000
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB — skip files larger than this.
-# A single file producing more chunks than this is almost always a generated
-# artifact (CSV/JSON dump, lockfile not in SKIP_FILENAMES, etc.). Embedding
-# thousands of chunks from one file in one batch has triggered ONNX runtime
-# `bad allocation` errors on Windows (#1296). The cap is conservative: a
-# 500-chunk file at CHUNK_SIZE=800 is ~400 KB of source, which covers most
-# legitimate hand-written content while bounding the worst-case batch.
-MAX_CHUNKS_PER_FILE = 500
+# A safety rail against pathological generated artifacts (lockfiles not in
+# SKIP_FILENAMES, vendored data dumps, etc.). Originally 500 to bound ONNX
+# runtime `bad allocation` errors on Windows (#1296), but at CHUNK_SIZE=800
+# that capped legitimate long-form content (#1455: full-text scholarly
+# editions, novels) at ~400 KB. The new default leaves two orders of
+# magnitude of safety margin against the original lockfile case
+# (~1124 chunks for `pnpm-lock.yaml` per #1296) while not touching
+# hand-written prose. Per-ONNX-call exposure is bounded by
+# `DRAWER_UPSERT_BATCH_SIZE` (1000 chunks/batch) regardless of this cap,
+# so the cap is a per-file admission rail, not a per-batch limit. Lower
+# this via `MEMPALACE_MAX_CHUNKS_PER_FILE` or
+# `mempalace mine --max-chunks-per-file N` if you hit ONNX bad_alloc on
+# Windows; set to 0 to disable the cap entirely.
+MAX_CHUNKS_PER_FILE = 50_000
 # Long Claude Code sessions and large transcript exports routinely exceed
 # 10 MB. The cap exists as a defensive rail against pathological binary
 # files, not as a limit on legitimate text. Per-drawer size is bounded
@@ -89,6 +110,48 @@ MAX_CHUNKS_PER_FILE = 500
 # drawers and therefore more storage, embedding, and processing work —
 # and file reads are not streamed (the whole content is loaded into
 # memory before chunking), so memory use scales with source size too.
+
+
+def _resolve_max_chunks_per_file(override: Optional[int] = None) -> int:
+    """Resolve the effective per-file chunk cap.
+
+    Precedence: ``override`` (CLI flag) > ``MEMPALACE_MAX_CHUNKS_PER_FILE``
+    env var > module-level ``MAX_CHUNKS_PER_FILE`` default. A sentinel
+    value of ``0`` (from any source) disables the cap entirely. Negative
+    values from either source emit a stderr warning and fall back to the
+    module default so a misconfigured ``--max-chunks-per-file=-500`` typo
+    (meaning "no, don't lower it that much") does not silently disable
+    the cap and OOM on a generated artifact.
+    """
+    if override is not None:
+        if override < 0:
+            print(
+                f"  ! WARNING: --max-chunks-per-file={override} is negative; "
+                f"using default {MAX_CHUNKS_PER_FILE}",
+                file=sys.stderr,
+            )
+            return MAX_CHUNKS_PER_FILE
+        return int(override)
+    raw = os.environ.get("MEMPALACE_MAX_CHUNKS_PER_FILE")
+    if raw is None:
+        return MAX_CHUNKS_PER_FILE
+    try:
+        val = int(raw)
+    except ValueError:
+        print(
+            f"  ! WARNING: MEMPALACE_MAX_CHUNKS_PER_FILE={raw!r} is not an integer; "
+            f"using default {MAX_CHUNKS_PER_FILE}",
+            file=sys.stderr,
+        )
+        return MAX_CHUNKS_PER_FILE
+    if val < 0:
+        print(
+            f"  ! WARNING: MEMPALACE_MAX_CHUNKS_PER_FILE={val} is negative; "
+            f"using default {MAX_CHUNKS_PER_FILE}",
+            file=sys.stderr,
+        )
+        return MAX_CHUNKS_PER_FILE
+    return val
 
 
 # =============================================================================
@@ -402,12 +465,48 @@ def detect_room(filepath: Path, content: str, rooms: list, project_path: Path) -
 # =============================================================================
 
 
-def chunk_text(content: str, source_file: str) -> list:
+def chunk_text(
+    content: str,
+    source_file: str,
+    chunk_size: int = None,
+    chunk_overlap: int = None,
+    min_chunk_size: int = None,
+) -> list:
     """
     Split content into drawer-sized chunks.
     Tries to split on paragraph/line boundaries.
     Returns list of {"content": str, "chunk_index": int}
+
+    Optional params override module-level defaults when provided.
     """
+    if chunk_size is None:
+        chunk_size = CHUNK_SIZE
+    if chunk_overlap is None:
+        chunk_overlap = CHUNK_OVERLAP
+    if min_chunk_size is None:
+        min_chunk_size = MIN_CHUNK_SIZE
+
+    # Defensive invariant guard. ``MempalaceConfig.chunk_*`` already
+    # enforces these and falls back to defaults on bad config.json
+    # values, but ``chunk_text`` is a public function — direct callers
+    # (tests, library users, future caller paths) might still pass
+    # values that would loop forever. Fail fast and loud rather than
+    # hang. See review feedback on #1024.
+    if not isinstance(chunk_size, int) or chunk_size <= 0:
+        raise ValueError(f"chunk_size must be a positive int, got {chunk_size!r}")
+    if not isinstance(chunk_overlap, int) or chunk_overlap < 0:
+        raise ValueError(f"chunk_overlap must be a non-negative int, got {chunk_overlap!r}")
+    if chunk_overlap >= chunk_size:
+        # ``start = end - chunk_overlap`` would not advance (or would go
+        # backward) when overlap >= size, producing an infinite loop on
+        # any non-empty input.
+        raise ValueError(
+            f"chunk_overlap ({chunk_overlap}) must be less than chunk_size "
+            f"({chunk_size}); equality or greater would loop forever"
+        )
+    if not isinstance(min_chunk_size, int) or min_chunk_size < 0:
+        raise ValueError(f"min_chunk_size must be a non-negative int, got {min_chunk_size!r}")
+
     # Clean up
     content = content.strip()
     if not content:
@@ -418,20 +517,20 @@ def chunk_text(content: str, source_file: str) -> list:
     chunk_index = 0
 
     while start < len(content):
-        end = min(start + CHUNK_SIZE, len(content))
+        end = min(start + chunk_size, len(content))
 
         # Try to break at paragraph boundary
         if end < len(content):
             newline_pos = content.rfind("\n\n", start, end)
-            if newline_pos > start + CHUNK_SIZE // 2:
+            if newline_pos > start + chunk_size // 2:
                 end = newline_pos
             else:
                 newline_pos = content.rfind("\n", start, end)
-                if newline_pos > start + CHUNK_SIZE // 2:
+                if newline_pos > start + chunk_size // 2:
                     end = newline_pos
 
         chunk = content[start:end].strip()
-        if len(chunk) >= MIN_CHUNK_SIZE:
+        if len(chunk) >= min_chunk_size:
             chunks.append(
                 {
                     "content": chunk,
@@ -440,7 +539,7 @@ def chunk_text(content: str, source_file: str) -> list:
             )
             chunk_index += 1
 
-        start = end - CHUNK_OVERLAP if end < len(content) else end
+        start = end - chunk_overlap if end < len(content) else end
 
     return chunks
 
@@ -741,7 +840,11 @@ def _extract_entities_for_metadata(content: str) -> str:
 
     known = _load_known_entities()
     for name in known:
-        if re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", content):
+        # Case-insensitive match — mirrors entity_detector.py's init-time
+        # behavior so a known entity like "Aya" tags drawers that mention
+        # "aya" / "AYA" / "Aya". Without re.IGNORECASE, lowercase mentions
+        # in chat transcripts and voice-typed content get silently untagged.
+        if re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", content, re.IGNORECASE):
             matched.add(name)
 
     from .palace import _candidate_entity_words
@@ -836,36 +939,63 @@ def process_file(
     agent: str,
     dry_run: bool,
     closets_col=None,
+    chunk_size: int = None,
+    chunk_overlap: int = None,
+    min_chunk_size: int = None,
+    max_chunks_per_file: Optional[int] = None,
 ) -> tuple:
-    """Read, chunk, route, and file one file. Returns (drawer_count, room_name)."""
+    """Read, chunk, route, and file one file.
+
+    Returns ``(drawer_count, room_name, skip_reason)``. ``skip_reason`` is
+    ``None`` on success and on every non-chunk-cap skip path: already
+    filed (pre- or post-lock re-check), unreadable (``OSError``), or
+    too-short content (below ``min_chunk_size``). It is ``"chunk_cap"``
+    when the per-file chunk cap aborted the file. Callers use the tag to
+    surface a separate counter in the mine summary (see #1455).
+    """
+    effective_min = min_chunk_size if min_chunk_size is not None else MIN_CHUNK_SIZE
 
     # Skip if already filed
     source_file = str(filepath)
     if not dry_run and file_already_mined(collection, source_file, check_mtime=True):
-        return 0, "general"
+        return 0, "general", None
 
     try:
         content = filepath.read_text(encoding="utf-8", errors="replace")
     except OSError:
-        return 0, "general"
+        return 0, "general", None
 
     content = content.strip()
-    if len(content) < MIN_CHUNK_SIZE:
-        return 0, "general"
+    if len(content) < effective_min:
+        return 0, "general", None
 
     room = detect_room(filepath, content, rooms, project_path)
-    chunks = chunk_text(content, source_file)
+    chunks = chunk_text(
+        content,
+        source_file,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        min_chunk_size=min_chunk_size,
+    )
 
-    if len(chunks) > MAX_CHUNKS_PER_FILE:
+    effective_cap = _resolve_max_chunks_per_file(max_chunks_per_file)
+    if effective_cap > 0 and len(chunks) > effective_cap:
+        # Skip notice goes to stderr alongside the existing symlink-skip
+        # warning style (see ``scan_project``'s ``SKIP: <rel> (symlink)``
+        # line). This keeps ``mempalace mine ... > out.log 2> err.log``
+        # piping coherent: degraded outcomes on stderr, progress on stdout.
         print(
             f"  ! [skip] {filepath.name[:50]:50} produced {len(chunks)} chunks "
-            f"(> {MAX_CHUNKS_PER_FILE}); add to SKIP_FILENAMES or .gitignore"
+            f"(> {effective_cap}); raise via --max-chunks-per-file or "
+            f"MEMPALACE_MAX_CHUNKS_PER_FILE (set 0 to disable), or add to "
+            f"SKIP_FILENAMES if this is a generated artifact",
+            file=sys.stderr,
         )
-        return 0, room
+        return 0, room, "chunk_cap"
 
     if dry_run:
         print(f"    [DRY RUN] {filepath.name} -> room:{room} ({len(chunks)} drawers)")
-        return len(chunks), room
+        return len(chunks), room, None
 
     # Lock this file so concurrent agents don't interleave delete+insert.
     # Without the lock, two agents can both pass file_already_mined(),
@@ -873,7 +1003,7 @@ def process_file(
     with mine_lock(source_file):
         # Re-check after acquiring lock — another agent may have just finished
         if file_already_mined(collection, source_file, check_mtime=True):
-            return 0, room
+            return 0, room, None
 
         # Purge stale drawers for this file before re-inserting the fresh chunks.
         # Converts modified-file re-mines from upsert-over-existing-IDs (which hits
@@ -947,7 +1077,7 @@ def process_file(
             purge_file_closets(closets_col, source_file)
             upsert_closet_lines(closets_col, closet_id_base, closet_lines, closet_meta)
 
-    return drawers_added, room
+    return drawers_added, room, None
 
 
 # =============================================================================
@@ -960,7 +1090,12 @@ def scan_project(
     respect_gitignore: bool = True,
     include_ignored: list = None,
 ) -> list:
-    """Return list of all readable file paths."""
+    """Return list of all readable file paths under ``project_dir``.
+
+    Skips symlinks and oversized files. Each skipped symlink is logged to
+    ``sys.stderr`` with a ``  SKIP: <relative-path> (symlink)`` line so the
+    caller can tell why a directory looks empty after walking.
+    """
     project_path = Path(project_dir).expanduser().resolve()
     files = []
     active_matchers = []
@@ -1008,6 +1143,11 @@ def scan_project(
                     continue
             # Skip symlinks — prevents following links to /dev/urandom, etc.
             if filepath.is_symlink():
+                rel = filepath.relative_to(project_path).as_posix()
+                try:
+                    print(f"  SKIP: {rel} (symlink)", file=sys.stderr)
+                except OSError:
+                    pass
                 continue
             # Skip files exceeding size limit
             try:
@@ -1034,6 +1174,7 @@ def mine(
     respect_gitignore: bool = True,
     include_ignored: list = None,
     files: list = None,
+    max_chunks_per_file: Optional[int] = None,
 ):
     """Mine a project directory into the palace.
 
@@ -1042,8 +1183,12 @@ def mine(
     caller (e.g. ``init`` showing a file-count estimate before the mine
     prompt) avoids walking the tree twice. When ``None`` (the default),
     ``mine`` walks the tree itself just like before.
-    """
 
+    ``max_chunks_per_file`` overrides the per-file chunk cap (see
+    :func:`_resolve_max_chunks_per_file`). ``None`` defers to
+    ``MEMPALACE_MAX_CHUNKS_PER_FILE`` or ``MAX_CHUNKS_PER_FILE``; ``0``
+    disables the cap entirely (#1455).
+    """
     if dry_run:
         return _mine_impl(
             project_dir,
@@ -1055,6 +1200,7 @@ def mine(
             respect_gitignore=respect_gitignore,
             include_ignored=include_ignored,
             files=files,
+            max_chunks_per_file=max_chunks_per_file,
         )
 
     # MineAlreadyRunning propagates so the CLI can render a clear holder-aware
@@ -1071,6 +1217,7 @@ def mine(
             respect_gitignore=respect_gitignore,
             include_ignored=include_ignored,
             files=files,
+            max_chunks_per_file=max_chunks_per_file,
         )
 
 
@@ -1084,9 +1231,17 @@ def _mine_impl(
     respect_gitignore: bool = True,
     include_ignored: list = None,
     files: list = None,
+    max_chunks_per_file: Optional[int] = None,
 ):
+    from .config import MempalaceConfig
+
     project_path = Path(project_dir).expanduser().resolve()
     config = load_config(project_dir)
+    palace_config = MempalaceConfig()
+
+    cfg_chunk_size = palace_config.chunk_size
+    cfg_chunk_overlap = palace_config.chunk_overlap
+    cfg_min_chunk_size = palace_config.min_chunk_size
 
     wing = wing_override or config["wing"]
     rooms = config.get("rooms", [{"name": "general", "description": "All project files"}])
@@ -1127,14 +1282,16 @@ def _mine_impl(
 
     total_drawers = 0
     files_skipped = 0
+    files_skipped_chunk_cap = 0
     files_processed = 0
     last_file = None
     room_counts = defaultdict(int)
+    effective_chunk_cap = _resolve_max_chunks_per_file(max_chunks_per_file)
 
     try:
         for i, filepath in enumerate(files, 1):
             try:
-                drawers, room = process_file(
+                drawers, room, skip_reason = process_file(
                     filepath=filepath,
                     project_path=project_path,
                     collection=collection,
@@ -1143,6 +1300,14 @@ def _mine_impl(
                     agent=agent,
                     dry_run=dry_run,
                     closets_col=closets_col,
+                    chunk_size=cfg_chunk_size,
+                    chunk_overlap=cfg_chunk_overlap,
+                    min_chunk_size=cfg_min_chunk_size,
+                    # Pass the already-resolved int so ``process_file``'s
+                    # ``override is not None`` branch skips the env re-read;
+                    # otherwise a malformed env var would emit its warning
+                    # per file.
+                    max_chunks_per_file=effective_chunk_cap,
                 )
             except KeyboardInterrupt:
                 # Re-raise so the outer handler prints the summary; we
@@ -1151,8 +1316,15 @@ def _mine_impl(
                 raise
             files_processed = i
             last_file = filepath.name
-            if drawers == 0 and not dry_run:
+            # All zero-drawer outcomes increment ``files_skipped`` in both
+            # modes so the summary "Files processed" arithmetic and the
+            # residual-skip counter stay honest under ``--dry-run`` too. The
+            # chunk-cap counter is partitioned out for its dedicated
+            # summary line (see #1455 + Gemini review on PR #1554).
+            if drawers == 0:
                 files_skipped += 1
+                if skip_reason == "chunk_cap":
+                    files_skipped_chunk_cap += 1
             else:
                 total_drawers += drawers
                 room_counts[room] += 1
@@ -1175,10 +1347,60 @@ def _mine_impl(
                     file=sys.stderr,
                 )
 
+            # Within-wing hallways: link entities (people, projects, concepts)
+            # that co-occur in drawers across this wing's rooms. Mirrors the
+            # tunnel-compute fault-tolerance pattern — hallway computation
+            # must never fail a mine; it's a derived analytic, not load-bearing
+            # for the drawer write that already committed above.
+            try:
+                hallways_created = compute_hallways_for_wing(wing, col=collection)
+                if hallways_created:
+                    print(f"\n  Hallways: +{len(hallways_created)} within-wing entity link(s)")
+            except Exception as e:
+                print(
+                    f"\n  WARNING: hallway computation skipped — {e}",
+                    file=sys.stderr,
+                )
+
+            # Cross-wing entity tunnels: derived from the hallway records
+            # materialized just above. When an entity appears in hallways of
+            # this wing AND another wing, a tunnel bridges them. Runs in
+            # parallel with topic tunnels — both kinds coexist via
+            # ``kind="entity"`` / ``kind="topic"``. Same fault-tolerance
+            # pattern: never fail a mine over a derived analytic.
+            try:
+                entity_tunnels_added = _compute_entity_tunnels_for_wing(wing)
+                if entity_tunnels_added:
+                    print(f"\n  Entity tunnels: +{entity_tunnels_added} cross-wing entity link(s)")
+            except Exception as e:
+                print(
+                    f"\n  WARNING: entity tunnel computation skipped — {e}",
+                    file=sys.stderr,
+                )
+
         print(f"\n{'=' * 55}")
         print("  Done.")
         print(f"  Files processed: {len(files) - files_skipped}")
-        print(f"  Files skipped (already filed): {files_skipped}")
+        # The residual skip bucket label depends on mode: dry-run bypasses
+        # the already-mined check, so the only paths producing (0, room,
+        # None) under dry_run are OSError / too-short / post-lock re-check
+        # (and re-check itself is unreachable when nothing is being
+        # written). Outside dry_run, the dominant case is "already filed".
+        residual_label = (
+            "Files skipped (read error or too short)"
+            if dry_run
+            else "Files skipped (already filed or other)"
+        )
+        print(f"  {residual_label}: {max(0, files_skipped - files_skipped_chunk_cap)}")
+        if files_skipped_chunk_cap > 0:
+            # ``effective_chunk_cap`` is necessarily > 0 here: ``process_file``
+            # only emits the ``"chunk_cap"`` skip_reason when its own
+            # ``effective_cap > 0`` guard passes (see ``process_file``).
+            print(
+                f"  Files skipped (chunk cap {effective_chunk_cap}): {files_skipped_chunk_cap} "
+                f"(raise via --max-chunks-per-file or MEMPALACE_MAX_CHUNKS_PER_FILE; "
+                f"set 0 to disable)"
+            )
         print(f"  Drawers filed: {total_drawers}")
         print("\n  By room:")
         for room, count in sorted(room_counts.items(), key=lambda x: x[1], reverse=True):
@@ -1250,7 +1472,12 @@ def _cleanup_mine_pid_file() -> None:
         if not pid_file.exists():
             return
         recorded = pid_file.read_text().strip()
-        if recorded and recorded.isdigit() and int(recorded) == os.getpid():
+        # PID file format: "{pid} {unix_timestamp}" (timestamp added in
+        # #1552 for stale-by-age detection).  Old-format files (bare
+        # "{pid}") are also handled: split on whitespace and take the
+        # first token as the PID.
+        pid_token = recorded.split()[0] if recorded else ""
+        if pid_token and pid_token.isdigit() and int(pid_token) == os.getpid():
             pid_file.unlink()
     except OSError:
         # Best-effort cleanup; never fail the mine over PID bookkeeping.
@@ -1276,6 +1503,31 @@ def _compute_topic_tunnels_for_wing(wing: str) -> int:
     return len(created)
 
 
+def _compute_entity_tunnels_for_wing(wing: str) -> int:
+    """Drop tunnels between ``wing`` and every other wing that shares an
+    entity via the within-wing hallway primitive.
+
+    Reads hallway records (``mempalace.hallways.list_hallways``) and
+    materializes cross-wing tunnels for any entity that has hallways in
+    this wing AND at least one other wing. Tunnels use ``kind="entity"``
+    and the synthetic endpoint room ``entity:<name>`` so they're
+    distinguishable from explicit and topic tunnels at read time but
+    interchangeable with them via the standard ``list_tunnels`` /
+    ``follow_tunnels`` API.
+
+    Returns the number of tunnels created or refreshed. Zero means no
+    eligible entity exists in this wing yet (or no hallway records do).
+    """
+    from .hallways import list_hallways
+    from .palace_graph import entity_tunnels_for_wing
+
+    hallways = list_hallways()
+    if not hallways:
+        return 0
+    created = entity_tunnels_for_wing(wing, hallways)
+    return len(created)
+
+
 # =============================================================================
 # STATUS
 # =============================================================================
@@ -1283,11 +1535,8 @@ def _compute_topic_tunnels_for_wing(wing: str) -> int:
 
 def status(palace_path: str):
     """Show what's been filed in the palace."""
-    try:
-        col = get_collection(palace_path, create=False)
-    except Exception:
-        print(f"\n  No palace found at {palace_path}")
-        print("  Run: mempalace init <dir> then mempalace mine <dir>")
+    col = _open_collection_or_explain(palace_path)
+    if col is None:
         return
 
     # Count by wing and room — paginate to avoid SQLite "too many SQL

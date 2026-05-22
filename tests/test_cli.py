@@ -1,8 +1,10 @@
 """Tests for mempalace.cli — the main CLI dispatcher."""
 
 import argparse
+import os
 import shlex
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
@@ -22,6 +24,68 @@ from mempalace.cli import (
     cmd_wakeup,
     main,
 )
+
+
+# ── CLI entry point: PYTHONPATH stripping ────────────────────────────────
+
+
+_LEAK_PREFIX = "/__mempalace_cli_leak_sentinel__"
+
+
+def test_cli_main_strips_leaked_pythonpath_from_env():
+    """mempalace.cli:main must drop PYTHONPATH from the process env so
+    any subprocess the CLI spawns starts clean. Mirrors the
+    sys.path-filter test in test_init.py but for the env half of the
+    split fix. See #1423.
+
+    Three assertions cover the full split contract:
+    - ENV_MID (after import, before main) is preserved verbatim:
+      regression detector for someone moving the env pop back into
+      __init__.py.
+    - SENTINEL_IN_PATH is False at import time: package-level sys.path
+      filter half of the split actually ran.
+    - ENV_AFTER (after main) is None: CLI entry-point env strip ran.
+
+    SystemExit is caught with a narrowed exit-code check so a future
+    argparse change that exits with a non-zero code (e.g. usage error)
+    surfaces as a test failure instead of being swallowed."""
+    expected_env = f"{_LEAK_PREFIX}/a{os.pathsep}{_LEAK_PREFIX}/b"
+    env = os.environ.copy()
+    env["PYTHONPATH"] = expected_env
+    # Run main() with --version so it exits cleanly without entering any
+    # subcommand. argparse raises SystemExit(0) on --version; the wrapper
+    # asserts the exit code is clean and prints the post-main PYTHONPATH
+    # so the assertion is observable.
+    code = (
+        "import os, sys\n"
+        "from mempalace.cli import main\n"
+        f"prefix = {_LEAK_PREFIX!r}\n"
+        "print('ENV_MID:', repr(os.environ.get('PYTHONPATH')))\n"
+        "print('SENTINEL_IN_PATH:', any(prefix in (p or '') for p in sys.path))\n"
+        "sys.argv = ['mempalace', '--version']\n"
+        "try:\n"
+        "    main()\n"
+        "except SystemExit as exc:\n"
+        "    assert exc.code in (0, None), f'unexpected exit code: {exc.code!r}'\n"
+        "print('ENV_AFTER:', repr(os.environ.get('PYTHONPATH')))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    diag = f"rc={result.returncode}; stdout={result.stdout!r}; stderr={result.stderr!r}"
+    assert result.returncode == 0, f"subprocess failed: {diag}"
+    assert f"ENV_MID: {expected_env!r}" in result.stdout, (
+        f"package import unexpectedly stripped env (regression in __init__.py): {diag}"
+    )
+    assert "SENTINEL_IN_PATH: False" in result.stdout, (
+        f"package import did not filter sys.path (regression in __init__.py): {diag}"
+    )
+    assert "ENV_AFTER: None" in result.stdout, f"CLI did not strip PYTHONPATH: {diag}"
 
 
 # ── cmd_status ─────────────────────────────────────────────────────────
@@ -502,6 +566,7 @@ def test_cmd_mine_projects_mode(mock_config_cls):
             dry_run=False,
             respect_gitignore=True,
             include_ignored=[],
+            max_chunks_per_file=None,
         )
 
 
@@ -977,16 +1042,45 @@ def test_cmd_repair_aborts_without_confirmation(mock_config_cls, tmp_path, capsy
 
 
 @patch("mempalace.cli.MempalaceConfig")
-def test_cmd_compress_no_palace(mock_config_cls, capsys):
-    mock_config_cls.return_value.palace_path = "/fake/palace"
+def test_cmd_sync_no_palace_dir(mock_config_cls, tmp_path, capsys):
+    """cmd_sync on a missing palace dir prints the State A message (#1498)."""
+    from mempalace.cli import cmd_sync
+
+    palace_path = tmp_path / "nonexistent"
+    mock_config_cls.return_value.palace_path = str(palace_path)
+    args = argparse.Namespace(palace=None, dir=None, root=[], wing=None, dry_run=False)
+    cmd_sync(args)
+    captured = capsys.readouterr()
+    assert "No palace found" in captured.out + captured.err
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_sync_palace_dir_no_db(mock_config_cls, tmp_path, capsys):
+    """cmd_sync on a palace dir without chroma.sqlite3 prints the State B
+    message and does NOT trigger chromadb's lazy DB creation (#1498)."""
+    from mempalace.cli import cmd_sync
+
+    mock_config_cls.return_value.palace_path = str(tmp_path)
+    args = argparse.Namespace(palace=None, dir=None, root=[], wing=None, dry_run=False)
+    cmd_sync(args)
+    captured = capsys.readouterr()
+    assert "has no chroma.sqlite3 yet" in captured.out + captured.err
+    # Side-effect-free: backend not invoked.
+    assert list(tmp_path.iterdir()) == []
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_compress_no_palace(mock_config_cls, tmp_path, capsys):
+    """cmd_compress exits non-zero with a 'No palace found' message on a missing dir.
+
+    Uses a real non-existent tmp_path so the stratified state helper (#1498)
+    walks the State A branch instead of hitting the chromadb backend.
+    """
+    mock_config_cls.return_value.palace_path = str(tmp_path / "nonexistent")
     args = argparse.Namespace(palace=None, wing=None, dry_run=False, config=None)
-    mock_backend = MagicMock()
-    mock_backend.get_collection.side_effect = Exception("no palace")
-    with (
-        patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend),
-        pytest.raises(SystemExit),
-    ):
+    with pytest.raises(SystemExit):
         cmd_compress(args)
+    assert "No palace found" in capsys.readouterr().out
 
 
 @patch("mempalace.cli.MempalaceConfig")
@@ -996,7 +1090,10 @@ def test_cmd_compress_no_drawers(mock_config_cls, capsys):
     mock_col = MagicMock()
     mock_col.get.return_value = {"documents": [], "metadatas": [], "ids": []}
     mock_backend = _mock_backend_for(col=mock_col)
-    with patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend):
+    with (
+        patch("mempalace.palace._open_collection_or_explain", return_value=mock_col),
+        patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend),
+    ):
         cmd_compress(args)
     out = capsys.readouterr().out
     assert "No drawers found" in out
@@ -1039,6 +1136,7 @@ def test_cmd_compress_dry_run(mock_config_cls, capsys):
     mock_dialect_mod = _make_mock_dialect_module(mock_dialect)
 
     with (
+        patch("mempalace.palace._open_collection_or_explain", return_value=mock_col),
         patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend),
         patch.dict("sys.modules", {"mempalace.dialect": mock_dialect_mod}),
     ):
@@ -1063,6 +1161,7 @@ def test_cmd_compress_with_config(mock_config_cls, tmp_path, capsys):
     mock_dialect_mod = _make_mock_dialect_module(mock_dialect)
 
     with (
+        patch("mempalace.palace._open_collection_or_explain", return_value=mock_col),
         patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend),
         patch.dict("sys.modules", {"mempalace.dialect": mock_dialect_mod}),
     ):
@@ -1103,7 +1202,8 @@ def test_cmd_compress_stores_results(mock_config_cls, capsys):
     mock_dialect_mod = _make_mock_dialect_module(mock_dialect)
 
     with (
-        patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend),
+        patch("mempalace.palace._open_collection_or_explain", return_value=mock_col),
+        patch("mempalace.palace.get_closets_collection", return_value=mock_comp_col),
         patch.dict("sys.modules", {"mempalace.dialect": mock_dialect_mod}),
     ):
         cmd_compress(args)
@@ -1111,12 +1211,6 @@ def test_cmd_compress_stores_results(mock_config_cls, capsys):
     assert "Stored" in out
     assert "Total:" in out
     mock_comp_col.upsert.assert_called_once()
-    # Verify the compress output goes to the closets collection so that
-    # palace.get_closets_collection() / searcher can read it back (#1244).
-    (call_args, _kwargs) = mock_backend.get_or_create_collection.call_args
-    assert (
-        call_args[1] == "mempalace_closets"
-    ), f"compress should write to mempalace_closets, got {call_args[1]!r}"
     assert "mempalace_closets" in out
 
 

@@ -28,7 +28,42 @@ from mempalace.hooks_cli import (
     hook_session_start,
     hook_precompact,
     run_hook,
+    _claim_mine_slot,
+    _pid_file_for_cmd,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolated_existing_palace_root(monkeypatch, tmp_path):
+    """Give every test an isolated, *existing* PALACE_ROOT/STATE_DIR.
+
+    Regression for #1510: nine save / log / precompact tests assumed
+    ``~/.mempalace`` existed and only passed in the full suite because an
+    earlier test file (``test_cli.py``) created it as a side effect, so
+    the ``_palace_root_exists()`` kill-switch was satisfied. Run in
+    isolation they short-circuited and failed.
+
+    Defaulting every test to a per-test palace root that exists makes
+    them robust on their own and protects future tests from the same
+    trap. ``_MINE_PID_DIR`` is patched too: it is derived from
+    ``STATE_DIR`` *at module import* (hooks_cli.py:277), so patching
+    ``STATE_DIR`` alone would leave mine-spawning tests writing PID files
+    under the import-time location instead of the per-test root. The
+    state dir is created so the docstring's "existing" promise holds.
+
+    Tests that exercise the absent-root kill-switch path call
+    ``_redirect_palace_root`` (or set their own PALACE_ROOT) *after* this
+    fixture; ``monkeypatch``'s last-write-wins means they keep their
+    absent/file root and teardown still restores the real module value.
+    """
+    root = tmp_path / ".mempalace"
+    state_dir = root / "hook_state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(hooks_cli_mod, "PALACE_ROOT", root)
+    monkeypatch.setattr(hooks_cli_mod, "STATE_DIR", state_dir)
+    monkeypatch.setattr(hooks_cli_mod, "_MINE_PID_DIR", state_dir / "mine_pids")
+    monkeypatch.setattr(hooks_cli_mod, "_state_dir_initialized", False)
+    return root
 
 
 # --- _mempalace_python ---
@@ -688,6 +723,42 @@ def test_mine_sync_uses_mempalace_python(tmp_path):
                     assert cmd[0] == "/fake/venv/python"
 
 
+def test_claim_mine_slot_writes_live_placeholder_pid(tmp_path):
+    """Regression #1443: claimed slots must not be empty during spawn startup."""
+    cmd = ["mempalace", "mine", "/tmp/proj", "--mode", "projects"]
+    pid_dir = tmp_path / "mine_pids"
+
+    with patch("mempalace.hooks_cli._MINE_PID_DIR", pid_dir):
+        pid_file = _claim_mine_slot(cmd)
+
+        assert pid_file == _pid_file_for_cmd(cmd)
+        # Format: "{pid} {unix_timestamp}" — first token must be our PID.
+        content = pid_file.read_text().strip()
+        assert content.split()[0] == str(os.getpid())
+        assert _mine_already_running(cmd) is True
+        assert _claim_mine_slot(cmd) is None
+
+
+def test_claim_mine_slot_reclaimed_slot_writes_live_placeholder_pid(tmp_path):
+    """Regression #1443: stale-slot reclaim must also write a live placeholder."""
+    cmd = ["mempalace", "mine", "/tmp/proj", "--mode", "projects"]
+    pid_dir = tmp_path / "mine_pids"
+
+    with (
+        patch("mempalace.hooks_cli._MINE_PID_DIR", pid_dir),
+        patch("mempalace.hooks_cli._pid_alive", return_value=False),
+    ):
+        pid_file = _pid_file_for_cmd(cmd)
+        pid_file.parent.mkdir(parents=True, exist_ok=True)
+        pid_file.write_text("12345")
+
+        reclaimed = _claim_mine_slot(cmd)
+
+        assert reclaimed == pid_file
+        # Format: "{pid} {unix_timestamp}" — first token must be our PID.
+        assert pid_file.read_text().strip().split()[0] == str(os.getpid())
+
+
 def test_maybe_auto_ingest_ignores_transcript_arg_path(tmp_path):
     """_maybe_auto_ingest does NOT mine the transcript directory.
 
@@ -759,7 +830,9 @@ def test_maybe_auto_ingest_skips_when_mine_running(tmp_path):
                 ]
                 pid_file = _pid_file_for_cmd(cmd)
                 pid_file.parent.mkdir(parents=True, exist_ok=True)
-                pid_file.write_text(str(os.getpid()))
+                import time as _time
+
+                pid_file.write_text(f"{os.getpid()} {int(_time.time())}")
                 with patch("mempalace.hooks_cli._mempalace_python", return_value=sys.executable):
                     with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
                         _maybe_auto_ingest()
@@ -825,6 +898,8 @@ def test_spawn_mine_uses_detached_kwargs(tmp_path):
 
 def test_spawn_mine_skips_when_target_running(tmp_path):
     """A second spawn for the same cmd target while the first is alive must skip."""
+    import time as _time
+
     pid_dir = tmp_path / "mine_pids"
     with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
         with patch("mempalace.hooks_cli._MINE_PID_DIR", pid_dir):
@@ -833,7 +908,7 @@ def test_spawn_mine_skips_when_target_running(tmp_path):
             cmd = ["mempalace", "mine", "/tmp/proj", "--mode", "projects"]
             pid_file = _pid_file_for_cmd(cmd)
             pid_file.parent.mkdir(parents=True, exist_ok=True)
-            pid_file.write_text(str(os.getpid()))  # live PID
+            pid_file.write_text(f"{os.getpid()} {int(_time.time())}")  # live PID, fresh
 
             with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
                 _spawn_mine(cmd)
@@ -871,8 +946,9 @@ def test_spawn_mine_reclaims_stale_slot(tmp_path):
                 mock_popen.return_value.pid = 4242
                 _spawn_mine(cmd)
                 mock_popen.assert_called_once()
-                # New PID is recorded in the reclaimed slot.
-                assert pid_file.read_text().strip() == "4242"
+                # New PID is recorded in the reclaimed slot (format: "{pid} {timestamp}").
+                content = pid_file.read_text().strip()
+                assert content.split()[0] == "4242"
 
 
 def test_spawn_mine_releases_slot_on_oserror(tmp_path):
@@ -888,9 +964,9 @@ def test_spawn_mine_releases_slot_on_oserror(tmp_path):
             with patch("mempalace.hooks_cli.subprocess.Popen", side_effect=OSError("spawn fail")):
                 with pytest.raises(OSError):
                     _spawn_mine(cmd)
-                assert (
-                    not pid_file.exists()
-                ), "slot must be released so the next hook fire isn't permanently blocked"
+                assert not pid_file.exists(), (
+                    "slot must be released so the next hook fire isn't permanently blocked"
+                )
 
 
 def test_spawn_mine_passes_pid_file_env_var(tmp_path):
@@ -948,7 +1024,9 @@ def test_ingest_transcript_skips_when_target_running(tmp_path):
                 ]
                 pid_file = _pid_file_for_cmd(expected_cmd)
                 pid_file.parent.mkdir(parents=True, exist_ok=True)
-                pid_file.write_text(str(os.getpid()))  # live target
+                import time as _time
+
+                pid_file.write_text(f"{os.getpid()} {int(_time.time())}")  # live target, fresh
 
                 with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
                     _ingest_transcript(str(transcript))
@@ -986,11 +1064,103 @@ def test_mine_already_running_dead_pid(tmp_path):
 
 
 def test_mine_already_running_live_pid(tmp_path):
-    """Returns True when the slot's recorded PID is alive."""
+    """Returns True when the slot's recorded PID is alive (new {pid ts} format)."""
+    import time as _time
+
     pid_dir = tmp_path / "mine_pids"
     cmd = ["mempalace", "mine", "/tmp/x", "--mode", "projects"]
-    _seed_slot(pid_dir, cmd, str(os.getpid()))  # current process is alive
+    # Use a recent timestamp so the default 2 h timeout does not trigger.
+    _seed_slot(pid_dir, cmd, f"{os.getpid()} {int(_time.time())}")
     with patch("mempalace.hooks_cli._MINE_PID_DIR", pid_dir):
+        assert _mine_already_running(cmd) is True
+
+
+def test_mine_already_running_live_pid_bare_format(tmp_path):
+    """Old bare-PID format uses file mtime for the stale-by-age check."""
+    pid_dir = tmp_path / "mine_pids"
+    cmd = ["mempalace", "mine", "/tmp/x", "--mode", "projects"]
+    _seed_slot(pid_dir, cmd, str(os.getpid()))  # old format: bare PID
+    with patch("mempalace.hooks_cli._MINE_PID_DIR", pid_dir):
+        assert _mine_already_running(cmd) is True
+
+
+def test_mine_already_running_bare_pid_old_mtime_is_stale(tmp_path):
+    """Old bare-PID slots are reclaimed once their file mtime exceeds timeout."""
+    import time as _time
+
+    pid_dir = tmp_path / "mine_pids"
+    cmd = ["mempalace", "mine", "/tmp/x", "--mode", "projects"]
+    slot = _seed_slot(pid_dir, cmd, str(os.getpid()))
+    old_mtime = _time.time() - 3601
+    os.utime(slot, (old_mtime, old_mtime))
+    with (
+        patch("mempalace.hooks_cli._MINE_PID_DIR", pid_dir),
+        patch.dict("os.environ", {"MEMPALACE_MINE_TIMEOUT_HOURS": "1"}),
+    ):
+        assert _mine_already_running(cmd) is False
+
+
+def test_mine_already_running_malformed_timestamp_is_stale(tmp_path):
+    """Malformed timestamps fail soft instead of crashing hook execution."""
+    pid_dir = tmp_path / "mine_pids"
+    cmd = ["mempalace", "mine", "/tmp/x", "--mode", "projects"]
+    _seed_slot(pid_dir, cmd, f"{os.getpid()} not-a-timestamp")
+    with patch("mempalace.hooks_cli._MINE_PID_DIR", pid_dir):
+        assert _mine_already_running(cmd) is False
+
+
+def test_mine_slot_timeout_invalid_env_disables_timeout():
+    """Invalid MEMPALACE_MINE_TIMEOUT_HOURS disables stale-by-age checks."""
+    from mempalace.hooks_cli import _mine_slot_timeout_secs
+
+    with patch.dict("os.environ", {"MEMPALACE_MINE_TIMEOUT_HOURS": "nope"}):
+        assert _mine_slot_timeout_secs() == 0.0
+
+
+def test_mine_already_running_live_pid_exceeds_timeout(tmp_path):
+    """Returns False when PID is alive but has exceeded the configured timeout (#1552)."""
+    import time as _time
+
+    pid_dir = tmp_path / "mine_pids"
+    cmd = ["mempalace", "mine", "/tmp/x", "--mode", "projects"]
+    # Timestamp far in the past so any positive timeout fires immediately.
+    old_ts = int(_time.time()) - 3601  # 1 second past 1-hour mark
+    _seed_slot(pid_dir, cmd, f"{os.getpid()} {old_ts}")
+    with (
+        patch("mempalace.hooks_cli._MINE_PID_DIR", pid_dir),
+        patch.dict("os.environ", {"MEMPALACE_MINE_TIMEOUT_HOURS": "1"}),
+    ):
+        assert _mine_already_running(cmd) is False
+
+
+def test_mine_already_running_live_pid_within_timeout(tmp_path):
+    """Returns True when PID is alive and has NOT exceeded the configured timeout."""
+    import time as _time
+
+    pid_dir = tmp_path / "mine_pids"
+    cmd = ["mempalace", "mine", "/tmp/x", "--mode", "projects"]
+    recent_ts = int(_time.time()) - 60  # only 1 minute old
+    _seed_slot(pid_dir, cmd, f"{os.getpid()} {recent_ts}")
+    with (
+        patch("mempalace.hooks_cli._MINE_PID_DIR", pid_dir),
+        patch.dict("os.environ", {"MEMPALACE_MINE_TIMEOUT_HOURS": "2"}),
+    ):
+        assert _mine_already_running(cmd) is True
+
+
+def test_mine_already_running_timeout_zero_disables_check(tmp_path):
+    """MEMPALACE_MINE_TIMEOUT_HOURS=0 disables the age-based stale check."""
+    import time as _time
+
+    pid_dir = tmp_path / "mine_pids"
+    cmd = ["mempalace", "mine", "/tmp/x", "--mode", "projects"]
+    old_ts = int(_time.time()) - 86400  # 24 hours ago — stale under any non-zero timeout
+    _seed_slot(pid_dir, cmd, f"{os.getpid()} {old_ts}")
+    with (
+        patch("mempalace.hooks_cli._MINE_PID_DIR", pid_dir),
+        patch.dict("os.environ", {"MEMPALACE_MINE_TIMEOUT_HOURS": "0"}),
+    ):
+        # Timeout disabled — alive PID is always considered running.
         assert _mine_already_running(cmd) is True
 
 
@@ -1005,10 +1175,13 @@ def test_mine_already_running_corrupt_file(tmp_path):
 
 def test_mine_already_running_distinct_cmds_independent(tmp_path):
     """Slots are keyed per cmd; an alive entry for cmd A doesn't shadow cmd B."""
+    import time as _time
+
     pid_dir = tmp_path / "mine_pids"
     cmd_a = ["mempalace", "mine", "/tmp/a", "--mode", "projects"]
     cmd_b = ["mempalace", "mine", "/tmp/b", "--mode", "projects"]
-    _seed_slot(pid_dir, cmd_a, str(os.getpid()))
+    recent_ts = int(_time.time())
+    _seed_slot(pid_dir, cmd_a, f"{os.getpid()} {recent_ts}")
     with patch("mempalace.hooks_cli._MINE_PID_DIR", pid_dir):
         assert _mine_already_running(cmd_a) is True
         assert _mine_already_running(cmd_b) is False
