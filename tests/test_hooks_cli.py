@@ -303,17 +303,9 @@ def test_stop_hook_mempalace_wing_env_overrides_path_derivation(tmp_path, monkey
     setting ``MEMPALACE_WING=react_native`` lets the session declare its
     real wing without renaming dirs.
 
-    Robust against the test-order issue: explicitly monkeypatches
-    ``PALACE_ROOT`` to a directory that exists, so the kill-switch from
-    commit 8472d55 doesn't short-circuit when running this test in
-    isolation. (Other older tests in this module implicitly rely on
-    ``test_cli.py`` creating ``~/.mempalace`` as a side effect — they
-    fail when run alone.)
+    PALACE_ROOT/STATE_DIR isolation is handled by the autouse
+    ``_redirect_palace_root`` fixture, so no manual setup is needed here.
     """
-    palace_root = tmp_path / ".mempalace"
-    palace_root.mkdir()
-    monkeypatch.setattr(hooks_cli_mod, "PALACE_ROOT", palace_root)
-
     project_dir = tmp_path / ".claude" / "projects" / "-home-jp-Projects-myproject"
     project_dir.mkdir(parents=True)
     transcript = project_dir / "session.jsonl"
