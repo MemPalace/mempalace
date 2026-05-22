@@ -27,14 +27,15 @@ The Python package that powers MemPalace. All modules, all logic.
 
 ## Architecture
 
-```
-User → CLI → miner/convo_miner → ChromaDB (palace)
-                                     ↕
-                              knowledge_graph (SQLite)
-                                     ↕
-User → MCP Server → searcher → results
-                  → kg_query → entity facts
-                  → diary    → agent journal
+```mermaid
+flowchart TD
+    U1([User]) --> CLI --> MM["miner / convo_miner"] --> C[(ChromaDB palace)]
+    C <--> KG[(knowledge_graph SQLite)]
+    U2([User]) --> MCP[MCP Server]
+    MCP --> SE[searcher] --> RE[results]
+    MCP --> KQ[kg_query] --> EF[entity facts]
+    MCP --> DI[diary] --> AJ[agent journal]
+    KG <--> SE
 ```
 
 The palace (ChromaDB) stores verbatim content. The knowledge graph (SQLite) stores structured relationships. The MCP server exposes both to any AI tool.
