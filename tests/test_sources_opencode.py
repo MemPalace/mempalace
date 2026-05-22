@@ -240,9 +240,9 @@ def test_ingest_skips_cancelled_session_with_too_few_turns(adapter, palace_ctx, 
     results = list(adapter.ingest(source=SourceRef(local_path=canonical_db), palace=palace_ctx))
     drawers = [r for r in results if isinstance(r, DrawerRecord)]
     src_files = {d.source_file for d in drawers}
-    assert all(
-        "ses_ddd444" not in sf for sf in src_files
-    ), "single-message cancelled session must be skipped"
+    assert all("ses_ddd444" not in sf for sf in src_files), (
+        "single-message cancelled session must be skipped"
+    )
 
 
 def test_drawer_metadata_carries_universal_and_schema_fields(adapter, palace_ctx, canonical_db):
@@ -264,17 +264,17 @@ def test_drawer_metadata_carries_universal_and_schema_fields(adapter, palace_ctx
     }
     for drawer in drawers:
         meta = drawer.metadata
-        assert universal_keys.issubset(
-            meta.keys()
-        ), f"missing universal keys: {universal_keys - meta.keys()}"
-        assert schema_keys.issubset(
-            meta.keys()
-        ), f"missing schema keys: {schema_keys - meta.keys()}"
+        assert universal_keys.issubset(meta.keys()), (
+            f"missing universal keys: {universal_keys - meta.keys()}"
+        )
+        assert schema_keys.issubset(meta.keys()), (
+            f"missing schema keys: {schema_keys - meta.keys()}"
+        )
         # Flat-scalar invariant — chroma constraint.
         for k, v in meta.items():
-            assert isinstance(
-                v, (str, int, float, bool)
-            ), f"metadata[{k}]={v!r} of type {type(v).__name__} is not flat-scalar"
+            assert isinstance(v, (str, int, float, bool)), (
+                f"metadata[{k}]={v!r} of type {type(v).__name__} is not flat-scalar"
+            )
 
 
 def test_drawer_route_hint_carries_wing(adapter, palace_ctx, canonical_db):
