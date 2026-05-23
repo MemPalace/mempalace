@@ -777,42 +777,121 @@ _ENCODED_PARENT_PREFIXES = (
 )
 
 
+# Cache for ``wing_aliases.json`` parsed contents, keyed by (path, mtime_ns).
+# Invalidates automatically when the file is edited; remains correct under
+# tests that ``monkeypatch.setattr`` ``PALACE_ROOT`` because the key changes.
+_WING_ALIASES_CACHE: dict = {}
+
+
+def _normalize_wing(value: str) -> str:
+    """Ensure a wing name carries exactly one ``wing_`` prefix.
+
+    Idempotent: ``wing_foo`` and ``foo`` both yield ``wing_foo``. Idempotency
+    does not extend to user-typed ``wing_wing_foo`` — that's preserved
+    verbatim so the user always sees what they wrote.
+    """
+    return value if value.startswith("wing_") else f"wing_{value}"
+
+
 def _load_wing_aliases() -> dict:
     """Load optional user-level wing aliases from ``~/.mempalace/wing_aliases.json``.
 
-    Schema (all keys optional):
+    Schema (single ``aliases`` map; keys ending in ``*`` are prefix patterns):
 
         {
-          "aliases":        {"<basename>": "<wing>", ...},
-          "prefix_aliases": {"<prefix>":   "<wing>", ...}
+          "aliases": {
+            "joy-web-experimental": "wing_experimental",   // exact
+            "joy-web*":              "wing_joy_web",       // prefix
+            "legacy-monorepo":       "wing_legacy"         // exact
+          }
         }
 
     Use case: collapse multiple working-copy clones of one repo (e.g.
-    ``joy-web``, ``joy-web-1``, ..., ``joy-web-5``) onto a single wing
-    so diary entries written from any clone land in the same place.
+    ``joy-web``, ``joy-web-1``, ..., ``joy-web-5``) onto a single wing.
 
-    - ``aliases`` is exact-match against the project's directory basename.
-    - ``prefix_aliases`` matches if the basename ``startswith()`` the prefix.
-      Longest matching prefix wins on ties.
+    Matching rules:
+
+    - Exact key matches the basename verbatim.
+    - A key ending in ``*`` is a prefix pattern: the basename must equal the
+      stem OR continue with ``-`` / ``_`` (delimiter-anchored — ``joy-web*``
+      matches ``joy-web``, ``joy-web-3``, ``joy-web_staging`` but NOT
+      ``joy-website``). This is the safe default for collapsing clones.
     - Exact match always beats a prefix match.
-    - Values may include or omit the ``wing_`` prefix — both normalize to one.
-    - Malformed or missing file → ``{}`` (silent; hooks must never fail on
-      a bad alias config).
+    - Longest matching prefix wins on ties.
+    - Values may include or omit the ``wing_`` prefix — normalized to one.
+    - Parse errors are logged via ``_log()`` and the file is treated as empty
+      so hooks degrade rather than crash.
+
+    Result is cached on (path, mtime_ns) so edits to the file are picked up
+    on the next call without re-reading on every hook fire.
     """
     path = PALACE_ROOT / "wing_aliases.json"
     try:
-        with open(path, encoding="utf-8") as fh:
+        mtime_ns = path.stat().st_mtime_ns
+    except OSError:
+        return {"exact": {}, "prefix": []}
+
+    cache_key = (str(path), mtime_ns)
+    cached = _WING_ALIASES_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        with path.open(encoding="utf-8") as fh:
             data = json.load(fh)
-    except (OSError, json.JSONDecodeError, ValueError):
-        return {}
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        _log(f"wing_aliases: ignoring {path}: {exc}")
+        result: dict = {"exact": {}, "prefix": []}
+        _WING_ALIASES_CACHE[cache_key] = result
+        return result
+
     if not isinstance(data, dict):
-        return {}
-    aliases = data.get("aliases") or {}
-    prefix = data.get("prefix_aliases") or {}
-    return {
-        "aliases": aliases if isinstance(aliases, dict) else {},
-        "prefix_aliases": prefix if isinstance(prefix, dict) else {},
-    }
+        _log(f"wing_aliases: ignoring {path}: top-level value is not an object")
+        result = {"exact": {}, "prefix": []}
+        _WING_ALIASES_CACHE[cache_key] = result
+        return result
+
+    raw = data.get("aliases")
+    if not isinstance(raw, dict):
+        result = {"exact": {}, "prefix": []}
+        _WING_ALIASES_CACHE[cache_key] = result
+        return result
+
+    exact: dict = {}
+    prefix: list = []
+    for key, val in raw.items():
+        if not isinstance(key, str) or not isinstance(val, str) or not val:
+            continue
+        wing = _normalize_wing(val)
+        if key.endswith("*"):
+            stem = key[:-1]
+            if stem:
+                prefix.append((stem, wing))
+        else:
+            exact[key] = wing
+    # Longest prefix first → first match wins, simpler than tracking best.
+    prefix.sort(key=lambda kv: len(kv[0]), reverse=True)
+    result = {"exact": exact, "prefix": prefix}
+    _WING_ALIASES_CACHE[cache_key] = result
+    return result
+
+
+def _match_prefix_alias(basename: str, prefix_pairs: list) -> Optional[str]:
+    """Return the aliased wing for ``basename`` against delimiter-anchored prefixes.
+
+    A prefix ``joy-web`` matches ``joy-web`` (equal) or ``joy-web-…`` /
+    ``joy-web_…`` (continues with a delimiter). It does NOT match
+    ``joy-website`` — the boundary is what prevents accidental project
+    collisions, which is the whole point of the prefix form.
+    """
+    for stem, wing in prefix_pairs:
+        if basename == stem:
+            return wing
+        if basename.startswith(stem) and len(basename) > len(stem):
+            nxt = basename[len(stem)]
+            if nxt in ("-", "_"):
+                return wing
+    return None
 
 
 def _basename_to_wing(basename: str, aliases: Optional[dict] = None) -> str:
@@ -824,23 +903,45 @@ def _basename_to_wing(basename: str, aliases: Optional[dict] = None) -> str:
     """
     if aliases is None:
         aliases = _load_wing_aliases()
-    exact = aliases.get("aliases", {}).get(basename)
-    if isinstance(exact, str) and exact:
-        return exact if exact.startswith("wing_") else f"wing_{exact}"
-    prefix_map = aliases.get("prefix_aliases", {})
-    if isinstance(prefix_map, dict) and prefix_map:
-        best_prefix = ""
-        best_wing = None
-        for pfx, wing in prefix_map.items():
-            if not isinstance(pfx, str) or not isinstance(wing, str):
-                continue
-            if basename.startswith(pfx) and len(pfx) > len(best_prefix):
-                best_prefix = pfx
-                best_wing = wing
-        if best_wing:
-            return best_wing if best_wing.startswith("wing_") else f"wing_{best_wing}"
+    exact_match = aliases.get("exact", {}).get(basename)
+    if exact_match:
+        return exact_match
+    prefix_match = _match_prefix_alias(basename, aliases.get("prefix", []))
+    if prefix_match:
+        return prefix_match
     slug = basename.lower().replace(" ", "_").replace("-", "_")
     return f"wing_{slug}"
+
+
+def _resolve_encoded_residual(residual: str, aliases: Optional[dict] = None) -> str:
+    """Resolve an encoded-folder residual to a wing, trying nested layouts.
+
+    Claude Code's encoded folder flattens path separators to dashes, so a
+    nested layout like ``/Users/me/code/clients/joy-web-3`` produces
+    ``Users-me-code-clients-joy-web-3``. After stripping the user-home and
+    one common parent token, the residual still contains intermediate
+    directories (``code-clients-joy-web-3``) — a flat ``startswith`` check
+    against ``joy-web`` would miss it.
+
+    Walk the residual right-to-left at ``-`` boundaries, checking each
+    suffix for an alias match. Returns the first hit; otherwise falls back
+    to the deterministic slug rule applied to the full residual.
+    """
+    if aliases is None:
+        aliases = _load_wing_aliases()
+    parts = residual.split("-")
+    # Right-to-left suffixes: shortest tail first (the leaf directory).
+    for i in range(len(parts) - 1, -1, -1):
+        candidate = "-".join(parts[i:])
+        if not candidate:
+            continue
+        exact_match = aliases.get("exact", {}).get(candidate)
+        if exact_match:
+            return exact_match
+        prefix_match = _match_prefix_alias(candidate, aliases.get("prefix", []))
+        if prefix_match:
+            return prefix_match
+    return _basename_to_wing(residual, aliases)
 
 
 def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
@@ -931,14 +1032,16 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
         if m:
             encoded = m.group(1)
         # Strip one common parent-dir token if present, keeping the rest as
-        # the project path. ``_basename_to_wing`` applies any user aliases
-        # and then handles the dash→underscore conversion uniformly.
+        # the project path. The residual may still contain intermediate
+        # directories for nested layouts (e.g. ``code-clients-joy-web-3``);
+        # ``_resolve_encoded_residual`` walks right-to-left suffixes so an
+        # alias matches the leaf project name, not the full path.
         for prefix in _ENCODED_PARENT_PREFIXES:
             if encoded.startswith(prefix):
                 encoded = encoded[len(prefix) :]
                 break
         if encoded:
-            return _basename_to_wing(encoded)
+            return _resolve_encoded_residual(encoded)
 
     # 3. Legacy — explicit -Projects-<name> segment
     match = re.search(r"-Projects-([^/]+?)(?:/|$)", normalized)
