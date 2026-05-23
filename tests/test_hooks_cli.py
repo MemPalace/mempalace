@@ -719,23 +719,44 @@ def test_wing_aliases_apply_to_encoded_fallback_path(tmp_path, monkeypatch):
     assert _wing_from_transcript_path(path) == "wing_joy_web"
 
 
-def test_wing_aliases_apply_to_nested_encoded_fallback(tmp_path, monkeypatch):
-    """Aliases must resolve against the leaf in nested layouts where the
-    encoded residual still contains intermediate directories.
+def test_wing_aliases_exact_resolves_in_nested_encoded_fallback(tmp_path, monkeypatch):
+    """Exact aliases resolve against any dash-suffix of the encoded residual.
 
     ``/Users/me/code/clients/joy-web-3`` encodes as
     ``Users-me-code-clients-joy-web-3``. After stripping ``Users-me-`` the
     residual is ``code-clients-joy-web-3`` — there is no parent token to
-    strip, so a flat ``startswith("joy-web")`` would miss. The right-to-left
-    suffix walk in ``_resolve_encoded_residual`` finds the leaf and applies
-    the alias.
+    strip. The right-to-left suffix walk finds the leaf ``joy-web-3`` and
+    applies the exact alias.
     """
     palace_root = tmp_path / ".mempalace"
-    _write_aliases(palace_root, {"aliases": {"joy-web*": "wing_joy_web"}})
+    _write_aliases(palace_root, {"aliases": {"joy-web-3": "wing_joy_web"}})
     _use_palace(monkeypatch, palace_root)
 
     path = "/Users/me/.claude/projects/-Users-me-code-clients-joy-web-3/missing.jsonl"
     assert _wing_from_transcript_path(path) == "wing_joy_web"
+
+
+def test_wing_aliases_prefix_does_not_match_suffix_in_encoded_fallback(tmp_path, monkeypatch):
+    """Prefix aliases must NOT fire on suffix candidates in the encoded
+    fallback — that would silently merge unrelated projects.
+
+    With alias ``web*`` (intended for a leaf literally named ``web``), a
+    nested path like ``/Users/me/code/clients/joy-web-3`` produces residual
+    ``code-clients-joy-web-3``. A naive right-to-left walk would test the
+    candidate ``web-3`` against ``web*``, find a boundary-anchored match,
+    and route ``joy-web-3`` to ``wing_web``. That's wrong: ``joy-web-3`` is
+    a different project from ``web``. We must fall through to the default
+    slug rule instead.
+    """
+    palace_root = tmp_path / ".mempalace"
+    _write_aliases(palace_root, {"aliases": {"web*": "wing_web"}})
+    _use_palace(monkeypatch, palace_root)
+
+    path = "/Users/me/.claude/projects/-Users-me-code-clients-joy-web-3/missing.jsonl"
+    # NOT wing_web — that would be the silent merge bug. The exact slug the
+    # fallback produces is an implementation detail; what matters is that
+    # it isn't wing_web.
+    assert _wing_from_transcript_path(path) != "wing_web"
 
 
 def test_wing_aliases_cache_invalidates_on_file_edit(tmp_path, monkeypatch):
@@ -745,7 +766,7 @@ def test_wing_aliases_cache_invalidates_on_file_edit(tmp_path, monkeypatch):
     up the new mapping naturally. This is the contract that lets users tweak
     aliases without having to restart their editor / shell.
     """
-    import time
+    import os
 
     palace_root = tmp_path / ".mempalace"
     _write_aliases(palace_root, {"aliases": {"proj*": "wing_v1"}})
@@ -755,10 +776,14 @@ def test_wing_aliases_cache_invalidates_on_file_edit(tmp_path, monkeypatch):
     transcript.write_text(json.dumps({"type": "user", "cwd": "/x/proj-a"}) + "\n")
     assert _wing_from_transcript_path(str(transcript)) == "wing_v1"
 
-    # mtime_ns resolution is nanosecond on most platforms but coarse on some
-    # filesystems — sleep enough to guarantee a distinct stat key.
-    time.sleep(0.01)
+    # Force a distinct mtime explicitly. ``time.sleep`` would be flaky on
+    # coarse-mtime filesystems (HFS+, some SMB/NFS = 1s resolution). Using
+    # os.utime with an explicit nanosecond bump is deterministic across
+    # platforms.
+    aliases_path = palace_root / "wing_aliases.json"
+    prev_ns = aliases_path.stat().st_mtime_ns
     _write_aliases(palace_root, {"aliases": {"proj*": "wing_v2"}})
+    os.utime(aliases_path, ns=(prev_ns + 1_000_000, prev_ns + 1_000_000))
     assert _wing_from_transcript_path(str(transcript)) == "wing_v2"
 
 
