@@ -218,18 +218,33 @@ def init_telemetry() -> bool:
     log_provider = LoggerProvider(resource=resource)
     log_provider.add_log_record_processor(BatchLogRecordProcessor(OTLPLogExporter()))
     set_logger_provider(log_provider)
-    # Bridge stdlib ``logging`` → OTel logs. Attaching to the ``mempalace``
-    # logger (not root) keeps the MCP stdio protection intact: chromadb
-    # / posthog stay on stderr, only MemPalace-owned loggers fan out to
-    # OTLP. LoggingHandler does NOT write to stdout/stderr itself.
+    # Bridge stdlib ``logging`` → OTel logs. Attaching to specific
+    # MemPalace-owned logger names (not root) keeps the MCP stdio
+    # protection intact: chromadb / posthog stay on stderr, only
+    # MemPalace's own loggers fan out to OTLP.
+    #
+    # MemPalace doesn't use a single root namespace — historically it
+    # uses ``mempalace_mcp`` (underscore) for runtime modules and the
+    # ``mempalace.*`` (dotted, via ``__name__``) tree for newer ones.
+    # We attach to BOTH so dispatch / search / miner logs all land,
+    # plus the ``mempalace_graph`` / ``mempalace_hallways`` /
+    # ``mempalace_format_miner`` siblings.
     handler = LoggingHandler(level=logging.INFO, logger_provider=log_provider)
-    mempalace_logger = logging.getLogger("mempalace")
-    mempalace_logger.addHandler(handler)
-    # Ensure INFO records propagate to the OTel handler even if the app
-    # hasn't configured a level. Existing stderr handlers keep their own
-    # levels — this only opens the gate for our handler.
-    if mempalace_logger.level == logging.NOTSET or mempalace_logger.level > logging.INFO:
-        mempalace_logger.setLevel(logging.INFO)
+    _MEMPALACE_LOGGER_NAMES = (
+        "mempalace",
+        "mempalace_mcp",
+        "mempalace_graph",
+        "mempalace_hallways",
+        "mempalace_format_miner",
+    )
+    for name in _MEMPALACE_LOGGER_NAMES:
+        lg = logging.getLogger(name)
+        lg.addHandler(handler)
+        # Ensure INFO records propagate to the OTel handler even if the
+        # app hasn't configured a level. Existing stderr handlers keep
+        # their own levels — this only opens the gate for our handler.
+        if lg.level == logging.NOTSET or lg.level > logging.INFO:
+            lg.setLevel(logging.INFO)
     _LOG_PROVIDER = log_provider
     _LOG_HANDLER = handler
 

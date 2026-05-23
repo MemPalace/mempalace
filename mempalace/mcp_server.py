@@ -4867,6 +4867,7 @@ def handle_request(request):
         # an agent + MemPalace then share one trace.
         from .telemetry import (
             extract_trace_context,
+            is_enabled as _otel_is_enabled,
             memory_operation,
             operation_for_tool,
         )
@@ -4875,11 +4876,16 @@ def handle_request(request):
 
         try:
             with memory_operation(tool_name, parent_context=parent_ctx):
-                logger.info(
-                    "memory.dispatch tool=%s operation=%s",
-                    tool_name,
-                    operation_for_tool(tool_name),
-                )
+                # The structured dispatch log line exists for trace
+                # correlation. Only emit when telemetry is on — otherwise
+                # we'd add noise to the default install path's stderr
+                # for no consumer benefit.
+                if _otel_is_enabled():
+                    logger.info(
+                        "memory.dispatch tool=%s operation=%s",
+                        tool_name,
+                        operation_for_tool(tool_name),
+                    )
                 result = _decorate_mcp_tool_result(tool_name, TOOLS[tool_name]["handler"](**tool_args))
 
             return {

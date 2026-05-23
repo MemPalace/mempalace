@@ -77,12 +77,20 @@ def test_operation_for_tool_known_and_unknown():
     assert telemetry.operation_for_tool("totally_made_up_tool") == "read"
 
 
-def test_mempalace_logger_unmodified_when_disabled(monkeypatch):
-    """The LoggingHandler must NOT be attached when telemetry is off."""
+def test_mempalace_loggers_unmodified_when_disabled(monkeypatch):
+    """The LoggingHandler must NOT be attached to any MemPalace logger
+    name when telemetry is off."""
     monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
     monkeypatch.setattr(telemetry, "_ENABLED", False)
 
-    before = list(logging.getLogger("mempalace").handlers)
+    names = (
+        "mempalace",
+        "mempalace_mcp",
+        "mempalace_graph",
+        "mempalace_hallways",
+        "mempalace_format_miner",
+    )
+    before = {n: list(logging.getLogger(n).handlers) for n in names}
     telemetry.init_telemetry()
-    after = list(logging.getLogger("mempalace").handlers)
+    after = {n: list(logging.getLogger(n).handlers) for n in names}
     assert before == after, "telemetry must not touch logging when disabled"
