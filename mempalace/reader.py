@@ -290,7 +290,7 @@ def _resolve_by_source(col, source_file: str) -> list[DrawerCandidate]:
     return candidates
 
 
-def _optional_int(value) -> Optional[int]:
+def _optional_int(value: object) -> Optional[int]:
     """Best-effort int coerce; None for None / non-numeric."""
     if value is None or value == "":
         return None
