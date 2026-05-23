@@ -11,6 +11,7 @@ Same palace as project mining. Different ingest strategy.
 import os
 import sys
 import hashlib
+import json
 import logging
 from pathlib import Path
 from datetime import datetime
@@ -481,6 +482,54 @@ def _is_ai_tool_path(path: Path) -> bool:
     return False
 
 
+def _cwd_basename_from_first_transcript(convo_path: Path) -> Optional[str]:
+    """Read the leaf basename of ``cwd`` from the first transcript under ``convo_path``.
+
+    Scans one level deep for a ``.jsonl`` file and returns the basename of
+    its first ``cwd``-bearing record (e.g. ``"joy-web-3"`` for a transcript
+    whose ``cwd`` is ``/Users/me/Claude/joy-web-3``). Returns ``None`` when
+    ``convo_path`` is not a directory of transcripts, no transcript records
+    a ``cwd``, or any I/O fails — callers fall through to the existing
+    behavior on ``None``.
+
+    Used only on AI-tool paths so the CLI miner can route through the same
+    alias map the Stop/PreCompact hooks use, collapsing working-copy clones
+    onto one wing without the user passing ``--wing`` explicitly.
+    """
+    try:
+        if convo_path.is_file() and convo_path.suffix == ".jsonl":
+            sample: Optional[Path] = convo_path
+        elif convo_path.is_dir():
+            sample = next(
+                (p for p in convo_path.iterdir() if p.is_file() and p.suffix == ".jsonl"),
+                None,
+            )
+        else:
+            sample = None
+        if sample is None:
+            return None
+        with sample.open(encoding="utf-8", errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if i >= 200:
+                    break
+                line = line.strip()
+                if not line or '"cwd"' not in line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                cwd = rec.get("cwd") if isinstance(rec, dict) else None
+                if not isinstance(cwd, str) or not cwd:
+                    continue
+                basename = cwd.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+                if basename:
+                    return basename
+    except OSError:
+        return None
+    return None
+
+
 def _resolve_wing(convo_path: Path, wing: Optional[str]) -> str:
     """Determine the destination wing for ``mine_convos``.
 
@@ -488,10 +537,18 @@ def _resolve_wing(convo_path: Path, wing: Optional[str]) -> str:
 
       1. Explicit ``wing`` argument from the user — always wins, even on
          an AI-tool path. Empty string is treated as "no wing".
-      2. AI-tool path detection — defaults to ``wing_api`` so Claude
+      2. AI-tool path with ``wing_aliases.json`` match — read ``cwd``
+         from the first JSONL transcript under ``convo_path`` and route
+         the leaf basename through ``hooks_cli._basename_to_wing``. If
+         the user has an alias for that basename (e.g. ``joy-web*`` →
+         ``wing_joy_web``), the CLI miner collapses clones the same way
+         the hook auto-save path does. Without a matching alias we fall
+         through to step 3 — non-alias users see the existing
+         ``wing_api`` default.
+      3. AI-tool path detection — defaults to ``wing_api`` so Claude
          Code / Codex / Gemini conversations group under a single wing
          dedicated to API-sourced content.
-      3. Basename fallback — sanitized via ``config.normalize_wing_name``
+      4. Basename fallback — sanitized via ``config.normalize_wing_name``
          (lowercase, spaces/hyphens collapsed to underscores). Shared
          single source of truth with ``cmd_init``,
          ``room_detector_local``, and ``miner.load_config`` so all
@@ -502,6 +559,22 @@ def _resolve_wing(convo_path: Path, wing: Optional[str]) -> str:
     if wing:
         return wing
     if _is_ai_tool_path(convo_path):
+        from .hooks_cli import _load_wing_aliases, _match_prefix_alias
+
+        # Only honor the cwd-derived wing when a user-defined alias
+        # actually fires (not just whatever the slug rule would produce).
+        # Otherwise AI corpora without alias config would suddenly splinter
+        # across one wing per project basename instead of grouping under
+        # the existing ``wing_api`` default — a regression.
+        basename = _cwd_basename_from_first_transcript(convo_path)
+        if basename:
+            aliases = _load_wing_aliases()
+            exact = aliases.get("exact", {}).get(basename)
+            if exact:
+                return exact
+            prefix = _match_prefix_alias(basename, aliases.get("prefix", []))
+            if prefix:
+                return prefix
         return "wing_api"
     return normalize_wing_name(convo_path.name)
 
