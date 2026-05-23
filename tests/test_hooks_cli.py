@@ -175,6 +175,21 @@ def test_count_skips_command_messages(tmp_path):
     assert _count_human_messages(str(transcript)) == 1
 
 
+def test_count_handles_copilot_cli_user_messages(tmp_path):
+    transcript = tmp_path / "events.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            {"type": "session.start", "data": {"sessionId": "s1"}},
+            {"type": "user.message", "data": {"content": "first"}},
+            {"type": "assistant.message", "data": {"content": "reply"}},
+            {"type": "user.message", "data": {"content": "<system-reminder>x</system-reminder>"}},
+            {"type": "user.message", "data": {"content": "", "transformedContent": "fallback"}},
+        ],
+    )
+    assert _count_human_messages(str(transcript)) == 2
+
+
 def test_count_handles_list_content(tmp_path):
     transcript = tmp_path / "t.jsonl"
     _write_transcript(
@@ -208,6 +223,15 @@ def test_count_malformed_json_lines(tmp_path):
     assert _count_human_messages(str(transcript)) == 1
 
 
+def test_count_ignores_non_object_json_lines(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text(
+        'null\n[]\n"string"\n{"message": {"role": "user", "content": "ok"}}\n',
+        encoding="utf-8",
+    )
+    assert _count_human_messages(str(transcript)) == 1
+
+
 # --- _extract_recent_messages ---
 
 
@@ -238,6 +262,22 @@ def test_extract_recent_messages_skips_commands(tmp_path):
     assert msgs[0] == "real msg"
 
 
+def test_extract_recent_messages_handles_copilot_cli(tmp_path):
+    transcript = tmp_path / "events.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            {"type": "user.message", "data": {"content": "copilot msg 1"}},
+            {"type": "assistant.message", "data": {"content": "reply"}},
+            {"type": "user.message", "data": {"content": "copilot msg 2"}},
+        ],
+    )
+    assert _extract_recent_messages(str(transcript), count=2) == [
+        "copilot msg 1",
+        "copilot msg 2",
+    ]
+
+
 def test_extract_recent_messages_missing_file():
     assert _extract_recent_messages("/nonexistent.jsonl") == []
 
@@ -245,7 +285,7 @@ def test_extract_recent_messages_missing_file():
 # --- hook_stop ---
 
 
-def _capture_hook_output(hook_fn, data, harness="claude-code", state_dir=None):
+def _capture_hook_output(hook_fn, data, harness="claude-code", state_dir=None, silent=True):
     """Run a hook and capture its JSON stdout output."""
     import io
     from unittest.mock import PropertyMock
@@ -256,7 +296,7 @@ def _capture_hook_output(hook_fn, data, harness="claude-code", state_dir=None):
         patches.append(patch("mempalace.hooks_cli.STATE_DIR", state_dir))
     # Mock MempalaceConfig so tests don't depend on user's ~/.mempalace/config.json
     mock_config = MagicMock()
-    type(mock_config).hook_silent_save = PropertyMock(return_value=True)
+    type(mock_config).hook_silent_save = PropertyMock(return_value=silent)
     type(mock_config).hook_desktop_toast = PropertyMock(return_value=False)
     patches.append(patch("mempalace.config.MempalaceConfig", return_value=mock_config))
     with contextlib.ExitStack() as stack:
@@ -289,8 +329,7 @@ def test_stop_hook_passthrough_when_active_string(tmp_path):
 def test_stop_hook_passthrough_below_interval(tmp_path):
     transcript = tmp_path / "t.jsonl"
     _write_transcript(
-        transcript,
-        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL - 1)],
+        transcript, [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(3)]
     )
     result = _capture_hook_output(
         hook_stop,
@@ -318,6 +357,36 @@ def test_stop_hook_saves_silently_at_interval(tmp_path):
     assert "hooks" in result["systemMessage"]
     # tmp_path has no "-Projects-" segment, so _wing_from_transcript_path falls back to "wing_sessions"
     mock_save.assert_called_once_with(str(transcript), "test", wing="wing_sessions", toast=False)
+
+
+def test_stop_hook_copilot_cli_forces_silent_and_uses_cwd_wing(tmp_path):
+    transcript = tmp_path / "events.jsonl"
+    _write_transcript(
+        transcript,
+        [{"type": "user.message", "data": {"content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
+    )
+    save_result = {"count": 15, "themes": []}
+    with (
+        patch("mempalace.hooks_cli._save_diary_direct", return_value=save_result) as mock_save,
+        patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest,
+    ):
+        result = _capture_hook_output(
+            hook_stop,
+            {
+                "sessionId": "copilot-session",
+                "transcriptPath": str(transcript),
+                "cwd": "C:\\workspace\\sample-project",
+            },
+            harness="copilot-cli",
+            state_dir=tmp_path,
+            silent=False,
+        )
+    assert "systemMessage" in result
+    assert "decision" not in result
+    mock_save.assert_called_once_with(
+        str(transcript), "copilot-session", wing="wing_sample_project", toast=False
+    )
+    mock_ingest.assert_called_once_with(str(transcript))
 
 
 def test_stop_hook_derives_wing_from_transcript_path(tmp_path):
@@ -572,6 +641,21 @@ def test_wing_from_transcript_path_cwd_handles_non_string_cwd(tmp_path):
         encoding="utf-8",
     )
     assert _wing_from_transcript_path(str(transcript)) == "wing_proper_name"
+
+
+def test_wing_from_transcript_path_reads_copilot_nested_context_cwd(tmp_path):
+    transcript = tmp_path / "events.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "session.start",
+                "data": {"sessionId": "s1", "context": {"cwd": "C:\\workspace\\sample-project"}},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert _wing_from_transcript_path(str(transcript)) == "wing_sample_project"
 
 
 # --- _log ---
@@ -861,11 +945,11 @@ def test_detached_popen_kwargs_posix(monkeypatch):
 
 
 def test_detached_popen_kwargs_windows(monkeypatch):
-    """On Windows, kwargs include creationflags that fully detach the child.
+    """On Windows, kwargs include creationflags that hide the child.
 
-    Without these, the parent hook hangs at session end on Windows because
-    the child's inherited stdout/stderr handles keep the parent's exit
-    blocked (#1268 root cause for the Python hook path).
+    Without these, hook-launched child processes can flash a console window,
+    and inherited handles can keep the parent's exit blocked (#1268 root cause
+    for the Python hook path).
     """
     from mempalace.hooks_cli import _detached_popen_kwargs
 
@@ -873,17 +957,19 @@ def test_detached_popen_kwargs_windows(monkeypatch):
     # Simulate Windows-only Popen flag constants. Patch on the imported
     # subprocess module within hooks_cli so getattr() picks them up.
     monkeypatch.setattr(
-        "mempalace.hooks_cli.subprocess.DETACHED_PROCESS", 0x00000008, raising=False
+        "mempalace.hooks_cli.subprocess.CREATE_NEW_PROCESS_GROUP", 0x00000200, raising=False
     )
     monkeypatch.setattr(
-        "mempalace.hooks_cli.subprocess.CREATE_NEW_PROCESS_GROUP", 0x00000200, raising=False
+        "mempalace.hooks_cli.subprocess.CREATE_NO_WINDOW", 0x08000000, raising=False
     )
     kwargs = _detached_popen_kwargs()
     assert kwargs.get("stdin") is subprocess.DEVNULL
     assert kwargs.get("close_fds") is True
     flags = kwargs.get("creationflags", 0)
-    assert flags & 0x00000008, "DETACHED_PROCESS must be set"
+    assert not flags & 0x00000008, "DETACHED_PROCESS must not mask CREATE_NO_WINDOW"
     assert flags & 0x00000200, "CREATE_NEW_PROCESS_GROUP must be set"
+    assert flags & 0x08000000, "CREATE_NO_WINDOW must be set"
+    assert kwargs.get("startupinfo") is not None
 
 
 def test_spawn_mine_uses_detached_kwargs(tmp_path):
@@ -1005,6 +1091,20 @@ def test_ingest_transcript_uses_detached_kwargs(tmp_path):
                 kwargs = mock_popen.call_args.kwargs
                 assert kwargs.get("stdin") is subprocess.DEVNULL
                 assert kwargs.get("close_fds") is True
+
+
+def test_mine_sync_uses_detached_kwargs(tmp_path):
+    """Precompact's synchronous mine path also hides/detaches child processes."""
+    mempal_dir = tmp_path / "project"
+    mempal_dir.mkdir()
+    with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli.subprocess.run") as mock_run:
+                _mine_sync()
+
+    kwargs = mock_run.call_args.kwargs
+    assert kwargs.get("stdin") is subprocess.DEVNULL
+    assert kwargs.get("close_fds") is True
 
 
 def test_ingest_transcript_skips_when_target_running(tmp_path):
@@ -1286,6 +1386,83 @@ def test_parse_harness_input_valid():
     assert result["stop_hook_active"] is True
 
 
+def test_parse_harness_input_non_object_json_payload():
+    result = _parse_harness_input(["not", "an", "object"], "copilot-cli")
+    assert result == {
+        "session_id": "unknown",
+        "stop_hook_active": False,
+        "transcript_path": "",
+        "cwd": "",
+    }
+
+
+def test_parse_harness_input_copilot_cli_camel_case():
+    result = _parse_harness_input(
+        {
+            "sessionId": "abc-123",
+            "transcriptPath": "C:\\Users\\me\\.copilot\\session-state\\abc-123\\events.jsonl",
+            "cwd": "C:\\workspace\\sample-project",
+        },
+        "copilot-cli",
+    )
+    assert result["session_id"] == "abc-123"
+    assert result["transcript_path"].endswith("events.jsonl")
+    assert result["cwd"] == "C:\\workspace\\sample-project"
+    assert result["stop_hook_active"] is False
+
+
+def test_parse_harness_input_copilot_cli_hook_wrapper():
+    result = _parse_harness_input(
+        {
+            "hookInvocationId": "hook-1",
+            "hookType": "agentStop",
+            "input": {
+                "sessionId": "abc-123",
+                "transcriptPath": "C:\\Users\\me\\.copilot\\session-state\\abc-123\\events.jsonl",
+                "cwd": "C:\\workspace\\sample-project",
+            },
+        },
+        "copilot-cli",
+    )
+    assert result["session_id"] == "abc-123"
+    assert result["transcript_path"].endswith("events.jsonl")
+    assert result["cwd"] == "C:\\workspace\\sample-project"
+
+
+def test_parse_harness_input_copilot_cli_event_wrapper():
+    result = _parse_harness_input(
+        {
+            "type": "hook.start",
+            "data": {
+                "hookInvocationId": "hook-1",
+                "hookType": "preCompact",
+                "input": {
+                    "sessionId": "abc-123",
+                    "transcriptPath": "C:\\Users\\me\\.copilot\\session-state\\abc-123\\events.jsonl",
+                    "cwd": "C:\\workspace\\sample-project",
+                },
+            },
+        },
+        "copilot-cli",
+    )
+    assert result["session_id"] == "abc-123"
+    assert result["transcript_path"].endswith("events.jsonl")
+    assert result["cwd"] == "C:\\workspace\\sample-project"
+
+
+def test_parse_harness_input_copilot_cli_session_state_fallback(tmp_path):
+    session_id = "abc-123"
+    transcript = tmp_path / ".copilot" / "session-state" / session_id / "events.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("{}", encoding="utf-8")
+
+    with patch("mempalace.hooks_cli.Path.home", return_value=tmp_path):
+        result = _parse_harness_input({"sessionId": session_id}, "copilot-cli")
+
+    assert result["session_id"] == session_id
+    assert result["transcript_path"] == str(transcript)
+
+
 # --- hook_stop with OSError on write ---
 
 
@@ -1429,7 +1606,8 @@ def test_run_hook_dispatches_session_start(tmp_path):
 def test_run_hook_dispatches_stop(tmp_path):
     transcript = tmp_path / "t.jsonl"
     _write_transcript(
-        transcript, [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(3)]
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL - 1)],
     )
     stdin_data = json.dumps(
         {
@@ -1443,6 +1621,49 @@ def test_run_hook_dispatches_stop(tmp_path):
             with patch("mempalace.hooks_cli._output") as mock_output:
                 run_hook("stop", "claude-code")
     mock_output.assert_called_once_with({})
+
+
+def test_run_hook_dispatches_copilot_wrapped_stop_payload(tmp_path):
+    transcript = tmp_path / "events.jsonl"
+    _write_transcript(
+        transcript,
+        [{"type": "user.message", "data": {"content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
+    )
+    stdin_data = json.dumps(
+        {
+            "hookInvocationId": "hook-1",
+            "hookType": "agentStop",
+            "input": {
+                "sessionId": "3662f2c2-7f30-4954-98f6-fd7cc238a56f",
+                "transcriptPath": str(transcript),
+                "cwd": "C:\\workspace\\sample-project",
+            },
+        }
+    )
+    mock_config = MagicMock()
+    mock_config.hook_silent_save = True
+    mock_config.hook_desktop_toast = False
+    save_result = {"count": SAVE_INTERVAL, "themes": []}
+    with (
+        patch("sys.stdin", io.StringIO(stdin_data)),
+        patch("mempalace.hooks_cli.STATE_DIR", tmp_path),
+        patch("mempalace.config.MempalaceConfig", return_value=mock_config),
+        patch("mempalace.hooks_cli._save_diary_direct", return_value=save_result) as mock_save,
+        patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest,
+        patch("mempalace.hooks_cli._output") as mock_output,
+    ):
+        run_hook("stop", "copilot-cli")
+
+    mock_output.assert_called_once_with(
+        {"systemMessage": f"\u2726 {SAVE_INTERVAL} memories woven into the palace"}
+    )
+    mock_save.assert_called_once_with(
+        str(transcript),
+        "3662f2c2-7f30-4954-98f6-fd7cc238a56f",
+        wing="wing_sample_project",
+        toast=False,
+    )
+    mock_ingest.assert_called_once_with(str(transcript))
 
 
 def test_run_hook_dispatches_precompact(tmp_path):
@@ -1468,6 +1689,15 @@ def test_run_hook_invalid_json(tmp_path):
         with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
             with patch("mempalace.hooks_cli._output") as mock_output:
                 run_hook("session-start", "claude-code")
+    mock_output.assert_called_once_with({})
+
+
+def test_run_hook_non_object_json_payload(tmp_path):
+    """Valid but non-object stdin JSON should not crash."""
+    with patch("sys.stdin", io.StringIO("[]")):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli._output") as mock_output:
+                run_hook("stop", "copilot-cli")
     mock_output.assert_called_once_with({})
 
 

@@ -9,6 +9,7 @@ Supported:
     - Claude Code JSONL (with tool_use/tool_result block capture)
     - OpenAI Codex CLI JSONL
     - Gemini CLI JSONL (~/.gemini/tmp/<project_hash>/chats/session-*.jsonl)
+    - GitHub Copilot CLI JSONL (~/.copilot/session-state/<session-id>/events.jsonl)
     - Slack JSON export
     - Plain text (pass through for paragraph chunking)
 
@@ -159,6 +160,10 @@ def _try_normalize_json(content: str) -> Optional[str]:
         return normalized
 
     normalized = _try_gemini_jsonl(content)
+    if normalized:
+        return normalized
+
+    normalized = _try_copilot_cli_jsonl(content)
     if normalized:
         return normalized
 
@@ -349,6 +354,61 @@ def _try_gemini_jsonl(content: str) -> Optional[str]:
             messages.append(("assistant", joined))
 
     if len(messages) >= 2 and has_session_metadata:
+        return _messages_to_transcript(messages)
+    return None
+
+
+def _try_copilot_cli_jsonl(content: str) -> Optional[str]:
+    """GitHub Copilot CLI sessions (~/.copilot/session-state/<id>/events.jsonl).
+
+    Copilot CLI stores an event stream with top-level ``type`` and ``data``
+    fields. Conversation text lives in ``user.message`` and
+    ``assistant.message`` records. Detection requires a ``session.start``
+    sentinel so ordinary JSONL files with similarly named fields do not
+    false-positive.
+    """
+    lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
+    messages = []
+    has_session_start = False
+    has_copilot_message = False
+
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+
+        entry_type = entry.get("type", "")
+        if entry_type == "session.start":
+            data = entry.get("data", {})
+            if isinstance(data, dict) and "sessionId" in data:
+                has_session_start = True
+            continue
+
+        if entry_type not in ("user.message", "assistant.message"):
+            continue
+
+        data = entry.get("data", {})
+        if not isinstance(data, dict):
+            continue
+
+        text = _extract_content(data.get("content", ""))
+        if not text and entry_type == "user.message":
+            text = _extract_content(data.get("transformedContent", ""))
+        if text:
+            text = strip_noise(text)
+        if not text:
+            continue
+
+        has_copilot_message = True
+        if entry_type == "user.message":
+            messages.append(("user", text))
+        else:
+            messages.append(("assistant", text))
+
+    if len(messages) >= 2 and has_session_start and has_copilot_message:
         return _messages_to_transcript(messages)
     return None
 

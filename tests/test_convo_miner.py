@@ -303,9 +303,10 @@ def test_mine_convos_dry_run_bypasses_palace_lock(tmp_path, monkeypatch):
 # When a user runs `mempalace mine --mode convos` against a directory
 # inside a known AI-tool storage path (Claude Code's
 # ~/.claude/projects/, OpenAI Codex's ~/.codex/, Google Gemini CLI's
-# ~/.gemini/), the wing auto-defaults to "wing_api" rather than the
-# directory basename. This keeps API-sourced conversations grouped
-# under a single dedicated wing for visibility and privacy isolation.
+# ~/.gemini/, GitHub Copilot CLI's ~/.copilot/session-state/), the wing
+# auto-defaults to "wing_api" rather than the directory basename. This keeps
+# API-sourced conversations grouped under a single dedicated wing for
+# visibility and privacy isolation.
 #
 # Explicit user-passed --wing always wins. Unrelated directories use
 # the existing basename fallback unchanged.
@@ -347,6 +348,13 @@ def test_is_ai_tool_path_gemini_root(tmp_path):
 def test_is_ai_tool_path_gemini_chats(tmp_path):
     """Gemini stores sessions under ~/.gemini/tmp/<hash>/chats/."""
     target = tmp_path / ".gemini" / "tmp" / "abc123" / "chats"
+    target.mkdir(parents=True)
+    assert _is_ai_tool_path(target) is True
+
+
+def test_is_ai_tool_path_copilot_session_state(tmp_path):
+    """Copilot CLI stores sessions under ~/.copilot/session-state/<session-id>/."""
+    target = tmp_path / ".copilot" / "session-state" / "abc-123"
     target.mkdir(parents=True)
     assert _is_ai_tool_path(target) is True
 
@@ -397,6 +405,12 @@ def test_resolve_wing_codex_auto_routes_to_wing_api(tmp_path):
 
 def test_resolve_wing_gemini_auto_routes_to_wing_api(tmp_path):
     target = tmp_path / ".gemini" / "tmp" / "abc" / "chats"
+    target.mkdir(parents=True)
+    assert _resolve_wing(target, wing=None) == "wing_api"
+
+
+def test_resolve_wing_copilot_auto_routes_to_wing_api(tmp_path):
+    target = tmp_path / ".copilot" / "session-state" / "abc-123"
     target.mkdir(parents=True)
     assert _resolve_wing(target, wing=None) == "wing_api"
 
