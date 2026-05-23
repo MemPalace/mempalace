@@ -1618,3 +1618,16 @@ def test_mine_does_not_remove_other_processes_pid_file(tmp_path):
 
     assert pid_file.exists(), "Foreign PID entries must not be removed"
     assert pid_file.read_text().strip() == str(other_pid)
+
+
+def test_scan_project_picks_up_cs_files():
+    """C# source files (.cs) should be included in READABLE_EXTENSIONS and scanned."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        project_root = Path(tmpdir).resolve()
+
+        write_file(project_root / "Program.cs", "namespace App { class Program {} }\n" * 20)
+
+        assert scanned_files(project_root, respect_gitignore=False) == ["Program.cs"]
+    finally:
+        shutil.rmtree(tmpdir)
