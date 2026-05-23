@@ -777,6 +777,72 @@ _ENCODED_PARENT_PREFIXES = (
 )
 
 
+def _load_wing_aliases() -> dict:
+    """Load optional user-level wing aliases from ``~/.mempalace/wing_aliases.json``.
+
+    Schema (all keys optional):
+
+        {
+          "aliases":        {"<basename>": "<wing>", ...},
+          "prefix_aliases": {"<prefix>":   "<wing>", ...}
+        }
+
+    Use case: collapse multiple working-copy clones of one repo (e.g.
+    ``joy-web``, ``joy-web-1``, ..., ``joy-web-5``) onto a single wing
+    so diary entries written from any clone land in the same place.
+
+    - ``aliases`` is exact-match against the project's directory basename.
+    - ``prefix_aliases`` matches if the basename ``startswith()`` the prefix.
+      Longest matching prefix wins on ties.
+    - Exact match always beats a prefix match.
+    - Values may include or omit the ``wing_`` prefix — both normalize to one.
+    - Malformed or missing file → ``{}`` (silent; hooks must never fail on
+      a bad alias config).
+    """
+    path = PALACE_ROOT / "wing_aliases.json"
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    aliases = data.get("aliases") or {}
+    prefix = data.get("prefix_aliases") or {}
+    return {
+        "aliases": aliases if isinstance(aliases, dict) else {},
+        "prefix_aliases": prefix if isinstance(prefix, dict) else {},
+    }
+
+
+def _basename_to_wing(basename: str, aliases: Optional[dict] = None) -> str:
+    """Resolve a project directory basename to a wing name.
+
+    Applies aliases (if any) before falling back to the deterministic slug
+    rule used everywhere else: lowercase, spaces/hyphens → underscores,
+    prefixed with ``wing_``.
+    """
+    if aliases is None:
+        aliases = _load_wing_aliases()
+    exact = aliases.get("aliases", {}).get(basename)
+    if isinstance(exact, str) and exact:
+        return exact if exact.startswith("wing_") else f"wing_{exact}"
+    prefix_map = aliases.get("prefix_aliases", {})
+    if isinstance(prefix_map, dict) and prefix_map:
+        best_prefix = ""
+        best_wing = None
+        for pfx, wing in prefix_map.items():
+            if not isinstance(pfx, str) or not isinstance(wing, str):
+                continue
+            if basename.startswith(pfx) and len(pfx) > len(best_prefix):
+                best_prefix = pfx
+                best_wing = wing
+        if best_wing:
+            return best_wing if best_wing.startswith("wing_") else f"wing_{best_wing}"
+    slug = basename.lower().replace(" ", "_").replace("-", "_")
+    return f"wing_{slug}"
+
+
 def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
     """Read ``cwd`` from the first JSONL line that records it.
 
@@ -786,6 +852,10 @@ def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
     the first record that includes a non-empty cwd, then derive the
     wing from its leaf path segment. Returns ``None`` if the file is
     unreadable, empty, or contains no cwd.
+
+    Honors user-level aliases in ``~/.mempalace/wing_aliases.json`` so
+    multiple working-copy clones can collapse onto a single wing — see
+    ``_load_wing_aliases``.
     """
     try:
         path = Path(transcript_path).expanduser()
@@ -810,8 +880,7 @@ def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
                     continue
                 project = cwd_norm.rsplit("/", 1)[-1]
                 if project:
-                    slug = project.lower().replace(" ", "_").replace("-", "_")
-                    return f"wing_{slug}"
+                    return _basename_to_wing(project)
     except OSError:
         pass
     return None
@@ -862,21 +931,19 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
         if m:
             encoded = m.group(1)
         # Strip one common parent-dir token if present, keeping the rest as
-        # the project path. Hyphens become underscores to preserve
-        # uniqueness for hyphenated project folder names.
+        # the project path. ``_basename_to_wing`` applies any user aliases
+        # and then handles the dash→underscore conversion uniformly.
         for prefix in _ENCODED_PARENT_PREFIXES:
             if encoded.startswith(prefix):
                 encoded = encoded[len(prefix) :]
                 break
-        project = encoded.lower().replace(" ", "_").replace("-", "_")
-        if project:
-            return f"wing_{project}"
+        if encoded:
+            return _basename_to_wing(encoded)
 
     # 3. Legacy — explicit -Projects-<name> segment
     match = re.search(r"-Projects-([^/]+?)(?:/|$)", normalized)
     if match:
-        project = match.group(1).lower().replace(" ", "_").replace("-", "_")
-        return f"wing_{project}"
+        return _basename_to_wing(match.group(1))
 
     # 4. Default
     return "wing_sessions"

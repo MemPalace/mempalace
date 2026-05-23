@@ -574,6 +574,121 @@ def test_wing_from_transcript_path_cwd_handles_non_string_cwd(tmp_path):
     assert _wing_from_transcript_path(str(transcript)) == "wing_proper_name"
 
 
+# --- _wing_from_transcript_path: wing_aliases.json (collapsing clones) ---
+
+
+def test_wing_aliases_collapse_prefix_matched_clones(tmp_path, monkeypatch):
+    """``prefix_aliases`` collapses N clones of one repo onto a single wing.
+
+    Common case: a user keeps 6 working copies of ``joy-web`` named
+    ``joy-web``, ``joy-web-1``, ..., ``joy-web-5`` for parallel branches.
+    Without aliases each clone would file diary entries under a different
+    wing (``wing_joy_web``, ``wing_joy_web_1``, ...), splintering search
+    across the same project.
+    """
+    palace_root = tmp_path / ".mempalace"
+    palace_root.mkdir(exist_ok=True)
+    (palace_root / "wing_aliases.json").write_text(
+        json.dumps({"prefix_aliases": {"joy-web": "wing_joy_web"}})
+    )
+    monkeypatch.setattr(hooks_cli_mod, "PALACE_ROOT", palace_root)
+
+    transcript = tmp_path / "s.jsonl"
+    for cwd in (
+        "/Users/me/git/joy-web",
+        "/Users/me/git/joy-web-1",
+        "/Users/me/git/joy-web-5",
+    ):
+        transcript.write_text(
+            json.dumps({"type": "user", "cwd": cwd}) + "\n", encoding="utf-8"
+        )
+        assert _wing_from_transcript_path(str(transcript)) == "wing_joy_web"
+
+
+def test_wing_aliases_exact_match_beats_prefix(tmp_path, monkeypatch):
+    """Exact ``aliases`` match always wins over ``prefix_aliases``."""
+    palace_root = tmp_path / ".mempalace"
+    palace_root.mkdir(exist_ok=True)
+    (palace_root / "wing_aliases.json").write_text(
+        json.dumps({
+            "aliases": {"joy-web-experimental": "wing_experimental"},
+            "prefix_aliases": {"joy-web": "wing_joy_web"},
+        })
+    )
+    monkeypatch.setattr(hooks_cli_mod, "PALACE_ROOT", palace_root)
+
+    transcript = tmp_path / "s.jsonl"
+    transcript.write_text(
+        json.dumps({"type": "user", "cwd": "/x/joy-web-experimental"}) + "\n"
+    )
+    assert _wing_from_transcript_path(str(transcript)) == "wing_experimental"
+    transcript.write_text(
+        json.dumps({"type": "user", "cwd": "/x/joy-web-5"}) + "\n"
+    )
+    assert _wing_from_transcript_path(str(transcript)) == "wing_joy_web"
+
+
+def test_wing_aliases_longest_prefix_wins(tmp_path, monkeypatch):
+    """On tied prefix matches, the longest prefix takes precedence."""
+    palace_root = tmp_path / ".mempalace"
+    palace_root.mkdir(exist_ok=True)
+    (palace_root / "wing_aliases.json").write_text(
+        json.dumps({"prefix_aliases": {"joy": "wing_joy_misc", "joy-web": "wing_joy_web"}})
+    )
+    monkeypatch.setattr(hooks_cli_mod, "PALACE_ROOT", palace_root)
+
+    transcript = tmp_path / "s.jsonl"
+    transcript.write_text(json.dumps({"type": "user", "cwd": "/x/joy-web-2"}) + "\n")
+    assert _wing_from_transcript_path(str(transcript)) == "wing_joy_web"
+    transcript.write_text(json.dumps({"type": "user", "cwd": "/x/joy-mobile"}) + "\n")
+    assert _wing_from_transcript_path(str(transcript)) == "wing_joy_misc"
+
+
+def test_wing_aliases_normalize_wing_prefix(tmp_path, monkeypatch):
+    """Alias values may omit ``wing_`` — the loader normalizes to a single prefix."""
+    palace_root = tmp_path / ".mempalace"
+    palace_root.mkdir(exist_ok=True)
+    (palace_root / "wing_aliases.json").write_text(
+        json.dumps({"aliases": {"foo": "bar", "baz": "wing_baz_explicit"}})
+    )
+    monkeypatch.setattr(hooks_cli_mod, "PALACE_ROOT", palace_root)
+
+    transcript = tmp_path / "s.jsonl"
+    transcript.write_text(json.dumps({"type": "user", "cwd": "/x/foo"}) + "\n")
+    assert _wing_from_transcript_path(str(transcript)) == "wing_bar"
+    transcript.write_text(json.dumps({"type": "user", "cwd": "/x/baz"}) + "\n")
+    assert _wing_from_transcript_path(str(transcript)) == "wing_baz_explicit"
+
+
+def test_wing_aliases_malformed_file_silently_ignored(tmp_path, monkeypatch):
+    """A broken aliases file must never crash the hook — fall through silently."""
+    palace_root = tmp_path / ".mempalace"
+    palace_root.mkdir(exist_ok=True)
+    (palace_root / "wing_aliases.json").write_text("definitely not json {{{")
+    monkeypatch.setattr(hooks_cli_mod, "PALACE_ROOT", palace_root)
+
+    transcript = tmp_path / "s.jsonl"
+    transcript.write_text(json.dumps({"type": "user", "cwd": "/x/myproj"}) + "\n")
+    assert _wing_from_transcript_path(str(transcript)) == "wing_myproj"
+
+
+def test_wing_aliases_apply_to_encoded_fallback_path(tmp_path, monkeypatch):
+    """Aliases also apply when cwd is unavailable and we fall back to the
+    encoded-folder heuristic — the post-strip name is what we alias against."""
+    palace_root = tmp_path / ".mempalace"
+    palace_root.mkdir(exist_ok=True)
+    (palace_root / "wing_aliases.json").write_text(
+        json.dumps({"prefix_aliases": {"joy-web": "wing_joy_web"}})
+    )
+    monkeypatch.setattr(hooks_cli_mod, "PALACE_ROOT", palace_root)
+
+    # No transcript file exists at this path → cwd reader returns None →
+    # fallback decodes the slug. After stripping ``Users-me-``, the residual
+    # is ``joy-web-3``, which the prefix alias collapses to ``wing_joy_web``.
+    path = "/Users/me/.claude/projects/-Users-me-joy-web-3/missing.jsonl"
+    assert _wing_from_transcript_path(path) == "wing_joy_web"
+
+
 # --- _log ---
 
 
