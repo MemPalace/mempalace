@@ -926,21 +926,25 @@ class TestCmdReadCLISubprocess:
         # Build a tiny source corpus.
         src_dir = tmp_path / "src"
         src_dir.mkdir()
+        # Use ASCII-only fixture content. The em-dash decorations that
+        # were here originally trip Windows' source-encoding handling
+        # in pytest assertion messages, causing the assertion-string
+        # literal to mismatch the (correctly UTF-8) subprocess stdout.
         (src_dir / "chat.md").write_text(
             "\n".join(
                 [
-                    "line 1 — hello",
-                    "line 2 — world",
-                    "line 3 — alpha",
-                    "line 4 — beta",
-                    "line 5 — gamma",
-                    "line 6 — delta",
-                    "line 7 — epsilon",
-                    "line 8 — zeta",
-                    "line 9 — eta",
-                    "line 10 — theta",
-                    "line 11 — iota",
-                    "line 12 — kappa",
+                    "line 1 hello",
+                    "line 2 world",
+                    "line 3 alpha",
+                    "line 4 beta",
+                    "line 5 gamma",
+                    "line 6 delta",
+                    "line 7 epsilon",
+                    "line 8 zeta",
+                    "line 9 eta",
+                    "line 10 theta",
+                    "line 11 iota",
+                    "line 12 kappa",
                 ]
             ),
             encoding="utf-8",
@@ -976,10 +980,10 @@ class TestCmdReadCLISubprocess:
         )
         assert read.returncode == 0, f"read failed: {read.stderr}"
         # Surgical slice contract: ONLY lines [3] through [7].
-        assert "[3] line 3 — alpha" in read.stdout
-        assert "[7] line 7 — epsilon" in read.stdout
+        assert "[3] line 3 alpha" in read.stdout
+        assert "[7] line 7 epsilon" in read.stdout
         # Hard negative: leaked lines outside the range would prove the
-        # whole-chunk-leak bug Igor caught is back.
+        # whole-chunk-leak regression class is back.
         assert "[1]" not in read.stdout, (
             f"unexpected leak of line 1; whole-chunk regression?\nstdout:\n{read.stdout}"
         )
