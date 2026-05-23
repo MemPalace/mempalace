@@ -486,11 +486,54 @@ def _maybe_run_mine_after_init(args, cfg) -> None:
         sys.exit(1)
 
 
+def _force_clean(palace_path: str, source_dir: str) -> int:
+    """Delete all drawers whose source_file is under source_dir. Returns count deleted."""
+    from pathlib import Path
+    from .palace import get_collection
+
+    try:
+        col = get_collection(palace_path)
+    except Exception:
+        return 0
+
+    source_prefix = str(Path(source_dir).expanduser().resolve())
+    if not source_prefix.endswith(os.sep):
+        source_prefix += os.sep
+
+    batch_size = 500
+    offset = 0
+    to_delete = []
+
+    while True:
+        batch = col.get(limit=batch_size, offset=offset, include=["metadatas"])
+        if not batch["ids"]:
+            break
+        for drawer_id, meta in zip(batch["ids"], batch["metadatas"]):
+            sf = meta.get("source_file", "")
+            try:
+                sf_resolved = str(Path(sf).resolve())
+            except OSError:
+                sf_resolved = sf
+            if sf_resolved.startswith(source_prefix) or sf_resolved == source_prefix.rstrip(os.sep):
+                to_delete.append(drawer_id)
+        offset += len(batch["ids"])
+
+    if to_delete:
+        print(f"\n  --force: removing {len(to_delete)} existing drawers from {source_prefix.rstrip(os.sep)}...")
+        for i in range(0, len(to_delete), 100):
+            col.delete(ids=to_delete[i : i + 100])
+        print("  Done. Re-mining fresh.\n")
+    return len(to_delete)
+
+
 def cmd_mine(args):
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     include_ignored = []
     for raw in args.include_ignored or []:
         include_ignored.extend(part.strip() for part in raw.split(",") if part.strip())
+
+    if getattr(args, "force", False) and not args.dry_run:
+        _force_clean(palace_path, args.dir)
 
     # --redetect-origin re-runs corpus_origin on the current corpus state
     # and overwrites <palace>/.mempalace/origin.json before mining proceeds.
@@ -1315,6 +1358,11 @@ def main():
     )
     p_mine.add_argument(
         "--dry-run", action="store_true", help="Show what would be filed without filing"
+    )
+    p_mine.add_argument(
+        "--force",
+        action="store_true",
+        help="Delete existing drawers for this directory before re-mining (atomic re-mine)",
     )
     p_mine.add_argument(
         "--extract",
