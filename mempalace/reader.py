@@ -234,7 +234,11 @@ def _resolve_by_ids(col, drawer_ids: list[str]) -> list[DrawerCandidate]:
     """Fetch drawers by explicit id list."""
     try:
         result = _chunked_get(col, list(drawer_ids), include=["documents", "metadatas"])
-    except Exception:
+    except Exception as e:
+        # Terminal failure — caller gets [] with no further recovery
+        # path. Log at WARNING (matches ``palace.py:706/747`` convention
+        # for partial-result / no-recovery situations).
+        logger.warning("_resolve_by_ids: fetch failed: %s", e)
         return []
     candidates: list[DrawerCandidate] = []
     for did, doc, meta in zip(
@@ -288,7 +292,18 @@ def _resolve_by_source(col, source_file: str) -> list[DrawerCandidate]:
             candidates.sort(key=lambda c: c.chunk_index)
             return candidates
     except Exception:
-        pass
+        # Planned fallthrough — the exact-match ``where`` query failing
+        # is expected for shorthand pointers that hand us just a basename
+        # (chromadb's metadata isn't indexed on basename). We drop into
+        # the paginated scan which IS the recovery path. Logged at DEBUG
+        # with exc_info=True so the failure is traceable when debugging
+        # but doesn't trigger alarm-fatigue for normal shorthand-pointer
+        # operation. Matches ``searcher.py:493/866`` convention for
+        # planned-fallthrough-with-recovery-available paths.
+        logger.debug(
+            "_resolve_by_source: exact-match where-filter failed; falling through to paginated scan",
+            exc_info=True,
+        )
 
     # Fallback: paginated metadatas-only scan identifies matches by
     # basename, then a chunked docs fetch retrieves only the matched
@@ -313,7 +328,10 @@ def _resolve_by_source(col, source_file: str) -> list[DrawerCandidate]:
             if not batch_ids:
                 break
             offset += len(batch_ids)
-    except Exception:
+    except Exception as e:
+        # Terminal failure — caller gets [] with no further recovery
+        # path. Log at WARNING (matches ``palace.py:706/747`` convention).
+        logger.warning("_resolve_by_source: fallback scan failed: %s", e)
         return []
 
     if not matched_ids:

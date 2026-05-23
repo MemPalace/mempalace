@@ -1236,3 +1236,123 @@ class TestCmdReadCLISubprocess:
             or "argument --all" in rejected.stderr
             or "mutually exclusive" in rejected.stderr.lower()
         ), f"argparse must surface the mutex constraint; got stderr={rejected.stderr!r}"
+
+
+# Gemini-bot consistency-pass — log on every bare-except site
+
+
+class TestExceptionLoggingConsistencyPass:
+    """Every bare-except block in reader.py must surface its catch
+    via the project's logging conventions:
+
+    - ``logger.warning(...)`` for terminal failures where the caller
+      gets an empty result with no further recovery (matches
+      ``palace.py:706`` / ``palace.py:747``).
+    - ``logger.debug(..., exc_info=True)`` for planned-fallthrough
+      paths where the failure is expected and an alternate code path
+      takes over (matches ``searcher.py:493`` / ``:866``).
+
+    Pre-fix all three of these sites silently swallowed their
+    exceptions, hiding chromadb / filesystem failures from diagnostics.
+    """
+
+    def test_resolve_by_ids_logs_warning_on_outer_fetch_failure(self, caplog):
+        """When ``_chunked_get`` itself fails (rather than a chunk
+        within it), ``_resolve_by_ids`` must emit a WARNING and
+        return []."""
+        import logging
+        from unittest.mock import patch
+        from mempalace.reader import _resolve_by_ids
+
+        with patch("mempalace.reader._chunked_get") as mock_chunked:
+            mock_chunked.side_effect = RuntimeError("simulated upstream failure")
+            with caplog.at_level(logging.WARNING, logger="mempalace.reader"):
+                result = _resolve_by_ids(object(), ["drawer_a", "drawer_b"])
+
+        assert result == [], (
+            f"_resolve_by_ids must return empty list on _chunked_get failure; got {result!r}"
+        )
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warnings, "expected WARNING log when _chunked_get raises; got none"
+        msg = " ".join(r.getMessage() for r in warnings)
+        assert "_resolve_by_ids" in msg, (
+            f"warning must name _resolve_by_ids for searchability; got {msg!r}"
+        )
+
+    def test_resolve_by_source_exact_match_failure_logs_debug_and_falls_through(self, caplog):
+        """When the exact-match ``col.get(where={...})`` raises, the
+        function must fall through to the paginated scan (NOT return
+        []), and a DEBUG log with exc_info=True must record the
+        planned fallthrough."""
+        import logging
+        from unittest.mock import MagicMock
+        from mempalace.reader import _resolve_by_source
+
+        # Build a collection that raises on the exact-match path but
+        # succeeds on the paginated scan path, so we can prove
+        # fallthrough.
+        col = MagicMock()
+        col.count.return_value = 1
+
+        def fake_get(ids=None, where=None, include=None, limit=None, offset=None, **kwargs):
+            if where is not None:
+                raise RuntimeError("simulated where-filter failure")
+            # Paginated scan path — single matching drawer.
+            if offset == 0:
+                return {
+                    "ids": ["d1"],
+                    "metadatas": [{"source_file": "/p/notes.md", "chunk_index": 0}],
+                }
+            if ids is not None:
+                return {
+                    "ids": ["d1"],
+                    "documents": ["matched content"],
+                    "metadatas": [{"source_file": "/p/notes.md", "chunk_index": 0}],
+                }
+            return {"ids": [], "documents": [], "metadatas": []}
+
+        col.get.side_effect = fake_get
+
+        with caplog.at_level(logging.DEBUG, logger="mempalace.reader"):
+            result = _resolve_by_source(col, "notes.md")
+
+        # Fallthrough proof: the paginated scan still produced the
+        # matched candidate, so result is NOT empty.
+        assert len(result) == 1, (
+            f"exact-match failure must fall through to paginated scan; got {len(result)} candidates"
+        )
+
+        # Debug log proof: the planned-fallthrough exception was
+        # captured with exc_info.
+        debug_records = [r for r in caplog.records if r.levelno == logging.DEBUG]
+        assert debug_records, "expected DEBUG log on exact-match failure (planned fallthrough)"
+        msg = " ".join(r.getMessage() for r in debug_records)
+        assert "_resolve_by_source" in msg or "exact" in msg.lower(), (
+            f"debug log must name the site for searchability; got {msg!r}"
+        )
+
+    def test_resolve_by_source_paginated_scan_failure_logs_warning(self, caplog):
+        """When ``col.count()`` raises during the paginated scan, the
+        function must emit a WARNING and return []."""
+        import logging
+        from unittest.mock import MagicMock
+        from mempalace.reader import _resolve_by_source
+
+        col = MagicMock()
+        # Exact-match path returns empty (no exception) so we fall
+        # through to the scan. Then count() raises.
+        col.get.return_value = {"ids": [], "documents": [], "metadatas": []}
+        col.count.side_effect = RuntimeError("simulated count failure")
+
+        with caplog.at_level(logging.WARNING, logger="mempalace.reader"):
+            result = _resolve_by_source(col, "notes.md")
+
+        assert result == [], (
+            f"_resolve_by_source paginated scan must return [] on terminal failure; got {result!r}"
+        )
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warnings, "expected WARNING log on paginated scan failure; got none"
+        msg = " ".join(r.getMessage() for r in warnings)
+        assert "_resolve_by_source" in msg or "scan" in msg.lower(), (
+            f"warning must name the site for searchability; got {msg!r}"
+        )
