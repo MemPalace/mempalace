@@ -377,7 +377,7 @@ def scan_convos(convo_dir: str) -> list:
 # =============================================================================
 
 
-def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extract_mode):
+def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extract_mode, content_hash=""):
     """Lock the source file, purge stale drawers, and upsert fresh chunks.
 
     Combines the per-file serialization that prevents concurrent agents from
@@ -437,6 +437,7 @@ def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extr
                         "ingest_mode": "convos",
                         "extract_mode": extract_mode,
                         "normalize_version": NORMALIZE_VERSION,
+                        "content_hash": content_hash,
                     }
                 )
             try:
@@ -514,6 +515,7 @@ def mine_convos(
     limit: int = 0,
     dry_run: bool = False,
     extract_mode: str = "exchange",
+    filepath_filter: str = None,
 ):
     """Mine a directory of conversation files into the palace.
 
@@ -588,6 +590,8 @@ def _mine_convos_impl(
     wing = _resolve_wing(convo_path, wing)
 
     files = scan_convos(convo_dir)
+    if filepath_filter:
+        files = [f for f in files if str(f) == filepath_filter]
     if limit > 0:
         files = files[:limit]
 
@@ -685,8 +689,14 @@ def _mine_convos_impl(
 
         # Lock + purge stale + file fresh chunks. Lock serializes concurrent
         # agents; purge removes pre-v2 drawers so the schema bump applies.
+        try:
+            raw_content = filepath.read_text(encoding="utf-8", errors="replace").strip()
+            file_hash = hashlib.md5(raw_content.encode(), usedforsecurity=False).hexdigest()
+        except OSError:
+            file_hash = ""
         drawers_added, room_delta, skipped = _file_chunks_locked(
-            collection, source_file, chunks, wing, room, agent, extract_mode
+            collection, source_file, chunks, wing, room, agent, extract_mode,
+            content_hash=file_hash,
         )
         if skipped:
             files_skipped += 1

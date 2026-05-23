@@ -88,6 +88,14 @@ from .config import (  # noqa: E402  (kept here for the legacy alias)
 )
 
 DRAWER_UPSERT_BATCH_SIZE = 1000
+
+
+def file_content_hash(filepath: Path) -> str:
+    """Compute MD5 of a file's content — single source of truth for sync/freshness checks."""
+    content = filepath.read_text(encoding="utf-8", errors="replace").strip()
+    return hashlib.md5(content.encode(), usedforsecurity=False).hexdigest()
+
+
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB — skip files larger than this.
 # A safety rail against pathological generated artifacts (lockfiles not in
 # SKIP_FILENAMES, vendored data dumps, etc.). Originally 500 to bound ONNX
@@ -875,6 +883,7 @@ def _build_drawer_metadata(
     agent: str,
     content: str,
     source_mtime: Optional[float],
+    content_hash: str = "",
 ) -> dict:
     """Build the metadata dict for one drawer without upserting.
 
@@ -893,6 +902,11 @@ def _build_drawer_metadata(
     }
     if source_mtime is not None:
         metadata["source_mtime"] = source_mtime
+    # Store content hash for sync/freshness detection.
+    # Fall back to hashing the drawer content so MCP-created drawers also get a hash.
+    metadata["content_hash"] = content_hash or hashlib.md5(
+        content.encode(), usedforsecurity=False
+    ).hexdigest()
     metadata["hall"] = detect_hall(content)
     entities = _extract_entities_for_metadata(content)
     if entities:
@@ -1023,6 +1037,7 @@ def process_file(
             source_mtime = os.path.getmtime(source_file)
         except OSError:
             source_mtime = None
+        file_hash = file_content_hash(filepath)
 
         drawers_added = 0
         for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
@@ -1042,6 +1057,7 @@ def process_file(
                         agent,
                         chunk["content"],
                         source_mtime,
+                        file_hash,
                     )
                 )
             collection.upsert(
