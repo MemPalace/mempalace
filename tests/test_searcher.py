@@ -596,9 +596,9 @@ def test_resolve_stop_words_none_reflects_config_change_between_calls(monkeypatc
 
     monkeypatch.setattr(searcher, "MempalaceConfig", FakeCfgJa)
     second = searcher._resolve_stop_words(None)
-    assert (
-        "した" in second
-    ), f"cache pinned stale empty set for None after config change; got {second!r}"
+    assert "した" in second, (
+        f"cache pinned stale empty set for None after config change; got {second!r}"
+    )
 
 
 # ── stop_words propagation through BM25-only / union-merge paths (post-#1306) ──
