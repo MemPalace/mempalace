@@ -34,6 +34,7 @@ import contextlib
 import os
 import shutil
 import sqlite3
+import subprocess
 import time
 from collections import defaultdict
 from datetime import datetime
@@ -70,6 +71,36 @@ def _drawers_collection_name() -> str:
         return MempalaceConfig().collection_name or COLLECTION_NAME
     except Exception:
         return COLLECTION_NAME
+
+
+def _sqlite_lock_holders(sqlite_path: str) -> list[str]:
+    """Return best-effort process summaries currently holding sqlite_path open."""
+    if not os.path.isfile(sqlite_path):
+        return []
+    if shutil.which("lsof") is None:
+        return []
+    try:
+        completed = subprocess.run(
+            ["lsof", sqlite_path],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+        )
+    except Exception:
+        return []
+    if completed.returncode != 0:
+        return []
+    lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+    if len(lines) <= 1:
+        return []
+    holders: list[str] = []
+    for line in lines[1:]:
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        holders.append(f"{parts[0]} pid={parts[1]} user={parts[2]}")
+    return holders
 
 
 def _recoverable_collections() -> tuple[str, ...]:
@@ -1220,6 +1251,12 @@ def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
     if not os.path.isdir(palace_path):
         print("  No palace found.\n")
         return {"status": "unknown", "message": "no palace at path"}
+    sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
+    lock_holders = _sqlite_lock_holders(sqlite_path)
+    if lock_holders:
+        print("\n  [sqlite lock holders]")
+        for holder in lock_holders[:10]:
+            print(f"    {holder}")
 
     drawers = hnsw_capacity_status(palace_path, collection_name)
     closets = hnsw_capacity_status(palace_path, CLOSETS_COLLECTION_NAME)
@@ -1244,7 +1281,7 @@ def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
     if drawers["diverged"] or closets["diverged"]:
         print("\n  Recommended: run `mempalace repair` to rebuild the index.")
     print()
-    return {"drawers": drawers, "closets": closets}
+    return {"drawers": drawers, "closets": closets, "lock_holders": lock_holders}
 
 
 # ---------------------------------------------------------------------------

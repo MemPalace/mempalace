@@ -480,6 +480,56 @@ def test_status_default_uses_configured_drawer_collection(tmp_path):
     assert capacity_status.call_args_list[1].args == (str(tmp_path), "mempalace_closets")
 
 
+def test_sqlite_lock_holders_parses_lsof_output(tmp_path, monkeypatch):
+    sqlite_path = tmp_path / "chroma.sqlite3"
+    sqlite3.connect(str(sqlite_path)).close()
+
+    class _Result:
+        returncode = 0
+        stdout = (
+            "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n"
+            "python 1234 alice 5u REG 1,16 4096 999 /tmp/chroma.sqlite3\n"
+            "sqlite3 5678 bob 3u REG 1,16 4096 999 /tmp/chroma.sqlite3\n"
+        )
+
+    monkeypatch.setattr(repair.shutil, "which", lambda _: "/usr/sbin/lsof")
+    monkeypatch.setattr(repair.subprocess, "run", lambda *args, **kwargs: _Result())
+
+    holders = repair._sqlite_lock_holders(str(sqlite_path))
+
+    assert holders == ["python pid=1234 user=alice", "sqlite3 pid=5678 user=bob"]
+
+
+def test_status_prints_lock_holders_when_present(tmp_path, capsys):
+    with (
+        patch("mempalace.repair._sqlite_lock_holders", return_value=["python pid=1234 user=alice"]),
+        patch("mempalace.repair.hnsw_capacity_status") as capacity_status,
+    ):
+        capacity_status.side_effect = [
+            {
+                "sqlite_count": 1,
+                "hnsw_count": 1,
+                "divergence": 0,
+                "diverged": False,
+                "status": "ok",
+                "message": "",
+            },
+            {
+                "sqlite_count": 0,
+                "hnsw_count": 0,
+                "divergence": 0,
+                "diverged": False,
+                "status": "ok",
+                "message": "",
+            },
+        ]
+        result = repair.status(palace_path=str(tmp_path))
+    out = capsys.readouterr().out
+    assert "[sqlite lock holders]" in out
+    assert "python pid=1234 user=alice" in out
+    assert result["lock_holders"] == ["python pid=1234 user=alice"]
+
+
 @patch("mempalace.repair.shutil")
 @patch("mempalace.repair.ChromaBackend")
 def test_rebuild_index_aborts_on_truncation_signal(mock_backend_cls, mock_shutil, tmp_path):
