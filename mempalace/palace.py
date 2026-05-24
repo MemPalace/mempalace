@@ -15,6 +15,7 @@ from typing import Optional
 
 from .backends import BackendClosedError, CollectionNotInitializedError, PalaceNotFoundError
 from .backends.chroma import ChromaBackend
+from .backends.registry import get_backend, resolve_backend_for_palace
 
 logger = logging.getLogger("mempalace_mcp")
 
@@ -44,7 +45,22 @@ SKIP_DIRS = {
     "target",
 }
 
-_DEFAULT_BACKEND = ChromaBackend()
+def _resolve_default_backend():
+    """Resolve the default backend per RFC 001 §3.3 priority order.
+
+    Honours the ``MEMPALACE_BACKEND`` environment variable so entry-point
+    backends (e.g. ``mempalace-postgres``) are selected automatically. Falls
+    back to the in-tree ChromaBackend when no override is set.
+    """
+    name = resolve_backend_for_palace(
+        env_value=os.environ.get("MEMPALACE_BACKEND"),
+    )
+    if name == "chroma":
+        return ChromaBackend()
+    return get_backend(name)
+
+
+_DEFAULT_BACKEND = _resolve_default_backend()
 
 # Schema version for drawer normalization. Bump when the normalization
 # pipeline changes in a way that existing drawers should be rebuilt to pick up
