@@ -1489,3 +1489,39 @@ def test_cmd_repair_fts_rebuild_mode_exits_nonzero_when_errors_remain(
     ):
         cmd_repair(args)
     assert excinfo.value.code == 1
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_legacy_autoheals_isolated_fts_errors_then_continues(
+    mock_config_cls, tmp_path, capsys
+):
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    sqlite3.connect(str(palace_dir / "chroma.sqlite3")).close()
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
+
+    args = argparse.Namespace(
+        palace=str(palace_dir),
+        mode="legacy",
+        yes=True,
+        backup=True,
+        dry_run=False,
+        confirm_truncation_ok=False,
+    )
+
+    mock_col = MagicMock()
+    mock_col.count.return_value = 0
+    mock_backend = MagicMock()
+    mock_backend.get_collection.return_value = mock_col
+
+    fts_errors = ["malformed inverted index for FTS5 table main.embedding_fulltext_search"]
+    with (
+        patch("mempalace.repair.sqlite_integrity_errors", return_value=fts_errors),
+        patch("mempalace.repair.maybe_rebuild_fts_index_when_only_fts_corrupt", return_value=[]),
+        patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend),
+    ):
+        cmd_repair(args)
+
+    out = capsys.readouterr().out
+    assert "Nothing to repair" in out
