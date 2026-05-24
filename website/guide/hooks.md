@@ -1,6 +1,6 @@
 # Auto-Save Hooks
 
-Two hooks for Claude Code and Codex that automatically save memories during work. No manual "save" commands needed.
+Hooks for Claude Code, Codex, and GitHub Copilot CLI that automatically save memories during work. No manual "save" commands needed.
 
 ## What They Do
 
@@ -61,6 +61,101 @@ Add to `.codex/hooks.json`:
 }
 ```
 
+## Install — GitHub Copilot CLI
+
+Add a repo-scoped hook file such as `.github/hooks/mempalace.json`:
+
+```json
+{
+  "version": 1,
+  "hooks": {
+    "agentStop": [
+      {
+        "type": "command",
+        "bash": "mempalace hook run --hook stop --harness copilot-cli",
+        "powershell": "$payload = [Console]::In.ReadToEnd(); $payload | & 'mempalace.exe' hook run --hook stop --harness copilot-cli",
+        "timeoutSec": 30
+      }
+    ],
+    "preCompact": [
+      {
+        "type": "command",
+        "bash": "mempalace hook run --hook precompact --harness copilot-cli",
+        "powershell": "$payload = [Console]::In.ReadToEnd(); $payload | & 'mempalace.exe' hook run --hook precompact --harness copilot-cli",
+        "timeoutSec": 30
+      }
+    ]
+  }
+}
+```
+
+On Windows, the `powershell` command must explicitly forward stdin. Copilot CLI writes the hook JSON to the PowerShell process's stdin, but PowerShell's native-command invocation does not reliably pass that original process stdin through to a child executable. Without the bridge, `mempalace.exe` may receive empty stdin and the hook will log `Session unknown: 0 exchanges`.
+
+The `ReadToEnd()` bridge is intentionally explicit:
+
+```powershell
+$payload = [Console]::In.ReadToEnd(); $payload | & 'mempalace.exe' hook run --hook stop --harness copilot-cli
+```
+
+It reads the complete hook JSON payload from PowerShell's process stdin, then pipes that payload into `mempalace.exe`, where MemPalace can parse `sessionId`, `transcriptPath`, and `cwd`.
+
+Alternatives exist, but are less predictable for this use case:
+
+- `$Input | & 'mempalace.exe' ...` uses PowerShell's pipeline input enumerator, which can line-buffer/objectize input and is less clear than reading the raw JSON payload.
+- `cmd /c mempalace.exe ...` may behave more like a transparent stdin pass-through, but adds another shell layer and `cmd.exe` quoting/escaping rules.
+- A separate `.ps1` wrapper can hide the long command, but it still needs the same stdin-forwarding step internally.
+
+For Bash, no bridge is needed because Bash normally leaves its stdin connected to the child command:
+
+```bash
+mempalace hook run --hook stop --harness copilot-cli
+```
+
+If `mempalace.exe` is not on `PATH`, use its absolute path:
+
+```json
+{
+  "version": 1,
+  "hooks": {
+    "agentStop": [
+      {
+        "type": "command",
+        "bash": "mempalace hook run --hook stop --harness copilot-cli",
+        "powershell": "$payload = [Console]::In.ReadToEnd(); $payload | & 'C:\\Users\\you\\.local\\bin\\mempalace.exe' hook run --hook stop --harness copilot-cli",
+        "timeoutSec": 30
+      }
+    ],
+    "preCompact": [
+      {
+        "type": "command",
+        "bash": "mempalace hook run --hook precompact --harness copilot-cli",
+        "powershell": "$payload = [Console]::In.ReadToEnd(); $payload | & 'C:\\Users\\you\\.local\\bin\\mempalace.exe' hook run --hook precompact --harness copilot-cli",
+        "timeoutSec": 30
+      }
+    ]
+  }
+}
+```
+
+Copilot CLI stores local session event streams under:
+
+```powershell
+$HOME\.copilot\session-state
+```
+
+To mine them manually:
+
+```powershell
+mempalace mine $HOME\.copilot\session-state --mode convos --wing sessions
+```
+
+Or from a session-state directory:
+
+```powershell
+cd $HOME\.copilot\session-state
+mempalace mine . --mode convos --wing sessions
+```
+
 ## Configuration
 
 Edit `mempal_save_hook.sh` to change:
@@ -87,7 +182,7 @@ User sends message → AI responds → Stop hook fires
                                                     AI stops (flag set)
 ```
 
-The `stop_hook_active` flag prevents infinite loops.
+The `stop_hook_active` flag prevents infinite loops in Claude Code. Copilot CLI does not expose that flag, so MemPalace uses silent direct saves for Copilot stop hooks instead of returning a blocking decision.
 
 ### PreCompact Hook
 

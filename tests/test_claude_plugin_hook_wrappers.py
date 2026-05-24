@@ -11,10 +11,27 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_HOOKS_DIR = REPO_ROOT / ".claude-plugin" / "hooks"
 BASH = shutil.which("bash")
 
-pytestmark = pytest.mark.skipif(
-    BASH is None,
-    reason="bash required for Claude plugin hook wrapper tests",
-)
+
+def _bash_skip_reason() -> str:
+    if BASH is None:
+        return "bash required for Claude plugin hook wrapper tests"
+    try:
+        result = subprocess.run(
+            [BASH, "-c", "true"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"bash is not runnable for Claude plugin hook wrapper tests: {exc}"
+    if result.returncode != 0:
+        return "bash is not runnable for Claude plugin hook wrapper tests"
+    return ""
+
+
+_BASH_SKIP_REASON = _bash_skip_reason()
+pytestmark = pytest.mark.skipif(bool(_BASH_SKIP_REASON), reason=_BASH_SKIP_REASON)
 
 SCRIPT_CASES = [
     ("mempal-stop-hook.sh", "stop"),

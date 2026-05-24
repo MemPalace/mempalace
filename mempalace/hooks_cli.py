@@ -3,7 +3,7 @@ Hook logic for MemPalace — Python implementation of session-start, stop, and p
 
 Reads JSON from stdin, outputs JSON to stdout.
 Supported hooks: session-start, stop, precompact
-Supported harnesses: claude-code, codex (extensible to cursor, gemini, etc.)
+Supported harnesses: claude-code, codex, copilot-cli (extensible to cursor, gemini, etc.)
 """
 
 import hashlib
@@ -25,19 +25,29 @@ PALACE_ROOT = Path.home() / ".mempalace"
 def _detached_popen_kwargs() -> dict:
     """Kwargs that fully detach a Popen child so the hook process can exit.
 
-    Without these, Windows holds the parent open until the child closes the
-    inherited stdout/stderr handles — manifesting as "Stop hook hangs" at
-    session end (#1268). On POSIX the parent can already exit (orphan
-    reparents to init), but ``start_new_session`` makes the boundary
-    explicit so signals to the hook don't propagate to the background mine.
+    Without these, Windows can either flash a console window or hold the
+    parent open until the child closes inherited handles — manifesting as
+    "Stop hook hangs" at session end (#1268). On POSIX the parent can already
+    exit (orphan reparents to init), but ``start_new_session`` makes the
+    boundary explicit so signals to the hook don't propagate to the background
+    mine.
     """
     kwargs: dict = {"stdin": subprocess.DEVNULL, "close_fds": True}
     if os.name == "nt":
         flags = 0
-        for name in ("DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP", "CREATE_BREAKAWAY_FROM_JOB"):
+        # CREATE_NO_WINDOW is the important flag for hook-launched console
+        # children. Do not combine it with DETACHED_PROCESS: Windows ignores
+        # CREATE_NO_WINDOW in that combination, which can still flash a window.
+        for name in ("CREATE_NO_WINDOW", "CREATE_NEW_PROCESS_GROUP", "CREATE_BREAKAWAY_FROM_JOB"):
             flags |= getattr(subprocess, name, 0)
         if flags:
             kwargs["creationflags"] = flags
+        startupinfo_cls = getattr(subprocess, "STARTUPINFO", None)
+        if startupinfo_cls is not None:
+            startupinfo = startupinfo_cls()
+            startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+            startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+            kwargs["startupinfo"] = startupinfo
     else:
         kwargs["start_new_session"] = True
     return kwargs
@@ -127,6 +137,59 @@ def _sanitize_session_id(session_id: str) -> str:
     return sanitized or "unknown"
 
 
+def _text_from_content(content) -> str:
+    """Extract text from common harness message content shapes."""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text", "")
+                if isinstance(text, str):
+                    parts.append(text)
+        return " ".join(p for p in parts if p).strip()
+    return ""
+
+
+def _is_hook_noise(text: str) -> bool:
+    return "<command-message>" in text or "<system-reminder>" in text
+
+
+def _user_message_text(entry: dict) -> str:
+    """Return user text from supported transcript schemas, or empty string."""
+    if not isinstance(entry, dict):
+        return ""
+
+    # Claude Code format
+    msg = entry.get("message", {})
+    if isinstance(msg, dict) and msg.get("role") == "user":
+        text = _text_from_content(msg.get("content", ""))
+        return "" if _is_hook_noise(text) else text
+
+    # Codex CLI format
+    if entry.get("type") == "event_msg":
+        payload = entry.get("payload", {})
+        if isinstance(payload, dict) and payload.get("type") == "user_message":
+            text = payload.get("message", "")
+            if isinstance(text, str):
+                text = text.strip()
+                return "" if _is_hook_noise(text) else text
+
+    # Copilot CLI format
+    if entry.get("type") == "user.message":
+        data = entry.get("data", {})
+        if isinstance(data, dict):
+            text = _text_from_content(data.get("content", ""))
+            if not text:
+                text = _text_from_content(data.get("transformedContent", ""))
+            return "" if _is_hook_noise(text) else text
+
+    return ""
+
+
 def _validate_transcript_path(transcript_path: str) -> Path:
     """Validate and resolve a transcript path, rejecting paths outside expected roots.
 
@@ -161,27 +224,8 @@ def _count_human_messages(transcript_path: str) -> int:
             for line in f:
                 try:
                     entry = json.loads(line)
-                    msg = entry.get("message", {})
-                    if isinstance(msg, dict) and msg.get("role") == "user":
-                        content = msg.get("content", "")
-                        if isinstance(content, str):
-                            if "<command-message>" in content:
-                                continue
-                        elif isinstance(content, list):
-                            text = " ".join(
-                                b.get("text", "") for b in content if isinstance(b, dict)
-                            )
-                            if "<command-message>" in text:
-                                continue
+                    if _user_message_text(entry):
                         count += 1
-                    # Also handle Codex CLI transcript format
-                    # {"type": "event_msg", "payload": {"type": "user_message", "message": "..."}}
-                    elif entry.get("type") == "event_msg":
-                        payload = entry.get("payload", {})
-                        if isinstance(payload, dict) and payload.get("type") == "user_message":
-                            msg_text = payload.get("message", "")
-                            if isinstance(msg_text, str) and "<command-message>" not in msg_text:
-                                count += 1
                 except (json.JSONDecodeError, AttributeError):
                     pass
     except OSError:
@@ -566,6 +610,7 @@ def _mine_sync():
                     stdout=log_f,
                     stderr=log_f,
                     timeout=60,
+                    **_detached_popen_kwargs(),
                 )
         except (OSError, subprocess.TimeoutExpired):
             pass
@@ -595,27 +640,9 @@ def _extract_recent_messages(transcript_path: str, count: int = _RECENT_MSG_COUN
             for line in f:
                 try:
                     entry = json.loads(line)
-                    # Claude Code format
-                    msg = entry.get("message") or entry.get("event_message") or {}
-                    if isinstance(msg, dict) and msg.get("role") == "user":
-                        content = msg.get("content", "")
-                        if isinstance(content, list):
-                            content = " ".join(
-                                b.get("text", "") for b in content if isinstance(b, dict)
-                            )
-                        if not isinstance(content, str) or not content.strip():
-                            continue
-                        if "<command-message>" in content or "<system-reminder>" in content:
-                            continue
-                        messages.append(content.strip()[:200])
-                    # Codex CLI format
-                    elif entry.get("type") == "event_msg":
-                        payload = entry.get("payload", {})
-                        if isinstance(payload, dict) and payload.get("type") == "user_message":
-                            text = payload.get("message", "")
-                            if isinstance(text, str) and text.strip():
-                                if "<command-message>" not in text:
-                                    messages.append(text.strip()[:200])
+                    text = _user_message_text(entry)
+                    if text:
+                        messages.append(text[:200])
                 except (json.JSONDecodeError, AttributeError):
                     pass
     except OSError:
@@ -712,7 +739,7 @@ def _save_diary_direct(
 
 
 def _ingest_transcript(transcript_path: str):
-    """Mine a Claude Code session transcript into the palace as a conversation."""
+    """Mine a session transcript into the palace as a conversation."""
     path = Path(transcript_path).expanduser()
     if not path.is_file() or path.stat().st_size < 100:
         return
@@ -746,18 +773,68 @@ def _ingest_transcript(transcript_path: str):
         pass
 
 
-SUPPORTED_HARNESSES = {"claude-code", "codex"}
+SUPPORTED_HARNESSES = {"claude-code", "codex", "copilot-cli"}
+
+
+def _copilot_hook_payload(data: dict) -> dict:
+    """Return the Copilot hook input payload regardless of wrapper shape."""
+    if not isinstance(data, dict):
+        return {}
+
+    # Copilot CLI gives hook commands the input object, but stores the same
+    # payload in events.jsonl under hook.start.data.input. Accept both shapes
+    # so tests and future callers can replay recorded hook events directly.
+    if isinstance(data.get("input"), dict):
+        return data["input"]
+    event_data = data.get("data")
+    if isinstance(event_data, dict) and isinstance(event_data.get("input"), dict):
+        return event_data["input"]
+    return data
+
+
+def _copilot_transcript_path(payload: dict, session_id: str) -> str:
+    """Return the Copilot transcript path from payload or session-state fallback."""
+    if not isinstance(payload, dict):
+        return ""
+
+    transcript_path = str(payload.get("transcriptPath") or payload.get("transcript_path") or "")
+    if transcript_path or session_id == "unknown":
+        return transcript_path
+
+    # Some Copilot hook payloads can be partial; session-state has a stable
+    # layout, so a valid sessionId is enough to recover the events.jsonl path.
+    candidate = Path.home() / ".copilot" / "session-state" / session_id / "events.jsonl"
+    return str(candidate) if candidate.is_file() else ""
 
 
 def _parse_harness_input(data: dict, harness: str) -> dict:
     """Parse stdin JSON according to the harness type."""
+    if not isinstance(data, dict):
+        data = {}
+
     if harness not in SUPPORTED_HARNESSES:
         print(f"Unknown harness: {harness}", file=sys.stderr)
         sys.exit(1)
+    if harness == "copilot-cli":
+        payload = _copilot_hook_payload(data)
+        # Copilot CLI uses camelCase names; accept snake_case too so tests and
+        # any future normalized wrappers can reuse the same harness parser.
+        session_id = _sanitize_session_id(
+            str(payload.get("sessionId") or payload.get("session_id", ""))
+        )
+        return {
+            "session_id": session_id,
+            "stop_hook_active": payload.get(
+                "stopHookActive", payload.get("stop_hook_active", False)
+            ),
+            "transcript_path": _copilot_transcript_path(payload, session_id),
+            "cwd": str(payload.get("cwd", "")),
+        }
     return {
         "session_id": _sanitize_session_id(str(data.get("session_id", "unknown"))),
         "stop_hook_active": data.get("stop_hook_active", False),
         "transcript_path": str(data.get("transcript_path", "")),
+        "cwd": str(data.get("cwd", "")),
     }
 
 
@@ -803,29 +880,43 @@ def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
                 except (json.JSONDecodeError, ValueError):
                     continue
                 cwd = data.get("cwd")
-                if not cwd or not isinstance(cwd, str):
-                    continue
-                cwd_norm = cwd.replace("\\", "/").rstrip("/")
-                if not cwd_norm:
-                    continue
-                project = cwd_norm.rsplit("/", 1)[-1]
-                if project:
-                    slug = project.lower().replace(" ", "_").replace("-", "_")
-                    return f"wing_{slug}"
+                nested = data.get("data")
+                if not cwd and isinstance(nested, dict):
+                    cwd = nested.get("cwd")
+                    context = nested.get("context")
+                    if not cwd and isinstance(context, dict):
+                        cwd = context.get("cwd")
+                wing = _wing_from_cwd(cwd)
+                if wing:
+                    return wing
     except OSError:
         pass
     return None
 
 
-def _wing_from_transcript_path(transcript_path: str) -> str:
-    """Derive a project wing name from a Claude Code transcript path.
+def _wing_from_cwd(cwd: str) -> Optional[str]:
+    """Derive a wing from a harness-provided working directory."""
+    if not cwd or not isinstance(cwd, str):
+        return None
+    cwd_norm = cwd.replace("\\", "/").rstrip("/")
+    if not cwd_norm:
+        return None
+    project = cwd_norm.rsplit("/", 1)[-1]
+    if not project:
+        return None
+    slug = project.lower().replace(" ", "_").replace("-", "_")
+    return f"wing_{slug}" if slug else None
+
+
+def _wing_from_transcript_path(transcript_path: str, cwd: str = "") -> str:
+    """Derive a project wing name from hook cwd, JSONL metadata, or transcript path.
 
     Strategy (in priority order):
 
-    1. PRIMARY — Read ``cwd`` from the JSONL transcript. Claude Code records
-       the absolute working directory on most message types, so the project
-       name is whatever the leaf path segment of cwd is. This is the
-       canonical answer when present.
+    1. PRIMARY — Read ``cwd`` from the hook payload or JSONL transcript.
+       Claude Code records it on most message types; Copilot CLI records it
+       in the hook payload and may include it under ``data.context``. The
+       project name is whatever the leaf path segment of cwd is.
 
     2. FALLBACK — Decode the encoded folder under ``.claude/projects/``.
        Claude Code flattens path separators to dashes (``/Users/me/code/foo``
@@ -844,7 +935,10 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
 
     Closes #1410.
     """
-    # 1. Primary — cwd from JSONL is the canonical source of truth
+    # 1. Primary — explicit hook cwd, then cwd from JSONL, is the canonical source of truth.
+    hook_cwd_wing = _wing_from_cwd(cwd)
+    if hook_cwd_wing:
+        return hook_cwd_wing
     cwd_wing = _wing_from_jsonl_cwd(transcript_path)
     if cwd_wing:
         return cwd_wing
@@ -891,6 +985,7 @@ def hook_stop(data: dict, harness: str):
     session_id = parsed["session_id"]
     stop_hook_active = parsed["stop_hook_active"]
     transcript_path = parsed["transcript_path"]
+    cwd = parsed.get("cwd", "")
 
     # If already in a block-mode save cycle, let through (infinite-loop prevention).
     # Silent mode saves directly without returning {"decision":"block"}, so there's
@@ -946,8 +1041,12 @@ def hook_stop(data: dict, harness: str):
         except Exception:
             silent = True
             toast = False
+        if harness == "copilot-cli":
+            # Copilot CLI's agentStop payload does not expose Claude Code's
+            # stop_hook_active recursion flag, so never return a block decision.
+            silent = True
 
-        project_wing = _wing_from_transcript_path(transcript_path)
+        project_wing = _wing_from_transcript_path(transcript_path, cwd=cwd)
 
         if silent:
             # Save directly via Python API — systemMessage renders in terminal

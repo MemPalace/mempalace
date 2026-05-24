@@ -11,6 +11,7 @@ from mempalace.normalize import (
     _try_claude_ai_json,
     _try_claude_code_jsonl,
     _try_codex_jsonl,
+    _try_copilot_cli_jsonl,
     _try_gemini_jsonl,
     _try_normalize_json,
     _try_slack_json,
@@ -611,6 +612,81 @@ def test_gemini_jsonl_messages_before_session_metadata_discarded():
     assert "preamble A" not in result
     assert "> real Q" in result
     assert "real A" in result
+
+
+# ── _try_copilot_cli_jsonl ─────────────────────────────────────────────
+
+
+def test_copilot_cli_jsonl_valid():
+    lines = [
+        json.dumps({"type": "session.start", "data": {"sessionId": "s1"}}),
+        json.dumps({"type": "user.message", "data": {"content": "What is Copilot CLI?"}}),
+        json.dumps(
+            {"type": "assistant.message", "data": {"content": "Copilot CLI runs in a terminal."}}
+        ),
+    ]
+    result = _try_copilot_cli_jsonl("\n".join(lines))
+    assert result is not None
+    assert "> What is Copilot CLI?" in result
+    assert "Copilot CLI runs in a terminal." in result
+
+
+def test_copilot_cli_jsonl_too_few_messages():
+    lines = [
+        json.dumps({"type": "session.start", "data": {"sessionId": "s1"}}),
+        json.dumps({"type": "user.message", "data": {"content": "Only one turn"}}),
+    ]
+    assert _try_copilot_cli_jsonl("\n".join(lines)) is None
+
+
+def test_copilot_cli_jsonl_ignores_non_conversation_fields():
+    lines = [
+        json.dumps({"type": "session.start", "data": {"sessionId": "s1"}}),
+        json.dumps(
+            {"type": "system.message", "data": {"content": "system prompt", "role": "system"}}
+        ),
+        json.dumps({"type": "hook.start", "data": {"input": {"transcriptPath": "x"}}}),
+        json.dumps(
+            {
+                "type": "assistant.message",
+                "data": {"encryptedContent": "secret", "reasoningOpaque": "hidden"},
+            }
+        ),
+        json.dumps({"type": "user.message", "data": {"content": "Real question"}}),
+        json.dumps(
+            {
+                "type": "assistant.message",
+                "data": {
+                    "content": "Real answer",
+                    "encryptedContent": "do-not-include",
+                    "reasoningOpaque": "do-not-include",
+                },
+            }
+        ),
+    ]
+    result = _try_copilot_cli_jsonl("\n".join(lines))
+    assert result is not None
+    assert "Real question" in result
+    assert "Real answer" in result
+    assert "system prompt" not in result
+    assert "do-not-include" not in result
+
+
+def test_copilot_cli_jsonl_requires_session_start():
+    lines = [
+        json.dumps({"type": "user.message", "data": {"content": "Q"}}),
+        json.dumps({"type": "assistant.message", "data": {"content": "A"}}),
+    ]
+    assert _try_copilot_cli_jsonl("\n".join(lines)) is None
+
+
+def test_copilot_cli_jsonl_does_not_match_codex():
+    lines = [
+        json.dumps({"type": "session_meta", "payload": {}}),
+        json.dumps({"type": "event_msg", "payload": {"type": "user_message", "message": "Q"}}),
+        json.dumps({"type": "event_msg", "payload": {"type": "agent_message", "message": "A"}}),
+    ]
+    assert _try_copilot_cli_jsonl("\n".join(lines)) is None
 
 
 # ── _try_claude_ai_json ───────────────────────────────────────────────
