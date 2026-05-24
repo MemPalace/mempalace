@@ -709,6 +709,126 @@ def cmd_search(args):
         sys.exit(1)
 
 
+def cmd_read(args):
+    """Resolve a closet pointer and print the surgical line-range slice.
+
+    Resurrects the original ``read.py`` concept Aya designed with Lumi —
+    closet pointer in, only-the-matched-lines out. See ``mempalace.reader``
+    for the parse/resolve/render logic; this handler is the argparse +
+    interactive-prompt glue.
+    """
+    from .palace import _open_collection_or_explain
+    from .reader import format_drawer_menu, parse_pointer, read_slice, resolve_drawers
+
+    # Source the pointer from arg or stdin. Refuse to block on an
+    # interactive TTY — without a pipe or redirect, stdin.read() would
+    # hang silently. Also handle ``sys.stdin = None`` (Windows pythonw
+    # and some detached daemon contexts) — calling .isatty() on None
+    # would AttributeError; treat it as a non-readable stream and
+    # exit cleanly with the usage hint.
+    pointer = args.pointer
+    if pointer is None or pointer == "-":
+        if sys.stdin is None or sys.stdin.isatty():
+            print(
+                "Error: no pointer provided. Pass as argument or pipe via stdin.\n"
+                'Example: mempalace read "2024-11-08:L42-L78 file.md"',
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        # Closet pointers are single-line by contract. Use readline()
+        # rather than read() so a huge stdin payload can't blow up
+        # memory if a user accidentally pipes the wrong stream.
+        pointer = sys.stdin.readline().strip()
+    if not pointer:
+        print(
+            "Error: no pointer provided. Pass as argument or pipe via stdin.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Parse the pointer.
+    try:
+        parsed = parse_pointer(pointer)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Open the palace collection.
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    col = _open_collection_or_explain(palace_path)
+    if col is None:
+        # ``_open_collection_or_explain`` already printed a state-specific message.
+        sys.exit(1)
+
+    # Resolve to drawer candidates.
+    candidates = resolve_drawers(col, parsed)
+    if not candidates:
+        print("Error: no drawers found for this pointer.", file=sys.stderr)
+        sys.exit(1)
+
+    # Thread the parsed line range through every read_slice call —
+    # without it, the verb returns whole chunks instead of the
+    # requested surgical slice. Igor blocker on PR #1588.
+    ls = parsed.line_start
+    le = parsed.line_end
+
+    # Single drawer or --all flag: render directly, no prompt.
+    if len(candidates) == 1 and not args.all:
+        print(read_slice(candidates[0], requested_line_start=ls, requested_line_end=le))
+        return
+
+    if args.all:
+        _print_all_candidates(candidates, ls, le)
+        return
+
+    # Non-interactive --drawer N selection.
+    if args.drawer is not None:
+        idx = args.drawer
+        if idx < 1 or idx > len(candidates):
+            print(
+                f"Error: --drawer {idx} out of range (1-{len(candidates)}).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print(read_slice(candidates[idx - 1], requested_line_start=ls, requested_line_end=le))
+        return
+
+    # Multi-candidate, no flag → clean error. The interactive picker
+    # was the source of every stdin/TTY/input() bot finding and had
+    # untested code paths. Replacing it with a deterministic error
+    # message + the menu to stderr makes the verb fully scriptable
+    # and removes the entire class of bugs.
+    print(
+        f"Error: pointer matched {len(candidates)} drawers. "
+        "Re-run with --drawer N (1-indexed) or --all to select.",
+        file=sys.stderr,
+    )
+    print(file=sys.stderr)
+    print(format_drawer_menu(candidates), file=sys.stderr)
+    sys.exit(1)
+
+
+def _print_all_candidates(candidates, requested_line_start=None, requested_line_end=None):
+    """Concatenate all candidates' slices with a separator between them.
+
+    Accepts and forwards the requested line range so every candidate
+    renders the surgical slice, not the whole chunk.
+    """
+    from .reader import read_slice
+
+    for i, cand in enumerate(candidates, start=1):
+        if i > 1:
+            print()
+        print(f"─── [{i}] chunk {cand.chunk_index} " + "─" * 30)
+        print(
+            read_slice(
+                cand,
+                requested_line_start=requested_line_start,
+                requested_line_end=requested_line_end,
+            )
+        )
+
+
 def cmd_wakeup(args):
     """Show L0 (identity) + L1 (essential story) — the wake-up context."""
     from .layers import MemoryStack
@@ -1405,6 +1525,42 @@ def main():
     p_search.add_argument("--room", default=None, help="Limit to one room")
     p_search.add_argument("--results", type=int, default=5, help="Number of results")
 
+    # read — consume a closet pointer, return the surgical line-range slice.
+    # Accepts full Tier 6a closet pointer, legacy 3-segment closet pointer,
+    # OR shorthand "YYYY-MM-DD:Lstart-Lend source_file.md". If no positional
+    # argument is given, reads from stdin so callers can do:
+    #     mempalace search "X" | mempalace read
+    p_read = sub.add_parser(
+        "read",
+        help="Read the slice referenced by a closet pointer",
+    )
+    p_read.add_argument(
+        "pointer",
+        nargs="?",
+        default=None,
+        help=(
+            "Closet pointer or shorthand. If omitted (or '-'), read from stdin. "
+            "Examples: '2024-11-08:L42-L78 file.md' or "
+            "'topic|entities|2024-11-08:L42-L78|→drawer_a,drawer_b'."
+        ),
+    )
+    # ``--drawer N`` and ``--all`` are mutually exclusive. Registering
+    # them in an argparse exclusive group surfaces the constraint in
+    # ``mempalace read --help`` and rejects the bad combination at
+    # parse time, before ``cmd_read`` runs.
+    p_read_picker = p_read.add_mutually_exclusive_group()
+    p_read_picker.add_argument(
+        "--drawer",
+        type=int,
+        default=None,
+        help="When the pointer matches multiple drawers, pick the N-th (1-indexed) non-interactively.",
+    )
+    p_read_picker.add_argument(
+        "--all",
+        action="store_true",
+        help="Read every drawer the pointer matches, concatenated with separators.",
+    )
+
     # compress
     p_compress = sub.add_parser(
         "compress", help="Compress drawers using AAAK Dialect (~30x reduction)"
@@ -1605,6 +1761,7 @@ def main():
         "mine": cmd_mine,
         "split": cmd_split,
         "search": cmd_search,
+        "read": cmd_read,
         "sweep": cmd_sweep,
         "sync": cmd_sync,
         "mcp": cmd_mcp,
