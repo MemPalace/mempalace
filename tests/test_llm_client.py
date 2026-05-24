@@ -13,6 +13,7 @@ import pytest
 from mempalace.llm_client import (
     AnthropicProvider,
     LLMError,
+    LLMProvider,
     OllamaProvider,
     OpenAICompatProvider,
     _http_post_json,
@@ -39,6 +40,57 @@ def test_get_provider_anthropic():
     p = get_provider("anthropic", "claude-haiku", api_key="sk-xxx")
     assert isinstance(p, AnthropicProvider)
     assert p.api_key == "sk-xxx"
+
+
+def test_get_provider_preserves_positional_timeout_compatibility():
+    p = get_provider("openai-compat", "foo", "http://localhost:1234", None, 30)
+    assert isinstance(p, OpenAICompatProvider)
+    assert p.timeout == 30
+
+
+def test_llm_provider_preserves_positional_timeout_compatibility():
+    p = LLMProvider("foo", "http://localhost:1234", None, 30)
+    assert p.endpoint == "http://localhost:1234"
+    assert p.timeout == 30
+    assert p.api_key_source is None
+
+
+def test_openai_compat_preserves_positional_timeout_compatibility():
+    p = OpenAICompatProvider("foo", "http://localhost:1234", None, 30)
+    assert p.endpoint == "http://localhost:1234"
+    assert p.timeout == 30
+
+
+def test_anthropic_preserves_positional_endpoint_timeout_compatibility():
+    p = AnthropicProvider("claude-haiku", "sk-ant-flag", "https://api.example", 30)
+    assert p.api_key == "sk-ant-flag"
+    assert p.endpoint == "https://api.example"
+    assert p.timeout == 30
+
+
+def test_get_provider_forwards_openai_compat_api_key_source(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-from-env")
+    p = get_provider(
+        "openai-compat",
+        "foo",
+        endpoint="http://localhost:1234",
+        api_key_source="env",
+    )
+    assert isinstance(p, OpenAICompatProvider)
+    assert p.api_key == "sk-from-env"
+    assert p.api_key_source == "env"
+
+
+def test_get_provider_forwards_anthropic_api_key_source(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-env")
+    p = get_provider(
+        "anthropic",
+        "claude-haiku",
+        api_key_source="env",
+    )
+    assert isinstance(p, AnthropicProvider)
+    assert p.api_key == "sk-ant-env"
+    assert p.api_key_source == "env"
 
 
 def test_get_provider_unknown_raises():
@@ -463,6 +515,72 @@ def test_openai_compat_api_key_source_env_when_fallback(monkeypatch):
     )
 
 
+def test_openai_compat_api_key_source_can_be_overridden_explicitly(monkeypatch):
+    """A caller that already resolved provenance should be able to pass
+    it through unchanged, even when the same env var is also present."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-from-env-irrelevant")
+    p = OpenAICompatProvider(
+        model="x",
+        endpoint="http://h",
+        api_key="sk-from-flag",
+        api_key_source="env",
+    )
+    assert p.api_key == "sk-from-flag"
+    assert p.api_key_source == "env"
+
+
+def test_openai_compat_api_key_source_flag_without_key_is_rejected(monkeypatch):
+    """api_key_source='flag' must not be accepted without an explicit key."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-from-env")
+    with pytest.raises(LLMError, match="api_key must be provided"):
+        OpenAICompatProvider(
+            model="x",
+            endpoint="http://h",
+            api_key_source="flag",
+        )
+
+
+def test_openai_compat_explicit_env_source_clears_when_env_missing(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    p = OpenAICompatProvider(
+        model="x",
+        endpoint="http://h",
+        api_key_source="env",
+    )
+    assert p.api_key is None
+    assert p.api_key_source is None
+
+
+def test_openai_compat_explicit_env_source_clears_when_env_empty(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "")
+    p = OpenAICompatProvider(
+        model="x",
+        endpoint="http://h",
+        api_key_source="env",
+    )
+    assert p.api_key is None
+    assert p.api_key_source is None
+
+
+def test_openai_compat_empty_api_key_is_treated_as_explicit(monkeypatch):
+    """Explicit empty strings should still count as provided values."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-from-env")
+    p = OpenAICompatProvider(model="x", endpoint="http://h", api_key="")
+    assert p.api_key == ""
+    assert p.api_key_source == "flag"
+
+
+def test_openai_compat_invalid_api_key_source_is_rejected():
+    """Only supported provenance values should be accepted."""
+    with pytest.raises(LLMError, match="api_key_source must be one of"):
+        OpenAICompatProvider(
+            model="x",
+            endpoint="http://h",
+            api_key="sk-from-flag",
+            api_key_source="bogus",
+        )
+
+
 def test_anthropic_api_key_source_tracking(monkeypatch):
     """AnthropicProvider tracks api_key_source the same way: 'flag' when
     passed explicitly, 'env' when resolved from ANTHROPIC_API_KEY env."""
@@ -476,6 +594,66 @@ def test_anthropic_api_key_source_tracking(monkeypatch):
     assert p_env.api_key_source == "env", (
         f"Env-fallback must produce 'env'; got {p_env.api_key_source!r}"
     )
+
+
+def test_anthropic_api_key_source_can_be_overridden_explicitly(monkeypatch):
+    """Explicit provenance should be preserved even when an env key is present."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-env")
+    p = AnthropicProvider(
+        model="claude-haiku",
+        api_key="sk-ant-flag",
+        api_key_source="env",
+    )
+    assert p.api_key == "sk-ant-flag"
+    assert p.api_key_source == "env"
+
+
+def test_anthropic_api_key_source_flag_without_key_is_rejected(monkeypatch):
+    """api_key_source='flag' must not be accepted without an explicit key."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-env")
+    with pytest.raises(LLMError, match="api_key must be provided"):
+        AnthropicProvider(
+            model="claude-haiku",
+            api_key_source="flag",
+        )
+
+
+def test_anthropic_explicit_env_source_clears_when_env_missing(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    p = AnthropicProvider(
+        model="claude-haiku",
+        api_key_source="env",
+    )
+    assert p.api_key is None
+    assert p.api_key_source is None
+
+
+def test_anthropic_explicit_env_source_clears_when_env_empty(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "")
+    p = AnthropicProvider(
+        model="claude-haiku",
+        api_key_source="env",
+    )
+    assert p.api_key is None
+    assert p.api_key_source is None
+
+
+def test_anthropic_empty_api_key_is_treated_as_explicit(monkeypatch):
+    """Explicit empty strings should still count as provided values."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-env")
+    p = AnthropicProvider(model="claude-haiku", api_key="")
+    assert p.api_key == ""
+    assert p.api_key_source == "flag"
+
+
+def test_anthropic_invalid_api_key_source_is_rejected():
+    """Only supported provenance values should be accepted."""
+    with pytest.raises(LLMError, match="api_key_source must be one of"):
+        AnthropicProvider(
+            model="claude-haiku",
+            api_key="sk-ant-flag",
+            api_key_source="bogus",
+        )
 
 
 def test_ollama_api_key_source_is_none():

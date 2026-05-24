@@ -284,11 +284,30 @@ class OpenAICompatProvider(LLMProvider):
         endpoint: Optional[str] = None,
         api_key: Optional[str] = None,
         timeout: int = 120,
+        api_key_source: Optional[str] = None,
         **_: object,
     ):
-        if api_key:
+        if api_key_source is not None:
+            if api_key_source not in {"env", "flag"}:
+                raise LLMError(
+                    "api_key_source must be one of {'env', 'flag'} "
+                    f"or None, got {api_key_source!r}"
+                )
+            if api_key is not None:
+                resolved_key = api_key
+                source: Optional[str] = api_key_source
+            elif api_key_source == "env":
+                env_key = os.environ.get("OPENAI_API_KEY")
+                resolved_key = env_key or None
+                source = "env" if env_key else None
+            else:
+                raise LLMError(
+                    "api_key must be provided when api_key_source is set "
+                    f"to {api_key_source!r}"
+                )
+        elif api_key is not None:
             resolved_key = api_key
-            source: Optional[str] = "flag"
+            source = "flag"
         else:
             env_key = os.environ.get("OPENAI_API_KEY")
             resolved_key = env_key or None
@@ -297,8 +316,8 @@ class OpenAICompatProvider(LLMProvider):
             model=model,
             endpoint=endpoint,
             api_key=resolved_key,
-            timeout=timeout,
             api_key_source=source,
+            timeout=timeout,
         )
 
     def _resolve_url(self) -> str:
@@ -370,11 +389,30 @@ class AnthropicProvider(LLMProvider):
         api_key: Optional[str] = None,
         endpoint: Optional[str] = None,
         timeout: int = 120,
+        api_key_source: Optional[str] = None,
         **_: object,
     ):
-        if api_key:
+        if api_key_source is not None:
+            if api_key_source not in {"env", "flag"}:
+                raise LLMError(
+                    "api_key_source must be one of {'env', 'flag'} "
+                    f"or None, got {api_key_source!r}"
+                )
+            if api_key is not None:
+                resolved_key = api_key
+                source: Optional[str] = api_key_source
+            elif api_key_source == "env":
+                env_key = os.environ.get("ANTHROPIC_API_KEY")
+                resolved_key = env_key or None
+                source = "env" if env_key else None
+            else:
+                raise LLMError(
+                    "api_key must be provided when api_key_source is set "
+                    f"to {api_key_source!r}"
+                )
+        elif api_key is not None:
             resolved_key = api_key
-            source: Optional[str] = "flag"
+            source = "flag"
         else:
             env_key = os.environ.get("ANTHROPIC_API_KEY")
             resolved_key = env_key or None
@@ -383,8 +421,8 @@ class AnthropicProvider(LLMProvider):
             model=model,
             endpoint=endpoint or self.DEFAULT_ENDPOINT,
             api_key=resolved_key,
-            timeout=timeout,
             api_key_source=source,
+            timeout=timeout,
         )
 
     def check_available(self) -> tuple[bool, str]:
@@ -447,9 +485,16 @@ def get_provider(
     endpoint: Optional[str] = None,
     api_key: Optional[str] = None,
     timeout: int = 120,
+    api_key_source: Optional[str] = None,
 ) -> LLMProvider:
     """Build a provider by name. Raises LLMError on unknown provider."""
     cls = PROVIDERS.get(name)
     if cls is None:
         raise LLMError(f"Unknown provider '{name}'. Choices: {sorted(PROVIDERS.keys())}")
-    return cls(model=model, endpoint=endpoint, api_key=api_key, timeout=timeout)
+    return cls(
+        model=model,
+        endpoint=endpoint,
+        api_key=api_key,
+        api_key_source=api_key_source,
+        timeout=timeout,
+    )
