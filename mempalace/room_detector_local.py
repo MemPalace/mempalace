@@ -292,7 +292,7 @@ def save_config(project_dir: str, project_name: str, rooms: list):
         ],
     }
     config_path = Path(project_dir).expanduser().resolve() / "mempalace.yaml"
-    with open(config_path, "w") as f:
+    with open(config_path, "w", encoding="utf-8") as f:
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
     print(f"\n  Config saved: {config_path}")

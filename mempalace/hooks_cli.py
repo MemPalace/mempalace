@@ -208,7 +208,7 @@ def _log(message: str):
         log_path = STATE_DIR / "hook.log"
         is_new = not log_path.exists()
         timestamp = datetime.now().strftime("%H:%M:%S")
-        with open(log_path, "a") as f:
+        with open(log_path, "a", encoding="utf-8") as f:
             f.write(f"[{timestamp}] {message}\n")
         if is_new:
             try:
@@ -384,7 +384,7 @@ def _mine_already_running(cmd: list[str]) -> bool:
     """
     pid_file = _pid_file_for_cmd(cmd)
     try:
-        recorded = pid_file.read_text().strip()
+        recorded = pid_file.read_text(encoding="utf-8").strip()
     except OSError:
         return False
     if not recorded:
@@ -492,7 +492,7 @@ def _spawn_mine(cmd: list) -> None:
         return
     child_env = os.environ.copy()
     child_env[_MINE_PID_FILE_ENV] = str(pid_file)
-    with open(log_path, "a") as log_f:
+    with open(log_path, "a", encoding="utf-8") as log_f:
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -552,7 +552,7 @@ def _mine_sync():
     log_path = STATE_DIR / "hook.log"
     for mine_dir, mode in targets:
         try:
-            with open(log_path, "a") as log_f:
+            with open(log_path, "a", encoding="utf-8") as log_f:
                 subprocess.run(
                     [
                         _mempalace_python(),
@@ -925,7 +925,7 @@ def hook_stop(data: dict, harness: str):
     last_save = 0
     if last_save_file.is_file():
         try:
-            last_save = int(last_save_file.read_text().strip())
+            last_save = int(last_save_file.read_text(encoding="utf-8").strip())
         except (ValueError, OSError):
             last_save = 0
 

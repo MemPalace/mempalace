@@ -127,7 +127,7 @@ def ingest_diaries(
         state: dict = {}
     else:
         try:
-            state = json.loads(state_file.read_text())
+            state = json.loads(state_file.read_text(encoding="utf-8", errors="replace"))
         except Exception:
             state = {}
 
