@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/mempalace-mempalace-badge.png)](https://mseep.ai/app/mempalace-mempalace)
+
 > [!CAUTION]
 > # 🚨 CRITICAL SECURITY WARNING: BEWARE OF SCAMS
 > **MemPalace has NO other official websites.**
