@@ -1366,7 +1366,6 @@ def test_rebuild_index_auto_rebuilds_fts5_before_aborting(
 
     fts5_error = "malformed inverted index for FTS5 table main.embedding_fulltext_search"
     call_count = {"n": 0}
-    original_errors = repair.sqlite_integrity_errors
 
     def mock_integrity_errors(palace_path):
         call_count["n"] += 1
@@ -1429,13 +1428,16 @@ def test_rebuild_index_does_not_attempt_fts5_rebuild_for_non_fts5_errors(
 
     _install_mock_backend(mock_backend_cls, MagicMock())
 
-    with patch(
-        "mempalace.repair.sqlite_integrity_errors",
-        return_value=[
-            "Page 4 of B-tree 12345: database disk image is malformed",
-            "malformed inverted index for FTS5 table main.embedding_fulltext_search",
-        ],
-    ), patch("mempalace.repair._vacuum_and_rebuild_fts5") as mock_fts5:
+    with (
+        patch(
+            "mempalace.repair.sqlite_integrity_errors",
+            return_value=[
+                "Page 4 of B-tree 12345: database disk image is malformed",
+                "malformed inverted index for FTS5 table main.embedding_fulltext_search",
+            ],
+        ),
+        patch("mempalace.repair._vacuum_and_rebuild_fts5") as mock_fts5,
+    ):
         repair.rebuild_index(palace_path=str(tmp_path))
 
     out = capsys.readouterr().out

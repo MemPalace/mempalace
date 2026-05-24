@@ -864,10 +864,7 @@ def cmd_repair(args):
         # FTS5 inverted-index corruption is repairable in-place without
         # touching any row data. Attempt auto-rebuild first when all errors
         # are FTS5-only so automated repair (cron, @reboot) can self-heal.
-        fts5_only = all(
-            "fts5" in e.lower() or "inverted index" in e.lower()
-            for e in sqlite_errors
-        )
+        fts5_only = all("fts5" in e.lower() or "inverted index" in e.lower() for e in sqlite_errors)
         if fts5_only:
             print("  FTS5 corruption detected — attempting auto-rebuild before repair...")
             _vacuum_and_rebuild_fts5(palace_path)

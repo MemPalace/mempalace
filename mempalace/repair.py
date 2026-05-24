@@ -766,10 +766,7 @@ def rebuild_index(
         # _vacuum_and_rebuild_fts5() call that already runs post-repair.
         # Attempt it first when the errors are FTS5-only so that automated
         # repair (cron, @reboot) can self-heal without manual intervention.
-        fts5_only = all(
-            "fts5" in e.lower() or "inverted index" in e.lower()
-            for e in sqlite_errors
-        )
+        fts5_only = all("fts5" in e.lower() or "inverted index" in e.lower() for e in sqlite_errors)
         if fts5_only:
             progress("  FTS5 corruption detected — attempting auto-rebuild before repair...")
             _vacuum_and_rebuild_fts5(palace_path, progress)
