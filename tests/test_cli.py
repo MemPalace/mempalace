@@ -81,6 +81,35 @@ def test_cmd_search_error_exits(mock_config_cls):
         assert exc_info.value.code == 1
 
 
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_search_recovers_from_transient_error_finding_id(mock_config_cls, capsys):
+    """End-to-end via cmd_search: one transient HNSW error should self-heal."""
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    args = argparse.Namespace(palace=None, query="q", wing=None, room=None, results=5)
+
+    first = MagicMock()
+    first.metadata = {"hnsw:space": "cosine"}
+    first.query.side_effect = RuntimeError("Error executing plan: Internal error: Error finding id")
+
+    second = MagicMock()
+    second.metadata = {"hnsw:space": "cosine"}
+    second.query.return_value = {
+        "documents": [["recovered doc"]],
+        "metadatas": [[{"source_file": "ok.md", "wing": "w", "room": "r"}]],
+        "distances": [[0.1]],
+    }
+
+    with (
+        patch("mempalace.searcher.get_collection", side_effect=[first, second]) as get_col,
+        patch("mempalace.searcher.time.sleep", return_value=None),
+    ):
+        cmd_search(args)
+
+    captured = capsys.readouterr()
+    assert "recovered doc" in captured.out
+    assert get_col.call_count == 2
+
+
 # ── cmd_instructions ───────────────────────────────────────────────────
 
 
@@ -1287,3 +1316,29 @@ def test_cmd_repair_from_sqlite_success_does_not_exit(mock_config_cls, tmp_path)
     with patch("mempalace.repair.rebuild_from_sqlite", return_value=fake_counts):
         # Should return cleanly; no SystemExit raised.
         cmd_repair(args)
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_from_sqlite_lock_conflict_exits_nonzero(mock_config_cls, tmp_path, capsys):
+    """Lock conflicts from from-sqlite repair must exit non-zero with context."""
+    from mempalace.palace import MineAlreadyRunning
+
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+
+    args = argparse.Namespace(
+        palace=str(palace_dir),
+        mode="from-sqlite",
+        source=None,
+        archive_existing=False,
+        yes=True,
+    )
+    with patch(
+        "mempalace.repair.rebuild_from_sqlite",
+        side_effect=MineAlreadyRunning("lock busy"),
+    ):
+        with pytest.raises(SystemExit) as excinfo:
+            cmd_repair(args)
+    assert excinfo.value.code == 1
+    assert "lock busy" in capsys.readouterr().err

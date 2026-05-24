@@ -775,6 +775,7 @@ def cmd_repair(args):
 
     if getattr(args, "mode", "legacy") == "from-sqlite":
         from .migrate import confirm_destructive_action
+        from .palace import MineAlreadyRunning
         from .repair import RebuildPartialError, rebuild_from_sqlite
 
         source_path = getattr(args, "source", None)
@@ -804,6 +805,9 @@ def cmd_repair(args):
                 dest_palace=palace_path,
                 archive_existing_dest=archive_existing,
             )
+        except MineAlreadyRunning as exc:
+            print(f"mempalace: {exc}", file=sys.stderr)
+            sys.exit(1)
         except RebuildPartialError as exc:
             # The error itself was already printed by rebuild_from_sqlite
             # with recovery instructions; surface a non-zero exit so

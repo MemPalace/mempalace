@@ -14,6 +14,7 @@ import math
 import os
 import re
 import sqlite3
+import time
 from pathlib import Path
 
 from .palace import get_closets_collection, get_collection
@@ -30,6 +31,29 @@ class SearchError(Exception):
 
 
 _TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
+_TRANSIENT_INDEX_RETRY_SLEEP_SECONDS = 2.0
+
+
+def _is_transient_index_error(exc: Exception) -> bool:
+    """Return True for transient Chroma index errors worth one retry.
+
+    Chroma can briefly return ``Internal error: Error finding id`` during
+    post-write HNSW flush windows. A one-shot retry after cache reset
+    usually recovers without surfacing an error to the CLI user.
+    """
+    msg = str(exc)
+    return "Error finding id" in msg or "Internal error" in msg
+
+
+def _force_search_backend_cache_reset(palace_path: str) -> None:
+    """Drop cached backend handles for ``palace_path`` before retrying."""
+    try:
+        from .palace import _DEFAULT_BACKEND
+
+        _DEFAULT_BACKEND._clients.pop(palace_path, None)
+        _DEFAULT_BACKEND._freshness.pop(palace_path, None)
+    except Exception:
+        pass
 
 
 def _first_or_empty(results, key: str) -> list:
@@ -308,42 +332,70 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
 
     where = build_where_filter(wing, room)
 
+    kwargs = {
+        "query_texts": [query],
+        "n_results": n_results,
+        "include": ["documents", "metadatas", "distances"],
+    }
+    if where:
+        kwargs["where"] = where
+
+    fallback_payload = None
+
     try:
-        kwargs = {
-            "query_texts": [query],
-            "n_results": n_results,
-            "include": ["documents", "metadatas", "distances"],
-        }
-        if where:
-            kwargs["where"] = where
-
         results = col.query(**kwargs)
-
     except Exception as e:
-        print(f"\n  Search error: {e}")
-        raise SearchError(f"Search error: {e}") from e
+        if _is_transient_index_error(e):
+            _force_search_backend_cache_reset(palace_path)
+            time.sleep(_TRANSIENT_INDEX_RETRY_SLEEP_SECONDS)
+            try:
+                col = get_collection(palace_path, create=False)
+                results = col.query(**kwargs)
+            except Exception as retry_error:
+                fallback_payload = _bm25_only_via_sqlite(
+                    query=query,
+                    palace_path=palace_path,
+                    wing=wing,
+                    room=room,
+                    n_results=n_results,
+                )
+                if fallback_payload.get("error"):
+                    print(f"\n  Search error: {retry_error}")
+                    raise SearchError(f"Search error: {retry_error}") from retry_error
+                print(
+                    "\n  NOTICE: vector index unavailable; using BM25-only sqlite fallback."
+                )
+        else:
+            print(f"\n  Search error: {e}")
+            raise SearchError(f"Search error: {e}") from e
 
-    docs = _first_or_empty(results, "documents")
-    metas = _first_or_empty(results, "metadatas")
-    dists = _first_or_empty(results, "distances")
+    if fallback_payload is not None:
+        hits = fallback_payload.get("results", [])
+        if not hits:
+            print(f'\n  No results found for: "{query}"')
+            return
+    else:
+        docs = _first_or_empty(results, "documents")
+        metas = _first_or_empty(results, "metadatas")
+        dists = _first_or_empty(results, "distances")
 
-    if not docs:
-        print(f'\n  No results found for: "{query}"')
-        return
+        if not docs:
+            print(f'\n  No results found for: "{query}"')
+            return
 
-    # Pure-cosine retrieval on the CLI path was missing lexical matches:
-    # a drawer whose text contains every query term can still score distance
-    # >= 1.0 against the natural-language query when the drawer is a
-    # mechanical artifact (directory listing, diff, log fragment) that
-    # embeds as file-tree noise rather than as prose about its subject.
-    # The MCP tool path already hybridizes BM25 with vector sim via
-    # `_hybrid_rank`; do the same here so CLI results match what agents
-    # see via `mempalace_search`.
-    hits = [
-        {"text": doc or "", "distance": float(dist), "metadata": meta or {}}
-        for doc, meta, dist in zip(docs, metas, dists)
-    ]
-    hits = _hybrid_rank(hits, query)
+        # Pure-cosine retrieval on the CLI path was missing lexical matches:
+        # a drawer whose text contains every query term can still score distance
+        # >= 1.0 against the natural-language query when the drawer is a
+        # mechanical artifact (directory listing, diff, log fragment) that
+        # embeds as file-tree noise rather than as prose about its subject.
+        # The MCP tool path already hybridizes BM25 with vector sim via
+        # `_hybrid_rank`; do the same here so CLI results match what agents
+        # see via `mempalace_search`.
+        hits = [
+            {"text": doc or "", "distance": float(dist), "metadata": meta or {}}
+            for doc, meta, dist in zip(docs, metas, dists)
+        ]
+        hits = _hybrid_rank(hits, query)
 
     print(f"\n{'=' * 60}")
     print(f'  Results for: "{query}"')
@@ -354,9 +406,16 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
     print(f"{'=' * 60}\n")
 
     for i, hit in enumerate(hits, 1):
-        vec_sim = round(max(0.0, 1 - hit["distance"]), 3)
+        distance = hit.get("distance")
+        vec_sim = round(max(0.0, 1 - distance), 3) if distance is not None else "n/a"
         bm25 = hit.get("bm25_score", 0.0)
-        meta = hit["metadata"]
+        meta = hit.get("metadata")
+        if not isinstance(meta, dict):
+            meta = {
+                "source_file": hit.get("source_file", "?"),
+                "wing": hit.get("wing", "?"),
+                "room": hit.get("room", "?"),
+            }
         source = Path(meta.get("source_file", "?")).name
         wing_name = meta.get("wing", "?")
         room_name = meta.get("room", "?")

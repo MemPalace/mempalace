@@ -282,6 +282,72 @@ class TestSearchCLI:
             with pytest.raises(SearchError, match="Search error"):
                 search("test", "/fake/path")
 
+    def test_search_retries_once_on_transient_error_finding_id(self, capsys):
+        """CLI search should mirror MCP's one-shot recovery on transient HNSW errors."""
+        first = MagicMock()
+        first.metadata = {"hnsw:space": "cosine"}
+        first.query.side_effect = RuntimeError(
+            "Error executing plan: Internal error: Error finding id"
+        )
+
+        second = MagicMock()
+        second.metadata = {"hnsw:space": "cosine"}
+        second.query.return_value = {
+            "documents": [["recovered doc"]],
+            "metadatas": [[{"source_file": "ok.md", "wing": "w", "room": "r"}]],
+            "distances": [[0.2]],
+        }
+
+        with (
+            patch("mempalace.searcher.get_collection", side_effect=[first, second]) as get_col,
+            patch("mempalace.searcher.time.sleep", return_value=None),
+        ):
+            search("anything", "/fake/path")
+
+        captured = capsys.readouterr()
+        assert "recovered doc" in captured.out
+        assert get_col.call_count == 2
+        assert first.query.call_count == 1
+        assert second.query.call_count == 1
+
+    def test_search_falls_back_to_bm25_when_transient_error_persists(self, capsys):
+        """If transient vector error persists after retry, CLI should use BM25 fallback."""
+        first = MagicMock()
+        first.metadata = {"hnsw:space": "cosine"}
+        first.query.side_effect = RuntimeError(
+            "Error executing plan: Internal error: Error finding id"
+        )
+
+        second = MagicMock()
+        second.metadata = {"hnsw:space": "cosine"}
+        second.query.side_effect = RuntimeError(
+            "Error executing plan: Internal error: Error finding id"
+        )
+
+        bm25_payload = {
+            "results": [
+                {
+                    "text": "bm25 recovered doc",
+                    "distance": None,
+                    "bm25_score": 3.14,
+                    "source_file": "s.md",
+                    "wing": "w",
+                    "room": "r",
+                }
+            ]
+        }
+        with (
+            patch("mempalace.searcher.get_collection", side_effect=[first, second]) as get_col,
+            patch("mempalace.searcher._bm25_only_via_sqlite", return_value=bm25_payload),
+            patch("mempalace.searcher.time.sleep", return_value=None),
+        ):
+            search("anything", "/fake/path")
+
+        captured = capsys.readouterr()
+        assert "BM25-only sqlite fallback" in captured.out
+        assert "bm25 recovered doc" in captured.out
+        assert get_col.call_count == 2
+
     def test_search_n_results(self, palace_path, seeded_collection, capsys):
         search("code", palace_path, n_results=1)
         captured = capsys.readouterr()

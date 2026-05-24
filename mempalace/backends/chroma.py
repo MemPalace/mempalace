@@ -638,6 +638,7 @@ def _pin_hnsw_threads(collection) -> None:
 
 
 _BLOB_FIX_MARKER = ".blob_seq_ids_migrated"
+_INVALID_HNSW_METADATA_FRESH_SECONDS = 1800.0
 
 
 def _valid_dimensionality(value: object) -> bool:
@@ -648,6 +649,27 @@ def _persisted_metadata_fields(obj: object) -> tuple[object, object]:
     if isinstance(obj, dict):
         return obj.get("dimensionality"), obj.get("id_to_label")
     return getattr(obj, "dimensionality", None), getattr(obj, "id_to_label", None)
+
+
+def _segment_recently_touched(seg_dir: str, window_seconds: float) -> bool:
+    """Return True when segment files were touched recently.
+
+    Fresh VECTOR segments can momentarily expose ``id_to_label`` while
+    ``dimensionality`` is still ``None`` during flush windows. Treating that as
+    corruption and renaming the segment races active writers and can create an
+    endless quarantine loop.
+    """
+    now = _dt.datetime.now().timestamp()
+    newest = 0.0
+    for name in ("index_metadata.pickle", "data_level0.bin", "link_lists.bin"):
+        path = os.path.join(seg_dir, name)
+        try:
+            newest = max(newest, os.path.getmtime(path))
+        except OSError:
+            continue
+    if newest <= 0.0:
+        return False
+    return (now - newest) <= window_seconds
 
 
 def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
@@ -709,6 +731,18 @@ def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
                 else:
                     has_labels = bool(id_to_label)
                     if has_labels and not _valid_dimensionality(dimensionality):
+                        if (
+                            dimensionality is None
+                            and _segment_recently_touched(
+                                seg_dir, _INVALID_HNSW_METADATA_FRESH_SECONDS
+                            )
+                        ):
+                            logger.debug(
+                                "Skipping invalid-HNSW quarantine for fresh segment %s "
+                                "(labels present, dimensionality=None)",
+                                seg_dir,
+                            )
+                            continue
                         reason = (
                             "labels present but dimensionality is missing or invalid "
                             f"({dimensionality!r})"

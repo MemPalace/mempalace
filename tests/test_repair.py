@@ -2,6 +2,7 @@
 
 import os
 import sqlite3
+import contextlib
 from contextlib import closing
 from unittest.mock import MagicMock, call, patch
 
@@ -1584,6 +1585,42 @@ def test_rebuild_from_sqlite_in_place_validates_source_before_archiving(tmp_path
     assert (palace / "marker.txt").read_text() == "not a real palace"
     archives = [p for p in tmp_path.iterdir() if "pre-rebuild" in p.name]
     assert archives == []
+
+
+def test_rebuild_from_sqlite_acquires_palace_locks(tmp_path, monkeypatch):
+    """from-sqlite rebuild must hold mine_palace_lock across source+dest paths.
+
+    Regression guard for issue #1586 class reports where concurrent writers
+    (CLI mine, hooks, MCP writes) interleave with rebuild and leave the
+    destination unhealthy immediately after "rebuild complete".
+    """
+
+    source = tmp_path / "source"
+    dest = tmp_path / "dest"
+    source.mkdir()
+    (source / "chroma.sqlite3").write_bytes(b"sqlite placeholder")
+
+    entered = []
+
+    @contextlib.contextmanager
+    def _fake_lock(path):
+        entered.append(path)
+        yield
+
+    monkeypatch.setattr("mempalace.palace.mine_palace_lock", _fake_lock)
+    monkeypatch.setattr(repair, "_recoverable_collections", lambda: ("mempalace_drawers",))
+    monkeypatch.setattr(repair, "_rebuild_one_collection", lambda **kwargs: 0)
+
+    counts = repair.rebuild_from_sqlite(str(source), str(dest))
+    assert counts == {"mempalace_drawers": 0}
+
+    expected = sorted(
+        {
+            os.path.abspath(str(source)),
+            os.path.abspath(str(dest)),
+        }
+    )
+    assert entered == expected
 
 
 def test_rebuild_from_sqlite_raises_on_upsert_failure(tmp_path, monkeypatch):
