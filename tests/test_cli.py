@@ -1342,3 +1342,53 @@ def test_cmd_repair_from_sqlite_lock_conflict_exits_nonzero(mock_config_cls, tmp
             cmd_repair(args)
     assert excinfo.value.code == 1
     assert "lock busy" in capsys.readouterr().err
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_fts_rebuild_mode_noop_when_quick_check_healthy(
+    mock_config_cls, tmp_path, capsys
+):
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    sqlite3.connect(str(palace_dir / "chroma.sqlite3")).close()
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+
+    args = argparse.Namespace(
+        palace=str(palace_dir),
+        mode="fts-rebuild",
+        yes=True,
+        backup=True,
+        dry_run=False,
+    )
+
+    with patch("mempalace.repair.sqlite_integrity_errors", return_value=[]):
+        cmd_repair(args)
+
+    out = capsys.readouterr().out
+    assert "already healthy" in out
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_fts_rebuild_mode_exits_nonzero_when_errors_remain(
+    mock_config_cls, tmp_path, capsys
+):
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    sqlite3.connect(str(palace_dir / "chroma.sqlite3")).close()
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+
+    args = argparse.Namespace(
+        palace=str(palace_dir),
+        mode="fts-rebuild",
+        yes=True,
+        backup=True,
+        dry_run=False,
+    )
+    errors = ["malformed inverted index for FTS5 table main.embedding_fulltext_search"]
+    with (
+        patch("mempalace.repair.sqlite_integrity_errors", return_value=errors),
+        patch("mempalace.repair.maybe_rebuild_fts_index_when_only_fts_corrupt", return_value=errors),
+        pytest.raises(SystemExit) as excinfo,
+    ):
+        cmd_repair(args)
+    assert excinfo.value.code == 1

@@ -749,6 +749,7 @@ def cmd_repair(args):
         _extract_drawers,
         _rebuild_collection_via_temp,
         check_extraction_safety,
+        maybe_rebuild_fts_index_when_only_fts_corrupt,
         maybe_repair_poisoned_max_seq_id_before_rebuild,
         print_sqlite_integrity_abort,
         sqlite_integrity_errors,
@@ -828,6 +829,20 @@ def cmd_repair(args):
             sys.exit(1)
         return
 
+    if getattr(args, "mode", "legacy") == "fts-rebuild":
+        sqlite_errors = sqlite_integrity_errors(palace_path)
+        if not sqlite_errors:
+            print("\n  SQLite quick_check is already healthy; no FTS rebuild needed.")
+            return
+        post_errors = maybe_rebuild_fts_index_when_only_fts_corrupt(
+            palace_path,
+            sqlite_errors,
+        )
+        if post_errors:
+            print_sqlite_integrity_abort(palace_path, post_errors)
+            sys.exit(1)
+        return
+
     db_path = os.path.join(palace_path, "chroma.sqlite3")
 
     if not os.path.isdir(palace_path):
@@ -845,6 +860,7 @@ def cmd_repair(args):
     # here so we can surface the clear recovery instructions and exit
     # cleanly before chromadb's compactor touches the disk.
     sqlite_errors = sqlite_integrity_errors(palace_path)
+    sqlite_errors = maybe_rebuild_fts_index_when_only_fts_corrupt(palace_path, sqlite_errors)
     if sqlite_errors:
         print_sqlite_integrity_abort(palace_path, sqlite_errors)
         sys.exit(1)
@@ -1426,14 +1442,16 @@ def main():
     )
     p_repair.add_argument(
         "--mode",
-        choices=["legacy", "max-seq-id", "from-sqlite"],
+        choices=["legacy", "max-seq-id", "from-sqlite", "fts-rebuild"],
         default="legacy",
         help=(
             "legacy: full-palace rebuild via the chromadb client (default). "
             "max-seq-id: un-poison max_seq_id rows corrupted by the legacy 0.6.x shim. "
             "from-sqlite: rebuild by reading rows directly from chroma.sqlite3, "
             "bypassing the chromadb client. Use when legacy mode bails because the "
-            "chromadb client cannot open the collection."
+            "chromadb client cannot open the collection. "
+            "fts-rebuild: rebuild only the FTS5 index when quick_check reports "
+            "isolated malformed inverted-index errors."
         ),
     )
     p_repair.add_argument(

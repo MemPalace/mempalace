@@ -1108,6 +1108,50 @@ def test_sqlite_integrity_errors_reports_unreadable_sqlite_file(tmp_path):
     assert "quick_check failed" in errors[0]
 
 
+def test_maybe_rebuild_fts_index_when_only_fts_corrupt_noop_for_non_fts_errors(tmp_path):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    (palace / "chroma.sqlite3").write_bytes(b"")
+    errors = ["Page 4 of B-tree 12345: database disk image is malformed"]
+
+    with patch("mempalace.repair.sqlite3.connect") as mock_connect:
+        result = repair.maybe_rebuild_fts_index_when_only_fts_corrupt(str(palace), errors)
+
+    assert result == errors
+    mock_connect.assert_not_called()
+
+
+def test_maybe_rebuild_fts_index_when_only_fts_corrupt_repairs_to_clean(tmp_path):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    (palace / "chroma.sqlite3").write_bytes(b"sqlite placeholder")
+    errors = ["malformed inverted index for FTS5 table main.embedding_fulltext_search"]
+
+    @contextlib.contextmanager
+    def _fake_lock(path):
+        yield
+
+    conn = MagicMock()
+    conn.execute.return_value.fetchall.return_value = [("ok",)]
+    cm = MagicMock()
+    cm.__enter__.return_value = conn
+    cm.__exit__.return_value = False
+
+    with (
+        patch("mempalace.palace.mine_palace_lock", _fake_lock),
+        patch("mempalace.repair.sqlite3.connect", return_value=cm),
+    ):
+        result = repair.maybe_rebuild_fts_index_when_only_fts_corrupt(str(palace), errors)
+
+    assert result == []
+    conn.execute.assert_any_call("PRAGMA busy_timeout=5000")
+    conn.execute.assert_any_call(
+        "INSERT INTO embedding_fulltext_search(embedding_fulltext_search) "
+        "VALUES('rebuild')"
+    )
+    conn.execute.assert_any_call("PRAGMA quick_check")
+
+
 @patch("mempalace.repair.shutil")
 @patch("mempalace.repair.ChromaBackend")
 def test_rebuild_index_aborts_on_sqlite_integrity_errors_before_delete_collection(

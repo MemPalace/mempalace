@@ -544,6 +544,68 @@ def sqlite_integrity_errors(palace_path: str) -> list[str]:
     return errors
 
 
+_FTS_MALFORMED_INDEX_ERROR = "malformed inverted index for fts5 table main.embedding_fulltext_search"
+
+
+def _is_only_fts_malformed_index(errors: list[str]) -> bool:
+    if not errors:
+        return False
+    return all(_FTS_MALFORMED_INDEX_ERROR in str(e).lower() for e in errors)
+
+
+def maybe_rebuild_fts_index_when_only_fts_corrupt(
+    palace_path: str,
+    errors: list[str],
+) -> list[str]:
+    """Attempt targeted FTS5 rebuild when quick_check reports only FTS corruption.
+
+    Returns the post-rebuild quick_check errors (empty on success), or the
+    original ``errors`` when this path is not applicable or rebuild fails.
+    """
+    if not _is_only_fts_malformed_index(errors):
+        return errors
+
+    sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(sqlite_path):
+        return errors
+
+    from .palace import MineAlreadyRunning, mine_palace_lock
+
+    print("\n  Detected isolated FTS5 malformed-index errors from quick_check.")
+    print("  Attempting targeted FTS rebuild under palace lock...")
+
+    try:
+        with mine_palace_lock(palace_path):
+            with sqlite3.connect(sqlite_path) as conn:
+                conn.execute("PRAGMA busy_timeout=5000")
+                conn.execute(
+                    "INSERT INTO embedding_fulltext_search(embedding_fulltext_search) "
+                    "VALUES('rebuild')"
+                )
+                rows = conn.execute("PRAGMA quick_check").fetchall()
+    except MineAlreadyRunning as exc:
+        print(f"  FTS rebuild skipped: {exc}")
+        return errors
+    except sqlite3.Error as exc:
+        print(f"  FTS rebuild failed: {exc}")
+        return errors
+
+    post_errors: list[str] = []
+    for row in rows:
+        if not row:
+            continue
+        message = str(row[0])
+        if message.lower() != "ok":
+            post_errors.append(message)
+
+    if post_errors:
+        print("  FTS rebuild completed but quick_check still reports issues.")
+        return post_errors
+
+    print("  FTS rebuild succeeded; quick_check is now healthy.")
+    return []
+
+
 def print_sqlite_integrity_abort(palace_path: str, errors: list[str]) -> None:
     """Print a clear repair abort message for SQLite-layer corruption."""
 
@@ -664,6 +726,7 @@ def rebuild_index(
     # corruption here lets us surface the clear recovery instructions and
     # exit cleanly before chromadb's compactor touches the disk.
     sqlite_errors = sqlite_integrity_errors(palace_path)
+    sqlite_errors = maybe_rebuild_fts_index_when_only_fts_corrupt(palace_path, sqlite_errors)
     if sqlite_errors:
         print_sqlite_integrity_abort(palace_path, sqlite_errors)
         return
