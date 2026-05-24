@@ -1327,6 +1327,65 @@ def test_chroma_backend_requarantines_after_inode_replacement(tmp_path, monkeypa
     ]
 
 
+def test_explain_ef_mismatch_recognizes_chromadb_conflict():
+    """When ChromaDB rejects a collection read due to an EF-name mismatch
+    (user changed MEMPALACE_EMBEDDING_MODEL on an existing palace), the
+    backend wraps the bare ValueError with a message that tells the user
+    how to recover. Without this, users hit a stack trace and don't know
+    rebuild-index exists."""
+    err = ValueError(
+        "An embedding function already exists in the collection configuration, "
+        "and a new one is provided. Embedding function conflict: new: "
+        "embeddinggemma_300m vs persisted: default"
+    )
+    msg = ChromaBackend._explain_ef_mismatch(err, "/tmp/palace.db")
+    assert msg is not None
+    assert "/tmp/palace.db" in msg
+    assert "MEMPALACE_EMBEDDING_MODEL" in msg
+    assert "rebuild-index" in msg
+
+
+def test_explain_ef_mismatch_returns_none_for_unrelated_errors():
+    """Don't paper over unrelated ValueErrors with the EF-mismatch message —
+    the caller needs to re-raise unmodified so debugging stays sane."""
+    err = ValueError("Some other ChromaDB problem")
+    assert ChromaBackend._explain_ef_mismatch(err, "/tmp/palace.db") is None
+
+
+def test_get_collection_translates_ef_mismatch_to_helpful_error(tmp_path):
+    """End-to-end: create a palace with the default EF, then try to read it
+    with a different EF name and confirm we surface the rebuild-index hint."""
+    backend = ChromaBackend()
+    palace_path = str(tmp_path / "palace")
+    os.makedirs(palace_path, exist_ok=True)
+
+    # Create the collection using the default (minilm-based) EF.
+    coll = backend.get_collection(palace_path, "drawers", create=True)
+    coll.add(documents=["seed"], ids=["1"])
+
+    # Now swap in an incompatible EF name (simulates the user setting
+    # MEMPALACE_EMBEDDING_MODEL=embeddinggemma without rebuild-index).
+    class _ConflictingEF:
+        @staticmethod
+        def name() -> str:
+            return "embeddinggemma_300m"
+
+        def __call__(self, input):
+            return [[0.0] * 384 for _ in input]
+
+    original_resolver = backend._resolve_embedding_function
+    backend._resolve_embedding_function = lambda: _ConflictingEF()
+    # Drop the cached client so the next call goes through the open path.
+    backend.close_palace(palace_path)
+
+    try:
+        with pytest.raises(ValueError, match=r"rebuild-index"):
+            backend.get_collection(palace_path, "drawers", create=False)
+    finally:
+        backend._resolve_embedding_function = original_resolver
+        backend.close_palace(palace_path)
+
+
 def test_palace_get_collection_uses_configured_collection_name(monkeypatch):
     from mempalace import palace
 

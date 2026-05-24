@@ -22,6 +22,7 @@ from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
     _metadata_matches_extract_mode,
+    _validate_palace_fts5_after_mine,
     file_already_mined,
     get_collection,
     mine_lock,
@@ -696,6 +697,9 @@ def _mine_convos_impl(
 
         total_drawers += drawers_added
         print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")
+
+    if not dry_run:
+        _validate_palace_fts5_after_mine(palace_path)
 
     print(f"\n{'=' * 55}")
     print("  Done.")

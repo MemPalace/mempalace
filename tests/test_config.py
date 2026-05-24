@@ -562,3 +562,59 @@ def test_miner_constants_alias_config_defaults():
     assert CHUNK_SIZE == DEFAULT_CHUNK_SIZE == 800
     assert CHUNK_OVERLAP == DEFAULT_CHUNK_OVERLAP == 100
     assert MIN_CHUNK_SIZE == DEFAULT_MIN_CHUNK_SIZE == 50
+
+
+# --- hooks.auto_save ---
+
+
+def test_hooks_auto_save_default():
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    assert cfg.hooks_auto_save is True
+
+
+def test_hooks_auto_save_from_config():
+    tmpdir = tempfile.mkdtemp()
+    with open(os.path.join(tmpdir, "config.json"), "w") as f:
+        json.dump({"hooks": {"auto_save": False}}, f)
+    cfg = MempalaceConfig(config_dir=tmpdir)
+    assert cfg.hooks_auto_save is False
+
+
+def test_hooks_auto_save_env_override_false():
+    os.environ["MEMPALACE_HOOKS_AUTO_SAVE"] = "false"
+    try:
+        cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+        assert cfg.hooks_auto_save is False
+    finally:
+        del os.environ["MEMPALACE_HOOKS_AUTO_SAVE"]
+
+
+def test_hooks_auto_save_env_override_zero():
+    os.environ["MEMPALACE_HOOKS_AUTO_SAVE"] = "0"
+    try:
+        cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+        assert cfg.hooks_auto_save is False
+    finally:
+        del os.environ["MEMPALACE_HOOKS_AUTO_SAVE"]
+
+
+def test_hooks_auto_save_env_override_no():
+    os.environ["MEMPALACE_HOOKS_AUTO_SAVE"] = "no"
+    try:
+        cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+        assert cfg.hooks_auto_save is False
+    finally:
+        del os.environ["MEMPALACE_HOOKS_AUTO_SAVE"]
+
+
+def test_hooks_auto_save_env_override_true():
+    """Env var set to 'true' overrides config file even if config says false."""
+    tmpdir = tempfile.mkdtemp()
+    with open(os.path.join(tmpdir, "config.json"), "w") as f:
+        json.dump({"hooks": {"auto_save": False}}, f)
+    os.environ["MEMPALACE_HOOKS_AUTO_SAVE"] = "true"
+    try:
+        cfg = MempalaceConfig(config_dir=tmpdir)
+        assert cfg.hooks_auto_save is True
+    finally:
+        del os.environ["MEMPALACE_HOOKS_AUTO_SAVE"]

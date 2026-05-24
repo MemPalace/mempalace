@@ -56,6 +56,116 @@ def test_extract_candidates_empty_text():
     assert result == {}
 
 
+# ── COCA content-word filter (Tier 2 linguistics cleanup) ───────────────
+
+
+def test_extract_candidates_filters_code_as_common_content_word():
+    """'Code' appearing 5x must NOT be detected — it's a common English
+    content word, not a proper noun. The current palace's known_entities.json
+    has 'Code' falsely listed as a person; this filter prevents that.
+    """
+    text = "Code is fun. Code works. Code helps. Code rules. Code wins."
+    result = extract_candidates(text)
+    assert "Code" not in result, (
+        f"'Code' should be filtered by COCA content-word list; got result keys: {list(result.keys())!r}"
+    )
+
+
+def test_extract_candidates_filters_all_known_aya_palace_false_positives():
+    """Every known false-positive entity in Aya's real palace must be
+    filtered. Empirical list from 2026-05-21 linguistics audit."""
+    false_positives = [
+        "Code",
+        "Brutal",
+        "Phase",
+        "Chat",
+        "Mar",
+        "Backups",
+        "Planning",
+        "Line",
+        "Note",
+    ]
+    for fp in false_positives:
+        text = " ".join([f"{fp} appears here."] * 5)
+        result = extract_candidates(text)
+        assert fp not in result, (
+            f"False positive '{fp}' should be filtered; got result keys: {list(result.keys())!r}"
+        )
+
+
+def test_extract_candidates_filter_is_case_insensitive():
+    """Capitalization variants of a COCA-blocked word must all be filtered."""
+    text = "CODE one. CODE two. CODE three. CODE four. CODE five."
+    result = extract_candidates(text)
+    assert "CODE" not in result, (
+        f"All-caps 'CODE' should be filtered case-insensitively; got: {list(result.keys())!r}"
+    )
+
+
+def test_extract_candidates_does_not_filter_real_names():
+    """Real proper-noun names appearing 3+ times must still be detected —
+    they're not in the COCA content-word list."""
+    text = "Riley said hi. Riley laughed. Riley smiled. Aya watched. Aya laughed. Aya smiled."
+    result = extract_candidates(text)
+    assert "Riley" in result, (
+        f"Real name 'Riley' should NOT be filtered; got: {list(result.keys())!r}"
+    )
+    assert "Aya" in result, f"Real name 'Aya' should NOT be filtered; got: {list(result.keys())!r}"
+
+
+def test_extract_candidates_does_not_filter_multi_word_phrases_with_coca_components():
+    """Multi-word phrase whose words include a COCA-filtered word must still
+    be detected. 'Code' alone is filtered, but 'Claude Code' as a compound
+    is a legitimate product name and stays.
+    """
+    text = (
+        "Claude Code is great. Claude Code rocks. Claude Code works. "
+        "Claude Code rules. Claude Code wins."
+    )
+    result = extract_candidates(text)
+    assert "Claude Code" in result, (
+        f"'Claude Code' multi-word phrase should NOT be filtered even though "
+        f"'code' is in COCA filter (Tier 3 will refine compound handling); "
+        f"got: {list(result.keys())!r}"
+    )
+
+
+def test_coca_wordlist_file_loads_with_expected_shape():
+    """The data file ships with a stable schema."""
+    import json
+    from pathlib import Path
+    import mempalace
+
+    pkg_dir = Path(mempalace.__file__).parent
+    p = pkg_dir / "data" / "coca_content_words.json"
+    assert p.exists(), f"COCA wordlist must exist at {p}"
+    d = json.loads(p.read_text(encoding="utf-8"))
+    assert d.get("schema_version") == 1, (
+        f"schema_version must be 1; got {d.get('schema_version')!r}"
+    )
+    words = d.get("words")
+    assert isinstance(words, list), f"'words' must be a list; got {type(words).__name__}"
+    assert len(words) >= 500, f"wordlist must have >=500 entries; got {len(words)}"
+    # All words must be lowercase strings (filter normalizes candidate to lowercase before lookup)
+    non_lower = [w for w in words if not isinstance(w, str) or w != w.lower()]
+    assert not non_lower, f"all words must be lowercase strings; offenders: {non_lower[:5]!r}"
+
+
+def test_coca_wordlist_contains_all_known_aya_false_positives():
+    """Direct data-level assertion: the wordlist must contain every known
+    false positive from Aya's real palace, lowercased."""
+    import json
+    from pathlib import Path
+    import mempalace
+
+    pkg_dir = Path(mempalace.__file__).parent
+    p = pkg_dir / "data" / "coca_content_words.json"
+    words = set(json.loads(p.read_text(encoding="utf-8"))["words"])
+    must_have = ["code", "brutal", "phase", "chat", "mar", "backups", "planning", "line", "note"]
+    missing = [w for w in must_have if w not in words]
+    assert not missing, f"COCA wordlist missing known false positives: {missing!r}"
+
+
 # ── score_entity ────────────────────────────────────────────────────────
 
 

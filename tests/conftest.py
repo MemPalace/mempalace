@@ -33,6 +33,23 @@ import pytest  # noqa: E402
 from mempalace.config import MempalaceConfig  # noqa: E402
 from mempalace.knowledge_graph import KnowledgeGraph  # noqa: E402
 
+# Redirect ChromaDB's ONNX model cache back to the real user's cache so tests
+# don't re-download the 79 MB model on every run. The HOME redirect above
+# would otherwise point ONNXMiniLM_L6_V2.DOWNLOAD_PATH at the empty temp dir.
+try:
+    from pathlib import Path  # noqa: E402
+    from chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2 import (  # noqa: E402
+        ONNXMiniLM_L6_V2,
+    )
+
+    _real_home = _original_env.get("USERPROFILE") or _original_env.get("HOME")
+    if _real_home:
+        _real_cache = Path(_real_home) / ".cache" / "chroma" / "onnx_models" / "all-MiniLM-L6-v2"
+        if _real_cache.exists():
+            ONNXMiniLM_L6_V2.DOWNLOAD_PATH = _real_cache
+except ImportError:
+    pass
+
 
 @pytest.fixture(autouse=True)
 def _reset_mcp_cache():

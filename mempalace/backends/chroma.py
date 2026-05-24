@@ -1227,6 +1227,38 @@ class ChromaBackend(BaseBackend):
             logger.exception("Failed to build embedding function; using chromadb default")
             return None
 
+    @staticmethod
+    def _explain_ef_mismatch(error: Exception, palace_path: str) -> Optional[str]:
+        """If ``error`` looks like a ChromaDB EF-name mismatch, return a
+        user-friendly explanation. Otherwise return None so the caller can
+        re-raise unchanged.
+
+        Triggered when ``MEMPALACE_EMBEDDING_MODEL`` is switched on an
+        existing palace — ChromaDB persists the EF name on the collection
+        and refuses reads with a different one. The bare ValueError
+        ChromaDB raises doesn't mention rebuild-index or the env var, so
+        users hit it and don't know how to recover.
+        """
+        msg = str(error)
+        if "Embedding function conflict" not in msg and "embedding function" not in msg.lower():
+            return None
+        try:
+            from ..config import MempalaceConfig
+
+            current_model = MempalaceConfig().embedding_model
+        except Exception:
+            current_model = "unknown"
+        return (
+            f"Embedding model mismatch reading palace at {palace_path!r}.\n"
+            f"  Underlying ChromaDB error: {msg}\n"
+            f"  Current MEMPALACE_EMBEDDING_MODEL={current_model!r}.\n"
+            f"  The palace was built with a different embedding model. Either:\n"
+            f"    (a) revert the model: unset MEMPALACE_EMBEDDING_MODEL (or set "
+            f"the previous value), or\n"
+            f"    (b) re-embed in place: `mempalace repair rebuild-index "
+            f"--palace {palace_path}` (writes new vectors with the current model)."
+        )
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -1434,11 +1466,21 @@ class ChromaBackend(BaseBackend):
                     },
                     **ef_kwargs,
                 )
+            except ValueError as e:
+                explanation = self._explain_ef_mismatch(e, palace_path)
+                if explanation:
+                    raise ValueError(explanation) from e
+                raise
         else:
             try:
                 collection = client.get_collection(collection_name, **ef_kwargs)
             except _ChromaNotFoundError as e:
                 raise CollectionNotInitializedError(palace_path) from e
+            except ValueError as e:
+                explanation = self._explain_ef_mismatch(e, palace_path)
+                if explanation:
+                    raise ValueError(explanation) from e
+                raise
         _pin_hnsw_threads(collection)
         return ChromaCollection(collection, palace_path=palace_path)
 

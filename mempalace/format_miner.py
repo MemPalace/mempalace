@@ -72,6 +72,7 @@ from typing import Optional, Union
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
+    _validate_palace_fts5_after_mine,
     file_already_mined,
     get_collection,
     mine_lock,
@@ -587,6 +588,7 @@ def _file_chunks_locked(
     room,
     agent,
     source_mtime: Optional[float] = None,
+    content: Optional[str] = None,
 ):
     """Lock the source file, purge stale drawers, and upsert fresh chunks.
 
@@ -604,7 +606,13 @@ def _file_chunks_locked(
     """
     # Lazy imports to avoid a module-load cycle (miner.py imports from this
     # module's package, so we defer these helpers until call time).
-    from .miner import _extract_entities_for_metadata, detect_hall
+    from .miner import _extract_content_date, _extract_entities_for_metadata, detect_hall
+
+    # Tier 6a content-date: extract once per file (not per chunk). Format-mined
+    # files often have date-rich content (RTF/PDF dates in body text, mtimes on
+    # the binary source). Caller may pass ``content`` (full extracted text) for
+    # the body-scan branch; if absent, the helper still uses filename + mtime.
+    file_content_date = _extract_content_date(source_file, content or "")
 
     drawers_added = 0
     with mine_lock(source_file):
@@ -649,6 +657,17 @@ def _file_chunks_locked(
                 }
                 if source_mtime is not None:
                     meta["source_mtime"] = source_mtime
+                # Tier 6a — propagate line range from chunk dict into drawer
+                # metadata so closet pointers can carry "where in source"
+                # info. Chunks emitted by older code paths without these
+                # keys produce drawers without the keys (graceful fallback).
+                if chunk.get("line_start") is not None:
+                    meta["line_start"] = chunk["line_start"]
+                if chunk.get("line_end") is not None:
+                    meta["line_end"] = chunk["line_end"]
+                # Tier 6a content-date: shared across all chunks of the file.
+                if file_content_date:
+                    meta["content_date"] = file_content_date
                 entities = _extract_entities_for_metadata(content)
                 if entities:
                     meta["entities"] = entities
@@ -864,6 +883,7 @@ def mine_formats(
                     room,
                     agent,
                     source_mtime=source_mtime,
+                    content=text,
                 )
                 if skipped:
                     files_skipped += 1
@@ -909,8 +929,9 @@ def mine_formats(
     else:
         # All files processed without interruption — compute cross-wing topic
         # tunnels linking this wing to others that share confirmed topics.
-        # Mirrors miner.py:1241-1249 exactly: tunnel-compute failures must
-        # never fail a mine, so any exception is logged and skipped quietly.
+        # Mirrors the post-loop tunnel block in miner._mine_impl: tunnel-compute
+        # failures must never fail a mine, so any exception is logged and
+        # skipped quietly.
         if not dry_run:
             try:
                 tunnels_added = _compute_topic_tunnels_for_wing(wing)
@@ -926,6 +947,14 @@ def mine_formats(
                     f"\n  WARNING: topic tunnel computation skipped — {exc}",
                     file=sys.stderr,
                 )
+
+            # End-of-mine FTS5 integrity check (#1537). Mirrors _mine_impl;
+            # raises MineValidationError to cmd_mine if PRAGMA quick_check
+            # finds malformed FTS5 rows so a corrupted palace cannot silently
+            # exit Done on the --mode extract path that bypasses _mine_impl.
+            # Sits outside the per-file try/except in the for-loop body, so
+            # caught per-file errors do not mask the integrity result.
+            _validate_palace_fts5_after_mine(palace_path)
     finally:
         # Hook-spawned mines write a PID file that miner.py's
         # _cleanup_mine_pid_file() clears; we mirror that so format-mode

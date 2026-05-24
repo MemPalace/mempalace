@@ -502,7 +502,7 @@ def cmd_mine(args):
             llm_provider=None,
         )
 
-    from .palace import MineAlreadyRunning
+    from .palace import MineAlreadyRunning, MineValidationError
 
     try:
         if args.mode == "convos":
@@ -548,6 +548,24 @@ def cmd_mine(args):
         # to wait for (or stop), and exit non-zero so wrappers like
         # nohup / scripts can detect the contention.
         print(f"mempalace: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except MineValidationError as exc:
+        # PRAGMA quick_check on chroma.sqlite3 returned errors at end of mine.
+        # The corruption may pre-date the mine; we surface it here so automation
+        # cannot proceed against a half-broken palace. Reuse cmd_repair's
+        # recovery banner so the operator sees one consistent message regardless
+        # of which command surfaces it.
+        from .repair import print_sqlite_integrity_abort
+
+        print_sqlite_integrity_abort(exc.palace_path, exc.errors)
+        print(
+            "\n  PRAGMA quick_check after this mine reported errors (the corruption\n"
+            "  may pre-date the mine itself). Drawers may still be intact for direct\n"
+            "  lookup; wing-filtered or full-text search will fail until the FTS5\n"
+            "  index is rebuilt. `mempalace repair --yes` rebuilds the FTS5 virtual\n"
+            "  table automatically (step 6 of the recovery above).",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
 

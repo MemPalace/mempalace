@@ -11,7 +11,6 @@ from datetime import date, datetime
 from functools import lru_cache
 from pathlib import Path
 
-
 # ── Input validation ──────────────────────────────────────────────────────────
 # Shared sanitizers for wing/room/entity names. Prevents path traversal,
 # excessively long strings, and special characters that could cause issues
@@ -19,6 +18,17 @@ from pathlib import Path
 
 MAX_NAME_LENGTH = 128
 _SAFE_NAME_RE = re.compile(r"^(?:[^\W_]|[^\W_][\w .'-]{0,126}[^\W_])$")
+
+# MCP clients (e.g. Claude Desktop, WorkBuddy) occasionally relay lone UTF-16
+# surrogates (U+D800–U+DFFF) when proxying binary-in-Unicode or corrupted
+# clipboard input. Python's ``str.encode('utf-8')`` raises on these, which
+# crashes ChromaDB add/upsert with -32000. See issue #1235.
+_LONE_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
+
+
+def strip_lone_surrogates(text: str) -> str:
+    """Replace lone UTF-16 surrogates with U+FFFD so the string is legal UTF-8 (#1235)."""
+    return _LONE_SURROGATE_RE.sub("�", text)
 
 
 def normalize_wing_name(name: str) -> str:
@@ -80,7 +90,7 @@ def sanitize_kg_value(value: str, field_name: str = "value") -> str:
     if "\x00" in value:
         raise ValueError(f"{field_name} contains null bytes")
 
-    return value
+    return strip_lone_surrogates(value)
 
 
 # ISO-8601 temporal validator for knowledge-graph temporal parameters
@@ -176,7 +186,7 @@ def sanitize_content(value: str, max_length: int = 100_000) -> str:
         raise ValueError(f"content exceeds maximum length of {max_length} characters")
     if "\x00" in value:
         raise ValueError("content contains null bytes")
-    return value
+    return strip_lone_surrogates(value)
 
 
 DEFAULT_PALACE_PATH = os.path.expanduser("~/.mempalace/palace")
@@ -244,8 +254,26 @@ DEFAULT_HALL_KEYWORDS = {
         "server",
     ],
     "identity": ["identity", "name", "who am i", "persona", "self"],
-    "family": ["family", "kids", "children", "daughter", "son", "parent", "mother", "father"],
-    "creative": ["game", "gameplay", "player", "app", "design", "art", "music", "story"],
+    "family": [
+        "family",
+        "kids",
+        "children",
+        "daughter",
+        "son",
+        "parent",
+        "mother",
+        "father",
+    ],
+    "creative": [
+        "game",
+        "gameplay",
+        "player",
+        "app",
+        "design",
+        "art",
+        "music",
+        "story",
+    ],
 }
 
 
@@ -307,6 +335,19 @@ class MempalaceConfig:
             except (json.JSONDecodeError, OSError):
                 pass
         return self._file_config.get("people_map", {})
+
+    @property
+    def hooks_auto_save(self):
+        """Whether the stop/precompact hooks should block for auto-save.
+
+        When False, hooks pass through without blocking — equivalent to
+        disabling auto-save while keeping hook scripts installed.
+        """
+        env_val = os.environ.get("MEMPALACE_HOOKS_AUTO_SAVE")
+        if env_val is not None:
+            return env_val.lower() not in ("false", "0", "no")
+        hooks = self._file_config.get("hooks", {})
+        return hooks.get("auto_save", True)
 
     @property
     def topic_wings(self):
@@ -477,6 +518,47 @@ class MempalaceConfig:
         if env_val:
             return env_val.strip().lower()
         return str(self._file_config.get("embedding_device", "auto")).strip().lower()
+
+    @property
+    def embedding_model(self):
+        """Embedding model identifier.
+
+        Values: ``"minilm"`` (ChromaDB's all-MiniLM-L6-v2 — English-only),
+        ``"embeddinggemma"`` (multilingual, 100+ languages, default for
+        new installs since onboarding writes the choice). Read from env
+        ``MEMPALACE_EMBEDDING_MODEL`` first, then ``embedding_model`` in
+        ``config.json``, then ``"minilm"`` as a back-compat fallback for
+        palaces created before onboarding asked the question.
+
+        Switching models on an existing palace requires re-embedding
+        (different vector space) — ChromaDB rejects reads when the persisted
+        EF name doesn't match. Run ``mempalace repair rebuild-index`` after
+        changing this value.
+        """
+        env_val = os.environ.get("MEMPALACE_EMBEDDING_MODEL")
+        if env_val:
+            return env_val.strip().lower()
+        return str(self._file_config.get("embedding_model", "minilm")).strip().lower()
+
+    def set_embedding_model(self, model: str) -> None:
+        """Persist the embedding-model choice to ``config.json``.
+
+        Onboarding calls this once on first run. Accepts ``"minilm"`` or
+        ``"embeddinggemma"``; other values are normalized to lowercase and
+        passed through (``embedding.get_embedding_function`` falls back to
+        minilm for unrecognized values).
+        """
+        self._file_config["embedding_model"] = str(model).strip().lower()
+        self._config_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(self._config_file, "w", encoding="utf-8") as f:
+                json.dump(self._file_config, f, indent=2, ensure_ascii=False)
+        except OSError:
+            pass
+        try:
+            self._config_file.chmod(0o600)
+        except (OSError, NotImplementedError):
+            pass
 
     @property
     def topic_tunnel_min_count(self):

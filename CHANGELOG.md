@@ -6,21 +6,103 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
-## [Unreleased]
+## [3.3.6] — 2026-05-24
+
+### Features
+
+- **Office-document mining via `--mode extract`.** New `mempalace mine <dir> --mode extract` ingests PDFs, Word (`.docx`), PowerPoint (`.pptx`), Excel (`.xlsx`), RTF, and EPUB books in addition to the existing source-code/text path. Install with `pip install mempalace[extract]` — pulls `striprtf` for RTF and MarkItDown (with `[docx,pdf,pptx,xlsx]` sub-extras) for the binary formats. Python 3.9 users get RTF coverage only because MarkItDown requires 3.10+. Drawers from the extract path carry `extract_mode` metadata so the convo miner's "already mined?" check and drawer-id generation stay isolated per mode (#1528). (#1555)
+
+- **Virtual line numbers + surgical closet pointers.** Stored drawers now carry virtual line numbers so the read CLI verb and closet pointers can cite exact line ranges. Closet pointers (Tier 6a) include date+line-range information derived from filename and content-body date parsing (`python-dateutil` is now a core dep), so MemPalace can point you to exact lines on exact dates rather than just "somewhere in this drawer." (#1555, #1584)
+
+- **Within-wing hallways.** When two entities (people, projects, topics) co-occur in the same drawer, the miner now records a "hallway" — a graph edge connecting them inside that wing. Computed automatically as part of the post-mine step in `compute_hallways_for_wing` so the graph grows incrementally with new content, no separate command. Foundation for cross-room entity navigation inside one palace. (#1558, #1560)
+
+- **Cross-wing tunnels promoted from hallways.** When the same entity appears in hallways across multiple wings, MemPalace now automatically promotes that into a tunnel — letting queries hop from one person's wing to a project wing they appear in, without anyone calling `create_tunnel` manually. Topic tunnels from the existing `compute_topic_tunnels` path remain unchanged. (#1565)
+
+- **Living-memory dynamics (Hebbian potentiation + Ebbinghaus decay).** Hallways and tunnels get stronger every time the same connection is reinforced by new content ("what fires together wires together") and fade gradually if a connection stops appearing in incoming drawers. Navigation weights track real palace usage instead of being static, so retrieval ranking improves over time as the palace is actually used. (#1578)
+
+- **API-tool transcripts auto-route to `wing_api`.** Conversation transcripts from API-style AI tools (Claude Code, Claude.ai, ChatGPT, Slack-bot exports, generic OpenAI-shape JSON, etc.) now route into a dedicated `wing_api` instead of mixing into the human-conversation wings. Keeps tool-call traffic from polluting personal/project wings and improves search precision when you're looking for "what did *I* say" vs. "what did the agent say." (#1236)
+
+- **Multilingual embedding by default for new installs: `embeddinggemma-300m` ONNX (q8, MRL→384-dim).** MemPalace's previous embedder (`all-MiniLM-L6-v2`) is trained English-only — cross-lingual cosine similarity on parallel-translated text averages 0.35 across DE/FR/HI/IT/KO/RU (RU at 0.17, near-orthogonal). A Russian-speaking user effectively cannot find their own memories, which breaks the "100% recall" design promise from CLAUDE.md. New `EmbeddinggemmaONNX` class in [`mempalace/embedding.py`](mempalace/embedding.py) brings this to 0.88 average (validated lossless vs the Ollama gguf via direct ONNX-runtime test). Lazy-downloads `onnx-community/embeddinggemma-300m-ONNX` (~300 MB) on first use via `huggingface_hub`. Output is truncated to 384 dims via Matryoshka Representation Learning so the model is a drop-in for ChromaDB's 384-dim collections — no schema change. Sim prefix (`"task: sentence similarity | query: "`) is applied automatically.
+
+  Onboarding (`python -m mempalace.onboarding`) now offers the multilingual model as the default — choosing it writes `embedding_model: embeddinggemma` to `config.json` so subsequent runs pick it up without re-prompting. Existing installs that never set the env var or ran onboarding stay on `minilm` (back-compat). `MEMPALACE_EMBEDDING_MODEL=minilm|embeddinggemma` overrides both. Switching models on an existing palace requires re-embedding — run `mempalace repair rebuild-index` after the change. (#1483)
+
+- **Multilingual deps moved to core.** `huggingface_hub`, `tokenizers`, and `numpy` are now required deps so the multilingual path works out of the box after `pip install mempalace`. The `[multilingual]` extra is kept as a no-op alias for back-compat with install scripts. The 300 MB ONNX model itself is still lazy-downloaded on first use, not at install time.
+
+- **Friendlier ChromaDB EF-name-mismatch error.** Switching `MEMPALACE_EMBEDDING_MODEL` on an existing palace without running `rebuild-index` previously surfaced ChromaDB's bare `Embedding function conflict: new: X vs persisted: Y` `ValueError` — accurate but didn't tell users how to recover. `ChromaBackend.get_collection()` now wraps that error and points at both options: revert the env var, or run `mempalace repair rebuild-index --palace <path>`. (#1483)
+
+- **`hooks.auto_save` toggle for silent-mode sessions.** New config knob (and `--silent` CLI flag wiring through the save hook) lets users opt out of automatic diary saves on `Stop` / `PreCompact`. Useful for "silent mode" sessions where you don't want every conversation captured. Default behavior is unchanged — auto-save still runs unless explicitly disabled. (#711)
+
+- **Filter common English content words from entity detection.** High-frequency English content words ("system", "user", "memory", "project", "context", etc.) were getting tagged as entities by the per-drawer detector and polluting the entity registry as "people." A shipped COCA wordlist (top-N content words) is now consulted during entity classification so these get filtered before they reach the registry. Hardened against malformed JSON in the bundled wordlist. (#1605)
+
+- **Case-insensitive entity matching at mine time.** The initial palace build (`mempalace init`) matched entity names case-insensitively, but the per-drawer tagger used during incremental mining did not — so the same person was tagged differently between init and ingest ("Aya" vs. "aya" became distinct entities). The incremental tagger now mirrors the case-insensitive matcher, restoring entity-tag consistency across the palace lifecycle. (#1557)
 
 ### Bug Fixes
+
+- **Silent data loss in three upsert paths.** Three upsert sites (file ingest, conversation ingest, and one repair branch) were calling the embedder on unchunked content, silently truncating at the embedder's max-token limit. Long drawers landed with only their leading section indexed, breaking the "100% recall" promise on long-form content. All three now route through the chunker first so the full document is embedded and stored. (#1540, follow-up to #1539)
+
+- **Paragraph chunker emitted oversized chunks for long paragraphs.** The paragraph splitter assumed paragraphs were always shorter than `CHUNK_SIZE` and emitted them whole; long paragraphs (legal text, dense technical writeups) silently exceeded the embedder's context window. The splitter now hard-caps each emitted chunk to honor `CHUNK_SIZE`. (#1538, fixes #1534)
+
+- **Per-file chunk cap was hardcoded and too low for large transcripts.** A safety limit capped chunks per file at a value tuned for source code; mining very large conversation transcripts silently dropped the tail past that cap. Now configurable, with the default raised to cover realistic transcript sizes. (#1554, fixes #1455)
+
+- **Hook subprocess / ChromaDB deadlock on Windows.** Stop/PreCompact hooks could deadlock against an already-open ChromaDB client on Windows, leaving the host (Claude Code) stuck waiting on the hook. Three-part fix: stale-PID timeout on mine-lock reclamation, idle-exit path in the MCP server, and structured errors when the deadlock pattern is detected so the host can recover. (#1562, fixes #1552)
+
+- **`create_tunnel` corrupted hyphenated wing names.** The endpoint parser split on `-`, so wings whose name contained a hyphen (`mem-palace`, `my-app`) were truncated mid-name and the tunnel pointed at a non-existent endpoint. Endpoint parsing now preserves the full slug. (#1529, fixes #1504)
+
+- **MCP knowledge-graph cache produced duplicate graphs for symlinked / differently-cased palace paths.** Cache key was the raw path string, so `/Users/me/.mempalace/palace` and `/Users/me/.mempalace/Palace` (case-folded on macOS) or a symlinked alias produced two separate cached `KnowledgeGraph` instances pointing at the same SQLite file, with stale-read risk. Cache now normalizes via `realpath` + `normcase` so they collapse onto a single canonical key. (#1383, fixes #1372)
+
+- **Save-hook truncated hyphenated project folder names.** Wing-name parser was splitting on `-` and keeping only the first segment, so `mem-palace` became `mem`. Fix preserves the full project-folder slug so hyphenated palaces stay coherent across hook invocations. (#1424, fixes #1410)
+
+- **Miner silently skipped symlinks.** Users were confused about missing data after mining; the miner was skipping symlinks without surfacing it. Now logs each skipped symlink with the reason so the gap is visible. (#1466, fixes #1462)
+
+- **Host-leaked `PYTHONPATH` could shadow MemPalace's own modules at import.** Package `__init__` now strips leaked entries on import so the imported MemPalace is always the installed one. (#1439, fixes #1423)
+
+- **macOS stock-bash hook scripts.** Hook scripts used `mapfile` (bash 4+), breaking macOS's stock `/bin/bash` 3.2. Switched to a sed pipeline so hooks work out of the box on every Mac. (#1441, fixes #1440)
+
+- **Plugin Stop/PreCompact hooks could hang indefinitely on a stuck child.** Bounded timeout ensures the host can always make forward progress even if MemPalace's child process is unhealthy. (#1470, fixes #1465)
+
+- **MCP handlers now return structured JSON-RPC errors for malformed input.** Unknown parameter names returned `-32602 Invalid params` instead of an unstructured Python `TypeError`; parameters of the wrong shape return a structured error instead of a raw traceback. (#1500, #1513)
+
+- **CLI distinguished "palace doesn't exist" from "palace exists but is empty".** Two states that look the same to a new user are now reported separately with actionable next-step messages for each. (#1532, fixes #1498)
+
+- **`mempalace repair` post-pass: VACUUM + FTS5 rebuild.** After a palace repair, the SQLite knowledge-graph file kept fragmented pages and a stale FTS5 index; running `VACUUM` and rebuilding FTS5 at the end reclaims disk and restores search performance. (#1523)
+
+- **Convo miner mode isolation.** The "already mined?" check and drawer-id generation ignored `extract_mode`, so switching modes either re-mined the same content (data dup) or collided drawer IDs across modes. Scoping by mode keeps each mode's drawers isolated and dedup-correct. (#1528, fixes #1505)
+
+- **FTS5 validation at end of mine.** Mining now validates the FTS5 index integrity as a post-step so corruption is caught at write time, not at read time. (#1548, fixes #1537)
+
+- **`hooks_cli` crashed on shallow install paths.** Code indexed `Path.parents[3]` assuming a deep install tree, raising `IndexError` when MemPalace ran from a shallow path (e.g. `/opt/mp`). Adds a guard so shallow installs no longer crash on hook commands. (#1585)
+
+- **HNSW segment quarantine: zero-byte vs missing-dim.** Earlier quarantine heuristic flagged any HNSW segment missing the `dim` metadata field as corrupt, but most were recoverable; the check now distinguishes recoverable-missing-dim from actually-corrupt, preserving working index segments. Zero-byte link-list files (partially-written segments) are now rejected outright. (#1452, #1461, fixes #1457)
+
+- **Mine-lock holder file written as UTF-8 instead of cp1252.** Non-ASCII Windows usernames and paths no longer corrupt the lock file and break stale-lock detection. (#1438)
+
+- **Miner slot claim now writes a placeholder PID immediately.** Crash between claim and PID-write no longer leaves a phantom lock. (#1543, fixes #1443)
+
+- **`mine_convos` now runs inside `mine_palace_lock`.** Two concurrent `convos mine` invocations can no longer corrupt the index. (#1477)
+
+- **Migration tool cleanup.** ChromaDB-version migration tool now closes its SQLite connection and removes the temp palace directory if an exception fires mid-migration; failed migrations stop leaking file handles and disk. Entity-registry atomic-write now deletes its `.tmp` sidecar if the write or rename fails. (#1216, #1408, fixes #1373)
+
+- **Repair tool tolerated empty/None metadata cells.** ChromaDB occasionally returns cells with empty metadata dicts or `None` during rebuild; both are now coerced to sensible defaults so the rebuild completes and otherwise-stuck palaces recover. (#1459, #1445, fixes #1426)
+
+- **`create_tunnel` MCP handler now propagates errors.** Bad endpoint or direction was being swallowed and returned as misleading success; now propagates as a structured MCP error. (#1546, fixes #1473)
 
 - **Explicit tunnels were stored at a hardcoded ``~/.mempalace/tunnels.json`` path that ignored ``MempalaceConfig.palace_path``.** Drawers, KG triples, the people map, and every other piece of palace state honour the configured ``palace_path`` (and the ``MEMPALACE_PALACE_PATH`` env var), but ``palace_graph._TUNNEL_FILE`` was a module-level constant initialised once from ``os.path.expanduser("~") + "/.mempalace/tunnels.json"``. Under any setup where ``$HOME`` is isolated from the configured palace — subagent profiles with their own ``$HOME``, sandboxes, multi-tenant hosts, container mounts that move the palace to ``/srv/`` — drawers landed in the configured palace while tunnels silently landed in a different file that no other process touching the same palace could see. Worst case is the agentic one: an isolated worker calls ``create_tunnel`` then ``list_tunnels`` and gets back its own write from the bubble, so the worker self-confirms a tunnel that doesn't exist in the shared palace and reports completion to the orchestrator. ``palace_graph._TUNNEL_FILE`` is replaced by ``_get_tunnel_file()`` which derives the path from a new ``MempalaceConfig.tunnel_file`` property (sibling of ``palace_path``). The default single-user install is unchanged because the default ``palace_path`` is still ``~/.mempalace/palace`` and its sibling ``tunnels.json`` is the legacy path. Backwards-compatibility: if the configured tunnel file does not exist but a file is present at the pre-3.3.6 hardcoded ``~/.mempalace/tunnels.json`` path AND the two paths differ, ``_load_tunnels`` logs a one-line ``WARNING`` naming both paths and returns an empty list — we intentionally do NOT auto-migrate because silently merging tunnel state across two locations risks clobbering newer data; the user moves or copies the file themselves. (#1467)
 
 - **``create_tunnel`` did not validate that the source and target rooms actually exist in the chroma index.** ``_require_name`` only checked that wing/room names were non-empty strings; nothing queried the collection to confirm at least one drawer carried matching ``{wing, room}`` metadata. Pointing an explicit tunnel at a phantom room — common when an agent fabricates a room name it expects to exist, or types a slug wrong — silently succeeded. Combined with the read-bubble described in the previous fix, an agent could ``create_tunnel`` → ``list_tunnels`` and have both calls return its own bogus write. ``create_tunnel`` now calls ``_check_room_exists(wing, room, col)`` for both endpoints before persisting an explicit tunnel; if either endpoint has zero matching drawers the call raises ``ValueError`` naming the offending wing/room pair. Three deliberate carve-outs: (1) ``kind != "explicit"`` skips validation because topic tunnels generated by ``compute_topic_tunnels`` use synthetic ``topic:<name>`` room identifiers that don't correspond to real chroma rooms; (2) ``_get_collection`` returning ``None`` (palace not yet created, transient backend failure, tests without a real chroma backend) skips validation rather than fail-closed — matches the tolerance pattern used everywhere else in ``palace_graph``; (3) exceptions raised by the underlying ``col.get(where=..., limit=1, include=[])`` query are logged and treated as "can't verify, allow" so a temporary index fault never blocks legitimate writes. **Behaviour change:** existing callers that previously created tunnels pointing at empty rooms (e.g. as scaffolding before mining them) will now raise ``ValueError``. File the drawer first, then create the tunnel — this is the order the documentation has always recommended. (#1468)
+
+### Performance
+
+- **Convo miner pre-fetches mined-set once.** Was issuing one `WHERE` query per file to check "already mined?"; now pre-fetches the full mined set once, slashing wall time on large transcript corpuses. (#1474)
+
+- **`rebuild_index` progress callback.** Multi-hour rebuilds now report progress with default ETA printer; users no longer have to guess whether the process is making progress. (#1487)
+
+- **MCP cold-start diagnostics + opt-in warmup.** Adds visibility into which embedder is loading and how long it takes, plus an opt-in warmup path so users can see and address slow first-query latency. (#1530, fixes #1495)
 
 ### Internal
 
 - ``palace_graph._TUNNEL_FILE`` (module-level constant) replaced by ``_get_tunnel_file(config=None)`` and ``_legacy_tunnel_file()``. Tests previously monkeypatching the constant must now monkeypatch the resolver functions. The ``tests/test_palace_graph_tunnels.py::_use_tmp_tunnel_file`` helper, ``tests/test_closets.py::TestTunnels`` setup/teardown, and three tests in ``tests/test_miner.py`` were updated accordingly. Topic-tunnel tests in ``test_miner`` continue to work without stubbing ``_get_collection`` because ``kind="topic"`` short-circuits the new validation path.
 
 ---
-
-
 
 ## [3.3.5] — 2026-05-09
 

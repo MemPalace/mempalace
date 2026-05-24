@@ -1,6 +1,6 @@
 [project]
 name = "mempalace"
-version = "3.3.5"
+version = "3.3.6"
 description = "Give your AI a memory — mine projects and conversations into a searchable palace. No API key required."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -30,6 +30,23 @@ dependencies = [
     "chromadb>=1.5.4,<2",
     "pyyaml>=6.0,<7",
     "tomli>=2.0.0; python_version < '3.11'",
+    # Multilingual embedding model deps. Onboarding now offers the
+    # embeddinggemma-300m ONNX model as the default for new installs, so
+    # these are required core deps (not optional extras). The 300 MB ONNX
+    # model itself is lazy-downloaded on first use, not at install time.
+    # Users who pick minilm during onboarding still get these installed
+    # but unused — small wheel-size cost in exchange for one fewer pip
+    # command in the multilingual setup path.
+    "huggingface_hub>=0.20",
+    "tokenizers>=0.15",
+    "numpy>=1.24",
+    # Tier 6a content-date extraction uses dateutil for natural-language
+    # date parsing (filename + content body branches). It happens to install
+    # transitively today via chromadb→kubernetes→python-dateutil, but that
+    # chain is not a contract — declared explicitly here to ensure
+    # _extract_content_date keeps working if upstream kubernetes drops the
+    # dependency. Per PR #1584 review (Igor, 2026-05-22).
+    "python-dateutil>=2.8",
 ]
 
 [project.urls]
@@ -51,7 +68,29 @@ chroma = "mempalace.backends.chroma:ChromaBackend"
 [project.entry-points."mempalace.sources"]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "pytest-cov>=4.0", "ruff==0.15.9", "psutil>=5.9"]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff==0.15.14",
+    "psutil>=5.9",
+    # Property-based testing — generates hundreds of random inputs per
+    # test to find counterexamples the hand-written positive tests miss.
+    # Used opt-in (sprinkle ``@given(...)`` on a test); zero runtime
+    # cost on tests that don't use it.
+    "hypothesis>=6.0",
+    # Pre-commit framework — gates every local ``git commit`` on the
+    # same ruff checks CI runs. Required activation step in
+    # CONTRIBUTING.md: ``pre-commit install`` once per clone. Without
+    # this, contributors silently bypass the lint gate locally and only
+    # discover failures at CI time.
+    "pre-commit>=3.0",
+    # mypy — static type checker. Catches lazy ``list`` / ``dict``
+    # annotations that should be ``list[str]`` / ``dict[str, int]``,
+    # missing return types, mismatched signatures across call sites.
+    # Run ad-hoc with ``mypy mempalace/``; CI doesn't gate on it yet but
+    # contributors should fix mypy errors they see before pushing.
+    "mypy>=1.0",
+]
 spellcheck = ["autocorrect>=2.0"]
 # Hardware acceleration for the ONNX embedding model. Install exactly one:
 #   pip install mempalace[gpu]       — NVIDIA CUDA
@@ -61,6 +100,9 @@ spellcheck = ["autocorrect>=2.0"]
 gpu = ["onnxruntime-gpu>=1.16"]
 dml = ["onnxruntime-directml>=1.16"]
 coreml = ["onnxruntime>=1.16"]
+# Multilingual extra kept as a no-op alias for back-compat with
+# `pip install mempalace[multilingual]` — these deps now ship in core.
+multilingual = []
 # Binary-format extraction for `mempalace mine --mode extract`. Per-format
 # transformer routing: striprtf for .rtf, MarkItDown for .pdf/.docx/.pptx/
 # .xlsx/.epub. MarkItDown requires Python ≥ 3.10 (env marker ensures it
@@ -78,7 +120,15 @@ extract = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=7.0", "pytest-cov>=4.0", "ruff==0.15.9", "psutil>=5.9"]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff==0.15.14",
+    "psutil>=5.9",
+    "hypothesis>=6.0",
+    "pre-commit>=3.0",
+    "mypy>=1.0",
+]
 
 [build-system]
 requires = ["hatchling"]

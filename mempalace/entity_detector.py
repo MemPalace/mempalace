@@ -32,6 +32,7 @@ Usage:
 
 from __future__ import annotations
 
+import json
 import re
 import os
 import functools
@@ -39,6 +40,42 @@ from pathlib import Path
 from collections import defaultdict
 
 from mempalace.i18n import get_entity_patterns
+
+
+# ==================== COCA CONTENT-WORD FILTER (Tier 2 linguistics cleanup) ====================
+#
+# Common English content words that frequently appear capitalized (sentence
+# start, headings, markdown emphasis) but are NOT proper nouns. Filtering
+# these at candidate-extraction time prevents false-positive entity detection
+# of words like "Code", "Brutal", "Phase", "Chat", "Note", "Line", etc.
+#
+# The data file lives at ``mempalace/data/coca_content_words.json``. Loaded
+# once on first call via ``_get_coca_filter``. Matching is case-insensitive:
+# callers must lowercase the candidate before lookup.
+#
+# Tier 3 (planned) will add a known-systems lexicon that protects compound
+# names like "Claude Code" — for now, the multi-word path in
+# ``extract_candidates`` is intentionally NOT filtered, so legitimate
+# compounds remain detectable.
+
+
+@functools.lru_cache(maxsize=1)
+def _get_coca_filter() -> frozenset[str]:
+    """Return the COCA content-word filter set (lowercased).
+
+    Loads ``mempalace/data/coca_content_words.json`` on first call and
+    caches the resulting frozenset. Subsequent calls are O(1). Returns
+    an empty frozenset if the data file is missing or malformed —
+    extraction behavior then degrades gracefully (no filter applied)
+    rather than crashing.
+    """
+    data_path = Path(__file__).parent / "data" / "coca_content_words.json"
+    try:
+        raw = json.loads(data_path.read_text(encoding="utf-8"))
+        words = raw.get("words", [])
+        return frozenset(w.lower() for w in words if isinstance(w, str))
+    except (OSError, json.JSONDecodeError, AttributeError, TypeError):
+        return frozenset()
 
 
 # ==================== LANGUAGE-AWARE PATTERN LOADING ====================
@@ -153,6 +190,7 @@ def extract_candidates(text: str, languages=("en",)) -> dict:
     langs = _normalize_langs(languages)
     patterns = get_entity_patterns(langs)
     stopwords = _get_stopwords(langs)
+    coca_filter = _get_coca_filter()
 
     counts: defaultdict = defaultdict(int)
 
@@ -163,7 +201,14 @@ def extract_candidates(text: str, languages=("en",)) -> dict:
         except re.error:
             continue
         for word in rx.findall(text):
-            if word.lower() in stopwords:
+            wl = word.lower()
+            if wl in stopwords:
+                continue
+            # Tier 2 linguistics cleanup: block common English content words
+            # (Code, Brutal, Phase, Line, Note, ...) from entity candidacy.
+            # Multi-word path below is intentionally not filtered so
+            # compound names like "Claude Code" still get detected.
+            if wl in coca_filter:
                 continue
             if len(word) < 2:
                 continue

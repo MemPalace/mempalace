@@ -6,6 +6,7 @@ from unittest.mock import patch
 from mempalace.onboarding import (
     DEFAULT_WINGS,
     _ask,
+    _ask_embedding_model,
     _ask_mode,
     _ask_people,
     _ask_projects,
@@ -422,6 +423,7 @@ def test_run_onboarding_basic_flow(tmp_path):
     """Test the full onboarding flow with minimal mocking."""
     with (
         patch("mempalace.onboarding._ask_mode", return_value="work"),
+        patch("mempalace.onboarding._ask_embedding_model", return_value="embeddinggemma"),
         patch(
             "mempalace.onboarding._ask_people",
             return_value=([{"name": "Bob", "relationship": "boss", "context": "work"}], {}),
@@ -440,6 +442,7 @@ def test_run_onboarding_with_ambiguous_names(tmp_path):
     """Onboarding prints a warning for ambiguous names."""
     with (
         patch("mempalace.onboarding._ask_mode", return_value="personal"),
+        patch("mempalace.onboarding._ask_embedding_model", return_value="embeddinggemma"),
         patch(
             "mempalace.onboarding._ask_people",
             return_value=([{"name": "Grace", "relationship": "friend", "context": "personal"}], {}),
@@ -450,3 +453,118 @@ def test_run_onboarding_with_ambiguous_names(tmp_path):
     ):
         registry = run_onboarding(directory=".", config_dir=tmp_path, auto_detect=False)
     assert "Grace" in registry.people
+
+
+# ── _ask_embedding_model ──────────────────────────────────────────────
+
+
+def test_ask_embedding_model_defaults_to_multilingual():
+    """Default is multilingual: empty input (just Enter) accepts the default."""
+    with patch("builtins.input", return_value=""):
+        assert _ask_embedding_model() == "embeddinggemma"
+
+
+def test_ask_embedding_model_explicit_yes():
+    with patch("builtins.input", return_value="y"):
+        assert _ask_embedding_model() == "embeddinggemma"
+
+
+def test_ask_embedding_model_explicit_no():
+    """User opts down to English-only — choice is recorded as 'minilm'."""
+    with patch("builtins.input", return_value="n"):
+        assert _ask_embedding_model() == "minilm"
+
+
+# ── run_onboarding persists embedding_model ────────────────────────────
+
+
+def test_run_onboarding_persists_multilingual_choice(tmp_path):
+    """When user picks multilingual, embedding_model is written to config.json
+    so subsequent loads pick up embeddinggemma without re-prompting."""
+    import json
+
+    from mempalace.config import MempalaceConfig
+
+    with (
+        patch("mempalace.onboarding._ask_mode", return_value="work"),
+        patch("mempalace.onboarding._ask_embedding_model", return_value="embeddinggemma"),
+        patch(
+            "mempalace.onboarding._ask_people",
+            return_value=([{"name": "Bob", "relationship": "boss", "context": "work"}], {}),
+        ),
+        patch("mempalace.onboarding._ask_projects", return_value=[]),
+        patch("mempalace.onboarding._ask_wings", return_value=["projects"]),
+        patch("mempalace.onboarding._yn", return_value=False),
+        patch("mempalace.onboarding._warn_ambiguous", return_value=[]),
+    ):
+        run_onboarding(directory=".", config_dir=tmp_path, auto_detect=False)
+
+    config_file = tmp_path / "config.json"
+    assert config_file.exists(), "onboarding must write config.json"
+    data = json.loads(config_file.read_text())
+    assert data["embedding_model"] == "embeddinggemma"
+    assert MempalaceConfig(config_dir=tmp_path).embedding_model == "embeddinggemma"
+
+
+def test_run_onboarding_persists_minilm_choice(tmp_path):
+    """When user opts down to English-only, the choice is still persisted —
+    we want the config to be explicit, not silently fall back to the hard
+    default. This way changing the hard default later won't silently shift
+    these users."""
+    import json
+
+    with (
+        patch("mempalace.onboarding._ask_mode", return_value="work"),
+        patch("mempalace.onboarding._ask_embedding_model", return_value="minilm"),
+        patch("mempalace.onboarding._ask_people", return_value=([], {})),
+        patch("mempalace.onboarding._ask_projects", return_value=[]),
+        patch("mempalace.onboarding._ask_wings", return_value=["projects"]),
+        patch("mempalace.onboarding._yn", return_value=False),
+        patch("mempalace.onboarding._warn_ambiguous", return_value=[]),
+    ):
+        run_onboarding(directory=".", config_dir=tmp_path, auto_detect=False)
+
+    data = json.loads((tmp_path / "config.json").read_text())
+    assert data["embedding_model"] == "minilm"
+
+
+# ── quick_setup writes embedding_model when provided ───────────────────
+
+
+def test_quick_setup_writes_embedding_model_when_provided(tmp_path):
+    """Programmatic setup honors the explicit embedding_model arg."""
+    import json
+
+    quick_setup(
+        mode="work",
+        people=[{"name": "Bob", "relationship": "boss", "context": "work"}],
+        config_dir=tmp_path,
+        embedding_model="embeddinggemma",
+    )
+    data = json.loads((tmp_path / "config.json").read_text())
+    assert data["embedding_model"] == "embeddinggemma"
+
+
+def test_quick_setup_leaves_config_alone_when_no_model_provided(tmp_path):
+    """Back-compat: callers that don't pass embedding_model don't get a
+    surprise config.json write."""
+    quick_setup(
+        mode="work",
+        people=[{"name": "Bob", "relationship": "boss", "context": "work"}],
+        config_dir=tmp_path,
+    )
+    assert not (tmp_path / "config.json").exists()
+
+
+# ── MempalaceConfig.set_embedding_model ────────────────────────────────
+
+
+def test_set_embedding_model_persists_and_reloads(tmp_path):
+    """Setter writes to config.json and a fresh MempalaceConfig reads it back."""
+    from mempalace.config import MempalaceConfig
+
+    MempalaceConfig(config_dir=tmp_path).set_embedding_model("embeddinggemma")
+    assert MempalaceConfig(config_dir=tmp_path).embedding_model == "embeddinggemma"
+
+    MempalaceConfig(config_dir=tmp_path).set_embedding_model("MiniLM")
+    assert MempalaceConfig(config_dir=tmp_path).embedding_model == "minilm"

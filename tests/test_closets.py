@@ -219,6 +219,133 @@ class TestBuildClosetLines:
         lines = build_closet_lines("/x.md", ids, "# A\n# B", "w", "r")
         assert all("→drawer_0,drawer_1,drawer_2" in line for line in lines)
 
+    # ── Tier 6a — date + line-range pointer segment ────────────────────────
+
+    def test_includes_date_line_segment_when_metas_provided(self):
+        """When drawer_metas carry filed_at + line_start/line_end, each pointer
+        line gains a 4th pipe-separated segment of shape ``YYYY-MM-DD:Lstart-Lend``
+        between the entities and the ``→drawer_ids`` segment.
+        """
+        content = (
+            "# Auth rewrite\n\nDecided we need to migrate to passkeys. "
+            "Built the prototype with WebAuthn. Reviewed the API surface."
+        )
+        metas = [
+            {
+                "wing": "proj",
+                "room": "backend",
+                "source_file": "/proj/auth.md",
+                "filed_at": "2026-05-21T22:30:00.123456",
+                "line_start": 42,
+                "line_end": 78,
+            },
+            {
+                "wing": "proj",
+                "room": "backend",
+                "source_file": "/proj/auth.md",
+                "filed_at": "2026-05-21T22:30:00.123456",
+                "line_start": 79,
+                "line_end": 110,
+            },
+        ]
+        lines = build_closet_lines(
+            "/proj/auth.md",
+            ["drawer_a", "drawer_b"],
+            content,
+            wing="proj",
+            room="backend",
+            drawer_metas=metas,
+        )
+        assert lines
+        for line in lines:
+            parts = line.split("|")
+            assert len(parts) == 4, f"expected 4 segments, got {line!r}"
+            date_line_seg = parts[2]
+            assert date_line_seg == "2026-05-21:L42-L78", (
+                f"date+line segment wrong: {date_line_seg!r}"
+            )
+            assert parts[3].startswith("→")
+
+    def test_falls_back_to_3_segment_format_when_metas_missing(self):
+        """Backward compat — no drawer_metas → old 3-segment pointer shape."""
+        content = "# Header\n\nBuilt the feature. Tested it."
+        lines = build_closet_lines("/x.md", ["d1"], content, "w", "r")
+        for line in lines:
+            assert len(line.split("|")) == 3, f"expected 3-segment legacy format, got {line!r}"
+
+    def test_falls_back_to_3_segment_format_when_metas_lack_line_keys(self):
+        """Backward compat — metas present but no line_start/line_end → 3 segments.
+
+        Drawers filed before Tier 6a landed lack line range keys. Closets
+        built from those drawers must emit the legacy 3-segment form, not a
+        broken pointer with ``None`` or empty values.
+        """
+        content = "# Header\n\nBuilt the feature. Tested it."
+        metas = [
+            {
+                "wing": "w",
+                "room": "r",
+                "source_file": "/x.md",
+                "filed_at": "2026-05-21T10:00:00",
+                # line_start / line_end intentionally absent
+            }
+        ]
+        lines = build_closet_lines("/x.md", ["d1"], content, "w", "r", drawer_metas=metas)
+        for line in lines:
+            assert len(line.split("|")) == 3, (
+                f"meta without line keys should fall back to 3-seg; got {line!r}"
+            )
+
+    def test_date_segment_uses_filed_at_date_portion_only(self):
+        """The date portion is the YYYY-MM-DD prefix of filed_at, not the
+        full ISO timestamp. Closet pointers stay compact and grep-friendly.
+        """
+        content = "# Topic\n\nDid the work. Reviewed it. Shipped it."
+        metas = [
+            {
+                "wing": "w",
+                "room": "r",
+                "source_file": "/x.md",
+                "filed_at": "2026-05-21T22:30:00.123456+00:00",
+                "line_start": 1,
+                "line_end": 12,
+            }
+        ]
+        lines = build_closet_lines("/x.md", ["d1"], content, "w", "r", drawer_metas=metas)
+        for line in lines:
+            seg = line.split("|")[2]
+            assert seg.startswith("2026-05-21:L"), f"date prefix wrong in {seg!r}"
+            assert "T" not in seg, f"raw timestamp leaked into closet pointer: {seg!r}"
+
+    def test_content_date_preferred_over_filed_at(self):
+        """When meta carries content_date, the closet pointer's date segment
+        reflects content-time (the date the content is FROM), not
+        ingestion-time (the date the chunk was mined). Critical for legacy
+        content where ingestion-time would be misleading.
+        """
+        content = "# Topic\n\nDid the work. Reviewed it. Shipped it."
+        metas = [
+            {
+                "wing": "w",
+                "room": "r",
+                "source_file": "/x.md",
+                # filed_at says "we mined this last week"
+                "filed_at": "2026-05-21T22:30:00.123456+00:00",
+                # content_date says "the content itself is from Nov 8 2024"
+                "content_date": "2024-11-08",
+                "line_start": 42,
+                "line_end": 78,
+            }
+        ]
+        lines = build_closet_lines("/x.md", ["d1"], content, "w", "r", drawer_metas=metas)
+        assert lines
+        for line in lines:
+            parts = line.split("|")
+            assert len(parts) == 4, f"expected 4 segments: {line!r}"
+            assert parts[2] == "2024-11-08:L42-L78", (
+                f"closet date segment did not prefer content_date: {parts[2]!r}"
+            )
+
 
 # ── upsert_closet_lines ───────────────────────────────────────────────
 
@@ -325,6 +452,55 @@ class TestMinerClosetRebuild:
             assert not col.get(ids=[stale_id])["ids"], (
                 f"orphan closet {stale_id} from larger first run survived purge"
             )
+
+    def test_production_miner_emits_4_segment_pointers_with_content_date(self, tmp_path):
+        """Regression for PR #1584 Igor review Issue #1.
+
+        Before the wiring fix, ``build_closet_lines`` learned the
+        ``drawer_metas`` kwarg but no production caller passed it — so the
+        Tier 6a 4-segment pointer (``topic|entities|YYYY-MM-DD:Lstart-Lend|
+        →drawers``) was emitted by tests only, not by real mines. This
+        test pins the end-to-end wiring: a real ``mine()`` of a file with
+        a recognizable date in its filename must produce closet documents
+        containing the 4-segment pointer with that filename-derived date.
+        """
+        project = tmp_path / "proj"
+        project.mkdir()
+        (project / "mempalace.yaml").write_text(
+            yaml.dump({"wing": "proj", "rooms": [{"name": "general", "description": "x"}]})
+        )
+        # Filename carries an unambiguous content date.
+        target = project / "2024-11-08-conversation.md"
+        target.write_text(
+            "# Brands of dog food\n\n"
+            "We talked about which brands work best for Osian's dog.\n"
+            "Decided to try a few organic options this month.\n" + ("Filler line.\n" * 20)
+        )
+
+        palace = tmp_path / "palace"
+        mine(str(project), str(palace), wing_override="proj", agent="test")
+
+        col = get_closets_collection(str(palace))
+        result = col.get(where={"source_file": str(target)})
+        assert result["ids"], "production mine must write closets"
+
+        # At least one closet document must contain the 4-segment Tier 6a
+        # pointer for the date this file is from (2024-11-08).
+        joined = "\n".join(result["documents"] or [])
+        assert "2024-11-08:L" in joined, (
+            f"production miner did not emit Tier 6a 4-segment pointer; closet documents: {joined!r}"
+        )
+        # Each non-empty pointer line carrying a date locator must have 4
+        # pipe-separated segments — proving build_closet_lines was called
+        # with drawer_metas (regression for Issue #1).
+        for doc in result["documents"] or []:
+            for line in (doc or "").splitlines():
+                if "2024-11-08:L" in line and "→" in line:
+                    parts = line.split("|")
+                    assert len(parts) == 4, (
+                        f"closet line with date locator must be 4 segments, "
+                        f"got {len(parts)}: {line!r}"
+                    )
 
 
 # ── _extract_drawer_ids_from_closet ───────────────────────────────────

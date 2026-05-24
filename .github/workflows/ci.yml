@@ -53,6 +53,6 @@ jobs:
       # Keep this pin identical to the `ruff==` pin in pyproject.toml
       # ([project.optional-dependencies].dev and [dependency-groups].dev)
       # so CI and `pip install -e ".[dev]"` format/lint identically.
-      - run: pip install "ruff==0.15.9"
+      - run: pip install "ruff==0.15.14"
       - run: ruff check .
       - run: ruff format --check .

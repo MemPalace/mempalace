@@ -15,6 +15,7 @@ from typing import Optional
 
 from .backends import BackendClosedError, CollectionNotInitializedError, PalaceNotFoundError
 from .backends.chroma import ChromaBackend
+from .entity_detector import _get_coca_filter
 
 logger = logging.getLogger("mempalace_mcp")
 
@@ -237,13 +238,20 @@ def _candidate_entity_words(text: str) -> list:
     return words
 
 
-def build_closet_lines(source_file, drawer_ids, content, wing, room):
+def build_closet_lines(source_file, drawer_ids, content, wing, room, drawer_metas=None):
     """Build compact closet pointer lines from drawer content.
 
     Returns a LIST of lines (not joined). Each line is one complete topic
     pointer — never split across closets.
 
-    Format: topic|entities|→drawer_ids
+    Legacy format (3 segments): ``topic|entities|→drawer_ids``
+    Tier 6a format (4 segments): ``topic|entities|YYYY-MM-DD:Lstart-Lend|→drawer_ids``
+
+    When ``drawer_metas`` is provided and the first meta carries both
+    ``line_start``/``line_end`` plus a parseable ``filed_at``, the 4-segment
+    form is emitted so retrieval can jump to the right span. Otherwise the
+    legacy 3-segment form is used — backward compat for drawers filed before
+    Tier 6a and for direct callers that don't have metadata handy.
     """
     import re
     from pathlib import Path
@@ -251,12 +259,22 @@ def build_closet_lines(source_file, drawer_ids, content, wing, room):
     drawer_ref = ",".join(drawer_ids[:3])
     window = content[:CLOSET_EXTRACT_WINDOW]
 
+    # Tier 6a — date+line locator segment. Built once per call; ``None``
+    # signals "fall back to legacy 3-segment format" for every emitted line.
+    date_line_seg = _build_date_line_segment(drawer_metas)
+
     # Extract proper nouns (2+ occurrences). Uses i18n-aware patterns so
     # non-Latin names (Cyrillic, accented Latin, etc.) are also detected.
+    coca_filter = _get_coca_filter()
     words = _candidate_entity_words(window)
     word_freq = {}
     for w in words:
         if w in _ENTITY_STOPLIST:
+            continue
+        # Tier 2 linguistics cleanup — drop common English content words
+        # ("Code", "Line", "Note", "Phase", …) so they don't appear in
+        # closet pointers as fake entities.
+        if w.lower() in coca_filter:
             continue
         word_freq[w] = word_freq.get(w, 0) + 1
     entities = sorted(
@@ -280,19 +298,67 @@ def build_closet_lines(source_file, drawer_ids, content, wing, room):
     # Extract quotes
     quotes = re.findall(r'"([^"]{15,150})"', window)
 
-    # Build pointer lines — each one is atomic, never split
+    # Build pointer lines — each one is atomic, never split. When the
+    # Tier 6a date+line segment is available, splice it in as the 3rd
+    # pipe-separated field; otherwise emit the legacy 3-segment form.
+    def _pointer(prefix: str) -> str:
+        if date_line_seg is not None:
+            return f"{prefix}|{entity_str}|{date_line_seg}|→{drawer_ref}"
+        return f"{prefix}|{entity_str}|→{drawer_ref}"
+
     lines = []
     for topic in topics:
-        lines.append(f"{topic}|{entity_str}|→{drawer_ref}")
+        lines.append(_pointer(topic))
     for quote in quotes[:3]:
-        lines.append(f'"{quote}"|{entity_str}|→{drawer_ref}')
+        lines.append(_pointer(f'"{quote}"'))
 
     # Always have at least one line
     if not lines:
         name = Path(source_file).stem[:40]
-        lines.append(f"{wing}/{room}/{name}|{entity_str}|→{drawer_ref}")
+        lines.append(_pointer(f"{wing}/{room}/{name}"))
 
     return lines
+
+
+def _build_date_line_segment(drawer_metas):
+    """Tier 6a — produce ``YYYY-MM-DD:Lstart-Lend`` from a drawer-meta list.
+
+    Reads the first meta's ``filed_at`` (date prefix only — never the raw
+    ISO timestamp; closet pointers stay compact and grep-friendly) plus its
+    ``line_start`` / ``line_end``. Returns ``None`` when any of the three
+    fields is missing or unparseable — caller then falls back to the legacy
+    3-segment closet pointer format. The choice to read only the first meta
+    matches ``drawer_ids[:3]`` truncation in ``build_closet_lines``: pointers
+    are approximate locators, not exhaustive indexes.
+    """
+    if not drawer_metas:
+        return None
+    meta = drawer_metas[0]
+    if not isinstance(meta, dict):
+        return None
+    line_start = meta.get("line_start")
+    line_end = meta.get("line_end")
+    if line_start is None or line_end is None:
+        return None
+
+    # Tier 6a date hierarchy: prefer ``content_date`` (extracted from file
+    # content, frontmatter, filename, or mtime — see
+    # mempalace.miner._extract_content_date) when present. Fall back to
+    # ``filed_at`` (ingestion timestamp) only when no content-aware date
+    # was extractable. ``content_date`` is already an ISO ``YYYY-MM-DD``;
+    # ``filed_at`` may be a full ISO timestamp like
+    # ``2026-05-21T22:30:00.123456+00:00`` and gets truncated at ``T``.
+    content_date = meta.get("content_date")
+    if content_date:
+        date_part = str(content_date)
+    else:
+        filed_at = meta.get("filed_at")
+        if not filed_at:
+            return None
+        date_part = str(filed_at).split("T", 1)[0]
+    if not date_part:
+        return None
+    return f"{date_part}:L{line_start}-L{line_end}"
 
 
 def purge_file_closets(closets_col, source_file: str) -> None:
@@ -389,6 +455,42 @@ def mine_lock(source_file: str):
 
 class MineAlreadyRunning(RuntimeError):
     """Raised when another `mempalace mine` already holds the per-palace lock."""
+
+
+class MineValidationError(RuntimeError):
+    """Raised at end of mine when PRAGMA quick_check on the palace reports errors."""
+
+    def __init__(self, palace_path: str, errors: list[str]) -> None:
+        if not errors:
+            raise ValueError("MineValidationError requires at least one error string")
+        if not palace_path:
+            raise ValueError("MineValidationError requires a non-empty palace_path")
+        super().__init__(f"FTS5/SQLite quick_check failed: {len(errors)} issue(s)")
+        self.palace_path = palace_path
+        # Freeze the forensic snapshot so handlers cannot mutate it.
+        self.errors: tuple[str, ...] = tuple(errors)
+
+
+def _validate_palace_fts5_after_mine(palace_path: str) -> None:
+    """Raise MineValidationError if PRAGMA quick_check reports any error after a mine.
+
+    Reuses the same primitive that `cmd_repair` already runs as preflight so the
+    operator sees the same recovery banner regardless of which command surfaces
+    the bug.
+    """
+    # Defer-import: keeps the repair module graph out of mine's hot import path.
+    from .repair import _close_chroma_handles, sqlite_integrity_errors
+
+    # Pass the live singleton so the writer's cached PersistentClient actually
+    # gets closed and WAL flushes before the read-only sqlite3 re-open.
+    # A transient ChromaBackend (the default) would only clear its own empty
+    # `_clients` dict and leave _DEFAULT_BACKEND's live handle in place,
+    # which on Windows keeps the sqlite file mmap'd.
+    _close_chroma_handles(palace_path, backend=_DEFAULT_BACKEND)
+
+    errors = sqlite_integrity_errors(palace_path)
+    if errors:
+        raise MineValidationError(palace_path, errors)
 
 
 # Per-thread record of palaces this thread already holds the lock for. Used by
