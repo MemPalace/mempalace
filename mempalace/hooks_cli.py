@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -74,13 +75,24 @@ def _mempalace_python() -> str:
         return env_python
     # This file lives at <venv>/lib/pythonX.Y/site-packages/mempalace/hooks_cli.py
     # or <project>/mempalace/hooks_cli.py (editable install).
-    venv_bin = Path(__file__).resolve().parents[3] / "bin" / "python"
-    if venv_bin.is_file():
-        return str(venv_bin)
+    #
+    # ``parents[3]`` / ``parents[1]`` would raise IndexError when the package
+    # lives at a shallow filesystem path — Docker containers mounting at
+    # ``/work``, ``/opt/app``, or other minimal-prefix installs don't have 4
+    # (or sometimes even 2) parent directories. Use ``len(parents)`` to
+    # check the depth before indexing; LBYL is the standard Python idiom
+    # for bounded-integer lookups. Per PR #1580 review (gemini-code-assist,
+    # medium priority).
+    parents = Path(__file__).resolve().parents
+    if len(parents) > 3:
+        venv_bin = parents[3] / "bin" / "python"
+        if venv_bin.is_file():
+            return str(venv_bin)
     # Editable install: assumes project root has a venv/ sibling to mempalace/
-    project_venv = Path(__file__).resolve().parents[1] / "venv" / "bin" / "python"
-    if project_venv.is_file():
-        return str(project_venv)
+    if len(parents) > 1:
+        project_venv = parents[1] / "venv" / "bin" / "python"
+        if project_venv.is_file():
+            return str(project_venv)
     return sys.executable
 
 
@@ -281,6 +293,31 @@ _MINE_PID_DIR = STATE_DIR / "mine_pids"
 # own slot on exit without scanning the whole directory.
 _MINE_PID_FILE_ENV = "MEMPALACE_MINE_PID_FILE"
 
+# Maximum wall-clock hours a mine subprocess is allowed to run before its
+# PID slot is treated as stale (even if the process is still alive).  A
+# wedged mine — e.g. one that is blocking indefinitely on ChromaDB
+# cold-init under concurrent Windows load (#1552) — would otherwise hold
+# its slot forever.  Set MEMPALACE_MINE_TIMEOUT_HOURS=0 to disable the
+# timeout (slots are reclaimed only when the PID is dead).
+_MINE_TIMEOUT_HOURS_ENV = "MEMPALACE_MINE_TIMEOUT_HOURS"
+_MINE_TIMEOUT_HOURS_DEFAULT = 2.0
+
+
+def _mine_slot_timeout_secs() -> float:
+    """Return the configured mine-slot timeout in seconds.
+
+    Reads ``MEMPALACE_MINE_TIMEOUT_HOURS`` from the environment (float).
+    Returns 0 if the env var is set to 0 or is not parseable.
+    """
+    raw = os.environ.get(_MINE_TIMEOUT_HOURS_ENV, "")
+    if raw:
+        try:
+            hours = float(raw)
+            return max(0.0, hours) * 3600
+        except ValueError:
+            return 0.0
+    return _MINE_TIMEOUT_HOURS_DEFAULT * 3600
+
 
 def _pid_file_for_cmd(cmd: list[str]) -> Path:
     """Return the per-target PID file path for a mine subcommand.
@@ -333,15 +370,70 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _mine_already_running(cmd: list[str]) -> bool:
-    """Return True if a previous mine for ``cmd``'s target is still alive."""
+    """Return True if a previous mine for ``cmd``'s target is still alive.
+
+    The PID file format is ``{pid} {unix_timestamp}`` (timestamp added in
+    #1552 to detect wedged subprocesses).  Old-format files (bare ``{pid}``)
+    use the PID file's mtime as the approximate start time so a still-running
+    pre-upgrade mine is not immediately misclassified as stale.
+
+    A process is considered stale (and this function returns False) when:
+    - the PID is dead, OR
+    - the configured mine timeout is > 0 AND the process has been running
+      longer than the timeout.
+    """
     pid_file = _pid_file_for_cmd(cmd)
     try:
         recorded = pid_file.read_text().strip()
     except OSError:
         return False
-    if not recorded.isdigit():
+    if not recorded:
         return False
-    return _pid_alive(int(recorded))
+    parts = recorded.split(None, 1)
+    if not parts[0].isdigit():
+        return False
+    pid = int(parts[0])
+    if not _pid_alive(pid):
+        return False
+    timeout_secs = _mine_slot_timeout_secs()
+    if timeout_secs > 0:
+        if len(parts) > 1 and parts[1]:
+            try:
+                start_ts = float(parts[1])
+            except ValueError:
+                return False
+        else:
+            try:
+                start_ts = pid_file.stat().st_mtime
+            except OSError:
+                return True
+        if time.time() - start_ts > timeout_secs:
+            return False
+    return True
+
+
+def _create_mine_slot_with_placeholder(pid_file: Path) -> Path:
+    """Atomically create a mine PID slot and write this hook PID into it.
+
+    The slot body is ``{pid} {unix_timestamp}`` so that stale-by-age
+    detection in ``_mine_already_running`` can determine how long the
+    recorded process has been running (#1552).
+    """
+    fd = os.open(str(pid_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="ascii") as f:
+            f.write(f"{os.getpid()} {int(time.time())}")
+    except OSError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            pid_file.unlink()
+        except OSError:
+            pass
+        raise
+    return pid_file
 
 
 def _claim_mine_slot(cmd: list[str]) -> Optional[Path]:
@@ -359,14 +451,14 @@ def _claim_mine_slot(cmd: list[str]) -> Optional[Path]:
     pid_file = _pid_file_for_cmd(cmd)
     pid_file.parent.mkdir(parents=True, exist_ok=True)
     try:
-        fd = os.open(str(pid_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        os.close(fd)
-        return pid_file
+        return _create_mine_slot_with_placeholder(pid_file)
     except FileExistsError:
         pass
+
     # Slot exists. If the holder is alive, defer.
     if _mine_already_running(cmd):
         return None
+
     # Stale entry; reclaim. The unlink+create is racy against another hook
     # firing right now, but the second create's O_EXCL will fail and that
     # caller will see the live PID via the next round.
@@ -376,10 +468,9 @@ def _claim_mine_slot(cmd: list[str]) -> Optional[Path]:
         pass
     except OSError:
         return None
+
     try:
-        fd = os.open(str(pid_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        os.close(fd)
-        return pid_file
+        return _create_mine_slot_with_placeholder(pid_file)
     except FileExistsError:
         return None
 
@@ -419,7 +510,7 @@ def _spawn_mine(cmd: list) -> None:
                 pass
             raise
     try:
-        pid_file.write_text(str(proc.pid))
+        pid_file.write_text(f"{proc.pid} {int(time.time())}")
     except OSError:
         pass
 
@@ -670,36 +761,124 @@ def _parse_harness_input(data: dict, harness: str) -> dict:
     }
 
 
+# Common parent-dir tokens stripped from the encoded folder when no
+# explicit ``-Projects-`` segment is present. Order matters: only the
+# first match strips. These cover the bulk of Unix layouts; cwd-from-JSONL
+# (the primary path) handles the long tail correctly without heuristics.
+_ENCODED_PARENT_PREFIXES = (
+    "git-",
+    "dev-",
+    "projects-",
+    "Projects-",
+    "src-",
+    "code-",
+    "work-",
+    "Documents-",
+)
+
+
+def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
+    """Read ``cwd`` from the first JSONL line that records it.
+
+    Claude Code stores the absolute working directory on most message
+    types (tool_use, tool_result, user/assistant turns), but not all
+    (e.g. queue-operation lines lack it). Scan up to 200 lines to find
+    the first record that includes a non-empty cwd, then derive the
+    wing from its leaf path segment. Returns ``None`` if the file is
+    unreadable, empty, or contains no cwd.
+    """
+    try:
+        path = Path(transcript_path).expanduser()
+        if not path.is_file():
+            return None
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i >= 200:
+                    break
+                line = line.strip()
+                if not line or '"cwd"' not in line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                cwd = data.get("cwd")
+                if not cwd or not isinstance(cwd, str):
+                    continue
+                cwd_norm = cwd.replace("\\", "/").rstrip("/")
+                if not cwd_norm:
+                    continue
+                project = cwd_norm.rsplit("/", 1)[-1]
+                if project:
+                    slug = project.lower().replace(" ", "_").replace("-", "_")
+                    return f"wing_{slug}"
+    except OSError:
+        pass
+    return None
+
+
 def _wing_from_transcript_path(transcript_path: str) -> str:
     """Derive a project wing name from a Claude Code transcript path.
 
-    Claude Code encodes the project's source directory by replacing path
-    separators with dashes, producing folders like:
-        ~/.claude/projects/-home-<user>-Projects-<project>/session.jsonl
-        ~/.claude/projects/-home-<user>-dev-<parent>-<project>/session.jsonl
-        ~/.claude/projects/-Users-<user>-<folder>-<project>/session.jsonl
+    Strategy (in priority order):
 
-    The project directory name is the final dash-separated token of the
-    encoded folder. Returns ``wing_<project>`` (lowercased, spaces → ``_``).
-    Falls back to ``wing_sessions`` if the path does not match a Claude Code
-    project-folder layout.
+    1. PRIMARY — Read ``cwd`` from the JSONL transcript. Claude Code records
+       the absolute working directory on most message types, so the project
+       name is whatever the leaf path segment of cwd is. This is the
+       canonical answer when present.
+
+    2. FALLBACK — Decode the encoded folder under ``.claude/projects/``.
+       Claude Code flattens path separators to dashes (``/Users/me/code/foo``
+       → ``-Users-me-code-foo``), so the original directory boundaries are
+       lost. We strip the platform user-home prefix (``Users-<user>-`` or
+       ``home-<user>-``) and one common parent-dir token (``git-``, ``dev-``,
+       ``projects-``, etc.), then convert the remaining dashes to
+       underscores. Unlike the previous "last token only" heuristic, this
+       never silently truncates a hyphenated project folder name like
+       ``claude-code``, ``react-native``, or ``customer-portal``.
+
+    3. LEGACY — Match an explicit ``-Projects-<name>`` segment for
+       transcripts not under the standard Claude Code projects dir.
+
+    4. DEFAULT — ``wing_sessions``.
+
+    Closes #1410.
     """
+    # 1. Primary — cwd from JSONL is the canonical source of truth
+    cwd_wing = _wing_from_jsonl_cwd(transcript_path)
+    if cwd_wing:
+        return cwd_wing
+
     # Normalize path separators for cross-platform (Windows backslashes)
     normalized = transcript_path.replace("\\", "/")
-    # Primary: pull the encoded project folder out of ``.claude/projects/``
-    # and take its last dash-separated token.
+
+    # 2. Fallback — encoded project folder under .claude/projects/
     match = re.search(r"/\.claude/projects/-([^/]+)", normalized)
     if match:
         encoded = match.group(1)
-        project = encoded.rsplit("-", 1)[-1]
+        # Strip platform user-home prefix so the wing isn't dominated by
+        # /Users/<user>/ or /home/<user>/.
+        m = re.match(r"(?:Users|home)-[^-]+-(.+)", encoded)
+        if m:
+            encoded = m.group(1)
+        # Strip one common parent-dir token if present, keeping the rest as
+        # the project path. Hyphens become underscores to preserve
+        # uniqueness for hyphenated project folder names.
+        for prefix in _ENCODED_PARENT_PREFIXES:
+            if encoded.startswith(prefix):
+                encoded = encoded[len(prefix) :]
+                break
+        project = encoded.lower().replace(" ", "_").replace("-", "_")
         if project:
-            return f"wing_{project.lower().replace(' ', '_')}"
-    # Legacy fallback: explicit ``-Projects-<name>`` segment, useful for
-    # transcripts not under the standard Claude Code projects dir.
+            return f"wing_{project}"
+
+    # 3. Legacy — explicit -Projects-<name> segment
     match = re.search(r"-Projects-([^/]+?)(?:/|$)", normalized)
     if match:
-        project = match.group(1).lower().replace(" ", "_")
+        project = match.group(1).lower().replace(" ", "_").replace("-", "_")
         return f"wing_{project}"
+
+    # 4. Default
     return "wing_sessions"
 
 

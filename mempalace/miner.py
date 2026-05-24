@@ -22,6 +22,7 @@ from typing import Optional
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
+    _open_collection_or_explain,
     build_closet_lines,
     file_already_mined,
     get_closets_collection,
@@ -31,6 +32,12 @@ from .palace import (
     purge_file_closets,
     upsert_closet_lines,
 )
+
+# Module-level import so tests can patch it as
+# ``mempalace.miner.compute_hallways_for_wing``. The integration call
+# lives at the end of _mine_impl, alongside the existing
+# ``_compute_topic_tunnels_for_wing`` post-mine block.
+from .hallways import compute_hallways_for_wing
 
 logger = logging.getLogger("mempalace_mcp")
 
@@ -70,18 +77,32 @@ SKIP_FILENAMES = {
     "yarn.lock",
 }
 
-CHUNK_SIZE = 800  # chars per drawer
-CHUNK_OVERLAP = 100  # overlap between chunks
-MIN_CHUNK_SIZE = 50  # skip tiny chunks
+# Re-export the shared defaults from ``config`` so legacy callers that
+# import ``CHUNK_SIZE`` / ``CHUNK_OVERLAP`` / ``MIN_CHUNK_SIZE`` from
+# ``mempalace.miner`` keep working unchanged. Single source of truth
+# lives in ``config.DEFAULT_CHUNK_*``.
+from .config import (  # noqa: E402  (kept here for the legacy alias)
+    DEFAULT_CHUNK_SIZE as CHUNK_SIZE,
+    DEFAULT_CHUNK_OVERLAP as CHUNK_OVERLAP,
+    DEFAULT_MIN_CHUNK_SIZE as MIN_CHUNK_SIZE,
+)
+
 DRAWER_UPSERT_BATCH_SIZE = 1000
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB — skip files larger than this.
-# A single file producing more chunks than this is almost always a generated
-# artifact (CSV/JSON dump, lockfile not in SKIP_FILENAMES, etc.). Embedding
-# thousands of chunks from one file in one batch has triggered ONNX runtime
-# `bad allocation` errors on Windows (#1296). The cap is conservative: a
-# 500-chunk file at CHUNK_SIZE=800 is ~400 KB of source, which covers most
-# legitimate hand-written content while bounding the worst-case batch.
-MAX_CHUNKS_PER_FILE = 500
+# A safety rail against pathological generated artifacts (lockfiles not in
+# SKIP_FILENAMES, vendored data dumps, etc.). Originally 500 to bound ONNX
+# runtime `bad allocation` errors on Windows (#1296), but at CHUNK_SIZE=800
+# that capped legitimate long-form content (#1455: full-text scholarly
+# editions, novels) at ~400 KB. The new default leaves two orders of
+# magnitude of safety margin against the original lockfile case
+# (~1124 chunks for `pnpm-lock.yaml` per #1296) while not touching
+# hand-written prose. Per-ONNX-call exposure is bounded by
+# `DRAWER_UPSERT_BATCH_SIZE` (1000 chunks/batch) regardless of this cap,
+# so the cap is a per-file admission rail, not a per-batch limit. Lower
+# this via `MEMPALACE_MAX_CHUNKS_PER_FILE` or
+# `mempalace mine --max-chunks-per-file N` if you hit ONNX bad_alloc on
+# Windows; set to 0 to disable the cap entirely.
+MAX_CHUNKS_PER_FILE = 50_000
 # Long Claude Code sessions and large transcript exports routinely exceed
 # 10 MB. The cap exists as a defensive rail against pathological binary
 # files, not as a limit on legitimate text. Per-drawer size is bounded
@@ -89,6 +110,48 @@ MAX_CHUNKS_PER_FILE = 500
 # drawers and therefore more storage, embedding, and processing work —
 # and file reads are not streamed (the whole content is loaded into
 # memory before chunking), so memory use scales with source size too.
+
+
+def _resolve_max_chunks_per_file(override: Optional[int] = None) -> int:
+    """Resolve the effective per-file chunk cap.
+
+    Precedence: ``override`` (CLI flag) > ``MEMPALACE_MAX_CHUNKS_PER_FILE``
+    env var > module-level ``MAX_CHUNKS_PER_FILE`` default. A sentinel
+    value of ``0`` (from any source) disables the cap entirely. Negative
+    values from either source emit a stderr warning and fall back to the
+    module default so a misconfigured ``--max-chunks-per-file=-500`` typo
+    (meaning "no, don't lower it that much") does not silently disable
+    the cap and OOM on a generated artifact.
+    """
+    if override is not None:
+        if override < 0:
+            print(
+                f"  ! WARNING: --max-chunks-per-file={override} is negative; "
+                f"using default {MAX_CHUNKS_PER_FILE}",
+                file=sys.stderr,
+            )
+            return MAX_CHUNKS_PER_FILE
+        return int(override)
+    raw = os.environ.get("MEMPALACE_MAX_CHUNKS_PER_FILE")
+    if raw is None:
+        return MAX_CHUNKS_PER_FILE
+    try:
+        val = int(raw)
+    except ValueError:
+        print(
+            f"  ! WARNING: MEMPALACE_MAX_CHUNKS_PER_FILE={raw!r} is not an integer; "
+            f"using default {MAX_CHUNKS_PER_FILE}",
+            file=sys.stderr,
+        )
+        return MAX_CHUNKS_PER_FILE
+    if val < 0:
+        print(
+            f"  ! WARNING: MEMPALACE_MAX_CHUNKS_PER_FILE={val} is negative; "
+            f"using default {MAX_CHUNKS_PER_FILE}",
+            file=sys.stderr,
+        )
+        return MAX_CHUNKS_PER_FILE
+    return val
 
 
 # =============================================================================
@@ -402,12 +465,54 @@ def detect_room(filepath: Path, content: str, rooms: list, project_path: Path) -
 # =============================================================================
 
 
-def chunk_text(content: str, source_file: str) -> list:
+def chunk_text(
+    content: str,
+    source_file: str,
+    chunk_size: int = None,
+    chunk_overlap: int = None,
+    min_chunk_size: int = None,
+) -> list:
     """
     Split content into drawer-sized chunks.
     Tries to split on paragraph/line boundaries.
-    Returns list of {"content": str, "chunk_index": int}
+    Returns list of {"content": str, "chunk_index": int, "line_start": int, "line_end": int}
+
+    ``line_start`` / ``line_end`` are 1-indexed line numbers in the stripped
+    source, giving an approximate locator for where the chunk came from.
+    Closet pointers (Tier 6a) use this to emit ``YYYY-MM-DD:L42-L78`` segments
+    so retrieval can jump straight to the right span without opening the
+    whole drawer.
+
+    Optional params override module-level defaults when provided.
     """
+    if chunk_size is None:
+        chunk_size = CHUNK_SIZE
+    if chunk_overlap is None:
+        chunk_overlap = CHUNK_OVERLAP
+    if min_chunk_size is None:
+        min_chunk_size = MIN_CHUNK_SIZE
+
+    # Defensive invariant guard. ``MempalaceConfig.chunk_*`` already
+    # enforces these and falls back to defaults on bad config.json
+    # values, but ``chunk_text`` is a public function — direct callers
+    # (tests, library users, future caller paths) might still pass
+    # values that would loop forever. Fail fast and loud rather than
+    # hang. See review feedback on #1024.
+    if not isinstance(chunk_size, int) or chunk_size <= 0:
+        raise ValueError(f"chunk_size must be a positive int, got {chunk_size!r}")
+    if not isinstance(chunk_overlap, int) or chunk_overlap < 0:
+        raise ValueError(f"chunk_overlap must be a non-negative int, got {chunk_overlap!r}")
+    if chunk_overlap >= chunk_size:
+        # ``start = end - chunk_overlap`` would not advance (or would go
+        # backward) when overlap >= size, producing an infinite loop on
+        # any non-empty input.
+        raise ValueError(
+            f"chunk_overlap ({chunk_overlap}) must be less than chunk_size "
+            f"({chunk_size}); equality or greater would loop forever"
+        )
+    if not isinstance(min_chunk_size, int) or min_chunk_size < 0:
+        raise ValueError(f"min_chunk_size must be a non-negative int, got {min_chunk_size!r}")
+
     # Clean up
     content = content.strip()
     if not content:
@@ -418,29 +523,41 @@ def chunk_text(content: str, source_file: str) -> list:
     chunk_index = 0
 
     while start < len(content):
-        end = min(start + CHUNK_SIZE, len(content))
+        end = min(start + chunk_size, len(content))
 
         # Try to break at paragraph boundary
         if end < len(content):
             newline_pos = content.rfind("\n\n", start, end)
-            if newline_pos > start + CHUNK_SIZE // 2:
+            if newline_pos > start + chunk_size // 2:
                 end = newline_pos
             else:
                 newline_pos = content.rfind("\n", start, end)
-                if newline_pos > start + CHUNK_SIZE // 2:
+                if newline_pos > start + chunk_size // 2:
                     end = newline_pos
 
         chunk = content[start:end].strip()
-        if len(chunk) >= MIN_CHUNK_SIZE:
+        if len(chunk) >= min_chunk_size:
+            # Tier 6a — 1-indexed line range in the stripped source.
+            # Approximate locator (±1 at boundaries is fine for "jump to
+            # roughly here"); exact-quote positioning is a future tier.
+            # Use the bounds form of ``str.count`` (counts on the original
+            # string with start/end limits) instead of slicing — slicing
+            # would allocate a new substring per chunk and produce O(N^2)
+            # work on a 500MB file with 50K chunks. Per PR #1579 review
+            # (gemini-code-assist, medium priority).
+            line_start = content.count("\n", 0, start) + 1
+            line_end = content.count("\n", 0, end) + 1
             chunks.append(
                 {
                     "content": chunk,
                     "chunk_index": chunk_index,
+                    "line_start": line_start,
+                    "line_end": line_end,
                 }
             )
             chunk_index += 1
 
-        start = end - CHUNK_OVERLAP if end < len(content) else end
+        start = end - chunk_overlap if end < len(content) else end
 
     return chunks
 
@@ -741,7 +858,11 @@ def _extract_entities_for_metadata(content: str) -> str:
 
     known = _load_known_entities()
     for name in known:
-        if re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", content):
+        # Case-insensitive match — mirrors entity_detector.py's init-time
+        # behavior so a known entity like "Aya" tags drawers that mention
+        # "aya" / "AYA" / "Aya". Without re.IGNORECASE, lowercase mentions
+        # in chat transcripts and voice-typed content get silently untagged.
+        if re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", content, re.IGNORECASE):
             matched.add(name)
 
     from .palace import _candidate_entity_words
@@ -764,6 +885,297 @@ def _extract_entities_for_metadata(content: str) -> str:
     return ";".join(capped)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Tier 6a content-date extraction
+#
+# Hierarchy (first match wins):
+#   1. Filename — ISO regex on stem, then dateutil fuzzy parse for natural-
+#      language formats (handles "April-6th-2011-notes", "Nov-8-2024", etc.)
+#   2. YAML frontmatter — date / created / published field
+#   3. Content body, first ~10 lines:
+#        a. ISO regex (YYYY-MM-DD / YYYY/MM/DD / YYYY.MM.DD)
+#        b. Slash dates with locale auto-disambiguation
+#           (if any day > 12 appears in the file, lock locale to DD/MM)
+#        c. dateutil fuzzy parse for natural-language ("November 8, 2024",
+#           "April 6th 2011", "8 Nov 2024", etc.)
+#   4. Filesystem mtime (os.path.getmtime)
+#   5. None — caller falls back to filed_at
+#
+# The "approximate locator" philosophy applies: this is a metadata enrichment
+# that makes closet pointers honest for content with embedded dates, NOT a
+# bulletproof timeline-reconstruction tool. Files with no date markers
+# anywhere and no filesystem mtime return None (caller uses filed_at).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+_ORDINAL_SUFFIX_RE = re.compile(r"\b(\d+)(st|nd|rd|th)\b", re.IGNORECASE)
+_ISO_DATE_RE = re.compile(r"\b(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})\b")
+_SLASH_DATE_RE = re.compile(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b")
+
+# Gate for dateutil fallback. A candidate string must match ONE of these
+# patterns to be considered a real date — otherwise dateutil's fuzzy mode
+# would hallucinate dates from any digit-bearing text (Igor's reproductions
+# on PR #1584: "tmp_random_file_5" → 2026-05-05, "Version 3.3.6" → 2006-03-03,
+# "Tested with 1000 drawers" → 1000-05-22, etc.). The fuzzy=True flag is
+# never set — dateutil only runs in strict mode on a substring we've
+# already validated.
+#
+# Three accepted shapes (all require a 4-digit year explicitly):
+#   1. Numeric: 4-digit year + separator + 1-2 digit month + separator + 1-2 digit day
+#      ("2024-11-08", "2024 11 08", "2024/06/15", "2024.11.08")
+#   2. Month-name + day + year: "November 8 2024", "Nov 8 2024", "Apr 6 2011"
+#   3. Day + month-name + year: "8 November 2024", "8 Nov 2024", "6 April 2011"
+#
+# Partial dates ("2024-06", "notes.2024", "Nov 8", "April 6") are
+# DELIBERATELY rejected — without all three components we'd fall back to
+# padding from today's date, which is hallucination, not extraction.
+_MONTH_NAME = (
+    r"(?:january|february|march|april|may|june|july|august|"
+    r"september|october|november|december|"
+    r"jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)"
+)
+_VALID_DATE_RE = re.compile(
+    r"(?:"
+    # Shape 1: YYYY sep MM sep DD (sep = - / . or whitespace)
+    r"\b\d{4}[-/.\s]+\d{1,2}[-/.\s]+\d{1,2}\b"
+    r"|"
+    # Shape 2: month-name + day + year
+    r"\b" + _MONTH_NAME + r"\.?[-\s]+\d{1,2}(?:st|nd|rd|th)?[,\s-]+\d{4}\b"
+    r"|"
+    # Shape 3: day + month-name + year
+    r"\b\d{1,2}(?:st|nd|rd|th)?[-\s]+" + _MONTH_NAME + r"\.?[,\s-]+\d{4}\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _try_iso_match(text: str) -> Optional[str]:
+    """Try to extract YYYY-MM-DD from text via the ISO regex. Returns ISO string or None."""
+    m = _ISO_DATE_RE.search(text)
+    if not m:
+        return None
+    try:
+        from datetime import date
+
+        return date(int(m.group(1)), int(m.group(2)), int(m.group(3))).isoformat()
+    except (ValueError, TypeError):
+        return None
+
+
+def _try_filename_date(source_file: str) -> Optional[str]:
+    """Extract date from filename stem.
+
+    ISO regex first (catches the canonical ``2024-11-08*`` diary pattern).
+    Then a strict regex gate (``_VALID_DATE_RE``) screens for complete
+    natural-language dates before invoking dateutil. ``fuzzy=True`` is
+    NOT used — it hallucinates dates on any digit-bearing input. Junk
+    filenames like ``tmp_random_file_5`` or ``notes.2024`` return None
+    so the caller falls through to frontmatter / content / mtime.
+    """
+    try:
+        stem = Path(source_file).stem
+    except (TypeError, ValueError):
+        return None
+    if not stem:
+        return None
+
+    # ISO direct: "2024-11-08", "2024-11-08-notes", etc.
+    iso = _try_iso_match(stem)
+    if iso:
+        return iso
+
+    # Natural language: "April-6th-2011-notes", "Nov-8-2024", etc.
+    # Preprocess: strip ordinals, dashes/underscores → spaces.
+    normalized = _ORDINAL_SUFFIX_RE.sub(r"\1", stem).replace("-", " ").replace("_", " ")
+
+    # Gate: require a complete date pattern. Without this, dateutil would
+    # accept any digit-bearing junk and fabricate a date.
+    m = _VALID_DATE_RE.search(normalized)
+    if not m:
+        return None
+
+    try:
+        from dateutil import parser as dateutil_parser
+
+        # Parse the matched substring only, no fuzzy mode.
+        dt = dateutil_parser.parse(m.group(0))
+        return dt.strftime("%Y-%m-%d")
+    except (ValueError, OverflowError, ImportError):
+        return None
+    except Exception:
+        # dateutil can raise unexpected exceptions on weird input; treat as no match.
+        return None
+
+
+def _try_frontmatter_date(content: str) -> Optional[str]:
+    """Extract date from YAML frontmatter date / created / published field.
+
+    Uses ``str.find`` to locate the closing ``\\n---`` delimiter and slices
+    the frontmatter directly. The earlier implementation split the entire
+    file into lines just to scan the first handful — wasteful on large
+    files. Per PR #1579 review (gemini-code-assist, medium priority).
+    """
+    if not content:
+        return None
+    stripped = content.lstrip()
+    if not stripped.startswith("---"):
+        return None
+
+    # Locate the closing "\n---" without materializing a line-list.
+    end_pos = stripped.find("\n---", 3)
+    if end_pos == -1:
+        return None
+
+    frontmatter_text = stripped[3:end_pos].strip()
+    if not frontmatter_text:
+        return None
+
+    try:
+        import yaml
+
+        data = yaml.safe_load(frontmatter_text)
+    except Exception:
+        return None
+
+    if not isinstance(data, dict):
+        return None
+
+    for field in ("date", "created", "published"):
+        value = data.get(field)
+        if value is None:
+            continue
+        # yaml.safe_load may parse ISO dates as datetime.date/datetime objects directly.
+        if hasattr(value, "strftime"):
+            return value.strftime("%Y-%m-%d")
+        # Otherwise parse via dateutil.
+        try:
+            from dateutil import parser as dateutil_parser
+
+            dt = dateutil_parser.parse(str(value))
+            return dt.strftime("%Y-%m-%d")
+        except (ValueError, OverflowError, ImportError):
+            continue
+        except Exception:
+            continue
+    return None
+
+
+def _try_content_body_date(content: str) -> Optional[str]:
+    """Scan first ~10 lines of content body for a date.
+
+    Order within the scan:
+      1. ISO regex (highest signal)
+      2. Slash dates with locale auto-disambiguation (DD/MM vs MM/DD)
+      3. dateutil fuzzy for natural-language ("November 8, 2024" etc.)
+
+    Uses ``str.find`` to skip frontmatter and bounded ``str.split(..., 10)``
+    to bound the head extraction — never materializes a full line-list on a
+    large file. Per PR #1579 review (gemini-code-assist, medium priority).
+    """
+    if not content:
+        return None
+
+    stripped = content.lstrip()
+
+    # Skip frontmatter if present, using ``find`` instead of full split.
+    if stripped.startswith("---"):
+        end_fm = stripped.find("\n---", 3)
+        if end_fm != -1:
+            eol = stripped.find("\n", end_fm + 1)
+            if eol != -1:
+                stripped = stripped[eol + 1 :]
+
+    # Bounded split — maxsplit=10 caps the work to 10 newline scans rather
+    # than splitting the entire file just to look at the first 10 lines.
+    head = "\n".join(stripped.split("\n", 10)[:10])
+    if not head:
+        return None
+
+    # 1. ISO regex — explicit, highest confidence.
+    iso = _try_iso_match(head)
+    if iso:
+        return iso
+
+    # 2. Slash dates with locale auto-disambiguation.
+    slash_matches = _SLASH_DATE_RE.findall(head)
+    if slash_matches:
+        # If any first-number > 12, the locale MUST be DD/MM (otherwise that
+        # number couldn't be a month). Lock it for ALL dates in this file.
+        is_dd_mm = any(int(m[0]) > 12 for m in slash_matches)
+        first = slash_matches[0]
+        a, b, y = int(first[0]), int(first[1]), int(first[2])
+        if y < 100:
+            # Two-digit year — stdlib convention: 70-99 → 19xx, 00-69 → 20xx.
+            y = 1900 + y if y >= 70 else 2000 + y
+        try:
+            from datetime import date
+
+            if is_dd_mm:
+                return date(y, b, a).isoformat()
+            return date(y, a, b).isoformat()
+        except (ValueError, TypeError):
+            pass  # Fall through to dateutil fuzzy.
+
+    # 3. dateutil natural-language fallback. Strict regex gate first
+    # (no fuzzy=True) — without it, dateutil hallucinates dates from any
+    # digit-bearing text. The gate requires a complete year+month+day
+    # pattern OR a month-name + day + year combination.
+    m = _VALID_DATE_RE.search(head)
+    if not m:
+        return None
+    try:
+        from dateutil import parser as dateutil_parser
+
+        dt = dateutil_parser.parse(m.group(0))
+        return dt.strftime("%Y-%m-%d")
+    except (ValueError, OverflowError, ImportError):
+        return None
+    except Exception:
+        return None
+
+
+def _try_mtime_date(source_file: str) -> Optional[str]:
+    """Filesystem mtime → ISO date."""
+    try:
+        mtime = os.path.getmtime(source_file)
+    except (OSError, TypeError):
+        return None
+    try:
+        return datetime.fromtimestamp(mtime).strftime("%Y-%m-%d")
+    except (OSError, ValueError, OverflowError):
+        return None
+
+
+def _extract_content_date(source_file: str, content: str) -> Optional[str]:
+    """Extract a content date from source_file or content.
+
+    Returns ISO 'YYYY-MM-DD' string, or None if no date can be determined.
+    See module-level comment block for the full hierarchy + design rationale.
+    """
+    # 1. Filename
+    result = _try_filename_date(source_file)
+    if result:
+        return result
+
+    # 2. YAML frontmatter
+    result = _try_frontmatter_date(content)
+    if result:
+        return result
+
+    # 3. Content body
+    result = _try_content_body_date(content)
+    if result:
+        return result
+
+    # 4. Filesystem mtime
+    result = _try_mtime_date(source_file)
+    if result:
+        return result
+
+    # 5. Nothing found — caller falls back to filed_at.
+    return None
+
+
 def _build_drawer_metadata(
     wing: str,
     room: str,
@@ -772,12 +1184,24 @@ def _build_drawer_metadata(
     agent: str,
     content: str,
     source_mtime: Optional[float],
+    line_start: Optional[int] = None,
+    line_end: Optional[int] = None,
+    content_date: Optional[str] = None,
 ) -> dict:
     """Build the metadata dict for one drawer without upserting.
 
     Split out from ``add_drawer`` so ``process_file`` can batch all chunks
     of a file into a single ``collection.upsert`` — one embedding forward
     pass per batch instead of per chunk.
+
+    Tier 6a — ``line_start`` / ``line_end`` are optional 1-indexed line
+    numbers in the source file. ``content_date`` is the optional ISO date
+    extracted from filename / frontmatter / content body / mtime. When
+    passed, they're stored in metadata so closet pointers can carry
+    "where in the source" + "when the content is from" info. When omitted
+    (legacy callers, pre-Tier-6a drawers), the keys are absent from the
+    returned dict and downstream code falls back to ``filed_at`` for the
+    date and the 3-segment closet pointer format.
     """
     metadata = {
         "wing": wing,
@@ -790,6 +1214,12 @@ def _build_drawer_metadata(
     }
     if source_mtime is not None:
         metadata["source_mtime"] = source_mtime
+    if line_start is not None:
+        metadata["line_start"] = line_start
+    if line_end is not None:
+        metadata["line_end"] = line_end
+    if content_date:
+        metadata["content_date"] = content_date
     metadata["hall"] = detect_hall(content)
     entities = _extract_entities_for_metadata(content)
     if entities:
@@ -836,36 +1266,63 @@ def process_file(
     agent: str,
     dry_run: bool,
     closets_col=None,
+    chunk_size: int = None,
+    chunk_overlap: int = None,
+    min_chunk_size: int = None,
+    max_chunks_per_file: Optional[int] = None,
 ) -> tuple:
-    """Read, chunk, route, and file one file. Returns (drawer_count, room_name)."""
+    """Read, chunk, route, and file one file.
+
+    Returns ``(drawer_count, room_name, skip_reason)``. ``skip_reason`` is
+    ``None`` on success and on every non-chunk-cap skip path: already
+    filed (pre- or post-lock re-check), unreadable (``OSError``), or
+    too-short content (below ``min_chunk_size``). It is ``"chunk_cap"``
+    when the per-file chunk cap aborted the file. Callers use the tag to
+    surface a separate counter in the mine summary (see #1455).
+    """
+    effective_min = min_chunk_size if min_chunk_size is not None else MIN_CHUNK_SIZE
 
     # Skip if already filed
     source_file = str(filepath)
     if not dry_run and file_already_mined(collection, source_file, check_mtime=True):
-        return 0, "general"
+        return 0, "general", None
 
     try:
         content = filepath.read_text(encoding="utf-8", errors="replace")
     except OSError:
-        return 0, "general"
+        return 0, "general", None
 
     content = content.strip()
-    if len(content) < MIN_CHUNK_SIZE:
-        return 0, "general"
+    if len(content) < effective_min:
+        return 0, "general", None
 
     room = detect_room(filepath, content, rooms, project_path)
-    chunks = chunk_text(content, source_file)
+    chunks = chunk_text(
+        content,
+        source_file,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        min_chunk_size=min_chunk_size,
+    )
 
-    if len(chunks) > MAX_CHUNKS_PER_FILE:
+    effective_cap = _resolve_max_chunks_per_file(max_chunks_per_file)
+    if effective_cap > 0 and len(chunks) > effective_cap:
+        # Skip notice goes to stderr alongside the existing symlink-skip
+        # warning style (see ``scan_project``'s ``SKIP: <rel> (symlink)``
+        # line). This keeps ``mempalace mine ... > out.log 2> err.log``
+        # piping coherent: degraded outcomes on stderr, progress on stdout.
         print(
             f"  ! [skip] {filepath.name[:50]:50} produced {len(chunks)} chunks "
-            f"(> {MAX_CHUNKS_PER_FILE}); add to SKIP_FILENAMES or .gitignore"
+            f"(> {effective_cap}); raise via --max-chunks-per-file or "
+            f"MEMPALACE_MAX_CHUNKS_PER_FILE (set 0 to disable), or add to "
+            f"SKIP_FILENAMES if this is a generated artifact",
+            file=sys.stderr,
         )
-        return 0, room
+        return 0, room, "chunk_cap"
 
     if dry_run:
         print(f"    [DRY RUN] {filepath.name} -> room:{room} ({len(chunks)} drawers)")
-        return len(chunks), room
+        return len(chunks), room, None
 
     # Lock this file so concurrent agents don't interleave delete+insert.
     # Without the lock, two agents can both pass file_already_mined(),
@@ -873,7 +1330,7 @@ def process_file(
     with mine_lock(source_file):
         # Re-check after acquiring lock — another agent may have just finished
         if file_already_mined(collection, source_file, check_mtime=True):
-            return 0, room
+            return 0, room, None
 
         # Purge stale drawers for this file before re-inserting the fresh chunks.
         # Converts modified-file re-mines from upsert-over-existing-IDs (which hits
@@ -894,7 +1351,19 @@ def process_file(
         except OSError:
             source_mtime = None
 
+        # Tier 6a content-date: extract once per file (not per chunk) and
+        # share across all chunks. Reads filename / frontmatter / content /
+        # mtime hierarchy. Returns None when nothing usable found → caller
+        # falls back to filed_at downstream.
+        file_content_date = _extract_content_date(source_file, content)
+
         drawers_added = 0
+        # Accumulate drawer metadata across batches so the closet emitter
+        # below can consume it (Tier 6a date+line locators). Without this,
+        # the new ``drawer_metas`` kwarg never reaches ``build_closet_lines``
+        # in production and the 4-segment pointer form lives only in tests.
+        # Per PR #1584 review (Igor, 2026-05-22).
+        all_metas: list = []
         for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
             batch_docs: list = []
             batch_ids: list = []
@@ -912,6 +1381,9 @@ def process_file(
                         agent,
                         chunk["content"],
                         source_mtime,
+                        line_start=chunk.get("line_start"),
+                        line_end=chunk.get("line_end"),
+                        content_date=file_content_date,
                     )
                 )
             collection.upsert(
@@ -920,6 +1392,7 @@ def process_file(
                 metadatas=batch_metas,
             )
             drawers_added += len(batch_docs)
+            all_metas.extend(batch_metas)
 
         # Build closet — the searchable index pointing to these drawers.
         # Purge first: a re-mine (mtime change or normalize_version bump) must
@@ -929,7 +1402,18 @@ def process_file(
                 f"drawer_{wing}_{room}_{hashlib.sha256((source_file + str(c['chunk_index'])).encode()).hexdigest()[:24]}"
                 for c in chunks
             ]
-            closet_lines = build_closet_lines(source_file, drawer_ids, content, wing, room)
+            # Pass drawer_metas so build_closet_lines can emit the Tier 6a
+            # 4-segment pointer (``topic|entities|YYYY-MM-DD:Lstart-Lend|→ids``)
+            # when line_start / line_end / content_date are present. Falls
+            # back to the legacy 3-segment form automatically when not.
+            closet_lines = build_closet_lines(
+                source_file,
+                drawer_ids,
+                content,
+                wing,
+                room,
+                drawer_metas=all_metas,
+            )
             closet_id_base = (
                 f"closet_{wing}_{room}_{hashlib.sha256(source_file.encode()).hexdigest()[:24]}"
             )
@@ -947,7 +1431,7 @@ def process_file(
             purge_file_closets(closets_col, source_file)
             upsert_closet_lines(closets_col, closet_id_base, closet_lines, closet_meta)
 
-    return drawers_added, room
+    return drawers_added, room, None
 
 
 # =============================================================================
@@ -960,7 +1444,12 @@ def scan_project(
     respect_gitignore: bool = True,
     include_ignored: list = None,
 ) -> list:
-    """Return list of all readable file paths."""
+    """Return list of all readable file paths under ``project_dir``.
+
+    Skips symlinks and oversized files. Each skipped symlink is logged to
+    ``sys.stderr`` with a ``  SKIP: <relative-path> (symlink)`` line so the
+    caller can tell why a directory looks empty after walking.
+    """
     project_path = Path(project_dir).expanduser().resolve()
     files = []
     active_matchers = []
@@ -1008,6 +1497,11 @@ def scan_project(
                     continue
             # Skip symlinks — prevents following links to /dev/urandom, etc.
             if filepath.is_symlink():
+                rel = filepath.relative_to(project_path).as_posix()
+                try:
+                    print(f"  SKIP: {rel} (symlink)", file=sys.stderr)
+                except OSError:
+                    pass
                 continue
             # Skip files exceeding size limit
             try:
@@ -1034,6 +1528,7 @@ def mine(
     respect_gitignore: bool = True,
     include_ignored: list = None,
     files: list = None,
+    max_chunks_per_file: Optional[int] = None,
 ):
     """Mine a project directory into the palace.
 
@@ -1042,8 +1537,12 @@ def mine(
     caller (e.g. ``init`` showing a file-count estimate before the mine
     prompt) avoids walking the tree twice. When ``None`` (the default),
     ``mine`` walks the tree itself just like before.
-    """
 
+    ``max_chunks_per_file`` overrides the per-file chunk cap (see
+    :func:`_resolve_max_chunks_per_file`). ``None`` defers to
+    ``MEMPALACE_MAX_CHUNKS_PER_FILE`` or ``MAX_CHUNKS_PER_FILE``; ``0``
+    disables the cap entirely (#1455).
+    """
     if dry_run:
         return _mine_impl(
             project_dir,
@@ -1055,6 +1554,7 @@ def mine(
             respect_gitignore=respect_gitignore,
             include_ignored=include_ignored,
             files=files,
+            max_chunks_per_file=max_chunks_per_file,
         )
 
     # MineAlreadyRunning propagates so the CLI can render a clear holder-aware
@@ -1071,6 +1571,7 @@ def mine(
             respect_gitignore=respect_gitignore,
             include_ignored=include_ignored,
             files=files,
+            max_chunks_per_file=max_chunks_per_file,
         )
 
 
@@ -1084,9 +1585,17 @@ def _mine_impl(
     respect_gitignore: bool = True,
     include_ignored: list = None,
     files: list = None,
+    max_chunks_per_file: Optional[int] = None,
 ):
+    from .config import MempalaceConfig
+
     project_path = Path(project_dir).expanduser().resolve()
     config = load_config(project_dir)
+    palace_config = MempalaceConfig()
+
+    cfg_chunk_size = palace_config.chunk_size
+    cfg_chunk_overlap = palace_config.chunk_overlap
+    cfg_min_chunk_size = palace_config.min_chunk_size
 
     wing = wing_override or config["wing"]
     rooms = config.get("rooms", [{"name": "general", "description": "All project files"}])
@@ -1127,14 +1636,16 @@ def _mine_impl(
 
     total_drawers = 0
     files_skipped = 0
+    files_skipped_chunk_cap = 0
     files_processed = 0
     last_file = None
     room_counts = defaultdict(int)
+    effective_chunk_cap = _resolve_max_chunks_per_file(max_chunks_per_file)
 
     try:
         for i, filepath in enumerate(files, 1):
             try:
-                drawers, room = process_file(
+                drawers, room, skip_reason = process_file(
                     filepath=filepath,
                     project_path=project_path,
                     collection=collection,
@@ -1143,6 +1654,14 @@ def _mine_impl(
                     agent=agent,
                     dry_run=dry_run,
                     closets_col=closets_col,
+                    chunk_size=cfg_chunk_size,
+                    chunk_overlap=cfg_chunk_overlap,
+                    min_chunk_size=cfg_min_chunk_size,
+                    # Pass the already-resolved int so ``process_file``'s
+                    # ``override is not None`` branch skips the env re-read;
+                    # otherwise a malformed env var would emit its warning
+                    # per file.
+                    max_chunks_per_file=effective_chunk_cap,
                 )
             except KeyboardInterrupt:
                 # Re-raise so the outer handler prints the summary; we
@@ -1151,8 +1670,15 @@ def _mine_impl(
                 raise
             files_processed = i
             last_file = filepath.name
-            if drawers == 0 and not dry_run:
+            # All zero-drawer outcomes increment ``files_skipped`` in both
+            # modes so the summary "Files processed" arithmetic and the
+            # residual-skip counter stay honest under ``--dry-run`` too. The
+            # chunk-cap counter is partitioned out for its dedicated
+            # summary line (see #1455 + Gemini review on PR #1554).
+            if drawers == 0:
                 files_skipped += 1
+                if skip_reason == "chunk_cap":
+                    files_skipped_chunk_cap += 1
             else:
                 total_drawers += drawers
                 room_counts[room] += 1
@@ -1175,10 +1701,60 @@ def _mine_impl(
                     file=sys.stderr,
                 )
 
+            # Within-wing hallways: link entities (people, projects, concepts)
+            # that co-occur in drawers across this wing's rooms. Mirrors the
+            # tunnel-compute fault-tolerance pattern — hallway computation
+            # must never fail a mine; it's a derived analytic, not load-bearing
+            # for the drawer write that already committed above.
+            try:
+                hallways_created = compute_hallways_for_wing(wing, col=collection)
+                if hallways_created:
+                    print(f"\n  Hallways: +{len(hallways_created)} within-wing entity link(s)")
+            except Exception as e:
+                print(
+                    f"\n  WARNING: hallway computation skipped — {e}",
+                    file=sys.stderr,
+                )
+
+            # Cross-wing entity tunnels: derived from the hallway records
+            # materialized just above. When an entity appears in hallways of
+            # this wing AND another wing, a tunnel bridges them. Runs in
+            # parallel with topic tunnels — both kinds coexist via
+            # ``kind="entity"`` / ``kind="topic"``. Same fault-tolerance
+            # pattern: never fail a mine over a derived analytic.
+            try:
+                entity_tunnels_added = _compute_entity_tunnels_for_wing(wing)
+                if entity_tunnels_added:
+                    print(f"\n  Entity tunnels: +{entity_tunnels_added} cross-wing entity link(s)")
+            except Exception as e:
+                print(
+                    f"\n  WARNING: entity tunnel computation skipped — {e}",
+                    file=sys.stderr,
+                )
+
         print(f"\n{'=' * 55}")
         print("  Done.")
         print(f"  Files processed: {len(files) - files_skipped}")
-        print(f"  Files skipped (already filed): {files_skipped}")
+        # The residual skip bucket label depends on mode: dry-run bypasses
+        # the already-mined check, so the only paths producing (0, room,
+        # None) under dry_run are OSError / too-short / post-lock re-check
+        # (and re-check itself is unreachable when nothing is being
+        # written). Outside dry_run, the dominant case is "already filed".
+        residual_label = (
+            "Files skipped (read error or too short)"
+            if dry_run
+            else "Files skipped (already filed or other)"
+        )
+        print(f"  {residual_label}: {max(0, files_skipped - files_skipped_chunk_cap)}")
+        if files_skipped_chunk_cap > 0:
+            # ``effective_chunk_cap`` is necessarily > 0 here: ``process_file``
+            # only emits the ``"chunk_cap"`` skip_reason when its own
+            # ``effective_cap > 0`` guard passes (see ``process_file``).
+            print(
+                f"  Files skipped (chunk cap {effective_chunk_cap}): {files_skipped_chunk_cap} "
+                f"(raise via --max-chunks-per-file or MEMPALACE_MAX_CHUNKS_PER_FILE; "
+                f"set 0 to disable)"
+            )
         print(f"  Drawers filed: {total_drawers}")
         print("\n  By room:")
         for room, count in sorted(room_counts.items(), key=lambda x: x[1], reverse=True):
@@ -1250,7 +1826,12 @@ def _cleanup_mine_pid_file() -> None:
         if not pid_file.exists():
             return
         recorded = pid_file.read_text().strip()
-        if recorded and recorded.isdigit() and int(recorded) == os.getpid():
+        # PID file format: "{pid} {unix_timestamp}" (timestamp added in
+        # #1552 for stale-by-age detection).  Old-format files (bare
+        # "{pid}") are also handled: split on whitespace and take the
+        # first token as the PID.
+        pid_token = recorded.split()[0] if recorded else ""
+        if pid_token and pid_token.isdigit() and int(pid_token) == os.getpid():
             pid_file.unlink()
     except OSError:
         # Best-effort cleanup; never fail the mine over PID bookkeeping.
@@ -1276,6 +1857,31 @@ def _compute_topic_tunnels_for_wing(wing: str) -> int:
     return len(created)
 
 
+def _compute_entity_tunnels_for_wing(wing: str) -> int:
+    """Drop tunnels between ``wing`` and every other wing that shares an
+    entity via the within-wing hallway primitive.
+
+    Reads hallway records (``mempalace.hallways.list_hallways``) and
+    materializes cross-wing tunnels for any entity that has hallways in
+    this wing AND at least one other wing. Tunnels use ``kind="entity"``
+    and the synthetic endpoint room ``entity:<name>`` so they're
+    distinguishable from explicit and topic tunnels at read time but
+    interchangeable with them via the standard ``list_tunnels`` /
+    ``follow_tunnels`` API.
+
+    Returns the number of tunnels created or refreshed. Zero means no
+    eligible entity exists in this wing yet (or no hallway records do).
+    """
+    from .hallways import list_hallways
+    from .palace_graph import entity_tunnels_for_wing
+
+    hallways = list_hallways()
+    if not hallways:
+        return 0
+    created = entity_tunnels_for_wing(wing, hallways)
+    return len(created)
+
+
 # =============================================================================
 # STATUS
 # =============================================================================
@@ -1283,11 +1889,8 @@ def _compute_topic_tunnels_for_wing(wing: str) -> int:
 
 def status(palace_path: str):
     """Show what's been filed in the palace."""
-    try:
-        col = get_collection(palace_path, create=False)
-    except Exception:
-        print(f"\n  No palace found at {palace_path}")
-        print("  Run: mempalace init <dir> then mempalace mine <dir>")
+    col = _open_collection_or_explain(palace_path)
+    if col is None:
         return
 
     # Count by wing and room — paginate to avoid SQLite "too many SQL

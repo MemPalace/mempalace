@@ -111,3 +111,48 @@ def test_quarantine_leaves_reasonable_payload_in_place(tmp_path):
 
     assert moved == []
     assert seg_dir.exists()
+
+
+def test_segment_health_rejects_zero_byte_link_lists_with_payload(tmp_path):
+    """Regression #1457: real HNSW payload with empty link_lists.bin is corrupt."""
+    seg_dir = tmp_path / "11111111-2222-3333-4444-555555555555"
+
+    _write_segment(
+        seg_dir,
+        data_size=2_000,
+        link_size=0,
+        write_metadata=True,
+    )
+
+    assert not _segment_appears_healthy(str(seg_dir))
+
+
+def test_quarantine_catches_zero_byte_link_lists_when_stale(tmp_path):
+    """Regression #1457: stale segments with empty link_lists.bin are quarantined."""
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    db_path = palace / "chroma.sqlite3"
+    db_path.write_text("sqlite placeholder")
+
+    seg_dir = palace / "11111111-2222-3333-4444-555555555555"
+    _write_segment(
+        seg_dir,
+        data_size=2_000,
+        link_size=0,
+        write_metadata=True,
+    )
+
+    hnsw_time = 1_700_000_000
+    sqlite_time = hnsw_time + 1_000
+    os.utime(seg_dir / "data_level0.bin", (hnsw_time, hnsw_time))
+    os.utime(db_path, (sqlite_time, sqlite_time))
+
+    moved = quarantine_stale_hnsw(str(palace), stale_seconds=300)
+
+    assert len(moved) == 1
+    assert not seg_dir.exists()
+
+    moved_path = Path(moved[0])
+    assert moved_path.exists()
+    assert moved_path.name.startswith("11111111-2222-3333-4444-555555555555.drift-")

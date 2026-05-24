@@ -33,12 +33,12 @@ class TestSaveHookAutoMines:
         # `--mode convos` so the convo miner runs (not the projects miner).
         assert "TRANSCRIPT_PATH" in src, "hook must read transcript_path"
         assert "mempalace mine" in src, "hook must invoke `mempalace mine`"
-        assert (
-            'dirname "$TRANSCRIPT_PATH"' in src
-        ), "hook must mine the transcript's parent directory"
-        assert (
-            "--mode convos" in src
-        ), "transcript mine must use --mode convos, not the projects miner"
+        assert 'dirname "$TRANSCRIPT_PATH"' in src, (
+            "hook must mine the transcript's parent directory"
+        )
+        assert "--mode convos" in src, (
+            "transcript mine must use --mode convos, not the projects miner"
+        )
 
     def test_mempal_dir_default_not_empty(self):
         """If MEMPAL_DIR is still used, it should have a sensible default,
@@ -86,16 +86,16 @@ class TestShellHookTranscriptValidation:
     def test_save_hook_defines_and_uses_validator(self):
         src = self._strip_comments(self._hook_src("mempal_save_hook.sh"))
         assert "is_valid_transcript_path() {" in src, "validator function must be defined"
-        assert (
-            'is_valid_transcript_path "$TRANSCRIPT_PATH"' in src
-        ), "validator must be invoked against TRANSCRIPT_PATH before mining"
+        assert 'is_valid_transcript_path "$TRANSCRIPT_PATH"' in src, (
+            "validator must be invoked against TRANSCRIPT_PATH before mining"
+        )
 
     def test_precompact_hook_defines_and_uses_validator(self):
         src = self._strip_comments(self._hook_src("mempal_precompact_hook.sh"))
         assert "is_valid_transcript_path() {" in src, "validator function must be defined"
-        assert (
-            'is_valid_transcript_path "$TRANSCRIPT_PATH"' in src
-        ), "validator must be invoked against TRANSCRIPT_PATH before mining"
+        assert 'is_valid_transcript_path "$TRANSCRIPT_PATH"' in src, (
+            "validator must be invoked against TRANSCRIPT_PATH before mining"
+        )
 
     @pytest.mark.skipif(
         sys.platform == "win32",
@@ -112,9 +112,7 @@ class TestShellHookTranscriptValidation:
             end = src.index("\n}\n", start) + 2
             func_src = src[start:end]
             script = tmp_path / "v.sh"
-            script.write_text(
-                f"{func_src}\n" 'is_valid_transcript_path "$1" && echo OK || echo NO\n'
-            )
+            script.write_text(f'{func_src}\nis_valid_transcript_path "$1" && echo OK || echo NO\n')
 
             def run(arg: str) -> str:
                 return subprocess.run(

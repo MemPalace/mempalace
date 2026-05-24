@@ -30,8 +30,8 @@ export default withMermaid(
       ['meta', { property: 'og:description', content: '96.6% LongMemEval recall. Zero API calls. Local, free, open source.' }],
       ['meta', { property: 'og:image', content: `${docsBase}mempalace_logo.png` }],
       ...(gaId ? [
-        ['script', { async: '', src: `https://www.googletagmanager.com/gtag/js?id=${gaId}` }],
-        ['script', {}, `window.dataLayer = window.dataLayer || [];\nfunction gtag(){dataLayer.push(arguments);}\ngtag('js', new Date());\ngtag('config', '${gaId}');`],
+        ['script', { async: '', src: `https://www.googletagmanager.com/gtag/js?id=${encodeURIComponent(gaId)}` }],
+        ['script', {}, `window.dataLayer = window.dataLayer || [];\nfunction gtag(){dataLayer.push(arguments);}\ngtag('js', new Date());\ngtag('config', ${JSON.stringify(gaId)});`],
       ] as const : []),
     ],
 
@@ -55,6 +55,7 @@ export default withMermaid(
               { text: 'Searching Memories', link: '/guide/searching' },
               { text: 'MCP Integration', link: '/guide/mcp-integration' },
               { text: 'Claude Code Plugin', link: '/guide/claude-code' },
+              { text: 'Claude Code Retention', link: '/guide/claude-code-retention' },
               { text: 'Gemini CLI', link: '/guide/gemini-cli' },
               { text: 'OpenClaw Skill', link: '/guide/openclaw' },
               { text: 'Local Models', link: '/guide/local-models' },

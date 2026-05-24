@@ -78,6 +78,6 @@ def test_mcp_server_no_stdout_noise_on_clean_exit():
         capture_output=True,
         timeout=60,
     )
-    assert (
-        proc.stdout == b""
-    ), f"stdout must be empty before the first JSON-RPC response, but got: {proc.stdout!r}"
+    assert proc.stdout == b"", (
+        f"stdout must be empty before the first JSON-RPC response, but got: {proc.stdout!r}"
+    )

@@ -22,6 +22,8 @@ Usage:
 import re
 from typing import List, Dict, Tuple
 
+from .config import DEFAULT_CHUNK_SIZE
+
 
 # =============================================================================
 # MARKER SETS — One per memory type
@@ -360,13 +362,23 @@ def _score_markers(text: str, markers: List[str]) -> Tuple[float, List[str]]:
 # =============================================================================
 
 
-def extract_memories(text: str, min_confidence: float = 0.3) -> List[Dict]:
+def extract_memories(
+    text: str,
+    min_confidence: float = 0.3,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+) -> List[Dict]:
     """
     Extract memories from a text string.
 
     Args:
         text: The text to extract from (any format).
         min_confidence: Minimum confidence threshold (0.0-1.0).
+        chunk_size: Per-memory character cap. Segments exceeding this
+            size are sliced verbatim into multiple memories that share
+            the same ``memory_type``. Caller (typically ``mine_convos``)
+            should pass ``MempalaceConfig.chunk_size`` so config-driven
+            sizing reaches this path; the default matches the
+            module-level CHUNK_SIZE in ``convo_miner.py``.
 
     Returns:
         List of dicts: {"content": str, "memory_type": str, "chunk_index": int}
@@ -410,13 +422,30 @@ def extract_memories(text: str, min_confidence: float = 0.3) -> List[Dict]:
         if confidence < min_confidence:
             continue
 
-        memories.append(
-            {
-                "content": para.strip(),
-                "memory_type": max_type,
-                "chunk_index": len(memories),
-            }
-        )
+        content = para.strip()
+        # Slice oversized segments verbatim. ``memory_type`` is propagated
+        # to every slice — reclassifying sub-segments risks dropping data
+        # (marker may live in only one slice), and the verbatim-store
+        # mandate in CLAUDE.md forbids silent loss. Acceptable trade-off:
+        # the label is an approximation for sub-slices, not a fresh
+        # classification.
+        if len(content) <= chunk_size:
+            memories.append(
+                {
+                    "content": content,
+                    "memory_type": max_type,
+                    "chunk_index": len(memories),
+                }
+            )
+            continue
+        for i in range(0, len(content), chunk_size):
+            memories.append(
+                {
+                    "content": content[i : i + chunk_size],
+                    "memory_type": max_type,
+                    "chunk_index": len(memories),
+                }
+            )
 
     return memories
 

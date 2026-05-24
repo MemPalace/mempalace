@@ -2,6 +2,10 @@
 
 These hook scripts make MemPalace save automatically. No manual "save" commands needed.
 
+If you are trying to protect existing Claude Code transcripts immediately,
+use the short checklist first: [`website/guide/claude-code-retention.md`](../website/guide/claude-code-retention.md).
+It covers hook wiring, JSONL backup, and one-time backfill.
+
 ## What They Do
 
 | Hook | When It Fires | What Happens |

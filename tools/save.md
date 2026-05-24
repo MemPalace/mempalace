@@ -24,3 +24,6 @@ Behavior:
 4. Report back: how many drawers were filed, into which wing/room.
 
 Requires `mempalace` to be installed (`uv tool install mempalace` recommended, or `pip install mempalace`).
+
+For the full setup and retention checklist, including hooks, JSONL backup, and
+one-time backfill, see [`website/guide/claude-code-retention.md`](../website/guide/claude-code-retention.md).

@@ -1336,11 +1336,7 @@ class TestStripNoiseRemovesSystemChrome:
 
     def test_strips_line_anchored_system_reminder_block(self):
         text = (
-            "> User:\n"
-            "<system-reminder>\n"
-            "Auto-save reminder...\n"
-            "</system-reminder>\n"
-            "> Real message."
+            "> User:\n<system-reminder>\nAuto-save reminder...\n</system-reminder>\n> Real message."
         )
         out = strip_noise(text)
         assert "system-reminder" not in out
@@ -1350,7 +1346,7 @@ class TestStripNoiseRemovesSystemChrome:
     def test_strips_system_reminder_with_blockquote_prefix(self):
         # _messages_to_transcript prefixes lines with "> ", so the line
         # anchor must also accept that shape.
-        text = "> User:\n" "> <system-reminder>Injected noise</system-reminder>\n" "> Real message."
+        text = "> User:\n> <system-reminder>Injected noise</system-reminder>\n> Real message."
         out = strip_noise(text)
         assert "Injected noise" not in out
         assert "Real message." in out

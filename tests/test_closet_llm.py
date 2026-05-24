@@ -312,9 +312,9 @@ class TestRegenerateClosets:
         survivors = closets.get(where={"source_file": source}, include=["documents", "metadatas"])
         assert survivors["ids"], "LLM closets should have been written"
         joined = "\n".join(survivors["documents"])
-        assert (
-            "STALE_REGEX_TOPIC" not in joined
-        ), "pre-existing regex closet was not purged before LLM write"
+        assert "STALE_REGEX_TOPIC" not in joined, (
+            "pre-existing regex closet was not purged before LLM write"
+        )
         assert "jwt auth" in joined
         for meta in survivors["metadatas"]:
             assert meta.get("generated_by", "").startswith("llm:")
@@ -399,9 +399,9 @@ class TestRegenerateClosets:
         # Three paginated calls: (limit=5000, offset=0), (5000, 5000), (5000, 10000).
         assert len(get_calls) == 3, f"expected 3 batched fetches, got {len(get_calls)}"
         for call in get_calls:
-            assert (
-                call["limit"] == 5000
-            ), f"batch must be 5000 — got {call['limit']} (would risk SQLITE_MAX_VARIABLE_NUMBER)"
+            assert call["limit"] == 5000, (
+                f"batch must be 5000 — got {call['limit']} (would risk SQLITE_MAX_VARIABLE_NUMBER)"
+            )
             # include must still request both documents and metadatas
             assert "documents" in call["include"]
             assert "metadatas" in call["include"]

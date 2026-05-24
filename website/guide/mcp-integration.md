@@ -16,12 +16,14 @@ mempalace mcp
 
 ```bash
 claude mcp add mempalace -- python -m mempalace.mcp_server
+codex mcp add mempalace -- python -m mempalace.mcp_server
 ```
 
 ### With Custom Palace Path
 
 ```bash
 claude mcp add mempalace -- python -m mempalace.mcp_server --palace /path/to/palace
+codex mcp add mempalace -- python -m mempalace.mcp_server --palace /path/to/palace
 ```
 
 Now your AI has all 29 tools available. Ask it anything:
@@ -35,6 +37,7 @@ Claude calls `mempalace_search` automatically, gets verbatim results, and answer
 MemPalace works with any tool that supports MCP:
 
 - **Claude Code** — native via plugin or manual MCP
+- **Codex CLI** — native via bundled Codex plugin or manual MCP
 - **OpenClaw** — via official skill, see [OpenClaw Skill](/guide/openclaw)
 - **ChatGPT** — via MCP bridge
 - **Cursor** — native MCP support

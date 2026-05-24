@@ -13,6 +13,7 @@ import sys
 import threading
 from typing import Optional
 
+from .backends import BackendClosedError, CollectionNotInitializedError, PalaceNotFoundError
 from .backends.chroma import ChromaBackend
 
 logger = logging.getLogger("mempalace_mcp")
@@ -76,6 +77,72 @@ def get_collection(
 def get_closets_collection(palace_path: str, create: bool = True):
     """Get the closets collection — the searchable index layer."""
     return get_collection(palace_path, collection_name="mempalace_closets", create=create)
+
+
+def _open_collection_or_explain(
+    palace_path: str,
+    *,
+    collection_name: Optional[str] = None,
+    out=None,
+):
+    """Open the palace collection or print a state-specific message and return ``None``.
+
+    For CLI and repair commands that want consistent, actionable user-facing
+    messages distinguishing four "not-healthy" states from one another. MCP
+    and library callers should catch
+    :class:`mempalace.backends.PalaceNotFoundError` /
+    :class:`mempalace.backends.CollectionNotInitializedError` directly.
+
+    The MCP server (``mcp_server.tool_status``) deliberately does NOT use
+    this helper: it uses ``_get_collection(create=db_exists)`` so a valid
+    palace whose collection was never bootstrapped lazily gets one on the
+    first status call, and a corruption-detection sqlite-only probe fires
+    first when the vector path is disabled (see PR #831 / issue #830).
+
+    State A: palace dir is absent.
+    State B: dir is present but ``chroma.sqlite3`` is absent. The helper
+        short-circuits to a message before reaching the backend, because
+        ``chromadb.PersistentClient`` lazily creates the DB file on first
+        open — calling the backend on this state would silently mutate
+        the filesystem for what should be a read-only inspection.
+    State C: DB is present but the ``mempalace_drawers`` collection has
+        never been bootstrapped (``init`` ran, ``mine`` has not).
+    State D: healthy — returns the opened collection.
+    State E: an unexpected error opens the backend — message points the
+        user at ``repair-status`` for further diagnosis.
+
+    ``out`` is the message sink; defaults to the builtin ``print``. Pass a
+    callable (e.g. a repair progress emitter) to route messages through it.
+    """
+    emit = out if out is not None else print
+
+    if not os.path.isdir(palace_path):
+        emit(f"\n  No palace found at {palace_path}")
+        emit("  Run: mempalace init <dir> then mempalace mine <dir>")
+        return None
+    if not os.path.isfile(os.path.join(palace_path, "chroma.sqlite3")):
+        emit(f"\n  Palace dir at {palace_path} exists but has no chroma.sqlite3 yet.")
+        emit("  Run: mempalace mine <dir>")
+        return None
+    try:
+        return get_collection(palace_path, collection_name=collection_name, create=False)
+    except CollectionNotInitializedError:
+        emit(f"\n  Palace at {palace_path} is initialized but empty (no drawers yet).")
+        emit("  Run: mempalace mine <dir>")
+        return None
+    except PalaceNotFoundError:
+        emit(f"\n  No palace found at {palace_path}")
+        emit("  Run: mempalace init <dir> then mempalace mine <dir>")
+        return None
+    except BackendClosedError:
+        # Surface this as a programmer error, not a palace-state UX message:
+        # a closed backend means the caller violated the backend lifecycle,
+        # not that the palace on disk is in a recoverable state.
+        raise
+    except Exception as e:  # noqa: BLE001 — backend exceptions vary (chromadb, OSError, lock errors)
+        emit(f"\n  Error opening palace at {palace_path}: {e!r}")
+        emit("  Try: mempalace repair-status --palace <path>")
+        return None
 
 
 CLOSET_CHAR_LIMIT = 1500  # fill closet until ~1500 chars, then start a new one
@@ -170,19 +237,30 @@ def _candidate_entity_words(text: str) -> list:
     return words
 
 
-def build_closet_lines(source_file, drawer_ids, content, wing, room):
+def build_closet_lines(source_file, drawer_ids, content, wing, room, drawer_metas=None):
     """Build compact closet pointer lines from drawer content.
 
     Returns a LIST of lines (not joined). Each line is one complete topic
     pointer — never split across closets.
 
-    Format: topic|entities|→drawer_ids
+    Legacy format (3 segments): ``topic|entities|→drawer_ids``
+    Tier 6a format (4 segments): ``topic|entities|YYYY-MM-DD:Lstart-Lend|→drawer_ids``
+
+    When ``drawer_metas`` is provided and the first meta carries both
+    ``line_start``/``line_end`` plus a parseable ``filed_at``, the 4-segment
+    form is emitted so retrieval can jump to the right span. Otherwise the
+    legacy 3-segment form is used — backward compat for drawers filed before
+    Tier 6a and for direct callers that don't have metadata handy.
     """
     import re
     from pathlib import Path
 
     drawer_ref = ",".join(drawer_ids[:3])
     window = content[:CLOSET_EXTRACT_WINDOW]
+
+    # Tier 6a — date+line locator segment. Built once per call; ``None``
+    # signals "fall back to legacy 3-segment format" for every emitted line.
+    date_line_seg = _build_date_line_segment(drawer_metas)
 
     # Extract proper nouns (2+ occurrences). Uses i18n-aware patterns so
     # non-Latin names (Cyrillic, accented Latin, etc.) are also detected.
@@ -213,19 +291,67 @@ def build_closet_lines(source_file, drawer_ids, content, wing, room):
     # Extract quotes
     quotes = re.findall(r'"([^"]{15,150})"', window)
 
-    # Build pointer lines — each one is atomic, never split
+    # Build pointer lines — each one is atomic, never split. When the
+    # Tier 6a date+line segment is available, splice it in as the 3rd
+    # pipe-separated field; otherwise emit the legacy 3-segment form.
+    def _pointer(prefix: str) -> str:
+        if date_line_seg is not None:
+            return f"{prefix}|{entity_str}|{date_line_seg}|→{drawer_ref}"
+        return f"{prefix}|{entity_str}|→{drawer_ref}"
+
     lines = []
     for topic in topics:
-        lines.append(f"{topic}|{entity_str}|→{drawer_ref}")
+        lines.append(_pointer(topic))
     for quote in quotes[:3]:
-        lines.append(f'"{quote}"|{entity_str}|→{drawer_ref}')
+        lines.append(_pointer(f'"{quote}"'))
 
     # Always have at least one line
     if not lines:
         name = Path(source_file).stem[:40]
-        lines.append(f"{wing}/{room}/{name}|{entity_str}|→{drawer_ref}")
+        lines.append(_pointer(f"{wing}/{room}/{name}"))
 
     return lines
+
+
+def _build_date_line_segment(drawer_metas):
+    """Tier 6a — produce ``YYYY-MM-DD:Lstart-Lend`` from a drawer-meta list.
+
+    Reads the first meta's ``filed_at`` (date prefix only — never the raw
+    ISO timestamp; closet pointers stay compact and grep-friendly) plus its
+    ``line_start`` / ``line_end``. Returns ``None`` when any of the three
+    fields is missing or unparseable — caller then falls back to the legacy
+    3-segment closet pointer format. The choice to read only the first meta
+    matches ``drawer_ids[:3]`` truncation in ``build_closet_lines``: pointers
+    are approximate locators, not exhaustive indexes.
+    """
+    if not drawer_metas:
+        return None
+    meta = drawer_metas[0]
+    if not isinstance(meta, dict):
+        return None
+    line_start = meta.get("line_start")
+    line_end = meta.get("line_end")
+    if line_start is None or line_end is None:
+        return None
+
+    # Tier 6a date hierarchy: prefer ``content_date`` (extracted from file
+    # content, frontmatter, filename, or mtime — see
+    # mempalace.miner._extract_content_date) when present. Fall back to
+    # ``filed_at`` (ingestion timestamp) only when no content-aware date
+    # was extractable. ``content_date`` is already an ISO ``YYYY-MM-DD``;
+    # ``filed_at`` may be a full ISO timestamp like
+    # ``2026-05-21T22:30:00.123456+00:00`` and gets truncated at ``T``.
+    content_date = meta.get("content_date")
+    if content_date:
+        date_part = str(content_date)
+    else:
+        filed_at = meta.get("filed_at")
+        if not filed_at:
+            return None
+        date_part = str(filed_at).split("T", 1)[0]
+    if not date_part:
+        return None
+    return f"{date_part}:L{line_start}-L{line_end}"
 
 
 def purge_file_closets(closets_col, source_file: str) -> None:
@@ -387,7 +513,10 @@ def _read_lock_holder(lock_file) -> str:
     """Read the prior holder's identity from the lock-file body, best-effort."""
     try:
         lock_file.seek(_LOCK_SENTINEL_BYTES)
-        content = lock_file.read().strip()
+        content = lock_file.read()
+        if isinstance(content, bytes):
+            content = content.decode("utf-8", errors="replace")
+        content = content.strip()
     except OSError:
         return "another writer (identity not recorded)"
     if not content:
@@ -404,11 +533,12 @@ def _write_lock_holder(lock_file) -> None:
     """
     try:
         ident = f"{os.getpid()} {' '.join(sys.argv[:3])}".strip()
+        ident_bytes = ident.encode("utf-8")
         lock_file.seek(_LOCK_SENTINEL_BYTES)
-        lock_file.truncate(_LOCK_SENTINEL_BYTES + len(ident.encode("utf-8")))
-        lock_file.write(ident)
+        lock_file.truncate(_LOCK_SENTINEL_BYTES + len(ident_bytes))
+        lock_file.write(ident_bytes)
         lock_file.flush()
-    except OSError:
+    except (OSError, UnicodeError):
         pass
 
 
@@ -470,7 +600,7 @@ def mine_palace_lock(palace_path: str):
             os.close(fd)
         except FileExistsError:
             pass
-    lf = open(lock_path, "r+")
+    lf = open(lock_path, "r+b")
     acquired = False
     try:
         # Lock byte 0 explicitly. msvcrt.locking is byte-position dependent;
@@ -531,7 +661,19 @@ def mine_palace_lock(palace_path: str):
 mine_global_lock = mine_palace_lock
 
 
-def file_already_mined(collection, source_file: str, check_mtime: bool = False) -> bool:
+def _metadata_matches_extract_mode(meta: dict, extract_mode: Optional[str]) -> bool:
+    if extract_mode is None:
+        return True
+    stored_mode = meta.get("extract_mode")
+    return stored_mode == extract_mode or (extract_mode == "exchange" and stored_mode is None)
+
+
+def file_already_mined(
+    collection,
+    source_file: str,
+    check_mtime: bool = False,
+    extract_mode: Optional[str] = None,
+) -> bool:
     """Check if a file has already been filed in the palace.
 
     Returns False (so the file gets re-mined) when:
@@ -543,12 +685,43 @@ def file_already_mined(collection, source_file: str, check_mtime: bool = False) 
     When check_mtime=True (used by project miner), also re-mines on content
     change. When check_mtime=False (used by convo miner), transcripts are
     assumed immutable, so only the version gate triggers a rebuild.
+
+    When extract_mode is set (used by convo miner), idempotency is scoped to
+    that extraction mode so exchange-mode and general-mode drawers can coexist
+    for the same source transcript. Legacy drawers without extract_mode are
+    treated as exchange-mode drawers.
     """
     try:
-        results = collection.get(where={"source_file": source_file}, limit=1)
-        if not results.get("ids"):
+        stored_meta = None
+        if extract_mode is None:
+            results = collection.get(where={"source_file": source_file}, limit=1)
+            if not results.get("ids"):
+                return False
+            stored_meta = results.get("metadatas", [{}])[0] or {}
+        else:
+            offset = 0
+            while True:
+                results = collection.get(
+                    where={"source_file": source_file},
+                    limit=1000,
+                    offset=offset,
+                    include=["metadatas"],
+                )
+                ids = results.get("ids") or []
+                metadatas = results.get("metadatas") or []
+                stored_meta = next(
+                    (
+                        meta or {}
+                        for meta in metadatas
+                        if _metadata_matches_extract_mode(meta or {}, extract_mode)
+                    ),
+                    None,
+                )
+                if stored_meta is not None or not ids:
+                    break
+                offset += len(ids)
+        if stored_meta is None:
             return False
-        stored_meta = results.get("metadatas", [{}])[0] or {}
         # Pre-v2 drawers have no version field — treat them as stale.
         stored_version = stored_meta.get("normalize_version", 1)
         if stored_version < NORMALIZE_VERSION:
@@ -562,3 +735,73 @@ def file_already_mined(collection, source_file: str, check_mtime: bool = False) 
         return True
     except Exception:
         return False
+
+
+def bulk_check_mined(collection) -> dict[str, float]:
+    """Pre-fetch source_file/source_mtime pairs for all documents in the collection.
+
+    Returns a dict mapping source_file -> source_mtime (as float) for every
+    document that has both fields.  Callers can check membership and compare
+    mtimes locally instead of issuing one ChromaDB query per file.
+
+    Fetches the full collection in paginated batches (like palace_graph.py)
+    since a WHERE-IN filter on thousands of paths is not supported by ChromaDB.
+    """
+    mined: dict[str, float] = {}
+    try:
+        total = collection.count()
+        offset = 0
+        while offset < total:
+            batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
+            for meta in batch["metadatas"]:
+                src = meta.get("source_file")
+                mtime = meta.get("source_mtime")
+                if src and mtime is not None:
+                    mined[src] = float(mtime)
+            if not batch["ids"]:
+                break
+            offset += len(batch["ids"])
+    except Exception:
+        logger.warning("bulk_check_mined: partial fetch, %d files loaded", len(mined))
+    return mined
+
+
+def prefetch_mined_set(collection, extract_mode: Optional[str] = None) -> set[str]:
+    """Pre-fetch the set of source_files already mined at the current NORMALIZE_VERSION.
+
+    Mirrors file_already_mined()'s version-gate semantics (check_mtime=False
+    branch) but in one bulk pass instead of one ChromaDB query per file.
+    Returns a set of source_file paths whose stored drawers are at or above
+    NORMALIZE_VERSION; callers do `if path in result_set: skip`.
+
+    When extract_mode is set, mirrors file_already_mined(..., extract_mode=...)
+    so conversation mines skip per extraction mode rather than per source file.
+
+    The convo miner walks thousands of transcript files; per-file
+    `collection.get(where={"source_file": X})` costs ~2s on a 150k-drawer
+    palace, making a 2000-file sweep take >1h of pure skip-checking. This
+    helper drops that to a single paginated scan plus O(1) lookups.
+    """
+    mined: set[str] = set()
+    try:
+        total = collection.count()
+        offset = 0
+        while offset < total:
+            batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
+            for meta in batch["metadatas"]:
+                meta = meta or {}
+                src = meta.get("source_file")
+                if not src:
+                    continue
+                if not _metadata_matches_extract_mode(meta, extract_mode):
+                    continue
+                # Same default as file_already_mined: missing version == 1
+                version = meta.get("normalize_version", 1)
+                if version >= NORMALIZE_VERSION:
+                    mined.add(src)
+            if not batch["ids"]:
+                break
+            offset += len(batch["ids"])
+    except Exception:
+        logger.warning("prefetch_mined_set: partial fetch, %d files loaded", len(mined))
+    return mined
