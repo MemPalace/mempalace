@@ -1033,6 +1033,45 @@ def test_quarantine_invalid_hnsw_metadata_skips_recent_missing_dimensionality(tm
     assert seg.exists()
 
 
+def test_quarantine_invalid_hnsw_metadata_respects_configured_fresh_window(tmp_path, monkeypatch):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    seg = palace / "abcd-1234-5678"
+    seg.mkdir()
+    meta = seg / "index_metadata.pickle"
+    with open(meta, "wb") as f:
+        pickle.dump({"dimensionality": None, "id_to_label": {"a": 1}}, f)
+
+    monkeypatch.setenv("MEMPALACE_INVALID_HNSW_METADATA_FRESH_SECONDS", "1")
+    old = time.time() - 5
+    os.utime(meta, (old, old))
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert len(moved) == 1
+    assert ".corrupt-" in moved[0]
+    assert not seg.exists()
+
+
+def test_quarantine_invalid_hnsw_metadata_boundary_at_fresh_window(tmp_path, monkeypatch):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    seg = palace / "abcd-1234-5678"
+    seg.mkdir()
+    meta = seg / "index_metadata.pickle"
+    with open(meta, "wb") as f:
+        pickle.dump({"dimensionality": None, "id_to_label": {"a": 1}}, f)
+
+    monkeypatch.setenv("MEMPALACE_INVALID_HNSW_METADATA_FRESH_SECONDS", "10")
+    recent = time.time() - 5
+    os.utime(meta, (recent, recent))
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert moved == []
+    assert seg.exists()
+
+
 def test_quarantine_invalid_hnsw_metadata_allows_uninitialized_segment(tmp_path):
     palace = tmp_path / "palace"
     palace.mkdir()

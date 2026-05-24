@@ -84,6 +84,69 @@ class TestSearchMemories:
         assert "error" in result
         assert "query failed" in result["error"]
 
+    def test_search_memories_retries_once_on_transient_error_finding_id(self):
+        first = MagicMock()
+        first.query.side_effect = RuntimeError(
+            "Error executing plan: Internal error: Error finding id"
+        )
+
+        second = MagicMock()
+        second.query.return_value = {
+            "documents": [["recovered doc"]],
+            "metadatas": [[{"source_file": "ok.md", "wing": "w", "room": "r"}]],
+            "distances": [[0.2]],
+        }
+        second.get.return_value = {
+            "documents": [],
+            "metadatas": [],
+            "ids": [],
+        }
+
+        with (
+            patch("mempalace.searcher.get_collection", side_effect=[first, second]) as get_col,
+            patch("mempalace.searcher.get_closets_collection", side_effect=RuntimeError("no closets")),
+            patch("mempalace.searcher.time.sleep", return_value=None),
+        ):
+            result = search_memories("anything", "/fake/path")
+
+        assert "error" not in result
+        assert result["results"][0]["text"] == "recovered doc"
+        assert get_col.call_count == 2
+        assert first.query.call_count == 1
+        assert second.query.call_count == 1
+
+    def test_search_memories_falls_back_to_bm25_when_transient_error_persists(self):
+        first = MagicMock()
+        first.query.side_effect = RuntimeError(
+            "Error executing plan: Internal error: Error finding id"
+        )
+
+        second = MagicMock()
+        second.query.side_effect = RuntimeError(
+            "Error executing plan: Internal error: Error finding id"
+        )
+
+        bm25_payload = {
+            "query": "anything",
+            "filters": {"wing": None, "room": None},
+            "total_before_filter": 1,
+            "results": [{"text": "bm25 recovered doc", "wing": "w", "room": "r"}],
+            "fallback": "bm25_only_via_sqlite",
+        }
+        retry_cols = [second, second, second, second]
+        with (
+            patch("mempalace.searcher.get_collection", side_effect=[first, *retry_cols]) as get_col,
+            patch("mempalace.searcher._bm25_only_via_sqlite", return_value=bm25_payload),
+            patch("mempalace.searcher.time.sleep", return_value=None),
+        ):
+            result = search_memories("anything", "/fake/path")
+
+        assert "error" not in result
+        assert result["results"][0]["text"] == "bm25 recovered doc"
+        assert result["fallback"] == "bm25_only_via_sqlite"
+        assert result["fallback_reason"] == "transient_vector_error_after_retry"
+        assert get_col.call_count == 5
+
     def test_search_memories_vector_path_uses_explicit_collection_name(self):
         mock_col = MagicMock()
         mock_col.query.return_value = {
@@ -337,7 +400,10 @@ class TestSearchCLI:
             ]
         }
         with (
-            patch("mempalace.searcher.get_collection", side_effect=[first, second]) as get_col,
+            patch(
+                "mempalace.searcher.get_collection",
+                side_effect=[first, second, second, second, second],
+            ) as get_col,
             patch("mempalace.searcher._bm25_only_via_sqlite", return_value=bm25_payload),
             patch("mempalace.searcher.time.sleep", return_value=None),
         ):
@@ -346,7 +412,7 @@ class TestSearchCLI:
         captured = capsys.readouterr()
         assert "BM25-only sqlite fallback" in captured.out
         assert "bm25 recovered doc" in captured.out
-        assert get_col.call_count == 2
+        assert get_col.call_count == 5
 
     def test_search_n_results(self, palace_path, seeded_collection, capsys):
         search("code", palace_path, n_results=1)

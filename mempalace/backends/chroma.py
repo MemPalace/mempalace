@@ -638,7 +638,24 @@ def _pin_hnsw_threads(collection) -> None:
 
 
 _BLOB_FIX_MARKER = ".blob_seq_ids_migrated"
-_INVALID_HNSW_METADATA_FRESH_SECONDS = 1800.0
+_INVALID_HNSW_METADATA_FRESH_SECONDS_DEFAULT = 600.0
+_INVALID_HNSW_METADATA_FRESH_SECONDS_ENV = "MEMPALACE_INVALID_HNSW_METADATA_FRESH_SECONDS"
+
+
+def _invalid_hnsw_metadata_fresh_seconds() -> float:
+    """Return freshness window for missing-dimensionality quarantine guards."""
+    raw = os.getenv(_INVALID_HNSW_METADATA_FRESH_SECONDS_ENV, "").strip()
+    if not raw:
+        return _INVALID_HNSW_METADATA_FRESH_SECONDS_DEFAULT
+    try:
+        value = float(raw)
+    except ValueError:
+        return _INVALID_HNSW_METADATA_FRESH_SECONDS_DEFAULT
+    return (
+        value
+        if value >= 0.0
+        else _INVALID_HNSW_METADATA_FRESH_SECONDS_DEFAULT
+    )
 
 
 def _valid_dimensionality(value: object) -> bool:
@@ -734,7 +751,7 @@ def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
                         if (
                             dimensionality is None
                             and _segment_recently_touched(
-                                seg_dir, _INVALID_HNSW_METADATA_FRESH_SECONDS
+                                seg_dir, _invalid_hnsw_metadata_fresh_seconds()
                             )
                         ):
                             logger.debug(
