@@ -1041,6 +1041,75 @@ def test_cmd_repair_aborts_without_confirmation(mock_config_cls, tmp_path, capsy
     mock_backend.create_collection.assert_not_called()
 
 
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_auto_rebuilds_fts5_before_aborting(mock_config_cls, tmp_path, capsys):
+    """FTS5-only quick_check errors trigger auto-rebuild in cmd_repair; repair proceeds.
+
+    Regression test for #1606: mempalace repair --yes should self-heal FTS5
+    inverted-index corruption rather than exiting 1 immediately.
+    """
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    with sqlite3.connect(str(palace_dir / "chroma.sqlite3")) as conn:
+        conn.execute(
+            "CREATE VIRTUAL TABLE embedding_fulltext_search"
+            " USING fts5(string_value, tokenize='unicode61')"
+        )
+        conn.commit()
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
+    args = argparse.Namespace(palace=None, yes=True)
+
+    mock_col = MagicMock()
+    mock_col.count.return_value = 0
+    mock_backend = _mock_backend_for(col=mock_col)
+
+    fts5_error = "malformed inverted index for FTS5 table main.embedding_fulltext_search"
+    call_count = {"n": 0}
+
+    def mock_integrity_errors(palace_path):
+        call_count["n"] += 1
+        return [fts5_error] if call_count["n"] == 1 else []
+
+    with (
+        patch("mempalace.repair.sqlite_integrity_errors", side_effect=mock_integrity_errors),
+        patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend),
+    ):
+        cmd_repair(args)
+
+    out = capsys.readouterr().out
+    assert "FTS5 corruption detected" in out
+    assert "FTS5 rebuilt successfully" in out
+    assert "SQLite-layer corruption detected before repair rebuild" not in out
+    assert call_count["n"] == 2
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_exits_1_when_fts5_rebuild_does_not_clear_errors(
+    mock_config_cls, tmp_path, capsys
+):
+    """If FTS5 auto-rebuild doesn't clear quick_check errors, cmd_repair exits 1."""
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    sqlite3.connect(str(palace_dir / "chroma.sqlite3")).close()
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
+    args = argparse.Namespace(palace=None, yes=True)
+
+    fts5_error = "malformed inverted index for FTS5 table main.embedding_fulltext_search"
+
+    with (
+        patch("mempalace.repair.sqlite_integrity_errors", return_value=[fts5_error]),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        cmd_repair(args)
+
+    assert exc_info.value.code == 1
+    out = capsys.readouterr().out
+    assert "FTS5 corruption detected" in out
+    assert "SQLite-layer corruption detected before repair rebuild" in out
+
+
 # ── cmd_compress ───────────────────────────────────────────────────────
 
 
