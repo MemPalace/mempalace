@@ -762,8 +762,23 @@ def rebuild_index(
     # exit cleanly before chromadb's compactor touches the disk.
     sqlite_errors = sqlite_integrity_errors(palace_path)
     if sqlite_errors:
-        print_sqlite_integrity_abort(palace_path, sqlite_errors)
-        return
+        # FTS5 inverted-index corruption is repairable in-place via the same
+        # _vacuum_and_rebuild_fts5() call that already runs post-repair.
+        # Attempt it first when the errors are FTS5-only so that automated
+        # repair (cron, @reboot) can self-heal without manual intervention.
+        fts5_only = all(
+            "fts5" in e.lower() or "inverted index" in e.lower()
+            for e in sqlite_errors
+        )
+        if fts5_only:
+            progress("  FTS5 corruption detected — attempting auto-rebuild before repair...")
+            _vacuum_and_rebuild_fts5(palace_path, progress)
+            sqlite_errors = sqlite_integrity_errors(palace_path)
+            if not sqlite_errors:
+                progress("  FTS5 rebuilt successfully — continuing with repair.")
+        if sqlite_errors:
+            print_sqlite_integrity_abort(palace_path, sqlite_errors)
+            return
 
     preflight = maybe_repair_poisoned_max_seq_id_before_rebuild(
         palace_path,
