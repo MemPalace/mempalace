@@ -453,7 +453,7 @@ def test_sub_threshold_mine_persists_hnsw_metadata(tmp_path):
         meta = entry / "index_metadata.pickle"
         link = entry / "link_lists.bin"
         data = entry / "data_level0.bin"
-        if data.exists() and data.stat().st_size > 1024:
+        if data.exists() and data.stat().st_size > _HNSW_MISSING_METADATA_DATA_FLOOR:
             assert meta.exists(), "index_metadata missing after sub-threshold upsert"
             assert link.exists() and link.stat().st_size > 0, "link_lists empty"
             assert _segment_appears_healthy(str(entry))
