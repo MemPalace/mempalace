@@ -391,14 +391,12 @@ def test_chroma_backend_creates_collection_with_cosine_distance(tmp_path):
 
 
 def test_chroma_backend_sets_hnsw_bloat_guard_on_creation(tmp_path):
-    """The HNSW guard from #344 must land on freshly-created collection metadata.
+    """HNSW batch/sync thresholds must land on freshly-created collection metadata.
 
-    Without batch_size + sync_threshold, mining ~10K+ drawers triggers the
-    resize+persist drift that bloats link_lists.bin into hundreds of GB sparse
-    and segfaults `status` / `search` / `repair`. The guard belongs at
-    collection-creation time so every fresh palace gets it without needing
-    a runtime retrofit. Asserting both keys land on the persisted metadata
-    also covers the #1161 "config silently dropped" concern at CI time.
+    Low thresholds (2/2 per #1579) ensure chromadb's Rust HNSW segment
+    persists index_metadata and link_lists after any mine of 2+ drawers.
+    Asserting both keys land on the persisted metadata also covers the
+    #1161 "config silently dropped" concern at CI time.
     """
     palace_path = tmp_path / "palace"
 
@@ -410,8 +408,8 @@ def test_chroma_backend_sets_hnsw_bloat_guard_on_creation(tmp_path):
 
     client = chromadb.PersistentClient(path=str(palace_path))
     col = client.get_collection("mempalace_drawers")
-    assert col.metadata.get("hnsw:batch_size") == 50_000
-    assert col.metadata.get("hnsw:sync_threshold") == 50_000
+    assert col.metadata.get("hnsw:batch_size") == 2
+    assert col.metadata.get("hnsw:sync_threshold") == 2
 
 
 def test_chroma_backend_create_collection_sets_hnsw_bloat_guard(tmp_path):
@@ -422,8 +420,51 @@ def test_chroma_backend_create_collection_sets_hnsw_bloat_guard(tmp_path):
 
     client = chromadb.PersistentClient(path=str(palace_path))
     col = client.get_collection("mempalace_drawers")
-    assert col.metadata.get("hnsw:batch_size") == 50_000
-    assert col.metadata.get("hnsw:sync_threshold") == 50_000
+    assert col.metadata.get("hnsw:batch_size") == 2
+    assert col.metadata.get("hnsw:sync_threshold") == 2
+
+
+def test_sub_threshold_mine_persists_hnsw_metadata(tmp_path):
+    """Regression for #1579: small mines must persist HNSW metadata.
+
+    _HNSW_BLOAT_GUARD sets batch_size=2 and sync_threshold=2 so that any
+    upsert of 2+ records crosses both thresholds, triggering chromadb's
+    _apply_batch and _persist.  Without this, index_metadata and link_lists
+    stay empty and quarantine_stale_hnsw renames the segment on cold open.
+    """
+    palace_path = str(tmp_path / "palace")
+    backend = ChromaBackend()
+    try:
+        col = backend.get_collection(palace_path, "mempalace_drawers", create=True)
+
+        col.upsert(
+            ids=["a", "b", "c"],
+            documents=["doc a", "doc b", "doc c"],
+            embeddings=[[0.1] * 384, [0.2] * 384, [0.3] * 384],
+            metadatas=[{"wing": "t"}, {"wing": "t"}, {"wing": "t"}],
+        )
+    finally:
+        backend.close()
+
+    found_healthy_segment = False
+    for entry in (tmp_path / "palace").iterdir():
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        meta = entry / "index_metadata.pickle"
+        link = entry / "link_lists.bin"
+        data = entry / "data_level0.bin"
+        if data.exists() and data.stat().st_size > 1024:
+            assert meta.exists(), "index_metadata missing after sub-threshold upsert"
+            assert link.exists() and link.stat().st_size > 0, "link_lists empty"
+            assert _segment_appears_healthy(str(entry))
+            found_healthy_segment = True
+
+    assert found_healthy_segment, "no VECTOR segment with data found"
+
+    # stale_seconds=0.0 forces the stage-2 integrity gate (_segment_appears_healthy)
+    # to run on every segment regardless of mtime delta, proving the fix directly.
+    moved = quarantine_stale_hnsw(palace_path, stale_seconds=0.0)
+    assert moved == [], f"quarantine fired on freshly-persisted segment: {moved}"
 
 
 def test_get_collection_create_true_is_idempotent(tmp_path):
@@ -449,7 +490,7 @@ def test_get_collection_create_true_preserves_existing_metadata(tmp_path):
     backend.get_collection(palace, collection_name="mempalace_drawers", create=True)
     col = backend.get_collection(palace, collection_name="mempalace_drawers", create=True)
     assert col._collection.metadata["hnsw:space"] == "cosine"
-    assert col._collection.metadata.get("hnsw:batch_size") == 50_000
+    assert col._collection.metadata.get("hnsw:batch_size") == 2
 
 
 def test_fix_blob_seq_ids_converts_blobs_to_integers(tmp_path):
