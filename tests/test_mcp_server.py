@@ -3208,3 +3208,75 @@ class TestUnknownParamName:
         )
         assert "error" not in resp
         assert "result" in resp
+
+
+# ── get_all_metadatas pagination (#478) ─────────────────────────────────
+
+
+class TestGetAllMetadatasPagination:
+    def test_pagination_across_multiple_pages(self):
+        """Mock a collection returning 1000 records on page 1, 500 on page 2."""
+        from unittest.mock import MagicMock
+        from mempalace.palace import get_all_metadatas, METADATA_PAGE_SIZE
+
+        col = MagicMock()
+        page1_ids = [f"id_{i}" for i in range(METADATA_PAGE_SIZE)]
+        page1_meta = [{"wing": "w", "room": "r"} for _ in range(METADATA_PAGE_SIZE)]
+        page2_ids = [f"id_{i}" for i in range(500)]
+        page2_meta = [{"wing": "w2", "room": "r2"} for _ in range(500)]
+
+        col.get.side_effect = [
+            {"ids": page1_ids, "metadatas": page1_meta},
+            {"ids": page2_ids, "metadatas": page2_meta},
+        ]
+
+        result = get_all_metadatas(col)
+        assert len(result) == METADATA_PAGE_SIZE + 500
+        assert col.get.call_count == 2
+
+    def test_defensive_strips_limit_offset(self):
+        """extra_kwargs with limit/offset should be stripped, not override pagination."""
+        from unittest.mock import MagicMock
+        from mempalace.palace import get_all_metadatas
+
+        col = MagicMock()
+        col.get.return_value = {"ids": [], "metadatas": []}
+
+        # Passing limit/offset should not break pagination
+        result = get_all_metadatas(col, limit=5, offset=99)
+        assert result == []
+        # The call should use the internal page size, not the caller's limit
+        call_kwargs = col.get.call_args[1]
+        assert call_kwargs["offset"] == 0
+        assert call_kwargs["limit"] == 1000
+
+
+# ── tool_search limit clamping (#477) ───────────────────────────────────
+
+
+class TestToolSearchLimitClamping:
+    def test_limit_below_min_clamped_to_1(self, monkeypatch, config, palace_path, seeded_collection, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_search
+
+        # limit=0 should be clamped to 1
+        result = tool_search(query="test", limit=0)
+        assert "results" in result
+        assert len(result["results"]) <= 1
+
+    def test_limit_negative_clamped_to_1(self, monkeypatch, config, palace_path, seeded_collection, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_search
+
+        result = tool_search(query="test", limit=-5)
+        assert "results" in result
+        assert len(result["results"]) <= 1
+
+    def test_limit_above_max_clamped_to_100(self, monkeypatch, config, palace_path, seeded_collection, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_search
+
+        # limit=999 should be clamped to 100; we only have 4 seeded records
+        result = tool_search(query="test", limit=999)
+        assert "results" in result
+        assert len(result["results"]) <= 100

@@ -780,7 +780,7 @@ def file_already_mined(
             if stored_mtime is None:
                 return False
             current_mtime = os.path.getmtime(source_file)
-            return abs(float(stored_mtime) - current_mtime) < 0.001
+            return abs(float(stored_mtime) - current_mtime) < 0.01
         return True
     except Exception:
         return False
@@ -854,3 +854,24 @@ def prefetch_mined_set(collection, extract_mode: Optional[str] = None) -> set[st
     except Exception:
         logger.warning("prefetch_mined_set: partial fetch, %d files loaded", len(mined))
     return mined
+
+# Shared pagination constant — used by mcp_server and miner
+METADATA_PAGE_SIZE = 1000
+
+
+def get_all_metadatas(col, **extra_kwargs):
+    """Paginate through all metadatas in a collection to avoid the 10K truncation bug."""
+    # Strip keys that would silently override internal pagination control.
+    for _reserved in ("limit", "offset", "include"):
+        extra_kwargs.pop(_reserved, None)
+    all_meta = []
+    offset = 0
+    while True:
+        kwargs = {"include": ["metadatas"], "limit": METADATA_PAGE_SIZE, "offset": offset}
+        kwargs.update(extra_kwargs)
+        batch = col.get(**kwargs)
+        all_meta.extend(batch["metadatas"])
+        if not batch["ids"] or len(batch["ids"]) < METADATA_PAGE_SIZE:
+            break
+        offset += len(batch["ids"])
+    return all_meta

@@ -204,9 +204,18 @@ PRONOUN_RE = re.compile("|".join(PRONOUN_PATTERNS), re.IGNORECASE) if PRONOUN_PA
 DIALOGUE_PATTERNS = list(_EN["dialogue_patterns"])
 PROJECT_VERB_PATTERNS = list(_EN["project_verb_patterns"])
 STOPWORDS = set(_EN["stopwords"])
+# GENERIC_STOPWORDS and TECHNICAL_STOPWORDS are backward-compat aliases.
+# The stopwords list in en.json merges both; split here for callers that
+# override technical terms independently.
+GENERIC_STOPWORDS = STOPWORDS
+TECHNICAL_STOPWORDS = STOPWORDS
+
 
 
 # ==================== EXTENSION POINTS (not language-scoped) ====================
+
+# Combined set used by the detector
+STOPWORDS = GENERIC_STOPWORDS | TECHNICAL_STOPWORDS
 
 # For entity detection — prose only, no code files
 # Code files have too many capitalized names (classes, functions) that aren't entities
