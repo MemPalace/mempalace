@@ -198,16 +198,31 @@ def compute_hallways_for_wing(
 
     min_count = max(1, int(min_count))
 
-    # 1. Query drawers for this wing.
+    # 1. Query drawers for this wing. Paginate the fetch — a single
+    #    get(where={"wing": wing}) binds one SQL variable per matching id and
+    #    trips SQLite's SQLITE_MAX_VARIABLE_NUMBER (32766) inside chromadb once
+    #    the wing exceeds ~32k drawers, crashing the post-mine hallway step on
+    #    exactly the large wings that most need it. Mirrors the paginated fetch
+    #    already used in miner.py (#851) and closet_llm.py (#1073): walk the
+    #    collection in batches of 5000 and filter to this wing client-side.
+    metadatas: list = []
     try:
-        results = col.get(where={"wing": wing}, include=["metadatas"])
+        total = col.count()
+        batch_size = 5000
+        offset = 0
+        while offset < total:
+            batch = col.get(limit=batch_size, offset=offset, include=["metadatas"])
+            batch_metas = (batch or {}).get("metadatas") or []
+            if not batch_metas:
+                break
+            metadatas.extend(m for m in batch_metas if (m or {}).get("wing") == wing)
+            offset += len(batch_metas)
     except Exception:
         logger.warning(
             "compute_hallways_for_wing: collection.get failed for %s", wing, exc_info=True
         )
         return []
 
-    metadatas = (results or {}).get("metadatas") or []
     if not metadatas:
         return []
 
