@@ -186,7 +186,7 @@ def split_file(filepath, output_dir, dry_run=False):
     if path.stat().st_size > max_size:
         print(f"  SKIP: {path.name} exceeds {max_size // (1024 * 1024)} MB limit")
         return []
-    lines = path.read_text(errors="replace").splitlines(keepends=True)
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
 
     boundaries = find_session_boundaries(lines)
     if len(boundaries) < 2:
@@ -275,7 +275,7 @@ def main():
         if f.stat().st_size > max_scan_size:
             print(f"  SKIP: {f.name} exceeds {max_scan_size // (1024 * 1024)} MB limit")
             continue
-        lines = f.read_text(errors="replace").splitlines(keepends=True)
+        lines = f.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
         boundaries = find_session_boundaries(lines)
         if len(boundaries) >= args.min_sessions:
             mega_files.append((f, len(boundaries)))

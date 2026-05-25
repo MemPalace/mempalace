@@ -391,7 +391,7 @@ def load_config(project_dir: str) -> dict:
                     }
                 ],
             }
-    with open(config_path) as f:
+    with open(config_path, encoding="utf-8", errors="replace") as f:
         return yaml.safe_load(f)
 
 
@@ -1842,7 +1842,7 @@ def _cleanup_mine_pid_file() -> None:
         pid_file = Path(pid_file_env)
         if not pid_file.exists():
             return
-        recorded = pid_file.read_text().strip()
+        recorded = pid_file.read_text(encoding="utf-8").strip()
         # PID file format: "{pid} {unix_timestamp}" (timestamp added in
         # #1552 for stale-by-age detection).  Old-format files (bare
         # "{pid}") are also handled: split on whitespace and take the

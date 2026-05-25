@@ -55,7 +55,7 @@ class Layer0:
             return self._text
 
         if os.path.exists(self.path):
-            with open(self.path, "r") as f:
+            with open(self.path, "r", encoding="utf-8", errors="replace") as f:
                 self._text = f.read().strip()
         else:
             self._text = (
