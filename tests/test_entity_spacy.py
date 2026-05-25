@@ -139,6 +139,26 @@ def test_extract_counts_repeated_entities():
     assert result["Igor"] == 1
 
 
+def test_extract_dedupes_case_variants_under_first_seen_canonical():
+    """spaCy can emit the same entity in mixed case ('Apple' vs 'apple')
+    across a single doc depending on the model's confidence at each
+    mention. The counts dict must dedupe by case-folded key but keep
+    the first-seen surface form as the canonical key."""
+    fake_ents = [
+        _make_fake_ent("Apple", "ORG"),  # first-seen = "Apple"
+        _make_fake_ent("apple", "ORG"),  # case variant, merges into "Apple"
+        _make_fake_ent("APPLE", "ORG"),  # another case variant
+    ]
+    fake_nlp = _make_fake_nlp(fake_ents)
+    with patch.object(entity_spacy, "_get_spacy_nlp", return_value=fake_nlp):
+        result = entity_spacy.extract_spacy_entities("any text")
+
+    # Only ONE key in the result, using the first-seen case
+    assert list(result.keys()) == ["Apple"]
+    # And the count is 3 (all three mentions merged)
+    assert result["Apple"] == 3
+
+
 def test_extract_strips_whitespace_in_entity_text():
     """spaCy occasionally emits ents with surrounding whitespace; strip them."""
     fake_ents = [

@@ -904,13 +904,23 @@ def _extract_entities_for_metadata(content: str) -> str:
     # "these aren't entity-worthy regardless of which pipeline found them."
     # ``extract_spacy_entities`` returns ``{}`` when spaCy isn't
     # available, so behavior is unchanged for users on the base install.
+    #
+    # Case-fold the membership check so spaCy hits don't duplicate
+    # entries already in ``matched`` under a different case (regex
+    # added "Aya" from a known-entities scan, spaCy emits "aya" —
+    # both would land as distinct entries without this guard). Same
+    # design contract as the merge in ``entity_detector.extract_candidates``.
+    matched_lower = {m.lower() for m in matched}
     for spacy_name in extract_spacy_entities(window):
+        key_lower = spacy_name.lower()
         if (
             spacy_name not in _ENTITY_STOPLIST
-            and spacy_name.lower() not in coca_filter
+            and key_lower not in coca_filter
+            and key_lower not in matched_lower
             and len(spacy_name) > 2
         ):
             matched.add(spacy_name)
+            matched_lower.add(key_lower)
 
     if not matched:
         return ""

@@ -236,6 +236,31 @@ def test_extract_candidates_single_word_code_still_coca_filtered():
     )
 
 
+def test_extract_candidates_case_folds_spacy_merge():
+    """When regex stored 'Apple' (3+ mentions) and spaCy emits 'apple' for
+    the same entity, the merge must collapse them onto ONE entry — the
+    regex case wins because it ran first. Without case-folding the merge,
+    both 'Apple' and 'apple' end up as distinct keys, scored and classified
+    separately as duplicates."""
+    from unittest.mock import patch
+
+    # Three "Apple" mentions clears the >=3 regex threshold, so result
+    # will contain "Apple" before the spaCy augmentation runs.
+    text = "Apple builds chips. Apple makes phones. Apple does silicon."
+
+    # spaCy returns the lowercase variant — this is the realistic
+    # scenario, since statistical NER picks up case from local context.
+    fake_spacy_result = {"apple": 1}
+
+    with patch("mempalace.entity_detector.extract_spacy_entities", return_value=fake_spacy_result):
+        result = extract_candidates(text)
+
+    assert "Apple" in result, f"'Apple' missing; got: {list(result.keys())!r}"
+    assert "apple" not in result, (
+        f"'apple' case-variant should have merged into 'Apple'; got both: {list(result.keys())!r}"
+    )
+
+
 def test_extract_candidates_detects_multiple_distinct_compounds():
     """Multiple known compounds in the same text are each detected
     independently."""

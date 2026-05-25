@@ -186,12 +186,27 @@ def extract_spacy_entities(text: str) -> dict[str, int]:
         )
         return {}
 
+    # Dedupe by case-folded surface form. spaCy can emit the same entity
+    # in mixed case across a single doc ("Apple" and "apple") depending on
+    # the model's confidence at each mention. Without case-folded dedup
+    # they end up as separate keys in the counts dict, which then poisons
+    # the downstream union (regex sees "Apple" count 5, spaCy adds
+    # "apple" count 1, both land as distinct entries). We keep the
+    # first-seen surface form as the canonical key (preserves the case
+    # the user actually wrote) and just sum counts under it.
     counts: dict[str, int] = {}
+    canonical_by_lower: dict[str, str] = {}
     for ent in doc.ents:
         if ent.label_ not in _KEEP_LABELS:
             continue
         name = ent.text.strip()
         if not name:
             continue
-        counts[name] = counts.get(name, 0) + 1
+        key_lower = name.lower()
+        canonical = canonical_by_lower.get(key_lower)
+        if canonical is None:
+            canonical_by_lower[key_lower] = name
+            counts[name] = 1
+        else:
+            counts[canonical] += 1
     return counts
