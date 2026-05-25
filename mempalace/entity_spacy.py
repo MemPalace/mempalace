@@ -105,31 +105,47 @@ def _get_spacy_nlp(model_name: str):
 
     import spacy
 
+    # Outer broad-Exception guard — this module's design contract is
+    # "strictly opt-in, never load-bearing." A ValueError on an invalid
+    # model name, an ImportError from a broken model package, or any
+    # other spaCy-internal failure must NOT crash the caller; the rest
+    # of the entity pipeline must keep running. The inner OSError-only
+    # path handles the common "model not installed → try to download"
+    # case; anything else falls through to the outer except.
     try:
-        return spacy.load(model_name)
-    except OSError:
-        # Model not installed — attempt one-time lazy download.
-        logger.info("spaCy model %r not present locally; downloading", model_name)
-        try:
-            spacy.cli.download(model_name)
-        except Exception as exc:  # network down, disk full, permissions, etc.
-            logger.warning(
-                "spaCy model download failed for %r (%s); spaCy NER "
-                "augmentation will be skipped for this session",
-                model_name,
-                exc,
-            )
-            return None
         try:
             return spacy.load(model_name)
-        except Exception as exc:
-            logger.warning(
-                "spaCy model %r still unloadable after download (%s); "
-                "spaCy NER augmentation will be skipped",
-                model_name,
-                exc,
-            )
-            return None
+        except OSError:
+            # Model not installed — attempt one-time lazy download.
+            logger.info("spaCy model %r not present locally; downloading", model_name)
+            try:
+                spacy.cli.download(model_name)
+            except Exception as exc:  # network down, disk full, permissions, etc.
+                logger.warning(
+                    "spaCy model download failed for %r (%s); spaCy NER "
+                    "augmentation will be skipped for this session",
+                    model_name,
+                    exc,
+                )
+                return None
+            try:
+                return spacy.load(model_name)
+            except Exception as exc:
+                logger.warning(
+                    "spaCy model %r still unloadable after download (%s); "
+                    "spaCy NER augmentation will be skipped",
+                    model_name,
+                    exc,
+                )
+                return None
+    except Exception as exc:
+        logger.warning(
+            "spaCy model %r failed to load (%s); spaCy NER augmentation "
+            "will be skipped for this session",
+            model_name,
+            exc,
+        )
+        return None
 
 
 def extract_spacy_entities(text: str) -> dict[str, int]:

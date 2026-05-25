@@ -235,6 +235,40 @@ def test_get_spacy_nlp_is_cached_per_model():
     assert fake_spacy.load.call_count == 1
 
 
+def test_get_spacy_nlp_returns_none_on_value_error():
+    """spacy.load can raise ValueError on an invalid model name. The
+    module's design contract is 'never load-bearing,' so this MUST
+    return None rather than propagate — the entity pipeline keeps
+    working even when spaCy mis-configures."""
+    fake_spacy = MagicMock()
+    fake_spacy.load.side_effect = ValueError("invalid model name")
+    with patch.dict(sys.modules, {"spacy": fake_spacy}):
+        result = entity_spacy._get_spacy_nlp("not_a_real_model")
+    assert result is None
+
+
+def test_get_spacy_nlp_returns_none_on_import_error_from_model_package():
+    """If a spaCy model package itself is broken (importable as a
+    package but raises ImportError on load), the loader must return
+    None rather than crash the caller."""
+    fake_spacy = MagicMock()
+    fake_spacy.load.side_effect = ImportError("broken model package")
+    with patch.dict(sys.modules, {"spacy": fake_spacy}):
+        result = entity_spacy._get_spacy_nlp("en_core_web_sm")
+    assert result is None
+
+
+def test_get_spacy_nlp_returns_none_on_arbitrary_exception():
+    """Any other spaCy-internal failure must NOT crash the caller. The
+    broad outer except is the design contract that says 'spaCy is opt-in,
+    never load-bearing.'"""
+    fake_spacy = MagicMock()
+    fake_spacy.load.side_effect = RuntimeError("some spacy internal failure")
+    with patch.dict(sys.modules, {"spacy": fake_spacy}):
+        result = entity_spacy._get_spacy_nlp("en_core_web_sm")
+    assert result is None
+
+
 def test_get_spacy_nlp_downloads_when_model_missing():
     """When spacy.load raises OSError (model not installed), the loader
     must call spacy.cli.download once, then retry load."""
