@@ -801,6 +801,36 @@ def test_mine_formats_respects_limit(_mine_formats_mocks):
     assert p_md.call_count == 2
 
 
+def test_mine_formats_limit_skips_already_mined(_mine_formats_mocks):
+    """--limit N counts only new work, not already-mined skips (#1535)."""
+    from unittest.mock import patch
+    from mempalace.format_miner import mine_formats
+
+    tmp = _mine_formats_mocks["tmp_path"]
+    files = []
+    for i in range(6):
+        p = tmp / f"f{i}.pdf"
+        p.write_bytes(b"%PDF-1.4 stub")
+        files.append(p)
+
+    call_idx = 0
+
+    def fake_already_mined(collection, source_file, **kwargs):
+        nonlocal call_idx
+        call_idx += 1
+        return call_idx <= 4
+
+    _mine_formats_mocks["file_already_mined"].side_effect = fake_already_mined
+    with (
+        patch("mempalace.format_miner.scan_formats", return_value=files),
+        patch(
+            "mempalace.format_miner._extract_via_markitdown", return_value="long text " * 50
+        ) as p_md,
+    ):
+        mine_formats(format_dir=str(tmp), palace_path=str(tmp / "palace"), limit=1)
+    assert p_md.call_count == 1
+
+
 def test_mine_formats_wing_defaults_from_directory_name(_mine_formats_mocks):
     """When wing=None, the directory's basename becomes the wing."""
     from unittest.mock import patch

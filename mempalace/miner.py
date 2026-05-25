@@ -1620,9 +1620,6 @@ def _mine_impl(
             respect_gitignore=respect_gitignore,
             include_ignored=include_ignored,
         )
-    if limit > 0:
-        files = files[:limit]
-
     from .embedding import describe_device
 
     print(f"\n{'=' * 55}")
@@ -1630,7 +1627,8 @@ def _mine_impl(
     print(f"{'=' * 55}")
     print(f"  Wing:    {wing}")
     print(f"  Rooms:   {', '.join(r['name'] for r in rooms)}")
-    print(f"  Files:   {len(files)}")
+    limit_suffix = f" (limit: {limit} new)" if limit > 0 else ""
+    print(f"  Files:   {len(files)}{limit_suffix}")
     print(f"  Palace:  {palace_path}")
     print(f"  Device:  {describe_device()}")
     if dry_run:
@@ -1649,6 +1647,7 @@ def _mine_impl(
         closets_col = None
 
     total_drawers = 0
+    files_mined = 0
     files_skipped = 0
     files_skipped_chunk_cap = 0
     files_processed = 0
@@ -1696,8 +1695,11 @@ def _mine_impl(
             else:
                 total_drawers += drawers
                 room_counts[room] += 1
+                files_mined += 1
                 if not dry_run:
                     print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers}")
+                if limit > 0 and files_mined >= limit:
+                    break
 
         if not dry_run:
             # Cross-wing topic tunnels: after every file in this wing has been
@@ -1750,7 +1752,7 @@ def _mine_impl(
 
         print(f"\n{'=' * 55}")
         print("  Done.")
-        print(f"  Files processed: {len(files) - files_skipped}")
+        print(f"  Files processed: {files_processed - files_skipped}")
         # The residual skip bucket label depends on mode: dry-run bypasses
         # the already-mined check, so the only paths producing (0, room,
         # None) under dry_run are OSError / too-short / post-lock re-check
