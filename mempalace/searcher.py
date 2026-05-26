@@ -205,8 +205,11 @@ def _rollup_by_stack(hits: list) -> list:
             output.append(hit)
         else:
             best_hit, count = seen_stacks[stack_id]
-            best_filed = (best_hit.get("metadata") or {}).get("filed_at", "")
-            this_filed = meta.get("filed_at", "")
+            # ``or ""`` guards against ``filed_at: None`` in metadata (which
+            # would crash ``this_filed > best_filed`` with TypeError). Returns
+            # "" for both missing AND None.
+            best_filed = (best_hit.get("metadata") or {}).get("filed_at") or ""
+            this_filed = meta.get("filed_at") or ""
             # Keep the latest layer (highest filed_at). Ties resolved by
             # whichever was seen first (preserves rank order).
             if this_filed > best_filed:

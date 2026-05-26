@@ -773,7 +773,13 @@ def cmd_delete(args):
         return
 
     if not args.force:
-        confirm = input(f"  Destroy {len(affected_ids)} drawer(s)? [y/N]: ").strip().lower()
+        # ``input()`` raises EOFError in non-TTY environments (CI pipelines,
+        # piped invocations). Treat that as a "no" — destruction is opt-in,
+        # so the safe default when we can't ask is to abort.
+        try:
+            confirm = input(f"  Destroy {len(affected_ids)} drawer(s)? [y/N]: ").strip().lower()
+        except EOFError:
+            confirm = "n"
         if confirm != "y":
             print("  Aborted. No drawers were destroyed.")
             return
@@ -845,7 +851,10 @@ def cmd_show(args):
 
     layers = sorted(
         zip(result["ids"], result["documents"], result["metadatas"]),
-        key=lambda triple: (triple[2] or {}).get("filed_at", ""),
+        # ``or ""`` guards against an explicit ``filed_at: None`` in metadata
+        # (which would crash sort with TypeError: '>' not supported between
+        # str and NoneType). Returns "" for both missing AND None.
+        key=lambda triple: (triple[2] or {}).get("filed_at") or "",
         reverse=True,  # latest first
     )
     total = len(layers)
@@ -874,7 +883,10 @@ def cmd_show(args):
         try:
             requested_int = int(requested)
             if requested_int < 1 or requested_int > total:
-                print(f"  ERROR: layer {requested_int} out of range (stack has {total} layers).")
+                print(
+                    f"  ERROR: layer {requested_int} out of range (stack has {total} layers).",
+                    file=sys.stderr,
+                )
                 sys.exit(2)
             idx = requested_int - 1
         except ValueError:
