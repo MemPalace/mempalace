@@ -317,3 +317,50 @@ class TestEmbeddingModelMismatchDetection:
 
         col = get_collection(palace_path)
         assert col.metadata.get("embedding_model") == "chromadb-default"
+
+
+class TestSecondaryCollectionInheritsModel:
+    """Secondary collections (closets, compressed) are created lazily, after
+    the drawers collection and without an explicit --model. They must inherit
+    the palace's canonical model (stamped on drawers at init) rather than
+    silently falling back to the ChromaDB default — otherwise one palace mixes
+    embedding models and non-English search degrades on the index layer.
+    """
+
+    def test_closets_inherits_drawers_model(self, tmp_path):
+        palace_path = str(tmp_path / "palace")
+        # drawers stamped with the palace model, as `init --model` does
+        get_collection(palace_path, model="intfloat/multilingual-e5-base")
+
+        import mempalace.config as cfg_mod
+        cfg_mod._embedding_cache.clear()
+
+        # closets created afterwards without an explicit model
+        closets = get_collection(palace_path, collection_name="mempalace_closets")
+        assert closets.metadata.get("embedding_model") == "intfloat/multilingual-e5-base"
+        assert (
+            read_collection_metadata(palace_path, "mempalace_closets").get("embedding_model")
+            == "intfloat/multilingual-e5-base"
+        )
+
+    def test_compressed_inherits_drawers_model(self, tmp_path):
+        palace_path = str(tmp_path / "palace")
+        get_collection(palace_path, model="intfloat/multilingual-e5-base")
+
+        import mempalace.config as cfg_mod
+        cfg_mod._embedding_cache.clear()
+
+        compressed = get_collection(palace_path, collection_name="mempalace_compressed")
+        assert compressed.metadata.get("embedding_model") == "intfloat/multilingual-e5-base"
+
+    def test_secondary_defaults_when_drawers_default(self, tmp_path):
+        """If drawers is on the default, secondary collections stay default too
+        (consistent — no spurious model, no mismatch)."""
+        palace_path = str(tmp_path / "palace")
+        get_collection(palace_path)  # drawers -> chromadb-default
+
+        import mempalace.config as cfg_mod
+        cfg_mod._embedding_cache.clear()
+
+        closets = get_collection(palace_path, collection_name="mempalace_closets")
+        assert closets.metadata.get("embedding_model") == "chromadb-default"

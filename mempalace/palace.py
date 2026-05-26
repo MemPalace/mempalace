@@ -16,9 +16,11 @@ from .backends.chroma import ChromaBackend
 from .config import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_CHUNK_OVERLAP,
+    DEFAULT_COLLECTION_NAME,
     EmbeddingModelMismatchError,
     MempalaceConfig,
     get_embedding_function,
+    get_embedding_model_name,
     read_collection_metadata,
 )
 
@@ -94,7 +96,18 @@ def get_collection(
     if model:
         current_model = model
     else:
-        current_model = existing_meta.get("embedding_model", "chromadb-default")
+        current_model = existing_meta.get("embedding_model")
+        if current_model is None:
+            # Secondary collections (closets, compressed) are created lazily
+            # after the drawers collection and without an explicit --model.
+            # Inherit the palace's canonical model (stamped on drawers at init)
+            # so one palace never mixes embedding models. Without this they
+            # silently fall back to the ChromaDB default while drawers use the
+            # configured model, degrading non-English search on the index layer.
+            if collection_name != DEFAULT_COLLECTION_NAME:
+                current_model = get_embedding_model_name(palace_path)
+            else:
+                current_model = "chromadb-default"
 
     # Mismatch pre-check: surface our domain error BEFORE chromadb's internal
     # EF-conflict validator does. Without this, an explicit model override
