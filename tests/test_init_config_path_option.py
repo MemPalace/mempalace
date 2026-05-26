@@ -50,6 +50,19 @@ def test_resolve_init_project_config_dir_prompts_for_custom_path(tmp_path):
     assert resolved == (project / ".mempalace" / "config").resolve()
 
 
+def test_resolve_init_project_config_dir_eof_falls_back_to_project_root(tmp_path):
+    from mempalace.cli import _resolve_init_project_config_dir
+
+    project = tmp_path / "project"
+    project.mkdir()
+    args = _base_args(project, yes=False, project_config_dir=None)
+
+    with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", side_effect=EOFError):
+        resolved = _resolve_init_project_config_dir(args=args, project_dir=str(project))
+
+    assert resolved == project.resolve()
+
+
 def test_cmd_init_writes_entities_to_selected_config_dir_and_passes_room_target(tmp_path):
     from mempalace.cli import cmd_init
 

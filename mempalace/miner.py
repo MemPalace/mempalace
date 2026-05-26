@@ -365,12 +365,15 @@ def load_config(project_dir: str) -> dict:
 
     pointer_path = resolved_project_dir / ".mempalace" / "config_dir.txt"
     if pointer_path.exists():
-        pointer_value = pointer_path.read_text(encoding="utf-8").strip()
-        if pointer_value:
-            pointer_dir = Path(pointer_value).expanduser()
-            if not pointer_dir.is_absolute():
-                pointer_dir = resolved_project_dir / pointer_dir
-            candidates.insert(0, pointer_dir.resolve() / "mempalace.yaml")
+        try:
+            pointer_value = pointer_path.read_text(encoding="utf-8").strip()
+            if pointer_value:
+                pointer_dir = Path(pointer_value).expanduser()
+                if not pointer_dir.is_absolute():
+                    pointer_dir = resolved_project_dir / pointer_dir
+                candidates.insert(0, pointer_dir.resolve() / "mempalace.yaml")
+        except (OSError, RuntimeError):
+            pass
 
     config_path = next((candidate for candidate in candidates if candidate.exists()), None)
     if config_path is None:

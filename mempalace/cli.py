@@ -258,13 +258,17 @@ def _resolve_init_project_config_dir(args, project_dir: str) -> Path:
     print("\n  Project config file location")
     print(f"    1) Default: project root ({project_path})")
     print("    2) Custom directory")
-    choice = input("  Choose [1/2] (default 1): ").strip().lower()
-    if choice not in {"2", "custom", "c"}:
+    try:
+        choice = input("  Choose [1/2] (default 1): ").strip().lower()
+        if choice not in {"2", "custom", "c"}:
+            return project_path
+        custom = input("  Config directory path (absolute or project-relative): ").strip()
+    except EOFError:
         return project_path
 
-    custom = input("  Config directory path (absolute or project-relative): ").strip()
     if not custom:
         return project_path
+
     selected = Path(custom).expanduser()
     if not selected.is_absolute():
         selected = project_path / selected

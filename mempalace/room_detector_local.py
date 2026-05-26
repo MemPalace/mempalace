@@ -291,10 +291,13 @@ def save_config(project_dir: str, project_name: str, rooms: list, config_dir: st
             for r in rooms
         ],
     }
-    config_root = Path(config_dir).expanduser().resolve() if config_dir else Path(project_dir).expanduser().resolve()
+    if config_dir:
+        config_root = Path(config_dir).expanduser().resolve()
+    else:
+        config_root = Path(project_dir).expanduser().resolve()
     config_root.mkdir(parents=True, exist_ok=True)
     config_path = config_root / "mempalace.yaml"
-    with open(config_path, "w") as f:
+    with open(config_path, "w", encoding="utf-8") as f:
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
     print(f"\n  Config saved: {config_path}")
