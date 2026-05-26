@@ -279,7 +279,7 @@ def get_user_approval(rooms: list) -> list:
     return rooms
 
 
-def save_config(project_dir: str, project_name: str, rooms: list):
+def save_config(project_dir: str, project_name: str, rooms: list, config_dir: str = None):
     config = {
         "wing": project_name,
         "rooms": [
@@ -291,7 +291,9 @@ def save_config(project_dir: str, project_name: str, rooms: list):
             for r in rooms
         ],
     }
-    config_path = Path(project_dir).expanduser().resolve() / "mempalace.yaml"
+    config_root = Path(config_dir).expanduser().resolve() if config_dir else Path(project_dir).expanduser().resolve()
+    config_root.mkdir(parents=True, exist_ok=True)
+    config_path = config_root / "mempalace.yaml"
     with open(config_path, "w") as f:
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
@@ -301,7 +303,7 @@ def save_config(project_dir: str, project_name: str, rooms: list):
     print(f"\n{'=' * 55}\n")
 
 
-def detect_rooms_local(project_dir: str, yes: bool = False):
+def detect_rooms_local(project_dir: str, yes: bool = False, config_dir: str = None):
     """Main entry point for local setup."""
     from .config import normalize_wing_name
 
@@ -336,4 +338,4 @@ def detect_rooms_local(project_dir: str, yes: bool = False):
         approved_rooms = rooms
     else:
         approved_rooms = get_user_approval(rooms)
-    save_config(project_dir, project_name, approved_rooms)
+    save_config(project_dir, project_name, approved_rooms, config_dir=config_dir)

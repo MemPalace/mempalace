@@ -177,7 +177,11 @@ def test_cmd_init_no_entities(mock_config_cls, tmp_path):
         patch("mempalace.cli._maybe_run_mine_after_init"),
     ):
         cmd_init(args)
-        mock_rooms.assert_called_once_with(project_dir=str(tmp_path), yes=True)
+        mock_rooms.assert_called_once_with(
+            project_dir=str(tmp_path),
+            yes=True,
+            config_dir=str(tmp_path),
+        )
         mock_config_cls.return_value.init.assert_called_once()
 
 
