@@ -665,6 +665,24 @@ def _pin_hnsw_threads(collection) -> None:
 
 
 _BLOB_FIX_MARKER = ".blob_seq_ids_migrated"
+_INVALID_HNSW_METADATA_FRESH_SECONDS_DEFAULT = 600.0
+_INVALID_HNSW_METADATA_FRESH_SECONDS_ENV = "MEMPALACE_INVALID_HNSW_METADATA_FRESH_SECONDS"
+
+
+def _invalid_hnsw_metadata_fresh_seconds() -> float:
+    """Return freshness window for missing-dimensionality quarantine guards."""
+    raw = os.getenv(_INVALID_HNSW_METADATA_FRESH_SECONDS_ENV, "").strip()
+    if not raw:
+        return _INVALID_HNSW_METADATA_FRESH_SECONDS_DEFAULT
+    try:
+        value = float(raw)
+    except ValueError:
+        return _INVALID_HNSW_METADATA_FRESH_SECONDS_DEFAULT
+    return (
+        value
+        if value >= 0.0
+        else _INVALID_HNSW_METADATA_FRESH_SECONDS_DEFAULT
+    )
 
 
 def _valid_dimensionality(value: object) -> bool:
@@ -714,6 +732,27 @@ def _missing_dimensionality_appears_recoverable(
         return all(label_to_id.get(label) == item_id for item_id, label in id_to_label.items())
     except TypeError:
         return False
+
+
+def _segment_recently_touched(seg_dir: str, window_seconds: float) -> bool:
+    """Return True when segment files were touched recently.
+
+    Fresh VECTOR segments can momentarily expose ``id_to_label`` while
+    ``dimensionality`` is still ``None`` during flush windows. Treating that as
+    corruption and renaming the segment races active writers and can create an
+    endless quarantine loop.
+    """
+    now = _dt.datetime.now().timestamp()
+    newest = 0.0
+    for name in ("index_metadata.pickle", "data_level0.bin", "link_lists.bin"):
+        path = os.path.join(seg_dir, name)
+        try:
+            newest = max(newest, os.path.getmtime(path))
+        except OSError:
+            continue
+    if newest <= 0.0:
+        return False
+    return (now - newest) <= window_seconds
 
 
 def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
@@ -774,21 +813,34 @@ def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
                     reason = f"invalid id_to_label type {type(id_to_label).__name__}"
                 else:
                     has_labels = bool(id_to_label)
-                    if (
-                        has_labels
-                        and dimensionality is None
-                        and not _missing_dimensionality_appears_recoverable(
-                            persisted, id_to_label, seg_dir
-                        )
-                    ):
+                    if has_labels and dimensionality is None:
+                        if _missing_dimensionality_appears_recoverable(persisted, id_to_label, seg_dir):
+                            logger.debug(
+                                "Skipping invalid-HNSW quarantine for segment %s "
+                                "(labels present, dimensionality=None, recoverable/fresh)",
+                                seg_dir,
+                            )
+                            continue
+                        total = _persisted_metadata_value(persisted, "total_elements_added")
+                        label_to_id = _persisted_metadata_value(persisted, "label_to_id")
+                        has_consistency_shape = isinstance(total, Integral) and not isinstance(
+                            total, bool
+                        ) and isinstance(label_to_id, dict)
+                        if (not has_consistency_shape) and _segment_recently_touched(
+                            seg_dir, _invalid_hnsw_metadata_fresh_seconds()
+                        ):
+                            logger.debug(
+                                "Skipping invalid-HNSW quarantine for fresh segment %s "
+                                "(labels present, dimensionality=None, no consistency shape yet)",
+                                seg_dir,
+                            )
+                            continue
                         reason = (
                             "labels present but dimensionality is missing or invalid "
                             f"({dimensionality!r})"
                         )
-                    elif (
-                        has_labels
-                        and dimensionality is not None
-                        and not _valid_dimensionality(dimensionality)
+                    elif has_labels and dimensionality is not None and not _valid_dimensionality(
+                        dimensionality
                     ):
                         reason = (
                             "labels present but dimensionality is missing or invalid "

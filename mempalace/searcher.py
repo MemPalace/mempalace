@@ -14,7 +14,9 @@ import math
 import os
 import re
 import sqlite3
+import time
 from pathlib import Path
+from typing import Optional
 
 from .backends import CollectionNotInitializedError, PalaceNotFoundError
 from .palace import get_closets_collection, get_collection
@@ -31,6 +33,121 @@ class SearchError(Exception):
 
 
 _TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
+_TRANSIENT_INDEX_RETRY_DELAYS_SECONDS = (0.25, 0.5, 1.0, 2.0)
+
+
+class _TransientRetryFailed(Exception):
+    """Raised when the retry attempt after a transient vector error also fails."""
+
+    def __init__(self, retry_error: Exception):
+        super().__init__(str(retry_error))
+        self.retry_error = retry_error
+
+
+def _is_transient_index_error(exc: Exception) -> bool:
+    """Return True for transient Chroma index errors worth one retry.
+
+    Chroma can briefly return ``Internal error: Error finding id`` during
+    post-write HNSW flush windows. A one-shot retry after cache reset
+    usually recovers without surfacing an error to the CLI user.
+    """
+    msg = str(exc)
+    return "Error finding id" in msg or "Internal error" in msg
+
+
+def _force_search_backend_cache_reset(palace_path: str) -> None:
+    """Drop cached backend handles for ``palace_path`` before retrying."""
+    try:
+        from .palace import _DEFAULT_BACKEND
+
+        _DEFAULT_BACKEND._clients.pop(palace_path, None)
+        _DEFAULT_BACKEND._freshness.pop(palace_path, None)
+    except Exception:
+        pass
+
+
+def _query_with_transient_retry(
+    col,
+    *,
+    palace_path: str,
+    query_kwargs: dict,
+    collection_name: Optional[str] = None,
+):
+    """Query with exponential backoff on transient HNSW lookup failures."""
+    transient_error: Optional[Exception] = None
+    try:
+        return col.query(**query_kwargs), col
+    except Exception as err:
+        if not _is_transient_index_error(err):
+            raise
+        transient_error = err
+    last_error: Exception = transient_error if transient_error is not None else RuntimeError(
+        "transient query failed"
+    )
+    for delay_seconds in _TRANSIENT_INDEX_RETRY_DELAYS_SECONDS:
+        _force_search_backend_cache_reset(palace_path)
+        time.sleep(delay_seconds)
+        try:
+            retry_col = get_collection(palace_path, collection_name=collection_name, create=False)
+        except Exception as reconnect_error:
+            last_error = reconnect_error
+            break
+        try:
+            return retry_col.query(**query_kwargs), retry_col
+        except Exception as retry_error:
+            last_error = retry_error
+            if not _is_transient_index_error(retry_error):
+                break
+    raise _TransientRetryFailed(last_error) from last_error
+
+
+def _search_memories_drawer_query_or_fallback(
+    drawers_col,
+    *,
+    query: str,
+    palace_path: str,
+    where: dict,
+    n_results: int,
+    wing: str,
+    room: str,
+    collection_name: Optional[str],
+) -> tuple[Optional[dict], Optional[object], Optional[dict], Optional[str]]:
+    """Return drawer query results, or a BM25 fallback/error payload.
+
+    Returns ``(drawer_results, drawers_col, fallback_payload, error_message)``.
+    Exactly one of ``drawer_results``, ``fallback_payload``, ``error_message``
+    is set.
+    """
+    dkwargs = {
+        "query_texts": [query],
+        "n_results": n_results * 3,
+        "include": ["documents", "metadatas", "distances"],
+    }
+    if where:
+        dkwargs["where"] = where
+    try:
+        drawer_results, drawers_col = _query_with_transient_retry(
+            drawers_col,
+            palace_path=palace_path,
+            query_kwargs=dkwargs,
+            collection_name=collection_name,
+        )
+        return drawer_results, drawers_col, None, None
+    except _TransientRetryFailed as exc:
+        fallback_payload = _bm25_only_via_sqlite(
+            query,
+            palace_path,
+            wing=wing,
+            room=room,
+            n_results=n_results,
+            collection_name=collection_name,
+        )
+        if fallback_payload.get("error"):
+            return None, None, None, f"Search error: {exc.retry_error}"
+        fallback_payload["fallback_reason"] = "transient_vector_error_after_retry"
+        return None, None, fallback_payload, None
+    except Exception as e:
+        return None, None, None, f"Search error: {e}"
 
 
 def _first_or_empty(results, key: str) -> list:
@@ -329,42 +446,67 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
 
     where = build_where_filter(wing, room)
 
+    kwargs = {
+        "query_texts": [query],
+        "n_results": n_results,
+        "include": ["documents", "metadatas", "distances"],
+    }
+    if where:
+        kwargs["where"] = where
+
+    fallback_payload = None
+
     try:
-        kwargs = {
-            "query_texts": [query],
-            "n_results": n_results,
-            "include": ["documents", "metadatas", "distances"],
-        }
-        if where:
-            kwargs["where"] = where
-
-        results = col.query(**kwargs)
-
+        results, col = _query_with_transient_retry(
+            col,
+            palace_path=palace_path,
+            query_kwargs=kwargs,
+        )
+    except _TransientRetryFailed as exc:
+        fallback_payload = _bm25_only_via_sqlite(
+            query=query,
+            palace_path=palace_path,
+            wing=wing,
+            room=room,
+            n_results=n_results,
+        )
+        if fallback_payload.get("error"):
+            print(f"\n  Search error: {exc.retry_error}")
+            raise SearchError(f"Search error: {exc.retry_error}") from exc.retry_error
+        print(
+            "\n  NOTICE: vector index unavailable; using BM25-only sqlite fallback."
+        )
     except Exception as e:
         print(f"\n  Search error: {e}")
         raise SearchError(f"Search error: {e}") from e
 
-    docs = _first_or_empty(results, "documents")
-    metas = _first_or_empty(results, "metadatas")
-    dists = _first_or_empty(results, "distances")
+    if fallback_payload is not None:
+        hits = fallback_payload.get("results", [])
+        if not hits:
+            print(f'\n  No results found for: "{query}"')
+            return
+    else:
+        docs = _first_or_empty(results, "documents")
+        metas = _first_or_empty(results, "metadatas")
+        dists = _first_or_empty(results, "distances")
 
-    if not docs:
-        print(f'\n  No results found for: "{query}"')
-        return
+        if not docs:
+            print(f'\n  No results found for: "{query}"')
+            return
 
-    # Pure-cosine retrieval on the CLI path was missing lexical matches:
-    # a drawer whose text contains every query term can still score distance
-    # >= 1.0 against the natural-language query when the drawer is a
-    # mechanical artifact (directory listing, diff, log fragment) that
-    # embeds as file-tree noise rather than as prose about its subject.
-    # The MCP tool path already hybridizes BM25 with vector sim via
-    # `_hybrid_rank`; do the same here so CLI results match what agents
-    # see via `mempalace_search`.
-    hits = [
-        {"text": doc or "", "distance": float(dist), "metadata": meta or {}}
-        for doc, meta, dist in zip(docs, metas, dists)
-    ]
-    hits = _hybrid_rank(hits, query)
+        # Pure-cosine retrieval on the CLI path was missing lexical matches:
+        # a drawer whose text contains every query term can still score distance
+        # >= 1.0 against the natural-language query when the drawer is a
+        # mechanical artifact (directory listing, diff, log fragment) that
+        # embeds as file-tree noise rather than as prose about its subject.
+        # The MCP tool path already hybridizes BM25 with vector sim via
+        # `_hybrid_rank`; do the same here so CLI results match what agents
+        # see via `mempalace_search`.
+        hits = [
+            {"text": doc or "", "distance": float(dist), "metadata": meta or {}}
+            for doc, meta, dist in zip(docs, metas, dists)
+        ]
+        hits = _hybrid_rank(hits, query)
 
     print(f"\n{'=' * 60}")
     print(f'  Results for: "{query}"')
@@ -375,9 +517,16 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
     print(f"{'=' * 60}\n")
 
     for i, hit in enumerate(hits, 1):
-        vec_sim = round(max(0.0, 1 - hit["distance"]), 3)
+        distance = hit.get("distance")
+        vec_sim = round(max(0.0, 1 - distance), 3) if distance is not None else "n/a"
         bm25 = hit.get("bm25_score", 0.0)
-        meta = hit["metadata"]
+        meta = hit.get("metadata")
+        if not isinstance(meta, dict):
+            meta = {
+                "source_file": hit.get("source_file", "?"),
+                "wing": hit.get("wing", "?"),
+                "room": hit.get("room", "?"),
+            }
         source = Path(meta.get("source_file", "?")).name
         wing_name = meta.get("wing", "?")
         room_name = meta.get("room", "?")
@@ -826,17 +975,22 @@ def search_memories(
     # This avoids the "weak-closets regression" where narrative content
     # produces low-signal closets (regex extraction matches few topics)
     # and closet-first routing hides drawers that direct search would find.
-    try:
-        dkwargs = {
-            "query_texts": [query],
-            "n_results": n_results * 3,  # over-fetch for re-ranking
-            "include": ["documents", "metadatas", "distances"],
-        }
-        if where:
-            dkwargs["where"] = where
-        drawer_results = drawers_col.query(**dkwargs)
-    except Exception as e:
-        return {"error": f"Search error: {e}"}
+    drawer_results, drawers_col, fallback_payload, error_message = (
+        _search_memories_drawer_query_or_fallback(
+            drawers_col,
+            query=query,
+            palace_path=palace_path,
+            where=where,
+            n_results=n_results,
+            wing=wing,
+            room=room,
+            collection_name=collection_name,
+        )
+    )
+    if fallback_payload is not None:
+        return fallback_payload
+    if error_message is not None:
+        return {"error": error_message}
 
     # Gather closet hits (best-per-source) to build a boost lookup.
     closet_boost_by_source: dict = {}  # source_file -> (rank, closet_dist, preview)

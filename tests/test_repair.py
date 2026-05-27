@@ -2,6 +2,7 @@
 
 import os
 import sqlite3
+import contextlib
 from contextlib import closing
 from unittest.mock import MagicMock, call, patch
 
@@ -662,6 +663,56 @@ def test_status_default_uses_configured_drawer_collection(tmp_path):
     assert capacity_status.call_args_list[1].args == (str(tmp_path), "mempalace_closets")
 
 
+def test_sqlite_lock_holders_parses_lsof_output(tmp_path, monkeypatch):
+    sqlite_path = tmp_path / "chroma.sqlite3"
+    sqlite3.connect(str(sqlite_path)).close()
+
+    class _Result:
+        returncode = 0
+        stdout = (
+            "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n"
+            "python 1234 alice 5u REG 1,16 4096 999 /tmp/chroma.sqlite3\n"
+            "sqlite3 5678 bob 3u REG 1,16 4096 999 /tmp/chroma.sqlite3\n"
+        )
+
+    monkeypatch.setattr(repair.shutil, "which", lambda _: "/usr/sbin/lsof")
+    monkeypatch.setattr(repair.subprocess, "run", lambda *args, **kwargs: _Result())
+
+    holders = repair._sqlite_lock_holders(str(sqlite_path))
+
+    assert holders == ["python pid=1234 user=alice", "sqlite3 pid=5678 user=bob"]
+
+
+def test_status_prints_lock_holders_when_present(tmp_path, capsys):
+    with (
+        patch("mempalace.repair._sqlite_lock_holders", return_value=["python pid=1234 user=alice"]),
+        patch("mempalace.repair.hnsw_capacity_status") as capacity_status,
+    ):
+        capacity_status.side_effect = [
+            {
+                "sqlite_count": 1,
+                "hnsw_count": 1,
+                "divergence": 0,
+                "diverged": False,
+                "status": "ok",
+                "message": "",
+            },
+            {
+                "sqlite_count": 0,
+                "hnsw_count": 0,
+                "divergence": 0,
+                "diverged": False,
+                "status": "ok",
+                "message": "",
+            },
+        ]
+        result = repair.status(palace_path=str(tmp_path))
+    out = capsys.readouterr().out
+    assert "[sqlite lock holders]" in out
+    assert "python pid=1234 user=alice" in out
+    assert result["lock_holders"] == ["python pid=1234 user=alice"]
+
+
 @patch("mempalace.repair.shutil")
 @patch("mempalace.repair.ChromaBackend")
 def test_rebuild_index_aborts_on_truncation_signal(mock_backend_cls, mock_shutil, tmp_path):
@@ -1290,6 +1341,50 @@ def test_sqlite_integrity_errors_reports_unreadable_sqlite_file(tmp_path):
     assert "quick_check failed" in errors[0]
 
 
+def test_maybe_rebuild_fts_index_when_only_fts_corrupt_noop_for_non_fts_errors(tmp_path):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    (palace / "chroma.sqlite3").write_bytes(b"")
+    errors = ["Page 4 of B-tree 12345: database disk image is malformed"]
+
+    with patch("mempalace.repair.sqlite3.connect") as mock_connect:
+        result = repair.maybe_rebuild_fts_index_when_only_fts_corrupt(str(palace), errors)
+
+    assert result == errors
+    mock_connect.assert_not_called()
+
+
+def test_maybe_rebuild_fts_index_when_only_fts_corrupt_repairs_to_clean(tmp_path):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    (palace / "chroma.sqlite3").write_bytes(b"sqlite placeholder")
+    errors = ["malformed inverted index for FTS5 table main.embedding_fulltext_search"]
+
+    @contextlib.contextmanager
+    def _fake_lock(path):
+        yield
+
+    conn = MagicMock()
+    conn.execute.return_value.fetchall.return_value = [("ok",)]
+    cm = MagicMock()
+    cm.__enter__.return_value = conn
+    cm.__exit__.return_value = False
+
+    with (
+        patch("mempalace.palace.mine_palace_lock", _fake_lock),
+        patch("mempalace.repair.sqlite3.connect", return_value=cm),
+    ):
+        result = repair.maybe_rebuild_fts_index_when_only_fts_corrupt(str(palace), errors)
+
+    assert result == []
+    conn.execute.assert_any_call("PRAGMA busy_timeout=5000")
+    conn.execute.assert_any_call(
+        "INSERT INTO embedding_fulltext_search(embedding_fulltext_search) "
+        "VALUES('rebuild')"
+    )
+    conn.execute.assert_any_call("PRAGMA quick_check")
+
+
 @patch("mempalace.repair.shutil")
 @patch("mempalace.repair.ChromaBackend")
 def test_rebuild_index_aborts_on_sqlite_integrity_errors_before_delete_collection(
@@ -1767,6 +1862,42 @@ def test_rebuild_from_sqlite_in_place_validates_source_before_archiving(tmp_path
     assert (palace / "marker.txt").read_text() == "not a real palace"
     archives = [p for p in tmp_path.iterdir() if "pre-rebuild" in p.name]
     assert archives == []
+
+
+def test_rebuild_from_sqlite_acquires_palace_locks(tmp_path, monkeypatch):
+    """from-sqlite rebuild must hold mine_palace_lock across source+dest paths.
+
+    Regression guard for issue #1586 class reports where concurrent writers
+    (CLI mine, hooks, MCP writes) interleave with rebuild and leave the
+    destination unhealthy immediately after "rebuild complete".
+    """
+
+    source = tmp_path / "source"
+    dest = tmp_path / "dest"
+    source.mkdir()
+    (source / "chroma.sqlite3").write_bytes(b"sqlite placeholder")
+
+    entered = []
+
+    @contextlib.contextmanager
+    def _fake_lock(path):
+        entered.append(path)
+        yield
+
+    monkeypatch.setattr("mempalace.palace.mine_palace_lock", _fake_lock)
+    monkeypatch.setattr(repair, "_recoverable_collections", lambda: ("mempalace_drawers",))
+    monkeypatch.setattr(repair, "_rebuild_one_collection", lambda **kwargs: 0)
+
+    counts = repair.rebuild_from_sqlite(str(source), str(dest))
+    assert counts == {"mempalace_drawers": 0}
+
+    expected = sorted(
+        {
+            os.path.abspath(str(source)),
+            os.path.abspath(str(dest)),
+        }
+    )
+    assert entered == expected
 
 
 def test_rebuild_from_sqlite_raises_on_upsert_failure(tmp_path, monkeypatch):

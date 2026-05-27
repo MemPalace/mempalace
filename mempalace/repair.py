@@ -30,9 +30,11 @@ Usage (from CLI):
 """
 
 import argparse
+import contextlib
 import os
 import shutil
 import sqlite3
+import subprocess
 import time
 from collections import defaultdict
 from contextlib import closing
@@ -73,6 +75,36 @@ def _drawers_collection_name() -> str:
         return COLLECTION_NAME
 
 
+def _sqlite_lock_holders(sqlite_path: str) -> list[str]:
+    """Return best-effort process summaries currently holding sqlite_path open."""
+    if not os.path.isfile(sqlite_path):
+        return []
+    if shutil.which("lsof") is None:
+        return []
+    try:
+        completed = subprocess.run(
+            ["lsof", sqlite_path],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+        )
+    except Exception:
+        return []
+    if completed.returncode != 0:
+        return []
+    lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+    if len(lines) <= 1:
+        return []
+    holders: list[str] = []
+    for line in lines[1:]:
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        holders.append(f"{parts[0]} pid={parts[1]} user={parts[2]}")
+    return holders
+
+
 def _recoverable_collections() -> tuple[str, ...]:
     """Collections rebuilt by ``rebuild_from_sqlite``, in upsert order.
 
@@ -99,6 +131,29 @@ def _get_palace_path():
     except Exception:
         default = os.path.join(os.path.expanduser("~"), ".mempalace", "palace")
         return default
+
+
+@contextlib.contextmanager
+def _rebuild_write_locks(source_palace: str, dest_palace: str):
+    """Acquire per-palace write locks for the full from-sqlite rebuild.
+
+    Rebuild mutates ``dest_palace`` and, for in-place mode, renames the
+    original palace before reading from the archive. Without taking the same
+    ``mine_palace_lock`` used by miners/MCP writes, concurrent writers can
+    interleave with repair and leave the destination immediately unhealthy.
+    """
+    from .palace import mine_palace_lock
+
+    paths = sorted(
+        {
+            os.path.abspath(os.path.expanduser(source_palace)),
+            os.path.abspath(os.path.expanduser(dest_palace)),
+        }
+    )
+    with contextlib.ExitStack() as stack:
+        for path in paths:
+            stack.enter_context(mine_palace_lock(path))
+        yield
 
 
 def _paginate_ids(col, where=None):
@@ -532,6 +587,68 @@ def sqlite_integrity_errors(palace_path: str) -> list[str]:
     return errors
 
 
+_FTS_MALFORMED_INDEX_ERROR = "malformed inverted index for fts5 table main.embedding_fulltext_search"
+
+
+def _is_only_fts_malformed_index(errors: list[str]) -> bool:
+    if not errors:
+        return False
+    return all(_FTS_MALFORMED_INDEX_ERROR in str(e).lower() for e in errors)
+
+
+def maybe_rebuild_fts_index_when_only_fts_corrupt(
+    palace_path: str,
+    errors: list[str],
+) -> list[str]:
+    """Attempt targeted FTS5 rebuild when quick_check reports only FTS corruption.
+
+    Returns the post-rebuild quick_check errors (empty on success), or the
+    original ``errors`` when this path is not applicable or rebuild fails.
+    """
+    if not _is_only_fts_malformed_index(errors):
+        return errors
+
+    sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(sqlite_path):
+        return errors
+
+    from .palace import MineAlreadyRunning, mine_palace_lock
+
+    print("\n  Detected isolated FTS5 malformed-index errors from quick_check.")
+    print("  Attempting targeted FTS rebuild under palace lock...")
+
+    try:
+        with mine_palace_lock(palace_path):
+            with sqlite3.connect(sqlite_path) as conn:
+                conn.execute("PRAGMA busy_timeout=5000")
+                conn.execute(
+                    "INSERT INTO embedding_fulltext_search(embedding_fulltext_search) "
+                    "VALUES('rebuild')"
+                )
+                rows = conn.execute("PRAGMA quick_check").fetchall()
+    except MineAlreadyRunning as exc:
+        print(f"  FTS rebuild skipped: {exc}")
+        return errors
+    except sqlite3.Error as exc:
+        print(f"  FTS rebuild failed: {exc}")
+        return errors
+
+    post_errors: list[str] = []
+    for row in rows:
+        if not row:
+            continue
+        message = str(row[0])
+        if message.lower() != "ok":
+            post_errors.append(message)
+
+    if post_errors:
+        print("  FTS rebuild completed but quick_check still reports issues.")
+        return post_errors
+
+    print("  FTS rebuild succeeded; quick_check is now healthy.")
+    return []
+
+
 def print_sqlite_integrity_abort(palace_path: str, errors: list[str]) -> None:
     """Print a clear repair abort message for SQLite-layer corruption."""
 
@@ -761,6 +878,7 @@ def rebuild_index(
     # corruption here lets us surface the clear recovery instructions and
     # exit cleanly before chromadb's compactor touches the disk.
     sqlite_errors = sqlite_integrity_errors(palace_path)
+    sqlite_errors = maybe_rebuild_fts_index_when_only_fts_corrupt(palace_path, sqlite_errors)
     if sqlite_errors:
         print_sqlite_integrity_abort(palace_path, sqlite_errors)
         return
@@ -1168,68 +1286,69 @@ def rebuild_from_sqlite(
             return {}
 
     archive_path: Optional[str] = None
-    if in_place:
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        archive_path = f"{dest_palace}.pre-rebuild-{ts}"
-        print(f"  Archiving {dest_palace} → {archive_path}")
-        shutil.move(dest_palace, archive_path)
-        source_palace = archive_path
-        src_db = os.path.join(source_palace, "chroma.sqlite3")
+    with _rebuild_write_locks(source_palace, dest_palace):
+        if in_place:
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            archive_path = f"{dest_palace}.pre-rebuild-{ts}"
+            print(f"  Archiving {dest_palace} → {archive_path}")
+            shutil.move(dest_palace, archive_path)
+            source_palace = archive_path
+            src_db = os.path.join(source_palace, "chroma.sqlite3")
 
-        # In-place only: drop chromadb's process-wide System registry so
-        # the new client at dest_palace builds a fresh System. Without
-        # this, ``create_collection`` raises "Collection already exists"
-        # because the cached System still holds the pre-rename schema.
-        # Cross-palace mode does not need this and would needlessly
-        # invalidate other callers' clients (see docstring warning).
+            # In-place only: drop chromadb's process-wide System registry so
+            # the new client at dest_palace builds a fresh System. Without
+            # this, ``create_collection`` raises "Collection already exists"
+            # because the cached System still holds the pre-rename schema.
+            # Cross-palace mode does not need this and would needlessly
+            # invalidate other callers' clients (see docstring warning).
+            try:
+                from chromadb.api.client import SharedSystemClient
+
+                SharedSystemClient.clear_system_cache()
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"  Warning: could not clear chromadb system cache ({exc!r}); "
+                    "in-place rebuild may fail with 'Collection already exists'."
+                )
+
+        os.makedirs(dest_palace, exist_ok=True)
+
+        # Backend lifetime is wrapped in try/finally so the dest palace's
+        # PersistentClient handle (opened lazily inside ``create_collection``
+        # / ``get_collection``) is released on every exit path: success,
+        # ``RebuildPartialError``, or any unexpected exception. Without this,
+        # a long-running process that calls ``rebuild_from_sqlite`` would
+        # leak SQLite/HNSW file handles into Chroma's ``SharedSystemClient``
+        # cache, surfacing later as "Collection already exists" on the next
+        # in-place rebuild or as a Windows file-lock failure on cleanup
+        # (cf. #1285's lifecycle hardening for the legacy rebuild path).
+        backend = ChromaBackend()
+        counts: dict[str, int] = {}
         try:
-            from chromadb.api.client import SharedSystemClient
+            for cname in _recoverable_collections():
+                print(f"\n  [{cname}]")
+                upserted = _rebuild_one_collection(
+                    backend=backend,
+                    source_palace=source_palace,
+                    dest_palace=dest_palace,
+                    collection_name=cname,
+                    batch_size=batch_size,
+                    archive_path=archive_path,
+                    counts_so_far=counts,
+                )
+                counts[cname] = upserted
+                if upserted == 0:
+                    print(f"    no rows found for {cname} in source palace")
+                else:
+                    print(f"    done: {upserted} rows in {cname}")
 
-            SharedSystemClient.clear_system_cache()
-        except Exception as exc:  # noqa: BLE001
-            print(
-                f"  Warning: could not clear chromadb system cache ({exc!r}); "
-                "in-place rebuild may fail with 'Collection already exists'."
-            )
-
-    os.makedirs(dest_palace, exist_ok=True)
-
-    # Backend lifetime is wrapped in try/finally so the dest palace's
-    # PersistentClient handle (opened lazily inside ``create_collection``
-    # / ``get_collection``) is released on every exit path: success,
-    # ``RebuildPartialError``, or any unexpected exception. Without this,
-    # a long-running process that calls ``rebuild_from_sqlite`` would
-    # leak SQLite/HNSW file handles into Chroma's ``SharedSystemClient``
-    # cache, surfacing later as "Collection already exists" on the next
-    # in-place rebuild or as a Windows file-lock failure on cleanup
-    # (cf. #1285's lifecycle hardening for the legacy rebuild path).
-    backend = ChromaBackend()
-    counts: dict[str, int] = {}
-    try:
-        for cname in _recoverable_collections():
-            print(f"\n  [{cname}]")
-            upserted = _rebuild_one_collection(
-                backend=backend,
-                source_palace=source_palace,
-                dest_palace=dest_palace,
-                collection_name=cname,
-                batch_size=batch_size,
-                archive_path=archive_path,
-                counts_so_far=counts,
-            )
-            counts[cname] = upserted
-            if upserted == 0:
-                print(f"    no rows found for {cname} in source palace")
-            else:
-                print(f"    done: {upserted} rows in {cname}")
-
-        print(f"\n  Rebuild complete. {sum(counts.values())} total rows.")
-        if archive_path is not None:
-            print(f"  Original palace archived at: {archive_path}")
-        print(f"{'=' * 55}\n")
-        return counts
-    finally:
-        backend.close()
+            print(f"\n  Rebuild complete. {sum(counts.values())} total rows.")
+            if archive_path is not None:
+                print(f"  Original palace archived at: {archive_path}")
+            print(f"{'=' * 55}\n")
+            return counts
+        finally:
+            backend.close()
 
 
 def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
@@ -1259,6 +1378,12 @@ def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
     if not os.path.isdir(palace_path):
         print("  No palace found.\n")
         return {"status": "unknown", "message": "no palace at path"}
+    sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
+    lock_holders = _sqlite_lock_holders(sqlite_path)
+    if lock_holders:
+        print("\n  [sqlite lock holders]")
+        for holder in lock_holders[:10]:
+            print(f"    {holder}")
 
     db_path = os.path.join(palace_path, "chroma.sqlite3")
     if not os.path.isfile(db_path):
@@ -1298,7 +1423,7 @@ def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
     if drawers["diverged"] or closets["diverged"]:
         print("\n  Recommended: run `mempalace repair` to rebuild the index.")
     print()
-    return {"drawers": drawers, "closets": closets}
+    return {"drawers": drawers, "closets": closets, "lock_holders": lock_holders}
 
 
 # ---------------------------------------------------------------------------
