@@ -1245,8 +1245,15 @@ def test_ingest_transcript_skips_when_target_running(tmp_path):
     with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
         with patch("mempalace.hooks_cli._MINE_PID_DIR", pid_dir):
             with patch("mempalace.hooks_cli._mempalace_python", return_value=sys.executable):
-                from mempalace.hooks_cli import _ingest_transcript, _pid_file_for_cmd
+                from mempalace.hooks_cli import (
+                    _ingest_transcript,
+                    _pid_file_for_cmd,
+                    _wing_from_transcript_path,
+                )
 
+                # Wing is now derived from the transcript (alias-aware), not
+                # hardcoded — a plain tmp transcript resolves to the
+                # ``wing_sessions`` catch-all.
                 expected_cmd = [
                     sys.executable,
                     "-m",
@@ -1256,7 +1263,7 @@ def test_ingest_transcript_skips_when_target_running(tmp_path):
                     "--mode",
                     "convos",
                     "--wing",
-                    "sessions",
+                    _wing_from_transcript_path(str(transcript)),
                 ]
                 pid_file = _pid_file_for_cmd(expected_cmd)
                 pid_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1267,6 +1274,67 @@ def test_ingest_transcript_skips_when_target_running(tmp_path):
                 with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
                     _ingest_transcript(str(transcript))
                     mock_popen.assert_not_called()
+
+
+def test_ingest_transcript_wing_follows_alias(tmp_path, monkeypatch):
+    """Verbatim transcript ingest routes to the alias-resolved wing, not a
+    hardcoded ``sessions`` — so live-session content lands in the same wing
+    as the diary checkpoint (regression for the pre-fix hardcoded --wing)."""
+    palace_root = tmp_path / ".mempalace"
+    palace_root.mkdir(exist_ok=True)
+    (palace_root / "wing_aliases.json").write_text(
+        json.dumps({"aliases": {"joy-web*": "wing_joy_web"}})
+    )
+    monkeypatch.setattr(hooks_cli_mod, "PALACE_ROOT", palace_root)
+    monkeypatch.setattr(hooks_cli_mod, "_WING_ALIASES_CACHE", {})
+
+    # A transcript whose cwd basename matches the joy-web* prefix alias.
+    project_dir = tmp_path / ".claude" / "projects" / "-Users-me-Claude-joy-web-3"
+    project_dir.mkdir(parents=True)
+    transcript = project_dir / "session.jsonl"
+    transcript.write_text(
+        json.dumps({"type": "user", "cwd": "/Users/me/Claude/joy-web-3", "content": "x" * 200})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        with patch("mempalace.hooks_cli._MINE_PID_DIR", tmp_path / "mine_pids"):
+            with patch("mempalace.hooks_cli._mempalace_python", return_value=sys.executable):
+                with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                    from mempalace.hooks_cli import _ingest_transcript
+
+                    _ingest_transcript(str(transcript))
+                    assert mock_popen.called
+                    cmd = mock_popen.call_args.args[0]
+                    assert "--wing" in cmd
+                    wing = cmd[cmd.index("--wing") + 1]
+                    assert wing == "wing_joy_web", f"expected alias wing, got {wing!r}"
+
+
+def test_ingest_transcript_wing_defaults_to_wing_sessions(tmp_path, monkeypatch):
+    """No alias / no cwd → falls back to the ``wing_sessions`` catch-all,
+    preserving the old behavior for unconfigured users (with the consistent
+    ``wing_`` prefix)."""
+    palace_root = tmp_path / ".mempalace"
+    palace_root.mkdir(exist_ok=True)
+    monkeypatch.setattr(hooks_cli_mod, "PALACE_ROOT", palace_root)
+    monkeypatch.setattr(hooks_cli_mod, "_WING_ALIASES_CACHE", {})
+
+    transcript = tmp_path / "loose-session.jsonl"
+    transcript.write_text("x" * 200)  # no cwd, not under .claude/projects
+
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        with patch("mempalace.hooks_cli._MINE_PID_DIR", tmp_path / "mine_pids"):
+            with patch("mempalace.hooks_cli._mempalace_python", return_value=sys.executable):
+                with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                    from mempalace.hooks_cli import _ingest_transcript
+
+                    _ingest_transcript(str(transcript))
+                    assert mock_popen.called
+                    cmd = mock_popen.call_args.args[0]
+                    wing = cmd[cmd.index("--wing") + 1]
+                    assert wing == "wing_sessions", f"expected catch-all, got {wing!r}"
 
 
 # --- _mine_already_running ---
@@ -1640,7 +1708,9 @@ def test_precompact_mines_transcript_dir(tmp_path, monkeypatch):
     # Mines the transcript's parent dir as convos, into wing "sessions".
     assert str(tmp_path) in cmd
     assert cmd[cmd.index("--mode") + 1] == "convos"
-    assert cmd[cmd.index("--wing") + 1] == "sessions"
+    # Wing is derived from the transcript (alias-aware); a loose tmp
+    # transcript with no cwd resolves to the wing_sessions catch-all.
+    assert cmd[cmd.index("--wing") + 1] == "wing_sessions"
 
 
 # --- run_hook ---

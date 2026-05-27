@@ -724,6 +724,16 @@ def _ingest_transcript(transcript_path: str):
     except Exception:
         return
 
+    # Derive the destination wing from the transcript itself so verbatim
+    # ingest lands in the SAME wing as the diary checkpoint for this session
+    # — honoring ``wing_aliases.json`` (cwd-based, alias-aware). Previously
+    # this hardcoded ``--wing sessions``, which pooled every project's
+    # auto-ingested content into one ``sessions`` wing and bypassed the
+    # alias map entirely. ``_wing_from_transcript_path`` falls back to
+    # ``wing_sessions`` when nothing resolves, preserving the old catch-all
+    # for unconfigured users (now with the consistent ``wing_`` prefix).
+    wing = _wing_from_transcript_path(transcript_path)
+
     try:
         # Route through ``_spawn_mine`` so the per-target PID guard kicks
         # in here too — repeated Stop/PreCompact fires for the same
@@ -738,10 +748,10 @@ def _ingest_transcript(transcript_path: str):
                 "--mode",
                 "convos",
                 "--wing",
-                "sessions",
+                wing,
             ]
         )
-        _log(f"Transcript ingest started: {path.name}")
+        _log(f"Transcript ingest started: {path.name} → {wing}")
     except OSError:
         pass
 
