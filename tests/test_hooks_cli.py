@@ -610,15 +610,19 @@ def test_stop_hook_auto_mine_disabled_skips_ingest(tmp_path):
     )
     save_result = {"count": 15, "themes": ["hooks"]}
     with (
+        patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls,
         patch("mempalace.hooks_cli._save_diary_direct", return_value=save_result) as mock_save,
         patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest,
         patch("mempalace.hooks_cli._maybe_auto_ingest") as mock_auto_ingest,
     ):
+        mock_cfg_cls.return_value.hooks_auto_save = True
+        mock_cfg_cls.return_value.hook_silent_save = True
+        mock_cfg_cls.return_value.hook_desktop_toast = False
+        mock_cfg_cls.return_value.hook_auto_mine = False
         result = _capture_hook_output(
             hook_stop,
             {"session_id": "test", "stop_hook_active": False, "transcript_path": str(transcript)},
             state_dir=tmp_path,
-            auto_mine=False,
         )
     assert "systemMessage" in result
     mock_save.assert_called_once()
@@ -635,15 +639,19 @@ def test_stop_hook_auto_mine_enabled_default(tmp_path):
     )
     save_result = {"count": 15, "themes": ["hooks"]}
     with (
+        patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls,
         patch("mempalace.hooks_cli._save_diary_direct", return_value=save_result) as mock_save,
         patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest,
         patch("mempalace.hooks_cli._maybe_auto_ingest") as mock_auto_ingest,
     ):
+        mock_cfg_cls.return_value.hooks_auto_save = True
+        mock_cfg_cls.return_value.hook_silent_save = True
+        mock_cfg_cls.return_value.hook_desktop_toast = False
+        mock_cfg_cls.return_value.hook_auto_mine = True
         result = _capture_hook_output(
             hook_stop,
             {"session_id": "test", "stop_hook_active": False, "transcript_path": str(transcript)},
             state_dir=tmp_path,
-            auto_mine=True,
         )
     assert "systemMessage" in result
     mock_save.assert_called_once()
@@ -654,14 +662,16 @@ def test_stop_hook_auto_mine_enabled_default(tmp_path):
 def test_precompact_auto_mine_disabled(tmp_path):
     """auto_mine=False: precompact returns empty output without ingesting or mining."""
     with (
+        patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls,
         patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest,
         patch("mempalace.hooks_cli._mine_sync") as mock_mine,
     ):
+        mock_cfg_cls.return_value.hooks_auto_save = True
+        mock_cfg_cls.return_value.hook_auto_mine = False
         result = _capture_hook_output(
             hook_precompact,
             {"session_id": "test", "transcript_path": str(tmp_path / "t.jsonl")},
             state_dir=tmp_path,
-            auto_mine=False,
         )
     assert result == {}
     mock_ingest.assert_not_called()
