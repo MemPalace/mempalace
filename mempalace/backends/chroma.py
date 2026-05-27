@@ -132,11 +132,10 @@ _HNSW_BLOAT_GUARD = {
     "hnsw:sync_threshold": 2,
 }
 
-# Missing index_metadata.pickle is normal only while a segment is still fresh
-# or effectively empty. Once data_level0.bin has non-trivial payload, a
-# missing metadata pickle means the segment was interrupted after writing HNSW
-# data but before writing its metadata. Letting Chroma open that shape can
-# segfault or hang in native HNSW code.
+# Below this size, data_level0.bin is too small for a meaningful HNSW graph.
+# Used by _hnsw_link_lists_is_usable_for_payload (empty link_lists is fine
+# when data is trivially small) and _missing_dimensionality_appears_recoverable
+# (don't attempt recovery on segments with negligible data).
 _HNSW_MISSING_METADATA_DATA_FLOOR = 1024
 
 
@@ -171,11 +170,14 @@ def _segment_appears_healthy(seg_dir: str) -> bool:
     ``0x2e`` (the protocol/terminator byte sequence chromadb serializes
     with).
 
-    Missing metadata is healthy only while the segment still looks fresh or
-    empty. If ``data_level0.bin`` already has non-trivial payload but
-    ``index_metadata.pickle`` is missing, the segment is partially flushed:
-    Chroma wrote vector data without the metadata it needs to reopen the
-    HNSW reader safely.
+    When metadata is missing, the segment is either *never-persisted*
+    (sub-threshold: fewer records than ``batch_size``, so chromadb never
+    triggered ``_persist()``) or *partially flushed* (persist started but
+    crashed).  The two are distinguished by ``link_lists.bin``: chromadb
+    writes link data during persist, so an empty/absent ``link_lists.bin``
+    together with absent metadata means no persist was ever attempted.
+    Note: ``data_level0.bin`` is pre-allocated at index creation and its
+    size does not indicate actual record count.
 
     Deliberately format-sniffs only; never deserializes. Deserialization
     can execute arbitrary code, and the byte-sniff is sufficient to
@@ -188,28 +190,23 @@ def _segment_appears_healthy(seg_dir: str) -> bool:
     files and quarantine_stale_hnsw would conservatively rename them
     out of the way.
     """
+    meta_path = os.path.join(seg_dir, "index_metadata.pickle")
+
+    if not os.path.isfile(meta_path):
+        link_path = os.path.join(seg_dir, "link_lists.bin")
+        try:
+            link_has_data = os.path.isfile(link_path) and os.path.getsize(link_path) > 0
+        except OSError:
+            return False
+        # Both absent → sub-threshold, never persisted.
+        # link_lists written but metadata not → interrupted persist.
+        return not link_has_data
+
     if not _hnsw_payload_appears_sane(seg_dir):
         return False
 
-    meta_path = os.path.join(seg_dir, "index_metadata.pickle")
-    if not os.path.isfile(meta_path):
-        data_path = os.path.join(seg_dir, "data_level0.bin")
-        try:
-            if (
-                os.path.isfile(data_path)
-                and os.path.getsize(data_path) > _HNSW_MISSING_METADATA_DATA_FLOOR
-            ):
-                return False
-        except OSError:
-            return False
-
-        # No metadata and no meaningful vector payload yet: fresh/empty segment.
-        return True
-
     try:
         size = os.path.getsize(meta_path)
-        # A real chromadb metadata file is at least tens of bytes; a
-        # smaller-than-floor file is almost certainly truncated.
         if size < 16:
             return False
         with open(meta_path, "rb") as f:
@@ -476,7 +473,7 @@ def _hnsw_element_count(palace_path: str, segment_id: str) -> Optional[int]:
 # DIVERGED the moment their queue exceeded 10% of sqlite_count, even
 # though chromadb is behaving correctly. The floor must scale with the
 # per-collection sync_threshold to distinguish real corruption (#1222 was
-# 176 613 missing of 192 997 — orders of magnitude past any reasonable
+# 176 613 missing of 192 997, orders of magnitude past any reasonable
 # sync_threshold) from expected steady-state lag.
 _HNSW_DIVERGENCE_FALLBACK_FLOOR = 2000
 _HNSW_DIVERGENCE_FRACTION = 0.10
