@@ -183,10 +183,11 @@ def test_cache_key_separates_models(monkeypatch):
         def __init__(self, preferred_providers=None):
             self.kind = "minilm"
 
-    monkeypatch.setattr(embedding, "_build_ef_class", lambda: DummyMiniLM)
+    monkeypatch.setattr(embedding, "_build_ef_class", lambda thread_cap=0: DummyMiniLM)
     monkeypatch.setattr(
         embedding, "_resolve_providers", lambda device: (["CPUExecutionProvider"], "cpu")
     )
+    monkeypatch.delenv("MEMPAL_MAX_THREADS", raising=False)
 
     ml = embedding.get_embedding_function(device="cpu", model="minilm")
     eg = embedding.get_embedding_function(device="cpu", model="embeddinggemma")
