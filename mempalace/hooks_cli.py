@@ -1026,8 +1026,6 @@ def hook_precompact(data: dict, harness: str):
 
     # Respect hooks.auto_mine — users who disabled background mining don't
     # want the pre-compaction mine either. Compaction still proceeds.
-    from .config import MempalaceConfig
-
     try:
         auto_mine = MempalaceConfig().hook_auto_mine
     except Exception:
