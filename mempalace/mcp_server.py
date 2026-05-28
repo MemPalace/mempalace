@@ -42,6 +42,25 @@ except (OSError, AttributeError):
     pass
 sys.stdout = sys.stderr
 
+# --- UTF-8 stdio enforcement (issue #1488) --------------------------------
+# On Windows the default locale encoding (e.g. cp1252) is used for stdio,
+# but Claude Desktop sends JSON-RPC payloads encoded as UTF-8. Force stdin
+# and stdout to UTF-8 so non-ASCII content (Cyrillic, CJK, accented Latin)
+# is decoded correctly. We reconfigure both streams; stdout is currently
+# pointing at stderr but will be restored to the real stdout in main().
+# We use errors='replace' as a last-resort fallback to prevent hard crashes
+# from truly malformed input, though well-behaved clients always send UTF-8.
+if hasattr(sys.stdin, 'reconfigure'):
+    try:
+        sys.stdin.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+if hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 import argparse  # noqa: E402  (deferred until after stdio protection above)
 import json  # noqa: E402
 import logging  # noqa: E402
