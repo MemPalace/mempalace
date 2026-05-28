@@ -1,21 +1,3 @@
-> [!CAUTION]
-> # 🚨 CRITICAL SECURITY WARNING: BEWARE OF SCAMS
-> **MemPalace has NO other official websites.**
-> 
-> The **ONLY** official sources are:
-> 1. This **[GitHub repository](https://github.com/MemPalace/mempalace)**
-> 2. The **[PyPI package](https://pypi.org/project/mempalace/)**
-> 3. The docs at **[mempalaceofficial.com](https://mempalaceofficial.com)**
-> 
-> **ANY other domain** (including `.tech`, `.net`, or other `.com` variants) is an **impostor** and may distribute **malware**. Do not download executables from untrusted sites. Details and timeline: [docs/HISTORY.md](docs/HISTORY.md).
-
-> [!IMPORTANT]
-> **🚨 Claude Code sessions expire in 30 days w/out auto-save hooks wired!** **[Read this →](https://github.com/MemPalace/mempalace/discussions/1388)**
->
-> Need the shortest recovery/setup path? Use the
-> [Claude Code retention setup checklist](https://mempalaceofficial.com/guide/claude-code-retention.html).
-
-
 <div align="center">
 
 <img src="assets/mempalace_logo.png" alt="MemPalace" width="240">
@@ -30,6 +12,14 @@ Local-first AI memory. Verbatim storage, pluggable backend, 96.6% R@5 raw on Lon
 [![][discord-shield]][discord-link]
 
 </div>
+
+> [!CAUTION]
+> **Beware of impostor sites.** MemPalace has no other official websites. The **only** official sources are this **[GitHub repository](https://github.com/MemPalace/mempalace)**, the **[PyPI package](https://pypi.org/project/mempalace/)**, and the docs at **[mempalaceofficial.com](https://mempalaceofficial.com)**. Any other domain (including `.tech`, `.net`, or other `.com` variants) is an impostor and may distribute malware. Details and timeline: [docs/HISTORY.md](docs/HISTORY.md).
+
+> [!IMPORTANT]
+> **Claude Code sessions expire in 30 days without auto-save hooks wired.** [Read this →](https://github.com/MemPalace/mempalace/discussions/1388)
+>
+> Need the shortest recovery/setup path? Use the [Claude Code retention setup checklist](https://mempalaceofficial.com/guide/claude-code-retention.html).
 
 ---
 

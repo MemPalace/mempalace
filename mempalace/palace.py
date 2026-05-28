@@ -15,7 +15,7 @@ from typing import Optional
 
 from .backends import BackendClosedError, CollectionNotInitializedError, PalaceNotFoundError
 from .backends.chroma import ChromaBackend
-from .entity_detector import _get_coca_filter
+from .entity_detector import _apply_known_systems_prepass, _get_coca_filter
 
 logger = logging.getLogger("mempalace_mcp")
 
@@ -265,9 +265,15 @@ def build_closet_lines(source_file, drawer_ids, content, wing, room, drawer_meta
 
     # Extract proper nouns (2+ occurrences). Uses i18n-aware patterns so
     # non-Latin names (Cyrillic, accented Latin, etc.) are also detected.
+    # Tier 3 linguistics cleanup — known-systems compound pre-pass. Detects
+    # multi-word product names ("Claude Code", "GitHub Copilot", …) atomically
+    # and masks them out of the working window so the single-word extraction
+    # below doesn't decompose them.
+    working_window, compound_counts = _apply_known_systems_prepass(window)
+
     coca_filter = _get_coca_filter()
-    words = _candidate_entity_words(window)
-    word_freq = {}
+    words = _candidate_entity_words(working_window)
+    word_freq: dict = dict(compound_counts)
     for w in words:
         if w in _ENTITY_STOPLIST:
             continue
