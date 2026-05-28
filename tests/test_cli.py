@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 
 from mempalace.cli import (
+    build_parser,
     cmd_compress,
     cmd_hook,
     cmd_init,
@@ -1384,3 +1385,20 @@ def test_cmd_repair_from_sqlite_success_does_not_exit(mock_config_cls, tmp_path)
     with patch("mempalace.repair.rebuild_from_sqlite", return_value=fake_counts):
         # Should return cleanly; no SystemExit raised.
         cmd_repair(args)
+
+
+class TestBuildParser:
+    """Tests for build_parser() — parser construction (no side effects)."""
+
+    def test_init_dir_defaults_to_current_directory(self):
+        """init subcommand dir argument defaults to '.' when not provided."""
+        parser = build_parser()
+        # Simulate: mempalace init (no dir argument)
+        args = parser.parse_args(["init"])
+        assert args.dir == "."
+
+    def test_init_dir_accepts_explicit_path(self):
+        """init subcommand dir argument accepts an explicit path."""
+        parser = build_parser()
+        args = parser.parse_args(["init", "/tmp/test"])
+        assert args.dir == "/tmp/test"
