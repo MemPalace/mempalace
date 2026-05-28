@@ -71,6 +71,21 @@ if [ -z "$MEMPAL_PYTHON_BIN" ] || [ ! -x "$MEMPAL_PYTHON_BIN" ]; then
     MEMPAL_PYTHON_BIN="$(command -v python3 2>/dev/null || echo python3)"
 fi
 
+# Run `mempalace mine` with the best available invocation method.
+# Same resolution order as mempal_save_hook.sh:
+#   1. $MEMPAL_PYTHON set  → "$MEMPAL_PYTHON_BIN" -m mempalace
+#   2. mempalace on PATH   → bare mempalace
+#   3. fallback            → "$MEMPAL_PYTHON_BIN" -m mempalace
+run_mempalace() {
+    if [ -n "${MEMPAL_PYTHON:-}" ]; then
+        "$MEMPAL_PYTHON_BIN" -m mempalace "$@"
+    elif command -v mempalace > /dev/null 2>&1; then
+        mempalace "$@"
+    else
+        "$MEMPAL_PYTHON_BIN" -m mempalace "$@"
+    fi
+}
+
 # ── Silent mode / opt-out ──────────────────────────────────────────────
 # Set MEMPALACE_HOOKS_AUTO_SAVE=false to disable auto-save blocking entirely.
 if [ -n "$MEMPALACE_HOOKS_AUTO_SAVE" ]; then
@@ -190,14 +205,14 @@ echo "[$(date '+%H:%M:%S')] PRE-COMPACT triggered for session $SESSION_ID" >> "$
 #   1. TRANSCRIPT_PATH (from Claude Code) → parent dir, --mode convos
 #   2. MEMPAL_DIR → --mode projects
 if is_valid_transcript_path "$TRANSCRIPT_PATH" && [ -f "$TRANSCRIPT_PATH" ]; then
-    "$MEMPAL_PYTHON_BIN" -m mempalace mine "$(dirname "$TRANSCRIPT_PATH")" --mode convos \
+    run_mempalace mine "$(dirname "$TRANSCRIPT_PATH")" --mode convos \
         >> "$STATE_DIR/hook.log" 2>&1
 elif [ -n "$TRANSCRIPT_PATH" ]; then
     echo "[$(date '+%H:%M:%S')] Skipping invalid transcript path: $TRANSCRIPT_PATH" \
         >> "$STATE_DIR/hook.log"
 fi
 if [ -n "$MEMPAL_DIR" ] && [ -d "$MEMPAL_DIR" ]; then
-    "$MEMPAL_PYTHON_BIN" -m mempalace mine "$MEMPAL_DIR" --mode projects \
+    run_mempalace mine "$MEMPAL_DIR" --mode projects \
         >> "$STATE_DIR/hook.log" 2>&1
 fi
 

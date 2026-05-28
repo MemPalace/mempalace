@@ -79,6 +79,27 @@ if [ -z "$MEMPAL_PYTHON_BIN" ] || [ ! -x "$MEMPAL_PYTHON_BIN" ]; then
     MEMPAL_PYTHON_BIN="$(command -v python3 2>/dev/null || echo python3)"
 fi
 
+# Run `mempalace mine` with the best available invocation method.
+#
+# Resolution order (first hit wins):
+#   1. $MEMPAL_PYTHON set      — use "$MEMPAL_PYTHON_BIN" -m mempalace
+#      (harness environments like Claude Code / Codex CLI that don't
+#      inherit the user's shell PATH; venv/pyenv installs)
+#   2. mempalace on PATH       — bare mempalace
+#      (pipx / uv tool installs where the entry point is on PATH but
+#      the system python3 may not have the package)
+#   3. fallback                — "$MEMPAL_PYTHON_BIN" -m mempalace
+#      (last resort, mirrors pre-67a0677 behaviour)
+run_mempalace() {
+    if [ -n "${MEMPAL_PYTHON:-}" ]; then
+        "$MEMPAL_PYTHON_BIN" -m mempalace "$@"
+    elif command -v mempalace > /dev/null 2>&1; then
+        mempalace "$@"
+    else
+        "$MEMPAL_PYTHON_BIN" -m mempalace "$@"
+    fi
+}
+
 # ── Silent mode / opt-out ──────────────────────────────────────────────
 # Set MEMPALACE_HOOKS_AUTO_SAVE=false to disable auto-save blocking entirely.
 # The hook stays installed but passes through without interrupting the session.
@@ -292,14 +313,14 @@ if [ "$SINCE_LAST" -ge "$SAVE_INTERVAL" ] && [ "$EXCHANGE_COUNT" -gt 0 ]; then
     # MEMPAL_DIR is *additive*, not an override: a user with MEMPAL_DIR
     # pointed at their project still gets the active conversation mined.
     if is_valid_transcript_path "$TRANSCRIPT_PATH" && [ -f "$TRANSCRIPT_PATH" ]; then
-        "$MEMPAL_PYTHON_BIN" -m mempalace mine "$(dirname "$TRANSCRIPT_PATH")" --mode convos \
+        run_mempalace mine "$(dirname "$TRANSCRIPT_PATH")" --mode convos \
             >> "$STATE_DIR/hook.log" 2>&1 &
     elif [ -n "$TRANSCRIPT_PATH" ]; then
         echo "[$(date '+%H:%M:%S')] Skipping invalid transcript path: $TRANSCRIPT_PATH" \
             >> "$STATE_DIR/hook.log"
     fi
     if [ -n "$MEMPAL_DIR" ] && [ -d "$MEMPAL_DIR" ]; then
-        "$MEMPAL_PYTHON_BIN" -m mempalace mine "$MEMPAL_DIR" --mode projects \
+        run_mempalace mine "$MEMPAL_DIR" --mode projects \
             >> "$STATE_DIR/hook.log" 2>&1 &
     fi
 
