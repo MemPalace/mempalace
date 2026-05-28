@@ -55,9 +55,14 @@ if hasattr(sys.stdin, 'reconfigure'):
         sys.stdin.reconfigure(encoding='utf-8', errors='replace')
     except Exception:
         pass
-if hasattr(sys.stdout, 'reconfigure'):
+if hasattr(_REAL_STDOUT, 'reconfigure'):
     try:
-        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        _REAL_STDOUT.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+if hasattr(sys.stderr, 'reconfigure'):
+    try:
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
     except Exception:
         pass
 
