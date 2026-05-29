@@ -561,6 +561,51 @@ class MempalaceConfig:
             pass
 
     @property
+    def hnsw_sync_threshold(self) -> int:
+        """HNSW ``sync_threshold`` used at collection creation.
+
+        Controls when chromadb flushes the HNSW index to disk. The default
+        of 50 000 defers persistence until a large batch completes, which
+        prevents the link_lists.bin bloat described in PR #344.
+
+        Operators with smaller palaces can lower this value
+        (e.g. ``MEMPALACE_HNSW_SYNC_THRESHOLD=500``) so that
+        ``index_metadata.pickle`` is written during a mine, preventing the
+        false-positive quarantine on cold open described in issue #1579.
+
+        Invalid values (zero, negative, non-numeric) fall back to 50 000.
+        """
+        env_val = os.environ.get("MEMPALACE_HNSW_SYNC_THRESHOLD")
+        if env_val is not None:
+            coerced = self._try_coerce_int(env_val, minimum=1)
+            if coerced is not None:
+                return coerced
+        coerced = self._try_coerce_int(
+            self._file_config.get("hnsw_sync_threshold", 50_000), minimum=1
+        )
+        return 50_000 if coerced is None else coerced
+
+    @property
+    def hnsw_batch_size(self) -> int:
+        """HNSW ``batch_size`` used at collection creation.
+
+        Works in tandem with ``hnsw_sync_threshold``: both should be raised
+        or lowered together. Default is 50 000 (matching the #344 bloat guard).
+
+        Override via ``MEMPALACE_HNSW_BATCH_SIZE`` env var or the
+        ``hnsw_batch_size`` key in ``config.json``.
+
+        Invalid values (zero, negative, non-numeric) fall back to 50 000.
+        """
+        env_val = os.environ.get("MEMPALACE_HNSW_BATCH_SIZE")
+        if env_val is not None:
+            coerced = self._try_coerce_int(env_val, minimum=1)
+            if coerced is not None:
+                return coerced
+        coerced = self._try_coerce_int(self._file_config.get("hnsw_batch_size", 50_000), minimum=1)
+        return 50_000 if coerced is None else coerced
+
+    @property
     def topic_tunnel_min_count(self):
         """Minimum number of overlapping confirmed topics required to create
         a cross-wing tunnel between two wings.

@@ -156,3 +156,138 @@ def test_quarantine_catches_zero_byte_link_lists_when_stale(tmp_path):
     moved_path = Path(moved[0])
     assert moved_path.exists()
     assert moved_path.name.startswith("11111111-2222-3333-4444-555555555555.drift-")
+
+
+# ── Fix B: deferred-persist (incremental mine) segments (#1579) ────────
+
+
+def test_deferred_persist_segment_not_quarantined(tmp_path):
+    """#1579: data_level0 present, link_lists empty, NO pickle → healthy deferred-persist.
+
+    Small/incremental mines never trigger hnsw:sync_threshold, so
+    index_metadata.pickle is never written. That is the NORMAL state,
+    not corruption. _segment_appears_healthy must return True for it.
+    """
+    seg_dir = tmp_path / "11111111-2222-3333-4444-555555555555"
+    seg_dir.mkdir(parents=True, exist_ok=True)
+    (seg_dir / "data_level0.bin").write_bytes(b"\0" * 167_600)
+    (seg_dir / "link_lists.bin").write_bytes(b"")
+    # NO index_metadata.pickle written
+
+    assert _segment_appears_healthy(str(seg_dir)), (
+        "deferred-persist segment (data present, link_lists empty, no pickle) "
+        "must be treated as healthy (fix #1579)"
+    )
+
+    # Also verify quarantine_stale_hnsw leaves it in place even when sqlite
+    # mtime is arbitrarily newer than the HNSW files.
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    db_path = palace / "chroma.sqlite3"
+    db_path.write_text("sqlite placeholder")
+
+    seg_dir2 = palace / "22222222-3333-4444-5555-666666666666"
+    seg_dir2.mkdir(parents=True, exist_ok=True)
+    (seg_dir2 / "data_level0.bin").write_bytes(b"\0" * 167_600)
+    (seg_dir2 / "link_lists.bin").write_bytes(b"")
+
+    hnsw_time = 1_700_000_000
+    sqlite_time = hnsw_time + 9_999
+    os.utime(seg_dir2 / "data_level0.bin", (hnsw_time, hnsw_time))
+    os.utime(db_path, (sqlite_time, sqlite_time))
+
+    moved = quarantine_stale_hnsw(str(palace), stale_seconds=300)
+    assert moved == [], (
+        "deferred-persist segment must not be quarantined even when stale_seconds exceeded"
+    )
+    assert seg_dir2.exists()
+
+
+def test_bloated_link_lists_still_quarantined(tmp_path):
+    """#344 regression guard: bloated link_lists (ratio > max) must still quarantine.
+
+    The deferred-persist fix must not loosen the #344 bloat detection path.
+    link_lists >> data_level0 is always structurally corrupt regardless of
+    whether pickle is present.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    db_path = palace / "chroma.sqlite3"
+    db_path.write_text("sqlite placeholder")
+
+    seg_dir = palace / "11111111-2222-3333-4444-555555555555"
+    seg_dir.mkdir(parents=True, exist_ok=True)
+    data_size = 1_000
+    link_size = int(data_size * (_HNSW_LINK_TO_DATA_MAX_RATIO + 1))
+    (seg_dir / "data_level0.bin").write_bytes(b"\0" * data_size)
+    (seg_dir / "link_lists.bin").write_bytes(b"\0" * link_size)
+    # No pickle — deferred-persist appearance, but link_lists is bloated
+
+    same_time = 1_700_000_000
+    os.utime(db_path, (same_time, same_time))
+    os.utime(seg_dir / "data_level0.bin", (same_time, same_time))
+
+    moved = quarantine_stale_hnsw(str(palace), stale_seconds=999_999)
+    assert len(moved) == 1, "bloated link_lists must still be quarantined even without pickle"
+    assert not seg_dir.exists()
+
+
+def test_corrupt_pickle_still_quarantined(tmp_path):
+    """#1579: pickle present but bad magic bytes → still quarantined.
+
+    The deferred-persist fix applies ONLY when pickle is absent.
+    A present-but-corrupt pickle is genuine corruption.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    db_path = palace / "chroma.sqlite3"
+    db_path.write_text("sqlite placeholder")
+
+    seg_dir = palace / "11111111-2222-3333-4444-555555555555"
+    _write_segment(
+        seg_dir,
+        data_size=2_000,
+        link_size=100,
+        write_metadata=False,
+    )
+    # Write a pickle with invalid magic bytes
+    (seg_dir / "index_metadata.pickle").write_bytes(b"\xff" + b"x" * 16 + b"\xff")
+
+    hnsw_time = 1_700_000_000
+    sqlite_time = hnsw_time + 1_000
+    os.utime(seg_dir / "data_level0.bin", (hnsw_time, hnsw_time))
+    os.utime(db_path, (sqlite_time, sqlite_time))
+
+    moved = quarantine_stale_hnsw(str(palace), stale_seconds=300)
+    assert len(moved) == 1, "corrupt pickle must still be quarantined"
+    assert not seg_dir.exists()
+
+
+def test_healthy_persisted_segment_unaffected(tmp_path):
+    """#1579: data + non-zero link_lists + valid pickle → healthy, not quarantined."""
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    db_path = palace / "chroma.sqlite3"
+    db_path.write_text("sqlite placeholder")
+
+    seg_dir = palace / "11111111-2222-3333-4444-555555555555"
+    _write_segment(
+        seg_dir,
+        data_size=2_000,
+        link_size=500,
+        write_metadata=True,
+    )
+
+    hnsw_time = 1_700_000_000
+    sqlite_time = hnsw_time + 9_999
+    os.utime(seg_dir / "data_level0.bin", (hnsw_time, hnsw_time))
+    os.utime(db_path, (sqlite_time, sqlite_time))
+
+    assert _segment_appears_healthy(str(seg_dir))
+
+    moved = quarantine_stale_hnsw(str(palace), stale_seconds=300)
+    assert moved == [], "healthy persisted segment must not be quarantined"
+    assert seg_dir.exists()
