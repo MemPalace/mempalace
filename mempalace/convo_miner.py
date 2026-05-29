@@ -385,10 +385,20 @@ def _extract_conversation_timestamp(filepath: str) -> Optional[str]:
     Reads the file directly to preserve the original conversation time
     regardless of when mining runs. Returns None for non-JSONL files or
     when no timestamped message entry is found.
+
+    Aborts immediately if the first non-empty line is not valid JSON —
+    pretty-printed JSON files (ChatGPT exports, Slack exports) would
+    otherwise raise JSONDecodeError on almost every line, causing a
+    significant performance bottleneck.
+
+    Handles both ISO 8601 strings and epoch timestamps (integer/float,
+    seconds or milliseconds) so timeline queries always receive a
+    lexicographically comparable ISO 8601 value.
     """
     if not filepath.endswith((".jsonl", ".json")):
         return None
     try:
+        first_line = True
         with open(filepath, encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 line = line.strip()
@@ -397,13 +407,29 @@ def _extract_conversation_timestamp(filepath: str) -> Optional[str]:
                 try:
                     entry = json.loads(line)
                 except json.JSONDecodeError:
+                    if first_line:
+                        return None
                     continue
+                first_line = False
                 if not isinstance(entry, dict):
                     continue
                 ts = entry.get("timestamp")
                 msg_type = entry.get("type", "")
                 if ts and msg_type in ("user", "human", "assistant"):
-                    return str(ts)
+                    if isinstance(ts, str):
+                        if "-" in ts or "T" in ts:
+                            return ts
+                        try:
+                            ts = float(ts)
+                        except ValueError:
+                            return None
+                    if isinstance(ts, (int, float)):
+                        try:
+                            if ts > 1e11:
+                                ts /= 1000.0
+                            return datetime.fromtimestamp(ts).isoformat()
+                        except (ValueError, OSError, OverflowError):
+                            return None
     except OSError:
         pass
     return None
