@@ -828,9 +828,18 @@ def cmd_repair(args):
         # No prompt when source != dest AND dest does not exist (pure
         # extract-into-fresh-dir case is non-destructive to existing
         # palaces).
+        dry_run = getattr(args, "dry_run", False)
+        # A dry run only reads the source SQLite and prints a plan — it
+        # never archives, creates, or writes — so it must not trip the
+        # destructive-action confirmation, which would otherwise block the
+        # preview behind a y/N prompt (or require --yes just to look).
         is_destructive_to_dest = source_path == palace_path or os.path.exists(palace_path)
-        if is_destructive_to_dest and not confirm_destructive_action(
-            "Rebuild from SQLite", palace_path, assume_yes=getattr(args, "yes", False)
+        if (
+            not dry_run
+            and is_destructive_to_dest
+            and not confirm_destructive_action(
+                "Rebuild from SQLite", palace_path, assume_yes=getattr(args, "yes", False)
+            )
         ):
             return
 
@@ -839,6 +848,7 @@ def cmd_repair(args):
                 source_palace=source_path,
                 dest_palace=palace_path,
                 archive_existing_dest=archive_existing,
+                dry_run=dry_run,
             )
         except RebuildPartialError as exc:
             # The error itself was already printed by rebuild_from_sqlite
