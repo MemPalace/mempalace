@@ -1750,6 +1750,54 @@ def test_rebuild_from_sqlite_source_missing_chroma_db(tmp_path):
     assert not dest.exists()
 
 
+def test_rebuild_from_sqlite_dry_run_cross_palace_writes_nothing(tmp_path):
+    """``dry_run=True`` must report the per-collection row counts a real
+    rebuild would produce while creating nothing at dest.
+
+    Catches: a regression where ``--dry-run`` is ignored and the rebuild
+    runs anyway (dest gets written), or where the preview returns the
+    wrong counts. The counts asserted here match what
+    ``test_rebuild_from_sqlite_roundtrips_via_real_chromadb`` proves a
+    real rebuild upserts, so the preview is verified against real
+    behavior, not just against itself.
+    """
+    source = tmp_path / "source"
+    dest = tmp_path / "dest"
+    drawer_rows = [(f"d{i}", f"body {i}", {"wing": "w", "room": "r"}) for i in range(12)]
+    _seed_palace(source, "mempalace_drawers", drawer_rows)
+    _seed_palace(source, "mempalace_closets", [("c1", "abbrev", {"wing": "w"})])
+
+    counts = repair.rebuild_from_sqlite(str(source), str(dest), dry_run=True)
+
+    assert counts == {"mempalace_drawers": 12, "mempalace_closets": 1}
+    # Nothing written: dest never created, source untouched.
+    assert not dest.exists()
+    assert (source / "chroma.sqlite3").exists()
+
+
+def test_rebuild_from_sqlite_dry_run_in_place_does_not_archive(tmp_path):
+    """An in-place ``dry_run`` must NOT move the live palace aside. The
+    archive rename is the first irreversible step of a real in-place
+    rebuild; a dry run that performs it would strand the user's only
+    palace at a timestamped path and leave the expected location empty.
+
+    Catches: a regression where the dry-run early-return is placed after
+    the archive move instead of before it.
+    """
+    palace = tmp_path / "palace"
+    _seed_palace(palace, "mempalace_drawers", [(f"d{i}", f"b{i}", {"wing": "w"}) for i in range(8)])
+    sqlite_before = (palace / "chroma.sqlite3").stat().st_size
+
+    counts = repair.rebuild_from_sqlite(
+        str(palace), str(palace), archive_existing_dest=True, dry_run=True
+    )
+
+    assert counts == {"mempalace_drawers": 8, "mempalace_closets": 0}
+    # Original palace untouched, no archive sibling created.
+    assert (palace / "chroma.sqlite3").stat().st_size == sqlite_before
+    assert [p for p in tmp_path.iterdir() if "pre-rebuild" in p.name] == []
+
+
 def test_rebuild_from_sqlite_in_place_validates_source_before_archiving(tmp_path):
     """In-place + archive_existing_dest=True with a dir that lacks
     chroma.sqlite3 must NOT rename the dir before bailing. An earlier

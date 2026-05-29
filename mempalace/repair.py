@@ -1053,6 +1053,7 @@ def rebuild_from_sqlite(
     *,
     archive_existing_dest: bool = False,
     batch_size: int = 1000,
+    dry_run: bool = False,
 ) -> dict[str, int]:
     """Rebuild a palace by reading drawers from ``source_palace``'s
     ``chroma.sqlite3`` and upserting them into a fresh palace at
@@ -1084,6 +1085,16 @@ def rebuild_from_sqlite(
       ``<dest_palace>.pre-rebuild-<timestamp>`` and read from there
       instead. Used by the in-place CLI flow where ``--source`` defaults
       to the same path as ``--palace``.
+
+    ``dry_run`` (CLI: ``--dry-run``) previews the rebuild without making
+    any change: source validation runs as normal, then per-collection
+    row counts are read from the source SQLite and printed, and the
+    function returns those would-be counts *without* archiving the
+    existing palace, creating collections, or re-embedding. Useful before
+    a multi-hour rebuild on a large palace. A dry run returns a populated
+    dict (one key per recoverable collection) so CLI callers treat it as
+    success; a validation refusal still returns ``{}`` exactly as a real
+    run would, so the preview faithfully reflects what would happen.
 
     Returns a ``{collection_name: row_count}`` dict so callers (CLI,
     tests) can verify the per-collection rebuild count without parsing
@@ -1166,6 +1177,31 @@ def rebuild_from_sqlite(
                 "(source_palace == dest_palace)."
             )
             return {}
+
+    # --dry-run: validation has passed, so report what a real run would
+    # do and stop before the first irreversible step (the in-place
+    # archive move). Counts come from ``sqlite_drawer_count`` — the same
+    # SQLite ground-truth helper repair uses elsewhere — so the preview
+    # matches the per-collection counts a real rebuild upserts. Reads the
+    # original ``source_palace`` (not yet archived at this point).
+    if dry_run:
+        print("\n  DRY RUN — no changes will be made.")
+        if in_place:
+            print(
+                f"  Would archive {dest_palace} → "
+                f"{dest_palace}.pre-rebuild-<timestamp>, then rebuild from the copy."
+            )
+        counts = {}
+        for cname in _recoverable_collections():
+            n = sqlite_drawer_count(source_palace, cname) or 0
+            counts[cname] = n
+            print(f"  [{cname}] would re-embed and upsert {n} rows")
+        print(
+            f"\n  Would rebuild {sum(counts.values())} total rows. "
+            "Re-run without --dry-run to execute."
+        )
+        print(f"{'=' * 55}\n")
+        return counts
 
     archive_path: Optional[str] = None
     if in_place:
