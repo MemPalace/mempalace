@@ -16,6 +16,7 @@ import re
 import sqlite3
 from pathlib import Path
 
+from ._sqlite_ro import open_ro
 from .backends import CollectionNotInitializedError, PalaceNotFoundError
 from .palace import get_closets_collection, get_collection
 
@@ -458,7 +459,11 @@ def _bm25_only_via_sqlite(
         return "".join(clauses), params
 
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        # Interactive search surface: bounded busy_timeout + statement deadline
+        # + read PRAGMAs (see mempalace._sqlite_ro). Behaviour-preserving --
+        # same SQL, same rows; only the connection setup and the runaway ceiling
+        # change. The existing finally: conn.close() below stays the owner.
+        conn = open_ro(db_path)
     except sqlite3.Error as e:
         return {"error": f"sqlite open failed: {e}"}
 
