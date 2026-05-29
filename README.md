@@ -65,7 +65,7 @@ the `mempalace` CLI in an isolated environment on your PATH:
 
 ```bash
 uv tool install mempalace
-mempalace init ~/projects/myapp
+mempalace init ~/projects/myapp    # or just: mempalace init (defaults to current dir)
 ```
 
 [`pipx`](https://pipx.pypa.io/) works the same way if you prefer it:
