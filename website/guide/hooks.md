@@ -13,33 +13,35 @@ The AI does the actual filing — it knows the conversation context, so it class
 
 ## Install — Claude Code
 
-Add to `.claude/settings.local.json`:
+### Via Plugin (Recommended)
+
+If you installed MemPalace via the Claude Code plugin marketplace, **hooks are registered automatically** — no configuration needed. Verify they're active with the `/hooks` command inside Claude Code.
+
+> **Do not** also add hooks manually to `settings.json` when the plugin is installed — this causes both the Stop and PreCompact hooks to fire twice per event.
+
+### Without Plugin (Manual)
+
+If you installed MemPalace with `pip install` or `uv tool install` but are **not** using the Claude Code plugin, add the following to `~/.claude/settings.json` (user-wide) or `.claude/settings.local.json` (project-scoped):
 
 ```json
 {
   "hooks": {
     "Stop": [{
-      "matcher": "*",
       "hooks": [{
         "type": "command",
-        "command": "/absolute/path/to/hooks/mempal_save_hook.sh",
+        "command": "mempalace hook run --hook stop --harness claude-code",
         "timeout": 30
       }]
     }],
     "PreCompact": [{
       "hooks": [{
         "type": "command",
-        "command": "/absolute/path/to/hooks/mempal_precompact_hook.sh",
+        "command": "mempalace hook run --hook precompact --harness claude-code",
         "timeout": 30
       }]
     }]
   }
 }
-```
-
-Make them executable:
-```bash
-chmod +x hooks/mempal_save_hook.sh hooks/mempal_precompact_hook.sh
 ```
 
 ## Install — Codex CLI
@@ -50,12 +52,12 @@ Add to `.codex/hooks.json`:
 {
   "Stop": [{
     "type": "command",
-    "command": "/absolute/path/to/hooks/mempal_save_hook.sh",
+    "command": "mempalace hook run --hook stop --harness codex",
     "timeout": 30
   }],
   "PreCompact": [{
     "type": "command",
-    "command": "/absolute/path/to/hooks/mempal_precompact_hook.sh",
+    "command": "mempalace hook run --hook precompact --harness codex",
     "timeout": 30
   }]
 }
@@ -63,9 +65,7 @@ Add to `.codex/hooks.json`:
 
 ## Configuration
 
-Edit `mempal_save_hook.sh` to change:
-
-- **`SAVE_INTERVAL=15`** — How many messages between saves. Lower = more frequent, higher = less interruption.
+- **`SAVE_INTERVAL`** — How many messages between saves (default: `15`). Lower = more frequent, higher = less interruption.
 - **`STATE_DIR`** — Where hook state is stored (defaults to `~/.mempalace/hook_state/`)
 - **`MEMPAL_DIR`** — Optional. Set to a conversations directory to auto-run `mempalace mine` on each save trigger.
 
