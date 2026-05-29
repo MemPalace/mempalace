@@ -265,6 +265,47 @@ def test_corrupt_pickle_still_quarantined(tmp_path):
     assert not seg_dir.exists()
 
 
+def test_partial_flush_missing_pickle_nonempty_links_still_quarantined(tmp_path):
+    """#1655 Gemini review: non-empty link_lists.bin + no pickle = interrupted partial flush.
+
+    chromadb writes link_lists.bin before index_metadata.pickle. A segment with
+    data above the floor, a non-empty (but not bloated) link_lists.bin, and no
+    pickle is an interrupted partial flush — NOT the benign deferred-persist state.
+    It must be quarantined.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    db_path = palace / "chroma.sqlite3"
+    db_path.write_text("sqlite placeholder")
+
+    seg_dir = palace / "11111111-2222-3333-4444-555555555555"
+    seg_dir.mkdir(parents=True, exist_ok=True)
+    # data above floor, link_lists non-empty but ratio << max (not a bloat hit)
+    data_size = 2_000
+    link_size = 200  # ratio = 0.1, well below _HNSW_LINK_TO_DATA_MAX_RATIO
+    (seg_dir / "data_level0.bin").write_bytes(b"\0" * data_size)
+    (seg_dir / "link_lists.bin").write_bytes(b"\0" * link_size)
+    # NO index_metadata.pickle — simulates interrupted flush
+
+    assert not _segment_appears_healthy(str(seg_dir)), (
+        "partial-flush segment (non-empty link_lists, no pickle) must be unhealthy"
+    )
+
+    hnsw_time = 1_700_000_000
+    sqlite_time = hnsw_time + 1_000
+    os.utime(seg_dir / "data_level0.bin", (hnsw_time, hnsw_time))
+    os.utime(db_path, (sqlite_time, sqlite_time))
+
+    moved = quarantine_stale_hnsw(str(palace), stale_seconds=300)
+    assert len(moved) == 1, "partial-flush segment must be quarantined"
+    assert not seg_dir.exists()
+
+    moved_path = Path(moved[0])
+    assert moved_path.exists()
+    assert moved_path.name.startswith("11111111-2222-3333-4444-555555555555.drift-")
+
+
 def test_healthy_persisted_segment_unaffected(tmp_path):
     """#1579: data + non-zero link_lists + valid pickle → healthy, not quarantined."""
     palace = tmp_path / "palace"

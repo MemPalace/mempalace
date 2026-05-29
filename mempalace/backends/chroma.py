@@ -104,11 +104,12 @@ def _hnsw_link_lists_is_usable_for_payload(seg_dir: str, *, pickle_present: bool
 
         link_size = os.path.getsize(link_path) if os.path.isfile(link_path) else 0
 
-        if link_size == 0 and not pickle_present:
-            # Deferred-persist: chromadb hasn't reached sync_threshold yet so
-            # neither link_lists.bin nor index_metadata.pickle have been written.
-            # This is healthy — the #344 ratio check still applies separately.
-            return True
+        if not pickle_present:
+            # Missing index_metadata.pickle is only healthy in the deferred-persist
+            # state, i.e. link_lists.bin is also empty/absent. A non-empty
+            # link_lists.bin with no pickle is an interrupted partial flush (chromadb
+            # writes link_lists before the pickle) and must be quarantined. (#1579, PR #1655 Gemini review)
+            return link_size == 0
 
         return link_size > 0
     except OSError:
