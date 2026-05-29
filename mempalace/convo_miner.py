@@ -603,6 +603,9 @@ def _mine_convos_impl(
         print("  DRY RUN — nothing will be filed")
     print(f"{'-' * 55}\n")
 
+    if not dry_run:
+        from .backends.chroma import quarantine_stale_hnsw
+        quarantine_stale_hnsw(palace_path, stale_seconds=900)
     collection = get_collection(palace_path) if not dry_run else None
 
     # Bulk pre-fetch already-mined set in one paginated pass instead of
