@@ -25,6 +25,7 @@ from .palace import (
     _validate_palace_fts5_after_mine,
     file_already_mined,
     get_collection,
+    make_id,
     mine_lock,
     mine_palace_lock,
     prefetch_mined_set,
@@ -409,8 +410,12 @@ def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extr
         # Batch chunks into bounded upserts so large transcripts keep most of
         # the embedding speedup without one huge Chroma/SQLite request. Keep
         # one filed_at per source file so all transcript drawers share an
-        # ingest timestamp.
+        # ingest timestamp. ``filed_at`` participates in the drawer_id hash
+        # so re-mining is additive (per-version layers) instead of
+        # silently overwriting via the upsert path.
         filed_at = datetime.now().isoformat()
+        # ``parent_drawer_id`` is per-mining-pass — searcher scope key.
+        parent_drawer_id = make_id("parent_", wing, source_file, extract_mode, filed_at)
         for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
             batch_docs: list = []
             batch_ids: list = []
@@ -419,11 +424,12 @@ def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extr
                 chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
                 if extract_mode == "general":
                     room_counts_delta[chunk_room] += 1
-                drawer_key = f"{source_file}:{extract_mode}:{chunk['chunk_index']}"
+                drawer_key = f"{source_file}:{extract_mode}:{chunk['chunk_index']}:{filed_at}"
                 drawer_id = (
                     f"drawer_{wing}_{chunk_room}_"
                     f"{hashlib.sha256(drawer_key.encode()).hexdigest()[:24]}"
                 )
+                stack_id = make_id("stack_", source_file, extract_mode, chunk["chunk_index"])
                 batch_docs.append(chunk["content"])
                 batch_ids.append(drawer_id)
                 batch_metas.append(
@@ -438,6 +444,9 @@ def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extr
                         "ingest_mode": "convos",
                         "extract_mode": extract_mode,
                         "normalize_version": NORMALIZE_VERSION,
+                        "parent_drawer_id": parent_drawer_id,
+                        "stack_id": stack_id,
+                        "superseded_at": None,
                     }
                 )
             try:

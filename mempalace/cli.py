@@ -709,6 +709,214 @@ def cmd_search(args):
         sys.exit(1)
 
 
+def cmd_delete(args):
+    """The SOLE destruction path: removes drawers by drawer_id, stack_id,
+    or parent_drawer_id. Re-mining never destroys; only this verb does.
+
+    The identifier prefix selects the scope:
+        ``drawer_*``  one specific layer (one ChromaDB row)
+        ``stack_*``   every layer of one logical chunk position (all versions)
+        ``parent_*``  every chunk from one mining pass
+
+    Default behavior prompts for confirmation; ``--force`` skips the prompt;
+    ``--dry-run`` shows what would be removed without removing anything.
+    """
+    from .backends import CollectionNotInitializedError, PalaceNotFoundError
+    from .palace import get_collection
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+
+    identifier = args.identifier
+    if identifier.startswith("drawer_"):
+        scope_field = None  # delete by exact ID
+        where = None
+    elif identifier.startswith("stack_"):
+        scope_field = "stack_id"
+        where = {"stack_id": identifier}
+    elif identifier.startswith("parent_"):
+        scope_field = "parent_drawer_id"
+        where = {"parent_drawer_id": identifier}
+    else:
+        print(
+            f"  ERROR: identifier '{identifier}' has no recognized prefix.\n"
+            "  Expected one of: drawer_*, stack_*, parent_*",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    try:
+        col = get_collection(palace_path, create=False)
+    except (CollectionNotInitializedError, PalaceNotFoundError) as exc:
+        print(f"  ERROR: cannot open palace at {palace_path}: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+    # Resolve which IDs will be affected — show them before destruction.
+    if scope_field is None:
+        existing = col.get(ids=[identifier], include=["metadatas"])
+    else:
+        existing = col.get(where=where, include=["metadatas"])
+    affected_ids = existing["ids"] if existing and existing.get("ids") else []
+
+    if not affected_ids:
+        print(f"  No drawers found for {identifier}.")
+        return
+
+    print(f"\n  Drawers matching {identifier}: {len(affected_ids)}")
+    for did in affected_ids[:10]:
+        print(f"    - {did}")
+    if len(affected_ids) > 10:
+        print(f"    ... and {len(affected_ids) - 10} more")
+    print()
+
+    if args.dry_run:
+        print("  [DRY RUN] No drawers were destroyed.")
+        return
+
+    if not args.force:
+        # ``input()`` raises EOFError in non-TTY environments (CI pipelines,
+        # piped invocations). Treat that as a "no" — destruction is opt-in,
+        # so the safe default when we can't ask is to abort.
+        try:
+            confirm = input(f"  Destroy {len(affected_ids)} drawer(s)? [y/N]: ").strip().lower()
+        except EOFError:
+            confirm = "n"
+        if confirm != "y":
+            print("  Aborted. No drawers were destroyed.")
+            return
+
+    col.delete(ids=affected_ids)
+    print(f"  Destroyed {len(affected_ids)} drawer(s) for {identifier}.")
+
+
+def cmd_show(args):
+    """Display a drawer or a stack of layers.
+
+    ``mempalace show <drawer_id>`` renders one specific layer.
+    ``mempalace show <stack_id>`` renders the latest layer of the stack
+    with a ``[layer N of M]`` indicator and prev/next navigation hints.
+
+    Flags:
+        ``--layer older``  jump to the layer immediately older than current
+        ``--layer newer``  jump to the layer immediately newer than current
+        ``--layer N``      jump to specific layer number (1-indexed; 1 = latest)
+        ``--all-layers``   flatten and display every layer in the stack
+    """
+    from .backends import CollectionNotInitializedError, PalaceNotFoundError
+    from .palace import get_collection
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+
+    identifier = args.identifier
+    if identifier.startswith("drawer_"):
+        # Single layer — show that row.
+        try:
+            col = get_collection(palace_path, create=False)
+        except (CollectionNotInitializedError, PalaceNotFoundError) as exc:
+            print(f"  ERROR: cannot open palace at {palace_path}: {exc}", file=sys.stderr)
+            sys.exit(2)
+        result = col.get(ids=[identifier], include=["documents", "metadatas"])
+        if not result or not result.get("ids"):
+            print(f"  No drawer found for {identifier}.")
+            sys.exit(1)
+        meta = result["metadatas"][0] or {}
+        doc = result["documents"][0] or ""
+        wing = meta.get("wing", "?")
+        room = meta.get("room", "?")
+        filed_at = meta.get("filed_at", "?")
+        print(f"\n  Drawer: {identifier}")
+        print(f"  {wing} / {room}  ingested {filed_at}")
+        print(f"  {'─' * 56}")
+        for line in doc.split("\n"):
+            print(f"  {line}")
+        return
+
+    if not identifier.startswith("stack_"):
+        print(
+            f"  ERROR: identifier '{identifier}' has no recognized prefix.\n"
+            "  Expected one of: drawer_*, stack_*",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    # Stack — gather all layers, sort latest-first.
+    try:
+        col = get_collection(palace_path, create=False)
+    except (CollectionNotInitializedError, PalaceNotFoundError) as exc:
+        print(f"  ERROR: cannot open palace at {palace_path}: {exc}", file=sys.stderr)
+        sys.exit(2)
+    result = col.get(where={"stack_id": identifier}, include=["documents", "metadatas"])
+    if not result or not result.get("ids"):
+        print(f"  No stack found for {identifier}.")
+        sys.exit(1)
+
+    layers = sorted(
+        zip(result["ids"], result["documents"], result["metadatas"]),
+        # ``or ""`` guards against an explicit ``filed_at: None`` in metadata
+        # (which would crash sort with TypeError: '>' not supported between
+        # str and NoneType). Returns "" for both missing AND None.
+        key=lambda triple: (triple[2] or {}).get("filed_at") or "",
+        reverse=True,  # latest first
+    )
+    total = len(layers)
+
+    if args.all_layers:
+        print(f"\n  Stack: {identifier}  ({total} layer{'s' if total != 1 else ''})")
+        for idx, (did, doc, meta) in enumerate(layers, 1):
+            print(f"  {'═' * 56}")
+            filed_at = (meta or {}).get("filed_at", "?")
+            print(f"  ─── Layer {idx} of {total} ({filed_at}) ───")
+            for line in (doc or "").split("\n"):
+                print(f"  {line}")
+        return
+
+    # Resolve which layer to show.
+    requested = args.layer or "latest"
+    if requested in ("latest", "newest"):
+        idx = 0
+    elif requested == "oldest":
+        idx = total - 1
+    elif requested in ("older", "prev", "previous"):
+        idx = 1 if total > 1 else 0
+    elif requested in ("newer", "next"):
+        idx = 0  # already latest; no "newer than latest"
+    else:
+        try:
+            requested_int = int(requested)
+            if requested_int < 1 or requested_int > total:
+                print(
+                    f"  ERROR: layer {requested_int} out of range (stack has {total} layers).",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+            idx = requested_int - 1
+        except ValueError:
+            print(
+                f"  ERROR: --layer must be 'older'/'newer'/'latest'/'oldest' or a "
+                f"1-indexed number; got {requested!r}",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+    did, doc, meta = layers[idx]
+    meta = meta or {}
+    filed_at = meta.get("filed_at", "?")
+    wing = meta.get("wing", "?")
+    room = meta.get("room", "?")
+    print(f"\n  Stack: {identifier}  [layer {idx + 1} of {total}]")
+    print(f"  {wing} / {room}  ingested {filed_at}")
+    print(f"  {'─' * 56}")
+    for line in (doc or "").split("\n"):
+        print(f"  {line}")
+    print(f"  {'─' * 56}")
+    if total > 1:
+        if idx > 0:
+            newer_filed = (layers[idx - 1][2] or {}).get("filed_at", "?")
+            print(f"  ▲ newer:  --layer newer  ({newer_filed})")
+        if idx < total - 1:
+            older_filed = (layers[idx + 1][2] or {}).get("filed_at", "?")
+            print(f"  ▼ older:  --layer older  ({older_filed})")
+
+
 def cmd_wakeup(args):
     """Show L0 (identity) + L1 (essential story) — the wake-up context."""
     from .layers import MemoryStack
@@ -1577,6 +1785,47 @@ def main():
 
     sub.add_parser("status", help="Show what's been filed")
 
+    # delete — the SOLE destruction path. Mining is purely additive; this verb
+    # is the only way drawers are ever removed from the palace.
+    p_delete = sub.add_parser(
+        "delete",
+        help="Destroy drawer(s) by drawer_id / stack_id / parent_drawer_id (sole destruction path)",
+    )
+    p_delete.add_argument(
+        "identifier",
+        help="ID of what to destroy. Prefix selects scope: drawer_* = one layer, stack_* = all layers of one chunk, parent_* = all chunks from one mining pass",
+    )
+    p_delete.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be destroyed without destroying anything",
+    )
+    p_delete.add_argument(
+        "--force",
+        action="store_true",
+        help="Skip the y/N confirmation prompt",
+    )
+
+    # show — render a drawer or a stack of layers with vertical navigation.
+    p_show = sub.add_parser(
+        "show",
+        help="Display a drawer (drawer_*) or a stack of layers (stack_*)",
+    )
+    p_show.add_argument(
+        "identifier",
+        help="ID of what to display. Prefix selects scope: drawer_* = one layer, stack_* = stack with layer navigation",
+    )
+    p_show.add_argument(
+        "--layer",
+        default=None,
+        help="Which layer of a stack to display: 'older' / 'newer' / 'latest' / 'oldest' / 1-indexed number (1 = latest)",
+    )
+    p_show.add_argument(
+        "--all-layers",
+        action="store_true",
+        help="Flatten the stack and display every layer top-down",
+    )
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1614,6 +1863,8 @@ def main():
         "repair-status": cmd_repair_status,
         "migrate": cmd_migrate,
         "status": cmd_status,
+        "delete": cmd_delete,
+        "show": cmd_show,
     }
     dispatch[args.command](args)
 

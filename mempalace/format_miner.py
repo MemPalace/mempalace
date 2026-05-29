@@ -75,6 +75,7 @@ from .palace import (
     _validate_palace_fts5_after_mine,
     file_already_mined,
     get_collection,
+    make_id,
     mine_lock,
 )
 
@@ -629,20 +630,25 @@ def _file_chunks_locked(
         if file_already_mined(collection, source_file, check_mtime=True, extract_mode="format"):
             return 0, True
 
-        try:
-            collection.delete(where={"source_file": source_file})
-        except Exception:
-            logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
-
+        # Re-mining is additive, never destructive: ``filed_at`` participates
+        # in the drawer_id hash so each mining pass produces unique IDs and
+        # the upsert below INSERTS new rows alongside any existing ones rather
+        # than overwriting them. The only path to drawer destruction is the
+        # explicit ``mempalace delete`` verb.
         filed_at = datetime.now().isoformat()
+        # ``parent_drawer_id`` is per-mining-pass (used as searcher scope key
+        # to fix #1580). ``stack_id`` groups versions of one chunk position
+        # across re-mines (used by searcher rollup for layer history).
+        parent_drawer_id = make_id("parent_", wing, room, source_file, filed_at)
         for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
             batch_docs: list = []
             batch_ids: list = []
             batch_metas: list = []
             for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
-                key = (source_file + str(chunk["chunk_index"])).encode()
+                key = (source_file + str(chunk["chunk_index"]) + filed_at).encode()
                 drawer_id = f"drawer_{wing}_{room}_{hashlib.sha256(key).hexdigest()[:24]}"
                 content = chunk["content"]
+                stack_id = make_id("stack_", source_file, chunk["chunk_index"])
                 meta: dict = {
                     "wing": wing,
                     "room": room,
@@ -654,6 +660,9 @@ def _file_chunks_locked(
                     "extract_mode": "format",
                     "normalize_version": NORMALIZE_VERSION,
                     "hall": detect_hall(content),
+                    "parent_drawer_id": parent_drawer_id,
+                    "stack_id": stack_id,
+                    "superseded_at": None,
                 }
                 if source_mtime is not None:
                     meta["source_mtime"] = source_mtime

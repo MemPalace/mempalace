@@ -58,6 +58,23 @@ _DEFAULT_BACKEND = ChromaBackend()
 NORMALIZE_VERSION = 2
 
 
+def make_id(prefix: str, *parts) -> str:
+    """Compose a deterministic ID: ``prefix + sha256(parts joined by |)[:24]``.
+
+    Single helper for the grouping identifiers introduced in PR A
+    (``parent_drawer_id``, ``stack_id``, and their diary variants). The
+    pipe separator avoids ambiguity for parts that contain underscores
+    or other characters that might collide if concatenated without a
+    separator. Centralising the formula keeps all four miner write
+    paths consistent and gives a single place to evolve the scheme.
+
+    Parts are coerced to ``str`` before joining, so ``int`` chunk
+    indexes and other numeric values can be passed directly.
+    """
+    body = "|".join(str(p) for p in parts)
+    return f"{prefix}{hashlib.sha256(body.encode()).hexdigest()[:24]}"
+
+
 def get_collection(
     palace_path: str,
     collection_name: Optional[str] = None,

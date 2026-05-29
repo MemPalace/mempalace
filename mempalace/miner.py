@@ -31,6 +31,7 @@ from .palace import (
     file_already_mined,
     get_closets_collection,
     get_collection,
+    make_id,
     mine_lock,
     mine_palace_lock,
     purge_file_closets,
@@ -1201,6 +1202,7 @@ def _build_drawer_metadata(
     line_start: Optional[int] = None,
     line_end: Optional[int] = None,
     content_date: Optional[str] = None,
+    filed_at: Optional[str] = None,
 ) -> dict:
     """Build the metadata dict for one drawer without upserting.
 
@@ -1217,14 +1219,38 @@ def _build_drawer_metadata(
     returned dict and downstream code falls back to ``filed_at`` for the
     date and the 3-segment closet pointer format.
     """
+    # ``filed_at`` is hoisted to the caller for the batched process_file
+    # path so all chunks of one mining pass share the same timestamp (and
+    # participate identically in the drawer_id hash that keeps re-mines
+    # additive). Legacy single-shot callers that don't pass filed_at get
+    # a fresh timestamp here for backward compatibility.
+    resolved_filed_at = filed_at if filed_at is not None else datetime.now().isoformat()
+
+    # ``parent_drawer_id`` groups every chunk produced by ONE mining pass
+    # of ONE source file together — searcher.expand_with_neighbors uses
+    # it as a scope key so neighbor expansion never stitches across
+    # unrelated drawer groups (closes #1580 once the searcher fix lands).
+    #
+    # ``stack_id`` groups every VERSION of one chunk position over time
+    # (same source_file + chunk_index, across re-mines). Searcher rollup
+    # uses it to surface one result per logical chunk with layer history.
+    #
+    # ``superseded_at`` is null infrastructure for the cooldown / archive
+    # mechanic: set on a prior layer when a newer one supersedes it.
+    parent_drawer_id = make_id("parent_", wing, room, source_file, resolved_filed_at)
+    stack_id = make_id("stack_", source_file, chunk_index)
+
     metadata = {
         "wing": wing,
         "room": room,
         "source_file": source_file,
         "chunk_index": chunk_index,
         "added_by": agent,
-        "filed_at": datetime.now().isoformat(),
+        "filed_at": resolved_filed_at,
         "normalize_version": NORMALIZE_VERSION,
+        "parent_drawer_id": parent_drawer_id,
+        "stack_id": stack_id,
+        "superseded_at": None,
     }
     if source_mtime is not None:
         metadata["source_mtime"] = source_mtime
@@ -1338,23 +1364,19 @@ def process_file(
         print(f"    [DRY RUN] {filepath.name} -> room:{room} ({len(chunks)} drawers)")
         return len(chunks), room, None
 
-    # Lock this file so concurrent agents don't interleave delete+insert.
-    # Without the lock, two agents can both pass file_already_mined(),
-    # both delete, and both insert — creating duplicates or losing data.
+    # Lock this file so concurrent re-mines don't interleave writes.
     with mine_lock(source_file):
         # Re-check after acquiring lock — another agent may have just finished
         if file_already_mined(collection, source_file, check_mtime=True):
             return 0, room, None
 
-        # Purge stale drawers for this file before re-inserting the fresh chunks.
-        # Converts modified-file re-mines from upsert-over-existing-IDs (which hits
-        # hnswlib's thread-unsafe updatePoint path and can segfault on macOS ARM
-        # with chromadb 0.6.3) into a clean delete+insert, bypassing the update
-        # path entirely.
-        try:
-            collection.delete(where={"source_file": source_file})
-        except Exception:
-            logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
+        # Re-mining is additive, never destructive: prior versions of this
+        # source_file remain in the palace untouched. Each mining pass gets a
+        # unique ``pass_filed_at`` that participates in the drawer_id hash,
+        # guaranteeing fresh IDs so the upsert below INSERTS new rows
+        # alongside any existing ones rather than overwriting them. The only
+        # path to drawer destruction is the explicit ``mempalace delete`` verb.
+        pass_filed_at = datetime.now().isoformat()
 
         # Batch chunks into bounded upserts so the embedding model sees many
         # chunks per forward pass without building one huge Chroma/SQLite
@@ -1383,7 +1405,10 @@ def process_file(
             batch_ids: list = []
             batch_metas: list = []
             for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
-                drawer_id = f"drawer_{wing}_{room}_{hashlib.sha256((source_file + str(chunk['chunk_index'])).encode()).hexdigest()[:24]}"
+                # ``pass_filed_at`` participates in the hash so each mining
+                # pass produces a unique drawer_id even when source_file +
+                # chunk_index match — preserves prior versions, additive only.
+                drawer_id = f"drawer_{wing}_{room}_{hashlib.sha256((source_file + str(chunk['chunk_index']) + pass_filed_at).encode()).hexdigest()[:24]}"
                 batch_docs.append(chunk["content"])
                 batch_ids.append(drawer_id)
                 batch_metas.append(
@@ -1398,6 +1423,7 @@ def process_file(
                         line_start=chunk.get("line_start"),
                         line_end=chunk.get("line_end"),
                         content_date=file_content_date,
+                        filed_at=pass_filed_at,
                     )
                 )
             collection.upsert(
@@ -1413,7 +1439,7 @@ def process_file(
         # fully replace the prior closets, not append to them.
         if closets_col and drawers_added > 0:
             drawer_ids = [
-                f"drawer_{wing}_{room}_{hashlib.sha256((source_file + str(c['chunk_index'])).encode()).hexdigest()[:24]}"
+                f"drawer_{wing}_{room}_{hashlib.sha256((source_file + str(c['chunk_index']) + pass_filed_at).encode()).hexdigest()[:24]}"
                 for c in chunks
             ]
             # Pass drawer_metas so build_closet_lines can emit the Tier 6a
