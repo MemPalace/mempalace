@@ -197,6 +197,14 @@ class KnowledgeGraph:
         if self._connection is None:
             self._connection = sqlite3.connect(self.db_path, timeout=10, check_same_thread=False)
             self._connection.execute("PRAGMA journal_mode=WAL")
+            # Bound the WAL: checkpoint every 100 pages (default 1000) and cap
+            # the journal file at 10 MB. When the MCP server is hosted behind
+            # multiple concurrent stdio clients (one mempalace-mcp child per
+            # editor / Claude Code session), a long-deferred checkpoint under
+            # write pressure is a known SQLite corruption window. Bounding the
+            # WAL keeps the blast radius small and recovery cheap.
+            self._connection.execute("PRAGMA wal_autocheckpoint=100")
+            self._connection.execute("PRAGMA journal_size_limit=10485760")
             self._connection.row_factory = sqlite3.Row
         return self._connection
 
