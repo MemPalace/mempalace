@@ -697,14 +697,21 @@ def test_quarantine_stale_hnsw_leaves_empty_segment_without_metadata_alone(tmp_p
     assert seg.exists()
 
 
-def test_segment_without_metadata_but_with_nontrivial_data_is_unhealthy(tmp_path):
-    """Data without index_metadata.pickle is a partial flush, not a fresh segment."""
+def test_segment_without_metadata_but_with_nontrivial_data_is_healthy_deferred_persist(tmp_path):
+    """Fix #1579: data present + no link_lists + no pickle is the NORMAL deferred-persist state.
+
+    Small/incremental mines never reach hnsw:sync_threshold so chromadb never
+    writes index_metadata.pickle. This segment is healthy — NOT a partial flush.
+    The old #1274 logic treated this as corrupt; #1579 corrects that.
+    The bloat-guard ratio check still fires if link_lists.bin is bloated.
+    """
 
     seg = tmp_path / "abcd-1234-5678"
     seg.mkdir()
     (seg / "data_level0.bin").write_bytes(b"\0" * (_HNSW_MISSING_METADATA_DATA_FLOOR + 1))
+    # No link_lists.bin, no index_metadata.pickle — deferred-persist shape.
 
-    assert not _segment_appears_healthy(str(seg))
+    assert _segment_appears_healthy(str(seg))
 
 
 def test_segment_without_metadata_and_tiny_data_is_still_treated_as_fresh(tmp_path):
@@ -717,8 +724,14 @@ def test_segment_without_metadata_and_tiny_data_is_still_treated_as_fresh(tmp_pa
     assert _segment_appears_healthy(str(seg))
 
 
-def test_quarantine_stale_hnsw_renames_missing_metadata_with_nontrivial_data(tmp_path):
-    """Regression for #1274: missing pickle + non-trivial data must quarantine."""
+def test_quarantine_leaves_deferred_persist_segment_in_place(tmp_path):
+    """Fix #1579: missing pickle + non-trivial data + no link_lists is deferred-persist.
+
+    This was previously quarantined as #1274 corruption but is actually the
+    NORMAL state for any palace that never reached hnsw:sync_threshold.
+    quarantine_stale_hnsw must leave it in place even when sqlite mtime is
+    much newer than the HNSW files.
+    """
 
     now = 1_700_000_000.0
     palace, seg = _make_palace_with_segment(
@@ -729,16 +742,13 @@ def test_quarantine_stale_hnsw_renames_missing_metadata_with_nontrivial_data(tmp
     )
     (seg / "data_level0.bin").write_bytes(b"\0" * (_HNSW_MISSING_METADATA_DATA_FLOOR + 1))
     os.utime(seg / "data_level0.bin", (now - 7200, now - 7200))
+    # No link_lists.bin — deferred-persist shape; _make_palace_with_segment
+    # does not write link_lists.bin, so this is already the right shape.
 
     moved = quarantine_stale_hnsw(str(palace), stale_seconds=3600.0)
 
-    assert len(moved) == 1
-    assert ".drift-" in moved[0]
-    assert not seg.exists()
-
-    drift_dirs = [p for p in palace.iterdir() if ".drift-" in p.name]
-    assert len(drift_dirs) == 1
-    assert (drift_dirs[0] / "data_level0.bin").exists()
+    assert moved == [], "deferred-persist segment must not be quarantined"
+    assert seg.exists()
 
 
 def test_quarantine_stale_hnsw_renames_truncated_metadata(tmp_path):
@@ -1407,3 +1417,70 @@ def test_palace_get_collection_uses_configured_collection_name(monkeypatch):
         "collection_name": "custom_drawers",
         "create": False,
     }
+
+
+# ── Fix A: configurable HNSW thresholds (#1579) ────────────────────────
+
+
+def test_sync_threshold_default_is_50000(tmp_path):
+    """With no env override, created collection must carry sync_threshold=50_000.
+
+    This is a regression guard: the default must never silently drop below
+    50_000 (the value validated by the #344 bloat regression suite).
+    """
+    palace_path = tmp_path / "palace"
+    ChromaBackend().get_collection(
+        str(palace_path),
+        collection_name="mempalace_drawers",
+        create=True,
+    )
+    client = chromadb.PersistentClient(path=str(palace_path))
+    col = client.get_collection("mempalace_drawers")
+    assert col.metadata.get("hnsw:sync_threshold") == 50_000
+
+
+def test_sync_threshold_env_override(tmp_path, monkeypatch):
+    """MEMPALACE_HNSW_SYNC_THRESHOLD env var must override the default at collection creation.
+
+    Large-palace operators who want deferred persistence to actually trigger
+    can lower this value so chromadb writes index_metadata.pickle before
+    the process exits, preventing false-positive quarantine on next open.
+    """
+    monkeypatch.setenv("MEMPALACE_HNSW_SYNC_THRESHOLD", "500")
+    palace_path = tmp_path / "palace"
+    ChromaBackend().get_collection(
+        str(palace_path),
+        collection_name="mempalace_drawers",
+        create=True,
+    )
+    client = chromadb.PersistentClient(path=str(palace_path))
+    col = client.get_collection("mempalace_drawers")
+    assert col.metadata.get("hnsw:sync_threshold") == 500
+
+
+def test_batch_size_env_override(tmp_path, monkeypatch):
+    """MEMPALACE_HNSW_BATCH_SIZE env var must override the default at collection creation."""
+    monkeypatch.setenv("MEMPALACE_HNSW_BATCH_SIZE", "1000")
+    palace_path = tmp_path / "palace"
+    ChromaBackend().get_collection(
+        str(palace_path),
+        collection_name="mempalace_drawers",
+        create=True,
+    )
+    client = chromadb.PersistentClient(path=str(palace_path))
+    col = client.get_collection("mempalace_drawers")
+    assert col.metadata.get("hnsw:batch_size") == 1000
+
+
+def test_hnsw_threshold_invalid_env_falls_back_to_default(tmp_path, monkeypatch):
+    """A garbage env value must fall back to the 50_000 default, not crash."""
+    monkeypatch.setenv("MEMPALACE_HNSW_SYNC_THRESHOLD", "not_a_number")
+    palace_path = tmp_path / "palace"
+    ChromaBackend().get_collection(
+        str(palace_path),
+        collection_name="mempalace_drawers",
+        create=True,
+    )
+    client = chromadb.PersistentClient(path=str(palace_path))
+    col = client.get_collection("mempalace_drawers")
+    assert col.metadata.get("hnsw:sync_threshold") == 50_000

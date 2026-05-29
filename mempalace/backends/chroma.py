@@ -71,13 +71,25 @@ def _hnsw_link_to_data_ratio(seg_dir: str) -> Optional[float]:
     return link_size / data_size
 
 
-def _hnsw_link_lists_is_usable_for_payload(seg_dir: str) -> bool:
+def _hnsw_link_lists_is_usable_for_payload(seg_dir: str, *, pickle_present: bool = True) -> bool:
     """Return False when a non-trivial HNSW payload lacks usable link lists.
 
-    A missing or empty link_lists.bin is acceptable only for a fresh/empty
-    segment. Once data_level0.bin has real payload, a zero-byte link_lists.bin
-    is not a harmless async-flush shape: ChromaDB can later hand the broken
-    graph to hnswlib and crash in native code.
+    Fix #1579 / #344: the check depends on whether index_metadata.pickle exists.
+
+    - pickle PRESENT + empty link_lists + non-trivial data → False (corrupt, #1457).
+      ChromaDB wrote vector data but the metadata/link-graph is incomplete. Letting
+      Chroma open this shape can crash in native HNSW code.
+    - pickle ABSENT + empty link_lists + non-trivial data → True (deferred-persist).
+      Small/incremental mines never reach hnsw:sync_threshold so chromadb never
+      calls persist() and never writes index_metadata.pickle. This is the NORMAL
+      state for any palace below the 50 000-entry sync_threshold, NOT corruption.
+      The #344 bloat check (ratio > _HNSW_LINK_TO_DATA_MAX_RATIO) still fires
+      independently on bloated link_lists regardless of pickle presence.
+
+    ``pickle_present`` must be supplied by the caller (``_segment_appears_healthy``)
+    which already has the pickle path available. Defaults to True (conservative —
+    treats absence of knowledge as "pickle present") for safety when called from
+    other contexts.
     """
     data_path = os.path.join(seg_dir, "data_level0.bin")
     link_path = os.path.join(seg_dir, "link_lists.bin")
@@ -90,14 +102,28 @@ def _hnsw_link_lists_is_usable_for_payload(seg_dir: str) -> bool:
         if data_size <= _HNSW_MISSING_METADATA_DATA_FLOOR:
             return True
 
-        return os.path.isfile(link_path) and os.path.getsize(link_path) > 0
+        link_size = os.path.getsize(link_path) if os.path.isfile(link_path) else 0
+
+        if not pickle_present:
+            # Missing index_metadata.pickle is only healthy in the deferred-persist
+            # state, i.e. link_lists.bin is also empty/absent. A non-empty
+            # link_lists.bin with no pickle is an interrupted partial flush (chromadb
+            # writes link_lists before the pickle) and must be quarantined. (#1579, PR #1655 Gemini review)
+            return link_size == 0
+
+        return link_size > 0
     except OSError:
         return False
 
 
-def _hnsw_payload_appears_sane(seg_dir: str) -> bool:
-    """Return False when HNSW payload files are structurally implausible."""
-    if not _hnsw_link_lists_is_usable_for_payload(seg_dir):
+def _hnsw_payload_appears_sane(seg_dir: str, *, pickle_present: bool = True) -> bool:
+    """Return False when HNSW payload files are structurally implausible.
+
+    ``pickle_present`` is forwarded to ``_hnsw_link_lists_is_usable_for_payload``
+    so that the deferred-persist case (empty link_lists, no pickle) is not
+    misidentified as corruption. See #1579.
+    """
+    if not _hnsw_link_lists_is_usable_for_payload(seg_dir, pickle_present=pickle_present):
         return False
 
     ratio = _hnsw_link_to_data_ratio(seg_dir)
@@ -128,6 +154,38 @@ _HNSW_BLOAT_GUARD = {
     "hnsw:batch_size": 50_000,
     "hnsw:sync_threshold": 50_000,
 }
+
+
+def _hnsw_bloat_guard() -> dict:
+    """Return the HNSW metadata dict for collection creation.
+
+    Defaults to ``_HNSW_BLOAT_GUARD`` (batch_size=50_000, sync_threshold=50_000)
+    but honours ``MEMPALACE_HNSW_SYNC_THRESHOLD`` / ``MEMPALACE_HNSW_BATCH_SIZE``
+    env vars and ``hnsw_sync_threshold`` / ``hnsw_batch_size`` in ``config.json``.
+
+    Lowering the threshold allows smaller palaces to trigger chromadb's persist
+    path so ``index_metadata.pickle`` is written before process exit, preventing
+    the false-positive quarantine on cold open described in issue #1579. The
+    default of 50 000 is kept to preserve the #344 bloat protection.
+    """
+    try:
+        from ..config import MempalaceConfig
+
+        cfg = MempalaceConfig()
+        return {
+            "hnsw:batch_size": cfg.hnsw_batch_size,
+            "hnsw:sync_threshold": cfg.hnsw_sync_threshold,
+        }
+    except Exception as exc:
+        # Never let a config failure break collection creation — fall back to
+        # the hard-coded defaults that have been stable since PR #344.
+        logger.warning(
+            "HNSW threshold config failed to load; using hard-coded defaults %s",
+            _HNSW_BLOAT_GUARD,
+            exc_info=exc,
+        )
+        return dict(_HNSW_BLOAT_GUARD)
+
 
 # Missing index_metadata.pickle is normal only while a segment is still fresh
 # or effectively empty. Once data_level0.bin has non-trivial payload, a
@@ -168,11 +226,16 @@ def _segment_appears_healthy(seg_dir: str) -> bool:
     ``0x2e`` (the protocol/terminator byte sequence chromadb serializes
     with).
 
-    Missing metadata is healthy only while the segment still looks fresh or
-    empty. If ``data_level0.bin`` already has non-trivial payload but
-    ``index_metadata.pickle`` is missing, the segment is partially flushed:
-    Chroma wrote vector data without the metadata it needs to reopen the
-    HNSW reader safely.
+    Fix #1579: missing ``index_metadata.pickle`` with non-trivial
+    ``data_level0.bin`` and empty/absent ``link_lists.bin`` is the
+    NORMAL deferred-persist state for small/incremental mines that never
+    reached ``hnsw:sync_threshold``. This must NOT be quarantined.
+
+    The two cases where a segment IS unhealthy despite missing pickle:
+    1. Bloated ``link_lists.bin`` (ratio > _HNSW_LINK_TO_DATA_MAX_RATIO,
+       the #344 danger): link_lists present and much larger than data.
+    2. Pickle present but failing the format sniff (bytes don't match
+       chromadb's protocol-2 envelope): partial-flush corruption.
 
     Deliberately format-sniffs only; never deserializes. Deserialization
     can execute arbitrary code, and the byte-sniff is sufficient to
@@ -185,22 +248,20 @@ def _segment_appears_healthy(seg_dir: str) -> bool:
     files and quarantine_stale_hnsw would conservatively rename them
     out of the way.
     """
-    if not _hnsw_payload_appears_sane(seg_dir):
+    meta_path = os.path.join(seg_dir, "index_metadata.pickle")
+    pickle_present = os.path.isfile(meta_path)
+
+    # Pass pickle_present so the usability check can distinguish the
+    # deferred-persist case (no pickle + empty link_lists) from corruption
+    # (pickle present + empty link_lists). See #1579 and #344.
+    if not _hnsw_payload_appears_sane(seg_dir, pickle_present=pickle_present):
         return False
 
-    meta_path = os.path.join(seg_dir, "index_metadata.pickle")
-    if not os.path.isfile(meta_path):
-        data_path = os.path.join(seg_dir, "data_level0.bin")
-        try:
-            if (
-                os.path.isfile(data_path)
-                and os.path.getsize(data_path) > _HNSW_MISSING_METADATA_DATA_FLOOR
-            ):
-                return False
-        except OSError:
-            return False
-
-        # No metadata and no meaningful vector payload yet: fresh/empty segment.
+    if not pickle_present:
+        # Deferred-persist: chromadb never reached sync_threshold.
+        # _hnsw_payload_appears_sane already rejected the bloat case above,
+        # so arriving here means link_lists is either absent, empty, or
+        # within ratio bounds — all safe. Return healthy. #1579
         return True
 
     try:
@@ -1462,7 +1523,7 @@ class ChromaBackend(BaseBackend):
                     metadata={
                         "hnsw:space": hnsw_space,
                         "hnsw:num_threads": 1,
-                        **_HNSW_BLOAT_GUARD,
+                        **_hnsw_bloat_guard(),
                     },
                     **ef_kwargs,
                 )
@@ -1537,7 +1598,7 @@ class ChromaBackend(BaseBackend):
             metadata={
                 "hnsw:space": hnsw_space,
                 "hnsw:num_threads": 1,
-                **_HNSW_BLOAT_GUARD,
+                **_hnsw_bloat_guard(),
             },
             **ef_kwargs,
         )
