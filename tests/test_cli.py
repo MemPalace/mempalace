@@ -795,7 +795,8 @@ def test_main_hook_no_subcommand_prints_help(capsys):
     with patch("sys.argv", ["mempalace", "hook"]):
         main()
     out = capsys.readouterr().out
-    assert "hook" in out.lower() or "run" in out.lower()
+    assert "usage:" in out.lower()
+    assert "run" in out.lower()
 
 
 def test_main_hook_run_dispatches():
@@ -814,7 +815,8 @@ def test_main_instructions_no_subcommand_prints_help(capsys):
     with patch("sys.argv", ["mempalace", "instructions"]):
         main()
     out = capsys.readouterr().out
-    assert "instructions" in out.lower() or "init" in out.lower()
+    assert "usage:" in out.lower()
+    assert "init" in out.lower()
 
 
 def test_main_instructions_dispatches():
