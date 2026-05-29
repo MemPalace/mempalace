@@ -8,6 +8,7 @@ Normalizes format, chunks by exchange pair (Q+A = one unit), files to palace.
 Same palace as project mining. Different ingest strategy.
 """
 
+import json
 import os
 import sys
 import hashlib
@@ -378,7 +379,37 @@ def scan_convos(convo_dir: str) -> list:
 # =============================================================================
 
 
-def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extract_mode):
+def _extract_conversation_timestamp(filepath: str) -> Optional[str]:
+    """Return the ISO 8601 timestamp of the first user/assistant message in a JSONL transcript.
+
+    Reads the file directly to preserve the original conversation time
+    regardless of when mining runs. Returns None for non-JSONL files or
+    when no timestamped message entry is found.
+    """
+    if not filepath.endswith((".jsonl", ".json")):
+        return None
+    try:
+        with open(filepath, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                ts = entry.get("timestamp")
+                msg_type = entry.get("type", "")
+                if ts and msg_type in ("user", "human", "assistant"):
+                    return str(ts)
+    except OSError:
+        pass
+    return None
+
+
+def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extract_mode, conversation_at=None):
     """Lock the source file, purge stale drawers, and upsert fresh chunks.
 
     Combines the per-file serialization that prevents concurrent agents from
@@ -426,8 +457,7 @@ def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extr
                 )
                 batch_docs.append(chunk["content"])
                 batch_ids.append(drawer_id)
-                batch_metas.append(
-                    {
+                meta = {
                         "wing": wing,
                         "room": chunk_room,
                         "hall": _detect_hall_cached(chunk["content"]),
@@ -439,7 +469,9 @@ def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extr
                         "extract_mode": extract_mode,
                         "normalize_version": NORMALIZE_VERSION,
                     }
-                )
+                if conversation_at:
+                    meta["conversation_at"] = conversation_at
+                batch_metas.append(meta)
             try:
                 collection.upsert(
                     documents=batch_docs,
@@ -686,8 +718,10 @@ def _mine_convos_impl(
 
         # Lock + purge stale + file fresh chunks. Lock serializes concurrent
         # agents; purge removes pre-v2 drawers so the schema bump applies.
+        conversation_at = _extract_conversation_timestamp(source_file)
         drawers_added, room_delta, skipped = _file_chunks_locked(
-            collection, source_file, chunks, wing, room, agent, extract_mode
+            collection, source_file, chunks, wing, room, agent, extract_mode,
+            conversation_at=conversation_at,
         )
         if skipped:
             files_skipped += 1
