@@ -1381,6 +1381,13 @@ def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offse
         for i, did in enumerate(result["ids"]):
             meta = _safe_meta(result["metadatas"][i])
             doc = result["documents"][i]
+            # Skip benchmark data and SESSION logs in diary data
+            if (
+                meta.get("is_benchmark")
+                or meta.get("added_by") == "benchmark"
+                or (doc and doc.startswith("SESSION:"))
+            ):
+                continue
             drawers.append(
                 {
                     "drawer_id": did,
