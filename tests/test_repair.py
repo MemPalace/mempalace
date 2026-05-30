@@ -1336,6 +1336,115 @@ def test_rebuild_index_aborts_on_sqlite_integrity_errors_before_delete_collectio
     mock_shutil.copy2.assert_not_called()
 
 
+@patch("mempalace.repair.shutil")
+@patch("mempalace.repair.ChromaBackend")
+def test_rebuild_index_auto_rebuilds_fts5_before_aborting(
+    mock_backend_cls,
+    mock_shutil,
+    tmp_path,
+    capsys,
+):
+    """FTS5-only quick_check errors trigger auto-rebuild; repair proceeds on success.
+
+    Regression test for #1606: _vacuum_and_rebuild_fts5 already exists and is
+    called post-repair, but was never attempted pre-repair when the preflight
+    found FTS5-only corruption.
+    """
+    sqlite_path = tmp_path / "chroma.sqlite3"
+    with sqlite3.connect(sqlite_path) as conn:
+        conn.execute("CREATE TABLE dummy(id INTEGER PRIMARY KEY)")
+        conn.execute(
+            "CREATE VIRTUAL TABLE embedding_fulltext_search"
+            " USING fts5(string_value, tokenize='unicode61')"
+        )
+        conn.commit()
+
+    mock_col = MagicMock()
+    mock_col.count.return_value = 0
+    mock_col.get.return_value = {"ids": [], "documents": [], "metadatas": []}
+    _install_mock_backend(mock_backend_cls, mock_col)
+
+    fts5_error = "malformed inverted index for FTS5 table main.embedding_fulltext_search"
+    call_count = {"n": 0}
+
+    def mock_integrity_errors(palace_path):
+        call_count["n"] += 1
+        # First call (preflight): return FTS5 error. Second call (post-rebuild): healthy.
+        return [fts5_error] if call_count["n"] == 1 else []
+
+    with patch("mempalace.repair.sqlite_integrity_errors", side_effect=mock_integrity_errors):
+        repair.rebuild_index(palace_path=str(tmp_path))
+
+    out = capsys.readouterr().out
+    assert "FTS5 corruption detected" in out
+    assert "FTS5 rebuilt successfully" in out
+    assert "SQLite-layer corruption detected before repair rebuild" not in out
+    assert call_count["n"] == 2
+
+
+@patch("mempalace.repair.shutil")
+@patch("mempalace.repair.ChromaBackend")
+def test_rebuild_index_aborts_when_fts5_rebuild_does_not_clear_errors(
+    mock_backend_cls,
+    mock_shutil,
+    tmp_path,
+    capsys,
+):
+    """If FTS5 rebuild doesn't fix quick_check, the original abort path fires."""
+    sqlite_path = tmp_path / "chroma.sqlite3"
+    with sqlite3.connect(sqlite_path) as conn:
+        conn.execute("CREATE TABLE dummy(id INTEGER PRIMARY KEY)")
+        conn.commit()
+
+    _install_mock_backend(mock_backend_cls, MagicMock())
+
+    fts5_error = "malformed inverted index for FTS5 table main.embedding_fulltext_search"
+
+    with patch(
+        "mempalace.repair.sqlite_integrity_errors",
+        return_value=[fts5_error],
+    ):
+        repair.rebuild_index(palace_path=str(tmp_path))
+
+    out = capsys.readouterr().out
+    assert "FTS5 corruption detected" in out
+    assert "SQLite-layer corruption detected before repair rebuild" in out
+    mock_backend_cls.return_value.delete_collection.assert_not_called()
+
+
+@patch("mempalace.repair.shutil")
+@patch("mempalace.repair.ChromaBackend")
+def test_rebuild_index_does_not_attempt_fts5_rebuild_for_non_fts5_errors(
+    mock_backend_cls,
+    mock_shutil,
+    tmp_path,
+    capsys,
+):
+    """Mixed or non-FTS5 corruption bypasses auto-rebuild and aborts immediately."""
+    sqlite_path = tmp_path / "chroma.sqlite3"
+    with sqlite3.connect(sqlite_path) as conn:
+        conn.execute("CREATE TABLE dummy(id INTEGER PRIMARY KEY)")
+        conn.commit()
+
+    _install_mock_backend(mock_backend_cls, MagicMock())
+
+    with (
+        patch(
+            "mempalace.repair.sqlite_integrity_errors",
+            return_value=[
+                "Page 4 of B-tree 12345: database disk image is malformed",
+                "malformed inverted index for FTS5 table main.embedding_fulltext_search",
+            ],
+        ),
+        patch("mempalace.repair._vacuum_and_rebuild_fts5") as mock_fts5,
+    ):
+        repair.rebuild_index(palace_path=str(tmp_path))
+
+    out = capsys.readouterr().out
+    assert "SQLite-layer corruption detected before repair rebuild" in out
+    mock_fts5.assert_not_called()
+
+
 def test_rebuild_index_runs_sqlite_preflight_before_chromadb_open(tmp_path, capsys):
     """The SQLite integrity preflight must run BEFORE backend.get_collection.
 
