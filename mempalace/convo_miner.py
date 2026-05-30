@@ -14,7 +14,7 @@ import sys
 import hashlib
 import logging
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import defaultdict
 from typing import Optional
 
@@ -427,7 +427,7 @@ def _extract_conversation_timestamp(filepath: str) -> Optional[str]:
                         try:
                             if ts > 1e11:
                                 ts /= 1000.0
-                            return datetime.fromtimestamp(ts).isoformat()
+                            return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
                         except (ValueError, OSError, OverflowError):
                             return None
     except OSError:
@@ -435,7 +435,9 @@ def _extract_conversation_timestamp(filepath: str) -> Optional[str]:
     return None
 
 
-def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extract_mode, conversation_at=None):
+def _file_chunks_locked(
+    collection, source_file, chunks, wing, room, agent, extract_mode, conversation_at=None
+):
     """Lock the source file, purge stale drawers, and upsert fresh chunks.
 
     Combines the per-file serialization that prevents concurrent agents from
@@ -484,17 +486,17 @@ def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extr
                 batch_docs.append(chunk["content"])
                 batch_ids.append(drawer_id)
                 meta = {
-                        "wing": wing,
-                        "room": chunk_room,
-                        "hall": _detect_hall_cached(chunk["content"]),
-                        "source_file": source_file,
-                        "chunk_index": chunk["chunk_index"],
-                        "added_by": agent,
-                        "filed_at": filed_at,
-                        "ingest_mode": "convos",
-                        "extract_mode": extract_mode,
-                        "normalize_version": NORMALIZE_VERSION,
-                    }
+                    "wing": wing,
+                    "room": chunk_room,
+                    "hall": _detect_hall_cached(chunk["content"]),
+                    "source_file": source_file,
+                    "chunk_index": chunk["chunk_index"],
+                    "added_by": agent,
+                    "filed_at": filed_at,
+                    "ingest_mode": "convos",
+                    "extract_mode": extract_mode,
+                    "normalize_version": NORMALIZE_VERSION,
+                }
                 if conversation_at:
                     meta["conversation_at"] = conversation_at
                 batch_metas.append(meta)
@@ -746,7 +748,13 @@ def _mine_convos_impl(
         # agents; purge removes pre-v2 drawers so the schema bump applies.
         conversation_at = _extract_conversation_timestamp(source_file)
         drawers_added, room_delta, skipped = _file_chunks_locked(
-            collection, source_file, chunks, wing, room, agent, extract_mode,
+            collection,
+            source_file,
+            chunks,
+            wing,
+            room,
+            agent,
+            extract_mode,
             conversation_at=conversation_at,
         )
         if skipped:
