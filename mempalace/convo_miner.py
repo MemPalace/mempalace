@@ -364,10 +364,28 @@ def scan_convos(convo_dir: str) -> list:
                     except OSError:
                         pass
                     continue
+                # Skip files exceeding size limit, or those whose stat() raises
+                # (permission denied, racing delete, broken symlink that
+                # survived the earlier is_symlink check). Both branches log
+                # to stderr to match the SKIP: (symlink) line above; silent
+                # drops at this gate were the original #923 complaint.
                 try:
-                    if filepath.stat().st_size > MAX_FILE_SIZE:
+                    file_size = filepath.stat().st_size
+                    if file_size > MAX_FILE_SIZE:
+                        print(
+                            f"  SKIP: {filepath.name} ({file_size / (1024 * 1024):.1f} MB)"
+                            f" exceeds {MAX_FILE_SIZE // (1024 * 1024)} MB limit",
+                            file=sys.stderr,
+                        )
                         continue
-                except OSError:
+                except OSError as exc:
+                    # Prefer ``exc.strerror`` so the path isn't duplicated in
+                    # the output (see the matching comment in
+                    # ``miner.scan_project``).
+                    print(
+                        f"  SKIP: {filepath.name} (stat error: {exc.strerror or exc})",
+                        file=sys.stderr,
+                    )
                     continue
                 files.append(filepath)
     return files
