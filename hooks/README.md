@@ -202,4 +202,61 @@ This only needs to be done once — after that, the hooks auto-mine each session
 
 ## Cost
 
-**Zero extra tokens.** The hooks notify the AI that saves happened in the background — the AI doesn't need to write anything in the chat. All filing is handled automatically. Previous versions asked the AI to write diary entries and drawer content in the chat window, which cost ~$1/session in retransmitted tokens.
+**Zero extra tokens.** The hooks are bash scripts that run locally. They don't call any API. The only "cost" is the AI spending a few seconds organizing memories at each checkpoint — and it's doing that with context it already has loaded.
+
+## Hook Usage Examples
+
+### When are hooks triggered?
+
+**Save Hook** — Triggered automatically every 15 messages.
+Decisions and code changes are saved automatically during long debugging sessions.
+
+**PreCompact Hook** — Triggered just before the context window fills up.
+Nothing is lost at the end of long sessions.
+
+---
+
+### Setup (for Claude Code)
+
+Add the following to your `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/YOUR_MEMPALACE_PATH/hooks/mempal_save_hook.sh"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/YOUR_MEMPALACE_PATH/hooks/mempal_precompact_hook.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+> Replace `/YOUR_MEMPALACE_PATH/` with the actual path, e.g. `/home/youruser/mempalace`
+
+---
+
+### Example Scenario
+
+1. You are working on an auth migration with Claude Code
+2. After 15 messages, the Save Hook fires automatically
+3. "Fixed OAuth token refresh bug, decided to migrate to Clerk" is saved to your palace
+4. Weeks later, you run `mempalace search "auth decision"`
+5. You find that old decision instantly ✅
