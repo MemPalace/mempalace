@@ -30,6 +30,7 @@ from .base import (
     UnsupportedFilterError,
 )
 from .chroma import ChromaBackend, ChromaCollection
+from .sqlite_vec import SqliteVecBackend, SqliteVecCollection
 from .registry import (
     available_backends,
     get_backend,
@@ -55,6 +56,8 @@ __all__ = [
     "PalaceNotFoundError",
     "PalaceRef",
     "QueryResult",
+    "SqliteVecBackend",
+    "SqliteVecCollection",
     "UnsupportedFilterError",
     "available_backends",
     "get_backend",

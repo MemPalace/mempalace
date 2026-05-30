@@ -178,12 +178,15 @@ def resolve_backend_for_palace(
 
 
 def _register_builtins() -> None:
-    """Register chroma as the in-tree default."""
+    """Register in-tree backends as defaults."""
     from .chroma import ChromaBackend
+    from .sqlite_vec import SqliteVecBackend
 
     # Use setdefault semantics so a caller that pre-registered for tests wins.
     if "chroma" not in _registry:
         _registry["chroma"] = ChromaBackend
+    if "sqlite_vec" not in _registry:
+        _registry["sqlite_vec"] = SqliteVecBackend
 
 
 _register_builtins()
