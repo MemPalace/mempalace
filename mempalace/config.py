@@ -1,7 +1,16 @@
 """
 MemPalace configuration system.
 
-Priority: env vars > config file (~/.mempalace/config.json) > defaults
+Priority: env vars > config file > defaults.
+
+The default config directory follows the XDG Base Directory Specification
+(https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html)
+with back-compat for existing installs:
+
+  1. $MEMPALACE_CONFIG_DIR if set (explicit override, used by tests and CI)
+  2. ~/.mempalace if it already exists (existing installs keep working)
+  3. $XDG_CONFIG_HOME/mempalace if XDG_CONFIG_HOME is set
+  4. ~/.config/mempalace (XDG default fallback)
 """
 
 import json
@@ -189,6 +198,51 @@ def sanitize_content(value: str, max_length: int = 100_000) -> str:
     return strip_lone_surrogates(value)
 
 
+# ── XDG Base Directory resolution ─────────────────────────────────────────────
+
+# Files that mark a ~/.mempalace directory as a real legacy install rather
+# than an empty/leftover directory. Any one is enough for back-compat.
+_LEGACY_MARKERS = ("config.json", "people_map.json")
+
+
+def _has_legacy_install(legacy: Path) -> bool:
+    """Return True if ``legacy`` is a real legacy install, not an empty dir.
+
+    A bare ``palace`` directory created by some other tool should not hijack
+    the XDG path, so the palace sub-directory only counts when it contains
+    an actual ChromaDB store (``chroma.sqlite3``).
+    """
+    if any((legacy / marker).is_file() for marker in _LEGACY_MARKERS):
+        return True
+    return (legacy / "palace" / "chroma.sqlite3").is_file()
+
+
+def _default_config_dir() -> Path:
+    """Return the default config directory.
+
+    See the module docstring for the resolution order.
+    """
+    env_dir = os.environ.get("MEMPALACE_CONFIG_DIR")
+    if env_dir and env_dir.strip():
+        return Path(env_dir).expanduser()
+
+    legacy = Path.home() / ".mempalace"
+    if legacy.is_dir() and _has_legacy_install(legacy):
+        return legacy
+
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg and xdg.strip():
+        xdg_path = Path(xdg).expanduser()
+        # Per XDG spec, relative paths must be ignored as invalid.
+        if xdg_path.is_absolute():
+            return xdg_path / "mempalace"
+
+    return Path.home() / ".config" / "mempalace"
+
+
+# DEPRECATED: kept only for backward compatibility with external importers.
+# This constant is frozen at the legacy location and is NOT XDG-aware — prefer
+# MempalaceConfig().palace_path in new code.
 DEFAULT_PALACE_PATH = os.path.expanduser("~/.mempalace/palace")
 DEFAULT_COLLECTION_NAME = "mempalace_drawers"
 
@@ -288,11 +342,10 @@ class MempalaceConfig:
 
         Args:
             config_dir: Override config directory (useful for testing).
-                        Defaults to ~/.mempalace.
+                        Defaults to the XDG-aware base directory — see
+                        _default_config_dir() for the resolution order.
         """
-        self._config_dir = (
-            Path(config_dir) if config_dir else Path(os.path.expanduser("~/.mempalace"))
-        )
+        self._config_dir = Path(config_dir).expanduser() if config_dir else _default_config_dir()
         self._config_file = self._config_dir / "config.json"
         self._people_map_file = self._config_dir / "people_map.json"
         self._file_config = {}
@@ -305,15 +358,29 @@ class MempalaceConfig:
                 self._file_config = {}
 
     @property
+    def config_dir(self):
+        """Active config directory (XDG-aware).
+
+        Public accessor for the resolved config-dir path so callers outside
+        ``config.py`` can derive sibling locations (write-ahead-log dir,
+        cache dir, etc.) without reaching into ``_config_dir``.
+        """
+        return self._config_dir
+
+    @property
     def palace_path(self):
-        """Path to the memory palace data directory."""
+        """Path to the memory palace data directory.
+
+        Defaults to a "palace" sub-directory inside the active config
+        directory, so the palace follows the config wherever XDG places it.
+        """
         env_val = os.environ.get("MEMPALACE_PALACE_PATH") or os.environ.get("MEMPAL_PALACE_PATH")
         if env_val:
             # Normalize: expand ~ and collapse .. to match the CLI --palace
             # code path (mcp_server.py:62) and prevent surprise redirection
             # when the env var contains unresolved components.
             return os.path.abspath(os.path.expanduser(env_val))
-        return self._file_config.get("palace_path", DEFAULT_PALACE_PATH)
+        return self._file_config.get("palace_path", str(self._config_dir / "palace"))
 
     @property
     def tunnel_file(self):
@@ -625,7 +692,7 @@ class MempalaceConfig:
             # dropping legitimate short conversation exchanges. Module-level
             # defaults already apply correctly when these keys are absent.
             default_config = {
-                "palace_path": DEFAULT_PALACE_PATH,
+                "palace_path": str(self._config_dir / "palace"),
                 "collection_name": DEFAULT_COLLECTION_NAME,
                 "topic_wings": DEFAULT_TOPIC_WINGS,
                 "hall_keywords": DEFAULT_HALL_KEYWORDS,

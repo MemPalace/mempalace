@@ -1,10 +1,11 @@
-import os
 import json
+import os
 import tempfile
 
 import pytest
 from mempalace.config import (
     MempalaceConfig,
+    _default_config_dir,
     normalize_wing_name,
     sanitize_iso_date,
     sanitize_iso_temporal,
@@ -13,10 +14,26 @@ from mempalace.config import (
 )
 
 
+def _set_home(monkeypatch, home):
+    """Point HOME and USERPROFILE at ``home`` so Path.home() is consistent
+    on both POSIX and Windows.
+    """
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+
+
 def test_default_config():
     cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
     assert "palace" in cfg.palace_path
     assert cfg.collection_name == "mempalace_drawers"
+
+
+def test_config_dir_property_exposes_resolved_path(tmp_path):
+    """`config_dir` is the public accessor callers outside config.py rely on
+    to derive sibling locations (WAL dir, cache dir, etc.) without reaching
+    into the underscore-prefixed `_config_dir`."""
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.config_dir == tmp_path
 
 
 def test_config_from_file():
@@ -618,3 +635,155 @@ def test_hooks_auto_save_env_override_true():
         assert cfg.hooks_auto_save is True
     finally:
         del os.environ["MEMPALACE_HOOKS_AUTO_SAVE"]
+
+
+# --- XDG Base Directory ---
+
+
+def test_default_config_dir_uses_xdg_when_set(monkeypatch, tmp_path):
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    xdg = tmp_path / "xdg"
+    xdg.mkdir()
+    _set_home(monkeypatch, fake_home)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.delenv("MEMPALACE_CONFIG_DIR", raising=False)
+
+    assert _default_config_dir() == xdg / "mempalace"
+
+    cfg = MempalaceConfig()
+    assert cfg.palace_path == str(xdg / "mempalace" / "palace")
+
+
+def test_default_config_dir_falls_back_to_dot_config(monkeypatch, tmp_path):
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    _set_home(monkeypatch, fake_home)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("MEMPALACE_CONFIG_DIR", raising=False)
+
+    assert _default_config_dir() == fake_home / ".config" / "mempalace"
+
+
+def test_legacy_mempalace_dir_respected_for_backcompat(monkeypatch, tmp_path):
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    legacy = fake_home / ".mempalace"
+    legacy.mkdir()
+    (legacy / "config.json").write_text("{}")
+    xdg = tmp_path / "xdg"
+    xdg.mkdir()
+
+    _set_home(monkeypatch, fake_home)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.delenv("MEMPALACE_CONFIG_DIR", raising=False)
+
+    assert _default_config_dir() == legacy
+
+    cfg = MempalaceConfig()
+    assert cfg.palace_path == str(legacy / "palace")
+
+
+def test_empty_legacy_dir_does_not_hijack_xdg(monkeypatch, tmp_path):
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    (fake_home / ".mempalace").mkdir()
+    xdg = tmp_path / "xdg"
+    xdg.mkdir()
+
+    _set_home(monkeypatch, fake_home)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.delenv("MEMPALACE_CONFIG_DIR", raising=False)
+
+    assert _default_config_dir() == xdg / "mempalace"
+
+
+def test_bare_palace_dir_does_not_trigger_legacy(monkeypatch, tmp_path):
+    # A bare ~/.mempalace/palace directory (without an actual ChromaDB
+    # store inside) should not be treated as a legacy install -- some
+    # other tool may have created the directory.
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    legacy = fake_home / ".mempalace"
+    legacy.mkdir()
+    (legacy / "palace").mkdir()
+    xdg = tmp_path / "xdg"
+    xdg.mkdir()
+
+    _set_home(monkeypatch, fake_home)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.delenv("MEMPALACE_CONFIG_DIR", raising=False)
+
+    assert _default_config_dir() == xdg / "mempalace"
+
+
+def test_palace_with_chromadb_triggers_legacy(monkeypatch, tmp_path):
+    # A ~/.mempalace/palace directory that actually contains the ChromaDB
+    # store counts as a real legacy install even without config.json.
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    legacy = fake_home / ".mempalace"
+    legacy.mkdir()
+    palace = legacy / "palace"
+    palace.mkdir()
+    (palace / "chroma.sqlite3").write_bytes(b"")
+    xdg = tmp_path / "xdg"
+    xdg.mkdir()
+
+    _set_home(monkeypatch, fake_home)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.delenv("MEMPALACE_CONFIG_DIR", raising=False)
+
+    assert _default_config_dir() == legacy
+
+
+def test_mempalace_config_dir_env_overrides_everything(monkeypatch, tmp_path):
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    legacy = fake_home / ".mempalace"
+    legacy.mkdir()
+    (legacy / "config.json").write_text("{}")
+    xdg = tmp_path / "xdg"
+    xdg.mkdir()
+    override = tmp_path / "override"
+    override.mkdir()
+
+    _set_home(monkeypatch, fake_home)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(override))
+
+    assert _default_config_dir() == override
+
+    cfg = MempalaceConfig()
+    assert cfg.palace_path == str(override / "palace")
+
+
+def test_empty_xdg_config_home_falls_back_to_dot_config(monkeypatch, tmp_path):
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    _set_home(monkeypatch, fake_home)
+    monkeypatch.delenv("MEMPALACE_CONFIG_DIR", raising=False)
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", "")
+    assert _default_config_dir() == fake_home / ".config" / "mempalace"
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", "   ")
+    assert _default_config_dir() == fake_home / ".config" / "mempalace"
+
+
+def test_relative_xdg_config_home_is_ignored(monkeypatch, tmp_path):
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    _set_home(monkeypatch, fake_home)
+    monkeypatch.setenv("XDG_CONFIG_HOME", "relative/path")
+    monkeypatch.delenv("MEMPALACE_CONFIG_DIR", raising=False)
+
+    assert _default_config_dir() == fake_home / ".config" / "mempalace"
+
+
+def test_init_writes_xdg_aware_palace_path(tmp_path):
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    cfg.init()
+    with open(tmp_path / "config.json") as f:
+        written = json.load(f)
+    assert written["palace_path"] == str(tmp_path / "palace")

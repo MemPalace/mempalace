@@ -3208,3 +3208,15 @@ class TestUnknownParamName:
         )
         assert "error" not in resp
         assert "result" in resp
+
+
+def test_wal_dir_nests_under_config_dir():
+    """`_WAL_DIR` must live under the active `MempalaceConfig.config_dir`,
+    not at a hardcoded `~/.mempalace/wal`. The previous hardcoded path
+    bypassed XDG resolution: a user with `MEMPALACE_CONFIG_DIR` pointing
+    at `~/.config/mempalace` would still see the WAL written to the
+    legacy location, fragmenting state across two directories."""
+    from mempalace import mcp_server
+
+    assert mcp_server._WAL_DIR.parent == mcp_server._config.config_dir
+    assert mcp_server._WAL_DIR.name == "wal"

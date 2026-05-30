@@ -1202,7 +1202,7 @@ def main():
     parser.add_argument(
         "--palace",
         default=None,
-        help="Where the palace lives (default: from ~/.mempalace/config.json or ~/.mempalace/palace)",
+        help="Where the palace lives (default: palace_path from config.json, resolved via XDG — see mempalace.config)",
     )
 
     sub = parser.add_subparsers(dest="command")
