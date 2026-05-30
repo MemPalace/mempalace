@@ -301,7 +301,15 @@ def _is_transient_index_error(result) -> bool:
     if not isinstance(result, dict):
         return False
     err = result.get("error", "")
-    return isinstance(err, str) and ("Error finding id" in err or "Internal error" in err)
+    if not isinstance(err, str):
+        return False
+    err_l = err.lower()
+    return (
+        "error finding id" in err_l
+        or "internal error" in err_l
+        or "stale-index" in err_l
+        or "stale index" in err_l
+    )
 
 
 def _force_chroma_cache_reset() -> None:

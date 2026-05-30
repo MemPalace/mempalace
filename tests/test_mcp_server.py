@@ -1025,6 +1025,34 @@ class TestSearchTool:
         assert "error" in result
         assert "index_recovered" not in result
 
+    def test_search_retries_once_on_stale_index_error(self, monkeypatch, config, kg):
+        """Stale-index errors should trigger one cache-reset retry."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        calls = {"n": 0}
+        reset_calls = {"n": 0}
+
+        def fake_search(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"error": "Search error: stale-index detected; retry recommended"}
+            return {"results": [{"text": "ok", "wing": "w", "room": "r"}]}
+
+        def fake_reset():
+            reset_calls["n"] += 1
+
+        monkeypatch.setattr(mcp_server, "search_memories", fake_search)
+        monkeypatch.setattr(mcp_server, "_force_chroma_cache_reset", fake_reset)
+        monkeypatch.setattr(mcp_server.time, "sleep", lambda _: None)
+
+        result = mcp_server.tool_search(query="anything")
+
+        assert calls["n"] == 2
+        assert reset_calls["n"] == 1
+        assert "results" in result
+        assert result.get("index_recovered") is True
+
     def test_list_drawers_rejects_invalid_wing(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace import mcp_server
