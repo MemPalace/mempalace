@@ -1024,6 +1024,58 @@ def cmd_mcp(args):
         print(f"  {base_server_cmd} --palace /path/to/palace")
 
 
+def cmd_extract_kg(args):
+    """Auto-populate the knowledge graph from palace drawers."""
+    from .kg_extractor import extract_kg
+    from .knowledge_graph import KnowledgeGraph
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    kg_path = os.path.join(palace_path, "knowledge_graph.sqlite3")
+    kg = KnowledgeGraph(db_path=kg_path)
+
+    mode = "DRY RUN" if args.dry_run else "EXTRACT"
+    print(f"\n{'=' * 55}")
+    print(f"  Knowledge Graph Auto-Extract ({mode})")
+    print(f"  Palace: {palace_path}")
+    if args.wing:
+        print(f"  Wing filter: {args.wing}")
+    if args.room:
+        print(f"  Room filter: {args.room}")
+    print(f"{'=' * 55}\n")
+
+    result = extract_kg(
+        palace_path=palace_path,
+        kg=kg,
+        wing=args.wing,
+        room=args.room,
+        dry_run=args.dry_run,
+    )
+
+    print(f"  Drawers scanned:  {result.drawers_scanned}")
+    print(f"  Entities found:   {result.entities_found}")
+    print(f"  Patterns matched: {result.patterns_matched}")
+    print(f"  Triples added:    {result.triples_added}")
+    print(f"  Triples skipped:  {result.triples_skipped} (already in KG)")
+
+    if result.errors:
+        print(f"\n  Errors ({len(result.errors)}):")
+        for err in result.errors[:5]:
+            print(f"    - {err}")
+
+    if result.details:
+        print("\n  Sample extractions:")
+        for t in result.details[:10]:
+            print(f"    {t['subject']} → {t['predicate']} → {t['object']}")
+            if t.get("source"):
+                print(f"      from: {t['source']}")
+
+    if not args.dry_run:
+        stats = kg.stats()
+        print(f"\n  KG totals: {stats['entities']} entities, {stats['triples']} triples")
+
+    print(f"\n{'=' * 55}\n")
+
+
 def cmd_compress(args):
     """Compress drawers in a wing using AAAK Dialect."""
     from .dialect import Dialect
@@ -1560,6 +1612,18 @@ def main():
         help="Show MCP setup command for connecting MemPalace to your AI client",
     )
 
+    # extract-kg
+    p_extract = sub.add_parser(
+        "extract-kg",
+        help="Auto-populate knowledge graph from palace drawers",
+    )
+    p_extract.add_argument("--wing", default=None, help="Filter by wing")
+    p_extract.add_argument("--room", default=None, help="Filter by room")
+    p_extract.add_argument(
+        "--dry-run", action="store_true",
+        help="Show what would be extracted without writing to KG",
+    )
+
     # status
     # migrate
     p_migrate = sub.add_parser(
@@ -1609,6 +1673,7 @@ def main():
         "sync": cmd_sync,
         "mcp": cmd_mcp,
         "compress": cmd_compress,
+        "extract-kg": cmd_extract_kg,
         "wake-up": cmd_wakeup,
         "repair": cmd_repair,
         "repair-status": cmd_repair_status,

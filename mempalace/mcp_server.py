@@ -1598,6 +1598,21 @@ def tool_kg_stats():
     return _call_kg(lambda kg: kg.stats())
 
 
+def tool_kg_extract(wing: str = None, room: str = None, dry_run: bool = False):
+    """Auto-populate the knowledge graph from palace drawers."""
+    from mempalace.kg_extractor import extract_kg
+
+    palace_path = _config.palace_path
+    result = extract_kg(
+        palace_path=palace_path,
+        kg=_kg,
+        wing=wing,
+        room=room,
+        dry_run=dry_run,
+    )
+    return result.to_dict()
+
+
 # ==================== AGENT DIARY ====================
 
 
@@ -2087,6 +2102,27 @@ TOOLS = {
         "description": "Knowledge graph overview: entities, triples, current vs expired facts, relationship types.",
         "input_schema": {"type": "object", "properties": {}},
         "handler": tool_kg_stats,
+    },
+    "mempalace_kg_extract": {
+        "description": "Auto-populate the knowledge graph by extracting relationships from palace drawers. Scans verbatim text for people, roles, employment, family, tools, and decisions. Idempotent — won't duplicate existing triples.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "wing": {
+                    "type": "string",
+                    "description": "Filter by wing (optional — omit to scan all drawers)",
+                },
+                "room": {
+                    "type": "string",
+                    "description": "Filter by room (optional)",
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "If true, show what would be extracted without writing (default: false)",
+                },
+            },
+        },
+        "handler": tool_kg_extract,
     },
     "mempalace_traverse": {
         "description": "Walk the palace graph from a room. Shows connected ideas across wings — the tunnels. Like following a thread through the palace: start at 'chromadb-setup' in wing_code, discover it connects to wing_myproject (planning) and wing_user (feelings about it).",
