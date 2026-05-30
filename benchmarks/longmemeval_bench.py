@@ -2917,7 +2917,7 @@ def _load_or_create_split(split_file: str, data: list, dev_size: int = 50, seed:
 
     split_path = Path(split_file)
     if split_path.exists():
-        with open(split_path) as f:
+        with open(split_path, encoding="utf-8") as f:
             return json.load(f)
 
     # Create new split
@@ -2927,9 +2927,9 @@ def _load_or_create_split(split_file: str, data: list, dev_size: int = 50, seed:
     dev_ids = all_ids[:dev_size]
     held_out_ids = all_ids[dev_size:]
     split = {"dev": dev_ids, "held_out": held_out_ids, "seed": seed, "dev_size": dev_size}
-    with open(split_path, "w") as f:
+    with open(split_path, "w", encoding="utf-8") as f:
         json.dump(split, f, indent=2)
-    print(f"  Created new split: {len(dev_ids)} dev / {len(held_out_ids)} held-out → {split_path}")
+    print(f"  Created new split: {len(dev_ids)} dev / {len(held_out_ids)} held-out -> {split_path}")
     return split
 
 
@@ -2957,7 +2957,7 @@ def run_benchmark(
     split_subset: "dev" (50 questions for tuning) or "held_out" (450 for final evaluation).
                   None = run all questions.
     """
-    with open(data_file) as f:
+    with open(data_file, encoding="utf-8") as f:
         data = json.load(f)
 
     # Apply train/test split filter before limit/skip
@@ -2966,7 +2966,7 @@ def run_benchmark(
         subset_ids = set(split[split_subset])
         before = len(data)
         data = [entry for entry in data if entry["question_id"] in subset_ids]
-        print(f"  Split filter ({split_subset}): {before} → {len(data)} questions")
+        print(f"  Split filter ({split_subset}): {before} -> {len(data)} questions")
 
     if limit > 0:
         data = data[:limit]
@@ -2998,7 +2998,7 @@ def run_benchmark(
             cache_path = Path(diary_cache_file)
             if cache_path.exists():
                 try:
-                    with open(cache_path) as f:
+                    with open(cache_path, encoding="utf-8") as f:
                         diary_cache = json.load(f)
                     print(
                         f"  Diary cache: loaded {len(diary_cache)} sessions from {cache_path.name}"
@@ -3031,7 +3031,7 @@ def run_benchmark(
                     # Save progress in case of interruption
                     if cache_path:
                         try:
-                            with open(cache_path, "w") as f:
+                            with open(cache_path, "w", encoding="utf-8") as f:
                                 json.dump(diary_cache, f)
                         except Exception:
                             pass
@@ -3039,14 +3039,14 @@ def run_benchmark(
             # Final cache save
             if cache_path:
                 try:
-                    with open(cache_path, "w") as f:
+                    with open(cache_path, "w", encoding="utf-8") as f:
                         json.dump(diary_cache, f)
-                    print(f"  Diary cache saved → {cache_path.name}")
+                    print(f"  Diary cache saved -> {cache_path.name}")
                 except Exception:
                     pass
 
     print(f"\n{'=' * 60}")
-    print("  MemPal × LongMemEval Benchmark")
+    print("  MemPal x LongMemEval Benchmark")
     print(f"{'=' * 60}")
     print(f"  Data:        {Path(data_file).name}")
     print(f"  Questions:   {len(data)}")
@@ -3055,7 +3055,7 @@ def run_benchmark(
     rerank_label = f" + LLM re-rank ({model_short})" if llm_rerank_enabled else ""
     diary_label = f" [diary ingest: {model_short}]" if mode == "diary" else ""
     print(f"  Mode:        {mode}{diary_label}{rerank_label}")
-    print(f"{'─' * 60}\n")
+    print(f"{'-' * 60}\n")
 
     # Collect metrics
     ks = [1, 3, 5, 10, 30, 50]
@@ -3216,7 +3216,7 @@ def run_benchmark(
 
     # Print results
     print(f"\n{'=' * 60}")
-    print(f"  RESULTS — MemPal ({mode} mode, {granularity} granularity)")
+    print(f"  RESULTS - MemPal ({mode} mode, {granularity} granularity)")
     print(f"{'=' * 60}")
     print(f"  Time: {elapsed:.1f}s ({elapsed / len(data):.2f}s per question)\n")
 
@@ -3245,15 +3245,15 @@ def run_benchmark(
     if mode == "diary" and diary_cache and diary_cache_file:
         try:
             real_cache = {k: v for k, v in diary_cache.items() if v is not None}
-            with open(diary_cache_file, "w") as f:
+            with open(diary_cache_file, "w", encoding="utf-8") as f:
                 json.dump(real_cache, f)
-            print(f"  Diary cache saved: {len(real_cache)} sessions → {diary_cache_file}")
+            print(f"  Diary cache saved: {len(real_cache)} sessions -> {diary_cache_file}")
         except Exception as e:
             print(f"  Warning: could not save diary cache: {e}")
 
     # Save results
     if out_file:
-        with open(out_file, "w") as f:
+        with open(out_file, "w", encoding="utf-8") as f:
             for entry in results_log:
                 f.write(json.dumps(entry) + "\n")
         print(f"  Results saved to: {out_file}")
@@ -3393,7 +3393,7 @@ if __name__ == "__main__":
     if args.create_split:
         if not args.split_file:
             args.split_file = "benchmarks/lme_split_50_450.json"
-        with open(args.data_file) as f:
+        with open(args.data_file, encoding="utf-8") as f:
             _all_data = json.load(f)
         _load_or_create_split(args.split_file, _all_data)
         sys.exit(0)
