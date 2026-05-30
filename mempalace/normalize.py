@@ -122,7 +122,7 @@ def normalize(filepath: str) -> str:
     if file_size > 500 * 1024 * 1024:  # 500 MB safety limit
         raise IOError(f"File too large ({file_size // (1024 * 1024)} MB): {filepath}")
     try:
-        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+        with open(filepath, "r", encoding="utf-8-sig", errors="replace") as f:
             content = f.read()
     except OSError as e:
         raise IOError(f"Could not read {filepath}: {e}") from e
