@@ -1127,6 +1127,42 @@ def test_client_quarantines_only_on_first_call_per_palace(tmp_path, monkeypatch)
     )
 
 
+def test_client_rearms_quarantine_on_mtime_change(tmp_path, monkeypatch):
+    """When the DB file's mtime changes between ``_client()`` calls (external
+    in-place write), the quarantine gate re-arms so HNSW checks run again.
+
+    Before #1573, the gate was only cleared on *inode* change (full palace
+    replacement); mtime-only changes left the gate armed, so long-running
+    processes were blind to external drift."""
+    palace_path = str(tmp_path / "palace")
+    os.makedirs(palace_path, exist_ok=True)
+    db_file = Path(palace_path) / "chroma.sqlite3"
+    db_file.write_text("")
+
+    monkeypatch.setattr(ChromaBackend, "_quarantined_paths", set())
+
+    calls: list[str] = []
+
+    def _spy(path, stale_seconds=300.0):
+        calls.append(path)
+        return []
+
+    monkeypatch.setattr("mempalace.backends.chroma.quarantine_stale_hnsw", _spy)
+
+    backend = ChromaBackend()
+    try:
+        backend._client(palace_path)
+        assert len(calls) == 1, "quarantine should fire on first open"
+
+        _, cached_mtime = backend._freshness[palace_path]
+        os.utime(str(db_file), (cached_mtime + 1.0, cached_mtime + 1.0))
+
+        backend._client(palace_path)
+        assert len(calls) == 2, "quarantine should re-fire after mtime change (gate re-armed)"
+    finally:
+        backend.close()
+
+
 # ── _pin_hnsw_threads (per-process retrofit, separate from this PR's gate) ──
 
 
@@ -1426,7 +1462,9 @@ def test_chroma_backend_preflights_metadata_before_persistent_client(tmp_path, m
     ]
 
 
-def test_chroma_backend_stale_quarantine_is_cold_start_only_on_refresh(tmp_path, monkeypatch):
+def test_chroma_backend_quarantine_rearms_on_mtime_refresh(tmp_path, monkeypatch):
+    """When the DB mtime changes between ``_client()`` calls, the quarantine
+    gate re-arms and the HNSW safety checks run again (#1573)."""
     palace = tmp_path / "palace"
     palace.mkdir()
     (palace / "chroma.sqlite3").write_text("")
@@ -1470,6 +1508,8 @@ def test_chroma_backend_stale_quarantine_is_cold_start_only_on_refresh(tmp_path,
         ("stale", str(palace)),
         ("collection_type", str(palace)),
         ("blob", str(palace)),
+        ("invalid", str(palace)),
+        ("stale", str(palace)),
     ]
 
 

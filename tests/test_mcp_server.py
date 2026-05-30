@@ -2718,6 +2718,57 @@ class TestStructuredErrors:
 
         assert mcp_server._kg_by_path == {}
 
+    def test_tool_reconnect_rearms_quarantine_gate(self, monkeypatch):
+        """``tool_reconnect`` must clear the per-process quarantine gate so
+        HNSW safety checks re-run on the next open (#1573)."""
+        from mempalace import mcp_server
+        from mempalace.backends.chroma import ChromaBackend
+
+        palace_path = "/test/palace/quarantine_rearm"
+        gate = {palace_path}
+        monkeypatch.setattr(ChromaBackend, "_quarantined_paths", gate)
+        monkeypatch.setattr(mcp_server, "_config", type("C", (), {"palace_path": palace_path})())
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda: None)
+
+        mcp_server.tool_reconnect()
+
+        assert palace_path not in gate, (
+            "tool_reconnect should clear quarantine gate for the palace path"
+        )
+
+    def test_get_client_rearms_quarantine_on_reconnect(self, monkeypatch, config, palace_path, kg):
+        """``_get_client`` must clear the quarantine gate before calling
+        ``make_client`` so HNSW safety checks re-run on reconnect (#1573)."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+        from mempalace.backends.chroma import ChromaBackend
+
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+
+        mcp_server._get_collection()
+
+        assert config.palace_path in ChromaBackend._quarantined_paths
+
+        old_mtime = mcp_server._palace_db_mtime
+        monkeypatch.setattr(mcp_server, "_palace_db_mtime", old_mtime - 10.0)
+
+        quarantine_calls: list[str] = []
+        original_prepare = ChromaBackend._prepare_palace_for_open
+
+        @staticmethod
+        def spy_prepare(path):
+            quarantine_calls.append(path)
+            original_prepare(path)
+
+        monkeypatch.setattr(ChromaBackend, "_prepare_palace_for_open", spy_prepare)
+
+        mcp_server._get_client()
+
+        assert len(quarantine_calls) == 1, (
+            "_get_client should call _prepare_palace_for_open on reconnect"
+        )
+
     def test_call_kg_retries_after_concurrent_close(self, monkeypatch):
         """A KG closed mid-handler must trigger a one-shot retry with a fresh
         instance — not surface a -32000 to the MCP client."""

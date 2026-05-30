@@ -475,11 +475,13 @@ def _get_client():
     mtime_changed = current_mtime != 0.0 and abs(current_mtime - _palace_db_mtime) > 0.01
 
     if _client_cache is None or inode_changed or mtime_changed:
-        # Run the HNSW capacity probe BEFORE chromadb opens the segment —
+        # Run the HNSW capacity probe BEFORE chromadb opens the segment --
         # if the index is severely undersized, segment load can segfault
         # the whole MCP server (#1222). The probe is pure sqlite +
-        # metadata-pickle read; never touches the HNSW binary files.
+        # metadata read; never touches the HNSW binary files.
         _refresh_vector_disabled_flag()
+        if inode_changed or mtime_changed:
+            ChromaBackend._quarantined_paths.discard(_config.palace_path)
         _client_cache = ChromaBackend.make_client(_config.palace_path)
         _collection_cache = None
         _metadata_cache = None
@@ -497,9 +499,9 @@ def _get_collection(create=False):
     cached client/collection went stale — typically after the chromadb
     rust bindings invalidated a handle following an out-of-band write —
     leaving the LLM with no diagnostic and no recovery path. The retry
-    forces ``_get_client()`` to rebuild from scratch (which re-runs
-    ``quarantine_stale_hnsw`` per #1322), so the second attempt heals the
-    common stale-handle / stale-HNSW case automatically.
+    forces ``_get_client()`` to rebuild the chromadb client from
+    scratch, so the second attempt heals the common stale-handle case
+    automatically.
     """
     global _client_cache, _collection_cache, _metadata_cache, _metadata_cache_time
     for attempt in range(2):
@@ -570,9 +572,9 @@ def _get_collection(create=False):
             )
             if attempt == 0:
                 # Reset all caches so the next attempt forces _get_client()
-                # to rebuild the chromadb client from scratch — that path
-                # re-runs quarantine_stale_hnsw (#1322) and reopens the
-                # collection cleanly, healing the common stale-handle case.
+                # to rebuild the chromadb client from scratch, reopening
+                # the collection cleanly and healing the common
+                # stale-handle case.
                 _client_cache = None
                 _collection_cache = None
                 _metadata_cache = None
@@ -1916,6 +1918,7 @@ def tool_reconnect():
     _collection_cache = None
     _palace_db_inode = 0
     _palace_db_mtime = 0.0
+    ChromaBackend._quarantined_paths.discard(_config.palace_path)
     # Force probe re-run on next _get_client by clearing the flag now;
     # _refresh_vector_disabled_flag will re-set it if the divergence
     # still applies after the reconnect.
