@@ -18,6 +18,8 @@ from collections import defaultdict
 from typing import Optional
 
 from .normalize import normalize
+from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
+import numpy as np
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
@@ -317,17 +319,84 @@ TOPIC_KEYWORDS = {
 }
 
 
+SIMILARITY_THRESHOLD = 0.25
+MAX_CONTENT_LENGTH = 4000
+
+# =============================================================================
+# ROOM ANCHORS — conversational style, multiple per room
+# =============================================================================
+
+ROOM_ANCHORS = {
+    "technical": [
+        "I'm writing a Python function but there's a bug and the API call returns an error.",
+        "How do I deploy this to the server? The test keeps failing after my code change.",
+    ],
+    "architecture": [
+        "How should we structure this system? What design pattern fits best here?",
+        "The current architecture won't scale, we need to rethink the modules and layers.",
+    ],
+    "planning": [
+        "What's our roadmap for next sprint? We need to prioritize the backlog.",
+        "The deadline for this milestone is next week, let's write up the requirements.",
+    ],
+    "decisions": [
+        "We decided to switch from Postgres to MongoDB because the trade-off was worth it.",
+        "After comparing the options, the team agreed to migrate to the new alternative.",
+    ],
+}
+
+
+# =============================================================================
+# EMBEDDING INIT — lazy singleton
+# =============================================================================
+
+_embed_fn = None
+_anchor_cache = None  # {room: np.array of shape (n_anchors, dim)}
+
+
+def _init_embeddings():
+    global _embed_fn, _anchor_cache
+    if _anchor_cache is not None:
+        return
+
+    _embed_fn = DefaultEmbeddingFunction()
+    _anchor_cache = {}
+    for room, anchors in ROOM_ANCHORS.items():
+        _anchor_cache[room] = np.array(_embed_fn(anchors))
+
+
+# =============================================================================
+# CORE — detect_convo_room
+# =============================================================================
+
 def detect_convo_room(content: str) -> str:
-    """Score conversation content against topic keywords."""
-    content_lower = content[:3000].lower()
+    """
+    Classify conversation content into a palace room via semantic similarity.
+
+    Returns room name string.
+    """
+    _init_embeddings()
+
+    text = content[:MAX_CONTENT_LENGTH]
+    content_embedding = np.array(_embed_fn([text])[0])
+    content_norm = np.linalg.norm(content_embedding)
+
     scores = {}
-    for room, keywords in TOPIC_KEYWORDS.items():
-        score = sum(1 for kw in keywords if kw in content_lower)
-        if score > 0:
-            scores[room] = score
-    if scores:
-        return max(scores, key=scores.get)
-    return "general"
+    for room, anchor_embeddings in _anchor_cache.items():
+        sims = anchor_embeddings @ content_embedding / (
+            np.linalg.norm(anchor_embeddings, axis=1) * content_norm
+        )
+        best_idx = int(np.argmax(sims))
+        scores[room] = float(sims[best_idx])
+
+
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    top_score = ranked[0][1]
+
+    if top_score < SIMILARITY_THRESHOLD:
+        return "general"
+
+    return ranked[0][0]
 
 
 # =============================================================================
