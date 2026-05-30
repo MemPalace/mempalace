@@ -668,12 +668,19 @@ def _value_expr(alias: str) -> str:
 
 
 def _open_ro(db_path: str):
-    """Open ``chroma.sqlite3`` read-only, or return ``None`` if unavailable."""
+    """Open ``chroma.sqlite3`` read-only, or return ``None`` if unavailable.
+
+    Builds the URI via ``Path.as_uri()`` rather than an f-string so Windows
+    drive letters/backslashes and paths containing spaces or ``?``/``#`` are
+    percent-encoded correctly. ``resolve()`` first because ``as_uri()`` requires
+    an absolute path (``db_path`` exists here, so resolution is safe).
+    """
     if not os.path.isfile(db_path):
         return None
     try:
-        return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    except sqlite3.Error:
+        db_uri = Path(db_path).resolve().as_uri() + "?mode=ro"
+        return sqlite3.connect(db_uri, uri=True)
+    except (sqlite3.Error, ValueError):
         return None
 
 

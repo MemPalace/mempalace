@@ -99,8 +99,13 @@ class SqliteExactRetriever:
             return "".join(clauses), params
 
         try:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-        except sqlite3.Error as e:
+            # Build the URI via Path.as_uri() (not an f-string) so Windows
+            # drive letters/backslashes and paths with spaces or ?/# are encoded
+            # correctly. resolve() first since as_uri() needs an absolute path;
+            # db_path exists (checked above), so resolution is safe.
+            db_uri = Path(db_path).resolve().as_uri() + "?mode=ro"
+            conn = sqlite3.connect(db_uri, uri=True)
+        except (sqlite3.Error, ValueError) as e:
             return {"error": f"sqlite open failed: {e}"}
 
         try:

@@ -8,9 +8,13 @@ on the same adapter, plus the labeled shapes ``palace_stats`` derives for the
 CLI and MCP read tools.
 """
 
+import os
+
+import chromadb
+
 from mempalace import palace_stats, source_file_access
 from mempalace.backends.base import BaseCollection
-from mempalace.backends.chroma import ChromaCollection
+from mempalace.backends.chroma import ChromaCollection, _open_ro
 
 
 def _adapter(collection, palace_path):
@@ -136,6 +140,36 @@ def test_fallback_default_when_no_palace_path(seeded_collection, collection):
     col = ChromaCollection(collection, palace_path=None)
     assert col.count_by("wing") == {"project": 3, "notes": 1}
     assert col.count_matching({"source_file": "auth.py"}) == 1
+
+
+# --------------------------------------------------------------------------
+# Read-only SQLite URIs are built with Path.as_uri() (PR #1664 review): a
+# palace path containing spaces must still open and use the SQL fast path.
+# --------------------------------------------------------------------------
+
+
+def test_sql_path_survives_spaces_in_palace_path(tmp_dir):
+    palace = os.path.join(tmp_dir, "palace with spaces")
+    os.makedirs(palace)
+    client = chromadb.PersistentClient(path=palace)
+    raw = client.get_or_create_collection("mempalace_drawers", metadata={"hnsw:space": "cosine"})
+    raw.add(
+        ids=["a", "b"],
+        documents=["x", "y"],
+        metadatas=[{"wing": "w", "room": "r"}, {"wing": "w", "room": "s"}],
+    )
+    try:
+        # The read-only opener builds a usable URI despite the space in the path.
+        conn = _open_ro(os.path.join(palace, "chroma.sqlite3"))
+        assert conn is not None
+        conn.close()
+        # And the SQL GROUP BY fast path returns correct counts.
+        col = ChromaCollection(raw, palace_path=palace)
+        assert col.count_by("wing") == {"w": 2}
+        assert col.count_by("room") == {"r": 1, "s": 1}
+    finally:
+        client.delete_collection("mempalace_drawers")
+        del client
 
 
 # --------------------------------------------------------------------------
