@@ -13,6 +13,7 @@ from mempalace.normalize import (
     _try_codex_jsonl,
     _try_gemini_jsonl,
     _try_normalize_json,
+    _try_pi_jsonl,
     _try_slack_json,
     normalize,
     strip_noise,
@@ -1403,3 +1404,115 @@ class TestStripNoiseRemovesSystemChrome:
         assert "line two" in out
         # Should collapse to no more than 3 newlines
         assert "\n\n\n\n" not in out
+
+
+# ── _try_pi_jsonl ──────────────────────────────────────────────────────
+#
+# Pi agent stores sessions as JSONL under
+# ``~/.config/pi/agent/sessions/{cwd}/{timestamp}_{uuid}.jsonl``. The
+# schema (per github.com/badlogic/pi-mono session.md):
+#
+#   {"type": "session", "version": "1", ...}
+#   {"type": "message", "message": {"role": "user", "content": "Q"}}
+#   {"type": "message", "message": {"role": "assistant",
+#       "content": [{"type": "text", "text": "A"}]}}
+#
+# Detection requires a ``session`` record with a ``version`` field so the
+# parser does not false-positive against Codex / Gemini / Claude Code
+# JSONL routed through the same dispatch chain.
+
+
+def test_pi_jsonl_valid_string_content():
+    """User content as a plain string is captured."""
+    lines = [
+        json.dumps({"type": "session", "version": "1"}),
+        json.dumps({"type": "message", "message": {"role": "user", "content": "Q"}}),
+        json.dumps({"type": "message", "message": {"role": "assistant", "content": "A"}}),
+    ]
+    result = _try_pi_jsonl("\n".join(lines))
+    assert result is not None
+    assert "> Q" in result
+    assert "A" in result
+
+
+def test_pi_jsonl_valid_block_content():
+    """Assistant content as [{type, text}] blocks is captured."""
+    lines = [
+        json.dumps({"type": "session", "version": "1"}),
+        json.dumps({"type": "message", "message": {"role": "user", "content": "Q"}}),
+        json.dumps(
+            {
+                "type": "message",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "Assistant reply"}],
+                },
+            }
+        ),
+    ]
+    result = _try_pi_jsonl("\n".join(lines))
+    assert result is not None
+    assert "Assistant reply" in result
+
+
+def test_pi_jsonl_no_session_header():
+    """Without a ``session`` record, parser returns None — protects against
+    false-positives on other JSONL formats that share a ``type=message`` shape."""
+    lines = [
+        json.dumps({"type": "message", "message": {"role": "user", "content": "Q"}}),
+        json.dumps({"type": "message", "message": {"role": "assistant", "content": "A"}}),
+    ]
+    result = _try_pi_jsonl("\n".join(lines))
+    assert result is None
+
+
+def test_pi_jsonl_session_without_version():
+    """A ``session`` record missing ``version`` is not a Pi header."""
+    lines = [
+        json.dumps({"type": "session"}),
+        json.dumps({"type": "message", "message": {"role": "user", "content": "Q"}}),
+        json.dumps({"type": "message", "message": {"role": "assistant", "content": "A"}}),
+    ]
+    result = _try_pi_jsonl("\n".join(lines))
+    assert result is None
+
+
+def test_pi_jsonl_skips_tool_results():
+    """toolResult role records are skipped (they are operational, not conversation)."""
+    lines = [
+        json.dumps({"type": "session", "version": "1"}),
+        json.dumps({"type": "message", "message": {"role": "user", "content": "Q"}}),
+        json.dumps(
+            {
+                "type": "message",
+                "message": {"role": "toolResult", "content": "tool output"},
+            }
+        ),
+        json.dumps({"type": "message", "message": {"role": "assistant", "content": "A"}}),
+    ]
+    result = _try_pi_jsonl("\n".join(lines))
+    assert result is not None
+    assert "tool output" not in result
+
+
+def test_pi_jsonl_under_two_messages_returns_none():
+    """A session with fewer than 2 captured turns is not considered valid."""
+    lines = [
+        json.dumps({"type": "session", "version": "1"}),
+        json.dumps({"type": "message", "message": {"role": "user", "content": "Q"}}),
+    ]
+    result = _try_pi_jsonl("\n".join(lines))
+    assert result is None
+
+
+def test_pi_jsonl_invalid_lines_skipped():
+    """Malformed JSON lines and non-dict entries are tolerated, not fatal."""
+    lines = [
+        "not json",
+        json.dumps([1, 2, 3]),  # list, not dict
+        json.dumps({"type": "session", "version": "1"}),
+        json.dumps({"type": "message", "message": {"role": "user", "content": "Q"}}),
+        json.dumps({"type": "message", "message": {"role": "assistant", "content": "A"}}),
+    ]
+    result = _try_pi_jsonl("\n".join(lines))
+    assert result is not None

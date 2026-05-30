@@ -9,6 +9,7 @@ Supported:
     - Claude Code JSONL (with tool_use/tool_result block capture)
     - OpenAI Codex CLI JSONL
     - Gemini CLI JSONL (~/.gemini/tmp/<project_hash>/chats/session-*.jsonl)
+    - Pi agent JSONL
     - Slack JSON export
     - Plain text (pass through for paragraph chunking)
 
@@ -159,6 +160,10 @@ def _try_normalize_json(content: str) -> Optional[str]:
         return normalized
 
     normalized = _try_gemini_jsonl(content)
+    if normalized:
+        return normalized
+
+    normalized = _try_pi_jsonl(content)
     if normalized:
         return normalized
 
@@ -349,6 +354,53 @@ def _try_gemini_jsonl(content: str) -> Optional[str]:
             messages.append(("assistant", joined))
 
     if len(messages) >= 2 and has_session_metadata:
+        return _messages_to_transcript(messages)
+    return None
+
+
+def _try_pi_jsonl(content: str) -> Optional[str]:
+    """Pi agent sessions (~/.config/pi/agent/sessions/{cwd}/{timestamp}_{uuid}.jsonl).
+
+    Pi stores sessions as JSONL with a tree-structured message history.
+    User messages have role "user" with content as string or [{type, text}] blocks.
+    Assistant messages have role "assistant" with content as [{type, text}] blocks
+    (may also include "thinking" blocks which are skipped by _extract_content).
+    Tool results (role "toolResult") are skipped — operational, not conversation.
+
+    Format documented at github.com/badlogic/pi-mono session.md.
+    """
+    lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
+    messages = []
+    has_session_header = False
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+
+        entry_type = entry.get("type", "")
+        if entry_type == "session" and "version" in entry:
+            has_session_header = True
+            continue
+
+        if entry_type != "message":
+            continue
+
+        message = entry.get("message", {})
+        if not isinstance(message, dict):
+            continue
+
+        role = message.get("role", "")
+        text = _extract_content(message.get("content", ""))
+
+        if role == "user" and text:
+            messages.append(("user", text))
+        elif role == "assistant" and text:
+            messages.append(("assistant", text))
+
+    if len(messages) >= 2 and has_session_header:
         return _messages_to_transcript(messages)
     return None
 
