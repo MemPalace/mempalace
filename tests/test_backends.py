@@ -138,6 +138,108 @@ def test_chroma_collection_rejects_unknown_where_operator():
         collection.query(query_texts=["q"], where={"$regex": "foo"})
 
 
+def test_chroma_collection_query_coerces_none_metadatas_to_empty_dict():
+    """ChromaDB 1.5.x can return None inside metadatas[i][j] even when
+    the write stored a dict. The backend boundary coerces each None to
+    {} so downstream callers receive a guaranteed list[dict]. Prevents
+    `AttributeError: 'NoneType' object has no attribute 'get'` at every
+    read site (searcher.py, layers.py, miner.status, etc.)."""
+    raw = {
+        "ids": [["a", "b", "c"]],
+        "documents": [["da", "db", "dc"]],
+        "metadatas": [[{"wing": "w1"}, None, {"wing": "w3"}]],
+        "distances": [[0.1, 0.2, 0.3]],
+    }
+    collection = ChromaCollection(_FakeCollection(query_response=raw))
+
+    result = collection.query(query_texts=["q"])
+
+    assert result.metadatas == [[{"wing": "w1"}, {}, {"wing": "w3"}]]
+    # Ids/docs/distances unaffected — their inner None handling is already
+    # covered by the outer-list coercion.
+    assert result.ids == [["a", "b", "c"]]
+    assert result.documents == [["da", "db", "dc"]]
+    assert result.distances == [[0.1, 0.2, 0.3]]
+
+
+def test_chroma_collection_query_coerces_all_none_inner_metadatas():
+    """Degenerate case: every metadata dict in the batch is None. Each
+    position still yields {} rather than leaving Nones for callers."""
+    raw = {
+        "ids": [["a", "b"]],
+        "documents": [["da", "db"]],
+        "metadatas": [[None, None]],
+        "distances": [[0.1, 0.2]],
+    }
+    collection = ChromaCollection(_FakeCollection(query_response=raw))
+
+    result = collection.query(query_texts=["q"])
+
+    assert result.metadatas == [[{}, {}]]
+
+
+def test_chroma_collection_query_coerces_none_across_multiple_queries():
+    """Two queries in one call, None dicts mixed through both."""
+    raw = {
+        "ids": [["a", "b"], ["c", "d"]],
+        "documents": [["da", "db"], ["dc", "dd"]],
+        "metadatas": [[{"wing": "w1"}, None], [None, {"wing": "w4"}]],
+        "distances": [[0.1, 0.2], [0.3, 0.4]],
+    }
+    collection = ChromaCollection(_FakeCollection(query_response=raw))
+
+    result = collection.query(query_texts=["q1", "q2"])
+
+    assert result.metadatas == [[{"wing": "w1"}, {}], [{}, {"wing": "w4"}]]
+
+
+def test_chroma_collection_get_coerces_none_metadatas_to_empty_dict():
+    """Same None-coercion guarantee on the get() path. Same rationale as
+    query(): callers zip ids with metadatas and reach `.get("wing")`
+    without first checking for None."""
+    raw = {
+        "ids": ["a", "b", "c"],
+        "documents": ["da", "db", "dc"],
+        "metadatas": [{"wing": "w1"}, None, {"wing": "w3"}],
+    }
+    collection = ChromaCollection(_FakeCollection(get_response=raw))
+
+    result = collection.get()
+
+    assert result.metadatas == [{"wing": "w1"}, {}, {"wing": "w3"}]
+
+
+def test_chroma_collection_get_coerces_padding_remains_dict():
+    """Padding short metadata lists to match ids length already uses {}.
+    Regression guard: the new None-coercion step must not convert those
+    padded {} into something else or re-introduce Nones."""
+    raw = {
+        "ids": ["a", "b", "c"],
+        "documents": ["da", "db", "dc"],
+        "metadatas": [{"wing": "w1"}],  # short — needs 2 padded {}
+    }
+    collection = ChromaCollection(_FakeCollection(get_response=raw))
+
+    result = collection.get()
+
+    assert result.metadatas == [{"wing": "w1"}, {}, {}]
+
+
+def test_chroma_collection_get_without_metadatas_requested_stays_empty():
+    """When the caller omits metadatas from include=, the boundary must
+    not fabricate coerced dicts — empty list in, empty list out."""
+    raw = {
+        "ids": ["a"],
+        "documents": ["da"],
+        "metadatas": [{"wing": "w1"}],  # present in raw but not requested
+    }
+    collection = ChromaCollection(_FakeCollection(get_response=raw))
+
+    result = collection.get(include=["documents"])
+
+    assert result.metadatas == []
+
+
 def test_chroma_collection_delegates_writes():
     fake = _FakeCollection()
     collection = ChromaCollection(fake)

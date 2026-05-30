@@ -1148,10 +1148,21 @@ class ChromaCollection(BaseCollection):
         def _none_list_to_empty(outer):
             return [(inner or []) for inner in outer]
 
+        # Coerce individual None metadata dicts to {} at the backend
+        # boundary. ChromaDB 1.5.x can return None inside metadatas[i][j]
+        # even when the write stored a dict — #999, #1013, and other
+        # fixes added per-site `meta = meta or {}` guards scattered
+        # across searcher.py, layers.py, and miner.py to tolerate this.
+        # Handling the coercion once here means every downstream caller
+        # receives a guaranteed list[dict], matching the type contract
+        # QueryResult.metadatas declares.
+        def _coerce_none_metas(outer):
+            return [[(m if m is not None else {}) for m in (inner or [])] for inner in outer]
+
         return QueryResult(
             ids=_none_list_to_empty(ids),
             documents=_none_list_to_empty(documents),
-            metadatas=_none_list_to_empty(metadatas),
+            metadatas=_coerce_none_metas(metadatas),
             distances=_none_list_to_empty(distances),
             embeddings=(
                 [list(inner) for inner in embeddings_raw]
@@ -1205,6 +1216,16 @@ class ChromaCollection(BaseCollection):
             out_docs = out_docs + [""] * (len(out_ids) - len(out_docs))
         if spec.metadatas and len(out_metas) < len(out_ids):
             out_metas = out_metas + [{}] * (len(out_ids) - len(out_metas))
+
+        # Coerce any individual None metadata dict to {} at the backend
+        # boundary. Same rationale as the parallel path in query():
+        # chromadb 1.5.x can return None inside the metadatas list even
+        # when writes stored a dict, and per-site `meta = meta or {}`
+        # guards across #999 / #1013 compensated. Doing this once here
+        # means callers receive a guaranteed list[dict], matching the
+        # type contract GetResult.metadatas declares.
+        if spec.metadatas:
+            out_metas = [(m if m is not None else {}) for m in out_metas]
 
         return GetResult(
             ids=out_ids,
