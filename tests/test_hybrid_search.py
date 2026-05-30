@@ -131,3 +131,70 @@ class TestClosetMetadata:
             assert h["matched_via"] == "drawer"
             assert "closet_preview" not in h
             assert h["closet_boost"] == 0.0
+
+
+# ── chunk-hydration robustness (#1125) ───────────────────────────────────
+
+
+class TestChunkHydrationNoneDocument:
+    """Drawer-grep enrichment must tolerate sibling drawers with no document
+    text. Chroma returns ``documents=None`` for entries inserted with only
+    embeddings (legacy mines, partial restores, no-text drawers), which
+    crashed the ``.lower()`` scan inside the enrichment loop.
+
+    Issue: https://github.com/MemPalace/mempalace/issues/1125
+    """
+
+    def test_closet_boosted_hit_with_none_sibling_does_not_crash(self, tmp_path):
+        palace = str(tmp_path / "palace")
+        col = get_collection(palace, create=True)
+        # D1: textual sibling — the drawer the closet boost surfaces.
+        col.upsert(
+            ids=["D1"],
+            documents=["JWT authentication tokens with a 24-hour session expiry."],
+            metadatas=[
+                {
+                    "wing": "backend",
+                    "room": "auth",
+                    "source_file": "auth.md",
+                    "chunk_index": 0,
+                }
+            ],
+        )
+        # D2: same source, embeddings-only — Chroma returns documents=None
+        # for it, which is the failure mode reported in #1125. No public
+        # MemPalace API for documentless inserts; raw chromadb access required.
+        embedding_dim = len(col._collection._embedding_function(["probe"])[0])
+        col._collection.add(
+            ids=["D2"],
+            embeddings=[[0.1] * embedding_dim],
+            metadatas=[
+                {
+                    "wing": "backend",
+                    "room": "auth",
+                    "source_file": "auth.md",
+                    "chunk_index": 1,
+                }
+            ],
+        )
+
+        _seed_strong_closet_for(
+            palace,
+            drawer_id="D1",
+            source_file="auth.md",
+            topics=["JWT auth tokens", "session expiry", "authentication service"],
+        )
+
+        # Currently raises AttributeError: 'NoneType' object has no attribute
+        # 'lower' inside the drawer-grep enrichment loop (issue #1125).
+        result = search_memories("JWT auth tokens expiry", palace, n_results=3)
+
+        assert "results" in result, "search must not crash on None doc siblings"
+        # Anchor: the closet boost must fire, otherwise the enrichment loop
+        # never runs and this test would pass vacuously without exercising
+        # the crash site.
+        assert any(h["matched_via"] == "drawer+closet" for h in result["results"]), (
+            "closet boost must fire so drawer-grep enrichment runs"
+        )
+        sources = [h["source_file"] for h in result["results"]]
+        assert "auth.md" in sources, "D1 must surface despite D2 having no text"

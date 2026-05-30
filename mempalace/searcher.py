@@ -965,14 +965,19 @@ def search_memories(
         query_terms = set(_tokenize(query))
         best_idx, best_score = 0, -1
         for idx, d in enumerate(ordered_docs):
-            d_lower = d.lower()
+            # Tolerate ``None`` documents — Chroma returns ``None`` in the
+            # ``documents`` field for drawers inserted with embeddings only
+            # (legacy mines, partial restores, no-text entries). Treat as
+            # empty so the keyword scan continues rather than raising
+            # ``AttributeError`` mid-search (issue #1125).
+            d_lower = (d or "").lower()
             s = sum(1 for t in query_terms if t in d_lower)
             if s > best_score:
                 best_score, best_idx = s, idx
 
         start = max(0, best_idx - 1)
         end = min(len(ordered_docs), best_idx + 2)
-        expanded = "\n\n".join(ordered_docs[start:end])
+        expanded = "\n\n".join(d or "" for d in ordered_docs[start:end])
         if len(expanded) > MAX_HYDRATION_CHARS:
             expanded = (
                 expanded[:MAX_HYDRATION_CHARS]
