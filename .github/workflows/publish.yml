@@ -1,0 +1,33 @@
+name: Publish to PyPI
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  check-versions:
+    uses: ./.github/workflows/version-guard.yml
+
+  publish:
+    needs: check-versions
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version-file: "pyproject.toml"
+
+      - name: build
+        run: uv build
+
+      - name: publish to pypi
+        run: uv publish --trusted-publishing always
