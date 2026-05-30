@@ -109,44 +109,30 @@ The hooks resolve the repo root automatically from their own path, so they work 
 
 ### Save Hook (Stop event)
 
-```
-User sends message → AI responds → Claude Code fires Stop hook
-                                            ↓
-                                    Hook counts human messages in JSONL transcript
-                                            ↓
-                              ┌─── < 15 since last save ──→ echo "{}" (let AI stop)
-                              │
-                              └─── ≥ 15 since last save
-                                            ↓
-                                    Auto-mine transcript → palace (tool output captured)
-                                            ↓
-                                    {"decision": "block", "reason": "save tool output verbatim..."}
-                                            ↓
-                                    AI saves to palace (topics, decisions, quotes)
-                                            ↓
-                                    AI tries to stop again
-                                            ↓
-                                    stop_hook_active = true
-                                            ↓
-                                    Hook sees flag → echo "{}" (let it through)
+```mermaid
+flowchart TD
+    A([User sends message]) --> B[AI responds] --> C[Claude Code fires Stop hook]
+    C --> D[Hook counts human messages in JSONL transcript]
+    D --> E{"≥ 15 since last save?"}
+    E -- No --> F["echo '{}' — let AI stop"]
+    E -- Yes --> G["Auto-mine transcript → palace (tool output captured)"]
+    G --> H["Block: save tool output verbatim..."]
+    H --> I["AI saves to palace (topics, decisions, quotes)"]
+    I --> J[AI tries to stop again]
+    J --> K[stop_hook_active = true]
+    K --> L["Hook sees flag → echo '{}'"]
 ```
 
 The `stop_hook_active` flag prevents infinite loops: block once → AI saves → tries to stop → flag is true → we let it through.
 
 ### PreCompact Hook
 
-```
-Context window getting full → Claude Code fires PreCompact
-                                        ↓
-                                Find transcript (from input or session_id lookup)
-                                        ↓
-                                Auto-mine transcript → palace (tool output captured)
-                                        ↓
-                                {"decision": "block", "reason": "save tool output verbatim..."}
-                                        ↓
-                                AI saves everything
-                                        ↓
-                                Compaction proceeds
+```mermaid
+flowchart TD
+    A([Context window getting full]) --> B[Claude Code fires PreCompact]
+    B --> C["Find transcript (from input or session_id lookup)"]
+    C --> D["Auto-mine transcript → palace (tool output captured)"]
+    D --> G([Compaction proceeds])
 ```
 
 No counting needed — compaction always warrants a save. The auto-mine captures raw tool output before the AI gets a chance to summarize it away.
