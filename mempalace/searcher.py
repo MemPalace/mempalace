@@ -32,6 +32,22 @@ class SearchError(Exception):
 
 _TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
 
+# Over-fetch tuning for the vector candidate pool (see issue #1125).
+#
+# Short queries — proper nouns and 1–3 token names — produce weak
+# embeddings relative to longer narrative drawers. The default 3× over-
+# fetch can drop name-bearing drawers below the candidate cutoff before
+# BM25 rerank ever sees them. The wider multiplier kicks in for queries
+# with ``len(_tokenize(query)) <= _SHORT_QUERY_TOKEN_THRESHOLD``.
+#
+# ``_OVERFETCH_MAX`` bounds the candidate fetch so latency stays sane on
+# large ``n_results`` requests; ``n_results`` itself acts as a floor so
+# the clamp never returns fewer candidates than the caller asked for.
+_SHORT_QUERY_TOKEN_THRESHOLD = 3
+_SHORT_QUERY_OVERFETCH_MULTIPLIER = 10
+_DEFAULT_OVERFETCH_MULTIPLIER = 3
+_OVERFETCH_MAX = 200
+
 
 def _first_or_empty(results, key: str) -> list:
     """Return the first inner list of a query result field, or [].
@@ -826,10 +842,31 @@ def search_memories(
     # This avoids the "weak-closets regression" where narrative content
     # produces low-signal closets (regex extraction matches few topics)
     # and closet-first routing hides drawers that direct search would find.
+    # Short queries — particularly proper nouns and 1-3 token names —
+    # produce weak embeddings relative to longer narrative drawers. The
+    # default ``n_results * 3`` over-fetch can drop name-bearing drawers
+    # below the candidate cutoff before BM25 rerank ever sees them.
+    # Widen the pool for short queries so rerank can do its job; clamp
+    # to 200 so the candidate fetch stays bounded on large n_results
+    # requests. See issue #1125.
+    # ``_tokenize`` handles the ``None``/empty cases that ``_TOKEN_RE.findall``
+    # would raise on, and uses the same regex as BM25 — keep token counting
+    # behaviourally identical to rerank tokenisation.
+    token_count = len(_tokenize(query))
+    overfetch_multiplier = (
+        _SHORT_QUERY_OVERFETCH_MULTIPLIER
+        if token_count <= _SHORT_QUERY_TOKEN_THRESHOLD
+        else _DEFAULT_OVERFETCH_MULTIPLIER
+    )
+    # Floor at ``n_results`` so a large request never returns fewer
+    # candidates than asked for; ceiling at ``_OVERFETCH_MAX`` so the
+    # vector ``.query()`` latency stays bounded.
+    overfetch_n = max(n_results, min(n_results * overfetch_multiplier, _OVERFETCH_MAX))
+
     try:
         dkwargs = {
             "query_texts": [query],
-            "n_results": n_results * 3,  # over-fetch for re-ranking
+            "n_results": overfetch_n,  # over-fetch for re-ranking
             "include": ["documents", "metadatas", "distances"],
         }
         if where:
@@ -965,14 +1002,19 @@ def search_memories(
         query_terms = set(_tokenize(query))
         best_idx, best_score = 0, -1
         for idx, d in enumerate(ordered_docs):
-            d_lower = d.lower()
+            # Tolerate ``None`` documents — Chroma returns ``None`` in the
+            # ``documents`` field for drawers inserted with embeddings only
+            # (legacy mines, partial restores, no-text entries). Treat as
+            # empty so the keyword scan continues rather than raising
+            # ``AttributeError`` mid-search (issue #1125).
+            d_lower = (d or "").lower()
             s = sum(1 for t in query_terms if t in d_lower)
             if s > best_score:
                 best_score, best_idx = s, idx
 
         start = max(0, best_idx - 1)
         end = min(len(ordered_docs), best_idx + 2)
-        expanded = "\n\n".join(ordered_docs[start:end])
+        expanded = "\n\n".join(d or "" for d in ordered_docs[start:end])
         if len(expanded) > MAX_HYDRATION_CHARS:
             expanded = (
                 expanded[:MAX_HYDRATION_CHARS]
