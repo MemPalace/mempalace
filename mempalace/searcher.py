@@ -390,7 +390,7 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
         for line in hit["text"].strip().split("\n"):
             print(f"      {line}")
         print()
-        print(f"  {'─' * 56}")
+        print(f"  {'-' * 56}")
 
     print()
 
