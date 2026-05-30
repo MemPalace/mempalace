@@ -30,6 +30,9 @@ from mempalace.backends.chroma import (
     quarantine_stale_hnsw,
 )
 
+# embeddinggemma-300m Matryoshka truncation (first 384 of 768 dims).
+_TEST_EMBED_DIM = 384
+
 
 class _FakeCollection:
     """Stand-in for a chromadb.Collection returning raw chroma-shaped dicts."""
@@ -392,14 +395,12 @@ def test_chroma_backend_creates_collection_with_cosine_distance(tmp_path):
 
 
 def test_chroma_backend_sets_hnsw_bloat_guard_on_creation(tmp_path):
-    """The HNSW guard from #344 must land on freshly-created collection metadata.
+    """HNSW batch/sync thresholds must land on freshly-created collection metadata.
 
-    Without batch_size + sync_threshold, mining ~10K+ drawers triggers the
-    resize+persist drift that bloats link_lists.bin into hundreds of GB sparse
-    and segfaults `status` / `search` / `repair`. The guard belongs at
-    collection-creation time so every fresh palace gets it without needing
-    a runtime retrofit. Asserting both keys land on the persisted metadata
-    also covers the #1161 "config silently dropped" concern at CI time.
+    Low thresholds (2/2 per #1579) make chromadb's Rust HNSW segment
+    persist index_metadata and link_lists after any mine of 2+ drawers.
+    Asserting both keys land on the persisted metadata also covers the
+    #1161 "config silently dropped" concern at CI time.
     """
     palace_path = tmp_path / "palace"
 
@@ -411,8 +412,8 @@ def test_chroma_backend_sets_hnsw_bloat_guard_on_creation(tmp_path):
 
     client = chromadb.PersistentClient(path=str(palace_path))
     col = client.get_collection("mempalace_drawers")
-    assert col.metadata.get("hnsw:batch_size") == 50_000
-    assert col.metadata.get("hnsw:sync_threshold") == 50_000
+    assert col.metadata.get("hnsw:batch_size") == 2
+    assert col.metadata.get("hnsw:sync_threshold") == 2
 
 
 def test_chroma_backend_create_collection_sets_hnsw_bloat_guard(tmp_path):
@@ -423,8 +424,85 @@ def test_chroma_backend_create_collection_sets_hnsw_bloat_guard(tmp_path):
 
     client = chromadb.PersistentClient(path=str(palace_path))
     col = client.get_collection("mempalace_drawers")
-    assert col.metadata.get("hnsw:batch_size") == 50_000
-    assert col.metadata.get("hnsw:sync_threshold") == 50_000
+    assert col.metadata.get("hnsw:batch_size") == 2
+    assert col.metadata.get("hnsw:sync_threshold") == 2
+
+
+def test_sub_threshold_mine_persists_hnsw_metadata(tmp_path):
+    """Regression for #1579: small mines must persist HNSW metadata.
+
+    _HNSW_BLOAT_GUARD sets batch_size=2 and sync_threshold=2 so that any
+    upsert of 2+ records crosses both thresholds, triggering chromadb's
+    _apply_batch and _persist.  Without this, index_metadata and link_lists
+    stay empty and quarantine_stale_hnsw renames the segment on cold open.
+    """
+    palace_path = str(tmp_path / "palace")
+    backend = ChromaBackend()
+    try:
+        col = backend.get_collection(palace_path, "mempalace_drawers", create=True)
+
+        col.upsert(
+            ids=["a", "b", "c"],
+            documents=["doc a", "doc b", "doc c"],
+            embeddings=[[0.1] * _TEST_EMBED_DIM, [0.2] * _TEST_EMBED_DIM, [0.3] * _TEST_EMBED_DIM],
+            metadatas=[{"wing": "t"}, {"wing": "t"}, {"wing": "t"}],
+        )
+    finally:
+        backend.close()
+
+    found_healthy_segment = False
+    for entry in (tmp_path / "palace").iterdir():
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        meta = entry / "index_metadata.pickle"
+        link = entry / "link_lists.bin"
+        data = entry / "data_level0.bin"
+        if data.exists() and data.stat().st_size > _HNSW_MISSING_METADATA_DATA_FLOOR:
+            assert meta.exists(), "index_metadata missing after sub-threshold upsert"
+            assert link.exists() and link.stat().st_size > 0, "link_lists empty"
+            assert _segment_appears_healthy(str(entry))
+            found_healthy_segment = True
+
+    assert found_healthy_segment, "no VECTOR segment with data found"
+
+    # stale_seconds=0.0 forces the stage-2 integrity gate (_segment_appears_healthy)
+    # to run on every segment regardless of mtime delta, proving the fix directly.
+    moved = quarantine_stale_hnsw(palace_path, stale_seconds=0.0)
+    assert moved == [], f"quarantine fired on freshly-persisted segment: {moved}"
+
+
+def test_single_record_upsert_not_quarantined(tmp_path):
+    """A single-record upsert must not trigger quarantine.
+
+    With batch_size=2 chromadb only persists HNSW metadata after the second
+    record.  A one-record segment has no index_metadata.pickle and no
+    link_lists.bin data; _segment_appears_healthy must treat that combination
+    as sub-threshold (never persisted), not as corruption.
+    """
+    palace_path = str(tmp_path / "palace")
+    backend = ChromaBackend()
+    try:
+        col = backend.get_collection(palace_path, "mempalace_drawers", create=True)
+        col.upsert(
+            ids=["solo"],
+            documents=["only one drawer"],
+            embeddings=[[0.5] * _TEST_EMBED_DIM],
+            metadatas=[{"wing": "t"}],
+        )
+    finally:
+        backend.close()
+
+    for entry in (tmp_path / "palace").iterdir():
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        data = entry / "data_level0.bin"
+        if data.exists() and data.stat().st_size > 0:
+            assert _segment_appears_healthy(str(entry)), (
+                f"single-record segment flagged unhealthy: data={data.stat().st_size}B"
+            )
+
+    moved = quarantine_stale_hnsw(palace_path, stale_seconds=0.0)
+    assert moved == [], f"quarantine fired on single-record segment: {moved}"
 
 
 def test_get_collection_create_true_is_idempotent(tmp_path):
@@ -450,7 +528,7 @@ def test_get_collection_create_true_preserves_existing_metadata(tmp_path):
     backend.get_collection(palace, collection_name="mempalace_drawers", create=True)
     col = backend.get_collection(palace, collection_name="mempalace_drawers", create=True)
     assert col._collection.metadata["hnsw:space"] == "cosine"
-    assert col._collection.metadata.get("hnsw:batch_size") == 50_000
+    assert col._collection.metadata.get("hnsw:batch_size") == 2
 
 
 def test_fix_blob_seq_ids_converts_blobs_to_integers(tmp_path):
@@ -879,17 +957,18 @@ def test_quarantine_stale_hnsw_leaves_empty_segment_without_metadata_alone(tmp_p
 
 
 def test_segment_without_metadata_but_with_nontrivial_data_is_unhealthy(tmp_path):
-    """Data without index_metadata.pickle is a partial flush, not a fresh segment."""
+    """Interrupted persist: link_lists written but metadata absent is unhealthy."""
 
     seg = tmp_path / "abcd-1234-5678"
     seg.mkdir()
     (seg / "data_level0.bin").write_bytes(b"\0" * (_HNSW_MISSING_METADATA_DATA_FLOOR + 1))
+    (seg / "link_lists.bin").write_bytes(b"\x01" * 128)
 
     assert not _segment_appears_healthy(str(seg))
 
 
 def test_segment_without_metadata_and_tiny_data_is_still_treated_as_fresh(tmp_path):
-    """Tiny data payloads can occur before metadata has flushed; leave them alone."""
+    """No metadata and no link_lists means no persist was attempted; treat as fresh."""
 
     seg = tmp_path / "abcd-1234-5678"
     seg.mkdir()
@@ -899,7 +978,7 @@ def test_segment_without_metadata_and_tiny_data_is_still_treated_as_fresh(tmp_pa
 
 
 def test_quarantine_stale_hnsw_renames_missing_metadata_with_nontrivial_data(tmp_path):
-    """Regression for #1274: missing pickle + non-trivial data must quarantine."""
+    """Regression for #1274: missing pickle + link data must quarantine."""
 
     now = 1_700_000_000.0
     palace, seg = _make_palace_with_segment(
@@ -909,6 +988,7 @@ def test_quarantine_stale_hnsw_renames_missing_metadata_with_nontrivial_data(tmp
         meta_bytes=None,
     )
     (seg / "data_level0.bin").write_bytes(b"\0" * (_HNSW_MISSING_METADATA_DATA_FLOOR + 1))
+    (seg / "link_lists.bin").write_bytes(b"\x01" * 128)
     os.utime(seg / "data_level0.bin", (now - 7200, now - 7200))
 
     moved = quarantine_stale_hnsw(str(palace), stale_seconds=3600.0)
@@ -1566,7 +1646,7 @@ def test_get_collection_translates_ef_mismatch_to_helpful_error(tmp_path):
             return "embeddinggemma_300m"
 
         def __call__(self, input):
-            return [[0.0] * 384 for _ in input]
+            return [[0.0] * _TEST_EMBED_DIM for _ in input]
 
     original_resolver = backend._resolve_embedding_function
     backend._resolve_embedding_function = lambda: _ConflictingEF()

@@ -105,36 +105,38 @@ def _hnsw_payload_appears_sane(seg_dir: str) -> bool:
     return ratio is None or ratio <= _HNSW_LINK_TO_DATA_MAX_RATIO
 
 
-# HNSW tuning to prevent link_lists.bin bloat on large mines (#344).
+# HNSW batch/sync thresholds applied at collection creation.
 #
-# With default params (batch_size=100, sync_threshold=1000, initial capacity
-# 1000), inserting tens of thousands of drawers triggers ~30 index resizes
-# and hundreds of persistDirty() calls. persistDirty uses relative seek
-# positioning in link_lists.bin; accumulated seek drift across resize cycles
-# causes the OS to extend the sparse file with zero-filled regions, each
-# cycle compounding the next. Result: link_lists.bin grows into hundreds of
-# GB sparse, after which `status`/`search`/`repair` segfault.
+# chromadb's Rust HNSW segment writes index_metadata.pickle and
+# link_lists.bin only when internal counters cross both thresholds
+# (batch_size gates _apply_batch; sync_threshold gates _persist).
+# Records below both thresholds stay in memory and are lost on exit.
 #
-# Setting large batch and sync thresholds at collection creation defers
-# persistence until a single large batch completes, breaking the resize+
-# persist feedback loop. Empirically validated on a 39,792-drawer rebuild
-# (palace 376 MB, link_lists.bin 0 bytes, no segfault) in 2026-04.
+# Previously 50k/50k to work around link_lists.bin sparse-file bloat
+# in pre-1.5.x Python chromadb (#344).  chromadb >=1.5.4 Rust bindings
+# (the minimum mempalace supports) do not exhibit that bloat; verified
+# at batch_size=2 with 20k records: link_lists.bin = 171 KB, no
+# sparse-file inflation.
 #
-# Note: chromadb 1.5.x exposes a `collection.modify(configuration={"hnsw":
-# {"batch_size": ..., "sync_threshold": ...}})` retrofit path for already-
-# created collections (`UpdateHNSWConfiguration` in chromadb's API), but
-# this PR doesn't pursue that — once link_lists.bin has bloated, the index
-# is already corrupt and the only known recovery is a fresh mine.
+# The 50k guard caused #1579: mines under 50k drawers never triggered
+# _persist(), leaving index_metadata.pickle absent and link_lists.bin
+# empty.  quarantine_stale_hnsw then renamed the segment on every cold
+# open after a 300s mtime gap, accumulating .drift-* directories.
+#
+# Lowered to 2 (empirical Rust-side minimum for chromadb >=1.5.4; the
+# Rust bindings reject 1 with InvalidArgumentError) so any mine of 2+
+# drawers triggers a natural persist.  Existing palaces created under
+# the old 50k guard keep those thresholds in their collection metadata
+# until the user runs repair --mode from-sqlite --archive-existing.
 _HNSW_BLOAT_GUARD = {
-    "hnsw:batch_size": 50_000,
-    "hnsw:sync_threshold": 50_000,
+    "hnsw:batch_size": 2,
+    "hnsw:sync_threshold": 2,
 }
 
-# Missing index_metadata.pickle is normal only while a segment is still fresh
-# or effectively empty. Once data_level0.bin has non-trivial payload, a
-# missing metadata pickle means the segment was interrupted after writing HNSW
-# data but before writing its metadata. Letting Chroma open that shape can
-# segfault or hang in native HNSW code.
+# Below this size, data_level0.bin is too small for a meaningful HNSW graph.
+# Used by _hnsw_link_lists_is_usable_for_payload (empty link_lists is fine
+# when data is trivially small) and _missing_dimensionality_appears_recoverable
+# (don't attempt recovery on segments with negligible data).
 _HNSW_MISSING_METADATA_DATA_FLOOR = 1024
 
 
@@ -169,11 +171,14 @@ def _segment_appears_healthy(seg_dir: str) -> bool:
     ``0x2e`` (the protocol/terminator byte sequence chromadb serializes
     with).
 
-    Missing metadata is healthy only while the segment still looks fresh or
-    empty. If ``data_level0.bin`` already has non-trivial payload but
-    ``index_metadata.pickle`` is missing, the segment is partially flushed:
-    Chroma wrote vector data without the metadata it needs to reopen the
-    HNSW reader safely.
+    When metadata is missing, the segment is either *never-persisted*
+    (sub-threshold: fewer records than ``batch_size``, so chromadb never
+    triggered ``_persist()``) or *partially flushed* (persist started but
+    crashed).  The two are distinguished by ``link_lists.bin``: chromadb
+    writes link data during persist, so an empty/absent ``link_lists.bin``
+    together with absent metadata means no persist was ever attempted.
+    Note: ``data_level0.bin`` is pre-allocated at index creation and its
+    size does not indicate actual record count.
 
     Deliberately format-sniffs only; never deserializes. Deserialization
     can execute arbitrary code, and the byte-sniff is sufficient to
@@ -186,28 +191,23 @@ def _segment_appears_healthy(seg_dir: str) -> bool:
     files and quarantine_stale_hnsw would conservatively rename them
     out of the way.
     """
+    meta_path = os.path.join(seg_dir, "index_metadata.pickle")
+
+    if not os.path.isfile(meta_path):
+        link_path = os.path.join(seg_dir, "link_lists.bin")
+        try:
+            link_has_data = os.path.isfile(link_path) and os.path.getsize(link_path) > 0
+        except OSError:
+            return False
+        # Both absent → sub-threshold, never persisted.
+        # link_lists written but metadata not → interrupted persist.
+        return not link_has_data
+
     if not _hnsw_payload_appears_sane(seg_dir):
         return False
 
-    meta_path = os.path.join(seg_dir, "index_metadata.pickle")
-    if not os.path.isfile(meta_path):
-        data_path = os.path.join(seg_dir, "data_level0.bin")
-        try:
-            if (
-                os.path.isfile(data_path)
-                and os.path.getsize(data_path) > _HNSW_MISSING_METADATA_DATA_FLOOR
-            ):
-                return False
-        except OSError:
-            return False
-
-        # No metadata and no meaningful vector payload yet: fresh/empty segment.
-        return True
-
     try:
         size = os.path.getsize(meta_path)
-        # A real chromadb metadata file is at least tens of bytes; a
-        # smaller-than-floor file is almost certainly truncated.
         if size < 16:
             return False
         with open(meta_path, "rb") as f:
@@ -467,14 +467,15 @@ def _hnsw_element_count(palace_path: str, segment_id: str) -> Optional[int]:
 # read the collection metadata (older palaces missing the row, sqlite
 # unreadable). 2000 = 2 × chromadb's default sync_threshold of 1000.
 #
-# Why dynamic: PR #1191 set ``hnsw:sync_threshold = 50_000`` to prevent
-# index bloat, which means flush-lag can grow up to 50K naturally. A
-# fixed 2000 floor would flag every actively-written palace as DIVERGED
-# the moment its queue exceeded 10% of sqlite_count, even though chromadb
-# is behaving correctly. The floor must scale with sync_threshold to
-# distinguish real corruption (#1222 was 176 613 missing of 192 997 —
-# orders of magnitude past 2 × any reasonable sync_threshold) from
-# expected steady-state lag.
+# Why dynamic: legacy palaces may still carry ``sync_threshold = 50_000``
+# (the pre-#1579 guard), so flush-lag can grow up to 50K on those palaces.
+# New palaces use sync_threshold=2 (#1579) and flush almost immediately.
+# A fixed 2000 floor would flag actively-written legacy palaces as
+# DIVERGED the moment their queue exceeded 10% of sqlite_count, even
+# though chromadb is behaving correctly. The floor must scale with the
+# per-collection sync_threshold to distinguish real corruption (#1222 was
+# 176 613 missing of 192 997, orders of magnitude past any reasonable
+# sync_threshold) from expected steady-state lag.
 _HNSW_DIVERGENCE_FALLBACK_FLOOR = 2000
 _HNSW_DIVERGENCE_FRACTION = 0.10
 
