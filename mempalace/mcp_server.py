@@ -925,6 +925,7 @@ def tool_search(
             n_results=limit,
             max_distance=dist,
             vector_disabled=_vector_disabled,
+            collection_name=_config.collection_name,
         )
         if not _is_transient_index_error(result):
             result["index_recovered"] = True
