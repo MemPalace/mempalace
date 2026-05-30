@@ -1,6 +1,6 @@
 # MemPalace - Codex CLI Plugin
 
-Give your AI a persistent memory -- mine projects and conversations into a searchable palace backed by ChromaDB, with 19 MCP tools, auto-save hooks, and guided skills.
+Give your AI a persistent memory -- mine projects and conversations into a searchable palace backed by ChromaDB, with 30 MCP tools, auto-save hooks, and guided skills.
 
 ## Prerequisites
 
@@ -62,6 +62,7 @@ codex /init
 
 | Skill | Description |
 |-------|-------------|
+| `/mempalace` | Generic MemPalace skill that routes to `mempalace instructions <command>` |
 | `/help` | Show available commands and usage tips |
 | `/init` | Initialize a new memory palace |
 | `/search` | Semantic search across all mined memories |
@@ -73,6 +74,11 @@ codex /init
 The plugin includes auto-save hooks that run on session stop (every 15 messages) and before context compaction, automatically preserving conversation context into your palace.
 
 Set the `MEMPAL_DIR` environment variable to a directory path to automatically run `mempalace mine` on that directory during each save trigger.
+
+## MCP Server
+
+The plugin ships `.codex-plugin/.mcp.json` pointing to `mempalace-mcp` and
+references it from `plugin.json` via `mcpServers`.
 
 ## Support
 

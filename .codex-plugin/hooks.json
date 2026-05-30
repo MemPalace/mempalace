@@ -1,4 +1,5 @@
 {
+  "description": "MemPalace auto-save and pre-compact hooks for Codex CLI",
   "hooks": {
     "SessionStart": [
       {
@@ -6,7 +7,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CODEX_PLUGIN_ROOT}/hooks/mempal-hook.sh\" session-start"
+            "command": "\"${PLUGIN_ROOT}/hooks/mempal-hook.sh\" session-start",
+            "timeout": 10
           }
         ]
       }
@@ -17,7 +19,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CODEX_PLUGIN_ROOT}/hooks/mempal-hook.sh\" stop"
+            "command": "\"${PLUGIN_ROOT}/hooks/mempal-hook.sh\" stop",
+            "timeout": 20
           }
         ]
       }
@@ -28,7 +31,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CODEX_PLUGIN_ROOT}/hooks/mempal-hook.sh\" precompact"
+            "command": "\"${PLUGIN_ROOT}/hooks/mempal-hook.sh\" precompact",
+            "timeout": 75
           }
         ]
       }
