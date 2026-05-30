@@ -584,6 +584,7 @@ def test_cmd_mine_convos_mode(mock_config_cls):
         no_gitignore=False,
         include_ignored=[],
         extract="general",
+        include_subagents=False,
     )
     with patch("mempalace.convo_miner.mine_convos") as mock_mine:
         cmd_mine(args)
@@ -595,7 +596,30 @@ def test_cmd_mine_convos_mode(mock_config_cls):
             limit=10,
             dry_run=True,
             extract_mode="general",
+            include_subagents=False,
         )
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_mine_convos_mode_threads_include_subagents_flag(mock_config_cls):
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    args = argparse.Namespace(
+        dir="/chats",
+        palace=None,
+        mode="convos",
+        wing="mywing",
+        agent="me",
+        limit=10,
+        dry_run=True,
+        no_gitignore=False,
+        include_ignored=[],
+        extract="exchange",
+        include_subagents=True,
+    )
+    with patch("mempalace.convo_miner.mine_convos") as mock_mine:
+        cmd_mine(args)
+        kwargs = mock_mine.call_args.kwargs
+        assert kwargs["include_subagents"] is True
 
 
 @patch("mempalace.cli.MempalaceConfig")

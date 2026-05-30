@@ -516,6 +516,7 @@ def cmd_mine(args):
                 limit=args.limit,
                 dry_run=args.dry_run,
                 extract_mode=args.extract,
+                include_subagents=getattr(args, "include_subagents", False),
             )
         elif args.mode == "extract":
             from .format_miner import mine_formats
@@ -1352,6 +1353,17 @@ def main():
             f"summary counter. Default {_miner_for_default.MAX_CHUNKS_PER_FILE} "
             f"(or MEMPALACE_MAX_CHUNKS_PER_FILE). Set 0 to disable. Lower this on "
             f"Windows if you hit ONNX bad_alloc (#1455)."
+        ),
+    )
+    p_mine.add_argument(
+        "--include-subagents",
+        action="store_true",
+        default=False,
+        help=(
+            "Also mine Claude Code subagent transcripts (subagents/ dirs). "
+            "Excluded by default: these are short ephemeral exchanges "
+            "(Explore/Plan/Grep agents) already summarized in the parent "
+            "session, and on typical workspaces they dominate file counts."
         ),
     )
 
