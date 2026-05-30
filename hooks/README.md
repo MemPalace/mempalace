@@ -2,6 +2,13 @@
 
 These hook scripts make MemPalace save automatically. No manual "save" commands needed.
 
+This file covers the **Claude Code** and **Codex CLI** hooks that live
+flat under `hooks/`. For the **Cursor IDE** hooks, see
+[`hooks/cursor/README.md`](cursor/README.md) or the rendered docs at
+[`website/guide/cursor-hooks.md`](../website/guide/cursor-hooks.md). The
+two are additive and share the same `~/.mempalace/hook_state/`
+directory.
+
 If you are trying to protect existing Claude Code transcripts immediately,
 use the short checklist first: [`website/guide/claude-code-retention.md`](../website/guide/claude-code-retention.md).
 It covers hook wiring, JSONL backup, and one-time backfill.

@@ -165,8 +165,14 @@ system prompt:
 
 ## Auto-save hooks
 
-Two Claude Code hooks save periodically and before context compression:
-[mempalaceofficial.com/guide/hooks](https://mempalaceofficial.com/guide/hooks.html).
+Auto-save hooks for **Claude Code, Codex CLI, and Cursor IDE** save
+periodically and before context compression:
+
+- Claude Code + Codex →
+  [mempalaceofficial.com/guide/hooks](https://mempalaceofficial.com/guide/hooks.html)
+- Cursor IDE (adds session-start recall and a transcript snapshot before
+  compaction) →
+  [mempalaceofficial.com/guide/cursor-hooks](https://mempalaceofficial.com/guide/cursor-hooks.html)
 
 If you are installing under time pressure, start with the
 [Claude Code retention setup checklist](https://mempalaceofficial.com/guide/claude-code-retention.html):
