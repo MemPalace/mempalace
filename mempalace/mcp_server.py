@@ -74,6 +74,7 @@ from .backends.chroma import (  # noqa: E402
 )
 from .query_sanitizer import sanitize_query  # noqa: E402
 from .searcher import search_memories  # noqa: E402
+from . import palace_stats  # noqa: E402
 from .palace_graph import (  # noqa: E402
     traverse,
     find_tunnels,
@@ -310,19 +311,11 @@ def _force_chroma_cache_reset() -> None:
     # state. Without clearing _DEFAULT_BACKEND._clients the retry
     # would just hit the same stale handle, since tool_search routes
     # via search_memories -> palace.get_collection -> backend cache.
-    global \
-        _client_cache, \
-        _collection_cache, \
-        _palace_db_inode, \
-        _palace_db_mtime, \
-        _metadata_cache, \
-        _metadata_cache_time
+    global _client_cache, _collection_cache, _palace_db_inode, _palace_db_mtime
     _client_cache = None
     _collection_cache = None
     _palace_db_inode = 0
     _palace_db_mtime = 0.0
-    _metadata_cache = None
-    _metadata_cache_time = 0
     try:
         from .palace import _DEFAULT_BACKEND
 
@@ -444,13 +437,7 @@ def _get_client():
     Note: FAT/exFAT may return 0 for st_ino — the ``current_inode != 0``
     guard skips reconnect detection on those filesystems (safe fallback).
     """
-    global \
-        _client_cache, \
-        _collection_cache, \
-        _palace_db_inode, \
-        _palace_db_mtime, \
-        _metadata_cache, \
-        _metadata_cache_time
+    global _client_cache, _collection_cache, _palace_db_inode, _palace_db_mtime
     db_path = os.path.join(_config.palace_path, "chroma.sqlite3")
     try:
         st = os.stat(db_path)
@@ -482,8 +469,6 @@ def _get_client():
         _refresh_vector_disabled_flag()
         _client_cache = ChromaBackend.make_client(_config.palace_path)
         _collection_cache = None
-        _metadata_cache = None
-        _metadata_cache_time = 0
         _palace_db_inode = current_inode
         _palace_db_mtime = current_mtime
     return _client_cache
@@ -501,7 +486,7 @@ def _get_collection(create=False):
     ``quarantine_stale_hnsw`` per #1322), so the second attempt heals the
     common stale-handle / stale-HNSW case automatically.
     """
-    global _client_cache, _collection_cache, _metadata_cache, _metadata_cache_time
+    global _client_cache, _collection_cache
     for attempt in range(2):
         try:
             client = _get_client()
@@ -550,16 +535,12 @@ def _get_collection(create=False):
                     )
                 _pin_hnsw_threads(raw)
                 _collection_cache = ChromaCollection(raw, palace_path=_config.palace_path)
-                _metadata_cache = None
-                _metadata_cache_time = 0
             elif _collection_cache is None:
                 ef = ChromaBackend._resolve_embedding_function()
                 ef_kwargs = {"embedding_function": ef} if ef is not None else {}
                 raw = client.get_collection(_config.collection_name, **ef_kwargs)
                 _pin_hnsw_threads(raw)
                 _collection_cache = ChromaCollection(raw, palace_path=_config.palace_path)
-                _metadata_cache = None
-                _metadata_cache_time = 0
             return _collection_cache
         except Exception:
             logger.exception(
@@ -575,8 +556,6 @@ def _get_collection(create=False):
                 # collection cleanly, healing the common stale-handle case.
                 _client_cache = None
                 _collection_cache = None
-                _metadata_cache = None
-                _metadata_cache_time = 0
     return None
 
 
@@ -612,44 +591,7 @@ def _safe_meta(meta):
     return meta if isinstance(meta, dict) else {}
 
 
-def _fetch_all_metadata(col, where=None):
-    """Paginate col.get() to avoid the 10K silent truncation limit."""
-    total = col.count()
-    all_meta = []
-    offset = 0
-    while offset < total:
-        kwargs = {"include": ["metadatas"], "limit": 1000, "offset": offset}
-        if where:
-            kwargs["where"] = where
-        batch = col.get(**kwargs)
-        if not batch["metadatas"]:
-            break
-        all_meta.extend(batch["metadatas"])
-        offset += len(batch["metadatas"])
-    return all_meta
-
-
-_metadata_cache = None
-_metadata_cache_time = 0
-_METADATA_CACHE_TTL = 5.0  # seconds
 _MAX_RESULTS = 100  # upper bound for search/list limit params
-
-
-def _get_cached_metadata(col, where=None):
-    """Return cached metadata if fresh, else fetch and cache."""
-    global _metadata_cache, _metadata_cache_time
-    now = time.time()
-    if (
-        where is None
-        and _metadata_cache is not None
-        and (now - _metadata_cache_time) < _METADATA_CACHE_TTL
-    ):
-        return _metadata_cache
-    result = _fetch_all_metadata(col, where=where)
-    if where is None:
-        _metadata_cache = result
-        _metadata_cache_time = now
-    return result
 
 
 def _sanitize_optional_name(value: str = None, field_name: str = "name") -> str:
@@ -762,15 +704,11 @@ def tool_status():
         "aaak_dialect": AAAK_SPEC,
     }
     try:
-        all_meta = _get_cached_metadata(col)
-        for m in all_meta:
-            m = m or {}
-            w = m.get("wing", "unknown")
-            r = m.get("room", "unknown")
-            wings[w] = wings.get(w, 0) + 1
-            rooms[r] = rooms.get(r, 0) + 1
+        wings, rooms = palace_stats.wing_room_summary(col)
+        result["wings"] = wings
+        result["rooms"] = rooms
     except Exception as e:
-        logger.exception("tool_status metadata fetch failed")
+        logger.exception("tool_status aggregation failed")
         result["error"] = str(e)
         result["partial"] = True
     return result
@@ -816,13 +754,9 @@ def tool_list_wings():
     wings = {}
     result = {"wings": wings}
     try:
-        all_meta = _get_cached_metadata(col)
-        for m in all_meta:
-            m = m or {}
-            w = m.get("wing", "unknown")
-            wings[w] = wings.get(w, 0) + 1
+        result["wings"] = palace_stats.wing_counts(col)
     except Exception as e:
-        logger.exception("tool_list_wings metadata fetch failed")
+        logger.exception("tool_list_wings aggregation failed")
         result["error"] = str(e)
         result["partial"] = True
     return result
@@ -839,14 +773,9 @@ def tool_list_rooms(wing: str = None):
     rooms = {}
     result = {"wing": wing or "all", "rooms": rooms}
     try:
-        where = {"wing": wing} if wing else None
-        all_meta = _fetch_all_metadata(col, where=where)
-        for m in all_meta:
-            m = m or {}
-            r = m.get("room", "unknown")
-            rooms[r] = rooms.get(r, 0) + 1
+        result["rooms"] = palace_stats.room_counts(col, wing=wing)
     except Exception as e:
-        logger.exception("tool_list_rooms metadata fetch failed")
+        logger.exception("tool_list_rooms aggregation failed")
         result["error"] = str(e)
         result["partial"] = True
     return result
@@ -859,16 +788,9 @@ def tool_get_taxonomy():
     taxonomy = {}
     result = {"taxonomy": taxonomy}
     try:
-        all_meta = _get_cached_metadata(col)
-        for m in all_meta:
-            m = m or {}
-            w = m.get("wing", "unknown")
-            r = m.get("room", "unknown")
-            if w not in taxonomy:
-                taxonomy[w] = {}
-            taxonomy[w][r] = taxonomy[w].get(r, 0) + 1
+        result["taxonomy"] = palace_stats.taxonomy(col)
     except Exception as e:
-        logger.exception("tool_get_taxonomy metadata fetch failed")
+        logger.exception("tool_get_taxonomy aggregation failed")
         result["error"] = str(e)
         result["partial"] = True
     return result
@@ -1117,7 +1039,6 @@ def tool_add_drawer(
     ``tool_delete_drawer(drawer_id)`` report "not found" on the chunked
     path because no row is stored under the logical group id.
     """
-    global _metadata_cache
     try:
         wing = sanitize_name(wing, "wing")
         room = sanitize_name(room, "room")
@@ -1191,7 +1112,6 @@ def tool_add_drawer(
                     "Drawer write was acknowledged but the new ID is not readable. "
                     "The palace index may be stale; run reconnect or repair."
                 )
-            _metadata_cache = None
             logger.info(f"Filed drawer: {drawer_id} → {wing}/{room}")
             return {
                 "success": True,
@@ -1225,7 +1145,6 @@ def tool_add_drawer(
                 "Drawer write was acknowledged but the new ID is not readable. "
                 "The palace index may be stale; run reconnect or repair."
             )
-        _metadata_cache = None
         logger.info(f"Filed drawer: {drawer_id} → {wing}/{room} ({len(chunk_ids)} chunks)")
         return {
             "success": True,
@@ -1241,7 +1160,6 @@ def tool_add_drawer(
 
 def tool_delete_drawer(drawer_id: str):
     """Delete a single drawer by ID."""
-    global _metadata_cache
     col = _get_collection()
     if not col:
         return _no_palace()
@@ -1265,7 +1183,6 @@ def tool_delete_drawer(drawer_id: str):
 
     try:
         col.delete(ids=[drawer_id])
-        _metadata_cache = None
         logger.info(f"Deleted drawer: {drawer_id}")
         return {"success": True, "drawer_id": drawer_id}
     except Exception as e:
@@ -1274,7 +1191,6 @@ def tool_delete_drawer(drawer_id: str):
 
 def tool_sync(project_dir: str = None, wing: str = None, apply: bool = False):
     """Prune drawers whose source files are gitignored, missing, or moved (#1252)."""
-    global _metadata_cache
     from .palace import MineAlreadyRunning
     from .sync import sync_palace
 
@@ -1283,31 +1199,27 @@ def tool_sync(project_dir: str = None, wing: str = None, apply: bool = False):
         return {"success": False, "error": np.get("error", "no palace"), "hint": np.get("hint")}
     project_dirs = [project_dir] if project_dir else None
     try:
-        try:
-            report = sync_palace(
-                palace_path=_config.palace_path,
-                project_dirs=project_dirs,
-                wing=wing,
-                dry_run=not apply,
-                wal_log=_wal_log,
-            )
-            return {"success": True, **report}
-        # Order matters: typed handlers must precede the bare Exception
-        # below, otherwise MineAlreadyRunning and ValueError fall into the
-        # generic "sync failed" branch and break the structured-error tests.
-        except MineAlreadyRunning as exc:
-            return {
-                "success": False,
-                "error": f"another mine is in progress: {exc}",
-                "error_class": "LockHeldByOtherProcess",
-            }
-        except ValueError as exc:
-            return {"success": False, "error": str(exc)}
-        except Exception as exc:
-            return {"success": False, "error": f"sync failed: {exc}"}
-    finally:
-        if apply:
-            _metadata_cache = None
+        report = sync_palace(
+            palace_path=_config.palace_path,
+            project_dirs=project_dirs,
+            wing=wing,
+            dry_run=not apply,
+            wal_log=_wal_log,
+        )
+        return {"success": True, **report}
+    # Order matters: typed handlers must precede the bare Exception
+    # below, otherwise MineAlreadyRunning and ValueError fall into the
+    # generic "sync failed" branch and break the structured-error tests.
+    except MineAlreadyRunning as exc:
+        return {
+            "success": False,
+            "error": f"another mine is in progress: {exc}",
+            "error_class": "LockHeldByOtherProcess",
+        }
+    except ValueError as exc:
+        return {"success": False, "error": str(exc)}
+    except Exception as exc:
+        return {"success": False, "error": f"sync failed: {exc}"}
 
 
 def tool_get_drawer(drawer_id: str):
@@ -1402,7 +1314,6 @@ def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offse
 
 def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, room: str = None):
     """Update an existing drawer's content and/or metadata."""
-    global _metadata_cache
 
     if content is None and wing is None and room is None:
         return {"success": True, "drawer_id": drawer_id, "noop": True}
@@ -1455,8 +1366,6 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
             update_kwargs["documents"] = [new_doc]
         update_kwargs["metadatas"] = [new_meta]
         col.update(**update_kwargs)
-
-        _metadata_cache = None
 
         logger.info(f"Updated drawer: {drawer_id}")
         return {

@@ -13,7 +13,6 @@ import logging
 import math
 import os
 import re
-import sqlite3
 from pathlib import Path
 
 from .backends import CollectionNotInitializedError, PalaceNotFoundError
@@ -240,11 +239,13 @@ def _expand_with_neighbors(drawers_col, matched_doc: str, matched_meta: dict, ra
     else:
         combined_text = "\n\n".join(doc for _, doc in indexed_docs)
 
-    # Cheap total_drawers lookup: metadata-only scan of the source file.
+    # Cheap total_drawers lookup: COUNT(*) on the source file, no documents
+    # materialized (#1657).
     total_drawers = None
     try:
-        all_meta = drawers_col.get(where={"source_file": src}, include=["metadatas"])
-        total_drawers = len(all_meta.ids) if all_meta.ids else None
+        from .source_file_access import count_drawers
+
+        total_drawers = count_drawers(drawers_col, src) or None
     except Exception:
         logger.debug("total_drawers lookup failed for %s", src, exc_info=True)
 
@@ -405,233 +406,23 @@ def _bm25_only_via_sqlite(
     _include_internal: bool = False,
     collection_name: str = None,
 ) -> dict:
-    """BM25-only search reading drawers directly from chroma.sqlite3.
+    """Thin shim → :class:`mempalace.verbatim_sqlite.SqliteExactRetriever`.
 
-    Used when HNSW is diverged or unloadable (#1222). Bypasses chromadb's
-    Python client entirely so a corrupt vector segment can't segfault the
-    MCP server. Routes through chromadb's own FTS5 trigram index
-    (``embedding_fulltext_search``) for candidate selection, then re-ranks
-    with the same Okapi-BM25 used in :func:`_hybrid_rank` so the result
-    shape matches the vector path.
-
-    The query is split into ≥3-char trigram-tokens and OR-joined for the
-    FTS5 MATCH — chromadb writes the index with ``tokenize='trigram'``,
-    so single-character tokens never match. When no usable token survives
-    (e.g. "is a"), candidate selection falls back to the most-recent
-    ``max_candidates`` rows so we still return *something* rather than
-    nothing.
+    The BM25-only fallback used when HNSW is diverged or unloadable (#1222)
+    now lives in its own adapter (#1657) which owns all ``chroma.sqlite3``
+    schema knowledge. This entry point is retained so the searcher's call
+    sites and existing tests keep a stable seam into that adapter.
     """
-    db_path = os.path.join(palace_path, "chroma.sqlite3")
-    if not os.path.isfile(db_path):
-        return {
-            "error": "No palace found",
-            "hint": "Run: mempalace init <dir> && mempalace mine <dir>",
-        }
-    if collection_name is None:
-        from .config import get_configured_collection_name
+    from .verbatim_sqlite import SqliteExactRetriever
 
-        collection_name = get_configured_collection_name()
-
-    def _metadata_filter_sql(row_id_expr: str) -> tuple[str, list[str]]:
-        clauses = []
-        params = []
-        for key, value in (("wing", wing), ("room", room)):
-            if not value:
-                continue
-            clauses.append(
-                f"""
-                AND EXISTS (
-                    SELECT 1
-                    FROM embedding_metadata mf
-                    WHERE mf.id = {row_id_expr}
-                      AND mf.key = ?
-                      AND COALESCE(
-                        mf.string_value,
-                        CAST(mf.int_value AS TEXT),
-                        CAST(mf.float_value AS TEXT),
-                        CAST(mf.bool_value AS TEXT)
-                      ) = ?
-                )
-                """
-            )
-            params.extend([key, value])
-        return "".join(clauses), params
-
-    try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    except sqlite3.Error as e:
-        return {"error": f"sqlite open failed: {e}"}
-
-    try:
-        # FTS5 MATCH expects whitespace-separated tokens. Drop tokens
-        # shorter than 3 chars (trigram tokenizer can't match them).
-        tokens = [t for t in _tokenize(query) if len(t) >= 3]
-        candidate_ids: list[int] = []
-        use_recency_fallback = not tokens
-        if tokens:
-            fts_query = " OR ".join(tokens)
-            filter_sql, filter_params = _metadata_filter_sql("embedding_fulltext_search.rowid")
-            try:
-                rows = conn.execute(
-                    f"""
-                    SELECT embedding_fulltext_search.rowid
-                    FROM embedding_fulltext_search
-                    JOIN embeddings e ON e.id = embedding_fulltext_search.rowid
-                    JOIN segments s ON e.segment_id = s.id
-                    JOIN collections c ON s.collection = c.id
-                    WHERE embedding_fulltext_search MATCH ?
-                      AND c.name = ?
-                    {filter_sql}
-                    LIMIT ?
-                    """,
-                    (fts_query, collection_name, *filter_params, max_candidates),
-                ).fetchall()
-                candidate_ids = [r[0] for r in rows]
-            except sqlite3.Error:
-                # FTS5 tokenizer mismatch or syntax error — fall through
-                # to the recency-window selector below.
-                logger.debug("FTS5 MATCH failed; using recency fallback", exc_info=True)
-                use_recency_fallback = True
-
-        if not candidate_ids and use_recency_fallback:
-            # No usable FTS tokens, or FTS itself failed — pull the most
-            # recent rows for the drawers segment so we can BM25-rank
-            # something rather than return empty-handed. A clean FTS miss
-            # must stay empty, especially after wing/room filtering, because
-            # recency fallback would return unrelated scoped drawers.
-            # Wrapped in try/except because the schema may differ on legacy
-            # palaces (older chromadb without ``created_at``, missing
-            # ``segments`` rows after partial restore, etc.); on schema
-            # mismatch we fall back to ordering by primary-key id and finally
-            # to an empty result rather than letting search raise.
-            try:
-                filter_sql, filter_params = _metadata_filter_sql("e.id")
-                rows = conn.execute(
-                    f"""
-                    SELECT e.id
-                    FROM embeddings e
-                    JOIN segments s ON e.segment_id = s.id
-                    JOIN collections c ON s.collection = c.id
-                    WHERE c.name = ?
-                    {filter_sql}
-                    ORDER BY e.created_at DESC
-                    LIMIT ?
-                    """,
-                    (collection_name, *filter_params, max_candidates),
-                ).fetchall()
-                candidate_ids = [r[0] for r in rows]
-            except sqlite3.Error:
-                logger.debug(
-                    "recency-window query failed; trying id-ordered fallback",
-                    exc_info=True,
-                )
-                try:
-                    filter_sql, filter_params = _metadata_filter_sql("e.id")
-                    rows = conn.execute(
-                        f"""
-                        SELECT e.id
-                        FROM embeddings e
-                        JOIN segments s ON e.segment_id = s.id
-                        JOIN collections c ON s.collection = c.id
-                        WHERE c.name = ?
-                        {filter_sql}
-                        ORDER BY e.id DESC
-                        LIMIT ?
-                        """,
-                        (collection_name, *filter_params, max_candidates),
-                    ).fetchall()
-                    candidate_ids = [r[0] for r in rows]
-                except sqlite3.Error:
-                    logger.debug("id-ordered fallback also failed", exc_info=True)
-                    candidate_ids = []
-
-        if not candidate_ids:
-            return {
-                "query": query,
-                "filters": {"wing": wing, "room": room},
-                "total_before_filter": 0,
-                "results": [],
-                "fallback": "bm25_only_via_sqlite",
-            }
-
-        placeholders = ",".join(["?"] * len(candidate_ids))
-        meta_rows = conn.execute(
-            f"""
-            SELECT id, key, string_value, int_value
-            FROM embedding_metadata
-            WHERE id IN ({placeholders})
-            """,
-            candidate_ids,
-        ).fetchall()
-    finally:
-        conn.close()
-
-    # Group metadata rows into per-drawer dicts.
-    drawers: dict[int, dict] = {}
-    for emb_id, key, sval, ival in meta_rows:
-        d = drawers.setdefault(emb_id, {"_id": emb_id, "metadata": {}, "text": ""})
-        if key == "chroma:document":
-            d["text"] = sval or ""
-        else:
-            d["metadata"][key] = sval if sval is not None else ival
-
-    # Apply wing/room filters in Python (FTS5 candidates may include
-    # entries from other wings).
-    candidates = []
-    for d in drawers.values():
-        meta = d["metadata"]
-        if wing and meta.get("wing") != wing:
-            continue
-        if room and meta.get("room") != room:
-            continue
-        full_source = meta.get("source_file", "") or ""
-        candidates.append(
-            {
-                "text": d["text"],
-                "wing": meta.get("wing", "unknown"),
-                "room": meta.get("room", "unknown"),
-                "source_file": Path(full_source).name if full_source else "?",
-                "created_at": meta.get("filed_at", "unknown"),
-                # No vector distance available in BM25-only mode.
-                "similarity": None,
-                "distance": None,
-                "matched_via": "bm25_sqlite",
-                # Internal: full path + chunk_index let callers (notably
-                # candidate_strategy="union") dedupe at chunk granularity
-                # rather than basename — two files in different directories
-                # may share a basename, and one source_file is split across
-                # multiple chunks. Stripped before this helper returns.
-                "_source_file_full": full_source,
-                "_chunk_index": meta.get("chunk_index"),
-            }
-        )
-
-    # Local BM25 over the candidate set.
-    docs = [c["text"] for c in candidates]
-    bm25_raw = _bm25_scores(query, docs)
-    max_bm25 = max(bm25_raw) if bm25_raw else 0.0
-    for c, raw in zip(candidates, bm25_raw):
-        c["bm25_score"] = round(raw, 3)
-        c["_score"] = (raw / max_bm25) if max_bm25 > 0 else 0.0
-    candidates.sort(key=lambda c: c["_score"], reverse=True)
-    hits = candidates[:n_results]
-    for h in hits:
-        h.pop("_score", None)
-        # Strip internal fields by default so the public BM25-only fallback
-        # response stays clean. Callers that need chunk-precise dedup
-        # (notably the union-merge path) opt in via _include_internal.
-        if not _include_internal:
-            h.pop("_source_file_full", None)
-            h.pop("_chunk_index", None)
-
-    return {
-        "query": query,
-        "filters": {"wing": wing, "room": room},
-        "total_before_filter": len(candidates),
-        "results": hits,
-        "fallback": "bm25_only_via_sqlite",
-        "fallback_reason": "vector_search_disabled",
-    }
+    return SqliteExactRetriever(palace_path, collection_name=collection_name).search(
+        query,
+        wing=wing,
+        room=room,
+        n_results=n_results,
+        max_candidates=max_candidates,
+        include_internal=_include_internal,
+    )
 
 
 def _merge_bm25_union_candidates(
@@ -743,6 +534,82 @@ def _apply_candidate_strategy(
     merger = _CANDIDATE_MERGERS[strategy]
     if merger is not None:
         merger(hits, query, palace_path, wing, room, n_results, max_distance=max_distance)
+
+
+_MAX_HYDRATION_CHARS = 10000
+
+
+def _enrich_closet_hits(hits: list, drawers_col, query: str) -> None:
+    """Drawer-grep enrichment for closet-boosted hits, in place.
+
+    For each closet-boosted hit whose source file has multiple drawers, replace
+    the drawer vector search landed on with the keyword-best chunk + its
+    immediate neighbors. The closet said "this source is relevant"; vector may
+    have picked the wrong chunk within it; grep picks the right one.
+
+    Bounded by the source-file fetch cap (#1657): a file larger than the cap is
+    *not* grep-enriched, because the grep needs the whole file and a capped,
+    unordered subset could omit the matched chunk and overwrite the hit with an
+    unrelated early one. Oversized hits keep their own (correct) text and only
+    get an accurate ``total_drawers`` from ``COUNT(*)``.
+    """
+    from .source_file_access import FETCH_LIMIT, count_drawers, fetch_drawers
+
+    for h in hits:
+        if h["matched_via"] == "drawer":
+            continue
+        full_source = h.get("_source_file_full") or ""
+        if not full_source:
+            continue
+        try:
+            total = count_drawers(drawers_col, full_source)
+        except Exception:
+            logger.debug("Drawer count failed for %s", full_source, exc_info=True)
+            continue
+        if total <= 1:
+            continue
+        if total > FETCH_LIMIT:
+            h["total_drawers"] = total
+            continue
+        try:
+            source_drawers = fetch_drawers(drawers_col, full_source)
+        except Exception:
+            logger.debug("Neighbor fetch failed for %s", full_source, exc_info=True)
+            continue
+        docs = source_drawers.documents
+        metas_ = source_drawers.metadatas
+        if len(docs) <= 1:
+            continue
+
+        # Sort by chunk_index so best_idx + neighbors are positional.
+        indexed = []
+        for idx, (d, m) in enumerate(zip(docs, metas_)):
+            ci = m.get("chunk_index", idx) if isinstance(m, dict) else idx
+            if not isinstance(ci, int):
+                ci = idx
+            indexed.append((ci, d))
+        indexed.sort(key=lambda p: p[0])
+        ordered_docs = [d for _, d in indexed]
+
+        query_terms = set(_tokenize(query))
+        best_idx, best_score = 0, -1
+        for idx, d in enumerate(ordered_docs):
+            d_lower = d.lower()
+            s = sum(1 for t in query_terms if t in d_lower)
+            if s > best_score:
+                best_score, best_idx = s, idx
+
+        start = max(0, best_idx - 1)
+        end = min(len(ordered_docs), best_idx + 2)
+        expanded = "\n\n".join(ordered_docs[start:end])
+        if len(expanded) > _MAX_HYDRATION_CHARS:
+            expanded = (
+                expanded[:_MAX_HYDRATION_CHARS] + f"\n\n[...truncated. {total} total drawers. "
+                "Use mempalace_get_drawer for full content.]"
+            )
+        h["text"] = expanded
+        h["drawer_index"] = best_idx
+        h["total_drawers"] = total
 
 
 def search_memories(
@@ -927,61 +794,7 @@ def search_memories(
     scored.sort(key=lambda h: h["_sort_key"])
     hits = scored[:n_results]
 
-    # Drawer-grep enrichment: for closet-boosted hits whose source has
-    # multiple drawers, return the keyword-best chunk + its immediate
-    # neighbors instead of just the drawer vector search landed on. The
-    # closet said "this source is relevant"; vector may have picked the
-    # wrong chunk within it; grep picks the right one.
-    MAX_HYDRATION_CHARS = 10000
-    for h in hits:
-        if h["matched_via"] == "drawer":
-            continue
-        full_source = h.get("_source_file_full") or ""
-        if not full_source:
-            continue
-        try:
-            source_drawers = drawers_col.get(
-                where={"source_file": full_source},
-                include=["documents", "metadatas"],
-            )
-        except Exception:
-            logger.debug("Neighbor fetch failed for %s", full_source, exc_info=True)
-            continue
-        docs = source_drawers.documents
-        metas_ = source_drawers.metadatas
-        if len(docs) <= 1:
-            continue
-
-        # Sort by chunk_index so best_idx + neighbors are positional.
-        indexed = []
-        for idx, (d, m) in enumerate(zip(docs, metas_)):
-            ci = m.get("chunk_index", idx) if isinstance(m, dict) else idx
-            if not isinstance(ci, int):
-                ci = idx
-            indexed.append((ci, d))
-        indexed.sort(key=lambda p: p[0])
-        ordered_docs = [d for _, d in indexed]
-
-        query_terms = set(_tokenize(query))
-        best_idx, best_score = 0, -1
-        for idx, d in enumerate(ordered_docs):
-            d_lower = d.lower()
-            s = sum(1 for t in query_terms if t in d_lower)
-            if s > best_score:
-                best_score, best_idx = s, idx
-
-        start = max(0, best_idx - 1)
-        end = min(len(ordered_docs), best_idx + 2)
-        expanded = "\n\n".join(ordered_docs[start:end])
-        if len(expanded) > MAX_HYDRATION_CHARS:
-            expanded = (
-                expanded[:MAX_HYDRATION_CHARS]
-                + f"\n\n[...truncated. {len(ordered_docs)} total drawers. "
-                "Use mempalace_get_drawer for full content.]"
-            )
-        h["text"] = expanded
-        h["drawer_index"] = best_idx
-        h["total_drawers"] = len(ordered_docs)
+    _enrich_closet_hits(hits, drawers_col, query)
 
     # Candidate strategy hook: optionally widen the rerank pool's *source*
     # before ranking. Default ("vector") is a no-op; "union" merges top-K

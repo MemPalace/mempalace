@@ -612,14 +612,18 @@ class TestSyncPalace:
             f"expected closet-skip warning, got: {[r.getMessage() for r in caplog.records]}"
         )
 
-    def test_metadata_cache_cleared_on_exception(self, monkeypatch, config, synced_world, kg):
-        """F9 regression: tool_sync's try/finally must clear `_metadata_cache`
-        even if sync_palace raises mid-apply.
+    def test_sync_returns_structured_error_on_exception(
+        self, monkeypatch, config, synced_world, kg
+    ):
+        """tool_sync must turn a mid-apply ``sync_palace`` failure into a
+        structured error result rather than propagating the exception.
 
         Tracks an explicit `called` flag on the explode mock so a refactor
         that bypasses the patched name (and lets the real sync_palace run)
-        cannot fake-pass — the assertion below verifies the patched explode
-        actually ran before the cache was cleared.
+        cannot fake-pass — the assertion verifies the patched explode actually
+        ran. (The metadata cache this once also cleared was removed in #1657:
+        count/taxonomy reads now aggregate via SQL, so there is no cache to
+        invalidate.)
         """
         from mempalace import mcp_server
 
@@ -633,7 +637,6 @@ class TestSyncPalace:
             json.dump({"palace_path": synced_world["palace_path"]}, f)
         monkeypatch.setattr(mcp_server, "_config", MempalaceConfig(config_dir=str(cfg_dir)))
         monkeypatch.setattr(mcp_server, "_get_kg", lambda: kg)
-        monkeypatch.setattr(mcp_server, "_metadata_cache", ["dirty-cache-marker"])
 
         called = {"n": 0}
 
@@ -650,10 +653,6 @@ class TestSyncPalace:
         assert called["n"] == 1, "explode mock did not actually run; test is a fake-pass"
         assert result.get("success") is False
         assert "simulated" in result.get("error", "")
-
-        assert mcp_server._metadata_cache is None, (
-            "F9: cache must be cleared even when sync_palace raises"
-        )
 
     def test_sync_report_keys_stable(self, synced_world):
         """Regression: SyncReport schema must not silently drop a field."""

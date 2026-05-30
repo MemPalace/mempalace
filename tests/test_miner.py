@@ -781,24 +781,22 @@ def test_status_palace_dir_without_db_reports_uninitialized(tmp_path, capsys):
 
 
 def test_status_handles_none_metadata_without_crash(tmp_path, capsys):
-    """status must not crash when col.get returns a None entry in metadatas.
+    """status must not crash when a drawer has no wing/room metadata.
 
     Palaces can contain drawers whose metadata was never set (older mining
-    paths, drawers written by third-party tools). Before the guard, status
-    crashed mid-tally with ``AttributeError: 'NoneType' object has no
-    attribute 'get'`` at the wing/room histogram line."""
+    paths, drawers written by third-party tools). The aggregation seam surfaces
+    those rows with value ``None`` (the SQL LEFT join keeps them); status relabels
+    that bucket to the ``?`` fallback (#1657) without crashing."""
     from unittest.mock import patch
 
     class FakeCol:
         def count(self):
             return 2
 
-        def get(self, *args, **kwargs):
-            return {
-                "ids": ["a", "b"],
-                "documents": ["doc a", "doc b"],
-                "metadatas": [{"wing": "proj", "room": "r"}, None],
-            }
+        def crosstab(self, key_a, key_b, where=None):
+            # One real cell + one missing-metadata cell, mirroring the SQL
+            # GROUP BY's LEFT-join output for a drawer with no wing/room.
+            return {"proj": {"r": 1}, None: {None: 1}}
 
     with patch("mempalace.miner._open_collection_or_explain", return_value=FakeCol()):
         status(str(tmp_path))

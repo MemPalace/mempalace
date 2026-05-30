@@ -1518,3 +1518,53 @@ class TestDrawerGrepExpansion:
         # Enriched text must include the grep-best chunk plus one neighbor
         # on each side (chunk boundary may clip).
         assert "chunk_" in top["text"]
+
+    def test_hybrid_enrichment_skips_grep_for_oversized_source(self, palace_path, monkeypatch):
+        """When a source file has more drawers than the fetch cap, enrichment must
+        NOT overwrite the matched drawer's text from a capped, unordered subset
+        (which could omit the matched chunk). It keeps the matched text and still
+        reports the accurate drawer count via COUNT(*) (#1657 review finding)."""
+        # Cap below the file's drawer count so the file is "oversized". The
+        # constant is imported inside search_memories at call time, so patching
+        # the module attribute takes effect.
+        monkeypatch.setattr("mempalace.source_file_access.FETCH_LIMIT", 2)
+
+        col = get_collection(palace_path)
+        source = "/proj/huge.md"
+        for i in range(5):
+            col.upsert(
+                ids=[f"drawer_proj_backend_huge_{i:03d}"],
+                documents=[f"chunk_{i} talks about JWT authentication flow"],
+                metadatas=[
+                    {
+                        "wing": "project",
+                        "room": "backend",
+                        "source_file": source,
+                        "chunk_index": i,
+                        "filed_at": "2026-04-13T00:00:00",
+                    }
+                ],
+            )
+        closets = get_closets_collection(palace_path)
+        closets.upsert(
+            ids=["closet_proj_backend_huge_01"],
+            documents=["JWT auth|;|→drawer_proj_backend_huge_002"],
+            metadatas=[{"wing": "project", "room": "backend", "source_file": source}],
+        )
+
+        result = search_memories("JWT authentication", palace_path)
+        boosted = [
+            h
+            for h in result["results"]
+            if h["matched_via"] == "drawer+closet" and h["source_file"] == "huge.md"
+        ]
+        assert boosted, "closet-agreeing oversized source should still be boosted"
+        top = boosted[0]
+        # Accurate count from COUNT(*), not the capped subset size.
+        assert top["total_drawers"] == 5
+        # Matched drawer's own single-chunk text preserved — the multi-chunk grep
+        # expansion (which joins neighbors with "\n\n") did NOT run.
+        assert "\n\n" not in top["text"]
+        assert top["text"].startswith("chunk_")
+        # The grep-only field is not fabricated when enrichment is skipped.
+        assert top.get("drawer_index") is None
