@@ -923,7 +923,17 @@ def hook_stop(data: dict, harness: str):
 
     _log(f"Session {session_id}: {exchange_count} exchanges, {since_last} since last save")
 
-    if since_last >= SAVE_INTERVAL and exchange_count > 0:
+    try:
+        from .config import MempalaceConfig
+        save_interval = int(MempalaceConfig().hooks_save_interval)
+    except Exception:
+        save_interval = SAVE_INTERVAL
+
+    if save_interval == 0:
+        _output({})
+        return
+
+    if since_last >= save_interval and exchange_count > 0:
         _log(f"TRIGGERING SAVE at exchange {exchange_count}")
 
         # Read hook settings from config
