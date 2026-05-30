@@ -834,7 +834,44 @@ def search_memories(
         }
         if where:
             dkwargs["where"] = where
-        drawer_results = drawers_col.query(**dkwargs)
+        try:
+            drawer_results = drawers_col.query(**dkwargs)
+        except Exception as filter_err:
+            if not where:
+                raise
+            # ChromaDB HNSW/SQLite index mismatch causes filtered queries to fail with
+            # "Error finding id" even when unfiltered search works fine. This happens when
+            # drawers are ingested via two different paths (e.g. bulk import vs MCP tool
+            # calls), leaving the vector index inconsistent with the metadata store.
+            # Workaround: retry unfiltered, then post-filter in Python.
+            logger.warning(
+                "Filtered search failed (%s); falling back to unfiltered + post-filter",
+                filter_err,
+            )
+            fallback_kwargs = {
+                "query_texts": [query],
+                "n_results": min(n_results * 15, 500),
+                "include": ["documents", "metadatas", "distances"],
+            }
+            raw = drawers_col.query(**fallback_kwargs)
+            wing_f, room_f = wing, room
+            fdocs, fmetas, fdists = [], [], []
+            for doc, meta, dist in zip(
+                raw["documents"][0], raw["metadatas"][0], raw["distances"][0]
+            ):
+                meta = meta or {}
+                if wing_f and meta.get("wing") != wing_f:
+                    continue
+                if room_f and meta.get("room") != room_f:
+                    continue
+                fdocs.append(doc)
+                fmetas.append(meta)
+                fdists.append(dist)
+            drawer_results = {
+                "documents": [fdocs],
+                "metadatas": [fmetas],
+                "distances": [fdists],
+            }
     except Exception as e:
         return {"error": f"Search error: {e}"}
 

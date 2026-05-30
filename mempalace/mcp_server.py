@@ -1601,7 +1601,7 @@ def tool_kg_stats():
 # ==================== AGENT DIARY ====================
 
 
-def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: str = ""):
+def tool_diary_write(agent_name: str, entry: str = None, topic: str = "general", wing: str = "", content: str = None):
     """
     Write a diary entry for this agent. Entries are timestamped and
     accumulate over time in a diary room.
@@ -1613,6 +1613,13 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
     that diary reads are case-insensitive (see #1243). "Claude",
     "claude", and "CLAUDE" all resolve to the same agent.
     """
+    # Accept 'content' as an alias for 'entry' — add_drawer uses 'content', making
+    # it natural to pattern off it. Accepting both avoids a silent -32000 error.
+    if entry is None and content is not None:
+        entry = content
+    elif entry is None:
+        return {"success": False, "error": "'entry' (or 'content') is required"}
+
     try:
         agent_name = sanitize_name(agent_name, "agent_name").lower()
         entry = sanitize_content(entry)
