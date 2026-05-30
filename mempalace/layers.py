@@ -138,8 +138,10 @@ class Layer1:
                     break
             scored.append((importance, meta, doc))
 
-        # Sort by importance descending, take top N
-        scored.sort(key=lambda x: x[0], reverse=True)
+        # Sort by importance descending, then by most-recent filing.
+        # Drawers without filed_at (e.g. migrated from older palaces) get ""
+        # which sorts after all real ISO-8601 timestamps — intentionally last.
+        scored.sort(key=lambda x: (x[0], x[1].get("filed_at", "")), reverse=True)
         top = scored[: self.MAX_DRAWERS]
 
         # Group by room for readability
