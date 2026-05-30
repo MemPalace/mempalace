@@ -416,3 +416,150 @@ def test_resolve_wing_empty_string_treated_as_no_wing(tmp_path):
     target = tmp_path / ".gemini" / "tmp"
     target.mkdir(parents=True)
     assert _resolve_wing(target, wing="") == "wing_api"
+
+
+# ── _resolve_wing — wing_aliases.json collapsing on the CLI miner ──────
+#
+# When the user has ``~/.mempalace/wing_aliases.json`` configured and runs
+# ``mempalace mine --mode convos ~/.claude/projects/-Users-me-joy-web-3/``
+# without an explicit ``--wing``, the miner now routes through the same
+# alias map the Stop/PreCompact hooks use. The basename comes from each
+# session's authoritative ``cwd``, so working-copy clones (``joy-web``,
+# ``joy-web-1``, ..., ``joy-web-5``) all collapse onto one wing — without
+# the user having to hand-pass ``--wing`` per directory in a wrapper.
+#
+# Behavior contract:
+#  - Alias hit → use the aliased wing.
+#  - Alias miss → fall through to the existing ``wing_api`` default
+#    (no surprise per-project wing splits for users without alias config).
+#  - No transcript / no cwd / I/O error → fall through to ``wing_api``.
+
+
+import json as _json  # noqa: E402
+
+import mempalace.hooks_cli as _hooks_cli_mod  # noqa: E402
+
+
+def _write_transcript_with_cwd(jsonl_path: Path, cwd: str) -> None:
+    """Write a minimal Claude Code-shaped transcript containing one cwd record."""
+    jsonl_path.write_text(
+        _json.dumps({"type": "queue-operation", "operation": "enqueue"})
+        + "\n"
+        + _json.dumps({"type": "user", "cwd": cwd, "content": "hi"})
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _install_aliases(tmp_path, monkeypatch, aliases_dict: dict) -> Path:
+    """Wire up an isolated ``wing_aliases.json`` for one test."""
+    palace_root = tmp_path / ".mempalace"
+    palace_root.mkdir(exist_ok=True)
+    (palace_root / "wing_aliases.json").write_text(_json.dumps({"aliases": aliases_dict}))
+    monkeypatch.setattr(_hooks_cli_mod, "PALACE_ROOT", palace_root)
+    monkeypatch.setattr(_hooks_cli_mod, "_WING_ALIASES_CACHE", {})
+    return palace_root
+
+
+def test_resolve_wing_alias_hit_collapses_clones(tmp_path, monkeypatch):
+    """A ``joy-web*`` prefix alias collapses every clone onto one wing."""
+    _install_aliases(tmp_path, monkeypatch, {"joy-web*": "wing_joy_web"})
+
+    target = tmp_path / ".claude" / "projects" / "-Users-me-Claude-joy-web-3"
+    target.mkdir(parents=True)
+    _write_transcript_with_cwd(target / "s.jsonl", "/Users/me/Claude/joy-web-3")
+    assert _resolve_wing(target, wing=None) == "wing_joy_web"
+
+    target2 = tmp_path / ".claude" / "projects" / "-Users-me-Claude-joy-web"
+    target2.mkdir(parents=True)
+    _write_transcript_with_cwd(target2 / "s.jsonl", "/Users/me/Claude/joy-web")
+    assert _resolve_wing(target2, wing=None) == "wing_joy_web"
+
+
+def test_resolve_wing_alias_miss_falls_through_to_wing_api(tmp_path, monkeypatch):
+    """No alias for this basename → keep the existing wing_api default.
+
+    Critical: users without ``wing_aliases.json`` (or with one that doesn't
+    name this project) MUST NOT see a behavior change. The cwd-derived
+    basename here would slug to ``wing_random_project`` if we honored it
+    unconditionally — and that would silently splinter their AI corpus
+    across many wings.
+    """
+    _install_aliases(tmp_path, monkeypatch, {"joy-web*": "wing_joy_web"})
+
+    target = tmp_path / ".claude" / "projects" / "-Users-me-Claude-random-project"
+    target.mkdir(parents=True)
+    _write_transcript_with_cwd(target / "s.jsonl", "/Users/me/Claude/random-project")
+    assert _resolve_wing(target, wing=None) == "wing_api"
+
+
+def test_resolve_wing_alias_exact_match(tmp_path, monkeypatch):
+    """Exact (non-``*``) aliases also apply on the CLI miner path."""
+    _install_aliases(tmp_path, monkeypatch, {"mempalace": "wing_mempalace"})
+
+    target = tmp_path / ".claude" / "projects" / "-Users-me-Claude-mempalace"
+    target.mkdir(parents=True)
+    _write_transcript_with_cwd(target / "s.jsonl", "/Users/me/Claude/mempalace")
+    assert _resolve_wing(target, wing=None) == "wing_mempalace"
+
+
+def test_resolve_wing_explicit_wing_still_wins_over_alias(tmp_path, monkeypatch):
+    """Step 1 of the precedence chain is still ``--wing`` — aliases never
+    override an explicit user choice, even when both would match."""
+    _install_aliases(tmp_path, monkeypatch, {"joy-web*": "wing_joy_web"})
+
+    target = tmp_path / ".claude" / "projects" / "-Users-me-Claude-joy-web-3"
+    target.mkdir(parents=True)
+    _write_transcript_with_cwd(target / "s.jsonl", "/Users/me/Claude/joy-web-3")
+    assert _resolve_wing(target, wing="user_chose_this") == "user_chose_this"
+
+
+def test_resolve_wing_no_transcripts_keeps_wing_api(tmp_path, monkeypatch):
+    """AI-tool path with no jsonl files yet → cannot derive cwd → wing_api."""
+    _install_aliases(tmp_path, monkeypatch, {"joy-web*": "wing_joy_web"})
+
+    target = tmp_path / ".claude" / "projects" / "-Users-me-Claude-joy-web-3"
+    target.mkdir(parents=True)
+    # No .jsonl files inside.
+    assert _resolve_wing(target, wing=None) == "wing_api"
+
+
+def test_resolve_wing_transcript_without_cwd_keeps_wing_api(tmp_path, monkeypatch):
+    """A transcript that records no ``cwd`` (queue-only file, old format) →
+    falls through cleanly to ``wing_api`` rather than crashing or guessing."""
+    _install_aliases(tmp_path, monkeypatch, {"joy-web*": "wing_joy_web"})
+
+    target = tmp_path / ".claude" / "projects" / "-Users-me-Claude-joy-web-3"
+    target.mkdir(parents=True)
+    (target / "s.jsonl").write_text(
+        _json.dumps({"type": "queue-operation"})
+        + "\n"
+        + _json.dumps({"type": "ai-title", "aiTitle": "untitled"})
+        + "\n",
+        encoding="utf-8",
+    )
+    assert _resolve_wing(target, wing=None) == "wing_api"
+
+
+def test_resolve_wing_malformed_transcript_keeps_wing_api(tmp_path, monkeypatch):
+    """A jsonl with garbage lines must not crash wing resolution."""
+    _install_aliases(tmp_path, monkeypatch, {"joy-web*": "wing_joy_web"})
+
+    target = tmp_path / ".claude" / "projects" / "-Users-me-Claude-anywhere"
+    target.mkdir(parents=True)
+    (target / "s.jsonl").write_text("not json at all\n{broken,\n", encoding="utf-8")
+    assert _resolve_wing(target, wing=None) == "wing_api"
+
+
+def test_resolve_wing_alias_does_not_affect_non_ai_paths(tmp_path, monkeypatch):
+    """Non-AI-tool corpora keep the existing basename behavior — aliases
+    only intercept on AI-tool paths because that's where ``cwd`` reading
+    makes sense (the path encoding is lossy on AI-tool dirs and lossless
+    on regular dirs)."""
+    _install_aliases(tmp_path, monkeypatch, {"joy-web*": "wing_joy_web"})
+
+    target = tmp_path / "Documents" / "joy-web-3"
+    target.mkdir(parents=True)
+    _write_transcript_with_cwd(target / "s.jsonl", "/Users/me/Claude/joy-web-3")
+    # Non-AI-tool path → step 4 (basename normalize), not alias-routed.
+    assert _resolve_wing(target, wing=None) == "joy_web_3"

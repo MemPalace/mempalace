@@ -105,6 +105,31 @@ mempalace mine <dir> --mode convos # Mine conversation transcripts only
 
 The hooks resolve the repo root automatically from their own path, so they work regardless of where you install the repo.
 
+## Collapsing Working-Copy Clones (`wing_aliases.json`)
+
+The hooks derive a wing name from each session's working directory: `~/code/joy-web` → `wing_joy_web`. If you keep multiple working copies of one repo on disk (parallel branches, comparison checkouts, scratch clones), each clone gets its own wing — `joy-web-1` → `wing_joy_web_1`, `joy-web-2` → `wing_joy_web_2`, and so on — which splinters diary entries across N wings for what is conceptually one project.
+
+Drop a `~/.mempalace/wing_aliases.json` to collapse them onto a single wing:
+
+```json
+{
+  "aliases": {
+    "joy-web*":              "wing_joy_web",
+    "joy-web-experimental":  "wing_experimental",
+    "legacy-monorepo":       "wing_legacy"
+  }
+}
+```
+
+- Keys ending in `*` are delimiter-anchored prefix patterns: `joy-web*` matches `joy-web`, `joy-web-3`, `joy-web_staging` — but **not** `joy-website` (the boundary requirement prevents accidentally merging two different projects).
+- All other keys are exact matches against the project directory basename.
+- Exact > prefix; longest prefix wins among prefix patterns.
+- Values may include or omit the `wing_` prefix — both normalize to one.
+
+The file is optional. Parse errors are logged to `~/.mempalace/hook_state/hook.log` so a typo isn't silently invisible; the hook then degrades to the default slug rule rather than crashing. Edits take effect on the next hook fire (cached on file mtime — no restart required).
+
+See [website/guide/configuration.md](../website/guide/configuration.md#hook-wing-aliases) for the full reference.
+
 ## How It Works (Technical)
 
 ### Save Hook (Stop event)

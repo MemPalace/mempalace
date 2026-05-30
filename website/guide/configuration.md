@@ -83,3 +83,29 @@ python -m mempalace.mcp_server --palace /custom/palace
 |----------|-------------|
 | `MEMPALACE_PALACE_PATH` | Override palace path (same as `--palace`) |
 | `MEMPAL_DIR` | Directory for auto-mining in hooks |
+
+## Hook Wing Aliases
+
+Optional file at `~/.mempalace/wing_aliases.json`. Used by the Stop / PreCompact hooks to collapse multiple working-copy clones of one repo onto a single wing — so diary entries from `~/code/joy-web`, `~/code/joy-web-1`, ..., `~/code/joy-web-5` all land in `wing_joy_web` instead of splintering across five wings.
+
+Single `aliases` map. Keys ending in `*` are delimiter-anchored prefix patterns; all other keys are exact matches.
+
+```json
+{
+  "aliases": {
+    "joy-web*":              "wing_joy_web",
+    "joy-web-experimental":  "wing_experimental",
+    "legacy-monorepo":       "wing_legacy"
+  }
+}
+```
+
+Matching rules:
+
+- **Exact** keys match the project directory basename verbatim.
+- **`*`-suffixed** keys match the stem OR the stem followed by `-` / `_`. So `joy-web*` matches `joy-web`, `joy-web-3`, `joy-web_staging` — but **not** `joy-website` (no delimiter boundary).
+- Exact match always wins over a prefix match.
+- Longest matching stem wins among prefix patterns.
+- Values may include or omit the `wing_` prefix — both normalize to one.
+
+The file is optional. Parse errors are logged to `~/.mempalace/hook_state/hook.log` and the file is treated as empty so hooks degrade rather than crash. Edits are picked up on the next hook fire (no process restart needed — cached on file mtime).

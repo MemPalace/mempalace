@@ -597,6 +597,236 @@ def test_wing_from_transcript_path_cwd_handles_non_string_cwd(tmp_path):
     assert _wing_from_transcript_path(str(transcript)) == "wing_proper_name"
 
 
+# --- _wing_from_transcript_path: wing_aliases.json (collapsing clones) ---
+
+
+def _write_aliases(palace_root, payload):
+    palace_root.mkdir(exist_ok=True)
+    (palace_root / "wing_aliases.json").write_text(json.dumps(payload))
+
+
+def _use_palace(monkeypatch, palace_root):
+    """Point hooks_cli at a tmp palace and clear the alias cache so the test
+    sees the file written for this test, not one cached from another test
+    that happens to share a stat mtime_ns key."""
+    monkeypatch.setattr(hooks_cli_mod, "PALACE_ROOT", palace_root)
+    hooks_cli_mod._WING_ALIASES_CACHE.clear()
+
+
+def test_wing_aliases_collapse_prefix_matched_clones(tmp_path, monkeypatch):
+    """A ``*``-suffixed key collapses N clones of one repo onto a single wing.
+
+    Common case: a user keeps 6 working copies of ``joy-web`` named
+    ``joy-web``, ``joy-web-1``, ..., ``joy-web-5`` for parallel branches.
+    Without aliases each clone would file diary entries under a different
+    wing (``wing_joy_web``, ``wing_joy_web_1``, ...), splintering search
+    across the same project.
+    """
+    palace_root = tmp_path / ".mempalace"
+    _write_aliases(palace_root, {"aliases": {"joy-web*": "wing_joy_web"}})
+    _use_palace(monkeypatch, palace_root)
+
+    transcript = tmp_path / "s.jsonl"
+    for cwd in (
+        "/Users/me/git/joy-web",
+        "/Users/me/git/joy-web-1",
+        "/Users/me/git/joy-web-5",
+        "/Users/me/git/joy-web_staging",  # underscore boundary also matches
+    ):
+        transcript.write_text(json.dumps({"type": "user", "cwd": cwd}) + "\n", encoding="utf-8")
+        assert _wing_from_transcript_path(str(transcript)) == "wing_joy_web"
+
+
+def test_wing_aliases_prefix_requires_delimiter_boundary(tmp_path, monkeypatch):
+    """The prefix form is delimiter-anchored to prevent silent project collisions.
+
+    ``joy-web*`` must NOT match ``joy-website`` — those are different
+    projects and merging them would violate verbatim-recall semantics.
+    """
+    palace_root = tmp_path / ".mempalace"
+    _write_aliases(palace_root, {"aliases": {"joy-web*": "wing_joy_web"}})
+    _use_palace(monkeypatch, palace_root)
+
+    transcript = tmp_path / "s.jsonl"
+    transcript.write_text(json.dumps({"type": "user", "cwd": "/x/joy-website"}) + "\n")
+    # Falls through to the default slug rule — no alias collision.
+    assert _wing_from_transcript_path(str(transcript)) == "wing_joy_website"
+
+    transcript.write_text(json.dumps({"type": "user", "cwd": "/x/joy-website-staging"}) + "\n")
+    assert _wing_from_transcript_path(str(transcript)) == "wing_joy_website_staging"
+
+
+def test_wing_aliases_exact_match_beats_prefix(tmp_path, monkeypatch):
+    """An exact key always wins over a ``*``-suffixed key."""
+    palace_root = tmp_path / ".mempalace"
+    _write_aliases(
+        palace_root,
+        {
+            "aliases": {
+                "joy-web-experimental": "wing_experimental",
+                "joy-web*": "wing_joy_web",
+            }
+        },
+    )
+    _use_palace(monkeypatch, palace_root)
+
+    transcript = tmp_path / "s.jsonl"
+    transcript.write_text(json.dumps({"type": "user", "cwd": "/x/joy-web-experimental"}) + "\n")
+    assert _wing_from_transcript_path(str(transcript)) == "wing_experimental"
+    transcript.write_text(json.dumps({"type": "user", "cwd": "/x/joy-web-5"}) + "\n")
+    assert _wing_from_transcript_path(str(transcript)) == "wing_joy_web"
+
+
+def test_wing_aliases_longest_prefix_wins(tmp_path, monkeypatch):
+    """On overlapping ``*``-prefixes, the longest stem wins."""
+    palace_root = tmp_path / ".mempalace"
+    _write_aliases(
+        palace_root,
+        {"aliases": {"joy*": "wing_joy_misc", "joy-web*": "wing_joy_web"}},
+    )
+    _use_palace(monkeypatch, palace_root)
+
+    transcript = tmp_path / "s.jsonl"
+    transcript.write_text(json.dumps({"type": "user", "cwd": "/x/joy-web-2"}) + "\n")
+    assert _wing_from_transcript_path(str(transcript)) == "wing_joy_web"
+    transcript.write_text(json.dumps({"type": "user", "cwd": "/x/joy-mobile"}) + "\n")
+    assert _wing_from_transcript_path(str(transcript)) == "wing_joy_misc"
+
+
+def test_wing_aliases_normalize_wing_prefix(tmp_path, monkeypatch):
+    """Alias values may omit ``wing_`` — the loader normalizes to a single prefix."""
+    palace_root = tmp_path / ".mempalace"
+    _write_aliases(
+        palace_root,
+        {"aliases": {"foo": "bar", "baz": "wing_baz_explicit"}},
+    )
+    _use_palace(monkeypatch, palace_root)
+
+    transcript = tmp_path / "s.jsonl"
+    transcript.write_text(json.dumps({"type": "user", "cwd": "/x/foo"}) + "\n")
+    assert _wing_from_transcript_path(str(transcript)) == "wing_bar"
+    transcript.write_text(json.dumps({"type": "user", "cwd": "/x/baz"}) + "\n")
+    assert _wing_from_transcript_path(str(transcript)) == "wing_baz_explicit"
+
+
+def test_wing_aliases_malformed_file_logs_and_degrades(tmp_path, monkeypatch):
+    """A broken aliases file must never crash the hook, but the parse error
+    must be logged so the user can debug why their alias isn't applying."""
+    palace_root = tmp_path / ".mempalace"
+    palace_root.mkdir(exist_ok=True)
+    (palace_root / "wing_aliases.json").write_text("definitely not json {{{")
+    _use_palace(monkeypatch, palace_root)
+
+    # Route _log() output into the same palace root so we can read it back.
+    monkeypatch.setattr(hooks_cli_mod, "STATE_DIR", palace_root / "hook_state")
+
+    transcript = tmp_path / "s.jsonl"
+    transcript.write_text(json.dumps({"type": "user", "cwd": "/x/myproj"}) + "\n")
+    assert _wing_from_transcript_path(str(transcript)) == "wing_myproj"
+
+    log = (palace_root / "hook_state" / "hook.log").read_text()
+    assert "wing_aliases" in log
+
+
+def test_wing_aliases_apply_to_encoded_fallback_path(tmp_path, monkeypatch):
+    """Aliases also apply when cwd is unavailable and we fall back to the
+    encoded-folder heuristic — the post-strip leaf is what we alias against."""
+    palace_root = tmp_path / ".mempalace"
+    _write_aliases(palace_root, {"aliases": {"joy-web*": "wing_joy_web"}})
+    _use_palace(monkeypatch, palace_root)
+
+    # No transcript file exists → cwd reader returns None → fallback decodes
+    # the slug. After stripping ``Users-me-``, the residual is ``joy-web-3``,
+    # which the prefix alias collapses to ``wing_joy_web``.
+    path = "/Users/me/.claude/projects/-Users-me-joy-web-3/missing.jsonl"
+    assert _wing_from_transcript_path(path) == "wing_joy_web"
+
+
+def test_wing_aliases_exact_resolves_in_nested_encoded_fallback(tmp_path, monkeypatch):
+    """Exact aliases resolve against any dash-suffix of the encoded residual.
+
+    ``/Users/me/code/clients/joy-web-3`` encodes as
+    ``Users-me-code-clients-joy-web-3``. After stripping ``Users-me-`` the
+    residual is ``code-clients-joy-web-3`` — there is no parent token to
+    strip. The right-to-left suffix walk finds the leaf ``joy-web-3`` and
+    applies the exact alias.
+    """
+    palace_root = tmp_path / ".mempalace"
+    _write_aliases(palace_root, {"aliases": {"joy-web-3": "wing_joy_web"}})
+    _use_palace(monkeypatch, palace_root)
+
+    path = "/Users/me/.claude/projects/-Users-me-code-clients-joy-web-3/missing.jsonl"
+    assert _wing_from_transcript_path(path) == "wing_joy_web"
+
+
+def test_wing_aliases_prefix_does_not_match_suffix_in_encoded_fallback(tmp_path, monkeypatch):
+    """Prefix aliases must NOT fire on suffix candidates in the encoded
+    fallback — that would silently merge unrelated projects.
+
+    With alias ``web*`` (intended for a leaf literally named ``web``), a
+    nested path like ``/Users/me/code/clients/joy-web-3`` produces residual
+    ``code-clients-joy-web-3``. A naive right-to-left walk would test the
+    candidate ``web-3`` against ``web*``, find a boundary-anchored match,
+    and route ``joy-web-3`` to ``wing_web``. That's wrong: ``joy-web-3`` is
+    a different project from ``web``. We must fall through to the default
+    slug rule instead.
+    """
+    palace_root = tmp_path / ".mempalace"
+    _write_aliases(palace_root, {"aliases": {"web*": "wing_web"}})
+    _use_palace(monkeypatch, palace_root)
+
+    path = "/Users/me/.claude/projects/-Users-me-code-clients-joy-web-3/missing.jsonl"
+    # NOT wing_web — that would be the silent merge bug. The exact slug the
+    # fallback produces is an implementation detail; what matters is that
+    # it isn't wing_web.
+    assert _wing_from_transcript_path(path) != "wing_web"
+
+
+def test_wing_aliases_cache_invalidates_on_file_edit(tmp_path, monkeypatch):
+    """Edits to wing_aliases.json must be visible without a process restart.
+
+    The mtime-keyed cache means the second read after a modification picks
+    up the new mapping naturally. This is the contract that lets users tweak
+    aliases without having to restart their editor / shell.
+    """
+    import os
+
+    palace_root = tmp_path / ".mempalace"
+    _write_aliases(palace_root, {"aliases": {"proj*": "wing_v1"}})
+    _use_palace(monkeypatch, palace_root)
+
+    transcript = tmp_path / "s.jsonl"
+    transcript.write_text(json.dumps({"type": "user", "cwd": "/x/proj-a"}) + "\n")
+    assert _wing_from_transcript_path(str(transcript)) == "wing_v1"
+
+    # Force a distinct mtime explicitly. ``time.sleep`` would be flaky on
+    # coarse-mtime filesystems (HFS+, some SMB/NFS = 1s resolution). Using
+    # os.utime with an explicit nanosecond bump is deterministic across
+    # platforms.
+    aliases_path = palace_root / "wing_aliases.json"
+    prev_ns = aliases_path.stat().st_mtime_ns
+    _write_aliases(palace_root, {"aliases": {"proj*": "wing_v2"}})
+    os.utime(aliases_path, ns=(prev_ns + 1_000_000, prev_ns + 1_000_000))
+    assert _wing_from_transcript_path(str(transcript)) == "wing_v2"
+
+
+def test_wing_aliases_missing_file_is_a_no_op(tmp_path, monkeypatch):
+    """No ``wing_aliases.json`` → fall through to the default slug rule with
+    no log noise. (Common case: the file simply doesn't exist.)"""
+    palace_root = tmp_path / ".mempalace"
+    palace_root.mkdir(exist_ok=True)
+    _use_palace(monkeypatch, palace_root)
+    monkeypatch.setattr(hooks_cli_mod, "STATE_DIR", palace_root / "hook_state")
+
+    transcript = tmp_path / "s.jsonl"
+    transcript.write_text(json.dumps({"type": "user", "cwd": "/x/myproj"}) + "\n")
+    assert _wing_from_transcript_path(str(transcript)) == "wing_myproj"
+
+    log_path = palace_root / "hook_state" / "hook.log"
+    if log_path.exists():
+        assert "wing_aliases" not in log_path.read_text()
+
+
 # --- _log ---
 
 
@@ -1038,8 +1268,15 @@ def test_ingest_transcript_skips_when_target_running(tmp_path):
     with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
         with patch("mempalace.hooks_cli._MINE_PID_DIR", pid_dir):
             with patch("mempalace.hooks_cli._mempalace_python", return_value=sys.executable):
-                from mempalace.hooks_cli import _ingest_transcript, _pid_file_for_cmd
+                from mempalace.hooks_cli import (
+                    _ingest_transcript,
+                    _pid_file_for_cmd,
+                    _wing_from_transcript_path,
+                )
 
+                # Wing is now derived from the transcript (alias-aware), not
+                # hardcoded — a plain tmp transcript resolves to the
+                # ``wing_sessions`` catch-all.
                 expected_cmd = [
                     sys.executable,
                     "-m",
@@ -1049,7 +1286,7 @@ def test_ingest_transcript_skips_when_target_running(tmp_path):
                     "--mode",
                     "convos",
                     "--wing",
-                    "sessions",
+                    _wing_from_transcript_path(str(transcript)),
                 ]
                 pid_file = _pid_file_for_cmd(expected_cmd)
                 pid_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1060,6 +1297,67 @@ def test_ingest_transcript_skips_when_target_running(tmp_path):
                 with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
                     _ingest_transcript(str(transcript))
                     mock_popen.assert_not_called()
+
+
+def test_ingest_transcript_wing_follows_alias(tmp_path, monkeypatch):
+    """Verbatim transcript ingest routes to the alias-resolved wing, not a
+    hardcoded ``sessions`` — so live-session content lands in the same wing
+    as the diary checkpoint (regression for the pre-fix hardcoded --wing)."""
+    palace_root = tmp_path / ".mempalace"
+    palace_root.mkdir(exist_ok=True)
+    (palace_root / "wing_aliases.json").write_text(
+        json.dumps({"aliases": {"joy-web*": "wing_joy_web"}})
+    )
+    monkeypatch.setattr(hooks_cli_mod, "PALACE_ROOT", palace_root)
+    monkeypatch.setattr(hooks_cli_mod, "_WING_ALIASES_CACHE", {})
+
+    # A transcript whose cwd basename matches the joy-web* prefix alias.
+    project_dir = tmp_path / ".claude" / "projects" / "-Users-me-Claude-joy-web-3"
+    project_dir.mkdir(parents=True)
+    transcript = project_dir / "session.jsonl"
+    transcript.write_text(
+        json.dumps({"type": "user", "cwd": "/Users/me/Claude/joy-web-3", "content": "x" * 200})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        with patch("mempalace.hooks_cli._MINE_PID_DIR", tmp_path / "mine_pids"):
+            with patch("mempalace.hooks_cli._mempalace_python", return_value=sys.executable):
+                with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                    from mempalace.hooks_cli import _ingest_transcript
+
+                    _ingest_transcript(str(transcript))
+                    assert mock_popen.called
+                    cmd = mock_popen.call_args.args[0]
+                    assert "--wing" in cmd
+                    wing = cmd[cmd.index("--wing") + 1]
+                    assert wing == "wing_joy_web", f"expected alias wing, got {wing!r}"
+
+
+def test_ingest_transcript_wing_defaults_to_wing_sessions(tmp_path, monkeypatch):
+    """No alias / no cwd → falls back to the ``wing_sessions`` catch-all,
+    preserving the old behavior for unconfigured users (with the consistent
+    ``wing_`` prefix)."""
+    palace_root = tmp_path / ".mempalace"
+    palace_root.mkdir(exist_ok=True)
+    monkeypatch.setattr(hooks_cli_mod, "PALACE_ROOT", palace_root)
+    monkeypatch.setattr(hooks_cli_mod, "_WING_ALIASES_CACHE", {})
+
+    transcript = tmp_path / "loose-session.jsonl"
+    transcript.write_text("x" * 200)  # no cwd, not under .claude/projects
+
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        with patch("mempalace.hooks_cli._MINE_PID_DIR", tmp_path / "mine_pids"):
+            with patch("mempalace.hooks_cli._mempalace_python", return_value=sys.executable):
+                with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                    from mempalace.hooks_cli import _ingest_transcript
+
+                    _ingest_transcript(str(transcript))
+                    assert mock_popen.called
+                    cmd = mock_popen.call_args.args[0]
+                    wing = cmd[cmd.index("--wing") + 1]
+                    assert wing == "wing_sessions", f"expected catch-all, got {wing!r}"
 
 
 # --- _mine_already_running ---
@@ -1437,7 +1735,9 @@ def test_precompact_mines_transcript_dir(tmp_path, monkeypatch):
     # Mines the transcript's parent dir as convos, into wing "sessions".
     assert str(tmp_path) in cmd
     assert cmd[cmd.index("--mode") + 1] == "convos"
-    assert cmd[cmd.index("--wing") + 1] == "sessions"
+    # Wing is derived from the transcript (alias-aware); a loose tmp
+    # transcript with no cwd resolves to the wing_sessions catch-all.
+    assert cmd[cmd.index("--wing") + 1] == "wing_sessions"
 
 
 # --- run_hook ---
