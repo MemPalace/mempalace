@@ -1,24 +1,8 @@
 #!/bin/bash
-# MemPalace PreCompact Hook — thin wrapper calling Python CLI
-# All logic lives in mempalace.hooks_cli for cross-harness extensibility
-run_mempalace_hook() {
-  if command -v mempalace >/dev/null 2>&1; then
-    mempalace hook run "$@"
-    return $?
-  fi
-
-  if command -v python3 >/dev/null 2>&1 && python3 -c "import mempalace" >/dev/null 2>&1; then
-    python3 -m mempalace hook run "$@"
-    return $?
-  fi
-
-  if command -v python >/dev/null 2>&1 && python -c "import mempalace" >/dev/null 2>&1; then
-    python -m mempalace hook run "$@"
-    return $?
-  fi
-
-  echo "MemPalace hook error: could not find a runnable mempalace command or module" >&2
-  return 1
-}
-
-run_mempalace_hook --hook precompact --harness claude-code
+# MemPalace PreCompact Hook
+# This hook MUST allow compaction to proceed. The previous implementation
+# routed through `mempalace hook run --hook precompact --harness claude-code`
+# which always returned a "block" decision, preventing both `/compact` and
+# auto-compact from working as documented.
+# Session saving is unaffected — it happens via the Stop hook (separate path).
+echo '{"decision": "allow"}'
