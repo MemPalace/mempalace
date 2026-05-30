@@ -16,6 +16,7 @@ Commands:
     mempalace mine <dir> --mode convos    Mine conversation exports
     mempalace mine <dir> --mode extract   Mine binary office documents (PDF/DOCX/etc.)
     mempalace search "query"              Find anything, exact words
+    mempalace export -o <dir>             Export the palace as browsable markdown (one file per room)
     mempalace mcp                         Show MCP setup command
     mempalace wake-up                     Show L0 + L1 wake-up context
     mempalace wake-up --wing my_app       Wake-up for a specific project
@@ -27,6 +28,7 @@ Examples:
     mempalace mine ~/.claude/projects/-Users-you-Projects-my_app --mode convos --wing my_app
     mempalace search "why did we switch to GraphQL"
     mempalace search "pricing discussion" --wing my_app --room costs
+    mempalace export -o ~/Desktop/palace-export
 """
 
 import os
@@ -756,6 +758,17 @@ def cmd_migrate(args):
         dry_run=args.dry_run,
         confirm=getattr(args, "yes", False),
     )
+
+
+def cmd_export(args):
+    """Export palace drawers as browsable markdown files."""
+    from .exporter import export_palace
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    output_dir = os.path.expanduser(args.output)
+    print(f"  Exporting palace to {output_dir}...")
+    export_palace(palace_path=palace_path, output_dir=output_dir)
+    print("  Done.")
 
 
 def cmd_status(args):
@@ -1577,6 +1590,19 @@ def main():
 
     sub.add_parser("status", help="Show what's been filed")
 
+    # export
+    p_export = sub.add_parser(
+        "export",
+        help="Export palace as browsable markdown files (one file per room)",
+    )
+    p_export.add_argument(
+        "-o", "--output", required=True, help="Output directory for markdown files"
+    )
+    # No per-subcommand --palace: rely on the root parser's global --palace
+    # so usage is `mempalace --palace <path> export -o <dir>` — consistent
+    # with mine / search / mcp / status / wake-up which all read args.palace
+    # from the global flag.
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1613,6 +1639,7 @@ def main():
         "repair": cmd_repair,
         "repair-status": cmd_repair_status,
         "migrate": cmd_migrate,
+        "export": cmd_export,
         "status": cmd_status,
     }
     dispatch[args.command](args)

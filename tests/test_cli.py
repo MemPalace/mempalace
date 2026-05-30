@@ -20,6 +20,7 @@ from mempalace.cli import (
     cmd_repair,
     cmd_search,
     cmd_split,
+    cmd_export,
     cmd_status,
     cmd_wakeup,
     main,
@@ -111,6 +112,36 @@ def test_cmd_status_custom_palace(mock_config_cls):
 
         expected = os.path.expanduser("~/my_palace")
         mock_miner.status.assert_called_once_with(palace_path=expected)
+
+
+# ── cmd_export ─────────────────────────────────────────────────────────
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_export_default_palace(mock_config_cls):
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    args = argparse.Namespace(palace=None, output="/tmp/export_target")
+    mock_exporter = MagicMock()
+    with patch.dict("sys.modules", {"mempalace.exporter": mock_exporter}):
+        cmd_export(args)
+        mock_exporter.export_palace.assert_called_once_with(
+            palace_path="/fake/palace", output_dir="/tmp/export_target"
+        )
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_export_custom_palace_and_output(mock_config_cls):
+    args = argparse.Namespace(palace="~/my_palace", output="~/export_target")
+    mock_exporter = MagicMock()
+    with patch.dict("sys.modules", {"mempalace.exporter": mock_exporter}):
+        cmd_export(args)
+        import os
+
+        expected_palace = os.path.expanduser("~/my_palace")
+        expected_output = os.path.expanduser("~/export_target")
+        mock_exporter.export_palace.assert_called_once_with(
+            palace_path=expected_palace, output_dir=expected_output
+        )
 
 
 # ── cmd_search ─────────────────────────────────────────────────────────
@@ -756,6 +787,36 @@ def test_main_split_dispatches():
     ):
         main()
         mock_cmd.assert_called_once()
+
+
+def test_main_export_dispatches():
+    """Argparse wiring + main() dispatch for the export subcommand.
+
+    Locks in -o/--output as the required arg and that the global
+    --palace flag (root parser) reaches cmd_export via args.palace
+    — there is no per-subcommand --palace.
+    """
+    from mempalace.cli import cmd_export  # noqa: F401 — sanity import
+
+    with (
+        patch("sys.argv", ["mempalace", "--palace", "/tmp/p", "export", "-o", "/tmp/out"]),
+        patch("mempalace.cli.cmd_export") as mock_cmd,
+    ):
+        main()
+        mock_cmd.assert_called_once()
+        # Forwarded args carry both the global --palace and -o/--output.
+        forwarded = mock_cmd.call_args[0][0]
+        assert forwarded.palace == "/tmp/p"
+        assert forwarded.output == "/tmp/out"
+
+    # And the long form -o == --output.
+    with (
+        patch("sys.argv", ["mempalace", "export", "--output", "/tmp/out2"]),
+        patch("mempalace.cli.cmd_export") as mock_cmd,
+    ):
+        main()
+        mock_cmd.assert_called_once()
+        assert mock_cmd.call_args[0][0].output == "/tmp/out2"
 
 
 def test_mcp_command_prints_setup_guidance(monkeypatch, capsys):
