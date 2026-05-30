@@ -872,8 +872,13 @@ def search_memories(
     CLOSET_DISTANCE_CAP = 1.5  # cosine dist > 1.5 = too weak to use as signal
 
     scored: list = []
-    for doc, meta, dist in zip(
-        _first_or_empty(drawer_results, "documents"),
+    ids = _first_or_empty(drawer_results, "ids")
+    docs = _first_or_empty(drawer_results, "documents")
+    if not ids and docs:
+        ids = [None] * len(docs)
+    for drawer_id, doc, meta, dist in zip(
+        ids,
+        docs,
         _first_or_empty(drawer_results, "metadatas"),
         _first_or_empty(drawer_results, "distances"),
     ):
@@ -902,6 +907,7 @@ def search_memories(
         # inverting the ranking so the best hybrid matches sort last.
         effective_dist = max(0.0, min(2.0, dist - boost))
         entry = {
+            "drawer_id": drawer_id,
             "text": doc,
             "wing": meta.get("wing", "unknown"),
             "room": meta.get("room", "unknown"),
