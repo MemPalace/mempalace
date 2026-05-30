@@ -11,6 +11,7 @@ from mempalace.normalize import (
     _try_claude_ai_json,
     _try_claude_code_jsonl,
     _try_codex_jsonl,
+    _try_gemini_json,
     _try_gemini_jsonl,
     _try_normalize_json,
     _try_slack_json,
@@ -611,6 +612,167 @@ def test_gemini_jsonl_messages_before_session_metadata_discarded():
     assert "preamble A" not in result
     assert "> real Q" in result
     assert "real A" in result
+
+
+# ── _try_gemini_json ──────────────────────────────────────────────────
+
+
+class TestGeminiJson:
+    """Tests for the Gemini JSON parser (Layouts 1, 2a, 2b).
+
+    Layouts:
+      1.  ``{"contents": [...]}``                      — Gemini API / CLI session JSON
+      2a. ``{"messages": [...]}``                      — Wrapper variant
+      2b. ``[{"role": ...}, ...]``                     — Flat top-level list
+
+    The parser must:
+      • Treat ``role="model"`` as the assistant role.
+      • Reject inputs without any ``role="model"`` entry (so it doesn't
+        false-positive against Claude / ChatGPT exports).
+      • Run *before* ``_try_claude_ai_json`` in the dispatch chain so the
+        Layout 2a (messages-wrapper) form isn't silently claimed by the
+        Claude parser, which would drop the model turns.
+      • Concatenate multi-part text within a single message.
+      • Skip non-text parts (``inline_data``, ``function_call``, …).
+    """
+
+    def test_contents_format(self, tmp_path):
+        """Layout 1: ``{"contents": [...]}`` with ``parts`` arrays parses correctly."""
+        data = {
+            "contents": [
+                {"role": "user", "parts": [{"text": "Capital of France?"}]},
+                {"role": "model", "parts": [{"text": "Paris."}]},
+            ]
+        }
+        f = tmp_path / "gemini.json"
+        f.write_text(json.dumps(data))
+        result = normalize(str(f))
+        assert "> Capital of France?" in result
+        assert "Paris." in result
+
+    def test_messages_wrapper_format(self, tmp_path):
+        """Layout 2a: ``{"messages": [...]}`` (the bug-fix case for review #1).
+
+        Without the parser-precedence fix, ``_try_claude_ai_json`` would
+        silently claim this input and drop all ``role="model"`` turns,
+        producing a user-only transcript. After the fix, ``_try_gemini_json``
+        runs first and recognises the ``model`` role.
+        """
+        data = {
+            "messages": [
+                {"role": "user", "content": "What is Python?"},
+                {"role": "model", "content": "A programming language."},
+                {"role": "user", "content": "And Java?"},
+                {"role": "model", "content": "Also a programming language."},
+            ]
+        }
+        f = tmp_path / "gemini_messages.json"
+        f.write_text(json.dumps(data))
+        result = normalize(str(f))
+        assert "> What is Python?" in result
+        assert "A programming language." in result
+        assert "> And Java?" in result
+        assert "Also a programming language." in result
+
+    def test_flat_list_format(self, tmp_path):
+        """Layout 2b: top-level ``[...]`` list with ``role="model"`` parses correctly."""
+        data = [
+            {"role": "user", "content": "Hi"},
+            {"role": "model", "content": "Hello! How can I help?"},
+            {"role": "user", "content": "Tell me a joke"},
+            {"role": "model", "content": "Why did the chicken cross the road?"},
+        ]
+        f = tmp_path / "gemini_flat.json"
+        f.write_text(json.dumps(data))
+        result = normalize(str(f))
+        assert "> Hi" in result
+        assert "Hello! How can I help?" in result
+        assert "Why did the chicken cross the road?" in result
+
+    def test_multi_part_text_joined(self):
+        """Multiple text parts within a single message are joined with spaces."""
+        data = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {"text": "Part one."},
+                        {"text": "Part two."},
+                    ],
+                },
+                {"role": "model", "parts": [{"text": "Got it."}]},
+            ]
+        }
+        result = _try_gemini_json(data)
+        assert result is not None
+        assert "Part one. Part two." in result
+
+    def test_non_text_parts_skipped(self):
+        """``inline_data`` / ``function_call`` parts are skipped; only ``text`` is extracted."""
+        data = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {"text": "Look at this image"},
+                        {"inline_data": {"mime_type": "image/png", "data": "..."}},
+                    ],
+                },
+                {"role": "model", "parts": [{"text": "I see it"}]},
+            ]
+        }
+        result = _try_gemini_json(data)
+        assert result is not None
+        assert "Look at this image" in result
+        assert "I see it" in result
+        # The inline_data shouldn't bleed into the transcript.
+        assert "image/png" not in result
+
+    def test_rejects_without_model_role(self):
+        """Without any ``role="model"`` entry the parser must return ``None``.
+
+        This is the disambiguator that prevents the Gemini parser from
+        false-positiving against Claude / ChatGPT exports that use the
+        ``"assistant"`` role.
+        """
+        data = [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello"},
+        ]
+        assert _try_gemini_json(data) is None
+
+    def test_rejects_too_few_messages(self):
+        """Inputs with fewer than 2 entries return ``None`` (not enough conversation)."""
+        data = {"contents": [{"role": "user", "parts": [{"text": "Just one"}]}]}
+        assert _try_gemini_json(data) is None
+
+    def test_rejects_non_dict_non_list(self):
+        """Scalar / unsupported inputs return ``None`` cleanly."""
+        assert _try_gemini_json("not a dict") is None
+        assert _try_gemini_json(42) is None
+        assert _try_gemini_json(None) is None
+
+    def test_messages_wrapper_does_not_get_claimed_by_claude(self, tmp_path):
+        """Regression test for review #1: the full ``normalize()`` pipeline must
+        route the ``{"messages":[..., model, ...]}`` form to the Gemini parser,
+        not to ``_try_claude_ai_json``. Both user and model turns must survive.
+        """
+        data = {
+            "messages": [
+                {"role": "user", "content": "Q1"},
+                {"role": "model", "content": "A1"},
+                {"role": "user", "content": "Q2"},
+                {"role": "model", "content": "A2"},
+            ]
+        }
+        f = tmp_path / "ambiguous.json"
+        f.write_text(json.dumps(data))
+        result = normalize(str(f))
+        # All four turns must appear — proves the Claude parser didn't eat this.
+        assert "A1" in result
+        assert "A2" in result
+        assert "> Q1" in result
+        assert "> Q2" in result
 
 
 # ── _try_claude_ai_json ───────────────────────────────────────────────

@@ -9,6 +9,7 @@ Supported:
     - Claude Code JSONL (with tool_use/tool_result block capture)
     - OpenAI Codex CLI JSONL
     - Gemini CLI JSONL (~/.gemini/tmp/<project_hash>/chats/session-*.jsonl)
+    - Gemini CLI / Google AI Studio JSON sessions (contents / messages / flat list)
     - Slack JSON export
     - Plain text (pass through for paragraph chunking)
 
@@ -167,7 +168,7 @@ def _try_normalize_json(content: str) -> Optional[str]:
     except json.JSONDecodeError:
         return None
 
-    for parser in (_try_claude_ai_json, _try_chatgpt_json, _try_slack_json):
+    for parser in (_try_gemini_json, _try_claude_ai_json, _try_chatgpt_json, _try_slack_json):
         normalized = parser(data)
         if normalized:
             return normalized
@@ -349,6 +350,88 @@ def _try_gemini_jsonl(content: str) -> Optional[str]:
             messages.append(("assistant", joined))
 
     if len(messages) >= 2 and has_session_metadata:
+        return _messages_to_transcript(messages)
+    return None
+
+
+def _try_gemini_json(data) -> Optional[str]:
+    """Gemini CLI / Google AI Studio JSON sessions.
+
+    Handles three layouts:
+
+    1. **Gemini API contents format** — used by Gemini CLI session files
+       (``~/.gemini/sessions/*.json``):
+       ``{"contents": [{"role": "user", "parts": [{"text": "..."}]}, ...]}``
+
+    2. **Messages wrapper** — exports that wrap the conversation under a
+       ``messages`` key:
+       ``{"messages": [{"role": "user", "content": "..."}, {"role": "model", "content": "..."}]}``
+
+    3. **Flat messages list** — top-level array form:
+       ``[{"role": "user", "content": "..."}, {"role": "model", "content": "..."}]``
+
+    Gemini uses ``"model"`` as the assistant role (not ``"assistant"``).
+    Detection requires at least one ``role="model"`` entry to disambiguate
+    from Claude/ChatGPT exports that use ``"assistant"``. This parser is
+    placed *before* ``_try_claude_ai_json`` in the dispatch chain so that
+    the layout-2 ``{"messages": [...]}`` wrapper does not get silently
+    claimed by the Claude parser, which would drop the model turns.
+    """
+    contents = None
+
+    # Layout 1: {"contents": [...]}
+    if isinstance(data, dict) and "contents" in data:
+        contents = data["contents"]
+    # Layout 2a: {"messages": [...]}
+    elif isinstance(data, dict) and "messages" in data:
+        contents = data["messages"]
+    # Layout 2b: top-level list
+    elif isinstance(data, list):
+        contents = data
+
+    if not isinstance(contents, list) or len(contents) < 2:
+        return None
+
+    messages = []
+    has_model_role = False
+    for item in contents:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role", "")
+
+        # Extract text — try "parts" first (Gemini API), then "content" (flat).
+        text = ""
+        parts = item.get("parts")
+        if isinstance(parts, list):
+            text_parts = []
+            for p in parts:
+                if isinstance(p, str):
+                    text_parts.append(p)
+                elif isinstance(p, dict) and "text" in p:
+                    text_parts.append(p["text"])
+            text = " ".join(text_parts).strip()
+        else:
+            text = _extract_content(item.get("content", ""))
+
+        if not text:
+            continue
+
+        if role == "user":
+            messages.append(("user", text))
+        elif role == "model":
+            messages.append(("assistant", text))
+            has_model_role = True
+        elif role == "assistant":
+            # Defensive: some hand-crafted exports use "assistant" even
+            # for Gemini sessions. Accept but don't flip has_model_role.
+            messages.append(("assistant", text))
+
+    # Disambiguator: must have seen at least one role="model" entry.
+    # This prevents the Gemini parser from claiming Claude/ChatGPT data.
+    if not has_model_role:
+        return None
+
+    if len(messages) >= 2:
         return _messages_to_transcript(messages)
     return None
 
