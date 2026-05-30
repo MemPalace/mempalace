@@ -280,6 +280,19 @@ def test_load_config_no_yaml_normalizes_hyphenated_wing():
         shutil.rmtree(parent)
 
 
+def test_load_config_pointer_read_error_falls_back_to_project_yaml(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    (project_root / "mempalace.yaml").write_text("wing: root_wing\nrooms: []\n", encoding="utf-8")
+    marker_dir = project_root / ".mempalace"
+    marker_dir.mkdir()
+    # Directory at pointer path forces pointer read_text() to raise IsADirectoryError.
+    (marker_dir / "config_dir.txt").mkdir()
+
+    config = load_config(str(project_root))
+    assert config["wing"] == "root_wing"
+
+
 def test_scan_project_skips_mempalace_generated_files():
     with tempfile.TemporaryDirectory() as tmpdir:
         project_root = Path(tmpdir).resolve()

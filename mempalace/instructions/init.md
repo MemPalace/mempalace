@@ -55,6 +55,18 @@ before continuing.
 
 Run `mempalace init --yes <dir>` where `<dir>` is the directory from Step 4.
 
+If the user wants project config files (`mempalace.yaml`, `entities.json`) in a
+specific directory, use:
+
+`mempalace init --yes <dir> --project-config-dir <path>`
+
+`<path>` may be absolute or relative to `<dir>`.
+
+If the user wants startup wiring only (no entity/room detection, no ingest
+prompt), use:
+
+`mempalace init --yes --empty <dir>`
+
 If this fails, report the error and stop.
 
 ## Step 6: Configure MCP server

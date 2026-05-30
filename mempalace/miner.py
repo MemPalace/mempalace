@@ -354,43 +354,63 @@ def is_force_included(path: Path, project_path: Path, include_paths: set) -> boo
 
 
 def load_config(project_dir: str) -> dict:
-    """Load mempalace.yaml from project directory (falls back to mempal.yaml)."""
+    """Load mempalace config with project-pointer and legacy fallbacks."""
     import yaml
 
     resolved_project_dir = Path(project_dir).expanduser().resolve()
-    config_path = resolved_project_dir / "mempalace.yaml"
-    if not config_path.exists():
-        # Fallback to legacy name
-        legacy_path = resolved_project_dir / "mempal.yaml"
-        if legacy_path.exists():
-            config_path = legacy_path
-        else:
-            from .config import normalize_wing_name
+    candidates = [
+        resolved_project_dir / "mempalace.yaml",
+        resolved_project_dir / ".mempalace" / "mempalace.yaml",
+    ]
 
-            # Normalize the dirname-derived fallback wing the same way
-            # ``cmd_init`` and ``room_detector_local`` do — otherwise a
-            # hyphenated project mined without a yaml file lands under a
-            # raw-name wing while ``topics_by_wing`` was keyed under the
-            # normalized slug, silently dropping every topic tunnel
-            # (the no-yaml branch of issue #1194).
-            wing_name = normalize_wing_name(resolved_project_dir.name)
-            print(
-                f"  No mempalace.yaml found in {resolved_project_dir} "
-                f"— using auto-detected defaults (wing='{wing_name}'). "
-                "Directories with the same basename will share a wing; "
-                "add mempalace.yaml to disambiguate.",
-                file=sys.stderr,
-            )
-            return {
-                "wing": wing_name,
-                "rooms": [
-                    {
-                        "name": "general",
-                        "description": "All project files",
-                        "keywords": ["general"],
-                    }
-                ],
-            }
+    pointer_path = resolved_project_dir / ".mempalace" / "config_dir.txt"
+    if pointer_path.exists():
+        try:
+            pointer_value = pointer_path.read_text(encoding="utf-8").strip()
+            if pointer_value:
+                pointer_dir = Path(pointer_value).expanduser()
+                if not pointer_dir.is_absolute():
+                    pointer_dir = resolved_project_dir / pointer_dir
+                candidates.insert(0, pointer_dir.resolve() / "mempalace.yaml")
+        except (OSError, RuntimeError):
+            pass
+
+    config_path = next((candidate for candidate in candidates if candidate.exists()), None)
+    if config_path is None:
+        # Fallback to legacy names
+        legacy_candidates = [
+            resolved_project_dir / "mempal.yaml",
+            resolved_project_dir / ".mempalace" / "mempal.yaml",
+        ]
+        config_path = next((candidate for candidate in legacy_candidates if candidate.exists()), None)
+
+    if config_path is None:
+        from .config import normalize_wing_name
+
+        # Normalize the dirname-derived fallback wing the same way
+        # ``cmd_init`` and ``room_detector_local`` do — otherwise a
+        # hyphenated project mined without a yaml file lands under a
+        # raw-name wing while ``topics_by_wing`` was keyed under the
+        # normalized slug, silently dropping every topic tunnel
+        # (the no-yaml branch of issue #1194).
+        wing_name = normalize_wing_name(resolved_project_dir.name)
+        print(
+            f"  No mempalace.yaml found in {resolved_project_dir} "
+            f"— using auto-detected defaults (wing='{wing_name}'). "
+            "Directories with the same basename will share a wing; "
+            "add mempalace.yaml to disambiguate.",
+            file=sys.stderr,
+        )
+        return {
+            "wing": wing_name,
+            "rooms": [
+                {
+                    "name": "general",
+                    "description": "All project files",
+                    "keywords": ["general"],
+                }
+            ],
+        }
     with open(config_path) as f:
         return yaml.safe_load(f)
 

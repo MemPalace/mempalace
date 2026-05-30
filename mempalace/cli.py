@@ -42,6 +42,7 @@ from .version import __version__
 
 
 _MEMPALACE_PROJECT_FILES = ("mempalace.yaml", "entities.json")
+_PROJECT_CONFIG_POINTER = Path(".mempalace") / "config_dir.txt"
 
 # Pass 0 corpus-origin sampling caps. Tier 1 reads FULL file content (no
 # front-bias sampling) but bounds total memory on enormous corpora. Tier 2
@@ -199,7 +200,7 @@ def _run_pass_zero(project_dir, palace_dir, llm_provider) -> dict:
     return wrapped
 
 
-def _ensure_mempalace_files_gitignored(project_dir) -> bool:
+def _ensure_mempalace_files_gitignored(project_dir, config_dir=None) -> bool:
     """If project_dir is a git repo, ensure MemPalace's per-project files
     are listed in .gitignore so they don't get committed by accident.
 
@@ -211,12 +212,23 @@ def _ensure_mempalace_files_gitignored(project_dir) -> bool:
     from pathlib import Path
 
     project_path = Path(project_dir).expanduser().resolve()
+    resolved_config_dir = (
+        Path(config_dir).expanduser().resolve() if config_dir else project_path
+    )
     if not (project_path / ".git").exists():
         return False
     gitignore = project_path / ".gitignore"
     existing = gitignore.read_text() if gitignore.exists() else ""
     existing_lines = {line.strip() for line in existing.splitlines()}
-    missing = [p for p in _MEMPALACE_PROJECT_FILES if p not in existing_lines]
+    missing = []
+    for filename in _MEMPALACE_PROJECT_FILES:
+        artifact_path = resolved_config_dir / filename
+        try:
+            rel = artifact_path.relative_to(project_path).as_posix()
+        except ValueError:
+            continue
+        if rel not in existing_lines:
+            missing.append(rel)
     if not missing:
         return False
     prefix = "" if not existing or existing.endswith("\n") else "\n"
@@ -227,12 +239,64 @@ def _ensure_mempalace_files_gitignored(project_dir) -> bool:
     return True
 
 
+def _resolve_init_project_config_dir(args, project_dir: str) -> Path:
+    """Choose where init writes per-project config artifacts."""
+    project_path = Path(project_dir).expanduser().resolve()
+    explicit = getattr(args, "project_config_dir", None)
+    if explicit:
+        selected = Path(explicit).expanduser()
+        if not selected.is_absolute():
+            selected = project_path / selected
+        return selected.resolve()
+
+    if getattr(args, "yes", False):
+        return project_path
+
+    if not sys.stdin.isatty():
+        return project_path
+
+    print("\n  Project config file location")
+    print(f"    1) Default: project root ({project_path})")
+    print("    2) Custom directory")
+    try:
+        choice = input("  Choose [1/2] (default 1): ").strip().lower()
+        if choice not in {"2", "custom", "c"}:
+            return project_path
+        custom = input("  Config directory path (absolute or project-relative): ").strip()
+    except EOFError:
+        return project_path
+
+    if not custom:
+        return project_path
+
+    selected = Path(custom).expanduser()
+    if not selected.is_absolute():
+        selected = project_path / selected
+    return selected.resolve()
+
+
+def _write_project_config_pointer(project_dir: Path, config_dir: Path) -> None:
+    """Persist non-default config directory so loader paths can resolve it."""
+    pointer_path = project_dir / _PROJECT_CONFIG_POINTER
+    if config_dir == project_dir:
+        if pointer_path.exists():
+            pointer_path.unlink()
+        return
+
+    pointer_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        pointer_value = config_dir.relative_to(project_dir).as_posix()
+    except ValueError:
+        pointer_value = str(config_dir)
+    pointer_path.write_text(pointer_value + "\n", encoding="utf-8")
+
+
 def cmd_init(args):
     import json
     from pathlib import Path
     from .entity_detector import confirm_entities
     from .project_scanner import discover_entities
-    from .room_detector_local import detect_rooms_local
+    from .room_detector_local import detect_rooms_local, save_config
 
     # Honor --palace (issue #1313): without this, init silently ignored the
     # flag and always used ~/.mempalace. Mirror the env-var pattern used by
@@ -242,6 +306,29 @@ def cmd_init(args):
         os.environ["MEMPALACE_PALACE_PATH"] = os.path.abspath(os.path.expanduser(args.palace))
 
     cfg = MempalaceConfig()
+    project_path = Path(args.dir).expanduser().resolve()
+    config_dir = _resolve_init_project_config_dir(args=args, project_dir=args.dir)
+    config_dir.mkdir(parents=True, exist_ok=True)
+    _write_project_config_pointer(project_dir=project_path, config_dir=config_dir)
+
+    # Optional startup mode (issue #557): initialize MemPalace wiring for a
+    # project without scanning files, detecting entities, or creating rooms.
+    # Users can later run `mempalace mine` when they actually want ingest.
+    if bool(getattr(args, "empty", False)):
+        from .config import normalize_wing_name
+
+        wing = normalize_wing_name(project_path.name)
+        print("\n  Empty init requested (--empty): skipping entity and room detection.")
+        save_config(
+            project_dir=args.dir,
+            project_name=wing,
+            rooms=[],
+            config_dir=str(config_dir),
+        )
+        cfg.init()
+        _ensure_mempalace_files_gitignored(args.dir, config_dir=str(config_dir))
+        print(f"  Empty init complete. Run `mempalace mine {shlex.quote(args.dir)}` when ready.")
+        return
 
     # Resolve entity-detection languages: --lang overrides config.
     lang_arg = getattr(args, "lang", None)
@@ -358,8 +445,7 @@ def cmd_init(args):
         # separately so the miner can later compute cross-wing tunnels
         # from shared topics (see palace_graph.compute_topic_tunnels).
         if confirmed["people"] or confirmed["projects"] or confirmed.get("topics"):
-            project_path = Path(args.dir).expanduser().resolve()
-            entities_path = project_path / "entities.json"
+            entities_path = config_dir / "entities.json"
             with open(entities_path, "w", encoding="utf-8") as f:
                 json.dump(confirmed, f, indent=2, ensure_ascii=False)
             print(f"  Entities saved: {entities_path}")
@@ -378,11 +464,15 @@ def cmd_init(args):
         print("  No entities detected — proceeding with directory-based rooms.")
 
     # Pass 2: detect rooms from folder structure
-    detect_rooms_local(project_dir=args.dir, yes=getattr(args, "yes", False))
+    detect_rooms_local(
+        project_dir=args.dir,
+        yes=getattr(args, "yes", False),
+        config_dir=str(config_dir),
+    )
     cfg.init()
 
     # Pass 3: protect git repos from accidentally committing per-project files
-    _ensure_mempalace_files_gitignored(args.dir)
+    _ensure_mempalace_files_gitignored(args.dir, config_dir=str(config_dir))
 
     # Pass 4: offer to run mine immediately. The directory just had its
     # rooms + entities set up, so 99% of users will mine next anyway —
@@ -1224,6 +1314,14 @@ def main():
         ),
     )
     p_init.add_argument(
+        "--empty",
+        action="store_true",
+        help=(
+            "Initialize palace/project config only. Skip entity detection, room "
+            "detection, and post-init mine prompt."
+        ),
+    )
+    p_init.add_argument(
         "--lang",
         default=None,
         help=(
@@ -1286,6 +1384,15 @@ def main():
             "LLM is configured via an environment-variable API key (issue #26). "
             "Use this in CI / non-interactive runs where you've already decided "
             "the external send is acceptable."
+        ),
+    )
+    p_init.add_argument(
+        "--project-config-dir",
+        default=None,
+        help=(
+            "Directory where init writes mempalace.yaml and entities.json. "
+            "Absolute path or path relative to <dir>. If omitted, init prompts "
+            "in interactive mode and defaults to project root in non-interactive mode."
         ),
     )
 
