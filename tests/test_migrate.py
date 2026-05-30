@@ -1,9 +1,12 @@
 """Tests for destructive-operation safety in mempalace.migrate."""
 
+import errno
 import os
 import sqlite3
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from mempalace.migrate import (
     _restore_stale_palace,
@@ -286,3 +289,75 @@ def test_migrate_cleans_temp_palace_on_chromadb_failure(tmp_path):
     assert captured_temp_paths, "mkdtemp was never called — flow short-circuited"
     for p in captured_temp_paths:
         assert not os.path.exists(p), f"temp palace was not cleaned up: {p}"
+
+
+def test_migrate_restores_palace_on_swap_failure(tmp_path, capsys):
+    """End-to-end coverage for swap-failure rollback.
+
+    `migrate` swaps the old palace aside via `os.replace` rather than
+    deleting it. If `os.replace(temp_palace, palace_path)` raises EXDEV
+    (cross-filesystem) AND its `shutil.move` fallback ALSO fails,
+    `_restore_stale_palace` rolls back by renaming the aside-copy back
+    into place. This exercises that full failure path through the public
+    `migrate()` entry point; develop already has unit-level tests for the
+    helper itself.
+    """
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    (palace_dir / "chroma.sqlite3").write_text("dummy db")
+    # Sentinel file we verify survives the failed swap via rename-aside rollback.
+    (palace_dir / "sentinel.txt").write_text("original")
+
+    fake_col = MagicMock()
+    fake_col.count.return_value = 1
+    fake_col.add.return_value = None
+
+    drawers = [{"id": "id1", "document": "doc", "metadata": {"wing": "w", "room": "r"}}]
+
+    # Selective os.replace mock: pass-through for the rename-aside (call A,
+    # palace -> palace.old) and the rollback (call C, palace.old -> palace);
+    # raise EXDEV exactly once on the swap-in (call B, temp -> palace).
+    real_os_replace = os.replace
+    fail_state = {"swap_in_failed": False}
+
+    def selective_replace(src, dst):
+        if os.fspath(dst) == os.fspath(palace_dir) and not fail_state["swap_in_failed"]:
+            fail_state["swap_in_failed"] = True
+            raise OSError(errno.EXDEV, "Invalid cross-device link")
+        return real_os_replace(src, dst)
+
+    with (
+        patch("mempalace.migrate.detect_chromadb_version", return_value="0.5.x"),
+        patch("mempalace.backends.chroma.ChromaBackend") as mock_backend_cls,
+        patch("mempalace.migrate.collection_write_roundtrip_works", return_value=False),
+        patch("mempalace.migrate.extract_drawers_from_sqlite", return_value=drawers),
+        patch("mempalace.migrate.confirm_destructive_action", return_value=True),
+        patch("mempalace.migrate.os.replace", side_effect=selective_replace),
+        patch(
+            "mempalace.migrate.shutil.move",
+            side_effect=OSError("fallback move also failed"),
+        ),
+        pytest.raises(OSError),
+    ):
+        mock_backend_cls.backend_version.return_value = "1.5.4"
+        mock_backend_cls.return_value.get_collection.return_value = fake_col
+        mock_backend_cls.return_value.get_or_create_collection.return_value = fake_col
+        migrate(str(palace_dir))
+
+    # Palace directory restored from the rename-aside copy.
+    assert palace_dir.is_dir(), "palace directory missing after rollback"
+    sentinel = palace_dir / "sentinel.txt"
+    assert sentinel.is_file(), "sentinel file not restored"
+    assert sentinel.read_text() == "original", "restored contents differ from original"
+
+    # Pre-migrate backup remains on disk for post-mortem.
+    backups = [p for p in tmp_path.iterdir() if p.name.startswith("palace.pre-migrate.")]
+    assert backups, "pre-migrate backup directory missing"
+
+    # Stale .old aside-copy was consumed by the rollback (renamed back).
+    stale_path = tmp_path / "palace.old"
+    assert not stale_path.exists(), "stale .old should have been consumed by rollback"
+
+    # No CRITICAL message — rollback succeeded cleanly.
+    out = capsys.readouterr().out
+    assert "CRITICAL" not in out
