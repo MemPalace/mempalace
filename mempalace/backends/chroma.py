@@ -2,6 +2,7 @@
 
 import contextlib
 import datetime as _dt
+import functools
 import json
 import logging
 import os
@@ -43,6 +44,41 @@ _SUPPORTED_OPERATORS = _REQUIRED_OPERATORS | _OPTIONAL_OPERATORS
 # Treat only >10x as corruption so normal flush lag or small segments do not get
 # quarantined.
 _HNSW_LINK_TO_DATA_MAX_RATIO = 10.0
+
+
+@functools.lru_cache(maxsize=64)
+def _resolve_persist_dir(palace_path: str, create: bool = False) -> str:
+    """Return the directory ChromaDB should use for this palace.
+
+    Reads ``<palace_path>/mempalace.yaml`` for ``backend.persist_directory``.
+    Relative paths are resolved against ``palace_path``.  Falls back to
+    ``palace_path`` for palaces that predate this config key.
+
+    Pass ``create=True`` to ensure the directory exists before writing (e.g.
+    before opening a ``PersistentClient``).  Read-only callers should use the
+    default ``create=False`` so that querying a path never creates directories
+    as a side effect.
+    """
+    try:
+        import yaml  # PyYAML — always available as a mempalace dependency
+
+        yaml_path = os.path.join(palace_path, "mempalace.yaml")
+        if os.path.isfile(yaml_path):
+            with open(yaml_path, encoding="utf-8") as fh:
+                cfg = yaml.safe_load(fh) or {}
+            persist = (cfg.get("backend") or {}).get("persist_directory")
+            if persist:
+                resolved = (
+                    persist
+                    if os.path.isabs(persist)
+                    else os.path.normpath(os.path.join(palace_path, persist))
+                )
+                if create:
+                    os.makedirs(resolved, exist_ok=True)
+                return resolved
+    except Exception:
+        pass
+    return palace_path
 
 
 def _hnsw_link_to_data_ratio(seg_dir: str) -> Optional[float]:
@@ -237,8 +273,9 @@ def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> lis
     The original directory is renamed, not deleted, so recovery remains
     possible if the heuristic ever misfires.
     """
+    persist_dir = _resolve_persist_dir(palace_path)
 
-    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    db_path = os.path.join(persist_dir, "chroma.sqlite3")
     if not os.path.isfile(db_path):
         return []
 
@@ -250,7 +287,7 @@ def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> lis
     moved: list[str] = []
 
     try:
-        entries = os.listdir(palace_path)
+        entries = os.listdir(persist_dir)
     except OSError:
         return []
 
@@ -258,7 +295,7 @@ def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> lis
         if "-" not in name or name.startswith(".") or ".drift-" in name:
             continue
 
-        seg_dir = os.path.join(palace_path, name)
+        seg_dir = os.path.join(persist_dir, name)
         if not os.path.isdir(seg_dir):
             continue
 
@@ -325,7 +362,7 @@ def _vector_segment_id(palace_path: str, collection_name: str) -> Optional[str]:
     Reads ``chroma.sqlite3`` directly so we never have to load a segment
     that may segfault on open (#1222 is exactly this case).
     """
-    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    db_path = os.path.join(_resolve_persist_dir(palace_path), "chroma.sqlite3")
     if not os.path.isfile(db_path):
         return None
     try:
@@ -493,7 +530,7 @@ def _read_sync_threshold(palace_path: str, collection_name: str) -> int:
     explicit setting — matches what older mempalace palaces were created
     with before PR #1191.
     """
-    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    db_path = os.path.join(_resolve_persist_dir(palace_path), "chroma.sqlite3")
     if not os.path.isfile(db_path):
         return 1000
     try:
@@ -613,7 +650,7 @@ def _sqlite_embedding_count(palace_path: str, collection_name: str) -> Optional[
     Mirrors :func:`mempalace.repair.sqlite_drawer_count` but kept in this
     module so the backend probe doesn't pull in the repair CLI module.
     """
-    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    db_path = os.path.join(_resolve_persist_dir(palace_path), "chroma.sqlite3")
     if not os.path.isfile(db_path):
         return None
     try:
@@ -727,8 +764,9 @@ def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
     out of the way before ``PersistentClient`` opens so Chroma can rebuild
     cleanly instead of touching known-bad metadata.
     """
+    persist_dir = _resolve_persist_dir(palace_path)
     try:
-        entries = os.listdir(palace_path)
+        entries = os.listdir(persist_dir)
     except OSError:
         return []
 
@@ -736,7 +774,7 @@ def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
     for name in entries:
         if "-" not in name or name.startswith(".") or ".drift-" in name or ".corrupt-" in name:
             continue
-        seg_dir = os.path.join(palace_path, name)
+        seg_dir = os.path.join(persist_dir, name)
         if not os.path.isdir(seg_dir):
             continue
 
@@ -845,7 +883,7 @@ def _fix_blob_seq_ids(palace_path: str) -> None:
     subsequent opens skip the sqlite connection entirely. Already-migrated
     palaces can touch the marker manually to opt into the fast path.
     """
-    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    db_path = os.path.join(_resolve_persist_dir(palace_path), "chroma.sqlite3")
     if not os.path.isfile(db_path):
         return
     marker = os.path.join(palace_path, _BLOB_FIX_MARKER)
@@ -902,7 +940,7 @@ def _fix_missing_collection_type(palace_path: str) -> None:
     Same lifecycle constraints as :func:`_fix_blob_seq_ids`: must run
     BEFORE ``PersistentClient`` is created.
     """
-    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    db_path = os.path.join(_resolve_persist_dir(palace_path), "chroma.sqlite3")
     if not os.path.isfile(db_path):
         return
     marker = os.path.join(palace_path, _COLLECTION_TYPE_MARKER)
@@ -1276,6 +1314,16 @@ class ChromaBackend(BaseBackend):
         self._closed = False
 
     @staticmethod
+    def _resolve_persist_dir(palace_path: str, create: bool = False) -> str:
+        """Return the directory ChromaDB should use for this palace.
+
+        Delegates to the module-level :func:`_resolve_persist_dir` (which is
+        memoized).  Kept as a static method so existing call-sites that
+        already have a ``ChromaBackend`` reference continue to work.
+        """
+        return _resolve_persist_dir(palace_path, create)
+
+    @staticmethod
     def _resolve_embedding_function():
         """Return the EF for the user's ``embedding_device`` setting.
 
@@ -1331,7 +1379,8 @@ class ChromaBackend(BaseBackend):
     @staticmethod
     def _db_stat(palace_path: str) -> tuple[int, float]:
         """Return ``(inode, mtime)`` of ``chroma.sqlite3`` or ``(0, 0.0)`` if absent."""
-        db_path = os.path.join(palace_path, "chroma.sqlite3")
+        persist_dir = ChromaBackend._resolve_persist_dir(palace_path)
+        db_path = os.path.join(persist_dir, "chroma.sqlite3")
         try:
             st = os.stat(db_path)
             return (st.st_ino, st.st_mtime)
@@ -1364,7 +1413,8 @@ class ChromaBackend(BaseBackend):
         cached_inode, cached_mtime = self._freshness.get(palace_path, (0, 0.0))
         current_inode, current_mtime = self._db_stat(palace_path)
 
-        db_path = os.path.join(palace_path, "chroma.sqlite3")
+        persist_dir = ChromaBackend._resolve_persist_dir(palace_path)
+        db_path = os.path.join(persist_dir, "chroma.sqlite3")
         # DB was present when cache was built but is now missing → invalidate.
         if cached is not None and not os.path.isfile(db_path):
             _close_client(self._clients.pop(palace_path, None))
@@ -1391,7 +1441,7 @@ class ChromaBackend(BaseBackend):
             if inode_changed:
                 ChromaBackend._quarantined_paths.discard(palace_path)
             ChromaBackend._prepare_palace_for_open(palace_path)
-            cached = chromadb.PersistentClient(path=palace_path)
+            cached = chromadb.PersistentClient(path=ChromaBackend._resolve_persist_dir(palace_path, create=True))
             self._clients[palace_path] = cached
             # Re-stat after the client constructor runs: chromadb creates
             # chroma.sqlite3 lazily, so the stat captured before the call
@@ -1454,10 +1504,11 @@ class ChromaBackend(BaseBackend):
         hot paths (e.g. ``_client()`` is called on every backend operation).
         """
         _fix_missing_collection_type(palace_path)
-        _fix_blob_seq_ids(palace_path)
+        persist_dir = ChromaBackend._resolve_persist_dir(palace_path)
+        _fix_blob_seq_ids(persist_dir)
         if palace_path not in ChromaBackend._quarantined_paths:
-            quarantine_invalid_hnsw_metadata(palace_path)
-            quarantine_stale_hnsw(palace_path)
+            quarantine_invalid_hnsw_metadata(persist_dir)
+            quarantine_stale_hnsw(persist_dir)
             ChromaBackend._quarantined_paths.add(palace_path)
 
     @staticmethod
@@ -1473,7 +1524,7 @@ class ChromaBackend(BaseBackend):
         vs. runtime thrash on steady-write daemons).
         """
         ChromaBackend._prepare_palace_for_open(palace_path)
-        return chromadb.PersistentClient(path=palace_path)
+        return chromadb.PersistentClient(path=ChromaBackend._resolve_persist_dir(palace_path, create=True))
 
     @staticmethod
     def backend_version() -> str:
@@ -1581,7 +1632,8 @@ class ChromaBackend(BaseBackend):
 
     @classmethod
     def detect(cls, path: str) -> bool:
-        return os.path.isfile(os.path.join(path, "chroma.sqlite3"))
+        persist_dir = cls._resolve_persist_dir(path)
+        return os.path.isfile(os.path.join(persist_dir, "chroma.sqlite3"))
 
     # ------------------------------------------------------------------
     # Legacy (pre-RFC 001) surface — retained while callers migrate.

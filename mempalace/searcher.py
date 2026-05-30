@@ -17,6 +17,7 @@ import sqlite3
 from pathlib import Path
 
 from .backends import CollectionNotInitializedError, PalaceNotFoundError
+from .backends.chroma import _resolve_persist_dir
 from .palace import get_closets_collection, get_collection
 
 # Closet pointer line format: "topic|entities|→drawer_id_a,drawer_id_b"
@@ -305,7 +306,7 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
         print(f"\n  No palace found at {palace_path}")
         print("  Run: mempalace init <dir> then mempalace mine <dir>")
         raise SearchError(f"No palace found at {palace_path}")
-    if not os.path.isfile(os.path.join(palace_path, "chroma.sqlite3")):
+    if not os.path.isfile(os.path.join(_resolve_persist_dir(palace_path), "chroma.sqlite3")):
         print(f"\n  Palace dir at {palace_path} exists but has no chroma.sqlite3 yet.")
         print("  Run: mempalace mine <dir>")
         raise SearchError(f"No palace database at {palace_path}")
@@ -421,7 +422,7 @@ def _bm25_only_via_sqlite(
     ``max_candidates`` rows so we still return *something* rather than
     nothing.
     """
-    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    db_path = os.path.join(_resolve_persist_dir(palace_path), "chroma.sqlite3")
     if not os.path.isfile(db_path):
         return {
             "error": "No palace found",
