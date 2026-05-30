@@ -32,9 +32,8 @@ HOME = Path.home()
 LUMI_DIR = Path(os.environ.get("MEMPALACE_SOURCE_DIR", str(HOME / "Desktop/transcripts")))
 
 # People we know about (for name detection in content)
-# Loaded from ~/.mempalace/known_names.json if it exists, otherwise generic fallback.
+# Loaded from ~/.mempalace/known_names.json if it exists; no built-in fallback names.
 _KNOWN_NAMES_PATH = HOME / ".mempalace" / "known_names.json"
-_FALLBACK_KNOWN_PEOPLE = ["Alice", "Ben", "Riley", "Max", "Sam", "Devon", "Jordan"]
 _KNOWN_NAMES_CACHE = None
 
 
@@ -60,13 +59,13 @@ def _load_known_names_config(force_reload: bool = False):
 
 
 def _load_known_people() -> list:
-    """Load known names from config file, falling back to a generic list."""
+    """Load known names from config file, or return empty list if not configured."""
     data = _load_known_names_config()
     if isinstance(data, list):
         return data
     if isinstance(data, dict):
         return data.get("names", [])
-    return list(_FALLBACK_KNOWN_PEOPLE)
+    return []
 
 
 KNOWN_PEOPLE = _load_known_people()
