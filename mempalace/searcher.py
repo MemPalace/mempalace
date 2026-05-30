@@ -32,6 +32,22 @@ class SearchError(Exception):
 
 _TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
 
+# Over-fetch tuning for the vector candidate pool (see issue #1125).
+#
+# Short queries — proper nouns and 1–3 token names — produce weak
+# embeddings relative to longer narrative drawers. The default 3× over-
+# fetch can drop name-bearing drawers below the candidate cutoff before
+# BM25 rerank ever sees them. The wider multiplier kicks in for queries
+# with ``len(_tokenize(query)) <= _SHORT_QUERY_TOKEN_THRESHOLD``.
+#
+# ``_OVERFETCH_MAX`` bounds the candidate fetch so latency stays sane on
+# large ``n_results`` requests; ``n_results`` itself acts as a floor so
+# the clamp never returns fewer candidates than the caller asked for.
+_SHORT_QUERY_TOKEN_THRESHOLD = 3
+_SHORT_QUERY_OVERFETCH_MULTIPLIER = 10
+_DEFAULT_OVERFETCH_MULTIPLIER = 3
+_OVERFETCH_MAX = 200
+
 
 def _first_or_empty(results, key: str) -> list:
     """Return the first inner list of a query result field, or [].
@@ -634,6 +650,23 @@ def _bm25_only_via_sqlite(
     }
 
 
+def _chunk_precise_dedup_key(entry: dict):
+    """Stable dedup key for hits crossing the vector / BM25 / contains
+    pools. Uses ``(_source_file_full, _chunk_index)`` so two files
+    sharing a basename in different directories don't collide and a
+    vector hit on chunk N of a source doesn't block another path from
+    contributing chunk M of the same source. Falls back to
+    ``source_file`` only when richer metadata is missing — avoids
+    silently dropping candidates on legacy data while still giving
+    chunk-precise dedup whenever the metadata is present.
+    """
+    full = entry.get("_source_file_full")
+    ci = entry.get("_chunk_index")
+    if full and ci is not None:
+        return (full, ci)
+    return entry.get("source_file")
+
+
 def _merge_bm25_union_candidates(
     hits: list,
     query: str,
@@ -642,6 +675,7 @@ def _merge_bm25_union_candidates(
     room: str,
     n_results: int,
     max_distance: float = 0.0,
+    collection_name: str = None,
 ) -> None:
     """Append top-K BM25-only candidates from sqlite into ``hits`` in place.
 
@@ -676,24 +710,15 @@ def _merge_bm25_union_candidates(
             room=room,
             n_results=n_results * 3,
             _include_internal=True,
+            collection_name=collection_name,
         ).get("results", [])
     except Exception:
         logger.debug("candidate_strategy=union: BM25 fetch failed", exc_info=True)
         return
 
-    def _dedup_key(entry: dict):
-        full = entry.get("_source_file_full")
-        ci = entry.get("_chunk_index")
-        if full and ci is not None:
-            return (full, ci)
-        # Fall back to basename only when richer metadata is missing —
-        # avoids silently dropping candidates on legacy data while still
-        # giving chunk-precise dedup whenever the metadata is present.
-        return entry.get("source_file")
-
-    seen = {_dedup_key(h) for h in hits}
+    seen = {_chunk_precise_dedup_key(h) for h in hits}
     for bh in bm25_extra:
-        key = _dedup_key(bh)
+        key = _chunk_precise_dedup_key(bh)
         if not key or key == "?" or key in seen:
             continue
         bh["distance"] = None
@@ -703,12 +728,106 @@ def _merge_bm25_union_candidates(
         seen.add(key)
 
 
+def _merge_contains_union_candidates(
+    hits: list,
+    query: str,
+    palace_path: str,
+    wing: str,
+    room: str,
+    n_results: int,
+    max_distance: float = 0.0,
+    collection_name: str = None,
+) -> None:
+    """Append drawers whose ``documents`` contain ``query`` as a literal
+    substring (Chroma ``where_document={"$contains": query}``) into
+    ``hits`` in place.
+
+    Used by ``search_memories(..., candidate_strategy="contains")`` to
+    catch proper-noun and exact-string matches whose embeddings fall
+    below the vector candidate cutoff. The vector path can over-fetch a
+    larger pool (see ``_OVERFETCH_MAX`` and the short-query widening),
+    but rare or single-token proper-noun queries still produce
+    embeddings too weak to clear the rerank window. A direct substring
+    fetch guarantees those drawers reach BM25 rerank. See issue #1125.
+
+    Dedup is chunk-precise: same key as ``_merge_bm25_union_candidates``
+    so two files sharing a basename in different directories don't
+    collide and a vector hit on chunk N doesn't block contains from
+    contributing chunk M of the same file.
+
+    Contains-only additions carry ``distance=None`` so ``_hybrid_rank``
+    scores them on BM25 contribution alone — mirrors the BM25-only
+    union path.
+
+    Skipped when ``max_distance > 0.0`` for the same reason as the BM25
+    union path: a strict vector-distance threshold has no meaning for
+    candidates that never ran a vector query, and silently injecting
+    them would break the existing ``max_distance`` guarantee.
+    """
+    if max_distance > 0.0:
+        return
+    if not query.strip():
+        return
+
+    try:
+        # ``get_collection`` resolves ``collection_name=None`` itself via
+        # ``get_configured_collection_name`` — no need to branch here.
+        drawers_col = get_collection(palace_path, collection_name=collection_name, create=False)
+    except Exception:
+        logger.debug("candidate_strategy=contains: collection fetch failed", exc_info=True)
+        return
+
+    where = build_where_filter(wing, room)
+    get_kwargs = {
+        "where_document": {"$contains": query},
+        "limit": min(n_results * 3, _OVERFETCH_MAX),
+        "include": ["documents", "metadatas"],
+    }
+    if where:
+        get_kwargs["where"] = where
+
+    try:
+        contains_results = drawers_col.get(**get_kwargs)
+    except Exception:
+        logger.debug("candidate_strategy=contains: where_document fetch failed", exc_info=True)
+        return
+
+    docs = contains_results.documents or []
+    metas = contains_results.metadatas or []
+
+    seen = {_chunk_precise_dedup_key(h) for h in hits}
+    for doc, meta in zip(docs, metas):
+        if doc is None or meta is None:
+            continue
+        full_source = meta.get("source_file", "") or ""
+        entry = {
+            "text": doc,
+            "wing": meta.get("wing", "unknown"),
+            "room": meta.get("room", "unknown"),
+            "source_file": Path(full_source).name if full_source else "?",
+            "created_at": meta.get("filed_at", "unknown"),
+            "similarity": None,
+            "distance": None,
+            "effective_distance": None,
+            "closet_boost": 0.0,
+            "matched_via": "contains",
+            "_source_file_full": full_source,
+            "_chunk_index": meta.get("chunk_index"),
+        }
+        key = _chunk_precise_dedup_key(entry)
+        if not key or key == "?" or key in seen:
+            continue
+        hits.append(entry)
+        seen.add(key)
+
+
 # Strategy dispatch — keeps search_memories' branch count under the
 # project's complexity ceiling (C901 max-complexity=25). New strategies
 # register here.
 _CANDIDATE_MERGERS = {
     "vector": None,  # default no-op
     "union": _merge_bm25_union_candidates,
+    "contains": _merge_contains_union_candidates,
 }
 
 
@@ -734,6 +853,7 @@ def _apply_candidate_strategy(
     room: str,
     n_results: int,
     max_distance: float = 0.0,
+    collection_name: str = None,
 ) -> None:
     """Dispatch to the registered merger for ``strategy``.
 
@@ -742,7 +862,16 @@ def _apply_candidate_strategy(
     """
     merger = _CANDIDATE_MERGERS[strategy]
     if merger is not None:
-        merger(hits, query, palace_path, wing, room, n_results, max_distance=max_distance)
+        merger(
+            hits,
+            query,
+            palace_path,
+            wing,
+            room,
+            n_results,
+            max_distance=max_distance,
+            collection_name=collection_name,
+        )
 
 
 def search_memories(
@@ -826,10 +955,31 @@ def search_memories(
     # This avoids the "weak-closets regression" where narrative content
     # produces low-signal closets (regex extraction matches few topics)
     # and closet-first routing hides drawers that direct search would find.
+    # Short queries — particularly proper nouns and 1-3 token names —
+    # produce weak embeddings relative to longer narrative drawers. The
+    # default ``n_results * 3`` over-fetch can drop name-bearing drawers
+    # below the candidate cutoff before BM25 rerank ever sees them.
+    # Widen the pool for short queries so rerank can do its job; clamp
+    # to 200 so the candidate fetch stays bounded on large n_results
+    # requests. See issue #1125.
+    # ``_tokenize`` handles the ``None``/empty cases that ``_TOKEN_RE.findall``
+    # would raise on, and uses the same regex as BM25 — keep token counting
+    # behaviourally identical to rerank tokenisation.
+    token_count = len(_tokenize(query))
+    overfetch_multiplier = (
+        _SHORT_QUERY_OVERFETCH_MULTIPLIER
+        if token_count <= _SHORT_QUERY_TOKEN_THRESHOLD
+        else _DEFAULT_OVERFETCH_MULTIPLIER
+    )
+    # Floor at ``n_results`` so a large request never returns fewer
+    # candidates than asked for; ceiling at ``_OVERFETCH_MAX`` so the
+    # vector ``.query()`` latency stays bounded.
+    overfetch_n = max(n_results, min(n_results * overfetch_multiplier, _OVERFETCH_MAX))
+
     try:
         dkwargs = {
             "query_texts": [query],
-            "n_results": n_results * 3,  # over-fetch for re-ranking
+            "n_results": overfetch_n,  # over-fetch for re-ranking
             "include": ["documents", "metadatas", "distances"],
         }
         if where:
@@ -965,14 +1115,19 @@ def search_memories(
         query_terms = set(_tokenize(query))
         best_idx, best_score = 0, -1
         for idx, d in enumerate(ordered_docs):
-            d_lower = d.lower()
+            # Tolerate ``None`` documents — Chroma returns ``None`` in the
+            # ``documents`` field for drawers inserted with embeddings only
+            # (legacy mines, partial restores, no-text entries). Treat as
+            # empty so the keyword scan continues rather than raising
+            # ``AttributeError`` mid-search (issue #1125).
+            d_lower = (d or "").lower()
             s = sum(1 for t in query_terms if t in d_lower)
             if s > best_score:
                 best_score, best_idx = s, idx
 
         start = max(0, best_idx - 1)
         end = min(len(ordered_docs), best_idx + 2)
-        expanded = "\n\n".join(ordered_docs[start:end])
+        expanded = "\n\n".join(d or "" for d in ordered_docs[start:end])
         if len(expanded) > MAX_HYDRATION_CHARS:
             expanded = (
                 expanded[:MAX_HYDRATION_CHARS]
@@ -998,6 +1153,7 @@ def search_memories(
         room,
         n_results,
         max_distance=max_distance,
+        collection_name=collection_name,
     )
 
     # BM25 hybrid re-rank within the final candidate set, then trim back

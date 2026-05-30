@@ -9,9 +9,19 @@ The ``"union"`` strategy also pulls top-K BM25-only candidates from sqlite
 FTS5 and merges them into the rerank pool. Both signal sources contribute
 candidates; the hybrid rerank picks the best from a richer pool.
 
+The ``"contains"`` strategy additionally injects drawers whose document
+text contains the query as a literal substring (Chroma
+``where_document={"$contains": query}``). This catches proper-noun and
+exact-string matches that produce embeddings too weak to clear the
+vector candidate cutoff — issue #1125.
+
 Default behavior is unchanged ("vector") — these tests exercise opt-in
-"union" mode.
+modes.
 """
+
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from mempalace.palace import get_collection
 from mempalace.searcher import search_memories
@@ -211,6 +221,232 @@ class TestCandidateUnion:
         assert readme_count >= 2, (
             f"union must surface both README.md files from different dirs "
             f"(basename collision would drop one); got sources={sources}"
+        )
+
+
+# ── candidate_strategy="contains" (#1125) ──────────────────────────────
+
+
+def _make_mocked_collection(vector_hits=None, contains_hits=None):
+    """Build a mock collection whose ``.query()`` and ``.get()`` return
+    fully-controlled candidates. Lets the contains-strategy tests pin
+    each path's contribution independently — small live corpora are too
+    permissive (vector returns all candidates) to discriminate which
+    strategy surfaced a result."""
+
+    def _doc_payload(hits):
+        if not hits:
+            return {"documents": [[]], "metadatas": [[]], "distances": [[]], "ids": [[]]}
+        return {
+            "documents": [[h["document"] for h in hits]],
+            "metadatas": [[h["metadata"] for h in hits]],
+            "distances": [[h.get("distance", 0.1) for h in hits]],
+            "ids": [[h["id"] for h in hits]],
+        }
+
+    def _get_payload(hits):
+        hits = hits or []
+        return MagicMock(
+            documents=[h["document"] for h in hits],
+            metadatas=[h["metadata"] for h in hits],
+            ids=[h["id"] for h in hits],
+        )
+
+    mock_col = MagicMock()
+    mock_col.metadata = {"hnsw:space": "cosine"}
+    mock_col.query.return_value = _doc_payload(vector_hits)
+
+    def fake_get(**kwargs):
+        # The closet path (if any) goes through ``query`` not ``get``;
+        # only the contains merger uses ``get(where_document=...)``.
+        # Other ``.get`` callers receive an empty result.
+        if "where_document" in kwargs:
+            return _get_payload(contains_hits)
+        return _get_payload([])
+
+    mock_col.get.side_effect = fake_get
+    return mock_col
+
+
+def _hit(*, id, source, document, wing="ops", room="infra", chunk_index=0):
+    return {
+        "id": id,
+        "document": document,
+        "metadata": {
+            "wing": wing,
+            "room": room,
+            "source_file": source,
+            "chunk_index": chunk_index,
+            "filed_at": "2026-01-01T00:00:00",
+        },
+    }
+
+
+class TestContainsStrategy:
+    """``contains`` strategy pulls drawers whose ``documents`` contain the
+    query as a literal substring and unions them into the rerank pool.
+
+    Tests use mocked collections rather than live ChromaDB so we can pin
+    each retrieval path's contribution and prove the strategy actually
+    does work — a small live corpus over-fetches every drawer into the
+    candidate pool anyway, masking which path surfaced a result.
+    """
+
+    def test_invalid_strategy_still_raises(self):
+        with pytest.raises(ValueError, match="bogus"):
+            with patch(
+                "mempalace.searcher.get_collection",
+                return_value=_make_mocked_collection(),
+            ):
+                search_memories("anything", "/fake/path", candidate_strategy="bogus")
+
+    def test_default_vector_strategy_unchanged_after_contains_added(self):
+        vector_only = [_hit(id="V1", source="rev_plan.md", document="quarterly revenue")]
+        with patch(
+            "mempalace.searcher.get_collection",
+            return_value=_make_mocked_collection(vector_hits=vector_only),
+        ):
+            without = search_memories("revenue", "/fake/path", n_results=2)
+            explicit = search_memories(
+                "revenue", "/fake/path", n_results=2, candidate_strategy="vector"
+            )
+        assert [h["source_file"] for h in without["results"]] == [
+            h["source_file"] for h in explicit["results"]
+        ], "explicit candidate_strategy='vector' must match default"
+
+    def test_contains_surfaces_substring_match_vector_misses(self):
+        """Vector returns unrelated drawers; only the contains path
+        surfaces the literal-substring drawer. Strategy must merge it
+        into the rerank pool."""
+        vector_hits = [
+            _hit(id="V1", source="rev_plan.md", document="quarterly revenue planning"),
+            _hit(id="V2", source="db_migration.md", document="postgres migration log"),
+        ]
+        contains_hits = [
+            _hit(
+                id="C1",
+                source="procurement.md",
+                document="Xerathon-7 chassis arrives Tuesday",
+            ),
+        ]
+        with patch(
+            "mempalace.searcher.get_collection",
+            return_value=_make_mocked_collection(
+                vector_hits=vector_hits, contains_hits=contains_hits
+            ),
+        ):
+            result = search_memories(
+                "Xerathon-7",
+                "/fake/path",
+                n_results=3,
+                candidate_strategy="contains",
+            )
+        sources = [h["source_file"] for h in result["results"]]
+        assert "procurement.md" in sources, (
+            f"contains strategy must merge the where_document substring "
+            f"match into the rerank pool; got sources={sources}"
+        )
+
+    def test_contains_invokes_where_document_filter(self):
+        """Contract test — the merger calls ``.get`` exactly once with
+        ``where_document={"$contains": query}``. Any drift breaks the
+        issue-#1125 promise."""
+        mock_col = _make_mocked_collection()
+        with patch("mempalace.searcher.get_collection", return_value=mock_col):
+            search_memories(
+                "Alice",
+                "/fake/path",
+                n_results=5,
+                candidate_strategy="contains",
+            )
+
+        where_doc_calls = [c for c in mock_col.get.call_args_list if "where_document" in c.kwargs]
+        assert len(where_doc_calls) == 1, (
+            f"contains must call .get with where_document exactly once; "
+            f"got {len(where_doc_calls)} calls"
+        )
+        kwargs = where_doc_calls[0].kwargs
+        assert kwargs["where_document"] == {"$contains": "Alice"}
+        # ``limit`` must be a positive int — exact value is the merger's
+        # tuning knob, but it must be set to avoid full-collection scans.
+        assert isinstance(kwargs.get("limit"), int) and kwargs["limit"] > 0, (
+            f"contains must pass a positive int limit to bound the fetch; "
+            f"got limit={kwargs.get('limit')!r}"
+        )
+
+    def test_contains_dedup_does_not_dupe_vector_hits(self):
+        """Same drawer surfaced by BOTH vector and contains paths must
+        appear exactly once in the merged pool. Without dedup the count
+        would be 2."""
+        shared = _hit(
+            id="SHARED",
+            source="procurement.md",
+            document="Xerathon-7 chassis arrives Tuesday",
+        )
+        with patch(
+            "mempalace.searcher.get_collection",
+            return_value=_make_mocked_collection(vector_hits=[shared], contains_hits=[shared]),
+        ):
+            result = search_memories(
+                "Xerathon-7",
+                "/fake/path",
+                n_results=4,
+                candidate_strategy="contains",
+            )
+        sources = [h["source_file"] for h in result["results"]]
+        assert sources.count("procurement.md") == 1, (
+            f"shared drawer must dedup to exactly one entry; got sources={sources}"
+        )
+
+    def test_contains_respects_wing_room_filters(self):
+        """The ``where`` filter (wing/room) must be forwarded to the
+        ``.get()`` call — otherwise the strategy leaks cross-room
+        candidates that the vector path filters out at query time."""
+        mock_col = _make_mocked_collection()
+        with patch("mempalace.searcher.get_collection", return_value=mock_col):
+            search_memories(
+                "Alice",
+                "/fake/path",
+                n_results=4,
+                wing="ops",
+                room="sales",
+                candidate_strategy="contains",
+            )
+
+        where_doc_calls = [c for c in mock_col.get.call_args_list if "where_document" in c.kwargs]
+        assert where_doc_calls, "contains must call .get with where_document"
+        passed_where = where_doc_calls[0].kwargs.get("where")
+        # Implementation may pass a single-key dict or a $and combination;
+        # the contract is only that wing AND room are both expressed.
+        flat = str(passed_where)
+        assert "ops" in flat and "sales" in flat, (
+            f"wing/room must be forwarded to the contains .get(); got where={passed_where!r}"
+        )
+
+    def test_contains_forwards_collection_name(self):
+        """Explicit ``collection_name`` (e.g. a tenant-prefixed collection)
+        must be forwarded into the contains merger's ``get_collection``
+        call so multi-collection deployments don't silently fall back to
+        the default collection."""
+        captured = {}
+
+        def fake_get_collection(palace_path, *, collection_name=None, create=True):
+            captured.setdefault("calls", []).append(collection_name)
+            mock_col = _make_mocked_collection()
+            return mock_col
+
+        with patch("mempalace.searcher.get_collection", side_effect=fake_get_collection):
+            search_memories(
+                "Alice",
+                "/fake/path",
+                n_results=2,
+                collection_name="tenant_abc_drawers",
+                candidate_strategy="contains",
+            )
+
+        assert "tenant_abc_drawers" in captured["calls"], (
+            f"contains merger must forward collection_name to get_collection; "
+            f"saw calls={captured['calls']}"
         )
 
 
