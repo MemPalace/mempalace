@@ -166,6 +166,32 @@ def _hybrid_rank(
     return results
 
 
+# Closet-boost ranking constants. Hoisted to module level so they can be
+# tuned from the outside (env var, config flag, or in-process patch for
+# A/B benchmarking) without touching `search_memories`. The ordinal signal
+# — "which closet matched best for this source" — is more reliable than
+# absolute distance on narrative content, where closet distances cluster
+# in 1.2–1.5 regardless of match quality.
+#
+# Empirical note (A/B ablation 2026-04-27 on the 151K canonical palace,
+# 12-probe set covering recent fork-side work + transcript content):
+# boost fires on ~20% of result rows, concentrated in queries whose
+# answer lives in mined files; closets are sparse on chat-transcript
+# queries (most fork-side decisions). When the boost did fire, it
+# re-ordered chunks within a single source file rather than displacing
+# right answers with wrong ones — i.e., VecRecall's critique
+# (https://github.com/MemPalace/mempalace/discussions/1129, "org-layer
+# in retrieval path drops R@5") didn't reproduce here. Kept as a
+# rare-but-cheap signal. Reproducer at
+# ``scripts/closet_boost_ablation.py``.
+#
+# Tuple (not list) — these are constants, not a working buffer. Patch
+# at module attribute level via ``searcher.CLOSET_RANK_BOOSTS = (...)``
+# rather than mutating in place.
+CLOSET_RANK_BOOSTS = (0.40, 0.25, 0.15, 0.08, 0.04)
+CLOSET_DISTANCE_CAP = 1.5  # cosine dist > 1.5 = too weak to use as signal
+
+
 def build_where_filter(wing: str = None, room: str = None) -> dict:
     """Build ChromaDB where filter for wing/room filtering."""
     if wing and room:
@@ -864,12 +890,6 @@ def search_memories(
     except Exception:
         # No closets yet — hybrid degrades to pure drawer search.
         logger.debug("Closet collection unavailable; using drawer-only search", exc_info=True)
-
-    # Rank-based boost. The ordinal signal ("which closet matched best") is
-    # more reliable than absolute distance on narrative content, where
-    # closet distances cluster in 1.2-1.5 range regardless of match quality.
-    CLOSET_RANK_BOOSTS = [0.40, 0.25, 0.15, 0.08, 0.04]
-    CLOSET_DISTANCE_CAP = 1.5  # cosine dist > 1.5 = too weak to use as signal
 
     scored: list = []
     for doc, meta, dist in zip(
