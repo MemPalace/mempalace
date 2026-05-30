@@ -935,7 +935,7 @@ def _fix_missing_collection_type(palace_path: str) -> None:
     Same lifecycle constraints as :func:`_fix_blob_seq_ids`: must run
     BEFORE ``PersistentClient`` is created.
     """
-    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    db_path = os.path.join(_resolve_persist_dir(palace_path), "chroma.sqlite3")
     if not os.path.isfile(db_path):
         return
     marker = os.path.join(palace_path, _COLLECTION_TYPE_MARKER)
