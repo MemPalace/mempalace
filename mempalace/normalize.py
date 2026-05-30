@@ -41,9 +41,12 @@ _NOISE_TAGS = (
     "system-reminder",
     "command-message",
     "command-name",
+    "command-args",
     "task-notification",
     "user-prompt-submit-hook",
     "hook_output",
+    "local-command-caveat",
+    "local-command-stdout",
 )
 
 
@@ -89,6 +92,14 @@ _HOOK_LINE_RE = re.compile(
 # "… +N lines" collapsed-output marker, line-anchored.
 _COLLAPSED_LINES_RE = re.compile(r"(?m)^(?:> )?…\s*\+\d+ lines.*\n?")
 
+# ANSI escape sequences leak into transcripts via Bash tool_result blocks
+# (e.g. /context, /help, any colored CLI output). Each pattern is anchored on
+# the literal ESC byte (\x1b) — user prose that mentions e.g. "[1m]" by name
+# does not start with ESC and therefore stays intact.
+_ANSI_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+# OSC sequences (terminal title, hyperlinks) terminated by BEL or ST.
+_ANSI_OSC_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+
 
 def strip_noise(text: str) -> str:
     """Remove system tags, hook output, and Claude Code UI chrome from text.
@@ -105,6 +116,10 @@ def strip_noise(text: str) -> str:
     # Strip the Claude Code collapsed-output chrome "[N tokens] (ctrl+o to expand)".
     # Narrow shape — a bare "(ctrl+o to expand)" in user prose stays intact.
     text = re.sub(r"\s*\[\d+\s+tokens?\]\s*\(ctrl\+o to expand\)", "", text)
+    # Strip ANSI escape sequences. Tag-wrapped ANSI is already gone via the
+    # tag patterns above; this sweep handles standalone ANSI in tool output.
+    text = _ANSI_CSI_RE.sub("", text)
+    text = _ANSI_OSC_RE.sub("", text)
     # Collapse runs of blank lines created by the removals
     text = re.sub(r"\n{4,}", "\n\n\n", text)
     return text.strip()

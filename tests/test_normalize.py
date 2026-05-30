@@ -1316,6 +1316,27 @@ class TestStripNoisePreservesUserContent:
         text = "> User:\n> The log showed … +50 lines of stack trace, useful."
         assert strip_noise(text) == text.strip()
 
+    def test_user_documents_ansi_escape_by_name(self):
+        # User prose that mentions an ANSI sequence by name (e.g. in docs)
+        # contains no ESC byte, so the ANSI sweep must not touch it.
+        text = (
+            "> User:\n"
+            "> The bold SGR code is `[1m` and reset is `[22m`. "
+            "Documenting the format here."
+        )
+        assert strip_noise(text) == text.strip()
+
+    def test_user_mentions_local_command_inline(self):
+        # Inline mention of a Claude Code envelope tag inside user prose
+        # (e.g. when documenting the harness) must not be stripped.
+        text = (
+            "> User:\n"
+            "> Claude Code wraps slash commands in "
+            "<local-command-caveat>...</local-command-caveat>"
+            " — that is the tag name."
+        )
+        assert strip_noise(text) == text.strip()
+
     def test_dangling_open_tag_does_not_span_messages(self):
         # THE span-eating bug: a stray unclosed <system-reminder> in one
         # message must NOT merge with a closing tag in another message and
@@ -1387,14 +1408,91 @@ class TestStripNoiseRemovesSystemChrome:
             "system-reminder",
             "command-message",
             "command-name",
+            "command-args",
             "task-notification",
             "user-prompt-submit-hook",
             "hook_output",
+            "local-command-caveat",
+            "local-command-stdout",
         ):
             text = f"> User:\n<{tag}>junk</{tag}>\n> Real."
             out = strip_noise(text)
             assert tag not in out, f"{tag} leaked into output"
             assert "Real." in out
+
+    def test_strips_full_claude_code_slash_command_envelope(self):
+        # Every slash-command invocation in Claude Code emits this 5-tag
+        # envelope. Before the fix, only command-name and command-message
+        # were stripped; the other three survived into stored drawers.
+        text = (
+            "<local-command-caveat>Caveat: do not respond.</local-command-caveat>\n"
+            "<command-name>/effort</command-name>\n"
+            "<command-message>effort</command-message>\n"
+            "<command-args>max</command-args>\n"
+            "<local-command-stdout>Set effort level to max</local-command-stdout>\n"
+            "Real follow-up content."
+        )
+        out = strip_noise(text)
+        for tag in (
+            "local-command-caveat",
+            "command-name",
+            "command-message",
+            "command-args",
+            "local-command-stdout",
+        ):
+            assert tag not in out, f"{tag} leaked"
+        assert "Real follow-up content." in out
+
+    def test_strips_empty_command_args_pair(self):
+        # Claude Code emits <command-args></command-args> with empty body
+        # when a slash command takes no arguments. The pattern still matches.
+        text = "> <command-message>clear</command-message>\n<command-args></command-args>"
+        out = strip_noise(text)
+        assert "command-args" not in out
+        assert "command-message" not in out
+
+    def test_strips_ansi_color_codes(self):
+        # SGR color codes from Bash tool output. Surrounding text preserved.
+        text = "before \x1b[1mbold\x1b[22m after"
+        out = strip_noise(text)
+        assert "\x1b" not in out
+        assert "before" in out
+        assert "bold" in out
+        assert "after" in out
+
+    def test_strips_ansi_truecolor_codes(self):
+        # 24-bit truecolor sequences from the /context renderer.
+        text = "\x1b[38;2;153;153;153m├\x1b[39m mempalace_add_drawer"
+        out = strip_noise(text)
+        assert "\x1b" not in out
+        assert "├ mempalace_add_drawer" in out
+
+    def test_strips_ansi_cursor_moves(self):
+        text = "before\x1b[2K\x1b[Hafter"
+        out = strip_noise(text)
+        assert "\x1b" not in out
+        assert "beforeafter" in out
+
+    def test_strips_ansi_osc_terminal_title(self):
+        # OSC 0 terminator: BEL.
+        text = "before\x1b]0;window title\x07after"
+        out = strip_noise(text)
+        assert "\x1b" not in out
+        assert "beforeafter" in out
+
+    def test_strips_ansi_osc_hyperlink(self):
+        # OSC 8 hyperlinks terminated by ST (ESC \).
+        text = "see \x1b]8;;https://example.com\x1b\\here\x1b]8;;\x1b\\."
+        out = strip_noise(text)
+        assert "\x1b" not in out
+        assert "see here." in out
+
+    def test_strips_ansi_inside_noise_tag_with_tag(self):
+        # ANSI inside a tag exits with the tag — the dedicated ANSI sweep
+        # only has to cover standalone ANSI in tool output, not double-strip.
+        text = "<local-command-stdout>Set mode to \x1b[1mdefault\x1b[22m</local-command-stdout>"
+        out = strip_noise(text)
+        assert out == ""
 
     def test_collapses_excessive_blank_lines(self):
         text = "line one\n\n\n\n\n\nline two"
