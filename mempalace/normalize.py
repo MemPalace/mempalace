@@ -26,6 +26,7 @@ from typing import Optional
 _SLACK_PROVENANCE_FOOTER = (
     "\n[source: slack-export | multi-party chat — speaker roles are positional, not verified]"
 )
+SEGMENT_SEPARATOR = "\n\n---\n\n"
 
 
 # ─── Noise stripping ─────────────────────────────────────────────────────
@@ -115,6 +116,23 @@ def normalize(filepath: str) -> str:
     Load a file and normalize to transcript format if it's a chat export.
     Plain text files pass through unchanged.
     """
+    return join_normalized_segments(normalize_segments(filepath))
+
+
+def join_normalized_segments(segments: list[str]) -> str:
+    if not segments:
+        return ""
+    if len(segments) == 1:
+        return segments[0]
+    return SEGMENT_SEPARATOR.join(segment.strip() for segment in segments if segment.strip())
+
+
+def normalize_segments(filepath: str) -> list[str]:
+    """
+    Load a file and normalize it to one or more transcript segments.
+    Most formats produce a single segment; ChatGPT export arrays preserve
+    one segment per conversation so callers can keep routing boundaries.
+    """
     try:
         file_size = os.path.getsize(filepath)
     except OSError as e:
@@ -128,35 +146,43 @@ def normalize(filepath: str) -> str:
         raise IOError(f"Could not read {filepath}: {e}") from e
 
     if not content.strip():
-        return content
+        return [content]
 
     # Already has > markers — pass through unchanged.
     lines = content.split("\n")
     if sum(1 for line in lines if line.strip().startswith(">")) >= 3:
-        return content
+        return [content]
 
     # Try JSON normalization. strip_noise is applied inside the Claude Code
     # JSONL parser (the only format that injects system tags/hook chrome);
     # other formats pass through verbatim.
     ext = Path(filepath).suffix.lower()
     if ext in (".json", ".jsonl") or content.strip()[:1] in ("{", "["):
-        normalized = _try_normalize_json(content)
-        if normalized:
-            return normalized
+        normalized_segments = _try_normalize_json_segments(content)
+        if normalized_segments:
+            return normalized_segments
 
-    return content
+    return [content]
 
 
 def _try_normalize_json(content: str) -> Optional[str]:
     """Try all known JSON chat schemas."""
+    normalized_segments = _try_normalize_json_segments(content)
+    if normalized_segments:
+        return join_normalized_segments(normalized_segments)
+    return None
+
+
+def _try_normalize_json_segments(content: str) -> Optional[list[str]]:
+    """Try all known JSON chat schemas, preserving segments when available."""
 
     normalized = _try_claude_code_jsonl(content)
     if normalized:
-        return normalized
+        return [normalized]
 
     normalized = _try_codex_jsonl(content)
     if normalized:
-        return normalized
+        return [normalized]
 
     normalized = _try_gemini_jsonl(content)
     if normalized:
@@ -167,10 +193,14 @@ def _try_normalize_json(content: str) -> Optional[str]:
     except json.JSONDecodeError:
         return None
 
+    chatgpt_export_segments = _try_chatgpt_export_json_segments(data)
+    if chatgpt_export_segments:
+        return chatgpt_export_segments
+
     for parser in (_try_claude_ai_json, _try_chatgpt_json, _try_slack_json):
         normalized = parser(data)
         if normalized:
-            return normalized
+            return [normalized]
 
     return None
 
@@ -443,6 +473,32 @@ def _try_chatgpt_json(data) -> Optional[str]:
     return None
 
 
+def _try_chatgpt_export_json(data) -> Optional[str]:
+    """ChatGPT export file: top-level list of conversation objects."""
+    segments = _try_chatgpt_export_json_segments(data)
+    if segments:
+        return join_normalized_segments(segments)
+    return None
+
+
+def _try_chatgpt_export_json_segments(data) -> Optional[list[str]]:
+    """ChatGPT export file: top-level list of conversation objects."""
+    if not isinstance(data, list):
+        return None
+    if not any(isinstance(item, dict) and "mapping" in item for item in data):
+        return None
+
+    transcripts = []
+    for item in data:
+        if not isinstance(item, dict) or "mapping" not in item:
+            continue
+        transcript = _try_chatgpt_json(item)
+        if transcript and transcript.strip():
+            transcripts.append(transcript.strip())
+
+    return transcripts or None
+
+
 def _try_slack_json(data) -> Optional[str]:
     """
     Slack channel export: [{"type": "message", "user": "...", "text": "..."}]
@@ -629,7 +685,7 @@ def _format_tool_result(content, tool_name: str) -> str:
     return "→ " + text
 
 
-def _messages_to_transcript(messages: list, spellcheck: bool = True) -> str:
+def _messages_to_transcript(messages: list, spellcheck: bool = False) -> str:
     """Convert [(role, text), ...] to transcript format with > markers."""
     if spellcheck:
         try:

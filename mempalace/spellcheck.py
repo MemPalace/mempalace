@@ -119,9 +119,13 @@ def _load_known_names() -> set:
 
         reg = EntityRegistry.load()
         names = set()
-        for entity in reg._data.get("entities", {}).values():
-            names.add(entity.get("canonical", "").lower())
-            for alias in entity.get("aliases", []):
+        for name, person in reg.people.items():
+            if name:
+                names.add(name.lower())
+            canonical = person.get("canonical", "")
+            if canonical:
+                names.add(canonical.lower())
+            for alias in person.get("aliases", []):
                 names.add(alias.lower())
         return names
     except Exception:
