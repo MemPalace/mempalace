@@ -1,0 +1,24 @@
+{
+  "name": "mempalace-remote",
+  "version": "0.1.1",
+  "description": "Use a MemPalace install on a remote host over SSH. Same MCP tools and auto-save hooks as the mempalace plugin, but proxied to a central palace instead of running locally.",
+  "author": {
+    "name": "messelink"
+  },
+  "license": "MIT",
+  "commands": [],
+  "mcpServers": {
+    "mempalace": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/mempalace-mcp-ssh.sh"
+    }
+  },
+  "keywords": [
+    "memory",
+    "ai",
+    "mcp",
+    "ssh",
+    "remote",
+    "palace"
+  ],
+  "repository": "https://github.com/MemPalace/mempalace"
+}

@@ -1,0 +1,5 @@
+{
+  "mempalace": {
+    "command": "${CLAUDE_PLUGIN_ROOT}/bin/mempalace-mcp-ssh.sh"
+  }
+}
