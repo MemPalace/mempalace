@@ -2824,16 +2824,31 @@ def main():
     # extend the protection to children.
     os.environ.pop("PYTHONPATH", None)
     _restore_stdout()
-    # Force UTF-8 on stdio. MCP JSON-RPC is UTF-8, but Python on Windows
-    # defaults stdin/stdout to the system codepage (e.g. cp1251), which
-    # corrupts non-ASCII payloads and surfaces as generic -32000 errors on
-    # Cyrillic/CJK content. See PEP 540.
-    for stream in (sys.stdin, sys.stdout):
-        if hasattr(stream, "reconfigure"):
-            try:
-                stream.reconfigure(encoding="utf-8", errors="replace")
-            except (AttributeError, OSError):
-                pass
+
+    # On Windows, Python defaults stdin/stdout to the system ANSI codepage
+    # (e.g. cp1251 / cp1252 / cp950). MCP clients send UTF-8 JSON, so the
+    # default decode produces a wrong-but-valid str whose non-ASCII chars
+    # later break the HuggingFace tokenizer inside ChromaDB's embedding
+    # function. The shared helper fixes every Python-level reader opened
+    # after main() starts; C-level dependency banners that fire at import
+    # time still go through fd-redirected stderr per #225.
+    #
+    # Per-stream policy (MCP-specific):
+    #   stdin  -- surrogateescape: a malformed byte from a misbehaving
+    #             client becomes a lone surrogate in the decoded str
+    #             instead of crashing readline; downstream json.loads
+    #             surfaces a clean -32700.
+    #   stdout -- strict: we control writes here; any failure is a real
+    #             bug we want loud.
+    #   stderr -- strict: same.
+    from ._stdio import reconfigure_stdio_utf8_on_windows
+
+    reconfigure_stdio_utf8_on_windows(
+        on_failure=lambda name, exc: logger.warning(
+            "Could not reconfigure %s to UTF-8: %s", name, exc
+        ),
+    )
+
     logger.info("MemPalace MCP Server starting...")
     # Pre-flight: probe HNSW capacity before any tool call so the warning
     # is visible at startup rather than on first use (#1222). Pure
