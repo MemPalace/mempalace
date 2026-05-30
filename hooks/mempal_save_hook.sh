@@ -249,7 +249,19 @@ with open(sys.argv[1]) as f:
             msg = entry.get('message', {})
             if isinstance(msg, dict) and msg.get('role') == 'user':
                 content = msg.get('content', '')
+                # Skip system/command messages
                 if isinstance(content, str) and '<command-message>' in content:
+                    continue
+                # Skip empty content lists or tool-result-only messages
+                # (role: "user" but not human input). all([]) is vacuously
+                # True, so the empty case must be guarded explicitly.
+                if isinstance(content, list) and (
+                    not content
+                    or all(
+                        isinstance(b, dict) and b.get('type') == 'tool_result'
+                        for b in content
+                    )
+                ):
                     continue
                 count += 1
         except:
