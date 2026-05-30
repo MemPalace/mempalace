@@ -85,6 +85,8 @@ from .palace_graph import (  # noqa: E402
 )
 
 from .knowledge_graph import KnowledgeGraph, DEFAULT_KG_PATH  # noqa: E402
+from .collision_scan import assert_no_collisions  # noqa: E402
+from .ids import ID_RECIPE, make_drawer_id_from_content  # noqa: E402
 
 
 def _init_logging() -> None:
@@ -1132,9 +1134,7 @@ def tool_add_drawer(
     if not col:
         return _no_palace()
 
-    drawer_id = (
-        f"drawer_{wing}_{room}_{hashlib.sha256((wing + room + content).encode()).hexdigest()[:24]}"
-    )
+    drawer_id = make_drawer_id_from_content(wing, room, content)
 
     _wal_log(
         "add_drawer",
@@ -1155,6 +1155,7 @@ def tool_add_drawer(
         "source_file": source_file or "",
         "added_by": added_by,
         "filed_at": datetime.now().isoformat(),
+        "id_recipe": ID_RECIPE,
     }
 
     # Idempotency. Three cases to detect a prior committed write:
@@ -1216,6 +1217,7 @@ def tool_add_drawer(
             chunk_metas.append(
                 {**base_meta, "chunk_index": chunk_idx, "parent_drawer_id": drawer_id}
             )
+        assert_no_collisions(list(zip(chunk_ids, chunk_metas)), col)
         col.upsert(ids=chunk_ids, documents=chunk_docs, metadatas=chunk_metas)
         # Probe the LAST chunk id, not the first — its presence confirms
         # the whole batch landed, not just the leading row.

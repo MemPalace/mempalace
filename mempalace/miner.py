@@ -41,7 +41,9 @@ from .palace import (
 # ``mempalace.miner.compute_hallways_for_wing``. The integration call
 # lives at the end of _mine_impl, alongside the existing
 # ``_compute_topic_tunnels_for_wing`` post-mine block.
+from .collision_scan import assert_no_collisions
 from .hallways import compute_hallways_for_wing
+from .ids import ID_RECIPE, make_drawer_id_from_chunk
 
 logger = logging.getLogger("mempalace_mcp")
 
@@ -1225,6 +1227,7 @@ def _build_drawer_metadata(
         "added_by": agent,
         "filed_at": datetime.now().isoformat(),
         "normalize_version": NORMALIZE_VERSION,
+        "id_recipe": ID_RECIPE,
     }
     if source_mtime is not None:
         metadata["source_mtime"] = source_mtime
@@ -1250,7 +1253,7 @@ def add_drawer(
     miner uses ``_build_drawer_metadata`` + a batched ``collection.upsert``
     to amortize the embedding model's forward-pass cost across chunks.
     """
-    drawer_id = f"drawer_{wing}_{room}_{hashlib.sha256((source_file + str(chunk_index)).encode()).hexdigest()[:24]}"
+    drawer_id = make_drawer_id_from_chunk(wing, room, source_file, chunk_index)
     try:
         source_mtime = os.path.getmtime(source_file)
     except OSError:
@@ -1383,7 +1386,7 @@ def process_file(
             batch_ids: list = []
             batch_metas: list = []
             for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
-                drawer_id = f"drawer_{wing}_{room}_{hashlib.sha256((source_file + str(chunk['chunk_index'])).encode()).hexdigest()[:24]}"
+                drawer_id = make_drawer_id_from_chunk(wing, room, source_file, chunk["chunk_index"])
                 batch_docs.append(chunk["content"])
                 batch_ids.append(drawer_id)
                 batch_metas.append(
@@ -1400,6 +1403,7 @@ def process_file(
                         content_date=file_content_date,
                     )
                 )
+            assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
             collection.upsert(
                 documents=batch_docs,
                 ids=batch_ids,
@@ -1413,8 +1417,7 @@ def process_file(
         # fully replace the prior closets, not append to them.
         if closets_col and drawers_added > 0:
             drawer_ids = [
-                f"drawer_{wing}_{room}_{hashlib.sha256((source_file + str(c['chunk_index'])).encode()).hexdigest()[:24]}"
-                for c in chunks
+                make_drawer_id_from_chunk(wing, room, source_file, c["chunk_index"]) for c in chunks
             ]
             # Pass drawer_metas so build_closet_lines can emit the Tier 6a
             # 4-segment pointer (``topic|entities|YYYY-MM-DD:Lstart-Lend|→ids``)

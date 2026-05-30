@@ -82,6 +82,8 @@ from .palace import (
 # mempalace.format_miner.<name>. Lazy imports inside functions would not
 # expose these as attributes of this module, breaking the test seams.
 from .config import MempalaceConfig, normalize_wing_name
+from .collision_scan import assert_no_collisions
+from .ids import ID_RECIPE, make_drawer_id_from_chunk
 from .miner import (
     _compute_topic_tunnels_for_wing,
     chunk_text,
@@ -640,8 +642,7 @@ def _file_chunks_locked(
             batch_ids: list = []
             batch_metas: list = []
             for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
-                key = (source_file + str(chunk["chunk_index"])).encode()
-                drawer_id = f"drawer_{wing}_{room}_{hashlib.sha256(key).hexdigest()[:24]}"
+                drawer_id = make_drawer_id_from_chunk(wing, room, source_file, chunk["chunk_index"])
                 content = chunk["content"]
                 meta: dict = {
                     "wing": wing,
@@ -654,6 +655,7 @@ def _file_chunks_locked(
                     "extract_mode": "format",
                     "normalize_version": NORMALIZE_VERSION,
                     "hall": detect_hall(content),
+                    "id_recipe": ID_RECIPE,
                 }
                 if source_mtime is not None:
                     meta["source_mtime"] = source_mtime
@@ -674,6 +676,7 @@ def _file_chunks_locked(
                 batch_docs.append(content)
                 batch_ids.append(drawer_id)
                 batch_metas.append(meta)
+            assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
             try:
                 collection.upsert(
                     documents=batch_docs,

@@ -385,6 +385,11 @@ class TestFileChunksLocked:
             def delete(self, *args, **kwargs):
                 pass
 
+            def get(self, ids=None, include=None, **kwargs):
+                # Pre-mining collision scan probes the collection; empty
+                # palace under test, so nothing matches.
+                return {"ids": [], "metadatas": []}
+
             def upsert(self, documents, ids, metadatas):
                 self.batch_sizes.append(len(documents))
 
