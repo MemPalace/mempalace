@@ -208,7 +208,7 @@ def _log(message: str):
         log_path = STATE_DIR / "hook.log"
         is_new = not log_path.exists()
         timestamp = datetime.now().strftime("%H:%M:%S")
-        with open(log_path, "a") as f:
+        with open(log_path, "a", encoding="utf-8") as f:
             f.write(f"[{timestamp}] {message}\n")
         if is_new:
             try:
