@@ -275,13 +275,10 @@ class TestSearchCLI:
         with pytest.raises(SearchError, match="No palace found"):
             search("anything", str(tmp_path / "missing"))
 
-    def test_search_no_results(self, palace_path, collection, capsys):
-        """Empty collection returns no results message."""
-        # collection is empty (no seeded data)
+    def test_search_no_results(self, palace_path, collection):
+        """search() returns None when no matches are found in the collection."""
         result = search("xyzzy_nonexistent_query", palace_path, n_results=1)
-        captured = capsys.readouterr()
-        # Either prints "No results" or returns None
-        assert result is None or "No results" in captured.out
+        assert result is None
 
     def test_search_query_error_raises(self, fake_palace_path):
         """search raises SearchError when query fails."""
