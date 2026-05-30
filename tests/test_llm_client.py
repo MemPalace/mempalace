@@ -1,17 +1,22 @@
 """Tests for mempalace.llm_client.
 
-HTTP is mocked throughout — these tests do not require a running Ollama
-or network access. Live-provider smoke tests live outside the unit-test
-suite.
+HTTP and subprocess are mocked throughout — these tests do not require a
+running Ollama, network access, or the ``claude`` CLI binary. Live-provider
+smoke tests live outside the unit-test suite (see
+``test_claude_code_real_invocation`` for the gated integration probe).
 """
 
 import json
+import os
+import subprocess
+import tempfile
 from unittest.mock import patch, MagicMock
 
 import pytest
 
 from mempalace.llm_client import (
     AnthropicProvider,
+    ClaudeCodeProvider,
     LLMError,
     OllamaProvider,
     OpenAICompatProvider,
@@ -39,6 +44,12 @@ def test_get_provider_anthropic():
     p = get_provider("anthropic", "claude-haiku", api_key="sk-xxx")
     assert isinstance(p, AnthropicProvider)
     assert p.api_key == "sk-xxx"
+
+
+def test_get_provider_claude_code():
+    p = get_provider("claude-code", "claude-haiku-4-5")
+    assert isinstance(p, ClaudeCodeProvider)
+    assert p.model == "claude-haiku-4-5"
 
 
 def test_get_provider_unknown_raises():
@@ -483,3 +494,276 @@ def test_ollama_api_key_source_is_none():
     p = OllamaProvider(model="gemma4:e4b")
     assert p.api_key is None
     assert p.api_key_source is None
+
+
+# ── ClaudeCodeProvider ──────────────────────────────────────────────────
+
+
+def _mock_completed(returncode: int, stdout: str = "", stderr: str = ""):
+    """Build a fake subprocess.CompletedProcess for patching subprocess.run."""
+    cp = MagicMock(spec=subprocess.CompletedProcess)
+    cp.returncode = returncode
+    cp.stdout = stdout
+    cp.stderr = stderr
+    return cp
+
+
+def _claude_envelope(result_text: str, cost: float = 0.0007) -> str:
+    """Build the JSON envelope `claude -p --output-format json` returns."""
+    return json.dumps(
+        {
+            "type": "result",
+            "result": result_text,
+            "total_cost_usd": cost,
+            "duration_ms": 1234,
+        }
+    )
+
+
+def test_claude_code_check_available_binary_missing():
+    with patch("mempalace.llm_client.shutil.which", return_value=None):
+        p = ClaudeCodeProvider(model="claude-haiku-4-5")
+        ok, msg = p.check_available()
+    assert not ok
+    assert "`claude` CLI not found" in msg
+
+
+def test_claude_code_check_available_not_authenticated():
+    with patch("mempalace.llm_client.shutil.which", return_value="/usr/local/bin/claude"):
+        with patch(
+            "mempalace.llm_client.subprocess.run",
+            return_value=_mock_completed(1, stdout="", stderr="not logged in"),
+        ):
+            p = ClaudeCodeProvider(model="claude-haiku-4-5")
+            ok, msg = p.check_available()
+    assert not ok
+    assert "Run `claude auth login`" in msg
+
+
+def test_claude_code_check_available_ready():
+    with patch("mempalace.llm_client.shutil.which", return_value="/usr/local/bin/claude"):
+        with patch(
+            "mempalace.llm_client.subprocess.run",
+            return_value=_mock_completed(0, stdout="logged in as user@example.com"),
+        ):
+            p = ClaudeCodeProvider(model="claude-haiku-4-5")
+            ok, msg = p.check_available()
+    assert ok
+    assert msg == "ok"
+
+
+_FAKE_CLAUDE_BIN = "/usr/local/bin/claude"
+
+
+def test_claude_code_classify_command_line():
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        return _mock_completed(0, stdout=_claude_envelope('{"ok": true}'))
+
+    with patch("mempalace.llm_client.shutil.which", return_value=_FAKE_CLAUDE_BIN):
+        with patch("mempalace.llm_client.subprocess.run", side_effect=fake_run):
+            p = ClaudeCodeProvider(model="claude-haiku-4-5", timeout=99)
+            p.classify("system text", "user text", json_mode=True)
+
+    # cmd[0] is the resolved absolute path from shutil.which, not a bare
+    # "claude" literal -- avoids a TOCTOU between check_available and
+    # classify if PATH changes between calls.
+    assert captured["cmd"][0] == _FAKE_CLAUDE_BIN
+    assert "-p" in captured["cmd"]
+    # `--bare` is intentionally NOT passed: it would force ANTHROPIC_API_KEY
+    # auth and disable OAuth / keychain, defeating the subscription path.
+    assert "--bare" not in captured["cmd"]
+    assert "--no-session-persistence" in captured["cmd"]
+    assert "--output-format" in captured["cmd"]
+    assert "json" in captured["cmd"]
+    assert "--model" in captured["cmd"]
+    assert "claude-haiku-4-5" in captured["cmd"]
+    # System prompt MUST NOT be in argv -- argv is visible to other local
+    # users via `ps` / /proc/*/cmdline and may carry sensitive context.
+    assert "--system-prompt" not in captured["cmd"]
+    assert "system text" not in captured["cmd"]
+    # System + user are framed in stdin with XML-like tags so a malicious
+    # drawer cannot spoof the boundary with literal "SYSTEM:" / "USER:"
+    # markers. json_mode appends a JSON-only directive inside the <system>
+    # block.
+    stdin_input = captured["kwargs"]["input"]
+    assert stdin_input.startswith("<system>\nsystem text")
+    assert "JSON only" in stdin_input
+    assert "</system>\n<user>\nuser text\n</user>" in stdin_input
+    assert "SYSTEM:" not in stdin_input
+    assert "USER:" not in stdin_input
+    assert captured["kwargs"]["timeout"] == 99
+    # cwd must be a temp dir so claude does not pick up a project-level CLAUDE.md
+    assert captured["kwargs"]["cwd"] == tempfile.gettempdir()
+    # Explicit UTF-8 decoding so Windows cp1252 locale does not mojibake the
+    # JSON envelope.
+    assert captured["kwargs"]["encoding"] == "utf-8"
+
+
+def test_claude_code_classify_json_mode_off_keeps_system_clean():
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        return _mock_completed(0, stdout=_claude_envelope("plain text reply"))
+
+    with patch("mempalace.llm_client.shutil.which", return_value=_FAKE_CLAUDE_BIN):
+        with patch("mempalace.llm_client.subprocess.run", side_effect=fake_run):
+            p = ClaudeCodeProvider(model="claude-haiku-4-5")
+            resp = p.classify("system text", "user", json_mode=False)
+
+    # No JSON-only directive appended when json_mode=False; raw system
+    # text appears verbatim inside the <system> block (not in argv).
+    assert "--system-prompt" not in captured["cmd"]
+    assert captured["kwargs"]["input"] == (
+        "<system>\nsystem text\n</system>\n<user>\nuser\n</user>"
+    )
+    assert resp.text == "plain text reply"
+
+
+def test_claude_code_strips_anthropic_credential_env_vars(monkeypatch):
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return _mock_completed(0, stdout=_claude_envelope("ok"))
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-key")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "tok-test")
+    monkeypatch.setenv("anthropic_api_key", "sk-lower")  # case-insensitive match
+    # ANTHROPIC_BASE_URL is configuration, not credentials -- a corporate
+    # proxy / internal gateway needs it to survive into the subprocess.
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://anthropic.internal.corp/api")
+    monkeypatch.setenv("UNRELATED_VAR", "kept")
+
+    with patch("mempalace.llm_client.shutil.which", return_value=_FAKE_CLAUDE_BIN):
+        with patch("mempalace.llm_client.subprocess.run", side_effect=fake_run):
+            p = ClaudeCodeProvider(model="claude-haiku-4-5")
+            p.classify("s", "u")
+
+    env = captured["env"]
+    assert env is not None
+    # API_KEY / AUTH_TOKEN (credential-bearing) get stripped so claude -p
+    # can't fall back to API-key auth and bill the API account instead of
+    # the subscription. Case-insensitive match guards against a lowercased
+    # export that would otherwise sneak through.
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "ANTHROPIC_AUTH_TOKEN" not in env
+    assert "anthropic_api_key" not in env
+    # Configuration vars (BASE_URL etc.) MUST pass through so corporate-proxy
+    # users keep their custom endpoint routing.
+    assert env.get("ANTHROPIC_BASE_URL") == "https://anthropic.internal.corp/api"
+    # Unrelated env vars must still pass through.
+    assert env.get("UNRELATED_VAR") == "kept"
+
+
+def test_claude_code_is_external_service_true():
+    # claude-code routes user content to Anthropic's hosted models via the
+    # local CLI binary, so the privacy gate (#1224) must treat it as
+    # external regardless of the URL-based base-class default.
+    p = ClaudeCodeProvider(model="claude-haiku-4-5")
+    assert p.is_external_service is True
+
+
+def test_claude_code_classify_parses_envelope():
+    with patch("mempalace.llm_client.shutil.which", return_value=_FAKE_CLAUDE_BIN):
+        with patch(
+            "mempalace.llm_client.subprocess.run",
+            return_value=_mock_completed(0, stdout=_claude_envelope("classified")),
+        ):
+            p = ClaudeCodeProvider(model="claude-haiku-4-5")
+            resp = p.classify("s", "u")
+
+    assert resp.text == "classified"
+    assert resp.provider == "claude-code"
+    assert resp.model == "claude-haiku-4-5"
+    assert resp.raw["total_cost_usd"] == pytest.approx(0.0007)
+
+
+def test_claude_code_classify_timeout_raises_llm_error():
+    with patch("mempalace.llm_client.shutil.which", return_value=_FAKE_CLAUDE_BIN):
+        with patch(
+            "mempalace.llm_client.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["claude"], timeout=1),
+        ):
+            p = ClaudeCodeProvider(model="claude-haiku-4-5", timeout=1)
+            with pytest.raises(LLMError, match="timed out after 1s"):
+                p.classify("s", "u")
+
+
+def test_claude_code_classify_spawn_failure_raises_llm_error():
+    with patch("mempalace.llm_client.shutil.which", return_value=_FAKE_CLAUDE_BIN):
+        with patch(
+            "mempalace.llm_client.subprocess.run",
+            side_effect=FileNotFoundError("no such file: claude"),
+        ):
+            p = ClaudeCodeProvider(model="claude-haiku-4-5")
+            with pytest.raises(LLMError, match="failed to spawn"):
+                p.classify("s", "u")
+
+
+def test_claude_code_classify_binary_missing_raises_llm_error():
+    # If the binary disappears between provider construction and classify,
+    # surface a clear LLMError rather than letting subprocess raise an
+    # opaque FileNotFoundError later.
+    with patch("mempalace.llm_client.shutil.which", return_value=None):
+        p = ClaudeCodeProvider(model="claude-haiku-4-5")
+        with pytest.raises(LLMError, match="not found in PATH"):
+            p.classify("s", "u")
+
+
+def test_claude_code_classify_nonzero_raises_llm_error():
+    with patch("mempalace.llm_client.shutil.which", return_value=_FAKE_CLAUDE_BIN):
+        with patch(
+            "mempalace.llm_client.subprocess.run",
+            return_value=_mock_completed(1, stdout="", stderr="boom: bad model"),
+        ):
+            p = ClaudeCodeProvider(model="claude-haiku-4-5")
+            with pytest.raises(LLMError, match=r"`claude -p` exited 1: boom"):
+                p.classify("s", "u")
+
+
+def test_claude_code_classify_malformed_json_raises_llm_error():
+    with patch("mempalace.llm_client.shutil.which", return_value=_FAKE_CLAUDE_BIN):
+        with patch(
+            "mempalace.llm_client.subprocess.run",
+            return_value=_mock_completed(0, stdout="not valid json"),
+        ):
+            p = ClaudeCodeProvider(model="claude-haiku-4-5")
+            with pytest.raises(LLMError, match="non-JSON envelope"):
+                p.classify("s", "u")
+
+
+def test_claude_code_classify_empty_result_raises_llm_error():
+    with patch("mempalace.llm_client.shutil.which", return_value=_FAKE_CLAUDE_BIN):
+        with patch(
+            "mempalace.llm_client.subprocess.run",
+            return_value=_mock_completed(0, stdout=_claude_envelope("")),
+        ):
+            p = ClaudeCodeProvider(model="claude-haiku-4-5")
+            with pytest.raises(LLMError, match="empty result"):
+                p.classify("s", "u")
+
+
+@pytest.mark.skipif(
+    os.environ.get("MEMPAL_TEST_CLAUDE_CLI") != "1",
+    reason="set MEMPAL_TEST_CLAUDE_CLI=1 to run live `claude -p` integration test",
+)
+def test_claude_code_real_invocation():
+    """End-to-end probe: spawns the real `claude` binary if available + authenticated."""
+    p = ClaudeCodeProvider(model="claude-haiku-4-5")
+    ok, msg = p.check_available()
+    if not ok:
+        pytest.skip(f"`claude` not ready: {msg}")
+    resp = p.classify(
+        "Reply with a single short JSON object.",
+        'Reply with {"hello": "world"} and nothing else.',
+        json_mode=True,
+    )
+    assert resp.provider == "claude-code"
+    assert resp.text  # non-empty
+    assert resp.raw.get("type") == "result"
