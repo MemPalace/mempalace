@@ -228,10 +228,22 @@ def _ensure_mempalace_files_gitignored(project_dir) -> bool:
 
 
 def cmd_init(args):
+
+    # Ensure target directory exists (create if missing)
+    path = str(Path(args.dir).expanduser())
+    if not os.path.exists(path):
+        os.makedirs(path, exist_ok=True)
+        print(f"  Created directory: {path}")
+
+    # Normalize args.dir to absolute path
+    args.dir = str(Path(path).resolve())
+
     import json
+    from .entity_detector import scan_for_detection, detect_entities, confirm_entities
     from pathlib import Path
     from .entity_detector import confirm_entities
     from .project_scanner import discover_entities
+
     from .room_detector_local import detect_rooms_local
 
     # Honor --palace (issue #1313): without this, init silently ignored the
