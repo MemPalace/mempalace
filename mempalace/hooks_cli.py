@@ -931,9 +931,11 @@ def hook_stop(data: dict, harness: str):
             config = MempalaceConfig()
             silent = config.hook_silent_save
             toast = config.hook_desktop_toast
+            auto_mine = config.hook_auto_mine
         except Exception:
             silent = True
             toast = False
+            auto_mine = True
 
         project_wing = _wing_from_transcript_path(transcript_path)
 
@@ -944,8 +946,10 @@ def hook_stop(data: dict, harness: str):
                 result = _save_diary_direct(
                     transcript_path, session_id, wing=project_wing, toast=toast
                 )
-                _ingest_transcript(transcript_path)
-            _maybe_auto_ingest()
+                if auto_mine:
+                    _ingest_transcript(transcript_path)
+            if auto_mine:
+                _maybe_auto_ingest()
             # Only advance save marker after successful save
             count = result.get("count", 0)
             if count > 0:
@@ -973,9 +977,10 @@ def hook_stop(data: dict, harness: str):
                 last_save_file.write_text(str(exchange_count), encoding="utf-8")
             except OSError:
                 pass
-            if transcript_path:
+            if transcript_path and auto_mine:
                 _ingest_transcript(transcript_path)
-            _maybe_auto_ingest()
+            if auto_mine:
+                _maybe_auto_ingest()
             reason = STOP_BLOCK_REASON + f" Write diary entry to wing={project_wing}."
             _output({"decision": "block", "reason": reason})
     else:
@@ -1018,6 +1023,18 @@ def hook_precompact(data: dict, harness: str):
         return
 
     _log(f"PRE-COMPACT triggered for session {session_id}")
+
+    # Respect hooks.auto_mine — users who disabled background mining don't
+    # want the pre-compaction mine either. Compaction still proceeds.
+    try:
+        auto_mine = MempalaceConfig().hook_auto_mine
+    except Exception:
+        auto_mine = True
+
+    if not auto_mine:
+        _log("auto_mine disabled; skipping pre-compaction mine")
+        _output({})
+        return
 
     # Capture tool output via our normalize path before compaction loses it
     if transcript_path:

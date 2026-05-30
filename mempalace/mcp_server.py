@@ -1796,7 +1796,9 @@ def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
         return {"error": "Failed to read diary entries"}
 
 
-def tool_hook_settings(silent_save: bool = None, desktop_toast: bool = None):
+def tool_hook_settings(
+    silent_save: bool = None, desktop_toast: bool = None, auto_mine: bool = None
+):
     """
     Get or set hook behavior settings.
 
@@ -1804,6 +1806,10 @@ def tool_hook_settings(silent_save: bool = None, desktop_toast: bool = None):
       False = legacy blocking MCP calls. Default: True.
     - desktop_toast: True = show notify-send desktop toast on save,
       False = terminal-only notification. Default: False.
+    - auto_mine: True = run background mine after diary save in stop/precompact
+      hooks (full behavior). False = write diary only, skip the recursive
+      ``~/.claude/projects/<cwd>/`` mine that can peg CPU for hours on large
+      archives. Default: True.
 
     Call with no arguments to see current settings.
     """
@@ -1821,6 +1827,9 @@ def tool_hook_settings(silent_save: bool = None, desktop_toast: bool = None):
     if desktop_toast is not None:
         config.set_hook_setting("desktop_toast", desktop_toast)
         changed.append(f"desktop_toast → {desktop_toast}")
+    if auto_mine is not None:
+        config.set_hook_setting("auto_mine", auto_mine)
+        changed.append(f"auto_mine → {auto_mine}")
 
     # Re-read to return current state
     try:
@@ -1833,6 +1842,7 @@ def tool_hook_settings(silent_save: bool = None, desktop_toast: bool = None):
         "settings": {
             "silent_save": config.hook_silent_save,
             "desktop_toast": config.hook_desktop_toast,
+            "auto_mine": config.hook_auto_mine,
         },
     }
     if changed:
@@ -2385,7 +2395,9 @@ TOOLS = {
         "description": (
             "Get or set hook behavior. silent_save: True = save directly "
             "(no MCP clutter), False = legacy blocking. desktop_toast: "
-            "True = show desktop notification. Call with no args to view."
+            "True = show desktop notification. auto_mine: True = run the "
+            "background mine after diary save (default), False = diary "
+            "only. Call with no args to view."
         ),
         "input_schema": {
             "type": "object",
@@ -2397,6 +2409,10 @@ TOOLS = {
                 "desktop_toast": {
                     "type": "boolean",
                     "description": "True = show desktop toast via notify-send",
+                },
+                "auto_mine": {
+                    "type": "boolean",
+                    "description": "True = run background mine in hooks, False = diary only",
                 },
             },
         },
