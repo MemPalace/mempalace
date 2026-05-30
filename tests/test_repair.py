@@ -1,13 +1,143 @@
 """Tests for mempalace.repair — scan, prune, and rebuild HNSW index."""
 
+import json
 import os
+import pickle
 import sqlite3
+import struct
 from contextlib import closing
 from unittest.mock import MagicMock, call, patch
 
 import pytest
 
 from mempalace import repair
+
+
+# ── helpers: synthesize a legacy-format HNSW segment on disk ──────────
+
+_DIM = 8
+_SIZE_PER_ELEMENT = 132 + _DIM * 4 + 8
+_LABEL_OFFSET = 132 + _DIM * 4
+_OFFSET_DATA = 132
+
+
+def _pack_header(max_elements: int, cur_count: int) -> bytes:
+    hdr = bytearray(100)
+    struct.pack_into("<I", hdr, 0, 1)  # format_version
+    struct.pack_into("<Q", hdr, 4, 0)  # offset_level0
+    struct.pack_into("<Q", hdr, 12, max_elements)
+    struct.pack_into("<Q", hdr, 20, cur_count)
+    struct.pack_into("<Q", hdr, 28, _SIZE_PER_ELEMENT)
+    struct.pack_into("<Q", hdr, 36, _LABEL_OFFSET)
+    struct.pack_into("<Q", hdr, 44, _OFFSET_DATA)
+    struct.pack_into("<i", hdr, 52, 0)
+    struct.pack_into("<I", hdr, 56, 0)
+    struct.pack_into("<Q", hdr, 60, 16)  # maxM
+    struct.pack_into("<Q", hdr, 68, 32)  # maxM0
+    struct.pack_into("<Q", hdr, 76, 16)  # M
+    struct.pack_into("<d", hdr, 84, 1 / 0.693)
+    struct.pack_into("<Q", hdr, 92, 100)  # ef_construction
+    return bytes(hdr)
+
+
+class _PickleMeta:
+    """Minimal shim for ChromaDB's PersistentLocalHnswSegment pickle."""
+
+
+def _seed_hnsw_segment(
+    palace_path: str,
+    *,
+    segment: str = "00000000-0000-0000-0000-000000000042",
+    labels=(101, 202, 303, 404),
+    extra_pickle_ids=("uid-stale",),
+    space: str = "cosine",
+    bloated_link_lists: int = 1024,
+):
+    """Write a synthetic HNSW segment + sqlite into ``palace_path``.
+
+    Returns ``(segment_uuid, collection_uuid, healthy_uids, vectors)``.
+    """
+    import numpy as np
+
+    os.makedirs(palace_path, exist_ok=True)
+    seg_dir = os.path.join(palace_path, segment)
+    os.makedirs(seg_dir)
+
+    coll_uuid = "aaaa1111-2222-3333-4444-555566667777"
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE segments(id TEXT PRIMARY KEY, type TEXT, scope TEXT, collection TEXT);
+        CREATE TABLE collection_metadata(collection_id TEXT, key TEXT, str_value TEXT);
+        CREATE TABLE embeddings_queue(seq_id INTEGER PRIMARY KEY, topic TEXT, id TEXT);
+        """
+    )
+    conn.execute(
+        "INSERT INTO segments VALUES (?, 'urn:chroma:segment/vector/hnsw-local-persisted', 'VECTOR', ?)",
+        (segment, coll_uuid),
+    )
+    if space is not None:
+        conn.execute(
+            "INSERT INTO collection_metadata VALUES (?, 'hnsw:space', ?)", (coll_uuid, space)
+        )
+    topic = f"persistent://default/default/{coll_uuid}"
+    for i, uid in enumerate([f"uid{i}" for i in range(3)], start=1):
+        conn.execute("INSERT INTO embeddings_queue VALUES (?, ?, ?)", (i, topic, uid))
+    conn.commit()
+    conn.close()
+
+    cur_count = len(labels)
+    max_elements = max(cur_count * 2, 10)
+    header = _pack_header(max_elements=max_elements, cur_count=cur_count)
+    with open(os.path.join(seg_dir, "header.bin"), "wb") as f:
+        f.write(header)
+
+    np.random.seed(1)
+    vectors = np.random.rand(cur_count, _DIM).astype(np.float32)
+    data = bytearray(max_elements * _SIZE_PER_ELEMENT)
+    data[:100] = header
+    for i, lbl in enumerate(labels):
+        slot = i * _SIZE_PER_ELEMENT
+        data[slot + _OFFSET_DATA : slot + _OFFSET_DATA + _DIM * 4] = vectors[i].tobytes()
+        struct.pack_into("<Q", data, slot + _LABEL_OFFSET, int(lbl))
+    with open(os.path.join(seg_dir, "data_level0.bin"), "wb") as f:
+        f.write(bytes(data))
+
+    # Build pickle: one mapped UUID per real label + any stale ones.
+    meta = _PickleMeta()
+    healthy_uids = [f"uid-{int(lbl)}" for lbl in labels]
+    meta.label_to_id = dict(zip([int(lbl) for lbl in labels], healthy_uids))
+    for idx, extra in enumerate(extra_pickle_ids, start=1000):
+        meta.label_to_id[idx] = extra
+    meta.id_to_label = {uid: lbl for lbl, uid in meta.label_to_id.items()}
+    meta.id_to_seq_id = {uid: i for i, uid in enumerate(meta.label_to_id.values(), start=1)}
+    meta.total_elements_added = len(meta.label_to_id)
+    meta.dimensionality = _DIM
+    with open(os.path.join(seg_dir, "index_metadata.pickle"), "wb") as f:
+        pickle.dump(meta, f)
+
+    # Simulate the bloat we're trying to clean.
+    with open(os.path.join(seg_dir, "link_lists.bin"), "wb") as f:
+        f.write(b"\x00" * bloated_link_lists)
+
+    return segment, coll_uuid, healthy_uids, vectors
+
+
+@pytest.fixture
+def synthetic_segment(tmp_path):
+    """Build a throwaway palace with one synthetic legacy-format HNSW segment."""
+    pytest.importorskip("numpy")
+    pytest.importorskip("hnswlib")
+    palace = tmp_path / "palace"
+    segment, coll, uids, vectors = _seed_hnsw_segment(str(palace))
+    return {
+        "palace": str(palace),
+        "segment": segment,
+        "collection": coll,
+        "uids": uids,
+        "vectors": vectors,
+    }
 
 
 # ── _get_palace_path ──────────────────────────────────────────────────
@@ -1944,3 +2074,364 @@ def test_rebuild_index_calls_vacuum(mock_backend_cls, mock_shutil, tmp_path):
         args, kwargs = mock_vacuum.call_args
         assert args[0] == str(tmp_path)
         assert "progress" in kwargs
+
+
+# ── rebuild_hnsw_segment (issue #1046) ────────────────────────────────
+
+
+def test_rebuild_hnsw_missing_segment_dir(tmp_path, capsys):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    (palace / "chroma.sqlite3").write_text("db")
+    result = repair.rebuild_hnsw_segment(str(palace), segment="missing-uuid", assume_yes=True)
+    assert result["aborted"] is True
+    assert result["reason"] == "segment-missing"
+    assert "Segment directory not found" in capsys.readouterr().out
+
+
+def test_rebuild_hnsw_missing_palace(tmp_path, capsys):
+    result = repair.rebuild_hnsw_segment(
+        str(tmp_path / "does-not-exist"), segment="abc", assume_yes=True
+    )
+    assert result["aborted"] is True
+    assert result["reason"] == "palace-missing"
+
+
+def test_rebuild_hnsw_missing_db(tmp_path, capsys):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    result = repair.rebuild_hnsw_segment(str(palace), segment="abc", assume_yes=True)
+    assert result["aborted"] is True
+    assert result["reason"] == "db-missing"
+
+
+def test_rebuild_hnsw_dry_run_no_mutation(synthetic_segment):
+    palace = synthetic_segment["palace"]
+    segment = synthetic_segment["segment"]
+    seg_dir = os.path.join(palace, segment)
+
+    before = {
+        name: os.stat(os.path.join(seg_dir, name)).st_mtime_ns for name in os.listdir(seg_dir)
+    }
+    palace_before = sorted(os.listdir(palace))
+
+    result = repair.rebuild_hnsw_segment(palace, segment=segment, dry_run=True, assume_yes=True)
+    assert result["aborted"] is False
+    assert result["dry_run"] is True
+    assert result["healthy_labels"] == 4
+    assert result["space"] == "cosine"
+
+    after = {name: os.stat(os.path.join(seg_dir, name)).st_mtime_ns for name in os.listdir(seg_dir)}
+    assert before == after
+    assert sorted(os.listdir(palace)) == palace_before
+
+
+def test_rebuild_hnsw_smoke(synthetic_segment):
+    import hnswlib
+
+    palace = synthetic_segment["palace"]
+    segment = synthetic_segment["segment"]
+    vectors = synthetic_segment["vectors"]
+
+    result = repair.rebuild_hnsw_segment(palace, segment=segment, assume_yes=True, max_elements=500)
+    assert result["aborted"] is False
+    assert result["healthy_labels"] == 4
+    assert result["max_elements"] == 500
+    assert result["backup"] and os.path.isdir(result["backup"])
+
+    seg_dir = os.path.join(palace, segment)
+    idx = hnswlib.Index(space="cosine", dim=_DIM)
+    idx.load_index(seg_dir, is_persistent_index=True, max_elements=500)
+    labels_got, _ = idx.knn_query(vectors, k=1)
+    assert list(labels_got.flatten()) == [101, 202, 303, 404]
+
+    # link_lists.bin is rebuilt from scratch; should be much smaller than the 1 KB we seeded
+    link_lists_size = os.path.getsize(os.path.join(seg_dir, "link_lists.bin"))
+    assert link_lists_size < 1024
+
+
+def test_rebuild_hnsw_purge_queue(synthetic_segment):
+    palace = synthetic_segment["palace"]
+    segment = synthetic_segment["segment"]
+    db_path = os.path.join(palace, "chroma.sqlite3")
+
+    before = sqlite3.connect(db_path).execute("SELECT COUNT(*) FROM embeddings_queue").fetchone()[0]
+    assert before > 0
+
+    result = repair.rebuild_hnsw_segment(palace, segment=segment, assume_yes=True, purge_queue=True)
+    assert result["queue_rows_purged"] == before
+
+    after = sqlite3.connect(db_path).execute("SELECT COUNT(*) FROM embeddings_queue").fetchone()[0]
+    assert after == 0
+
+
+def test_rebuild_hnsw_quarantine_orphans_writes_sidecar(synthetic_segment):
+    palace = synthetic_segment["palace"]
+    segment = synthetic_segment["segment"]
+    sidecar = os.path.join(palace, "quarantined_orphans.json")
+    assert not os.path.exists(sidecar)
+
+    repair.rebuild_hnsw_segment(palace, segment=segment, assume_yes=True, quarantine_orphans=True)
+
+    assert os.path.isfile(sidecar)
+    with open(sidecar) as f:
+        data = json.load(f)
+    assert isinstance(data, list) and len(data) == 1
+    assert "uid-stale" in data[0]["stale_pickle_ids"]
+
+
+def test_rebuild_hnsw_max_elements_override(synthetic_segment):
+    palace = synthetic_segment["palace"]
+    segment = synthetic_segment["segment"]
+    seg_dir = os.path.join(palace, segment)
+
+    result = repair.rebuild_hnsw_segment(palace, segment=segment, assume_yes=True, max_elements=500)
+    assert result["max_elements"] == 500
+
+    with open(os.path.join(seg_dir, "header.bin"), "rb") as f:
+        hdr = repair._parse_hnsw_header(f.read(100))
+    assert hdr.max_elements == 500
+
+
+def test_rebuild_hnsw_max_elements_override_below_count(synthetic_segment):
+    palace = synthetic_segment["palace"]
+    segment = synthetic_segment["segment"]
+    with pytest.raises(ValueError, match="smaller than healthy"):
+        repair.rebuild_hnsw_segment(palace, segment=segment, assume_yes=True, max_elements=2)
+
+
+def test_rebuild_hnsw_rollback_on_build_failure(synthetic_segment, monkeypatch):
+    palace = synthetic_segment["palace"]
+    segment = synthetic_segment["segment"]
+    seg_dir = os.path.join(palace, segment)
+    pre_contents = sorted(os.listdir(seg_dir))
+    pre_sizes = {name: os.path.getsize(os.path.join(seg_dir, name)) for name in pre_contents}
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("synthetic build failure")
+
+    monkeypatch.setattr(repair, "_build_persistent_index", _boom)
+
+    with pytest.raises(RuntimeError, match="synthetic build failure"):
+        repair.rebuild_hnsw_segment(palace, segment=segment, assume_yes=True)
+
+    assert os.path.isdir(seg_dir), "live segment dir must survive a failed build"
+    assert sorted(os.listdir(seg_dir)) == pre_contents
+    for name in pre_contents:
+        assert os.path.getsize(os.path.join(seg_dir, name)) == pre_sizes[name], (
+            f"{name} was modified despite rollback"
+        )
+    # No stray .old-* dirs left around
+    assert not any(n.startswith(segment + ".old-") for n in os.listdir(palace))
+
+
+def test_rebuild_hnsw_no_backup_flag(synthetic_segment):
+    palace = synthetic_segment["palace"]
+    segment = synthetic_segment["segment"]
+
+    result = repair.rebuild_hnsw_segment(palace, segment=segment, assume_yes=True, backup=False)
+    assert result["backup"] is None
+    assert not any(n.startswith(segment + ".hnsw-backup-") for n in os.listdir(palace))
+
+
+def test_detect_space_fallback_when_missing(tmp_path):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    db_path = palace / "chroma.sqlite3"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE segments(id TEXT PRIMARY KEY, type TEXT, scope TEXT, collection TEXT);
+        CREATE TABLE collection_metadata(collection_id TEXT, key TEXT, str_value TEXT);
+        INSERT INTO segments VALUES ('seg-x', 'VECTOR', 'VECTOR', 'coll-x');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    assert repair._detect_space(str(palace), "seg-x") == "l2"
+
+
+def test_detect_space_returns_configured_value(tmp_path):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    db_path = palace / "chroma.sqlite3"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE segments(id TEXT PRIMARY KEY, type TEXT, scope TEXT, collection TEXT);
+        CREATE TABLE collection_metadata(collection_id TEXT, key TEXT, str_value TEXT);
+        INSERT INTO segments VALUES ('seg-x', 'VECTOR', 'VECTOR', 'coll-x');
+        INSERT INTO collection_metadata VALUES ('coll-x', 'hnsw:space', 'ip');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    assert repair._detect_space(str(palace), "seg-x") == "ip"
+
+
+def test_parse_hnsw_header_round_trip():
+    header = _pack_header(max_elements=1000, cur_count=42)
+    hdr = repair._parse_hnsw_header(header)
+    assert hdr.max_elements == 1000
+    assert hdr.cur_count == 42
+    assert hdr.dim == _DIM
+    assert hdr.size_per_element == _SIZE_PER_ELEMENT
+
+
+def test_parse_hnsw_header_too_short():
+    with pytest.raises(ValueError, match="too short"):
+        repair._parse_hnsw_header(b"\x00" * 20)
+
+
+def test_extract_vectors_accepts_cur_count_sized_file():
+    np = pytest.importorskip("numpy")
+    cur_count, max_elements = 5, 100
+    header = _pack_header(max_elements=max_elements, cur_count=cur_count)
+    hdr = repair._parse_hnsw_header(header)
+
+    data = bytearray(cur_count * _SIZE_PER_ELEMENT)
+    data[:100] = header
+    vectors = np.arange(cur_count * _DIM, dtype=np.float32).reshape(cur_count, _DIM)
+    for i in range(cur_count):
+        slot = i * _SIZE_PER_ELEMENT
+        data[slot + _OFFSET_DATA : slot + _OFFSET_DATA + _DIM * 4] = vectors[i].tobytes()
+        struct.pack_into("<Q", data, slot + _LABEL_OFFSET, i + 1)
+
+    labels, out_vectors = repair._extract_vectors(bytes(data), hdr)
+    assert len(labels) == cur_count
+    assert out_vectors.shape == (cur_count, _DIM)
+    assert list(int(x) for x in labels) == [1, 2, 3, 4, 5]
+
+
+def test_sanitize_vectors_drops_zeros_and_dedups():
+    np = pytest.importorskip("numpy")
+    labels = np.array([5, 5, 0, 7, 3], dtype=np.uint64)
+    vectors = np.arange(5 * 4, dtype=np.float32).reshape(5, 4)
+    out_labels, out_vectors = repair._sanitize_vectors(labels, vectors)
+    # Zero dropped; duplicate 5 deduplicated keeping the later row.
+    assert 0 not in set(int(x) for x in out_labels)
+    assert sorted(int(x) for x in out_labels) == [3, 5, 7]
+    # The second occurrence of label 5 (index 1) has row [4,5,6,7]; that's what survives.
+    row_for_5 = out_vectors[list(out_labels).index(5)]
+    assert list(row_for_5) == [4.0, 5.0, 6.0, 7.0]
+
+
+def test_compute_max_elements_default():
+    assert repair._compute_max_elements(100, None) == 200_000
+    assert repair._compute_max_elements(500_000, None) == 650_000
+
+
+def test_compute_max_elements_override_rejects_below_count():
+    with pytest.raises(ValueError):
+        repair._compute_max_elements(100, 50)
+
+
+def test_atomic_swap_rollback(tmp_path):
+    live = tmp_path / "seg"
+    live.mkdir()
+    (live / "marker").write_text("live-v1")
+
+    tmpdir = tmp_path / "tmp-new"
+    tmpdir.mkdir()
+    (tmpdir / "marker").write_text("new-v1")
+
+    # Sabotage os.replace so the swap fails after the live dir was renamed aside.
+    original_replace = os.replace
+    call_count = {"n": 0}
+
+    def failing_replace(src, dst):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise OSError("synthetic replace failure")
+        return original_replace(src, dst)
+
+    with patch("mempalace.repair.os.replace", side_effect=failing_replace):
+        with pytest.raises(OSError):
+            repair._atomic_swap_segment(str(tmpdir), str(live))
+
+    assert live.exists(), "rollback must restore live dir"
+    assert (live / "marker").read_text() == "live-v1"
+
+
+def test_purge_segment_queue_deletes_only_matching(tmp_path):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    db_path = palace / "chroma.sqlite3"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE segments(id TEXT PRIMARY KEY, type TEXT, scope TEXT, collection TEXT);
+        CREATE TABLE embeddings_queue(seq_id INTEGER PRIMARY KEY, topic TEXT, id TEXT);
+        INSERT INTO segments VALUES ('seg-x', 'VECTOR', 'VECTOR', 'coll-x');
+        INSERT INTO embeddings_queue VALUES (1, 'persistent://default/default/coll-x', 'a');
+        INSERT INTO embeddings_queue VALUES (2, 'persistent://default/default/coll-x', 'b');
+        INSERT INTO embeddings_queue VALUES (3, 'persistent://default/default/coll-other', 'c');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    deleted = repair._purge_segment_queue(str(palace), "seg-x")
+    assert deleted == 2
+
+    remaining = sqlite3.connect(str(db_path)).execute("SELECT id FROM embeddings_queue").fetchall()
+    assert [r[0] for r in remaining] == ["c"]
+
+
+def test_quarantine_orphans_appends(tmp_path):
+    palace = str(tmp_path / "palace")
+    os.makedirs(palace)
+    sidecar = repair._quarantine_orphans(palace, ["uid-1"], [999])
+    sidecar = repair._quarantine_orphans(palace, ["uid-2"], [1001])
+    with open(sidecar) as f:
+        data = json.load(f)
+    assert len(data) == 2
+    assert data[0]["stale_pickle_ids"] == ["uid-1"]
+    assert data[1]["orphan_hnsw_labels"] == [1001]
+
+
+# ── status() integration: capacity-divergence fix-it hint (#1046 + #1222) ──
+
+
+def test_status_suggests_hnsw_segment_mode_when_diverged(tmp_path, monkeypatch, capsys):
+    """When hnsw_capacity_status reports divergence, status() should print
+    the actionable `--mode hnsw --segment <uuid>` recovery command alongside
+    the legacy full-rebuild option, with the segment UUID inline.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    (palace / "chroma.sqlite3").write_text("db")
+    seg_uuid = "deadbeef-1111-2222-3333-444455556666"
+
+    def _fake_status(_palace, collection):
+        if collection == "mempalace_drawers":
+            return {
+                "segment_id": seg_uuid,
+                "sqlite_count": 200_000,
+                "hnsw_count": 16_384,
+                "divergence": 183_616,
+                "diverged": True,
+                "status": "diverged",
+                "message": "HNSW frozen at stale max_elements",
+            }
+        return {
+            "segment_id": None,
+            "sqlite_count": 0,
+            "hnsw_count": None,
+            "divergence": None,
+            "diverged": False,
+            "status": "ok",
+            "message": "",
+        }
+
+    monkeypatch.setattr(repair, "hnsw_capacity_status", _fake_status)
+    monkeypatch.setattr(repair, "sqlite_drawer_count", lambda *a, **k: 200_000)
+    result = repair.status(palace_path=str(palace))
+    out = capsys.readouterr().out
+
+    assert result["drawers"]["diverged"] is True
+    assert "--mode hnsw --segment" in out
+    assert seg_uuid in out
+    assert "mempalace repair" in out  # legacy full-rebuild path also surfaced

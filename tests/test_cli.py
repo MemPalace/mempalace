@@ -1041,6 +1041,123 @@ def test_cmd_repair_aborts_without_confirmation(mock_config_cls, tmp_path, capsy
     mock_backend.create_collection.assert_not_called()
 
 
+# ── cmd_repair --mode hnsw (issue #1046) ───────────────────────────────
+
+
+def _hnsw_args(tmp_path, **overrides):
+    defaults = dict(
+        palace=str(tmp_path),
+        mode="hnsw",
+        segment=None,
+        max_elements=None,
+        backup=True,
+        purge_queue=False,
+        quarantine_orphans=False,
+        dry_run=False,
+        yes=True,
+    )
+    defaults.update(overrides)
+    return argparse.Namespace(**defaults)
+
+
+def test_cmd_repair_hnsw_requires_segment(tmp_path, capsys):
+    args = _hnsw_args(tmp_path, segment=None)
+    with patch("mempalace.repair.rebuild_hnsw_segment") as mock_rebuild:
+        cmd_repair(args)
+    mock_rebuild.assert_not_called()
+    assert "--mode hnsw requires --segment" in capsys.readouterr().out
+
+
+def test_cmd_repair_hnsw_dispatches_with_defaults(tmp_path):
+    args = _hnsw_args(tmp_path, segment="seg-abc")
+    with patch("mempalace.repair.rebuild_hnsw_segment") as mock_rebuild:
+        cmd_repair(args)
+    mock_rebuild.assert_called_once()
+    call = mock_rebuild.call_args
+    assert call.kwargs["segment"] == "seg-abc"
+    assert call.kwargs["backup"] is True
+    assert call.kwargs["dry_run"] is False
+    assert call.kwargs["purge_queue"] is False
+    assert call.kwargs["quarantine_orphans"] is False
+    assert call.kwargs["max_elements"] is None
+    assert call.kwargs["assume_yes"] is True
+
+
+def test_cmd_repair_hnsw_forwards_all_flags(tmp_path):
+    args = _hnsw_args(
+        tmp_path,
+        segment="seg-xyz",
+        max_elements=1234,
+        backup=False,
+        purge_queue=True,
+        quarantine_orphans=True,
+        dry_run=True,
+        yes=False,
+    )
+    with patch("mempalace.repair.rebuild_hnsw_segment") as mock_rebuild:
+        cmd_repair(args)
+    mock_rebuild.assert_called_once()
+    call = mock_rebuild.call_args
+    assert call.kwargs["segment"] == "seg-xyz"
+    assert call.kwargs["max_elements"] == 1234
+    assert call.kwargs["backup"] is False
+    assert call.kwargs["purge_queue"] is True
+    assert call.kwargs["quarantine_orphans"] is True
+    assert call.kwargs["dry_run"] is True
+    assert call.kwargs["assume_yes"] is False
+
+
+def test_cmd_repair_legacy_mode_does_not_invoke_hnsw(tmp_path, capsys):
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    (palace_dir / "chroma.sqlite3").write_text("db")
+    args = argparse.Namespace(palace=str(palace_dir), mode="legacy", yes=True)
+    mock_col = MagicMock()
+    mock_col.count.return_value = 0
+    mock_backend = _mock_backend_for(col=mock_col)
+    # The sqlite integrity preflight added in the #1362/#1364 ordering fix
+    # aborts with sys.exit(1) on the bogus "db" content seeded above before
+    # any rebuild path runs. That still proves the legacy path didn't fan
+    # out to the hnsw rebuild helper, which is what this test guards.
+    with (
+        patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend),
+        patch("mempalace.repair.rebuild_hnsw_segment") as mock_hnsw,
+        pytest.raises(SystemExit),
+    ):
+        cmd_repair(args)
+    mock_hnsw.assert_not_called()
+
+
+def test_main_repair_hnsw_parses_flags():
+    argv = [
+        "mempalace",
+        "repair",
+        "--mode",
+        "hnsw",
+        "--segment",
+        "seg-abc",
+        "--max-elements",
+        "777",
+        "--no-backup",
+        "--purge-queue",
+        "--quarantine-orphans",
+        "--dry-run",
+        "--yes",
+    ]
+    with patch("sys.argv", argv), patch("mempalace.cli.cmd_repair") as mock_cmd:
+        main()
+        mock_cmd.assert_called_once()
+        ns = mock_cmd.call_args.args[0]
+        assert ns.mode == "hnsw"
+        assert ns.segment == "seg-abc"
+        assert ns.max_elements == 777
+        assert ns.backup is False
+        assert ns.purge_queue is True
+        assert ns.quarantine_orphans is True
+        assert ns.dry_run is True
+        assert ns.yes is True
+
+
 # ── cmd_compress ───────────────────────────────────────────────────────
 
 
