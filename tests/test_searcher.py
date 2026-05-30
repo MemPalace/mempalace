@@ -5,6 +5,7 @@ Uses the real ChromaDB fixtures from conftest.py for integration tests,
 plus mock-based tests for error paths.
 """
 
+import sqlite3
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -411,3 +412,340 @@ class TestSearchCLI:
         captured = capsys.readouterr()
         assert "[1]" in captured.out
         assert "[2]" in captured.out
+
+
+# ── _tokenize stop-word filter ─────────────────────────────────────────
+
+
+def test_tokenize_default_keeps_all_tokens():
+    """Without stop_words, behaviour matches the pre-i18n tokenizer."""
+    from mempalace.searcher import _tokenize
+
+    assert _tokenize("The cat sat on the mat") == ["the", "cat", "sat", "on", "the", "mat"]
+
+
+def test_tokenize_filters_stop_words():
+    """When stop_words is given, matching tokens are dropped."""
+    from mempalace.searcher import _tokenize
+
+    tokens = _tokenize("The cat sat on the mat", stop_words=frozenset({"the", "on"}))
+    assert "the" not in tokens
+    assert "on" not in tokens
+    assert tokens == ["cat", "sat", "mat"]
+
+
+def test_tokenize_stop_words_empty_is_no_op():
+    """Empty frozenset is the same as default — full backwards compat."""
+    from mempalace.searcher import _tokenize
+
+    assert _tokenize("hello world", stop_words=frozenset()) == _tokenize("hello world")
+
+
+def test_bm25_scores_filters_stop_words_from_query_and_docs():
+    """BM25 with a stop-words set uses the filtered vocabulary on both sides."""
+    from mempalace.searcher import _bm25_scores
+
+    query = "the quick fox"
+    docs = ["the quick fox", "the lazy dog"]
+    stop_words = frozenset({"the"})
+
+    filtered = _bm25_scores(query, docs, stop_words=stop_words)
+    unfiltered = _bm25_scores(query, docs)
+
+    # Both should rank the first doc higher than the second (fox + quick match).
+    assert filtered[0] > filtered[1]
+    assert unfiltered[0] > unfiltered[1]
+    # Filtered scoring differs because IDF no longer counts "the" across docs.
+    assert filtered != unfiltered
+
+
+def test_bm25_scores_all_stopwords_query_returns_zeros():
+    """If every query term is a stop word, BM25 short-circuits to all-zero."""
+    from mempalace.searcher import _bm25_scores
+
+    scores = _bm25_scores(
+        "the and of", ["a doc", "another"], stop_words=frozenset({"the", "and", "of"})
+    )
+    assert scores == [0.0, 0.0]
+
+
+def test_bm25_scores_all_stopword_docs_returns_zero_vector():
+    """Every doc emptied by stop-word filter yields zero scores without divide errors."""
+    from mempalace.searcher import _bm25_scores
+
+    scores = _bm25_scores("fox", ["the the the", "the the"], stop_words=frozenset({"the", "fox"}))
+    assert scores == [0.0, 0.0]
+
+
+@pytest.fixture(autouse=True)
+def _isolate_stopword_cache_and_env(monkeypatch):
+    """Reset the stop-word resolution surface before each test.
+
+    Two things would otherwise leak across tests in this module:
+
+    * ``_stopwords_for_canonical`` is ``@lru_cache``'d, so the first test to
+      load a locale pins it for the rest of the run. Clearing here turns
+      every locale lookup into a fresh load.
+    * ``_resolve_stop_words(None)`` reads ``MEMPALACE_LANG`` /
+      ``MEMPAL_LANG`` env vars before consulting ``MempalaceConfig``. A
+      developer running tests with one of those exported in their shell
+      would silently bypass the ``MempalaceConfig`` mocks below and see
+      different results than CI. Strip them here.
+    """
+    from mempalace import searcher
+
+    searcher._stopwords_for_canonical.cache_clear()
+    monkeypatch.delenv("MEMPALACE_LANG", raising=False)
+    monkeypatch.delenv("MEMPAL_LANG", raising=False)
+    yield
+
+
+def test_resolve_stop_words_falls_back_silently_when_config_raises(monkeypatch):
+    """If MempalaceConfig() blows up, return an empty set so search keeps working."""
+    from mempalace import searcher
+
+    def boom(*args, **kwargs):
+        raise OSError("config.json unreadable")
+
+    monkeypatch.setattr(searcher, "MempalaceConfig", boom)
+    assert searcher._resolve_stop_words(None) == frozenset()
+
+
+def test_resolve_stop_words_none_with_no_explicit_lang_returns_empty(monkeypatch):
+    """Unconfigured palaces must not suddenly filter stop words."""
+    from mempalace import searcher
+
+    class FakeCfg:
+        lang_explicit = None
+
+    monkeypatch.setattr(searcher, "MempalaceConfig", FakeCfg)
+    assert searcher._resolve_stop_words(None) == frozenset()
+
+
+def test_resolve_stop_words_none_with_explicit_lang_applies_filter(monkeypatch):
+    """When the user opts in via lang_explicit, the locale's stop words load."""
+    from mempalace import searcher
+
+    class FakeCfg:
+        lang_explicit = "ja"
+
+    monkeypatch.setattr(searcher, "MempalaceConfig", FakeCfg)
+    sw = searcher._resolve_stop_words(None)
+    assert "した" in sw
+
+
+def test_resolve_stop_words_uses_env_var_before_config(monkeypatch):
+    """The env-var fast path must avoid constructing MempalaceConfig at all
+    on the hot search path when the user has set MEMPALACE_LANG."""
+    from mempalace import searcher
+
+    monkeypatch.setenv("MEMPALACE_LANG", "ja")
+
+    sentinel_calls = []
+
+    class TripwireCfg:
+        def __init__(self):
+            sentinel_calls.append("config-loaded")
+
+        lang_explicit = None
+
+    monkeypatch.setattr(searcher, "MempalaceConfig", TripwireCfg)
+    sw = searcher._resolve_stop_words(None)
+    assert "した" in sw
+    assert sentinel_calls == [], "MempalaceConfig was constructed despite MEMPALACE_LANG being set"
+
+
+def test_resolve_stop_words_canonicalizes_cache_key():
+    """Case variants of the same locale must hit the same lru_cache slot.
+
+    Without canonicalization, ``"en"`` and ``"EN"`` would each consume a
+    cache entry pointing at the same set; ``maxsize=16`` could be exhausted
+    by a tenant rotating through capitalizations.
+    """
+    from mempalace import searcher
+
+    a = searcher._resolve_stop_words("en")
+    b = searcher._resolve_stop_words("EN")
+    c = searcher._resolve_stop_words("En")
+    assert a is b is c
+
+
+def test_resolve_stop_words_caches_per_lang():
+    """Repeat lookups for the same lang hit the lru_cache and return the same object."""
+    from mempalace import searcher
+
+    a = searcher._resolve_stop_words("ja")
+    b = searcher._resolve_stop_words("ja")
+    assert a is b
+
+
+def test_resolve_stop_words_none_reflects_config_change_between_calls(monkeypatch):
+    """The None-arg path must re-read config on every call; a stale cache key
+    would pin the first result for the lifetime of the process (igorls, #977)."""
+    from mempalace import searcher
+
+    class FakeCfgUnset:
+        lang_explicit = None
+
+    monkeypatch.setattr(searcher, "MempalaceConfig", FakeCfgUnset)
+    first = searcher._resolve_stop_words(None)
+    assert first == frozenset()
+
+    class FakeCfgJa:
+        lang_explicit = "ja"
+
+    monkeypatch.setattr(searcher, "MempalaceConfig", FakeCfgJa)
+    second = searcher._resolve_stop_words(None)
+    assert "した" in second, (
+        f"cache pinned stale empty set for None after config change; got {second!r}"
+    )
+
+
+# ── stop_words propagation through BM25-only / union-merge paths (post-#1306) ──
+#
+# #1306 added a second BM25 scoring site inside `_bm25_only_via_sqlite` that
+# the original PR didn't cover (it landed on develop after this branch was
+# opened). These tests pin the propagation chain so the BM25 fallback and the
+# `candidate_strategy="union"` merge tokenize at the same locale as
+# `_hybrid_rank`.
+
+
+def test_bm25_only_via_sqlite_forwards_stop_words_to_bm25_scores(monkeypatch, tmp_path):
+    """`_bm25_only_via_sqlite` must pass `stop_words` into `_bm25_scores`.
+
+    Without this, vector-disabled (#1222) palaces silently lose stop-word
+    filtering on the BM25 fallback path.
+    """
+    from mempalace import searcher
+
+    captured = {}
+    real_bm25 = searcher._bm25_scores
+
+    def _spy(query, docs, **kwargs):
+        captured["stop_words"] = kwargs.get("stop_words")
+        return real_bm25(query, docs, **kwargs)
+
+    monkeypatch.setattr(searcher, "_bm25_scores", _spy)
+
+    # Build a minimal chroma.sqlite3 with one matching drawer so the scoring
+    # path is reached. Schema mirrors what `_bm25_only_via_sqlite` reads,
+    # including the embeddings/segments/collections JOIN added by #1306 to
+    # scope candidate selection by collection name.
+    db = tmp_path / "chroma.sqlite3"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE VIRTUAL TABLE embedding_fulltext_search USING fts5(string_value, tokenize='trigram');
+        CREATE TABLE embedding_metadata (id INTEGER, key TEXT, string_value TEXT, int_value INTEGER);
+        CREATE TABLE collections (id TEXT PRIMARY KEY, name TEXT);
+        CREATE TABLE segments (id TEXT PRIMARY KEY, collection TEXT);
+        CREATE TABLE embeddings (id INTEGER PRIMARY KEY, segment_id TEXT, created_at TEXT);
+        INSERT INTO collections VALUES ('c1', 'mempalace_drawers');
+        INSERT INTO segments VALUES ('s1', 'c1');
+        INSERT INTO embeddings VALUES (1, 's1', '2026-05-03');
+        INSERT INTO embedding_fulltext_search (rowid, string_value) VALUES (1, 'the cat sat');
+        INSERT INTO embedding_metadata VALUES (1, 'chroma:document', 'the cat sat', NULL);
+        INSERT INTO embedding_metadata VALUES (1, 'wing', 'general', NULL);
+        INSERT INTO embedding_metadata VALUES (1, 'room', 'inbox', NULL);
+        INSERT INTO embedding_metadata VALUES (1, 'source_file', '/x/cat.md', NULL);
+        INSERT INTO embedding_metadata VALUES (1, 'filed_at', '2026-05-03', NULL);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    searcher._bm25_only_via_sqlite(
+        "the cat",
+        str(tmp_path),
+        n_results=5,
+        collection_name="mempalace_drawers",
+        stop_words=frozenset({"the"}),
+    )
+
+    assert captured["stop_words"] == frozenset({"the"})
+
+
+def test_apply_candidate_strategy_forwards_stop_words_to_merger(monkeypatch):
+    """`_apply_candidate_strategy` must forward `stop_words` to the merger."""
+    from mempalace import searcher
+
+    captured = {}
+
+    def _stub_merger(hits, query, palace, wing, room, n, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setitem(searcher._CANDIDATE_MERGERS, "union", _stub_merger)
+
+    searcher._apply_candidate_strategy(
+        "union",
+        [],
+        "q",
+        "/p",
+        None,
+        None,
+        n_results=5,
+        max_distance=0.0,
+        stop_words=frozenset({"a", "an"}),
+    )
+
+    assert captured["stop_words"] == frozenset({"a", "an"})
+
+
+def test_search_memories_vector_disabled_uses_resolved_stop_words(monkeypatch, tmp_path):
+    """`vector_disabled=True` must route `_resolve_stop_words(lang)` into the
+    BM25 fallback, not skip stop-word resolution as it did pre-fix."""
+    from mempalace import searcher
+
+    captured = {}
+
+    def _stub(*args, **kwargs):
+        captured["stop_words"] = kwargs.get("stop_words")
+        return {"results": [], "fallback": "bm25_only_via_sqlite"}
+
+    monkeypatch.setattr(searcher, "_bm25_only_via_sqlite", _stub)
+    monkeypatch.setattr(searcher, "_resolve_stop_words", lambda lang: frozenset({"de", "es"}))
+
+    searcher.search_memories(
+        query="q",
+        palace_path=str(tmp_path),
+        vector_disabled=True,
+    )
+
+    assert captured["stop_words"] == frozenset({"de", "es"})
+
+
+def test_search_cli_threads_resolved_stop_words_to_hybrid_rank(monkeypatch, tmp_path):
+    """The `mempalace search ...` CLI handler must resolve stop_words and
+    pass them to `_hybrid_rank`, matching the MCP `search_memories` path so
+    `MEMPALACE_LANG` filtering works for CLI users too."""
+    from mempalace import searcher
+
+    # Satisfy the State-A/B filesystem-first checks added in #1498 so
+    # `search()` reaches the `_hybrid_rank` call this test exercises.
+    (tmp_path / "chroma.sqlite3").touch()
+
+    captured = {}
+
+    def _fake_get_collection(palace_path, create=False):
+        class _Col:
+            def query(self, **kwargs):
+                return {
+                    "documents": [["the cat sat"]],
+                    "metadatas": [[{"wing": "general"}]],
+                    "distances": [[0.5]],
+                }
+
+        return _Col()
+
+    def _hybrid_spy(results, query, **kwargs):
+        captured["stop_words"] = kwargs.get("stop_words")
+        return results
+
+    monkeypatch.setattr(searcher, "get_collection", _fake_get_collection)
+    monkeypatch.setattr(searcher, "_warn_if_legacy_metric", lambda col: None)
+    monkeypatch.setattr(searcher, "_resolve_stop_words", lambda lang: frozenset({"the"}))
+    monkeypatch.setattr(searcher, "_hybrid_rank", _hybrid_spy)
+
+    searcher.search(query="cat", palace_path=str(tmp_path))
+
+    assert captured["stop_words"] == frozenset({"the"})

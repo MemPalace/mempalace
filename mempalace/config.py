@@ -587,6 +587,43 @@ class MempalaceConfig:
         return max(1, parsed)
 
     @property
+    def lang_explicit(self):
+        """Primary language code when explicitly configured, else ``None``.
+
+        Resolution order: ``MEMPALACE_LANG`` / ``MEMPAL_LANG`` env var, then
+        ``config.json["lang"]``. Returns ``None`` if neither is set. Use this
+        when a caller needs to know whether the user has opted in to locale
+        behaviour (e.g. to avoid silently changing search scoring for palaces
+        that have never set a language).
+        """
+        env_val = os.environ.get("MEMPALACE_LANG") or os.environ.get("MEMPAL_LANG")
+        if env_val and env_val.strip():
+            return env_val.strip()
+        cfg = self._file_config.get("lang")
+        if isinstance(cfg, str) and cfg.strip():
+            return cfg.strip()
+        return None
+
+    @property
+    def lang(self):
+        """Primary language code for localized output and display.
+
+        Resolution order: ``lang_explicit`` (env or config.json), first entry
+        of ``entity_languages``, then ``"en"``. Always returns a non-empty
+        string so callers that need a language for display purposes never
+        have to handle ``None``. Code paths that must not silently change
+        behaviour for unconfigured palaces should read ``lang_explicit``
+        instead.
+        """
+        explicit = self.lang_explicit
+        if explicit:
+            return explicit
+        entity_langs = self.entity_languages
+        if entity_langs:
+            return entity_langs[0]
+        return "en"
+
+    @property
     def hook_silent_save(self):
         """Whether the stop hook saves directly (True) or blocks for MCP calls (False)."""
         return self._file_config.get("hooks", {}).get("silent_save", True)
