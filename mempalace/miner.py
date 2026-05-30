@@ -20,6 +20,7 @@ from collections import defaultdict
 from typing import Optional
 
 from .entity_detector import _apply_known_systems_prepass, _get_coca_filter
+from .entity_spacy import extract_spacy_entities
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
@@ -891,6 +892,35 @@ def _extract_entities_for_metadata(content: str) -> str:
     for w, c in freq.items():
         if c >= 2 and len(w) > 2:
             matched.add(w)
+
+    # Tier 4 linguistics cleanup — augment with spaCy NER for the same
+    # window when the ``mempalace[nlp]`` extra is installed. spaCy hits
+    # land at count 1+ because statistical NER is high-precision and
+    # doesn't need the >=2 frequency guard the regex path uses, but they
+    # ARE filtered through the same COCA content-word filter Tier 2
+    # applies to the regex path — spaCy can still surface common English
+    # content words ("Code", "Phase", "Line") as entities in context-poor
+    # sentences, and the COCA filter is the design promise that says
+    # "these aren't entity-worthy regardless of which pipeline found them."
+    # ``extract_spacy_entities`` returns ``{}`` when spaCy isn't
+    # available, so behavior is unchanged for users on the base install.
+    #
+    # Case-fold the membership check so spaCy hits don't duplicate
+    # entries already in ``matched`` under a different case (regex
+    # added "Aya" from a known-entities scan, spaCy emits "aya" —
+    # both would land as distinct entries without this guard). Same
+    # design contract as the merge in ``entity_detector.extract_candidates``.
+    matched_lower = {m.lower() for m in matched}
+    for spacy_name in extract_spacy_entities(window):
+        key_lower = spacy_name.lower()
+        if (
+            spacy_name not in _ENTITY_STOPLIST
+            and key_lower not in coca_filter
+            and key_lower not in matched_lower
+            and len(spacy_name) > 2
+        ):
+            matched.add(spacy_name)
+            matched_lower.add(key_lower)
 
     if not matched:
         return ""

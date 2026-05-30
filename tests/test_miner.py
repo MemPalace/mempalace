@@ -567,6 +567,32 @@ def test_entity_metadata_matches_known_names_case_insensitively(monkeypatch):
     assert "Lumi" in matched_mixed
 
 
+def test_extract_entities_for_metadata_case_folds_spacy_merge(monkeypatch):
+    """When the regex/known-entities pipeline added 'Aya' to matched
+    and spaCy emits 'aya' (lowercase) as a separate entity, the merge
+    must NOT produce both. The case-fold guard collapses them onto a
+    single entry — the existing case in matched wins because it landed
+    first. Without this, downstream sees duplicate tags ('Aya' AND
+    'aya') in chromadb drawer metadata."""
+    from mempalace import miner
+
+    # Stub known entities so 'Aya' is matched first by the regex pipeline
+    monkeypatch.setattr(miner, "_load_known_entities", lambda: frozenset({"Aya"}))
+
+    # spaCy returns lowercase variant — the realistic scenario when the
+    # source text spells the name lowercase (chat transcript, etc.)
+    monkeypatch.setattr(miner, "extract_spacy_entities", lambda window: {"aya": 1})
+
+    result = miner._extract_entities_for_metadata("aya was here.")
+    matched = set(result.split(";")) if result else set()
+
+    assert "Aya" in matched, f"existing-case 'Aya' must remain; got: {matched!r}"
+    assert "aya" not in matched, (
+        f"spaCy lowercase 'aya' must merge into existing 'Aya', not duplicate; "
+        f"got both: {matched!r}"
+    )
+
+
 def test_file_already_mined_check_mtime():
     tmpdir = tempfile.mkdtemp()
     try:

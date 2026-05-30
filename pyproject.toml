@@ -118,6 +118,21 @@ extract = [
     # covered by striprtf above.
     "markitdown[docx,pdf,pptx,xlsx]>=0.1.5; python_version >= '3.10'",
 ]
+# Opt-in spaCy NLP for entity-detection augmentation. Adds statistical NER
+# (PERSON, ORG, GPE, PRODUCT, WORK_OF_ART, EVENT) alongside the existing
+# regex+COCA pipeline. spaCy is local CPU/GPU NLP — NOT an LLM, no network
+# calls beyond first-time model download.
+#
+# The model itself ("en_core_web_sm" by default, ~12 MB) is NOT installed
+# by this extra. mempalace lazy-downloads it on first use via
+# ``spacy.cli.download``, mirroring the embeddinggemma pattern. Users on
+# metered or offline machines can pre-install with
+# ``python -m spacy download en_core_web_sm``. Override via
+# MEMPALACE_SPACY_MODEL=en_core_web_md|lg|trf for higher accuracy
+# (md=~41 MB, lg=~560 MB, trf=~436 MB GPU-recommended).
+nlp = [
+    "spacy>=3.7",
+]
 
 [dependency-groups]
 dev = [

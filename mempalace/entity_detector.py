@@ -40,6 +40,7 @@ from pathlib import Path
 from collections import defaultdict
 
 from mempalace.i18n import get_entity_patterns
+from mempalace.entity_spacy import extract_spacy_entities
 
 
 # ==================== COCA CONTENT-WORD FILTER (Tier 2 linguistics cleanup) ====================
@@ -328,7 +329,35 @@ def extract_candidates(text: str, languages=("en",)) -> dict:
                 continue
             counts[phrase] += 1
 
-    return {name: count for name, count in counts.items() if count >= 3}
+    result = {name: count for name, count in counts.items() if count >= 3}
+
+    # Tier 4 linguistics cleanup — augment with spaCy NER when the
+    # ``mempalace[nlp]`` extra is installed. spaCy uses statistical NER
+    # (high-precision proper-noun detection), so its hits bypass the
+    # frequency threshold that the regex pipeline needs to filter
+    # false positives. If spaCy is not installed,
+    # ``extract_spacy_entities`` returns ``{}`` and behavior is unchanged.
+    # Regex-detected names retain their regex count when both pipelines
+    # agree, so existing scoring/classification downstream is unaffected.
+    # Case-fold the merge key. spaCy may emit "Apple" while regex stored
+    # "apple" (or vice versa) — the case-sensitive ``name not in result``
+    # check would treat them as distinct and let both into the final dict.
+    # Comparing against a lowercased view of the existing keys collapses
+    # them onto a single entry; the regex pipeline's case wins because
+    # it ran first.
+    existing_keys_lower = {k.lower() for k in result}
+    for name, spacy_count in extract_spacy_entities(text).items():
+        key_lower = name.lower()
+        if (
+            key_lower not in existing_keys_lower
+            and key_lower not in stopwords
+            and key_lower not in coca_filter
+            and len(name) > 2
+        ):
+            result[name] = spacy_count
+            existing_keys_lower.add(key_lower)
+
+    return result
 
 
 # ==================== SIGNAL SCORING ====================
