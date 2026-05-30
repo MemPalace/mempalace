@@ -1916,21 +1916,14 @@ def status(palace_path: str):
     if col is None:
         return
 
-    # Count by wing and room — paginate to avoid SQLite "too many SQL
-    # variables" error on large palaces (see #802, #850).
+    # Count by wing and room via one aggregate query on the storage seam
+    # (SQL GROUP BY on the ChromaDB backend) instead of paginating the whole
+    # collection and tallying in Python — minutes → milliseconds on large
+    # palaces (#1657; supersedes the #802/#850 batch-scan workaround).
+    from .palace_stats import taxonomy
+
     total = col.count()
-    wing_rooms: dict = defaultdict(lambda: defaultdict(int))
-    batch_size = 5000
-    offset = 0
-    while offset < total:
-        r = col.get(limit=batch_size, offset=offset, include=["metadatas"])
-        batch = r["metadatas"]
-        if not batch:
-            break
-        for m in batch:
-            m = m or {}
-            wing_rooms[m.get("wing", "?")][m.get("room", "?")] += 1
-        offset += len(batch)
+    wing_rooms = taxonomy(col, missing="?")
 
     print(f"\n{'=' * 55}")
     print(f"  MemPalace Status — {total} drawers")

@@ -151,6 +151,10 @@ class TestSearchMemories:
         # Drawer a.md gets a tiny base distance (0.08) — nearly exact match.
         # Drawer b.md gets a larger base distance (0.35).
         drawers_col = MagicMock()
+        # Single-drawer sources -> closet-boost grep-enrichment is a no-op, so
+        # this test stays focused on distance clamping (#1657: enrichment now
+        # counts via count_matching before fetching).
+        drawers_col.count_matching.return_value = 1
         drawers_col.query.return_value = {
             "documents": [["doc-a", "doc-b"]],
             "metadatas": [

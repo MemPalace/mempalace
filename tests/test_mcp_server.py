@@ -695,32 +695,33 @@ class TestReadTools:
         assert "project" in result["wings"]
         assert "notes" in result["wings"]
 
-    def test_status_handles_none_metadata_without_partial(
+    def test_status_handles_missing_wing_without_partial(
         self, monkeypatch, config, palace_path, kg
     ):
-        """tool_status must not crash or go partial when the metadata cache
-        returns a ``None`` entry — palaces can contain drawers with no
-        metadata (older mining paths, third-party writes). Before the guard,
-        ``m.get("wing")`` raised AttributeError mid-tally and the result
-        carried ``"error"`` + ``"partial": True`` even though the data was
-        perfectly fetchable."""
+        """tool_status must not crash or go partial when a drawer has no wing
+        metadata — palaces can contain drawers with absent keys (older mining
+        paths, third-party writes). The aggregation seam surfaces those rows
+        with value ``None`` and palace_stats relabels them ``"unknown"`` (#1657),
+        so the count stays exact and no ``"error"``/``"partial"`` flag appears."""
         from unittest.mock import patch as _patch
 
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace.mcp_server import tool_status
 
-        # Inject a metadata cache where one entry is None
-        with _patch("mempalace.mcp_server._get_collection") as mock_get_col:
-            fake_col = type("C", (), {"count": lambda self: 2})()
-            mock_get_col.return_value = fake_col
-            with _patch(
-                "mempalace.mcp_server._get_cached_metadata",
-                return_value=[{"wing": "proj", "room": "r"}, None],
-            ):
-                result = tool_status()
+        # Fake collection whose crosstab returns one fully-keyed cell and one
+        # missing-wing cell (None), mirroring the SQL GROUP BY's LEFT-join output.
+        fake_col = type(
+            "C",
+            (),
+            {
+                "count": lambda self: 2,
+                "crosstab": lambda self, a, b, where=None: {"proj": {"r": 1}, None: {None: 1}},
+            },
+        )()
+        with _patch("mempalace.mcp_server._get_collection", return_value=fake_col):
+            result = tool_status()
 
-        # The None-metadata drawer falls under 'unknown/unknown' — no crash,
-        # no partial flag.
+        # The missing-wing drawer falls under 'unknown' — no crash, no partial.
         assert "error" not in result
         assert result.get("partial") is not True
         assert result["total_drawers"] == 2

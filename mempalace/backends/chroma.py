@@ -636,6 +636,144 @@ def _sqlite_embedding_count(palace_path: str, collection_name: str) -> Optional[
         return None
 
 
+# ---------------------------------------------------------------------------
+# Read-only metadata aggregation (#1657)
+#
+# The count/taxonomy read path used to paginate the whole collection and tally
+# wing/room in Python — O(N) and hundreds of MB of dicts on a 400K-drawer
+# palace. These helpers push the aggregation into one SQL ``GROUP BY`` over the
+# same ``embeddings ⋈ segments ⋈ collections`` join that
+# ``repair.sqlite_drawer_count`` already trusts as the ground-truth drawer
+# count, so the grouped counts sum back to ``collection.count()``. LEFT JOIN on
+# ``embedding_metadata`` keeps rows whose key is absent (value ``None``), giving
+# byte-for-byte parity with the old Python scan's ``m.get(key)`` default.
+#
+# Chroma stores a metadata value in exactly one typed column (string / int /
+# float / bool). The Python scan groups on whatever typed value Chroma returns,
+# so to match it we must group on the same value — not ``string_value`` alone,
+# which would collapse every int/float/bool-valued key (e.g. ``chunk_index``)
+# into the "missing" bucket. ``_VALUE_EXPR`` coalesces the typed columns in the
+# column order sqlite preserves, so the grouped key has the same Python type the
+# scan sees (bool reads back as 0/1, but ``True == 1`` / ``False == 0`` makes the
+# count dicts compare equal).
+# ---------------------------------------------------------------------------
+
+
+def _value_expr(alias: str) -> str:
+    """COALESCE of the typed metadata columns for ``alias`` (parity with scan)."""
+    return (
+        f"COALESCE({alias}.string_value, {alias}.int_value, "
+        f"{alias}.float_value, {alias}.bool_value)"
+    )
+
+
+def _open_ro(db_path: str):
+    """Open ``chroma.sqlite3`` read-only, or return ``None`` if unavailable."""
+    if not os.path.isfile(db_path):
+        return None
+    try:
+        return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+
+
+def _sql_count_by(db_path: str, collection_name: str, key: str) -> Optional[dict]:
+    """``{value_or_None: count}`` for one metadata ``key`` via SQL ``GROUP BY``.
+
+    Returns ``None`` on any schema/read error so callers fall back to the
+    full-scan default.
+    """
+    conn = _open_ro(db_path)
+    if conn is None:
+        return None
+    val = _value_expr("m")
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT {val}, COUNT(*)
+            FROM embeddings e
+            JOIN segments s ON e.segment_id = s.id
+            JOIN collections c ON s.collection = c.id
+            LEFT JOIN embedding_metadata m ON m.id = e.id AND m.key = ?
+            WHERE c.name = ?
+            GROUP BY {val}
+            """,
+            (key, collection_name),
+        ).fetchall()
+        return {value: count for value, count in rows}
+    except sqlite3.Error:
+        logger.debug("_sql_count_by failed for key=%s", key, exc_info=True)
+        return None
+    finally:
+        conn.close()
+
+
+def _sql_crosstab(db_path: str, collection_name: str, key_a: str, key_b: str) -> Optional[dict]:
+    """``{value_a: {value_b: count}}`` for two metadata keys via SQL ``GROUP BY``.
+
+    Each embedding contributes exactly one ``(value_a, value_b)`` cell (each
+    ``LEFT JOIN`` matches at most one ``embedding_metadata`` row per key), so the
+    grand total equals ``collection.count()``. Returns ``None`` on read error.
+    """
+    conn = _open_ro(db_path)
+    if conn is None:
+        return None
+    val_a = _value_expr("a")
+    val_b = _value_expr("b")
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT {val_a}, {val_b}, COUNT(*)
+            FROM embeddings e
+            JOIN segments s ON e.segment_id = s.id
+            JOIN collections c ON s.collection = c.id
+            LEFT JOIN embedding_metadata a ON a.id = e.id AND a.key = ?
+            LEFT JOIN embedding_metadata b ON b.id = e.id AND b.key = ?
+            WHERE c.name = ?
+            GROUP BY {val_a}, {val_b}
+            """,
+            (key_a, key_b, collection_name),
+        ).fetchall()
+        out: dict = {}
+        for va, vb, count in rows:
+            out.setdefault(va, {})[vb] = count
+        return out
+    except sqlite3.Error:
+        logger.debug("_sql_crosstab failed for keys=%s,%s", key_a, key_b, exc_info=True)
+        return None
+    finally:
+        conn.close()
+
+
+def _sql_count_matching(db_path: str, collection_name: str, key: str, value: str) -> Optional[int]:
+    """``COUNT(*)`` of rows whose metadata ``key`` equals ``value``.
+
+    Used to count a single source file's drawers without materializing them.
+    Returns ``None`` on read error.
+    """
+    conn = _open_ro(db_path)
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM embeddings e
+            JOIN segments s ON e.segment_id = s.id
+            JOIN collections c ON s.collection = c.id
+            JOIN embedding_metadata m ON m.id = e.id AND m.key = ?
+            WHERE c.name = ? AND m.string_value = ?
+            """,
+            (key, collection_name, value),
+        ).fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
+    except sqlite3.Error:
+        logger.debug("_sql_count_matching failed for %s=%s", key, value, exc_info=True)
+        return None
+    finally:
+        conn.close()
+
+
 def _pin_hnsw_threads(collection) -> None:
     """Best-effort retrofit: pin ``hnsw:num_threads=1`` on an existing collection.
 
@@ -1225,6 +1363,49 @@ class ChromaCollection(BaseCollection):
 
     def count(self):
         return self._collection.count()
+
+    def _sql_db_path(self) -> Optional[str]:
+        """Path to ``chroma.sqlite3`` for the SQL fast paths, or ``None``.
+
+        ``None`` when this collection was constructed without a palace path
+        (legacy direct construction) — callers then take the base full-scan
+        default.
+        """
+        if not self._palace_path:
+            return None
+        return os.path.join(self._palace_path, "chroma.sqlite3")
+
+    def count_by(self, key, *, where=None):
+        # SQL GROUP BY only covers the unfiltered case; a where-clause falls
+        # back to the base scan rather than translating the filter to SQL.
+        if where is None:
+            db_path = self._sql_db_path()
+            if db_path is not None:
+                result = _sql_count_by(db_path, self._collection.name, key)
+                if result is not None:
+                    return result
+        return super().count_by(key, where=where)
+
+    def crosstab(self, key_a, key_b, *, where=None):
+        if where is None:
+            db_path = self._sql_db_path()
+            if db_path is not None:
+                result = _sql_crosstab(db_path, self._collection.name, key_a, key_b)
+                if result is not None:
+                    return result
+        return super().crosstab(key_a, key_b, where=where)
+
+    def count_matching(self, where):
+        # Fast-path the only shape callers use: a single ``{key: value}``
+        # equality. Anything richer takes the base scan.
+        db_path = self._sql_db_path()
+        if db_path is not None and isinstance(where, dict) and len(where) == 1:
+            ((key, value),) = where.items()
+            if isinstance(value, str):
+                result = _sql_count_matching(db_path, self._collection.name, key, value)
+                if result is not None:
+                    return result
+        return super().count_matching(where)
 
     @property
     def metadata(self) -> dict:

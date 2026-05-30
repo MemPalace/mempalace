@@ -247,6 +247,81 @@ class BaseCollection(ABC):
     def estimated_count(self) -> int:
         return self.count()
 
+    def count_by(self, key: str, *, where: Optional[dict] = None) -> dict:
+        """Return ``{value: count}`` grouping rows by metadata ``key``.
+
+        Rows lacking ``key`` are grouped under the Python key ``None`` — callers
+        decide how to label that bucket (``"unknown"``, ``"?"``, …). The default
+        implementation paginates :meth:`get` and tallies in Python; backends
+        SHOULD override with a single aggregate query (e.g. SQL ``GROUP BY``)
+        whose counts are identical to this scan. ``where`` filters rows before
+        grouping.
+        """
+        counts: dict = {}
+        offset = 0
+        page = 1000
+        while True:
+            batch = self.get(where=where, limit=page, offset=offset, include=["metadatas"])
+            metas = batch.metadatas
+            if not metas:
+                break
+            for m in metas:
+                m = m or {}
+                v = m.get(key)
+                counts[v] = counts.get(v, 0) + 1
+            if len(metas) < page:
+                break
+            offset += len(metas)
+        return counts
+
+    def crosstab(self, key_a: str, key_b: str, *, where: Optional[dict] = None) -> dict:
+        """Return ``{value_a: {value_b: count}}`` grouping by two metadata keys.
+
+        Each row contributes to exactly one ``(value_a, value_b)`` cell; missing
+        keys group under ``None``. Summing the inner dicts reproduces
+        :meth:`count_by` for ``key_a``; summing across outer keys reproduces it
+        for ``key_b``. Default paginates :meth:`get`; backends SHOULD override
+        with one aggregate query producing identical counts.
+        """
+        out: dict = {}
+        offset = 0
+        page = 1000
+        while True:
+            batch = self.get(where=where, limit=page, offset=offset, include=["metadatas"])
+            metas = batch.metadatas
+            if not metas:
+                break
+            for m in metas:
+                m = m or {}
+                bucket = out.setdefault(m.get(key_a), {})
+                b = m.get(key_b)
+                bucket[b] = bucket.get(b, 0) + 1
+            if len(metas) < page:
+                break
+            offset += len(metas)
+        return out
+
+    def count_matching(self, where: dict) -> int:
+        """Return the number of rows matching ``where`` without materializing them.
+
+        Default paginates :meth:`get` requesting no payload and sums the ids;
+        backends SHOULD override with a ``COUNT(*)`` so counting a large
+        source file no longer drags its documents into memory.
+        """
+        total = 0
+        offset = 0
+        page = 1000
+        while True:
+            batch = self.get(where=where, limit=page, offset=offset, include=[])
+            n = len(batch.ids)
+            if n == 0:
+                break
+            total += n
+            if n < page:
+                break
+            offset += n
+        return total
+
     def close(self) -> None:
         return None
 

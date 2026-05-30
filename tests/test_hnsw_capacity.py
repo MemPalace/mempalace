@@ -434,6 +434,22 @@ def palace_with_drawers(tmp_path):
     return tmp_path
 
 
+def test_sqlite_exact_retriever_interface(palace_with_drawers):
+    """The extracted adapter (#1657) is exercisable on its own, without the
+    searcher: construct it with (palace_path, collection_name) and call
+    ``search`` → the same result shape the shim returns."""
+    from mempalace.verbatim_sqlite import SqliteExactRetriever
+
+    retriever = SqliteExactRetriever(str(palace_with_drawers))
+    out = retriever.search("segfault chromadb", n_results=5)
+    assert out["fallback"] == "bm25_only_via_sqlite"
+    assert len(out["results"]) >= 1
+    assert out["results"][0]["matched_via"] == "bm25_sqlite"
+    # include_internal surfaces chunk-precise dedup fields for the union path.
+    internal = retriever.search("segfault chromadb", n_results=5, include_internal=True)
+    assert "_source_file_full" in internal["results"][0]
+
+
 def test_bm25_fallback_returns_matches(palace_with_drawers):
     out = _bm25_only_via_sqlite("segfault chromadb", str(palace_with_drawers), n_results=5)
     assert out["fallback"] == "bm25_only_via_sqlite"
