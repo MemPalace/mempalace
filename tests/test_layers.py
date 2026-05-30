@@ -71,12 +71,19 @@ def test_layer0_default_path():
 
 
 def _mock_chromadb_for_layer(docs, metas, monkeypatch=None):
-    """Return a mock collection whose get() returns docs/metas."""
+    """Return a mock collection whose get() returns docs/metas.
+
+    Layer1._fetch_drawers() has two phases: a fast-path (importance >= 3
+    pre-filter) and a fallback full-scan.  For small test datasets (< 500
+    items), each phase makes exactly one col.get() call before breaking
+    (len < _BATCH).  We provide two identical responses: the first is consumed
+    by the fast path, and the second is only consumed when the fast path
+    doesn't return enough results (< MAX_DRAWERS) and the fallback executes.
+    """
     mock_col = MagicMock()
-    # First batch returns data, second batch returns empty (end of pagination)
     mock_col.get.side_effect = [
-        {"documents": docs, "metadatas": metas},
-        {"documents": [], "metadatas": []},
+        {"documents": docs, "metadatas": metas},  # fast-path batch
+        {"documents": docs, "metadatas": metas},  # fallback batch (< MAX_DRAWERS → fallback)
     ]
     return mock_col
 
@@ -141,9 +148,13 @@ def test_layer1_with_wing_filter():
         result = layer.generate()
 
     assert "ESSENTIAL STORY" in result
-    # Verify wing filter was passed
+    # Verify wing filter was passed in the first (fast-path) call.
+    # The fast-path combines wing with an importance pre-filter via $and.
     call_kwargs = mock_col.get.call_args_list[0][1]
-    assert call_kwargs.get("where") == {"wing": "project_x"}
+    where = call_kwargs.get("where", {})
+    assert "$and" in where
+    assert {"wing": "project_x"} in where["$and"]
+    assert {"importance": {"$gte": 3}} in where["$and"]
 
 
 def test_layer1_truncates_long_snippets():
@@ -201,12 +212,69 @@ def test_layer1_importance_from_various_keys():
     assert "ESSENTIAL STORY" in result
 
 
-def test_layer1_batch_exception_breaks():
-    """If col.get raises on a batch, loop breaks gracefully."""
+def test_layer1_pagination_stops_at_max_scan():
+    """_fetch_drawers() paginates in _BATCH (500) chunks and stops at MAX_SCAN."""
+    _BATCH = 500
+    # Build a full batch of 500 docs (first page) and a partial second page
+    batch_docs = [f"doc{i}" for i in range(_BATCH)]
+    batch_metas = [{"room": "r", "importance": 5} for _ in range(_BATCH)]
+    partial_docs = [f"doc{i}" for i in range(100)]
+    partial_metas = [{"room": "r", "importance": 5} for _ in range(100)]
+
     mock_col = MagicMock()
+    # Fast path: page 1 (full batch) -> page 2 (partial, triggers break)
     mock_col.get.side_effect = [
-        {"documents": ["doc1"], "metadatas": [{"room": "r"}]},
+        {"documents": batch_docs, "metadatas": batch_metas},
+        {"documents": partial_docs, "metadatas": partial_metas},
+    ]
+
+    with (
+        patch("mempalace.layers.MempalaceConfig") as mock_cfg,
+        patch("mempalace.layers._get_collection", return_value=mock_col),
+    ):
+        mock_cfg.return_value.palace_path = "/fake"
+        layer = Layer1(palace_path="/fake")
+        result = layer.generate()
+
+    # Fast path got 600 results (>= MAX_DRAWERS=15), so no fallback needed.
+    # Two get() calls: first batch of 500, second batch of 100 (< _BATCH -> break).
+    assert mock_col.get.call_count == 2
+    assert "ESSENTIAL STORY" in result
+
+
+def test_layer1_pagination_caps_at_max_scan():
+    """_fetch_drawers() stops reading once MAX_SCAN is reached, even mid-pagination."""
+    _BATCH = 500
+    batch_docs = [f"doc{i}" for i in range(_BATCH)]
+    batch_metas = [{"room": "r", "importance": 5} for _ in range(_BATCH)]
+
+    mock_col = MagicMock()
+    # Return full batches every time — the loop should stop after hitting MAX_SCAN
+    mock_col.get.return_value = {"documents": batch_docs, "metadatas": batch_metas}
+
+    with (
+        patch("mempalace.layers.MempalaceConfig") as mock_cfg,
+        patch("mempalace.layers._get_collection", return_value=mock_col),
+    ):
+        mock_cfg.return_value.palace_path = "/fake"
+        layer = Layer1(palace_path="/fake")
+        layer.MAX_SCAN = 1200  # Should stop after 3 pages (500+500+500 >= 1200)
+        result = layer.generate()
+
+    # Fast path: 3 pages to reach >= MAX_SCAN, then stops.
+    # No fallback since 1500 >= MAX_DRAWERS.
+    assert mock_col.get.call_count == 3
+    assert "ESSENTIAL STORY" in result
+
+
+def test_layer1_batch_exception_breaks():
+    """If the fast-path raises, fallback scan still returns results gracefully."""
+    mock_col = MagicMock()
+    # Call 1: fast-path raises — caught, fast-path resets to empty
+    # Call 2: fallback returns one doc successfully
+    mock_col.get.side_effect = [
         RuntimeError("batch error"),
+        {"documents": ["doc1"], "metadatas": [{"room": "r", "importance": 5}]},
     ]
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
