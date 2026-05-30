@@ -305,6 +305,18 @@ def test_scan_project_respects_gitignore():
         shutil.rmtree(tmpdir)
 
 
+def test_scan_project_includes_rst_files():
+    tmpdir = tempfile.mkdtemp()
+    try:
+        project_root = Path(tmpdir).resolve()
+
+        write_file(project_root / "docs" / "guide.rst", "Heading\n=======\n\nBody text\n" * 20)
+
+        assert scanned_files(project_root) == ["docs/guide.rst"]
+    finally:
+        shutil.rmtree(tmpdir)
+
+
 def test_scan_project_respects_nested_gitignore():
     tmpdir = tempfile.mkdtemp()
     try:
