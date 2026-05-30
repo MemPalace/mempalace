@@ -47,13 +47,17 @@ _HNSW_LINK_TO_DATA_MAX_RATIO = 10.0
 
 
 @functools.lru_cache(maxsize=64)
-def _resolve_persist_dir(palace_path: str) -> str:
+def _resolve_persist_dir(palace_path: str, create: bool = False) -> str:
     """Return the directory ChromaDB should use for this palace.
 
     Reads ``<palace_path>/mempalace.yaml`` for ``backend.persist_directory``.
-    Relative paths are resolved against ``palace_path``; the directory is
-    created if it does not yet exist.  Falls back to ``palace_path`` for
-    palaces that predate this config key (fully backwards-compatible).
+    Relative paths are resolved against ``palace_path``.  Falls back to
+    ``palace_path`` for palaces that predate this config key.
+
+    Pass ``create=True`` to ensure the directory exists before writing (e.g.
+    before opening a ``PersistentClient``).  Read-only callers should use the
+    default ``create=False`` so that querying a path never creates directories
+    as a side effect.
     """
     try:
         import yaml  # PyYAML — always available as a mempalace dependency
@@ -69,7 +73,8 @@ def _resolve_persist_dir(palace_path: str) -> str:
                     if os.path.isabs(persist)
                     else os.path.normpath(os.path.join(palace_path, persist))
                 )
-                os.makedirs(resolved, exist_ok=True)
+                if create:
+                    os.makedirs(resolved, exist_ok=True)
                 return resolved
     except Exception:
         pass
@@ -1309,14 +1314,14 @@ class ChromaBackend(BaseBackend):
         self._closed = False
 
     @staticmethod
-    def _resolve_persist_dir(palace_path: str) -> str:
+    def _resolve_persist_dir(palace_path: str, create: bool = False) -> str:
         """Return the directory ChromaDB should use for this palace.
 
         Delegates to the module-level :func:`_resolve_persist_dir` (which is
         memoized).  Kept as a static method so existing call-sites that
         already have a ``ChromaBackend`` reference continue to work.
         """
-        return _resolve_persist_dir(palace_path)
+        return _resolve_persist_dir(palace_path, create)
 
     @staticmethod
     def _resolve_embedding_function():
@@ -1436,7 +1441,7 @@ class ChromaBackend(BaseBackend):
             if inode_changed:
                 ChromaBackend._quarantined_paths.discard(palace_path)
             ChromaBackend._prepare_palace_for_open(palace_path)
-            cached = chromadb.PersistentClient(path=persist_dir)
+            cached = chromadb.PersistentClient(path=ChromaBackend._resolve_persist_dir(palace_path, create=True))
             self._clients[palace_path] = cached
             # Re-stat after the client constructor runs: chromadb creates
             # chroma.sqlite3 lazily, so the stat captured before the call
@@ -1519,7 +1524,7 @@ class ChromaBackend(BaseBackend):
         vs. runtime thrash on steady-write daemons).
         """
         ChromaBackend._prepare_palace_for_open(palace_path)
-        return chromadb.PersistentClient(path=ChromaBackend._resolve_persist_dir(palace_path))
+        return chromadb.PersistentClient(path=ChromaBackend._resolve_persist_dir(palace_path, create=True))
 
     @staticmethod
     def backend_version() -> str:

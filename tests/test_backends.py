@@ -203,7 +203,7 @@ def test_resolve_persist_dir_fallback_no_backend_key(tmp_path):
 
 
 def test_resolve_persist_dir_absolute_path(tmp_path):
-    """Absolute persist_directory is returned as-is and created."""
+    """Absolute persist_directory is returned as-is; created only when create=True."""
     _resolve_persist_dir.cache_clear()
     db_dir = tmp_path / "external_db"
     (tmp_path / "mempalace.yaml").write_text(
@@ -211,7 +211,12 @@ def test_resolve_persist_dir_absolute_path(tmp_path):
     )
     result = _resolve_persist_dir(str(tmp_path))
     assert result == str(db_dir)
-    assert db_dir.is_dir()
+    assert not db_dir.exists()  # create=False (default) must not mkdir
+
+    _resolve_persist_dir.cache_clear()
+    result = _resolve_persist_dir(str(tmp_path), create=True)
+    assert result == str(db_dir)
+    assert db_dir.is_dir()  # create=True must mkdir
 
 
 def test_resolve_persist_dir_relative_path(tmp_path):
@@ -221,7 +226,11 @@ def test_resolve_persist_dir_relative_path(tmp_path):
     result = _resolve_persist_dir(str(tmp_path))
     expected = str((tmp_path / ".db").resolve())
     assert result == expected
-    assert (tmp_path / ".db").is_dir()
+    assert not (tmp_path / ".db").exists()  # create=False must not mkdir
+
+    _resolve_persist_dir.cache_clear()
+    _resolve_persist_dir(str(tmp_path), create=True)
+    assert (tmp_path / ".db").is_dir()  # create=True must mkdir
 
 
 def test_resolve_persist_dir_bad_yaml_fallback(tmp_path):
