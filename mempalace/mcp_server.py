@@ -1598,6 +1598,14 @@ def tool_kg_stats():
     return _call_kg(lambda kg: kg.stats())
 
 
+def tool_doctor():
+    """Run diagnostic checks on palace health."""
+    from mempalace.doctor import diagnose
+
+    report = diagnose(_config.palace_path)
+    return report.to_dict()
+
+
 # ==================== AGENT DIARY ====================
 
 
@@ -2087,6 +2095,11 @@ TOOLS = {
         "description": "Knowledge graph overview: entities, triples, current vs expired facts, relationship types.",
         "input_schema": {"type": "object", "properties": {}},
         "handler": tool_kg_stats,
+    },
+    "mempalace_doctor": {
+        "description": "Run diagnostic checks on palace health. Reports metadata completeness, KG status, drawer sizes, and wing/room distribution. Read-only — never modifies data.",
+        "input_schema": {"type": "object", "properties": {}},
+        "handler": tool_doctor,
     },
     "mempalace_traverse": {
         "description": "Walk the palace graph from a room. Shows connected ideas across wings — the tunnels. Like following a thread through the palace: start at 'chromadb-setup' in wing_code, discover it connects to wing_myproject (planning) and wing_user (feelings about it).",

@@ -1024,6 +1024,29 @@ def cmd_mcp(args):
         print(f"  {base_server_cmd} --palace /path/to/palace")
 
 
+def cmd_doctor(args):
+    """Run diagnostic checks on the palace."""
+    from .doctor import diagnose
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+
+    print(f"\n{'=' * 55}")
+    print("  Palace Doctor")
+    print(f"  Palace: {palace_path}")
+    print(f"{'=' * 55}\n")
+
+    report = diagnose(palace_path)
+
+    for check in report.checks:
+        icon = {"OK": "+", "WARN": "!", "ERROR": "X"}[check.status]
+        print(f"  [{icon}] {check.name}: {check.message}")
+        if check.details:
+            print(f"      {check.details}")
+
+    print(f"\n  Summary: {report.summary}")
+    print(f"\n{'=' * 55}\n")
+
+
 def cmd_compress(args):
     """Compress drawers in a wing using AAAK Dialect."""
     from .dialect import Dialect
@@ -1560,6 +1583,9 @@ def main():
         help="Show MCP setup command for connecting MemPalace to your AI client",
     )
 
+    # doctor
+    sub.add_parser("doctor", help="Run diagnostic checks on palace health")
+
     # status
     # migrate
     p_migrate = sub.add_parser(
@@ -1609,6 +1635,7 @@ def main():
         "sync": cmd_sync,
         "mcp": cmd_mcp,
         "compress": cmd_compress,
+        "doctor": cmd_doctor,
         "wake-up": cmd_wakeup,
         "repair": cmd_repair,
         "repair-status": cmd_repair_status,
