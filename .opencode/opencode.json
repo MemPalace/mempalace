@@ -1,0 +1,10 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "mempalace": {
+      "type": "local",
+      "command": ["python", "-m", "mempalace.mcp_server"],
+      "enabled": true
+    }
+  }
+}
