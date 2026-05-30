@@ -48,6 +48,7 @@ logger = logging.getLogger("mempalace_mcp")
 READABLE_EXTENSIONS = {
     ".txt",
     ".md",
+    ".org",
     ".py",
     ".js",
     ".ts",
