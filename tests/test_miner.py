@@ -290,6 +290,33 @@ def test_scan_project_skips_mempalace_generated_files():
         assert scanned_files(project_root) == ["notes.md"]
 
 
+def test_scan_project_includes_swift_files():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        project_root = Path(tmpdir).resolve()
+        write_file(
+            project_root / "Sources" / "App.swift",
+            "struct App {}\n" * 20,
+        )
+        assert scanned_files(project_root) == ["Sources/App.swift"]
+
+
+def test_scan_project_includes_kotlin_files():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        project_root = Path(tmpdir).resolve()
+        write_file(
+            project_root / "src" / "Main.kt",
+            "fun main() {}\n" * 20,
+        )
+        write_file(
+            project_root / "settings.gradle.kts",
+            'rootProject.name = "demo"\n' * 20,
+        )
+        assert scanned_files(project_root) == [
+            "settings.gradle.kts",
+            "src/Main.kt",
+        ]
+
+
 def test_scan_project_respects_gitignore():
     tmpdir = tempfile.mkdtemp()
     try:
