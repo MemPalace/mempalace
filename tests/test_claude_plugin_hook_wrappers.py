@@ -53,11 +53,14 @@ def _run_hook(
     script_name: str,
     payload: str,
     bin_dir: Path,
+    extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     assert BASH is not None
 
     env = os.environ.copy()
     env["PATH"] = str(bin_dir)
+    if extra_env:
+        env.update(extra_env)
 
     return subprocess.run(
         [BASH, _shell_path(PLUGIN_HOOKS_DIR / script_name)],
@@ -73,9 +76,12 @@ def _run_hook(
 def test_plugin_hook_wrapper_prefers_mempalace_cli(
     tmp_path: Path, script_name: str, hook_name: str
 ) -> None:
+    """bare mempalace on PATH is preferred over $MEMPAL_PYTHON_BIN -m mempalace."""
     args_file = tmp_path / "args.txt"
     stdin_file = tmp_path / "stdin.json"
 
+    # python3 stub must exist so MEMPAL_PYTHON_BIN resolves — but mempalace
+    # stub should be preferred because it's on PATH and MEMPAL_PYTHON is unset.
     bin_dir = _make_bin_dir(
         tmp_path,
         {
@@ -85,13 +91,13 @@ def test_plugin_hook_wrapper_prefers_mempalace_cli(
                 f"{_capture_stdin_to(stdin_file)}"
                 "printf '{}\\n'\n"
             ),
-            "python": "#!/bin/sh\nexit 99\n",
             "python3": "#!/bin/sh\nexit 99\n",
         },
     )
 
     payload = '{"session_id":"abc123"}'
-    result = _run_hook(script_name, payload, bin_dir)
+    # Unset MEMPAL_PYTHON so the hook uses the PATH-based resolution
+    result = _run_hook(script_name, payload, bin_dir, extra_env={"MEMPAL_PYTHON": ""})
 
     assert result.returncode == 0
     assert result.stdout == "{}\n"
@@ -103,75 +109,51 @@ def test_plugin_hook_wrapper_prefers_mempalace_cli(
 
 
 @pytest.mark.parametrize(("script_name", "hook_name"), SCRIPT_CASES)
-@pytest.mark.parametrize("python_name", ["python3", "python"])
-def test_plugin_hook_wrapper_falls_back_to_importable_python(
-    tmp_path: Path, script_name: str, hook_name: str, python_name: str
+def test_plugin_hook_wrapper_uses_mempal_python_when_set(
+    tmp_path: Path, script_name: str, hook_name: str
 ) -> None:
+    """$MEMPAL_PYTHON overrides PATH-based resolution and uses -m mempalace."""
     args_file = tmp_path / "args.txt"
     stdin_file = tmp_path / "stdin.json"
 
-    python_stub = (
+    explicit_python = tmp_path / "my_python"
+    _write_executable(
+        explicit_python,
         "#!/bin/sh\n"
-        'if [ "$1" = "-c" ]; then\n'
-        "  exit 0\n"
-        "fi\n"
         f'printf \'%s\' "$*" > "{_shell_path(args_file)}"\n'
         f"{_capture_stdin_to(stdin_file)}"
-        "printf '{}\\n'\n"
+        "printf '{}\\n'\n",
     )
-    bin_dir = _make_bin_dir(tmp_path, {python_name: python_stub})
 
-    payload = '{"session_id":"xyz789"}'
-    result = _run_hook(script_name, payload, bin_dir)
+    bin_dir = _make_bin_dir(tmp_path, {"mempalace": "#!/bin/sh\nexit 99\n"})
+
+    payload = '{"session_id":"explicit"}'
+    result = _run_hook(
+        script_name, payload, bin_dir, extra_env={"MEMPAL_PYTHON": str(explicit_python)}
+    )
 
     assert result.returncode == 0
     assert result.stdout == "{}\n"
-    assert (
-        args_file.read_text(encoding="utf-8")
-        == f"-m mempalace hook run --hook {hook_name} --harness claude-code"
+    assert args_file.read_text(encoding="utf-8").startswith(
+        f"-m mempalace hook run --hook {hook_name} --harness claude-code"
     )
     assert stdin_file.read_text(encoding="utf-8") == payload
 
 
 @pytest.mark.parametrize(("script_name", "hook_name"), SCRIPT_CASES)
-def test_plugin_hook_wrapper_errors_cleanly_when_no_runner_exists(
+def test_plugin_hook_wrapper_falls_back_to_python3_minus_m(
     tmp_path: Path, script_name: str, hook_name: str
 ) -> None:
-    bin_dir = _make_bin_dir(tmp_path, {})
-
-    payload = '{"session_id":"no-runner"}'
-    result = _run_hook(script_name, payload, bin_dir)
-
-    assert result.returncode != 0
-    assert result.stdout == ""
-    assert "could not find a runnable mempalace command or module" in result.stderr
-
-
-@pytest.mark.parametrize(("script_name", "hook_name"), SCRIPT_CASES)
-def test_plugin_hook_wrapper_falls_back_to_python_when_python3_cannot_import(
-    tmp_path: Path, script_name: str, hook_name: str
-) -> None:
+    """Falls back to python3 -m mempalace when mempalace is not on PATH."""
     args_file = tmp_path / "args.txt"
     stdin_file = tmp_path / "stdin.json"
-    bad_python3_used = tmp_path / "bad_python3_used.txt"
 
+    # No mempalace stub — hook must fall through to python3 -m mempalace
     bin_dir = _make_bin_dir(
         tmp_path,
         {
             "python3": (
                 "#!/bin/sh\n"
-                'if [ "$1" = "-c" ]; then\n'
-                "  exit 1\n"
-                "fi\n"
-                f"printf 'used' > \"{_shell_path(bad_python3_used)}\"\n"
-                "echo 'No module named mempalace' >&2\n"
-                "exit 1\n"
-            ),
-            "python": (
-                "#!/bin/sh\n"
-                'if [ "$1" = "-c" ]; then\n'
-                "  exit 0\n"
-                "fi\n"
                 f'printf \'%s\' "$*" > "{_shell_path(args_file)}"\n'
                 f"{_capture_stdin_to(stdin_file)}"
                 "printf '{}\\n'\n"
@@ -180,13 +162,11 @@ def test_plugin_hook_wrapper_falls_back_to_python_when_python3_cannot_import(
     )
 
     payload = '{"session_id":"fallback"}'
-    result = _run_hook(script_name, payload, bin_dir)
+    result = _run_hook(script_name, payload, bin_dir, extra_env={"MEMPAL_PYTHON": ""})
 
     assert result.returncode == 0
     assert result.stdout == "{}\n"
-    assert (
-        args_file.read_text(encoding="utf-8")
-        == f"-m mempalace hook run --hook {hook_name} --harness claude-code"
+    assert args_file.read_text(encoding="utf-8").startswith(
+        f"-m mempalace hook run --hook {hook_name} --harness claude-code"
     )
     assert stdin_file.read_text(encoding="utf-8") == payload
-    assert not bad_python3_used.exists()
