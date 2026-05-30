@@ -119,7 +119,7 @@ If you're planning a significant change, open an issue first to discuss the appr
 
 - **Discord**: [Join us](https://discord.com/invite/ycTQQCu6kn)
 - **Issues**: Bug reports and feature requests welcome
-- **Discussions**: For questions and ideas
+- **Questions and ideas**: Please use Discord or open an issue while GitHub Discussions are not enabled for this repo
 
 ## License
 
