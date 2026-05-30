@@ -35,6 +35,15 @@ import shlex
 import argparse
 from pathlib import Path
 
+# Force UTF-8 stdout/stderr so non-ASCII characters in CLI output
+# (e.g. the U+2500 box-drawing divider in `searcher.py` search
+# results, the U+2014 em-dash in `miner.py` status header) don't
+# crash on Windows cp1252 consoles or emit invalid UTF-8 bytes
+# (cp1252 0x97) that break parent-process readers.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 from .config import MempalaceConfig
 from .corpus_origin import detect_origin_heuristic, detect_origin_llm
 from .llm_client import LLMError, get_provider
