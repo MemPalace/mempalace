@@ -78,6 +78,9 @@ SKIP_FILENAMES = {
     ".gitignore",
     "package-lock.json",
     "pnpm-lock.yaml",
+    ".pnpm-debug.log",
+    "pnpm-debug.log",
+    "pnpm-workspace.yaml",
     "yarn.lock",
 }
 

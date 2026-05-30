@@ -43,6 +43,7 @@ SKIP_DIRS = {
     ".eggs",
     "htmlcov",
     "target",
+    ".pnpm-store",
 }
 
 _DEFAULT_BACKEND = ChromaBackend()
