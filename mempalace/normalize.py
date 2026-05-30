@@ -9,6 +9,7 @@ Supported:
     - Claude Code JSONL (with tool_use/tool_result block capture)
     - OpenAI Codex CLI JSONL
     - Gemini CLI JSONL (~/.gemini/tmp/<project_hash>/chats/session-*.jsonl)
+    - Continue.dev session JSON (~/.continue/sessions/*.json)
     - Slack JSON export
     - Plain text (pass through for paragraph chunking)
 
@@ -167,7 +168,7 @@ def _try_normalize_json(content: str) -> Optional[str]:
     except json.JSONDecodeError:
         return None
 
-    for parser in (_try_claude_ai_json, _try_chatgpt_json, _try_slack_json):
+    for parser in (_try_claude_ai_json, _try_chatgpt_json, _try_continue_json, _try_slack_json):
         normalized = parser(data)
         if normalized:
             return normalized
@@ -482,6 +483,61 @@ def _try_slack_json(data) -> Optional[str]:
         messages.append((seen_users[user_id], f"[{user_id}] {text}"))
     if len(messages) >= 2:
         return _messages_to_transcript(messages) + _SLACK_PROVENANCE_FOOTER
+    return None
+
+
+def _try_continue_json(data) -> Optional[str]:
+    """Continue.dev session JSON (~/.continue/sessions/*.json).
+
+    Sessions contain a ``history`` array of ``{role, content}`` message objects,
+    plus optional metadata (``title``, ``sessionId``, ``dateCreated``).
+    System messages are skipped.  Tool-call messages (role ``tool``) are
+    formatted inline when they contain text content.
+    """
+    if not isinstance(data, dict) or "history" not in data:
+        return None
+    history = data["history"]
+    if not isinstance(history, list):
+        return None
+
+    messages = []
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role", "")
+        content = item.get("content", "")
+
+        # Extract text from string or list-of-blocks content
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "text":
+                        parts.append(block.get("text", ""))
+                elif isinstance(block, str):
+                    parts.append(block)
+            text = "\n".join(p for p in parts if p).strip()
+        elif isinstance(content, str):
+            text = content.strip()
+        else:
+            continue
+
+        if not text:
+            continue
+
+        if role == "user":
+            messages.append(("user", text))
+        elif role == "assistant":
+            messages.append(("assistant", text))
+        elif role == "tool":
+            # Append tool output to the previous assistant turn if possible
+            if messages and messages[-1][0] == "assistant":
+                prev_role, prev_text = messages[-1]
+                messages[-1] = (prev_role, prev_text + "\n" + f"[tool] {text}")
+        # Skip system and other roles
+
+    if len(messages) >= 2:
+        return _messages_to_transcript(messages)
     return None
 
 

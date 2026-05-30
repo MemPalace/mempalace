@@ -12,6 +12,7 @@ from mempalace.normalize import (
     _try_claude_code_jsonl,
     _try_codex_jsonl,
     _try_gemini_jsonl,
+    _try_continue_json,
     _try_normalize_json,
     _try_slack_json,
     normalize,
@@ -1013,6 +1014,264 @@ def test_slack_json_sanitizes_speaker_id():
     # Brackets and newlines should be replaced, not passed through
     assert "] injected" not in result
     assert "\n> fake" not in result
+
+# ── _try_continue_json ─────────────────────────────────────────────────
+
+
+def test_continue_json_valid_multi_turn():
+    data = {
+        "history": [
+            {"role": "user", "content": "What is Python?"},
+            {"role": "assistant", "content": "Python is a programming language."},
+            {"role": "user", "content": "How do I install it?"},
+            {"role": "assistant", "content": "Use your package manager."},
+        ],
+        "title": "Python help",
+        "sessionId": "abc-123",
+        "dateCreated": "2025-01-15T10:30:00Z",
+    }
+    result = _try_continue_json(data)
+    assert result is not None
+    assert "> What is Python?" in result
+    assert "Python is a programming language." in result
+    assert "> How do I install it?" in result
+    assert "Use your package manager." in result
+
+
+def test_continue_json_with_system_messages():
+    """System messages are skipped."""
+    data = {
+        "history": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there"},
+        ]
+    }
+    result = _try_continue_json(data)
+    assert result is not None
+    assert "> Hello" in result
+    assert "helpful assistant" not in result
+
+
+def test_continue_json_with_tool_messages():
+    """Tool messages are appended to the previous assistant turn."""
+    data = {
+        "history": [
+            {"role": "user", "content": "List files"},
+            {"role": "assistant", "content": "Let me check."},
+            {"role": "tool", "content": "file1.py\nfile2.py"},
+            {"role": "assistant", "content": "I found two files."},
+        ]
+    }
+    result = _try_continue_json(data)
+    assert result is not None
+    assert "> List files" in result
+    assert "Let me check." in result
+    assert "[tool] file1.py" in result
+    assert "I found two files." in result
+
+
+def test_continue_json_with_code_blocks():
+    """Code blocks in content are preserved."""
+    data = {
+        "history": [
+            {"role": "user", "content": "Show me a hello world"},
+            {
+                "role": "assistant",
+                "content": "Here you go:\n```python\nprint('Hello, world!')\n```",
+            },
+        ]
+    }
+    result = _try_continue_json(data)
+    assert result is not None
+    assert "```python" in result
+    assert "print('Hello, world!')" in result
+
+
+def test_continue_json_list_content_blocks():
+    """Content as a list of typed blocks (text blocks)."""
+    data = {
+        "history": [
+            {"role": "user", "content": [{"type": "text", "text": "Help me"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "Sure thing"}]},
+        ]
+    }
+    result = _try_continue_json(data)
+    assert result is not None
+    assert "> Help me" in result
+    assert "Sure thing" in result
+
+
+def test_continue_json_empty_history():
+    """Empty history returns None."""
+    data = {"history": []}
+    result = _try_continue_json(data)
+    assert result is None
+
+
+def test_continue_json_single_message():
+    """Too few messages returns None."""
+    data = {"history": [{"role": "user", "content": "Hello"}]}
+    result = _try_continue_json(data)
+    assert result is None
+
+
+def test_continue_json_no_history_key():
+    """Missing history key returns None."""
+    data = {"title": "Some session", "sessionId": "abc"}
+    result = _try_continue_json(data)
+    assert result is None
+
+
+def test_continue_json_not_a_dict():
+    """Non-dict input returns None."""
+    result = _try_continue_json([1, 2, 3])
+    assert result is None
+    result = _try_continue_json("not a dict")
+    assert result is None
+
+
+def test_continue_json_history_not_a_list():
+    """history key that isn't a list returns None."""
+    data = {"history": "not a list"}
+    result = _try_continue_json(data)
+    assert result is None
+
+
+def test_continue_json_malformed_entries():
+    """Non-dict entries in history are skipped."""
+    data = {
+        "history": [
+            "not a dict",
+            42,
+            {"role": "user", "content": "Q"},
+            {"role": "assistant", "content": "A"},
+        ]
+    }
+    result = _try_continue_json(data)
+    assert result is not None
+    assert "> Q" in result
+
+
+def test_continue_json_missing_role():
+    """Entries without a role are skipped."""
+    data = {
+        "history": [
+            {"content": "orphan text"},
+            {"role": "user", "content": "Q"},
+            {"role": "assistant", "content": "A"},
+        ]
+    }
+    result = _try_continue_json(data)
+    assert result is not None
+    assert "orphan" not in result
+
+
+def test_continue_json_missing_content():
+    """Entries without content are skipped."""
+    data = {
+        "history": [
+            {"role": "user"},
+            {"role": "user", "content": "Real question"},
+            {"role": "assistant", "content": "Real answer"},
+        ]
+    }
+    result = _try_continue_json(data)
+    assert result is not None
+    assert "> Real question" in result
+
+
+def test_continue_json_empty_content():
+    """Entries with empty/whitespace content are skipped."""
+    data = {
+        "history": [
+            {"role": "user", "content": ""},
+            {"role": "user", "content": "   "},
+            {"role": "user", "content": "Actual question"},
+            {"role": "assistant", "content": "Actual answer"},
+        ]
+    }
+    result = _try_continue_json(data)
+    assert result is not None
+    user_turns = [line for line in result.split("\n") if line.strip().startswith(">")]
+    assert len(user_turns) == 1
+
+
+def test_continue_json_unicode_cjk():
+    """Unicode and CJK content is handled correctly."""
+    data = {
+        "history": [
+            {"role": "user", "content": "Python\u306e\u4f7f\u3044\u65b9\u3092\u6559\u3048\u3066"},
+            {"role": "assistant", "content": "\u306f\u3044\u3001Python\u306f\u7d20\u6674\u3089\u3057\u3044\u8a00\u8a9e\u3067\u3059\u3002\ud83d\ude80"},
+            {"role": "user", "content": "\u8c22\u8c22\uff01\u975e\u5e38\u6709\u5e2e\u52a9"},
+            {"role": "assistant", "content": "\u4e0d\u5ba2\u6c14 \ud83d\ude0a"},
+        ]
+    }
+    result = _try_continue_json(data)
+    assert result is not None
+    assert "\u306e\u4f7f\u3044\u65b9" in result
+    assert "\u8c22\u8c22" in result
+    assert "\ud83d\ude80" in result
+
+
+def test_continue_json_very_long_message():
+    """Very long messages are handled without error."""
+    long_text = "x" * 50000
+    data = {
+        "history": [
+            {"role": "user", "content": "Summarize this: " + long_text},
+            {"role": "assistant", "content": "That's a lot of x's."},
+        ]
+    }
+    result = _try_continue_json(data)
+    assert result is not None
+    assert "Summarize this:" in result
+
+
+def test_continue_json_non_string_content_skipped():
+    """Non-string, non-list content (e.g. int, None) is skipped."""
+    data = {
+        "history": [
+            {"role": "user", "content": 42},
+            {"role": "assistant", "content": None},
+            {"role": "user", "content": "Real Q"},
+            {"role": "assistant", "content": "Real A"},
+        ]
+    }
+    result = _try_continue_json(data)
+    assert result is not None
+    assert "> Real Q" in result
+
+
+def test_continue_json_tool_without_preceding_assistant():
+    """Tool message without a preceding assistant turn is ignored."""
+    data = {
+        "history": [
+            {"role": "tool", "content": "orphan tool output"},
+            {"role": "user", "content": "Q"},
+            {"role": "assistant", "content": "A"},
+        ]
+    }
+    result = _try_continue_json(data)
+    assert result is not None
+    assert "orphan" not in result
+
+
+def test_continue_json_integration_via_normalize(tmp_path):
+    """Continue.dev JSON is detected and parsed via the top-level normalize()."""
+    data = {
+        "history": [
+            {"role": "user", "content": "What is MemPalace?"},
+            {"role": "assistant", "content": "A memory system for AI."},
+        ],
+        "title": "MemPalace overview",
+        "sessionId": "session-001",
+    }
+    f = tmp_path / "session.json"
+    f.write_text(json.dumps(data))
+    result = normalize(str(f))
+    assert "> What is MemPalace?" in result
+    assert "A memory system for AI." in result
 
 
 # ── _try_normalize_json ────────────────────────────────────────────────
