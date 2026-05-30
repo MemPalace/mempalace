@@ -710,6 +710,33 @@ def mine_palace_lock(palace_path: str):
 mine_global_lock = mine_palace_lock
 
 
+def _build_where(wing: str, room: str | None = None) -> dict:
+    """Build a ChromaDB where filter for wing/room scoped operations."""
+    if room:
+        return {"$and": [{"wing": wing}, {"room": room}]}
+    return {"wing": wing}
+
+
+def find_drawer_ids(collection, wing: str, room: str | None = None) -> list[str]:
+    """Return drawer IDs matching a wing (and optional room) in one scan.
+
+    Uses ``include=[]`` so ChromaDB only fetches IDs — no documents,
+    embeddings, or metadatas. Callers that need both a count and a
+    subsequent delete should call this once and reuse the result to
+    avoid a second scan.
+    """
+    try:
+        results = collection.get(where=_build_where(wing, room), include=[])
+        return list(results.get("ids", []))
+    except Exception:
+        return []
+
+
+def count_drawers(collection, wing: str, room: str | None = None) -> int:
+    """Count drawers in a wing (and optionally a specific room)."""
+    return len(find_drawer_ids(collection, wing, room))
+
+
 def _metadata_matches_extract_mode(meta: dict, extract_mode: Optional[str]) -> bool:
     if extract_mode is None:
         return True
