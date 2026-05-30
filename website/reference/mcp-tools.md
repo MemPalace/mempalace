@@ -128,6 +128,37 @@ Prune drawers whose source files are gitignored, deleted, or moved. Returns a dr
 
 ---
 
+### `mempalace_mine`
+
+Mine project files into the palace. Returns a structured diff (`added` / `updated` / `unchanged` / `skipped`, each `{files, drawers}` except `unchanged`/`skipped` which are `{files}`). Reuses upstream's `source_mtime` metadata + `bulk_check_mined()` batch lookup for per-file categorization. Orphan handling is delegated to `mempalace_sync` — this tool does not delete drawers for missing source files.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `mode` | string (`incremental`/`full`) | No | `incremental` (sync, fast daily) or `full` (async background). Default: `incremental`. |
+| `wait` | boolean | No | `true`: block and return diff; `false`: spawn background job, return `job_id`. Default follows mode (`true` for incremental, `false` for full). |
+| `project_dir` | string | No | Mine exactly one folder (must contain `mempalace.yaml`) |
+| `scan_root` | string | No | Auto-discover all `mempalace.yaml` under this root. Default: `~/Claude`. Ignored if `project_dir` is set. |
+
+**Returns (sync, wait=true):** `{ status: "done", job_id, added: {files, drawers}, updated: {files, drawers}, unchanged: {files}, skipped: {files}, targets: [...], wings: {...}, duration_seconds, errors }`
+
+**Returns (async, wait=false):** `{ status: "spawned", job_id, pid, log_path }` — poll with `mempalace_mine_status`.
+
+**Returns (lock contention):** `{ status: "already_running", job_id }` (MCP-side runner lock) or `{ status: "already_running_palace_lock", error, note }` (upstream `mine_palace_lock`).
+
+---
+
+### `mempalace_mine_status`
+
+Read the current state of a background mine job started with `mempalace_mine(wait=false)`. Reports `stale` when status is `running` but the heartbeat is older than 5 minutes — the mining process likely died (sleep, crash, kill).
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `job_id` | string | **Yes** | UUID returned by `mempalace_mine` |
+
+**Returns:** Persisted job dict with `status` (queued/running/done/failed/stale), `started_at`, `finished_at`, `heartbeat`, and the full `result` dict if `status=done`.
+
+---
+
 ### `mempalace_get_drawer`
 
 Fetch a single drawer by ID — returns full content and metadata.
