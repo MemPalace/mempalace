@@ -451,7 +451,7 @@ def _get_client():
         _palace_db_mtime, \
         _metadata_cache, \
         _metadata_cache_time
-    db_path = os.path.join(_config.palace_path, "chroma.sqlite3")
+    db_path = os.path.join(ChromaBackend._resolve_persist_dir(_config.palace_path), "chroma.sqlite3")
     try:
         st = os.stat(db_path)
         current_inode = st.st_ino
@@ -673,7 +673,7 @@ def _tool_status_via_sqlite() -> dict:
     """
     import sqlite3 as _sqlite3
 
-    db_path = os.path.join(_config.palace_path, "chroma.sqlite3")
+    db_path = os.path.join(ChromaBackend._resolve_persist_dir(_config.palace_path), "chroma.sqlite3")
     if not os.path.isfile(db_path):
         return _no_palace()
     collection_name = _config.collection_name
