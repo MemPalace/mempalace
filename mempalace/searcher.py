@@ -19,6 +19,15 @@ from pathlib import Path
 from .backends import CollectionNotInitializedError, PalaceNotFoundError
 from .palace import get_closets_collection, get_collection
 
+try:
+    import jieba
+    _HAS_JIEBA = True
+except ImportError:
+    _HAS_JIEBA = False
+
+# CJK Unified Ideographs + Extensions + Kana + Hangul + Fullwidth forms
+_CJK_RE = re.compile(r'[\u4e00-\u9fff\u3400-\u4dbf\u3040-\u309f\u30a0-\u30ff\uff00-\uffef]')
+
 # Closet pointer line format: "topic|entities|→drawer_id_a,drawer_id_b"
 # Multiple lines may join with newlines inside one closet document.
 _CLOSET_DRAWER_REF_RE = re.compile(r"→([\w,]+)")
@@ -49,7 +58,11 @@ def _first_or_empty(results, key: str) -> list:
 
 
 def _tokenize(text: str) -> list:
-    """Lowercase + strip to alphanumeric tokens of length ≥ 2.
+    """Tokenize text for BM25 scoring.
+
+    For CJK text (Chinese/Japanese/Korean), uses jieba word segmentation
+    when available. Falls back to the original regex tokenizer for ASCII
+    text or when jieba is not installed.
 
     Tolerates ``None`` documents — Chroma can return ``None`` in the
     ``documents`` field for drawers without text content, which would
@@ -57,7 +70,10 @@ def _tokenize(text: str) -> list:
     """
     if not text:
         return []
-    return _TOKEN_RE.findall(text.lower())
+    text_lower = text.lower()
+    if _HAS_JIEBA and _CJK_RE.search(text_lower):
+        return [t for t in jieba.cut(text_lower) if len(t) >= 2 and not t.isspace()]
+    return _TOKEN_RE.findall(text_lower)
 
 
 def _bm25_scores(

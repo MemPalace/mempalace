@@ -92,6 +92,8 @@ dev = [
     "mypy>=1.0",
 ]
 spellcheck = ["autocorrect>=2.0"]
+# CJK (Chinese/Japanese/Korean) tokenization for BM25 keyword search
+cjk = ["jieba>=0.42"]
 # Hardware acceleration for the ONNX embedding model. Install exactly one:
 #   pip install mempalace[gpu]       — NVIDIA CUDA
 #   pip install mempalace[dml]       — DirectML (Windows AMD/Intel/NVIDIA)
