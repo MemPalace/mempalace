@@ -5,6 +5,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 mempal.yaml
+benchmarks/.beam_cache/
 .a5c/
 .claude/
 .codex/
