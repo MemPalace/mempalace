@@ -923,7 +923,17 @@ def hook_stop(data: dict, harness: str):
 
     _log(f"Session {session_id}: {exchange_count} exchanges, {since_last} since last save")
 
-    if since_last >= SAVE_INTERVAL and exchange_count > 0:
+    try:
+        from .config import MempalaceConfig
+        save_interval = int(MempalaceConfig().hooks_save_interval)
+    except Exception:
+        save_interval = SAVE_INTERVAL
+
+    if save_interval == 0:
+        _output({})
+        return
+
+    if since_last >= save_interval and exchange_count > 0:
         _log(f"TRIGGERING SAVE at exchange {exchange_count}")
 
         # Read hook settings from config
@@ -1018,6 +1028,17 @@ def hook_precompact(data: dict, harness: str):
         return
 
     _log(f"PRE-COMPACT triggered for session {session_id}")
+
+    try:
+        from .config import MempalaceConfig
+        precompact_enabled = MempalaceConfig().hooks_precompact
+    except Exception:
+        precompact_enabled = True
+
+    if not precompact_enabled:
+        _log("Precompact hook disabled via config — skipping mine, allowing compaction")
+        _output({})
+        return
 
     # Capture tool output via our normalize path before compaction loses it
     if transcript_path:

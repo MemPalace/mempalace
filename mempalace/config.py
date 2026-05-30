@@ -592,6 +592,39 @@ class MempalaceConfig:
         return self._file_config.get("hooks", {}).get("silent_save", True)
 
     @property
+    def hooks_save_interval(self) -> int:
+        """Number of exchanges between auto-save prompts. 0 = disabled.
+
+        Config: {"hooks": {"save_interval": 30}}
+        Env var (takes precedence): MEMPALACE_HOOKS_SAVE_INTERVAL=30
+        """
+        env_val = os.environ.get("MEMPALACE_HOOKS_SAVE_INTERVAL", "").strip()
+        if env_val:
+            try:
+                return max(0, int(env_val))
+            except ValueError:
+                pass
+        val = self._file_config.get("hooks", {}).get("save_interval", 15)
+        try:
+            return max(0, int(val))
+        except (TypeError, ValueError):
+            return 15
+
+    @property
+    def hooks_precompact(self) -> bool:
+        """Whether the precompact hook fires before context compaction. Default: True.
+
+        Config: {"hooks": {"precompact": false}}
+        Env var (takes precedence): MEMPALACE_HOOKS_PRECOMPACT=false
+        """
+        env_val = os.environ.get("MEMPALACE_HOOKS_PRECOMPACT", "").strip().lower()
+        if env_val in ("0", "false", "no", "off"):
+            return False
+        if env_val in ("1", "true", "yes", "on"):
+            return True
+        return bool(self._file_config.get("hooks", {}).get("precompact", True))
+
+    @property
     def hook_desktop_toast(self):
         """Whether the stop hook shows a desktop notification via notify-send."""
         return self._file_config.get("hooks", {}).get("desktop_toast", False)
