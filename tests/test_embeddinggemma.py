@@ -126,7 +126,7 @@ def test_lazy_load_runs_once(patched_lazy_load):
     ef(["one"])
     ef(["two"])
     ef(["three"])
-    assert patched_lazy_load["hf_hub_download"] == 2  # model + tokenizer, once total
+    assert patched_lazy_load["hf_hub_download"] == 3  # model + weights + tokenizer, once
     assert patched_lazy_load["InferenceSession"] == 1
     assert patched_lazy_load["Tokenizer.from_file"] == 1
 
