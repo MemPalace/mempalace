@@ -758,6 +758,89 @@ def cmd_migrate(args):
     )
 
 
+def cmd_purge(args):
+    """Delete drawers by wing and/or room.
+
+    Uses ``collection.delete(where=...)`` — chromadb's filter-delete path
+    doesn't go through ``updatePoint`` / ``repairConnectionsForUpdate``,
+    which is the upsert-only race from #521 that an earlier draft of this
+    command tried to side-step with a nuke-and-rebuild. The simpler path
+    works without losing drawers if the process is interrupted, without
+    re-embedding the survivors under a default model, and without
+    bypassing the backend abstraction.
+
+    ``--room`` without ``--wing`` purges that room across ALL wings.
+    Not idempotent — running purge twice on the same criteria prints
+    "No drawers found" the second time.
+    """
+    from .backends.chroma import ChromaBackend
+    from .migrate import confirm_destructive_action, contains_palace_database
+
+    palace_path = os.path.abspath(
+        os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    )
+
+    if not os.path.isdir(palace_path) or not contains_palace_database(palace_path):
+        print(f"\n  No palace found at {palace_path}")
+        return
+
+    if args.wing and args.room:
+        where = {"$and": [{"wing": args.wing}, {"room": args.room}]}
+    elif args.wing:
+        where = {"wing": args.wing}
+    elif args.room:
+        where = {"room": args.room}
+    else:
+        print("  Error: specify --wing and/or --room")
+        return
+
+    backend = ChromaBackend()
+    try:
+        col = backend.get_collection(palace_path, "mempalace_drawers")
+    except Exception as e:
+        print(f"\n  Error reading palace: {e}")
+        return
+
+    # Probe match count via a `where=`-filtered get with no payload.
+    # ChromaCollection.get returns the typed result; we only need ids.
+    try:
+        matched = col.get(where=where, include=[])
+    except Exception as e:
+        print(f"\n  Error querying drawers: {e}")
+        return
+
+    match_ids = matched.get("ids") if isinstance(matched, dict) else getattr(matched, "ids", [])
+    match_ids = match_ids or []
+    match_count = len(match_ids)
+
+    label_parts = []
+    if args.wing:
+        label_parts.append(f"wing={args.wing}")
+    if args.room:
+        label_parts.append(f"room={args.room}")
+    label = " ".join(label_parts)
+
+    if match_count == 0:
+        print(f"\n  No drawers found matching {label}\n")
+        return
+
+    print(f"\n  Found {match_count:,} drawers matching {label}")
+
+    if not args.yes:
+        if not confirm_destructive_action(f"Purge of {match_count:,} drawers", palace_path):
+            return
+
+    print("  Deleting matching drawers...")
+    try:
+        col.delete(where=where)
+    except Exception as e:
+        print(f"\n  Delete failed: {e}\n")
+        return
+
+    remaining = col.count()
+    print(f"\n  Purged {match_count:,} drawers. Remaining: {remaining:,}\n")
+
+
 def cmd_status(args):
     from .miner import status
 
@@ -1577,6 +1660,18 @@ def main():
 
     sub.add_parser("status", help="Show what's been filed")
 
+    # purge
+    p_purge = sub.add_parser(
+        "purge",
+        help="Delete drawers by wing and/or room (filtered delete via chromadb)",
+    )
+    p_purge.add_argument("--wing", help="Wing to purge")
+    p_purge.add_argument("--room", help="Room to purge (across all wings if --wing omitted)")
+    p_purge.add_argument("--palace", help="Path to palace directory (default: from config)")
+    p_purge.add_argument(
+        "--yes", action="store_true", help="Skip interactive confirmation (destructive!)"
+    )
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1613,6 +1708,7 @@ def main():
         "repair": cmd_repair,
         "repair-status": cmd_repair_status,
         "migrate": cmd_migrate,
+        "purge": cmd_purge,
         "status": cmd_status,
     }
     dispatch[args.command](args)

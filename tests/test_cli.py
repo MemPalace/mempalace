@@ -17,6 +17,7 @@ from mempalace.cli import (
     cmd_init,
     cmd_instructions,
     cmd_mine,
+    cmd_purge,
     cmd_repair,
     cmd_search,
     cmd_split,
@@ -111,6 +112,179 @@ def test_cmd_status_custom_palace(mock_config_cls):
 
         expected = os.path.expanduser("~/my_palace")
         mock_miner.status.assert_called_once_with(palace_path=expected)
+
+
+# ── cmd_purge ──────────────────────────────────────────────────────────
+
+
+def _make_purge_args(**overrides):
+    """Build a Namespace with all purge args set."""
+    defaults = {"palace": None, "wing": None, "room": None, "yes": True}
+    defaults.update(overrides)
+    return argparse.Namespace(**defaults)
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_purge_no_palace_found(mock_config_cls, capsys, tmp_path):
+    """Purge prints a clear message when the palace doesn't exist."""
+    missing = tmp_path / "nonexistent"
+    mock_config_cls.return_value.palace_path = str(missing)
+    args = _make_purge_args(wing="any", palace=str(missing))
+    cmd_purge(args)
+    out = capsys.readouterr().out
+    assert "No palace found" in out
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_purge_requires_filter(mock_config_cls, capsys, tmp_path):
+    """Purge refuses to run without --wing or --room (no mass-delete safety valve)."""
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    (palace / "chroma.sqlite3").write_text("")
+    mock_config_cls.return_value.palace_path = str(palace)
+    args = _make_purge_args(palace=str(palace))  # no wing, no room
+    cmd_purge(args)
+    out = capsys.readouterr().out
+    assert "Error: specify --wing and/or --room" in out
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_purge_no_matches(mock_config_cls, capsys, tmp_path):
+    """When the filter matches zero drawers, purge exits cleanly."""
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    (palace / "chroma.sqlite3").write_text("")
+    mock_config_cls.return_value.palace_path = str(palace)
+    args = _make_purge_args(wing="empty-wing", palace=str(palace))
+
+    mock_col = MagicMock()
+    mock_col.get.return_value = {"ids": []}
+    mock_backend = MagicMock()
+    mock_backend.return_value.get_collection.return_value = mock_col
+    with patch("mempalace.backends.chroma.ChromaBackend", mock_backend):
+        cmd_purge(args)
+    out = capsys.readouterr().out
+    assert "No drawers found matching" in out
+    mock_col.delete.assert_not_called()
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_purge_wing_and_room_uses_and_filter(mock_config_cls, tmp_path):
+    """Purge builds a $and filter when both --wing and --room are set."""
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    (palace / "chroma.sqlite3").write_text("")
+    mock_config_cls.return_value.palace_path = str(palace)
+    args = _make_purge_args(wing="myproj", room="drafts", palace=str(palace))
+
+    mock_col = MagicMock()
+    mock_col.get.return_value = {"ids": []}
+    mock_backend = MagicMock()
+    mock_backend.return_value.get_collection.return_value = mock_col
+    with patch("mempalace.backends.chroma.ChromaBackend", mock_backend):
+        cmd_purge(args)
+    first_call = mock_col.get.call_args_list[0]
+    assert first_call.kwargs["where"] == {"$and": [{"wing": "myproj"}, {"room": "drafts"}]}
+
+
+def test_cmd_purge_deletes_via_where_clause(tmp_path):
+    """End-to-end: purge filters via collection.delete(where=...) — preserves
+    embedding function, no rmtree, no rebuild. Regression for igorls' #1087
+    review concerns 1, 2, 3."""
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    # Real chromadb palace via the backend so the embedding function is
+    # whatever the backend resolves (the actual concern from the review).
+    from mempalace.backends.chroma import ChromaBackend
+
+    backend = ChromaBackend()
+    col = backend.get_collection(str(palace), "mempalace_drawers", create=True)
+    col.add(
+        ids=["k1", "k2", "p1", "p2"],
+        documents=["keep one", "keep two", "purge one", "purge two"],
+        metadatas=[
+            {"wing": "keep", "room": "r"},
+            {"wing": "keep", "room": "r"},
+            {"wing": "purge-me", "room": "r"},
+            {"wing": "purge-me", "room": "r"},
+        ],
+    )
+    assert col.count() == 4
+
+    args = _make_purge_args(wing="purge-me", palace=str(palace))
+    with patch("mempalace.cli.MempalaceConfig") as mock_config_cls:
+        mock_config_cls.return_value.palace_path = str(palace)
+        cmd_purge(args)
+
+    # Re-open through the backend to confirm survivors and that the index
+    # still works (no nuke, embedding function intact).
+    col2 = backend.get_collection(str(palace), "mempalace_drawers", create=False)
+    assert col2.count() == 2
+    surviving = col2.get(include=["metadatas"])
+    surviving_ids = surviving.get("ids") if isinstance(surviving, dict) else surviving.ids
+    assert set(surviving_ids) == {"k1", "k2"}
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_purge_interactive_abort_leaves_data_intact(mock_config_cls, capsys, tmp_path):
+    """yes=False + the user types anything other than 'y'/'yes' → no delete.
+
+    The custom input() prompt was retired in #1087's rewrite in favor of
+    confirm_destructive_action() (mempalace/migrate.py); this test
+    exercises the interactive branch end-to-end via patched input() and
+    asserts both the operator-visible message and that .delete() was
+    never called.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    (palace / "chroma.sqlite3").write_text("")
+    mock_config_cls.return_value.palace_path = str(palace)
+    args = _make_purge_args(wing="purge-me", palace=str(palace), yes=False)
+
+    mock_col = MagicMock()
+    mock_col.get.return_value = {"ids": ["d1", "d2"]}
+    mock_backend = MagicMock()
+    mock_backend.return_value.get_collection.return_value = mock_col
+
+    with (
+        patch("mempalace.backends.chroma.ChromaBackend", mock_backend),
+        patch("builtins.input", return_value="n"),
+    ):
+        cmd_purge(args)
+
+    out = capsys.readouterr().out
+    assert "Aborted" in out, f"abort message missing: {out!r}"
+    mock_col.delete.assert_not_called()
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_purge_eof_on_confirm_aborts_safely(mock_config_cls, capsys, tmp_path):
+    """yes=False + EOF on stdin (non-interactive call) → abort, not crash.
+
+    Closes the EOFError concern — purge piped from a non-tty (CI, cron,
+    `< /dev/null`) used to raise an unhandled exception. Now
+    confirm_destructive_action catches EOFError and aborts cleanly.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    (palace / "chroma.sqlite3").write_text("")
+    mock_config_cls.return_value.palace_path = str(palace)
+    args = _make_purge_args(wing="purge-me", palace=str(palace), yes=False)
+
+    mock_col = MagicMock()
+    mock_col.get.return_value = {"ids": ["d1"]}
+    mock_backend = MagicMock()
+    mock_backend.return_value.get_collection.return_value = mock_col
+
+    with (
+        patch("mempalace.backends.chroma.ChromaBackend", mock_backend),
+        patch("builtins.input", side_effect=EOFError),
+    ):
+        cmd_purge(args)
+
+    out = capsys.readouterr().out
+    assert "Aborted" in out
+    mock_col.delete.assert_not_called()
 
 
 # ── cmd_search ─────────────────────────────────────────────────────────
