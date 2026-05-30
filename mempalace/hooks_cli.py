@@ -935,7 +935,13 @@ def hook_stop(data: dict, harness: str):
             silent = True
             toast = False
 
-        project_wing = _wing_from_transcript_path(transcript_path)
+        # MEMPALACE_WING env var takes precedence over path-derived wing
+        # so a session can declare its own wing without depending on the
+        # encoded transcript folder layout (which loses information for
+        # project dir names containing ``-``).
+        from .config import session_wing_override
+
+        project_wing = session_wing_override() or _wing_from_transcript_path(transcript_path)
 
         if silent:
             # Save directly via Python API — systemMessage renders in terminal

@@ -10,6 +10,7 @@ from mempalace.config import (
     sanitize_iso_temporal,
     sanitize_kg_value,
     sanitize_name,
+    session_wing_override,
 )
 
 
@@ -134,6 +135,85 @@ def test_normalize_wing_name_already_clean():
 
 def test_normalize_wing_name_mixed():
     assert normalize_wing_name("My-Cool App") == "my_cool_app"
+
+
+# --- session_wing_override ---
+
+
+def test_session_wing_override_unset(monkeypatch):
+    monkeypatch.delenv("MEMPALACE_WING", raising=False)
+    monkeypatch.delenv("MEMPAL_WING", raising=False)
+    assert session_wing_override() is None
+
+
+def test_session_wing_override_empty_string(monkeypatch):
+    monkeypatch.setenv("MEMPALACE_WING", "")
+    monkeypatch.delenv("MEMPAL_WING", raising=False)
+    assert session_wing_override() is None
+
+
+def test_session_wing_override_whitespace_only(monkeypatch):
+    """Pure whitespace is treated as unset, not as a wing literally named ``\\t``."""
+    monkeypatch.setenv("MEMPALACE_WING", "   \t ")
+    monkeypatch.delenv("MEMPAL_WING", raising=False)
+    assert session_wing_override() is None
+
+
+def test_session_wing_override_normalizes(monkeypatch):
+    """Env value runs through normalize_wing_name so the override is wing-slug-shaped."""
+    monkeypatch.setenv("MEMPALACE_WING", "My-Cool App")
+    monkeypatch.delenv("MEMPAL_WING", raising=False)
+    assert session_wing_override() == "my_cool_app"
+
+
+def test_session_wing_override_mempal_fallback(monkeypatch):
+    """Legacy ``MEMPAL_WING`` works when ``MEMPALACE_WING`` is unset."""
+    monkeypatch.delenv("MEMPALACE_WING", raising=False)
+    monkeypatch.setenv("MEMPAL_WING", "mempalace")
+    assert session_wing_override() == "mempalace"
+
+
+def test_session_wing_override_mempalace_wins_over_mempal(monkeypatch):
+    """When both are set, ``MEMPALACE_WING`` takes precedence (matches MEMPAL_PYTHON convention)."""
+    monkeypatch.setenv("MEMPALACE_WING", "preferred")
+    monkeypatch.setenv("MEMPAL_WING", "legacy")
+    assert session_wing_override() == "preferred"
+
+
+def test_session_wing_override_rejects_path_traversal(monkeypatch):
+    """``..`` segments in the env value disable the override (no unsafe slug)."""
+    monkeypatch.setenv("MEMPALACE_WING", "../../etc")
+    monkeypatch.delenv("MEMPAL_WING", raising=False)
+    assert session_wing_override() is None
+
+
+def test_session_wing_override_rejects_path_separators(monkeypatch):
+    """Forward / back slashes are rejected — wing names must not look like paths."""
+    monkeypatch.setenv("MEMPALACE_WING", "foo/bar")
+    monkeypatch.delenv("MEMPAL_WING", raising=False)
+    assert session_wing_override() is None
+
+
+def test_session_wing_override_rejects_overlong(monkeypatch):
+    """Values longer than ``MAX_NAME_LENGTH`` (128) are rejected."""
+    monkeypatch.setenv("MEMPALACE_WING", "x" * 200)
+    monkeypatch.delenv("MEMPAL_WING", raising=False)
+    assert session_wing_override() is None
+
+
+def test_session_wing_override_rejects_invalid_chars(monkeypatch):
+    """Characters outside the wing/room slug charset (e.g. ``@``, ``$``) are rejected."""
+    monkeypatch.setenv("MEMPALACE_WING", "wing@host")
+    monkeypatch.delenv("MEMPAL_WING", raising=False)
+    assert session_wing_override() is None
+
+
+def test_session_wing_override_invalid_falls_back_silently(monkeypatch):
+    """Invalid env value yields ``None`` rather than raising — caller can use default derivation."""
+    monkeypatch.setenv("MEMPALACE_WING", "../../etc")
+    monkeypatch.delenv("MEMPAL_WING", raising=False)
+    # Must not raise — silently disables the override
+    assert session_wing_override() is None
 
 
 # --- sanitize_name ---
