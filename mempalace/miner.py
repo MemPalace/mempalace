@@ -475,19 +475,37 @@ def chunk_text(
     chunk_size: int = None,
     chunk_overlap: int = None,
     min_chunk_size: int = None,
+    *,
+    symbol_header_prefix=None,
 ) -> list:
     """
     Split content into drawer-sized chunks.
     Tries to split on paragraph/line boundaries.
-    Returns list of {"content": str, "chunk_index": int, "line_start": int, "line_end": int}
 
-    ``line_start`` / ``line_end`` are 1-indexed line numbers in the stripped
-    source, giving an approximate locator for where the chunk came from.
-    Closet pointers (Tier 6a) use this to emit ``YYYY-MM-DD:L42-L78`` segments
-    so retrieval can jump straight to the right span without opening the
-    whole drawer.
+    Args:
+        content: text to chunk.
+        source_file: file path used for room/topic inference and (when
+            ``symbol_header_prefix`` is supplied) chunk enrichment.
+        chunk_size, chunk_overlap, min_chunk_size: optional overrides for
+            the module-level defaults. When ``None`` (default), the
+            module constants ``CHUNK_SIZE`` / ``CHUNK_OVERLAP`` /
+            ``MIN_CHUNK_SIZE`` are used. Validated as positive ints; an
+            overlap >= size is rejected to avoid an infinite loop.
+        symbol_header_prefix: optional callable
+            ``(chunk_text, source_file, chunk_index) -> str``. When
+            supplied, the returned header is prepended to each chunk
+            with a blank line separator before storage. Lets AST-lite
+            symbol enrichment (function names, class paths, imports)
+            and similar representation-axis experiments stack on this
+            code path without forking it. Default ``None`` preserves
+            original behavior exactly. Discussed in
+            MemPalace/mempalace#1384.
 
-    Optional params override module-level defaults when provided.
+    Returns:
+        list of ``{"content": str, "chunk_index": int, "line_start": int,
+        "line_end": int}``.  ``line_start`` / ``line_end`` are 1-indexed
+        line numbers in the stripped source, giving an approximate locator
+        for where the chunk came from.
     """
     if chunk_size is None:
         chunk_size = CHUNK_SIZE
@@ -541,6 +559,10 @@ def chunk_text(
 
         chunk = content[start:end].strip()
         if len(chunk) >= min_chunk_size:
+            if symbol_header_prefix is not None:
+                header = symbol_header_prefix(chunk, source_file, chunk_index)
+                if header:
+                    chunk = f"{header}\n\n{chunk}"
             # Tier 6a — 1-indexed line range in the stripped source.
             # Approximate locator (±1 at boundaries is fine for "jump to
             # roughly here"); exact-quote positioning is a future tier.
