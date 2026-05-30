@@ -739,7 +739,7 @@ def tool_status():
     # #1222 failure mode, opening the persistent client to call .count()
     # can segfault — short-circuit to a pure-sqlite path when divergence
     # is detected so status stays reachable.
-    db_exists = os.path.isfile(os.path.join(_config.palace_path, "chroma.sqlite3"))
+    db_exists = os.path.isfile(os.path.join(ChromaBackend._resolve_persist_dir(_config.palace_path), "chroma.sqlite3"))
     _refresh_vector_disabled_flag()
 
     if _vector_disabled:
@@ -2724,7 +2724,7 @@ def _maybe_eager_warmup_embedder() -> None:
         )
         return
     palace_path = _config.palace_path
-    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    db_path = os.path.join(ChromaBackend._resolve_persist_dir(palace_path), "chroma.sqlite3")
     if not os.path.isfile(db_path):
         # Pre-check (NOT a try/except on _ChromaNotFoundError, which never
         # propagates out of _get_collection — see docstring). No palace

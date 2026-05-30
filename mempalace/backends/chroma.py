@@ -2,6 +2,7 @@
 
 import contextlib
 import datetime as _dt
+import functools
 import json
 import logging
 import os
@@ -43,6 +44,36 @@ _SUPPORTED_OPERATORS = _REQUIRED_OPERATORS | _OPTIONAL_OPERATORS
 # Treat only >10x as corruption so normal flush lag or small segments do not get
 # quarantined.
 _HNSW_LINK_TO_DATA_MAX_RATIO = 10.0
+
+
+@functools.lru_cache(maxsize=64)
+def _resolve_persist_dir(palace_path: str) -> str:
+    """Return the directory ChromaDB should use for this palace.
+
+    Reads ``<palace_path>/mempalace.yaml`` for ``backend.persist_directory``.
+    Relative paths are resolved against ``palace_path``; the directory is
+    created if it does not yet exist.  Falls back to ``palace_path`` for
+    palaces that predate this config key (fully backwards-compatible).
+    """
+    try:
+        import yaml  # PyYAML — always available as a mempalace dependency
+
+        yaml_path = os.path.join(palace_path, "mempalace.yaml")
+        if os.path.isfile(yaml_path):
+            with open(yaml_path, encoding="utf-8") as fh:
+                cfg = yaml.safe_load(fh) or {}
+            persist = (cfg.get("backend") or {}).get("persist_directory")
+            if persist:
+                resolved = (
+                    persist
+                    if os.path.isabs(persist)
+                    else os.path.normpath(os.path.join(palace_path, persist))
+                )
+                os.makedirs(resolved, exist_ok=True)
+                return resolved
+    except Exception:
+        pass
+    return palace_path
 
 
 def _hnsw_link_to_data_ratio(seg_dir: str) -> Optional[float]:
@@ -237,8 +268,9 @@ def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> lis
     The original directory is renamed, not deleted, so recovery remains
     possible if the heuristic ever misfires.
     """
+    persist_dir = _resolve_persist_dir(palace_path)
 
-    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    db_path = os.path.join(persist_dir, "chroma.sqlite3")
     if not os.path.isfile(db_path):
         return []
 
@@ -250,7 +282,7 @@ def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> lis
     moved: list[str] = []
 
     try:
-        entries = os.listdir(palace_path)
+        entries = os.listdir(persist_dir)
     except OSError:
         return []
 
@@ -258,7 +290,7 @@ def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> lis
         if "-" not in name or name.startswith(".") or ".drift-" in name:
             continue
 
-        seg_dir = os.path.join(palace_path, name)
+        seg_dir = os.path.join(persist_dir, name)
         if not os.path.isdir(seg_dir):
             continue
 
@@ -325,7 +357,7 @@ def _vector_segment_id(palace_path: str, collection_name: str) -> Optional[str]:
     Reads ``chroma.sqlite3`` directly so we never have to load a segment
     that may segfault on open (#1222 is exactly this case).
     """
-    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    db_path = os.path.join(_resolve_persist_dir(palace_path), "chroma.sqlite3")
     if not os.path.isfile(db_path):
         return None
     try:
@@ -493,7 +525,7 @@ def _read_sync_threshold(palace_path: str, collection_name: str) -> int:
     explicit setting — matches what older mempalace palaces were created
     with before PR #1191.
     """
-    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    db_path = os.path.join(_resolve_persist_dir(palace_path), "chroma.sqlite3")
     if not os.path.isfile(db_path):
         return 1000
     try:
@@ -613,7 +645,7 @@ def _sqlite_embedding_count(palace_path: str, collection_name: str) -> Optional[
     Mirrors :func:`mempalace.repair.sqlite_drawer_count` but kept in this
     module so the backend probe doesn't pull in the repair CLI module.
     """
-    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    db_path = os.path.join(_resolve_persist_dir(palace_path), "chroma.sqlite3")
     if not os.path.isfile(db_path):
         return None
     try:
@@ -727,8 +759,9 @@ def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
     out of the way before ``PersistentClient`` opens so Chroma can rebuild
     cleanly instead of touching known-bad metadata.
     """
+    persist_dir = _resolve_persist_dir(palace_path)
     try:
-        entries = os.listdir(palace_path)
+        entries = os.listdir(persist_dir)
     except OSError:
         return []
 
@@ -736,7 +769,7 @@ def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
     for name in entries:
         if "-" not in name or name.startswith(".") or ".drift-" in name or ".corrupt-" in name:
             continue
-        seg_dir = os.path.join(palace_path, name)
+        seg_dir = os.path.join(persist_dir, name)
         if not os.path.isdir(seg_dir):
             continue
 
@@ -845,7 +878,7 @@ def _fix_blob_seq_ids(palace_path: str) -> None:
     subsequent opens skip the sqlite connection entirely. Already-migrated
     palaces can touch the marker manually to opt into the fast path.
     """
-    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    db_path = os.path.join(_resolve_persist_dir(palace_path), "chroma.sqlite3")
     if not os.path.isfile(db_path):
         return
     marker = os.path.join(palace_path, _BLOB_FIX_MARKER)
@@ -1279,30 +1312,11 @@ class ChromaBackend(BaseBackend):
     def _resolve_persist_dir(palace_path: str) -> str:
         """Return the directory ChromaDB should use for this palace.
 
-        Reads ``<palace_path>/mempalace.yaml`` for ``backend.persist_directory``.
-        Relative paths are resolved against ``palace_path``; the directory is
-        created if it does not yet exist.  Falls back to ``palace_path`` for
-        palaces that predate this config key (fully backwards-compatible).
+        Delegates to the module-level :func:`_resolve_persist_dir` (which is
+        memoized).  Kept as a static method so existing call-sites that
+        already have a ``ChromaBackend`` reference continue to work.
         """
-        try:
-            import yaml  # PyYAML — always available as a mempalace dependency
-
-            yaml_path = os.path.join(palace_path, "mempalace.yaml")
-            if os.path.isfile(yaml_path):
-                with open(yaml_path, encoding="utf-8") as fh:
-                    cfg = yaml.safe_load(fh) or {}
-                persist = (cfg.get("backend") or {}).get("persist_directory")
-                if persist:
-                    resolved = (
-                        persist
-                        if os.path.isabs(persist)
-                        else os.path.normpath(os.path.join(palace_path, persist))
-                    )
-                    os.makedirs(resolved, exist_ok=True)
-                    return resolved
-        except Exception:
-            pass
-        return palace_path
+        return _resolve_persist_dir(palace_path)
 
     @staticmethod
     def _resolve_embedding_function():

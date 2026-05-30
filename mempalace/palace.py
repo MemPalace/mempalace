@@ -121,7 +121,7 @@ def _open_collection_or_explain(
         emit(f"\n  No palace found at {palace_path}")
         emit("  Run: mempalace init <dir> then mempalace mine <dir>")
         return None
-    if not os.path.isfile(os.path.join(palace_path, "chroma.sqlite3")):
+    if not os.path.isfile(os.path.join(ChromaBackend._resolve_persist_dir(palace_path), "chroma.sqlite3")):
         emit(f"\n  Palace dir at {palace_path} exists but has no chroma.sqlite3 yet.")
         emit("  Run: mempalace mine <dir>")
         return None

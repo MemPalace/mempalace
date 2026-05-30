@@ -42,7 +42,7 @@ from typing import Callable, Iterator, Optional
 
 from chromadb.errors import NotFoundError as ChromaNotFoundError
 
-from .backends.chroma import ChromaBackend, hnsw_capacity_status
+from .backends.chroma import ChromaBackend, _resolve_persist_dir, hnsw_capacity_status
 
 
 COLLECTION_NAME = "mempalace_drawers"
@@ -470,7 +470,7 @@ def sqlite_drawer_count(palace_path: str, collection_name: Optional[str] = None)
     "unknown" and fall back to the cap-detection check.
     """
     collection_name = collection_name or _drawers_collection_name()
-    sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
+    sqlite_path = os.path.join(_resolve_persist_dir(palace_path), "chroma.sqlite3")
     if not os.path.exists(sqlite_path):
         return None
     try:
@@ -511,7 +511,7 @@ def sqlite_integrity_errors(palace_path: str) -> list[str]:
     path.
     """
 
-    sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
+    sqlite_path = os.path.join(_resolve_persist_dir(palace_path), "chroma.sqlite3")
     if not os.path.exists(sqlite_path):
         return []
 
@@ -535,7 +535,7 @@ def sqlite_integrity_errors(palace_path: str) -> list[str]:
 def print_sqlite_integrity_abort(palace_path: str, errors: list[str]) -> None:
     """Print a clear repair abort message for SQLite-layer corruption."""
 
-    sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
+    sqlite_path = os.path.join(_resolve_persist_dir(palace_path), "chroma.sqlite3")
     preview = errors[:5]
 
     print("\n  ABORT: SQLite-layer corruption detected before repair rebuild.")
@@ -582,7 +582,7 @@ def maybe_repair_poisoned_max_seq_id_before_rebuild(
     extracts only already-visible embeddings and can discard queued writes.
     """
 
-    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    db_path = os.path.join(_resolve_persist_dir(palace_path), "chroma.sqlite3")
     if not os.path.isfile(db_path):
         return None
 
@@ -694,7 +694,7 @@ def _vacuum_and_rebuild_fts5(palace_path: str, progress=print) -> None:
     The repair itself succeeded at this point — VACUUM/FTS5 are best-effort
     cleanup, not correctness requirements.
     """
-    sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
+    sqlite_path = os.path.join(_resolve_persist_dir(palace_path), "chroma.sqlite3")
     if not os.path.exists(sqlite_path):
         return
     try:
@@ -809,7 +809,7 @@ def rebuild_index(
         return
 
     # Back up ONLY the SQLite database, not the bloated HNSW files
-    sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
+    sqlite_path = os.path.join(_resolve_persist_dir(palace_path), "chroma.sqlite3")
     backup_path = sqlite_path + ".backup"
     if os.path.exists(sqlite_path):
         progress(f"  Backing up chroma.sqlite3 ({os.path.getsize(sqlite_path) / 1e6:.0f} MB)...")
@@ -997,7 +997,7 @@ def extract_via_sqlite(palace_path: str, collection_name: str) -> Iterator[tuple
     "empty collection" from "collection not present" should query
     :func:`sqlite_drawer_count` first.
     """
-    sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
+    sqlite_path = os.path.join(_resolve_persist_dir(palace_path), "chroma.sqlite3")
     if not os.path.isfile(sqlite_path):
         return
 
@@ -1127,7 +1127,7 @@ def rebuild_from_sqlite(
     source_palace = os.path.abspath(os.path.expanduser(source_palace))
     dest_palace = os.path.abspath(os.path.expanduser(dest_palace))
 
-    src_db = os.path.join(source_palace, "chroma.sqlite3")
+    src_db = os.path.join(_resolve_persist_dir(source_palace), "chroma.sqlite3")
 
     in_place = source_palace == dest_palace
 
@@ -1174,7 +1174,7 @@ def rebuild_from_sqlite(
         print(f"  Archiving {dest_palace} → {archive_path}")
         shutil.move(dest_palace, archive_path)
         source_palace = archive_path
-        src_db = os.path.join(source_palace, "chroma.sqlite3")
+        src_db = os.path.join(_resolve_persist_dir(source_palace), "chroma.sqlite3")
 
         # In-place only: drop chromadb's process-wide System registry so
         # the new client at dest_palace builds a fresh System. Without
@@ -1260,7 +1260,7 @@ def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
         print("  No palace found.\n")
         return {"status": "unknown", "message": "no palace at path"}
 
-    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    db_path = os.path.join(_resolve_persist_dir(palace_path), "chroma.sqlite3")
     if not os.path.isfile(db_path):
         print(f"  Palace dir at {palace_path} exists but has no chroma.sqlite3 yet.\n")
         return {"status": "uninitialized", "message": "palace has no chroma.sqlite3 yet"}
@@ -1448,7 +1448,7 @@ def repair_max_seq_id(
     from .migrate import confirm_destructive_action, contains_palace_database
 
     palace_path = os.path.abspath(os.path.expanduser(palace_path))
-    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    db_path = os.path.join(_resolve_persist_dir(palace_path), "chroma.sqlite3")
 
     result: dict = {
         "palace_path": palace_path,
@@ -1530,7 +1530,7 @@ def repair_max_seq_id(
 
     if backup:
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        backup_path = os.path.join(palace_path, f"chroma.sqlite3.max-seq-id-backup-{timestamp}")
+        backup_path = os.path.join(_resolve_persist_dir(palace_path), f"chroma.sqlite3.max-seq-id-backup-{timestamp}")
         shutil.copy2(db_path, backup_path)
         result["backup"] = backup_path
         print(f"  Backup:  {backup_path}")

@@ -25,6 +25,7 @@ from mempalace.backends.chroma import (
     _fix_blob_seq_ids,
     _fix_missing_collection_type,
     _pin_hnsw_threads,
+    _resolve_persist_dir,
     _segment_appears_healthy,
     quarantine_invalid_hnsw_metadata,
     quarantine_stale_hnsw,
@@ -179,6 +180,78 @@ def test_chroma_detect_matches_palace_with_chroma_sqlite(tmp_path):
     (tmp_path / "chroma.sqlite3").write_bytes(b"")
     assert ChromaBackend.detect(str(tmp_path)) is True
     assert ChromaBackend.detect(str(tmp_path.parent)) is False
+
+
+# ---------------------------------------------------------------------------
+# _resolve_persist_dir
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_persist_dir_fallback_no_yaml(tmp_path):
+    """No mempalace.yaml → returns palace_path unchanged."""
+    _resolve_persist_dir.cache_clear()
+    result = _resolve_persist_dir(str(tmp_path))
+    assert result == str(tmp_path)
+
+
+def test_resolve_persist_dir_fallback_no_backend_key(tmp_path):
+    """mempalace.yaml without backend.persist_directory → returns palace_path."""
+    _resolve_persist_dir.cache_clear()
+    (tmp_path / "mempalace.yaml").write_text("wing: rachael\n")
+    result = _resolve_persist_dir(str(tmp_path))
+    assert result == str(tmp_path)
+
+
+def test_resolve_persist_dir_absolute_path(tmp_path):
+    """Absolute persist_directory is returned as-is and created."""
+    _resolve_persist_dir.cache_clear()
+    db_dir = tmp_path / "external_db"
+    (tmp_path / "mempalace.yaml").write_text(
+        f"backend:\n  persist_directory: {db_dir}\n"
+    )
+    result = _resolve_persist_dir(str(tmp_path))
+    assert result == str(db_dir)
+    assert db_dir.is_dir()
+
+
+def test_resolve_persist_dir_relative_path(tmp_path):
+    """Relative persist_directory is resolved against palace_path."""
+    _resolve_persist_dir.cache_clear()
+    (tmp_path / "mempalace.yaml").write_text("backend:\n  persist_directory: .db\n")
+    result = _resolve_persist_dir(str(tmp_path))
+    expected = str((tmp_path / ".db").resolve())
+    assert result == expected
+    assert (tmp_path / ".db").is_dir()
+
+
+def test_resolve_persist_dir_bad_yaml_fallback(tmp_path):
+    """Malformed YAML → falls back to palace_path without raising."""
+    _resolve_persist_dir.cache_clear()
+    (tmp_path / "mempalace.yaml").write_bytes(b"\x00\xff\xfe")
+    result = _resolve_persist_dir(str(tmp_path))
+    assert result == str(tmp_path)
+
+
+def test_resolve_persist_dir_memoized(tmp_path):
+    """Same path returns the same result on repeated calls (lru_cache)."""
+    _resolve_persist_dir.cache_clear()
+    r1 = _resolve_persist_dir(str(tmp_path))
+    r2 = _resolve_persist_dir(str(tmp_path))
+    assert r1 == r2
+    info = _resolve_persist_dir.cache_info()
+    assert info.hits >= 1
+
+
+def test_chroma_detect_respects_external_persist_dir(tmp_path):
+    """ChromaBackend.detect() finds the DB in the configured persist_directory."""
+    _resolve_persist_dir.cache_clear()
+    db_dir = tmp_path / "external_db"
+    db_dir.mkdir()
+    (db_dir / "chroma.sqlite3").write_bytes(b"")
+    (tmp_path / "mempalace.yaml").write_text(
+        f"backend:\n  persist_directory: {db_dir}\n"
+    )
+    assert ChromaBackend.detect(str(tmp_path)) is True
 
 
 def test_query_rejects_missing_input():

@@ -613,6 +613,7 @@ def cmd_sweep(args):
 
 def cmd_sync(args):
     """Prune drawers whose source files are gitignored, deleted, or moved (#1252)."""
+    from .backends.chroma import _resolve_persist_dir
     from .mcp_server import _wal_log
     from .palace import MineAlreadyRunning
     from .sync import sync_palace
@@ -622,7 +623,7 @@ def cmd_sync(args):
     if not os.path.isdir(palace_path):
         print(f"\n  No palace found at {palace_path}")
         return
-    if not os.path.isfile(os.path.join(palace_path, "chroma.sqlite3")):
+    if not os.path.isfile(os.path.join(_resolve_persist_dir(palace_path), "chroma.sqlite3")):
         print(f"\n  Palace dir at {palace_path} exists but has no chroma.sqlite3 yet.")
         print("  Run: mempalace mine <dir>")
         return
@@ -860,7 +861,7 @@ def cmd_repair(args):
             sys.exit(1)
         return
 
-    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    db_path = os.path.join(ChromaBackend._resolve_persist_dir(palace_path), "chroma.sqlite3")
 
     if not os.path.isdir(palace_path):
         print(f"\n  No palace found at {palace_path}")
