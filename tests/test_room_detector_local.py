@@ -264,6 +264,14 @@ def test_get_user_approval_accept_all():
     assert result == rooms
 
 
+def test_get_user_approval_yes_skips_input():
+    rooms = [{"name": "frontend", "description": "UI"}]
+    with patch("builtins.input") as mock_input:
+        result = get_user_approval(rooms, yes=True)
+    assert result == rooms
+    mock_input.assert_not_called()
+
+
 def test_get_user_approval_edit_remove():
     rooms = [
         {"name": "frontend", "description": "UI"},

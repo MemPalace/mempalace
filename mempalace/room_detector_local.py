@@ -15,8 +15,13 @@ import sys
 import yaml
 from pathlib import Path
 from collections import defaultdict
+from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+Room = dict[str, Any]
+
 
 # Common room patterns — detected from folder names and filenames
 # Format: {folder_keyword: room_name}
@@ -97,14 +102,14 @@ FOLDER_ROOM_MAP = {
 }
 
 
-def detect_rooms_from_folders(project_dir: str) -> list:
+def detect_rooms_from_folders(project_dir: str) -> list[Room]:
     """
     Walk the project folder structure.
     Find top-level subdirectories that match known room patterns.
     Returns list of room dicts.
     """
     project_path = Path(project_dir).expanduser().resolve()
-    found_rooms = {}
+    found_rooms: dict[str, str] = {}
 
     SKIP_DIRS = {
         ".git",
@@ -169,7 +174,7 @@ def detect_rooms_from_folders(project_dir: str) -> list:
                             found_rooms[room_name] = subitem.name
 
     # Build room list
-    rooms = []
+    rooms: list[Room] = []
     for room_name, original in found_rooms.items():
         rooms.append(
             {
@@ -192,13 +197,13 @@ def detect_rooms_from_folders(project_dir: str) -> list:
     return rooms
 
 
-def detect_rooms_from_files(project_dir: str) -> list:
+def detect_rooms_from_files(project_dir: str) -> list[Room]:
     """
     Fallback: if folder structure gives no signal,
     detect rooms from recurring filename patterns.
     """
     project_path = Path(project_dir).expanduser().resolve()
-    keyword_counts = defaultdict(int)
+    keyword_counts: defaultdict[str, int] = defaultdict(int)
 
     SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build"}
 
@@ -211,7 +216,7 @@ def detect_rooms_from_files(project_dir: str) -> list:
                     keyword_counts[room] += 1
 
     # Return rooms that appear more than twice
-    rooms = []
+    rooms: list[Room] = []
     for room, count in sorted(keyword_counts.items(), key=lambda x: x[1], reverse=True):
         if count >= 2:
             rooms.append(
@@ -230,7 +235,7 @@ def detect_rooms_from_files(project_dir: str) -> list:
     return rooms
 
 
-def print_proposed_structure(project_name: str, rooms: list, total_files: int, source: str):
+def print_proposed_structure(project_name: str, rooms: list[Room], total_files: int, source: str):
     print(f"\n{'=' * 55}")
     print("  MemPalace Init — Local setup")
     print(f"{'=' * 55}")
@@ -242,8 +247,12 @@ def print_proposed_structure(project_name: str, rooms: list, total_files: int, s
     print(f"\n{'─' * 55}")
 
 
-def get_user_approval(rooms: list) -> list:
+def get_user_approval(rooms: list[Room], yes: bool = False) -> list[Room]:
     """Same approval flow as AI version."""
+    if yes:
+        print(f"  Auto-accepting {len(rooms)} rooms.")
+        return rooms
+
     print("  Review the proposed rooms above.")
     print("  Options:")
     print("    [enter]  Accept all rooms")
@@ -279,7 +288,7 @@ def get_user_approval(rooms: list) -> list:
     return rooms
 
 
-def save_config(project_dir: str, project_name: str, rooms: list):
+def save_config(project_dir: str, project_name: str, rooms: list[Room]):
     config = {
         "wing": project_name,
         "rooms": [
@@ -332,8 +341,5 @@ def detect_rooms_local(project_dir: str, yes: bool = False):
         source = "fallback (flat project)"
 
     print_proposed_structure(project_name, rooms, len(files), source)
-    if yes:
-        approved_rooms = rooms
-    else:
-        approved_rooms = get_user_approval(rooms)
+    approved_rooms = get_user_approval(rooms, yes=yes)
     save_config(project_dir, project_name, approved_rooms)
