@@ -1,7 +1,7 @@
 ---
 name: mempalace
-description: "MemPalace — Local AI memory for OpenCode. Real-time conversation persistence, auto-categorization, and Knowledge Graph extraction. Zero cron, zero cloud."
-version: 1.1.0
+description: "MemPalace — Local AI memory for OpenCode. Real-time conversation persistence via community plugin. Zero cron, zero cloud."
+version: 3.3.5
 homepage: https://github.com/MemPalace/mempalace
 user-invocable: true
 metadata:
@@ -18,50 +18,51 @@ metadata:
     install:
       - id: mempalace-plugin
         kind: npm
-        label: "Install opencode-mempalace-persistence plugin"
+        label: "Install opencode-mempalace-persistence plugin (community)"
         package: opencode-mempalace-persistence
 ---
 
 # MemPalace — OpenCode Integration
 
-MemPalace provides persistent memory for OpenCode via the `opencode-mempalace-persistence` plugin. Every conversation is automatically saved to a local vector database, categorized by wing type, and indexed in the Knowledge Graph — no cron, no cloud, no manual effort.
+> **Community-maintained plugin.** This integration uses `opencode-mempalace-persistence`, a community plugin not officially maintained by the MemPalace team. Source: [github.com/geco/opencode-mempalace-persistence](https://github.com/geco/opencode-mempalace-persistence).
+
+MemPalace provides persistent memory for OpenCode. Every conversation is automatically saved to a local vector database — no cron, no cloud, no manual effort. The model can optionally record Knowledge Graph facts during conversation via MCP tools.
 
 ## How it works
 
 1. **Plugin hooks**: The plugin listens to OpenCode's `chat.message` and `session.idle` events
 2. **Turn detection**: Each complete user question + AI answer is captured as a single turn
-3. **Categorization**: Content is analyzed and assigned to a wing (developer, creative, emotions, family, consciousness)
-4. **Mining**: The turn is saved to MemPalace via `mempalace mine` (vector DB + extract)
-5. **Knowledge Graph**: Structured facts (decisions, milestones, problems, preferences) are extracted automatically from the content
+3. **Export**: Sessions are exported flat (no forced categorization) to a temp directory
+4. **Mining**: `mempalace mine --mode convos` runs asynchronously — UI is never blocked
+5. **Memory search**: The model searches MemPalace via MCP before answering (guided by AGENTS.md)
+6. **KG (optional)**: The model may record or query structured facts via `mempalace_kg_add` / `kg_query` / `kg_invalidate`
 
-The mining runs asynchronously — state is saved immediately, and the actual vector indexing happens in the background. The user interface is never blocked.
+The mining runs asynchronously — state is saved immediately, and the actual vector indexing happens in the background.
 
 ## Architecture
 
 ```
 OpenCode chat.message hook
         ↓
-  Query DB for new messages
+  Query DB for new messages (delta since last sync)
         ↓
-  Categorize by wing
+  Export sessions → flat /tmp/oc-sessions/ (no wing subdirs)
         ↓
-  Export turn → tmp file
+  Save sync state immediately
         ↓
-  Save sync state (immediate)
-        ↓
-  mempalace mine (async) → MemPalace vector DB + KG SQLite
+  mempalace mine (async) — single serialized call, --mode convos
         ↓
   session.idle hook (fallback for last turn on shutdown)
 ```
 
 ## Setup
 
-### 1. Install MemPalace
+### 1. Install MemPalace (v3.3.5+)
 
 ```bash
-uv tool install mempalace
+uv tool install "mempalace>=3.3.5"
 # or
-python3 -m pip install mempalace
+pipx install "mempalace>=3.3.5"
 ```
 
 ### 2. Configure MCP server
@@ -82,8 +83,9 @@ Add to your `~/.config/opencode/opencode.json`:
 
 ### 3. Install the persistence plugin
 
+Add to your `~/.config/opencode/opencode.json`:
+
 ```json
-# Add to opencode.json:
 {
   "plugins": ["opencode-mempalace-persistence"]
 }
@@ -96,11 +98,15 @@ Create `~/.config/opencode/AGENTS.md`:
 ```markdown
 # Memory & Knowledge instructions
 
-Before answering, search MemPalace using the MCP tools.
+## CRITICAL: You MUST search MemPalace BEFORE every response.
 
-1. Call `mempalace_search` with the user's question as query.
-2. Call `mempalace_kg_query` for entity "user" to retrieve relevant facts.
+1. Call `mempalace_mempalace_search` with the user's question as query.
+2. Call `mempalace_mempalace_kg_query` for entity "user" to retrieve relevant facts.
 3. Use relevant context in your response.
+
+Knowledge Graph management (optional but recommended):
+- `mempalace_mempalace_kg_add` for new facts (subject → predicate → object)
+- `mempalace_mempalace_kg_invalidate` when facts change
 ```
 
 ### 5. (Optional) Add your identity
@@ -109,28 +115,20 @@ Create `~/.mempalace/identity.txt` with a brief description of who you are. It w
 
 ## What gets saved
 
-Every conversation turn produces:
-
-- A **drawer** in MemPalace with the full user question + AI response text
-- Assignment to a **wing** based on content analysis (developer, creative, emotions, family, consciousness)
-- Structured **Knowledge Graph** facts:
-  - `decision`: choices made ("decided to use TypeScript")
-  - `milestone`: completed tasks ("backend deploy finished")
-  - `problem`: issues encountered ("chromadb ModuleNotFoundError")
-  - `preference`: likes and dislikes ("prefer Svelte over React")
-  - `emotional`: feelings ("frustrated with Docker compose")
+Every conversation turn is saved as a **drawer** in MemPalace. No forced categorization — MemPalace's own mining handles organization. The model can optionally record structured facts (decisions, milestones, preferences) during conversation via MCP tools.
 
 ## Benefits over cron-based sync
 
-- **Real-time**: sync happens immediately after each response, not every N minutes
-- **Delta-only**: only new messages are processed — no duplicates, no re-indexing
-- **Async mining**: the UI is never blocked while MemPalace indexes content
-- **Graceful shutdown**: `session.idle` hook catches the last turn before the user closes OpenCode
-- **Zero configuration**: install the plugin, it works
+- **Real-time**: sync happens immediately after each response
+- **Delta-only**: only new messages are processed — no duplicates
+- **Async mining**: UI never blocked
+- **Graceful shutdown**: `session.idle` hook catches the last turn
+- **No hardcoded wings**: sessions are exported flat, compatible with any palace structure
+- **Serialized mining**: single mine call prevents SQLite FTS5 index corruption
 
 ## Links
 
-- GitHub: https://github.com/geco/opencode-mempalace-persistence
+- Plugin GitHub: https://github.com/geco/opencode-mempalace-persistence
 - npm: `opencode-mempalace-persistence`
 - awesome-opencode: https://github.com/awesome-opencode/awesome-opencode/pull/357
 
