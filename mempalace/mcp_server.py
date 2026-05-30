@@ -1118,6 +1118,14 @@ def tool_add_drawer(
     path because no row is stored under the logical group id.
     """
     global _metadata_cache
+    # Sanitize source_file: strip null bytes and cap length to prevent metadata
+    # injection. source_file is stored verbatim in ChromaDB metadata so it must
+    # be clean. None/empty string is allowed (meaning "no source").
+    _MAX_SOURCE_FILE_LENGTH = 1024
+    if source_file is not None:
+        source_file = source_file.replace("\x00", "")
+        if len(source_file) > _MAX_SOURCE_FILE_LENGTH:
+            source_file = source_file[:_MAX_SOURCE_FILE_LENGTH]
     try:
         wing = sanitize_name(wing, "wing")
         room = sanitize_name(room, "room")
@@ -1616,7 +1624,9 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
     try:
         agent_name = sanitize_name(agent_name, "agent_name").lower()
         entry = sanitize_content(entry)
-        topic = sanitize_name(topic, "topic")
+        # Sanitize topic: allow None/empty (default to "general"), otherwise validate.
+        if topic and topic != "general":
+            topic = sanitize_name(topic, "topic")
     except ValueError as e:
         return {"success": False, "error": str(e)}
 
@@ -2854,7 +2864,20 @@ def main():
             line = line.strip()
             if not line:
                 continue
-            request = json.loads(line)
+            try:
+                request = json.loads(line)
+            except json.JSONDecodeError as e:
+                # Malformed JSON — return JSON-RPC -32700 Parse Error so MCP
+                # clients can recover gracefully rather than timing out.
+                logger.warning(f"JSON parse error: {e}")
+                error_resp = {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32700, "message": "Parse error"},
+                }
+                sys.stdout.write(json.dumps(error_resp) + "\n")
+                sys.stdout.flush()
+                continue
             response = handle_request(request)
             if response is not None:
                 sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
