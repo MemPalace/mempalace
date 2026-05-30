@@ -13,6 +13,7 @@ import pytest
 
 from mempalace.cli import (
     cmd_compress,
+    cmd_export,
     cmd_hook,
     cmd_init,
     cmd_instructions,
@@ -143,6 +144,36 @@ def test_cmd_search_error_exits(mock_config_cls):
         with pytest.raises(SystemExit) as exc_info:
             cmd_search(args)
         assert exc_info.value.code == 1
+
+
+# ── cmd_export ─────────────────────────────────────────────────────────
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_export_calls_export_palace(mock_config_cls):
+    """Default palace path comes from config; output_dir is forwarded as-is."""
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    args = argparse.Namespace(palace=None, output_dir="/tmp/out")
+    with patch("mempalace.exporter.export_palace") as mock_export:
+        cmd_export(args)
+        mock_export.assert_called_once_with(
+            palace_path="/fake/palace",
+            output_dir="/tmp/out",
+        )
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_export_expands_user_paths(mock_config_cls):
+    """Both --palace and output_dir support ~ expansion."""
+    import os
+
+    args = argparse.Namespace(palace="~/my_palace", output_dir="~/out")
+    with patch("mempalace.exporter.export_palace") as mock_export:
+        cmd_export(args)
+        mock_export.assert_called_once_with(
+            palace_path=os.path.expanduser("~/my_palace"),
+            output_dir=os.path.expanduser("~/out"),
+        )
 
 
 # ── cmd_instructions ───────────────────────────────────────────────────
@@ -717,6 +748,15 @@ def test_main_search_dispatches():
     with (
         patch("sys.argv", ["mempalace", "search", "my query"]),
         patch("mempalace.cli.cmd_search") as mock_cmd,
+    ):
+        main()
+        mock_cmd.assert_called_once()
+
+
+def test_main_export_dispatches():
+    with (
+        patch("sys.argv", ["mempalace", "export", "/tmp/out"]),
+        patch("mempalace.cli.cmd_export") as mock_cmd,
     ):
         main()
         mock_cmd.assert_called_once()

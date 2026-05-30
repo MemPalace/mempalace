@@ -124,6 +124,20 @@ Show what's been filed — drawer count, wing/room breakdown.
 mempalace status
 ```
 
+## `mempalace export`
+
+Export the palace as a browsable folder of Markdown files — a top-level `index.md` plus one `.md` per room under each wing directory. Useful for sharing, offline reading, or feeding into other doc tools.
+
+```bash
+mempalace export <output_dir>
+mempalace export ./palace_md
+mempalace --palace ~/.mempalace/palace export ~/Documents/palace_export
+```
+
+| Option | Description |
+|--------|-------------|
+| `<output_dir>` | **Required.** Directory to write Markdown files (created if missing) |
+
 ## `mempalace repair`
 
 Rebuild palace vector index from stored data. Fixes segfaults after database corruption.

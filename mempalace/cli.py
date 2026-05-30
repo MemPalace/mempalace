@@ -20,6 +20,7 @@ Commands:
     mempalace wake-up                     Show L0 + L1 wake-up context
     mempalace wake-up --wing my_app       Wake-up for a specific project
     mempalace status                      Show what's been filed
+    mempalace export <output_dir>         Export the palace as a Markdown tree
 
 Examples:
     mempalace init ~/projects/my_app
@@ -707,6 +708,15 @@ def cmd_search(args):
         )
     except SearchError:
         sys.exit(1)
+
+
+def cmd_export(args):
+    """Export the palace as a browsable folder of Markdown files."""
+    from .exporter import export_palace
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    output_dir = os.path.expanduser(args.output_dir)
+    export_palace(palace_path=palace_path, output_dir=output_dir)
 
 
 def cmd_wakeup(args):
@@ -1405,6 +1415,14 @@ def main():
     p_search.add_argument("--room", default=None, help="Limit to one room")
     p_search.add_argument("--results", type=int, default=5, help="Number of results")
 
+    # export
+    p_export = sub.add_parser(
+        "export", help="Export the palace to a browsable Markdown tree"
+    )
+    p_export.add_argument(
+        "output_dir", help="Directory to write Markdown files (created if missing)"
+    )
+
     # compress
     p_compress = sub.add_parser(
         "compress", help="Compress drawers using AAAK Dialect (~30x reduction)"
@@ -1609,6 +1627,7 @@ def main():
         "sync": cmd_sync,
         "mcp": cmd_mcp,
         "compress": cmd_compress,
+        "export": cmd_export,
         "wake-up": cmd_wakeup,
         "repair": cmd_repair,
         "repair-status": cmd_repair_status,
