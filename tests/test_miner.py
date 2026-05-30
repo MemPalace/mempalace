@@ -1023,6 +1023,39 @@ def test_add_drawer_stamps_normalize_version(tmp_path):
         del col, client
 
 
+# ── load_config — .mempalace/ directory support ──────────────────────
+
+
+def test_load_config_prefers_dotmempalace_dir(tmp_path):
+    """load_config should prefer .mempalace/mempalace.yaml over root."""
+    dot_dir = tmp_path / ".mempalace"
+    dot_dir.mkdir()
+    # Write config in both locations with different wing names
+    yaml.dump({"wing": "from_dotdir", "rooms": []}, (dot_dir / "mempalace.yaml").open("w"))
+    yaml.dump({"wing": "from_root", "rooms": []}, (tmp_path / "mempalace.yaml").open("w"))
+    config = load_config(str(tmp_path))
+    assert config["wing"] == "from_dotdir"
+
+
+def test_load_config_falls_back_to_root(tmp_path):
+    """load_config should fall back to project root if .mempalace/ doesn't exist."""
+    yaml.dump({"wing": "from_root", "rooms": []}, (tmp_path / "mempalace.yaml").open("w"))
+    config = load_config(str(tmp_path))
+    assert config["wing"] == "from_root"
+
+
+def test_load_config_uses_auto_defaults_when_missing(tmp_path):
+    """load_config should return auto-detected defaults when no config file found."""
+    from mempalace.config import normalize_wing_name
+
+    config = load_config(str(tmp_path))
+    # Fallback wing is the normalized dirname (issue #1194 — slugify so the
+    # miner's lookup key matches what cmd_init/room_detector_local write).
+    assert config["wing"] == normalize_wing_name(tmp_path.name)
+    assert config["rooms"][0]["name"] == "general"
+
+
+
 def test_mine_creates_topic_tunnels_for_shared_topics(tmp_path, monkeypatch):
     """End-to-end: when two wings have already-confirmed topics that overlap,
     the miner's mine-time pass drops a cross-wing tunnel between them.

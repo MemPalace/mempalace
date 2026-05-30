@@ -862,7 +862,7 @@ def test_end_to_end_init_with_llm_separates_personas(ai_dialogue_corpus: Path, t
     assert origin_data["result"]["user_name"] == "Jordan"
 
     # 2. entities.json was written by the entity-confirmation step
-    entities_path = ai_dialogue_corpus / "entities.json"
+    entities_path = ai_dialogue_corpus / ".mempalace" / "entities.json"
     assert entities_path.exists()
     entities = json.loads(entities_path.read_text())
 
@@ -917,7 +917,7 @@ def test_no_llm_path_matches_v333_classification(ai_dialogue_corpus: Path, tmp_p
 
     # entities.json shows v3.3.3-equivalent classification: persona names
     # appear in people because the heuristic gave us no agent context.
-    entities = json.loads((ai_dialogue_corpus / "entities.json").read_text())
+    entities = json.loads((ai_dialogue_corpus / ".mempalace" / "entities.json").read_text())
     saved_people = set(entities.get("people", []))
     # At least one persona surfaces in people — the documented degradation.
     assert {"Echo", "Sparrow", "Cipher"} & saved_people, (
@@ -1191,7 +1191,7 @@ def test_integration_entities_json_includes_topics_excludes_personas(
     ):
         cmd_init(args)
 
-    entities_path = ai_dialogue_corpus / "entities.json"
+    entities_path = ai_dialogue_corpus / ".mempalace" / "entities.json"
     assert entities_path.exists()
     entities = json.loads(entities_path.read_text())
 

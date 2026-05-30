@@ -291,7 +291,9 @@ def save_config(project_dir: str, project_name: str, rooms: list):
             for r in rooms
         ],
     }
-    config_path = Path(project_dir).expanduser().resolve() / "mempalace.yaml"
+    mempalace_dir = Path(project_dir).expanduser().resolve() / ".mempalace"
+    mempalace_dir.mkdir(exist_ok=True)
+    config_path = mempalace_dir / "mempalace.yaml"
     with open(config_path, "w") as f:
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 

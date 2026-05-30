@@ -41,7 +41,7 @@ from .llm_client import LLMError, get_provider
 from .version import __version__
 
 
-_MEMPALACE_PROJECT_FILES = ("mempalace.yaml", "entities.json")
+_MEMPALACE_PROJECT_FILES = (".mempalace/", "mempalace.yaml", "entities.json")
 
 # Pass 0 corpus-origin sampling caps. Tier 1 reads FULL file content (no
 # front-bias sampling) but bounds total memory on enormous corpora. Tier 2
@@ -352,14 +352,16 @@ def cmd_init(args):
     )
     if total > 0:
         confirmed = confirm_entities(detected, yes=getattr(args, "yes", False))
-        # Save confirmed entities to <project>/entities.json (per-project
-        # audit trail — user can inspect or hand-edit) AND merge into the
-        # global registry the miner reads at mine time. Topics are kept
-        # separately so the miner can later compute cross-wing tunnels
+        # Save confirmed entities to <project>/.mempalace/entities.json
+        # (per-project audit trail under the .mempalace/ subdir) AND merge
+        # into the global registry the miner reads at mine time. Topics are
+        # kept separately so the miner can later compute cross-wing tunnels
         # from shared topics (see palace_graph.compute_topic_tunnels).
         if confirmed["people"] or confirmed["projects"] or confirmed.get("topics"):
             project_path = Path(args.dir).expanduser().resolve()
-            entities_path = project_path / "entities.json"
+            mempalace_dir = project_path / ".mempalace"
+            mempalace_dir.mkdir(exist_ok=True)
+            entities_path = mempalace_dir / "entities.json"
             with open(entities_path, "w", encoding="utf-8") as f:
                 json.dump(confirmed, f, indent=2, ensure_ascii=False)
             print(f"  Entities saved: {entities_path}")
@@ -1034,7 +1036,7 @@ def cmd_compress(args):
     # Load dialect (with optional entity config)
     config_path = args.config
     if not config_path:
-        for candidate in ["entities.json", os.path.join(palace_path, "entities.json")]:
+        for candidate in [os.path.join(".mempalace", "entities.json"), "entities.json", os.path.join(palace_path, "entities.json")]:
             if os.path.exists(candidate):
                 config_path = candidate
                 break

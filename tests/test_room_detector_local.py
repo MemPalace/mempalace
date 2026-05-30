@@ -218,7 +218,7 @@ def test_save_config_creates_yaml(tmp_path):
         {"name": "backend", "description": "Server files", "keywords": ["backend"]},
     ]
     save_config(str(tmp_path), "myproject", rooms)
-    config_file = tmp_path / "mempalace.yaml"
+    config_file = tmp_path / ".mempalace" / "mempalace.yaml"
     assert config_file.exists()
     content = config_file.read_text()
     assert "myproject" in content
@@ -231,7 +231,7 @@ def test_save_config_valid_yaml(tmp_path):
 
     rooms = [{"name": "general", "description": "All files", "keywords": []}]
     save_config(str(tmp_path), "test_proj", rooms)
-    config_file = tmp_path / "mempalace.yaml"
+    config_file = tmp_path / ".mempalace" / "mempalace.yaml"
     data = yaml.safe_load(config_file.read_text())
     assert data["wing"] == "test_proj"
     assert len(data["rooms"]) == 1
@@ -302,7 +302,7 @@ def test_detect_rooms_local_yes_mode(tmp_path):
     mock_miner.scan_project.return_value = ["file1.py"]
     with patch.dict("sys.modules", {"mempalace.miner": mock_miner}):
         detect_rooms_local(str(tmp_path), yes=True)
-    assert (tmp_path / "mempalace.yaml").exists()
+    assert (tmp_path / ".mempalace" / "mempalace.yaml").exists()
 
 
 def test_detect_rooms_local_fallback_to_files(tmp_path):
@@ -313,7 +313,7 @@ def test_detect_rooms_local_fallback_to_files(tmp_path):
     mock_miner.scan_project.return_value = ["f1", "f2"]
     with patch.dict("sys.modules", {"mempalace.miner": mock_miner}):
         detect_rooms_local(str(tmp_path), yes=True)
-    assert (tmp_path / "mempalace.yaml").exists()
+    assert (tmp_path / ".mempalace" / "mempalace.yaml").exists()
 
 
 def test_detect_rooms_local_missing_dir():
@@ -337,4 +337,4 @@ def test_detect_rooms_local_interactive(tmp_path):
         ),
     ):
         detect_rooms_local(str(tmp_path), yes=False)
-    assert (tmp_path / "mempalace.yaml").exists()
+    assert (tmp_path / ".mempalace" / "mempalace.yaml").exists()
