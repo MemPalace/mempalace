@@ -57,6 +57,7 @@ export default withMermaid(
               { text: 'Claude Code Plugin', link: '/guide/claude-code' },
               { text: 'Claude Code Retention', link: '/guide/claude-code-retention' },
               { text: 'Gemini CLI', link: '/guide/gemini-cli' },
+              { text: 'Antigravity Plugin', link: '/guide/antigravity' },
               { text: 'OpenClaw Skill', link: '/guide/openclaw' },
               { text: 'Local Models', link: '/guide/local-models' },
               { text: 'Auto-Save Hooks', link: '/guide/hooks' },
