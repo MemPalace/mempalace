@@ -1537,7 +1537,7 @@ def test_explain_ef_mismatch_recognizes_chromadb_conflict():
     assert msg is not None
     assert "/tmp/palace.db" in msg
     assert "MEMPALACE_EMBEDDING_MODEL" in msg
-    assert "rebuild-index" in msg
+    assert "mempalace --palace /tmp/palace.db repair rebuild-index" in msg
 
 
 def test_explain_ef_mismatch_returns_none_for_unrelated_errors():

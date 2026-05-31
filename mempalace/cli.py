@@ -796,6 +796,10 @@ def cmd_repair(args):
         os.path.expanduser(args.palace) if args.palace else config.palace_path
     )
 
+    if getattr(args, "repair_action", None) == "rebuild-index":
+        args.mode = "from-sqlite"
+        args.archive_existing = True
+
     if getattr(args, "mode", "legacy") == "max-seq-id":
         from .repair import repair_max_seq_id
 
@@ -1483,6 +1487,15 @@ def main():
     )
     p_repair.add_argument(
         "--yes", action="store_true", help="Skip confirmation for destructive changes"
+    )
+    p_repair.add_argument(
+        "repair_action",
+        nargs="?",
+        choices=["rebuild-index"],
+        help=(
+            "Re-embed the palace from SQLite using the current embedding model "
+            "(alias for --mode from-sqlite --archive-existing)."
+        ),
     )
     p_repair.add_argument(
         "--confirm-truncation-ok",
