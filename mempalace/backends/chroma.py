@@ -8,6 +8,7 @@ import math
 import os
 import pickle
 import re
+import shlex
 import sqlite3
 from collections import defaultdict
 from numbers import Integral
@@ -1800,6 +1801,7 @@ class ChromaBackend(BaseBackend):
             current_model = MempalaceConfig().embedding_model
         except Exception:
             current_model = "unknown"
+        rebuild_cmd = f"mempalace --palace {shlex.quote(palace_path)} repair rebuild-index"
         return (
             f"Embedding model mismatch reading palace at {palace_path!r}.\n"
             f"  Underlying ChromaDB error: {msg}\n"
@@ -1807,8 +1809,8 @@ class ChromaBackend(BaseBackend):
             f"  The palace was built with a different embedding model. Either:\n"
             f"    (a) revert the model: unset MEMPALACE_EMBEDDING_MODEL (or set "
             f"the previous value), or\n"
-            f"    (b) re-embed in place: `mempalace repair rebuild-index "
-            f"--palace {palace_path}` (writes new vectors with the current model)."
+            f"    (b) re-embed in place: `{rebuild_cmd}` "
+            f"(writes new vectors with the current model)."
         )
 
     # ------------------------------------------------------------------
