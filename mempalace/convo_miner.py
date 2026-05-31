@@ -8,12 +8,13 @@ Normalizes format, chunks by exchange pair (Q+A = one unit), files to palace.
 Same palace as project mining. Different ingest strategy.
 """
 
+import json
 import os
 import sys
 import hashlib
 import logging
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import defaultdict
 from typing import Optional
 
@@ -378,7 +379,83 @@ def scan_convos(convo_dir: str) -> list:
 # =============================================================================
 
 
-def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extract_mode):
+def _extract_conversation_timestamp(filepath: str) -> Optional[tuple[str, int]]:
+    """Return (iso_str, epoch_int) for the first user/assistant message in a JSONL transcript.
+
+    Reads the file directly to preserve the original conversation time
+    regardless of when mining runs. Returns None for non-JSONL files or
+    when no timestamped message entry is found.
+
+    Aborts immediately if the first non-empty line is not valid JSON —
+    pretty-printed JSON files (ChatGPT exports, Slack exports) would
+    otherwise raise JSONDecodeError on almost every line, causing a
+    significant performance bottleneck.
+
+    Handles both ISO 8601 strings and epoch timestamps (integer/float,
+    seconds or milliseconds). Always returns both a human-readable ISO 8601
+    string and an integer Unix epoch so callers can store both for display
+    and numeric filtering without losing either representation.
+    """
+    if not filepath.endswith((".jsonl", ".json")):
+        return None
+    try:
+        first_line = True
+        with open(filepath, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    if first_line:
+                        return None
+                    continue
+                first_line = False
+                if not isinstance(entry, dict):
+                    continue
+                ts = entry.get("timestamp")
+                msg_type = entry.get("type", "")
+                if ts and msg_type in ("user", "human", "assistant"):
+                    if isinstance(ts, str):
+                        if "-" in ts or "T" in ts:
+                            try:
+                                dt = datetime.fromisoformat(ts)
+                                if dt.tzinfo is None:
+                                    dt = dt.replace(tzinfo=timezone.utc)
+                                epoch = int(dt.timestamp())
+                                return ts, epoch
+                            except ValueError:
+                                return None
+                        try:
+                            ts = float(ts)
+                        except ValueError:
+                            return None
+                    if isinstance(ts, (int, float)):
+                        try:
+                            if ts > 1e11:
+                                ts /= 1000.0
+                            epoch = int(ts)
+                            iso = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+                            return iso, epoch
+                        except (ValueError, OSError, OverflowError):
+                            return None
+    except OSError:
+        pass
+    return None
+
+
+def _file_chunks_locked(
+    collection,
+    source_file,
+    chunks,
+    wing,
+    room,
+    agent,
+    extract_mode,
+    conversation_at=None,
+    conversation_at_epoch=None,
+):
     """Lock the source file, purge stale drawers, and upsert fresh chunks.
 
     Combines the per-file serialization that prevents concurrent agents from
@@ -426,20 +503,23 @@ def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extr
                 )
                 batch_docs.append(chunk["content"])
                 batch_ids.append(drawer_id)
-                batch_metas.append(
-                    {
-                        "wing": wing,
-                        "room": chunk_room,
-                        "hall": _detect_hall_cached(chunk["content"]),
-                        "source_file": source_file,
-                        "chunk_index": chunk["chunk_index"],
-                        "added_by": agent,
-                        "filed_at": filed_at,
-                        "ingest_mode": "convos",
-                        "extract_mode": extract_mode,
-                        "normalize_version": NORMALIZE_VERSION,
-                    }
-                )
+                meta = {
+                    "wing": wing,
+                    "room": chunk_room,
+                    "hall": _detect_hall_cached(chunk["content"]),
+                    "source_file": source_file,
+                    "chunk_index": chunk["chunk_index"],
+                    "added_by": agent,
+                    "filed_at": filed_at,
+                    "ingest_mode": "convos",
+                    "extract_mode": extract_mode,
+                    "normalize_version": NORMALIZE_VERSION,
+                }
+                if conversation_at:
+                    meta["conversation_at"] = conversation_at
+                if conversation_at_epoch is not None:
+                    meta["conversation_at_epoch"] = conversation_at_epoch
+                batch_metas.append(meta)
             try:
                 collection.upsert(
                     documents=batch_docs,
@@ -686,8 +766,18 @@ def _mine_convos_impl(
 
         # Lock + purge stale + file fresh chunks. Lock serializes concurrent
         # agents; purge removes pre-v2 drawers so the schema bump applies.
+        ts_result = _extract_conversation_timestamp(source_file)
+        conversation_at, conversation_at_epoch = ts_result if ts_result else (None, None)
         drawers_added, room_delta, skipped = _file_chunks_locked(
-            collection, source_file, chunks, wing, room, agent, extract_mode
+            collection,
+            source_file,
+            chunks,
+            wing,
+            room,
+            agent,
+            extract_mode,
+            conversation_at=conversation_at,
+            conversation_at_epoch=conversation_at_epoch,
         )
         if skipped:
             files_skipped += 1

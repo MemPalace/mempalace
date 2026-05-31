@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import shutil
@@ -7,6 +8,7 @@ import chromadb
 import pytest
 
 from mempalace.convo_miner import (
+    _extract_conversation_timestamp,
     _is_ai_tool_path,
     _resolve_wing,
     mine_convos,
@@ -416,3 +418,65 @@ def test_resolve_wing_empty_string_treated_as_no_wing(tmp_path):
     target = tmp_path / ".gemini" / "tmp"
     target.mkdir(parents=True)
     assert _resolve_wing(target, wing="") == "wing_api"
+
+
+# --- _extract_conversation_timestamp: preserve the original conversation time ---
+
+
+def _write_jsonl(tmp_path, lines, name="convo.jsonl"):
+    path = tmp_path / name
+    path.write_text("\n".join(json.dumps(line) for line in lines) + "\n", encoding="utf-8")
+    return str(path)
+
+
+def test_extract_timestamp_iso_string_passthrough(tmp_path):
+    """An ISO 8601 string on the first message entry is returned as (iso, epoch) tuple."""
+    path = _write_jsonl(tmp_path, [{"type": "user", "timestamp": "2024-03-01T09:30:00+00:00"}])
+    result = _extract_conversation_timestamp(path)
+    assert result is not None
+    iso, epoch = result
+    assert iso == "2024-03-01T09:30:00+00:00"
+    assert epoch == 1709285400
+
+
+def test_extract_timestamp_epoch_seconds_is_utc(tmp_path):
+    """Epoch seconds return a UTC ISO string and the integer epoch unchanged.
+    so timeline ordering is machine- and DST-independent."""
+    # 2024-03-01T09:30:00Z
+    path = _write_jsonl(tmp_path, [{"type": "assistant", "timestamp": 1709285400}])
+    result = _extract_conversation_timestamp(path)
+    assert result is not None
+    iso, epoch = result
+    assert iso == "2024-03-01T09:30:00+00:00"
+    assert epoch == 1709285400
+
+
+def test_extract_timestamp_epoch_millis_scaled(tmp_path):
+    """Millisecond epochs (> 1e11) are scaled to seconds before conversion."""
+    path = _write_jsonl(tmp_path, [{"type": "user", "timestamp": 1709285400000}])
+    result = _extract_conversation_timestamp(path)
+    assert result is not None
+    iso, epoch = result
+    assert iso == "2024-03-01T09:30:00+00:00"
+    assert epoch == 1709285400
+
+
+def test_extract_timestamp_aborts_on_pretty_printed_json(tmp_path):
+    """A first line that isn't valid JSON (pretty-printed export) returns None
+    immediately rather than scanning every line."""
+    path = tmp_path / "pretty.json"
+    path.write_text('{\n  "type": "user",\n  "timestamp": 1709285400\n}\n', encoding="utf-8")
+    assert _extract_conversation_timestamp(str(path)) is None
+
+
+def test_extract_timestamp_none_when_no_timestamped_message(tmp_path):
+    """Entries without a timestamp on a user/assistant message yield None."""
+    path = _write_jsonl(tmp_path, [{"type": "system", "timestamp": 1709285400}, {"type": "user"}])
+    assert _extract_conversation_timestamp(path) is None
+
+
+def test_extract_timestamp_none_for_non_jsonl_extension(tmp_path):
+    """Non-JSONL/JSON files are skipped without reading."""
+    path = tmp_path / "transcript.txt"
+    path.write_text("> hi\nhello\n", encoding="utf-8")
+    assert _extract_conversation_timestamp(str(path)) is None
