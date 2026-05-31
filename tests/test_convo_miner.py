@@ -430,23 +430,35 @@ def _write_jsonl(tmp_path, lines, name="convo.jsonl"):
 
 
 def test_extract_timestamp_iso_string_passthrough(tmp_path):
-    """An ISO 8601 string on the first message entry is returned verbatim."""
+    """An ISO 8601 string on the first message entry is returned as (iso, epoch) tuple."""
     path = _write_jsonl(tmp_path, [{"type": "user", "timestamp": "2024-03-01T09:30:00+00:00"}])
-    assert _extract_conversation_timestamp(path) == "2024-03-01T09:30:00+00:00"
+    result = _extract_conversation_timestamp(path)
+    assert result is not None
+    iso, epoch = result
+    assert iso == "2024-03-01T09:30:00+00:00"
+    assert epoch == 1709285400
 
 
 def test_extract_timestamp_epoch_seconds_is_utc(tmp_path):
-    """Epoch seconds become a UTC, offset-aware ISO value (not naive local time)
+    """Epoch seconds return a UTC ISO string and the integer epoch unchanged.
     so timeline ordering is machine- and DST-independent."""
     # 2024-03-01T09:30:00Z
     path = _write_jsonl(tmp_path, [{"type": "assistant", "timestamp": 1709285400}])
-    assert _extract_conversation_timestamp(path) == "2024-03-01T09:30:00+00:00"
+    result = _extract_conversation_timestamp(path)
+    assert result is not None
+    iso, epoch = result
+    assert iso == "2024-03-01T09:30:00+00:00"
+    assert epoch == 1709285400
 
 
 def test_extract_timestamp_epoch_millis_scaled(tmp_path):
     """Millisecond epochs (> 1e11) are scaled to seconds before conversion."""
     path = _write_jsonl(tmp_path, [{"type": "user", "timestamp": 1709285400000}])
-    assert _extract_conversation_timestamp(path) == "2024-03-01T09:30:00+00:00"
+    result = _extract_conversation_timestamp(path)
+    assert result is not None
+    iso, epoch = result
+    assert iso == "2024-03-01T09:30:00+00:00"
+    assert epoch == 1709285400
 
 
 def test_extract_timestamp_aborts_on_pretty_printed_json(tmp_path):

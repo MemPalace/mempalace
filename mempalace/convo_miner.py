@@ -379,8 +379,8 @@ def scan_convos(convo_dir: str) -> list:
 # =============================================================================
 
 
-def _extract_conversation_timestamp(filepath: str) -> Optional[str]:
-    """Return the ISO 8601 timestamp of the first user/assistant message in a JSONL transcript.
+def _extract_conversation_timestamp(filepath: str) -> Optional[tuple[str, int]]:
+    """Return (iso_str, epoch_int) for the first user/assistant message in a JSONL transcript.
 
     Reads the file directly to preserve the original conversation time
     regardless of when mining runs. Returns None for non-JSONL files or
@@ -392,8 +392,9 @@ def _extract_conversation_timestamp(filepath: str) -> Optional[str]:
     significant performance bottleneck.
 
     Handles both ISO 8601 strings and epoch timestamps (integer/float,
-    seconds or milliseconds) so timeline queries always receive a
-    lexicographically comparable ISO 8601 value.
+    seconds or milliseconds). Always returns both a human-readable ISO 8601
+    string and an integer Unix epoch so callers can store both for display
+    and numeric filtering without losing either representation.
     """
     if not filepath.endswith((".jsonl", ".json")):
         return None
@@ -418,7 +419,14 @@ def _extract_conversation_timestamp(filepath: str) -> Optional[str]:
                 if ts and msg_type in ("user", "human", "assistant"):
                     if isinstance(ts, str):
                         if "-" in ts or "T" in ts:
-                            return ts
+                            try:
+                                dt = datetime.fromisoformat(ts)
+                                if dt.tzinfo is None:
+                                    dt = dt.replace(tzinfo=timezone.utc)
+                                epoch = int(dt.timestamp())
+                                return ts, epoch
+                            except ValueError:
+                                return None
                         try:
                             ts = float(ts)
                         except ValueError:
@@ -427,7 +435,9 @@ def _extract_conversation_timestamp(filepath: str) -> Optional[str]:
                         try:
                             if ts > 1e11:
                                 ts /= 1000.0
-                            return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+                            epoch = int(ts)
+                            iso = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+                            return iso, epoch
                         except (ValueError, OSError, OverflowError):
                             return None
     except OSError:
@@ -436,7 +446,15 @@ def _extract_conversation_timestamp(filepath: str) -> Optional[str]:
 
 
 def _file_chunks_locked(
-    collection, source_file, chunks, wing, room, agent, extract_mode, conversation_at=None
+    collection,
+    source_file,
+    chunks,
+    wing,
+    room,
+    agent,
+    extract_mode,
+    conversation_at=None,
+    conversation_at_epoch=None,
 ):
     """Lock the source file, purge stale drawers, and upsert fresh chunks.
 
@@ -499,6 +517,8 @@ def _file_chunks_locked(
                 }
                 if conversation_at:
                     meta["conversation_at"] = conversation_at
+                if conversation_at_epoch is not None:
+                    meta["conversation_at_epoch"] = conversation_at_epoch
                 batch_metas.append(meta)
             try:
                 collection.upsert(
@@ -746,7 +766,8 @@ def _mine_convos_impl(
 
         # Lock + purge stale + file fresh chunks. Lock serializes concurrent
         # agents; purge removes pre-v2 drawers so the schema bump applies.
-        conversation_at = _extract_conversation_timestamp(source_file)
+        ts_result = _extract_conversation_timestamp(source_file)
+        conversation_at, conversation_at_epoch = ts_result if ts_result else (None, None)
         drawers_added, room_delta, skipped = _file_chunks_locked(
             collection,
             source_file,
@@ -756,6 +777,7 @@ def _mine_convos_impl(
             agent,
             extract_mode,
             conversation_at=conversation_at,
+            conversation_at_epoch=conversation_at_epoch,
         )
         if skipped:
             files_skipped += 1
