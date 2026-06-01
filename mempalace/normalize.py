@@ -141,6 +141,24 @@ def normalize(filepath: str) -> str:
     # other formats pass through verbatim.
     ext = Path(filepath).suffix.lower()
     if ext in (".json", ".jsonl") or content.strip()[:1] in ("{", "["):
+        # Kiro-aware enrichment: when the file is a Kiro workspace-session
+        # transcript living under a kiro.kiroagent dir, splice the real
+        # assistant output from Kiro's exec store onto the "On it." stubs.
+        # exec_map_for_session returns None for non-Kiro paths (fall through),
+        # or a (possibly empty) map for Kiro session files.
+        from .kiro_ingest import exec_map_for_session
+
+        exec_map = exec_map_for_session(filepath)
+        if exec_map is not None:
+            try:
+                data = json.loads(content)
+            except json.JSONDecodeError:
+                data = None
+            if data is not None:
+                normalized = _try_kiro_json(data, exec_map=exec_map)
+                if normalized:
+                    return normalized
+
         normalized = _try_normalize_json(content)
         if normalized:
             return normalized
@@ -387,7 +405,27 @@ def _is_kiro_system_prompt(text: str) -> bool:
     return any(head.startswith(p) for p in _KIRO_SYSTEM_PROMPT_PREFIXES)
 
 
-def _try_kiro_json(data) -> Optional[str]:
+# The stub Kiro writes to a transcript assistant turn when the real output
+# lives in the exec store. Mirrors kiro_ingest.ASSISTANT_STUB (kept in sync by
+# a test) so the splice condition here and the exec-map builder agree.
+_KIRO_ASSISTANT_STUB = "On it."
+
+
+def _kiro_role(raw: object) -> str:
+    """Map a Kiro turn role to MemPalace's user/assistant transcript model.
+
+    Mirrors kiro-recall's ``toRole``: user/human stay "user"; everything else
+    (assistant/ai/bot, plus ``tool`` frames and any unknown role) folds into
+    "assistant" so its text is still ingested rather than silently dropped.
+    The injected system/identity prompt is filtered separately by text prefix,
+    not by role, so folding unknown→assistant does not let it leak in.
+    """
+    if raw in ("user", "human"):
+        return "user"
+    return "assistant"
+
+
+def _try_kiro_json(data, exec_map: Optional[dict] = None) -> Optional[str]:
     """Kiro IDE session transcript: a dict with a ``history`` array.
 
     Detection requires both a ``history`` list and a ``sessionId`` so this
@@ -395,11 +433,16 @@ def _try_kiro_json(data) -> Optional[str]:
     ChatGPT (``mapping`` key), or Slack (top-level list). Kiro's per-project
     ``sessions.json`` index is a list, not a dict, so it is ignored here.
 
-    Assistant turns sometimes carry only a short stub (e.g. ``"On it."``) when
-    Kiro stores the full output in a separate exec-log file; we ingest whatever
-    text the transcript itself contains and leave exec-log splicing to a future
-    enhancement. Empty turns and the injected system/identity prompt are
-    skipped.
+    Kiro frequently writes the assistant turn's content as the stub
+    ``"On it."`` while the real generated output (reasoning + prose) lives in a
+    separate per-execution file keyed by the turn's ``executionId``. When an
+    ``exec_map`` (executionId → real text, built by ``kiro_ingest``) is
+    supplied, those stubs are spliced with the real output so the assistant
+    side is actually searchable. Without it, the stub is ingested verbatim.
+
+    Empty turns and the injected system/identity prompt are skipped. Tool and
+    unknown-role frames are folded into the assistant side (parity with
+    kiro-recall) rather than dropped.
     """
     if not isinstance(data, dict):
         return None
@@ -414,14 +457,20 @@ def _try_kiro_json(data) -> Optional[str]:
         message = entry.get("message")
         if not isinstance(message, dict):
             continue
-        role = message.get("role", "")
+        role = _kiro_role(message.get("role"))
         text = _extract_content(message.get("content", "")).strip()
+
+        # Splice real assistant output from the exec store onto "On it." stubs.
+        # The executionId lives on the history entry, not the message.
+        if exec_map and role == "assistant" and text == _KIRO_ASSISTANT_STUB:
+            exec_id = entry.get("executionId")
+            enriched = exec_map.get(exec_id) if isinstance(exec_id, str) else None
+            if enriched:
+                text = enriched.strip()
+
         if not text or _is_kiro_system_prompt(text):
             continue
-        if role in ("user", "human"):
-            messages.append(("user", text))
-        elif role in ("assistant", "ai", "bot"):
-            messages.append(("assistant", text))
+        messages.append((role, text))
 
     if len(messages) >= 2:
         return _messages_to_transcript(messages)

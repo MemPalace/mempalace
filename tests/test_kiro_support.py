@@ -269,3 +269,139 @@ def test_kiro_path_routes_to_wing_api():
         "kiro.kiroagent/workspace-sessions/abc/sess.json"
     )
     assert _is_ai_tool_path(kiro_path) is True
+
+
+# ── exec-log splicing (correct agent data, parity with kiro-recall) ──────
+
+from mempalace import kiro_ingest  # noqa: E402
+from mempalace.normalize import _KIRO_ASSISTANT_STUB  # noqa: E402
+
+
+def _build_kiro_tree(tmp_path, history, exec_objects):
+    """Create a fake Kiro agent dir with a workspace-session + exec store.
+
+    Returns the path to the session transcript file.
+    """
+    agent = tmp_path / "globalStorage" / "kiro.kiroagent"
+    # transcript: <agent>/workspace-sessions/<wsHash>/<sessionId>.json
+    sess_dir = agent / "workspace-sessions" / "d3JrSGFzaA"
+    sess_dir.mkdir(parents=True)
+    session = {
+        "sessionId": "sess-exec-1",
+        "title": "exec splice",
+        "workspaceDirectory": "/Users/me/code/app",
+        "history": history,
+    }
+    sess_file = sess_dir / "sess-exec-1.json"
+    sess_file.write_text(json.dumps(session))
+    # exec store: <agent>/<wsHash>/<chatHash>/<leaf> (depth-2 dirs, no ext)
+    for i, obj in enumerate(exec_objects):
+        leaf_dir = agent / "wsHashDir" / f"chatHashDir{i}"
+        leaf_dir.mkdir(parents=True, exist_ok=True)
+        (leaf_dir / f"exec{i}").write_text(json.dumps(obj))
+    kiro_ingest.clear_cache()
+    return sess_file
+
+
+def test_exec_splice_replaces_stub(tmp_path):
+    history = [
+        {
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": "Why does login fail?"}],
+            },
+            "executionId": "e1",
+        },
+        {"message": {"role": "assistant", "content": "On it."}, "executionId": "exec-A"},
+    ]
+    exec_objects = [
+        {
+            "executionId": "exec-A",
+            "chatSessionId": "sess-exec-1",
+            "actions": [
+                {"actionType": "reasoning", "output": {"message": "Checking the cookie flags."}},
+                {
+                    "actionType": "say",
+                    "output": {"message": "The session cookie lacked SameSite=None; Secure."},
+                },
+                {"actionType": "tool_call", "output": {"message": "(ignored non-prose action)"}},
+            ],
+        }
+    ]
+    sess_file = _build_kiro_tree(tmp_path, history, exec_objects)
+    out = normalize(str(sess_file))
+    assert "The session cookie lacked SameSite=None; Secure." in out
+    assert "Checking the cookie flags." in out  # reasoning included
+    assert "On it." not in out  # stub replaced
+    assert "(ignored non-prose action)" not in out  # non say/reasoning dropped
+
+
+def test_no_exec_store_keeps_stub(tmp_path):
+    history = [
+        {
+            "message": {"role": "user", "content": [{"type": "text", "text": "Question one here"}]},
+            "executionId": "e1",
+        },
+        {"message": {"role": "assistant", "content": "On it."}, "executionId": "exec-missing"},
+        {
+            "message": {"role": "user", "content": [{"type": "text", "text": "Question two here"}]},
+            "executionId": "e2",
+        },
+        {"message": {"role": "assistant", "content": "A real answer."}, "executionId": "e3"},
+    ]
+    sess_file = _build_kiro_tree(tmp_path, history, [])  # no exec files
+    out = normalize(str(sess_file))
+    assert "On it." in out  # nothing to splice -> stub preserved verbatim
+    assert "A real answer." in out
+
+
+def test_exec_map_only_for_kiro_session_paths(tmp_path):
+    # A plain JSON file not under kiro.kiroagent/workspace-sessions -> None.
+    f = tmp_path / "random.json"
+    f.write_text("{}")
+    assert kiro_ingest.exec_map_for_session(str(f)) is None
+
+
+def test_build_exec_map_parses_and_skips(tmp_path):
+    agent = tmp_path / "globalStorage" / "kiro.kiroagent"
+    (agent / "workspace-sessions").mkdir(parents=True)  # must be skipped
+    good = agent / "ws" / "chat"
+    good.mkdir(parents=True)
+    (good / "exec-good").write_text(
+        json.dumps(
+            {
+                "executionId": "X1",
+                "actions": [{"actionType": "say", "output": {"message": "hello world"}}],
+            }
+        )
+    )
+    (good / "exec-noprose").write_text(
+        json.dumps(
+            {
+                "executionId": "X2",
+                "actions": [{"actionType": "tool_call", "output": {"message": "noise"}}],
+            }
+        )
+    )
+    (good / "exec-garbage").write_text("not json {{{")
+    m = kiro_ingest.build_exec_map(agent)
+    assert m == {"X1": "hello world"}  # X2 (no prose) + garbage skipped
+
+
+def test_tool_and_unknown_roles_kept():
+    sess = {
+        "sessionId": "s",
+        "history": [
+            {"message": {"role": "user", "content": "the question"}},
+            {"message": {"role": "tool", "content": "TOOL OUTPUT: build passed"}},
+            {"message": {"role": "weird", "content": "ambiguous-role text"}},
+        ],
+    }
+    out = _try_kiro_json(sess)
+    assert out is not None
+    assert "TOOL OUTPUT: build passed" in out  # tool frame kept
+    assert "ambiguous-role text" in out  # unknown role kept
+
+
+def test_stub_constant_in_sync():
+    assert _KIRO_ASSISTANT_STUB == kiro_ingest.ASSISTANT_STUB

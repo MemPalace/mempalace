@@ -87,6 +87,7 @@ mempalace/
 ├── exporter.py          # Palace data export
 ├── hooks_cli.py         # Hook management CLI
 ├── kiro_install.py      # Kiro IDE integration (MCP register + steering + sync)
+├── kiro_ingest.py       # Kiro exec-store splicing (real assistant output)
 ├── query_sanitizer.py   # Prompt contamination prevention
 ├── split_mega_files.py  # Split concatenated transcript files
 └── version.py           # Single source of truth for version

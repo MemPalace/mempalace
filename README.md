@@ -195,9 +195,14 @@ mempalace kiro status         # show what's wired up and where sessions live
 mempalace kiro uninstall      # remove the MCP entry + steering (palace kept)
 ```
 
-The merge never clobbers other MCP servers, and every tool is auto-approved
-except the two destructive deletes. Details and the manual-setup path:
-[`.kiro-plugin/README.md`](.kiro-plugin/README.md).
+`kiro sync` reads **both** of Kiro's data sources: the workspace-session
+transcript *and* the per-execution exec store. Kiro often writes the assistant
+turn as a stub (`"On it."`) while the real generated output lives in the exec
+store keyed by `executionId`; MemPalace splices the real reasoning + prose back
+onto the turn so the agent's actual answers are searchable, not just your
+prompts. The merge never clobbers other MCP servers, and every tool is
+auto-approved except the two destructive deletes. Details and the manual-setup
+path: [`.kiro-plugin/README.md`](.kiro-plugin/README.md).
 
 For per-message recall on top of the file-level chunks the hooks produce,
 run `mempalace sweep <transcript-dir>` periodically — it stores one

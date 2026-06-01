@@ -73,6 +73,11 @@ mempalace kiro sync          # auto-detects Kiro's session directory
 mempalace kiro sync --dry-run
 ```
 
+`kiro sync` reads both Kiro data sources — the workspace-session transcript and
+the per-execution exec store — and splices the real assistant output (reasoning
++ prose) onto the `"On it."` stubs Kiro writes to the transcript, so the agent's
+actual answers are ingested, not just your prompts.
+
 If Kiro is installed somewhere non-standard, set `MEMPALACE_KIRO_AGENT_DIR` to
 its `globalStorage/kiro.kiroagent` path, or mine the directory directly:
 
