@@ -285,6 +285,40 @@ def test_raises_on_non_contiguous_indices(monkeypatch):
         ef(["a", "b"])
 
 
+def test_raises_on_http_protocol_exception(monkeypatch):
+    # BadStatusLine / IncompleteRead — common with local/overloaded servers.
+    from http.client import HTTPException
+
+    def boom(req, timeout=None):
+        raise HTTPException("incomplete read")
+
+    monkeypatch.setattr("urllib.request.urlopen", boom)
+    ef = embedding.OpenAICompatEmbeddingFunction("http://h", "m")
+    with pytest.raises(embedding.EmbeddingAPIError, match="failed"):
+        ef(["a"])
+
+
+def test_raises_on_value_error_from_urlopen(monkeypatch):
+    # urlopen raises ValueError on an invalid/missing URL scheme.
+    def boom(req, timeout=None):
+        raise ValueError("unknown url type")
+
+    monkeypatch.setattr("urllib.request.urlopen", boom)
+    ef = embedding.OpenAICompatEmbeddingFunction("http://h", "m")
+    with pytest.raises(embedding.EmbeddingAPIError, match="failed"):
+        ef(["a"])
+
+
+def test_raises_on_non_object_response(monkeypatch):
+    def bad(req, timeout=None):
+        return _FakeResp(json.dumps([1, 2, 3]).encode())  # JSON list, not an object
+
+    monkeypatch.setattr("urllib.request.urlopen", bad)
+    ef = embedding.OpenAICompatEmbeddingFunction("http://h", "m")
+    with pytest.raises(embedding.EmbeddingAPIError, match="non-object response"):
+        ef(["a"])
+
+
 def test_raises_and_surfaces_server_error_body(monkeypatch):
     # HTTP 200 with an OpenAI-style error envelope (no "data") — surface it.
     def err(req, timeout=None):

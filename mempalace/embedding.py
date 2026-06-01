@@ -303,6 +303,7 @@ class OpenAICompatEmbeddingFunction:
         return self(input)
 
     def __call__(self, input):  # noqa: A002 — ChromaDB EF protocol uses `input`
+        import http.client
         import json
         from urllib.error import HTTPError, URLError
         from urllib.request import Request, urlopen
@@ -327,7 +328,10 @@ class OpenAICompatEmbeddingFunction:
             try:
                 with urlopen(req, timeout=_EF_API_TIMEOUT) as resp:
                     data = json.loads(resp.read())
-            except (HTTPError, URLError, OSError, json.JSONDecodeError) as e:
+            # ValueError covers an invalid/missing URL scheme and json.JSONDecodeError;
+            # http.client.HTTPException covers low-level protocol faults (BadStatusLine,
+            # IncompleteRead) common with local/overloaded servers.
+            except (HTTPError, URLError, OSError, http.client.HTTPException, ValueError) as e:
                 raise EmbeddingAPIError(
                     f"Embedding API request to {self._url} failed: {e}. Check that the "
                     f"server is reachable and MEMPALACE_EMBEDDING_API_URL / embedding_api_url "
@@ -349,6 +353,10 @@ class OpenAICompatEmbeddingFunction:
         """
         import numpy as np
 
+        if not isinstance(data, dict):
+            raise EmbeddingAPIError(
+                f"Embedding API at {self._url} returned a non-object response: {data}"
+            )
         rows = data.get("data")
         if not isinstance(rows, list):
             raise EmbeddingAPIError(
