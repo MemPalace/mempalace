@@ -86,6 +86,7 @@ mempalace/
 ├── spellcheck.py        # Auto-correct user messages
 ├── exporter.py          # Palace data export
 ├── hooks_cli.py         # Hook management CLI
+├── kiro_install.py      # Kiro IDE integration (MCP register + steering + sync)
 ├── query_sanitizer.py   # Prompt contamination prevention
 ├── split_mega_files.py  # Split concatenated transcript files
 └── version.py           # Single source of truth for version
@@ -93,6 +94,10 @@ mempalace/
 hooks/                   # Claude Code hook scripts
 ├── mempal_save_hook.sh        # Stop: triggers diary save
 └── mempal_precompact_hook.sh  # PreCompact: saves state before compression
+
+.claude-plugin/          # Claude Code plugin (MCP + hooks + skills)
+.codex-plugin/           # Codex CLI plugin (MCP + hooks + skills)
+.kiro-plugin/            # Kiro IDE integration (MCP config + steering)
 ```
 
 ## Conventions

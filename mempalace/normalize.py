@@ -9,6 +9,7 @@ Supported:
     - Claude Code JSONL (with tool_use/tool_result block capture)
     - OpenAI Codex CLI JSONL
     - Gemini CLI JSONL (~/.gemini/tmp/<project_hash>/chats/session-*.jsonl)
+    - Kiro IDE session JSON (globalStorage/kiro.kiroagent/workspace-sessions/<id>.json)
     - Slack JSON export
     - Plain text (pass through for paragraph chunking)
 
@@ -167,7 +168,7 @@ def _try_normalize_json(content: str) -> Optional[str]:
     except json.JSONDecodeError:
         return None
 
-    for parser in (_try_claude_ai_json, _try_chatgpt_json, _try_slack_json):
+    for parser in (_try_kiro_json, _try_claude_ai_json, _try_chatgpt_json, _try_slack_json):
         normalized = parser(data)
         if normalized:
             return normalized
@@ -349,6 +350,80 @@ def _try_gemini_jsonl(content: str) -> Optional[str]:
             messages.append(("assistant", joined))
 
     if len(messages) >= 2 and has_session_metadata:
+        return _messages_to_transcript(messages)
+    return None
+
+
+# ─── Kiro IDE session JSON ───────────────────────────────────────────────
+# Kiro (the AI IDE) writes one JSON file per chat session under its
+# globalStorage, e.g.
+#   <globalStorage>/kiro.kiroagent/workspace-sessions/<base64url(path)>/<sessionId>.json
+# Shape (verified against live data via the kiro-recall project):
+#   {
+#     "sessionId": "...", "title": "...", "workspaceDirectory": "...",
+#     "sessionType": "...", "selectedModel": "...", "defaultModelTitle": "...",
+#     "history": [ { "message": {"role": "user"|"assistant", "content": ...},
+#                    "executionId": "..." }, ... ]
+#   }
+# `content` is a plain string (usually assistant turns) or a list of typed
+# parts [{"type": "text", "text": "..."}] (usually user turns). Kiro prepends
+# a large injected system/identity prompt to the first user turn — it is
+# boilerplate, not conversation, so we drop turns that begin with one of the
+# known leading markers (mirrors kiro-recall's parser).
+
+_KIRO_SYSTEM_PROMPT_PREFIXES = (
+    "<identity>",
+    "<key_kiro_features>",
+    "<goal>",
+    "<rules>",
+    "<system>",
+    "You are Kiro,",
+)
+
+
+def _is_kiro_system_prompt(text: str) -> bool:
+    """True if ``text`` is Kiro's injected system/identity prompt (not chat)."""
+    head = text.lstrip()
+    return any(head.startswith(p) for p in _KIRO_SYSTEM_PROMPT_PREFIXES)
+
+
+def _try_kiro_json(data) -> Optional[str]:
+    """Kiro IDE session transcript: a dict with a ``history`` array.
+
+    Detection requires both a ``history`` list and a ``sessionId`` so this
+    parser never false-positives on Claude.ai exports (flat lists),
+    ChatGPT (``mapping`` key), or Slack (top-level list). Kiro's per-project
+    ``sessions.json`` index is a list, not a dict, so it is ignored here.
+
+    Assistant turns sometimes carry only a short stub (e.g. ``"On it."``) when
+    Kiro stores the full output in a separate exec-log file; we ingest whatever
+    text the transcript itself contains and leave exec-log splicing to a future
+    enhancement. Empty turns and the injected system/identity prompt are
+    skipped.
+    """
+    if not isinstance(data, dict):
+        return None
+    history = data.get("history")
+    if not isinstance(history, list) or "sessionId" not in data:
+        return None
+
+    messages = []
+    for entry in history:
+        if not isinstance(entry, dict):
+            continue
+        message = entry.get("message")
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role", "")
+        text = _extract_content(message.get("content", "")).strip()
+        if not text or _is_kiro_system_prompt(text):
+            continue
+        if role in ("user", "human"):
+            messages.append(("user", text))
+        elif role in ("assistant", "ai", "bot"):
+            messages.append(("assistant", text))
+
+    if len(messages) >= 2:
         return _messages_to_transcript(messages)
     return None
 

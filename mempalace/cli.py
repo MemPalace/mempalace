@@ -1024,6 +1024,29 @@ def cmd_mcp(args):
         print(f"  {base_server_cmd} --palace /path/to/palace")
 
 
+def cmd_kiro(args):
+    """Manage MemPalace's Kiro IDE integration (MCP + steering + transcript sync)."""
+    from . import kiro_install
+
+    action = getattr(args, "kiro_action", None)
+    local = getattr(args, "local", None)
+    palace = getattr(args, "palace", None)
+
+    if action == "install":
+        lines = kiro_install.install(local=local, palace=palace, command=args.mcp_command)
+    elif action == "uninstall":
+        lines = kiro_install.uninstall(local=local)
+    elif action == "sync":
+        lines = kiro_install.sync(palace=palace, agent_dir=args.agent_dir, dry_run=args.dry_run)
+    elif action == "status":
+        lines = kiro_install.status(local=local, agent_dir=args.agent_dir)
+    else:
+        print("Usage: mempalace kiro {install|uninstall|sync|status}", file=sys.stderr)
+        sys.exit(1)
+
+    print("\n".join(lines))
+
+
 def cmd_compress(args):
     """Compress drawers in a wing using AAAK Dialect."""
     from .dialect import Dialect
@@ -1460,7 +1483,7 @@ def main():
     p_hook_run.add_argument(
         "--harness",
         required=True,
-        choices=["claude-code", "codex"],
+        choices=["claude-code", "codex", "kiro"],
         help="Harness type (determines stdin JSON format)",
     )
 
@@ -1472,6 +1495,76 @@ def main():
     instructions_sub = p_instructions.add_subparsers(dest="instructions_name")
     for instr_name in ["init", "search", "mine", "help", "status"]:
         instructions_sub.add_parser(instr_name, help=f"Output {instr_name} instructions")
+
+    # kiro — first-class Kiro IDE integration (MCP server + steering + sync)
+    p_kiro = sub.add_parser(
+        "kiro",
+        help="Set up MemPalace in the Kiro IDE (register MCP server, write steering, sync history)",
+    )
+    kiro_sub = p_kiro.add_subparsers(dest="kiro_action")
+
+    p_kiro_install = kiro_sub.add_parser(
+        "install",
+        help="Register the mempalace MCP server in Kiro and write the steering file",
+    )
+    p_kiro_install.add_argument(
+        "--local",
+        nargs="?",
+        const=os.getcwd(),
+        default=None,
+        metavar="DIR",
+        help="Install into a workspace's .kiro instead of ~/.kiro (defaults to CWD)",
+    )
+    p_kiro_install.add_argument(
+        "--command",
+        dest="mcp_command",
+        default="mempalace-mcp",
+        help="Command Kiro runs for the MCP server (default: mempalace-mcp)",
+    )
+
+    p_kiro_uninstall = kiro_sub.add_parser(
+        "uninstall",
+        help="Remove the mempalace MCP entry and steering file from Kiro",
+    )
+    p_kiro_uninstall.add_argument(
+        "--local",
+        nargs="?",
+        const=os.getcwd(),
+        default=None,
+        metavar="DIR",
+        help="Uninstall from a workspace's .kiro instead of ~/.kiro (defaults to CWD)",
+    )
+
+    p_kiro_sync = kiro_sub.add_parser(
+        "sync",
+        help="Mine Kiro's session transcripts into the palace (--mode convos)",
+    )
+    p_kiro_sync.add_argument(
+        "--agent-dir",
+        default=None,
+        help="Override the autodetected globalStorage/kiro.kiroagent directory",
+    )
+    p_kiro_sync.add_argument(
+        "--dry-run", action="store_true", help="Show what would be filed without filing"
+    )
+
+    p_kiro_status = kiro_sub.add_parser(
+        "status",
+        help="Show whether MemPalace is wired into Kiro and where its sessions live",
+    )
+    p_kiro_status.add_argument(
+        "--local",
+        nargs="?",
+        const=os.getcwd(),
+        default=None,
+        metavar="DIR",
+        help="Check a workspace's .kiro instead of ~/.kiro (defaults to CWD)",
+    )
+    p_kiro_status.add_argument(
+        "--agent-dir",
+        default=None,
+        help="Override the autodetected globalStorage/kiro.kiroagent directory",
+    )
 
     # repair
     p_repair = sub.add_parser(
@@ -1598,6 +1691,13 @@ def main():
             return
         args.name = name
         cmd_instructions(args)
+        return
+
+    if args.command == "kiro":
+        if not getattr(args, "kiro_action", None):
+            p_kiro.print_help()
+            return
+        cmd_kiro(args)
         return
 
     dispatch = {

@@ -460,6 +460,8 @@ def _is_ai_tool_path(path: Path) -> bool:
     or `.codex-archive` do NOT match):
       - any segment ``.codex`` (Codex CLI sessions / archives)
       - any segment ``.gemini`` (Gemini CLI sessions under ~/.gemini/tmp/...)
+      - any segment ``kiro.kiroagent`` (Kiro IDE session transcripts under
+        ``<globalStorage>/kiro.kiroagent/workspace-sessions/...``)
       - the consecutive segment pair ``.claude/projects`` (Claude Code).
         ``.claude`` alone is NOT matched — that is the settings/config dir,
         not a conversation source.
@@ -475,6 +477,8 @@ def _is_ai_tool_path(path: Path) -> bool:
     if ".codex" in parts:
         return True
     if ".gemini" in parts:
+        return True
+    if "kiro.kiroagent" in parts:
         return True
     for i in range(len(parts) - 1):
         if parts[i] == ".claude" and parts[i + 1] == "projects":

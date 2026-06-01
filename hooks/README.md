@@ -198,6 +198,17 @@ For Codex CLI sessions:
 mempalace mine ~/.codex/sessions/ --mode convos
 ```
 
+For Kiro IDE sessions (auto-detects Kiro's `globalStorage/kiro.kiroagent`):
+```bash
+mempalace kiro sync
+# or point at the directory directly:
+mempalace mine <kiro-sessions-dir> --mode convos
+```
+
+Kiro has no Stop/PreCompact hook mechanism, so this transcript sync (not a
+live hook) is how MemPalace keeps up with Kiro chats. See
+[`.kiro-plugin/README.md`](../.kiro-plugin/README.md) for the full Kiro setup.
+
 This only needs to be done once — after that, the hooks auto-mine each session as you go.
 
 ## Cost

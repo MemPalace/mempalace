@@ -1,0 +1,41 @@
+{
+  "mcpServers": {
+    "mempalace": {
+      "type": "stdio",
+      "command": "mempalace-mcp",
+      "args": [],
+      "disabled": false,
+      "autoApprove": [
+        "mempalace_status",
+        "mempalace_list_wings",
+        "mempalace_list_rooms",
+        "mempalace_get_taxonomy",
+        "mempalace_get_aaak_spec",
+        "mempalace_kg_query",
+        "mempalace_kg_add",
+        "mempalace_kg_invalidate",
+        "mempalace_kg_timeline",
+        "mempalace_kg_stats",
+        "mempalace_traverse",
+        "mempalace_find_tunnels",
+        "mempalace_graph_stats",
+        "mempalace_create_tunnel",
+        "mempalace_list_tunnels",
+        "mempalace_follow_tunnels",
+        "mempalace_search",
+        "mempalace_check_duplicate",
+        "mempalace_add_drawer",
+        "mempalace_get_drawer",
+        "mempalace_list_drawers",
+        "mempalace_update_drawer",
+        "mempalace_diary_write",
+        "mempalace_diary_read",
+        "mempalace_hook_settings",
+        "mempalace_memories_filed_away",
+        "mempalace_sync",
+        "mempalace_reconnect"
+      ],
+      "description": "MemPalace: persistent, searchable AI memory. Recall past work and conversations; file verbatim memories. Local-only, no API key."
+    }
+  }
+}

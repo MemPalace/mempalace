@@ -75,6 +75,7 @@ pip install mempalace
 # Mine content into the palace
 mempalace mine ~/projects/myapp                    # project files
 mempalace mine ~/.claude/projects/ --mode convos   # Claude Code sessions (scope with --wing per project)
+mempalace kiro sync                                # Kiro IDE sessions (auto-detected)
 
 # Search
 mempalace search "why did we switch to GraphQL"
@@ -172,6 +173,31 @@ If you are installing under time pressure, start with the
 [Claude Code retention setup checklist](https://mempalaceofficial.com/guide/claude-code-retention.html):
 wire the hooks, back up existing JSONL transcripts, and backfill them with
 `mempalace mine ~/.claude/projects/ --mode convos`.
+
+## Kiro IDE
+
+First-class support for the [Kiro IDE](https://kiro.dev). One command
+registers the MemPalace MCP server in Kiro and writes a steering file so the
+agent recalls memory proactively:
+
+```bash
+mempalace kiro install        # ~/.kiro (global); add --local for a workspace
+```
+
+Reload Kiro (**Command Palette → "Developer: Reload Window"**) and the
+`mempalace` server starts automatically. Kiro has no live Stop/PreCompact
+hooks, so MemPalace captures history by reading the session transcripts Kiro
+already writes to disk — import them any time with:
+
+```bash
+mempalace kiro sync           # auto-detects Kiro's session directory
+mempalace kiro status         # show what's wired up and where sessions live
+mempalace kiro uninstall      # remove the MCP entry + steering (palace kept)
+```
+
+The merge never clobbers other MCP servers, and every tool is auto-approved
+except the two destructive deletes. Details and the manual-setup path:
+[`.kiro-plugin/README.md`](.kiro-plugin/README.md).
 
 For per-message recall on top of the file-level chunks the hooks produce,
 run `mempalace sweep <transcript-dir>` periodically — it stores one

@@ -738,11 +738,21 @@ def _ingest_transcript(transcript_path: str):
         pass
 
 
-SUPPORTED_HARNESSES = {"claude-code", "codex"}
+SUPPORTED_HARNESSES = {"claude-code", "codex", "kiro"}
 
 
 def _parse_harness_input(data: dict, harness: str) -> dict:
-    """Parse stdin JSON according to the harness type."""
+    """Parse stdin JSON according to the harness type.
+
+    All currently-supported harnesses (claude-code, codex, kiro) deliver the
+    same three fields we care about — ``session_id``, ``stop_hook_active``,
+    and ``transcript_path`` — so a single tolerant parse covers them. Kiro
+    does not expose live Stop/PreCompact hooks the way Claude Code and Codex
+    do; its primary capture path is transcript sync (``mempalace kiro sync``
+    / ``mempalace mine --mode convos``). The harness is accepted here for
+    parity and so a future Kiro hook bridge can reuse this entry point
+    without a schema change.
+    """
     if harness not in SUPPORTED_HARNESSES:
         print(f"Unknown harness: {harness}", file=sys.stderr)
         sys.exit(1)

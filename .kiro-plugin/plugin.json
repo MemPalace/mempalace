@@ -1,0 +1,31 @@
+{
+  "name": "mempalace",
+  "version": "3.3.6",
+  "description": "Give your AI a memory — mine projects and conversations into a searchable palace. MCP tools + steering for the Kiro IDE.",
+  "author": {
+    "name": "milla-jovovich"
+  },
+  "homepage": "https://github.com/MemPalace/mempalace",
+  "repository": "https://github.com/MemPalace/mempalace",
+  "license": "MIT",
+  "keywords": [
+    "memory",
+    "ai",
+    "rag",
+    "mcp",
+    "chromadb",
+    "palace",
+    "search",
+    "kiro"
+  ],
+  "kiro": {
+    "mcp": "./mcp.json",
+    "steering": "./steering/",
+    "install": "mempalace kiro install"
+  },
+  "mcpServers": {
+    "mempalace": {
+      "command": "mempalace-mcp"
+    }
+  }
+}
