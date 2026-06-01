@@ -1038,8 +1038,40 @@ class ChromaCollection(BaseCollection):
             for m in metadatas
         ]
 
+    @staticmethod
+    def _sanitize_documents_for_chromadb(documents):
+        """Strip lone UTF-16 surrogates from every document before it reaches
+        the chromadb client.
+
+        A single lone surrogate (U+D800–U+DFFF) raises ``UnicodeEncodeError``
+        inside chromadb's encode path and aborts the *entire* add/upsert batch
+        with a ``-32000`` Internal Error, silently dropping every other row in
+        the same batch (#1235).
+
+        #1235 fixed this for the MCP write tools via ``sanitize_content``, but
+        the bulk ingest paths (miner, convo_miner, sweeper, diary_ingest) build
+        documents without routing through that helper and reach this backend
+        directly. Sanitising here makes the chokepoint catch-all complete: the
+        sibling :meth:`_sanitize_metadatas_for_chromadb` already guarantees this
+        for metadata one method over; documents get the same guarantee.
+        """
+        if documents is None:
+            return None
+        from ..config import strip_lone_surrogates
+
+        # chromadb accepts OneOrMany[Document]: a bare str is a single document,
+        # not an iterable of characters. Handle it explicitly so we don't split
+        # it into per-character documents — that would be exactly the kind of
+        # silent corruption this method exists to prevent.
+        if isinstance(documents, str):
+            return strip_lone_surrogates(documents)
+        return [strip_lone_surrogates(d) if isinstance(d, str) else d for d in documents]
+
     def add(self, *, documents, ids, metadatas=None, embeddings=None):
-        kwargs: dict[str, Any] = {"documents": documents, "ids": ids}
+        kwargs: dict[str, Any] = {
+            "documents": self._sanitize_documents_for_chromadb(documents),
+            "ids": ids,
+        }
         sanitized = self._sanitize_metadatas_for_chromadb(metadatas)
         if sanitized is not None:
             kwargs["metadatas"] = sanitized
@@ -1049,7 +1081,10 @@ class ChromaCollection(BaseCollection):
             self._collection.add(**kwargs)
 
     def upsert(self, *, documents, ids, metadatas=None, embeddings=None):
-        kwargs: dict[str, Any] = {"documents": documents, "ids": ids}
+        kwargs: dict[str, Any] = {
+            "documents": self._sanitize_documents_for_chromadb(documents),
+            "ids": ids,
+        }
         sanitized = self._sanitize_metadatas_for_chromadb(metadatas)
         if sanitized is not None:
             kwargs["metadatas"] = sanitized
@@ -1070,7 +1105,7 @@ class ChromaCollection(BaseCollection):
             raise ValueError("update requires at least one of documents, metadatas, embeddings")
         kwargs: dict[str, Any] = {"ids": ids}
         if documents is not None:
-            kwargs["documents"] = documents
+            kwargs["documents"] = self._sanitize_documents_for_chromadb(documents)
         if metadatas is not None:
             kwargs["metadatas"] = metadatas
         if embeddings is not None:
