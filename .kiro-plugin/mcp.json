@@ -35,7 +35,11 @@
         "mempalace_sync",
         "mempalace_reconnect"
       ],
-      "description": "MemPalace: persistent, searchable AI memory. Recall past work and conversations; file verbatim memories. Local-only, no API key."
+      "description": "MemPalace: persistent, searchable AI memory. Recall past work and conversations; file verbatim memories. Local-only, no API key.",
+      "env": {
+        "MEMPALACE_KIRO_AUTOSYNC": "1",
+        "MEMPALACE_KIRO_RETENTION_DAYS": "30"
+      }
     }
   }
 }

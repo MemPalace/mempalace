@@ -170,6 +170,16 @@ def _agent_dir_for(filepath: str) -> Optional[Path]:
     return None
 
 
+def is_kiro_session_path(filepath: str) -> bool:
+    """True if ``filepath`` is a Kiro workspace-session transcript path.
+
+    Used by retention pruning to identify which stored drawers came from
+    Kiro sessions (by their ``source_file`` metadata) without touching
+    drawers from other ingest sources.
+    """
+    return _agent_dir_for(filepath) is not None
+
+
 def exec_map_for_session(filepath: str) -> Optional[dict[str, str]]:
     """Return the cached exec map for the Kiro session at ``filepath``, or None.
 

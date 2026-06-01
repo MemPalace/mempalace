@@ -195,6 +195,19 @@ mempalace kiro status         # show what's wired up and where sessions live
 mempalace kiro uninstall      # remove the MCP entry + steering (palace kept)
 ```
 
+**Auto-sync + retention.** `kiro install` wires the MCP server to run a
+debounced background `kiro sync` whenever Kiro starts (Kiro has no hooks, so
+MCP startup is the trigger) and applies a **30-day rolling window** by default:
+sessions older than the window are skipped on ingest and pruned from the palace,
+so old data is deleted automatically. Tune or disable both:
+
+```bash
+mempalace kiro install --retention-days 90   # keep 90 days
+mempalace kiro install --retention-days 0     # keep everything, never prune
+mempalace kiro install --no-autosync          # manual sync only
+mempalace kiro sync --retention-days 7 --dry-run   # preview a prune
+```
+
 `kiro sync` reads **both** of Kiro's data sources: the workspace-session
 transcript *and* the per-execution exec store. Kiro often writes the assistant
 turn as a stub (`"On it."`) while the real generated output lives in the exec

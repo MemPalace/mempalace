@@ -1033,11 +1033,22 @@ def cmd_kiro(args):
     palace = getattr(args, "palace", None)
 
     if action == "install":
-        lines = kiro_install.install(local=local, palace=palace, command=args.mcp_command)
+        lines = kiro_install.install(
+            local=local,
+            palace=palace,
+            command=args.mcp_command,
+            autosync=args.autosync,
+            retention_days=args.retention_days,
+        )
     elif action == "uninstall":
         lines = kiro_install.uninstall(local=local)
     elif action == "sync":
-        lines = kiro_install.sync(palace=palace, agent_dir=args.agent_dir, dry_run=args.dry_run)
+        lines = kiro_install.sync(
+            palace=palace,
+            agent_dir=args.agent_dir,
+            dry_run=args.dry_run,
+            retention_days=args.retention_days,
+        )
     elif action == "status":
         lines = kiro_install.status(local=local, agent_dir=args.agent_dir)
     else:
@@ -1521,6 +1532,21 @@ def main():
         default="mempalace-mcp",
         help="Command Kiro runs for the MCP server (default: mempalace-mcp)",
     )
+    p_kiro_install.add_argument(
+        "--no-autosync",
+        dest="autosync",
+        action="store_false",
+        default=True,
+        help="Don't auto-sync Kiro history on MCP startup (sync stays manual)",
+    )
+    p_kiro_install.add_argument(
+        "--retention-days",
+        type=int,
+        default=30,
+        metavar="N",
+        help="Rolling retention window in days written into Kiro's config "
+        "(default: 30; 0 = keep everything forever)",
+    )
 
     p_kiro_uninstall = kiro_sub.add_parser(
         "uninstall",
@@ -1546,6 +1572,15 @@ def main():
     )
     p_kiro_sync.add_argument(
         "--dry-run", action="store_true", help="Show what would be filed without filing"
+    )
+    p_kiro_sync.add_argument(
+        "--retention-days",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Rolling retention window in days (default: MEMPALACE_KIRO_RETENTION_DAYS "
+        "env or 30; 0 = keep everything). Sessions older than this are skipped on "
+        "ingest and pruned from the palace.",
     )
 
     p_kiro_status = kiro_sub.add_parser(

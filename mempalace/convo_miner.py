@@ -340,12 +340,17 @@ def detect_convo_room(content: str) -> str:
 # =============================================================================
 
 
-def scan_convos(convo_dir: str) -> list:
+def scan_convos(convo_dir: str, newer_than: Optional[float] = None) -> list:
     """Find all potential conversation files.
 
     Skips symlinks and oversized files. Each skipped symlink is logged to
     ``sys.stderr`` with a ``  SKIP: <relative-path> (symlink)`` line so the
     caller can tell why an apparent conversation directory yielded no files.
+
+    ``newer_than`` (a Unix timestamp, optional) enables a rolling-window
+    skip: files whose mtime is older than it are excluded up front, so
+    aged-out transcripts are never re-ingested. ``None`` (default) scans
+    everything — behaviour for non-retention callers is unchanged.
     """
     convo_path = Path(convo_dir).expanduser().resolve()
     files = []
@@ -365,9 +370,13 @@ def scan_convos(convo_dir: str) -> list:
                         pass
                     continue
                 try:
-                    if filepath.stat().st_size > MAX_FILE_SIZE:
-                        continue
+                    st = filepath.stat()
                 except OSError:
+                    continue
+                if st.st_size > MAX_FILE_SIZE:
+                    continue
+                # Retention: drop transcripts older than the rolling window.
+                if newer_than is not None and st.st_mtime < newer_than:
                     continue
                 files.append(filepath)
     return files
@@ -519,12 +528,17 @@ def mine_convos(
     limit: int = 0,
     dry_run: bool = False,
     extract_mode: str = "exchange",
+    newer_than: Optional[float] = None,
 ):
     """Mine a directory of conversation files into the palace.
 
     extract_mode:
         "exchange" — default exchange-pair chunking (Q+A = one unit)
         "general"  — general extractor: decisions, preferences, milestones, problems, emotions
+
+    ``newer_than`` (optional Unix timestamp) restricts ingest to files
+    modified after it — used by the Kiro rolling-retention path so aged-out
+    transcripts are never re-ingested. ``None`` (default) ingests everything.
 
     The real work is in :func:`_mine_convos_impl`; this wrapper holds the
     per-palace flock around it so two concurrent ``mempalace mine --mode
@@ -551,6 +565,7 @@ def mine_convos(
             limit=limit,
             dry_run=dry_run,
             extract_mode=extract_mode,
+            newer_than=newer_than,
         )
 
     with mine_palace_lock(palace_path):
@@ -562,6 +577,7 @@ def mine_convos(
             limit=limit,
             dry_run=dry_run,
             extract_mode=extract_mode,
+            newer_than=newer_than,
         )
 
 
@@ -573,6 +589,7 @@ def _mine_convos_impl(
     limit: int = 0,
     dry_run: bool = False,
     extract_mode: str = "exchange",
+    newer_than: Optional[float] = None,
 ):
     from .config import MempalaceConfig
 
@@ -592,7 +609,7 @@ def _mine_convos_impl(
     convo_path = Path(convo_dir).expanduser().resolve()
     wing = _resolve_wing(convo_path, wing)
 
-    files = scan_convos(convo_dir)
+    files = scan_convos(convo_dir, newer_than=newer_than)
     if limit > 0:
         files = files[:limit]
 

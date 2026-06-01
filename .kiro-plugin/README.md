@@ -78,6 +78,27 @@ the per-execution exec store — and splices the real assistant output (reasonin
 + prose) onto the `"On it."` stubs Kiro writes to the transcript, so the agent's
 actual answers are ingested, not just your prompts.
 
+## Auto-sync & retention
+
+`mempalace kiro install` configures two things in the MCP entry's `env`:
+
+- **Auto-sync** (`MEMPALACE_KIRO_AUTOSYNC=1`) — the MCP server runs a debounced,
+  detached `kiro sync` in the background each time Kiro starts it (Kiro has no
+  Stop/PreCompact hooks, so MCP startup is the trigger). Debounce defaults to
+  ~30 min (`MEMPALACE_KIRO_AUTOSYNC_INTERVAL_MIN`). Disable with
+  `--no-autosync`.
+- **Retention** (`MEMPALACE_KIRO_RETENTION_DAYS=30`) — a rolling window. Sessions
+  whose transcript is older than the window (or whose transcript Kiro itself
+  deleted) are skipped on ingest **and** pruned from the palace on each sync, so
+  old data is removed automatically. Set `--retention-days 0` to keep everything
+  forever, or any N for an N-day window.
+
+```bash
+mempalace kiro install --retention-days 90
+mempalace kiro install --no-autosync
+mempalace kiro sync --retention-days 7 --dry-run   # preview a prune
+```
+
 If Kiro is installed somewhere non-standard, set `MEMPALACE_KIRO_AGENT_DIR` to
 its `globalStorage/kiro.kiroagent` path, or mine the directory directly:
 

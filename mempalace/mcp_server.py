@@ -2846,6 +2846,19 @@ def main():
     # Idle auto-exit: release ChromaDB file handles from stale servers
     # that outlived their Claude Code session (#1552).
     _start_idle_exit_watchdog()
+    # Kiro auto-sync: when launched by Kiro (env set by `mempalace kiro
+    # install`), kick off a debounced, detached background `mempalace kiro
+    # sync` so new Kiro chats land in the palace without a manual sync.
+    # Kiro has no Stop/PreCompact hooks, so MCP startup is the trigger.
+    # Best-effort and non-blocking; the child's output goes to a log file,
+    # never to this server's stdout (which carries MCP JSON-RPC).
+    if os.environ.get("MEMPALACE_KIRO_AUTOSYNC", "").strip().lower() in ("1", "true", "yes", "on"):
+        try:
+            from .kiro_install import maybe_autosync
+
+            maybe_autosync()
+        except Exception as exc:  # never let auto-sync break server startup
+            logger.warning("Kiro auto-sync trigger skipped: %s", exc)
     while True:
         try:
             line = sys.stdin.readline()

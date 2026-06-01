@@ -405,3 +405,168 @@ def test_tool_and_unknown_roles_kept():
 
 def test_stub_constant_in_sync():
     assert _KIRO_ASSISTANT_STUB == kiro_ingest.ASSISTANT_STUB
+
+
+# ── auto-sync + 30-day rolling retention ─────────────────────────────────
+
+import contextlib  # noqa: E402
+import os  # noqa: E402
+import time  # noqa: E402
+
+from mempalace.convo_miner import scan_convos  # noqa: E402
+
+
+def test_mcp_entry_env_autosync_and_retention():
+    e_on = k._mcp_entry("mempalace-mcp", None, autosync=True, retention_days=30)
+    assert e_on["env"] == {"MEMPALACE_KIRO_AUTOSYNC": "1", "MEMPALACE_KIRO_RETENTION_DAYS": "30"}
+    e_off = k._mcp_entry("mempalace-mcp", None, autosync=False, retention_days=0)
+    assert "MEMPALACE_KIRO_AUTOSYNC" not in e_off["env"]
+    assert e_off["env"]["MEMPALACE_KIRO_RETENTION_DAYS"] == "0"
+
+
+def test_resolve_retention_days_precedence(monkeypatch):
+    monkeypatch.delenv(k.RETENTION_ENV, raising=False)
+    assert k.resolve_retention_days() == 30
+    assert k.resolve_retention_days(7) == 7
+    assert k.resolve_retention_days(-5) == 0  # clamp
+    monkeypatch.setenv(k.RETENTION_ENV, "14")
+    assert k.resolve_retention_days() == 14  # env beats default
+    assert k.resolve_retention_days(3) == 3  # explicit beats env
+    monkeypatch.setenv(k.RETENTION_ENV, "garbage")
+    assert k.resolve_retention_days() == 30  # bad env -> default
+
+
+def test_install_writes_autosync_and_retention_env(tmp_path):
+    k.install(local=str(tmp_path), retention_days=45)
+    env = json.loads((tmp_path / ".kiro" / "settings" / "mcp.json").read_text())["mcpServers"][
+        "mempalace"
+    ]["env"]
+    assert env["MEMPALACE_KIRO_AUTOSYNC"] == "1"
+    assert env["MEMPALACE_KIRO_RETENTION_DAYS"] == "45"
+
+    k.install(local=str(tmp_path), autosync=False, retention_days=0)
+    env2 = json.loads((tmp_path / ".kiro" / "settings" / "mcp.json").read_text())["mcpServers"][
+        "mempalace"
+    ]["env"]
+    assert "MEMPALACE_KIRO_AUTOSYNC" not in env2
+    assert env2["MEMPALACE_KIRO_RETENTION_DAYS"] == "0"
+
+
+def test_scan_convos_skips_old_files(tmp_path):
+    recent = tmp_path / "recent.json"
+    recent.write_text('{"sessionId":"r","history":[]}')
+    old = tmp_path / "old.json"
+    old.write_text('{"sessionId":"o","history":[]}')
+    forty_days = time.time() - 40 * 86400
+    os.utime(old, (forty_days, forty_days))
+
+    all_files = {p.name for p in scan_convos(str(tmp_path))}
+    assert {"recent.json", "old.json"} <= all_files
+
+    cutoff = time.time() - 30 * 86400
+    recent_only = {p.name for p in scan_convos(str(tmp_path), newer_than=cutoff)}
+    assert "recent.json" in recent_only
+    assert "old.json" not in recent_only  # aged out -> skipped on ingest
+
+
+class _FakeCollection:
+    """Minimal stand-in for a Chroma collection for prune tests."""
+
+    def __init__(self, rows):
+        # rows: list of (id, metadata)
+        self.rows = list(rows)
+        self.deleted: list[str] = []
+
+    def get(self, limit=None, offset=0, include=None, where=None):
+        page = self.rows[offset : offset + limit] if limit else self.rows
+        return {"ids": [r[0] for r in page], "metadatas": [r[1] for r in page]}
+
+    def delete(self, ids):
+        self.deleted.extend(ids)
+        gone = set(ids)
+        self.rows = [r for r in self.rows if r[0] not in gone]
+
+
+def _patch_palace(monkeypatch, fake_col):
+    import mempalace.palace as palace
+
+    @contextlib.contextmanager
+    def _noop_lock(_path):
+        yield
+
+    monkeypatch.setattr(palace, "get_collection", lambda *a, **kw: fake_col)
+    monkeypatch.setattr(palace, "mine_palace_lock", _noop_lock)
+    monkeypatch.setattr(palace, "get_closets_collection", lambda *a, **kw: None)
+
+
+def _kiro_session_file(tmp_path, name, age_days=0):
+    agent = tmp_path / "globalStorage" / "kiro.kiroagent"
+    sdir = agent / "workspace-sessions" / "ws"
+    sdir.mkdir(parents=True, exist_ok=True)
+    f = sdir / f"{name}.json"
+    f.write_text("{}")
+    if age_days:
+        ts = time.time() - age_days * 86400
+        os.utime(f, (ts, ts))
+    return str(f)
+
+
+def test_prune_expired_sessions(tmp_path, monkeypatch):
+    recent = _kiro_session_file(tmp_path, "recent", age_days=2)
+    ancient = _kiro_session_file(tmp_path, "ancient", age_days=40)
+    gone = str(
+        tmp_path / "globalStorage" / "kiro.kiroagent" / "workspace-sessions" / "ws" / "gone.json"
+    )  # kiro path, file does not exist -> expired
+    rows = [
+        ("d_recent", {"source_file": recent, "ingest_mode": "convos"}),
+        ("d_ancient", {"source_file": ancient, "ingest_mode": "convos"}),
+        ("d_gone", {"source_file": gone, "ingest_mode": "convos"}),
+        ("d_other", {"source_file": "/some/project/main.py"}),  # non-Kiro -> never touched
+        ("d_nosrc", {}),  # no source -> ignored
+    ]
+    fake = _FakeCollection(rows)
+    _patch_palace(monkeypatch, fake)
+
+    report = k.prune_expired_sessions("/fake/palace", retention_days=30)
+    assert report["pruned_drawers"] == 2  # ancient + gone
+    assert report["expired_sessions"] == 2
+    assert set(fake.deleted) == {"d_ancient", "d_gone"}
+    # recent + non-Kiro + no-source survive
+    assert {r[0] for r in fake.rows} == {"d_recent", "d_other", "d_nosrc"}
+
+
+def test_prune_disabled_when_retention_zero(tmp_path, monkeypatch):
+    fake = _FakeCollection([("d", {"source_file": _kiro_session_file(tmp_path, "x", 99)})])
+    _patch_palace(monkeypatch, fake)
+    report = k.prune_expired_sessions("/fake/palace", retention_days=0)
+    assert report["skipped"] is True
+    assert fake.deleted == []
+
+
+def test_prune_dry_run_deletes_nothing(tmp_path, monkeypatch):
+    ancient = _kiro_session_file(tmp_path, "ancient", age_days=40)
+    fake = _FakeCollection([("d_ancient", {"source_file": ancient})])
+    _patch_palace(monkeypatch, fake)
+    report = k.prune_expired_sessions("/fake/palace", retention_days=30, dry_run=True)
+    assert report["would_remove"] == 1
+    assert fake.deleted == []  # dry-run never deletes
+
+
+def test_maybe_autosync_debounce(tmp_path, monkeypatch):
+    monkeypatch.setattr(k, "_STATE_DIR", tmp_path)
+    monkeypatch.setattr(k, "_AUTOSYNC_STATE", tmp_path / "autosync.state")
+    monkeypatch.setattr(k, "_AUTOSYNC_LOG", tmp_path / "autosync.log")
+    monkeypatch.setenv(k.AUTOSYNC_INTERVAL_ENV, "60")
+
+    spawned = []
+
+    class _FakePopen:
+        def __init__(self, cmd, **kw):
+            spawned.append(cmd)
+
+    monkeypatch.setattr(k.subprocess, "Popen", _FakePopen)
+
+    assert k.maybe_autosync() is True  # first fires
+    assert k.maybe_autosync() is False  # within interval -> debounced
+    assert len(spawned) == 1
+    assert spawned[0][-2:] == ["kiro", "sync"]
