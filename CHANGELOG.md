@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [Unreleased]
+
+### Features
+
+- **Embeddings via any OpenAI-compatible `/v1/embeddings` endpoint.** New `embedding_model: "openai-compat"` option computes embeddings on a server (LM Studio, llama.cpp, vLLM, Ollama's OpenAI shim, or a self-hosted endpoint) instead of a local ONNX model — useful for larger/multilingual embedders such as Qwen3-Embedding, or GPU offload. New `OpenAICompatEmbeddingFunction` in [`mempalace/embedding.py`](mempalace/embedding.py) speaks the standard `/v1/embeddings` protocol over stdlib `urllib` (no new dependency), batches requests, re-sorts the response by `index`, and L2-normalizes for the cosine collection. Endpoint settings are resolved by `MempalaceConfig` as a single source of truth — `embedding_api_url` / `embedding_api_model` / `embedding_api_key` in `config.json`, each overridable via the matching `MEMPALACE_EMBEDDING_API_*` env var. The embedding function's `name()` encodes the model id so changing it forces `mempalace repair rebuild-index` (different vector space). Mirrors the existing `openai-compat` LLM provider naming; stays local when the endpoint is on your machine/LAN. (#1559)
+
+---
+
 ## [3.3.6] — 2026-05-24
 
 ### Features
