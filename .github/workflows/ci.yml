@@ -50,6 +50,9 @@ jobs:
         with:
           python-version: "3.11"
           cache: 'pip'
-      - run: pip install "ruff>=0.4.0,<0.5"
+      # Keep this pin identical to the `ruff==` pin in pyproject.toml
+      # ([project.optional-dependencies].dev and [dependency-groups].dev)
+      # so CI and `pip install -e ".[dev]"` format/lint identically.
+      - run: pip install "ruff==0.15.14"
       - run: ruff check .
       - run: ruff format --check .

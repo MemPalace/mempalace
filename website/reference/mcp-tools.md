@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-Detailed parameter schemas for all 29 MCP tools.
+Detailed parameter schemas for all 30 MCP tools.
 
 ## Palace — Read Tools
 
@@ -111,6 +111,20 @@ Delete a drawer by ID. Irreversible.
 | `drawer_id` | string | **Yes** | ID of the drawer to delete |
 
 **Returns:** `{ success, drawer_id }`
+
+---
+
+### `mempalace_sync`
+
+Prune drawers whose source files are gitignored, deleted, or moved. Returns a dry-run report by default; pass `apply=true` to commit deletions.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `project_dir` | string | No | Project root to scope the sync (auto-detected from drawer metadata if omitted) |
+| `wing` | string | No | Limit to one wing |
+| `apply` | boolean | No | Actually delete drawers; default is dry-run preview |
+
+**Returns:** `{ scanned, kept, gitignored, missing, no_source, out_of_scope, removed_drawers, removed_closets, dry_run, by_source }`
 
 ---
 

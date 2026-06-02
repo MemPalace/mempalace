@@ -45,19 +45,22 @@ sys.stdout = sys.stderr
 import argparse  # noqa: E402  (deferred until after stdio protection above)
 import json  # noqa: E402
 import logging  # noqa: E402
+import re  # noqa: E402
 import hashlib  # noqa: E402
 import sqlite3  # noqa: E402
 import threading  # noqa: E402
 import time  # noqa: E402
 from datetime import date, datetime  # noqa: E402
 from pathlib import Path  # noqa: E402
+from typing import Optional  # noqa: E402
 
 from .config import (  # noqa: E402
     MempalaceConfig,
     sanitize_kg_value,
     sanitize_name,
     sanitize_content,
-    sanitize_iso_date,
+    sanitize_iso_temporal,
+    strip_lone_surrogates,
 )
 from .version import __version__  # noqa: E402
 from chromadb.errors import NotFoundError as _ChromaNotFoundError  # noqa: E402
@@ -83,7 +86,70 @@ from .palace_graph import (  # noqa: E402
 
 from .knowledge_graph import KnowledgeGraph, DEFAULT_KG_PATH  # noqa: E402
 
-logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stderr)
+
+def _init_logging() -> None:
+    """Root-logger init: always stderr, optionally append to ``MEMPALACE_LOG_FILE``.
+
+    Stderr-only is the default. When ``MEMPALACE_LOG_FILE`` is set, a
+    ``FileHandler`` is attached so MCP-client failures that the client
+    does not surface (e.g. the ``-32000`` cold-load timeout in #1495)
+    remain diagnosable from the file.
+
+    Failure modes:
+
+    * Invalid path (missing directory, no perms, Windows NUL byte) →
+      stderr-only with a warning. The env var must not become a new
+      server-start failure surface — that would defeat the diagnostic
+      goal. ``ValueError`` is included in the catch because Windows
+      raises it for paths with embedded NUL bytes, not ``OSError``.
+    * Root logger already configured (host app embedding the server,
+      transitive imports touching ``logging``) → ``force=True`` resets
+      the handlers so MEMPALACE_LOG_FILE's contract holds regardless
+      of what touched root logging first. Without ``force=True``,
+      ``basicConfig`` is a no-op when handlers exist and the env var
+      silently does nothing — exactly the diagnostic black hole #1495
+      exists to close.
+    * Concurrent writers (multiple ``mempalace-mcp`` processes pointing
+      at the same path) interleave at the line level. The handler uses
+      append mode so nothing is overwritten, but operators running
+      Claude Code + Claude Desktop simultaneously should give each
+      process its own log path.
+
+    ``delay=True`` is intentionally NOT set: deferring the open means an
+    invalid path raises at ``emit()`` time (unhandled), defeating the
+    fail-soft contract. With eager open the same error surfaces inside
+    ``FileHandler.__init__`` and lands in our ``except`` below.
+
+    Module-level invocation: this function runs at import time, preserving
+    the side effect of the previous module-level ``logging.basicConfig``
+    call. Callers that import ``mempalace.mcp_server`` for introspection
+    (``TOOLS`` dict, handler functions) inherit the reset; this matches
+    pre-PR behaviour and is intentional for an MCP entry-point module.
+    """
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
+    # MEMPALACE_LOG_FILE is operator-supplied and opt-in; this is a
+    # local-first server (CLAUDE.md design principle), so no path
+    # sanitization — the operator's process UID is the trust boundary.
+    log_file = os.environ.get("MEMPALACE_LOG_FILE", "").strip()
+    file_handler_error: Exception | None = None
+    if log_file:
+        try:
+            handlers.append(logging.FileHandler(log_file, mode="a", encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            # Fail-soft: see "Invalid path" failure mode above. Broad on
+            # (OSError, ValueError) because Windows raises ValueError for
+            # NUL-byte paths while POSIX uses OSError for missing-dir / EPERM.
+            file_handler_error = exc
+    logging.basicConfig(level=logging.INFO, format="%(message)s", handlers=handlers, force=True)
+    if file_handler_error is not None:
+        logging.getLogger("mempalace_mcp").warning(
+            "MEMPALACE_LOG_FILE=%r could not be opened (%s); using stderr only",
+            log_file,
+            file_handler_error,
+        )
+
+
+_init_logging()
 logger = logging.getLogger("mempalace_mcp")
 
 
@@ -111,6 +177,27 @@ _kg_by_path: dict[str, KnowledgeGraph] = {}
 _kg_cache_lock = threading.Lock()
 _palace_flag_given: bool = bool(_args.palace)
 
+# MCP server idle auto-exit (#1552).  Stale MCP servers from ended Claude
+# Code sessions do not self-terminate, accumulating ChromaDB/HNSW file
+# handles on Windows.  When MEMPALACE_MCP_IDLE_HOURS is set (or defaults
+# to 8 h), a background daemon thread exits the process once no request
+# has been handled for that long.  Set to 0 to disable.
+_MCP_IDLE_HOURS_ENV = "MEMPALACE_MCP_IDLE_HOURS"
+_MCP_IDLE_HOURS_DEFAULT = 8.0
+_last_request_time: float = time.monotonic()
+
+
+def _mcp_idle_timeout_secs() -> float:
+    """Return the configured MCP idle timeout in seconds (0 = disabled)."""
+    raw = os.environ.get(_MCP_IDLE_HOURS_ENV, "")
+    if raw:
+        try:
+            hours = float(raw)
+            return max(0.0, hours) * 3600
+        except ValueError:
+            return 0.0
+    return _MCP_IDLE_HOURS_DEFAULT * 3600
+
 
 def _resolve_kg_path() -> str:
     if _palace_flag_given:
@@ -118,8 +205,35 @@ def _resolve_kg_path() -> str:
     return DEFAULT_KG_PATH
 
 
-def _get_kg() -> KnowledgeGraph:
-    path = os.path.abspath(_resolve_kg_path())
+def _canonicalize_kg_path(path: str) -> str:
+    """Canonicalize a KG cache key so aliases collapse onto one entry.
+
+    ``realpath`` resolves symlinks: two tenants pointing at the same
+    SQLite file via different layouts (``/srv/A`` and
+    ``/srv/link-to-A``) hit a single cached ``KnowledgeGraph`` rather
+    than opening duplicate connections. ``normcase`` normalizes Windows
+    drive-letter casing (``C:\\palace`` vs ``c:\\palace``) and
+    path-separator style; on POSIX it returns the input unchanged.
+    """
+    return os.path.normcase(os.path.realpath(path))
+
+
+def _get_kg(canonical_path=None) -> KnowledgeGraph:
+    """Return the cached ``KnowledgeGraph`` for the resolved palace.
+
+    When ``canonical_path`` is ``None`` (default), the path is resolved
+    from module state and canonicalized. Callers like :func:`_call_kg`
+    that have already captured a canonical key before entering a retry
+    loop should pass it through here so the dict insertion uses the same
+    key the caller will later use for eviction. Recomputing the key
+    inside this function would let ``MEMPALACE_PALACE_PATH`` rotation,
+    a symlink remap, or a mount remap between the captured value and
+    this call drift the insert and evict keys apart, stranding a closed
+    handle under one key while the lookup probes another.
+    """
+    path = (
+        canonical_path if canonical_path is not None else _canonicalize_kg_path(_resolve_kg_path())
+    )
     kg = _kg_by_path.get(path)
     if kg is not None:
         return kg
@@ -148,14 +262,24 @@ def _call_kg(op):
     KG. Beyond one retry give up: a second close means we're losing a
     sustained race we won't win in this loop, and a hung loop is worse
     than a clear failure surface.
+
+    The canonical path is captured once at the top and threaded through
+    every ``_get_kg`` call plus the eviction lookup. Doing canonicalize
+    only here means an ``OSError`` from ``realpath`` (transient Windows
+    junction loss, broken mount) surfaces cleanly before any handler
+    runs instead of masking a ``sqlite3.ProgrammingError`` mid-retry.
+    Passing the captured key through to ``_get_kg`` also locks the
+    insert key to the evict key even if FS or env state mutates between
+    attempts, preventing a closed handle from leaking under a stale
+    key the lookup no longer matches.
     """
+    path = _canonicalize_kg_path(_resolve_kg_path())
     for attempt in range(2):
-        kg = _get_kg()
+        kg = _get_kg(path)
         try:
             return op(kg)
         except sqlite3.ProgrammingError:
             if attempt == 0:
-                path = os.path.abspath(_resolve_kg_path())
                 with _kg_cache_lock:
                     if _kg_by_path.get(path) is kg:
                         _kg_by_path.pop(path, None)
@@ -167,6 +291,46 @@ _client_cache = None
 _collection_cache = None
 _palace_db_inode = 0  # inode of chroma.sqlite3 at cache time
 _palace_db_mtime = 0.0  # mtime of chroma.sqlite3 at cache time
+
+
+def _is_transient_index_error(result) -> bool:
+    # Chroma can return "Internal error: Error finding id" during the
+    # HNSW flush window after a bulk CLI mine — SQLite rows are
+    # committed but the binary segment metadata isn't flushed yet.
+    # Self-heals once the flush completes (~30-60s). See issue #1315.
+    if not isinstance(result, dict):
+        return False
+    err = result.get("error", "")
+    return isinstance(err, str) and ("Error finding id" in err or "Internal error" in err)
+
+
+def _force_chroma_cache_reset() -> None:
+    # Drop both the MCP-local client cache and the shared backend's
+    # per-palace cache so the next call rebuilds against the post-flush
+    # state. Without clearing _DEFAULT_BACKEND._clients the retry
+    # would just hit the same stale handle, since tool_search routes
+    # via search_memories -> palace.get_collection -> backend cache.
+    global \
+        _client_cache, \
+        _collection_cache, \
+        _palace_db_inode, \
+        _palace_db_mtime, \
+        _metadata_cache, \
+        _metadata_cache_time
+    _client_cache = None
+    _collection_cache = None
+    _palace_db_inode = 0
+    _palace_db_mtime = 0.0
+    _metadata_cache = None
+    _metadata_cache_time = 0
+    try:
+        from .palace import _DEFAULT_BACKEND
+
+        _DEFAULT_BACKEND._clients.pop(_config.palace_path, None)
+        _DEFAULT_BACKEND._freshness.pop(_config.palace_path, None)
+    except Exception:
+        pass
+
 
 # ── Vector-search disabled flag (#1222) ──────────────────────────────────
 # Set when ``hnsw_capacity_status`` reports a divergence between sqlite
@@ -180,7 +344,7 @@ _vector_disabled_reason = ""
 # Optional[dict] (not ``dict | None``) keeps Python 3.9 import-time
 # parsing happy — PEP 604 unions in annotations only became unconditional
 # at module-eval time in 3.10.
-_vector_capacity_status = None  # type: Optional[dict]
+_vector_capacity_status: Optional[dict] = None
 
 
 def _refresh_vector_disabled_flag() -> None:
@@ -193,7 +357,7 @@ def _refresh_vector_disabled_flag() -> None:
     """
     global _vector_disabled, _vector_disabled_reason, _vector_capacity_status
     try:
-        info = hnsw_capacity_status(_config.palace_path, "mempalace_drawers")
+        info = hnsw_capacity_status(_config.palace_path, _config.collection_name)
     except Exception:
         logger.debug("HNSW capacity probe raised", exc_info=True)
         return
@@ -426,6 +590,28 @@ def _no_palace():
 # ==================== HELPERS ====================
 
 
+def _safe_meta(meta):
+    """Coerce a Chroma metadata value to a dict.
+
+    ChromaDB's ``col.get()`` / ``col.query()`` can return ``None`` for the
+    metadata cell of a partially-flushed row (or any row written without
+    metadata in older formats). Indexing the result then yields ``None``,
+    and downstream ``.get(...)`` calls raise::
+
+        AttributeError: 'NoneType' object has no attribute 'get'
+
+    This bug bricked the embeddings_queue cleanup path in issue #1426 —
+    the handler crashed before reaching the ``DELETE FROM embeddings_queue``
+    step, so the queue grew without bound while writes kept appearing
+    successful.
+
+    Centralizing the coercion through this helper makes the contract
+    explicit and keeps the fix self-documenting at every call site:
+    *metadata is always a dict by the time it leaves the boundary*.
+    """
+    return meta if isinstance(meta, dict) else {}
+
+
 def _fetch_all_metadata(col, where=None):
     """Paginate col.get() to avoid the 10K silent truncation limit."""
     total = col.count()
@@ -490,6 +676,7 @@ def _tool_status_via_sqlite() -> dict:
     db_path = os.path.join(_config.palace_path, "chroma.sqlite3")
     if not os.path.isfile(db_path):
         return _no_palace()
+    collection_name = _config.collection_name
 
     wings: dict = {}
     rooms: dict = {}
@@ -503,8 +690,9 @@ def _tool_status_via_sqlite() -> dict:
                 FROM embeddings e
                 JOIN segments s ON e.segment_id = s.id
                 JOIN collections c ON s.collection = c.id
-                WHERE c.name = 'mempalace_drawers'
-                """
+                WHERE c.name = ?
+                """,
+                (collection_name,),
             ).fetchone()
             total = int(row[0]) if row and row[0] is not None else 0
             for key, target in (("wing", wings), ("room", rooms)):
@@ -515,12 +703,12 @@ def _tool_status_via_sqlite() -> dict:
                     JOIN embeddings e ON em.id = e.id
                     JOIN segments s ON e.segment_id = s.id
                     JOIN collections c ON s.collection = c.id
-                    WHERE c.name = 'mempalace_drawers'
+                    WHERE c.name = ?
                       AND em.key = ?
                       AND em.string_value IS NOT NULL
                     GROUP BY em.string_value
                     """,
-                    (key,),
+                    (collection_name, key),
                 ):
                     target[value] = count
         finally:
@@ -720,7 +908,26 @@ def tool_search(
         n_results=limit,
         max_distance=dist,
         vector_disabled=_vector_disabled,
+        collection_name=_config.collection_name,
     )
+    if _is_transient_index_error(result):
+        # Post-bulk-write HNSW flush window (#1315): drop caches, give
+        # the segment a moment to settle, retry once. Caller never sees
+        # the transient unless the second attempt also fails.
+        _force_chroma_cache_reset()
+        time.sleep(2)
+        _refresh_vector_disabled_flag()
+        result = search_memories(
+            sanitized["clean_query"],
+            palace_path=_config.palace_path,
+            wing=wing,
+            room=room,
+            n_results=limit,
+            max_distance=dist,
+            vector_disabled=_vector_disabled,
+        )
+        if not _is_transient_index_error(result):
+            result["index_recovered"] = True
     if _vector_disabled:
         result["vector_disabled"] = True
         result["vector_disabled_reason"] = _vector_disabled_reason
@@ -739,9 +946,7 @@ def tool_search(
 
 
 def tool_check_duplicate(content: str, threshold: float = 0.9):
-    col = _get_collection()
-    if not col:
-        return _no_palace()
+    _refresh_vector_disabled_flag()
     if _vector_disabled:
         # Without a usable HNSW we can't compute cosine similarity for
         # near-duplicate detection. Report the limitation rather than
@@ -756,7 +961,11 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
                 "duplicate detection requires vector search; run `mempalace repair` to restore"
             ),
         }
+    col = _get_collection()
+    if not col:
+        return _no_palace()
     try:
+        content = strip_lone_surrogates(content)
         results = col.query(
             query_texts=[content],
             n_results=5,
@@ -770,7 +979,7 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
                 if similarity >= threshold:
                     # Chroma 1.5.x can return None for partially-flushed rows;
                     # coerce to empty sentinels so downstream .get() is safe.
-                    meta = results["metadatas"][0][i] or {}
+                    meta = _safe_meta(results["metadatas"][0][i])
                     doc = results["documents"][0][i] or ""
                     duplicates.append(
                         {
@@ -840,22 +1049,27 @@ def tool_create_tunnel(
     Example: an API design discussion in project_api connects to the
     database schema in project_database.
     """
+    # sanitize_name and create_tunnel both raise ValueError for invalid or
+    # missing endpoints (empty/non-string names, and create_tunnel's
+    # room-existence checks). Catch both so the real reason is surfaced
+    # instead of escaping and being wrapped as the opaque "Internal tool
+    # error" (#1473), mirroring sibling tools.
     try:
         source_wing = sanitize_name(source_wing, "source_wing")
         source_room = sanitize_name(source_room, "source_room")
         target_wing = sanitize_name(target_wing, "target_wing")
         target_room = sanitize_name(target_room, "target_room")
+        return create_tunnel(
+            source_wing,
+            source_room,
+            target_wing,
+            target_room,
+            label=label,
+            source_drawer_id=source_drawer_id,
+            target_drawer_id=target_drawer_id,
+        )
     except ValueError as e:
         return {"error": str(e)}
-    return create_tunnel(
-        source_wing,
-        source_room,
-        target_wing,
-        target_room,
-        label=label,
-        source_drawer_id=source_drawer_id,
-        target_drawer_id=target_drawer_id,
-    )
 
 
 def tool_list_tunnels(wing: str = None):
@@ -891,12 +1105,26 @@ def tool_follow_tunnels(wing: str, room: str):
 def tool_add_drawer(
     wing: str, room: str, content: str, source_file: str = None, added_by: str = "mcp"
 ):
-    """File verbatim content into a wing/room. Checks for duplicates first."""
+    """File verbatim content into a wing/room. Checks for duplicates first.
+
+    Content above ``chunk_size`` is split into bounded per-chunk drawers
+    via a single batched upsert. Each chunk carries ``parent_drawer_id``
+    linkage and ``chunk_index`` metadata so search can rejoin them. The
+    returned ``drawer_id`` is the LOGICAL group handle on the chunked
+    path; physical drawer ids are in ``chunk_ids`` (#1539). To delete
+    or fetch the underlying drawers, iterate ``chunk_ids`` or query by
+    ``parent_drawer_id`` — ``tool_get_drawer(drawer_id)`` and
+    ``tool_delete_drawer(drawer_id)`` report "not found" on the chunked
+    path because no row is stored under the logical group id.
+    """
     global _metadata_cache
     try:
         wing = sanitize_name(wing, "wing")
         room = sanitize_name(room, "room")
         content = sanitize_content(content)
+        if source_file:
+            source_file = strip_lone_surrogates(source_file)
+        added_by = strip_lone_surrogates(added_by)
     except ValueError as e:
         return {"success": False, "error": str(e)}
 
@@ -920,32 +1148,93 @@ def tool_add_drawer(
         },
     )
 
-    # Idempotency: if the deterministic ID already exists, return success as a no-op.
+    chunk_size = _config.chunk_size
+    base_meta = {
+        "wing": wing,
+        "room": room,
+        "source_file": source_file or "",
+        "added_by": added_by,
+        "filed_at": datetime.now().isoformat(),
+    }
+
+    # Idempotency. Three cases to detect a prior committed write:
+    # (a) Single-doc path: drawer_id row exists (the only id used).
+    # (b) Chunked path: probe the LAST chunk id — its presence implies
+    #     every earlier chunk also landed, since the batched upsert
+    #     is all-or-nothing.
+    # (c) Legacy pre-#1539 single-row write of oversized content under
+    #     drawer_id: probe drawer_id alongside the last chunk id so a
+    #     re-call with identical oversized content does not duplicate
+    #     the legacy row by adding fresh chunks under different ids.
+    if len(content) <= chunk_size:
+        idempotency_probe_ids = [drawer_id]
+    else:
+        last_chunk_idx = (len(content) - 1) // chunk_size
+        idempotency_probe_ids = [drawer_id, f"{drawer_id}_chunk_{last_chunk_idx:06d}"]
     try:
-        existing = col.get(ids=[drawer_id])
-        if existing and existing["ids"]:
+        existing = col.get(ids=idempotency_probe_ids, include=[])
+        if existing.ids:
             return {"success": True, "reason": "already_exists", "drawer_id": drawer_id}
     except Exception:
-        logger.debug("Idempotency pre-check failed for %s", drawer_id, exc_info=True)
+        logger.debug("Idempotency pre-check failed for %s", idempotency_probe_ids, exc_info=True)
 
     try:
-        col.upsert(
-            ids=[drawer_id],
-            documents=[content],
-            metadatas=[
-                {
-                    "wing": wing,
-                    "room": room,
-                    "source_file": source_file or "",
-                    "chunk_index": 0,
-                    "added_by": added_by,
-                    "filed_at": datetime.now().isoformat(),
-                }
-            ],
-        )
+        if len(content) <= chunk_size:
+            col.upsert(
+                ids=[drawer_id],
+                documents=[content],
+                metadatas=[{**base_meta, "chunk_index": 0}],
+            )
+            inserted = col.get(ids=[drawer_id], include=[])
+            if not inserted.ids:
+                raise RuntimeError(
+                    "Drawer write was acknowledged but the new ID is not readable. "
+                    "The palace index may be stale; run reconnect or repair."
+                )
+            _metadata_cache = None
+            logger.info(f"Filed drawer: {drawer_id} → {wing}/{room}")
+            return {
+                "success": True,
+                "drawer_id": drawer_id,
+                "wing": wing,
+                "room": room,
+                "chunks": 1,
+            }
+
+        # Oversized content: split into bounded per-chunk drawers so the
+        # embedding model never sees a document above ``chunk_size``.
+        # Single batched ``upsert`` so the embedding pass either commits
+        # every chunk or none — no half-written palace if the embedding
+        # model fails mid-loop (#1539).
+        chunk_ids: list[str] = []
+        chunk_docs: list[str] = []
+        chunk_metas: list[dict] = []
+        for i in range(0, len(content), chunk_size):
+            chunk_idx = i // chunk_size
+            chunk_ids.append(f"{drawer_id}_chunk_{chunk_idx:06d}")
+            chunk_docs.append(content[i : i + chunk_size])
+            chunk_metas.append(
+                {**base_meta, "chunk_index": chunk_idx, "parent_drawer_id": drawer_id}
+            )
+        col.upsert(ids=chunk_ids, documents=chunk_docs, metadatas=chunk_metas)
+        # Probe the LAST chunk id, not the first — its presence confirms
+        # the whole batch landed, not just the leading row.
+        inserted = col.get(ids=[chunk_ids[-1]], include=[])
+        if not inserted.ids:
+            raise RuntimeError(
+                "Drawer write was acknowledged but the new ID is not readable. "
+                "The palace index may be stale; run reconnect or repair."
+            )
         _metadata_cache = None
-        logger.info(f"Filed drawer: {drawer_id} → {wing}/{room}")
-        return {"success": True, "drawer_id": drawer_id, "wing": wing, "room": room}
+        logger.info(f"Filed drawer: {drawer_id} → {wing}/{room} ({len(chunk_ids)} chunks)")
+        return {
+            "success": True,
+            "drawer_id": drawer_id,
+            "wing": wing,
+            "room": room,
+            "chunks": len(chunk_ids),
+            "chunk_ids": chunk_ids,
+        }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -962,7 +1251,9 @@ def tool_delete_drawer(drawer_id: str):
 
     # Log the deletion with the content being removed for audit trail
     deleted_content = existing.get("documents", [""])[0] if existing.get("documents") else ""
-    deleted_meta = existing.get("metadatas", [{}])[0] if existing.get("metadatas") else {}
+    deleted_meta = _safe_meta(
+        existing.get("metadatas", [{}])[0] if existing.get("metadatas") else {}
+    )
     _wal_log(
         "delete_drawer",
         {
@@ -981,6 +1272,44 @@ def tool_delete_drawer(drawer_id: str):
         return {"success": False, "error": str(e)}
 
 
+def tool_sync(project_dir: str = None, wing: str = None, apply: bool = False):
+    """Prune drawers whose source files are gitignored, missing, or moved (#1252)."""
+    global _metadata_cache
+    from .palace import MineAlreadyRunning
+    from .sync import sync_palace
+
+    if not _config.palace_path:
+        np = _no_palace()
+        return {"success": False, "error": np.get("error", "no palace"), "hint": np.get("hint")}
+    project_dirs = [project_dir] if project_dir else None
+    try:
+        try:
+            report = sync_palace(
+                palace_path=_config.palace_path,
+                project_dirs=project_dirs,
+                wing=wing,
+                dry_run=not apply,
+                wal_log=_wal_log,
+            )
+            return {"success": True, **report}
+        # Order matters: typed handlers must precede the bare Exception
+        # below, otherwise MineAlreadyRunning and ValueError fall into the
+        # generic "sync failed" branch and break the structured-error tests.
+        except MineAlreadyRunning as exc:
+            return {
+                "success": False,
+                "error": f"another mine is in progress: {exc}",
+                "error_class": "LockHeldByOtherProcess",
+            }
+        except ValueError as exc:
+            return {"success": False, "error": str(exc)}
+        except Exception as exc:
+            return {"success": False, "error": f"sync failed: {exc}"}
+    finally:
+        if apply:
+            _metadata_cache = None
+
+
 def tool_get_drawer(drawer_id: str):
     """Fetch a single drawer by ID. Returns full content and metadata."""
     col = _get_collection()
@@ -990,7 +1319,7 @@ def tool_get_drawer(drawer_id: str):
         result = col.get(ids=[drawer_id], include=["documents", "metadatas"])
         if not result["ids"]:
             return {"error": f"Drawer not found: {drawer_id}"}
-        meta = result["metadatas"][0]
+        meta = _safe_meta(result["metadatas"][0])
         doc = result["documents"][0]
         # source_file is the absolute filesystem path written by the
         # miners. Reduce to its basename before handing it to the MCP
@@ -1050,7 +1379,7 @@ def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offse
 
         drawers = []
         for i, did in enumerate(result["ids"]):
-            meta = result["metadatas"][i]
+            meta = _safe_meta(result["metadatas"][i])
             doc = result["documents"][i]
             drawers.append(
                 {
@@ -1086,7 +1415,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
         if not existing["ids"]:
             return {"success": False, "error": f"Drawer not found: {drawer_id}"}
 
-        old_meta = existing["metadatas"][0]
+        old_meta = _safe_meta(existing["metadatas"][0])
         old_doc = existing["documents"][0]
 
         new_doc = old_doc
@@ -1147,11 +1476,13 @@ def tool_kg_query(entity: str, as_of: str = None, direction: str = "both"):
     """Query the knowledge graph for an entity's relationships."""
     try:
         entity = sanitize_kg_value(entity, "entity")
-        as_of = sanitize_iso_date(as_of, "as_of")
+        as_of = sanitize_iso_temporal(as_of, "as_of")
     except ValueError as e:
         return {"error": str(e)}
+
     if direction not in ("outgoing", "incoming", "both"):
         return {"error": "direction must be 'outgoing', 'incoming', or 'both'"}
+
     results = _call_kg(lambda kg: kg.query_entity(entity, as_of=as_of, direction=direction))
     return {"entity": entity, "as_of": as_of, "facts": results, "count": len(results)}
 
@@ -1169,19 +1500,18 @@ def tool_kg_add(
     """Add a relationship to the knowledge graph.
 
     All temporal and provenance fields are optional. ``valid_to`` lets callers
-    backfill historical facts with a known end date in a single call (instead
-    of a separate ``kg_invalidate``). ``source_file`` and ``source_drawer_id``
-    are RFC 002 provenance fields populated by adapters / bulk importers.
+    backfill historical facts with a known end date/time in a single call
+    instead of a separate ``kg_invalidate`` call.
 
-    TODO(#1283): once the ISO-8601 validation PR lands, wire ``validate_iso_date``
-    over ``valid_from`` / ``valid_to`` here so malformed dates fail fast at the
-    MCP boundary instead of silently producing empty query results.
+    Temporal values accept either ``YYYY-MM-DD`` or canonical UTC datetimes in
+    the form ``YYYY-MM-DDTHH:MM:SSZ``.
     """
     try:
         subject = sanitize_kg_value(subject, "subject")
         predicate = sanitize_name(predicate, "predicate")
         object = sanitize_kg_value(object, "object")
-        valid_from = sanitize_iso_date(valid_from, "valid_from")
+        valid_from = sanitize_iso_temporal(valid_from, "valid_from")
+        valid_to = sanitize_iso_temporal(valid_to, "valid_to")
     except ValueError as e:
         return {"success": False, "error": str(e)}
 
@@ -1198,6 +1528,7 @@ def tool_kg_add(
             "source_drawer_id": source_drawer_id,
         },
     )
+
     triple_id = _call_kg(
         lambda kg: kg.add_triple(
             subject,
@@ -1214,23 +1545,25 @@ def tool_kg_add(
 
 
 def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = None):
-    """Mark a fact as no longer true (set end date).
+    """Mark a fact as no longer true.
 
-    Returns the actual ``ended`` date that was stored — when the caller omits
-    ``ended``, the underlying graph stamps ``date.today()``, and the response
-    reflects that resolved value (instead of the literal string ``"today"``)
-    so callers can verify what was persisted.
+    Returns the actual ``ended`` date/time that was stored. When the caller
+    omits ``ended``, the underlying graph stamps ``date.today()`` and the
+    response reflects that resolved value.
 
-    TODO(#1283): apply ``validate_iso_date`` to ``ended`` once that PR lands.
+    Temporal values accept either ``YYYY-MM-DD`` or canonical UTC datetimes in
+    the form ``YYYY-MM-DDTHH:MM:SSZ``.
     """
     try:
         subject = sanitize_kg_value(subject, "subject")
         predicate = sanitize_name(predicate, "predicate")
         object = sanitize_kg_value(object, "object")
-        ended = sanitize_iso_date(ended, "ended")
+        ended = sanitize_iso_temporal(ended, "ended")
     except ValueError as e:
         return {"success": False, "error": str(e)}
+
     resolved_ended = ended or date.today().isoformat()
+
     _wal_log(
         "kg_invalidate",
         {
@@ -1240,6 +1573,7 @@ def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = N
             "ended": resolved_ended,
         },
     )
+
     _call_kg(lambda kg: kg.invalidate(subject, predicate, object, ended=resolved_ended))
     return {
         "success": True,
@@ -1316,29 +1650,76 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
         # semantic search quality. For now, store raw AAAK in metadata so it's
         # preserved, and keep the document as-is for embedding (even though
         # compressed AAAK degrades embedding quality).
-        col.add(
-            ids=[entry_id],
-            documents=[entry],
-            metadatas=[
+        base_metadata = {
+            "wing": wing,
+            "room": room,
+            "hall": "hall_diary",
+            "topic": topic,
+            "type": "diary_entry",
+            "agent": agent_name,
+            "filed_at": now.isoformat(),
+            "date": now.strftime("%Y-%m-%d"),
+        }
+        chunk_size = _config.chunk_size
+        if len(entry) <= chunk_size:
+            col.add(
+                ids=[entry_id],
+                documents=[entry],
+                metadatas=[{**base_metadata, "chunk_index": 0}],
+            )
+            logger.info(f"Diary entry: {entry_id} → {wing}/diary/{topic}")
+            return {
+                "success": True,
+                "entry_id": entry_id,
+                "agent": agent_name,
+                "topic": topic,
+                "timestamp": now.isoformat(),
+                "chunks": 1,
+            }
+
+        # Oversized entry: split into bounded per-chunk drawers so the
+        # embedding model never sees a document above ``chunk_size``.
+        # Every chunk carries ``parent_entry_id`` so search can rejoin
+        # them and ``chunk_index`` for ordered reconstruction (#1539).
+        # Note on ``entry_id`` in the return value: for the chunked
+        # path the returned ``entry_id`` is the LOGICAL group handle
+        # (no drawer is stored under that exact id). The physical
+        # drawer ids are in ``chunk_ids``. Callers wanting to fetch
+        # by id should iterate ``chunk_ids``; callers wanting to
+        # query by metadata can filter on ``parent_entry_id``.
+        # Use a single batched ``add`` so the embedding pass either
+        # commits all chunks or none — avoids a half-written palace
+        # if the embedding model fails mid-loop. ``col.add`` (not
+        # ``upsert``) is intentional here: ``entry_id`` is timestamp-
+        # based with microsecond precision, so every call generates a
+        # fresh id and a duplicate is by definition a same-microsecond
+        # clash that should surface as an error rather than silently
+        # overwrite the prior entry (cf. ``tool_add_drawer`` whose
+        # content-hash ids are deliberately idempotent and use upsert).
+        chunk_ids: list[str] = []
+        chunk_docs: list[str] = []
+        chunk_metas: list[dict] = []
+        for i in range(0, len(entry), chunk_size):
+            chunk_idx = i // chunk_size
+            chunk_ids.append(f"{entry_id}_chunk_{chunk_idx:06d}")
+            chunk_docs.append(entry[i : i + chunk_size])
+            chunk_metas.append(
                 {
-                    "wing": wing,
-                    "room": room,
-                    "hall": "hall_diary",
-                    "topic": topic,
-                    "type": "diary_entry",
-                    "agent": agent_name,
-                    "filed_at": now.isoformat(),
-                    "date": now.strftime("%Y-%m-%d"),
+                    **base_metadata,
+                    "chunk_index": chunk_idx,
+                    "parent_entry_id": entry_id,
                 }
-            ],
-        )
-        logger.info(f"Diary entry: {entry_id} → {wing}/diary/{topic}")
+            )
+        col.add(ids=chunk_ids, documents=chunk_docs, metadatas=chunk_metas)
+        logger.info(f"Diary entry: {entry_id} → {wing}/diary/{topic} ({len(chunk_ids)} chunks)")
         return {
             "success": True,
             "entry_id": entry_id,
             "agent": agent_name,
             "topic": topic,
             "timestamp": now.isoformat(),
+            "chunks": len(chunk_ids),
+            "chunk_ids": chunk_ids,
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -1391,6 +1772,7 @@ def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
         # Combine and sort by timestamp
         entries = []
         for doc, meta in zip(results["documents"], results["metadatas"]):
+            meta = _safe_meta(meta)
             entries.append(
                 {
                     "date": meta.get("date", ""),
@@ -1506,6 +1888,30 @@ def tool_reconnect():
         _palace_db_mtime, \
         _vector_disabled, \
         _vector_disabled_reason
+    from . import palace as palace_module
+
+    close_errors = []
+    try:
+        palace_module._DEFAULT_BACKEND.close_palace(_config.palace_path)
+    except Exception as exc:
+        logger.debug("Failed to close shared palace backend during reconnect", exc_info=True)
+        close_errors.append(f"backend close_palace failed: {exc}")
+    try:
+        from chromadb.api.client import SharedSystemClient
+
+        clear_system_cache = getattr(SharedSystemClient, "clear_system_cache", None)
+        if callable(clear_system_cache):
+            clear_system_cache()
+        else:
+            logger.debug(
+                "SharedSystemClient.clear_system_cache is unavailable; skipping shared Chroma cache clear during reconnect"
+            )
+    except Exception as exc:
+        logger.debug(
+            "Failed to clear Chroma shared system cache during reconnect",
+            exc_info=True,
+        )
+        close_errors.append(f"shared Chroma cache clear failed: {exc}")
     _client_cache = None
     _collection_cache = None
     _palace_db_inode = 0
@@ -1527,11 +1933,23 @@ def tool_reconnect():
     try:
         col = _get_collection()
         if col is None:
-            return {
+            result = {
                 "success": False,
                 "message": "No palace found after reconnect",
                 "drawers": 0,
                 "vector_disabled": _vector_disabled,
+            }
+            if close_errors:
+                result["error"] = "; ".join(close_errors)
+            return result
+        if close_errors:
+            return {
+                "success": False,
+                "message": "Reconnect reopened the palace but failed to fully reset cached handles",
+                "drawers": col.count(),
+                "vector_disabled": _vector_disabled,
+                "vector_disabled_reason": _vector_disabled_reason,
+                "error": "; ".join(close_errors),
             }
         return {
             "success": True,
@@ -1588,7 +2006,7 @@ TOOLS = {
                 },
                 "as_of": {
                     "type": "string",
-                    "description": "Date filter — only facts valid at this date (YYYY-MM-DD, optional)",
+                    "description": "Date/datetime filter — only facts valid at this time (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ, optional)",
                 },
                 "direction": {
                     "type": "string",
@@ -1612,11 +2030,11 @@ TOOLS = {
                 "object": {"type": "string", "description": "The entity being connected to"},
                 "valid_from": {
                     "type": "string",
-                    "description": "When this became true (YYYY-MM-DD, optional)",
+                    "description": "When this became true (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ, optional)",
                 },
                 "valid_to": {
                     "type": "string",
-                    "description": "When this stopped being true (YYYY-MM-DD, optional). Use for backfilling already-ended historical facts.",
+                    "description": "When this stopped being true (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ, optional). Use for backfilling already-ended historical facts.",
                 },
                 "source_closet": {
                     "type": "string",
@@ -1645,7 +2063,7 @@ TOOLS = {
                 "object": {"type": "string", "description": "Connected entity"},
                 "ended": {
                     "type": "string",
-                    "description": "When it stopped being true (YYYY-MM-DD, default: today)",
+                    "description": "When it stopped being true (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ, default: today)",
                 },
             },
             "required": ["subject", "predicate", "object"],
@@ -1841,6 +2259,24 @@ TOOLS = {
         },
         "handler": tool_delete_drawer,
     },
+    "mempalace_sync": {
+        "description": "Prune drawers whose source files are gitignored, deleted, or moved. Returns dry-run report by default; pass apply=true to commit deletions.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "project_dir": {
+                    "type": "string",
+                    "description": "Project root to scope the sync (optional; auto-detected from drawer metadata if omitted)",
+                },
+                "wing": {"type": "string", "description": "Limit to one wing (optional)"},
+                "apply": {
+                    "type": "boolean",
+                    "description": "Actually delete drawers; default is dry-run preview",
+                },
+            },
+        },
+        "handler": tool_sync,
+    },
     "mempalace_get_drawer": {
         "description": "Fetch a single drawer by ID — returns full content and metadata.",
         "input_schema": {
@@ -1993,13 +2429,30 @@ SUPPORTED_PROTOCOL_VERSIONS = [
 ]
 
 
+def _internal_tool_error(req_id, tool_name: str, exc: BaseException = None) -> dict:
+    logger.exception(f"Tool error in {tool_name}")
+    error: dict = {"code": -32000, "message": "Internal tool error"}
+    if exc is not None:
+        error["data"] = {
+            "error_class": type(exc).__name__,
+            "message": str(exc),
+        }
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": error,
+    }
+
+
 def handle_request(request):
+    global _last_request_time
     if not isinstance(request, dict):
         return {
             "jsonrpc": "2.0",
             "id": None,
             "error": {"code": -32600, "message": "Invalid Request"},
         }
+    _last_request_time = time.monotonic()
     method = request.get("method") or ""
     params = request.get("params") or {}
     req_id = request.get("id")
@@ -2070,6 +2523,26 @@ def handle_request(request):
         except (ValueError, TypeError):
             accepts_var_keyword = False
         if not accepts_var_keyword:
+            # An unknown kwarg here is almost always a wrong parameter *name*
+            # (e.g. text= instead of content=). Silently dropping it makes the
+            # cause surface only indirectly as a later "Missing required 'X'",
+            # so name it explicitly — symmetric with the missing-required path
+            # below. wait_for_previous is an internal transport kwarg in no
+            # tool schema; it is popped before dispatch further down, so it
+            # must not be reported as unknown here.
+            unknown = [k for k in tool_args if k not in schema_props and k != "wait_for_previous"]
+            if unknown:
+                quoted = ", ".join(f"'{k}'" for k in unknown)
+                word = "parameter" if len(unknown) == 1 else "parameters"
+                logger.debug("Tool %s: unknown %s %s", tool_name, word, quoted)
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {
+                        "code": -32602,
+                        "message": f"Unknown {word} {quoted} for tool {tool_name}",
+                    },
+                }
             tool_args = {k: v for k, v in tool_args.items() if k in schema_props}
         # Coerce argument types based on input_schema.
         # MCP JSON transport may deliver integers as floats or strings;
@@ -2088,8 +2561,8 @@ def handle_request(request):
                     "id": req_id,
                     "error": {"code": -32602, "message": f"Invalid value for parameter '{key}'"},
                 }
+        tool_args.pop("wait_for_previous", None)
         try:
-            tool_args.pop("wait_for_previous", None)
             result = TOOLS[tool_name]["handler"](**tool_args)
             return {
                 "jsonrpc": "2.0",
@@ -2100,13 +2573,36 @@ def handle_request(request):
                     ]
                 },
             }
-        except Exception:
-            logger.exception(f"Tool error in {tool_name}")
-            return {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "error": {"code": -32000, "message": "Internal tool error"},
-            }
+        except TypeError as e:
+            # Qualname match prevents leaking internal helper/param names raised
+            # inside the handler body — see test_handler_internal_signature_shape_stays_generic.
+            msg = str(e)
+            handler = TOOLS[tool_name]["handler"]
+            handler_qn = getattr(handler, "__qualname__", None) or getattr(handler, "__name__", "")
+            # Qualname can include "<locals>" for nested defs and "<lambda>"
+            # for lambdas — accept Python's TypeError emit verbatim.
+            m_missing = re.match(
+                r"^([\w\.<>]+)\(\) missing \d+ required "
+                r"(?:positional |keyword-only )?arguments?: (.+)$",
+                msg,
+            )
+            if m_missing and m_missing.group(1) == handler_qn:
+                names = re.findall(r"'(\w+)'", m_missing.group(2))
+                if names:
+                    quoted = ", ".join(f"'{n}'" for n in names)
+                    word = "parameter" if len(names) == 1 else "parameters"
+                    logger.debug("Tool %s: missing required %s %s", tool_name, word, quoted)
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "error": {
+                            "code": -32602,
+                            "message": f"Missing required {word} {quoted} for tool {tool_name}",
+                        },
+                    }
+            return _internal_tool_error(req_id, tool_name, e)
+        except Exception as exc:
+            return _internal_tool_error(req_id, tool_name, exc)
 
     # Notifications (missing id) must never get a response
     if req_id is None:
@@ -2131,7 +2627,202 @@ def _restore_stdout():
     sys.stdout = _REAL_STDOUT
 
 
+_WARMUP_TRUTHY = {"1", "true", "yes", "on"}
+_WARMUP_FALSY = {"", "0", "false", "no", "off"}
+# Sentinel text for the warmup query. Distinctive so it cannot semantically
+# match real drawer content (e.g. a palace containing notes about "warmup"
+# routines) and is greppable in chromadb debug logs if the team ever adds
+# request instrumentation. Single non-empty string is enough to trigger
+# ChromaDB's ONNXMiniLM_L6_V2.__call__ → _download_model_if_not_exists +
+# InferenceSession.
+_WARMUP_PROBE_TEXT = "__mempalace_warmup_probe__"
+
+
+def _describe_device_safe() -> str:
+    """Return ``embedding.describe_device()`` value or ``"unknown"`` on failure.
+
+    Used only inside warmup-failure log lines; the import is deferred so
+    that an embedding-stack import error cannot itself crash the warmup
+    diagnostic path.
+    """
+    try:
+        from .embedding import describe_device
+
+        return describe_device()
+    except Exception:  # fail-soft: see docstring — log-message helper must not crash
+        return "unknown"
+
+
+def _maybe_eager_warmup_embedder() -> None:
+    """Pre-load embedder + HNSW segment at startup when ``MEMPALACE_EAGER_WARMUP`` is truthy.
+
+    The first MCP tool call that touches chromadb (``diary_write``,
+    ``add_drawer``, ``search``) otherwise pays two compounding cold-load
+    costs that together can exceed the MCP client timeout and surface as
+    ``-32000`` "Internal tool error" with no recoverable trace on the
+    agent side (#1495):
+
+    1. ONNX/CoreML embedder init in :func:`mempalace.embedding.get_embedding_function`
+       (5–30s on first inference; ChromaDB's ``ONNXMiniLM_L6_V2.__call__``
+       triggers ``_download_model_if_not_exists`` + ``InferenceSession``).
+    2. HNSW segment cold-load (reading ``data_level0.bin`` into RAM on
+       first collection operation; seconds on palaces of 50k+ drawers).
+
+    Warming via :func:`_get_collection`'s collection-then-query path
+    covers BOTH in a single startup-phase call — mirroring the reporter's
+    proposal in #1495 — so users with large existing palaces see the
+    same benefit as users on the embedder-only cost path.
+
+    Truthy parsing accepts ``1/true/yes/on`` (case-insensitive); falsy
+    set ``0/false/no/off`` and empty/whitespace are silently off; any
+    other value logs a warning and stays off so typos like ``tru`` do
+    not silently disable the feature.
+
+    Fresh-install guard (pre-check, NOT a catch): ``_get_collection``'s
+    retry layer absorbs ``_ChromaNotFoundError`` and returns ``None`` while
+    also materialising ``chroma.sqlite3`` on disk via the chromadb client
+    constructor. To preserve the documented "no palace yet → nothing to
+    warm" contract WITHOUT writing palace scaffolding before
+    ``mempalace init`` (which would violate CLAUDE.md "Incremental only"),
+    we test for ``chroma.sqlite3`` ourselves before touching the chromadb
+    client. Operators who set ``MEMPALACE_EAGER_WARMUP=1`` in their MCP
+    config and launch the server before running ``mempalace init`` get a
+    single INFO line and no on-disk side effect.
+
+    Fail-soft beyond the fresh-install pre-check:
+
+    * **Backend open failure** (palace path misconfigured, file locked,
+      corrupted HNSW that ``quarantine_stale_hnsw`` cannot recover) →
+      log exception with device + palace context and return. The next
+      embedding-requiring call sees the same fail mode it would have
+      without warmup.
+    * **`_get_collection` retried and returned None** → palace exists
+      but chromadb cannot open the collection (rare; usually a stale
+      sqlite + segment-files mismatch surfaced by `_get_client` rebuild).
+      A warning suffices because the retry layer already wrote two
+      tracebacks with the underlying chromadb error class.
+    * **Query failure** (network failure during ONNX model download,
+      provider init crash, runtime decoder error) → log exception with
+      device + palace context and return. Same fail-mode preservation.
+
+    Note: on an existing palace with an empty collection (created via
+    ``mempalace init`` but never written to), ``col.query`` succeeds but
+    returns ``{'ids': [[]]}`` without reading any HNSW segment — the
+    embedder warms but there is no HNSW segment to load. The success log
+    still says ``embedder + HNSW ready`` because the no-HNSW-segment case
+    has zero cold-load cost; nothing was skipped that the first real tool
+    call would have paid.
+    """
+    raw = os.environ.get("MEMPALACE_EAGER_WARMUP", "").strip().lower()
+    if raw in _WARMUP_FALSY:
+        return
+    if raw not in _WARMUP_TRUTHY:
+        logger.warning(
+            "MEMPALACE_EAGER_WARMUP=%r is not recognized (use one of %s); warmup disabled",
+            raw,
+            sorted(_WARMUP_TRUTHY | (_WARMUP_FALSY - {""})),
+        )
+        return
+    palace_path = _config.palace_path
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        # Pre-check (NOT a try/except on _ChromaNotFoundError, which never
+        # propagates out of _get_collection — see docstring). No palace
+        # file means nothing to warm AND avoids the chromadb-client
+        # side effect of materialising the palace dir.
+        logger.info(
+            "MEMPALACE_EAGER_WARMUP=%s: no palace at %s — nothing to warm",
+            raw,
+            palace_path,
+        )
+        return
+    # Cache device once: _describe_device_safe re-imports embedding stack
+    # each call, which is wasteful inside a function that already paid
+    # that cost via the warmup query below.
+    device = _describe_device_safe()
+    try:
+        col = _get_collection(create=False)
+    except Exception as exc:  # fail-soft per docstring — broad on purpose
+        logger.exception(
+            "MEMPALACE_EAGER_WARMUP=%s: collection open failed (palace=%s, device=%s, error=%s)",
+            raw,
+            palace_path,
+            device,
+            type(exc).__name__,
+        )
+        return
+    if col is None:
+        logger.warning(
+            "MEMPALACE_EAGER_WARMUP=%s: _get_collection returned None for palace=%s — see prior log lines",
+            raw,
+            palace_path,
+        )
+        return
+    try:
+        col.query(query_texts=[_WARMUP_PROBE_TEXT], n_results=1)
+    except Exception as exc:  # fail-soft per docstring — broad on purpose
+        logger.exception(
+            "MEMPALACE_EAGER_WARMUP=%s: warmup query failed (palace=%s, device=%s, error=%s)",
+            raw,
+            palace_path,
+            device,
+            type(exc).__name__,
+        )
+    else:
+        logger.info(
+            "MEMPALACE_EAGER_WARMUP=%s: embedder + HNSW ready (palace=%s, device=%s)",
+            raw,
+            palace_path,
+            device,
+        )
+
+
+def _start_idle_exit_watchdog() -> None:
+    """Start a daemon thread that exits the process after an idle period.
+
+    When no request has been handled for ``MEMPALACE_MCP_IDLE_HOURS``
+    (default 8 h), the thread terminates the process so that stale MCP
+    servers from ended Claude Code sessions do not accumulate ChromaDB /
+    HNSW file handles on Windows (#1552).
+
+    Set ``MEMPALACE_MCP_IDLE_HOURS=0`` to disable the watchdog.
+    """
+    timeout = _mcp_idle_timeout_secs()
+    if timeout <= 0:
+        return
+    check_interval = min(60.0, timeout / 4)
+
+    def _watchdog() -> None:
+        while True:
+            time.sleep(check_interval)
+            idle = time.monotonic() - _last_request_time
+            if idle >= timeout:
+                logger.info(
+                    "MCP server idle for %.1f h (limit %.1f h); exiting to release file handles.",
+                    idle / 3600,
+                    timeout / 3600,
+                )
+                os._exit(0)
+
+    t = threading.Thread(target=_watchdog, name="mcp-idle-watchdog", daemon=True)
+    t.start()
+
+
 def main():
+    """MCP server entry point for the ``mempalace-mcp`` console script.
+
+    Side effect: pops ``PYTHONPATH`` from ``os.environ`` (see #1423) so
+    any subprocess this server spawns inherits a clean env. Host
+    applications that call ``main()`` programmatically should be aware
+    that the parent process loses ``PYTHONPATH`` as well. Library imports
+    (``import mempalace.searcher`` from a host app) do NOT trigger this
+    side effect; only the CLI/MCP entry points pop the env var.
+    """
+    # Drop leaked PYTHONPATH so any subprocess this server spawns starts
+    # with a clean env. The sys.path filter in mempalace/__init__.py
+    # already protects this process from the same ABI mismatch; here we
+    # extend the protection to children.
+    os.environ.pop("PYTHONPATH", None)
     _restore_stdout()
     # Force UTF-8 on stdio. MCP JSON-RPC is UTF-8, but Python on Windows
     # defaults stdin/stdout to the system codepage (e.g. cp1251), which
@@ -2148,6 +2839,13 @@ def main():
     # is visible at startup rather than on first use (#1222). Pure
     # filesystem read; never opens a chromadb client.
     _refresh_vector_disabled_flag()
+    # Opt-in: pre-load the embedder so the first chromadb-write tool call
+    # does not pay the ONNX/CoreML cold-load tax under the MCP client
+    # timeout (#1495). Default off — preserves current startup latency.
+    _maybe_eager_warmup_embedder()
+    # Idle auto-exit: release ChromaDB file handles from stale servers
+    # that outlived their Claude Code session (#1552).
+    _start_idle_exit_watchdog()
     while True:
         try:
             line = sys.stdin.readline()

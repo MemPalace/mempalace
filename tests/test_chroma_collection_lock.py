@@ -36,9 +36,13 @@ from mempalace.palace import MineAlreadyRunning, mine_palace_lock
 
 
 def _get_mp_context():
-    """Same start-method picker as test_palace_locks.py."""
-    start_method = "spawn" if os.name == "nt" else "fork"
-    return multiprocessing.get_context(start_method)
+    """Same start-method picker as test_palace_locks.py — ``spawn`` everywhere.
+
+    ``fork`` deadlocks under Python 3.13 when the parent is multi-threaded
+    (pytest + chromadb + onnxruntime), and macOS forbids fork-without-exec via
+    CoreFoundation. ``spawn`` is slower (re-imports) but safe.
+    """
+    return multiprocessing.get_context("spawn")
 
 
 # ---------------------------------------------------------------------------
@@ -313,9 +317,9 @@ def test_read_path_does_not_acquire_lock(tmp_path, monkeypatch):
             if method is None:
                 continue
             src = inspect.getsource(method)
-            assert (
-                "_write_lock" not in src
-            ), f"{read_attr} must NOT acquire the write lock (read path)"
+            assert "_write_lock" not in src, (
+                f"{read_attr} must NOT acquire the write lock (read path)"
+            )
     finally:
         open(release, "w").close()
         holder.join(timeout=5)

@@ -2,11 +2,14 @@
 
 ## Installation
 
-Install MemPalace from PyPI:
+We recommend [`uv`](https://docs.astral.sh/uv/) — `uv tool install` puts
+the `mempalace` CLI in an isolated environment on your PATH:
 
 ```bash
-pip install mempalace
+uv tool install mempalace
 ```
+
+If you prefer pip, `pip install mempalace` still works.
 
 ::: danger Security Warning
 The domain `mempalace.tech` is a **brand-squatting site** not affiliated with this project. It is known to run ad-redirects and potential malware. The official MemPalace distribution is only available via this [GitHub repository](https://github.com/MemPalace/mempalace) and [PyPI](https://pypi.org/project/mempalace/). Never install binaries or scripts from unofficial domains.
@@ -25,7 +28,7 @@ No API key required for the core local workflow. After installation, the main st
 ```bash
 git clone https://github.com/MemPalace/mempalace.git
 cd mempalace
-pip install -e ".[dev]"
+uv sync --extra dev   # or: pip install -e ".[dev]"
 ```
 
 ## Quick Start
@@ -77,7 +80,7 @@ That gives you a working local memory index.
 
 ## What Happens Next
 
-After the one-time setup, you don't run MemPalace commands manually. Your AI uses it for you through [MCP integration](/guide/mcp-integration) or a [Claude Code plugin](/guide/claude-code).
+After the one-time setup, you don't run MemPalace commands manually. Your AI uses it for you through [MCP integration](/guide/mcp-integration), the bundled Codex plugin, or a [Claude Code plugin](/guide/claude-code).
 
 Ask your AI anything:
 
@@ -88,5 +91,5 @@ It calls `mempalace_search` automatically, gets verbatim results, and answers yo
 ## Next Steps
 
 - [Mining Your Data](/guide/mining) — deep dive into mining modes
-- [MCP Integration](/guide/mcp-integration) — connect to Claude, ChatGPT, Cursor, Gemini
+- [MCP Integration](/guide/mcp-integration) — connect to Claude, Codex, ChatGPT, Cursor, Gemini
 - [The Palace](/concepts/the-palace) — understand wings, rooms, halls, and tunnels

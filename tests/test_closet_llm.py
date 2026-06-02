@@ -196,9 +196,33 @@ class TestCallLLM:
                 }
             )
 
-        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
-            parsed, usage = _call_llm(cfg, "/tmp/x", "w", "r", "c")
+        with (
+            patch("urllib.request.urlopen", side_effect=fake_urlopen),
+            patch("mempalace.closet_llm.time.sleep"),
+        ):
+            parsed, _ = _call_llm(cfg, "/tmp/x", "w", "r", "c")
         assert parsed is None
+
+    def test_retries_on_json_decode_error(self):
+        cfg = self._make_cfg()
+        call_count = {"n": 0}
+
+        def fake_urlopen(req, timeout=None):
+            call_count["n"] += 1
+            return _FakeResp(
+                {
+                    "choices": [{"message": {"content": "not json at all"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                }
+            )
+
+        with (
+            patch("urllib.request.urlopen", side_effect=fake_urlopen),
+            patch("mempalace.closet_llm.time.sleep"),
+        ):
+            parsed, _ = _call_llm(cfg, "/tmp/x", "w", "r", "c")
+        assert parsed is None
+        assert call_count["n"] == 3
 
 
 # ── regenerate_closets error paths ───────────────────────────────────────
@@ -288,9 +312,9 @@ class TestRegenerateClosets:
         survivors = closets.get(where={"source_file": source}, include=["documents", "metadatas"])
         assert survivors["ids"], "LLM closets should have been written"
         joined = "\n".join(survivors["documents"])
-        assert (
-            "STALE_REGEX_TOPIC" not in joined
-        ), "pre-existing regex closet was not purged before LLM write"
+        assert "STALE_REGEX_TOPIC" not in joined, (
+            "pre-existing regex closet was not purged before LLM write"
+        )
         assert "jwt auth" in joined
         for meta in survivors["metadatas"]:
             assert meta.get("generated_by", "").startswith("llm:")
@@ -375,9 +399,9 @@ class TestRegenerateClosets:
         # Three paginated calls: (limit=5000, offset=0), (5000, 5000), (5000, 10000).
         assert len(get_calls) == 3, f"expected 3 batched fetches, got {len(get_calls)}"
         for call in get_calls:
-            assert (
-                call["limit"] == 5000
-            ), f"batch must be 5000 — got {call['limit']} (would risk SQLITE_MAX_VARIABLE_NUMBER)"
+            assert call["limit"] == 5000, (
+                f"batch must be 5000 — got {call['limit']} (would risk SQLITE_MAX_VARIABLE_NUMBER)"
+            )
             # include must still request both documents and metadatas
             assert "documents" in call["include"]
             assert "metadatas" in call["include"]

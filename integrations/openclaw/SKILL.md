@@ -102,10 +102,10 @@ You have access to a local memory palace via MCP tools. The palace stores verbat
 
 ## Setup
 
-Install MemPalace and populate the palace:
+Install MemPalace and populate the palace (uv recommended):
 
 ```bash
-pip install mempalace
+uv tool install mempalace   # or: pip install mempalace
 mempalace init ~/my-convos
 mempalace mine ~/my-convos
 ```

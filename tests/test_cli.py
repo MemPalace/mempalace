@@ -1,10 +1,13 @@
 """Tests for mempalace.cli — the main CLI dispatcher."""
 
 import argparse
+import os
 import shlex
+import sqlite3
+import subprocess
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -21,6 +24,68 @@ from mempalace.cli import (
     cmd_wakeup,
     main,
 )
+
+
+# ── CLI entry point: PYTHONPATH stripping ────────────────────────────────
+
+
+_LEAK_PREFIX = "/__mempalace_cli_leak_sentinel__"
+
+
+def test_cli_main_strips_leaked_pythonpath_from_env():
+    """mempalace.cli:main must drop PYTHONPATH from the process env so
+    any subprocess the CLI spawns starts clean. Mirrors the
+    sys.path-filter test in test_init.py but for the env half of the
+    split fix. See #1423.
+
+    Three assertions cover the full split contract:
+    - ENV_MID (after import, before main) is preserved verbatim:
+      regression detector for someone moving the env pop back into
+      __init__.py.
+    - SENTINEL_IN_PATH is False at import time: package-level sys.path
+      filter half of the split actually ran.
+    - ENV_AFTER (after main) is None: CLI entry-point env strip ran.
+
+    SystemExit is caught with a narrowed exit-code check so a future
+    argparse change that exits with a non-zero code (e.g. usage error)
+    surfaces as a test failure instead of being swallowed."""
+    expected_env = f"{_LEAK_PREFIX}/a{os.pathsep}{_LEAK_PREFIX}/b"
+    env = os.environ.copy()
+    env["PYTHONPATH"] = expected_env
+    # Run main() with --version so it exits cleanly without entering any
+    # subcommand. argparse raises SystemExit(0) on --version; the wrapper
+    # asserts the exit code is clean and prints the post-main PYTHONPATH
+    # so the assertion is observable.
+    code = (
+        "import os, sys\n"
+        "from mempalace.cli import main\n"
+        f"prefix = {_LEAK_PREFIX!r}\n"
+        "print('ENV_MID:', repr(os.environ.get('PYTHONPATH')))\n"
+        "print('SENTINEL_IN_PATH:', any(prefix in (p or '') for p in sys.path))\n"
+        "sys.argv = ['mempalace', '--version']\n"
+        "try:\n"
+        "    main()\n"
+        "except SystemExit as exc:\n"
+        "    assert exc.code in (0, None), f'unexpected exit code: {exc.code!r}'\n"
+        "print('ENV_AFTER:', repr(os.environ.get('PYTHONPATH')))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    diag = f"rc={result.returncode}; stdout={result.stdout!r}; stderr={result.stderr!r}"
+    assert result.returncode == 0, f"subprocess failed: {diag}"
+    assert f"ENV_MID: {expected_env!r}" in result.stdout, (
+        f"package import unexpectedly stripped env (regression in __init__.py): {diag}"
+    )
+    assert "SENTINEL_IN_PATH: False" in result.stdout, (
+        f"package import did not filter sys.path (regression in __init__.py): {diag}"
+    )
+    assert "ENV_AFTER: None" in result.stdout, f"CLI did not strip PYTHONPATH: {diag}"
 
 
 # ── cmd_status ─────────────────────────────────────────────────────────
@@ -501,6 +566,7 @@ def test_cmd_mine_projects_mode(mock_config_cls):
             dry_run=False,
             respect_gitignore=True,
             include_ignored=[],
+            max_chunks_per_file=None,
         )
 
 
@@ -552,6 +618,45 @@ def test_cmd_mine_include_ignored_comma_split(mock_config_cls):
         mock_mine.assert_called_once()
         call_kwargs = mock_mine.call_args[1]
         assert call_kwargs["include_ignored"] == ["a.txt", "b.txt", "c.txt"]
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_mine_exits_nonzero_on_lock_holder(mock_config_cls, capsys):
+    """Regression #1264: lock contention must exit non-zero with a clear message.
+
+    Before this fix the CLI silently returned 0 when another writer held
+    the palace lock — operators using nohup/scripts had no way to detect
+    the contention. The new behavior raises MineAlreadyRunning out of
+    miner.mine() and cmd_mine catches it, printing the holder identity
+    to stderr and exiting non-zero.
+    """
+    from mempalace.palace import MineAlreadyRunning
+
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    args = argparse.Namespace(
+        dir="/src",
+        palace=None,
+        mode="projects",
+        wing=None,
+        agent="mempalace",
+        limit=0,
+        dry_run=False,
+        no_gitignore=False,
+        include_ignored=[],
+        extract="exchange",
+    )
+    with patch(
+        "mempalace.miner.mine",
+        side_effect=MineAlreadyRunning(
+            "palace /fake/palace is held by PID 12345 (mempalace mcp_server); wait for it to finish"
+        ),
+    ):
+        with pytest.raises(SystemExit) as excinfo:
+            cmd_mine(args)
+    assert excinfo.value.code == 1
+    captured = capsys.readouterr()
+    assert "PID 12345" in captured.err
+    assert "mcp_server" in captured.err
 
 
 # ── cmd_wakeup ─────────────────────────────────────────────────────────
@@ -661,6 +766,7 @@ def test_mcp_command_prints_setup_guidance(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert "MemPalace MCP quick setup:" in captured.out
     assert "claude mcp add mempalace -- mempalace-mcp" in captured.out
+    assert "codex mcp add mempalace -- mempalace-mcp" in captured.out
     assert "\nOptional custom palace:\n" in captured.out
     assert "mempalace-mcp --palace /path/to/palace" in captured.out
     assert "[--palace /path/to/palace]" not in captured.out
@@ -677,6 +783,8 @@ def test_mcp_command_uses_custom_palace_path_when_provided(monkeypatch, capsys):
 
     assert "mempalace-mcp --palace" in captured.out
     assert expanded in captured.out
+    assert "claude mcp add mempalace -- mempalace-mcp --palace" in captured.out
+    assert "codex mcp add mempalace -- mempalace-mcp --palace" in captured.out
     assert "Optional custom palace:" not in captured.out
     assert "[--palace /path/to/palace]" not in captured.out
     assert captured.err == ""
@@ -774,8 +882,9 @@ def test_cmd_repair_requires_palace_database(mock_config_cls, tmp_path, capsys):
 def test_cmd_repair_error_reading(mock_config_cls, tmp_path, capsys):
     palace_dir = tmp_path / "palace"
     palace_dir.mkdir()
-    (palace_dir / "chroma.sqlite3").write_text("db")
+    sqlite3.connect(str(palace_dir / "chroma.sqlite3")).close()
     mock_config_cls.return_value.palace_path = str(palace_dir)
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
     args = argparse.Namespace(palace=None)
     mock_backend = MagicMock()
     mock_backend.get_collection.side_effect = Exception("corrupt db")
@@ -789,8 +898,9 @@ def test_cmd_repair_error_reading(mock_config_cls, tmp_path, capsys):
 def test_cmd_repair_zero_drawers(mock_config_cls, tmp_path, capsys):
     palace_dir = tmp_path / "palace"
     palace_dir.mkdir()
-    (palace_dir / "chroma.sqlite3").write_text("db")
+    sqlite3.connect(str(palace_dir / "chroma.sqlite3")).close()
     mock_config_cls.return_value.palace_path = str(palace_dir)
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
     args = argparse.Namespace(palace=None)
     mock_col = MagicMock()
     mock_col.count.return_value = 0
@@ -805,8 +915,9 @@ def test_cmd_repair_zero_drawers(mock_config_cls, tmp_path, capsys):
 def test_cmd_repair_success(mock_config_cls, tmp_path, capsys):
     palace_dir = tmp_path / "palace"
     palace_dir.mkdir()
-    (palace_dir / "chroma.sqlite3").write_text("db")
+    sqlite3.connect(str(palace_dir / "chroma.sqlite3")).close()
     mock_config_cls.return_value.palace_path = str(palace_dir)
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
     args = argparse.Namespace(palace=None, yes=True)
     mock_col = MagicMock()
     mock_col.count.return_value = 2
@@ -815,21 +926,107 @@ def test_cmd_repair_success(mock_config_cls, tmp_path, capsys):
         "documents": ["doc1", "doc2"],
         "metadatas": [{"wing": "a"}, {"wing": "b"}],
     }
+    mock_temp_col = MagicMock()
+    mock_temp_col.count.return_value = 2
     mock_new_col = MagicMock()
+    mock_new_col.count.return_value = 2
     mock_backend = _mock_backend_for(col=mock_col, new_col=mock_new_col)
+    mock_backend.create_collection.side_effect = [mock_temp_col, mock_new_col]
     with patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend):
         cmd_repair(args)
     out = capsys.readouterr().out
     assert "Repair complete" in out
     assert "2 drawers rebuilt" in out
+    assert mock_backend.delete_collection.call_args_list == [
+        call(str(palace_dir), "mempalace_drawers__repair_tmp"),
+        call(str(palace_dir), "mempalace_drawers"),
+        call(str(palace_dir), "mempalace_drawers__repair_tmp"),
+    ]
+    mock_temp_col.upsert.assert_called_once()
+    mock_new_col.upsert.assert_called_once()
+    mock_new_col.add.assert_not_called()
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_uses_configured_collection(mock_config_cls, tmp_path, capsys):
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    sqlite3.connect(str(palace_dir / "chroma.sqlite3")).close()
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+    mock_config_cls.return_value.collection_name = "custom_drawers"
+    args = argparse.Namespace(palace=None, yes=True)
+    mock_col = MagicMock()
+    mock_col.count.return_value = 2
+    mock_col.get.return_value = {
+        "ids": ["id1", "id2"],
+        "documents": ["doc1", "doc2"],
+        "metadatas": [{"wing": "a"}, {"wing": "b"}],
+    }
+    mock_temp_col = MagicMock()
+    mock_temp_col.count.return_value = 2
+    mock_new_col = MagicMock()
+    mock_new_col.count.return_value = 2
+    mock_backend = _mock_backend_for(col=mock_col, new_col=mock_new_col)
+    mock_backend.create_collection.side_effect = [mock_temp_col, mock_new_col]
+
+    with patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend):
+        cmd_repair(args)
+
+    out = capsys.readouterr().out
+    assert "Repair complete" in out
+    mock_backend.get_collection.assert_called_once_with(str(palace_dir), "custom_drawers")
+    assert mock_backend.create_collection.call_args_list == [
+        call(str(palace_dir), "custom_drawers__repair_tmp"),
+        call(str(palace_dir), "custom_drawers"),
+    ]
+    assert mock_backend.delete_collection.call_args_list == [
+        call(str(palace_dir), "custom_drawers__repair_tmp"),
+        call(str(palace_dir), "custom_drawers"),
+        call(str(palace_dir), "custom_drawers__repair_tmp"),
+    ]
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_restores_backup_on_live_rebuild_failure(mock_config_cls, tmp_path, capsys):
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    sqlite3.connect(str(palace_dir / "chroma.sqlite3")).close()
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
+    args = argparse.Namespace(palace=None, yes=True)
+    mock_col = MagicMock()
+    mock_col.count.return_value = 2
+    mock_col.get.return_value = {
+        "ids": ["id1", "id2"],
+        "documents": ["doc1", "doc2"],
+        "metadatas": [{"wing": "a"}, {"wing": "b"}],
+    }
+    mock_temp_col = MagicMock()
+    mock_temp_col.count.return_value = 2
+    mock_backend = _mock_backend_for(col=mock_col)
+    mock_backend.create_collection.side_effect = [mock_temp_col, RuntimeError("live build failed")]
+    with patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend):
+        with pytest.raises(SystemExit) as excinfo:
+            cmd_repair(args)
+    out = capsys.readouterr().out
+    assert excinfo.value.code == 1
+    assert "Repair failed" in out
+    assert "restoring from backup" in out
+    mock_backend.close_palace.assert_called_once_with(str(palace_dir))
+    assert mock_backend.delete_collection.call_args_list == [
+        call(str(palace_dir), "mempalace_drawers__repair_tmp"),
+        call(str(palace_dir), "mempalace_drawers"),
+        call(str(palace_dir), "mempalace_drawers__repair_tmp"),
+    ]
 
 
 @patch("mempalace.cli.MempalaceConfig")
 def test_cmd_repair_aborts_without_confirmation(mock_config_cls, tmp_path, capsys):
     palace_dir = tmp_path / "palace"
     palace_dir.mkdir()
-    (palace_dir / "chroma.sqlite3").write_text("db")
+    sqlite3.connect(str(palace_dir / "chroma.sqlite3")).close()
     mock_config_cls.return_value.palace_path = str(palace_dir)
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
     args = argparse.Namespace(palace=None)
     mock_col = MagicMock()
     mock_col.count.return_value = 1
@@ -848,16 +1045,45 @@ def test_cmd_repair_aborts_without_confirmation(mock_config_cls, tmp_path, capsy
 
 
 @patch("mempalace.cli.MempalaceConfig")
-def test_cmd_compress_no_palace(mock_config_cls, capsys):
-    mock_config_cls.return_value.palace_path = "/fake/palace"
+def test_cmd_sync_no_palace_dir(mock_config_cls, tmp_path, capsys):
+    """cmd_sync on a missing palace dir prints the State A message (#1498)."""
+    from mempalace.cli import cmd_sync
+
+    palace_path = tmp_path / "nonexistent"
+    mock_config_cls.return_value.palace_path = str(palace_path)
+    args = argparse.Namespace(palace=None, dir=None, root=[], wing=None, dry_run=False)
+    cmd_sync(args)
+    captured = capsys.readouterr()
+    assert "No palace found" in captured.out + captured.err
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_sync_palace_dir_no_db(mock_config_cls, tmp_path, capsys):
+    """cmd_sync on a palace dir without chroma.sqlite3 prints the State B
+    message and does NOT trigger chromadb's lazy DB creation (#1498)."""
+    from mempalace.cli import cmd_sync
+
+    mock_config_cls.return_value.palace_path = str(tmp_path)
+    args = argparse.Namespace(palace=None, dir=None, root=[], wing=None, dry_run=False)
+    cmd_sync(args)
+    captured = capsys.readouterr()
+    assert "has no chroma.sqlite3 yet" in captured.out + captured.err
+    # Side-effect-free: backend not invoked.
+    assert list(tmp_path.iterdir()) == []
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_compress_no_palace(mock_config_cls, tmp_path, capsys):
+    """cmd_compress exits non-zero with a 'No palace found' message on a missing dir.
+
+    Uses a real non-existent tmp_path so the stratified state helper (#1498)
+    walks the State A branch instead of hitting the chromadb backend.
+    """
+    mock_config_cls.return_value.palace_path = str(tmp_path / "nonexistent")
     args = argparse.Namespace(palace=None, wing=None, dry_run=False, config=None)
-    mock_backend = MagicMock()
-    mock_backend.get_collection.side_effect = Exception("no palace")
-    with (
-        patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend),
-        pytest.raises(SystemExit),
-    ):
+    with pytest.raises(SystemExit):
         cmd_compress(args)
+    assert "No palace found" in capsys.readouterr().out
 
 
 @patch("mempalace.cli.MempalaceConfig")
@@ -867,7 +1093,10 @@ def test_cmd_compress_no_drawers(mock_config_cls, capsys):
     mock_col = MagicMock()
     mock_col.get.return_value = {"documents": [], "metadatas": [], "ids": []}
     mock_backend = _mock_backend_for(col=mock_col)
-    with patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend):
+    with (
+        patch("mempalace.palace._open_collection_or_explain", return_value=mock_col),
+        patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend),
+    ):
         cmd_compress(args)
     out = capsys.readouterr().out
     assert "No drawers found" in out
@@ -910,6 +1139,7 @@ def test_cmd_compress_dry_run(mock_config_cls, capsys):
     mock_dialect_mod = _make_mock_dialect_module(mock_dialect)
 
     with (
+        patch("mempalace.palace._open_collection_or_explain", return_value=mock_col),
         patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend),
         patch.dict("sys.modules", {"mempalace.dialect": mock_dialect_mod}),
     ):
@@ -934,6 +1164,7 @@ def test_cmd_compress_with_config(mock_config_cls, tmp_path, capsys):
     mock_dialect_mod = _make_mock_dialect_module(mock_dialect)
 
     with (
+        patch("mempalace.palace._open_collection_or_explain", return_value=mock_col),
         patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend),
         patch.dict("sys.modules", {"mempalace.dialect": mock_dialect_mod}),
     ):
@@ -974,7 +1205,8 @@ def test_cmd_compress_stores_results(mock_config_cls, capsys):
     mock_dialect_mod = _make_mock_dialect_module(mock_dialect)
 
     with (
-        patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend),
+        patch("mempalace.palace._open_collection_or_explain", return_value=mock_col),
+        patch("mempalace.palace.get_closets_collection", return_value=mock_comp_col),
         patch.dict("sys.modules", {"mempalace.dialect": mock_dialect_mod}),
     ):
         cmd_compress(args)
@@ -982,12 +1214,6 @@ def test_cmd_compress_stores_results(mock_config_cls, capsys):
     assert "Stored" in out
     assert "Total:" in out
     mock_comp_col.upsert.assert_called_once()
-    # Verify the compress output goes to the closets collection so that
-    # palace.get_closets_collection() / searcher can read it back (#1244).
-    (call_args, _kwargs) = mock_backend.get_or_create_collection.call_args
-    assert (
-        call_args[1] == "mempalace_closets"
-    ), f"compress should write to mempalace_closets, got {call_args[1]!r}"
     assert "mempalace_closets" in out
 
 
@@ -1097,3 +1323,64 @@ def test_reconfigure_stdio_is_noop_off_windows():
         _reconfigure_stdio_utf8_on_windows()
 
     assert stdin.reconfigure_calls == []
+
+
+# ── cmd_repair: from-sqlite mode exit codes ──────────────────────────
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_from_sqlite_validation_refusal_exits_nonzero(mock_config_cls, tmp_path, capsys):
+    """When ``rebuild_from_sqlite`` returns ``{}`` for a validation
+    refusal (missing source DB, in-place without --archive-existing,
+    refusing to overwrite an existing dest), the CLI must surface a
+    non-zero exit so unattended scripts and CI distinguish "invalid
+    inputs" from "successful recovery that found zero rows."
+
+    Catches: a regression where the CLI treats the validation-refusal
+    sentinel as success, leaving CI green on a no-op repair that should
+    have alerted an operator.
+    """
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+
+    args = argparse.Namespace(
+        palace=str(palace_dir),
+        mode="from-sqlite",
+        source=None,
+        archive_existing=False,
+        yes=True,
+    )
+    with patch("mempalace.repair.rebuild_from_sqlite", return_value={}):
+        with pytest.raises(SystemExit) as excinfo:
+            cmd_repair(args)
+    assert excinfo.value.code == 1
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_from_sqlite_success_does_not_exit(mock_config_cls, tmp_path):
+    """A successful from-sqlite rebuild — even one that finds zero rows
+    in a legitimately empty source palace — must NOT call ``sys.exit``.
+    A populated counts dict (with ``0`` values) is the success signal;
+    only the empty dict ``{}`` is reserved for validation refusal.
+
+    Catches: a regression where ``if not counts`` is replaced by
+    ``if not sum(counts.values())`` or similar, conflating "empty source"
+    with "validation refused" and breaking idempotent recovery scripts.
+    """
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+
+    args = argparse.Namespace(
+        palace=str(palace_dir),
+        mode="from-sqlite",
+        source=None,
+        archive_existing=False,
+        yes=True,
+    )
+    # Zero rows but per-collection keys present → success, no exit.
+    fake_counts = {"mempalace_drawers": 0, "mempalace_closets": 0}
+    with patch("mempalace.repair.rebuild_from_sqlite", return_value=fake_counts):
+        # Should return cleanly; no SystemExit raised.
+        cmd_repair(args)

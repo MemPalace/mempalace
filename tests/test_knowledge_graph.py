@@ -6,6 +6,8 @@ timeline, stats, and edge cases (duplicate triples, ID collisions).
 """
 
 import pytest
+import sqlite3
+from mempalace.knowledge_graph import KnowledgeGraph
 
 
 class TestEntityOperations:
@@ -171,3 +173,152 @@ class TestStats:
         assert stats["triples"] == 5
         assert stats["current_facts"] == 4  # 1 expired (Acme Corp)
         assert stats["expired_facts"] == 1
+
+
+class TestTemporalDateTimeCompatibility:
+    def test_datetime_query_matches_legacy_date_only_fact(self, kg):
+        kg.add_triple(
+            "Alice",
+            "ate_at",
+            "Cafe",
+            valid_from="2026-05-06",
+            valid_to="2026-05-06",
+        )
+
+        result = kg.query_entity("Alice", as_of="2026-05-06T15:00:00Z")
+
+        assert len(result) == 1
+        assert result[0]["object"] == "Cafe"
+
+    def test_datetime_query_before_legacy_date_only_fact_does_not_match(self, kg):
+        kg.add_triple(
+            "Alice",
+            "ate_at",
+            "Cafe",
+            valid_from="2026-05-06",
+            valid_to="2026-05-06",
+        )
+
+        result = kg.query_entity("Alice", as_of="2026-05-05T23:59:59Z")
+
+        assert result == []
+
+    def test_datetime_query_after_legacy_date_only_fact_does_not_match(self, kg):
+        kg.add_triple(
+            "Alice",
+            "ate_at",
+            "Cafe",
+            valid_from="2026-05-06",
+            valid_to="2026-05-06",
+        )
+
+        result = kg.query_entity("Alice", as_of="2026-05-07T00:00:00Z")
+
+        assert result == []
+
+    def test_rejects_timezone_offset_datetime_at_kg_layer(self, kg):
+        with pytest.raises(ValueError):
+            kg.add_triple(
+                "Bob",
+                "works_at",
+                "Globex",
+                valid_from="2026-05-06T20:30:00-05:00",
+            )
+
+    def test_rejects_naive_datetime_at_kg_layer(self, kg):
+        with pytest.raises(ValueError):
+            kg.add_triple(
+                "Carol",
+                "is_in",
+                "NYC",
+                valid_from="2026-05-07T01:23:00",
+            )
+
+    def test_rejects_space_separated_datetime_at_kg_layer(self, kg):
+        with pytest.raises(ValueError):
+            kg.add_triple(
+                "Eve",
+                "is_in",
+                "London",
+                valid_from="2026-05-06T15:00:00Z",
+                valid_to="2026-05-06 20:00:00",
+            )
+
+    def test_date_only_valid_to_is_end_of_day_for_interval_check(self, kg):
+        kg.add_triple(
+            "Eve",
+            "is_in",
+            "London",
+            valid_from="2026-05-06T15:00:00Z",
+            valid_to="2026-05-06",
+        )
+
+        result = kg.query_entity("Eve", as_of="2026-05-06T20:00:00Z")
+
+        assert len(result) == 1
+        assert result[0]["object"] == "London"
+
+    def test_rejects_interval_when_date_only_end_is_before_datetime_start(self, kg):
+        with pytest.raises(
+            ValueError,
+            match=r"valid_to='2026-05-06'.*valid_from='2026-05-07T01:00:00Z'",
+        ):
+            kg.add_triple(
+                "Eve",
+                "is_in",
+                "London",
+                valid_from="2026-05-07T01:00:00Z",
+                valid_to="2026-05-06",
+            )
+
+    def test_query_relationship_uses_safe_temporal_comparison(self, kg):
+        kg.add_triple(
+            "Alice",
+            "visited",
+            "Cafe",
+            valid_from="2026-05-06",
+            valid_to="2026-05-06",
+        )
+
+        result = kg.query_relationship("visited", as_of="2026-05-06T15:00:00Z")
+
+        assert len(result) == 1
+        assert result[0]["subject"] == "Alice"
+        assert result[0]["object"] == "Cafe"
+
+    def test_invalidate_rejects_timezone_offset_ended(self, kg):
+        kg.add_triple(
+            "Alice",
+            "works_at",
+            "Acme",
+            valid_from="2026-05-06T14:00:00Z",
+        )
+
+        with pytest.raises(ValueError):
+            kg.invalidate(
+                "Alice",
+                "works_at",
+                "Acme",
+                ended="2026-05-06T20:30:00-05:00",
+            )
+
+
+class TestKnowledgeGraphConnectionCleanup:
+    def test_close_closes_connection_and_resets_handle(self, tmp_path):
+        kg = KnowledgeGraph(str(tmp_path / "kg.sqlite3"))
+        conn = kg._conn()
+
+        kg.close()
+
+        assert kg._connection is None
+        with pytest.raises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")
+
+    def test_context_manager_closes_connection(self, tmp_path):
+        with KnowledgeGraph(str(tmp_path / "kg.sqlite3")) as kg:
+            conn = kg._conn()
+            kg.add_entity("Alice")
+
+        assert kg._connection is None
+        with pytest.raises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")

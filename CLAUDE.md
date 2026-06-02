@@ -36,26 +36,26 @@ We do not accept summarization of user content, cloud storage/sync features, tel
 ## Setup
 
 ```bash
-pip install -e ".[dev]"
+uv sync --extra dev   # recommended; or: pip install -e ".[dev]"
 ```
 
 ## Commands
 
 ```bash
 # Run tests
-python -m pytest tests/ -v --ignore=tests/benchmarks
+uv run pytest tests/ -v --ignore=tests/benchmarks
 
 # Run tests with coverage
-python -m pytest tests/ -v --ignore=tests/benchmarks --cov=mempalace --cov-report=term-missing
+uv run pytest tests/ -v --ignore=tests/benchmarks --cov=mempalace --cov-report=term-missing
 
 # Lint
-ruff check .
+uv run ruff check .
 
 # Format
-ruff format .
+uv run ruff format .
 
 # Format check (CI mode)
-ruff format --check .
+uv run ruff format --check .
 ```
 
 ## Project Structure

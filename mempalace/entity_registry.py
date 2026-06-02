@@ -327,15 +327,26 @@ class EntityRegistry:
         # instead of a half-written file or an empty file from the truncate.
         payload = json.dumps(self._data, indent=2)
         tmp_path = self._path.with_name(self._path.name + ".tmp")
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            f.write(payload)
-            f.flush()
-            os.fsync(f.fileno())
         try:
-            tmp_path.chmod(0o600)
-        except (OSError, NotImplementedError):
-            pass
-        os.replace(tmp_path, self._path)
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            try:
+                tmp_path.chmod(0o600)
+            except (OSError, NotImplementedError):
+                pass
+            os.replace(tmp_path, self._path)
+        except BaseException:
+            # Disk full, perms flip, broken FUSE mount, IO error, KeyboardInterrupt
+            # mid-write — unlink the .tmp sidecar so it does not litter the palace
+            # directory or confuse diagnostics. The previous registry is intact
+            # because os.replace is atomic on POSIX/NTFS.
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
         # On ext4 (and similar) the rename's durability across power loss
         # requires an additional fsync on the parent directory. Without it,
         # the kernel can ack the rename and a crash reverts to the state

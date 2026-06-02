@@ -29,7 +29,8 @@ import time
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
-from .config import MempalaceConfig
+from .config import MempalaceConfig, normalize_wing_name
+from .dynamics import initialize_dynamics_fields
 from .palace import get_collection as _get_palace_collection
 from .palace import mine_lock
 
@@ -43,10 +44,17 @@ def _normalize_wing(wing: str | None) -> str | None:
     (e.g. ``mempalace_public``).  Callers that pass the raw directory name
     (``mempalace-public``) would silently miss.  This helper aligns the lookup
     key with the stored metadata.
+
+    Non-string inputs (from corrupt or hand-edited ``tunnels.json``) return
+    ``None`` rather than raising, so a single malformed record cannot break
+    the read-path filters that iterate the whole file.
     """
-    if wing is None:
+    if not isinstance(wing, str):
         return None
-    return wing.lower().replace(" ", "_").replace("-", "_")
+    wing = wing.strip()
+    if not wing:
+        return None
+    return normalize_wing_name(wing)
 
 
 # Module-level graph cache with TTL and write-invalidation.
@@ -328,30 +336,65 @@ def _fuzzy_match(query: str, nodes: dict, n: int = 5):
 # Explicit tunnels are created by agents when they notice a connection
 # between two specific drawers or rooms in different wings/projects.
 #
-# Stored as a JSON file at ~/.mempalace/tunnels.json so they persist
-# across palace rebuilds (not in ChromaDB which can be recreated).
+# Stored as a JSON file based on MempalaceConfig.palace_path (where the
+# palace itself lives) so they persist across palace rebuilds (not in
+# ChromaDB which can be recreated).
 
 
-_TUNNEL_FILE = os.path.join(os.path.expanduser("~"), ".mempalace", "tunnels.json")
+def _get_tunnel_file(config=None) -> str:
+    """Return the path to the tunnels.json file, derived from MempalaceConfig.palace_path."""
+    config = config or MempalaceConfig()
+    return config.tunnel_file
 
 
-def _load_tunnels():
+def _legacy_tunnel_file() -> str:
+    """The pre-3.3.6 hardcoded path. Kept only for one-time orphan detection."""
+    return os.path.join(os.path.expanduser("~"), ".mempalace", "tunnels.json")
+
+
+def _load_tunnels(config=None):
     """Load explicit tunnels from disk.
 
     Returns an empty list if the file is missing or corrupt (e.g. truncated
     by a crash mid-write on a system that lacks atomic-rename semantics).
+
+    Backwards-compatibility: prior to 3.3.6 the tunnel file was hardcoded at
+    ``~/.mempalace/tunnels.json`` regardless of the configured palace_path.
+    If the configured tunnel file is missing but a legacy file exists at a
+    different path, log a one-line warning naming both paths so users can
+    move the file manually. We do NOT auto-migrate — auto-merging tunnel
+    state across two locations is too magical for a bugfix and risks
+    clobbering newer data.
+
+    ``config`` may be passed in by the caller to avoid re-instantiating
+    ``MempalaceConfig`` (which re-reads ``mempalace.yaml`` from disk) on
+    every helper call within a single create_tunnel cycle.
     """
-    if not os.path.exists(_TUNNEL_FILE):
-        return []
-    try:
-        with open(_TUNNEL_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        return []
-    return data if isinstance(data, list) else []
+    current_tunnel_file = _get_tunnel_file(config)
+    if os.path.exists(current_tunnel_file):
+        try:
+            with open(current_tunnel_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            logger.warning(
+                "Mempalace tunnels file '%s' is corrupt or unreadable; starting empty.",
+                current_tunnel_file,
+            )
+            return []
+        return data if isinstance(data, list) else []
+
+    legacy = _legacy_tunnel_file()
+    if legacy != current_tunnel_file and os.path.exists(legacy):
+        logger.warning(
+            "Legacy tunnels file at '%s' is being ignored; configured location is '%s'. "
+            "Move or copy the legacy file to the configured path to recover its tunnels.",
+            legacy,
+            current_tunnel_file,
+        )
+    return []
 
 
-def _save_tunnels(tunnels):
+def _save_tunnels(tunnels, config=None):
     """Persist explicit tunnels atomically.
 
     Writes to ``tunnels.json.tmp`` then ``os.replace``s it into place, so
@@ -363,15 +406,19 @@ def _save_tunnels(tunnels):
     the user has explicitly linked) and should not be world-readable on
     shared Linux/multi-user systems. Matches the file-permission pattern
     established by #814 for the other sensitive palace files.
+
+    ``config`` may be passed in by the caller to avoid re-instantiating
+    ``MempalaceConfig`` on every save.
     """
-    parent = os.path.dirname(_TUNNEL_FILE)
+    tunnel_file = _get_tunnel_file(config)
+    parent = os.path.dirname(tunnel_file)
     os.makedirs(parent, exist_ok=True)
     try:
         os.chmod(parent, 0o700)
     except (OSError, NotImplementedError):
         # Windows / unsupported filesystems — tolerate.
         pass
-    tmp_path = _TUNNEL_FILE + ".tmp"
+    tmp_path = tunnel_file + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(tunnels, f, indent=2)
         f.flush()
@@ -380,9 +427,9 @@ def _save_tunnels(tunnels):
         except OSError:
             # Not all filesystems (or Windows file handles) support fsync — tolerate.
             pass
-    os.replace(tmp_path, _TUNNEL_FILE)
+    os.replace(tmp_path, tunnel_file)
     try:
-        os.chmod(_TUNNEL_FILE, 0o600)
+        os.chmod(tunnel_file, 0o600)
     except (OSError, NotImplementedError):
         pass
 
@@ -414,6 +461,30 @@ def _require_name(value: str, field: str) -> str:
     return value.strip()
 
 
+def _check_room_exists(wing: str, room: str, col) -> bool:
+    """Check if at least one drawer exists for the given wing/room in ChromaDB."""
+    if col is None:
+        # If collection is unreachable, can't verify, so allow.
+        logger.debug(
+            "ChromaDB collection not reachable, skipping room existence validation for %s/%s",
+            wing,
+            room,
+        )
+        return True
+    try:
+        results = col.get(where={"$and": [{"wing": wing}, {"room": room}]}, limit=1, include=[])
+        return len(results["ids"]) > 0
+    except Exception:
+        # If query fails, assume it's a temporary issue or permissions, and allow.
+        logger.warning(
+            "Error checking room existence in ChromaDB for %s/%s; allowing tunnel creation.",
+            wing,
+            room,
+            exc_info=True,
+        )
+        return True
+
+
 def create_tunnel(
     source_wing: str,
     source_room: str,
@@ -429,7 +500,8 @@ def create_tunnel(
     Tunnels are undirected: ``create_tunnel(A, B)`` and ``create_tunnel(B, A)``
     resolve to the same canonical ID. A second call with the same endpoints
     updates the stored label (and drawer IDs, if provided) rather than
-    creating a duplicate.
+    creating a duplicate. Endpoints are compared **verbatim** — ``"my-wing"``
+    and ``"my_wing"`` are distinct (see Note below and #1504).
 
     The ``source`` / ``target`` fields on the returned dict preserve the
     argument order the caller used, so callers can display it directionally
@@ -453,15 +525,36 @@ def create_tunnel(
         The stored tunnel dict.
 
     Raises:
-        ValueError: if any wing or room is empty or non-string.
+        ValueError: if any wing or room is empty or non-string, or if an explicit
+                    tunnel points to a nonexistent room.
+
+    Note:
+        Wing slugs are stored verbatim — passing ``"my-wing"`` and ``"my_wing"``
+        produces two distinct tunnels (canonical IDs differ). Read-path helpers
+        (``list_tunnels`` / ``follow_tunnels``) normalize both sides at compare
+        time so legacy underscore data and explicit-flag hyphen data both
+        match queries in either form. See #1504.
     """
     source_wing = _require_name(source_wing, "source_wing")
     source_room = _require_name(source_room, "source_room")
     target_wing = _require_name(target_wing, "target_wing")
     target_room = _require_name(target_room, "target_room")
 
-    source_wing = _normalize_wing(source_wing)
-    target_wing = _normalize_wing(target_wing)
+    # Single MempalaceConfig() per call — reused by _get_tunnel_file /
+    # _load_tunnels / _save_tunnels below. Each MempalaceConfig() re-reads
+    # mempalace.yaml from disk; before this change the helpers each
+    # instantiated their own, triggering several redundant disk reads per
+    # create_tunnel call (flagged by gemini-code-assist on #1469).
+    config = MempalaceConfig()
+
+    # Validate room existence for explicit tunnels only. Use the verbatim wing
+    # slugs here so #1504's hyphen-preserving write path remains intact.
+    if kind == "explicit":
+        col = _get_collection(config)
+        if not _check_room_exists(source_wing, source_room, col):
+            raise ValueError(f"Source room '{source_room}' does not exist in wing '{source_wing}'")
+        if not _check_room_exists(target_wing, target_room, col):
+            raise ValueError(f"Target room '{target_room}' does not exist in wing '{target_wing}'")
 
     tunnel_id = _canonical_tunnel_id(source_wing, source_room, target_wing, target_room)
 
@@ -481,19 +574,33 @@ def create_tunnel(
     # Serialize the load → mutate → save cycle. Without this, two concurrent
     # create_tunnel calls can both read the same snapshot and the later
     # writer silently drops the earlier writer's tunnel.
-    with mine_lock(_TUNNEL_FILE):
-        tunnels = _load_tunnels()
+    with mine_lock(_get_tunnel_file(config)):
+        tunnels = _load_tunnels(config)
         for existing in tunnels:
             if existing.get("id") == tunnel_id:
                 # Preserve original creation timestamp on label updates.
                 tunnel["created_at"] = existing.get("created_at", tunnel["created_at"])
                 tunnel["updated_at"] = datetime.now(timezone.utc).isoformat()
+                # Preserve L7 dynamics fields across re-creation events.
+                # Without this, a label update (or any re-create) would
+                # reset the connection's strength / stability / access_count
+                # — defeating the living-connection layer. Backfill any
+                # still-missing fields so legacy records also pick up
+                # defaults on next touch. Per PR #1578 review
+                # (gemini-code-assist, medium priority): use dict-update
+                # with a comprehension so the field list lives in one place
+                # and future schema expansion can't drop a field by accident.
+                _dyn_fields = ("strength", "stability", "last_activated", "access_count")
+                tunnel.update({k: existing[k] for k in _dyn_fields if k in existing})
+                initialize_dynamics_fields(tunnel)
                 existing.clear()
                 existing.update(tunnel)
-                _save_tunnels(tunnels)
+                _save_tunnels(tunnels, config)
                 return existing
+        # Brand-new tunnel — initialize dynamics from defaults.
+        initialize_dynamics_fields(tunnel)
         tunnels.append(tunnel)
-        _save_tunnels(tunnels)
+        _save_tunnels(tunnels, config)
     return tunnel
 
 
@@ -506,17 +613,24 @@ def list_tunnels(wing: str = None):
     norm_wing = _normalize_wing(wing)
     tunnels = _load_tunnels()
     if norm_wing:
+        # Normalize stored wings too: older tunnels.json records hold the
+        # underscore form (from the prior write-path normalization), while
+        # post-#1504 records hold whatever the caller passed. Comparing
+        # normalized-on-both-sides matches either.
+        # ``t.get(k) or {}`` (not ``t.get(k, {})``) handles ``"source": null``
+        # from a hand-edited file — ``.get`` defaults only on missing keys.
         tunnels = [
             t
             for t in tunnels
-            if t["source"]["wing"] == norm_wing or t["target"]["wing"] == norm_wing
+            if _normalize_wing((t.get("source") or {}).get("wing")) == norm_wing
+            or _normalize_wing((t.get("target") or {}).get("wing")) == norm_wing
         ]
     return tunnels
 
 
 def delete_tunnel(tunnel_id: str):
     """Delete an explicit tunnel by ID. Returns ``{"deleted": <id>}``."""
-    with mine_lock(_TUNNEL_FILE):
+    with mine_lock(_get_tunnel_file()):
         tunnels = _load_tunnels()
         tunnels = [t for t in tunnels if t.get("id") != tunnel_id]
         _save_tunnels(tunnels)
@@ -529,15 +643,23 @@ def follow_tunnels(wing: str, room: str, col=None, config=None):
     Given a location (wing/room), finds all tunnels leading from or to it,
     and optionally fetches the connected drawer content.
     """
+    # Fall back to raw ``wing`` so an empty/whitespace query string still
+    # produces a value to compare with; ``_normalize_wing`` returns ``None``
+    # for empty input. Stored wings are normalized on the read path so the
+    # mempalace.yaml slug (underscore) and an explicit ``--wing`` slug
+    # (verbatim) both resolve through the same comparison.
     norm_wing = _normalize_wing(wing) or wing
     tunnels = _load_tunnels()
     connections = []
 
     for t in tunnels:
-        src = t["source"]
-        tgt = t["target"]
+        # ``or {}`` (not ``.get(k, {})``) handles ``"source": null`` from a
+        # hand-edited file — ``.get`` defaults only on missing keys, not on
+        # explicit ``null`` values.
+        src = t.get("source") or {}
+        tgt = t.get("target") or {}
 
-        if src["wing"] == norm_wing and src["room"] == room:
+        if _normalize_wing(src.get("wing")) == norm_wing and src.get("room") == room:
             connections.append(
                 {
                     "direction": "outgoing",
@@ -548,7 +670,7 @@ def follow_tunnels(wing: str, room: str, col=None, config=None):
                     "tunnel_id": t["id"],
                 }
             )
-        elif tgt["wing"] == norm_wing and tgt["room"] == room:
+        elif _normalize_wing(tgt.get("wing")) == norm_wing and tgt.get("room") == room:
             connections.append(
                 {
                     "direction": "incoming",
@@ -666,7 +788,12 @@ def compute_topic_tunnels(
                 continue
             bucket.setdefault(key, n.strip())
         if bucket:
-            wing_topics[wing.strip()] = bucket
+            # Auto-generated topic tunnels normalize the wing key so repeated
+            # mining runs with mixed slug forms (``my-wing`` vs ``my_wing``)
+            # produce one canonical record, not two parallel ones. User-issued
+            # ``create_tunnel`` calls (e.g. via MCP) preserve verbatim slugs;
+            # only this auto-generation path canonicalizes the key.
+            wing_topics[normalize_wing_name(wing.strip())] = bucket
 
     wings = sorted(wing_topics.keys())
     created: list[dict] = []
@@ -710,8 +837,19 @@ def topic_tunnels_for_wing(
     if not topics_by_wing or not isinstance(wing, str) or not wing.strip():
         return []
 
-    wing = wing.strip()
+    # Canonicalize the lookup key so a hyphenated arg still finds an
+    # underscore-normalized entry (and vice versa). ``compute_topic_tunnels``
+    # canonicalizes the keys it writes, so callers can pass either form.
+    wing = normalize_wing_name(wing.strip())
     own = topics_by_wing.get(wing)
+    if own is None:
+        # Fallback: caller may have built ``topics_by_wing`` with verbatim
+        # keys (unusual but allowed). Try every entry, normalized, before
+        # giving up.
+        for k, v in topics_by_wing.items():
+            if isinstance(k, str) and normalize_wing_name(k.strip()) == wing:
+                own = v
+                break
     if not isinstance(own, (list, tuple)) or not own:
         return []
 
@@ -721,7 +859,9 @@ def topic_tunnels_for_wing(
     # one place.
     created: list[dict] = []
     for other, other_topics in topics_by_wing.items():
-        if not isinstance(other, str) or not other.strip() or other == wing:
+        if not isinstance(other, str) or not other.strip():
+            continue
+        if normalize_wing_name(other.strip()) == wing:
             continue
         if not isinstance(other_topics, (list, tuple)) or not other_topics:
             continue
@@ -733,4 +873,79 @@ def topic_tunnels_for_wing(
                 label_prefix=label_prefix,
             )
         )
+    return created
+
+
+def entity_tunnels_for_wing(
+    wing: str,
+    hallways: list,
+    label_prefix: str = "shared entity",
+) -> list:
+    """Compute entity tunnels involving a single wing.
+
+    An entity tunnel bridges two wings when the same entity (person,
+    project, concept, interest) appears in within-wing hallways of both.
+    This is the architectural counterpart to ``topic_tunnels_for_wing`` —
+    same storage path (``create_tunnel`` → ``~/.mempalace/tunnels.json``),
+    same dedup, same listing API — but the substrate is hallway records
+    rather than raw topic words. See v4 architecture doc, Wing →
+    Drawer-entities → Hallway → Tunnel.
+
+    Endpoints use the synthetic room id ``entity:<name>`` (mirrors
+    ``topic:<slug>``) so they can't collide with literal folder-derived
+    rooms of the same name. Casing of the entity is preserved.
+
+    Topic tunnels are NOT replaced — both systems coexist for one release
+    cycle while entity tunnels prove out. Deprecation is a separate PR.
+    """
+    if not hallways or not isinstance(wing, str) or not wing.strip():
+        return []
+
+    wing_norm = normalize_wing_name(wing.strip())
+
+    # Build: entity -> {normalized_wing -> original_wing_display_name}
+    # Both entity_a and entity_b positions count toward "this entity is
+    # in this wing"; the hallway primitive treats the pair as unordered.
+    entity_wings: dict = {}
+    for h in hallways:
+        if not isinstance(h, dict):
+            continue
+        h_wing = h.get("wing")
+        if not isinstance(h_wing, str) or not h_wing.strip():
+            continue
+        h_wing_norm = normalize_wing_name(h_wing.strip())
+        for ent_key in ("entity_a", "entity_b"):
+            ent = h.get(ent_key)
+            if not isinstance(ent, str) or not ent.strip():
+                continue
+            # setdefault preserves the first-seen display form so the
+            # tunnel endpoint matches the wing name the caller used.
+            entity_wings.setdefault(ent, {}).setdefault(h_wing_norm, h_wing)
+
+    if not entity_wings:
+        return []
+
+    created: list = []
+    # Stable entity order so tunnels materialize deterministically across
+    # runs — matters for tests and for diff-able tunnels.json files.
+    for entity in sorted(entity_wings.keys()):
+        wings_for_entity = entity_wings[entity]
+        if wing_norm not in wings_for_entity:
+            continue
+        own_wing_display = wings_for_entity[wing_norm]
+        # Stable other-wing order; ``wing_norm`` itself is excluded so an
+        # entity that lives only in this wing produces zero tunnels.
+        other_wings_norm = sorted(w for w in wings_for_entity if w != wing_norm)
+        for other_norm in other_wings_norm:
+            other_display = wings_for_entity[other_norm]
+            room = f"entity:{entity}"
+            tunnel = create_tunnel(
+                source_wing=own_wing_display,
+                source_room=room,
+                target_wing=other_display,
+                target_room=room,
+                label=f"{label_prefix}: {entity}",
+                kind="entity",
+            )
+            created.append(tunnel)
     return created

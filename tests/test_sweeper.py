@@ -97,9 +97,9 @@ class TestSweeperParsing:
         records = list(parse_claude_jsonl(str(mock_claude_jsonl)))
         assistant_rec = records[1]
         assert assistant_rec["role"] == "assistant"
-        assert (
-            "Paris" in assistant_rec["content"]
-        ), f"Assistant content blocks must be flattened to text; got: {assistant_rec['content']!r}"
+        assert "Paris" in assistant_rec["content"], (
+            f"Assistant content blocks must be flattened to text; got: {assistant_rec['content']!r}"
+        )
 
     def test_parse_preserves_tool_blocks_verbatim(self, tmp_path):
         """Per the design principle "verbatim always", tool_use and
