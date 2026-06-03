@@ -25,6 +25,7 @@ import argparse
 import hashlib
 import json
 import logging
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -175,14 +176,26 @@ def load_wing_config(palace_path: Path) -> dict:
 
 
 def classify_wing(text: str, wing_config: dict) -> str:
-    """Return the best matching wing name, or 'wing_general'."""
+    """Return the best matching wing name, or 'wing_general'.
+
+    Keeps in sync with ``_match_wing_by_keywords`` in the live provider
+    (``integrations/hermes/__init__.py``). Both use word-boundary matching so
+    backfilled drawers route to the same wings as live writes — bare substring
+    matching here would let backfill file ``"… available …"`` under an
+    ``ai``-keyword wing while the live provider correctly routed it to
+    ``wing_general``.
+    """
     if not wing_config:
         return "wing_general"
     text_lower = text.lower()
     for wing_name, wing_def in wing_config.items():
-        keywords = wing_def.get("keywords", [])
-        if any(kw.lower() in text_lower for kw in keywords):
-            return wing_name
+        keywords = wing_def.get("keywords", []) if isinstance(wing_def, dict) else []
+        for kw in keywords:
+            if not kw:
+                continue
+            pattern = r"\b" + re.escape(kw.lower()) + r"\b"
+            if re.search(pattern, text_lower):
+                return wing_name
     return "wing_general"
 
 

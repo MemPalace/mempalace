@@ -174,9 +174,17 @@ def test_yaml_update_handles_scalar_memory_value(tmp_path):
     data = yaml.safe_load(config.read_text())
     assert data["memory"]["provider"] == "mempalace"
     assert data["model"] == "x"
-    # Single top-level memory key — file is valid YAML.
+    # Exactly one top-level ``memory:`` key. The earlier heuristic produced
+    # two when the original value was a scalar — yaml round-tripping rules
+    # that out structurally, but assert it via the actual count to catch any
+    # future regression at the serialiser level.
     text = config.read_text()
-    assert text.count("\nmemory:") + text.startswith("memory:") <= 2  # one occurrence
+    top_level_memory = sum(
+        1
+        for line in text.splitlines()
+        if line.startswith("memory:") or line.rstrip() == "memory:"
+    )
+    assert top_level_memory == 1
 
 
 def test_yaml_update_creates_file_when_missing(tmp_path):

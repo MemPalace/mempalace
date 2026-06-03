@@ -146,6 +146,70 @@ def test_handle_tool_call_without_initialize_returns_error_json(provider):
     assert "error" in result
 
 
+def test_on_session_end_no_op_when_not_initialized(provider):
+    # Without ``_initialized``, the worker thread isn't running. Enqueueing
+    # here would silently fill the bounded queue with tasks that never drain.
+    provider._initialized = False
+    provider._cron_skipped = False
+    pre = provider._worker_queue.qsize()
+    provider.on_session_end([{"role": "user", "content": "hi"}])
+    assert provider._worker_queue.qsize() == pre
+
+
+def test_on_memory_write_no_op_when_not_initialized(provider):
+    provider._initialized = False
+    provider._cron_skipped = False
+    pre = provider._worker_queue.qsize()
+    provider.on_memory_write("add", "user", "some fact")
+    assert provider._worker_queue.qsize() == pre
+
+
+def test_normalize_content_flattens_anthropic_list(integration_module):
+    fn = integration_module._normalize_content
+    blocks = [
+        {"type": "text", "text": "what's the auth flow?"},
+        {"type": "tool_use", "name": "grep", "input": {"q": "JWT"}},
+        {"type": "text", "text": "(short clarifier)"},
+    ]
+    out = fn(blocks)
+    assert "what's the auth flow?" in out
+    assert "[tool_use: grep]" in out
+    assert "(short clarifier)" in out
+    # Must not be the literal Python repr.
+    assert "{'type'" not in out
+
+
+def test_match_wing_by_keywords_word_boundary(integration_module):
+    fn = integration_module._match_wing_by_keywords
+    wing_config = {
+        "wing_ai": {"keywords": ["ai"]},
+        "wing_dev": {"keywords": ["python"]},
+    }
+    # Substring matching would have routed "said" / "rain" / "available" to wing_ai.
+    assert fn("She said rain is available", wing_config) == "wing_general"
+    assert fn("write some ai bindings", wing_config) == "wing_ai"
+    assert fn("python script for scraping", wing_config) == "wing_dev"
+
+
+def test_backfill_classify_wing_matches_live_provider():
+    # Import backfill the same way the install command does.
+    import importlib.util
+
+    backfill_path = (
+        Path(__file__).resolve().parent.parent / "integrations" / "hermes" / "backfill.py"
+    )
+    spec = importlib.util.spec_from_file_location("hermes_backfill", backfill_path)
+    assert spec is not None and spec.loader is not None
+    backfill = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(backfill)
+
+    wing_config = {"wing_ai": {"keywords": ["ai"]}}
+    # Both the live provider and backfill must reject substring matches —
+    # otherwise backfilled drawers route differently than live writes.
+    assert backfill.classify_wing("She said rain is available", wing_config) == "wing_general"
+    assert backfill.classify_wing("write some ai bindings", wing_config) == "wing_ai"
+
+
 # ---------------------------------------------------------------------------
 # Session switch / turn counter bookkeeping.
 # ---------------------------------------------------------------------------

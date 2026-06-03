@@ -65,6 +65,31 @@ except ImportError:  # pragma: no cover - Hermes not installed
 logger = logging.getLogger("mempalace.hermes")
 
 
+def _match_wing_by_keywords(text: str, wing_config: Dict[str, Any]) -> str:
+    """Return the first wing whose keywords match a whole word in ``text``.
+
+    Word boundaries matter — bare substring matching routes turns mentioning
+    ``said`` into a wing whose keyword is ``ai``. Fall back to ``wing_general``.
+
+    Lives at module scope so ``backfill.py`` can use exactly the same matching
+    logic the live provider uses (it cannot import from this file as a
+    relative import — it's run by ``importlib.util.spec_from_file_location``).
+    The duplicate below in ``backfill.py`` must be kept in sync.
+    """
+    if not wing_config:
+        return "wing_general"
+    text_lower = text.lower()
+    for wing_name, wing_def in wing_config.items():
+        keywords = wing_def.get("keywords", []) if isinstance(wing_def, dict) else []
+        for kw in keywords:
+            if not kw:
+                continue
+            pattern = r"\b" + re.escape(kw.lower()) + r"\b"
+            if re.search(pattern, text_lower):
+                return wing_name
+    return "wing_general"
+
+
 def _normalize_content(content: Any) -> str:
     """Flatten an Anthropic/OpenAI ``content`` field to a plain string.
 
@@ -441,7 +466,10 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         self._turn_count = turn_number
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        if self._cron_skipped:
+        # Skip when the provider never came up — enqueueing to a queue whose
+        # worker never started would silently fill the bounded buffer with
+        # tasks that can never drain.
+        if self._cron_skipped or not self._initialized:
             return
         try:
             self._worker_queue.put_nowait(
@@ -451,7 +479,10 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
                 )
             )
         except queue.Full:
-            pass
+            logger.warning(
+                "MemPalace queue full at session_end — %d messages will not be filed",
+                len(messages or []),
+            )
         # Regenerate the AAAK wake-up cache for the next session.
         threading.Thread(
             target=self._refresh_wake_up_cache,
@@ -510,7 +541,13 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
-        if self._cron_skipped or action != "add" or target != "user" or not content:
+        if (
+            self._cron_skipped
+            or not self._initialized  # worker isn't running; queueing leaks
+            or action != "add"
+            or target != "user"
+            or not content
+        ):
             return
         try:
             self._worker_queue.put_nowait(
@@ -520,7 +557,7 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
                 )
             )
         except queue.Full:
-            pass
+            logger.warning("MemPalace queue full at memory_write — entry dropped")
 
     def on_delegation(
         self,
@@ -705,22 +742,7 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         forced = self._config.get("wing")
         if forced:
             return str(forced)
-        if not self._wing_config:
-            return "wing_general"
-        text_lower = text.lower()
-        for wing_name, wing_def in self._wing_config.items():
-            keywords = wing_def.get("keywords", []) if isinstance(wing_def, dict) else []
-            for kw in keywords:
-                if not kw:
-                    continue
-                # Word-boundary match. Bare ``kw.lower() in text_lower`` makes
-                # any short keyword (``ai``, ``go``, ``rb``) match inside
-                # unrelated words (``said``, ``google``, ``orbit``) and routes
-                # turns to wrong wings.
-                pattern = r"\b" + re.escape(kw.lower()) + r"\b"
-                if re.search(pattern, text_lower):
-                    return wing_name
-        return "wing_general"
+        return _match_wing_by_keywords(text, self._wing_config)
 
     # ----- Internal: filing + background worker --------------------------
 
@@ -766,12 +788,15 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             for idx, msg in enumerate(messages):
                 if msg.get("role") != "user":
                     continue
-                content = msg.get("content", "") or ""
+                # Same content normalization ``sync_turn`` and ``pre_compress``
+                # use — list-shaped Anthropic content must not be persisted as
+                # its ``repr``.
+                content = _normalize_content(msg.get("content"))
                 if not content:
                     continue
                 assistant_content = ""
                 if idx + 1 < len(messages) and messages[idx + 1].get("role") == "assistant":
-                    assistant_content = messages[idx + 1].get("content", "") or ""
+                    assistant_content = _normalize_content(messages[idx + 1].get("content"))
                 self._file_turn(
                     {
                         "user": content,
