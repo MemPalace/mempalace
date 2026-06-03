@@ -38,9 +38,15 @@ import logging
 import os
 import queue
 import threading
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from mempalace.backends.chroma import ChromaBackend
+from mempalace.knowledge_graph import KnowledgeGraph
+from mempalace.layers import MemoryStack
+from mempalace.searcher import search_memories
 
 # When this plugin is loaded by Hermes, ``agent.memory_provider`` is on the
 # import path. When mempalace's own test suite imports this module (or a tool
@@ -204,12 +210,14 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         return "mempalace"
 
     def is_available(self) -> bool:
-        """Return True iff ``mempalace`` is importable. No network calls."""
-        try:
-            import mempalace as _mp
-        except ImportError:
-            return False
-        return _mp is not None
+        """Always True — module-level imports prove mempalace is installed.
+
+        If mempalace were missing, ``import`` of this module would have failed
+        before Hermes' plugin loader called ``is_available``. The check is
+        kept for ABC conformance and so a future config flag can disable the
+        provider here without surgery elsewhere.
+        """
+        return True
 
     def initialize(self, session_id: str, **kwargs: Any) -> None:
         # System-generated contexts (cron, flush) would corrupt user representation.
@@ -240,8 +248,6 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         # not hang Hermes startup. The agent runs without palace context until
         # the next successful initialize().
         try:
-            from mempalace.backends.chroma import ChromaBackend
-
             self._backend = ChromaBackend()
             with self._collection_lock:
                 self._collection = self._backend.get_or_create_collection(
@@ -300,8 +306,6 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         if self._cron_skipped or not self._initialized or not query:
             return ""
         try:
-            from mempalace.searcher import search_memories
-
             n = max(1, min(int(self._config.get("n_prefetch", 3)), 20))
             result = search_memories(
                 query,
@@ -603,8 +607,6 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
 
     def _refresh_wake_up_cache(self) -> None:
         try:
-            from mempalace.layers import MemoryStack
-
             stack = MemoryStack(palace_path=self._palace_path)
             wing = self._config.get("wing") or ""
             self._wake_up_cache = stack.wake_up(wing=wing) or ""
@@ -682,8 +684,6 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
 
     def _mirror_mem_write(self, payload: Dict[str, Any]) -> None:
         try:
-            from mempalace.knowledge_graph import KnowledgeGraph
-
             db_path = str(Path(self._palace_path).parent / "knowledge_graph.sqlite3")
             kg = KnowledgeGraph(db_path=db_path)
             kg.add_triple(
@@ -741,8 +741,6 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
     ) -> Dict[str, Any]:
         if not query:
             return {"error": "Missing required parameter: query"}
-        from mempalace.searcher import search_memories
-
         n = max(1, min(int(n_results or 5), 50))
         data = search_memories(
             query,
@@ -802,8 +800,6 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
     def _tool_kg_query(self, entity: str, since: Optional[str] = None) -> Dict[str, Any]:
         if not entity:
             return {"error": "Missing required parameter: entity"}
-        from mempalace.knowledge_graph import KnowledgeGraph
-
         db_path = str(Path(self._palace_path).parent / "knowledge_graph.sqlite3")
         kg = KnowledgeGraph(db_path=db_path)
         relations = kg.query_entity(entity, as_of=since or "")
@@ -812,8 +808,6 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
     def _tool_kg_add(self, subject: str, predicate: str, obj: str) -> Dict[str, Any]:
         if not (subject and predicate and obj):
             return {"error": "subject, predicate, object are all required"}
-        from mempalace.knowledge_graph import KnowledgeGraph
-
         db_path = str(Path(self._palace_path).parent / "knowledge_graph.sqlite3")
         kg = KnowledgeGraph(db_path=db_path)
         kg.add_triple(subject=subject, predicate=predicate, obj=obj)
@@ -840,8 +834,6 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         # Stream the file and keep only the trailing ``n`` lines. Avoids
         # loading multi-megabyte diaries into memory just to discard the
         # head.
-        from collections import deque
-
         with open(diary_path, encoding="utf-8") as f:
             tail = deque(f, maxlen=n)
         recent: List[Dict[str, Any]] = []
