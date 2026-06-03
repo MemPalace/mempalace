@@ -58,11 +58,7 @@ def build_corpus(dest: Path, n_files: int, paragraphs_per_file: int, seed: int) 
             paragraphs.append(" ".join(words))
         (dest / f"doc_{i:03d}.md").write_text("\n\n".join(paragraphs))
     (dest / "mempalace.yaml").write_text(
-        "wing: bench\n"
-        "rooms:\n"
-        "  - name: general\n"
-        "    description: all\n"
-        "    keywords: [general]\n"
+        "wing: bench\nrooms:\n  - name: general\n    description: all\n    keywords: [general]\n"
     )
 
 
@@ -121,8 +117,7 @@ def _process_file_unbatched(filepath, project_path, collection, wing, rooms, age
             ]
             closet_lines = build_closet_lines(source_file, drawer_ids, content, wing, room)
             closet_id_base = (
-                f"closet_{wing}_{room}_"
-                f"{hashlib.sha256(source_file.encode()).hexdigest()[:24]}"
+                f"closet_{wing}_{room}_{hashlib.sha256(source_file.encode()).hexdigest()[:24]}"
             )
             closet_meta = {
                 "wing": wing,
@@ -155,7 +150,7 @@ def mine_once(project_dir: str, palace_path: str, batched: bool) -> tuple[int, f
     t0 = time.perf_counter()
     for filepath in files:
         if batched:
-            drawers, _ = miner.process_file(
+            drawers, _, _ = miner.process_file(
                 filepath=filepath,
                 project_path=project_path,
                 collection=collection,
@@ -217,9 +212,9 @@ def run_scenario(label: str, n_files: int, paragraphs_per_file: int, seed: int) 
 
 
 SCENARIOS = {
-    "small":  ("Small files (~50 paragraphs)",  10, 50),
+    "small": ("Small files (~50 paragraphs)", 10, 50),
     "medium": ("Medium files (~200 paragraphs)", 20, 200),
-    "large":  ("Large files (~500 paragraphs)",  10, 500),
+    "large": ("Large files (~500 paragraphs)", 10, 500),
 }
 
 
@@ -237,7 +232,9 @@ def _env_summary(device_label: str) -> list[str]:
         import onnxruntime as ort
 
         ort_v = ort.__version__
-        providers = ",".join(p.replace("ExecutionProvider", "") for p in ort.get_available_providers())
+        providers = ",".join(
+            p.replace("ExecutionProvider", "") for p in ort.get_available_providers()
+        )
     except Exception:
         ort_v = "?"
         providers = "?"

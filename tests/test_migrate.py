@@ -1,10 +1,16 @@
 """Tests for destructive-operation safety in mempalace.migrate."""
 
 import os
+import sqlite3
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from mempalace.migrate import collection_write_roundtrip_works, _restore_stale_palace, migrate
+from mempalace.migrate import (
+    _restore_stale_palace,
+    collection_write_roundtrip_works,
+    extract_drawers_from_sqlite,
+    migrate,
+)
 
 
 def test_migrate_requires_palace_database(tmp_path, capsys):
@@ -157,6 +163,38 @@ def test_collection_write_roundtrip_fails_when_delete_silently_drops():
     assert len(col.ids) == 1
 
 
+def _make_minimal_chromadb_sqlite(tmp_path):
+    """Build a SQLite file with the minimal schema extract_drawers_from_sqlite reads."""
+    db = tmp_path / "chroma.sqlite3"
+    conn = sqlite3.connect(str(db))
+    conn.executescript(
+        """
+        CREATE TABLE embeddings (id INTEGER PRIMARY KEY, embedding_id TEXT);
+        CREATE TABLE embedding_metadata (
+            id INTEGER, key TEXT,
+            string_value TEXT, int_value INTEGER,
+            float_value REAL, bool_value INTEGER
+        );
+        INSERT INTO embeddings VALUES (1, 'd-001');
+        INSERT INTO embedding_metadata VALUES (1, 'chroma:document', 'hello', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES (1, 'wing', 'personal', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES (1, 'room', '2026-04-26', NULL, NULL, NULL);
+        """
+    )
+    conn.commit()
+    conn.close()
+    return str(db)
+
+
+def test_extract_drawers_returns_drawers(tmp_path):
+    db_path = _make_minimal_chromadb_sqlite(tmp_path)
+    drawers = extract_drawers_from_sqlite(db_path)
+    assert len(drawers) == 1
+    assert drawers[0]["id"] == "d-001"
+    assert drawers[0]["document"] == "hello"
+    assert drawers[0]["metadata"] == {"wing": "personal", "room": "2026-04-26"}
+
+
 def test_migrate_dry_run_rebuilds_when_collection_is_readable_but_not_writable(tmp_path, capsys):
     palace_dir = tmp_path / "palace"
     palace_dir.mkdir()
@@ -200,3 +238,51 @@ def test_migrate_dry_run_rebuilds_when_collection_is_readable_but_not_writable(t
     assert "Rebuilding from SQLite" in out
     assert "Extracted 1 drawers from SQLite" in out
     assert "DRY RUN" in out
+
+
+def test_migrate_cleans_temp_palace_on_chromadb_failure(tmp_path):
+    """If chromadb fails after the temp palace is created, mkdtemp's
+    directory must be removed — without try/finally it leaked into the
+    system temp root forever."""
+    import tempfile as _tempfile
+
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    (palace_dir / "chroma.sqlite3").write_text("db")
+
+    captured_temp_paths = []
+    real_mkdtemp = _tempfile.mkdtemp
+
+    def tracking_mkdtemp(*args, **kwargs):
+        path = real_mkdtemp(*args, **kwargs)
+        captured_temp_paths.append(path)
+        return path
+
+    failing_backend = MagicMock()
+    # First ChromaBackend().get_collection() must raise so we drop into
+    # the SQL-extraction path; the second ChromaBackend().get_or_create_collection()
+    # raises to trigger the cleanup we are testing.
+    failing_backend.get_collection.side_effect = Exception("unreadable")
+    failing_backend.get_or_create_collection.side_effect = RuntimeError("chromadb boom")
+
+    import mempalace.backends.chroma as _chroma_mod
+
+    with (
+        patch("mempalace.migrate.detect_chromadb_version", return_value="0.5.x"),
+        patch(
+            "mempalace.migrate.extract_drawers_from_sqlite",
+            return_value=[{"id": "id1", "document": "doc", "metadata": {"wing": "w", "room": "r"}}],
+        ),
+        patch("builtins.input", return_value="y"),
+        patch("mempalace.migrate.shutil.copytree"),
+        patch("mempalace.migrate.tempfile.mkdtemp", side_effect=tracking_mkdtemp),
+        patch.object(_chroma_mod, "ChromaBackend", return_value=failing_backend),
+    ):
+        try:
+            migrate(str(palace_dir), confirm=True)
+        except Exception:
+            pass
+
+    assert captured_temp_paths, "mkdtemp was never called — flow short-circuited"
+    for p in captured_temp_paths:
+        assert not os.path.exists(p), f"temp palace was not cleaned up: {p}"

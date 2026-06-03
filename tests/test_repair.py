@@ -76,6 +76,94 @@ def test_paginate_ids_offset_exception_fallback():
     assert "id1" in ids
 
 
+# ── _extract_drawers ──────────────────────────────────────────────────
+
+
+def test_extract_drawers_preserves_valid_metadata():
+    """Non-empty dict metadata passes through unchanged."""
+    col = MagicMock()
+    col.get.return_value = {
+        "ids": ["id1", "id2"],
+        "documents": ["doc1", "doc2"],
+        "metadatas": [{"wing": "a", "room": "1"}, {"wing": "b", "room": "2"}],
+    }
+    all_ids, all_docs, all_metas = repair._extract_drawers(col, total=2, batch_size=2)
+    assert all_ids == ["id1", "id2"]
+    assert all_docs == ["doc1", "doc2"]
+    assert all_metas == [{"wing": "a", "room": "1"}, {"wing": "b", "room": "2"}]
+
+
+def test_extract_drawers_sanitizes_none_metadata():
+    """None entries in metadatas are coerced to the sentinel dict.
+
+    chromadb 1.5.x's `validate_metadata` raises `ValueError: Expected metadata
+    to be a non-empty dict, got 0 metadata attributes in add.` if it sees a
+    None entry; the sanitizer keeps the rebuild upsert from crashing.
+    """
+    col = MagicMock()
+    col.get.return_value = {
+        "ids": ["id1", "id2", "id3"],
+        "documents": ["doc1", "doc2", "doc3"],
+        "metadatas": [{"wing": "a"}, None, {"wing": "c"}],
+    }
+    _, _, all_metas = repair._extract_drawers(col, total=3, batch_size=3)
+    assert all_metas[0] == {"wing": "a"}
+    assert all_metas[1] == {"_repaired_empty_meta": True}
+    assert all_metas[2] == {"wing": "c"}
+
+
+def test_extract_drawers_sanitizes_empty_dict_metadata():
+    """Empty dict {} entries are coerced to the sentinel dict.
+
+    chromadb 1.5.x rejects `{}` the same way it rejects `None`. The comment
+    in the previous code path mistakenly assumed otherwise.
+    """
+    col = MagicMock()
+    col.get.return_value = {
+        "ids": ["id1", "id2"],
+        "documents": ["doc1", "doc2"],
+        "metadatas": [{}, {"wing": "b"}],
+    }
+    _, _, all_metas = repair._extract_drawers(col, total=2, batch_size=2)
+    assert all_metas[0] == {"_repaired_empty_meta": True}
+    assert all_metas[1] == {"wing": "b"}
+
+
+def test_extract_drawers_sanitization_preserves_alignment():
+    """Sanitized output keeps the same length and ordering as input.
+
+    Critical invariant: ids[i] / documents[i] / metadatas[i] must stay in
+    lockstep through the sanitizer; otherwise the rebuild upsert mis-pairs
+    documents with metadata.
+    """
+    col = MagicMock()
+    col.get.return_value = {
+        "ids": ["id1", "id2", "id3", "id4"],
+        "documents": ["d1", "d2", "d3", "d4"],
+        "metadatas": [None, {"k": "v"}, {}, None],
+    }
+    all_ids, all_docs, all_metas = repair._extract_drawers(col, total=4, batch_size=4)
+    assert len(all_ids) == len(all_docs) == len(all_metas) == 4
+    assert all_ids == ["id1", "id2", "id3", "id4"]
+    assert all_metas[0] == {"_repaired_empty_meta": True}
+    assert all_metas[1] == {"k": "v"}
+    assert all_metas[2] == {"_repaired_empty_meta": True}
+    assert all_metas[3] == {"_repaired_empty_meta": True}
+
+
+def test_extract_drawers_multiple_batches():
+    """Pagination handles batch boundaries without losing/duplicating rows."""
+    col = MagicMock()
+    col.get.side_effect = [
+        {"ids": ["id1", "id2"], "documents": ["d1", "d2"], "metadatas": [{"a": 1}, None]},
+        {"ids": ["id3"], "documents": ["d3"], "metadatas": [{}]},
+        {"ids": [], "documents": [], "metadatas": []},
+    ]
+    all_ids, all_docs, all_metas = repair._extract_drawers(col, total=3, batch_size=2)
+    assert all_ids == ["id1", "id2", "id3"]
+    assert all_metas == [{"a": 1}, {"_repaired_empty_meta": True}, {"_repaired_empty_meta": True}]
+
+
 # ── scan_palace ───────────────────────────────────────────────────────
 
 
@@ -450,9 +538,104 @@ def test_rebuild_index_default_uses_configured_collection(mock_backend_cls, mock
     ]
 
 
+def test_status_returns_uninitialized_when_db_missing(tmp_path, capsys):
+    """repair.status on a palace dir without chroma.sqlite3 returns a
+    structured status (no chromadb client opened, per the design that
+    repair-status must work even on corrupted palaces — #1498)."""
+    # tmp_path exists, no chroma.sqlite3
+    result = repair.status(palace_path=str(tmp_path))
+
+    assert result["status"] == "uninitialized"
+    assert "no chroma.sqlite3" in result["message"]
+    captured = capsys.readouterr()
+    assert "has no chroma.sqlite3 yet" in captured.out + captured.err
+
+
+def test_status_returns_empty_when_db_present_no_drawers(tmp_path, capsys):
+    """repair.status on a palace with chroma.sqlite3 but zero drawer rows
+    returns a structured 'empty' status, distinguishable from 'unknown' /
+    'uninitialized' (#1498). Mocks sqlite_drawer_count to assert the
+    return-shape contract; see the real-disk sibling below for the
+    no-chromadb-client invariant."""
+    (tmp_path / "chroma.sqlite3").touch()
+    with patch("mempalace.repair.sqlite_drawer_count", return_value=0):
+        result = repair.status(palace_path=str(tmp_path))
+
+    assert result["status"] == "empty"
+    assert "no drawers yet" in result["message"]
+    captured = capsys.readouterr()
+    assert "initialized but empty" in captured.out + captured.err
+
+
+def test_status_empty_palace_never_opens_chromadb_client(tmp_path):
+    """Design invariant from #1498: repair.status on an initialized-but-empty
+    palace must NOT open a chromadb client. Opening would materialize HNSW
+    segment state files on disk, breaking the promise that repair-status is
+    safe to run on corrupted palaces.
+
+    Real-disk sibling of test_status_returns_empty_when_db_present_no_drawers:
+    bootstrap a real chroma.sqlite3 via PersistentClient (creates the DB
+    file but no collection), then assert repair.status returns 'empty' and
+    no chromadb segment artifacts appeared in the dir."""
+    import chromadb
+
+    chromadb.PersistentClient(path=str(tmp_path))
+    before = sorted(p.name for p in tmp_path.iterdir())
+
+    result = repair.status(palace_path=str(tmp_path))
+
+    after = sorted(p.name for p in tmp_path.iterdir())
+    assert result["status"] == "empty", result
+    # repair.status must not create new files; chromadb writes HNSW segment
+    # state and *.bin payloads on collection open — none of those should
+    # appear here.
+    assert before == after, f"repair.status mutated palace on disk: before={before} after={after}"
+
+
+def test_status_falls_through_to_capacity_when_sqlite_count_unreadable(tmp_path):
+    """When sqlite_drawer_count returns None (schema drift / locked file),
+    repair.status must fall through to hnsw_capacity_status instead of
+    short-circuiting on 'empty' (#1498)."""
+    (tmp_path / "chroma.sqlite3").touch()
+    with (
+        patch("mempalace.repair.sqlite_drawer_count", return_value=None),
+        patch("mempalace.repair.hnsw_capacity_status") as capacity_status,
+    ):
+        capacity_status.side_effect = [
+            {
+                "sqlite_count": None,
+                "hnsw_count": None,
+                "divergence": None,
+                "diverged": False,
+                "status": "unknown",
+                "message": "",
+            },
+            {
+                "sqlite_count": None,
+                "hnsw_count": None,
+                "divergence": None,
+                "diverged": False,
+                "status": "unknown",
+                "message": "",
+            },
+        ]
+        result = repair.status(palace_path=str(tmp_path))
+
+    # Did not short-circuit on 'empty': fell through to capacity check.
+    # The healthy/fall-through path returns {drawers, closets} dicts, no top-level "status" key.
+    assert "status" not in result or result["status"] != "empty"
+    assert "drawers" in result and "closets" in result
+    assert capacity_status.called
+
+
 def test_status_default_uses_configured_drawer_collection(tmp_path):
+    # Provide the on-disk preconditions the stratified state helper (#1498)
+    # checks before reaching the capacity probe: chroma.sqlite3 file exists
+    # and sqlite_drawer_count returns a positive number (palace not empty).
+    (tmp_path / "chroma.sqlite3").touch()
     with (
         patch("mempalace.repair._drawers_collection_name", return_value="custom_drawers"),
+        patch("mempalace.repair.sqlite_drawer_count", return_value=1),
         patch("mempalace.repair.hnsw_capacity_status") as capacity_status,
     ):
         capacity_status.side_effect = [
@@ -1198,9 +1381,9 @@ def test_rebuild_index_runs_sqlite_preflight_before_chromadb_open(tmp_path, caps
     PAGE = 4096
     CORRUPT_BYTES = 16384  # 4 pages
     HEADER_GUARD = PAGE * 2  # leave header + root pages intact
-    assert (
-        pre_size >= HEADER_GUARD + CORRUPT_BYTES
-    ), f"sqlite db too small to mangle without truncating: {pre_size} bytes"
+    assert pre_size >= HEADER_GUARD + CORRUPT_BYTES, (
+        f"sqlite db too small to mangle without truncating: {pre_size} bytes"
+    )
     # Round (pre_size - CORRUPT_BYTES) down to a page boundary so we
     # mangle whole pages. Cap at offset 40960 (page 10) for stable
     # diagnostics across SQLite versions that may grow the file.
@@ -1672,3 +1855,92 @@ def test_rebuild_from_sqlite_honors_configured_drawer_collection_name(tmp_path, 
         )
     except Exception:
         pass  # Expected: collection wasn't created.
+
+
+# ── _vacuum_and_rebuild_fts5 ──────────────────────────────────────────
+
+
+def test_vacuum_and_rebuild_fts5_vacuums_and_rebuilds(tmp_path):
+    """VACUUM runs and FTS5 index is rebuilt when the table is present."""
+    sqlite_path = tmp_path / "chroma.sqlite3"
+    with closing(sqlite3.connect(str(sqlite_path))) as conn:
+        conn.execute(
+            "CREATE VIRTUAL TABLE embedding_fulltext_search"
+            " USING fts5(string_value, tokenize='unicode61')"
+        )
+        conn.execute("INSERT INTO embedding_fulltext_search(string_value) VALUES('hello world')")
+        conn.commit()
+
+    repair._vacuum_and_rebuild_fts5(str(tmp_path))
+
+    with closing(sqlite3.connect(str(sqlite_path))) as conn:
+        result = conn.execute("PRAGMA integrity_check").fetchall()
+    assert result == [("ok",)]
+
+
+def test_vacuum_and_rebuild_fts5_no_fts5_table(tmp_path):
+    """VACUUM runs without error when embedding_fulltext_search is absent."""
+    sqlite_path = tmp_path / "chroma.sqlite3"
+    with closing(sqlite3.connect(str(sqlite_path))) as conn:
+        conn.execute("CREATE TABLE dummy (id INTEGER PRIMARY KEY)")
+        conn.commit()
+
+    # Must not raise even without the FTS5 table.
+    repair._vacuum_and_rebuild_fts5(str(tmp_path))
+
+    with closing(sqlite3.connect(str(sqlite_path))) as conn:
+        result = conn.execute("PRAGMA integrity_check").fetchall()
+    assert result == [("ok",)]
+
+
+def test_vacuum_and_rebuild_fts5_missing_sqlite(tmp_path):
+    """Silently skips when chroma.sqlite3 does not exist."""
+    repair._vacuum_and_rebuild_fts5(str(tmp_path))  # no file — must not raise
+
+
+@patch("mempalace.repair.shutil")
+@patch("mempalace.repair.ChromaBackend")
+def test_rebuild_index_calls_vacuum(mock_backend_cls, mock_shutil, tmp_path):
+    """rebuild_index closes chroma handles then calls _vacuum_and_rebuild_fts5.
+
+    ChromaDB's PersistentClient holds an open connection to chroma.sqlite3;
+    VACUUM requires an exclusive lock so _close_chroma_handles must be called
+    before _vacuum_and_rebuild_fts5.
+    """
+    sqlite_path = tmp_path / "chroma.sqlite3"
+    with closing(sqlite3.connect(str(sqlite_path))) as conn:
+        conn.execute("CREATE TABLE dummy(id INTEGER PRIMARY KEY)")
+        conn.commit()
+
+    mock_col = MagicMock()
+    mock_col.count.return_value = 1
+    mock_col.get.return_value = {
+        "ids": ["id1"],
+        "documents": ["doc1"],
+        "metadatas": [{"wing": "a"}],
+    }
+    mock_new_col = MagicMock()
+    mock_new_col.count.return_value = 1
+    mock_temp_col = MagicMock()
+    mock_temp_col.count.return_value = 1
+    mock_backend = _install_mock_backend(mock_backend_cls, mock_col)
+    mock_backend.create_collection.side_effect = [mock_temp_col, mock_new_col]
+
+    call_order = []
+    with (
+        patch.object(
+            repair, "_close_chroma_handles", side_effect=lambda *a, **kw: call_order.append("close")
+        ) as mock_close,
+        patch.object(
+            repair,
+            "_vacuum_and_rebuild_fts5",
+            side_effect=lambda *a, **kw: call_order.append("vacuum"),
+        ) as mock_vacuum,
+    ):
+        repair.rebuild_index(palace_path=str(tmp_path))
+        mock_close.assert_called_once()
+        mock_vacuum.assert_called_once()
+        assert call_order == ["close", "vacuum"], "backend must be closed before VACUUM"
+        args, kwargs = mock_vacuum.call_args
+        assert args[0] == str(tmp_path)
+        assert "progress" in kwargs

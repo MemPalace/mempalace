@@ -2,6 +2,7 @@
 
 import contextlib
 import datetime as _dt
+import json
 import logging
 import os
 import pickle
@@ -16,6 +17,7 @@ from chromadb.errors import NotFoundError as _ChromaNotFoundError
 from .base import (
     BaseBackend,
     BaseCollection,
+    CollectionNotInitializedError,
     GetResult,
     HealthStatus,
     PalaceNotFoundError,
@@ -70,8 +72,34 @@ def _hnsw_link_to_data_ratio(seg_dir: str) -> Optional[float]:
     return link_size / data_size
 
 
+def _hnsw_link_lists_is_usable_for_payload(seg_dir: str) -> bool:
+    """Return False when a non-trivial HNSW payload lacks usable link lists.
+
+    A missing or empty link_lists.bin is acceptable only for a fresh/empty
+    segment. Once data_level0.bin has real payload, a zero-byte link_lists.bin
+    is not a harmless async-flush shape: ChromaDB can later hand the broken
+    graph to hnswlib and crash in native code.
+    """
+    data_path = os.path.join(seg_dir, "data_level0.bin")
+    link_path = os.path.join(seg_dir, "link_lists.bin")
+
+    try:
+        if not os.path.isfile(data_path):
+            return True
+
+        data_size = os.path.getsize(data_path)
+        if data_size <= _HNSW_MISSING_METADATA_DATA_FLOOR:
+            return True
+
+        return os.path.isfile(link_path) and os.path.getsize(link_path) > 0
+    except OSError:
+        return False
+
+
 def _hnsw_payload_appears_sane(seg_dir: str) -> bool:
     """Return False when HNSW payload files are structurally implausible."""
+    if not _hnsw_link_lists_is_usable_for_payload(seg_dir):
+        return False
 
     ratio = _hnsw_link_to_data_ratio(seg_dir)
     return ratio is None or ratio <= _HNSW_LINK_TO_DATA_MAX_RATIO
@@ -638,26 +666,66 @@ def _pin_hnsw_threads(collection) -> None:
 
 
 _BLOB_FIX_MARKER = ".blob_seq_ids_migrated"
+_COLLECTION_TYPE_MARKER = ".collection_type_fixed"
 
 
 def _valid_dimensionality(value: object) -> bool:
     return isinstance(value, Integral) and not isinstance(value, bool) and int(value) > 0
 
 
-def _persisted_metadata_fields(obj: object) -> tuple[object, object]:
+def _persisted_metadata_value(obj: object, name: str) -> object:
     if isinstance(obj, dict):
-        return obj.get("dimensionality"), obj.get("id_to_label")
-    return getattr(obj, "dimensionality", None), getattr(obj, "id_to_label", None)
+        return obj.get(name)
+    return getattr(obj, name, None)
+
+
+def _persisted_metadata_fields(obj: object) -> tuple[object, object]:
+    return _persisted_metadata_value(obj, "dimensionality"), _persisted_metadata_value(
+        obj, "id_to_label"
+    )
+
+
+def _missing_dimensionality_appears_recoverable(
+    persisted: object, id_to_label: dict, seg_dir: str
+) -> bool:
+    total = _persisted_metadata_value(persisted, "total_elements_added")
+    label_to_id = _persisted_metadata_value(persisted, "label_to_id")
+    data_path = os.path.join(seg_dir, "data_level0.bin")
+    link_path = os.path.join(seg_dir, "link_lists.bin")
+
+    if not isinstance(total, Integral) or isinstance(total, bool):
+        return False
+    if not isinstance(label_to_id, dict):
+        return False
+    try:
+        if not (
+            os.path.isfile(data_path)
+            and os.path.isfile(link_path)
+            and os.path.getsize(data_path) > _HNSW_MISSING_METADATA_DATA_FLOOR
+        ):
+            return False
+    except OSError:
+        return False
+    if not _hnsw_payload_appears_sane(seg_dir):
+        return False
+
+    label_count = len(id_to_label)
+    if int(total) != label_count or len(label_to_id) != label_count:
+        return False
+    try:
+        return all(label_to_id.get(label) == item_id for item_id, label in id_to_label.items())
+    except TypeError:
+        return False
 
 
 def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
     """Quarantine segment dirs whose ``index_metadata.pickle`` is unreadable or invalid.
 
     Chroma's persisted HNSW metadata is untrusted disk state. If a segment has
-    labels but no valid positive dimensionality, current Chroma versions can
-    accept the pickle and crash later in the Rust loader. We rename the entire
-    segment out of the way before ``PersistentClient`` opens so Chroma can
-    rebuild cleanly instead of touching known-bad metadata.
+    labels but invalid or partial metadata, current Chroma versions can accept
+    the pickle and crash later in the Rust loader. We rename the entire segment
+    out of the way before ``PersistentClient`` opens so Chroma can rebuild
+    cleanly instead of touching known-bad metadata.
     """
     try:
         entries = os.listdir(palace_path)
@@ -708,7 +776,22 @@ def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
                     reason = f"invalid id_to_label type {type(id_to_label).__name__}"
                 else:
                     has_labels = bool(id_to_label)
-                    if has_labels and not _valid_dimensionality(dimensionality):
+                    if (
+                        has_labels
+                        and dimensionality is None
+                        and not _missing_dimensionality_appears_recoverable(
+                            persisted, id_to_label, seg_dir
+                        )
+                    ):
+                        reason = (
+                            "labels present but dimensionality is missing or invalid "
+                            f"({dimensionality!r})"
+                        )
+                    elif (
+                        has_labels
+                        and dimensionality is not None
+                        and not _valid_dimensionality(dimensionality)
+                    ):
                         reason = (
                             "labels present but dimensionality is missing or invalid "
                             f"({dimensionality!r})"
@@ -802,6 +885,69 @@ def _fix_blob_seq_ids(palace_path: str) -> None:
         logger.exception("Could not write migration marker %s", marker)
 
 
+def _fix_missing_collection_type(palace_path: str) -> None:
+    """Add ``_type`` to ``collections.config_json_str`` where absent.
+
+    chromadb <= 1.5.8 writes ``config_json_str = '{}'`` (empty JSON) when
+    creating collections.  chromadb 1.5.9 switched from the permissive
+    ``load_collection_configuration_from_json_str`` to
+    ``CollectionConfigurationInternal.from_json`` which requires a ``_type``
+    key — its absence raises ``KeyError: '_type'`` on palace open.
+
+    This migration adds the missing marker so both old and new chromadb
+    versions can load the collection.  The value
+    ``"CollectionConfigurationInternal"`` matches what ``to_json()`` writes
+    for freshly-created collections.
+
+    Same lifecycle constraints as :func:`_fix_blob_seq_ids`: must run
+    BEFORE ``PersistentClient`` is created.
+    """
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return
+    marker = os.path.join(palace_path, _COLLECTION_TYPE_MARKER)
+    if os.path.isfile(marker):
+        return
+    conn = sqlite3.connect(db_path)
+    try:
+        try:
+            rows = conn.execute("SELECT id, config_json_str FROM collections").fetchall()
+        except sqlite3.OperationalError:
+            return
+        updates = []
+        for coll_id, config_str in rows:
+            if not config_str:
+                config_str = "{}"
+            try:
+                config = json.loads(config_str)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(config, dict):
+                continue
+            if "_type" not in config:
+                config["_type"] = "CollectionConfigurationInternal"
+                updates.append((json.dumps(config), coll_id))
+        if updates:
+            conn.executemany(
+                "UPDATE collections SET config_json_str = ? WHERE id = ?",
+                updates,
+            )
+            conn.commit()
+            logger.info(
+                "Fixed %d collection(s) missing _type in config_json_str",
+                len(updates),
+            )
+    except Exception:
+        logger.exception("Could not fix collection config_json_str in %s", db_path)
+        return
+    finally:
+        conn.close()
+    try:
+        Path(marker).touch()
+    except OSError:
+        logger.exception("Could not write migration marker %s", marker)
+
+
 # ---------------------------------------------------------------------------
 # Collection adapter
 # ---------------------------------------------------------------------------
@@ -873,10 +1019,30 @@ class ChromaCollection(BaseCollection):
     # Writes
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _sanitize_metadatas_for_chromadb(metadatas):
+        """chromadb 1.5.x rejects None and empty-dict entries in the metadatas
+        list (ValueError: Expected metadata to be a non-empty dict, got 0
+        metadata attributes in add). Coerce any such entry to a sentinel so
+        the write succeeds. Operators can later locate coerced drawers via
+        ``where={"_repaired_empty_meta": True}``.
+
+        This is the chokepoint catch-all: even if a caller's own sanitizer
+        misses a case (or skips for performance), reaching the chromadb
+        client always goes through here first.
+        """
+        if metadatas is None:
+            return None
+        return [
+            m if (isinstance(m, dict) and len(m) > 0) else {"_repaired_empty_meta": True}
+            for m in metadatas
+        ]
+
     def add(self, *, documents, ids, metadatas=None, embeddings=None):
         kwargs: dict[str, Any] = {"documents": documents, "ids": ids}
-        if metadatas is not None:
-            kwargs["metadatas"] = metadatas
+        sanitized = self._sanitize_metadatas_for_chromadb(metadatas)
+        if sanitized is not None:
+            kwargs["metadatas"] = sanitized
         if embeddings is not None:
             kwargs["embeddings"] = embeddings
         with self._write_lock():
@@ -884,8 +1050,9 @@ class ChromaCollection(BaseCollection):
 
     def upsert(self, *, documents, ids, metadatas=None, embeddings=None):
         kwargs: dict[str, Any] = {"documents": documents, "ids": ids}
-        if metadatas is not None:
-            kwargs["metadatas"] = metadatas
+        sanitized = self._sanitize_metadatas_for_chromadb(metadatas)
+        if sanitized is not None:
+            kwargs["metadatas"] = sanitized
         if embeddings is not None:
             kwargs["embeddings"] = embeddings
         with self._write_lock():
@@ -1125,6 +1292,38 @@ class ChromaBackend(BaseBackend):
             logger.exception("Failed to build embedding function; using chromadb default")
             return None
 
+    @staticmethod
+    def _explain_ef_mismatch(error: Exception, palace_path: str) -> Optional[str]:
+        """If ``error`` looks like a ChromaDB EF-name mismatch, return a
+        user-friendly explanation. Otherwise return None so the caller can
+        re-raise unchanged.
+
+        Triggered when ``MEMPALACE_EMBEDDING_MODEL`` is switched on an
+        existing palace — ChromaDB persists the EF name on the collection
+        and refuses reads with a different one. The bare ValueError
+        ChromaDB raises doesn't mention rebuild-index or the env var, so
+        users hit it and don't know how to recover.
+        """
+        msg = str(error)
+        if "Embedding function conflict" not in msg and "embedding function" not in msg.lower():
+            return None
+        try:
+            from ..config import MempalaceConfig
+
+            current_model = MempalaceConfig().embedding_model
+        except Exception:
+            current_model = "unknown"
+        return (
+            f"Embedding model mismatch reading palace at {palace_path!r}.\n"
+            f"  Underlying ChromaDB error: {msg}\n"
+            f"  Current MEMPALACE_EMBEDDING_MODEL={current_model!r}.\n"
+            f"  The palace was built with a different embedding model. Either:\n"
+            f"    (a) revert the model: unset MEMPALACE_EMBEDDING_MODEL (or set "
+            f"the previous value), or\n"
+            f"    (b) re-embed in place: `mempalace repair rebuild-index "
+            f"--palace {palace_path}` (writes new vectors with the current model)."
+        )
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -1232,15 +1431,18 @@ class ChromaBackend(BaseBackend):
         """Run the pre-open safety pass shared by :meth:`make_client` and
         :meth:`_client`.
 
-        Three steps, all required before constructing a ``PersistentClient``:
+        Four steps, all required before constructing a ``PersistentClient``:
 
-        1. ``_fix_blob_seq_ids`` — repairs the BLOB seq_id quirk that bites
+        1. ``_fix_missing_collection_type`` — adds the ``_type`` marker to
+           ``collections.config_json_str`` that chromadb 1.5.9+ requires
+           but <= 1.5.8 never wrote (#1611).
+        2. ``_fix_blob_seq_ids`` — repairs the BLOB seq_id quirk that bites
            certain chromadb migrations.
-        2. ``quarantine_invalid_hnsw_metadata`` — renames aside any HNSW
+        3. ``quarantine_invalid_hnsw_metadata`` — renames aside any HNSW
            ``index_metadata.pickle`` that fails to load, so chromadb opens
            against an empty index instead of crashing on the unloadable
            pickle (#1266 / PR #1285).
-        3. ``quarantine_stale_hnsw`` — also gated by :attr:`_quarantined_paths`
+        4. ``quarantine_stale_hnsw`` — also gated by :attr:`_quarantined_paths`
            so it fires once per palace per process. This is the SIGSEGV
            prevention path for stale HNSW segments (see #1121, #1132, #1263);
            wiring it through this helper means CLI mining, search, repair,
@@ -1251,6 +1453,7 @@ class ChromaBackend(BaseBackend):
         re-open a palace. The ``_quarantined_paths`` gate prevents thrash on
         hot paths (e.g. ``_client()`` is called on every backend operation).
         """
+        _fix_missing_collection_type(palace_path)
         _fix_blob_seq_ids(palace_path)
         if palace_path not in ChromaBackend._quarantined_paths:
             quarantine_invalid_hnsw_metadata(palace_path)
@@ -1259,7 +1462,7 @@ class ChromaBackend(BaseBackend):
 
     @staticmethod
     def make_client(palace_path: str):
-        """Create a fresh ``PersistentClient`` (fixes BLOB seq_ids first).
+        """Create a fresh ``PersistentClient`` (runs pre-open safety pass first).
 
         Deprecated-ish: exposed for legacy long-lived callers that manage their
         own client cache. New code should obtain a collection through
@@ -1332,8 +1535,21 @@ class ChromaBackend(BaseBackend):
                     },
                     **ef_kwargs,
                 )
+            except ValueError as e:
+                explanation = self._explain_ef_mismatch(e, palace_path)
+                if explanation:
+                    raise ValueError(explanation) from e
+                raise
         else:
-            collection = client.get_collection(collection_name, **ef_kwargs)
+            try:
+                collection = client.get_collection(collection_name, **ef_kwargs)
+            except _ChromaNotFoundError as e:
+                raise CollectionNotInitializedError(palace_path) from e
+            except ValueError as e:
+                explanation = self._explain_ef_mismatch(e, palace_path)
+                if explanation:
+                    raise ValueError(explanation) from e
+                raise
         _pin_hnsw_threads(collection)
         return ChromaCollection(collection, palace_path=palace_path)
 

@@ -7,6 +7,8 @@
 #   tier1: must-evaluate set (~10 models, balanced size/quantization)
 #   tier2: worth running if time permits
 #   tier3: special cases (FP16 ceilings, QAT comparisons)
+#   community: third-party GGUF fine-tunes (igorls, heretic, etc.)
+#   local: models already pulled locally — no extra disk needed
 
 candidates:
   # ── Tier 1: balanced q4_K_M sweep across families ────────────────────
@@ -279,3 +281,41 @@ candidates:
     tier: cloud
     cloud: true
     notes: "Kimi K2.6 — current Moonshot release. Replaces kimi-k2:1t-cloud which returned HTTP 500 on the first run."
+
+  # ── Community tier: third-party GGUF variants ────────────────────────
+  - tag: igorls/gemma4-e4b-classifier:latest
+    family: gemma4
+    size_b: 7.5
+    variant: classifier-tuned
+    quantization: q4_K_M
+    expected_vram_mb: 6000
+    tier: community
+    notes: "Igor's classifier fine-tune on Gemma 4 E4B. Purpose-built for classification tasks."
+
+  - tag: igorls/gemma4-e4b-classifier:Q8_0
+    family: gemma4
+    size_b: 7.5
+    variant: classifier-tuned
+    quantization: q8_0
+    expected_vram_mb: 8000
+    tier: community
+    notes: "Q8_0 variant of Igor's classifier fine-tune. 8.0 GB on disk — may require >8 GB VRAM."
+
+  - tag: igorls/gemma-4-E4B-it-heretic-GGUF:Q4_K_M
+    family: gemma4
+    size_b: 7.5
+    variant: instruct
+    quantization: q4_K_M
+    expected_vram_mb: 6612
+    tier: community
+    notes: "Heretic fine-tune. Architecture is Gemma 4 Extended; actual params=7.5B despite E4B name. Outside ≤4B scope — compare separately."
+
+  # ── Local tier: models already pulled, no extra disk needed ──────────
+  - tag: gemma4:e4b
+    family: gemma4
+    size_b: 4.0
+    variant: instruct
+    quantization: default
+    expected_vram_mb: 4510
+    tier: local
+    notes: "Already pulled locally. Default quantization (q4_K_M equivalent)."

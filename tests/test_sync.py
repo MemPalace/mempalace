@@ -444,9 +444,9 @@ class TestSyncPalace:
         # Allow-list — params must be exactly the documented audit shape so
         # any future leak (source_file, content, ID lists, etc.) trips a
         # test failure rather than slipping through a deny-list.
-        assert set(params.keys()) <= {
-            "first_id"
-        }, f"WAL params drifted from the audit allow-list: {params.keys()}"
+        assert set(params.keys()) <= {"first_id"}, (
+            f"WAL params drifted from the audit allow-list: {params.keys()}"
+        )
 
     def test_registry_sentinels_preserved_on_apply(self, tmp_dir, palace_path):
         """F2 regression: convo miner `_reg_*` sentinels must survive sync apply.
@@ -567,9 +567,9 @@ class TestSyncPalace:
         inner_resolved = inner.resolve(strict=False)
         outer_resolved = outer.resolve(strict=False)
         assert inner_resolved in roots, f"expected inner in roots, got {roots}"
-        assert (
-            outer_resolved not in roots
-        ), f"deepest should win exclusively: roots={roots}, outer leaked"
+        assert outer_resolved not in roots, (
+            f"deepest should win exclusively: roots={roots}, outer leaked"
+        )
 
     def test_apply_with_empty_project_dirs_raises(self, palace_path):
         """Round-2 P1: `project_dirs=[]` (empty list) with apply must raise,
@@ -608,9 +608,9 @@ class TestSyncPalace:
                 project_dirs=[synced_world["repo_path"]],
                 dry_run=False,
             )
-        assert any(
-            "Closet purge skipped" in record.getMessage() for record in caplog.records
-        ), f"expected closet-skip warning, got: {[r.getMessage() for r in caplog.records]}"
+        assert any("Closet purge skipped" in record.getMessage() for record in caplog.records), (
+            f"expected closet-skip warning, got: {[r.getMessage() for r in caplog.records]}"
+        )
 
     def test_metadata_cache_cleared_on_exception(self, monkeypatch, config, synced_world, kg):
         """F9 regression: tool_sync's try/finally must clear `_metadata_cache`
@@ -651,9 +651,9 @@ class TestSyncPalace:
         assert result.get("success") is False
         assert "simulated" in result.get("error", "")
 
-        assert (
-            mcp_server._metadata_cache is None
-        ), "F9: cache must be cleared even when sync_palace raises"
+        assert mcp_server._metadata_cache is None, (
+            "F9: cache must be cleared even when sync_palace raises"
+        )
 
     def test_sync_report_keys_stable(self, synced_world):
         """Regression: SyncReport schema must not silently drop a field."""
@@ -946,9 +946,9 @@ class TestSyncPalace:
             wing="demo",
             dry_run=True,
         )
-        assert (
-            report["gitignored"] == 1
-        ), f"symmetric resolve broken: drawer mis-bucketed; report={report}"
+        assert report["gitignored"] == 1, (
+            f"symmetric resolve broken: drawer mis-bucketed; report={report}"
+        )
         assert report["out_of_scope"] == 0
 
     def test_classification_cache_avoids_redundant_disk_hits(
@@ -1005,9 +1005,9 @@ class TestSyncPalace:
         )
         assert report["scanned"] == 5
         assert report["gitignored"] == 5
-        assert (
-            call_count["n"] == 1
-        ), f"cache miss: expected 1 _classify_drawer call (4 cache hits), got {call_count['n']}"
+        assert call_count["n"] == 1, (
+            f"cache miss: expected 1 _classify_drawer call (4 cache hits), got {call_count['n']}"
+        )
 
     def test_closet_batch_purge_single_call(self, synced_world, monkeypatch):
         """Batched $in closet purge: one delete() call across all removable
@@ -1074,16 +1074,16 @@ class TestSyncPalace:
             str(repo_path / "deleted.py"),
         }
         expected = len(seeded_sources & set(report["by_source"].keys()))
-        assert (
-            report["removed_closets"] == expected
-        ), f"removed_closets ({report['removed_closets']}) != |seeded ∩ removable| ({expected})"
+        assert report["removed_closets"] == expected, (
+            f"removed_closets ({report['removed_closets']}) != |seeded ∩ removable| ({expected})"
+        )
         assert "wrapper" in captured, "get_closets_collection patch not invoked"
-        assert (
-            captured["wrapper"].delete_calls == 1
-        ), f"expected one batch delete call, got {captured['wrapper'].delete_calls}"
-        assert (
-            captured["wrapper"].get_calls == 1
-        ), f"expected one batch get call, got {captured['wrapper'].get_calls}"
+        assert captured["wrapper"].delete_calls == 1, (
+            f"expected one batch delete call, got {captured['wrapper'].delete_calls}"
+        )
+        assert captured["wrapper"].get_calls == 1, (
+            f"expected one batch get call, got {captured['wrapper'].get_calls}"
+        )
 
     def test_registry_check_runs_before_cache_lookup(self, tmp_dir, palace_path):
         """A non-registry drawer with the same source_file must NOT poison
@@ -1148,9 +1148,9 @@ class TestSyncPalace:
         finally:
             del client
         assert "a_regular" not in survivors
-        assert (
-            "_reg_zzz_sentinel" in survivors
-        ), "registry sentinel was incorrectly pruned via cached non-registry verdict"
+        assert "_reg_zzz_sentinel" in survivors, (
+            "registry sentinel was incorrectly pruned via cached non-registry verdict"
+        )
 
     def test_normalize_project_dirs_sort_stable_on_equal_length(self):
         """`_normalize_project_dirs` must sort by `(-len, str)` so equal-length

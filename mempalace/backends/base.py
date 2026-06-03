@@ -35,6 +35,18 @@ class PalaceNotFoundError(BackendError, FileNotFoundError):
     """
 
 
+class CollectionNotInitializedError(PalaceNotFoundError):
+    """Raised when the palace exists on disk but the requested collection has
+    never been created (e.g. ``init`` ran but ``mine`` has not).
+
+    Distinct from :class:`PalaceNotFoundError`: the palace dir and DB are
+    present and valid, only the collection has not been bootstrapped yet.
+    Subclass of :class:`PalaceNotFoundError` (and therefore
+    :class:`FileNotFoundError`) so legacy callers catching either parent
+    keep working unchanged.
+    """
+
+
 class BackendClosedError(BackendError):
     """Raised when a backend method is called after ``close()``."""
 

@@ -1,15 +1,3 @@
-> [!CAUTION]
-> **Scam alert.** The only official sources for MemPalace are this
-> [GitHub repository](https://github.com/MemPalace/mempalace), the
-> [PyPI package](https://pypi.org/project/mempalace/), and the docs site at
-> **[mempalaceofficial.com](https://mempalaceofficial.com)**. Any other
-> domain — including `mempalace.tech` — is an impostor and may distribute
-> malware. Details and timeline: [docs/HISTORY.md](docs/HISTORY.md).
-
-> [!IMPORTANT]
-> **🚨 Claude Code sessions expire in 30 days w/out auto-save hooks wired!** **[Read this →](https://github.com/MemPalace/mempalace/discussions/1388)**
-
-
 <div align="center">
 
 <img src="assets/mempalace_logo.png" alt="MemPalace" width="240">
@@ -24,6 +12,14 @@ Local-first AI memory. Verbatim storage, pluggable backend, 96.6% R@5 raw on Lon
 [![][discord-shield]][discord-link]
 
 </div>
+
+> [!CAUTION]
+> **Beware of impostor sites.** MemPalace has no other official websites. The **only** official sources are this **[GitHub repository](https://github.com/MemPalace/mempalace)**, the **[PyPI package](https://pypi.org/project/mempalace/)**, and the docs at **[mempalaceofficial.com](https://mempalaceofficial.com)**. Any other domain (including `.tech`, `.net`, or other `.com` variants) is an impostor and may distribute malware. Details and timeline: [docs/HISTORY.md](docs/HISTORY.md).
+
+> [!IMPORTANT]
+> **Claude Code sessions expire in 30 days without auto-save hooks wired.** [Read this →](https://github.com/MemPalace/mempalace/discussions/1388)
+>
+> Need the shortest recovery/setup path? Use the [Claude Code retention setup checklist](https://mempalaceofficial.com/guide/claude-code-retention.html).
 
 ---
 
@@ -49,6 +45,11 @@ Architecture, concepts, and mining flows:
 
 ## Install
 
+MemPalace ships a CLI, so install it in an isolated environment to avoid
+PEP 668 errors on Debian/Ubuntu/Homebrew Pythons and to keep mempalace's
+deps (`chromadb`, `numpy`, `grpcio`, …) from conflicting with anything
+else in your global site-packages.
+
 We recommend [`uv`](https://docs.astral.sh/uv/) — `uv tool install` puts
 the `mempalace` CLI in an isolated environment on your PATH:
 
@@ -57,7 +58,16 @@ uv tool install mempalace
 mempalace init ~/projects/myapp
 ```
 
-If you prefer pip, `pip install mempalace` still works.
+[`pipx`](https://pipx.pypa.io/) works the same way if you prefer it:
+`pipx install mempalace`.
+
+Prefer plain `pip` only inside an activated virtualenv where you
+explicitly want `import mempalace` available:
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install mempalace
+```
 
 ## Quickstart
 
@@ -158,6 +168,11 @@ system prompt:
 Two Claude Code hooks save periodically and before context compression:
 [mempalaceofficial.com/guide/hooks](https://mempalaceofficial.com/guide/hooks.html).
 
+If you are installing under time pressure, start with the
+[Claude Code retention setup checklist](https://mempalaceofficial.com/guide/claude-code-retention.html):
+wire the hooks, back up existing JSONL transcripts, and backfill them with
+`mempalace mine ~/.claude/projects/ --mode convos`.
+
 For per-message recall on top of the file-level chunks the hooks produce,
 run `mempalace sweep <transcript-dir>` periodically — it stores one
 verbatim drawer per user/assistant message, idempotent and resume-safe.
@@ -168,7 +183,7 @@ verbatim drawer per user/assistant message, idempotent and resume-safe.
 
 - Python 3.9+
 - A vector-store backend (ChromaDB by default)
-- ~300 MB disk for the default embedding model
+- ~300 MB disk for the embedding model. Onboarding (`python -m mempalace.onboarding`) offers `embeddinggemma-300m` (multilingual, 100+ languages, recommended) or `all-MiniLM-L6-v2` (English-only, ~30 MB). See the docstring at [`mempalace/embedding.py`](mempalace/embedding.py) for details and migration notes.
 
 No API key is required for the core benchmark path.
 
@@ -190,7 +205,7 @@ PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 MIT — see [LICENSE](LICENSE).
 
 <!-- Link Definitions -->
-[version-shield]: https://img.shields.io/badge/version-3.3.5-4dc9f6?style=flat-square&labelColor=0a0e14
+[version-shield]: https://img.shields.io/badge/version-3.3.6-4dc9f6?style=flat-square&labelColor=0a0e14
 [release-link]: https://github.com/MemPalace/mempalace/releases
 [python-shield]: https://img.shields.io/badge/python-3.9+-7dd8f8?style=flat-square&labelColor=0a0e14&logo=python&logoColor=7dd8f8
 [python-link]: https://www.python.org/
