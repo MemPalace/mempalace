@@ -765,8 +765,9 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             logger.debug("MemPalace _mine_session error: %s", exc)
 
     def _mirror_mem_write(self, payload: Dict[str, Any]) -> None:
+        db_path = str(Path(self._palace_path).parent / "knowledge_graph.sqlite3")
+        kg: Optional[KnowledgeGraph] = None
         try:
-            db_path = str(Path(self._palace_path).parent / "knowledge_graph.sqlite3")
             kg = KnowledgeGraph(db_path=db_path)
             kg.add_triple(
                 subject="user",
@@ -775,6 +776,12 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             )
         except Exception as exc:
             logger.debug("MemPalace _mirror_mem_write error: %s", exc)
+        finally:
+            if kg is not None:
+                try:
+                    kg.close()
+                except Exception:
+                    pass
 
     def _background_worker(self) -> None:
         # Drain pending items even after the stop signal — otherwise turns
@@ -910,7 +917,13 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             return {"error": "Missing required parameter: entity"}
         db_path = str(Path(self._palace_path).parent / "knowledge_graph.sqlite3")
         kg = KnowledgeGraph(db_path=db_path)
-        relations = kg.query_entity(entity, as_of=since or "")
+        try:
+            relations = kg.query_entity(entity, as_of=since or "")
+        finally:
+            try:
+                kg.close()
+            except Exception:
+                pass
         return {"entity": entity, "relations": relations}
 
     def _tool_kg_add(self, subject: str, predicate: str, obj: str) -> Dict[str, Any]:
@@ -918,7 +931,13 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             return {"error": "subject, predicate, object are all required"}
         db_path = str(Path(self._palace_path).parent / "knowledge_graph.sqlite3")
         kg = KnowledgeGraph(db_path=db_path)
-        kg.add_triple(subject=subject, predicate=predicate, obj=obj)
+        try:
+            kg.add_triple(subject=subject, predicate=predicate, obj=obj)
+        finally:
+            try:
+                kg.close()
+            except Exception:
+                pass
         return {"status": "ok", "triple": [subject, predicate, obj]}
 
     def _tool_diary_write(self, entry: str) -> Dict[str, Any]:
