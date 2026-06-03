@@ -774,7 +774,12 @@ def cmd_repair_status(args):
 
 
 def cmd_repair(args):
-    """Rebuild palace vector index from SQLite metadata."""
+    """Rebuild palace vector index from SQLite metadata.
+
+    ``--mode hnsw`` dispatches to the segment-level rebuild path
+    (:func:`mempalace.repair.rebuild_hnsw_segment`); the legacy default
+    mode rebuilds the whole collection via re-embed.
+    """
     import shutil
     from .backends.chroma import ChromaBackend
     from .migrate import confirm_destructive_action, contains_palace_database
@@ -796,6 +801,24 @@ def cmd_repair(args):
         os.path.expanduser(args.palace) if args.palace else config.palace_path
     )
 
+    if getattr(args, "mode", "legacy") == "hnsw":
+        if not getattr(args, "segment", None):
+            print("  --mode hnsw requires --segment <uuid>")
+            return
+        from .repair import rebuild_hnsw_segment
+
+        rebuild_hnsw_segment(
+            palace_path,
+            segment=args.segment,
+            max_elements=getattr(args, "max_elements", None),
+            backup=getattr(args, "backup", True),
+            purge_queue=getattr(args, "purge_queue", False),
+            quarantine_orphans=getattr(args, "quarantine_orphans", False),
+            dry_run=getattr(args, "dry_run", False),
+            assume_yes=getattr(args, "yes", False),
+        )
+        return
+
     if getattr(args, "mode", "legacy") == "max-seq-id":
         from .repair import repair_max_seq_id
 
@@ -803,6 +826,23 @@ def cmd_repair(args):
             palace_path,
             segment=getattr(args, "segment", None),
             from_sidecar=getattr(args, "from_sidecar", None),
+            backup=getattr(args, "backup", True),
+            dry_run=getattr(args, "dry_run", False),
+            assume_yes=getattr(args, "yes", False),
+        )
+        return
+
+    if getattr(args, "mode", "legacy") == "reconcile":
+        if not getattr(args, "segment", None):
+            print("  --mode reconcile requires --segment <uuid>")
+            return
+        from .repair import reconcile_orphan_sql_rows
+
+        reconcile_orphan_sql_rows(
+            palace_path,
+            segment=args.segment,
+            metadata_segment=getattr(args, "metadata_segment", None),
+            max_elements=getattr(args, "max_elements", None),
             backup=getattr(args, "backup", True),
             dry_run=getattr(args, "dry_run", False),
             assume_yes=getattr(args, "yes", False),
@@ -1477,8 +1517,8 @@ def main():
     p_repair = sub.add_parser(
         "repair",
         help=(
-            "Rebuild palace vector index (legacy mode) or un-poison max_seq_id rows "
-            "(--mode max-seq-id)"
+            "Rebuild palace vector index (legacy mode), rebuild a single HNSW segment "
+            "(--mode hnsw, issue #1046), or un-poison max_seq_id rows (--mode max-seq-id)"
         ),
     )
     p_repair.add_argument(
@@ -1496,14 +1536,16 @@ def main():
     )
     p_repair.add_argument(
         "--mode",
-        choices=["legacy", "max-seq-id", "from-sqlite"],
+        choices=["legacy", "hnsw", "max-seq-id", "from-sqlite", "reconcile"],
         default="legacy",
         help=(
             "legacy: full-palace rebuild via the chromadb client (default). "
+            "hnsw: rebuild one segment from data_level0.bin (issue #1046). "
             "max-seq-id: un-poison max_seq_id rows corrupted by the legacy 0.6.x shim. "
             "from-sqlite: rebuild by reading rows directly from chroma.sqlite3, "
             "bypassing the chromadb client. Use when legacy mode bails because the "
-            "chromadb client cannot open the collection."
+            "chromadb client cannot open the collection. "
+            "reconcile: re-embed SQL-only orphan rows into the HNSW segment."
         ),
     )
     p_repair.add_argument(
@@ -1526,7 +1568,10 @@ def main():
     p_repair.add_argument(
         "--segment",
         default=None,
-        help="Segment UUID filter for --mode max-seq-id (repairs only that segment).",
+        help=(
+            "Segment UUID. For --mode max-seq-id: repair only that segment (optional filter). "
+            "For --mode hnsw or reconcile: required, points to <palace>/<uuid>/."
+        ),
     )
     p_repair.add_argument(
         "--from-sidecar",
@@ -1537,15 +1582,49 @@ def main():
         ),
     )
     p_repair.add_argument(
+        "--metadata-segment",
+        default=None,
+        help=(
+            "METADATA segment UUID for --mode reconcile "
+            "(auto-detected from sibling-segment lookup when omitted)"
+        ),
+    )
+    p_repair.add_argument(
+        "--max-elements",
+        type=int,
+        default=None,
+        help="HNSW max_elements for new index (--mode hnsw only; default: max(count*1.3, 200_000))",
+    )
+    p_repair.add_argument(
         "--backup",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Back up SQLite before mutation (default: on)",
+        help=(
+            "Back up before mutation (default: on). "
+            "--mode hnsw: SQLite + data_level0.bin + pickle. "
+            "--mode max-seq-id: SQLite only."
+        ),
+    )
+    p_repair.add_argument(
+        "--purge-queue",
+        action="store_true",
+        help=(
+            "(--mode hnsw only) Clear the embeddings_queue rows for this segment's "
+            "collection after rebuild"
+        ),
+    )
+    p_repair.add_argument(
+        "--quarantine-orphans",
+        action="store_true",
+        help=(
+            "(--mode hnsw only) Append dropped UUIDs + orphan HNSW labels to "
+            "quarantined_orphans.json"
+        ),
     )
     p_repair.add_argument(
         "--dry-run",
         action="store_true",
-        help="Print detected poisoned rows and exit without mutation (--mode max-seq-id only)",
+        help="Print rebuild/repair report and exit without mutation (--mode hnsw / max-seq-id)",
     )
 
     # repair-status — read-only HNSW capacity health check (#1222)
