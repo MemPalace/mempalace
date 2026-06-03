@@ -695,10 +695,15 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             logger.debug("MemPalace _mirror_mem_write error: %s", exc)
 
     def _background_worker(self) -> None:
-        while not self._worker_stop.is_set():
+        # Drain pending items even after the stop signal — otherwise turns
+        # queued just before shutdown would be lost. The compound condition
+        # exits only when both: (a) stop signal raised, (b) queue empty.
+        while not self._worker_stop.is_set() or not self._worker_queue.empty():
             try:
                 task, payload = self._worker_queue.get(timeout=1.0)
             except queue.Empty:
+                if self._worker_stop.is_set():
+                    break
                 continue
             try:
                 if task == "file_turn":
@@ -832,9 +837,15 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         diary_path = Path(self._palace_path).parent / "diary.jsonl"
         if not diary_path.exists():
             return {"entries": []}
-        lines = diary_path.read_text(encoding="utf-8").strip().splitlines()
+        # Stream the file and keep only the trailing ``n`` lines. Avoids
+        # loading multi-megabyte diaries into memory just to discard the
+        # head.
+        from collections import deque
+
+        with open(diary_path, encoding="utf-8") as f:
+            tail = deque(f, maxlen=n)
         recent: List[Dict[str, Any]] = []
-        for raw_line in lines[-n:]:
+        for raw_line in tail:
             try:
                 recent.append(json.loads(raw_line))
             except json.JSONDecodeError:
