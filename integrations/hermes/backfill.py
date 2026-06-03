@@ -108,9 +108,7 @@ def _messages_to_exchanges(messages: list[dict]) -> list[dict]:
                 next_content = messages[i + 1].get("content", "") or ""
                 if isinstance(next_content, list):
                     next_content = " ".join(
-                        block.get("text", "")
-                        for block in next_content
-                        if isinstance(block, dict)
+                        block.get("text", "") for block in next_content if isinstance(block, dict)
                     )
                 assistant_content = next_content
                 i += 1
@@ -154,9 +152,7 @@ def _parse_markdown_session(text: str) -> list[dict]:
 
     # Flush last block
     if current_role == "assistant" and pending_user:
-        exchanges.append(
-            {"user": pending_user, "assistant": "\n".join(current_lines).strip()}
-        )
+        exchanges.append({"user": pending_user, "assistant": "\n".join(current_lines).strip()})
 
     return exchanges
 
@@ -365,8 +361,16 @@ def main():
 
     args = parser.parse_args()
 
-    sessions_dir = Path(args.sessions_dir).expanduser() if args.sessions_dir else Path.home() / ".hermes" / "sessions"
-    palace_path = str(Path(args.palace_path).expanduser()) if args.palace_path else str(Path.home() / ".mempalace" / "palace")
+    sessions_dir = (
+        Path(args.sessions_dir).expanduser()
+        if args.sessions_dir
+        else Path.home() / ".hermes" / "sessions"
+    )
+    palace_path = (
+        str(Path(args.palace_path).expanduser())
+        if args.palace_path
+        else str(Path.home() / ".mempalace" / "palace")
+    )
 
     if args.dry_run:
         logger.info("(dry run — nothing will be written)")
