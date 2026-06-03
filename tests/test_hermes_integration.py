@@ -1,8 +1,9 @@
 """Tests for the MemPalace ↔ Hermes integration provider.
 
 The provider lives outside the importable ``mempalace`` package (it sits in
-``integrations/hermes/`` so it can be copied into ``~/.hermes/plugins/`` at
-install time). These tests load it the same way: by file path.
+``mempalace/integrations/hermes/`` so it can be copied into
+``~/.hermes/plugins/`` at install time). These tests load it the same way:
+by file path.
 
 They also stub ``agent.memory_provider`` to mirror the runtime contract — the
 plugin is only ever imported with Hermes on the import path.
@@ -44,7 +45,13 @@ def _install_stub_memory_provider() -> None:
 @pytest.fixture(scope="module")
 def integration_module():
     _install_stub_memory_provider()
-    path = Path(__file__).resolve().parent.parent / "integrations" / "hermes" / "__init__.py"
+    path = (
+        Path(__file__).resolve().parent.parent
+        / "mempalace"
+        / "integrations"
+        / "hermes"
+        / "__init__.py"
+    )
     spec = importlib.util.spec_from_file_location("hermes_integration", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -92,7 +99,7 @@ def test_config_schema_has_documented_keys(provider):
 
 
 def test_tool_schemas_module_constant_has_eight_tools(integration_module):
-    # Documented in integrations/hermes/README.md as "8 tools exposed".
+    # Documented in mempalace/integrations/hermes/README.md as "8 tools exposed".
     schemas = integration_module.TOOL_SCHEMAS
     names = [s["name"] for s in schemas]
     assert names == [
@@ -196,7 +203,11 @@ def test_backfill_classify_wing_matches_live_provider():
     import importlib.util
 
     backfill_path = (
-        Path(__file__).resolve().parent.parent / "integrations" / "hermes" / "backfill.py"
+        Path(__file__).resolve().parent.parent
+        / "mempalace"
+        / "integrations"
+        / "hermes"
+        / "backfill.py"
     )
     spec = importlib.util.spec_from_file_location("hermes_backfill", backfill_path)
     assert spec is not None and spec.loader is not None

@@ -1171,19 +1171,17 @@ def cmd_hermes_install(args):
             f"importable from {install_python}. Plugin files will still be copied."
         )
 
-    # 4. Resolve the integration source files. In-tree (cloned mempalace repo)
-    #    first, then installed-package fallback.
-    integration_dir = Path(__file__).resolve().parent.parent / "integrations" / "hermes"
-    if not integration_dir.exists():
-        spec = importlib.util.find_spec("mempalace")
-        if spec is not None and spec.submodule_search_locations:
-            integration_dir = (
-                Path(next(iter(spec.submodule_search_locations))).parent / "integrations" / "hermes"
-            )
-
-    if not integration_dir.exists():
-        print(f"Error: could not locate integrations/hermes/ at {integration_dir}")
+    # 4. Resolve the integration source files. They ship as the
+    #    ``mempalace.integrations.hermes`` subpackage so this works
+    #    identically in source-tree, editable, and wheel installs.
+    spec = importlib.util.find_spec("mempalace.integrations.hermes")
+    if spec is None or not spec.submodule_search_locations:
+        print(
+            "Error: could not locate mempalace.integrations.hermes — is mempalace "
+            "installed correctly?"
+        )
         sys.exit(1)
+    integration_dir = Path(next(iter(spec.submodule_search_locations)))
 
     # 5. Drop plugin files into the user-installed plugin directory.
     plugin_dir = hermes_home / "plugins" / "mempalace"

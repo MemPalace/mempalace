@@ -179,7 +179,7 @@ def classify_wing(text: str, wing_config: dict) -> str:
     """Return the best matching wing name, or 'wing_general'.
 
     Keeps in sync with ``_match_wing_by_keywords`` in the live provider
-    (``integrations/hermes/__init__.py``). Both use word-boundary matching so
+    (``mempalace/integrations/hermes/__init__.py``). Both use word-boundary matching so
     backfilled drawers route to the same wings as live writes — bare substring
     matching here would let backfill file ``"… available …"`` under an
     ``ai``-keyword wing while the live provider correctly routed it to

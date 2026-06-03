@@ -173,7 +173,7 @@ pip install mempalace
 mempalace hermes install
 ```
 
-See [`integrations/hermes/`](integrations/hermes/) for details.
+See [`mempalace/integrations/hermes/`](mempalace/integrations/hermes/) for details.
 
 ## Auto-save hooks
 

@@ -53,8 +53,8 @@ representation.
 
 If you'd rather not run `mempalace hermes install`:
 
-1. Copy `integrations/hermes/__init__.py` → `~/.hermes/plugins/mempalace/__init__.py`
-2. Copy `integrations/hermes/backfill.py` → `~/.hermes/plugins/mempalace/backfill.py`
+1. Copy `mempalace/integrations/hermes/__init__.py` → `~/.hermes/plugins/mempalace/__init__.py`
+2. Copy `mempalace/integrations/hermes/backfill.py` → `~/.hermes/plugins/mempalace/backfill.py`
 3. Write `~/.hermes/plugins/mempalace/plugin.yaml`:
 
    ```yaml
