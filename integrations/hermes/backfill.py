@@ -26,7 +26,7 @@ import hashlib
 import json
 import logging
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -227,8 +227,15 @@ def file_exchange(
         return False
 
     try:
-        ts = datetime.utcnow().isoformat()
-        doc_id = hashlib.sha256(f"{source_file}:{text[:120]}".encode()).hexdigest()[:16]
+        # Timezone-aware so timestamps sort + compare against the runtime
+        # provider's writes (which use ``datetime.now(timezone.utc)``).
+        ts = datetime.now(timezone.utc).isoformat()
+        # Hash the **full** text plus the timestamp, not a 120-char prefix.
+        # The prefix-only variant collided on common openings (e.g. 12 turns
+        # starting "User: hi can you help me with…") and ``col.upsert``
+        # silently overwrote them. 32 hex chars matches the runtime
+        # provider's id width — 16 was tight enough to collide accidentally.
+        doc_id = hashlib.sha256(f"{ts}:{source_file}:{text}".encode("utf-8")).hexdigest()[:32]
         collection.upsert(
             ids=[doc_id],
             documents=[text],
