@@ -149,8 +149,8 @@ def test_atomic_write_text_overwrites_existing(tmp_path):
 def test_yaml_update_adds_memory_section_when_missing(tmp_path):
     config = tmp_path / "config.yaml"
     config.write_text("model: claude-opus\n")
-    updated, msg = _update_hermes_config_yaml(config, "mempalace")
-    assert updated is True
+    status, msg = _update_hermes_config_yaml(config, "mempalace")
+    assert status == "updated"
     data = yaml.safe_load(config.read_text())
     assert data["memory"]["provider"] == "mempalace"
     assert data["model"] == "claude-opus"
@@ -160,8 +160,8 @@ def test_yaml_update_adds_memory_section_when_missing(tmp_path):
 def test_yaml_update_replaces_existing_provider(tmp_path):
     config = tmp_path / "config.yaml"
     config.write_text("memory:\n  provider: honcho\n")
-    updated, _ = _update_hermes_config_yaml(config, "mempalace")
-    assert updated is True
+    status, _ = _update_hermes_config_yaml(config, "mempalace")
+    assert status == "updated"
     assert yaml.safe_load(config.read_text())["memory"]["provider"] == "mempalace"
 
 
@@ -169,8 +169,8 @@ def test_yaml_update_handles_scalar_memory_value(tmp_path):
     # Original line-based heuristic produced duplicate `memory:` keys for this.
     config = tmp_path / "config.yaml"
     config.write_text("memory: ~\nmodel: x\n")
-    updated, _ = _update_hermes_config_yaml(config, "mempalace")
-    assert updated is True
+    status, _ = _update_hermes_config_yaml(config, "mempalace")
+    assert status == "updated"
     data = yaml.safe_load(config.read_text())
     assert data["memory"]["provider"] == "mempalace"
     assert data["model"] == "x"
@@ -180,9 +180,7 @@ def test_yaml_update_handles_scalar_memory_value(tmp_path):
     # future regression at the serialiser level.
     text = config.read_text()
     top_level_memory = sum(
-        1
-        for line in text.splitlines()
-        if line.startswith("memory:") or line.rstrip() == "memory:"
+        1 for line in text.splitlines() if line.startswith("memory:") or line.rstrip() == "memory:"
     )
     assert top_level_memory == 1
 
@@ -190,8 +188,8 @@ def test_yaml_update_handles_scalar_memory_value(tmp_path):
 def test_yaml_update_creates_file_when_missing(tmp_path):
     config = tmp_path / "config.yaml"
     assert not config.exists()
-    updated, _ = _update_hermes_config_yaml(config, "mempalace")
-    assert updated is True
+    status, _ = _update_hermes_config_yaml(config, "mempalace")
+    assert status == "updated"
     assert config.exists()
     assert yaml.safe_load(config.read_text())["memory"]["provider"] == "mempalace"
 
@@ -199,24 +197,26 @@ def test_yaml_update_creates_file_when_missing(tmp_path):
 def test_yaml_update_noop_when_already_set(tmp_path):
     config = tmp_path / "config.yaml"
     config.write_text("memory:\n  provider: mempalace\n")
-    updated, msg = _update_hermes_config_yaml(config, "mempalace")
-    assert updated is False
+    status, msg = _update_hermes_config_yaml(config, "mempalace")
+    # Distinct from "error" — caller should NOT fail the install for this.
+    assert status == "noop"
     assert "already has" in msg
 
 
 def test_yaml_update_rejects_non_mapping(tmp_path):
     config = tmp_path / "config.yaml"
     config.write_text("- not\n- a\n- mapping\n")
-    updated, msg = _update_hermes_config_yaml(config, "mempalace")
-    assert updated is False
+    status, msg = _update_hermes_config_yaml(config, "mempalace")
+    # Distinct from "noop" — install command should exit non-zero.
+    assert status == "error"
     assert "not a YAML mapping" in msg
 
 
 def test_yaml_update_handles_malformed_yaml(tmp_path):
     config = tmp_path / "config.yaml"
     config.write_text("{ this is: not: parseable\n")
-    updated, msg = _update_hermes_config_yaml(config, "mempalace")
-    assert updated is False
+    status, msg = _update_hermes_config_yaml(config, "mempalace")
+    assert status == "error"
     assert "Could not parse" in msg
 
 

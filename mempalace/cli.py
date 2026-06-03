@@ -1084,19 +1084,30 @@ def _atomic_write_text(path: Path, content: str) -> None:
     os.replace(tmp, path)
 
 
-def _update_hermes_config_yaml(config_yaml: Path, provider: str) -> tuple[bool, str]:
+def _update_hermes_config_yaml(config_yaml: Path, provider: str) -> tuple[str, str]:
     """Set ``memory.provider`` in ``config_yaml`` to ``provider``.
 
-    Returns ``(updated, message)``. Uses a real YAML parser/serialiser so
-    arbitrary layouts (anchors, mixed indentation, scalar ``memory: ~``)
-    round-trip safely. The trade-off is that PyYAML's safe_dump rewrites
-    the file in canonical form — inline comments and unusual key ordering
-    are lost. We warn the user up front rather than corrupt the file.
+    Returns ``(status, message)`` where ``status`` is one of:
+
+    * ``"updated"`` — file was changed (new content written).
+    * ``"noop"``    — file already had the desired provider, no write.
+    * ``"error"``   — could not read, parse, or write the file.
+
+    The caller (``cmd_hermes_install``) uses the status to decide the
+    install's exit code: ``"error"`` is the only one that fails CI.
+    Collapsing "already set" and "could not parse" into the same
+    ``False`` return value (as the previous shape did) made the install
+    silently succeed for bad YAML files.
+
+    Uses ``yaml.safe_load`` / ``yaml.safe_dump`` for round-trip
+    correctness on arbitrary layouts (anchors, mixed indentation, scalar
+    ``memory: ~``). The trade-off is that ``safe_dump`` rewrites in
+    canonical form — inline comments and unusual key ordering are lost.
     """
     try:
         import yaml
     except ImportError:
-        return False, "PyYAML not installed — cannot edit config.yaml safely."
+        return "error", "PyYAML not installed — cannot edit config.yaml safely."
 
     try:
         existing_raw = config_yaml.read_text(encoding="utf-8") if config_yaml.exists() else ""
@@ -1104,7 +1115,7 @@ def _update_hermes_config_yaml(config_yaml: Path, provider: str) -> tuple[bool, 
         if data is None:
             data = {}
         if not isinstance(data, dict):
-            return False, f"{config_yaml} is not a YAML mapping; refusing to edit."
+            return "error", f"{config_yaml} is not a YAML mapping; refusing to edit."
 
         memory = data.get("memory")
         if not isinstance(memory, dict):
@@ -1112,16 +1123,16 @@ def _update_hermes_config_yaml(config_yaml: Path, provider: str) -> tuple[bool, 
             data["memory"] = memory
 
         if memory.get("provider") == provider:
-            return False, f"{config_yaml} already has memory.provider: {provider}"
+            return "noop", f"{config_yaml} already has memory.provider: {provider}"
 
         memory["provider"] = provider
         new_text = yaml.safe_dump(data, sort_keys=False, default_flow_style=False)
         _atomic_write_text(config_yaml, new_text)
-        return True, f"Updated {config_yaml}: memory.provider = {provider}"
+        return "updated", f"Updated {config_yaml}: memory.provider = {provider}"
     except yaml.YAMLError as exc:
-        return False, f"Could not parse {config_yaml}: {exc}"
+        return "error", f"Could not parse {config_yaml}: {exc}"
     except Exception as exc:
-        return False, f"Could not update {config_yaml}: {exc}"
+        return "error", f"Could not update {config_yaml}: {exc}"
 
 
 def cmd_hermes_install(args):
@@ -1220,7 +1231,9 @@ def cmd_hermes_install(args):
 
     # 7. Update Hermes config.yaml via real YAML parser/serialiser.
     config_yaml = hermes_home / "config.yaml"
-    config_updated, config_message = _update_hermes_config_yaml(config_yaml, "mempalace")
+    config_status, config_message = _update_hermes_config_yaml(config_yaml, "mempalace")
+    config_updated = config_status == "updated"
+    config_error = config_status == "error"
     if config_message:
         print(f"  {config_message}")
 
@@ -1283,7 +1296,7 @@ def cmd_hermes_install(args):
     print("  2. Restart Hermes (hermes gateway start, or your usual entrypoint)")
     print("  3. Verify: hermes memory status   (should show mempalace active)")
 
-    if pip_failed or files_missing or backfill_error:
+    if pip_failed or files_missing or backfill_error or config_error:
         sys.exit(1)
 
 
