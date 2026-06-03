@@ -21,9 +21,16 @@ Design notes
   or ``platform == "cron"``. Cron-context turns are system-generated and
   would otherwise corrupt the user's representation.
 
-* Configuration is read from ``$HERMES_HOME/mempalace.json`` first, then
-  env vars (``MEMPALACE_PALACE_PATH``, ``MEMPALACE_IDENTITY_PATH``,
-  ``MEMPALACE_WING``, ``MEMPALACE_COLLECTION_NAME``), then defaults.
+* Configuration precedence: ``$HERMES_HOME/mempalace.json`` is read
+  first, then env vars override (``MEMPALACE_PALACE_PATH``,
+  ``MEMPALACE_IDENTITY_PATH``, ``MEMPALACE_WING``). An empty env var
+  is ignored — ``export MEMPALACE_WING=`` is intent to unset. Defaults
+  fill in anything still missing. ``collection_name`` is intentionally
+  not user-configurable here: the provider writes through
+  ``self._collection_name`` while ``search_memories`` (used by
+  ``prefetch`` and ``_tool_search``) reads its own configured collection
+  name from ``~/.mempalace/config.json``, and exposing two ways to set
+  it would let the two diverge silently.
 
 * ``~/.mempalace/identity.txt`` (L0) and ``~/.mempalace/wing_config.json``
   are loaded if present but never created here. Run

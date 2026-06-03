@@ -87,12 +87,26 @@ python ~/.hermes/plugins/mempalace/backfill.py \
 
 ## Configuration
 
-Resolved in this order (first match wins):
+The provider reads from `$HERMES_HOME/mempalace.json` first; non-empty
+env vars then override individual keys; anything still missing falls
+back to defaults. An empty env var is treated as unset, not as an
+empty-string override.
 
-1. `$HERMES_HOME/mempalace.json` — written by `hermes memory setup`
-2. Environment: `MEMPALACE_PALACE_PATH`, `MEMPALACE_IDENTITY_PATH`,
-   `MEMPALACE_WING`, `MEMPALACE_COLLECTION_NAME`
-3. Defaults (see `MempalaceProvider.get_config_schema()`)
+Supported config keys (also exposed via `MempalaceProvider.get_config_schema()`):
+
+| Key | Env var | Default |
+|---|---|---|
+| `palace_path` | `MEMPALACE_PALACE_PATH` | `~/.mempalace/palace` |
+| `identity_path` | `MEMPALACE_IDENTITY_PATH` | `~/.mempalace/identity.txt` |
+| `wing` | `MEMPALACE_WING` | auto-classify via `wing_config.json` |
+| `n_prefetch` | — | `3` (clamped to 1-20) |
+
+`collection_name` is intentionally **not** user-configurable on this
+side. Writes go through this provider's collection; reads from
+`prefetch` / `_tool_search` go through `search_memories`, which reads
+its own collection name from `~/.mempalace/config.json`. Letting users
+set the name in two places would silently let the two diverge — set
+it once in mempalace's own config.
 
 Underlying mempalace state lives in `~/.mempalace/`:
 
