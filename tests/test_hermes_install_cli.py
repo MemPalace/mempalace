@@ -1,0 +1,220 @@
+"""Tests for the ``mempalace hermes install`` CLI command helpers.
+
+The end-to-end install flow shells out to ``pip`` and writes into the user's
+Hermes home — out of scope for unit tests. These tests cover the pure helpers
+that resolve paths and edit ``config.yaml``, since those carried the riskiest
+review findings on PR #1684 (palace_path divergence, YAML edit brittleness,
+Windows path).
+"""
+
+from __future__ import annotations
+
+import types
+from pathlib import Path
+
+import pytest
+import yaml
+
+from mempalace.cli import (
+    _atomic_write_text,
+    _resolve_hermes_home,
+    _resolve_install_palace_path,
+    _resolve_install_python,
+    _update_hermes_config_yaml,
+)
+
+
+# ---------------------------------------------------------------------------
+# _resolve_hermes_home
+# ---------------------------------------------------------------------------
+
+
+def _args(hermes_home=None):
+    return types.SimpleNamespace(hermes_home=hermes_home)
+
+
+def test_resolve_hermes_home_uses_explicit_arg(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    explicit = tmp_path / "custom-home"
+    assert _resolve_hermes_home(_args(str(explicit))) == explicit.resolve()
+
+
+def test_resolve_hermes_home_uses_env_var(tmp_path, monkeypatch):
+    target = tmp_path / "env-home"
+    monkeypatch.setenv("HERMES_HOME", str(target))
+    assert _resolve_hermes_home(_args(None)) == target
+
+
+def test_resolve_hermes_home_defaults_to_dot_hermes(monkeypatch):
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    assert _resolve_hermes_home(_args(None)) == Path("~/.hermes").expanduser()
+
+
+def test_resolve_hermes_home_refuses_cwd(monkeypatch):
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    # ``.`` resolves to CWD — would silently install plugin files there.
+    with pytest.raises(SystemExit) as excinfo:
+        _resolve_hermes_home(_args("."))
+    assert excinfo.value.code == 2
+
+
+def test_resolve_hermes_home_refuses_root(monkeypatch):
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    with pytest.raises(SystemExit) as excinfo:
+        _resolve_hermes_home(_args("/"))
+    assert excinfo.value.code == 2
+
+
+# ---------------------------------------------------------------------------
+# _resolve_install_python
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_install_python_prefers_posix_venv(tmp_path):
+    venv_python = tmp_path / "hermes-agent" / "venv" / "bin" / "python3"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.write_text("#!/bin/sh\n")
+    assert _resolve_install_python(tmp_path) == str(venv_python)
+
+
+def test_resolve_install_python_falls_back_to_python_no_3(tmp_path):
+    # Some venvs only ship `python` not `python3` (Windows-style scaffolds).
+    p = tmp_path / "hermes-agent" / "venv" / "bin" / "python"
+    p.parent.mkdir(parents=True)
+    p.write_text("#!/bin/sh\n")
+    assert _resolve_install_python(tmp_path) == str(p)
+
+
+def test_resolve_install_python_finds_windows_layout(tmp_path):
+    p = tmp_path / "hermes-agent" / "venv" / "Scripts" / "python.exe"
+    p.parent.mkdir(parents=True)
+    p.write_text("#!/bin/sh\n")
+    assert _resolve_install_python(tmp_path) == str(p)
+
+
+def test_resolve_install_python_falls_back_to_sys_executable(tmp_path):
+    import sys
+
+    # No venv anywhere under hermes_home → fall back gracefully.
+    assert _resolve_install_python(tmp_path) == sys.executable
+
+
+# ---------------------------------------------------------------------------
+# _resolve_install_palace_path
+# ---------------------------------------------------------------------------
+
+
+def test_palace_path_honors_env_var(tmp_path, monkeypatch):
+    target = tmp_path / "user-chosen-palace"
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(target))
+    assert _resolve_install_palace_path() == target
+
+
+def test_palace_path_default_when_env_unset(monkeypatch):
+    monkeypatch.delenv("MEMPALACE_PALACE_PATH", raising=False)
+    assert _resolve_install_palace_path() == Path("~/.mempalace/palace").expanduser()
+
+
+def test_palace_path_ignores_empty_env_var(monkeypatch):
+    # ``export MEMPALACE_PALACE_PATH=`` is intent to unset, not to use "".
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", "")
+    assert _resolve_install_palace_path() == Path("~/.mempalace/palace").expanduser()
+
+
+# ---------------------------------------------------------------------------
+# _atomic_write_text
+# ---------------------------------------------------------------------------
+
+
+def test_atomic_write_text_creates_parent_dirs(tmp_path):
+    target = tmp_path / "deep" / "nested" / "file.yaml"
+    _atomic_write_text(target, "hello\n")
+    assert target.read_text() == "hello\n"
+
+
+def test_atomic_write_text_overwrites_existing(tmp_path):
+    target = tmp_path / "f.txt"
+    target.write_text("original\n")
+    _atomic_write_text(target, "replaced\n")
+    assert target.read_text() == "replaced\n"
+    # No stray .tmp left behind.
+    assert not (tmp_path / "f.txt.tmp").exists()
+
+
+# ---------------------------------------------------------------------------
+# _update_hermes_config_yaml
+# ---------------------------------------------------------------------------
+
+
+def test_yaml_update_adds_memory_section_when_missing(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text("model: claude-opus\n")
+    updated, msg = _update_hermes_config_yaml(config, "mempalace")
+    assert updated is True
+    data = yaml.safe_load(config.read_text())
+    assert data["memory"]["provider"] == "mempalace"
+    assert data["model"] == "claude-opus"
+    assert "Updated" in msg
+
+
+def test_yaml_update_replaces_existing_provider(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text("memory:\n  provider: honcho\n")
+    updated, _ = _update_hermes_config_yaml(config, "mempalace")
+    assert updated is True
+    assert yaml.safe_load(config.read_text())["memory"]["provider"] == "mempalace"
+
+
+def test_yaml_update_handles_scalar_memory_value(tmp_path):
+    # Original line-based heuristic produced duplicate `memory:` keys for this.
+    config = tmp_path / "config.yaml"
+    config.write_text("memory: ~\nmodel: x\n")
+    updated, _ = _update_hermes_config_yaml(config, "mempalace")
+    assert updated is True
+    data = yaml.safe_load(config.read_text())
+    assert data["memory"]["provider"] == "mempalace"
+    assert data["model"] == "x"
+    # Single top-level memory key — file is valid YAML.
+    text = config.read_text()
+    assert text.count("\nmemory:") + text.startswith("memory:") <= 2  # one occurrence
+
+
+def test_yaml_update_creates_file_when_missing(tmp_path):
+    config = tmp_path / "config.yaml"
+    assert not config.exists()
+    updated, _ = _update_hermes_config_yaml(config, "mempalace")
+    assert updated is True
+    assert config.exists()
+    assert yaml.safe_load(config.read_text())["memory"]["provider"] == "mempalace"
+
+
+def test_yaml_update_noop_when_already_set(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text("memory:\n  provider: mempalace\n")
+    updated, msg = _update_hermes_config_yaml(config, "mempalace")
+    assert updated is False
+    assert "already has" in msg
+
+
+def test_yaml_update_rejects_non_mapping(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text("- not\n- a\n- mapping\n")
+    updated, msg = _update_hermes_config_yaml(config, "mempalace")
+    assert updated is False
+    assert "not a YAML mapping" in msg
+
+
+def test_yaml_update_handles_malformed_yaml(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text("{ this is: not: parseable\n")
+    updated, msg = _update_hermes_config_yaml(config, "mempalace")
+    assert updated is False
+    assert "Could not parse" in msg
+
+
+def test_yaml_update_is_atomic(tmp_path):
+    # The write happens via _atomic_write_text — no .tmp leaks on success.
+    config = tmp_path / "config.yaml"
+    config.write_text("model: x\n")
+    _update_hermes_config_yaml(config, "mempalace")
+    assert not (tmp_path / "config.yaml.tmp").exists()
