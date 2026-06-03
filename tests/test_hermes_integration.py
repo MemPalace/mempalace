@@ -85,8 +85,10 @@ def test_config_schema_has_documented_keys(provider):
         "identity_path",
         "wing",
         "n_prefetch",
-        "collection_name",
     }
+    # ``collection_name`` is intentionally absent — exposing it would let the
+    # provider write to a collection that ``search_memories`` doesn't read.
+    assert "collection_name" not in keys
 
 
 def test_tool_schemas_module_constant_has_eight_tools(integration_module):
@@ -174,9 +176,14 @@ def test_on_turn_start_tracks_turn_number(provider):
 # ---------------------------------------------------------------------------
 
 
-def test_on_pre_compress_returns_string_hint(provider):
-    # Bypass full initialize() — we only need _cron_skipped=False and the queue.
+def test_on_pre_compress_returns_string_hint_only_when_ready(provider):
+    # Before initialize: no hint (provider can't actually persist anything).
     provider._cron_skipped = False
+    assert provider.on_pre_compress([{"role": "user", "content": "hi"}]) == ""
+
+    # Simulate post-initialize ready state. We don't need a real backend for
+    # this assertion — just the readiness flag the hint gates on.
+    provider._initialized = True
     hint = provider.on_pre_compress([{"role": "user", "content": "hi"}])
     assert isinstance(hint, str) and "mempalace_search" in hint
 
@@ -414,14 +421,29 @@ def test_initialize_reads_mempalace_json(provider, tmp_dir, palace_path):
             {
                 "palace_path": palace_path,
                 "n_prefetch": 7,
-                "collection_name": "custom_drawers",
+                "wing": "wing_from_config",
             }
         )
     )
     provider.initialize("s1", hermes_home=str(tmp_dir))
     try:
         assert provider._config["n_prefetch"] == 7
-        assert provider._collection_name == "custom_drawers"
+        assert provider._config["wing"] == "wing_from_config"
+    finally:
+        provider.shutdown()
+
+
+def test_collection_name_is_not_user_configurable(provider, tmp_dir, palace_path):
+    # Exposing ``collection_name`` would let the provider write to a collection
+    # that ``search_memories`` (which reads from mempalace's own config) does
+    # not read — making the provider silently appear mute. The field is
+    # intentionally absent from the schema and ignored in config files.
+    (Path(tmp_dir) / "mempalace.json").write_text(
+        json.dumps({"palace_path": palace_path, "collection_name": "custom_drawers"})
+    )
+    provider.initialize("s1", hermes_home=str(tmp_dir))
+    try:
+        assert provider._collection_name == provider.DEFAULT_COLLECTION_NAME
     finally:
         provider.shutdown()
 

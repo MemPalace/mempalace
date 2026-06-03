@@ -64,6 +64,46 @@ except ImportError:  # pragma: no cover - Hermes not installed
 logger = logging.getLogger("mempalace.hermes")
 
 
+def _normalize_content(content: Any) -> str:
+    """Flatten an Anthropic/OpenAI ``content`` field to a plain string.
+
+    Hermes turns frequently carry ``content`` as a list of typed parts
+    (``[{"type": "text", "text": "..."}, {"type": "tool_use", ...}]``).
+    A naive ``f"User: {content}"`` would persist the literal ``repr`` of
+    the list and corrupt semantic search recall over the palace. Concatenate
+    the ``text`` blocks (and surface a tool-use marker so search hits still
+    say a tool was called) instead.
+    """
+    if not content:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for block in content:
+            if not isinstance(block, dict):
+                parts.append(str(block))
+                continue
+            btype = block.get("type", "")
+            if btype == "text":
+                text = block.get("text", "")
+                if text:
+                    parts.append(text)
+            elif btype == "tool_use":
+                name = block.get("name", "?")
+                parts.append(f"[tool_use: {name}]")
+            elif btype == "tool_result":
+                result = block.get("content")
+                parts.append(f"[tool_result] {_normalize_content(result)}")
+            else:
+                # Unknown block type — fall back to text field or skip.
+                text = block.get("text", "")
+                if text:
+                    parts.append(text)
+        return "\n".join(parts)
+    return str(content)
+
+
 # ---------------------------------------------------------------------------
 # Tool schemas (OpenAI function-calling format; no `handler` field — dispatch
 # happens via ``MempalaceProvider.handle_tool_call``).
@@ -203,6 +243,10 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         self._worker_thread: Optional[threading.Thread] = None
         self._worker_stop = threading.Event()
 
+        # initialize() must be serialised against concurrent re-entries so we
+        # don't spawn two worker threads sharing one queue.
+        self._init_lock = threading.Lock()
+
     # ----- Required ABC ------------------------------------------------------
 
     @property
@@ -229,59 +273,87 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
                 agent_context,
                 platform,
             )
-            self._cron_skipped = True
+            with self._init_lock:
+                self._cron_skipped = True
             return
 
-        self._session_id = session_id or ""
-        self._hermes_home = str(kwargs.get("hermes_home", "") or "")
+        # Serialise the rest: producers all read _initialized / _collection /
+        # _worker_thread; a re-entrant initialize() must not duplicate the
+        # worker or leave torn-up state visible to a parallel sync_turn.
+        with self._init_lock:
+            # Clear the cron-skip flag — a previous cron-context initialize on
+            # the same instance must not leave the provider permanently inert.
+            self._cron_skipped = False
 
-        self._config = self._load_config()
-        self._palace_path = str(
-            Path(self._config.get("palace_path", self.DEFAULT_PALACE_PATH)).expanduser()
-        )
-        self._collection_name = self._config.get("collection_name", self.DEFAULT_COLLECTION_NAME)
+            self._session_id = session_id or ""
+            self._hermes_home = str(kwargs.get("hermes_home", "") or "")
 
-        self._load_wing_config()
-        self._load_identity()
+            self._config = self._load_config()
+            self._palace_path = str(
+                Path(self._config.get("palace_path", self.DEFAULT_PALACE_PATH)).expanduser()
+            )
+            # Collection name is intentionally **not** configurable. ``_file_turn``
+            # writes through ``self._collection``; ``prefetch`` / ``_tool_search``
+            # go through ``search_memories``, which reads its own configured
+            # collection name from ``~/.mempalace/config.json``. Exposing two
+            # ways to set the name invites write-here, read-there mismatches
+            # that silently make the provider look mute.
+            self._collection_name = self.DEFAULT_COLLECTION_NAME
 
-        # Backend init: failures (slow disk, locked SQLite, missing palace) must
-        # not hang Hermes startup. The agent runs without palace context until
-        # the next successful initialize().
-        try:
-            self._backend = ChromaBackend()
-            with self._collection_lock:
-                self._collection = self._backend.get_or_create_collection(
-                    self._palace_path,
+            self._load_wing_config()
+            self._load_identity()
+
+            # Backend init: failures (slow disk, locked SQLite, missing palace)
+            # must not hang Hermes startup. The agent runs without palace
+            # context until the next successful initialize().
+            backend_ready = False
+            try:
+                self._backend = ChromaBackend()
+                with self._collection_lock:
+                    self._collection = self._backend.get_or_create_collection(
+                        self._palace_path,
+                        self._collection_name,
+                    )
+                logger.info(
+                    "MemPalace: collection '%s' ready (palace=%s)",
                     self._collection_name,
+                    self._palace_path,
                 )
-            logger.info(
-                "MemPalace: collection '%s' ready (palace=%s)",
-                self._collection_name,
-                self._palace_path,
-            )
-        except Exception as exc:
-            logger.warning("MemPalace backend init failed: %s", exc)
-            with self._collection_lock:
-                self._collection = None
+                backend_ready = True
+            except Exception as exc:
+                logger.warning("MemPalace backend init failed: %s", exc)
+                with self._collection_lock:
+                    self._collection = None
 
-        # Background worker for filing.
-        if self._worker_thread is None or not self._worker_thread.is_alive():
-            self._worker_stop.clear()
-            self._worker_thread = threading.Thread(
-                target=self._background_worker,
-                daemon=True,
-                name="mempalace-worker",
-            )
-            self._worker_thread.start()
+            # Background worker for filing — only when the backend opened.
+            # Starting a worker against a None collection invites the
+            # on_pre_compress / sync_turn data-loss path where the hint
+            # promises persistence the worker can't deliver.
+            if backend_ready and (
+                self._worker_thread is None or not self._worker_thread.is_alive()
+            ):
+                self._worker_stop.clear()
+                self._worker_thread = threading.Thread(
+                    target=self._background_worker,
+                    daemon=True,
+                    name="mempalace-worker",
+                )
+                self._worker_thread.start()
 
-        # Warm the wake-up cache without blocking startup.
-        threading.Thread(
-            target=self._refresh_wake_up_cache,
-            daemon=True,
-            name="mempalace-wakeup",
-        ).start()
+            # Warm the wake-up cache without blocking startup, but only if the
+            # backend is up — otherwise MemoryStack reads a half-set palace.
+            if backend_ready:
+                threading.Thread(
+                    target=self._refresh_wake_up_cache,
+                    daemon=True,
+                    name="mempalace-wakeup",
+                ).start()
 
-        self._initialized = True
+            # ``_initialized`` reflects readiness — get_tool_schemas /
+            # handle_tool_call / prefetch / sync_turn / on_pre_compress key
+            # off this. A failed backend init leaves it False so callers see
+            # a uniformly inactive provider rather than half-broken state.
+            self._initialized = backend_ready
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         if self._cron_skipped or not self._initialized:
@@ -338,21 +410,29 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
     ) -> None:
         if self._cron_skipped or not self._initialized:
             return
-        if not user_content and not assistant_content:
+        user_text = _normalize_content(user_content)
+        assistant_text = _normalize_content(assistant_content)
+        if not user_text and not assistant_text:
             return
         try:
             self._worker_queue.put_nowait(
                 (
                     "file_turn",
                     {
-                        "user": user_content,
-                        "assistant": assistant_content,
+                        "user": user_text,
+                        "assistant": assistant_text,
                         "session_id": session_id or self._session_id,
                     },
                 )
             )
         except queue.Full:
-            logger.debug("MemPalace worker queue full — dropping turn")
+            # Loud, not silent: the verbatim invariant is what mempalace sells.
+            # If the queue saturates we want operators to see it.
+            logger.warning(
+                "MemPalace worker queue full (maxsize=%d) — turn dropped; "
+                "writes likely stalled on disk or ChromaDB",
+                self.WORKER_QUEUE_MAX,
+            )
 
     # ----- Optional lifecycle hooks ----------------------------------------
 
@@ -396,12 +476,12 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
         """File the messages about to be discarded and signal verbatim persistence.
 
-        Returns a short hint included in the compression summary prompt so the
-        summarizer knows the verbatim copy is searchable and can be aggressive
-        about discarding raw turns. To switch to a "preserve N themes" hint
-        instead, override this method in a subclass.
+        The hint is **only** returned when the worker can actually persist the
+        payload — if the backend never came up or the queue is saturated, we
+        say nothing so the summarizer falls back to its default conservative
+        discarding rather than acting on a false promise.
         """
-        if self._cron_skipped:
+        if self._cron_skipped or not self._initialized:
             return ""
         try:
             self._worker_queue.put_nowait(
@@ -411,7 +491,11 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
                 )
             )
         except queue.Full:
-            pass
+            logger.warning(
+                "MemPalace queue full at pre_compress — %d messages will not be filed",
+                len(messages or []),
+            )
+            return ""
         return (
             "MemPalace has filed every message in this window verbatim. "
             "Compressed content remains searchable via the `mempalace_search` "
@@ -524,11 +608,6 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
                 "description": "Number of search results to inject per turn.",
                 "default": 3,
             },
-            {
-                "key": "collection_name",
-                "description": "ChromaDB collection name.",
-                "default": self.DEFAULT_COLLECTION_NAME,
-            },
         ]
 
     def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
@@ -573,10 +652,13 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             ("MEMPALACE_PALACE_PATH", "palace_path"),
             ("MEMPALACE_IDENTITY_PATH", "identity_path"),
             ("MEMPALACE_WING", "wing"),
-            ("MEMPALACE_COLLECTION_NAME", "collection_name"),
         ):
-            if env_key in os.environ:
-                config[conf_key] = os.environ[env_key]
+            # Only honor a non-empty env var. ``export MEMPALACE_WING=`` (e.g.
+            # from a deactivation script) is intent to *unset*, not to set the
+            # wing to the empty string.
+            value = os.environ.get(env_key)
+            if value:
+                config[conf_key] = value
         return config
 
     def _load_wing_config(self) -> None:
@@ -711,15 +793,41 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
                 elif task == "session_end":
                     self._mine_session(payload)
                 elif task == "pre_compress":
-                    for msg in payload.get("messages", []) or []:
-                        if msg.get("role") == "user":
+                    # Pair adjacent (user, assistant) messages into turns and
+                    # file each pair. Filing only role==user would silently
+                    # drop assistant content the ``on_pre_compress`` hint
+                    # promised the summarizer was searchable.
+                    msgs = payload.get("messages", []) or []
+                    session_id = payload.get("session_id", "") or ""
+                    i = 0
+                    while i < len(msgs):
+                        msg = msgs[i]
+                        if msg.get("role") != "user":
+                            # Lone non-user message (orphan tool result, etc.)
+                            # — file under user= empty so we don't lose it.
                             self._file_turn(
                                 {
-                                    "user": msg.get("content", "") or "",
-                                    "assistant": "",
-                                    "session_id": payload.get("session_id", "") or "",
+                                    "user": "",
+                                    "assistant": _normalize_content(msg.get("content")),
+                                    "session_id": session_id,
                                 }
                             )
+                            i += 1
+                            continue
+                        user_content = _normalize_content(msg.get("content"))
+                        assistant_content = ""
+                        if i + 1 < len(msgs) and msgs[i + 1].get("role") == "assistant":
+                            assistant_content = _normalize_content(msgs[i + 1].get("content"))
+                            i += 2
+                        else:
+                            i += 1
+                        self._file_turn(
+                            {
+                                "user": user_content,
+                                "assistant": assistant_content,
+                                "session_id": session_id,
+                            }
+                        )
                 elif task == "mem_write":
                     self._mirror_mem_write(payload)
             except Exception as exc:
