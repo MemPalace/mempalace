@@ -225,3 +225,213 @@ def test_shutdown_drains_running_worker(provider):
     provider._worker_thread.start()
     provider.shutdown()
     assert not provider._worker_thread.is_alive()
+
+
+# ---------------------------------------------------------------------------
+# End-to-end integration: real palace via mempalace's own fixtures.
+#
+# These exercise the ChromaBackend code path that fixes the dim-mismatch bug
+# from prior in-tree Hermes PRs, and run the tool handlers against the
+# `seeded_collection` / `seeded_kg` fixtures from `tests/conftest.py`.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def initialized_provider(provider, palace_path, tmp_dir):
+    """Provider initialized against a fresh temp palace."""
+    config_path = Path(tmp_dir) / "mempalace.json"
+    config_path.write_text(json.dumps({"palace_path": palace_path}))
+    provider.initialize("test-session-1", hermes_home=str(tmp_dir), platform="cli")
+    yield provider
+    provider.shutdown()
+
+
+def test_initialize_opens_chroma_via_backend(initialized_provider):
+    """The dim-mismatch fix: collection access goes through ChromaBackend."""
+    from mempalace.backends.chroma import ChromaBackend
+
+    assert initialized_provider._initialized is True
+    assert initialized_provider._collection is not None
+    assert isinstance(initialized_provider._backend, ChromaBackend)
+
+
+def test_get_tool_schemas_returns_eight_after_initialize(initialized_provider):
+    schemas = initialized_provider.get_tool_schemas()
+    names = [s["name"] for s in schemas]
+    assert len(schemas) == 8
+    assert "mempalace_search" in names
+    assert "mempalace_kg_query" in names
+
+
+def test_sync_turn_persists_through_worker(initialized_provider):
+    initialized_provider.sync_turn("what's the plan?", "ship the PR")
+    initialized_provider._worker_queue.join()  # block until worker drains the task
+
+    col = initialized_provider._collection
+    assert col.count() >= 1
+    metas = col.get(include=["metadatas"]).get("metadatas") or []
+    assert any(m.get("source") == "hermes" for m in metas)
+
+
+def test_sync_turn_routes_to_configured_wing(initialized_provider):
+    initialized_provider._wing_config = {"wing_dev": {"keywords": ["pytest"]}}
+    initialized_provider.sync_turn("running pytest -q", "all passed")
+    initialized_provider._worker_queue.join()
+
+    metas = initialized_provider._collection.get(include=["metadatas"]).get("metadatas") or []
+    assert any(m.get("wing") == "wing_dev" for m in metas)
+
+
+def test_sync_turn_skips_when_both_sides_empty(initialized_provider):
+    pre = initialized_provider._collection.count()
+    initialized_provider.sync_turn("", "")
+    # Queue should not have received an item; nothing to join, but worker has
+    # nothing to do either. Give it a moment then re-check.
+    initialized_provider._worker_queue.join()
+    assert initialized_provider._collection.count() == pre
+
+
+# ----- Tool handlers against seeded data ----------------------------------
+
+
+@pytest.fixture
+def provider_on_seeded_palace(seeded_collection, provider, palace_path, tmp_dir):
+    """Provider pointed at the same palace_path that ``seeded_collection`` filled.
+
+    ``seeded_collection`` writes 4 drawers via raw ``chromadb.PersistentClient``;
+    we then have the provider open the same path via ``ChromaBackend`` — the
+    fact that this round-trips at all is the dim-mismatch regression check.
+    """
+    (Path(tmp_dir) / "mempalace.json").write_text(json.dumps({"palace_path": palace_path}))
+    provider.initialize("s1", hermes_home=str(tmp_dir))
+    yield provider
+    provider.shutdown()
+
+
+def test_status_tool_counts_seeded_drawers(provider_on_seeded_palace):
+    result = json.loads(provider_on_seeded_palace.handle_tool_call("mempalace_status", {}))
+    assert result["total_drawers"] == 4
+    assert result["wings"]["project"] == 3
+    assert result["wings"]["notes"] == 1
+
+
+def test_list_wings_tool_returns_seeded_wings(provider_on_seeded_palace):
+    result = json.loads(provider_on_seeded_palace.handle_tool_call("mempalace_list_wings", {}))
+    assert result["wings"] == {"project": 3, "notes": 1}
+
+
+def test_list_rooms_tool_filters_by_wing(provider_on_seeded_palace):
+    result = json.loads(
+        provider_on_seeded_palace.handle_tool_call(
+            "mempalace_list_rooms",
+            {"wing": "project"},
+        )
+    )
+    assert result["wing"] == "project"
+    assert result["rooms"]["backend"] == 2
+    assert result["rooms"]["frontend"] == 1
+
+
+def test_list_rooms_tool_rejects_missing_wing(provider_on_seeded_palace):
+    result = json.loads(
+        provider_on_seeded_palace.handle_tool_call(
+            "mempalace_list_rooms",
+            {},
+        )
+    )
+    assert "error" in result
+
+
+# ----- Knowledge-graph tool handlers --------------------------------------
+
+
+def test_kg_add_persists_to_palace_sibling_sqlite(initialized_provider, palace_path):
+    """The provider writes to ``<palace_path>/../knowledge_graph.sqlite3``."""
+    from mempalace.knowledge_graph import KnowledgeGraph
+
+    result = json.loads(
+        initialized_provider.handle_tool_call(
+            "mempalace_kg_add",
+            {"subject": "user", "predicate": "likes", "object": "coffee"},
+        )
+    )
+    assert result["status"] == "ok"
+
+    db_path = str(Path(palace_path).parent / "knowledge_graph.sqlite3")
+    independent_kg = KnowledgeGraph(db_path=db_path)
+    try:
+        relations = independent_kg.query_entity("user")
+    finally:
+        independent_kg.close()
+    assert any(
+        (r.get("predicate") == "likes" and r.get("object") == "coffee") for r in (relations or [])
+    )
+
+
+def test_kg_query_tool_rejects_missing_entity(initialized_provider):
+    result = json.loads(
+        initialized_provider.handle_tool_call(
+            "mempalace_kg_query",
+            {},
+        )
+    )
+    assert "error" in result
+
+
+# ----- Diary roundtrip ----------------------------------------------------
+
+
+def test_diary_write_read_roundtrip(initialized_provider):
+    write = json.loads(
+        initialized_provider.handle_tool_call(
+            "mempalace_diary_write",
+            {"entry": "Today I deepened test coverage."},
+        )
+    )
+    assert write["status"] == "ok"
+
+    read = json.loads(
+        initialized_provider.handle_tool_call(
+            "mempalace_diary_read",
+            {"n": 5},
+        )
+    )
+    assert read["entries"]
+    assert read["entries"][-1]["entry"] == "Today I deepened test coverage."
+
+
+def test_diary_read_empty_when_no_writes(initialized_provider):
+    result = json.loads(initialized_provider.handle_tool_call("mempalace_diary_read", {}))
+    assert result["entries"] == []
+
+
+# ----- Config-load path ---------------------------------------------------
+
+
+def test_initialize_reads_mempalace_json(provider, tmp_dir, palace_path):
+    (Path(tmp_dir) / "mempalace.json").write_text(
+        json.dumps(
+            {
+                "palace_path": palace_path,
+                "n_prefetch": 7,
+                "collection_name": "custom_drawers",
+            }
+        )
+    )
+    provider.initialize("s1", hermes_home=str(tmp_dir))
+    try:
+        assert provider._config["n_prefetch"] == 7
+        assert provider._collection_name == "custom_drawers"
+    finally:
+        provider.shutdown()
+
+
+def test_env_vars_override_config_file(provider, tmp_dir, palace_path, monkeypatch):
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", palace_path)
+    monkeypatch.setenv("MEMPALACE_WING", "wing_forced")
+    provider.initialize("s1", hermes_home=str(tmp_dir))
+    try:
+        assert provider._palace_path == palace_path
+        assert provider._config["wing"] == "wing_forced"
+    finally:
+        provider.shutdown()
