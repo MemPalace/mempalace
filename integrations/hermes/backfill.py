@@ -194,11 +194,20 @@ def classify_wing(text: str, wing_config: dict) -> str:
 def file_exchange(
     exchange: dict,
     wing: str,
-    palace_path: str,
     source_file: str,
+    *,
+    collection=None,
     dry_run: bool = False,
 ) -> bool:
-    """File a single exchange into the palace. Returns True on success."""
+    """File a single exchange into the palace. Returns True on success.
+
+    ``collection`` is a ChromaDB collection produced once by ``backfill()`` via
+    ``mempalace.backends.chroma.ChromaBackend.get_or_create_collection`` — the
+    same construction path the runtime provider uses. Pre-built so we don't
+    spin up a fresh ``PersistentClient`` per exchange, and so the canonical
+    embedding function is bound (avoiding the dim-mismatch bug that broke the
+    prior in-tree Hermes-side PRs on existing palaces).
+    """
     user_msg = exchange.get("user", "").strip()
     assistant_msg = exchange.get("assistant", "").strip()
     if not user_msg:
@@ -213,15 +222,14 @@ def file_exchange(
         logger.info("  [dry-run] [%s] %s...", wing, preview)
         return True
 
-    try:
-        import chromadb
+    if collection is None:
+        logger.debug("file_exchange: collection is None — skipping write")
+        return False
 
+    try:
         ts = datetime.utcnow().isoformat()
         doc_id = hashlib.sha256(f"{source_file}:{text[:120]}".encode()).hexdigest()[:16]
-
-        client = chromadb.PersistentClient(path=palace_path)
-        col = client.get_or_create_collection("mempalace_drawers")
-        col.upsert(
+        collection.upsert(
             ids=[doc_id],
             documents=[text],
             metadatas=[
@@ -276,6 +284,19 @@ def backfill(
         session_files = session_files[:limit]
         logger.info("Processing first %d files (--limit)", limit)
 
+    # Open the collection once via ChromaBackend so the canonical embedding
+    # function is bound and we don't recreate a PersistentClient per exchange.
+    collection = None
+    if not dry_run:
+        try:
+            from mempalace.backends.chroma import ChromaBackend
+
+            backend = ChromaBackend()
+            collection = backend.get_or_create_collection(palace_path, "mempalace_drawers")
+        except Exception as exc:
+            logger.error("Could not open palace collection at %s: %s", palace_path, exc)
+            return 0
+
     total_filed = 0
     total_skipped = 0
 
@@ -293,8 +314,8 @@ def backfill(
             ok = file_exchange(
                 exchange,
                 wing=wing,
-                palace_path=palace_path,
                 source_file=str(session_file),
+                collection=collection,
                 dry_run=dry_run,
             )
             if ok:
