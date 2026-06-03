@@ -248,6 +248,13 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
     DEFAULT_PALACE_PATH = "~/.mempalace/palace"
     DEFAULT_IDENTITY_PATH = "~/.mempalace/identity.txt"
     WORKER_QUEUE_MAX = 500
+    # Cap for status-style metadata scans. On large palaces (200k+ drawers)
+    # an unbounded ``col.get(include=["metadatas"])`` would materialize every
+    # row into Python memory just to compute counts — multi-second hangs and
+    # OOM risk on small hosts. Above this cap, breakdowns are sampled from
+    # the first ``STATUS_SCAN_LIMIT`` drawers and the response carries a
+    # ``truncated`` field so the caller knows it isn't a full census.
+    STATUS_SCAN_LIMIT = 5000
 
     def __init__(self) -> None:
         # Config + lifecycle state
@@ -919,34 +926,68 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         hits = data.get("results", []) if isinstance(data, dict) else []
         return {"results": hits, "count": len(hits)}
 
+    def _scan_metadatas(
+        self, col: Any, where: Optional[Dict[str, Any]] = None
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        """Pull at most ``STATUS_SCAN_LIMIT`` metadata records.
+
+        Returns ``(metas, truncated)``. ``truncated`` is True when the
+        underlying collection holds more rows than the cap so the caller
+        can surface that to the model.
+        """
+        cap = self.STATUS_SCAN_LIMIT
+        kwargs: Dict[str, Any] = {"include": ["metadatas"], "limit": cap}
+        if where:
+            kwargs["where"] = where
+        try:
+            result = col.get(**kwargs)
+        except TypeError:
+            # Very old chroma versions might not accept ``limit`` on
+            # ``get``; fall back to the full scan path.
+            result = col.get(include=["metadatas"], **({"where": where} if where else {}))
+        metas = result.get("metadatas") or []
+        truncated = len(metas) >= cap
+        return metas, truncated
+
     def _tool_status(self) -> Dict[str, Any]:
         with self._collection_lock:
             col = self._collection
         if col is None:
             return {"error": "MemPalace not initialized"}
-        count = col.count()
-        metas = col.get(include=["metadatas"]).get("metadatas") or []
+        total = col.count()
+        metas, truncated = self._scan_metadatas(col)
         wings: Dict[str, int] = {}
         for m in metas:
             w = m.get("wing", "unknown")
             wings[w] = wings.get(w, 0) + 1
-        return {
-            "total_drawers": count,
+        out: Dict[str, Any] = {
+            "total_drawers": total,
             "wings": wings,
             "palace_path": self._palace_path,
         }
+        if truncated:
+            out["truncated"] = (
+                f"Wing breakdown sampled from first {self.STATUS_SCAN_LIMIT} of {total} drawers."
+            )
+        return out
 
     def _tool_list_wings(self) -> Dict[str, Any]:
         with self._collection_lock:
             col = self._collection
         if col is None:
             return {"error": "MemPalace not initialized"}
-        metas = col.get(include=["metadatas"]).get("metadatas") or []
+        metas, truncated = self._scan_metadatas(col)
         wings: Dict[str, int] = {}
         for m in metas:
             w = m.get("wing", "unknown")
             wings[w] = wings.get(w, 0) + 1
-        return {"wings": wings}
+        out: Dict[str, Any] = {"wings": wings}
+        if truncated:
+            out["truncated"] = (
+                f"Sampled from first {self.STATUS_SCAN_LIMIT} drawers "
+                f"(palace total: {col.count()})."
+            )
+        return out
 
     def _tool_list_rooms(self, wing: str) -> Dict[str, Any]:
         if not wing:
@@ -955,12 +996,17 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             col = self._collection
         if col is None:
             return {"error": "MemPalace not initialized"}
-        metas = col.get(where={"wing": wing}, include=["metadatas"]).get("metadatas") or []
+        metas, truncated = self._scan_metadatas(col, where={"wing": wing})
         rooms: Dict[str, int] = {}
         for m in metas:
             r = m.get("room", "unknown")
             rooms[r] = rooms.get(r, 0) + 1
-        return {"wing": wing, "rooms": rooms}
+        out: Dict[str, Any] = {"wing": wing, "rooms": rooms}
+        if truncated:
+            out["truncated"] = (
+                f"Sampled from first {self.STATUS_SCAN_LIMIT} drawers in wing '{wing}'."
+            )
+        return out
 
     def _tool_kg_query(self, entity: str, since: Optional[str] = None) -> Dict[str, Any]:
         if not entity:
