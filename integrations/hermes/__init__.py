@@ -37,6 +37,7 @@ import json
 import logging
 import os
 import queue
+import re
 import threading
 from collections import deque
 from datetime import datetime, timezone
@@ -697,13 +698,28 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             self._wake_up_cache = ""
 
     def _classify_wing(self, text: str) -> str:
+        # If the user pinned a default wing in config, honor it without running
+        # keyword classification. The config field's whole purpose is "don't
+        # auto-classify this profile's turns" — silently keyword-routing on
+        # top of it would make the setting functionally dead.
+        forced = self._config.get("wing")
+        if forced:
+            return str(forced)
         if not self._wing_config:
             return "wing_general"
         text_lower = text.lower()
         for wing_name, wing_def in self._wing_config.items():
             keywords = wing_def.get("keywords", []) if isinstance(wing_def, dict) else []
-            if any(kw.lower() in text_lower for kw in keywords):
-                return wing_name
+            for kw in keywords:
+                if not kw:
+                    continue
+                # Word-boundary match. Bare ``kw.lower() in text_lower`` makes
+                # any short keyword (``ai``, ``go``, ``rb``) match inside
+                # unrelated words (``said``, ``google``, ``orbit``) and routes
+                # turns to wrong wings.
+                pattern = r"\b" + re.escape(kw.lower()) + r"\b"
+                if re.search(pattern, text_lower):
+                    return wing_name
         return "wing_general"
 
     # ----- Internal: filing + background worker --------------------------
@@ -720,24 +736,26 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         try:
             text = f"User: {user_msg}\n\nAssistant: {assistant_msg}".strip()
             wing = self._classify_wing(text)
-            room = payload.get("session_id") or "conversations"
+            # Always file under a stable room name ("conversations"). Using
+            # session_id here would mint one room per session — pollutes
+            # ``mempalace_list_rooms`` and splits live writes from backfill
+            # drawers (which also write to "conversations"). The session id
+            # stays available on the dedicated metadata field below.
             ts = datetime.now(timezone.utc).isoformat()
             # SHA-256 over (timestamp + full content). Earlier audits of this
             # plugin found that a prefix hash caused silent collisions on long
             # repeated turns.
             doc_id = hashlib.sha256(f"{ts}:{text}".encode("utf-8")).hexdigest()[:32]
-            col.upsert(
-                ids=[doc_id],
-                documents=[text],
-                metadatas=[
-                    {
-                        "wing": wing,
-                        "room": room,
-                        "source": "hermes",
-                        "ts": ts,
-                    }
-                ],
-            )
+            metadata: Dict[str, Any] = {
+                "wing": wing,
+                "room": "conversations",
+                "source": "hermes",
+                "ts": ts,
+            }
+            session_id = payload.get("session_id") or ""
+            if session_id:
+                metadata["session_id"] = session_id
+            col.upsert(ids=[doc_id], documents=[text], metadatas=[metadata])
         except Exception as exc:
             logger.debug("MemPalace _file_turn error: %s", exc)
 
