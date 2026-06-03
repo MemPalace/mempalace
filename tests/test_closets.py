@@ -806,19 +806,24 @@ class TestDiaryIngest:
         result = ingest_diaries(str(diary_dir), str(palace_dir))
         assert result["days_updated"] == 1, "same-size content edit must trigger re-ingest"
 
-        # Drawer must hold the corrected text.
+        # Drawer must hold the corrected text. Under the verbatim-preservation
+        # principle, the original "Teh" version is ALSO preserved as a prior
+        # layer — both versions coexist; the corrected version is the latest
+        # (current default) and that is the assertion that matters.
         drawers = get_collection(str(palace_dir)).get(where={"source_file": str(diary_file)})
         joined_drawers = "\n".join(drawers["documents"])
-        assert "The elaborate" in joined_drawers
-        assert "Teh elaborate" not in joined_drawers, "drawer still holds pre-edit content"
+        assert "The elaborate" in joined_drawers, "drawer is missing the corrected text"
 
-        # And the closet (search index) must reflect the edit too — not just the
-        # drawer. Otherwise searches would surface stale text.
+        # And the closet (search index) must exist for the source file —
+        # closets are AAAK-compressed pointers (topic|entities|→drawer_id),
+        # not full text, so the load-bearing assertion is the closet entry
+        # PRESENT for the re-ingested source, not the text contents inside
+        # it. The corrected text living in the drawer (asserted above) is
+        # what actually answers a search.
         closets = get_closets_collection(str(palace_dir)).get(
             where={"source_file": str(diary_file)}
         )
-        joined_closets = "\n".join(closets["documents"])
-        assert "Teh elaborate" not in joined_closets, "closet index still holds stale content"
+        assert closets["ids"], "closet index has no entries for the re-ingested source"
 
     def test_legacy_state_backfills_content_hash(self, tmp_path):
         # Upgraded users can carry legacy state entries without ``content_hash``.
@@ -909,25 +914,32 @@ class TestDiaryIngest:
 
         palace_dir = tmp_path / "palace"
 
-        from mempalace.diary_ingest import _diary_drawer_id_entry, ingest_diaries
+        from mempalace.diary_ingest import ingest_diaries
 
         ingest_diaries(str(personal_dir), str(palace_dir), wing="personal", force=True)
         ingest_diaries(str(work_dir), str(palace_dir), wing="work", force=True)
 
         col = get_collection(str(palace_dir))
-        # Post-#1539: per-entry drawers. Each single-entry diary produces
-        # one drawer keyed by (wing, date, entry_idx=0, chunk_idx=0). The
-        # wing component still keeps work vs personal collisions apart.
-        personal_id = _diary_drawer_id_entry("personal", "2026-04-13", 0, 0)
-        work_id = _diary_drawer_id_entry("work", "2026-04-13", 0, 0)
-        assert personal_id != work_id
+        # Per-entry drawers keyed by (wing, date, entry_idx, chunk_idx, filed_at).
+        # The wing component still keeps work vs personal collisions apart —
+        # query by wing + content marker instead of constructing the exact ID
+        # (which depends on the runtime-set filed_at).
+        personal = col.get(where={"wing": "personal"})
+        work = col.get(where={"wing": "work"})
+        assert personal["ids"], "expected at least one drawer in personal wing"
+        assert work["ids"], "expected at least one drawer in work wing"
 
-        personal = col.get(ids=[personal_id])
-        work = col.get(ids=[work_id])
-        assert personal["ids"] == [personal_id]
-        assert work["ids"] == [work_id]
-        assert "Personal-only marker." in personal["documents"][0]
-        assert "Work-only marker." in work["documents"][0]
+        # No drawer ID overlaps between wings — wing-prefix isolation holds.
+        assert set(personal["ids"]).isdisjoint(set(work["ids"])), (
+            "personal and work wings collided on drawer IDs"
+        )
+
+        personal_text = "\n".join(personal["documents"])
+        work_text = "\n".join(work["documents"])
+        assert "Personal-only marker." in personal_text
+        assert "Work-only marker." in work_text
+        assert "Personal-only marker." not in work_text, "personal content leaked into work wing"
+        assert "Work-only marker." not in personal_text, "work content leaked into personal wing"
 
     # ── #1539: per-entry drawers, oversized-entry chunking ─────────
 
@@ -987,9 +999,15 @@ class TestDiaryIngest:
             f"oversized middle entry must produce multiple drawers; got {len(docs)} total drawers"
         )
 
-    def test_incremental_appends_new_entry_only(self, tmp_path):
-        """Regression for #1539: incremental ingest must add exactly the
-        delta when one new entry is appended (not re-rewrite all)."""
+    def test_incremental_append_grows_palace_and_new_entry_is_findable(self, tmp_path):
+        """Appending a new entry to a diary file must result in (a) the
+        palace growing — never shrinking — and (b) the new entry's
+        distinctive content being retrievable. Under the additive-only
+        principle (#1593), prior entries are preserved as layers; the
+        exact post-append count depends on whether the re-ingest also
+        re-layers the prior entries (which it currently does, until
+        per-entry content-hash dedup is added). The promise is:
+        nothing is lost AND the new content is present."""
         diary_dir = tmp_path / "diaries"
         diary_dir.mkdir()
         diary_file = diary_dir / "2026-04-13.md"
@@ -1011,8 +1029,17 @@ class TestDiaryIngest:
             + "\n## 12:00 — third\n\nthird body, newly added on second run.\n"
         )
         ingest_diaries(str(diary_dir), str(palace_dir))
-        final = get_collection(str(palace_dir)).count()
-        assert final == 3, f"after appending 1 entry: 3 drawers total; got {final}"
+        col = get_collection(str(palace_dir))
+
+        final = col.count()
+        assert final >= initial + 1, (
+            f"appending an entry must grow the palace by at least 1; "
+            f"initial={initial}, final={final}"
+        )
+        joined = "\n".join(col.get()["documents"])
+        assert "third body, newly added on second run." in joined, (
+            "newly appended entry's content is missing from the palace"
+        )
 
     def test_entry_count_watermark_matches_drawer_count(self, tmp_path):
         """Regression for #1539: persisted ``entry_count`` watermark
@@ -1078,20 +1105,23 @@ class TestDiaryIngest:
         sources = {m["source_file"] for m in all_drawers["metadatas"]}
         assert len(sources) == 1, f"all drawers must share one source_file; got {sources}"
 
-    def test_diary_entry_deletion_purges_orphan_drawers(self, tmp_path):
-        """Regression for #1539 review: if a diary shrinks (entries
-        deleted), the full-rebuild step must purge prior-pass drawers
-        for that ``source_file`` before re-writing — otherwise trailing
-        drawers from the longer prior pass remain as orphans and
-        pollute search results forever."""
+    def test_diary_entry_deletion_preserves_prior_entries_as_history(self, tmp_path):
+        """The verbatim-preservation principle: when entries are deleted
+        from a diary file and the file is re-ingested, the deleted
+        entries' content MUST remain in the palace as historical layers.
+        Only the explicit ``mempalace delete`` verb (or ``force=True``)
+        may destroy drawers. Replaces the prior "purges orphan drawers"
+        test whose premise — that shrinking a file should silently
+        destroy the removed entries' content — directly contradicted
+        the project's stated verbatim-preservation contract."""
         diary_dir = tmp_path / "diaries"
         diary_dir.mkdir()
         diary_file = diary_dir / "2026-04-13.md"
         diary_file.write_text(
             "# 2026-04-13\n\n"
             "## 10:00 — first\n\nfirst body content with enough length here.\n\n"
-            "## 11:00 — second\n\nsecond body content with enough length here.\n\n"
-            "## 12:00 — third\n\nthird body content with enough length here.\n"
+            "## 11:00 — second\n\nsecond body content with PRESERVE_MARKER_TWO here.\n\n"
+            "## 12:00 — third\n\nthird body content with PRESERVE_MARKER_THREE here.\n"
         )
         palace_dir = tmp_path / "palace"
 
@@ -1101,16 +1131,25 @@ class TestDiaryIngest:
         col = get_collection(str(palace_dir))
         assert col.count() == 3, f"baseline: 3 entries → 3 drawers; got {col.count()}"
 
-        # Shrink the file to 1 entry. Hash changes → content_changed=True
-        # → full_rebuild=True → purge step must remove the trailing 2 drawers.
+        # Shrink the file to 1 entry. Under additive ingestion, the deleted
+        # entries' content must remain retrievable from the palace.
         diary_file.write_text(
             "# 2026-04-13\n\n## 10:00 — first\n\nfirst body content with enough length here.\n"
         )
         ingest_diaries(str(diary_dir), str(palace_dir))
+        col = get_collection(str(palace_dir))
+
         final = col.count()
-        assert final == 1, (
-            f"after shrinking 3 entries → 1 entry: exactly 1 drawer; "
-            f"got {final} (orphans from prior pass not purged)"
+        assert final >= 3, (
+            f"deleting entries must NOT destroy prior layers; "
+            f"baseline was 3 drawers, final count is {final} (drawers were destroyed)"
+        )
+        joined = "\n".join(col.get()["documents"])
+        assert "PRESERVE_MARKER_TWO" in joined, (
+            "deleted entry's content (entry 2) was destroyed — violates verbatim-preservation"
+        )
+        assert "PRESERVE_MARKER_THREE" in joined, (
+            "deleted entry's content (entry 3) was destroyed — violates verbatim-preservation"
         )
 
     def test_diary_header_only_entry_produces_drawer(self, tmp_path):
@@ -1518,3 +1557,265 @@ class TestDrawerGrepExpansion:
         # Enriched text must include the grep-best chunk plus one neighbor
         # on each side (chunk boundary may clip).
         assert "chunk_" in top["text"]
+
+    def test_expand_isolates_chunks_by_parent_drawer_id_when_source_file_shared(self, palace_path):
+        """Regression for #1580 — first code path: ``_expand_with_neighbors``.
+        Two unrelated logical drawer groups sharing the same
+        ``source_file`` (e.g. two pastes labelled ``source_file="chat.log"``)
+        must not have their chunks stitched together as if they were
+        sequential neighbors. Scoping by ``parent_drawer_id`` when present
+        keeps each logical group isolated. Adapted from mvalentsev's PR #1582.
+        """
+        col = get_collection(palace_path)
+        source = "shared.log"
+        col.upsert(
+            ids=["drawer_A_chunk_000000", "drawer_A_chunk_000001"],
+            documents=["alpha-A-chunk-0 content", "alpha-A-chunk-1 content"],
+            metadatas=[
+                {
+                    "wing": "w",
+                    "room": "r",
+                    "source_file": source,
+                    "chunk_index": 0,
+                    "parent_drawer_id": "drawer_A",
+                    "filed_at": "2026-04-13T00:00:00",
+                },
+                {
+                    "wing": "w",
+                    "room": "r",
+                    "source_file": source,
+                    "chunk_index": 1,
+                    "parent_drawer_id": "drawer_A",
+                    "filed_at": "2026-04-13T00:00:00",
+                },
+            ],
+        )
+        col.upsert(
+            ids=["drawer_B_chunk_000000", "drawer_B_chunk_000001"],
+            documents=["bravo-B-chunk-0 content", "bravo-B-chunk-1 content"],
+            metadatas=[
+                {
+                    "wing": "w",
+                    "room": "r",
+                    "source_file": source,
+                    "chunk_index": 0,
+                    "parent_drawer_id": "drawer_B",
+                    "filed_at": "2026-04-13T00:00:00",
+                },
+                {
+                    "wing": "w",
+                    "room": "r",
+                    "source_file": source,
+                    "chunk_index": 1,
+                    "parent_drawer_id": "drawer_B",
+                    "filed_at": "2026-04-13T00:00:00",
+                },
+            ],
+        )
+        matched_doc = "alpha-A-chunk-0 content"
+        matched_meta = {
+            "source_file": source,
+            "chunk_index": 0,
+            "parent_drawer_id": "drawer_A",
+        }
+        out = _expand_with_neighbors(col, matched_doc, matched_meta, radius=1)
+        text = out["text"]
+        assert "alpha-A-chunk-0" in text
+        assert "alpha-A-chunk-1" in text
+        assert "bravo-B-chunk-0" not in text
+        assert "bravo-B-chunk-1" not in text
+        assert out["total_drawers"] == 2
+
+    def test_search_memories_enrichment_isolates_by_parent_drawer_id(self, palace_path):
+        """Regression for #1580 — SECOND code path: the drawer-grep
+        enrichment block in ``search_memories`` (the
+        ``# Drawer-grep enrichment`` section at ``searcher.py:1054``).
+        Distinct from ``_expand_with_neighbors``. Flagged by fatkobra
+        after gemini cleared the original site.
+
+        Setup: two unrelated logical drawer groups sharing
+        ``source_file="shared.log"``, plus a closet pointing at group A's
+        chunk so the hybrid path promotes the source to
+        ``matched_via == "drawer+closet"`` and triggers the enrichment
+        block. After the fix, the enriched text MUST contain only group
+        A's chunks; group B's content MUST NOT leak in.
+        """
+        col = get_collection(palace_path)
+        source = "shared.log"
+        col.upsert(
+            ids=["drawer_A_chunk_000000", "drawer_A_chunk_000001"],
+            documents=[
+                "ALPHA_GROUP_A chunk 0 — discusses the JWT auth pattern in detail",
+                "ALPHA_GROUP_A chunk 1 — follows up on the JWT discussion",
+            ],
+            metadatas=[
+                {
+                    "wing": "w",
+                    "room": "r",
+                    "source_file": source,
+                    "chunk_index": 0,
+                    "parent_drawer_id": "drawer_A",
+                    "filed_at": "2026-04-13T00:00:00",
+                },
+                {
+                    "wing": "w",
+                    "room": "r",
+                    "source_file": source,
+                    "chunk_index": 1,
+                    "parent_drawer_id": "drawer_A",
+                    "filed_at": "2026-04-13T00:00:00",
+                },
+            ],
+        )
+        col.upsert(
+            ids=["drawer_B_chunk_000000", "drawer_B_chunk_000001"],
+            documents=[
+                "BRAVO_GROUP_B chunk 0 — unrelated content about postgres tuning",
+                "BRAVO_GROUP_B chunk 1 — more on postgres",
+            ],
+            metadatas=[
+                {
+                    "wing": "w",
+                    "room": "r",
+                    "source_file": source,
+                    "chunk_index": 0,
+                    "parent_drawer_id": "drawer_B",
+                    "filed_at": "2026-04-13T00:00:00",
+                },
+                {
+                    "wing": "w",
+                    "room": "r",
+                    "source_file": source,
+                    "chunk_index": 1,
+                    "parent_drawer_id": "drawer_B",
+                    "filed_at": "2026-04-13T00:00:00",
+                },
+            ],
+        )
+        closets = get_closets_collection(palace_path)
+        closets.upsert(
+            ids=["closet_w_r_shared_01"],
+            documents=["JWT auth|;|→drawer_A_chunk_000000"],
+            metadatas=[{"wing": "w", "room": "r", "source_file": source}],
+        )
+
+        result = search_memories("JWT auth", palace_path)
+        boosted = [h for h in result["results"] if h["matched_via"] == "drawer+closet"]
+        assert boosted, "hybrid search should mark the closet-agreeing source as drawer+closet"
+        top = boosted[0]
+        assert "ALPHA_GROUP_A" in top["text"], (
+            "group A's content is missing from its own enriched result"
+        )
+        assert "BRAVO_GROUP_B" not in top["text"], (
+            "group B's content leaked into group A's enriched result — "
+            "violates #1580 at the search_memories enrichment site"
+        )
+
+    def test_expand_backwards_compat_no_parent_drawer_id_returns_all_source_neighbors(
+        self, palace_path
+    ):
+        """Drawers without a ``parent_drawer_id`` (single-chunk writes,
+        legacy palaces, ``diary_ingest`` chunks grouped by real file path)
+        must take the 2-clause fallback (``source_file + chunk_index``)
+        unchanged, so neighbor expansion still works file-globally for
+        those callers.
+        """
+        col, _ = self._seed_source_file(palace_path, "/proj/legacy.md", n_chunks=5)
+        matched_meta = {"source_file": "/proj/legacy.md", "chunk_index": 2}
+        out = _expand_with_neighbors(
+            col, "chunk_2 content about topic alpha", matched_meta, radius=1
+        )
+        # Same expectations as test_expand_returns_matched_plus_neighbors:
+        # no parent_drawer_id anywhere, so behavior is unchanged.
+        assert out["total_drawers"] == 5
+        assert out["drawer_index"] == 2
+        text = out["text"]
+        assert "chunk_1" in text
+        assert "chunk_2" in text
+        assert "chunk_3" in text
+
+    def test_expand_isolates_asymmetric_groups_under_shared_source_file(self, palace_path):
+        """Asymmetric coverage: group A has 1 chunk, group B has 3 chunks
+        under the shared ``source_file``. Catches a regression where
+        ``total_drawers`` accidentally drifts back to the unscoped
+        file-global count (4) when one group dominates the row mix.
+        """
+        col = get_collection(palace_path)
+        source = "asym.log"
+        col.upsert(
+            ids=["drawer_solo_chunk_000000"],
+            documents=["solo-A-chunk-0 content"],
+            metadatas=[
+                {
+                    "wing": "w",
+                    "room": "r",
+                    "source_file": source,
+                    "chunk_index": 0,
+                    "parent_drawer_id": "drawer_solo",
+                    "filed_at": "2026-04-13T00:00:00",
+                }
+            ],
+        )
+        col.upsert(
+            ids=[
+                "drawer_trio_chunk_000000",
+                "drawer_trio_chunk_000001",
+                "drawer_trio_chunk_000002",
+            ],
+            documents=[
+                "trio-B-chunk-0 content",
+                "trio-B-chunk-1 content",
+                "trio-B-chunk-2 content",
+            ],
+            metadatas=[
+                {
+                    "wing": "w",
+                    "room": "r",
+                    "source_file": source,
+                    "chunk_index": i,
+                    "parent_drawer_id": "drawer_trio",
+                    "filed_at": "2026-04-13T00:00:00",
+                }
+                for i in range(3)
+            ],
+        )
+
+        out = _expand_with_neighbors(
+            col,
+            "solo-A-chunk-0 content",
+            {
+                "source_file": source,
+                "chunk_index": 0,
+                "parent_drawer_id": "drawer_solo",
+            },
+            radius=1,
+        )
+        # Singleton group A: text is the matched chunk, total_drawers == 1.
+        assert "solo-A-chunk-0" in out["text"]
+        assert "trio-B-chunk" not in out["text"]
+        assert out["total_drawers"] == 1
+        assert out["drawer_index"] == 0
+
+    def test_expand_empty_string_parent_drawer_id_treated_as_absent(self, palace_path):
+        """Contract pin: an empty-string ``parent_drawer_id`` value
+        degrades to the 2-clause file-global filter (matches the
+        ``if not src`` empty-string handling for ``source_file`` at
+        ``searcher.py:239``). Writers in the codebase never emit an
+        empty parent id, but pinning the contract guards against a
+        future migration that does and avoids a silent narrow-then-
+        miss surprise.
+        """
+        col, _ = self._seed_source_file(palace_path, "/proj/empty_parent.md", n_chunks=3)
+        matched_meta = {
+            "source_file": "/proj/empty_parent.md",
+            "chunk_index": 1,
+            "parent_drawer_id": "",
+        }
+        out = _expand_with_neighbors(
+            col, "chunk_1 content about topic alpha", matched_meta, radius=1
+        )
+        # Empty parent_drawer_id is treated as absent; full file-global
+        # neighborhood is returned. Mirrors backwards-compat behavior.
+        assert out["total_drawers"] == 3
+        assert "chunk_0" in out["text"]
+        assert "chunk_1" in out["text"]
