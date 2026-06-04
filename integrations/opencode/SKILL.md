@@ -26,33 +26,33 @@ metadata:
 
 > **Community-maintained plugin.** This integration uses `opencode-mempalace-persistence`, a community plugin not officially maintained by the MemPalace team. Source: [github.com/geco/opencode-mempalace-persistence](https://github.com/geco/opencode-mempalace-persistence).
 
-MemPalace provides persistent memory for OpenCode. Every conversation is automatically saved to a local vector database — no cron, no cloud, no manual effort. The model can optionally record Knowledge Graph facts during conversation via MCP tools.
+MemPalace provides persistent memory for OpenCode. Every conversation is automatically saved to a local vector database — no cron, no cloud, no manual effort. The plugin can inject relevant memories directly into every prompt, and the model can record Knowledge Graph facts during conversation via MCP tools.
 
 ## How it works
 
-1. **Plugin hooks**: The plugin listens to OpenCode's `chat.message` and `session.idle` events
-2. **Turn detection**: Each complete user question + AI answer is captured as a single turn
-3. **Export**: Sessions are exported flat (no forced categorization) to a temp directory
-4. **Mining**: `mempalace mine --mode convos` runs asynchronously — UI is never blocked
-5. **Memory search**: The model searches MemPalace via MCP before answering (guided by AGENTS.md)
-6. **KG (optional)**: The model may record or query structured facts via `mempalace_kg_add` / `kg_query` / `kg_invalidate`
+1. **Memory injection**: On every user message, the plugin hooks into `experimental.chat.messages.transform` and injects the user's identity + relevant memories from MemPalace directly into the prompt
+2. **Persistence**: After each response, the plugin captures the conversation turn and exports it
+3. **Mining**: `mempalace mine --mode convos` runs asynchronously — UI is never blocked
+4. **KG (mandatory)**: The model records/updates structured facts via `mempalace_kg_add` / `kg_query` / `kg_invalidate` as instructed by AGENTS.md
 
-The mining runs asynchronously — state is saved immediately, and the actual vector indexing happens in the background.
+Both memory injection and persistence are handled by the plugin — no model discipline required.
 
 ## Architecture
 
 ```
-OpenCode chat.message hook
-        ↓
-  Query DB for new messages (delta since last sync)
-        ↓
-  Export sessions → flat /tmp/oc-sessions/ (no wing subdirs)
-        ↓
-  Save sync state immediately
-        ↓
-  mempalace mine (async) — single serialized call, --mode convos
-        ↓
-  session.idle hook (fallback for last turn on shutdown)
+User message
+      ↓
+experimental.chat.messages.transform hook
+      ↓
+Plugin injects identity + MemPalace search results
+      ↓
+Model sees context → responds
+      ↓
+chat.message + session.idle hooks
+      ↓
+Export conversation → flat /tmp/oc-sessions/
+      ↓
+mempalace mine (async) — single serialized call, --mode convos
 ```
 
 ## Setup
@@ -91,31 +91,67 @@ Add to your `~/.config/opencode/opencode.json`:
 }
 ```
 
-### 4. Add memory instructions for the model
+### 4. Enable memory injection (recommended)
 
-Create `~/.config/opencode/AGENTS.md`:
+Create `~/.mempalace/plugin-config.json` — this tells the plugin to automatically inject your identity and relevant memories into every prompt:
+
+```json
+{
+  "autoInjectContext": true
+}
+```
+
+**Do NOT put this in `opencode.json`** — OpenCode's schema validation rejects unknown keys. The plugin reads its config from `~/.mempalace/plugin-config.json` instead.
+
+When enabled, on every user message:
+- **First message**: Injects your identity from `~/.mempalace/identity.txt`
+- **Every message**: Runs `mempalace search` and injects relevant results
+
+### 5. Add memory instructions for the model
+
+Create `~/.config/opencode/AGENTS.md` — since the plugin handles memory search, the model only needs to manage the Knowledge Graph:
 
 ```markdown
 # Memory & Knowledge instructions
 
-## CRITICAL: You MUST search MemPalace BEFORE every response.
+## CRITICAL: You MUST follow these steps BEFORE every response.
 
-1. Call `mempalace_mempalace_search` with the user's question as query.
-2. Call `mempalace_mempalace_kg_query` for entity "user" to retrieve relevant facts.
-3. Use relevant context in your response.
+### Step 1 — Query Knowledge Graph
+Call `mempalace_mempalace_kg_query` for entity "user". Then filter the returned facts — keep only those whose text contains keywords from the user's question, so irrelevant facts are excluded.
 
-Knowledge Graph management (optional but recommended):
-- `mempalace_mempalace_kg_add` for new facts (subject → predicate → object)
-- `mempalace_mempalace_kg_invalidate` when facts change
+### Step 2 — Record Knowledge Graph facts
+
+After responding, if you discovered any new facts during the conversation (decisions made, milestones reached, problems encountered, preferences expressed, emotional states), call `mempalace_mempalace_kg_add` to record them. Object must be 128 characters or fewer.
+
+**This is mandatory** — facts about the user's projects, decisions, and preferences must be saved for future sessions. If you're unsure whether something is a fact, err on the side of saving it. A session with zero KG entries is likely missing important information.
 ```
 
-### 5. (Optional) Add your identity
+### 6. Add your identity
 
-Create `~/.mempalace/identity.txt` with a brief description of who you are. It will be loaded automatically at session start.
+Create `~/.mempalace/identity.txt` with a brief description of who you are:
+
+```
+I am [name], a [role]. I work with [technologies]. My main projects are [projects].
+```
+
+This is loaded automatically by the plugin — no need to add it to `instructions` in opencode.json.
+
+## Alternative: Model-driven memory search
+
+If you prefer the model to search MemPalace on its own (requires good model tool-use discipline), omit `autoInjectContext` or set it to `false` in `plugin-config.json`, and use the full AGENTS.md that instructs the model to call `mempalace_mempalace_search` before every response.
+
+## Comparison
+
+| Feature | Auto-inject (recommended) | Model-driven |
+|---------|:-:|:-:|
+| Memory search | Plugin injects automatically | Model calls `mempalace_search` |
+| Identity | Plugin injects automatically | Via `instructions: ["identity.txt"]` |
+| AGENTS.md needed | Minimal (KG only) | Full (search + KG) |
+| Depends on model discipline | No | Yes |
 
 ## What gets saved
 
-Every conversation turn is saved as a **drawer** in MemPalace. No forced categorization — MemPalace's own mining handles organization. The model can optionally record structured facts (decisions, milestones, preferences) during conversation via MCP tools.
+Every conversation turn is saved as a **drawer** in MemPalace. No forced categorization — MemPalace's own mining handles organization. The model records structured facts (decisions, milestones, preferences) during conversation via MCP tools.
 
 ## Benefits over cron-based sync
 
