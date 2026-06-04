@@ -882,6 +882,7 @@ def tool_search(
     max_distance: float = 1.5,
     min_similarity: float = None,
     context: str = None,
+    candidate_strategy: str = "vector",
 ):
     limit = max(1, min(limit, _MAX_RESULTS))
     try:
@@ -909,6 +910,7 @@ def tool_search(
         max_distance=dist,
         vector_disabled=_vector_disabled,
         collection_name=_config.collection_name,
+        candidate_strategy=candidate_strategy,
     )
     if _is_transient_index_error(result):
         # Post-bulk-write HNSW flush window (#1315): drop caches, give
@@ -925,6 +927,7 @@ def tool_search(
             n_results=limit,
             max_distance=dist,
             vector_disabled=_vector_disabled,
+            candidate_strategy=candidate_strategy,
         )
         if not _is_transient_index_error(result):
             result["index_recovered"] = True
@@ -2206,6 +2209,11 @@ TOOLS = {
                 "context": {
                     "type": "string",
                     "description": "Background context for the search (optional). NOT used for embedding — only for future re-ranking.",
+                },
+                "candidate_strategy": {
+                    "type": "string",
+                    "enum": ["vector", "union"],
+                    "description": "How candidates for the hybrid re-rank are gathered. 'vector' (default) ranks the vector-recall pool only. 'union' also merges top BM25 candidates from the sqlite FTS5 index, recalling drawers a keyword matches but the embedding missed.",
                 },
             },
             "required": ["query"],
