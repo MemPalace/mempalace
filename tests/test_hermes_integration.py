@@ -424,6 +424,54 @@ def test_list_rooms_tool_rejects_missing_wing(provider_on_seeded_palace):
     assert "error" in result
 
 
+def test_status_tool_omits_truncated_under_cap(provider_on_seeded_palace):
+    # 4 seeded drawers, cap is 5000 — the response must not advertise
+    # itself as a partial view when in fact it's complete.
+    result = json.loads(provider_on_seeded_palace.handle_tool_call("mempalace_status", {}))
+    assert "truncated" not in result
+    assert "scanned" not in result
+
+
+def test_status_tool_marks_truncated_with_structured_fields(provider_on_seeded_palace):
+    # Force the cap below the seeded count so we exercise the truncation path.
+    # The model needs ``truncated`` (bool) + ``scanned`` (int) so it can
+    # compute coverage = scanned / total_drawers itself rather than parsing
+    # a sentence.
+    provider_on_seeded_palace.STATUS_SCAN_LIMIT = 2
+    result = json.loads(provider_on_seeded_palace.handle_tool_call("mempalace_status", {}))
+    assert result["truncated"] is True
+    assert result["scanned"] == 2
+    assert result["total_drawers"] == 4
+
+
+def test_list_wings_tool_marks_truncated_with_palace_total(provider_on_seeded_palace):
+    # ``_tool_list_wings`` has no unconditional ``total_drawers`` field —
+    # when truncated it must surface ``total_drawers`` so callers can
+    # compute coverage without a second ``mempalace_status`` call.
+    provider_on_seeded_palace.STATUS_SCAN_LIMIT = 2
+    result = json.loads(provider_on_seeded_palace.handle_tool_call("mempalace_list_wings", {}))
+    assert result["truncated"] is True
+    assert result["scanned"] == 2
+    assert result["total_drawers"] == 4
+
+
+def test_list_rooms_tool_marks_truncated_without_wing_total(provider_on_seeded_palace):
+    # Rooms can't cheaply give an exact wing total (no ``where=`` on
+    # ``count()`` in the pinned chroma version). The structured fields are
+    # still present; the absent ``total_drawers`` is intentional and
+    # documented in the code.
+    provider_on_seeded_palace.STATUS_SCAN_LIMIT = 1
+    result = json.loads(
+        provider_on_seeded_palace.handle_tool_call(
+            "mempalace_list_rooms",
+            {"wing": "project"},
+        )
+    )
+    assert result["truncated"] is True
+    assert result["scanned"] == 1
+    assert "total_drawers" not in result
+
+
 # ----- Knowledge-graph tool handlers --------------------------------------
 
 

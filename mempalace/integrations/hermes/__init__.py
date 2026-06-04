@@ -252,8 +252,10 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
     # an unbounded ``col.get(include=["metadatas"])`` would materialize every
     # row into Python memory just to compute counts — multi-second hangs and
     # OOM risk on small hosts. Above this cap, breakdowns are sampled from
-    # the first ``STATUS_SCAN_LIMIT`` drawers and the response carries a
-    # ``truncated`` field so the caller knows it isn't a full census.
+    # the first ``STATUS_SCAN_LIMIT`` drawers and the response carries
+    # ``truncated: True`` plus a ``scanned`` count so the caller knows
+    # exactly how partial the view is and can compute coverage against the
+    # palace total it already has.
     STATUS_SCAN_LIMIT = 5000
 
     def __init__(self) -> None:
@@ -966,9 +968,11 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             "palace_path": self._palace_path,
         }
         if truncated:
-            out["truncated"] = (
-                f"Wing breakdown sampled from first {self.STATUS_SCAN_LIMIT} of {total} drawers."
-            )
+            # ``total_drawers`` already gives the model the 100% reference;
+            # ``scanned`` lets it compute coverage = scanned / total_drawers
+            # and qualify any wing claim accordingly.
+            out["truncated"] = True
+            out["scanned"] = len(metas)
         return out
 
     def _tool_list_wings(self) -> Dict[str, Any]:
@@ -983,10 +987,12 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             wings[w] = wings.get(w, 0) + 1
         out: Dict[str, Any] = {"wings": wings}
         if truncated:
-            out["truncated"] = (
-                f"Sampled from first {self.STATUS_SCAN_LIMIT} drawers "
-                f"(palace total: {col.count()})."
-            )
+            out["truncated"] = True
+            out["scanned"] = len(metas)
+            # Palace total is the model's 100% reference — same shape as
+            # ``_tool_status`` so a coverage ratio can be computed without
+            # an additional tool call.
+            out["total_drawers"] = col.count()
         return out
 
     def _tool_list_rooms(self, wing: str) -> Dict[str, Any]:
@@ -1003,9 +1009,12 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             rooms[r] = rooms.get(r, 0) + 1
         out: Dict[str, Any] = {"wing": wing, "rooms": rooms}
         if truncated:
-            out["truncated"] = (
-                f"Sampled from first {self.STATUS_SCAN_LIMIT} drawers in wing '{wing}'."
-            )
+            out["truncated"] = True
+            out["scanned"] = len(metas)
+            # ChromaDB's ``count()`` doesn't support ``where=`` filtering
+            # in the versions mempalace pins, so we can't cheaply give an
+            # exact wing total. The model can still see this view is partial
+            # via the truncated/scanned pair.
         return out
 
     def _tool_kg_query(self, entity: str, since: Optional[str] = None) -> Dict[str, Any]:
