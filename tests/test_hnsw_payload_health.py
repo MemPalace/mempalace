@@ -1,4 +1,5 @@
 import os
+import pickle
 from pathlib import Path
 
 from mempalace.backends.chroma import (
@@ -155,4 +156,84 @@ def test_quarantine_catches_zero_byte_link_lists_when_stale(tmp_path):
 
     moved_path = Path(moved[0])
     assert moved_path.exists()
+    assert moved_path.name.startswith("11111111-2222-3333-4444-555555555555.drift-")
+
+
+# ---------------------------------------------------------------------------
+# Regression: pre-first-flush HNSW segments under _HNSW_BLOAT_GUARD
+#
+# With hnsw:sync_threshold = 50_000, chromadb preallocates data_level0.bin
+# at segment creation but does not flush link_lists.bin or
+# index_metadata.pickle until 50k WAL entries accumulate. Meanwhile,
+# chroma.sqlite3 is written on every upsert, so its mtime races ahead of
+# the HNSW binaries within minutes of active use. The previous heuristic
+# treated this normal operating shape as corruption and quarantined the
+# segment, producing a 550_000-vector -> 0-vector regression on every
+# fresh PersistentClient open.
+# ---------------------------------------------------------------------------
+
+
+def test_segment_health_treats_preflush_with_missing_pickle_as_healthy(tmp_path):
+    """Pre-first-flush: data preallocated, link_lists empty, pickle missing -> safe."""
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    db_path = palace / "chroma.sqlite3"
+    db_path.write_text("sqlite placeholder")
+
+    seg_dir = palace / "11111111-2222-3333-4444-555555555555"
+    seg_dir.mkdir()
+    # data_level0.bin > floor (chromadb preallocation), link_lists.bin == 0,
+    # NO index_metadata.pickle (compactor has never run on this segment).
+    (seg_dir / "data_level0.bin").write_bytes(b"\0" * 167_600)
+    (seg_dir / "link_lists.bin").write_bytes(b"")
+
+    # sqlite_mtime - hnsw_mtime = 467s, exceeds the 300s default threshold.
+    hnsw_time = 1_700_000_000
+    sqlite_time = hnsw_time + 467
+    os.utime(seg_dir / "data_level0.bin", (hnsw_time, hnsw_time))
+    os.utime(db_path, (sqlite_time, sqlite_time))
+
+    assert _segment_appears_healthy(str(seg_dir))
+
+    moved = quarantine_stale_hnsw(str(palace), stale_seconds=300)
+    assert moved == []
+    assert seg_dir.exists()
+
+
+def test_segment_health_quarantines_when_pickle_claims_labels_but_link_lists_empty(
+    tmp_path,
+):
+    """Dangerous shape: id_to_label populated, link_lists empty -> quarantine."""
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    db_path = palace / "chroma.sqlite3"
+    db_path.write_text("sqlite placeholder")
+
+    seg_dir = palace / "11111111-2222-3333-4444-555555555555"
+    seg_dir.mkdir()
+    (seg_dir / "data_level0.bin").write_bytes(b"\0" * 167_600)
+    (seg_dir / "link_lists.bin").write_bytes(b"")
+    # A real pickle of a dict carrying a non-empty id_to_label. Plain dict
+    # pickling uses EMPTY_DICT/SETITEMS opcodes, which do not pass through
+    # _SafePersistentDataUnpickler.find_class, so the safe unpickler accepts
+    # it. _persisted_metadata_fields reads id_to_label via obj.get(...).
+    payload = {"dimensionality": 384, "id_to_label": {1: 1, 2: 2, 3: 3}}
+    (seg_dir / "index_metadata.pickle").write_bytes(pickle.dumps(payload))
+
+    # Drive mtime gap above the stale threshold so quarantine_stale_hnsw
+    # evaluates _segment_appears_healthy at all (without drift, the function
+    # short-circuits at "not stale" and never inspects health).
+    hnsw_time = 1_700_000_000
+    sqlite_time = hnsw_time + 1_000
+    os.utime(seg_dir / "data_level0.bin", (hnsw_time, hnsw_time))
+    os.utime(db_path, (sqlite_time, sqlite_time))
+
+    assert not _segment_appears_healthy(str(seg_dir))
+
+    moved = quarantine_stale_hnsw(str(palace), stale_seconds=300)
+    assert len(moved) == 1
+    assert not seg_dir.exists()
+    moved_path = Path(moved[0])
     assert moved_path.name.startswith("11111111-2222-3333-4444-555555555555.drift-")

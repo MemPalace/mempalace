@@ -75,23 +75,99 @@ def _hnsw_link_to_data_ratio(seg_dir: str) -> Optional[float]:
 def _hnsw_link_lists_is_usable_for_payload(seg_dir: str) -> bool:
     """Return False when a non-trivial HNSW payload lacks usable link lists.
 
-    A missing or empty link_lists.bin is acceptable only for a fresh/empty
-    segment. Once data_level0.bin has real payload, a zero-byte link_lists.bin
-    is not a harmless async-flush shape: ChromaDB can later hand the broken
-    graph to hnswlib and crash in native code.
+    A missing or empty link_lists.bin is acceptable in three cases:
+
+    1. The segment is fresh/empty (data_level0.bin missing or <= the
+       MISSING_METADATA floor).
+    2. The segment is pre-first-flush: ``_HNSW_BLOAT_GUARD`` sets
+       ``hnsw:sync_threshold = 50_000``, so chromadb preallocates a
+       non-trivial ``data_level0.bin`` at segment creation but holds
+       every WAL entry in ``embeddings_queue`` until the threshold is
+       crossed. During that window ``link_lists.bin`` and
+       ``index_metadata.pickle`` are both absent/empty; chromadb will
+       NOT open the HNSW reader against this shape — it replays from
+       the queue. This is the steady-state operating mode of any palace
+       under the bloat-guard tuning, not corruption.
+    3. The metadata pickle exists but its ``id_to_label`` mapping is
+       empty — chromadb has flushed the segment skeleton but not
+       committed any graph edges yet.
+
+    The DANGEROUS shape is "``index_metadata.pickle`` claims a populated
+    graph (``id_to_label`` non-empty) but ``link_lists.bin`` is empty or
+    missing" — that is where chromadb opens the HNSW reader and hands
+    hnswlib a graph with no link table, SIGSEGV in native code. We keep
+    quarantining that shape, and we still quarantine on any unreadable
+    pickle paired with an empty link table (conservative: unknown commit
+    state, prefer the safety rename to a possible crash).
     """
     data_path = os.path.join(seg_dir, "data_level0.bin")
     link_path = os.path.join(seg_dir, "link_lists.bin")
+    meta_path = os.path.join(seg_dir, "index_metadata.pickle")
 
     try:
+        # Case 1a: no data file → fresh segment, safe.
         if not os.path.isfile(data_path):
             return True
 
         data_size = os.path.getsize(data_path)
+        # Case 1b: data file under the floor → preallocation only, safe.
         if data_size <= _HNSW_MISSING_METADATA_DATA_FLOOR:
             return True
 
-        return os.path.isfile(link_path) and os.path.getsize(link_path) > 0
+        link_has_payload = (
+            os.path.isfile(link_path) and os.path.getsize(link_path) > 0
+        )
+        pickle_present_nonempty = (
+            os.path.isfile(meta_path) and os.path.getsize(meta_path) > 0
+        )
+
+        if link_has_payload:
+            # Case 3: committed graph. link_lists and index_metadata.pickle
+            # are written together during chromadb's compactor flush; a
+            # non-empty link with missing/empty pickle is a torn write
+            # (data on disk, no recovery metadata). Require the pickle
+            # to be present and parseable. This subsumes the byte-envelope
+            # sniff the caller used to perform — the unpickle attempt is
+            # a strictly stronger truncation check.
+            if not pickle_present_nonempty:
+                return False
+            try:
+                _SafePersistentDataUnpickler.load(meta_path)
+            except Exception:
+                return False
+            return True
+
+        # link_lists is missing or empty. Distinguish pre-first-flush
+        # (safe — chromadb has not committed any graph) from
+        # "graph claimed but link table missing" (unsafe — SIGSEGV path).
+        # The pickle is the authoritative signal of commit state: if it
+        # is absent or empty, chromadb has not yet written a graph
+        # snapshot, so the segment will WAL-replay on next open.
+        if not pickle_present_nonempty:
+            return True
+
+        # Pickle exists and is non-empty: inspect id_to_label.
+        # Unparseable pickle paired with empty link_lists is treated as
+        # unsafe — preserves the strict path the existing
+        # quarantine_invalid_hnsw_metadata gate also enforces.
+        try:
+            persisted = _SafePersistentDataUnpickler.load(meta_path)
+        except Exception:
+            return False
+
+        _dimensionality, id_to_label = _persisted_metadata_fields(persisted)
+        if not isinstance(id_to_label, dict):
+            # Pickle parses but yields no usable id_to_label mapping
+            # (None or malformed type). Unknown commit state → refuse.
+            return False
+        if len(id_to_label) == 0:
+            # Skeleton committed, no committed graph edges yet → safe.
+            # link_lists.bin empty matches that state.
+            return True
+        # id_to_label claims labels but link_lists.bin is empty —
+        # DANGEROUS: chromadb will open and hand hnswlib a graph with
+        # no link table → SIGSEGV in native code. Refuse.
+        return False
     except OSError:
         return False
 
@@ -162,61 +238,26 @@ def _validate_where(where: Optional[dict]) -> None:
 def _segment_appears_healthy(seg_dir: str) -> bool:
     """Return True if a chromadb HNSW segment dir looks intact.
 
-    Sniff-tests the chromadb-written segment metadata file
-    (``index_metadata.pickle``) for its expected format bytes without
-    parsing it. ChromaDB writes that file after a successful HNSW flush;
-    a complete write starts with byte ``0x80`` and ends with byte
-    ``0x2e`` (the protocol/terminator byte sequence chromadb serializes
-    with).
+    Single delegation point: all classification rules — fresh/empty,
+    pre-first-flush, committed graph, torn write, dangerous claimed
+    graph with missing link table, payload bloat — are owned by
+    :func:`_hnsw_payload_appears_sane` (which in turn calls
+    :func:`_hnsw_link_lists_is_usable_for_payload`).
 
-    Missing metadata is healthy only while the segment still looks fresh or
-    empty. If ``data_level0.bin`` already has non-trivial payload but
-    ``index_metadata.pickle`` is missing, the segment is partially flushed:
-    Chroma wrote vector data without the metadata it needs to reopen the
-    HNSW reader safely.
+    Earlier revisions of this function duplicated the
+    missing-pickle/data-floor heuristic here, which silently
+    overruled the helper and quarantined valid pre-first-flush
+    segments under ``_HNSW_BLOAT_GUARD`` (sync_threshold=50_000).
+    Consolidated into the helper so the rules live in exactly one
+    place.
 
-    Deliberately format-sniffs only; never deserializes. Deserialization
-    can execute arbitrary code, and the byte-sniff is sufficient to
-    distinguish a complete write from truncation, zero-fill, or
-    partial-flush corruption.
-
-    Assumes pickle protocol >= 2 (``0x80`` PROTO marker). Matches what
-    chromadb writes today; if a future chromadb version emits protocol
-    0/1 segments, this check would start returning False on healthy
-    files and quarantine_stale_hnsw would conservatively rename them
-    out of the way.
+    The previous byte-envelope sniff (0x80 PROTO marker + 0x2e STOP
+    byte) for present pickles is subsumed by the helper's
+    :class:`_SafePersistentDataUnpickler` load attempt, which is
+    strictly stronger — truncated, zero-filled, or malformed pickles
+    raise and the helper returns False.
     """
-    if not _hnsw_payload_appears_sane(seg_dir):
-        return False
-
-    meta_path = os.path.join(seg_dir, "index_metadata.pickle")
-    if not os.path.isfile(meta_path):
-        data_path = os.path.join(seg_dir, "data_level0.bin")
-        try:
-            if (
-                os.path.isfile(data_path)
-                and os.path.getsize(data_path) > _HNSW_MISSING_METADATA_DATA_FLOOR
-            ):
-                return False
-        except OSError:
-            return False
-
-        # No metadata and no meaningful vector payload yet: fresh/empty segment.
-        return True
-
-    try:
-        size = os.path.getsize(meta_path)
-        # A real chromadb metadata file is at least tens of bytes; a
-        # smaller-than-floor file is almost certainly truncated.
-        if size < 16:
-            return False
-        with open(meta_path, "rb") as f:
-            head = f.read(2)
-            f.seek(-1, 2)  # last byte
-            tail = f.read(1)
-    except OSError:
-        return False
-    return len(head) == 2 and head[0] == 0x80 and tail == b"\x2e"
+    return _hnsw_payload_appears_sane(seg_dir)
 
 
 def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> list[str]:
