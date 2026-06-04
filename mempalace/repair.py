@@ -42,6 +42,7 @@ from typing import Callable, Iterator, Optional
 
 from chromadb.errors import NotFoundError as ChromaNotFoundError
 
+from ._sqlite_ro import connect_ro, open_ro
 from .backends.chroma import ChromaBackend, hnsw_capacity_status
 
 
@@ -474,9 +475,7 @@ def sqlite_drawer_count(palace_path: str, collection_name: Optional[str] = None)
     if not os.path.exists(sqlite_path):
         return None
     try:
-        import sqlite3
-
-        conn = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
+        conn = open_ro(sqlite_path, deadline_s=120.0)
         try:
             row = conn.execute(
                 """
@@ -516,7 +515,11 @@ def sqlite_integrity_errors(palace_path: str) -> list[str]:
         return []
 
     try:
-        with sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True) as conn:
+        # Full-DB integrity scan run as an explicit maintenance op (not on the
+        # MCP event loop), so no wall-clock deadline -- it legitimately scans
+        # the whole multi-GB file. connect_ro still guarantees close (the bare
+        # `with sqlite3.connect(...)` form commits but never closes).
+        with connect_ro(sqlite_path, deadline_s=None) as conn:
             rows = conn.execute("PRAGMA quick_check").fetchall()
     except sqlite3.Error as e:
         return [f"PRAGMA quick_check failed: {e}"]
@@ -1001,7 +1004,7 @@ def extract_via_sqlite(palace_path: str, collection_name: str) -> Iterator[tuple
     if not os.path.isfile(sqlite_path):
         return
 
-    conn = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
+    conn = open_ro(sqlite_path, deadline_s=120.0)
     try:
         seg_row = conn.execute(
             """
