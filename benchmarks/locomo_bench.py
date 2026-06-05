@@ -1032,7 +1032,7 @@ if __name__ == "__main__":
         "--llm-model",
         default="claude-sonnet-4-6",
         help="Model for LLM rerank (default: claude-sonnet-4-6). "
-        "MiniMax models also supported: MiniMax-M2.7, MiniMax-M2.7-highspeed "
+        "MiniMax models also supported: MiniMax-M3 (recommended), MiniMax-M2.7 "
         "(set MINIMAX_API_KEY env var or pass via --llm-key).",
     )
     parser.add_argument(

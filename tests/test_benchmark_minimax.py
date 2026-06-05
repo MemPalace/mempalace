@@ -40,6 +40,9 @@ class TestLlmBaseUrl:
     def test_minimax_m2_7_returns_minimax(self):
         assert _locomo._llm_base_url("MiniMax-M2.7") == "https://api.minimax.io/anthropic"
 
+    def test_minimax_m3_returns_minimax(self):
+        assert _locomo._llm_base_url("MiniMax-M3") == "https://api.minimax.io/anthropic"
+
     def test_minimax_highspeed_returns_minimax(self):
         assert _locomo._llm_base_url("MiniMax-M2.7-highspeed") == "https://api.minimax.io/anthropic"
 
@@ -49,6 +52,9 @@ class TestLlmBaseUrl:
 
     def test_longmemeval_minimax_returns_minimax(self):
         assert _longmem._llm_base_url("MiniMax-M2.7") == "https://api.minimax.io/anthropic"
+
+    def test_longmemeval_minimax_m3_returns_minimax(self):
+        assert _longmem._llm_base_url("MiniMax-M3") == "https://api.minimax.io/anthropic"
 
     def test_longmemeval_claude_returns_anthropic(self):
         assert _longmem._llm_base_url("claude-haiku-4-5-20251001") == "https://api.anthropic.com"
@@ -71,6 +77,11 @@ class TestLoadApiKey:
         monkeypatch.setenv("MINIMAX_API_KEY", "minimax-secret")
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         assert _locomo._load_api_key("", model="MiniMax-M2.7") == "minimax-secret"
+
+    def test_minimax_m3_uses_minimax_key(self, monkeypatch):
+        monkeypatch.setenv("MINIMAX_API_KEY", "minimax-secret")
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        assert _locomo._load_api_key("", model="MiniMax-M3") == "minimax-secret"
 
     def test_minimax_model_falls_back_to_anthropic_if_no_minimax_key(self, monkeypatch):
         monkeypatch.delenv("MINIMAX_API_KEY", raising=False)

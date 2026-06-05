@@ -3293,7 +3293,7 @@ if __name__ == "__main__":
         default="claude-haiku-4-5-20251001",
         help="Model for LLM re-ranking and diary ingest "
         "(default: claude-haiku-4-5-20251001). "
-        "MiniMax models also supported: MiniMax-M2.7, MiniMax-M2.7-highspeed "
+        "MiniMax models also supported: MiniMax-M3 (recommended), MiniMax-M2.7 "
         "(set MINIMAX_API_KEY env var or pass via --llm-key).",
     )
     parser.add_argument(
