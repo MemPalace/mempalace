@@ -30,7 +30,7 @@ MemPalace provides persistent memory for OpenCode. Every conversation is automat
 
 ## How it works
 
-1. **Memory injection**: On every user message, the plugin hooks into `experimental.chat.messages.transform` and injects the user's identity + relevant memories from MemPalace directly into the prompt
+1. **Memory injection**: On every user message, the plugin hooks into `experimental.chat.messages.transform` (OpenCode 1.14+) and injects the user's identity + relevant memories from MemPalace directly into the prompt
 2. **Persistence**: After each response, the plugin captures the conversation turn and exports it
 3. **Mining**: `mempalace mine --mode convos` runs asynchronously — UI is never blocked
 4. **KG (mandatory)**: The model records/updates structured facts via `mempalace_kg_add` / `kg_query` / `kg_invalidate` as instructed by AGENTS.md
@@ -90,6 +90,8 @@ Add to your `~/.config/opencode/opencode.json`:
   "plugins": ["opencode-mempalace-persistence"]
 }
 ```
+
+> **OpenCode version note:** The `experimental.chat.messages.transform` hook used by this plugin is available in OpenCode 1.14+. It is a stable experimental API — the hook signature has not changed since introduction. If a breaking change occurs in a future OpenCode version, this doc will be updated.
 
 ### 4. Enable memory injection (recommended)
 
