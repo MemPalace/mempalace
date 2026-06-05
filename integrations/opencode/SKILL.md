@@ -12,9 +12,8 @@ metadata:
       - linux
       - win32
     requires:
-      anyBins:
+      allBins:
         - mempalace
-        - python3
     install:
       - id: mempalace-plugin
         kind: npm
@@ -109,6 +108,8 @@ When enabled, on every user message:
 - **First message**: Injects your identity from `~/.mempalace/identity.txt`
 - **Every message**: Runs `mempalace search` and injects relevant results
 
+> **Performance note:** With auto-inject enabled, the plugin runs `mempalace search` before every message, and AGENTS.md adds `mempalace_kg_query` on top — two MCP calls per response. On slow hardware or large palaces this adds latency. The combined cost is typically under 500ms on a modern machine with a palace under 100MB.
+
 ### 5. Add memory instructions for the model
 
 Create `~/.config/opencode/AGENTS.md` — since the plugin handles memory search, the model only needs to manage the Knowledge Graph:
@@ -125,7 +126,7 @@ Call `mempalace_mempalace_kg_query` for entity "user". Then filter the returned 
 
 After responding, if you discovered any new facts during the conversation (decisions made, milestones reached, problems encountered, preferences expressed, emotional states), call `mempalace_mempalace_kg_add` to record them. Object must be 128 characters or fewer.
 
-**This is mandatory** — facts about the user's projects, decisions, and preferences must be saved for future sessions. If you're unsure whether something is a fact, err on the side of saving it. A session with zero KG entries is likely missing important information.
+**This is mandatory** — record facts you are confident about. Prefer quality over quantity; noisy KG entries degrade retrieval over time.
 ```
 
 ### 6. Add your identity
