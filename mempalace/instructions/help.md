@@ -16,7 +16,7 @@ AI memory system. Store everything, find anything. Local, free, no API key.
 
 ---
 
-## MCP Tools (19)
+## MCP Tools (30)
 
 ### Palace (read)
 - mempalace_status -- Palace status and stats
@@ -26,10 +26,14 @@ AI memory system. Store everything, find anything. Local, free, no API key.
 - mempalace_search -- Search memories by query
 - mempalace_check_duplicate -- Check if a memory already exists
 - mempalace_get_aaak_spec -- Get the AAAK specification
+- mempalace_get_drawer -- Fetch one drawer by ID
+- mempalace_list_drawers -- List drawers with pagination and filters
 
 ### Palace (write)
 - mempalace_add_drawer -- Add a new memory (drawer)
+- mempalace_update_drawer -- Update drawer content or metadata
 - mempalace_delete_drawer -- Delete a memory (drawer)
+- mempalace_sync -- Prune drawers whose source files are gone/ignored
 
 ### Knowledge Graph
 - mempalace_kg_query -- Query the knowledge graph
@@ -42,10 +46,19 @@ AI memory system. Store everything, find anything. Local, free, no API key.
 - mempalace_traverse -- Traverse the palace structure
 - mempalace_find_tunnels -- Find cross-wing connections
 - mempalace_graph_stats -- Graph connectivity statistics
+- mempalace_create_tunnel -- Create explicit cross-wing tunnel
+- mempalace_list_tunnels -- List explicit tunnels
+- mempalace_delete_tunnel -- Delete explicit tunnel
+- mempalace_follow_tunnels -- Follow tunnels from a room
 
 ### Agent Diary
 - mempalace_diary_write -- Write a diary entry
 - mempalace_diary_read -- Read diary entries
+
+### System / Runtime
+- mempalace_hook_settings -- Get or set hook behavior
+- mempalace_memories_filed_away -- Check recent checkpoint status
+- mempalace_reconnect -- Reconnect and refresh in-memory indexes
 
 ---
 

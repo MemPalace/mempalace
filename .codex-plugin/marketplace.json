@@ -7,7 +7,7 @@
   "plugins": [
     {
       "name": "mempalace",
-      "source": "./.claude-plugin",
+      "source": "./.codex-plugin",
       "description": "AI memory system — mine projects and conversations into a searchable palace. 30 MCP tools, auto-save hooks, guided setup.",
       "version": "3.3.6",
       "author": {
