@@ -1479,3 +1479,37 @@ class TestStripNoiseClaudeCodeEnvelopeAndAnsi:
         text = "> Assistant: result \x1b[32mOK\x1b[0m and then the real explanation follows."
         out = strip_noise(text)
         assert "result OK and then the real explanation follows." in out
+
+    def test_strips_local_command_stdout_with_blank_lines(self):
+        # Command output commonly has blank lines (tables, stack traces,
+        # multi-paragraph). The envelope must still be stripped fully — the
+        # original blank-line guard would have leaked it (#1333 review).
+        text = (
+            "> <local-command-stdout>line 1\n"
+            "\n"
+            "line 3 after a blank line\n"
+            "\n"
+            "line 5</local-command-stdout>\n"
+            "> Real message."
+        )
+        out = strip_noise(text)
+        assert "local-command-stdout" not in out
+        assert "line 3 after a blank line" not in out
+        assert "line 5" not in out
+        assert "Real message." in out
+
+    def test_same_tag_reopen_does_not_span_eat(self):
+        # Anti-span-eating: a dangling open tag must not consume across to a
+        # later block's close. The negative lookahead halts at the re-opened
+        # tag, so user content between a malformed open and a later well-formed
+        # block survives. (Replaces the old blank-line guard's protection.)
+        text = (
+            "> <system-reminder>dangling open with no close\n"
+            "> User: real content that must survive\n"
+            "> <system-reminder>real noise</system-reminder>\n"
+            "> Tail."
+        )
+        out = strip_noise(text)
+        assert "real content that must survive" in out
+        assert "Tail." in out
+        assert "real noise" not in out

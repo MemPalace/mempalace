@@ -56,11 +56,15 @@ _NOISE_TAGS = (
 
 def _tag_pattern(name: str) -> "re.Pattern[str]":
     # Opening tag must begin a line (optionally after a `> ` blockquote marker,
-    # since _messages_to_transcript prefixes lines with `> `). Body is lazy but
-    # forbidden from crossing a blank line, so a dangling open tag can't span
-    # multiple messages. Closing tag eats optional trailing whitespace + newline.
+    # since _messages_to_transcript prefixes lines with `> `). The body is lazy
+    # and halts at another opening tag of the same name, so a dangling open tag
+    # can't span past the next same-tag block — while still allowing blank lines
+    # *inside* the tag (multi-paragraph <local-command-stdout> output, tables,
+    # stack traces; #1333). Combined with the line-start anchor this keeps a
+    # stray tag from eating neighbouring messages. Closing tag eats optional
+    # trailing whitespace + newline.
     return re.compile(
-        rf"(?m)^(?:> )?<{name}(?:\s[^>]*)?>" rf"(?:(?!\n\s*\n)[\s\S])*?" rf"</{name}>[ \t]*\n?"
+        rf"(?m)^(?:> )?<{name}(?:\s[^>]*)?>" rf"(?:(?!<{name}\b)[\s\S])*?" rf"</{name}>[ \t]*\n?"
     )
 
 
