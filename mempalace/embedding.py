@@ -191,6 +191,21 @@ class EmbeddinggemmaONNX:
         model_path = hf_hub_download(
             _EMBEDDINGGEMMA_REPO, subfolder="onnx", filename=_EMBEDDINGGEMMA_ONNX
         )
+        # The q8 export stores weights in a sibling external-data file
+        # (``model_quantized.onnx_data``) that the .onnx references by relative
+        # path. hf_hub_download fetches one file at a time, so without this the
+        # weights are absent and onnxruntime fails on first use with
+        # "External data path does not exist: …model_quantized.onnx_data".
+        # Co-locate it in the same snapshot dir so the relative path resolves.
+        try:
+            hf_hub_download(
+                _EMBEDDINGGEMMA_REPO,
+                subfolder="onnx",
+                filename=_EMBEDDINGGEMMA_ONNX + "_data",
+            )
+        except Exception:
+            # Some exports inline their weights — a missing sibling is non-fatal.
+            logger.debug("No external-data sibling for %s", _EMBEDDINGGEMMA_ONNX)
         tok_path = hf_hub_download(_EMBEDDINGGEMMA_REPO, filename="tokenizer.json")
 
         self._session = ort.InferenceSession(model_path, providers=self._providers)
