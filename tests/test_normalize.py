@@ -1387,6 +1387,9 @@ class TestStripNoiseRemovesSystemChrome:
             "system-reminder",
             "command-message",
             "command-name",
+            "command-args",
+            "local-command-caveat",
+            "local-command-stdout",
             "task-notification",
             "user-prompt-submit-hook",
             "hook_output",
@@ -1403,3 +1406,76 @@ class TestStripNoiseRemovesSystemChrome:
         assert "line two" in out
         # Should collapse to no more than 3 newlines
         assert "\n\n\n\n" not in out
+
+
+class TestStripNoiseClaudeCodeEnvelopeAndAnsi:
+    """#1333: the rest of the slash-command envelope and ANSI escapes from
+    Bash-tool output must be stripped, while prose that merely *names* them
+    survives (verbatim is sacred)."""
+
+    def test_strips_local_command_stdout_envelope(self):
+        text = (
+            "> User:\n"
+            "> <local-command-stdout>Set defaultPermissionMode to default\n"
+            "Disabled auto-compact</local-command-stdout>\n"
+            "> Real message."
+        )
+        out = strip_noise(text)
+        assert "local-command-stdout" not in out
+        assert "defaultPermissionMode" not in out
+        assert "Real message." in out
+
+    def test_strips_empty_command_args_remnant(self):
+        text = "> User:\n> <command-args></command-args>\n> Real."
+        out = strip_noise(text)
+        assert "command-args" not in out
+        assert "Real." in out
+
+    def test_strips_local_command_caveat(self):
+        text = "> <local-command-caveat>caveat text</local-command-caveat>\n> Real."
+        out = strip_noise(text)
+        assert "local-command-caveat" not in out
+        assert "caveat text" not in out
+        assert "Real." in out
+
+    def test_strips_csi_sgr_color_codes(self):
+        # Real sample shape from #1333: ESC[38;2;r;g;bm ... ESC[39m, ESC[1m...ESC[22m
+        text = "\x1b[38;2;153;153;153m├\x1b[39m mempalace_add_drawer \x1b[1mbold\x1b[22m"
+        out = strip_noise(text)
+        assert "\x1b" not in out
+        assert "├ mempalace_add_drawer bold" in out
+
+    def test_strips_ansi_nested_in_local_command_stdout(self):
+        text = "> <local-command-stdout>x \x1b[1mY\x1b[22m z</local-command-stdout>\n> Real."
+        out = strip_noise(text)
+        assert "\x1b" not in out
+        assert "Real." in out
+
+    def test_strips_osc_bel_terminated(self):
+        text = "before \x1b]0;window title\x07 after"
+        out = strip_noise(text)
+        assert "\x1b" not in out
+        assert "window title" not in out
+        assert "before" in out and "after" in out
+
+    def test_strips_osc_hyperlink_st_terminated(self):
+        text = "see \x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\ done"
+        out = strip_noise(text)
+        assert "\x1b" not in out
+        assert "https://example.com" not in out
+        assert "see" in out and "link" in out and "done" in out
+
+    def test_preserves_prose_naming_ansi_sequences(self):
+        # No literal ESC byte → prose that documents "[1m" / "ESC[0m" by name
+        # must be left untouched.
+        text = (
+            "> User:\n"
+            "> To bold terminal text print ESC[1m and reset with [0m. "
+            "The CSI prefix is ESC[ — keep this verbatim."
+        )
+        assert strip_noise(text) == text.strip()
+
+    def test_csi_strip_does_not_eat_following_prose(self):
+        text = "> Assistant: result \x1b[32mOK\x1b[0m and then the real explanation follows."
+        out = strip_noise(text)
+        assert "result OK and then the real explanation follows." in out
