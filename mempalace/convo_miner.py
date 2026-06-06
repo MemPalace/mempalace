@@ -146,6 +146,7 @@ def file_conversation_exchange(
 CONVO_EXTENSIONS = {
     ".txt",
     ".md",
+    ".org",
     ".json",
     ".jsonl",
 }
