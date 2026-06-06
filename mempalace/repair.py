@@ -315,7 +315,7 @@ def scan_palace(palace_path=None, only_wing=None, collection_name: Optional[str]
     print(f"  BAD:  {len(bad_set):,}  ({len(bad_set) / max(len(all_ids), 1) * 100:.1f}%)")
 
     bad_file = os.path.join(palace_path, "corrupt_ids.txt")
-    with open(bad_file, "w") as f:
+    with open(bad_file, "w", encoding="utf-8") as f:
         for bid in sorted(bad_set):
             f.write(bid + "\n")
     print(f"\n  Bad IDs written to: {bad_file}")
@@ -332,7 +332,7 @@ def prune_corrupt(palace_path=None, confirm=False, collection_name: Optional[str
         print("  No corrupt_ids.txt found — run scan first.")
         return
 
-    with open(bad_file) as f:
+    with open(bad_file, encoding="utf-8", errors="replace") as f:
         bad_ids = [line.strip() for line in f if line.strip()]
     print(f"  {len(bad_ids):,} corrupt IDs queued for deletion")
 
