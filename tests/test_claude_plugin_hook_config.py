@@ -24,6 +24,11 @@ EVENT_TIMEOUT_BOUNDS: dict[str, tuple[int, int]] = {
     "PreCompact": (60, 90),
 }
 
+EXPECTED_DIRECT_COMMANDS: dict[str, str] = {
+    "Stop": "mempalace hook run --hook stop --harness claude-code",
+    "PreCompact": "mempalace hook run --hook pre-compact --harness claude-code",
+}
+
 
 @pytest.fixture(scope="module")
 def hook_config() -> dict:
@@ -86,3 +91,21 @@ def test_no_unbounded_events_in_plugin_config(hook_config: dict) -> None:
         "Add a (floor, ceiling) entry to EVENT_TIMEOUT_BOUNDS in this test "
         "after deciding the worst-case freeze the event can tolerate."
     )
+
+
+@pytest.mark.parametrize("event, expected_command", sorted(EXPECTED_DIRECT_COMMANDS.items()))
+def test_plugin_hooks_use_direct_cross_platform_commands(
+    hook_config: dict, event: str, expected_command: str
+) -> None:
+    """Plugin hook commands should not shell through bash wrappers (#1660).
+
+    Windows expands ``CLAUDE_PLUGIN_ROOT`` to a backslash path. Passing that
+    path through ``bash "${CLAUDE_PLUGIN_ROOT}/hooks/..."`` mangles the hook
+    script path before execution. Calling ``mempalace hook run`` directly keeps
+    the same hook behavior without depending on shell path translation.
+    """
+    entries = hook_config["hooks"][event]
+    assert len(entries) == 1, f"{event} expected exactly one entry"
+    sub_hooks = entries[0]["hooks"]
+    assert len(sub_hooks) == 1, f"{event} expected exactly one command hook"
+    assert sub_hooks[0]["command"] == expected_command
