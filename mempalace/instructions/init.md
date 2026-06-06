@@ -67,6 +67,10 @@ Run the command for the AI client the user is configuring:
     # Codex CLI
     codex mcp add mempalace -- mempalace-mcp
 
+    # Cursor (plugin installs MCP automatically; manual fallback)
+    # Add to ~/.cursor/mcp.json:
+    # {"mcpServers": {"mempalace": {"command": "mempalace-mcp"}}}
+
 If this fails, report the error but continue to the next step (MCP
 configuration can be done manually later).
 

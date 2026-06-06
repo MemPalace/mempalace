@@ -44,6 +44,7 @@ Thumbs.db
 .codex/
 .codex-plugin/
 .claude-plugin/
+.cursor-plugin/
 benchmarks/
 docs/
 website/

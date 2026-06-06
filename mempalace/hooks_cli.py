@@ -1130,7 +1130,7 @@ def _ingest_transcript(transcript_path: str):
         _log(f"transcript ingest hook failed: {exc}")
 
 
-SUPPORTED_HARNESSES = {"claude-code", "codex"}
+SUPPORTED_HARNESSES = {"claude-code", "codex", "cursor"}
 
 
 def _diary_agent_for_harness(harness: str) -> str:
@@ -1152,6 +1152,28 @@ def _parse_harness_input(data: dict, harness: str) -> dict:
     if harness not in SUPPORTED_HARNESSES:
         print(f"Unknown harness: {harness}", file=sys.stderr)
         sys.exit(1)
+
+    if harness == "cursor":
+        # Cursor stop/preCompact stdin uses conversation_id (not session_id)
+        # and loop_count. loop_count > 0 means this stop is a follow-up from
+        # our own followup_message — Cursor's equivalent of Claude Code's
+        # stop_hook_active (see hooks/cursor/STDIN_SHAPE.md).
+        session_id = data.get("session_id") or data.get("conversation_id") or "unknown"
+        transcript_path = data.get("transcript_path") or data.get("transcriptPath") or ""
+        try:
+            loop_count = int(data.get("loop_count", 0))
+        except (ValueError, TypeError):
+            loop_count = 0
+        if "stop_hook_active" in data:
+            stop_hook_active = data.get("stop_hook_active")
+        else:
+            stop_hook_active = loop_count > 0
+        return {
+            "session_id": _sanitize_session_id(str(session_id)),
+            "stop_hook_active": stop_hook_active,
+            "transcript_path": str(transcript_path or ""),
+        }
+
     return {
         "session_id": _sanitize_session_id(str(data.get("session_id", "unknown"))),
         "stop_hook_active": data.get("stop_hook_active", False),

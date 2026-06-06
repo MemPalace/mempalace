@@ -10,4 +10,5 @@ mempalace/ @milla-jovovich @bensig
 # Plugins and integrations
 .claude-plugin/ @bensig
 .codex-plugin/ @bensig
+.cursor-plugin/ @bensig
 integrations/ @bensig
