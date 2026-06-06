@@ -69,6 +69,79 @@ python -m venv .venv && source .venv/bin/activate
 pip install mempalace
 ```
 
+### Docker
+
+A container image is also available for running the MCP server or the CLI
+without a local Python toolchain. Everything persists under `/data` (palace,
+config, and the cached embedding model), so mount a volume there.
+
+```bash
+# Build the image (CPU; bundles the `extract` + `spellcheck` extras)
+docker build -t mempalace .
+
+# MCP server over stdio — note the `-i` flag (JSON-RPC needs stdin)
+docker run -i --rm -v mempalace-data:/data mempalace
+
+# Run any CLI command instead (mount the host directory you want to mine)
+docker run --rm -v mempalace-data:/data -v /path/to/project:/work mempalace mine /work
+docker run --rm -v mempalace-data:/data mempalace search "why GraphQL"
+```
+
+Wire it into an MCP client (e.g. Claude Code) as a stdio server:
+
+```json
+{
+  "mcpServers": {
+    "mempalace": {
+      "command": "docker",
+      "args": ["run", "-i", "--rm", "-v", "mempalace-data:/data", "mempalace"]
+    }
+  }
+}
+```
+
+`docker compose run --rm mcp` works too (see `docker-compose.yml`). For
+CUDA-accelerated embeddings, build the GPU variant with
+`docker build -f Dockerfile.gpu -t mempalace:gpu .` and run it with
+`--gpus all`. Customise the bundled extras at build time, e.g.
+`docker build --build-arg EXTRAS="extract,spellcheck" -t mempalace .`.
+
+## Storage backends
+
+ChromaDB is the default. For the pluggable-backend preview, MemPalace also
+ships `sqlite_exact` for local exact-vector correctness checks, and two opt-in
+external service backends — `qdrant` (REST) and `pgvector` (Postgres). The two
+external backends exercise the storage contract on different substrates (a
+REST/dict store and a SQL/JSONB store), so it is not accidentally shaped around
+one vendor.
+
+```bash
+# local no-service backend
+mempalace mine ~/projects/myapp --backend sqlite_exact
+
+# Qdrant backend, defaulting to http://localhost:6333
+MEMPALACE_QDRANT_URL=http://localhost:6333 \
+  mempalace mine ~/projects/myapp --backend qdrant
+
+# Postgres + pgvector backend, defaulting to postgresql://localhost:5432/mempalace
+#   needs the optional driver: pip install mempalace[pgvector]
+#   and the `vector` extension available on the server
+MEMPALACE_PGVECTOR_DSN=postgresql://localhost:5432/mempalace \
+  mempalace mine ~/projects/myapp --backend pgvector
+```
+
+Qdrant can also be configured with `MEMPALACE_QDRANT_API_KEY`,
+`MEMPALACE_QDRANT_NAMESPACE`, and `MEMPALACE_QDRANT_TIMEOUT`; pgvector with
+`MEMPALACE_PGVECTOR_NAMESPACE`. Both external backends isolate tenants by
+namespace (advertised via the `supports_namespace_isolation` capability) and
+write a local marker (`qdrant_backend.json` / `pgvector_backend.json`) to guard
+against silently opening a palace against the wrong server.
+
+When `MEMPALACE_QDRANT_URL` or `MEMPALACE_PGVECTOR_DSN` points anywhere other
+than your own local or trusted self-hosted service, MemPalace will send and
+store verbatim drawer text and metadata there. That is an explicit opt-in
+backend choice, never the default.
+
 ## Quickstart
 
 ```bash
@@ -205,7 +278,7 @@ PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 MIT — see [LICENSE](LICENSE).
 
 <!-- Link Definitions -->
-[version-shield]: https://img.shields.io/badge/version-3.3.6-4dc9f6?style=flat-square&labelColor=0a0e14
+[version-shield]: https://img.shields.io/badge/version-3.4.0-4dc9f6?style=flat-square&labelColor=0a0e14
 [release-link]: https://github.com/MemPalace/mempalace/releases
 [python-shield]: https://img.shields.io/badge/python-3.9+-7dd8f8?style=flat-square&labelColor=0a0e14&logo=python&logoColor=7dd8f8
 [python-link]: https://www.python.org/

@@ -713,6 +713,40 @@ def test_main_status_dispatches():
         mock_cmd.assert_called_once()
 
 
+def test_main_backend_flag_sets_explicit_backend(monkeypatch):
+    monkeypatch.delenv("MEMPALACE_BACKEND_EXPLICIT", raising=False)
+    monkeypatch.delenv("MEMPALACE_BACKEND", raising=False)
+    with (
+        patch("sys.argv", ["mempalace", "status", "--backend", "sqlite_exact"]),
+        patch("mempalace.cli.cmd_status") as mock_cmd,
+    ):
+        main()
+
+    mock_cmd.assert_called_once()
+    args = mock_cmd.call_args.args[0]
+    assert args.backend == "sqlite_exact"
+    assert os.environ["MEMPALACE_BACKEND_EXPLICIT"] == "sqlite_exact"
+    os.environ.pop("MEMPALACE_BACKEND_EXPLICIT", None)
+    os.environ.pop("MEMPALACE_BACKEND", None)
+
+
+def test_main_backend_flag_accepts_qdrant(monkeypatch):
+    monkeypatch.delenv("MEMPALACE_BACKEND_EXPLICIT", raising=False)
+    monkeypatch.delenv("MEMPALACE_BACKEND", raising=False)
+    with (
+        patch("sys.argv", ["mempalace", "status", "--backend", "qdrant"]),
+        patch("mempalace.cli.cmd_status") as mock_cmd,
+    ):
+        main()
+
+    mock_cmd.assert_called_once()
+    args = mock_cmd.call_args.args[0]
+    assert args.backend == "qdrant"
+    assert os.environ["MEMPALACE_BACKEND_EXPLICIT"] == "qdrant"
+    os.environ.pop("MEMPALACE_BACKEND_EXPLICIT", None)
+    os.environ.pop("MEMPALACE_BACKEND", None)
+
+
 def test_main_search_dispatches():
     with (
         patch("sys.argv", ["mempalace", "search", "my query"]),
@@ -788,6 +822,34 @@ def test_mcp_command_uses_custom_palace_path_when_provided(monkeypatch, capsys):
     assert "Optional custom palace:" not in captured.out
     assert "[--palace /path/to/palace]" not in captured.out
     assert captured.err == ""
+
+
+def test_mcp_command_includes_backend_when_provided(monkeypatch, capsys):
+    monkeypatch.delenv("MEMPALACE_BACKEND_EXPLICIT", raising=False)
+    monkeypatch.delenv("MEMPALACE_BACKEND", raising=False)
+    monkeypatch.setattr(sys, "argv", ["mempalace", "mcp", "--backend", "sqlite_exact"])
+
+    main()
+
+    captured = capsys.readouterr()
+    assert "mempalace-mcp --backend sqlite_exact" in captured.out
+    assert captured.err == ""
+    os.environ.pop("MEMPALACE_BACKEND_EXPLICIT", None)
+    os.environ.pop("MEMPALACE_BACKEND", None)
+
+
+def test_mcp_command_includes_qdrant_backend(monkeypatch, capsys):
+    monkeypatch.delenv("MEMPALACE_BACKEND_EXPLICIT", raising=False)
+    monkeypatch.delenv("MEMPALACE_BACKEND", raising=False)
+    monkeypatch.setattr(sys, "argv", ["mempalace", "mcp", "--backend", "qdrant"])
+
+    main()
+
+    captured = capsys.readouterr()
+    assert "mempalace-mcp --backend qdrant" in captured.out
+    assert captured.err == ""
+    os.environ.pop("MEMPALACE_BACKEND_EXPLICIT", None)
+    os.environ.pop("MEMPALACE_BACKEND", None)
 
 
 def test_main_hook_no_subcommand_prints_help(capsys):

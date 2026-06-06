@@ -16,8 +16,19 @@ import re
 import sqlite3
 from pathlib import Path
 
-from .backends import CollectionNotInitializedError, PalaceNotFoundError
-from .palace import get_closets_collection, get_collection
+from .backends import (
+    BackendError,
+    BackendMismatchError,
+    CollectionNotInitializedError,
+    PalaceNotFoundError,
+    UnsupportedCapabilityError,
+)
+from .palace import (
+    _open_collection_or_explain,
+    get_closets_collection,
+    get_collection,
+    resolve_backend_name,
+)
 
 # Closet pointer line format: "topic|entities|→drawer_id_a,drawer_id_b"
 # Multiple lines may join with newlines inside one closet document.
@@ -296,32 +307,11 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
     Search the palace. Returns verbatim drawer content.
     Optionally filter by wing (project) or room (aspect).
     """
-    # Filesystem-first checks distinguish State A / State B before reaching
-    # chromadb. PersistentClient lazily creates chroma.sqlite3 on first open
-    # of an empty palace dir, so without these checks State B collapses into
-    # the "initialized but empty" State C message and mutates the dir as a
-    # side effect of a read-only search call (#1498).
-    if not os.path.isdir(palace_path):
-        print(f"\n  No palace found at {palace_path}")
-        print("  Run: mempalace init <dir> then mempalace mine <dir>")
-        raise SearchError(f"No palace found at {palace_path}")
-    if not os.path.isfile(os.path.join(palace_path, "chroma.sqlite3")):
-        print(f"\n  Palace dir at {palace_path} exists but has no chroma.sqlite3 yet.")
-        print("  Run: mempalace mine <dir>")
+    col = _open_collection_or_explain(palace_path, opener=get_collection)
+    if col is None:
+        if not os.path.isdir(palace_path):
+            raise SearchError(f"No palace found at {palace_path}")
         raise SearchError(f"No palace database at {palace_path}")
-    try:
-        col = get_collection(palace_path, create=False)
-    except CollectionNotInitializedError as e:
-        # State C from #1498: palace initialized but never mined.
-        print(f"\n  Palace at {palace_path} is initialized but empty (no drawers yet).")
-        print("  Run: mempalace mine <dir>")
-        raise SearchError(f"Palace at {palace_path} is initialized but empty") from e
-    except PalaceNotFoundError as e:
-        # Backend filesystem-race fallback: dir was deleted between our
-        # check above and the backend call. Same message as State A.
-        print(f"\n  No palace found at {palace_path}")
-        print("  Run: mempalace init <dir> then mempalace mine <dir>")
-        raise SearchError(f"No palace found at {palace_path}") from e
 
     # Alert the user if this palace predates hnsw:space=cosine being set on
     # creation — their similarity scores will be junk until they run repair.
@@ -636,14 +626,14 @@ def _bm25_only_via_sqlite(
 
 def _merge_bm25_union_candidates(
     hits: list,
+    drawers_col,
     query: str,
-    palace_path: str,
     wing: str,
     room: str,
     n_results: int,
     max_distance: float = 0.0,
 ) -> None:
-    """Append top-K BM25-only candidates from sqlite into ``hits`` in place.
+    """Append top-K backend lexical candidates into ``hits`` in place.
 
     Used by ``search_memories(..., candidate_strategy="union")`` to widen
     the rerank pool's *source* (not just its size) — vector-only candidate
@@ -668,18 +658,40 @@ def _merge_bm25_union_candidates(
     if max_distance > 0.0:
         return
 
+    where = build_where_filter(wing, room)
     try:
-        bm25_extra = _bm25_only_via_sqlite(
-            query,
-            palace_path,
-            wing=wing,
-            room=room,
+        lexical = drawers_col.lexical_search(
+            query=query,
             n_results=n_results * 3,
-            _include_internal=True,
-        ).get("results", [])
+            where=where or None,
+        )
+    except UnsupportedCapabilityError:
+        raise
     except Exception:
-        logger.debug("candidate_strategy=union: BM25 fetch failed", exc_info=True)
+        logger.debug("candidate_strategy=union: lexical fetch failed", exc_info=True)
         return
+
+    bm25_extra = []
+    for hit in lexical.hits:
+        meta = hit.metadata or {}
+        full_source = meta.get("source_file", "") or ""
+        bm25_extra.append(
+            {
+                "text": hit.document or "",
+                "wing": meta.get("wing", "unknown"),
+                "room": meta.get("room", "unknown"),
+                "source_file": Path(full_source).name if full_source else "?",
+                "created_at": meta.get("filed_at", "unknown"),
+                "similarity": None,
+                "distance": None,
+                "effective_distance": None,
+                "closet_boost": 0.0,
+                "matched_via": "bm25_backend",
+                "bm25_score": round(float(hit.score), 3),
+                "_source_file_full": full_source,
+                "_chunk_index": meta.get("chunk_index"),
+            }
+        )
 
     def _dedup_key(entry: dict):
         full = entry.get("_source_file_full")
@@ -728,8 +740,8 @@ def _validate_candidate_strategy(strategy: str) -> None:
 def _apply_candidate_strategy(
     strategy: str,
     hits: list,
+    drawers_col,
     query: str,
-    palace_path: str,
     wing: str,
     room: str,
     n_results: int,
@@ -742,7 +754,163 @@ def _apply_candidate_strategy(
     """
     merger = _CANDIDATE_MERGERS[strategy]
     if merger is not None:
-        merger(hits, query, palace_path, wing, room, n_results, max_distance=max_distance)
+        merger(hits, drawers_col, query, wing, room, n_results, max_distance=max_distance)
+
+
+def _finalize_candidate_hits(
+    *,
+    candidate_strategy: str,
+    hits: list,
+    drawers_col,
+    query: str,
+    wing: str,
+    room: str,
+    n_results: int,
+    max_distance: float,
+) -> tuple:
+    try:
+        _apply_candidate_strategy(
+            candidate_strategy,
+            hits,
+            drawers_col,
+            query,
+            wing,
+            room,
+            n_results,
+            max_distance=max_distance,
+        )
+    except UnsupportedCapabilityError:
+        return [], {
+            "error": "candidate_strategy='union' requires a backend with lexical_search support",
+            "unsupported_capability": "supports_lexical_search",
+            "hint": "Use candidate_strategy='vector' or select a backend that supports lexical search.",
+        }
+
+    hits = _hybrid_rank(hits, query)[:n_results]
+    for h in hits:
+        h.pop("_sort_key", None)
+        h.pop("_source_file_full", None)
+        h.pop("_chunk_index", None)
+    return hits, None
+
+
+def _backend_mismatch_result(error: BackendMismatchError) -> dict:
+    return {
+        "error": "Backend mismatch",
+        "details": str(error),
+        "hint": "Select the matching backend or use a fresh palace directory.",
+    }
+
+
+def _unknown_backend_result(error: KeyError) -> dict:
+    return {
+        "error": "Unknown backend",
+        "details": str(error),
+        "hint": "Check MEMPALACE_BACKEND or the configured backend name.",
+    }
+
+
+def _vector_disabled_search(
+    *,
+    query: str,
+    palace_path: str,
+    wing: str,
+    room: str,
+    n_results: int,
+    collection_name: str,
+) -> dict:
+    try:
+        backend_name = resolve_backend_name(palace_path)
+    except BackendMismatchError as e:
+        return _backend_mismatch_result(e)
+    except KeyError as e:
+        return _unknown_backend_result(e)
+    if backend_name != "chroma":
+        return {
+            "error": "vector_disabled fallback is Chroma-only",
+            "unsupported_capability": "chroma_hnsw_fallback",
+            "backend": backend_name,
+            "hint": "Disable vector_disabled for non-Chroma backends.",
+        }
+    return _bm25_only_via_sqlite(
+        query,
+        palace_path,
+        wing=wing,
+        room=room,
+        n_results=n_results,
+        collection_name=collection_name,
+    )
+
+
+def _open_search_collection(palace_path: str, collection_name: str):
+    try:
+        return get_collection(palace_path, collection_name=collection_name, create=False), None
+    except BackendMismatchError as e:
+        return None, _backend_mismatch_result(e)
+    except KeyError as e:
+        return None, _unknown_backend_result(e)
+    except (CollectionNotInitializedError, PalaceNotFoundError) as e:
+        logger.error("No palace found at %s: %s", palace_path, e)
+        return None, {
+            "error": "No palace found",
+            "hint": "Run: mempalace init <dir> && mempalace mine <dir>",
+        }
+    except BackendError as e:
+        logger.error("Backend error opening palace at %s: %s", palace_path, e)
+        return None, {
+            "error": "Backend error",
+            "details": str(e),
+            "hint": "Check the selected backend configuration and availability.",
+        }
+    except Exception as e:
+        logger.error("No palace found at %s: %s", palace_path, e)
+        return None, {
+            "error": "No palace found",
+            "hint": "Run: mempalace init <dir> && mempalace mine <dir>",
+        }
+
+
+def _query_drawers_with_filter_fallback(drawers_col, dkwargs, query, n_results, wing, room):
+    """Run the filtered drawer query, falling back to an unfiltered query plus a
+    Python-side post-filter when ChromaDB raises on the filtered query.
+
+    A ChromaDB HNSW/SQLite index mismatch makes filtered queries fail with
+    "Error finding id" even when unfiltered search works fine — it happens when
+    drawers are ingested via two different paths (e.g. bulk import vs MCP tool
+    calls), leaving the vector index inconsistent with the metadata store. We
+    retry unfiltered (over-fetching) and re-apply the wing/room filter in Python.
+    See #1245 / #1035.
+    """
+    where = dkwargs.get("where")
+    try:
+        return drawers_col.query(**dkwargs)
+    except Exception as filter_err:
+        if not where:
+            raise
+        logger.warning(
+            "Filtered search failed (%s); falling back to unfiltered + post-filter",
+            filter_err,
+        )
+        raw = drawers_col.query(
+            query_texts=[query],
+            n_results=min(n_results * 15, 500),
+            include=["documents", "metadatas", "distances"],
+        )
+        fdocs, fmetas, fdists = [], [], []
+        for doc, meta, dist in zip(
+            _first_or_empty(raw, "documents"),
+            _first_or_empty(raw, "metadatas"),
+            _first_or_empty(raw, "distances"),
+        ):
+            meta = meta or {}
+            if wing and meta.get("wing") != wing:
+                continue
+            if room and meta.get("room") != room:
+                continue
+            fdocs.append(doc)
+            fmetas.append(meta)
+            fdists.append(dist)
+        return {"documents": [fdocs], "metadatas": [fmetas], "distances": [fdists]}
 
 
 def search_memories(
@@ -780,14 +948,12 @@ def search_memories(
               ``n_results * 3`` rows from the vector index are the rerank pool.
               Cheap; works well when query and target docs agree in the
               embedding space.
-            * ``"union"`` — also pull top ``n_results * 3`` BM25 candidates
-              from the sqlite FTS5 index and merge them into the rerank pool
-              (deduped by source_file). Catches docs with strong BM25 signal
-              that are vector-distant from the query (e.g. terminology guides
-              looked up by narrative-shaped queries; policy clauses surfaced
-              by scenario descriptions). Adds one sqlite open + FTS5 MATCH
-              per query; perf cost is small but unmeasured at corpus scale.
-              Opt in until the cost is characterized.
+            * ``"union"`` — also pull top ``n_results * 3`` lexical candidates
+              through the backend's ``lexical_search`` capability and merge
+              them into the rerank pool (deduped by source_file). Catches docs
+              with strong BM25 signal that are vector-distant from the query.
+              Perf depends on the selected backend; opt in until the cost is
+              characterized.
 
               When ``max_distance > 0.0`` is also set, BM25-only candidates
               are skipped — they have no vector distance and would silently
@@ -799,23 +965,18 @@ def search_memories(
     _validate_candidate_strategy(candidate_strategy)
 
     if vector_disabled:
-        return _bm25_only_via_sqlite(
-            query,
-            palace_path,
+        return _vector_disabled_search(
+            query=query,
+            palace_path=palace_path,
             wing=wing,
             room=room,
             n_results=n_results,
             collection_name=collection_name,
         )
 
-    try:
-        drawers_col = get_collection(palace_path, collection_name=collection_name, create=False)
-    except Exception as e:
-        logger.error("No palace found at %s: %s", palace_path, e)
-        return {
-            "error": "No palace found",
-            "hint": "Run: mempalace init <dir> && mempalace mine <dir>",
-        }
+    drawers_col, open_error = _open_search_collection(palace_path, collection_name)
+    if open_error:
+        return open_error
 
     where = build_where_filter(wing, room)
 
@@ -834,7 +995,9 @@ def search_memories(
         }
         if where:
             dkwargs["where"] = where
-        drawer_results = drawers_col.query(**dkwargs)
+        drawer_results = _query_drawers_with_filter_fallback(
+            drawers_col, dkwargs, query, n_results, wing, room
+        )
     except Exception as e:
         return {"error": f"Search error: {e}"}
 
@@ -985,31 +1148,24 @@ def search_memories(
 
     # Candidate strategy hook: optionally widen the rerank pool's *source*
     # before ranking. Default ("vector") is a no-op; "union" merges top-K
-    # BM25 candidates from sqlite. See `_apply_candidate_strategy`.
+    # backend lexical candidates. See `_apply_candidate_strategy`.
     # ``max_distance`` is forwarded so union mode can refuse to inject
     # BM25-only (distance=None) candidates that would silently bypass the
     # caller's strict distance threshold.
-    _apply_candidate_strategy(
-        candidate_strategy,
-        hits,
-        query,
-        palace_path,
-        wing,
-        room,
-        n_results,
+    # The helper also runs the final BM25 hybrid re-rank and strips internal
+    # dedup fields before returning.
+    hits, strategy_error = _finalize_candidate_hits(
+        candidate_strategy=candidate_strategy,
+        hits=hits,
+        drawers_col=drawers_col,
+        query=query,
+        wing=wing,
+        room=room,
+        n_results=n_results,
         max_distance=max_distance,
     )
-
-    # BM25 hybrid re-rank within the final candidate set, then trim back
-    # to the requested size. Without the trim, ``candidate_strategy="union"``
-    # would return up to 4× ``n_results`` (vector hits + BM25 union pool),
-    # breaking the existing ``search_memories`` size contract that the MCP
-    # ``limit`` parameter is built on.
-    hits = _hybrid_rank(hits, query)[:n_results]
-    for h in hits:
-        h.pop("_sort_key", None)
-        h.pop("_source_file_full", None)
-        h.pop("_chunk_index", None)
+    if strategy_error:
+        return strategy_error
 
     return {
         "query": query,

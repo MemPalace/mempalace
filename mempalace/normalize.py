@@ -122,7 +122,7 @@ def normalize(filepath: str) -> str:
     if file_size > 500 * 1024 * 1024:  # 500 MB safety limit
         raise IOError(f"File too large ({file_size // (1024 * 1024)} MB): {filepath}")
     try:
-        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+        with open(filepath, "r", encoding="utf-8-sig", errors="replace") as f:
             content = f.read()
     except OSError as e:
         raise IOError(f"Could not read {filepath}: {e}") from e
@@ -523,6 +523,8 @@ def _format_tool_use(block: dict) -> str:
     """Format a tool_use block into a human-readable one-liner."""
     name = block.get("name", "Unknown")
     inp = block.get("input", {})
+    if isinstance(inp, list):
+        inp = {}
 
     if name == "Bash":
         cmd = inp.get("command", "")
