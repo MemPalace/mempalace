@@ -36,18 +36,39 @@ The plugin is inactive when `agent_context in {"cron", "flush"}` or
 `platform == "cron"` — system-generated turns must not corrupt the user
 representation.
 
-## 8 tools exposed
+## 19 tools exposed (mirrors openclaw)
+
+Surface mirrors mempalace's reference [openclaw skill](../openclaw/SKILL.md) so a
+Hermes session and a Claude Code session see the same vocabulary.
 
 | Tool | What |
 |------|------|
-| `mempalace_search` | Semantic search across the palace, optionally scoped by wing/room |
-| `mempalace_status` | Palace overview: total drawers, per-wing counts |
+| `mempalace_search` | Semantic search, optionally scoped by wing/room |
+| `mempalace_status` | Palace overview: total drawers, per-wing counts, protocol |
 | `mempalace_list_wings` | All wings with drawer counts |
 | `mempalace_list_rooms` | Rooms (and counts) within a wing |
-| `mempalace_kg_query` | Knowledge-graph relationships for an entity, with optional `since` filter |
-| `mempalace_kg_add` | Add a `(subject, predicate, object)` fact to the knowledge graph |
-| `mempalace_diary_write` | Append an AAAK diary entry |
+| `mempalace_get_taxonomy` | Full wing → room → drawer-count tree |
+| `mempalace_get_aaak_spec` | The AAAK dialect spec (also in the wake-up block) |
+| `mempalace_add_drawer` | File a verbatim drawer (auto-tags `added_by=hermes`) |
+| `mempalace_delete_drawer` | Remove a drawer by id |
+| `mempalace_check_duplicate` | Find the closest existing drawer before filing |
+| `mempalace_kg_query` | Knowledge-graph relationships for an entity |
+| `mempalace_kg_add` | Add a `(subject, predicate, object)` fact |
+| `mempalace_kg_invalidate` | Mark a fact ended (palace-protocol step 5) |
+| `mempalace_kg_timeline` | Full temporal timeline for an entity |
+| `mempalace_kg_stats` | Graph counts |
+| `mempalace_diary_write` | Append a diary entry |
 | `mempalace_diary_read` | Read recent diary entries |
+| `mempalace_traverse` | Walk the room graph from a starting room |
+| `mempalace_graph_stats` | Room / hallway / tunnel counts |
+| `mempalace_find_tunnels` | Discover cross-wing tunnels |
+
+Intentionally omitted (matches openclaw's omissions): `update_drawer`,
+`list_drawers`, `get_drawer` (append-first design — navigate via `search`
+and supersede with new adds); tunnel management (`create_tunnel`,
+`list_tunnels`, `delete_tunnel`, `follow_tunnels` — tunnels are created
+by mining); admin ops (`sync`, `hook_settings`, `reconnect`); internal
+helpers (`memories_filed_away`).
 
 ## Manual install
 

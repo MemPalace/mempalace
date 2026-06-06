@@ -88,10 +88,12 @@ def test_tool_schemas_visible_before_initialize(provider):
     # reaching ``handle_tool_call`` at all. Backend readiness gating
     # belongs in ``handle_tool_call``, not here.
     schemas = provider.get_tool_schemas()
-    assert len(schemas) == 8
+    assert len(schemas) == 19  # mirrors mempalace's openclaw skill
     names = {s["name"] for s in schemas}
     assert "mempalace_status" in names
     assert "mempalace_search" in names
+    assert "mempalace_add_drawer" in names
+    assert "mempalace_kg_invalidate" in names
 
 
 def test_config_schema_has_documented_keys(provider):
@@ -107,20 +109,39 @@ def test_config_schema_has_documented_keys(provider):
     assert "collection_name" not in keys
 
 
-def test_tool_schemas_module_constant_has_eight_tools(integration_module):
-    # Documented in mempalace/integrations/hermes/README.md as "8 tools exposed".
+def test_tool_schemas_module_constant_mirrors_openclaw_skill(integration_module):
+    # The 19-tool surface mirrors ``mempalace/integrations/openclaw/SKILL.md``
+    # — the maintainer's vetted shape for an agent. Intentionally excludes
+    # ``update_drawer`` / ``list_drawers`` / ``get_drawer`` (append-first),
+    # all tunnel management except discovery, and admin ops.
     schemas = integration_module.TOOL_SCHEMAS
-    names = [s["name"] for s in schemas]
-    assert names == [
+    names = {s["name"] for s in schemas}
+    assert names == {
+        # Search + structure
         "mempalace_search",
         "mempalace_status",
         "mempalace_list_wings",
         "mempalace_list_rooms",
+        "mempalace_get_taxonomy",
+        "mempalace_get_aaak_spec",
+        # Drawer add / remove / dedup
+        "mempalace_add_drawer",
+        "mempalace_delete_drawer",
+        "mempalace_check_duplicate",
+        # Knowledge graph
         "mempalace_kg_query",
         "mempalace_kg_add",
+        "mempalace_kg_invalidate",
+        "mempalace_kg_timeline",
+        "mempalace_kg_stats",
+        # Per-agent diary
         "mempalace_diary_write",
         "mempalace_diary_read",
-    ]
+        # Room-graph navigation (discover-only)
+        "mempalace_traverse",
+        "mempalace_graph_stats",
+        "mempalace_find_tunnels",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -346,12 +367,13 @@ def test_initialize_opens_chroma_via_backend(initialized_provider):
     assert isinstance(initialized_provider._backend, ChromaBackend)
 
 
-def test_get_tool_schemas_returns_eight_after_initialize(initialized_provider):
+def test_get_tool_schemas_returns_full_surface_after_initialize(initialized_provider):
     schemas = initialized_provider.get_tool_schemas()
-    names = [s["name"] for s in schemas]
-    assert len(schemas) == 8
+    names = {s["name"] for s in schemas}
+    assert len(schemas) == 19
     assert "mempalace_search" in names
     assert "mempalace_kg_query" in names
+    assert "mempalace_add_drawer" in names
 
 
 def test_sync_turn_persists_through_worker(initialized_provider):

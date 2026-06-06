@@ -233,6 +233,139 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
             },
         },
     },
+    {
+        "name": "mempalace_add_drawer",
+        "description": (
+            "File a verbatim drawer into the palace. Use for explicit "
+            "structured content the user dictates or you decide to "
+            "persist — the per-turn auto-filing happens separately."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "wing": {"type": "string", "description": "Wing name."},
+                "room": {"type": "string", "description": "Room within the wing."},
+                "content": {"type": "string", "description": "Verbatim drawer content."},
+                "source_file": {"type": "string", "description": "Optional source-file annotation."},
+            },
+            "required": ["wing", "room", "content"],
+        },
+    },
+    {
+        "name": "mempalace_delete_drawer",
+        "description": (
+            "Remove a drawer. Reserve for PII cleanup or correcting a "
+            "wrong filing — mempalace's design prefers superseding adds "
+            "over deletes (so ``update_drawer`` / ``list_drawers`` / "
+            "``get_drawer`` aren't exposed; use ``search`` to navigate)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"drawer_id": {"type": "string"}},
+            "required": ["drawer_id"],
+        },
+    },
+    {
+        "name": "mempalace_check_duplicate",
+        "description": (
+            "Check whether content similar to the given text already "
+            "exists in the palace before filing. Returns closest match "
+            "and similarity score."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "string"},
+                "threshold": {"type": "number", "description": "Default 0.9."},
+            },
+            "required": ["content"],
+        },
+    },
+    {
+        "name": "mempalace_kg_invalidate",
+        "description": (
+            "Mark a (subject, predicate, object) fact as no longer valid "
+            "from a given date — per the palace protocol's step 5."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "subject": {"type": "string"},
+                "predicate": {"type": "string"},
+                "object": {"type": "string"},
+                "ended": {
+                    "type": "string",
+                    "description": (
+                        "ISO date the fact stopped being true "
+                        "(optional, defaults to now)."
+                    ),
+                },
+            },
+            "required": ["subject", "predicate", "object"],
+        },
+    },
+    {
+        "name": "mempalace_kg_timeline",
+        "description": "Full temporal timeline for an entity in the knowledge graph.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "entity": {
+                    "type": "string",
+                    "description": "Entity name (optional — all entities if omitted).",
+                },
+            },
+        },
+    },
+    {
+        "name": "mempalace_kg_stats",
+        "description": "Knowledge graph summary statistics.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "mempalace_get_taxonomy",
+        "description": "Full wing → room → drawer-count tree of the palace.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "mempalace_get_aaak_spec",
+        "description": (
+            "Return the full AAAK compression dialect specification "
+            "(also injected in the wake-up block)."
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "mempalace_traverse",
+        "description": "Traverse the room graph from a starting room, following hallway links.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "start_room": {"type": "string"},
+                "max_hops": {"type": "integer", "description": "Default 2."},
+            },
+            "required": ["start_room"],
+        },
+    },
+    {
+        "name": "mempalace_graph_stats",
+        "description": "Palace graph statistics — rooms, hallways, cross-wing tunnels.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "mempalace_find_tunnels",
+        "description": (
+            "Find cross-wing tunnels — direct semantic links between "
+            "rooms in different wings."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "wing_a": {"type": "string"},
+                "wing_b": {"type": "string"},
+            },
+        },
+    },
 ]
 
 
@@ -642,6 +775,42 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
                 return json.dumps(self._tool_diary_write(args.get("entry", "")))
             if tool_name == "mempalace_diary_read":
                 return json.dumps(self._tool_diary_read(int(args.get("n", 10))))
+
+            # Tools that delegate directly to ``mempalace.mcp_server``'s
+            # public ``tool_*`` entry points. These share mempalace's own
+            # config for palace_path resolution — so they operate against
+            # whichever palace ``mempalace.config.MempalaceConfig`` finds
+            # (defaults to ``~/.mempalace/palace``). If the user has set a
+            # different ``palace_path`` in the Hermes plugin config, the
+            # existing eight tools above honor it but these eleven do not.
+            # Documented as a known asymmetry; matches mempalace's own
+            # tool-server boundary.
+            from mempalace import mcp_server as _mp_mcp
+
+            if tool_name == "mempalace_add_drawer":
+                args.setdefault("added_by", "hermes")
+                return json.dumps(_mp_mcp.tool_add_drawer(**args))
+            if tool_name == "mempalace_delete_drawer":
+                return json.dumps(_mp_mcp.tool_delete_drawer(**args))
+            if tool_name == "mempalace_check_duplicate":
+                return json.dumps(_mp_mcp.tool_check_duplicate(**args))
+            if tool_name == "mempalace_kg_invalidate":
+                return json.dumps(_mp_mcp.tool_kg_invalidate(**args))
+            if tool_name == "mempalace_kg_timeline":
+                return json.dumps(_mp_mcp.tool_kg_timeline(**args))
+            if tool_name == "mempalace_kg_stats":
+                return json.dumps(_mp_mcp.tool_kg_stats())
+            if tool_name == "mempalace_get_taxonomy":
+                return json.dumps(_mp_mcp.tool_get_taxonomy())
+            if tool_name == "mempalace_get_aaak_spec":
+                return json.dumps(_mp_mcp.tool_get_aaak_spec())
+            if tool_name == "mempalace_traverse":
+                return json.dumps(_mp_mcp.tool_traverse_graph(**args))
+            if tool_name == "mempalace_graph_stats":
+                return json.dumps(_mp_mcp.tool_graph_stats())
+            if tool_name == "mempalace_find_tunnels":
+                return json.dumps(_mp_mcp.tool_find_tunnels(**args))
+
             return json.dumps({"error": f"Unknown tool: {tool_name}"})
         except Exception as exc:
             logger.exception("MemPalace tool %s failed", tool_name)
