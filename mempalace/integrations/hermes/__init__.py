@@ -398,7 +398,15 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             self._initialized = backend_ready
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        if self._cron_skipped or not self._initialized:
+        # Schemas describe the *interface*, not runtime readiness. Hermes'
+        # ``agent.memory_manager._register_provider`` snapshots schemas at
+        # registration time (BEFORE ``initialize()`` runs) to build its
+        # tool-name → provider routing table; if we returned ``[]`` there,
+        # the dispatcher would never learn our tool names and every later
+        # call would hit ``"Unknown tool: <name>"`` from the dispatcher
+        # without reaching ``handle_tool_call`` at all. Backend readiness
+        # is checked at call time in ``handle_tool_call``.
+        if self._cron_skipped:
             return []
         return list(TOOL_SCHEMAS)
 

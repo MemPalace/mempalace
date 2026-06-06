@@ -78,11 +78,20 @@ def test_is_available_imports_mempalace(provider):
     assert provider.is_available() is True
 
 
-def test_tool_schemas_hidden_before_initialize(provider):
-    # Required by ABC: callers must not see schemas while initialize() hasn't
-    # been called — half-initialized state would otherwise advertise tools the
-    # provider cannot actually service.
-    assert provider.get_tool_schemas() == []
+def test_tool_schemas_visible_before_initialize(provider):
+    # Regression for the discovery bug: Hermes'
+    # ``agent.memory_manager._register_provider`` snapshots
+    # ``get_tool_schemas()`` once at registration time to build its
+    # ``tool_name → provider`` routing table. If we returned ``[]`` there,
+    # the dispatcher would never learn our tool names and every later call
+    # would hit ``"Unknown tool: <name>"`` from the dispatcher without
+    # reaching ``handle_tool_call`` at all. Backend readiness gating
+    # belongs in ``handle_tool_call``, not here.
+    schemas = provider.get_tool_schemas()
+    assert len(schemas) == 8
+    names = {s["name"] for s in schemas}
+    assert "mempalace_status" in names
+    assert "mempalace_search" in names
 
 
 def test_config_schema_has_documented_keys(provider):
