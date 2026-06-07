@@ -36,10 +36,12 @@ The plugin is inactive when `agent_context in {"cron", "flush"}` or
 `platform == "cron"` — system-generated turns must not corrupt the user
 representation.
 
-## 19 tools exposed (mirrors openclaw)
+## 27 tools exposed
 
-Surface mirrors mempalace's reference [openclaw skill](../openclaw/SKILL.md) so a
-Hermes session and a Claude Code session see the same vocabulary.
+Surface = mempalace's reference [openclaw skill](../openclaw/SKILL.md)'s
+**19 tools** (as of PR #491, April 2026) **+ 8 agent-facing tools mempalace
+has added since** that openclaw hasn't caught up to. Excludes admin tools
+only.
 
 | Tool | What |
 |------|------|
@@ -50,7 +52,10 @@ Hermes session and a Claude Code session see the same vocabulary.
 | `mempalace_get_taxonomy` | Full wing → room → drawer-count tree |
 | `mempalace_get_aaak_spec` | The AAAK dialect spec (also in the wake-up block) |
 | `mempalace_add_drawer` | File a verbatim drawer (auto-tags `added_by=hermes`) |
+| `mempalace_update_drawer` | Edit a drawer in place (mempalace is append-first; prefer superseding) |
 | `mempalace_delete_drawer` | Remove a drawer by id |
+| `mempalace_list_drawers` | Browse drawers in a wing/room |
+| `mempalace_get_drawer` | Fetch full verbatim content by id |
 | `mempalace_check_duplicate` | Find the closest existing drawer before filing |
 | `mempalace_kg_query` | Knowledge-graph relationships for an entity |
 | `mempalace_kg_add` | Add a `(subject, predicate, object)` fact |
@@ -62,13 +67,15 @@ Hermes session and a Claude Code session see the same vocabulary.
 | `mempalace_traverse` | Walk the room graph from a starting room |
 | `mempalace_graph_stats` | Room / hallway / tunnel counts |
 | `mempalace_find_tunnels` | Discover cross-wing tunnels |
+| `mempalace_create_tunnel` | Mint a cross-wing tunnel for a bridging entity |
+| `mempalace_list_tunnels` | List tunnels (optionally by wing) |
+| `mempalace_delete_tunnel` | Remove a tunnel by id |
+| `mempalace_follow_tunnels` | Discover rooms connected from a `(wing, room)` |
+| `mempalace_memories_filed_away` | Drawers filed during the current session |
 
-Intentionally omitted (matches openclaw's omissions): `update_drawer`,
-`list_drawers`, `get_drawer` (append-first design — navigate via `search`
-and supersede with new adds); tunnel management (`create_tunnel`,
-`list_tunnels`, `delete_tunnel`, `follow_tunnels` — tunnels are created
-by mining); admin ops (`sync`, `hook_settings`, `reconnect`); internal
-helpers (`memories_filed_away`).
+**Intentionally omitted** (admin operations not agent-facing):
+`mempalace_sync` (mines a project directory into the palace; user-initiated),
+`mempalace_hook_settings`, `mempalace_reconnect`.
 
 ## Manual install
 

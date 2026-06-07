@@ -88,11 +88,12 @@ def test_tool_schemas_visible_before_initialize(provider):
     # reaching ``handle_tool_call`` at all. Backend readiness gating
     # belongs in ``handle_tool_call``, not here.
     schemas = provider.get_tool_schemas()
-    assert len(schemas) == 19  # mirrors mempalace's openclaw skill
+    assert len(schemas) == 27  # openclaw set + 8 tools added after #491
     names = {s["name"] for s in schemas}
     assert "mempalace_status" in names
     assert "mempalace_search" in names
     assert "mempalace_add_drawer" in names
+    assert "mempalace_update_drawer" in names  # added after openclaw #491
     assert "mempalace_kg_invalidate" in names
 
 
@@ -109,11 +110,12 @@ def test_config_schema_has_documented_keys(provider):
     assert "collection_name" not in keys
 
 
-def test_tool_schemas_module_constant_mirrors_openclaw_skill(integration_module):
-    # The 19-tool surface mirrors ``mempalace/integrations/openclaw/SKILL.md``
-    # — the maintainer's vetted shape for an agent. Intentionally excludes
-    # ``update_drawer`` / ``list_drawers`` / ``get_drawer`` (append-first),
-    # all tunnel management except discovery, and admin ops.
+def test_tool_schemas_module_constant_matches_expected_surface(integration_module):
+    # 27 tools — openclaw's reference skill set (19 tools at
+    # MemPalace/mempalace#491, April 2026) plus the 8 agent-facing tools
+    # mempalace has added since that openclaw hasn't caught up to.
+    # Admin/internal tools (sync, hook_settings, reconnect) intentionally
+    # omitted.
     schemas = integration_module.TOOL_SCHEMAS
     names = {s["name"] for s in schemas}
     assert names == {
@@ -124,9 +126,12 @@ def test_tool_schemas_module_constant_mirrors_openclaw_skill(integration_module)
         "mempalace_list_rooms",
         "mempalace_get_taxonomy",
         "mempalace_get_aaak_spec",
-        # Drawer add / remove / dedup
+        # Drawer CRUD
         "mempalace_add_drawer",
+        "mempalace_update_drawer",
         "mempalace_delete_drawer",
+        "mempalace_list_drawers",
+        "mempalace_get_drawer",
         "mempalace_check_duplicate",
         # Knowledge graph
         "mempalace_kg_query",
@@ -137,10 +142,16 @@ def test_tool_schemas_module_constant_mirrors_openclaw_skill(integration_module)
         # Per-agent diary
         "mempalace_diary_write",
         "mempalace_diary_read",
-        # Room-graph navigation (discover-only)
+        # Room-graph navigation + tunnel management
         "mempalace_traverse",
         "mempalace_graph_stats",
         "mempalace_find_tunnels",
+        "mempalace_create_tunnel",
+        "mempalace_list_tunnels",
+        "mempalace_delete_tunnel",
+        "mempalace_follow_tunnels",
+        # Session-level
+        "mempalace_memories_filed_away",
     }
 
 
@@ -370,10 +381,12 @@ def test_initialize_opens_chroma_via_backend(initialized_provider):
 def test_get_tool_schemas_returns_full_surface_after_initialize(initialized_provider):
     schemas = initialized_provider.get_tool_schemas()
     names = {s["name"] for s in schemas}
-    assert len(schemas) == 19
+    assert len(schemas) == 27
     assert "mempalace_search" in names
     assert "mempalace_kg_query" in names
     assert "mempalace_add_drawer" in names
+    assert "mempalace_update_drawer" in names
+    assert "mempalace_memories_filed_away" in names
 
 
 def test_sync_turn_persists_through_worker(initialized_provider):

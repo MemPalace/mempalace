@@ -252,13 +252,51 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "mempalace_update_drawer",
+        "description": (
+            "Edit an existing drawer in place. Prefer adding a new "
+            "drawer that supersedes the old one — mempalace is "
+            "append-first."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "drawer_id": {"type": "string"},
+                "content": {"type": "string", "description": "New verbatim content (optional)."},
+                "wing": {"type": "string", "description": "New wing (optional)."},
+                "room": {"type": "string", "description": "New room (optional)."},
+            },
+            "required": ["drawer_id"],
+        },
+    },
+    {
         "name": "mempalace_delete_drawer",
         "description": (
             "Remove a drawer. Reserve for PII cleanup or correcting a "
-            "wrong filing — mempalace's design prefers superseding adds "
-            "over deletes (so ``update_drawer`` / ``list_drawers`` / "
-            "``get_drawer`` aren't exposed; use ``search`` to navigate)."
+            "wrong filing — mempalace's design prefers superseding adds."
         ),
+        "parameters": {
+            "type": "object",
+            "properties": {"drawer_id": {"type": "string"}},
+            "required": ["drawer_id"],
+        },
+    },
+    {
+        "name": "mempalace_list_drawers",
+        "description": "List drawers in a wing/room with their previews.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "wing": {"type": "string"},
+                "room": {"type": "string"},
+                "limit": {"type": "integer", "description": "Default 20."},
+                "offset": {"type": "integer", "description": "Default 0."},
+            },
+        },
+    },
+    {
+        "name": "mempalace_get_drawer",
+        "description": "Fetch a drawer's full verbatim content by id.",
         "parameters": {
             "type": "object",
             "properties": {"drawer_id": {"type": "string"}},
@@ -365,6 +403,61 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                 "wing_b": {"type": "string"},
             },
         },
+    },
+    {
+        "name": "mempalace_create_tunnel",
+        "description": (
+            "Create a tunnel between two rooms across wings to bridge "
+            "cross-cutting entities."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "wing_a": {"type": "string"},
+                "room_a": {"type": "string"},
+                "wing_b": {"type": "string"},
+                "room_b": {"type": "string"},
+                "description": {"type": "string"},
+            },
+            "required": ["wing_a", "room_a", "wing_b", "room_b"],
+        },
+    },
+    {
+        "name": "mempalace_list_tunnels",
+        "description": "List tunnels, optionally scoped to a wing.",
+        "parameters": {
+            "type": "object",
+            "properties": {"wing": {"type": "string"}},
+        },
+    },
+    {
+        "name": "mempalace_delete_tunnel",
+        "description": "Remove a tunnel by id.",
+        "parameters": {
+            "type": "object",
+            "properties": {"tunnel_id": {"type": "string"}},
+            "required": ["tunnel_id"],
+        },
+    },
+    {
+        "name": "mempalace_follow_tunnels",
+        "description": (
+            "Follow tunnels outward from a (wing, room) pair to "
+            "discover connected rooms."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "wing": {"type": "string"},
+                "room": {"type": "string"},
+            },
+            "required": ["wing", "room"],
+        },
+    },
+    {
+        "name": "mempalace_memories_filed_away",
+        "description": "Show drawers filed (with metadata) during the current session.",
+        "parameters": {"type": "object", "properties": {}},
     },
 ]
 
@@ -778,43 +871,88 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
 
             # Tools that delegate directly to ``mempalace.mcp_server``'s
             # public ``tool_*`` entry points. These share mempalace's own
-            # config for palace_path resolution — so they operate against
-            # whichever palace ``mempalace.config.MempalaceConfig`` finds
-            # (defaults to ``~/.mempalace/palace``). If the user has set a
-            # different ``palace_path`` in the Hermes plugin config, the
-            # existing eight tools above honor it but these eleven do not.
-            # Documented as a known asymmetry; matches mempalace's own
-            # tool-server boundary.
-            from mempalace import mcp_server as _mp_mcp
-
-            if tool_name == "mempalace_add_drawer":
-                args.setdefault("added_by", "hermes")
-                return json.dumps(_mp_mcp.tool_add_drawer(**args))
-            if tool_name == "mempalace_delete_drawer":
-                return json.dumps(_mp_mcp.tool_delete_drawer(**args))
-            if tool_name == "mempalace_check_duplicate":
-                return json.dumps(_mp_mcp.tool_check_duplicate(**args))
-            if tool_name == "mempalace_kg_invalidate":
-                return json.dumps(_mp_mcp.tool_kg_invalidate(**args))
-            if tool_name == "mempalace_kg_timeline":
-                return json.dumps(_mp_mcp.tool_kg_timeline(**args))
-            if tool_name == "mempalace_kg_stats":
-                return json.dumps(_mp_mcp.tool_kg_stats())
-            if tool_name == "mempalace_get_taxonomy":
-                return json.dumps(_mp_mcp.tool_get_taxonomy())
-            if tool_name == "mempalace_get_aaak_spec":
-                return json.dumps(_mp_mcp.tool_get_aaak_spec())
-            if tool_name == "mempalace_traverse":
-                return json.dumps(_mp_mcp.tool_traverse_graph(**args))
-            if tool_name == "mempalace_graph_stats":
-                return json.dumps(_mp_mcp.tool_graph_stats())
-            if tool_name == "mempalace_find_tunnels":
-                return json.dumps(_mp_mcp.tool_find_tunnels(**args))
+            # config for palace_path resolution rather than this plugin's
+            # ``self._palace_path`` — a known asymmetry that the original
+            # eight tools above don't share. In the common case (default
+            # palace at ``~/.mempalace/palace``) both resolve to the same
+            # place.
+            # New tools (everything that has a matching ``tool_*`` in
+            # mempalace.mcp_server) dispatch by name derivation. One
+            # mempalace asymmetry to remap: ``mempalace_traverse`` maps to
+            # ``tool_traverse_graph`` on the mcp_server side.
+            result = self._dispatch_mcp_passthrough(tool_name, args)
+            if result is not None:
+                return result
 
             return json.dumps({"error": f"Unknown tool: {tool_name}"})
         except Exception as exc:
             logger.exception("MemPalace tool %s failed", tool_name)
             return json.dumps({"error": f"{tool_name} failed: {exc}"})
+
+    # Tools that need name-remapping when dispatching to
+    # ``mempalace.mcp_server.tool_*``. Everything else uses
+    # ``tool_name.replace("mempalace_", "tool_", 1)`` straight up.
+    _MCP_FUNC_REMAP: Dict[str, str] = {
+        "mempalace_traverse": "tool_traverse_graph",
+    }
+
+    # Allowlist of tools that route through the mcp_server passthrough.
+    # Anything NOT here either has explicit handling above (the original
+    # eight ``_tool_*`` methods) or returns ``"Unknown tool"``. Using an
+    # allowlist (rather than ``getattr(_mp_mcp, name, None)`` only) keeps
+    # mempalace's admin / internal tool_* functions hidden from this
+    # plugin's surface even if a future caller passes their names.
+    _MCP_PASSTHROUGH_TOOLS = frozenset(
+        {
+            "mempalace_add_drawer",
+            "mempalace_update_drawer",
+            "mempalace_delete_drawer",
+            "mempalace_list_drawers",
+            "mempalace_get_drawer",
+            "mempalace_check_duplicate",
+            "mempalace_kg_invalidate",
+            "mempalace_kg_timeline",
+            "mempalace_kg_stats",
+            "mempalace_get_taxonomy",
+            "mempalace_get_aaak_spec",
+            "mempalace_traverse",
+            "mempalace_graph_stats",
+            "mempalace_find_tunnels",
+            "mempalace_create_tunnel",
+            "mempalace_list_tunnels",
+            "mempalace_delete_tunnel",
+            "mempalace_follow_tunnels",
+            "mempalace_memories_filed_away",
+        }
+    )
+
+    def _dispatch_mcp_passthrough(
+        self, tool_name: str, args: Dict[str, Any]
+    ) -> Optional[str]:
+        """Forward an allowlisted tool to its mempalace.mcp_server entry.
+
+        Returns the JSON-encoded result, or ``None`` if the tool isn't in
+        the allowlist (so the caller can fall through to the standard
+        ``"Unknown tool"`` error).
+        """
+        if tool_name not in self._MCP_PASSTHROUGH_TOOLS:
+            return None
+        from mempalace import mcp_server as _mp_mcp
+
+        func_name = self._MCP_FUNC_REMAP.get(
+            tool_name, tool_name.replace("mempalace_", "tool_", 1)
+        )
+        func = getattr(_mp_mcp, func_name, None)
+        if func is None:
+            return json.dumps(
+                {"error": f"{tool_name}: mempalace.mcp_server.{func_name} not found"}
+            )
+        # ``add_drawer`` is the only tool that needs a client-side default
+        # — tag agent-originated drawers so they're distinguishable from
+        # miner-ingested ones.
+        if tool_name == "mempalace_add_drawer":
+            args.setdefault("added_by", "hermes")
+        return json.dumps(func(**args))
 
     # ----- Setup wizard integration ----------------------------------------
 
