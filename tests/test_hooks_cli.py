@@ -13,6 +13,7 @@ import mempalace.hooks_cli as hooks_cli_mod
 from mempalace.hooks_cli import (
     SAVE_INTERVAL,
     _count_human_messages,
+    _diary_agent_for_harness,
     _extract_recent_messages,
     _get_mine_targets,
     _log,
@@ -22,6 +23,7 @@ from mempalace.hooks_cli import (
     _mine_sync,
     _parse_harness_input,
     _sanitize_session_id,
+    _save_diary_direct,
     _validate_transcript_path,
     _wing_from_transcript_path,
     hook_stop,
@@ -336,7 +338,9 @@ def test_stop_hook_saves_silently_at_interval(tmp_path):
     assert result["systemMessage"].startswith("\u2726 15 memories woven into the palace")
     assert "hooks" in result["systemMessage"]
     # tmp_path has no "-Projects-" segment, so _wing_from_transcript_path falls back to "wing_sessions"
-    mock_save.assert_called_once_with(str(transcript), "test", wing="wing_sessions", toast=False)
+    mock_save.assert_called_once_with(
+        str(transcript), "test", wing="wing_sessions", toast=False, agent_name="claude"
+    )
 
 
 def test_stop_hook_derives_wing_from_transcript_path(tmp_path):
@@ -355,7 +359,9 @@ def test_stop_hook_derives_wing_from_transcript_path(tmp_path):
             {"session_id": "test", "stop_hook_active": False, "transcript_path": str(transcript)},
             state_dir=tmp_path,
         )
-    mock_save.assert_called_once_with(str(transcript), "test", wing="wing_myproject", toast=False)
+    mock_save.assert_called_once_with(
+        str(transcript), "test", wing="wing_myproject", toast=False, agent_name="claude"
+    )
 
 
 def test_stop_hook_tracks_save_point(tmp_path):
@@ -381,6 +387,84 @@ def test_stop_hook_tracks_save_point(tmp_path):
         result = _capture_hook_output(hook_stop, data, state_dir=tmp_path)
     assert result == {}
     mock_save.assert_not_called()
+
+
+# --- #1693: hook checkpoints must be discoverable by diary_read ---
+
+
+def test_diary_agent_for_harness_maps_known_harnesses():
+    assert _diary_agent_for_harness("claude-code") == "claude"
+    assert _diary_agent_for_harness("codex") == "codex"
+
+
+def test_diary_agent_for_harness_unknown_falls_back_to_name():
+    """A future harness must never collapse to the legacy 'session-hook'
+    identity, which no diary_read(agent_name=...) call ever matches (#1693)."""
+    assert _diary_agent_for_harness("cursor") == "cursor"
+    for harness in ("claude-code", "codex", "cursor", "gemini"):
+        assert _diary_agent_for_harness(harness) != "session-hook"
+
+
+@pytest.mark.parametrize(
+    "harness,expected_agent",
+    [("claude-code", "claude"), ("codex", "codex")],
+)
+def test_stop_hook_files_checkpoint_under_harness_agent(tmp_path, harness, expected_agent):
+    """The Stop hook must file checkpoints under the agent identity that the
+    session's harness reads with, not the legacy hardcoded 'session-hook'
+    (#1693)."""
+    # _save_diary_direct is mocked below, so the transcript format is irrelevant
+    # here: _count_human_messages counts both harness shapes, and we assert only
+    # the harness -> agent_name routing, not transcript parsing.
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
+    )
+    with patch(
+        "mempalace.hooks_cli._save_diary_direct", return_value={"count": 5, "themes": []}
+    ) as mock_save:
+        _capture_hook_output(
+            hook_stop,
+            {"session_id": "test", "stop_hook_active": False, "transcript_path": str(transcript)},
+            harness=harness,
+            state_dir=tmp_path,
+        )
+    assert mock_save.call_args.kwargs["agent_name"] == expected_agent
+
+
+def test_stop_hook_checkpoint_visible_to_diary_read(monkeypatch, config, palace_path, kg, tmp_path):
+    """End-to-end regression for #1693: a checkpoint written by the Stop hook
+    save path is discoverable via diary_read under the harness agent identity,
+    and is not siloed under the legacy 'session-hook' identity."""
+    import chromadb
+
+    from mempalace import mcp_server
+    from mempalace.mcp_server import tool_diary_read
+
+    monkeypatch.setattr(mcp_server, "_config", config)
+    monkeypatch.setattr(mcp_server, "_get_kg", lambda *a, **kw: kg)
+    client = chromadb.PersistentClient(path=palace_path)
+    client.get_or_create_collection("mempalace_drawers", metadata={"hnsw:space": "cosine"})
+    del client
+
+    transcript = tmp_path / "session.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(5)],
+    )
+
+    agent = _diary_agent_for_harness("claude-code")
+    res = _save_diary_direct(str(transcript), "sess1", wing="wing_.claude", agent_name=agent)
+    assert res["count"] > 0
+
+    visible = tool_diary_read(agent_name="claude")
+    assert visible.get("total", 0) >= 1
+    assert "CHECKPOINT" in visible["entries"][0]["content"]
+
+    # The legacy identity no longer captures hook checkpoints.
+    legacy = tool_diary_read(agent_name="session-hook")
+    assert legacy.get("entries") == []
 
 
 # --- hook_session_start ---

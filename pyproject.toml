@@ -1,6 +1,6 @@
 [project]
 name = "mempalace"
-version = "3.3.6"
+version = "3.4.0"
 description = "Give your AI a memory — mine projects and conversations into a searchable palace. No API key required."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -60,6 +60,9 @@ mempalace-mcp = "mempalace.mcp_server:main"
 
 [project.entry-points."mempalace.backends"]
 chroma = "mempalace.backends.chroma:ChromaBackend"
+pgvector = "mempalace.backends.pgvector:PgVectorBackend"
+qdrant = "mempalace.backends.qdrant:QdrantBackend"
+sqlite_exact = "mempalace.backends.sqlite_exact:SQLiteExactBackend"
 
 # RFC 002 source-adapter entry-point group. Core publishes no first-party
 # adapters under this group yet; ``miner.py`` and ``convo_miner.py`` migrate
@@ -71,7 +74,7 @@ chroma = "mempalace.backends.chroma:ChromaBackend"
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
-    "ruff==0.15.14",
+    "ruff==0.15.15",
     "psutil>=5.9",
     # Property-based testing — generates hundreds of random inputs per
     # test to find counterexamples the hand-written positive tests miss.
@@ -92,6 +95,11 @@ dev = [
     "mypy>=1.0",
 ]
 spellcheck = ["autocorrect>=2.0"]
+# Opt-in Postgres + pgvector backend. Only the psycopg driver is needed on the
+# client; the server must have the `vector` extension available. Selected via
+# MEMPALACE_BACKEND=pgvector / --backend pgvector; never required for the
+# default (Chroma) install.
+pgvector = ["psycopg[binary]>=3.1"]
 # Hardware acceleration for the ONNX embedding model. Install exactly one:
 #   pip install mempalace[gpu]       — NVIDIA CUDA
 #   pip install mempalace[dml]       — DirectML (Windows AMD/Intel/NVIDIA)
@@ -123,7 +131,7 @@ extract = [
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
-    "ruff==0.15.14",
+    "ruff==0.15.15",
     "psutil>=5.9",
     "hypothesis>=6.0",
     "pre-commit>=3.0",

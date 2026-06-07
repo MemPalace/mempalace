@@ -58,6 +58,14 @@ class UnsupportedFilterError(BackendError):
     """
 
 
+class UnsupportedCapabilityError(BackendError):
+    """Raised when a backend does not implement an optional capability."""
+
+
+class BackendMismatchError(BackendError):
+    """Raised when a selected backend does not match existing palace artifacts."""
+
+
 class DimensionMismatchError(BackendError):
     """Raised when the embedding dimension on write does not match the collection."""
 
@@ -78,6 +86,29 @@ class PalaceRef:
     ``id`` is always present and is the key backends use to cache handles.
     ``local_path`` is populated for filesystem-rooted palaces.
     ``namespace`` is used by server-mode backends for tenant / prefix routing.
+
+    Isolation contract (RFC 001 §2.1, conformance: ``tests/test_backend_conformance.py``)
+    -----------------------------------------------------------------------------------
+    ``id`` is the *required* isolation key. Within a single backend instance:
+
+        A record written for one ``PalaceRef.id`` MUST NOT be returned,
+        modified, or deleted by an operation issued for a different
+        ``PalaceRef.id``. Cross-palace access is a spec violation.
+
+    ``namespace`` is *additional* partitioning, honored only by backends that
+    advertise the ``supports_namespace_isolation`` capability. For those
+    backends the same guarantee extends to namespaces:
+
+        A record written under one ``namespace`` MUST NOT be returned,
+        modified, or deleted by an operation issued under a different
+        ``namespace`` within the same backend instance. Cross-namespace
+        access is a spec violation.
+
+    Backends that do not advertise ``supports_namespace_isolation`` (e.g.
+    ``sqlite_exact``, whose isolation is the on-disk path alone) MAY ignore
+    ``namespace`` entirely; callers MUST NOT rely on it for tenant isolation
+    on such backends. Any conforming backend can self-check both guarantees by
+    running the shared assertions in ``tests/_backend_conformance.py``.
     """
 
     id: str
@@ -177,6 +208,23 @@ class GetResult(_DictCompatMixin):
         return cls(ids=[], documents=[], metadatas=[], embeddings=None)
 
 
+@dataclass(frozen=True)
+class LexicalHit:
+    """One hit from backend lexical candidate search."""
+
+    id: str
+    document: str
+    metadata: dict
+    score: float
+
+
+@dataclass(frozen=True)
+class LexicalResult:
+    """Typed return from ``BaseCollection.lexical_search``."""
+
+    hits: list[LexicalHit]
+
+
 # ---------------------------------------------------------------------------
 # Collection contract
 # ---------------------------------------------------------------------------
@@ -253,6 +301,15 @@ class BaseCollection(ABC):
     def health(self) -> HealthStatus:
         return HealthStatus.healthy()
 
+    def lexical_search(
+        self,
+        *,
+        query: str,
+        n_results: int = 10,
+        where: Optional[dict] = None,
+    ) -> LexicalResult:
+        raise UnsupportedCapabilityError("backend does not support lexical_search")
+
     def update(
         self,
         *,
@@ -311,6 +368,14 @@ class BaseBackend(ABC):
     Instances are lightweight on construction — no I/O, no network. All
     connection work is deferred to ``get_collection``. Instances are thread-
     safe for concurrent ``get_collection`` calls across different palaces.
+
+    Every backend MUST satisfy the per-``PalaceRef.id`` isolation guarantee in
+    :class:`PalaceRef`. Backends that additionally isolate by
+    ``PalaceRef.namespace`` (multi-tenant / hosted deployments) MUST advertise
+    the ``supports_namespace_isolation`` capability token; doing so is a
+    promise to satisfy the cross-namespace guarantee and to pass the namespace
+    arm of the conformance suite. Backends without the token MAY ignore
+    ``namespace``.
     """
 
     name: ClassVar[str]

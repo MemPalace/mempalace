@@ -17,6 +17,7 @@ def test_default_config():
     cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
     assert "palace" in cfg.palace_path
     assert cfg.collection_name == "mempalace_drawers"
+    assert cfg.backend == "chroma"
 
 
 def test_config_from_file():
@@ -25,6 +26,54 @@ def test_config_from_file():
         json.dump({"palace_path": "/custom/palace"}, f)
     cfg = MempalaceConfig(config_dir=tmpdir)
     assert cfg.palace_path == "/custom/palace"
+
+
+def test_backend_from_config_wins_over_env(tmp_path, monkeypatch):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"backend": "sqlite_exact"}, f)
+    monkeypatch.setenv("MEMPALACE_BACKEND", "chroma")
+
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.backend == "sqlite_exact"
+
+
+def test_backend_from_env_when_config_absent(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEMPALACE_BACKEND", "SQLite_Exact")
+
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.backend == "sqlite_exact"
+
+
+def test_qdrant_config_from_env_and_file(tmp_path, monkeypatch):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump(
+            {
+                "qdrant_url": "http://config.example:6333",
+                "qdrant_api_key": "config-key",
+                "qdrant_namespace": "config-ns",
+                "qdrant_timeout": 2,
+            },
+            f,
+        )
+    monkeypatch.setenv("MEMPALACE_QDRANT_URL", "http://env.example:6333")
+    monkeypatch.setenv("MEMPALACE_QDRANT_API_KEY", "env-key")
+    monkeypatch.setenv("MEMPALACE_QDRANT_NAMESPACE", "env-ns")
+    monkeypatch.setenv("MEMPALACE_QDRANT_TIMEOUT", "3.5")
+
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+
+    assert cfg.qdrant_url == "http://env.example:6333"
+    assert cfg.qdrant_api_key == "env-key"
+    assert cfg.qdrant_namespace == "env-ns"
+    assert cfg.qdrant_timeout == 3.5
+
+
+def test_set_backend_persists_choice(tmp_path):
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    cfg.set_backend("sqlite_exact")
+
+    reloaded = MempalaceConfig(config_dir=str(tmp_path))
+    assert reloaded.backend == "sqlite_exact"
 
 
 def test_embedding_device_defaults_to_auto(monkeypatch):
@@ -115,6 +164,17 @@ def test_init():
     cfg = MempalaceConfig(config_dir=tmpdir)
     cfg.init()
     assert os.path.exists(os.path.join(tmpdir, "config.json"))
+    with open(os.path.join(tmpdir, "config.json")) as f:
+        saved = json.load(f)
+    assert "backend" not in saved
+    assert MempalaceConfig(config_dir=tmpdir).backend == "chroma"
+
+
+def test_set_backend_rejects_unknown_backend(tmp_path):
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+
+    with pytest.raises(KeyError):
+        cfg.set_backend("does_not_exist")
 
 
 # --- normalize_wing_name ---
@@ -134,6 +194,16 @@ def test_normalize_wing_name_already_clean():
 
 def test_normalize_wing_name_mixed():
     assert normalize_wing_name("My-Cool App") == "my_cool_app"
+
+
+def test_normalize_wing_name_strips_leading_separator():
+    # Claude Code path-encoded project dirs begin with a separator; the slug
+    # must not start with "_" or sanitize_name / MCP writes would reject it.
+    assert normalize_wing_name("-home-user-linux-book") == "home_user_linux_book"
+
+
+def test_normalize_wing_name_strips_trailing_separator():
+    assert normalize_wing_name("project-") == "project"
 
 
 # --- sanitize_name ---

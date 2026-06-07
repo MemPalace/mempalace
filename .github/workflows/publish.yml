@@ -1,0 +1,124 @@
+name: Publish to PyPI
+
+# Publishes mempalace to PyPI via Trusted Publishing (OIDC — no stored token).
+#
+# Triggers:
+#   * release: published — the normal path (drafting + publishing a GitHub
+#     Release fires this).
+#   * workflow_dispatch — a manual escape hatch. GitHub does not reliably emit
+#     a `release` event when a *draft* tied to a pre-existing tag is published,
+#     so this lets a maintainer run the publish for any existing tag from the
+#     Actions tab ("Run workflow" → enter the tag, e.g. v3.4.0).
+#
+# Build + publish run in ONE job on purpose: a two-job split hands the wheel
+# between jobs via upload/download-artifact, which failed repeatedly with
+# `BlobNotFound` on the same-run download. Building and publishing in the same
+# job removes that handoff entirely. The job is gated by the `pypi` environment
+# (manual approval), and the checks below keep it self-contained — it never
+# uploads a tag that isn't on main or doesn't match the version manifest.
+#
+# One-time setup required before the first run (see docs/RELEASING.md):
+#   1. PyPI → Manage project `mempalace` → Publishing → Add a trusted publisher:
+#        Owner: MemPalace   Repository: mempalace
+#        Workflow: publish.yml   Environment: pypi
+#   2. GitHub → repo Settings → Environments → New environment `pypi`,
+#      add yourself as a Required reviewer (this is the manual approval gate).
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish (e.g. v3.4.0). Used when the release event didn't fire."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Build + publish to PyPI
+    runs-on: ubuntu-latest
+    # The `pypi` environment gate (required reviewer) pauses the whole job until
+    # approved, and scopes the OIDC trust on the PyPI side.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/mempalace
+    permissions:
+      contents: read # checkout
+      id-token: write # mint the short-lived OIDC token for Trusted Publishing
+    steps:
+      - name: Resolve the release tag
+        id: tag
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${RELEASE_TAG:-${INPUT_TAG:-}}"
+          if [[ -z "$tag" ]]; then
+            echo "::error::no tag to publish — neither a release tag nor a workflow_dispatch input was provided"
+            exit 1
+          fi
+          # Validate the shape before it is ever used as a git ref (ref-injection
+          # guard): require vMAJOR.MINOR.PATCH with an optional -/+ suffix, so
+          # loose values like 'v3' or 'v3foo' are rejected.
+          re='^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'
+          if [[ ! "$tag" =~ $re ]]; then
+            echo "::error::tag '$tag' is not a valid release tag (expected vMAJOR.MINOR.PATCH[-suffix])"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Resolved tag: $tag"
+
+      - uses: actions/checkout@v6
+        with:
+          # Fully-qualified refs/tags/ so an unqualified name can't resolve to a
+          # same-named *branch* instead of the tag (checkout prefers branches).
+          # steps.tag.outputs.tag is format-validated above (ref-injection guard).
+          ref: refs/tags/${{ steps.tag.outputs.tag }}
+          fetch-depth: 0 # full history for the ancestry check
+
+      - name: Verify the tag is on main
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          tag_sha=$(git rev-parse HEAD) # the checked-out tag commit
+          main_sha=$(git rev-parse FETCH_HEAD)
+          if git merge-base --is-ancestor "$tag_sha" "$main_sha"; then
+            echo "Tag $TAG ($tag_sha) is reachable from main — OK."
+          else
+            echo "::error::tag $TAG is not an ancestor of main. Releases must be cut from main."
+            exit 1
+          fi
+
+      - name: Verify the tag matches the version manifest
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # version.py is the source of truth (per CLAUDE.md); version-guard.yml
+          # separately enforces that pyproject + the three plugin manifests agree.
+          py_version=$(grep -E '^__version__' mempalace/version.py | cut -d'"' -f2)
+          tag_version="${TAG#v}"
+          if [[ "$tag_version" != "$py_version" ]]; then
+            echo "::error::tag $TAG does not match mempalace/version.py ($py_version). Bump the version files before releasing."
+            exit 1
+          fi
+          echo "Tag $TAG matches manifest version $py_version — OK."
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Build sdist + wheel
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

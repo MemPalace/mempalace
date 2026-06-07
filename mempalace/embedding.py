@@ -191,6 +191,9 @@ class EmbeddinggemmaONNX:
         model_path = hf_hub_download(
             _EMBEDDINGGEMMA_REPO, subfolder="onnx", filename=_EMBEDDINGGEMMA_ONNX
         )
+        hf_hub_download(
+            _EMBEDDINGGEMMA_REPO, subfolder="onnx", filename=_EMBEDDINGGEMMA_ONNX + "_data"
+        )
         tok_path = hf_hub_download(_EMBEDDINGGEMMA_REPO, filename="tokenizer.json")
 
         self._session = ort.InferenceSession(model_path, providers=self._providers)
@@ -222,6 +225,14 @@ class EmbeddinggemmaONNX:
         # MTEB methodology assumes; ChromaDB's distance is configured for it).
         norms = np.linalg.norm(sent_emb, axis=1, keepdims=True) + 1e-12
         return (sent_emb / norms).tolist()
+
+    def embed_query(self, input: list[str]) -> list[list[float]]:  # noqa: A002 — ChromaDB EF protocol
+        """Embed query documents (ChromaDB EF protocol)."""
+        return self(input)
+
+    def embed_documents(self, input: list[str]) -> list[list[float]]:  # noqa: A002
+        """Embed a batch of documents (ChromaDB EF protocol)."""
+        return self(input)
 
 
 def get_embedding_function(device: Optional[str] = None, model: Optional[str] = None):

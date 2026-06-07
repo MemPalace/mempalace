@@ -10,13 +10,14 @@ Same palace as project mining. Different ingest strategy.
 
 import os
 import sys
-import hashlib
 import logging
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
 from typing import Optional
 
+from .collision_scan import assert_no_collisions
+from .ids import ID_RECIPE, make_convo_drawer_id, make_convo_sentinel_id
 from .normalize import normalize
 from .palace import (
     NORMALIZE_VERSION,
@@ -83,8 +84,7 @@ def _register_file(collection, source_file: str, wing: str, agent: str, extract_
     re-read and re-processed on every mine run because nothing was written to
     ChromaDB on the first pass.
     """
-    sentinel_key = f"{source_file}:{extract_mode}"
-    sentinel_id = f"_reg_{hashlib.sha256(sentinel_key.encode()).hexdigest()[:24]}"
+    sentinel_id = make_convo_sentinel_id(source_file, extract_mode)
     collection.upsert(
         documents=[f"[registry] {source_file}"],
         ids=[sentinel_id],
@@ -98,6 +98,7 @@ def _register_file(collection, source_file: str, wing: str, agent: str, extract_
                 "ingest_mode": "registry",
                 "extract_mode": extract_mode,
                 "normalize_version": NORMALIZE_VERSION,
+                "id_recipe": ID_RECIPE,
             }
         ],
     )
@@ -192,11 +193,15 @@ def _chunk_by_exchange(lines: list, chunk_size: int, min_chunk_size: int) -> lis
                 next_line = lines[i]
                 if next_line.strip().startswith(">") or next_line.strip().startswith("---"):
                     break
-                if next_line.strip():
-                    ai_lines.append(next_line.strip())
+                # Preserve the line as-is — blank lines and indentation carry meaning
+                # (paragraph breaks, list/code structure) and must survive verbatim.
+                ai_lines.append(next_line)
                 i += 1
 
-            ai_response = " ".join(ai_lines)
+            # Join on newline (not space) so line structure, blank lines, and
+            # indentation reach the drawer unchanged. Trim only trailing blank
+            # lines produced by the loop stopping at the next `>` turn.
+            ai_response = "\n".join(ai_lines).rstrip("\n")
             content = f"{user_turn}\n{ai_response}" if ai_response else user_turn
 
             _emit_bounded(chunks, content, chunk_size, min_chunk_size)
@@ -419,10 +424,8 @@ def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extr
                 chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
                 if extract_mode == "general":
                     room_counts_delta[chunk_room] += 1
-                drawer_key = f"{source_file}:{extract_mode}:{chunk['chunk_index']}"
-                drawer_id = (
-                    f"drawer_{wing}_{chunk_room}_"
-                    f"{hashlib.sha256(drawer_key.encode()).hexdigest()[:24]}"
+                drawer_id = make_convo_drawer_id(
+                    wing, chunk_room, source_file, extract_mode, chunk["chunk_index"]
                 )
                 batch_docs.append(chunk["content"])
                 batch_ids.append(drawer_id)
@@ -438,8 +441,10 @@ def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extr
                         "ingest_mode": "convos",
                         "extract_mode": extract_mode,
                         "normalize_version": NORMALIZE_VERSION,
+                        "id_recipe": ID_RECIPE,
                     }
                 )
+            assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
             try:
                 collection.upsert(
                     documents=batch_docs,

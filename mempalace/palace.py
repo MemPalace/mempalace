@@ -13,9 +13,20 @@ import sys
 import threading
 from typing import Optional
 
-from .backends import BackendClosedError, CollectionNotInitializedError, PalaceNotFoundError
-from .backends.chroma import ChromaBackend
-from .entity_detector import _get_coca_filter
+from .backends import (
+    BackendClosedError,
+    BackendMismatchError,
+    CollectionNotInitializedError,
+    PalaceNotFoundError,
+    PalaceRef,
+    detect_backend_for_path,
+    detect_backends_for_path,
+    get_backend,
+    get_backend_class,
+    resolve_backend_for_palace,
+)
+from .backends.embedding_wrapper import EmbeddingCollection
+from .entity_detector import _apply_known_systems_prepass, _get_coca_filter
 
 logger = logging.getLogger("mempalace_mcp")
 
@@ -45,7 +56,8 @@ SKIP_DIRS = {
     "target",
 }
 
-_DEFAULT_BACKEND = ChromaBackend()
+_DEFAULT_BACKEND = get_backend("chroma")
+_EXPLICIT_BACKEND_ENV = "MEMPALACE_BACKEND_EXPLICIT"
 
 # Schema version for drawer normalization. Bump when the normalization
 # pipeline changes in a way that existing drawers should be rebuilt to pick up
@@ -62,22 +74,122 @@ def get_collection(
     palace_path: str,
     collection_name: Optional[str] = None,
     create: bool = True,
+    backend: Optional[str] = None,
 ):
     """Get the palace collection through the backend layer."""
     if collection_name is None:
         from .config import get_configured_collection_name
 
         collection_name = get_configured_collection_name()
-    return _DEFAULT_BACKEND.get_collection(
+    backend_obj = get_backend_for_palace(palace_path, explicit=backend)
+    palace_ref = PalaceRef(id=palace_path, local_path=palace_path)
+    try:
+        collection = backend_obj.get_collection(
+            palace=palace_ref,
+            collection_name=collection_name,
+            create=create,
+        )
+    except TypeError as exc:
+        if "unexpected keyword argument 'palace'" not in str(exc):
+            raise
+        collection = backend_obj.get_collection(
+            palace_path,
+            collection_name=collection_name,
+            create=create,
+        )
+    if "requires_explicit_embeddings" in getattr(backend_obj, "capabilities", frozenset()):
+        return EmbeddingCollection(collection)
+    return collection
+
+
+def get_closets_collection(
+    palace_path: str,
+    create: bool = True,
+    backend: Optional[str] = None,
+):
+    """Get the closets collection — the searchable index layer."""
+    return get_collection(
         palace_path,
-        collection_name=collection_name,
+        collection_name="mempalace_closets",
         create=create,
+        backend=backend,
     )
 
 
-def get_closets_collection(palace_path: str, create: bool = True):
-    """Get the closets collection — the searchable index layer."""
-    return get_collection(palace_path, collection_name="mempalace_closets", create=create)
+def _config_backend_value(palace_path: str) -> Optional[str]:
+    try:
+        from .config import MempalaceConfig
+
+        cfg = MempalaceConfig()
+        cfg_palace = os.path.abspath(os.path.expanduser(cfg.palace_path))
+        target_palace = os.path.abspath(os.path.expanduser(palace_path))
+        if cfg_palace != target_palace:
+            return None
+        value = cfg._file_config.get("backend")
+        return str(value).strip().lower() if value else None
+    except Exception:
+        return None
+
+
+def _env_backend_value() -> Optional[str]:
+    value = os.environ.get("MEMPALACE_BACKEND")
+    return value.strip().lower() if value else None
+
+
+def resolve_backend_name(palace_path: str, explicit: Optional[str] = None) -> str:
+    """Resolve and validate the selected backend for ``palace_path``.
+
+    Public resolution order:
+
+    1. Explicit CLI/MCP flag or direct ``get_collection(..., backend=...)``.
+    2. ``backend`` in ``~/.mempalace/config.json``.
+    3. ``MEMPALACE_BACKEND``.
+    4. Detected existing palace artifacts.
+    5. ``chroma``.
+
+    If artifacts for a different backend are already present, raise
+    ``BackendMismatchError`` so normal write paths cannot silently mix storage
+    formats in one palace directory.
+    """
+    explicit = explicit or os.environ.get(_EXPLICIT_BACKEND_ENV)
+    selected = resolve_backend_for_palace(
+        explicit=explicit.strip().lower() if explicit else None,
+        config_value=_config_backend_value(palace_path),
+        env_value=_env_backend_value(),
+        palace_path=palace_path,
+        default="chroma",
+    )
+    get_backend_class(selected)
+    detected_backends = detect_backends_for_path(palace_path)
+    if len(detected_backends) > 1:
+        raise BackendMismatchError(
+            f"palace at {palace_path!r} contains multiple backend artifacts: "
+            f"{', '.join(detected_backends)}"
+        )
+    detected = detected_backends[0] if detected_backends else None
+    if detected and detected != selected:
+        raise BackendMismatchError(
+            f"palace at {palace_path!r} contains {detected!r} backend artifacts, "
+            f"but {selected!r} was selected"
+        )
+    return selected
+
+
+def get_backend_for_palace(palace_path: str, explicit: Optional[str] = None):
+    """Return the resolved backend instance for ``palace_path``."""
+    return get_backend(resolve_backend_name(palace_path, explicit=explicit))
+
+
+def _backend_artifact_label(backend_name: Optional[str]) -> str:
+    if backend_name == "chroma":
+        return "chroma.sqlite3"
+    if backend_name == "qdrant":
+        return "qdrant_backend.json"
+    if backend_name == "pgvector":
+        return "pgvector_backend.json"
+    if backend_name == "sqlite_exact":
+        return "sqlite_exact.sqlite3"
+    return "backend database"
 
 
 def _open_collection_or_explain(
@@ -85,6 +197,7 @@ def _open_collection_or_explain(
     *,
     collection_name: Optional[str] = None,
     out=None,
+    opener=None,
 ):
     """Open the palace collection or print a state-specific message and return ``None``.
 
@@ -101,11 +214,11 @@ def _open_collection_or_explain(
     first when the vector path is disabled (see PR #831 / issue #830).
 
     State A: palace dir is absent.
-    State B: dir is present but ``chroma.sqlite3`` is absent. The helper
-        short-circuits to a message before reaching the backend, because
-        ``chromadb.PersistentClient`` lazily creates the DB file on first
-        open — calling the backend on this state would silently mutate
-        the filesystem for what should be a read-only inspection.
+    State B: dir is present but no backend database artifact is present.
+        The helper short-circuits to a message before reaching the backend,
+        because some backends lazily create their DB file on first open —
+        calling the backend on this state would silently mutate the filesystem
+        for what should be a read-only inspection.
     State C: DB is present but the ``mempalace_drawers`` collection has
         never been bootstrapped (``init`` ran, ``mine`` has not).
     State D: healthy — returns the opened collection.
@@ -116,17 +229,41 @@ def _open_collection_or_explain(
     callable (e.g. a repair progress emitter) to route messages through it.
     """
     emit = out if out is not None else print
+    open_collection = opener or get_collection
 
     if not os.path.isdir(palace_path):
         emit(f"\n  No palace found at {palace_path}")
         emit("  Run: mempalace init <dir> then mempalace mine <dir>")
         return None
-    if not os.path.isfile(os.path.join(palace_path, "chroma.sqlite3")):
-        emit(f"\n  Palace dir at {palace_path} exists but has no chroma.sqlite3 yet.")
+    try:
+        backend_name = resolve_backend_name(palace_path)
+    except BackendMismatchError as e:
+        emit(f"\n  Backend mismatch at {palace_path}: {e}")
+        emit("  Select the matching backend or use a fresh palace directory.")
+        return None
+    except KeyError as e:
+        # Unknown backend name (e.g. a typo in MEMPALACE_BACKEND/--backend):
+        # resolve_backend_name -> get_backend_class raises KeyError carrying the
+        # available-backend list. Surface it as a CLI state message rather than
+        # letting it escape as a stack trace.
+        emit(f"\n  Unknown backend selected for {palace_path}: {e.args[0] if e.args else e}")
+        emit("  Set --backend or MEMPALACE_BACKEND to a registered backend.")
+        return None
+    detected = detect_backend_for_path(palace_path)
+    if detected is None:
+        emit(
+            f"\n  Palace dir at {palace_path} exists but has no "
+            f"{_backend_artifact_label(backend_name)} yet."
+        )
         emit("  Run: mempalace mine <dir>")
         return None
     try:
-        return get_collection(palace_path, collection_name=collection_name, create=False)
+        return open_collection(
+            palace_path,
+            collection_name=collection_name,
+            create=False,
+            backend=backend_name,
+        )
     except CollectionNotInitializedError:
         emit(f"\n  Palace at {palace_path} is initialized but empty (no drawers yet).")
         emit("  Run: mempalace mine <dir>")
@@ -134,6 +271,10 @@ def _open_collection_or_explain(
     except PalaceNotFoundError:
         emit(f"\n  No palace found at {palace_path}")
         emit("  Run: mempalace init <dir> then mempalace mine <dir>")
+        return None
+    except BackendMismatchError as e:
+        emit(f"\n  Backend mismatch at {palace_path}: {e}")
+        emit("  Select the matching backend or use a fresh palace directory.")
         return None
     except BackendClosedError:
         # Surface this as a programmer error, not a palace-state UX message:
@@ -265,9 +406,15 @@ def build_closet_lines(source_file, drawer_ids, content, wing, room, drawer_meta
 
     # Extract proper nouns (2+ occurrences). Uses i18n-aware patterns so
     # non-Latin names (Cyrillic, accented Latin, etc.) are also detected.
+    # Tier 3 linguistics cleanup — known-systems compound pre-pass. Detects
+    # multi-word product names ("Claude Code", "GitHub Copilot", …) atomically
+    # and masks them out of the working window so the single-word extraction
+    # below doesn't decompose them.
+    working_window, compound_counts = _apply_known_systems_prepass(window)
+
     coca_filter = _get_coca_filter()
-    words = _candidate_entity_words(window)
-    word_freq = {}
+    words = _candidate_entity_words(working_window)
+    word_freq: dict = dict(compound_counts)
     for w in words:
         if w in _ENTITY_STOPLIST:
             continue
@@ -478,6 +625,9 @@ def _validate_palace_fts5_after_mine(palace_path: str) -> None:
     operator sees the same recovery banner regardless of which command surfaces
     the bug.
     """
+    if resolve_backend_name(palace_path) != "chroma":
+        return
+
     # Defer-import: keeps the repair module graph out of mine's hot import path.
     from .repair import _close_chroma_handles, sqlite_integrity_errors
 
@@ -735,47 +885,51 @@ def file_already_mined(
     treated as exchange-mode drawers.
     """
     try:
-        stored_meta = None
-        if extract_mode is None:
-            results = collection.get(where={"source_file": source_file}, limit=1)
-            if not results.get("ids"):
-                return False
-            stored_meta = results.get("metadatas", [{}])[0] or {}
-        else:
-            offset = 0
-            while True:
-                results = collection.get(
-                    where={"source_file": source_file},
-                    limit=1000,
-                    offset=offset,
-                    include=["metadatas"],
-                )
-                ids = results.get("ids") or []
-                metadatas = results.get("metadatas") or []
-                stored_meta = next(
-                    (
-                        meta or {}
-                        for meta in metadatas
-                        if _metadata_matches_extract_mode(meta or {}, extract_mode)
-                    ),
-                    None,
-                )
-                if stored_meta is not None or not ids:
-                    break
-                offset += len(ids)
-        if stored_meta is None:
-            return False
-        # Pre-v2 drawers have no version field — treat them as stale.
-        stored_version = stored_meta.get("normalize_version", 1)
-        if stored_version < NORMALIZE_VERSION:
-            return False
-        if check_mtime:
-            stored_mtime = stored_meta.get("source_mtime")
-            if stored_mtime is None:
-                return False
-            current_mtime = os.path.getmtime(source_file)
-            return abs(float(stored_mtime) - current_mtime) < 0.001
-        return True
+        # Under the additive-mining model, a single ``source_file`` can have
+        # multiple ``parent_drawer_id`` groups in the palace — one per
+        # mining pass — each with its own stored ``source_mtime`` and
+        # ``normalize_version``. The function must return True if ANY stored
+        # group is current (matching version + matching mtime when checked),
+        # because ChromaDB's ``get(..., limit=1)`` has undefined ordering
+        # across multiple matching rows: a ``limit=1`` shortcut picks
+        # whichever row ChromaDB orders first and only checks that one,
+        # causing spurious re-mines whenever the stale group is returned.
+        # Iterating via the same paginated pattern used in the
+        # extract_mode-is-set branch lets the function short-circuit on the
+        # first matching group regardless of ordering.
+        current_mtime = os.path.getmtime(source_file) if check_mtime else None
+        offset = 0
+        while True:
+            results = collection.get(
+                where={"source_file": source_file},
+                limit=1000,
+                offset=offset,
+                include=["metadatas"],
+            )
+            ids = results.get("ids") or []
+            metadatas = results.get("metadatas") or []
+            for meta in metadatas:
+                meta = meta or {}
+                # extract_mode scoping (was the existing ``else`` branch):
+                if extract_mode is not None and not _metadata_matches_extract_mode(
+                    meta, extract_mode
+                ):
+                    continue
+                # Pre-v2 drawers have no version field — treat them as stale.
+                stored_version = meta.get("normalize_version", 1)
+                if stored_version < NORMALIZE_VERSION:
+                    continue
+                if not check_mtime:
+                    return True
+                stored_mtime = meta.get("source_mtime")
+                if stored_mtime is None:
+                    continue
+                if abs(float(stored_mtime) - current_mtime) < 0.001:
+                    return True
+            if not ids:
+                break
+            offset += len(ids)
+        return False
     except Exception:
         return False
 
