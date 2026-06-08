@@ -538,7 +538,7 @@ class TestHandleRequest:
         assert "mempalace_kg_add" in names
         diary_write = next(t for t in tools if t["name"] == "mempalace_diary_write")
         schema = diary_write["inputSchema"]
-        assert schema["required"] == ["agent_name", "entry"]
+        assert schema["required"] == ["agent_name"]
         assert "content" in schema["properties"]
         assert "anyOf" not in schema
 

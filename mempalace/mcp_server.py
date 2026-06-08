@@ -2668,9 +2668,9 @@ TOOLS = {
                 },
             },
             # Keep the root schema composition-free for Anthropic-compatible MCP
-            # clients. Advertise the canonical 'entry' field as required while
-            # still accepting 'content' as a compatibility alias at dispatch.
-            "required": ["agent_name", "entry"],
+            # clients, and leave 'content'-only compatibility intact by requiring
+            # only agent_name at schema level before dispatch remaps content->entry.
+            "required": ["agent_name"],
         },
         "handler": tool_diary_write,
     },
