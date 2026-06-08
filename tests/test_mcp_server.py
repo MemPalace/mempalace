@@ -536,6 +536,11 @@ class TestHandleRequest:
         assert "mempalace_search" in names
         assert "mempalace_add_drawer" in names
         assert "mempalace_kg_add" in names
+        diary_write = next(t for t in tools if t["name"] == "mempalace_diary_write")
+        schema = diary_write["inputSchema"]
+        assert schema["required"] == ["agent_name"]
+        assert "content" in schema["properties"]
+        assert "anyOf" not in schema
 
     def test_null_arguments_does_not_hang(self, monkeypatch, config, palace_path, seeded_kg):
         """Sending arguments: null should return a result, not hang (#394)."""

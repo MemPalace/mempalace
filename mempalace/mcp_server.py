@@ -2668,12 +2668,9 @@ TOOLS = {
                 },
             },
             # agent_name is always required; 'entry' or its alias 'content' must
-            # be present (the server remaps content->entry at dispatch).
+            # be present by dispatch time; keep the root schema composition-free
+            # for Anthropic-compatible MCP clients, then remap content->entry later.
             "required": ["agent_name"],
-            "anyOf": [
-                {"required": ["entry"]},
-                {"required": ["content"]},
-            ],
         },
         "handler": tool_diary_write,
     },
