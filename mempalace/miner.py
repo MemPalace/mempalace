@@ -15,7 +15,7 @@ from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
 
-from .palace import SKIP_DIRS, get_collection, file_already_mined
+from .palace import SKIP_DIRS, get_collection, get_remote_collection, file_already_mined
 
 READABLE_EXTENSIONS = {
     ".txt",
@@ -544,6 +544,8 @@ def mine(
     dry_run: bool = False,
     respect_gitignore: bool = True,
     include_ignored: list = None,
+    remote_url: str = None,
+    remote_token: str = None,
 ):
     """Mine a project directory into the palace."""
 
@@ -567,7 +569,7 @@ def mine(
     print(f"  Wing:    {wing}")
     print(f"  Rooms:   {', '.join(r['name'] for r in rooms)}")
     print(f"  Files:   {len(files)}")
-    print(f"  Palace:  {palace_path}")
+    print(f"  Palace:  {remote_url or palace_path}")
     if dry_run:
         print("  DRY RUN — nothing will be filed")
     if not respect_gitignore:
@@ -577,7 +579,15 @@ def mine(
     print(f"{'─' * 55}\n")
 
     if not dry_run:
-        collection = get_collection(palace_path)
+        if remote_url:
+            token = remote_token or os.environ.get("MEMPALACE_TOKEN", "")
+            if not token:
+                raise RuntimeError(
+                    "remote-url requires a token — pass --remote-token or set MEMPALACE_TOKEN"
+                )
+            collection = get_remote_collection(remote_url, token)
+        else:
+            collection = get_collection(palace_path)
     else:
         collection = None
 
@@ -602,6 +612,8 @@ def mine(
             room_counts[room] += 1
             if not dry_run:
                 print(f"  ✓ [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers}")
+            if not dry_run and hasattr(collection, "mark_file_done"):
+                collection.mark_file_done(str(filepath))
 
     print(f"\n{'=' * 55}")
     print("  Done.")

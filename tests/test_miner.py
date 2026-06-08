@@ -296,3 +296,48 @@ def test_status_missing_palace_does_not_create_empty_collection(tmp_path, capsys
     out = capsys.readouterr().out
     assert "No palace found" in out
     assert not palace_path.exists()
+
+
+def test_mine_uses_remote_collection_when_remote_url_set(tmp_path, monkeypatch):
+    """When remote_url is passed, mine uses RemoteCollection."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    from mempalace.miner import mine
+    from unittest.mock import patch, MagicMock
+
+    mock_col = MagicMock()
+    mock_col.get.return_value = {"ids": [], "documents": [], "metadatas": []}
+
+    (tmp_path / "hello.txt").write_text("this is some content for testing the miner remote path")
+    write_file(
+        tmp_path / "mempalace.yaml",
+        "wing: test_remote\nrooms:\n  - name: general\n    description: General\n",
+    )
+
+    with patch("mempalace.miner.get_remote_collection", return_value=mock_col):
+        mine(
+            project_dir=str(tmp_path),
+            palace_path=str(tmp_path / "palace"),
+            remote_url="http://x",
+            remote_token="tok",
+        )
+
+    assert mock_col.upsert.called or mock_col.get.called
+
+
+def test_mine_raises_when_remote_url_but_no_token(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("MEMPALACE_TOKEN", raising=False)
+    from mempalace.miner import mine
+    import pytest
+
+    write_file(
+        tmp_path / "mempalace.yaml",
+        "wing: test_remote\nrooms:\n  - name: general\n    description: General\n",
+    )
+
+    with pytest.raises(RuntimeError, match="remote-url requires a token"):
+        mine(
+            project_dir=str(tmp_path),
+            palace_path=str(tmp_path / "palace"),
+            remote_url="http://x",
+        )
