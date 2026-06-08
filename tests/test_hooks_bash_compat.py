@@ -141,6 +141,8 @@ class TestNoBash4OnlyBuiltins:
         src = _hook_src_no_comments(SESSION_END_HOOK)
         assert "mempalace hook run --hook session-end --harness" in src
         assert "MEMPALACE_HOOK_HARNESS" in src
+        assert "MEMPAL_PYTHON" in src
+        assert "python3" in src
 
 
 class TestSessionIdExtraction:

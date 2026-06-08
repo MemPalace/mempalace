@@ -65,11 +65,6 @@ Add to `.codex/hooks.json`:
     "command": "/absolute/path/to/hooks/mempal_save_hook.sh",
     "timeout": 30
   }],
-  "SessionEnd": [{
-    "type": "command",
-    "command": "mempalace hook run --hook session-end --harness codex",
-    "timeout": 30
-  }],
   "PreCompact": [{
     "type": "command",
     "command": "/absolute/path/to/hooks/mempal_precompact_hook.sh",
@@ -77,6 +72,8 @@ Add to `.codex/hooks.json`:
   }]
 }
 ```
+
+Codex CLI does not currently expose a `SessionEnd` hook event, so the clean-exit hook is Claude Code only for now.
 
 ## Configuration
 

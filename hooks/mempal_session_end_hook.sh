@@ -1,9 +1,25 @@
 #!/bin/bash
 # MEMPALACE SESSION-END HOOK — Final save on clean exit
-#
-# Thin wrapper around the Python hook dispatcher so the clean-exit path
-# reuses the same save/mining logic as the first-class CLI hook.
 
-HOOK_HARNESS="${MEMPALACE_HOOK_HARNESS:-claude-code}"
+run_mempalace_hook() {
+  if command -v mempalace >/dev/null 2>&1; then
+    exec mempalace hook run "$@"
+  fi
 
-exec mempalace hook run --hook session-end --harness "$HOOK_HARNESS"
+  MEMPAL_PYTHON_BIN="${MEMPAL_PYTHON:-}"
+  if [ -z "$MEMPAL_PYTHON_BIN" ] || [ ! -x "$MEMPAL_PYTHON_BIN" ]; then
+    MEMPAL_PYTHON_BIN="$(command -v python3 2>/dev/null || echo python3)"
+  fi
+  if "$MEMPAL_PYTHON_BIN" -c "import mempalace" >/dev/null 2>&1; then
+    exec "$MEMPAL_PYTHON_BIN" -m mempalace hook run "$@"
+  fi
+
+  if command -v python >/dev/null 2>&1 && python -c "import mempalace" >/dev/null 2>&1; then
+    exec python -m mempalace hook run "$@"
+  fi
+
+  echo "MemPalace hook error: could not find a runnable mempalace command or module" >&2
+  exit 1
+}
+
+run_mempalace_hook --hook session-end --harness "${MEMPALACE_HOOK_HARNESS:-claude-code}"
