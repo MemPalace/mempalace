@@ -158,11 +158,12 @@ def test_cmd_instructions_calls_run_instructions():
 # ── cmd_hook ───────────────────────────────────────────────────────────
 
 
-def test_cmd_hook_calls_run_hook():
-    args = argparse.Namespace(hook="session-start", harness="claude-code")
+@pytest.mark.parametrize("hook_name", ["session-start", "session-end"])
+def test_cmd_hook_calls_run_hook(hook_name):
+    args = argparse.Namespace(hook=hook_name, harness="claude-code")
     with patch("mempalace.hooks_cli.run_hook") as mock_run:
         cmd_hook(args)
-        mock_run.assert_called_once_with(hook_name="session-start", harness="claude-code")
+        mock_run.assert_called_once_with(hook_name=hook_name, harness="claude-code")
 
 
 # ── cmd_init ───────────────────────────────────────────────────────────
@@ -864,6 +865,18 @@ def test_main_hook_run_dispatches():
         patch(
             "sys.argv",
             ["mempalace", "hook", "run", "--hook", "session-start", "--harness", "claude-code"],
+        ),
+        patch("mempalace.cli.cmd_hook") as mock_cmd,
+    ):
+        main()
+        mock_cmd.assert_called_once()
+
+
+def test_main_hook_run_dispatches_session_end():
+    with (
+        patch(
+            "sys.argv",
+            ["mempalace", "hook", "run", "--hook", "session-end", "--harness", "claude-code"],
         ),
         patch("mempalace.cli.cmd_hook") as mock_cmd,
     ):

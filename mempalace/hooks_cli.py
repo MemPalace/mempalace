@@ -1,8 +1,8 @@
 """
-Hook logic for MemPalace — Python implementation of session-start, stop, and precompact hooks.
+Hook logic for MemPalace — Python implementation of session-start, stop, session-end, and precompact hooks.
 
 Reads JSON from stdin, outputs JSON to stdout.
-Supported hooks: session-start, stop, precompact
+Supported hooks: session-start, stop, session-end, precompact
 Supported harnesses: claude-code, codex (extensible to cursor, gemini, etc.)
 """
 
@@ -892,6 +892,52 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
     return "wing_sessions"
 
 
+def _save_result_payload(result: dict) -> dict:
+    """Format a hook save result into a terminal-visible payload."""
+    count = result.get("count", 0)
+    if count <= 0:
+        return {}
+    themes = result.get("themes", [])
+    tag = f" \u2014 {', '.join(themes)}" if themes else ""
+    return {"systemMessage": f"\u2726 {count} memories woven into the palace{tag}"}
+
+
+def _run_session_save(
+    transcript_path: str,
+    session_id: str,
+    harness: str,
+    *,
+    toast: bool,
+    sync_project_mine: bool,
+) -> dict:
+    """Save the current session and run the matching ingest path."""
+    result = {"count": 0}
+    if transcript_path:
+        result = _save_diary_direct(
+            transcript_path,
+            session_id,
+            wing=_wing_from_transcript_path(transcript_path),
+            toast=toast,
+            agent_name=_diary_agent_for_harness(harness),
+        )
+        _ingest_transcript(transcript_path)
+    if sync_project_mine:
+        _mine_sync()
+    else:
+        _maybe_auto_ingest()
+    return result
+
+
+def _clear_session_last_save(session_id: str) -> None:
+    """Drop the per-session save marker after the session exits."""
+    try:
+        (STATE_DIR / f"{session_id}_last_save").unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
 def hook_stop(data: dict, harness: str):
     """Stop hook: block every N messages for auto-save."""
     if not _palace_root_exists():
@@ -953,21 +999,15 @@ def hook_stop(data: dict, harness: str):
             silent = True
             toast = False
 
-        project_wing = _wing_from_transcript_path(transcript_path)
-
         if silent:
             # Save directly via Python API — systemMessage renders in terminal
-            result = {"count": 0}
-            if transcript_path:
-                result = _save_diary_direct(
-                    transcript_path,
-                    session_id,
-                    wing=project_wing,
-                    toast=toast,
-                    agent_name=_diary_agent_for_harness(harness),
-                )
-                _ingest_transcript(transcript_path)
-            _maybe_auto_ingest()
+            result = _run_session_save(
+                transcript_path,
+                session_id,
+                harness,
+                toast=toast,
+                sync_project_mine=False,
+            )
             # Only advance save marker after successful save
             count = result.get("count", 0)
             if count > 0:
@@ -975,16 +1015,7 @@ def hook_stop(data: dict, harness: str):
                     last_save_file.write_text(str(exchange_count), encoding="utf-8")
                 except OSError:
                     pass
-                themes = result.get("themes", [])
-                if themes:
-                    tag = " \u2014 " + ", ".join(themes)
-                else:
-                    tag = ""
-                _output(
-                    {
-                        "systemMessage": f"\u2726 {count} memories woven into the palace{tag}",
-                    }
-                )
+                _output(_save_result_payload(result))
             else:
                 _output({})
         else:
@@ -995,6 +1026,7 @@ def hook_stop(data: dict, harness: str):
                 last_save_file.write_text(str(exchange_count), encoding="utf-8")
             except OSError:
                 pass
+            project_wing = _wing_from_transcript_path(transcript_path)
             if transcript_path:
                 _ingest_transcript(transcript_path)
             _maybe_auto_ingest()
@@ -1019,6 +1051,40 @@ def hook_session_start(data: dict, harness: str):
 
     # Pass through — no blocking on session start
     _output({})
+
+
+def hook_session_end(data: dict, harness: str):
+    """Session end hook: force one final save on clean exit."""
+    if not _palace_root_exists():
+        _output({})
+        return
+    parsed = _parse_harness_input(data, harness)
+    session_id = parsed["session_id"]
+    transcript_path = parsed["transcript_path"]
+
+    try:
+        config = MempalaceConfig()
+        if not config.hooks_auto_save:
+            _output({})
+            return
+
+        _log(f"SESSION END triggered for session {session_id}")
+
+        try:
+            toast = config.hook_desktop_toast
+        except Exception:
+            toast = False
+
+        result = _run_session_save(
+            transcript_path,
+            session_id,
+            harness,
+            toast=toast,
+            sync_project_mine=True,
+        )
+        _output(_save_result_payload(result))
+    finally:
+        _clear_session_last_save(session_id)
 
 
 def hook_precompact(data: dict, harness: str):
@@ -1064,6 +1130,7 @@ def run_hook(hook_name: str, harness: str):
     hooks = {
         "session-start": hook_session_start,
         "stop": hook_stop,
+        "session-end": hook_session_end,
         "precompact": hook_precompact,
     }
 

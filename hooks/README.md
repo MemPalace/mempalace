@@ -11,6 +11,7 @@ It covers hook wiring, JSONL backup, and one-time backfill.
 | Hook | When It Fires | What Happens |
 |------|--------------|-------------|
 | **Save Hook** | Every 15 human messages | Auto-mines transcript (tool output included), then blocks the AI to save topics/decisions/quotes |
+| **SessionEnd Hook** | Clean session exit | Runs one final checkpoint save plus a final project mine before the harness exits |
 | **PreCompact Hook** | Right before context compaction | Auto-mines transcript, then emergency save — forces the AI to save EVERYTHING before losing context |
 
 **Two-layer capture:** Hooks auto-mine the JSONL transcript directly into the palace (capturing raw tool output — Bash results, search findings, build errors). They also block the AI with a reason message telling it to save verbatim tool output and key context. Belt and suspenders — tool output gets stored even if the AI summarizes instead of quoting.
@@ -30,6 +31,13 @@ Add to `.claude/settings.local.json`:
         "timeout": 30
       }]
     }],
+    "SessionEnd": [{
+      "hooks": [{
+        "type": "command",
+        "command": "/absolute/path/to/hooks/mempal_session_end_hook.sh",
+        "timeout": 30
+      }]
+    }],
     "PreCompact": [{
       "hooks": [{
         "type": "command",
@@ -43,7 +51,7 @@ Add to `.claude/settings.local.json`:
 
 Make them executable:
 ```bash
-chmod +x hooks/mempal_save_hook.sh hooks/mempal_precompact_hook.sh
+chmod +x hooks/mempal_save_hook.sh hooks/mempal_session_end_hook.sh hooks/mempal_precompact_hook.sh
 ```
 
 ## Install — Codex CLI (OpenAI)
@@ -55,6 +63,11 @@ Add to `.codex/hooks.json`:
   "Stop": [{
     "type": "command",
     "command": "/absolute/path/to/hooks/mempal_save_hook.sh",
+    "timeout": 30
+  }],
+  "SessionEnd": [{
+    "type": "command",
+    "command": "mempalace hook run --hook session-end --harness codex",
     "timeout": 30
   }],
   "PreCompact": [{

@@ -27,6 +27,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SAVE_HOOK = REPO_ROOT / "hooks" / "mempal_save_hook.sh"
 PRECOMPACT_HOOK = REPO_ROOT / "hooks" / "mempal_precompact_hook.sh"
+SESSION_END_HOOK = REPO_ROOT / "hooks" / "mempal_session_end_hook.sh"
 
 # Re-used by every parametrize decorator that runs the same test against
 # both hooks. ``ids=`` keeps pytest output readable (`...[save_hook]`
@@ -127,6 +128,19 @@ class TestNoBash4OnlyBuiltins:
             text=True,
         )
         assert p.returncode == 0, f"{hook.name} syntax error: {p.stderr}"
+
+    def test_session_end_wrapper_syntax_clean(self):
+        p = subprocess.run(
+            ["bash", "-n", str(SESSION_END_HOOK)],
+            capture_output=True,
+            text=True,
+        )
+        assert p.returncode == 0, f"{SESSION_END_HOOK.name} syntax error: {p.stderr}"
+
+    def test_session_end_wrapper_dispatches_through_cli(self):
+        src = _hook_src_no_comments(SESSION_END_HOOK)
+        assert "mempalace hook run --hook session-end --harness" in src
+        assert "MEMPALACE_HOOK_HARNESS" in src
 
 
 class TestSessionIdExtraction:

@@ -26,6 +26,7 @@ from mempalace.hooks_cli import (
     _save_diary_direct,
     _validate_transcript_path,
     _wing_from_transcript_path,
+    hook_session_end,
     hook_stop,
     hook_session_start,
     hook_precompact,
@@ -1566,6 +1567,14 @@ def test_run_hook_dispatches_precompact(tmp_path):
     mock_output.assert_called_once_with({})
 
 
+def test_run_hook_dispatches_session_end():
+    stdin_data = json.dumps({"session_id": "run-test"})
+    with patch("sys.stdin", io.StringIO(stdin_data)):
+        with patch("mempalace.hooks_cli.hook_session_end") as mock_hook:
+            run_hook("session-end", "claude-code")
+    mock_hook.assert_called_once_with({"session_id": "run-test"}, "claude-code")
+
+
 # --- auto_save config toggle ---
 
 
@@ -1640,6 +1649,54 @@ def test_precompact_hook_enabled_by_default(tmp_path):
             )
     assert result == {}
     mock_mine.assert_called_once()
+
+
+def test_session_end_hook_disabled_by_config_clears_last_save(tmp_path):
+    last_save_file = tmp_path / "test_last_save"
+    last_save_file.write_text("15", encoding="utf-8")
+    with patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls:
+        mock_cfg_cls.return_value.hooks_auto_save = False
+        result = _capture_hook_output(
+            hook_session_end,
+            {"session_id": "test", "transcript_path": ""},
+            state_dir=tmp_path,
+        )
+    assert result == {}
+    assert not last_save_file.exists()
+
+
+def test_session_end_hook_final_save_and_cleanup(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(3)],
+    )
+    last_save_file = tmp_path / "test_last_save"
+    last_save_file.write_text("2", encoding="utf-8")
+    with patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls:
+        mock_cfg_cls.return_value.hooks_auto_save = True
+        mock_cfg_cls.return_value.hook_desktop_toast = False
+        with (
+            patch(
+                "mempalace.hooks_cli._save_diary_direct",
+                return_value={"count": 3, "themes": ["exit"]},
+            ) as mock_save,
+            patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest,
+            patch("mempalace.hooks_cli._mine_sync") as mock_mine,
+        ):
+            result = _capture_hook_output(
+                hook_session_end,
+                {"session_id": "test", "transcript_path": str(transcript)},
+                state_dir=tmp_path,
+            )
+    assert result["systemMessage"].startswith("\u2726 3 memories woven into the palace")
+    assert "exit" in result["systemMessage"]
+    mock_save.assert_called_once_with(
+        str(transcript), "test", wing="wing_sessions", toast=False, agent_name="claude"
+    )
+    mock_ingest.assert_called_once_with(str(transcript))
+    mock_mine.assert_called_once()
+    assert not last_save_file.exists()
 
 
 def test_run_hook_unknown_hook():
@@ -1800,6 +1857,15 @@ def test_hook_session_start_does_not_create_palace_dir_when_absent(tmp_path, mon
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         hook_session_start({"session_id": "absent"}, "claude-code")
+    assert json.loads(buf.getvalue() or "{}") == {}
+    assert not fake_root.exists()
+
+
+def test_hook_session_end_does_not_create_palace_dir_when_absent(tmp_path, monkeypatch):
+    fake_root = _redirect_palace_root(monkeypatch, tmp_path)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        hook_session_end({"session_id": "absent", "transcript_path": ""}, "claude-code")
     assert json.loads(buf.getvalue() or "{}") == {}
     assert not fake_root.exists()
 
