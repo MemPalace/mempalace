@@ -693,3 +693,48 @@ def test_cmd_repair_trailing_slash_does_not_recurse():
     palace_path = os.path.expanduser(args.palace).rstrip(os.sep)
     backup_path = palace_path + ".backup"
     assert not backup_path.startswith(palace_path + os.sep)
+
+
+# ── --remote-url / --remote-token flags ────────────────────────────────
+
+
+def test_mine_remote_url_flag_passed_to_mine_convos(tmp_path, monkeypatch):
+    """--remote-url and --remote-token are forwarded to mine_convos."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    from mempalace import cli
+
+    with patch("mempalace.convo_miner.mine_convos") as mock_mine:
+        cli.main([
+            "mine", str(tmp_path),
+            "--mode", "convos",
+            "--remote-url", "http://palace.test",
+            "--remote-token", "secret",
+        ])
+
+    mock_mine.assert_called_once()
+    call_args = mock_mine.call_args
+    all_args = {**dict(zip(
+        ["convo_dir", "palace_path", "wing", "agent", "limit", "dry_run", "extract_mode",
+         "remote_url", "remote_token"],
+        call_args.args
+    )), **(call_args.kwargs or {})}
+    assert all_args.get("remote_url") == "http://palace.test"
+    assert all_args.get("remote_token") == "secret"
+
+
+def test_mine_remote_url_with_palace_prints_warning(tmp_path, monkeypatch, capsys):
+    """Using --remote-url with --palace prints a warning to stderr."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    from mempalace import cli
+
+    with patch("mempalace.convo_miner.mine_convos"):
+        cli.main([
+            "--palace", str(tmp_path / "palace"),
+            "mine", str(tmp_path),
+            "--mode", "convos",
+            "--remote-url", "http://palace.test",
+            "--remote-token", "tok",
+        ])
+
+    captured = capsys.readouterr()
+    assert "Warning" in captured.err or "warning" in captured.err.lower()

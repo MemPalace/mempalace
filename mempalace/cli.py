@@ -71,8 +71,23 @@ def cmd_mine(args):
     for raw in args.include_ignored or []:
         include_ignored.extend(part.strip() for part in raw.split(",") if part.strip())
 
+    remote_url = getattr(args, "remote_url", None)
+    remote_token = getattr(args, "remote_token", None)
+
+    if remote_url and args.palace:
+        print(
+            "Warning: --palace is ignored when --remote-url is set",
+            file=sys.stderr,
+        )
+
     if args.mode == "convos":
         from .convo_miner import mine_convos
+
+        extra = {}
+        if remote_url is not None:
+            extra["remote_url"] = remote_url
+        if remote_token is not None:
+            extra["remote_token"] = remote_token
 
         mine_convos(
             convo_dir=args.dir,
@@ -82,9 +97,16 @@ def cmd_mine(args):
             limit=args.limit,
             dry_run=args.dry_run,
             extract_mode=args.extract,
+            **extra,
         )
     else:
         from .miner import mine
+
+        extra = {}
+        if remote_url is not None:
+            extra["remote_url"] = remote_url
+        if remote_token is not None:
+            extra["remote_token"] = remote_token
 
         mine(
             project_dir=args.dir,
@@ -95,6 +117,7 @@ def cmd_mine(args):
             dry_run=args.dry_run,
             respect_gitignore=not args.no_gitignore,
             include_ignored=include_ignored,
+            **extra,
         )
 
 
@@ -413,7 +436,7 @@ def cmd_compress(args):
         print("  (dry run -- nothing stored)")
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(
         description="MemPalace — Give your AI a memory. No API key required.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -469,6 +492,18 @@ def main():
         choices=["exchange", "general"],
         default="exchange",
         help="Extraction strategy for convos mode: 'exchange' (default) or 'general' (5 memory types)",
+    )
+    p_mine.add_argument(
+        "--remote-url",
+        default=None,
+        metavar="URL",
+        help="Send drawers to a remote mempalace HTTP server instead of local palace",
+    )
+    p_mine.add_argument(
+        "--remote-token",
+        default=None,
+        metavar="TOKEN",
+        help="Bearer token for --remote-url (default: MEMPALACE_TOKEN env var)",
     )
 
     # search
@@ -575,7 +610,7 @@ def main():
 
     sub.add_parser("status", help="Show what's been filed")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if not args.command:
         parser.print_help()
