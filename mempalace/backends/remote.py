@@ -13,9 +13,6 @@ from .base import BaseCollection
 
 logger = logging.getLogger(__name__)
 
-_STATE_DIR = Path.home() / ".mempalace" / "remote_state"
-
-
 class RemoteCollection(BaseCollection):
     """BaseCollection implementation that POSTs drawers to a remote HTTP MCP server."""
 
@@ -23,7 +20,8 @@ class RemoteCollection(BaseCollection):
         self._url = url.rstrip("/")
         self._token = token
         state_key = hashlib.sha256(url.encode()).hexdigest()[:16]
-        self._state_path = _STATE_DIR / f"{state_key}.json"
+        state_dir = Path.home() / ".mempalace" / "remote_state"
+        self._state_path = state_dir / f"{state_key}.json"
         self._state = self._load_state()
 
     # ── State file ──────────────────────────────────────────────────────
@@ -38,7 +36,7 @@ class RemoteCollection(BaseCollection):
         return {"url": self._url, "source_files": []}
 
     def _save_state(self) -> None:
-        _STATE_DIR.mkdir(parents=True, exist_ok=True)
+        self._state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._state_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self._state, indent=2, ensure_ascii=False), encoding="utf-8")
         tmp.replace(self._state_path)
@@ -97,7 +95,7 @@ class RemoteCollection(BaseCollection):
         metadatas: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         if metadatas is None:
-            metadatas = [{}] * len(documents)
+            metadatas = [{} for _ in range(len(documents))]
         for doc, _id, meta in zip(documents, ids, metadatas):
             if meta.get("ingest_mode") == "registry":
                 source_file = meta.get("source_file", "")
@@ -130,7 +128,7 @@ class RemoteCollection(BaseCollection):
     def get(self, *, where: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Dict[str, Any]:
         source_file = (where or {}).get("source_file")
         if source_file and source_file in self._state["source_files"]:
-            return {"ids": [source_file], "documents": [], "metadatas": []}
+            return {"ids": [source_file], "documents": [""], "metadatas": [{}]}
         return {"ids": [], "documents": [], "metadatas": []}
 
     def delete(self, **kwargs: Any) -> None:
