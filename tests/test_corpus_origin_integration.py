@@ -178,7 +178,7 @@ def test_corpus_origin_reclassifies_personas(
     # All three personas land in the new bucket.
     expected_personas = {"Echo", "Sparrow", "Cipher"}
     assert expected_personas <= persona_names_in_bucket, (
-        f"Expected all three personas in agent_personas, got: " f"{persona_names_in_bucket}"
+        f"Expected all three personas in agent_personas, got: {persona_names_in_bucket}"
     )
 
     # And NONE of them remain in the people bucket.
@@ -293,8 +293,7 @@ def test_init_pass_zero_writes_origin_json_to_palace(ai_dialogue_corpus: Path, t
     assert isinstance(data["result"].get("likely_ai_dialogue"), bool)
     # Fixture is heavy AI-dialogue — heuristic should classify as such.
     assert data["result"]["likely_ai_dialogue"] is True, (
-        "Heuristic should classify the AI-dialogue fixture as AI-dialogue. "
-        f"Got: {data['result']}"
+        f"Heuristic should classify the AI-dialogue fixture as AI-dialogue. Got: {data['result']}"
     )
 
 
@@ -744,9 +743,9 @@ def test_init_graceful_fallback_when_provider_unavailable(
     out = capsys.readouterr().out
     # The fallback message should mention how to silence (--no-llm) so the
     # user knows what flipped.
-    assert (
-        "no-llm" in out.lower() or "--no-llm" in out
-    ), f"Graceful fallback message must point at --no-llm. Got: {out!r}"
+    assert "no-llm" in out.lower() or "--no-llm" in out, (
+        f"Graceful fallback message must point at --no-llm. Got: {out!r}"
+    )
 
 
 def test_init_graceful_fallback_on_provider_construction_error(
@@ -1308,9 +1307,9 @@ def test_integration_llm_refine_corpus_origin_preamble_does_not_break_topic_labe
         "TOPIC label instructions disappeared from SYSTEM_PROMPT — "
         "corpus-origin preamble appears to have replaced rather than appended"
     )
-    assert (
-        "CORPUS CONTEXT" in captured["system"]
-    ), "corpus-origin corpus context preamble missing from prompt"
+    assert "CORPUS CONTEXT" in captured["system"], (
+        "corpus-origin corpus context preamble missing from prompt"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -1546,12 +1545,12 @@ def test_merge_tier_fields_heuristic_no_no_personas_leak():
 
     assert wrapped is not None
     res = wrapped["result"]
-    assert (
-        res["likely_ai_dialogue"] is False
-    ), f"Both tiers said NOT AI-dialogue; merged result must be False. Got: {res}"
-    assert (
-        res["agent_persona_names"] == []
-    ), f"No personas should leak when both tiers report none. Got: {res}"
+    assert res["likely_ai_dialogue"] is False, (
+        f"Both tiers said NOT AI-dialogue; merged result must be False. Got: {res}"
+    )
+    assert res["agent_persona_names"] == [], (
+        f"No personas should leak when both tiers report none. Got: {res}"
+    )
     # Heuristic owns confidence. Mocked LLM returned 0.95; heuristic's
     # narrative-branch confidence is 0.9. Verifying we kept 0.9 catches
     # any future regression that lets LLM confidence override heuristic.
@@ -1609,24 +1608,23 @@ def test_merge_tier_fields_heuristic_yes_llm_yes_combines_evidence():
     # LLM produced its own; the merged result should include both signal
     # trails for audit purposes.
     evidence_text = " ".join(res["evidence"])
-    assert (
-        "LLM-extracted" in evidence_text
-    ), f"LLM evidence string missing from merged result. Got: {res['evidence']}"
+    assert "LLM-extracted" in evidence_text, (
+        f"LLM evidence string missing from merged result. Got: {res['evidence']}"
+    )
     # Heuristic always produces at least one evidence line for AI-dialogue
     # input (brand-term match), so the combined list has more than just LLM's.
     assert len(res["evidence"]) >= 2, (
-        f"Combined evidence should include both heuristic + LLM lines. " f"Got: {res['evidence']}"
+        f"Combined evidence should include both heuristic + LLM lines. Got: {res['evidence']}"
     )
     # Each entry must carry its tier prefix so on-disk origin.json is
     # auditable — readers can tell which tier produced which signal line.
     tier1_lines = [e for e in res["evidence"] if e.startswith("Tier-1 heuristic: ")]
     tier2_lines = [e for e in res["evidence"] if e.startswith("Tier-2 LLM: ")]
     assert tier1_lines, (
-        f"Expected at least one 'Tier-1 heuristic: ' prefixed evidence line. "
-        f"Got: {res['evidence']}"
+        f"Expected at least one 'Tier-1 heuristic: ' prefixed evidence line. Got: {res['evidence']}"
     )
     assert tier2_lines, (
-        f"Expected at least one 'Tier-2 LLM: ' prefixed evidence line. " f"Got: {res['evidence']}"
+        f"Expected at least one 'Tier-2 LLM: ' prefixed evidence line. Got: {res['evidence']}"
     )
     # Every entry should be tier-prefixed (no untagged passthrough).
     untagged = [
@@ -1759,11 +1757,11 @@ def test_init_prints_privacy_warning_when_provider_is_external(
 
     out = capsys.readouterr().out
     assert "EXTERNAL API" in out, (
-        f"Privacy warning must mention 'EXTERNAL API' when provider is external. " f"Got: {out!r}"
+        f"Privacy warning must mention 'EXTERNAL API' when provider is external. Got: {out!r}"
     )
-    assert (
-        "--no-llm" in out
-    ), f"Privacy warning must point users at --no-llm to opt out. Got: {out!r}"
+    assert "--no-llm" in out, (
+        f"Privacy warning must point users at --no-llm to opt out. Got: {out!r}"
+    )
     # The warning should also tell users MemPalace isn't responsible
     # for downstream provider behavior.
     assert (
@@ -1804,7 +1802,7 @@ def test_init_no_privacy_warning_when_provider_is_local(
 
     out = capsys.readouterr().out
     assert "EXTERNAL API" not in out, (
-        f"Privacy warning fired for a LOCAL provider — should not have. " f"Got: {out!r}"
+        f"Privacy warning fired for a LOCAL provider — should not have. Got: {out!r}"
     )
 
 
@@ -1827,9 +1825,9 @@ def test_init_no_privacy_warning_with_no_llm_flag(ai_dialogue_corpus: Path, tmp_
 
     mock_get.assert_not_called(), "--no-llm must short-circuit before provider acquisition"
     out = capsys.readouterr().out
-    assert (
-        "EXTERNAL API" not in out
-    ), f"Privacy warning fired on --no-llm path — should not have. Got: {out!r}"
+    assert "EXTERNAL API" not in out, (
+        f"Privacy warning fired on --no-llm path — should not have. Got: {out!r}"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -1988,9 +1986,9 @@ def test_init_accept_external_llm_flag_bypasses_consent_prompt(
         "--accept-external-llm must bypass the consent prompt for "
         "non-interactive / CI use. input() was called anyway."
     )
-    assert (
-        fake_provider.classify.called
-    ), "With --accept-external-llm, init must proceed with the LLM."
+    assert fake_provider.classify.called, (
+        "With --accept-external-llm, init must proceed with the LLM."
+    )
 
 
 def test_init_no_consent_prompt_when_endpoint_is_local(

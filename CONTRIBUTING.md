@@ -15,7 +15,17 @@ uv sync --extra dev
 
 # Or with pip in your own venv:
 # pip install -e ".[dev]"
+
+# Activate pre-commit hooks (one-time, per clone)
+pre-commit install
 ```
+
+The `pre-commit install` step is important: the repo has a
+`.pre-commit-config.yaml` that pins ruff to the exact version CI uses,
+but the actual git hook is per-machine and **must be installed
+locally**. Without this step, you can commit code that passes your
+local lint (using whatever ruff version you happen to have installed)
+but fails CI on push.
 
 ## Running Tests
 
@@ -24,6 +34,23 @@ uv run pytest tests/ -v
 ```
 
 All tests must pass before submitting a PR. Tests should run without API keys or network access.
+
+### Property-based tests (optional)
+
+`hypothesis` is available in the dev extras for property-based tests:
+
+```python
+from hypothesis import given, strategies as st
+
+@given(st.text(min_size=1, max_size=40))
+def test_function_never_fabricates_output_on_random_input(s):
+    # ... property that must hold for ANY string in the strategy
+```
+
+Hypothesis generates hundreds of inputs per test and shrinks failing
+cases to a minimal counterexample. Useful any time a function returns
+`Optional[X]` or has a wide input domain — it catches the failure-space
+gaps that hand-written positive tests miss.
 
 ## Running Benchmarks
 

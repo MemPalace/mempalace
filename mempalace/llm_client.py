@@ -211,6 +211,7 @@ class OllamaProvider(LLMProvider):
         model: str,
         endpoint: Optional[str] = None,
         timeout: int = 180,
+        num_ctx: Optional[int] = None,
         **_: object,
     ):
         super().__init__(
@@ -218,6 +219,7 @@ class OllamaProvider(LLMProvider):
             endpoint=endpoint or self.DEFAULT_ENDPOINT,
             timeout=timeout,
         )
+        self.num_ctx = num_ctx
 
     def check_available(self) -> tuple[bool, str]:
         try:
@@ -242,6 +244,9 @@ class OllamaProvider(LLMProvider):
         json_mode: bool = True,
         think: Optional[bool] = None,
     ) -> LLMResponse:
+        options: dict = {"temperature": 0.1}
+        if self.num_ctx is not None:
+            options["num_ctx"] = self.num_ctx
         body: dict = {
             "model": self.model,
             "messages": [
@@ -249,7 +254,7 @@ class OllamaProvider(LLMProvider):
                 {"role": "user", "content": user},
             ],
             "stream": False,
-            "options": {"temperature": 0.1},
+            "options": options,
         }
         if json_mode:
             body["format"] = "json"
@@ -447,9 +452,14 @@ def get_provider(
     endpoint: Optional[str] = None,
     api_key: Optional[str] = None,
     timeout: int = 120,
+    **provider_kwargs: object,
 ) -> LLMProvider:
-    """Build a provider by name. Raises LLMError on unknown provider."""
+    """Build a provider by name. Raises LLMError on unknown provider.
+
+    Extra kwargs (e.g. num_ctx for Ollama) are forwarded to the provider's
+    constructor; providers that don't recognize them ignore via **_.
+    """
     cls = PROVIDERS.get(name)
     if cls is None:
         raise LLMError(f"Unknown provider '{name}'. Choices: {sorted(PROVIDERS.keys())}")
-    return cls(model=model, endpoint=endpoint, api_key=api_key, timeout=timeout)
+    return cls(model=model, endpoint=endpoint, api_key=api_key, timeout=timeout, **provider_kwargs)

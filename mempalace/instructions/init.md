@@ -59,9 +59,13 @@ If this fails, report the error and stop.
 
 ## Step 6: Configure MCP server
 
-Run the following command to register the MemPalace MCP server with Claude:
+Run the command for the AI client the user is configuring:
 
+    # Claude Code
     claude mcp add mempalace -- mempalace-mcp
+
+    # Codex CLI
+    codex mcp add mempalace -- mempalace-mcp
 
 If this fails, report the error but continue to the next step (MCP
 configuration can be done manually later).

@@ -44,6 +44,7 @@ jobs:
         env:
           DOCS_BASE: ${{ steps.pages.outputs.base_path }}
           DOCS_EDIT_BRANCH: ${{ github.ref_name }}
+          MEMPALACE_DOCS_GA_ID: ${{ vars.MEMPALACE_DOCS_GA_ID }}
         run: bun run docs:build
 
       - uses: actions/upload-pages-artifact@v5

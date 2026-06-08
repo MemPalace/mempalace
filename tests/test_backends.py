@@ -9,7 +9,9 @@ import chromadb
 import pytest
 
 from mempalace.backends import (
+    CollectionNotInitializedError,
     GetResult,
+    PalaceNotFoundError,
     PalaceRef,
     QueryResult,
     UnsupportedFilterError,
@@ -21,11 +23,15 @@ from mempalace.backends.chroma import (
     ChromaCollection,
     _HNSW_MISSING_METADATA_DATA_FLOOR,
     _fix_blob_seq_ids,
+    _fix_missing_collection_type,
     _pin_hnsw_threads,
     _segment_appears_healthy,
     quarantine_invalid_hnsw_metadata,
     quarantine_stale_hnsw,
 )
+
+# embeddinggemma-300m Matryoshka truncation (first 384 of 768 dims).
+_TEST_EMBED_DIM = 384
 
 
 class _FakeCollection:
@@ -176,6 +182,103 @@ def test_chroma_detect_matches_palace_with_chroma_sqlite(tmp_path):
     (tmp_path / "chroma.sqlite3").write_bytes(b"")
     assert ChromaBackend.detect(str(tmp_path)) is True
     assert ChromaBackend.detect(str(tmp_path.parent)) is False
+
+
+def test_chroma_lexical_search_uses_sqlite_fts_not_full_collection_scan(tmp_path):
+    db_path = tmp_path / "chroma.sqlite3"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE collections (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+        CREATE TABLE segments (id INTEGER PRIMARY KEY, collection INTEGER NOT NULL);
+        CREATE TABLE embeddings (
+            id INTEGER PRIMARY KEY,
+            segment_id INTEGER NOT NULL,
+            embedding_id TEXT,
+            created_at TEXT
+        );
+        CREATE TABLE embedding_metadata (
+            id INTEGER,
+            key TEXT,
+            string_value TEXT,
+            int_value INTEGER,
+            float_value REAL,
+            bool_value INTEGER
+        );
+        CREATE VIRTUAL TABLE embedding_fulltext_search USING fts5(string_value);
+        """
+    )
+    conn.execute("INSERT INTO collections(id, name) VALUES (1, 'mempalace_drawers')")
+    conn.execute("INSERT INTO segments(id, collection) VALUES (1, 1)")
+    ids = list(range(1, 14))
+    for emb_id in ids:
+        wing = "target" if emb_id == 13 else "old"
+        doc = "needle shared lexical note"
+        conn.execute(
+            "INSERT INTO embeddings(id, segment_id, embedding_id, created_at) VALUES (?, 1, ?, ?)",
+            (emb_id, f"public-{emb_id}", f"2026-01-01T00:00:{emb_id:02d}"),
+        )
+        conn.execute(
+            "INSERT INTO embedding_fulltext_search(rowid, string_value) VALUES (?, ?)",
+            (emb_id, doc),
+        )
+        conn.execute(
+            "INSERT INTO embedding_metadata(id, key, string_value) VALUES (?, 'chroma:document', ?)",
+            (emb_id, doc),
+        )
+        conn.execute(
+            "INSERT INTO embedding_metadata(id, key, string_value) VALUES (?, 'wing', ?)",
+            (emb_id, wing),
+        )
+    conn.commit()
+    conn.close()
+
+    class _NoScanCollection:
+        name = "mempalace_drawers"
+
+        def count(self):
+            raise AssertionError("lexical_search should use Chroma sqlite FTS")
+
+        def get(self, **_kwargs):
+            raise AssertionError("lexical_search should use Chroma sqlite FTS")
+
+    collection = ChromaCollection(_NoScanCollection(), palace_path=str(tmp_path))
+
+    hits = collection.lexical_search(query="needle", n_results=1, where={"wing": "target"}).hits
+
+    assert [hit.metadata["wing"] for hit in hits] == ["target"]
+    # Hit ids must be the public embedding_id (so lexical_search -> get(ids=...)
+    # round-trips), not the internal embeddings.id rowid.
+    assert [hit.id for hit in hits] == ["public-13"]
+
+
+def test_chroma_lexical_search_ids_roundtrip_through_get(tmp_path):
+    """lexical_search must return public drawer ids that get(ids=...) accepts.
+
+    Regression for the sqlite FTS path returning the internal rowid instead of
+    embeddings.embedding_id, which silently broke hybrid search id round-trips.
+    """
+    backend = ChromaBackend()
+    palace = tmp_path / "palace"
+    ref = PalaceRef(id=str(palace), local_path=str(palace))
+    col = backend.get_collection(palace=ref, collection_name="mempalace_drawers", create=True)
+    col.add(
+        ids=["drawer-alpha", "drawer-bravo", "drawer-charlie"],
+        documents=[
+            "rareterm needle lexical note",
+            "unrelated content here",
+            "another rareterm needle entry",
+        ],
+        metadatas=[{"wing": "w"}, {"wing": "w"}, {"wing": "w"}],
+    )
+    hits = col.lexical_search(query="rareterm needle", n_results=5).hits
+    hit_ids = [hit.id for hit in hits]
+    assert hit_ids, "expected lexical hits"
+    assert set(hit_ids) <= {"drawer-alpha", "drawer-bravo", "drawer-charlie"}
+    # Every returned id must resolve back through get() — proving it is a public id.
+    fetched = col.get(ids=hit_ids)
+    assert set(fetched.ids) == set(hit_ids)
+    backend.close()
 
 
 def test_query_rejects_missing_input():
@@ -389,14 +492,12 @@ def test_chroma_backend_creates_collection_with_cosine_distance(tmp_path):
 
 
 def test_chroma_backend_sets_hnsw_bloat_guard_on_creation(tmp_path):
-    """The HNSW guard from #344 must land on freshly-created collection metadata.
+    """HNSW batch/sync thresholds must land on freshly-created collection metadata.
 
-    Without batch_size + sync_threshold, mining ~10K+ drawers triggers the
-    resize+persist drift that bloats link_lists.bin into hundreds of GB sparse
-    and segfaults `status` / `search` / `repair`. The guard belongs at
-    collection-creation time so every fresh palace gets it without needing
-    a runtime retrofit. Asserting both keys land on the persisted metadata
-    also covers the #1161 "config silently dropped" concern at CI time.
+    Low thresholds (2/2 per #1579) make chromadb's Rust HNSW segment
+    persist index_metadata and link_lists after any mine of 2+ drawers.
+    Asserting both keys land on the persisted metadata also covers the
+    #1161 "config silently dropped" concern at CI time.
     """
     palace_path = tmp_path / "palace"
 
@@ -408,8 +509,8 @@ def test_chroma_backend_sets_hnsw_bloat_guard_on_creation(tmp_path):
 
     client = chromadb.PersistentClient(path=str(palace_path))
     col = client.get_collection("mempalace_drawers")
-    assert col.metadata.get("hnsw:batch_size") == 50_000
-    assert col.metadata.get("hnsw:sync_threshold") == 50_000
+    assert col.metadata.get("hnsw:batch_size") == 2
+    assert col.metadata.get("hnsw:sync_threshold") == 2
 
 
 def test_chroma_backend_create_collection_sets_hnsw_bloat_guard(tmp_path):
@@ -420,8 +521,85 @@ def test_chroma_backend_create_collection_sets_hnsw_bloat_guard(tmp_path):
 
     client = chromadb.PersistentClient(path=str(palace_path))
     col = client.get_collection("mempalace_drawers")
-    assert col.metadata.get("hnsw:batch_size") == 50_000
-    assert col.metadata.get("hnsw:sync_threshold") == 50_000
+    assert col.metadata.get("hnsw:batch_size") == 2
+    assert col.metadata.get("hnsw:sync_threshold") == 2
+
+
+def test_sub_threshold_mine_persists_hnsw_metadata(tmp_path):
+    """Regression for #1579: small mines must persist HNSW metadata.
+
+    _HNSW_BLOAT_GUARD sets batch_size=2 and sync_threshold=2 so that any
+    upsert of 2+ records crosses both thresholds, triggering chromadb's
+    _apply_batch and _persist.  Without this, index_metadata and link_lists
+    stay empty and quarantine_stale_hnsw renames the segment on cold open.
+    """
+    palace_path = str(tmp_path / "palace")
+    backend = ChromaBackend()
+    try:
+        col = backend.get_collection(palace_path, "mempalace_drawers", create=True)
+
+        col.upsert(
+            ids=["a", "b", "c"],
+            documents=["doc a", "doc b", "doc c"],
+            embeddings=[[0.1] * _TEST_EMBED_DIM, [0.2] * _TEST_EMBED_DIM, [0.3] * _TEST_EMBED_DIM],
+            metadatas=[{"wing": "t"}, {"wing": "t"}, {"wing": "t"}],
+        )
+    finally:
+        backend.close()
+
+    found_healthy_segment = False
+    for entry in (tmp_path / "palace").iterdir():
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        meta = entry / "index_metadata.pickle"
+        link = entry / "link_lists.bin"
+        data = entry / "data_level0.bin"
+        if data.exists() and data.stat().st_size > _HNSW_MISSING_METADATA_DATA_FLOOR:
+            assert meta.exists(), "index_metadata missing after sub-threshold upsert"
+            assert link.exists() and link.stat().st_size > 0, "link_lists empty"
+            assert _segment_appears_healthy(str(entry))
+            found_healthy_segment = True
+
+    assert found_healthy_segment, "no VECTOR segment with data found"
+
+    # stale_seconds=0.0 forces the stage-2 integrity gate (_segment_appears_healthy)
+    # to run on every segment regardless of mtime delta, proving the fix directly.
+    moved = quarantine_stale_hnsw(palace_path, stale_seconds=0.0)
+    assert moved == [], f"quarantine fired on freshly-persisted segment: {moved}"
+
+
+def test_single_record_upsert_not_quarantined(tmp_path):
+    """A single-record upsert must not trigger quarantine.
+
+    With batch_size=2 chromadb only persists HNSW metadata after the second
+    record.  A one-record segment has no index_metadata.pickle and no
+    link_lists.bin data; _segment_appears_healthy must treat that combination
+    as sub-threshold (never persisted), not as corruption.
+    """
+    palace_path = str(tmp_path / "palace")
+    backend = ChromaBackend()
+    try:
+        col = backend.get_collection(palace_path, "mempalace_drawers", create=True)
+        col.upsert(
+            ids=["solo"],
+            documents=["only one drawer"],
+            embeddings=[[0.5] * _TEST_EMBED_DIM],
+            metadatas=[{"wing": "t"}],
+        )
+    finally:
+        backend.close()
+
+    for entry in (tmp_path / "palace").iterdir():
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        data = entry / "data_level0.bin"
+        if data.exists() and data.stat().st_size > 0:
+            assert _segment_appears_healthy(str(entry)), (
+                f"single-record segment flagged unhealthy: data={data.stat().st_size}B"
+            )
+
+    moved = quarantine_stale_hnsw(palace_path, stale_seconds=0.0)
+    assert moved == [], f"quarantine fired on single-record segment: {moved}"
 
 
 def test_get_collection_create_true_is_idempotent(tmp_path):
@@ -447,7 +625,7 @@ def test_get_collection_create_true_preserves_existing_metadata(tmp_path):
     backend.get_collection(palace, collection_name="mempalace_drawers", create=True)
     col = backend.get_collection(palace, collection_name="mempalace_drawers", create=True)
     assert col._collection.metadata["hnsw:space"] == "cosine"
-    assert col._collection.metadata.get("hnsw:batch_size") == 50_000
+    assert col._collection.metadata.get("hnsw:batch_size") == 2
 
 
 def test_fix_blob_seq_ids_converts_blobs_to_integers(tmp_path):
@@ -612,6 +790,186 @@ def test_fix_blob_seq_ids_skips_sqlite_when_marker_present(tmp_path):
     mock_connect.assert_not_called()
 
 
+# ── _fix_missing_collection_type ─────────────────────────────────────────
+
+
+def test_fix_collection_type_adds_type(tmp_path):
+    """Legacy config_json_str '{}' gets _type added."""
+    import json
+
+    db_path = tmp_path / "chroma.sqlite3"
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.execute("CREATE TABLE collections (id TEXT PRIMARY KEY, config_json_str TEXT)")
+        conn.execute(
+            "INSERT INTO collections (id, config_json_str) VALUES (?, ?)",
+            ("col-1", "{}"),
+        )
+        conn.commit()
+
+    _fix_missing_collection_type(str(tmp_path))
+
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        row = conn.execute("SELECT config_json_str FROM collections WHERE id = 'col-1'").fetchone()
+        config = json.loads(row[0])
+        assert config["_type"] == "CollectionConfigurationInternal"
+
+
+def test_fix_collection_type_preserves_existing(tmp_path):
+    """Config that already has _type is left unchanged."""
+    import json
+
+    original = json.dumps({"_type": "CollectionConfigurationInternal", "extra": 1})
+    db_path = tmp_path / "chroma.sqlite3"
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.execute("CREATE TABLE collections (id TEXT PRIMARY KEY, config_json_str TEXT)")
+        conn.execute(
+            "INSERT INTO collections (id, config_json_str) VALUES (?, ?)",
+            ("col-1", original),
+        )
+        conn.commit()
+
+    _fix_missing_collection_type(str(tmp_path))
+
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        row = conn.execute("SELECT config_json_str FROM collections WHERE id = 'col-1'").fetchone()
+        assert row[0] == original
+
+
+def test_fix_collection_type_noop_without_db(tmp_path):
+    """No error when palace has no chroma.sqlite3, no marker written."""
+    from mempalace.backends.chroma import _COLLECTION_TYPE_MARKER
+
+    _fix_missing_collection_type(str(tmp_path))
+    assert not (tmp_path / _COLLECTION_TYPE_MARKER).exists()
+
+
+def test_fix_collection_type_writes_marker(tmp_path):
+    """Marker is written after a successful migration."""
+    from mempalace.backends.chroma import _COLLECTION_TYPE_MARKER
+
+    db_path = tmp_path / "chroma.sqlite3"
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.execute("CREATE TABLE collections (id TEXT PRIMARY KEY, config_json_str TEXT)")
+        conn.execute(
+            "INSERT INTO collections (id, config_json_str) VALUES (?, ?)",
+            ("col-1", "{}"),
+        )
+        conn.commit()
+
+    marker = tmp_path / _COLLECTION_TYPE_MARKER
+    assert not marker.exists()
+
+    _fix_missing_collection_type(str(tmp_path))
+
+    assert marker.is_file()
+
+
+def test_fix_collection_type_skips_with_marker(tmp_path):
+    """When the marker exists, sqlite3 is not opened."""
+    from unittest.mock import patch
+
+    from mempalace.backends.chroma import _COLLECTION_TYPE_MARKER
+
+    db_path = tmp_path / "chroma.sqlite3"
+    db_path.write_bytes(b"sentinel")
+    (tmp_path / _COLLECTION_TYPE_MARKER).touch()
+
+    with patch("mempalace.backends.chroma.sqlite3.connect") as mock_connect:
+        _fix_missing_collection_type(str(tmp_path))
+
+    mock_connect.assert_not_called()
+
+
+def test_fix_collection_type_writes_marker_when_already_has_type(tmp_path):
+    """Marker written even when all collections already have _type (noop case)."""
+    import json
+
+    from mempalace.backends.chroma import _COLLECTION_TYPE_MARKER
+
+    db_path = tmp_path / "chroma.sqlite3"
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.execute("CREATE TABLE collections (id TEXT PRIMARY KEY, config_json_str TEXT)")
+        conn.execute(
+            "INSERT INTO collections (id, config_json_str) VALUES (?, ?)",
+            ("col-1", json.dumps({"_type": "CollectionConfigurationInternal"})),
+        )
+        conn.commit()
+
+    marker = tmp_path / _COLLECTION_TYPE_MARKER
+    assert not marker.exists()
+
+    _fix_missing_collection_type(str(tmp_path))
+
+    assert marker.is_file(), "marker must be written even when no collections needed fixing"
+
+
+def test_fix_collection_type_multi_collection_mixed(tmp_path):
+    """Multiple collections: NULL, empty, and already-valid configs."""
+    import json
+
+    db_path = tmp_path / "chroma.sqlite3"
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.execute("CREATE TABLE collections (id TEXT PRIMARY KEY, config_json_str TEXT)")
+        conn.execute("INSERT INTO collections VALUES (?, ?)", ("col-null", None))
+        conn.execute("INSERT INTO collections VALUES (?, ?)", ("col-empty", "{}"))
+        conn.execute(
+            "INSERT INTO collections VALUES (?, ?)",
+            ("col-ok", json.dumps({"_type": "CollectionConfigurationInternal"})),
+        )
+        conn.commit()
+
+    _fix_missing_collection_type(str(tmp_path))
+
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        rows = {
+            r[0]: json.loads(r[1]) if r[1] else None
+            for r in conn.execute("SELECT id, config_json_str FROM collections")
+        }
+    assert rows["col-null"]["_type"] == "CollectionConfigurationInternal"
+    assert rows["col-empty"]["_type"] == "CollectionConfigurationInternal"
+    assert rows["col-ok"] == {"_type": "CollectionConfigurationInternal"}
+
+
+def test_fix_collection_type_skips_non_dict_json(tmp_path):
+    """Non-dict JSON (array, null literal) is skipped without error."""
+    import json
+
+    db_path = tmp_path / "chroma.sqlite3"
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.execute("CREATE TABLE collections (id TEXT PRIMARY KEY, config_json_str TEXT)")
+        conn.execute("INSERT INTO collections VALUES (?, ?)", ("col-arr", "[]"))
+        conn.execute("INSERT INTO collections VALUES (?, ?)", ("col-null", "null"))
+        conn.execute("INSERT INTO collections VALUES (?, ?)", ("col-ok", "{}"))
+        conn.commit()
+
+    _fix_missing_collection_type(str(tmp_path))
+
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        rows = dict(conn.execute("SELECT id, config_json_str FROM collections").fetchall())
+    assert rows["col-arr"] == "[]"
+    assert rows["col-null"] == "null"
+    assert json.loads(rows["col-ok"])["_type"] == "CollectionConfigurationInternal"
+
+
+def test_fix_collection_type_skips_malformed_json(tmp_path):
+    """Malformed JSON in one row does not prevent fixing other rows."""
+    import json
+
+    db_path = tmp_path / "chroma.sqlite3"
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.execute("CREATE TABLE collections (id TEXT PRIMARY KEY, config_json_str TEXT)")
+        conn.execute("INSERT INTO collections VALUES (?, ?)", ("col-bad", "{corrupt"))
+        conn.execute("INSERT INTO collections VALUES (?, ?)", ("col-ok", "{}"))
+        conn.commit()
+
+    _fix_missing_collection_type(str(tmp_path))
+
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        rows = dict(conn.execute("SELECT id, config_json_str FROM collections").fetchall())
+    assert rows["col-bad"] == "{corrupt"
+    assert json.loads(rows["col-ok"])["_type"] == "CollectionConfigurationInternal"
+
+
 # ── quarantine_stale_hnsw ─────────────────────────────────────────────────
 
 
@@ -696,17 +1054,18 @@ def test_quarantine_stale_hnsw_leaves_empty_segment_without_metadata_alone(tmp_p
 
 
 def test_segment_without_metadata_but_with_nontrivial_data_is_unhealthy(tmp_path):
-    """Data without index_metadata.pickle is a partial flush, not a fresh segment."""
+    """Interrupted persist: link_lists written but metadata absent is unhealthy."""
 
     seg = tmp_path / "abcd-1234-5678"
     seg.mkdir()
     (seg / "data_level0.bin").write_bytes(b"\0" * (_HNSW_MISSING_METADATA_DATA_FLOOR + 1))
+    (seg / "link_lists.bin").write_bytes(b"\x01" * 128)
 
     assert not _segment_appears_healthy(str(seg))
 
 
 def test_segment_without_metadata_and_tiny_data_is_still_treated_as_fresh(tmp_path):
-    """Tiny data payloads can occur before metadata has flushed; leave them alone."""
+    """No metadata and no link_lists means no persist was attempted; treat as fresh."""
 
     seg = tmp_path / "abcd-1234-5678"
     seg.mkdir()
@@ -716,7 +1075,7 @@ def test_segment_without_metadata_and_tiny_data_is_still_treated_as_fresh(tmp_pa
 
 
 def test_quarantine_stale_hnsw_renames_missing_metadata_with_nontrivial_data(tmp_path):
-    """Regression for #1274: missing pickle + non-trivial data must quarantine."""
+    """Regression for #1274: missing pickle + link data must quarantine."""
 
     now = 1_700_000_000.0
     palace, seg = _make_palace_with_segment(
@@ -726,6 +1085,7 @@ def test_quarantine_stale_hnsw_renames_missing_metadata_with_nontrivial_data(tmp
         meta_bytes=None,
     )
     (seg / "data_level0.bin").write_bytes(b"\0" * (_HNSW_MISSING_METADATA_DATA_FLOOR + 1))
+    (seg / "link_lists.bin").write_bytes(b"\x01" * 128)
     os.utime(seg / "data_level0.bin", (now - 7200, now - 7200))
 
     moved = quarantine_stale_hnsw(str(palace), stale_seconds=3600.0)
@@ -821,9 +1181,9 @@ def test_make_client_quarantines_only_on_first_call_per_palace(tmp_path, monkeyp
     ChromaBackend.make_client(palace_path)
     ChromaBackend.make_client(palace_path)
 
-    assert calls == [
-        palace_path
-    ], "quarantine_stale_hnsw should fire once per palace per process, not on every reconnect"
+    assert calls == [palace_path], (
+        "quarantine_stale_hnsw should fire once per palace per process, not on every reconnect"
+    )
 
 
 def test_make_client_gates_invalid_metadata_on_first_call(tmp_path, monkeypatch):
@@ -939,9 +1299,45 @@ def test_client_quarantines_only_on_first_call_per_palace(tmp_path, monkeypatch)
     finally:
         backend.close()
 
-    assert (
-        calls == [palace_path]
-    ), "quarantine_stale_hnsw should fire once per palace per process from _client(), not on every call"
+    assert calls == [palace_path], (
+        "quarantine_stale_hnsw should fire once per palace per process from _client(), not on every call"
+    )
+
+
+def test_client_rearms_quarantine_on_mtime_change(tmp_path, monkeypatch):
+    """When the DB file's mtime changes between ``_client()`` calls (external
+    in-place write), the quarantine gate re-arms so HNSW checks run again.
+
+    Before #1573, the gate was only cleared on *inode* change (full palace
+    replacement); mtime-only changes left the gate armed, so long-running
+    processes were blind to external drift."""
+    palace_path = str(tmp_path / "palace")
+    os.makedirs(palace_path, exist_ok=True)
+    db_file = Path(palace_path) / "chroma.sqlite3"
+    db_file.write_text("")
+
+    monkeypatch.setattr(ChromaBackend, "_quarantined_paths", set())
+
+    calls: list[str] = []
+
+    def _spy(path, stale_seconds=300.0):
+        calls.append(path)
+        return []
+
+    monkeypatch.setattr("mempalace.backends.chroma.quarantine_stale_hnsw", _spy)
+
+    backend = ChromaBackend()
+    try:
+        backend._client(palace_path)
+        assert len(calls) == 1, "quarantine should fire on first open"
+
+        _, cached_mtime = backend._freshness[palace_path]
+        os.utime(str(db_file), (cached_mtime + 1.0, cached_mtime + 1.0))
+
+        backend._client(palace_path)
+        assert len(calls) == 2, "quarantine should re-fire after mtime change (gate re-armed)"
+    finally:
+        backend.close()
 
 
 # ── _pin_hnsw_threads (per-process retrofit, separate from this PR's gate) ──
@@ -993,6 +1389,43 @@ def test_get_collection_applies_retrofit_on_existing_palace(tmp_path):
     assert wrapper._collection.configuration_json["hnsw"]["num_threads"] == 1
 
 
+def test_get_collection_raises_palace_not_found_when_dir_missing(tmp_path):
+    """create=False on a missing dir raises PalaceNotFoundError, not the
+    new CollectionNotInitializedError. The two states must be distinguishable
+    so callers can render state-specific messages (#1498)."""
+    missing = tmp_path / "no-such-dir"
+    with pytest.raises(PalaceNotFoundError) as excinfo:
+        ChromaBackend().get_collection(
+            str(missing),
+            collection_name="mempalace_drawers",
+            create=False,
+        )
+    # Must be the parent class, not the new subclass: dir is genuinely absent.
+    assert not isinstance(excinfo.value, CollectionNotInitializedError)
+
+
+def test_get_collection_raises_collection_not_initialized_on_empty_palace(tmp_path):
+    """When the palace dir + DB exist but the collection has never been
+    created, ChromaBackend.get_collection(create=False) raises the new
+    CollectionNotInitializedError instead of leaking chromadb.NotFoundError
+    (#1498)."""
+    palace_path = tmp_path / "palace"
+    palace_path.mkdir()
+    # PersistentClient lazily creates chroma.sqlite3 — no collection yet.
+    chromadb.PersistentClient(path=str(palace_path))
+    assert (palace_path / "chroma.sqlite3").is_file()
+
+    with pytest.raises(CollectionNotInitializedError) as excinfo:
+        ChromaBackend().get_collection(
+            str(palace_path),
+            collection_name="mempalace_drawers",
+            create=False,
+        )
+    # Backward-compat: subclass of PalaceNotFoundError (and FileNotFoundError).
+    assert isinstance(excinfo.value, PalaceNotFoundError)
+    assert isinstance(excinfo.value, FileNotFoundError)
+
+
 def test_quarantine_invalid_hnsw_metadata_renames_missing_dimensionality(tmp_path):
     palace = tmp_path / "palace"
     palace.mkdir()
@@ -1000,6 +1433,59 @@ def test_quarantine_invalid_hnsw_metadata_renames_missing_dimensionality(tmp_pat
     seg.mkdir()
     with open(seg / "index_metadata.pickle", "wb") as f:
         pickle.dump({"dimensionality": None, "id_to_label": {"a": 1}}, f)
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert len(moved) == 1
+    assert ".corrupt-" in moved[0]
+    assert not seg.exists()
+
+
+def test_quarantine_invalid_hnsw_metadata_keeps_consistent_missing_dimensionality(tmp_path):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    seg = palace / "abcd-1234-5678"
+    seg.mkdir()
+    (seg / "data_level0.bin").write_bytes(b"x" * 2048)
+    (seg / "link_lists.bin").write_bytes(b"x" * 128)
+    with open(seg / "index_metadata.pickle", "wb") as f:
+        pickle.dump(
+            {
+                "dimensionality": None,
+                "total_elements_added": 2,
+                "max_seq_id": None,
+                "id_to_label": {"a": 1, "b": 2},
+                "label_to_id": {1: "a", 2: "b"},
+                "id_to_seq_id": {},
+            },
+            f,
+        )
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert moved == []
+    assert seg.exists()
+
+
+def test_quarantine_invalid_hnsw_metadata_renames_mismatched_missing_dimensionality(tmp_path):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    seg = palace / "abcd-1234-5678"
+    seg.mkdir()
+    (seg / "data_level0.bin").write_bytes(b"x" * 2048)
+    (seg / "link_lists.bin").write_bytes(b"x" * 128)
+    with open(seg / "index_metadata.pickle", "wb") as f:
+        pickle.dump(
+            {
+                "dimensionality": None,
+                "total_elements_added": 2,
+                "max_seq_id": None,
+                "id_to_label": {"a": 1, "b": 2},
+                "label_to_id": {1: "b", 2: "a"},
+                "id_to_seq_id": {},
+            },
+            f,
+        )
 
     moved = quarantine_invalid_hnsw_metadata(str(palace))
 
@@ -1126,6 +1612,9 @@ def test_chroma_backend_preflights_metadata_before_persistent_client(tmp_path, m
 
         return inner
 
+    monkeypatch.setattr(
+        "mempalace.backends.chroma._fix_missing_collection_type", _record("collection_type")
+    )
     monkeypatch.setattr("mempalace.backends.chroma._fix_blob_seq_ids", _record("blob"))
     monkeypatch.setattr(
         "mempalace.backends.chroma.quarantine_invalid_hnsw_metadata", _record("invalid")
@@ -1143,13 +1632,16 @@ def test_chroma_backend_preflights_metadata_before_persistent_client(tmp_path, m
     backend._client(str(palace))
 
     assert calls == [
+        ("collection_type", str(palace)),
         ("blob", str(palace)),
         ("invalid", str(palace)),
         ("stale", str(palace)),
     ]
 
 
-def test_chroma_backend_stale_quarantine_is_cold_start_only_on_refresh(tmp_path, monkeypatch):
+def test_chroma_backend_quarantine_rearms_on_mtime_refresh(tmp_path, monkeypatch):
+    """When the DB mtime changes between ``_client()`` calls, the quarantine
+    gate re-arms and the HNSW safety checks run again (#1573)."""
     palace = tmp_path / "palace"
     palace.mkdir()
     (palace / "chroma.sqlite3").write_text("")
@@ -1163,6 +1655,9 @@ def test_chroma_backend_stale_quarantine_is_cold_start_only_on_refresh(tmp_path,
         return inner
 
     monkeypatch.setattr(ChromaBackend, "_quarantined_paths", set())
+    monkeypatch.setattr(
+        "mempalace.backends.chroma._fix_missing_collection_type", _record("collection_type")
+    )
     monkeypatch.setattr("mempalace.backends.chroma._fix_blob_seq_ids", _record("blob"))
     monkeypatch.setattr(
         "mempalace.backends.chroma.quarantine_invalid_hnsw_metadata", _record("invalid")
@@ -1184,10 +1679,14 @@ def test_chroma_backend_stale_quarantine_is_cold_start_only_on_refresh(tmp_path,
     backend._client(str(palace))
 
     assert calls == [
+        ("collection_type", str(palace)),
         ("blob", str(palace)),
         ("invalid", str(palace)),
         ("stale", str(palace)),
+        ("collection_type", str(palace)),
         ("blob", str(palace)),
+        ("invalid", str(palace)),
+        ("stale", str(palace)),
     ]
 
 
@@ -1205,6 +1704,9 @@ def test_chroma_backend_requarantines_after_inode_replacement(tmp_path, monkeypa
         return inner
 
     monkeypatch.setattr(ChromaBackend, "_quarantined_paths", set())
+    monkeypatch.setattr(
+        "mempalace.backends.chroma._fix_missing_collection_type", _record("collection_type")
+    )
     monkeypatch.setattr("mempalace.backends.chroma._fix_blob_seq_ids", _record("blob"))
     monkeypatch.setattr(
         "mempalace.backends.chroma.quarantine_invalid_hnsw_metadata", _record("invalid")
@@ -1226,13 +1728,74 @@ def test_chroma_backend_requarantines_after_inode_replacement(tmp_path, monkeypa
     backend._client(str(palace))
 
     assert calls == [
+        ("collection_type", str(palace)),
         ("blob", str(palace)),
         ("invalid", str(palace)),
         ("stale", str(palace)),
+        ("collection_type", str(palace)),
         ("blob", str(palace)),
         ("invalid", str(palace)),
         ("stale", str(palace)),
     ]
+
+
+def test_explain_ef_mismatch_recognizes_chromadb_conflict():
+    """When ChromaDB rejects a collection read due to an EF-name mismatch
+    (user changed MEMPALACE_EMBEDDING_MODEL on an existing palace), the
+    backend wraps the bare ValueError with a message that tells the user
+    how to recover. Without this, users hit a stack trace and don't know
+    rebuild-index exists."""
+    err = ValueError(
+        "An embedding function already exists in the collection configuration, "
+        "and a new one is provided. Embedding function conflict: new: "
+        "embeddinggemma_300m vs persisted: default"
+    )
+    msg = ChromaBackend._explain_ef_mismatch(err, "/tmp/palace.db")
+    assert msg is not None
+    assert "/tmp/palace.db" in msg
+    assert "MEMPALACE_EMBEDDING_MODEL" in msg
+    assert "rebuild-index" in msg
+
+
+def test_explain_ef_mismatch_returns_none_for_unrelated_errors():
+    """Don't paper over unrelated ValueErrors with the EF-mismatch message —
+    the caller needs to re-raise unmodified so debugging stays sane."""
+    err = ValueError("Some other ChromaDB problem")
+    assert ChromaBackend._explain_ef_mismatch(err, "/tmp/palace.db") is None
+
+
+def test_get_collection_translates_ef_mismatch_to_helpful_error(tmp_path):
+    """End-to-end: create a palace with the default EF, then try to read it
+    with a different EF name and confirm we surface the rebuild-index hint."""
+    backend = ChromaBackend()
+    palace_path = str(tmp_path / "palace")
+    os.makedirs(palace_path, exist_ok=True)
+
+    # Create the collection using the default (minilm-based) EF.
+    coll = backend.get_collection(palace_path, "drawers", create=True)
+    coll.add(documents=["seed"], ids=["1"])
+
+    # Now swap in an incompatible EF name (simulates the user setting
+    # MEMPALACE_EMBEDDING_MODEL=embeddinggemma without rebuild-index).
+    class _ConflictingEF:
+        @staticmethod
+        def name() -> str:
+            return "embeddinggemma_300m"
+
+        def __call__(self, input):
+            return [[0.0] * _TEST_EMBED_DIM for _ in input]
+
+    original_resolver = backend._resolve_embedding_function
+    backend._resolve_embedding_function = lambda: _ConflictingEF()
+    # Drop the cached client so the next call goes through the open path.
+    backend.close_palace(palace_path)
+
+    try:
+        with pytest.raises(ValueError, match=r"rebuild-index"):
+            backend.get_collection(palace_path, "drawers", create=False)
+    finally:
+        backend._resolve_embedding_function = original_resolver
+        backend.close_palace(palace_path)
 
 
 def test_palace_get_collection_uses_configured_collection_name(monkeypatch):

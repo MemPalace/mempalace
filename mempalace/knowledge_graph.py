@@ -36,7 +36,6 @@ Usage:
 """
 
 import functools
-import hashlib
 import json
 import logging
 import os
@@ -48,6 +47,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 from .config import sanitize_iso_temporal
+from .ids import make_triple_id
 
 logger = logging.getLogger(__name__)
 
@@ -369,7 +369,9 @@ class KnowledgeGraph:
                     conn.commit()
                     return existing["id"]  # Already exists and still valid
 
-                triple_id = f"t_{sub_id}_{pred}_{obj_id}_{hashlib.sha256(f'{valid_from}{datetime.now().isoformat()}'.encode()).hexdigest()[:12]}"
+                triple_id = make_triple_id(
+                    sub_id, pred, obj_id, valid_from, datetime.now().isoformat()
+                )
                 conn.execute(
                     """INSERT INTO triples (
                         id, subject, predicate, object, valid_from, valid_to,
