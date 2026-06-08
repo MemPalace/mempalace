@@ -2667,10 +2667,10 @@ TOOLS = {
                     "description": "Alias for 'entry' — accepted because add_drawer uses 'content'. Provide either 'entry' or 'content'; 'entry' wins if both are given.",
                 },
             },
-            # agent_name is always required; 'entry' or its alias 'content' must
-            # be present by dispatch time; keep the root schema composition-free
-            # for Anthropic-compatible MCP clients, then remap content->entry later.
-            "required": ["agent_name"],
+            # Keep the root schema composition-free for Anthropic-compatible MCP
+            # clients. Advertise the canonical 'entry' field as required while
+            # still accepting 'content' as a compatibility alias at dispatch.
+            "required": ["agent_name", "entry"],
         },
         "handler": tool_diary_write,
     },
