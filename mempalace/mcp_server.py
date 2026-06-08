@@ -2668,12 +2668,8 @@ TOOLS = {
                 },
             },
             # agent_name is always required; 'entry' or its alias 'content' must
-            # be present (the server remaps content->entry at dispatch).
+            # be present — validated at dispatch (content is remapped to entry).
             "required": ["agent_name"],
-            "anyOf": [
-                {"required": ["entry"]},
-                {"required": ["content"]},
-            ],
         },
         "handler": tool_diary_write,
     },
