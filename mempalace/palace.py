@@ -50,6 +50,12 @@ def get_collection(
     )
 
 
+def get_remote_collection(url: str, token: str) -> "RemoteCollection":
+    """Get a collection that writes to a remote HTTP mempalace server."""
+    from .backends.remote import RemoteCollection
+    return RemoteCollection(url=url, token=token)
+
+
 def file_already_mined(collection, source_file: str, check_mtime: bool = False) -> bool:
     """Check if a file has already been filed in the palace.
 

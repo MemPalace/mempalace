@@ -132,3 +132,18 @@ def test_query_raises(col):
 def test_count_raises(col):
     with pytest.raises(NotImplementedError):
         col.count()
+
+
+def test_get_remote_collection_returns_remote_instance(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    from mempalace.palace import get_remote_collection
+    from mempalace.backends.remote import RemoteCollection
+    col = get_remote_collection("http://palace.test", "tok")
+    assert isinstance(col, RemoteCollection)
+
+
+def test_get_remote_collection_strips_trailing_slash(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    from mempalace.palace import get_remote_collection
+    col = get_remote_collection("http://palace.test/", "tok")
+    assert col._url == "http://palace.test"
