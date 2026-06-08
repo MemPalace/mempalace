@@ -16,7 +16,7 @@ from datetime import datetime
 from collections import defaultdict
 
 from .normalize import normalize
-from .palace import SKIP_DIRS, get_collection, file_already_mined
+from .palace import SKIP_DIRS, get_collection, get_remote_collection, file_already_mined
 
 
 # File types that might contain conversations
@@ -280,6 +280,8 @@ def mine_convos(
     limit: int = 0,
     dry_run: bool = False,
     extract_mode: str = "exchange",
+    remote_url: str = None,
+    remote_token: str = None,
 ):
     """Mine a directory of conversation files into the palace.
 
@@ -302,12 +304,23 @@ def mine_convos(
     print(f"  Wing:    {wing}")
     print(f"  Source:  {convo_path}")
     print(f"  Files:   {len(files)}")
-    print(f"  Palace:  {palace_path}")
+    print(f"  Palace:  {remote_url or palace_path}")
     if dry_run:
         print("  DRY RUN — nothing will be filed")
     print(f"{'-' * 55}\n")
 
-    collection = get_collection(palace_path) if not dry_run else None
+    if not dry_run:
+        if remote_url:
+            token = remote_token or os.environ.get("MEMPALACE_TOKEN", "")
+            if not token:
+                raise RuntimeError(
+                    "remote-url requires a token — pass --remote-token or set MEMPALACE_TOKEN"
+                )
+            collection = get_remote_collection(remote_url, token)
+        else:
+            collection = get_collection(palace_path)
+    else:
+        collection = None
 
     total_drawers = 0
     files_skipped = 0
@@ -406,6 +419,8 @@ def mine_convos(
 
         total_drawers += drawers_added
         print(f"  ✓ [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")
+        if hasattr(collection, "mark_file_done"):
+            collection.mark_file_done(source_file)
 
     print(f"\n{'=' * 55}")
     print("  Done.")
