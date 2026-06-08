@@ -724,3 +724,136 @@ def test_layer2_handles_none_metadata():
         result = layer.retrieve()
 
     assert "L2 — ON-DEMAND" in result
+
+
+
+# ── Layer1 — issue #1629: importance scoring fallback ──────────────────
+
+
+def test_layer1_deterministic_when_no_importance():
+    """Wake-up output is byte-stable for a fixed palace.
+
+    Issue #1629: when no drawer carries an importance key, the previous
+    default-to-3 made every drawer tie and the sort was effectively
+    non-deterministic. After the fix, the composite key includes a stable
+    drawer id, so the rendered L1 text is identical across runs and
+    independent of insertion order.
+    """
+    docs = ["alpha memory", "beta memory", "gamma memory"]
+    metas = [
+        {"room": "r", "source_file": "a.txt", "filed_at": "2026-06-01"},
+        {"room": "r", "source_file": "b.txt", "filed_at": "2026-06-02"},
+        {"room": "r", "source_file": "c.txt", "filed_at": "2026-06-03"},
+    ]
+
+    def render(layer_input_docs, layer_input_metas):
+        mock_col = _mock_chromadb_for_layer(layer_input_docs, layer_input_metas)
+        with (
+            patch("mempalace.layers.MempalaceConfig") as mock_cfg,
+            patch("mempalace.layers._get_collection", return_value=mock_col),
+        ):
+            mock_cfg.return_value.palace_path = "/fake"
+            layer = Layer1(palace_path="/fake")
+            return layer.generate()
+
+    forward = render(docs, metas)
+    reverse = render(list(reversed(docs)), list(reversed(metas)))
+
+    assert forward == reverse, (
+        f"insertion order changed rendered output:\n"
+        f"forward={forward!r}\nreverse={reverse!r}"
+    )
+    assert "alpha memory" in forward
+
+
+def test_layer1_prefers_recent_when_no_importance():
+    """Most recent drawer ranks first when no drawer has importance set."""
+    docs = ["old", "newest", "older"]
+    metas = [
+        {"room": "r", "source_file": "old.txt", "filed_at": "2020-01-01"},
+        {"room": "r", "source_file": "new.txt", "filed_at": "2026-06-08"},
+        {"room": "r", "source_file": "older.txt", "filed_at": "2025-01-01"},
+    ]
+    mock_col = _mock_chromadb_for_layer(docs, metas)
+
+    with (
+        patch("mempalace.layers.MempalaceConfig") as mock_cfg,
+        patch("mempalace.layers._get_collection", return_value=mock_col),
+    ):
+        mock_cfg.return_value.palace_path = "/fake"
+        layer = Layer1(palace_path="/fake")
+        result = layer.generate()
+
+    new_idx = result.find("newest")
+    old_idx = result.find("older")
+    assert new_idx != -1 and old_idx != -1
+    assert new_idx < old_idx, (
+        f"expected 'newest' before 'older' in L1; got:\n{result}"
+    )
+
+
+def test_layer1_keeps_importance_keyed_top():
+    """A drawer with explicit importance still ranks above non-importance drawers."""
+    docs = ["unimportant recent", "ancient but important"]
+    metas = [
+        {"room": "r", "source_file": "recent.txt", "filed_at": "2026-06-08"},
+        {"room": "r", "source_file": "ancient.txt", "filed_at": "2020-01-01", "importance": 9},
+    ]
+    mock_col = _mock_chromadb_for_layer(docs, metas)
+
+    with (
+        patch("mempalace.layers.MempalaceConfig") as mock_cfg,
+        patch("mempalace.layers._get_collection", return_value=mock_col),
+    ):
+        mock_cfg.return_value.palace_path = "/fake"
+        layer = Layer1(palace_path="/fake")
+        result = layer.generate()
+
+    ancient_idx = result.find("ancient but important")
+    unimp_idx = result.find("unimportant recent")
+    assert ancient_idx != -1 and unimp_idx != -1
+    assert ancient_idx < unimp_idx, (
+        f"expected importance-keyed drawer to rank above non-importance; got:\n{result}"
+    )
+
+
+def test_layer1_does_not_crash_on_unparseable_importance():
+    """Malformed importance value falls back to recency, not 3."""
+    docs = ["only doc"]
+    metas = [
+        {
+            "room": "r",
+            "source_file": "weird.txt",
+            "filed_at": "2026-06-08",
+            "importance": "not-a-number",
+        }
+    ]
+    mock_col = _mock_chromadb_for_layer(docs, metas)
+
+    with (
+        patch("mempalace.layers.MempalaceConfig") as mock_cfg,
+        patch("mempalace.layers._get_collection", return_value=mock_col),
+    ):
+        mock_cfg.return_value.palace_path = "/fake"
+        layer = Layer1(palace_path="/fake")
+        result = layer.generate()
+
+    assert "ESSENTIAL STORY" in result
+    assert "only doc" in result
+
+
+def test_layer1_score_drawer_returns_expected_shape():
+    """Unit test the helper directly: bucket 0 for importance, 1 for fallback."""
+    layer = Layer1(palace_path="/fake")
+
+    importance_tuple = layer._score_drawer(
+        "doc", {"importance": 5, "filed_at": "2026-06-08", "source_file": "a.txt"}
+    )
+    assert importance_tuple[0] == 0
+
+    fallback_tuple = layer._score_drawer(
+        "doc2", {"filed_at": "2026-06-08", "source_file": "a.txt"}
+    )
+    assert fallback_tuple[0] == 1
+
+    assert importance_tuple[0] < fallback_tuple[0]

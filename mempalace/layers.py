@@ -18,6 +18,7 @@ and ~/.mempalace/identity.txt.
 
 import os
 import sys
+import hashlib
 from pathlib import Path
 from collections import defaultdict
 
@@ -121,32 +122,46 @@ class Layer1:
         if not docs:
             return "## L1 — No memories yet."
 
-        # Score each drawer: prefer high importance, recent filing
+        # Score each drawer: prefer high importance, then recency + source priority
+        # for drawers that do not populate an importance key. The previous
+        # implementation defaulted importance to 3 for every drawer, so every
+        # drawer tied and the sort was effectively non-deterministic (issue #1629).
         scored = []
         for doc, meta in zip(docs, metas):
             meta = meta or {}
             doc = doc or ""
-            importance = 3
-            # Try multiple metadata keys that might carry weight info
-            for key in ("importance", "emotional_weight", "weight"):
-                val = meta.get(key)
-                if val is not None:
-                    try:
-                        importance = float(val)
-                    except (ValueError, TypeError):
-                        pass
-                    break
-            scored.append((importance, meta, doc))
+            scored.append(self._score_drawer(doc, meta))
 
-        # Sort by importance descending, take top N
-        scored.sort(key=lambda x: x[0], reverse=True)
-        top = scored[: self.MAX_DRAWERS]
+        # Assign recency_rank to the fallback bucket (bucket=1).
+        fallback = [s for s in scored if s[0] == 1]
+        rank_lookup: dict[tuple[str, int, str], int] = {}
+        for rank, item in enumerate(
+            sorted(
+                fallback,
+                key=lambda s: (s[3].split("|", 1)[1], -s[2], s[3].split("|", 1)[0]),
+                reverse=True,
+            )
+        ):
+            rk = item[3].split("|", 1)[1]
+            rank_lookup[(rk, item[2], item[3].split("|", 1)[0])] = rank
+
+        rescored = []
+        for s in scored:
+            if s[0] == 0:
+                rescored.append(s)
+                continue
+            rk = s[3].split("|", 1)[1]
+            rank = rank_lookup.get((rk, s[2], s[3].split("|", 1)[0]), 0)
+            rescored.append((s[0], rank, s[2], s[3], s[4], s[5]))
+
+        rescored.sort(key=lambda x: (x[0], x[1], -x[2], x[3]))
+        top = rescored[: self.MAX_DRAWERS]
 
         # Group by room for readability
         by_room = defaultdict(list)
-        for imp, meta, doc in top:
+        for _bucket, _recency, _source_pri, _doc_id, meta, doc in top:
             room = meta.get("room", "general")
-            by_room[room].append((imp, meta, doc))
+            by_room[room].append((meta, doc))
 
         # Build compact text
         lines = ["## L1 — ESSENTIAL STORY"]
@@ -157,7 +172,7 @@ class Layer1:
             lines.append(room_line)
             total_len += len(room_line)
 
-            for _imp, meta, doc in entries:
+            for meta, doc in entries:
                 source = Path(meta.get("source_file", "")).name if meta.get("source_file") else ""
 
                 # Truncate doc to keep L1 compact
@@ -177,6 +192,66 @@ class Layer1:
                 total_len += len(entry_line)
 
         return "\n".join(lines)
+
+    def _score_drawer(
+        self, doc: str, meta: dict
+    ) -> tuple[int, int, int, str, dict, str]:
+        """Return a sortable ranking tuple for a single drawer.
+
+        Tuple shape: (bucket, recency_rank, source_priority, doc_id, meta, doc).
+        bucket=0 means the drawer carries an explicit importance key (or one
+        of its aliases), bucket=1 means fallback. recency_rank is assigned
+        in a second pass in generate() so the most-recently-filed non-importance
+        drawer gets rank 0. source_priority is a small per-source bonus so
+        user-source drawers win over tool_output / system sources when
+        recency ties. doc_id is a stable per-drawer identifier used as the
+        final tiebreaker (and for grouping by filing timestamp).
+        """
+        explicit_importance = None
+        for key in ("importance", "emotional_weight", "weight"):
+            val = meta.get(key)
+            if val is None:
+                continue
+            try:
+                explicit_importance = float(val)
+            except (ValueError, TypeError):
+                continue
+            break
+
+        if explicit_importance is not None:
+            return (0, 0, 0, _drawer_id(doc, meta), meta, doc)
+
+        filed_at = meta.get("filed_at") or meta.get("created_at") or ""
+        recency_key = str(filed_at) if filed_at else ""
+        source_pri = 0
+        src = str(meta.get("source", "")).lower()
+        if not src and meta.get("source_file"):
+            source_pri = 2
+        elif "user" in src:
+            source_pri = 2
+        elif "tool" in src:
+            source_pri = 1
+        elif "system" in src:
+            source_pri = 0
+        return (
+            1,
+            0,
+            source_pri,
+            _drawer_id(doc, meta) + "|" + recency_key,
+            meta,
+            doc,
+        )
+
+
+def _drawer_id(doc: str, meta: dict) -> str:
+    """Stable identifier for a drawer used as a sort tiebreaker."""
+    sid = meta.get("id") or meta.get("drawer_id")
+    if sid:
+        return str(sid)
+    src = meta.get("source_file", "")
+    if src and doc:
+        return f"{src}:{hashlib.sha1(doc.encode('utf-8')).hexdigest()[:12]}"
+    return hashlib.sha1(doc.encode('utf-8')).hexdigest()[:16]
 
 
 # ---------------------------------------------------------------------------
