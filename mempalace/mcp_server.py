@@ -769,9 +769,9 @@ def tool_status():
             r = m.get("room", "unknown")
             wings[w] = wings.get(w, 0) + 1
             rooms[r] = rooms.get(r, 0) + 1
-    except Exception as e:
+    except Exception:
         logger.exception("tool_status metadata fetch failed")
-        result["error"] = str(e)
+        result["error"] = "Internal error"
         result["partial"] = True
     return result
 
@@ -821,9 +821,9 @@ def tool_list_wings():
             m = m or {}
             w = m.get("wing", "unknown")
             wings[w] = wings.get(w, 0) + 1
-    except Exception as e:
+    except Exception:
         logger.exception("tool_list_wings metadata fetch failed")
-        result["error"] = str(e)
+        result["error"] = "Internal error"
         result["partial"] = True
     return result
 
@@ -845,9 +845,9 @@ def tool_list_rooms(wing: str = None):
             m = m or {}
             r = m.get("room", "unknown")
             rooms[r] = rooms.get(r, 0) + 1
-    except Exception as e:
+    except Exception:
         logger.exception("tool_list_rooms metadata fetch failed")
-        result["error"] = str(e)
+        result["error"] = "Internal error"
         result["partial"] = True
     return result
 
@@ -867,9 +867,9 @@ def tool_get_taxonomy():
             if w not in taxonomy:
                 taxonomy[w] = {}
             taxonomy[w][r] = taxonomy[w].get(r, 0) + 1
-    except Exception as e:
+    except Exception:
         logger.exception("tool_get_taxonomy metadata fetch failed")
-        result["error"] = str(e)
+        result["error"] = "Internal error"
         result["partial"] = True
     return result
 
@@ -1235,8 +1235,15 @@ def tool_add_drawer(
             "chunks": len(chunk_ids),
             "chunk_ids": chunk_ids,
         }
-    except Exception as e:
+    except RuntimeError as e:
+        # Readback-failure is raised deliberately with a fixed, actionable
+        # message (no internal details interpolated) — surface it so callers
+        # can self-repair (reconnect / repair) rather than see a blank error.
+        logger.exception("tool_add_drawer readback failed")
         return {"success": False, "error": str(e)}
+    except Exception:
+        logger.exception("tool_add_drawer failed")
+        return {"success": False, "error": "Internal error"}
 
 
 def tool_delete_drawer(drawer_id: str):
@@ -1268,8 +1275,9 @@ def tool_delete_drawer(drawer_id: str):
         _metadata_cache = None
         logger.info(f"Deleted drawer: {drawer_id}")
         return {"success": True, "drawer_id": drawer_id}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+    except Exception:
+        logger.exception("tool_delete_drawer failed")
+        return {"success": False, "error": "Internal error"}
 
 
 def tool_sync(project_dir: str = None, wing: str = None, apply: bool = False):
@@ -1337,8 +1345,9 @@ def tool_get_drawer(drawer_id: str):
             "room": safe_meta.get("room", ""),
             "metadata": safe_meta,
         }
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        logger.exception("tool_get_drawer failed")
+        return {"error": "Internal error"}
 
 
 def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offset: int = 0):
@@ -1396,8 +1405,9 @@ def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offse
             "offset": offset,
             "limit": limit,
         }
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        logger.exception("tool_list_drawers failed")
+        return {"error": "Internal error"}
 
 
 def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, room: str = None):
@@ -1465,8 +1475,9 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
             "wing": new_meta.get("wing", ""),
             "room": new_meta.get("room", ""),
         }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+    except Exception:
+        logger.exception("tool_update_drawer failed")
+        return {"success": False, "error": "Internal error"}
 
 
 # ==================== KNOWLEDGE GRAPH ====================
@@ -1721,8 +1732,9 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
             "chunks": len(chunk_ids),
             "chunk_ids": chunk_ids,
         }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+    except Exception:
+        logger.exception("tool_diary_write failed")
+        return {"success": False, "error": "Internal error"}
 
 
 def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
@@ -1811,8 +1823,9 @@ def tool_hook_settings(silent_save: bool = None, desktop_toast: bool = None):
 
     try:
         config = MempalaceConfig()
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+    except Exception:
+        logger.exception("tool_hook_settings failed")
+        return {"success": False, "error": "Internal error"}
 
     changed = []
     if silent_save is not None:
@@ -1958,8 +1971,9 @@ def tool_reconnect():
             "vector_disabled": _vector_disabled,
             "vector_disabled_reason": _vector_disabled_reason,
         }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+    except Exception:
+        logger.exception("tool_reconnect failed")
+        return {"success": False, "error": "Internal error"}
 
 
 # ==================== MCP PROTOCOL ====================
