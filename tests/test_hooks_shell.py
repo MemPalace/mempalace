@@ -32,6 +32,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SAVE_HOOK = REPO_ROOT / "hooks" / "mempal_save_hook.sh"
 PRECOMPACT_HOOK = REPO_ROOT / "hooks" / "mempal_precompact_hook.sh"
 SESSION_END_HOOK = REPO_ROOT / "hooks" / "mempal_session_end_hook.sh"
+PLUGIN_SESSION_END_HOOK = REPO_ROOT / ".claude-plugin" / "hooks" / "mempal-session-end-hook.sh"
 
 
 pytestmark = pytest.mark.skipif(os.name == "nt", reason="bash hook scripts are POSIX-only")
@@ -244,6 +245,61 @@ exit 1
         fake = _write_fake_mempalace(tmp_path / "mempalace", args_file, stdin_file)
         result = _run_hook(
             SESSION_END_HOOK,
+            {"session_id": "abc", "transcript_path": ""},
+            env_overrides={
+                "HOME": str(tmp_path),
+                "MEMPALACE_HOOK_HARNESS": "codex",
+            },
+            path_prefix=[fake.parent],
+        )
+        assert result.returncode == 0
+        assert args_file.read_text() == "hook run --hook session-end --harness codex"
+
+
+class TestPluginSessionEndWrapper:
+    def test_dispatches_via_mempal_python_override(self, tmp_path):
+        args_file = tmp_path / "args.log"
+        stdin_file = tmp_path / "stdin.json"
+        shim = tmp_path / "python3"
+        shim.write_text(
+            f"""#!/bin/bash
+if [ "$1" = "-c" ]; then
+  exit 0
+fi
+if [ "$1" = "-m" ] && [ "$2" = "mempalace" ]; then
+  printf '%s' "$*" > "{args_file}"
+  cat > "{stdin_file}"
+  printf '{{}}'
+  exit 0
+fi
+exit 1
+""",
+            encoding="utf-8",
+        )
+        shim.chmod(shim.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        payload = {"session_id": "abc", "transcript_path": ""}
+        result = _run_hook(
+            PLUGIN_SESSION_END_HOOK,
+            payload,
+            env_overrides={
+                "HOME": str(tmp_path),
+                "PATH": "",
+                "MEMPAL_PYTHON": str(shim),
+            },
+        )
+        assert result.returncode == 0
+        assert json.loads(result.stdout) == {}
+        assert (
+            args_file.read_text() == "mempalace hook run --hook session-end --harness claude-code"
+        )
+        assert json.loads(stdin_file.read_text()) == payload
+
+    def test_dispatches_to_cli_with_harness_override(self, tmp_path):
+        args_file = tmp_path / "args.log"
+        stdin_file = tmp_path / "stdin.json"
+        fake = _write_fake_mempalace(tmp_path / "mempalace", args_file, stdin_file)
+        result = _run_hook(
+            PLUGIN_SESSION_END_HOOK,
             {"session_id": "abc", "transcript_path": ""},
             env_overrides={
                 "HOME": str(tmp_path),
