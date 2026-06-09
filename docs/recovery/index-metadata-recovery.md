@@ -40,15 +40,14 @@ The data is recoverable — the `data_level0.bin`, `link_lists.bin`,
 the quarantined dir. Only the `dimensionality` field is missing. We can
 supply it externally.
 
-### 1. Stop the mempalace MCP server / palace-daemon
+### 1. Stop the mempalace MCP server
 
 Two `PersistentClient` instances against the same palace deadlock on the
 sqlite filelock. The recovery script needs exclusive access.
 
 ```bash
 # If running mempalace MCP via Claude Code or similar, kill that process.
-# If running palace-daemon:
-sudo systemctl stop palace-daemon.service
+# If running any other service that holds the palace open, stop it too.
 ```
 
 ### 2. Snapshot sqlite as a rollback
@@ -137,7 +136,7 @@ PYEOF
 ### 6. Restart the service + verify
 
 ```bash
-sudo systemctl start palace-daemon.service       # or your equivalent
+# Restart your mempalace MCP server or equivalent service
 sleep 10  # warmup window
 
 # Confirm vector search is back (not BM25-only fallback):
@@ -191,12 +190,13 @@ rm "$PALACE/<UUID>/index_metadata.pickle.broken-backup"
   bad state during its temp-collection refile pass
 - MemPalace/mempalace#1493 — proposal to have the integrity gate auto-recover
   this exact corruption shape rather than just quarantining
-- jphein/palace-daemon `docs/recovery/chromadb-metadata-dict-patch.md` —
-  the same procedure written from a palace-daemon operator's perspective
-  (HTTP probes instead of CLI commands)
-- jphein/palace-daemon `tests/test_chromadb_metadata_recovery.py` —
-  regression test that builds a real palace, corrupts the metadata,
-  applies the patch, asserts chromadb fully loads + queries the result
+- [jphein/palace-daemon](https://github.com/jphein/palace-daemon) is an
+  external third-party service layer for mempalace (not shipped with this
+  project). Its `docs/recovery/chromadb-metadata-dict-patch.md` covers
+  the same procedure from an HTTP-service operator's perspective, and
+  `tests/test_chromadb_metadata_recovery.py` contains a regression test
+  that builds a real palace, corrupts the metadata, applies the patch,
+  and asserts chromadb fully loads + queries the result
 
 ## Tested on
 
