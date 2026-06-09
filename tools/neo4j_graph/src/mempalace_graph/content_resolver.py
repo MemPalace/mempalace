@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
+from urllib.parse import unquote
 
 from .mempalace_schema_inspector import open_readonly_sqlite, quote_ident
-from .mempalace_sqlite_reader import CONTENT_FIELDS, TITLE_FIELDS, first_existing, parse_metadata
+from .mempalace_sqlite_reader import CONTENT_FIELDS, TITLE_FIELDS, first_existing, first_existing_value, parse_metadata
 from .mempalace_chroma_reader import resolve_chroma_record
 from .models import ResolvedContent
 
@@ -38,13 +39,15 @@ def resolve_chroma(path: Path, locator: str) -> ResolvedContent:
 
 def resolve_sqlite(path: Path, locator: str) -> ResolvedContent:
     parts = locator.split(":", 3)
-    if len(parts) != 3 and not (len(parts) == 4 and parts[2] == "rowid"):
+    if len(parts) != 3 and not (len(parts) == 4 and parts[2] in {"rowid", "pk"}):
         raise ResolveError("Error: Source locator is stale or unsupported. Run sync again.")
     table = parts[1]
     with open_readonly_sqlite(path) as conn:
         conn.row_factory = sqlite3.Row
-        if len(parts) == 4:
+        if len(parts) == 4 and parts[2] == "rowid":
             row = conn.execute(f"SELECT * FROM {quote_ident(table)} WHERE rowid=?", (parts[3],)).fetchone()
+        elif len(parts) == 4 and parts[2] == "pk":
+            row = resolve_composite_pk(conn, table, parts[3])
         else:
             pk = primary_key(conn, table)
             if not pk:
@@ -53,9 +56,24 @@ def resolve_sqlite(path: Path, locator: str) -> ResolvedContent:
     if not row:
         raise ResolveError("Error: Source locator is stale or unsupported. Run sync again.")
     data = dict(row)
-    metadata = parse_metadata(first_existing(data, ["metadata", "properties"]))
+    metadata = parse_metadata(first_existing_value(data, ["metadata", "properties"]))
     content = first_existing(data, CONTENT_FIELDS) or (json.dumps(metadata, indent=2) if metadata else "")
     return ResolvedContent(first_existing(data, TITLE_FIELDS), content, metadata, str(path), locator)
+
+
+def resolve_composite_pk(conn: sqlite3.Connection, table: str, encoded_values: str) -> sqlite3.Row | None:
+    try:
+        values = json.loads(unquote(encoded_values))
+    except (TypeError, ValueError) as exc:
+        raise ResolveError("Error: Source locator is stale or unsupported. Run sync again.") from exc
+    if not isinstance(values, dict) or not values:
+        raise ResolveError("Error: Source locator is stale or unsupported. Run sync again.")
+    columns = list(values)
+    where_clause = " AND ".join(f"{quote_ident(column)}=?" for column in columns)
+    return conn.execute(
+        f"SELECT * FROM {quote_ident(table)} WHERE {where_clause}",
+        tuple(values[column] for column in columns),
+    ).fetchone()
 
 
 def resolve_jsonl(path: Path, locator: str) -> ResolvedContent:

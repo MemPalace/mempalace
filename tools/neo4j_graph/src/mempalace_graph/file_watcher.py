@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
-from threading import Timer
+from threading import Lock, Timer
 
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
@@ -19,6 +19,7 @@ class DebouncedSyncHandler(FileSystemEventHandler):
         self.config = config
         self.create_schema = create_schema
         self.timer: Timer | None = None
+        self.lock = Lock()
         self.watch_names = {
             "knowledge_graph.sqlite3",
             "chroma.sqlite3",
@@ -34,11 +35,12 @@ class DebouncedSyncHandler(FileSystemEventHandler):
             return
         if path.name not in self.watch_names:
             return
-        if self.timer:
-            self.timer.cancel()
-        self.timer = Timer(self.config.watch_debounce_seconds, self._run_sync)
-        self.timer.daemon = True
-        self.timer.start()
+        with self.lock:
+            if self.timer:
+                self.timer.cancel()
+            self.timer = Timer(self.config.watch_debounce_seconds, self._run_sync)
+            self.timer.daemon = True
+            self.timer.start()
 
     def _run_sync(self) -> None:
         try:

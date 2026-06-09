@@ -23,6 +23,13 @@ def read_wal_events(path: Path, start_offset: int = 0) -> tuple[list[WalEvent], 
 
     events: list[WalEvent] = []
     errors: list[str] = []
+    size_bytes = path.stat().st_size
+    if start_offset > size_bytes:
+        errors.append(f"Warning: write log offset {start_offset} exceeds current size {size_bytes}; reading from start")
+        start_offset = 0
+    if start_offset < 0:
+        errors.append(f"Warning: write log offset {start_offset} is negative; reading from start")
+        start_offset = 0
     end_offset = start_offset
     with path.open("rb") as fh:
         fh.seek(start_offset)

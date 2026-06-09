@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
-from .mempalace_schema_inspector import SchemaInspection, open_readonly_sqlite, quote_ident
+from .mempalace_schema_inspector import SchemaInspection, TableInfo, open_readonly_sqlite, quote_ident
 from .models import MemoryRecord, RelationshipRecord
 from .normalizer import DEFAULT_CLOSET, DEFAULT_DRAWER, DEFAULT_ROOM, DEFAULT_WING
 
@@ -25,7 +27,7 @@ def read_sqlite_records(path: Path, inspection: SchemaInspection, source_hash: s
         for table in inspection.tables:
             if table.name in memory_tables:
                 try:
-                    records.extend(_read_memory_table(conn, table.name, path, source_hash, source_modified_at))
+                    records.extend(_read_memory_table(conn, table, path, source_hash, source_modified_at))
                 except sqlite3.Error as exc:
                     warnings.append(f"Could not read memory table {table.name}: {exc}")
             if table.name in relationship_tables:
@@ -36,20 +38,20 @@ def read_sqlite_records(path: Path, inspection: SchemaInspection, source_hash: s
     return records, relationships, warnings
 
 
-def _read_memory_table(conn: sqlite3.Connection, table: str, path: Path, source_hash: str | None, source_modified_at: str | None) -> list[MemoryRecord]:
+def _read_memory_table(conn: sqlite3.Connection, table: TableInfo, path: Path, source_hash: str | None, source_modified_at: str | None) -> list[MemoryRecord]:
     out: list[MemoryRecord] = []
-    cursor = conn.execute(f"SELECT rowid AS __rowid__, * FROM {quote_ident(table)}")
+    cursor = memory_rows(conn, table.name)
     for row in cursor:
         data = dict(row)
-        metadata = parse_metadata(first_existing(data, ["metadata", "properties"]))
+        metadata = parse_metadata(first_existing_value(data, ["metadata", "properties"]))
         record_id = first_existing(data, ID_FIELDS)
-        locator = f"sqlite:{table}:{record_id}" if record_id else f"sqlite:{table}:rowid:{data['__rowid__']}"
+        locator, fallback_record_id = sqlite_locator(table, data, record_id)
         content = first_existing(data, CONTENT_FIELDS)
         title = first_existing(data, TITLE_FIELDS) or first_line(content)
         hierarchy = extract_hierarchy(data, metadata)
         out.append(
             MemoryRecord(
-                id=str(record_id or ""),
+                id=str(record_id or fallback_record_id or ""),
                 title=title,
                 snippet=first_existing(data, ["snippet", "summary"]),
                 content=content,
@@ -77,6 +79,34 @@ def _read_memory_table(conn: sqlite3.Connection, table: str, path: Path, source_
     return out
 
 
+def memory_rows(conn: sqlite3.Connection, table: str) -> sqlite3.Cursor:
+    try:
+        return conn.execute(f"SELECT rowid AS __rowid__, * FROM {quote_ident(table)}")
+    except sqlite3.OperationalError:
+        return conn.execute(f"SELECT * FROM {quote_ident(table)}")
+
+
+def sqlite_locator(table: TableInfo, data: dict[str, Any], record_id: str | None) -> tuple[str, str | None]:
+    if record_id:
+        return f"sqlite:{table.name}:{record_id}", record_id
+    rowid = data.get("__rowid__")
+    if rowid not in (None, ""):
+        return f"sqlite:{table.name}:rowid:{rowid}", str(rowid)
+
+    pk_values = {name: data.get(name) for name in table.primary_keys if data.get(name) not in (None, "")}
+    if len(pk_values) == 1 and len(table.primary_keys) == 1:
+        pk_value = str(next(iter(pk_values.values())))
+        return f"sqlite:{table.name}:{pk_value}", pk_value
+    if len(pk_values) == len(table.primary_keys) and table.primary_keys:
+        encoded = quote(json.dumps(pk_values, sort_keys=True, separators=(",", ":")), safe="")
+        digest = sha256(json.dumps(pk_values, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+        return f"sqlite:{table.name}:pk:{encoded}", digest
+
+    encoded = json.dumps(data, sort_keys=True, default=str)
+    digest = sha256(encoded.encode("utf-8")).hexdigest()[:16]
+    return f"sqlite:{table.name}:hash:{digest}", digest
+
+
 def _read_relationship_table(conn: sqlite3.Connection, table: str) -> list[RelationshipRecord]:
     out: list[RelationshipRecord] = []
     cursor = conn.execute(f"SELECT * FROM {quote_ident(table)}")
@@ -97,19 +127,26 @@ def parse_metadata(value: Any) -> dict[str, Any]:
         return value
     if not value:
         return {}
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
     try:
-        loaded = json.loads(str(value))
-    except (TypeError, json.JSONDecodeError):
+        loaded = json.loads(value if isinstance(value, str) else str(value))
+    except (TypeError, ValueError):
         return {}
     return loaded if isinstance(loaded, dict) else {}
 
 
 def first_existing(data: dict[str, Any], names: list[str]) -> str | None:
+    value = first_existing_value(data, names)
+    return str(value) if value is not None else None
+
+
+def first_existing_value(data: dict[str, Any], names: list[str]) -> Any | None:
     lowered = {key.lower(): key for key in data}
     for name in names:
         key = lowered.get(name.lower())
         if key is not None and data[key] not in (None, ""):
-            return str(data[key])
+            return data[key]
     return None
 
 

@@ -94,22 +94,22 @@ class Neo4jClient:
             SET sf.modified_at = $payload.source_modified_at,
                 sf.hash = $payload.source_file_hash
             MERGE (m)-[:FROM_FILE]->(sf)
-            WITH m
-            UNWIND $people AS person
+            FOREACH (person IN $people |
               MERGE (p:Person {name: person})
               MERGE (m)-[:MENTIONS]->(p)
-            WITH m
-            UNWIND $topics AS topic
+            )
+            FOREACH (topic IN $topics |
               MERGE (t:Topic {name: topic})
               MERGE (m)-[:ABOUT]->(t)
-            WITH m
-            UNWIND $projects AS project
+            )
+            FOREACH (project IN $projects |
               MERGE (p:Project {name: project})
               MERGE (m)-[:RELATED_TO_PROJECT]->(p)
-            WITH m
-            UNWIND $tags AS tag
+            )
+            FOREACH (tag IN $tags |
               MERGE (t:Tag {name: tag})
               MERGE (m)-[:TAGGED_AS]->(t)
+            )
             """,
             payload=payload,
             wing=record.wing,
