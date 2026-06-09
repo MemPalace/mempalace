@@ -874,6 +874,32 @@ def _safe_meta(meta):
     return meta if isinstance(meta, dict) else {}
 
 
+def _is_chroma_compaction_corruption(exc_msg: str) -> bool:
+    msg = exc_msg.lower()
+    return (
+        "not compatible" in msg
+        and "sql type blob" in msg
+        and ("mismatched types" in msg or "rust type" in msg)
+    )
+
+
+def _write_error_payload(exc: BaseException) -> dict:
+    message = str(exc)
+    payload = {
+        "success": False,
+        "error": message,
+        "error_class": type(exc).__name__,
+    }
+    if _is_chroma_compaction_corruption(message):
+        payload["repair_guidance"] = (
+            "Detected Chroma compaction corruption. "
+            "Run `mempalace repair --mode from-sqlite --archive-existing` "
+            "to rebuild from chroma.sqlite3."
+        )
+        payload["hint"] = "Run `mempalace repair --mode from-sqlite --archive-existing`."
+    return payload
+
+
 def _fetch_all_metadata(col, where=None):
     """Paginate col.get() to avoid the 10K silent truncation limit."""
     total = col.count()
@@ -1442,7 +1468,9 @@ def tool_add_drawer(
         existing = col.get(ids=idempotency_probe_ids, include=[])
         if existing.ids:
             return {"success": True, "reason": "already_exists", "drawer_id": drawer_id}
-    except Exception:
+    except Exception as exc:
+        if _is_chroma_compaction_corruption(str(exc)):
+            return _write_error_payload(exc)
         logger.debug("Idempotency pre-check failed for %s", idempotency_probe_ids, exc_info=True)
 
     try:
@@ -1504,7 +1532,7 @@ def tool_add_drawer(
             "chunk_ids": chunk_ids,
         }
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return _write_error_payload(e)
 
 
 def tool_delete_drawer(drawer_id: str):
@@ -1513,31 +1541,31 @@ def tool_delete_drawer(drawer_id: str):
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
-    existing = col.get(ids=[drawer_id])
-    if not existing["ids"]:
-        return {"success": False, "error": f"Drawer not found: {drawer_id}"}
-
-    # Log the deletion with the content being removed for audit trail
-    deleted_content = existing.get("documents", [""])[0] if existing.get("documents") else ""
-    deleted_meta = _safe_meta(
-        existing.get("metadatas", [{}])[0] if existing.get("metadatas") else {}
-    )
-    _wal_log(
-        "delete_drawer",
-        {
-            "drawer_id": drawer_id,
-            "deleted_meta": deleted_meta,
-            "content_preview": deleted_content[:200],
-        },
-    )
-
     try:
+        existing = col.get(ids=[drawer_id])
+        if not existing["ids"]:
+            return {"success": False, "error": f"Drawer not found: {drawer_id}"}
+
+        # Log the deletion with the content being removed for audit trail
+        deleted_content = existing.get("documents", [""])[0] if existing.get("documents") else ""
+        deleted_meta = _safe_meta(
+            existing.get("metadatas", [{}])[0] if existing.get("metadatas") else {}
+        )
+        _wal_log(
+            "delete_drawer",
+            {
+                "drawer_id": drawer_id,
+                "deleted_meta": deleted_meta,
+                "content_preview": deleted_content[:200],
+            },
+        )
+
         col.delete(ids=[drawer_id])
         _metadata_cache = None
         logger.info(f"Deleted drawer: {drawer_id}")
         return {"success": True, "drawer_id": drawer_id}
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return _write_error_payload(e)
 
 
 def tool_sync(project_dir: str = None, wing: str = None, apply: bool = False):
@@ -1734,7 +1762,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
             "room": new_meta.get("room", ""),
         }
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return _write_error_payload(e)
 
 
 # ==================== KNOWLEDGE GRAPH ====================
@@ -1990,7 +2018,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
             "chunk_ids": chunk_ids,
         }
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return _write_error_payload(e)
 
 
 def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):

@@ -1212,6 +1212,32 @@ class TestWriteTools:
         assert result["success"] is False
         assert "not readable" in result["error"]
 
+    def test_add_drawer_surfaces_chroma_compaction_corruption(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        error = (
+            "mismatched types; Rust type 'u64' and corresponding SQL type BLOB are not compatible"
+        )
+
+        class _FakeGetResult:
+            ids = []
+
+        class _FakeCol:
+            def get(self, **kwargs):
+                return _FakeGetResult()
+
+            def upsert(self, **kwargs):
+                raise RuntimeError(error)
+
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: _FakeCol())
+
+        result = mcp_server.tool_add_drawer("w", "r", "content")
+        assert result["success"] is False
+        assert error in result["error"]
+        assert "repair_guidance" in result
+        assert "mempalace repair --mode from-sqlite --archive-existing" in result["repair_guidance"]
+
     def test_add_drawer_shared_header_no_collision(self, monkeypatch, config, palace_path, kg):
         """Documents sharing a >100-char header must get distinct IDs (full-content hash)."""
         _patch_mcp_server(monkeypatch, config, kg)
@@ -1249,6 +1275,55 @@ class TestWriteTools:
 
         result = tool_delete_drawer("nonexistent_drawer")
         assert result["success"] is False
+
+    def test_delete_drawer_surfaces_chroma_compaction_corruption(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        error = (
+            "mismatched types; Rust type 'u64' and corresponding SQL type BLOB are not compatible"
+        )
+
+        class _FakeCol:
+            def get(self, **kwargs):
+                return {"ids": ["drawer_proj_backend_aaa"], "documents": ["old"], "metadatas": [{}]}
+
+            def delete(self, **kwargs):
+                raise RuntimeError(error)
+
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: _FakeCol())
+
+        result = mcp_server.tool_delete_drawer("drawer_proj_backend_aaa")
+        assert result["success"] is False
+        assert error in result["error"]
+        assert result["error_class"] == "RuntimeError"
+        assert "repair_guidance" in result
+
+    def test_update_drawer_surfaces_chroma_compaction_corruption(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        error = (
+            "mismatched types; Rust type 'u64' and corresponding SQL type BLOB are not compatible"
+        )
+
+        class _FakeCol:
+            def get(self, **kwargs):
+                return {
+                    "ids": ["drawer_proj_backend_aaa"],
+                    "documents": ["original"],
+                    "metadatas": [{"wing": "w", "room": "r"}],
+                }
+
+            def update(self, **kwargs):
+                raise RuntimeError(error)
+
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: _FakeCol())
+
+        result = mcp_server.tool_update_drawer("drawer_proj_backend_aaa", content="updated")
+        assert result["success"] is False
+        assert error in result["error"]
+        assert "repair_guidance" in result
 
     def test_check_duplicate_handles_none_metadata(self, monkeypatch, config, kg):
         """tool_check_duplicate must tolerate None entries in the result lists
@@ -2215,6 +2290,29 @@ class TestDiaryTools:
         _client2, col = _get_collection(palace_path)
         del _client2
         assert col.count() == 1
+
+    def test_diary_write_surfaces_chroma_compaction_corruption(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        error = (
+            "mismatched types; Rust type 'u64' and corresponding SQL type BLOB are not compatible"
+        )
+
+        class _FakeCol:
+            def add(self, **kwargs):
+                raise RuntimeError(error)
+
+            def get(self, **kwargs):
+                raise AssertionError("insert path should fail before readback")
+
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: _FakeCol())
+
+        result = mcp_server.tool_diary_write(agent_name="TestAgent", entry="corrupt")
+        assert result["success"] is False
+        assert error in result["error"]
+        assert result["error_class"] == "RuntimeError"
+        assert "repair_guidance" in result
 
     def test_diary_write_oversized_entry_chunked(self, monkeypatch, config, palace_path, kg):
         """Regression for #1539: an entry far above CHUNK_SIZE must be
