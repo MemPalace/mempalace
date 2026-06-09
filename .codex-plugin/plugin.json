@@ -18,12 +18,7 @@
     "search"
   ],
   "skills": "./skills/",
-  "hooks": "./hooks.json",
-  "mcpServers": {
-    "mempalace": {
-      "command": "mempalace-mcp"
-    }
-  },
+  "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "MemPalace",
     "shortDescription": "AI memory system for Codex",
