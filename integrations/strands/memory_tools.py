@@ -104,7 +104,7 @@ def mp_kb_search(query: str, wing: str = "default") -> str:
 
     Args:
         query: Natural language search query.
-        wing: Knowledge base wing to search (default: "default").
+        wing: Knowledge base wing to search (default: \"default\").
     """
     searcher = _get_searcher()
     if not searcher:
@@ -133,9 +133,9 @@ def mp_kb_search(query: str, wing: str = "default") -> str:
         text = hit.get("text", "").strip()
         source = hit.get("source_file", "unknown")
         if text:
-            passages.append(f"[{i}] ({source}):\n{text}")
+            passages.append(f"[{i}] ({source}):\\n{text}")
 
-    return "\n\n---\n\n".join(passages)
+    return "\\n\\n---\\n\\n".join(passages)
 
 
 @tool(context=True)
@@ -146,13 +146,14 @@ def mp_memory_recall(query: str, tool_context: ToolContext) -> str:
     or when the user refers to something discussed previously.
 
     Args:
-        query: What to recall (e.g. "preferences", "last discussion").
+        query: What to recall (e.g. \"preferences\", \"last discussion\").
     """
     searcher = _get_searcher()
     if not searcher:
         return "Memory unavailable (mempalace not installed)."
 
-    user_id = tool_context.invocation_state.get("user_id", "default")
+    invocation_state = getattr(tool_context, "invocation_state", None) or {}
+    user_id = invocation_state.get("user_id") or "default"
 
     try:
         result = searcher(
@@ -177,9 +178,9 @@ def mp_memory_recall(query: str, tool_context: ToolContext) -> str:
     for hit in hits:
         text = hit.get("text", "").strip()
         if text:
-            memories.append(f"• {text}")
+            memories.append(f"\u2022 {text}")
 
-    return "From memory:\n" + "\n".join(memories)
+    return "From memory:\\n" + "\\n".join(memories)
 
 
 @tool(context=True)
@@ -196,10 +197,11 @@ def mp_memory_store(fact: str, tool_context: ToolContext) -> str:
         fact: Concise statement to remember (one sentence).
     """
     col = _get_collection()
-    if not col:
-        return "Memory unavailable — fact not stored."
+    if col is False:
+        return "Memory unavailable \u2014 fact not stored."
 
-    user_id = tool_context.invocation_state.get("user_id", "default")
+    invocation_state = getattr(tool_context, "invocation_state", None) or {}
+    user_id = invocation_state.get("user_id") or "default"
 
     try:
         ts = datetime.now(timezone.utc).isoformat()
@@ -224,5 +226,5 @@ def mp_memory_store(fact: str, tool_context: ToolContext) -> str:
         return f"Failed to store memory: {exc}"
 
 
-# Barrel export — add to your Agent's tools list.
+# Barrel export \u2014 add to your Agent's tools list.
 MEMORY_TOOLS = [mp_kb_search, mp_memory_recall, mp_memory_store]
