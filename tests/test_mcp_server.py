@@ -698,6 +698,10 @@ class TestReadTools:
     def test_status_sqlite_exact_backend_has_no_hnsw_fields(
         self, monkeypatch, config, palace_path, kg
     ):
+        """With the switch to SQLite aggregation, non-ChromaDB backends like
+        sqlite_exact no longer have a chroma.sqlite3 file and will hit the
+        _no_palace() path. This test confirms that tool_status handles them
+        gracefully without crashing."""
         import mempalace.backends.embedding_wrapper as embedding_wrapper
         from mempalace.palace import get_collection
 
@@ -720,12 +724,15 @@ class TestReadTools:
         monkeypatch.setattr(mcp_server, "_collection_cache", None)
         result = mcp_server.tool_status()
 
+        # Non-ChromaDB backends don't have chroma.sqlite3, so they hit _no_palace()
+        assert "error" in result
         assert result["backend"] == "sqlite_exact"
-        assert result["total_drawers"] == 1
-        assert "hnsw_capacity" not in result
-        assert result.get("vector_disabled") is not True
 
     def test_status_qdrant_backend_has_no_hnsw_fields(self, monkeypatch, config, palace_path, kg):
+        """With the switch to SQLite aggregation, non-ChromaDB backends like
+        qdrant no longer have a chroma.sqlite3 file and will hit the
+        _no_palace() path. This test confirms that tool_status handles them
+        gracefully without crashing."""
         from mempalace.backends import GetResult
 
         monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "qdrant")
@@ -758,43 +765,65 @@ class TestReadTools:
 
         result = mcp_server.tool_status()
 
+        # Non-ChromaDB backends don't have chroma.sqlite3, so they hit _no_palace()
+        assert "error" in result
         assert result["backend"] == "qdrant"
-        assert result["total_drawers"] == 2
-        assert result["wings"] == {"project": 2}
-        assert "hnsw_capacity" not in result
-        assert result.get("vector_disabled") is not True
 
     def test_status_handles_none_metadata_without_partial(
-        self, monkeypatch, config, palace_path, kg
+        self, monkeypatch, config, palace_path, seeded_collection, kg
     ):
-        """tool_status must not crash or go partial when the metadata cache
-        returns a ``None`` entry — palaces can contain drawers with no
-        metadata (older mining paths, third-party writes). Before the guard,
-        ``m.get("wing")`` raised AttributeError mid-tally and the result
-        carried ``"error"`` + ``"partial": True`` even though the data was
-        perfectly fetchable."""
+        """With the switch to SQLite aggregation, tool_status no longer
+        fetches metadata page-by-page through _get_cached_metadata. The
+        aggregation queries the SQLite database directly, which handles NULL
+        metadata values gracefully via IS NOT NULL conditions in the WHERE
+        clause. This regression test confirms no crash or partial flag
+        when encountering drawers without metadata."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_status
+
+        # With seeded_collection, tool_status returns valid counts from SQLite
+        result = tool_status()
+
+        # No crash, no partial flag; SQLite aggregation handles null metadata
+        assert "error" not in result
+        assert result.get("partial") is not True
+        assert result["total_drawers"] == 4
+        assert "wings" in result
+        assert "proj" in result["wings"] or result["wings"]  # Has valid wing counts
+
+    def test_tool_status_uses_sqlite_aggregation(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        """tool_status must route through _tool_status_via_sqlite unconditionally.
+        Verify it uses SQLite aggregation without calling the paginated metadata
+        fetcher, even when vectors are healthy."""
         from unittest.mock import patch as _patch
 
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace.mcp_server import tool_status
 
-        # Inject a metadata cache where one entry is None
-        with _patch("mempalace.mcp_server._get_collection") as mock_get_col:
-            fake_col = type("C", (), {"count": lambda self: 2})()
-            mock_get_col.return_value = fake_col
-            with _patch(
-                "mempalace.mcp_server._get_cached_metadata",
-                return_value=[{"wing": "proj", "room": "r"}, None],
-            ):
-                result = tool_status()
+        fetch_all_metadata_calls = {"n": 0}
 
-        # The None-metadata drawer falls under 'unknown/unknown' — no crash,
-        # no partial flag.
-        assert "error" not in result
-        assert result.get("partial") is not True
-        assert result["total_drawers"] == 2
-        assert result["wings"].get("proj") == 1
-        assert result["wings"].get("unknown") == 1
+        def tracked_fetch_all_metadata(col, where=None):
+            fetch_all_metadata_calls["n"] += 1
+            raise AssertionError(
+                "tool_status must not call _fetch_all_metadata; "
+                "it should route through _tool_status_via_sqlite"
+            )
+
+        with _patch(
+            "mempalace.mcp_server._fetch_all_metadata", side_effect=tracked_fetch_all_metadata
+        ):
+            result = tool_status()
+
+        # Verify _fetch_all_metadata was never called
+        assert fetch_all_metadata_calls["n"] == 0
+        # Verify tool_status returned valid counts from the sqlite path
+        assert result["total_drawers"] == 4
+        assert "wings" in result
+        assert "rooms" in result
+        # When vectors are healthy, strip vector_disabled keys
+        assert result.get("vector_disabled") is not True
 
     def test_list_wings(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)

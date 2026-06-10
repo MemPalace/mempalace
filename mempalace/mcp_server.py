@@ -1002,45 +1002,15 @@ def _tool_status_via_sqlite() -> dict:
 
 
 def tool_status():
-    # Run the safe sqlite/pickle probe before we touch chromadb. In the
-    # #1222 failure mode, opening the persistent client to call .count()
-    # can segfault — short-circuit to a pure-sqlite path when divergence
-    # is detected so status stays reachable.
-    db_exists = _backend_db_exists()
     _refresh_vector_disabled_flag()
 
-    if _vector_disabled:
-        return _tool_status_via_sqlite()
+    result = _tool_status_via_sqlite()
 
-    # Use create=True only when a palace DB already exists on disk -- this
-    # bootstraps the ChromaDB collection on a valid-but-empty palace without
-    # accidentally creating a palace in a non-existent directory (#830).
-    col = _get_collection(create=db_exists)
-    if not col:
-        return _collection_error_or_no_palace()
-    count = col.count()
-    wings = {}
-    rooms = {}
-    result = {
-        "total_drawers": count,
-        "wings": wings,
-        "rooms": rooms,
-        "protocol": PALACE_PROTOCOL,
-        "aaak_dialect": AAAK_SPEC,
-        "backend": _selected_backend_name(),
-    }
-    try:
-        all_meta = _get_cached_metadata(col)
-        for m in all_meta:
-            m = m or {}
-            w = m.get("wing", "unknown")
-            r = m.get("room", "unknown")
-            wings[w] = wings.get(w, 0) + 1
-            rooms[r] = rooms.get(r, 0) + 1
-    except Exception as e:
-        logger.exception("tool_status metadata fetch failed")
-        result["error"] = str(e)
-        result["partial"] = True
+    if not _vector_disabled:
+        result.pop("vector_disabled", None)
+        result.pop("vector_disabled_reason", None)
+        result["backend"] = _selected_backend_name()
+
     return result
 
 
