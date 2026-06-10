@@ -1467,6 +1467,141 @@ def test_quarantine_invalid_hnsw_metadata_keeps_consistent_missing_dimensionalit
     assert seg.exists()
 
 
+def test_quarantine_patches_recoverable_dim_none_from_sqlite(tmp_path):
+    """When dim-None pickle is recoverable, quarantine_invalid_hnsw_metadata
+    should read the dimension from chroma.sqlite3 and patch the pickle in place.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    seg = palace / "abcd-1234-5678"
+    seg.mkdir()
+    (seg / "data_level0.bin").write_bytes(b"x" * 2048)
+    (seg / "link_lists.bin").write_bytes(b"x" * 128)
+    with open(seg / "index_metadata.pickle", "wb") as f:
+        pickle.dump(
+            {
+                "dimensionality": None,
+                "total_elements_added": 2,
+                "max_seq_id": None,
+                "id_to_label": {"a": 1, "b": 2},
+                "label_to_id": {1: "a", 2: "b"},
+                "id_to_seq_id": {},
+            },
+            f,
+        )
+
+    # Create a mock chroma.sqlite3 with collections.dimension = 384
+    db_path = palace / "chroma.sqlite3"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            """
+            CREATE TABLE collections (
+                id TEXT PRIMARY KEY,
+                name TEXT,
+                dimension INTEGER
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE segments (
+                id TEXT PRIMARY KEY,
+                collection TEXT,
+                scope TEXT,
+                FOREIGN KEY (collection) REFERENCES collections(id)
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO collections (id, name, dimension) VALUES (?, ?, ?)",
+            ("coll-1", "test_collection", 384),
+        )
+        conn.execute(
+            "INSERT INTO segments (id, collection, scope) VALUES (?, ?, ?)",
+            ("abcd-1234-5678", "coll-1", "VECTOR"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    # Should not quarantine; segment should exist
+    assert moved == []
+    assert seg.exists()
+
+    # Verify the pickle was patched
+    with open(seg / "index_metadata.pickle", "rb") as f:
+        patched = pickle.load(f)
+    assert patched["dimensionality"] == 384
+
+
+def test_quarantine_keeps_recoverable_when_sqlite_dim_zero(tmp_path):
+    """When dim-None pickle is recoverable but chroma.sqlite3 has dimension=0 or None,
+    the segment is still kept (not quarantined) because it's structurally sound.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    seg = palace / "abcd-1234-5678"
+    seg.mkdir()
+    (seg / "data_level0.bin").write_bytes(b"x" * 2048)
+    (seg / "link_lists.bin").write_bytes(b"x" * 128)
+    with open(seg / "index_metadata.pickle", "wb") as f:
+        pickle.dump(
+            {
+                "dimensionality": None,
+                "total_elements_added": 2,
+                "max_seq_id": None,
+                "id_to_label": {"a": 1, "b": 2},
+                "label_to_id": {1: "a", 2: "b"},
+                "id_to_seq_id": {},
+            },
+            f,
+        )
+
+    # Create a mock chroma.sqlite3 with collections.dimension = 0 or None
+    db_path = palace / "chroma.sqlite3"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            """
+            CREATE TABLE collections (
+                id TEXT PRIMARY KEY,
+                name TEXT,
+                dimension INTEGER
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE segments (
+                id TEXT PRIMARY KEY,
+                collection TEXT,
+                scope TEXT,
+                FOREIGN KEY (collection) REFERENCES collections(id)
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO collections (id, name, dimension) VALUES (?, ?, ?)",
+            ("coll-1", "test_collection", 0),  # dimension=0, not valid
+        )
+        conn.execute(
+            "INSERT INTO segments (id, collection, scope) VALUES (?, ?, ?)",
+            ("abcd-1234-5678", "coll-1", "VECTOR"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    # Should still not quarantine because payload is structurally sound
+    assert moved == []
+    assert seg.exists()
+
+
 def test_quarantine_invalid_hnsw_metadata_keeps_post_deletion_missing_dimensionality(tmp_path):
     """A deleted-from segment has total_elements_added > live label count (the
     counter is monotonic); that dim-None shape is recoverable, not corruption (#1710).

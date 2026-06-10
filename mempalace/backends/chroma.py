@@ -901,6 +901,63 @@ def _persisted_metadata_fields(obj: object) -> tuple[object, object]:
     )
 
 
+def _read_collection_dim_from_sqlite(palace_path: str, seg_dir: str) -> Optional[int]:
+    """Return the embedding dimension for the segment's collection from chroma.sqlite3.
+
+    Joins segments → collections → embeddings to find the vector dimension
+    stored as the byte-width of data_level0.bin divided by the HNSW element
+    size, OR reads the EmbedderIdentity sidecar if present.  Falls back to
+    None when the DB is absent or the segment UUID cannot be resolved.
+    """
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return None
+    seg_uuid = os.path.basename(seg_dir)
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            # ChromaDB stores dimension in the collections table (added in 1.x)
+            row = conn.execute(
+                """
+                SELECT c.dimension
+                FROM collections c
+                JOIN segments s ON s.collection = c.id
+                WHERE s.id = ?
+                LIMIT 1
+                """,
+                (seg_uuid,),
+            ).fetchone()
+            if row and row[0] is not None and int(row[0]) > 0:
+                return int(row[0])
+        finally:
+            conn.close()
+    except Exception:
+        logger.debug("_read_collection_dim_from_sqlite failed for %s", seg_dir, exc_info=True)
+    return None
+
+
+def _patch_dim_none_pickle(meta_path: str, dim: int) -> bool:
+    """Rewrite index_metadata.pickle with dimensionality set to ``dim``.
+
+    Writes atomically via a tmp file.  Returns True on success.
+    """
+    try:
+        with open(meta_path, "rb") as f:
+            data = pickle.load(f)  # noqa: S301 — trusted own-pickle
+        if isinstance(data, dict):
+            data["dimensionality"] = dim
+        else:
+            setattr(data, "dimensionality", dim)
+        tmp = meta_path + ".tmp"
+        with open(tmp, "wb") as f:
+            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, meta_path)
+        return True
+    except Exception:
+        logger.debug("_patch_dim_none_pickle failed for %s", meta_path, exc_info=True)
+        return False
+
+
 def _missing_dimensionality_appears_recoverable(
     persisted: object, id_to_label: dict, seg_dir: str
 ) -> bool:
@@ -997,17 +1054,30 @@ def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
                     reason = f"invalid id_to_label type {type(id_to_label).__name__}"
                 else:
                     has_labels = bool(id_to_label)
-                    if (
-                        has_labels
-                        and dimensionality is None
-                        and not _missing_dimensionality_appears_recoverable(
+                    if has_labels and dimensionality is None:
+                        if _missing_dimensionality_appears_recoverable(
                             persisted, id_to_label, seg_dir
-                        )
-                    ):
-                        reason = (
-                            "labels present but dimensionality is missing or invalid "
-                            f"({dimensionality!r})"
-                        )
+                        ):
+                            # Payload is structurally sound — chromadb 1.5.8 flush
+                            # left dim=None.  Recover from chroma.sqlite3 instead
+                            # of quarantining the only copy of those vectors.
+                            recovered_dim = _read_collection_dim_from_sqlite(palace_path, seg_dir)
+                            if recovered_dim is not None:
+                                if _patch_dim_none_pickle(meta_path, recovered_dim):
+                                    logger.warning(
+                                        "Patched dim-None pickle in %s: set dimensionality=%d "
+                                        "(chromadb 1.5.8 checkpoint bug — vectors preserved)",
+                                        seg_dir,
+                                        recovered_dim,
+                                    )
+                                    continue
+                            # dim not in sqlite or patch failed — segment is still recoverable,
+                            # so keep it (don't set reason)
+                        else:
+                            reason = (
+                                "labels present but dimensionality is missing or invalid "
+                                f"({dimensionality!r})"
+                            )
                     elif (
                         has_labels
                         and dimensionality is not None
