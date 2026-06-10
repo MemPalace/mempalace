@@ -1051,9 +1051,10 @@ def tool_status():
 PALACE_PROTOCOL = """IMPORTANT — MemPalace Memory Protocol:
 1. ON WAKE-UP: Call mempalace_status to load palace overview + AAAK spec.
 2. BEFORE RESPONDING about any person, project, or past event: call mempalace_kg_query or mempalace_search FIRST. Never guess — verify.
-3. IF UNSURE about a fact (name, gender, age, relationship): say "let me check" and query the palace. Wrong is worse than slow.
-4. AFTER EACH SESSION: call mempalace_diary_write to record what happened, what you learned, what matters.
-5. WHEN FACTS CHANGE: call mempalace_kg_invalidate on the old fact, mempalace_kg_add for the new one.
+3. FOR FACTS YOU KNOW EXIST BUT CAN'T RECALL EXACTLY: use mempalace_kg_search to find triples by semantic similarity.
+4. IF UNSURE about a fact (name, gender, age, relationship): say "let me check" and query the palace. Wrong is worse than slow.
+5. AFTER EACH SESSION: call mempalace_diary_write to record what happened, what you learned, what matters.
+6. WHEN FACTS CHANGE: call mempalace_kg_invalidate on the old fact, mempalace_kg_add for the new one.
 
 This protocol ensures the AI KNOWS before it speaks. Storage is not memory — but storage + this protocol = memory."""
 
@@ -1990,6 +1991,27 @@ def tool_kg_query(entity: str, as_of: str = None, direction: str = "both"):
     return {"entity": entity, "as_of": as_of, "facts": results, "count": len(results)}
 
 
+def _kg_synthetic_doc(subject: str, predicate: str, obj: str, triple_id: str) -> tuple[str, dict]:
+    """Create a synthetic document for KG triple indexing in ChromaDB.
+
+    Converts a triple into searchable text + metadata for semantic search.
+    The text is a simple humanized form: 'Subject predicate_name Object'.
+    Metadata preserves the exact KG identifiers for reconstruction.
+    """
+    pred_human = predicate.replace("_", " ")
+    doc = f"{subject} {pred_human} {obj}"
+    meta = {
+        "wing": "kg",
+        "room": "triples",
+        "ingest_mode": "kg",
+        "kg_triple_id": triple_id,
+        "kg_subject": subject,
+        "kg_predicate": predicate,
+        "kg_object": obj,
+    }
+    return doc, meta
+
+
 def tool_kg_add(
     subject: str,
     predicate: str,
@@ -2044,6 +2066,16 @@ def tool_kg_add(
             source_drawer_id=source_drawer_id,
         )
     )
+
+    # Index triple in ChromaDB for semantic search.
+    try:
+        col = _get_collection(create=True)
+        if col:
+            doc, meta = _kg_synthetic_doc(subject, predicate, object, triple_id)
+            col.upsert(documents=[doc], ids=[triple_id], metadatas=[meta])
+    except Exception as _kg_idx_err:
+        logger.warning("kg_add: failed to index triple in ChromaDB: %s", _kg_idx_err)
+
     return {"success": True, "triple_id": triple_id, "fact": f"{subject} → {predicate} → {object}"}
 
 
@@ -2099,6 +2131,60 @@ def tool_kg_timeline(entity: str = None):
 def tool_kg_stats():
     """Knowledge graph overview: entities, triples, relationship types."""
     return _call_kg(lambda kg: kg.stats())
+
+
+def tool_kg_search(query: str, limit: int = 10):
+    """Semantic search over knowledge graph triples.
+
+    Use when you know a fact exists but can't remember the exact entity name
+    or relationship type. Returns matching triples with similarity scores.
+
+    Args:
+        query: Natural language search query (e.g., "who did swimming", "Alice parent")
+        limit: Maximum number of results to return (1-50, default 10)
+
+    Returns:
+        Dict with query, result count, and matched triples with similarity scores.
+    """
+    try:
+        sanitized = sanitize_query(query)
+        clean_query = sanitized.get("clean_query", "")
+        if not clean_query:
+            return {"error": "Query is empty after sanitization"}
+        limit = max(1, min(50, int(limit)))
+    except (ValueError, TypeError) as e:
+        return {"error": f"Invalid limit: {e}"}
+
+    try:
+        results = search_memories(
+            clean_query,
+            palace_path=_config.palace_path,
+            wing="kg",
+            room="triples",
+            n_results=limit,
+        )
+    except Exception as e:
+        return {"error": f"Search failed: {str(e)}", "results": []}
+
+    if "error" in results:
+        return results
+
+    hits = []
+    for result in results.get("results", []):
+        # Each result is a dict with text, wing, room, similarity, distance, etc.
+        # KG triple documents have the format: "subject predicate_human object"
+        # and are tagged with wing="kg", room="triples" in the index.
+        if result.get("wing") == "kg" and result.get("room") == "triples":
+            text = result.get("text", "")
+            hits.append(
+                {
+                    "text": text,
+                    "similarity": result.get("similarity", 0),
+                    "distance": result.get("distance", 0),
+                }
+            )
+
+    return {"query": clean_query, "results": hits, "count": len(hits)}
 
 
 # ==================== AGENT DIARY ====================
@@ -2630,6 +2716,27 @@ TOOLS = {
         "description": "Knowledge graph overview: entities, triples, current vs expired facts, relationship types.",
         "input_schema": {"type": "object", "properties": {}},
         "handler": tool_kg_stats,
+    },
+    "mempalace_kg_search": {
+        "description": "Semantic search over knowledge graph triples. Use when you know a fact exists but can't remember the exact entity name.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Semantic search query",
+                    "maxLength": 250,
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max results (default 10)",
+                    "minimum": 1,
+                    "maximum": 50,
+                },
+            },
+            "required": ["query"],
+        },
+        "handler": tool_kg_search,
     },
     "mempalace_traverse": {
         "description": "Walk the palace graph from a room. Shows connected ideas across wings — the tunnels. Like following a thread through the palace: start at 'chromadb-setup' in wing_code, discover it connects to wing_myproject (planning) and wing_user (feelings about it).",

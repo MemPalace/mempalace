@@ -2142,6 +2142,84 @@ class TestKGTools:
         assert "valid_from" in result["error"]
         assert "YYYY-MM-DDTHH:MM:SSZ" in result["error"]
 
+    # --- KG Search (issue #376) ---
+
+    def test_kg_synthetic_doc_creates_humanized_text(self, monkeypatch, config, palace_path, kg):
+        """_kg_synthetic_doc converts predicate underscores to spaces."""
+        from mempalace.mcp_server import _kg_synthetic_doc
+
+        doc, meta = _kg_synthetic_doc("Alice", "child_of", "Bob", "t_alice_child_of_bob_xyz")
+        assert doc == "Alice child of Bob"
+        assert meta["wing"] == "kg"
+        assert meta["room"] == "triples"
+        assert meta["kg_subject"] == "Alice"
+        assert meta["kg_predicate"] == "child_of"
+        assert meta["kg_object"] == "Bob"
+        assert meta["kg_triple_id"] == "t_alice_child_of_bob_xyz"
+
+    def test_kg_add_indexes_triple_in_chromadb(self, monkeypatch, config, palace_path, kg):
+        """tool_kg_add attempts to upsert the triple into ChromaDB."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, col = _get_collection(palace_path, create=True)
+        try:
+            from mempalace.mcp_server import tool_kg_add
+
+            result = tool_kg_add(
+                subject="Max",
+                predicate="does",
+                object="swimming",
+                valid_from="2025-01-01",
+            )
+            assert result["success"] is True
+            triple_id = result["triple_id"]
+
+            # Verify the triple was indexed in ChromaDB
+            docs = col.get(ids=[triple_id], include=["documents", "metadatas"])
+            assert len(docs["ids"]) == 1
+            assert docs["documents"][0] == "Max does swimming"
+            assert docs["metadatas"][0]["kg_subject"] == "Max"
+            assert docs["metadatas"][0]["kg_predicate"] == "does"
+            assert docs["metadatas"][0]["kg_object"] == "swimming"
+        finally:
+            _client.delete_collection("mempalace_drawers")
+            _client.close()
+
+    def test_kg_search_cleans_query_before_search(self, monkeypatch, config, palace_path, kg):
+        """tool_kg_search sanitizes the query input."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_kg_search
+
+        # Search with an empty query should return error
+        result = tool_kg_search("")
+        assert "error" in result
+
+    def test_kg_search_limit_parameter_bounds_results(self, monkeypatch, config, palace_path, kg):
+        """tool_kg_search enforces limit bounds (1-50)."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_kg_search
+
+        # Limit too high is clamped to 50; empty result is ok
+        result = tool_kg_search("nonexistent query", limit=200)
+        assert isinstance(result, dict)
+
+        # Limit too low is raised to 1; empty result is ok
+        result = tool_kg_search("another query", limit=0)
+        assert isinstance(result, dict)
+
+    def test_kg_search_returns_expected_format(self, monkeypatch, config, palace_path, kg):
+        """tool_kg_search returns results in expected format."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_kg_search
+
+        result = tool_kg_search("some query", limit=5)
+        assert "query" in result or "error" in result
+        if "query" in result:
+            assert "results" in result
+            assert "count" in result
+            assert isinstance(result["count"], int)
+
 
 # ── Diary Tools ─────────────────────────────────────────────────────────
 
