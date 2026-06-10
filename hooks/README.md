@@ -46,6 +46,24 @@ Make them executable:
 chmod +x hooks/mempal_save_hook.sh hooks/mempal_precompact_hook.sh
 ```
 
+## Install — Antigravity (Google)
+
+The Antigravity integration lives in its own subdirectory because the
+wire format (camelCase JSON, `injectSteps[]` output) and event names
+(`Stop`, `PreInvocation`) are Antigravity-specific. Use the dedicated
+installer:
+
+```bash
+bash hooks/antigravity/install.sh
+```
+
+This installs to `~/.gemini/config/plugins/mempalace/`, registers the
+MCP server, ships the `mempalace` skill, and wires the Stop +
+PreInvocation hooks. See [`hooks/antigravity/README.md`](antigravity/README.md)
+for the full guide and [`hooks/antigravity/INVESTIGATION.md`](antigravity/INVESTIGATION.md)
+for the source-of-truth audit of which Antigravity surfaces the
+integration uses.
+
 ## Install — Codex CLI (OpenAI)
 
 Add to `.codex/hooks.json`:
@@ -73,6 +91,26 @@ Edit `mempal_save_hook.sh` to change:
 - **`STATE_DIR`** — Where hook state is stored (defaults to `~/.mempalace/hook_state/`)
 - **`MEMPAL_DIR`** — Optional **project directory** (code, notes, docs) to also mine on each save trigger, with `--mode projects`. The hook ALWAYS mines the active conversation transcript automatically with `--mode convos` — `MEMPAL_DIR` is purely additive, never an override. Leave blank if you don't want to ingest project files.
 - **`MEMPALACE_PYTHON`** — Optional env var. Python interpreter with mempalace + chromadb installed. Auto-detects: `MEMPALACE_PYTHON` env var → repo `venv/bin/python3` → system `python3`. Set this if your venv is in a non-standard location.
+
+### Disabling Auto-Save (Silent Mode)
+
+To keep hooks installed but disable auto-save blocking entirely, set `hooks.auto_save` to `false` in your config:
+
+**Option 1 — config file** (`~/.mempalace/config.json`):
+```json
+{
+  "hooks": {
+    "auto_save": false
+  }
+}
+```
+
+**Option 2 — environment variable:**
+```bash
+export MEMPALACE_HOOKS_AUTO_SAVE=false
+```
+
+When disabled, both the stop hook and precompact hook pass through without blocking. You can still save manually with `mempalace mine <dir> --mode convos`.
 
 ### mempalace CLI
 

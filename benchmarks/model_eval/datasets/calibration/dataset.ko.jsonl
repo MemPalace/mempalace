@@ -1,0 +1,20 @@
+{"id": "cal_001", "text": "이 Python 파일의 들여쓰기를 수정해 주실 수 있나요?", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_002", "text": "내일 회의는 몇 시에 시작하나요?", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_003", "text": "예보에 따르면 주말 내내 비가 올 것으로 보입니다.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_004", "text": "정말 놀라워요!", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_005", "text": "안녕하세요, Bramble.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_006", "text": "테스트를 자세한 출력으로 실행하세요.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_007", "text": "잠깐 통화 가능하신가요?", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_008", "text": "조심해!", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_009", "text": "여러분, 좋은 아침입니다.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_010", "text": "어제 분기 결산을 마쳤습니다.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_011", "text": "AR 장기화 보고서를 보여주세요.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_012", "text": "왜 aarch64에서 빌드가 실패했나요?", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_013", "text": "안녕하세요.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_014", "text": "그 배포는 재앙이었어!", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_015", "text": "수분 매개자 조사에서 토종 벌 7종이 확인되었다.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_016", "text": "원격 저장소에서 오래된 브랜치를 삭제하세요.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_017", "text": "안녕, Aria.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_018", "text": "와, 지연 시간 감소폭이 엄청나네!", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_019", "text": "세 번째 논문을 요약해 주실 수 있나요?", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_020", "text": "계정과목표는 이제 4자리 계층 구조를 사용합니다.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}

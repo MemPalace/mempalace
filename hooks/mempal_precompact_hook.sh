@@ -71,6 +71,29 @@ if [ -z "$MEMPAL_PYTHON_BIN" ] || [ ! -x "$MEMPAL_PYTHON_BIN" ]; then
     MEMPAL_PYTHON_BIN="$(command -v python3 2>/dev/null || echo python3)"
 fi
 
+# ── Silent mode / opt-out ──────────────────────────────────────────────
+# Set MEMPALACE_HOOKS_AUTO_SAVE=false to disable auto-save blocking entirely.
+if [ -n "$MEMPALACE_HOOKS_AUTO_SAVE" ]; then
+    case "$MEMPALACE_HOOKS_AUTO_SAVE" in
+        false|0|no) echo "{}"; exit 0 ;;
+    esac
+else
+    CONFIG_FILE="$HOME/.mempalace/config.json"
+    if [ -f "$CONFIG_FILE" ]; then
+        AUTO_SAVE=$("$MEMPAL_PYTHON_BIN" -c "
+import json, sys
+try:
+    cfg = json.load(open(sys.argv[1]))
+    print(str(cfg.get('hooks', {}).get('auto_save', True)).lower())
+except Exception: print('true')
+" "$CONFIG_FILE" 2>/dev/null)
+        if [ "$AUTO_SAVE" = "false" ]; then
+            echo "{}"
+            exit 0
+        fi
+    fi
+fi
+
 # Read JSON input from stdin
 INPUT=$(cat)
 

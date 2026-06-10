@@ -85,6 +85,31 @@ def _yn(prompt, default="y"):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _ask_embedding_model() -> str:
+    """Return ``"embeddinggemma"`` (multilingual, default) or ``"minilm"``.
+
+    Defaulting to multilingual: the recall promise breaks for non-EN content
+    under the English-only MiniLM default — cross-lingual cosine similarity
+    collapses to roughly 0.35 (essentially random). Multilingual is the safe
+    default; English-only is offered as an opt-down for users on slow links
+    or who really only ever store English content.
+    """
+    _header("Language support")
+    print("""
+  MemPalace embeds your memories into a vector space so the AI can find
+  related content later. The default model supports 100+ languages,
+  including non-Latin scripts (CJK, Cyrillic, Arabic, Devanagari).
+
+    Multilingual: ~300 MB one-time download, works across all languages.
+    English-only: ~30 MB, smaller and faster, but cross-lingual recall
+                  is poor (a Russian memory and its English translation
+                  won't match each other).
+""")
+    if _yn("  Use the multilingual embedding model?", default="y"):
+        return "embeddinggemma"
+    return "minilm"
+
+
 def _ask_mode() -> str:
     _header("Welcome to MemPalace")
     print("""
@@ -374,6 +399,13 @@ def run_onboarding(
     # Step 1: Mode
     mode = _ask_mode()
 
+    # Step 1b: Embedding model (asked once on first run; choice persists in
+    # config.json so future loads don't re-prompt).
+    embedding_model = _ask_embedding_model()
+    from .config import MempalaceConfig
+
+    MempalaceConfig(config_dir=config_dir).set_embedding_model(embedding_model)
+
     # Step 2: People
     people, aliases = _ask_people(mode)
 
@@ -461,12 +493,17 @@ def quick_setup(
     projects: list = None,
     aliases: dict = None,
     config_dir: Path = None,
+    embedding_model: str = None,
 ) -> EntityRegistry:
     """
     Programmatic setup without interactive prompts.
     Used in tests and benchmark scripts.
 
     people: list of dicts {"name": str, "relationship": str, "context": str}
+    embedding_model: optional ``"minilm"`` or ``"embeddinggemma"``. When set,
+        writes the choice to ``config.json`` so subsequent runs pick the
+        right EF. When omitted, the config stays untouched and the hard
+        default (``"minilm"``) governs.
     """
     registry = EntityRegistry.load(config_dir)
     registry.seed(
@@ -475,6 +512,10 @@ def quick_setup(
         projects=projects or [],
         aliases=aliases or {},
     )
+    if embedding_model is not None:
+        from .config import MempalaceConfig
+
+        MempalaceConfig(config_dir=config_dir).set_embedding_model(embedding_model)
     return registry
 
 

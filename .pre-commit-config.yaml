@@ -4,7 +4,7 @@ repos:
     # ([project.optional-dependencies].dev / [dependency-groups].dev) and
     # .github/workflows/ci.yml. A different ruff here produces different
     # formatter output than CI and breaks `ruff format --check` in lint.
-    rev: v0.15.9
+    rev: v0.15.14
     hooks:
       - id: ruff
         args: [--fix]

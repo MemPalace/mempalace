@@ -9,6 +9,7 @@ import chromadb
 import pytest
 import yaml
 
+from mempalace.config import normalize_wing_name
 from mempalace.miner import detect_room, load_config, mine, scan_project, status
 from mempalace.palace import NORMALIZE_VERSION, file_already_mined, prefetch_mined_set
 
@@ -257,7 +258,12 @@ def test_load_config_uses_defaults_when_yaml_missing():
         assert isinstance(config, dict)
         assert "wing" in config
         assert "rooms" in config
-        assert config["wing"] == project_root.name
+        # The default wing is the normalized dirname, not the raw name: temp
+        # dir names can contain leading/trailing '_' (tempfile's alphabet
+        # includes it), which normalize_wing_name strips. Comparing to the raw
+        # name was flaky across platforms (it only passed when the random name
+        # had no separators).
+        assert config["wing"] == normalize_wing_name(project_root.name)
     finally:
         shutil.rmtree(tmpdir)
 
@@ -808,6 +814,133 @@ def test_status_handles_none_metadata_without_crash(tmp_path, capsys):
     # alongside the real wing=proj row.
     assert "WING: ?" in out
     assert "WING: proj" in out
+
+
+def test_status_does_not_cold_load_vector_index(palace_path, seeded_collection, capsys):
+    """#1681 regression: a healthy ``status`` must NOT open the collection.
+
+    Opening it cold-loads the HNSW vector index, which costs ~60s of CPU per
+    call on large palaces. The counts come from chroma.sqlite3 instead. If
+    anyone reroutes the happy path back through the vector index, the sentinel
+    patched over ``_open_collection_or_explain`` fires. (Revert ``status`` to
+    its pre-fix body and this test fails loudly — that's the regression it
+    guards.)
+    """
+    from unittest.mock import MagicMock, patch
+
+    sentinel = MagicMock(side_effect=AssertionError("status cold-loaded the vector index"))
+    with patch("mempalace.miner._open_collection_or_explain", sentinel):
+        status(palace_path)
+
+    sentinel.assert_not_called()
+    out = capsys.readouterr().out
+    assert "MemPalace Status — 4 drawers" in out
+    assert "WING: project" in out
+    assert "WING: notes" in out
+
+
+def test_sqlite_wing_room_counts_exact_tally(palace_path, seeded_collection):
+    """The sqlite tally must equal the seeded drawers exactly — 2 project/
+    backend, 1 project/frontend, 1 notes/planning — with no double counting.
+
+    Guards the double ``LEFT JOIN embedding_metadata`` against fan-out: if the
+    join multiplied rows (e.g. a drawer carrying several metadata keys), the
+    total would exceed 4 and the room counts would inflate.
+    """
+    from mempalace.backends.chroma import _sqlite_wing_room_counts
+
+    result = _sqlite_wing_room_counts(palace_path, "mempalace_drawers")
+    assert result is not None
+    total, wing_rooms = result
+    assert total == 4
+    assert {w: dict(r) for w, r in wing_rooms.items()} == {
+        "project": {"backend": 2, "frontend": 1},
+        "notes": {"planning": 1},
+    }
+
+
+def test_status_falls_back_to_chroma_when_sqlite_unreadable(palace_path, seeded_collection, capsys):
+    """When the sqlite fast path returns ``None`` (exotic schema / read error),
+    ``status`` must fall back to the ChromaDB client path and still report the
+    correct tally — not crash or print nothing."""
+    from unittest.mock import patch
+
+    with patch("mempalace.backends.chroma._sqlite_wing_room_counts", return_value=None):
+        status(palace_path)
+
+    out = capsys.readouterr().out
+    assert "MemPalace Status — 4 drawers" in out
+    assert "WING: project" in out
+
+
+def test_sqlite_wing_room_counts_none_when_collection_absent(palace_path):
+    """DB exists but the drawers collection was never bootstrapped -> ``None``,
+    so ``status`` routes to the 'initialized but empty' message instead of
+    printing a misleading ``0 drawers`` tally (State C, #1498)."""
+    import chromadb
+
+    from mempalace.backends.chroma import _sqlite_wing_room_counts
+
+    chromadb.PersistentClient(path=palace_path)  # creates chroma.sqlite3, no collection
+    assert _sqlite_wing_room_counts(palace_path, "mempalace_drawers") is None
+
+
+def test_sqlite_wing_room_counts_numeric_wing_not_dropped(palace_path, collection):
+    """A drawer whose wing/room is stored numerically (int_value, not
+    string_value) must be tallied under its stringified value — matching the
+    ChromaDB path, which surfaces the native number — not silently bucketed
+    under '?'. Without the int/float COALESCE this row would vanish into '?'
+    while returning a non-None result that skips the fallback."""
+    from mempalace.backends.chroma import _sqlite_wing_room_counts
+
+    collection.add(
+        ids=["drawer_numeric_meta"],
+        documents=["a drawer filed with a numeric wing and room"],
+        metadatas=[{"wing": 2026, "room": 7}],
+    )
+    result = _sqlite_wing_room_counts(palace_path, "mempalace_drawers")
+    assert result is not None
+    _, wing_rooms = result
+    assert {w: dict(r) for w, r in wing_rooms.items()} == {"2026": {"7": 1}}
+
+
+def test_sqlite_wing_room_counts_partial_metadata_buckets_question_mark(palace_path, collection):
+    """A drawer with a wing but no room (and vice versa) must be counted under
+    '?' for the missing axis, never dropped. Guards the LEFT JOINs against
+    being narrowed to inner joins, which would silently discard partial
+    drawers and undercount the total."""
+    from mempalace.backends.chroma import _sqlite_wing_room_counts
+
+    collection.add(
+        ids=["drawer_wing_only", "drawer_room_only"],
+        documents=["has a wing but no room", "has a room but no wing"],
+        metadatas=[{"wing": "alpha"}, {"room": "beta"}],
+    )
+    result = _sqlite_wing_room_counts(palace_path, "mempalace_drawers")
+    assert result is not None
+    total, wing_rooms = result
+    assert total == 2  # neither drawer dropped
+    assert {w: dict(r) for w, r in wing_rooms.items()} == {
+        "alpha": {"?": 1},
+        "?": {"beta": 1},
+    }
+
+
+def test_sqlite_wing_room_counts_returns_none_on_locked_db(palace_path, seeded_collection):
+    """A sustained sqlite lock (writer holding the DB) must degrade to ``None``
+    so ``status`` falls back to the slow-but-correct ChromaDB path rather than
+    raising. busy_timeout waits out *transient* locks; a hard lock still ends
+    here. Simulated by forcing the read to raise OperationalError."""
+    import sqlite3 as _sqlite3
+    from unittest.mock import patch
+
+    from mempalace.backends.chroma import _sqlite_wing_room_counts
+
+    with patch(
+        "mempalace.backends.chroma.sqlite3.connect",
+        side_effect=_sqlite3.OperationalError("database is locked"),
+    ):
+        assert _sqlite_wing_room_counts(palace_path, "mempalace_drawers") is None
 
 
 def test_process_file_uses_bounded_upsert_batches(tmp_path, monkeypatch):
@@ -1618,3 +1751,563 @@ def test_mine_does_not_remove_other_processes_pid_file(tmp_path):
 
     assert pid_file.exists(), "Foreign PID entries must not be removed"
     assert pid_file.read_text().strip() == str(other_pid)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tier 6a — chunk_text line-range emission + _build_drawer_metadata line keys
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestChunkTextLineRanges:
+    """Tier 6a — chunk_text emits 1-indexed (line_start, line_end) per chunk.
+
+    Closet pointer lines need to carry "where in the source file" info so
+    retrieval can jump straight to the relevant span instead of opening the
+    whole drawer. Line ranges live on the chunk dict, get plumbed through
+    ``_build_drawer_metadata`` into drawer metadata, then read by
+    ``build_closet_lines`` to emit ``YYYY-MM-DD:Lstart-Lend`` segments.
+    """
+
+    def test_each_chunk_carries_line_range(self):
+        from mempalace.miner import chunk_text
+
+        content = "\n".join(f"line {i}" for i in range(1, 401))  # 400 lines
+        chunks = chunk_text(content, "/x.md", chunk_size=800, chunk_overlap=80)
+        assert chunks, "should produce at least one chunk for a 400-line file"
+        for c in chunks:
+            assert "line_start" in c, f"chunk missing line_start: {c.keys()}"
+            assert "line_end" in c, f"chunk missing line_end: {c.keys()}"
+            assert isinstance(c["line_start"], int) and c["line_start"] >= 1
+            assert isinstance(c["line_end"], int) and c["line_end"] >= c["line_start"]
+
+    def test_first_chunk_starts_at_line_1(self):
+        from mempalace.miner import chunk_text
+
+        content = "\n".join(f"line {i}" for i in range(1, 200))
+        chunks = chunk_text(content, "/x.md", chunk_size=600, chunk_overlap=60)
+        assert chunks[0]["line_start"] == 1
+
+    def test_last_chunk_end_covers_final_line(self):
+        from mempalace.miner import chunk_text
+
+        total_lines = 300
+        content = "\n".join(f"line {i}" for i in range(1, total_lines + 1))
+        chunks = chunk_text(content, "/x.md", chunk_size=500, chunk_overlap=50)
+        # Last chunk's line_end must reach the final line of the source.
+        assert chunks[-1]["line_end"] >= total_lines, (
+            f"last chunk ends at L{chunks[-1]['line_end']}, expected >= L{total_lines}"
+        )
+
+    def test_single_chunk_spans_all_lines_for_small_input(self):
+        from mempalace.miner import chunk_text
+
+        content = "alpha\nbeta\ngamma\ndelta\nepsilon"  # 5 lines, well under chunk_size
+        chunks = chunk_text(content, "/x.md", chunk_size=2000, chunk_overlap=100, min_chunk_size=5)
+        assert len(chunks) == 1
+        assert chunks[0]["line_start"] == 1
+        assert chunks[0]["line_end"] == 5
+
+
+class TestBuildDrawerMetadataLineRange:
+    """Tier 6a — _build_drawer_metadata stores optional line_start / line_end.
+
+    When chunk metadata carries line range info, the drawer record carries it
+    too. When it doesn't (legacy callers, older miners), the function omits
+    the keys entirely — backward compatible.
+    """
+
+    def test_includes_line_range_when_provided(self):
+        from mempalace.miner import _build_drawer_metadata
+
+        meta = _build_drawer_metadata(
+            wing="wing_x",
+            room="room_y",
+            source_file="/file.md",
+            chunk_index=0,
+            agent="cedar",
+            content="some content here for entity scanning",
+            source_mtime=None,
+            line_start=42,
+            line_end=78,
+        )
+        assert meta.get("line_start") == 42
+        assert meta.get("line_end") == 78
+
+    def test_omits_line_range_when_not_provided(self):
+        from mempalace.miner import _build_drawer_metadata
+
+        meta = _build_drawer_metadata(
+            wing="wing_x",
+            room="room_y",
+            source_file="/file.md",
+            chunk_index=0,
+            agent="cedar",
+            content="some content",
+            source_mtime=None,
+        )
+        assert "line_start" not in meta
+        assert "line_end" not in meta
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tier 6a content-date extraction — hierarchy: filename → frontmatter →
+# content body → filesystem mtime → fallback to filed_at
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestExtractContentDate:
+    """Content-date extraction returns ISO 'YYYY-MM-DD' or None.
+
+    Priority order (first match wins):
+      1. Filename patterns (via dateutil fuzzy parse on the stem)
+      2. YAML frontmatter date / created / published field
+      3. Content body, first ~10 lines:
+         - ISO substrings, Claude preambles, natural-language dates
+         - Locale auto-disambiguation when slash-separated dates appear
+      4. Filesystem mtime
+      5. None (caller falls back to filed_at)
+    """
+
+    def test_filename_iso_extracts(self, tmp_path):
+        from mempalace.miner import _extract_content_date
+
+        f = tmp_path / "2024-11-08.md"
+        f.write_text("body content with no date inside")
+        assert _extract_content_date(str(f), f.read_text()) == "2024-11-08"
+
+    def test_filename_natural_language_with_ordinal_extracts(self, tmp_path):
+        from mempalace.miner import _extract_content_date
+
+        f = tmp_path / "April-6th-2011-notes.md"
+        f.write_text("body content")
+        assert _extract_content_date(str(f), f.read_text()) == "2011-04-06"
+
+    def test_filename_compact_dash_format_extracts(self, tmp_path):
+        from mempalace.miner import _extract_content_date
+
+        f = tmp_path / "Nov-8-2024.md"
+        f.write_text("body content")
+        assert _extract_content_date(str(f), f.read_text()) == "2024-11-08"
+
+    def test_yaml_frontmatter_date_field_extracts(self, tmp_path):
+        from mempalace.miner import _extract_content_date
+
+        f = tmp_path / "untitled.md"
+        content = (
+            "---\ntitle: Some Notes\ndate: 2024-11-08\ntags: [diary]\n---\n\nBody content here.\n"
+        )
+        f.write_text(content)
+        assert _extract_content_date(str(f), content) == "2024-11-08"
+
+    def test_yaml_frontmatter_created_field_extracts(self, tmp_path):
+        from mempalace.miner import _extract_content_date
+
+        f = tmp_path / "untitled.md"
+        content = "---\ncreated: 2023-07-15\n---\n\nbody\n"
+        f.write_text(content)
+        assert _extract_content_date(str(f), content) == "2023-07-15"
+
+    def test_claude_session_preamble_extracts(self, tmp_path):
+        from mempalace.miner import _extract_content_date
+
+        f = tmp_path / "transcript.md"
+        content = "Session resumed from compact on 2024-11-08\nUser: hey lumi\nLumi: hi aya\n"
+        f.write_text(content)
+        assert _extract_content_date(str(f), content) == "2024-11-08"
+
+    def test_iso_date_in_first_line_extracts(self, tmp_path):
+        from mempalace.miner import _extract_content_date
+
+        f = tmp_path / "untitled.md"
+        content = "# Notes from 2024-11-08\n\nWe talked about brands of dog food.\n"
+        f.write_text(content)
+        assert _extract_content_date(str(f), content) == "2024-11-08"
+
+    def test_natural_language_date_in_content_extracts(self, tmp_path):
+        from mempalace.miner import _extract_content_date
+
+        f = tmp_path / "untitled.md"
+        content = "Notes from November 8, 2024 — what we talked about today.\n"
+        f.write_text(content)
+        assert _extract_content_date(str(f), content) == "2024-11-08"
+
+    def test_ambiguous_slash_date_locks_dd_mm_when_day_over_12_appears(self, tmp_path):
+        """04/11/22 + 25/03/21 in the same file → locale locks to DD/MM."""
+        from mempalace.miner import _extract_content_date
+
+        f = tmp_path / "untitled.md"
+        # 25/03/21 cannot be MM/DD (no month 25) → file locale must be DD/MM
+        # Therefore 04/11/22 → 4 November 2022 → "2022-11-04"
+        content = "Started writing on 04/11/22.\nEarlier notes from 25/03/21 referenced.\n"
+        f.write_text(content)
+        assert _extract_content_date(str(f), content) == "2022-11-04"
+
+    def test_ambiguous_slash_date_defaults_to_mm_dd_without_disambiguator(self, tmp_path):
+        """04/11/22 with no day-over-12 disambiguator → default to US MM/DD/YY → 2022-04-11."""
+        from mempalace.miner import _extract_content_date
+
+        f = tmp_path / "untitled.md"
+        content = "Note from 04/11/22 about something.\n"
+        f.write_text(content)
+        assert _extract_content_date(str(f), content) == "2022-04-11"
+
+    def test_filename_wins_over_content_date(self, tmp_path):
+        """Priority: filename pattern fires before content scan."""
+        from mempalace.miner import _extract_content_date
+
+        f = tmp_path / "2020-01-01.md"
+        content = "but the content says 2024-11-08 inside\n"
+        f.write_text(content)
+        assert _extract_content_date(str(f), content) == "2020-01-01"
+
+    def test_frontmatter_wins_over_content_body(self, tmp_path):
+        from mempalace.miner import _extract_content_date
+
+        f = tmp_path / "untitled.md"
+        content = (
+            "---\ndate: 2020-01-01\n---\n\nBody talks about 2024-11-08 but frontmatter is older.\n"
+        )
+        f.write_text(content)
+        assert _extract_content_date(str(f), content) == "2020-01-01"
+
+    def test_mtime_fallback_when_no_dates_found(self, tmp_path):
+        """When filename / frontmatter / content all yield nothing, fall back to mtime."""
+        from mempalace.miner import _extract_content_date
+
+        f = tmp_path / "untitled.md"
+        f.write_text("just a sentence with no date markers at all\n")
+        # Set mtime to a known value (2023-07-15 12:00 UTC)
+        import os
+
+        target = 1689422400.0  # 2023-07-15 12:00 UTC
+        os.utime(str(f), (target, target))
+        result = _extract_content_date(str(f), f.read_text())
+        assert result == "2023-07-15", f"expected mtime fallback, got {result!r}"
+
+    def test_returns_none_when_nothing_extractable_and_file_missing(self):
+        """Graceful when source_file path doesn't exist (e.g., test fixtures)."""
+        from mempalace.miner import _extract_content_date
+
+        # No filename pattern, no content dates, no real file → None
+        result = _extract_content_date("/nonexistent/untitled.md", "just plain text\n")
+        assert result is None
+
+    def test_returns_none_for_empty_content_and_missing_file(self):
+        from mempalace.miner import _extract_content_date
+
+        result = _extract_content_date("/nonexistent/untitled.md", "")
+        assert result is None
+
+    # ── Negative cases — verbatim from Igor's PR #1584 review ──────────────
+    # Per Igor (2026-05-22 11:18 UTC): dateutil.parser.parse(fuzzy=True)
+    # hallucinates dates on benign inputs. These tests pin the fix: junk
+    # filenames and digit-bearing-but-not-date content must NOT yield a
+    # fabricated date. Each input here returned a confident wrong date
+    # before the fix; each must return None after.
+
+    def test_no_hallucination_junk_filename_with_trailing_digit(self):
+        """Filename like 'tmp_random_file_5' returned '2026-05-05' before fix."""
+        from mempalace.miner import _extract_content_date
+
+        # /nonexistent ensures mtime fallback returns None (so any non-None
+        # result would be a hallucinated date, not a real mtime).
+        result = _extract_content_date("/nonexistent/tmp_random_file_5.md", "")
+        assert result is None, f"junk filename hallucinated date {result!r}"
+
+    def test_no_hallucination_untitled_with_index(self):
+        """Filename like 'untitled-1' returned '2026-05-01' before fix."""
+        from mempalace.miner import _extract_content_date
+
+        result = _extract_content_date("/nonexistent/untitled-1.md", "")
+        assert result is None, f"untitled-N hallucinated date {result!r}"
+
+    def test_no_hallucination_filename_year_only(self):
+        """Filename like 'notes.2024.md' returned '2024-05-22' before fix
+        (year extracted, month+day fabricated from today).
+        """
+        from mempalace.miner import _extract_content_date
+
+        result = _extract_content_date("/nonexistent/notes.2024.md", "")
+        assert result is None, (
+            f"year-only filename hallucinated date {result!r}; "
+            "year + month-name OR year-month-day required"
+        )
+
+    def test_no_hallucination_filename_year_and_month_only(self):
+        """Filename like '2024-06.md' returned '2024-06-22' before fix
+        (year+month extracted, day fabricated from today).
+
+        A filename must carry a complete year+month+day OR a recognizable
+        month-name token to be accepted as a content date — partial
+        year-month with day padded from today is hallucination.
+        """
+        from mempalace.miner import _extract_content_date
+
+        result = _extract_content_date("/nonexistent/2024-06.md", "")
+        assert result is None, f"year-month-only filename hallucinated date {result!r}"
+
+    def test_no_hallucination_content_with_issue_number(self):
+        """Content 'Bug fix for issue 42 in module 7' returned '2042-07-22'
+        before fix.
+        """
+        from mempalace.miner import _extract_content_date
+
+        content = "Bug fix for issue 42 in module 7\n\nMore body text here.\n"
+        result = _extract_content_date("/nonexistent/issue.md", content)
+        assert result is None, f"issue-number content hallucinated date {result!r}"
+
+    def test_no_hallucination_content_with_count(self):
+        """Content 'Tested with 1000 drawers' returned '1000-05-22' before fix
+        (year 1000 AD!).
+        """
+        from mempalace.miner import _extract_content_date
+
+        content = "Tested with 1000 drawers in this configuration.\n"
+        result = _extract_content_date("/nonexistent/test.md", content)
+        assert result is None, f"count-in-content hallucinated date {result!r}"
+
+    def test_no_hallucination_content_with_version_number(self):
+        """Content 'Version 3.3.6 released' returned '2006-03-03' before fix."""
+        from mempalace.miner import _extract_content_date
+
+        content = "Version 3.3.6 released today with new features.\n"
+        result = _extract_content_date("/nonexistent/release.md", content)
+        assert result is None, f"version-number content hallucinated date {result!r}"
+
+    # ── Two-digit year boundary (per Igor smaller-item #4) ─────────────────
+    # The stdlib convention is 70-99 → 19xx, 00-69 → 20xx. Pin the boundary.
+
+    def test_two_digit_year_69_is_2069(self, tmp_path):
+        from mempalace.miner import _extract_content_date
+
+        f = tmp_path / "untitled.md"
+        # 25/03/69 — day > 12 forces DD/MM, then 69 → 2069
+        content = "Plan from 25/03/69 timeline.\n"
+        f.write_text(content)
+        assert _extract_content_date(str(f), content) == "2069-03-25"
+
+    def test_two_digit_year_70_is_1970(self, tmp_path):
+        from mempalace.miner import _extract_content_date
+
+        f = tmp_path / "untitled.md"
+        content = "Note from 25/03/70.\n"
+        f.write_text(content)
+        assert _extract_content_date(str(f), content) == "1970-03-25"
+
+    def test_two_digit_year_99_is_1999(self, tmp_path):
+        from mempalace.miner import _extract_content_date
+
+        f = tmp_path / "untitled.md"
+        content = "Reference from 25/12/99 archives.\n"
+        f.write_text(content)
+        assert _extract_content_date(str(f), content) == "1999-12-25"
+
+    def test_two_digit_year_00_is_2000(self, tmp_path):
+        from mempalace.miner import _extract_content_date
+
+        f = tmp_path / "untitled.md"
+        content = "Y2K reference: 25/01/00.\n"
+        f.write_text(content)
+        assert _extract_content_date(str(f), content) == "2000-01-25"
+
+
+def test_file_already_mined_handles_multiple_groups_under_one_source_file(tmp_path):
+    """Under the additive-mining model, a single ``source_file`` can have
+    multiple ``parent_drawer_id`` groups in the palace — one per mining pass
+    — each with its own stored ``source_mtime``. ``file_already_mined`` must
+    return True if ANY group's stored mtime matches the file's current
+    mtime, regardless of which group ChromaDB's ``get(..., limit=1)`` happens
+    to return first.
+
+    Current code uses ``collection.get(where={"source_file": X}, limit=1)``
+    which has undefined ordering across multiple matching rows. When ChromaDB
+    returns a stale group (older mining pass with a different stored mtime),
+    the function returns False, the additive miner concludes the file changed,
+    and writes yet another duplicate group for a file that has not actually
+    changed. Steady state: duplicate groups accumulate without bound.
+
+    This test pins the failure space deterministically using a MockCollection
+    that always returns the stale group on limit=1 (worst-case ordering). A
+    correct implementation iterates all groups via the paginated pattern
+    already used in the ``extract_mode is not None`` branch.
+
+    Issue: follow-up to PR #1628 (the every-bare-source_file-query audit).
+    """
+    # Create a real file with known mtime.
+    test_file = tmp_path / "doc.md"
+    test_file.write_text("content that hasn't changed since the latest mine.")
+    current_mtime = os.path.getmtime(str(test_file))
+
+    # Build a MockCollection that simulates two parent_drawer_id groups
+    # under the same source_file with DIFFERENT stored mtimes:
+    #   group_A: stale, source_mtime = current_mtime - 100  (older pass)
+    #   group_B: current, source_mtime = current_mtime      (latest pass)
+    # The mock returns group_A for limit=1 calls (worst-case ordering) and
+    # returns BOTH groups for the paginated limit=1000 calls (what the fix
+    # must use).
+    stale_meta = {
+        "source_file": str(test_file),
+        "chunk_index": 0,
+        "parent_drawer_id": "drawer_group_A",
+        "source_mtime": current_mtime - 100.0,
+        "normalize_version": NORMALIZE_VERSION,
+    }
+    current_meta = {
+        "source_file": str(test_file),
+        "chunk_index": 0,
+        "parent_drawer_id": "drawer_group_B",
+        "source_mtime": current_mtime,
+        "normalize_version": NORMALIZE_VERSION,
+    }
+
+    class MockCollection:
+        """Simulates the ChromaDB get() contract for two parent_drawer_id
+        groups sharing one source_file. Returns the STALE group when called
+        with limit=1 (the worst-case-ordering shape that triggers the bug).
+        Returns BOTH groups (paginated) when called with limit=1000 — what
+        a correctly-iterating implementation must do."""
+
+        def get(self, where=None, limit=None, offset=0, include=None):
+            if limit == 1:
+                return {"ids": ["a_0"], "metadatas": [stale_meta]}
+            if offset == 0:
+                return {"ids": ["a_0", "b_0"], "metadatas": [stale_meta, current_meta]}
+            return {"ids": [], "metadatas": []}
+
+    col = MockCollection()
+
+    # EXPECTED: file_already_mined returns True because at least one stored
+    # group's mtime matches the current file mtime.
+    # CURRENT BUG: returns False because limit=1 grabs the stale group.
+    assert file_already_mined(col, str(test_file), check_mtime=True) is True, (
+        "file_already_mined returned False even though a group with matching "
+        "mtime exists. The limit=1 query picked the stale group; the function "
+        "must iterate all groups for the source_file (mirroring the existing "
+        "paginated pattern in the extract_mode-is-set branch)."
+    )
+
+
+# ── --limit skips already-mined files (#1535) ──────────────────────────
+
+
+def test_mine_limit_skips_already_mined_files(tmp_path, capsys):
+    """--limit N should count only NEW work, not already-mined skips (#1535)."""
+    from unittest.mock import patch
+
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=10)
+    palace_path = project_root / "palace"
+
+    call_count = 0
+
+    def fake_process_file(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count <= 8:
+            return (0, "general", None)
+        return (3, "general", None)
+
+    with patch("mempalace.miner.process_file", side_effect=fake_process_file):
+        mine(str(project_root), str(palace_path), limit=5)
+
+    out = capsys.readouterr().out
+    assert "Drawers filed: 6" in out
+    assert call_count == 10
+
+
+def test_mine_limit_stops_after_n_new_files(tmp_path, capsys):
+    """--limit 3 on 5 unmined files mines exactly 3 and stops."""
+    from unittest.mock import patch
+
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=5)
+    palace_path = project_root / "palace"
+
+    call_count = 0
+
+    def fake_process_file(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return (2, "general", None)
+
+    with patch("mempalace.miner.process_file", side_effect=fake_process_file):
+        mine(str(project_root), str(palace_path), limit=3)
+
+    assert call_count == 3
+    out = capsys.readouterr().out
+    assert "Drawers filed: 6" in out
+
+
+def test_mine_limit_zero_mines_all(tmp_path, capsys):
+    """--limit 0 (default) processes every file."""
+    from unittest.mock import patch
+
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=4)
+    palace_path = project_root / "palace"
+
+    call_count = 0
+
+    def fake_process_file(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return (1, "general", None)
+
+    with patch("mempalace.miner.process_file", side_effect=fake_process_file):
+        mine(str(project_root), str(palace_path), limit=0)
+
+    assert call_count == 4
+    out = capsys.readouterr().out
+    assert "Drawers filed: 4" in out
+
+
+def test_mine_limit_dry_run(tmp_path, capsys):
+    """--dry-run --limit N counts new files toward the limit."""
+    from unittest.mock import patch
+
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=5)
+    palace_path = project_root / "palace"
+
+    call_count = 0
+
+    def fake_process_file(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return (2, "general", None)
+
+    with patch("mempalace.miner.process_file", side_effect=fake_process_file):
+        mine(str(project_root), str(palace_path), limit=3, dry_run=True)
+
+    assert call_count == 3
+
+
+def test_mine_limit_summary_counts(tmp_path, capsys):
+    """Summary arithmetic is correct when limit causes early exit."""
+    from unittest.mock import patch
+
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=8)
+    palace_path = project_root / "palace"
+
+    call_idx = 0
+
+    def fake_process_file(*args, **kwargs):
+        nonlocal call_idx
+        call_idx += 1
+        if call_idx % 2 == 0:
+            return (0, "general", None)
+        return (3, "general", None)
+
+    with patch("mempalace.miner.process_file", side_effect=fake_process_file):
+        mine(str(project_root), str(palace_path), limit=2)
+
+    out = capsys.readouterr().out
+    assert "Files processed: 2" in out
+    assert "Drawers filed: 6" in out
+    assert "(limit: 2 new)" in out

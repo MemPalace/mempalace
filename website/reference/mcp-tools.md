@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-Detailed parameter schemas for all 30 MCP tools.
+Detailed parameter schemas for all 31 MCP tools.
 
 ## Palace — Read Tools
 
@@ -111,6 +111,24 @@ Delete a drawer by ID. Irreversible.
 | `drawer_id` | string | **Yes** | ID of the drawer to delete |
 
 **Returns:** `{ success, drawer_id }`
+
+---
+
+### `mempalace_mine`
+
+Mine a directory into the palace — the MCP equivalent of `mempalace mine`. Wraps the same in-process miners the CLI uses; runs synchronously and returns the miner's summary as `output`. The palace write lock is automatic — a concurrent mine returns a structured already-running error. Orphan cleanup is separate (see `mempalace_sync`).
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `source` | string | **Yes** | Directory to mine |
+| `mode` | string | No | `projects` (code/docs, default), `convos` (chat transcripts), or `extract` (office docs; needs the `mempalace[extract]` extra) |
+| `wing` | string | No | Target wing (default: source directory name) |
+| `agent` | string | No | Recorded on every drawer (default: `mempalace`) |
+| `limit` | integer | No | Max files to process (0 = all; default 0) |
+| `dry_run` | boolean | No | Report what would be filed without writing (default false) |
+| `extract` | string | No | Convos extraction strategy: `exchange` (default) or `general`; ignored by other modes |
+
+**Returns:** `{ success, mode, dry_run, output }` on success (`output` is the miner's human-readable summary; `output_truncated: true` is added when a very large summary is tail-trimmed), or `{ success: false, error, error_class? }` on failure.
 
 ---
 
@@ -316,6 +334,30 @@ Delete an explicit tunnel by its ID.
 | `tunnel_id` | string | **Yes** | Tunnel ID to delete |
 
 **Returns:** `{ success, tunnel_id }`
+
+---
+
+### `mempalace_list_hallways`
+
+List within-wing hallway records (entity-to-entity co-occurrence links built at mine time). Optionally filter by wing.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `wing` | string | No | Filter hallways by wing |
+
+**Returns:** `[ { id, wing, entity_a, entity_b, co_occurrence_count, rooms, ... }, ... ]`
+
+---
+
+### `mempalace_delete_hallway`
+
+Delete a hallway record by its ID.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `hallway_id` | string | **Yes** | Hallway ID to delete |
+
+**Returns:** `{ deleted: bool }`
 
 ---
 
