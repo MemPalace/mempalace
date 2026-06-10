@@ -406,7 +406,7 @@ def _refresh_vector_disabled_flag(*, force: bool = False) -> None:
     global _vector_disabled, _vector_disabled_reason, _vector_capacity_status
     global _vector_probe_last_run
     now = time.monotonic()
-    if not force and (now - _vector_probe_last_run) < _VECTOR_PROBE_TTL:
+    if not force and _vector_probe_last_run != 0.0 and (now - _vector_probe_last_run) < _VECTOR_PROBE_TTL:
         return
     if not _is_chroma_backend():
         _vector_disabled = False
@@ -418,6 +418,7 @@ def _refresh_vector_disabled_flag(*, force: bool = False) -> None:
         info = hnsw_capacity_status(_config.palace_path, _config.collection_name)
     except Exception:
         logger.debug("HNSW capacity probe raised", exc_info=True)
+        _vector_probe_last_run = now
         return
     _vector_capacity_status = info
     _vector_probe_last_run = now
