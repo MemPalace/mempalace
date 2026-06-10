@@ -566,10 +566,6 @@ def _mine_sync():
                     env=child_env,
                     timeout=60,
                 )
-                try:
-                    pid_file.write_text(f"{os.getpid()} {int(time.time())}")
-                except OSError:
-                    pass
         except (OSError, subprocess.TimeoutExpired):
             pass
         finally:
