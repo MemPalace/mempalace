@@ -2220,6 +2220,58 @@ class TestKGTools:
             assert "count" in result
             assert isinstance(result["count"], int)
 
+    def test_kg_search_returns_structured_triples(self, monkeypatch, config, palace_path, kg):
+        """tool_kg_search returns structured triple fields, not raw text."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        try:
+            from mempalace.mcp_server import tool_kg_add, tool_kg_search
+
+            result = tool_kg_add(subject="Alice", predicate="does", object="swimming")
+            assert result["success"] is True
+
+            search = tool_kg_search("Alice swimming", limit=5)
+            assert "results" in search
+            assert "count" in search
+            if search["count"] > 0:
+                hit = search["results"][0]
+                assert "triple_id" in hit
+                assert "subject" in hit
+                assert "predicate" in hit
+                assert "object" in hit
+                assert "similarity" in hit
+                # Must not be raw text blob — structured fields must be non-empty strings
+                assert isinstance(hit["subject"], str)
+                assert isinstance(hit["predicate"], str)
+                assert isinstance(hit["object"], str)
+        finally:
+            _client.delete_collection("mempalace_drawers")
+            _client.close()
+
+    def test_kg_search_excludes_invalidated_facts(self, monkeypatch, config, palace_path, kg):
+        """tool_kg_search filters out triples that have been invalidated."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        try:
+            from mempalace.mcp_server import tool_kg_add, tool_kg_invalidate, tool_kg_search
+
+            # Add and then invalidate a triple
+            add_result = tool_kg_add(subject="Bob", predicate="works_at", object="OldCo")
+            assert add_result["success"] is True
+            triple_id = add_result["triple_id"]
+
+            inv_result = tool_kg_invalidate(subject="Bob", predicate="works_at", object="OldCo")
+            assert inv_result["success"] is True
+
+            # The invalidated triple must not appear in search results
+            search = tool_kg_search("Bob works at OldCo", limit=10)
+            assert "results" in search
+            returned_ids = [r["triple_id"] for r in search["results"]]
+            assert triple_id not in returned_ids
+        finally:
+            _client.delete_collection("mempalace_drawers")
+            _client.close()
+
 
 # ── Diary Tools ─────────────────────────────────────────────────────────
 

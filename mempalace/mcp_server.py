@@ -2145,6 +2145,8 @@ def tool_kg_search(query: str, limit: int = 10):
 
     Returns:
         Dict with query, result count, and matched triples with similarity scores.
+        Each result includes triple_id, subject, predicate, object, and similarity.
+        Invalidated facts (valid_to IS NOT NULL in SQLite) are excluded.
     """
     try:
         sanitized = sanitize_query(query)
@@ -2155,35 +2157,66 @@ def tool_kg_search(query: str, limit: int = 10):
     except (ValueError, TypeError) as e:
         return {"error": f"Invalid limit: {e}"}
 
+    col = _get_collection()
+    if not col:
+        return _collection_error_or_no_palace()
+
     try:
-        results = search_memories(
-            clean_query,
-            palace_path=_config.palace_path,
-            wing="kg",
-            room="triples",
+        raw = col.query(
+            query_texts=[clean_query],
             n_results=limit,
+            where={"$and": [{"wing": "kg"}, {"room": "triples"}]},
+            include=["metadatas", "documents", "distances"],
         )
     except Exception as e:
         return {"error": f"Search failed: {str(e)}", "results": []}
 
-    if "error" in results:
-        return results
+    ids = raw.get("ids", [[]])[0]
+    if not ids:
+        return {"query": clean_query, "results": [], "count": 0}
 
-    hits = []
-    for result in results.get("results", []):
-        # Each result is a dict with text, wing, room, similarity, distance, etc.
-        # KG triple documents have the format: "subject predicate_human object"
-        # and are tagged with wing="kg", room="triples" in the index.
-        if result.get("wing") == "kg" and result.get("room") == "triples":
-            text = result.get("text", "")
-            hits.append(
-                {
-                    "text": text,
-                    "similarity": result.get("similarity", 0),
-                    "distance": result.get("distance", 0),
-                }
+    metadatas = raw.get("metadatas", [[]])[0]
+    distances = raw.get("distances", [[]])[0]
+    metric = _metric_for_collection(col)
+
+    # Collect triple_ids that appear active in ChromaDB metadata
+    candidates = []
+    for i, _doc_id in enumerate(ids):
+        meta = _safe_meta(metadatas[i] if i < len(metadatas) else None)
+        triple_id = meta.get("kg_triple_id", "")
+        if not triple_id:
+            continue
+        dist = distances[i] if i < len(distances) else 1.0
+        similarity = round(_distance_to_similarity(dist, metric), 3)
+        candidates.append(
+            {
+                "triple_id": triple_id,
+                "subject": meta.get("kg_subject", ""),
+                "predicate": meta.get("kg_predicate", ""),
+                "object": meta.get("kg_object", ""),
+                "similarity": similarity,
+            }
+        )
+
+    if not candidates:
+        return {"query": clean_query, "results": [], "count": 0}
+
+    # Verify each triple is still active (valid_to IS NULL) in SQLite
+    triple_ids = [c["triple_id"] for c in candidates]
+    placeholders = ",".join("?" * len(triple_ids))
+    active_ids = _call_kg(
+        lambda kg: {
+            row["id"]
+            for row in kg._conn()
+            .execute(
+                f"SELECT id FROM triples WHERE id IN ({placeholders}) AND valid_to IS NULL",
+                triple_ids,
             )
+            .fetchall()
+        }
+    )
 
+    hits = [c for c in candidates if c["triple_id"] in active_ids]
     return {"query": clean_query, "results": hits, "count": len(hits)}
 
 
