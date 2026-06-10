@@ -904,10 +904,9 @@ def _persisted_metadata_fields(obj: object) -> tuple[object, object]:
 def _read_collection_dim_from_sqlite(palace_path: str, seg_dir: str) -> Optional[int]:
     """Return the embedding dimension for the segment's collection from chroma.sqlite3.
 
-    Joins segments → collections → embeddings to find the vector dimension
-    stored as the byte-width of data_level0.bin divided by the HNSW element
-    size, OR reads the EmbedderIdentity sidecar if present.  Falls back to
-    None when the DB is absent or the segment UUID cannot be resolved.
+    Queries the collections table's dimension column by joining collections and
+    segments on the segment UUID.  Falls back to None when the DB is absent or
+    the segment UUID cannot be resolved.
     """
     db_path = os.path.join(palace_path, "chroma.sqlite3")
     if not os.path.isfile(db_path):
@@ -941,6 +940,7 @@ def _patch_dim_none_pickle(meta_path: str, dim: int) -> bool:
 
     Writes atomically via a tmp file.  Returns True on success.
     """
+    tmp = meta_path + ".tmp"
     try:
         with open(meta_path, "rb") as f:
             data = pickle.load(f)  # noqa: S301 — trusted own-pickle
@@ -948,13 +948,16 @@ def _patch_dim_none_pickle(meta_path: str, dim: int) -> bool:
             data["dimensionality"] = dim
         else:
             setattr(data, "dimensionality", dim)
-        tmp = meta_path + ".tmp"
         with open(tmp, "wb") as f:
             pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
         os.replace(tmp, meta_path)
         return True
     except Exception:
         logger.debug("_patch_dim_none_pickle failed for %s", meta_path, exc_info=True)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
         return False
 
 
