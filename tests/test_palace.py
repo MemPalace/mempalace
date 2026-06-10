@@ -61,6 +61,21 @@ def test_open_collection_or_explain_state_c_no_collection(tmp_path):
     assert any("mempalace mine" in line for line in lines)
 
 
+def test_open_collection_or_explain_unknown_backend(tmp_path, monkeypatch):
+    """An unknown backend name (typo in MEMPALACE_BACKEND/--backend) must
+    surface as a CLI state message, not an escaping KeyError stack trace."""
+    emit, lines = _capture()
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    monkeypatch.setenv("MEMPALACE_BACKEND", "does_not_exist")
+
+    result = _open_collection_or_explain(str(palace), out=emit)
+
+    assert result is None
+    assert any("Unknown backend selected" in line for line in lines)
+    assert any("does_not_exist" in line for line in lines)
+
+
 def test_open_collection_or_explain_state_d_healthy(tmp_path):
     """State D: healthy palace — returns the opened collection silently."""
     emit, lines = _capture()

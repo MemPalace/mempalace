@@ -114,7 +114,7 @@ class TestClosetMetadata:
             palace,
             drawer_id="D1",
             source_file="fixture_D1.md",
-            topics=["JWT auth tokens", "24h expiry", "authentication"],
+            topics=["JWT authentication", "24h expiry", "auth tokens"],
         )
         result = search_memories("JWT authentication", palace, n_results=2)
         top = result["results"][0]

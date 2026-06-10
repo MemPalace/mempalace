@@ -1,6 +1,6 @@
 [project]
 name = "mempalace"
-version = "3.3.6"
+version = "3.4.0"
 description = "Give your AI a memory — mine projects and conversations into a searchable palace. No API key required."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -60,6 +60,9 @@ mempalace-mcp = "mempalace.mcp_server:main"
 
 [project.entry-points."mempalace.backends"]
 chroma = "mempalace.backends.chroma:ChromaBackend"
+pgvector = "mempalace.backends.pgvector:PgVectorBackend"
+qdrant = "mempalace.backends.qdrant:QdrantBackend"
+sqlite_exact = "mempalace.backends.sqlite_exact:SQLiteExactBackend"
 
 # RFC 002 source-adapter entry-point group. Core publishes no first-party
 # adapters under this group yet; ``miner.py`` and ``convo_miner.py`` migrate
@@ -92,6 +95,11 @@ dev = [
     "mypy>=1.0",
 ]
 spellcheck = ["autocorrect>=2.0"]
+# Opt-in Postgres + pgvector backend. Only the psycopg driver is needed on the
+# client; the server must have the `vector` extension available. Selected via
+# MEMPALACE_BACKEND=pgvector / --backend pgvector; never required for the
+# default (Chroma) install.
+pgvector = ["psycopg[binary]>=3.1"]
 # Hardware acceleration for the ONNX embedding model. Install exactly one:
 #   pip install mempalace[gpu]       — NVIDIA CUDA
 #   pip install mempalace[dml]       — DirectML (Windows AMD/Intel/NVIDIA)
@@ -160,6 +168,15 @@ markers = [
     "benchmark: scale/performance benchmark tests",
     "slow: tests that take more than 30 seconds",
     "stress: destructive scale tests (100K+ drawers)",
+]
+filterwarnings = [
+    # Many tests build raw-chromadb palaces directly (no recorded embedder
+    # identity), which correctly emits this on open. The behavior itself is
+    # asserted in tests/test_embedder_identity.py; ignore the fixture noise.
+    # Matched by message (not by class path) so pytest does not import the
+    # mempalace package at config time — importing it before coverage starts
+    # would drop module-level lines from the report.
+    "ignore:palace collection.*has no recorded embedder identity",
 ]
 
 [tool.coverage.run]

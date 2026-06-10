@@ -191,6 +191,9 @@ class EmbeddinggemmaONNX:
         model_path = hf_hub_download(
             _EMBEDDINGGEMMA_REPO, subfolder="onnx", filename=_EMBEDDINGGEMMA_ONNX
         )
+        hf_hub_download(
+            _EMBEDDINGGEMMA_REPO, subfolder="onnx", filename=_EMBEDDINGGEMMA_ONNX + "_data"
+        )
         tok_path = hf_hub_download(_EMBEDDINGGEMMA_REPO, filename="tokenizer.json")
 
         self._session = ort.InferenceSession(model_path, providers=self._providers)
@@ -222,6 +225,14 @@ class EmbeddinggemmaONNX:
         # MTEB methodology assumes; ChromaDB's distance is configured for it).
         norms = np.linalg.norm(sent_emb, axis=1, keepdims=True) + 1e-12
         return (sent_emb / norms).tolist()
+
+    def embed_query(self, input: list[str]) -> list[list[float]]:  # noqa: A002 — ChromaDB EF protocol
+        """Embed query documents (ChromaDB EF protocol)."""
+        return self(input)
+
+    def embed_documents(self, input: list[str]) -> list[list[float]]:  # noqa: A002
+        """Embed a batch of documents (ChromaDB EF protocol)."""
+        return self(input)
 
 
 def get_embedding_function(device: Optional[str] = None, model: Optional[str] = None):
@@ -276,3 +287,59 @@ def describe_device(device: Optional[str] = None) -> str:
         device = MempalaceConfig().embedding_device
     _, effective = _resolve_providers(device)
     return effective
+
+
+# Probed vector widths, keyed by resolved model name. Populated once per
+# process the first time an identity is resolved for a model.
+_DIM_CACHE: dict = {}
+
+
+def current_model_name(model: Optional[str] = None) -> str:
+    """Resolve the canonical embedder model name (cheap, no model load).
+
+    This is the configured ``embedding_model`` (``"minilm"`` /
+    ``"embeddinggemma"`` / ...), not the embedding function's internal
+    ``name()`` (which is spoofed to ``"default"`` for ChromaDB compatibility).
+    """
+    if model is not None:
+        return str(model).strip().lower()
+    from .config import MempalaceConfig
+
+    return MempalaceConfig().embedding_model
+
+
+def probe_dimension(device: Optional[str] = None, model: Optional[str] = None) -> int:
+    """Return the embedder's output dimension by embedding a short probe.
+
+    Model-agnostic — works for any model without a hardcoded table — and
+    cached per resolved model name so the probe is paid at most once per
+    process. Returns ``0`` if the probe fails (treated as "dimension unknown"
+    by the identity check, so a probe failure never blocks normal operation).
+    """
+    name = current_model_name(model)
+    cached = _DIM_CACHE.get(name)
+    if cached is not None:
+        return cached
+    try:
+        ef = get_embedding_function(device=device, model=model)
+        vectors = ef(input=["probe"])
+        dim = len(vectors[0]) if vectors and vectors[0] is not None else 0
+    except Exception:
+        logger.debug("Embedding dimension probe failed for model=%s", name, exc_info=True)
+        dim = 0
+    _DIM_CACHE[name] = dim
+    return dim
+
+
+def get_embedder_identity(device: Optional[str] = None, model: Optional[str] = None):
+    """Resolve the current embedder identity (RFC 001).
+
+    ``model_name`` from config (cheap); ``dimension`` from a cached one-time
+    probe. Returns an :class:`~mempalace.backends.base.EmbedderIdentity`.
+    """
+    from .backends.base import EmbedderIdentity
+
+    return EmbedderIdentity(
+        model_name=current_model_name(model),
+        dimension=probe_dimension(device=device, model=model),
+    )

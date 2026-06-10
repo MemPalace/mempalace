@@ -343,8 +343,10 @@ class TestSearchCLI:
         # Non-zero bm25 reported
         assert "bm25=" in first_block
         assert "bm25=0.0" not in first_block
-        # Cosine still reported for transparency
-        assert "cosine=" in first_block
+        # Metric-labeled vector similarity still reported for transparency.
+        # Label is now "<metric>_sim=" (honest about the backend's metric)
+        # rather than a hard-coded "cosine=".
+        assert "cosine_sim=" in first_block
 
     def test_search_warns_when_palace_uses_wrong_distance_metric(self, fake_palace_path, capsys):
         """Legacy palaces created without `hnsw:space=cosine` silently

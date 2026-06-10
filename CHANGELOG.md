@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [Unreleased]
+
+### Features
+
+- **First-class Antigravity IDE support.** New `.antigravity-plugin/` package + idempotent installer at `hooks/antigravity/install.sh` that registers MemPalace as a Google Antigravity plugin (MCP server, skill, two lifecycle hooks) at `~/.gemini/config/plugins/mempalace/`. The Stop hook background-mines the active conversation transcript every Nth fire (default 15, configurable via `MEMPAL_SAVE_INTERVAL`); the PreInvocation hook injects verbatim memory on the first model call only via Antigravity's `injectSteps[].ephemeralMessage` output, gated by `invocationNum == 1`. Both hooks are bash 3.2.57 compatible (macOS default), use the same `~/.mempalace/hook_state/` directory as the Claude Code / Codex / Cursor hooks (`antigravity_*`-namespaced state files), and respect every existing kill switch (`MEMPAL_DISABLE_HOOK`, `MEMPALACE_HOOKS_AUTO_SAVE`, `~/.mempalace/config.json` `hooks.auto_save`). Installer is `cmp`-gated (re-run produces a byte-identical install), uninstall is basename-guarded (refuses to wipe a directory whose basename isn't `mempalace`), and `--dry-run` is side-effect free. Full audit of which Antigravity surfaces we ship and which we deliberately don't is in [`hooks/antigravity/INVESTIGATION.md`](hooks/antigravity/INVESTIGATION.md). User-facing guide: [`website/guide/antigravity.md`](website/guide/antigravity.md). Standalone examples in [`examples/antigravity/`](examples/antigravity/).
+  - **Zero-config interpreter resolution.** `mempal_resolve_python` now derives the Python interpreter from the `mempalace-mcp` / `mempalace` console-script shebang on `$PATH` before falling back to `python3`. The common `uv tool install mempalace` / `pipx install` layout installs the console scripts into an isolated environment whose interpreter is **not** system `python3`, so the previous `command -v python3` resolution landed on a Python that couldn't import `mempalace`, the `-m mempalace` probe failed, and mining silently never fired. Resolution is pure shebang parsing + `stat` (no Python subprocess at source time, preserving the hook performance budget). `MEMPAL_PYTHON` remains the explicit override. Documented under *How the hooks find your `mempalace` install* in the guide.
+
+### Bug Fixes
+
+- **Backup retention to prevent unbounded disk usage.** `mempalace migrate` (full-palace `<palace>.pre-migrate.<timestamp>` copies) and `mempalace repair max-seq-id` (`chroma.sqlite3.max-seq-id-backup-<timestamp>` copies) each wrote a fresh, full-size, timestamped backup every run and never deleted the old ones. On a machine that mines or repairs on a schedule, those copies could silently accumulate until they filled the disk — one palace was found with hundreds of GB of stale backups beside a few hundred MB of live data, hidden from a normal `du` of the home directory. A new `max_backups` setting (default `10`, env `MEMPALACE_MAX_BACKUPS`, or `config.json`) now prunes the oldest backups after each new one is written. Set it to `0` to keep every backup. Pruning is keyed by filesystem mtime, scoped strictly to each backup's own naming pattern (live data is never touched), and best-effort so a deletion failure can never abort a migration or repair that already succeeded.
+
+---
+
 ## [3.3.6] — 2026-05-24
 
 ### Features

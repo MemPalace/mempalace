@@ -46,6 +46,24 @@ Make them executable:
 chmod +x hooks/mempal_save_hook.sh hooks/mempal_precompact_hook.sh
 ```
 
+## Install — Antigravity (Google)
+
+The Antigravity integration lives in its own subdirectory because the
+wire format (camelCase JSON, `injectSteps[]` output) and event names
+(`Stop`, `PreInvocation`) are Antigravity-specific. Use the dedicated
+installer:
+
+```bash
+bash hooks/antigravity/install.sh
+```
+
+This installs to `~/.gemini/config/plugins/mempalace/`, registers the
+MCP server, ships the `mempalace` skill, and wires the Stop +
+PreInvocation hooks. See [`hooks/antigravity/README.md`](antigravity/README.md)
+for the full guide and [`hooks/antigravity/INVESTIGATION.md`](antigravity/INVESTIGATION.md)
+for the source-of-truth audit of which Antigravity surfaces the
+integration uses.
+
 ## Install — Codex CLI (OpenAI)
 
 Add to `.codex/hooks.json`:

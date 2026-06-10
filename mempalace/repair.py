@@ -1529,11 +1529,25 @@ def repair_max_seq_id(
         return result
 
     if backup:
+        import glob
+
+        from .backups import prune_backups
+        from .config import MempalaceConfig
+
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         backup_path = os.path.join(palace_path, f"chroma.sqlite3.max-seq-id-backup-{timestamp}")
         shutil.copy2(db_path, backup_path)
         result["backup"] = backup_path
         print(f"  Backup:  {backup_path}")
+
+        # Retain only the most recent N backups (the copy just written is the
+        # newest and is kept). Without this, every max-seq-id repair leaves a
+        # full chroma.sqlite3 copy behind that is never cleaned up.
+        prune_backups(
+            os.path.join(glob.escape(palace_path), "chroma.sqlite3.max-seq-id-backup-*"),
+            MempalaceConfig().max_backups,
+            log=print,
+        )
 
     _close_chroma_handles(palace_path)
 
