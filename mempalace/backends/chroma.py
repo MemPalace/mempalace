@@ -2058,15 +2058,27 @@ class ChromaBackend(BaseBackend):
             try:
                 collection = client.get_collection(collection_name, **ef_kwargs)
             except _ChromaNotFoundError:
-                collection = client.create_collection(
+                # Delegate to create_collection so it respects env var/sync_threshold.
+                sync_threshold = None
+                env_val = os.environ.get("MEMPALACE_HNSW_SYNC_THRESHOLD")
+                if env_val is not None:
+                    try:
+                        sync_threshold = int(env_val)
+                    except ValueError:
+                        logger.warning(
+                            "Unparseable MEMPALACE_HNSW_SYNC_THRESHOLD=%r, disabling sync override",
+                            env_val,
+                        )
+                        sync_threshold = None
+
+                # Call create_collection to handle the sync_threshold properly
+                created_col = self.create_collection(
+                    palace_path,
                     collection_name,
-                    metadata={
-                        "hnsw:space": hnsw_space,
-                        "hnsw:num_threads": 1,
-                        **_HNSW_BLOAT_GUARD,
-                    },
-                    **ef_kwargs,
+                    hnsw_space=hnsw_space,
+                    sync_threshold=sync_threshold,
                 )
+                collection = created_col._collection
             except ValueError as e:
                 explanation = self._explain_ef_mismatch(e, palace_path)
                 if explanation:
@@ -2157,7 +2169,10 @@ class ChromaBackend(BaseBackend):
                 try:
                     sync_threshold = int(env_val)
                 except ValueError:
-                    pass
+                    logger.warning(
+                        "Unparseable MEMPALACE_HNSW_SYNC_THRESHOLD=%r, disabling sync override",
+                        env_val,
+                    )
 
         hnsw_guard = {**_HNSW_BLOAT_GUARD}
         if sync_threshold is not None:

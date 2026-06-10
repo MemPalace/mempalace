@@ -1086,6 +1086,7 @@ def cmd_repair(args):
             all_metas,
             batch_size,
             collection_name=collection_name,
+            sync_threshold=getattr(args, "hnsw_sync_threshold", None),
             progress=print,
         )
     except RebuildCollectionError as e:

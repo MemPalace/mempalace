@@ -723,6 +723,7 @@ def rebuild_index(
     confirm_truncation_ok: bool = False,
     collection_name: Optional[str] = None,
     progress: Optional[Callable[[str], None]] = None,
+    sync_threshold: Optional[int] = None,
 ):
     """Rebuild the HNSW index from scratch.
 
@@ -742,6 +743,10 @@ def rebuild_index(
     annotations on ``Staged N/M`` and ``Re-filed N/M`` lines. Pass a
     custom callable (e.g. a daemon-side capture for HTTP status, or a
     silent ``lambda *_: None`` for tests) to override.
+
+    ``sync_threshold`` overrides hnsw:sync_threshold for the rebuilt collection.
+    When provided and >= 2, sets both hnsw:sync_threshold and hnsw:batch_size.
+    Can also be set via MEMPALACE_HNSW_SYNC_THRESHOLD env var.
     """
     if progress is None:
         progress = _DefaultProgress()
@@ -830,6 +835,7 @@ def rebuild_index(
             all_metas,
             batch_size,
             collection_name=collection_name,
+            sync_threshold=sync_threshold,
             progress=progress,
         )
     except RebuildCollectionError as e:
