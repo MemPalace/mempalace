@@ -1462,8 +1462,13 @@ def tool_add_drawer(
         existing = col.get(ids=idempotency_probe_ids, include=[])
         if existing.ids:
             return {"success": True, "reason": "already_exists", "drawer_id": drawer_id}
-    except Exception:
-        logger.debug("Idempotency pre-check failed for %s", idempotency_probe_ids, exc_info=True)
+    except Exception as e:
+        logger.warning(
+            "Idempotency pre-check failed for %s; refusing write to protect index integrity",
+            idempotency_probe_ids,
+            exc_info=True,
+        )
+        return {"success": False, "error": f"idempotency check failed: {e}"}
 
     try:
         if len(content) <= chunk_size:

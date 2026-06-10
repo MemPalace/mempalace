@@ -1766,6 +1766,36 @@ class TestWriteTools:
         assert deleted_logical["success"] is False
         assert "not found" in deleted_logical["error"].lower()
 
+    def test_add_drawer_returns_error_on_idempotency_check_failure(self, monkeypatch, config, kg):
+        """When idempotency pre-check raises (e.g., corrupt HNSW index),
+        tool_add_drawer must return success: False without calling
+        col.upsert. The index is never written to when the read path is
+        unhealthy, preventing unbounded sparse-file growth from repeated
+        upserts on a stressed or partially-corrupt graph."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        class _FakeGetResult:
+            ids = []
+
+        upsert_called = []
+
+        class _FakeCol:
+            def get(self, ids=None, **kwargs):
+                # Simulate idempotency check failure
+                raise RuntimeError("HNSW index under stress; seek drift in link_lists.bin")
+
+            def upsert(self, **kwargs):
+                upsert_called.append(True)
+                return None
+
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: _FakeCol())
+
+        result = mcp_server.tool_add_drawer("w", "r", "test content")
+        assert result["success"] is False
+        assert "idempotency check failed" in result["error"]
+        assert len(upsert_called) == 0, "upsert must not be called when idempotency check fails"
+
 
 # ── KG Tools ────────────────────────────────────────────────────────────
 
