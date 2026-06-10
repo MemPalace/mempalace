@@ -114,12 +114,16 @@ def test_quarantine_leaves_reasonable_payload_in_place(tmp_path):
 
 
 def test_segment_health_rejects_zero_byte_link_lists_with_payload(tmp_path):
-    """Regression #1457: real HNSW payload with empty link_lists.bin is corrupt."""
+    """Regression #1457: real HNSW payload with empty link_lists.bin is corrupt.
+
+    Uses data_size > _HNSW_ZERO_LINK_LISTS_DATA_CEIL so the segment is large
+    enough that an all-layer-0 HNSW graph is implausible.
+    """
     seg_dir = tmp_path / "11111111-2222-3333-4444-555555555555"
 
     _write_segment(
         seg_dir,
-        data_size=2_000,
+        data_size=1_000_000,  # > 512 KB, so zero-byte link_lists is suspicious
         link_size=0,
         write_metadata=True,
     )
@@ -128,7 +132,11 @@ def test_segment_health_rejects_zero_byte_link_lists_with_payload(tmp_path):
 
 
 def test_quarantine_catches_zero_byte_link_lists_when_stale(tmp_path):
-    """Regression #1457: stale segments with empty link_lists.bin are quarantined."""
+    """Regression #1457: stale segments with empty link_lists.bin are quarantined.
+
+    Uses data_size > _HNSW_ZERO_LINK_LISTS_DATA_CEIL so the segment is large
+    enough that an all-layer-0 HNSW graph is implausible.
+    """
     palace = tmp_path / "palace"
     palace.mkdir()
 
@@ -138,7 +146,7 @@ def test_quarantine_catches_zero_byte_link_lists_when_stale(tmp_path):
     seg_dir = palace / "11111111-2222-3333-4444-555555555555"
     _write_segment(
         seg_dir,
-        data_size=2_000,
+        data_size=1_000_000,  # > 512 KB, so zero-byte link_lists is suspicious
         link_size=0,
         write_metadata=True,
     )
@@ -156,3 +164,53 @@ def test_quarantine_catches_zero_byte_link_lists_when_stale(tmp_path):
     moved_path = Path(moved[0])
     assert moved_path.exists()
     assert moved_path.name.startswith("11111111-2222-3333-4444-555555555555.drift-")
+
+
+def test_segment_health_accepts_zero_byte_link_lists_for_small_index(tmp_path):
+    """Issue #1716: small all-layer-0 HNSW indexes legitimately have zero-byte link_lists.
+
+    When data_size <= _HNSW_ZERO_LINK_LISTS_DATA_CEIL, a zero-byte link_lists.bin
+    is plausible for an index where all elements landed on layer 0.
+    """
+    seg_dir = tmp_path / "11111111-2222-3333-4444-555555555555"
+
+    _write_segment(
+        seg_dir,
+        data_size=300_000,  # < 512 KB, so all-layer-0 is expected
+        link_size=0,
+        write_metadata=True,
+    )
+
+    assert _segment_appears_healthy(str(seg_dir))
+
+
+def test_quarantine_leaves_small_zero_byte_link_lists_in_place(tmp_path):
+    """Issue #1716: small segments with zero-byte link_lists are not quarantined.
+
+    When data_size <= _HNSW_ZERO_LINK_LISTS_DATA_CEIL, the segment is left
+    in place even if mtime drifts and link_lists.bin is zero-byte.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    db_path = palace / "chroma.sqlite3"
+    db_path.write_text("sqlite placeholder")
+
+    seg_dir = palace / "11111111-2222-3333-4444-555555555555"
+    _write_segment(
+        seg_dir,
+        data_size=300_000,  # < 512 KB, so all-layer-0 is expected
+        link_size=0,
+        write_metadata=True,
+    )
+
+    hnsw_time = 1_700_000_000
+    sqlite_time = hnsw_time + 1_000
+    os.utime(seg_dir / "data_level0.bin", (hnsw_time, hnsw_time))
+    os.utime(db_path, (sqlite_time, sqlite_time))
+
+    moved = quarantine_stale_hnsw(str(palace), stale_seconds=300)
+
+    # Segment should not be quarantined.
+    assert moved == []
+    assert seg_dir.exists()

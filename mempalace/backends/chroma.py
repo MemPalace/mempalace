@@ -82,10 +82,14 @@ def _hnsw_link_to_data_ratio(seg_dir: str) -> Optional[float]:
 def _hnsw_link_lists_is_usable_for_payload(seg_dir: str) -> bool:
     """Return False when a non-trivial HNSW payload lacks usable link lists.
 
-    A missing or empty link_lists.bin is acceptable only for a fresh/empty
-    segment. Once data_level0.bin has real payload, a zero-byte link_lists.bin
-    is not a harmless async-flush shape: ChromaDB can later hand the broken
-    graph to hnswlib and crash in native code.
+    A missing or empty link_lists.bin is acceptable for:
+    - a fresh/empty segment (data_level0.bin trivially small), or
+    - a small index where all elements sit on HNSW layer 0 (hnswlib
+      legitimately serializes an empty link_lists.bin in this case).
+
+    For larger segments, a zero-byte link_lists.bin indicates an
+    interrupted persist — ChromaDB can crash in native code if it
+    hands the broken graph to hnswlib.
     """
     data_path = os.path.join(seg_dir, "data_level0.bin")
     link_path = os.path.join(seg_dir, "link_lists.bin")
@@ -98,7 +102,16 @@ def _hnsw_link_lists_is_usable_for_payload(seg_dir: str) -> bool:
         if data_size <= _HNSW_MISSING_METADATA_DATA_FLOOR:
             return True
 
-        return os.path.isfile(link_path) and os.path.getsize(link_path) > 0
+        link_exists = os.path.isfile(link_path)
+        if link_exists and os.path.getsize(link_path) > 0:
+            return True
+
+        # Zero-byte or missing link_lists: acceptable for small indexes
+        # where an all-layer-0 HNSW graph is expected.
+        if data_size <= _HNSW_ZERO_LINK_LISTS_DATA_CEIL:
+            return True
+
+        return False
     except OSError:
         return False
 
@@ -145,6 +158,14 @@ _HNSW_BLOAT_GUARD = {
 # when data is trivially small) and _missing_dimensionality_appears_recoverable
 # (don't attempt recovery on segments with negligible data).
 _HNSW_MISSING_METADATA_DATA_FLOOR = 1024
+
+# Below this data_level0.bin size, a zero-byte link_lists.bin is plausible:
+# all elements landed on HNSW layer 0, which is the expected shape for small
+# indexes (hnswlib only serializes link lists for elements with level > 0).
+# 512 KB covers ~200 elements at 384-dim / M=16, well within the all-layer-0
+# probability envelope.  Above this threshold a zero-byte link_lists.bin is
+# treated as a failed persist and flagged as unusable.
+_HNSW_ZERO_LINK_LISTS_DATA_CEIL = 512 * 1024
 
 
 def _validate_where(where: Optional[dict]) -> None:
