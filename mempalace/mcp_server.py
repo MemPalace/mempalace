@@ -1895,8 +1895,21 @@ def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offse
         return {"error": str(e)}
 
 
-def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, room: str = None):
-    """Update an existing drawer's content and/or metadata."""
+def tool_update_drawer(
+    drawer_id: str,
+    content: str = None,
+    wing: str = None,
+    room: str = None,
+    append: bool = False,
+):
+    """Update an existing drawer's content and/or metadata.
+
+    When ``append`` is True and ``content`` is given, the content is
+    concatenated onto the existing drawer body instead of replacing it, so a
+    caller updating a long drawer need only send the delta rather than
+    re-transmitting the whole body on every edit. ``append`` defaults to
+    False, preserving the prior replace-in-full behavior.
+    """
     global _metadata_cache
 
     if content is None and wing is None and room is None:
@@ -1916,9 +1929,10 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
         new_doc = old_doc
         if content is not None:
             try:
-                new_doc = sanitize_content(content)
+                sanitized = sanitize_content(content)
             except ValueError as e:
                 return {"success": False, "error": str(e)}
+            new_doc = old_doc + sanitized if append else sanitized
 
         new_meta = dict(old_meta)
         if wing is not None:
@@ -1949,6 +1963,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
                 "new_wing": new_meta.get("wing", ""),
                 "new_room": new_meta.get("room", ""),
                 "content_changed": content is not None,
+                "append": append,
                 "content_preview": new_doc[:200] if content is not None else None,
             },
         )
@@ -2932,7 +2947,7 @@ TOOLS = {
         "handler": tool_list_drawers,
     },
     "mempalace_update_drawer": {
-        "description": "Update an existing drawer's content and/or metadata (wing, room). Fetches existing drawer first; returns error if not found.",
+        "description": "Update an existing drawer's content and/or metadata (wing, room). Fetches existing drawer first; returns error if not found. Set append=true to concatenate content onto the existing body (send only the delta) instead of replacing it.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -2948,6 +2963,10 @@ TOOLS = {
                 "room": {
                     "type": "string",
                     "description": "New room (optional — omit to keep existing)",
+                },
+                "append": {
+                    "type": "boolean",
+                    "description": "If true, append content to the existing drawer body instead of replacing it (send only the delta). Default false (replace).",
                 },
             },
             "required": ["drawer_id"],
