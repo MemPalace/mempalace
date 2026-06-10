@@ -9,6 +9,7 @@ import os
 import pickle
 import re
 import sqlite3
+import struct
 from collections import defaultdict
 from numbers import Integral
 from pathlib import Path
@@ -334,6 +335,13 @@ def _segment_appears_healthy(seg_dir: str) -> bool:
     if not _hnsw_payload_appears_sane(seg_dir):
         return False
 
+    binary_hdr = _read_hnsw_binary_header(seg_dir)
+    if binary_hdr is not None and (
+        binary_hdr["max_elements"] > _SANE_ELEMENT_CAP
+        or binary_hdr["cur_element_count"] > _SANE_ELEMENT_CAP
+    ):
+        return False
+
     try:
         size = os.path.getsize(meta_path)
         if size < 16:
@@ -582,6 +590,42 @@ def _hnsw_element_count(palace_path: str, segment_id: str) -> Optional[int]:
         return None
 
 
+_SANE_ELEMENT_CAP = 50_000_000  # well above any realistic palace
+
+
+def _read_hnsw_binary_header(seg_dir: str) -> Optional[dict]:
+    """Read max_elements and cur_element_count from the hnswlib binary header.
+
+    Returns a dict with ``max_elements`` and ``cur_element_count``, or
+    ``None`` if the file is absent, too small, or unreadable. Values are
+    read as unsigned 64-bit integers (hnswlib writes ``size_t`` on
+    64-bit platforms).
+
+    This is a secondary validation layer: the primary element count
+    comes from ``index_metadata.pickle`` via :func:`_hnsw_element_count`.
+    When the pickle is stale or the binary header is corrupt (e.g.
+    chroma-core/chroma#4460 type-confusion), the two counts diverge.
+    """
+    data_path = os.path.join(seg_dir, "data_level0.bin")
+    if not os.path.isfile(data_path):
+        return None
+    try:
+        with open(data_path, "rb") as f:
+            hdr = f.read(48)  # read enough for the full header prefix
+        if len(hdr) < 24:
+            return None
+        # hnswlib 64-bit layout: offset_level0 (8), max_elements (8),
+        # cur_element_count (8), ...
+        offset_level0, max_elements, cur_element_count = struct.unpack_from("<QQQ", hdr, 0)
+        return {
+            "offset_level0": offset_level0,
+            "max_elements": max_elements,
+            "cur_element_count": cur_element_count,
+        }
+    except (OSError, struct.error):
+        return None
+
+
 # Divergence threshold: chromadb's HNSW flushes asynchronously, so HNSW
 # typically lags sqlite by up to ``sync_threshold`` records under active
 # write load — that's the *brute-force batch* that hasn't been compacted
@@ -693,6 +737,26 @@ def hnsw_capacity_status(palace_path: str, collection_name: str = "mempalace_dra
 
         hnsw_count = _hnsw_element_count(palace_path, seg_id)
         out["hnsw_count"] = hnsw_count
+
+        seg_dir = os.path.join(palace_path, seg_id)
+        binary_hdr = _read_hnsw_binary_header(seg_dir)
+        if binary_hdr is not None:
+            out["binary_max_elements"] = binary_hdr["max_elements"]
+            out["binary_cur_elements"] = binary_hdr["cur_element_count"]
+            if (
+                binary_hdr["max_elements"] > _SANE_ELEMENT_CAP
+                or binary_hdr["cur_element_count"] > _SANE_ELEMENT_CAP
+            ):
+                out["status"] = "corrupt"
+                out["diverged"] = True
+                out["message"] = (
+                    f"HNSW binary header has astronomical values "
+                    f"(max={binary_hdr['max_elements']:,} "
+                    f"cur={binary_hdr['cur_element_count']:,}) — "
+                    f"likely type-confusion corruption (chroma-core/chroma#4460). "
+                    f"Run `mempalace repair` to rebuild."
+                )
+                return out
 
         sync_threshold = _read_sync_threshold(palace_path, collection_name)
         # Two synchronization windows worth — see comment above
