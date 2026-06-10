@@ -15,7 +15,7 @@ import logging
 import re
 from pathlib import Path
 from datetime import datetime
-from collections import defaultdict
+from collections import defaultdict, Counter
 from typing import Optional
 
 from .collision_scan import assert_no_collisions
@@ -528,7 +528,6 @@ def detect_wing(filepath: Path) -> str:
     # Tier 2: JSONL cwd-based
     if filepath.suffix.lower() == ".jsonl":
         try:
-            from collections import Counter
             cwd_counts: Counter = Counter()
             with open(filepath, encoding="utf-8", errors="replace") as f:
                 for i, line in enumerate(f):
@@ -538,8 +537,7 @@ def detect_wing(filepath: Path) -> str:
                         entry = json.loads(line)
                         cwd = entry.get("cwd") or entry.get("message", {}).get("cwd")
                         if cwd:
-                            p = Path(cwd)
-                            parts = [s for s in p.parts if s and s not in ("~", "/", "\\")]
+                            parts = [s for s in cwd.replace("\\", "/").split("/") if s and s != "~"]
                             if parts:
                                 cwd_counts[parts[-1]] += 1
                     except (json.JSONDecodeError, TypeError, AttributeError):
@@ -558,7 +556,6 @@ def detect_wing(filepath: Path) -> str:
             r"(?:/|\\)(?:Projects?|repos?|workspace|src|code|dev)(?:/|\\)([^/\\\s\"'`<>]{2,40})",
             re.IGNORECASE,
         )
-        from collections import Counter
         found: Counter = Counter()
         for m in project_re.finditer(raw):
             candidate = m.group(1).rstrip("/\\")

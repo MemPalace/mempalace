@@ -500,6 +500,20 @@ class TestDetectWing:
         result = detect_wing(chat_file)
         assert result == "webapp", f"Expected 'webapp', got '{result}'"
 
+    def test_tier2_jsonl_cwd_windows_path(self, tmp_path):
+        """Tier 2: Windows-style backslash paths are parsed cross-platform."""
+        from mempalace.convo_miner import detect_wing
+
+        chat_file = tmp_path / "chat.jsonl"
+        lines = [
+            r'{"cwd": "C:\\Users\\alice\\Projects\\winapp", "message": "hello"}',
+            r'{"cwd": "C:\\Users\\alice\\Projects\\winapp", "message": "world"}',
+        ]
+        chat_file.write_text("\n".join(lines), encoding="utf-8")
+
+        result = detect_wing(chat_file)
+        assert result == "winapp", f"Expected 'winapp', got '{result}'"
+
     def test_tier2_cwd_in_message_field(self, tmp_path):
         """Tier 2: also check message.cwd if top-level cwd is missing."""
         from mempalace.convo_miner import detect_wing
