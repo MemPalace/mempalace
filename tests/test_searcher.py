@@ -413,3 +413,45 @@ class TestSearchCLI:
         captured = capsys.readouterr()
         assert "[1]" in captured.out
         assert "[2]" in captured.out
+
+    def test_search_wing_filter_fallback_on_hnsw_drift(self, fake_palace_path, capsys):
+        """search() gracefully falls back to unfiltered + post-filter when
+        a filtered query fails due to HNSW/SQLite mismatch (orphan IDs).
+
+        Simulates: a filtered query raises "Error finding id", but an
+        unfiltered query succeeds. The fallback retries unfiltered,
+        post-filters in Python by wing, and returns results without
+        raising SearchError.
+        """
+        mock_col = MagicMock()
+        mock_col.metadata = {"hnsw:space": "cosine"}
+
+        # First call (filtered): raises, simulating orphan ID drift
+        # Second call (unfiltered fallback): succeeds
+        mock_col.query.side_effect = [
+            RuntimeError("Error finding id"),
+            {
+                "documents": [["doc in project wing", "doc in notes wing"]],
+                "metadatas": [
+                    [
+                        {"source_file": "a.md", "wing": "project", "room": "frontend"},
+                        {"source_file": "b.md", "wing": "notes", "room": "general"},
+                    ]
+                ],
+                "distances": [[0.1, 0.2]],
+            },
+        ]
+
+        with patch("mempalace.searcher.get_collection", return_value=mock_col):
+            search("test query", fake_palace_path, wing="project")
+
+        captured = capsys.readouterr()
+        # Should print results (no SearchError raised)
+        assert "Results for" in captured.out
+        assert "[1]" in captured.out
+        # Should contain the filtered result (wing matches)
+        assert "project" in captured.out or "a.md" in captured.out
+        # Fallback was applied: only the project wing result is shown (post-filtered)
+        assert "a.md" in captured.out  # project wing result
+        # notes wing result should NOT be shown (filtered out in Python)
+        assert "b.md" not in captured.out

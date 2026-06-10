@@ -376,7 +376,7 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
         if where:
             kwargs["where"] = where
 
-        results = col.query(**kwargs)
+        results = _query_drawers_with_filter_fallback(col, kwargs, query, n_results, wing, room)
 
     except Exception as e:
         print(f"\n  Search error: {e}")
