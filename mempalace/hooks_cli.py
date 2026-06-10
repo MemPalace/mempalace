@@ -517,10 +517,11 @@ def _maybe_auto_ingest():
     asymmetric interpreter handling and PID-file overwrite when both
     targets fire from a single hook call (#1231 review).
 
-    Per-target dedup is done by ``_spawn_mine`` itself: each (dir, mode)
-    target gets its own PID slot, so distinct targets never block each
-    other but a re-fire of the same target while the previous one is
-    still running is silently skipped.
+    Per-target dedup is done by ``_spawn_mine`` itself (and by
+    ``_mine_sync``, which uses the same PID-slot mechanism): each
+    (dir, mode) target gets its own PID slot, so distinct targets never
+    block each other but a re-fire of the same target while the previous
+    one is still running is silently skipped (#1253).
     """
     targets = _get_mine_targets()
     if not targets:
@@ -538,6 +539,10 @@ def _mine_sync():
     Transcript convos are ingested separately via ``_ingest_transcript``
     in ``hook_precompact`` — keeping them out of this function avoids
     timeout stacking against the harness 30s ceiling (#1231 review).
+
+    Uses the same per-target PID-slot guard as ``_spawn_mine`` so a
+    concurrent ``Stop``/``PreCompact`` double-fire cannot launch two HNSW
+    writers against the same palace (#1253).
     """
     targets = _get_mine_targets()
     if not targets:
@@ -545,24 +550,33 @@ def _mine_sync():
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     log_path = STATE_DIR / "hook.log"
     for mine_dir, mode in targets:
+        cmd = [_mempalace_python(), "-m", "mempalace", "mine", mine_dir, "--mode", mode]
+        pid_file = _claim_mine_slot(cmd)
+        if pid_file is None:
+            _log(f"Skipping sync mine: target already running ({mine_dir!r} {mode!r})")
+            continue
+        child_env = os.environ.copy()
+        child_env[_MINE_PID_FILE_ENV] = str(pid_file)
         try:
             with open(log_path, "a") as log_f:
                 subprocess.run(
-                    [
-                        _mempalace_python(),
-                        "-m",
-                        "mempalace",
-                        "mine",
-                        mine_dir,
-                        "--mode",
-                        mode,
-                    ],
+                    cmd,
                     stdout=log_f,
                     stderr=log_f,
+                    env=child_env,
                     timeout=60,
                 )
+                try:
+                    pid_file.write_text(f"{os.getpid()} {int(time.time())}")
+                except OSError:
+                    pass
         except (OSError, subprocess.TimeoutExpired):
             pass
+        finally:
+            try:
+                pid_file.unlink()
+            except OSError:
+                pass
 
 
 def _desktop_toast(body: str, title: str = "MemPalace"):

@@ -1098,6 +1098,39 @@ def test_spawn_mine_passes_pid_file_env_var(tmp_path):
                 assert child_env.get("MEMPALACE_MINE_PID_FILE") == expected
 
 
+def test_mine_sync_skips_when_target_running(tmp_path):
+    """_mine_sync skips if the per-target PID slot is already claimed (#1253)."""
+    import time as _time
+
+    mempal_dir = tmp_path / "project"
+    mempal_dir.mkdir()
+    pid_dir = tmp_path / "mine_pids"
+    with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli._MINE_PID_DIR", pid_dir):
+                from mempalace.hooks_cli import _pid_file_for_cmd, _mine_sync
+
+                cmd = [
+                    sys.executable,
+                    "-m",
+                    "mempalace",
+                    "mine",
+                    str(mempal_dir.resolve()),
+                    "--mode",
+                    "projects",
+                ]
+                # Pre-populate the per-target slot with a live PID (our own).
+                pid_file = _pid_file_for_cmd(cmd)
+                pid_file.parent.mkdir(parents=True, exist_ok=True)
+                pid_file.write_text(f"{os.getpid()} {int(_time.time())}")
+
+                with patch("mempalace.hooks_cli._mempalace_python", return_value=sys.executable):
+                    with patch("mempalace.hooks_cli.subprocess.run") as mock_run:
+                        _mine_sync()
+                        # subprocess.run should NOT be called when the slot is taken
+                        mock_run.assert_not_called()
+
+
 def test_ingest_transcript_uses_detached_kwargs(tmp_path):
     """_ingest_transcript spawns the convos mine with detach kwargs."""
     transcript = tmp_path / "session.jsonl"
