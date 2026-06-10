@@ -2135,7 +2135,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
     now = datetime.now()
     entry_id = (
         f"diary_{wing}_{now.strftime('%Y%m%d_%H%M%S%f')}_"
-        f"{hashlib.sha256(entry.encode()).hexdigest()[:12]}"
+        f"{hashlib.sha256(entry.encode('utf-8')).hexdigest()[:12]}"
     )
 
     _wal_log(
@@ -3481,10 +3481,10 @@ def main():
     # defaults stdin/stdout to the system codepage (e.g. cp1251), which
     # corrupts non-ASCII payloads and surfaces as generic -32000 errors on
     # Cyrillic/CJK content. See PEP 540.
-    for stream in (sys.stdin, sys.stdout):
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             try:
-                stream.reconfigure(encoding="utf-8", errors="replace")
+                stream.reconfigure(encoding="utf-8", errors="strict")
             except (AttributeError, OSError):
                 pass
     logger.info("MemPalace MCP Server starting...")
