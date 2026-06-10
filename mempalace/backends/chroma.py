@@ -2128,17 +2128,50 @@ class ChromaBackend(BaseBackend):
         self._client(palace_path).delete_collection(collection_name)
 
     def create_collection(
-        self, palace_path: str, collection_name: str, hnsw_space: str = "cosine"
+        self,
+        palace_path: str,
+        collection_name: str,
+        hnsw_space: str = "cosine",
+        sync_threshold: Optional[int] = None,
     ) -> ChromaCollection:
-        """Create (not get-or-create) ``collection_name`` with the given HNSW space."""
+        """Create (not get-or-create) ``collection_name`` with the given HNSW space.
+
+        Args:
+            palace_path: Path to the palace directory.
+            collection_name: Name of the collection to create.
+            hnsw_space: HNSW space metric (default: 'cosine').
+            sync_threshold: Override hnsw:sync_threshold for this collection.
+                When provided and >= 2, sets both hnsw:sync_threshold and
+                hnsw:batch_size to this value. Raises ValueError if < 2.
+                Can also be set via MEMPALACE_HNSW_SYNC_THRESHOLD env var.
+        """
+        import os
+
         ef = self._resolve_embedding_function()
         ef_kwargs = {"embedding_function": ef} if ef is not None else {}
+
+        # Allow env var fallback when sync_threshold param is None
+        if sync_threshold is None:
+            env_val = os.environ.get("MEMPALACE_HNSW_SYNC_THRESHOLD")
+            if env_val is not None:
+                try:
+                    sync_threshold = int(env_val)
+                except ValueError:
+                    pass
+
+        hnsw_guard = {**_HNSW_BLOAT_GUARD}
+        if sync_threshold is not None:
+            if sync_threshold < 2:
+                raise ValueError(f"sync_threshold must be >= 2, got {sync_threshold}")
+            hnsw_guard["hnsw:sync_threshold"] = sync_threshold
+            hnsw_guard["hnsw:batch_size"] = sync_threshold
+
         collection = self._client(palace_path).create_collection(
             collection_name,
             metadata={
                 "hnsw:space": hnsw_space,
                 "hnsw:num_threads": 1,
-                **_HNSW_BLOAT_GUARD,
+                **hnsw_guard,
             },
             **ef_kwargs,
         )

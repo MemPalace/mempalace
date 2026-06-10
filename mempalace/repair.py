@@ -194,6 +194,7 @@ def _rebuild_collection_via_temp(
     all_metas,
     batch_size: int,
     collection_name: Optional[str] = None,
+    sync_threshold: Optional[int] = None,
     progress=print,
 ) -> int:
     expected = len(all_ids)
@@ -205,7 +206,7 @@ def _rebuild_collection_via_temp(
         _delete_collection_if_exists(backend, palace_path, temp_name)
 
         progress(f"  Building temporary collection: {temp_name}")
-        temp_col = backend.create_collection(palace_path, temp_name)
+        temp_col = backend.create_collection(palace_path, temp_name, sync_threshold=sync_threshold)
         staged = 0
         for i in range(0, expected, batch_size):
             batch_ids = all_ids[i : i + batch_size]
@@ -219,7 +220,9 @@ def _rebuild_collection_via_temp(
         progress("  Rebuilding live collection...")
         backend.delete_collection(palace_path, collection_name)
         live_replaced = True
-        new_col = backend.create_collection(palace_path, collection_name)
+        new_col = backend.create_collection(
+            palace_path, collection_name, sync_threshold=sync_threshold
+        )
 
         rebuilt = 0
         for i in range(0, expected, batch_size):
@@ -892,6 +895,7 @@ def _rebuild_one_collection(
     batch_size: int,
     archive_path: Optional[str],
     counts_so_far: dict[str, int],
+    sync_threshold: Optional[int] = None,
 ) -> int:
     """Stream rows for one collection from SQLite and upsert into a
     freshly-created collection at ``dest_palace``. Returns rows
@@ -925,7 +929,7 @@ def _rebuild_one_collection(
         # reported as a structured ``RebuildPartialError`` carrying
         # ``archive_path`` — instead of an unstructured exception that
         # strands the user without recovery instructions.
-        col = backend.create_collection(dest_palace, collection_name)
+        col = backend.create_collection(dest_palace, collection_name, sync_threshold=sync_threshold)
 
         for emb_id, doc, meta in extract_via_sqlite(source_palace, collection_name):
             ids.append(emb_id)
@@ -1053,6 +1057,7 @@ def rebuild_from_sqlite(
     *,
     archive_existing_dest: bool = False,
     batch_size: int = 1000,
+    sync_threshold: Optional[int] = None,
 ) -> dict[str, int]:
     """Rebuild a palace by reading drawers from ``source_palace``'s
     ``chroma.sqlite3`` and upserting them into a fresh palace at
@@ -1216,6 +1221,7 @@ def rebuild_from_sqlite(
                 batch_size=batch_size,
                 archive_path=archive_path,
                 counts_so_far=counts,
+                sync_threshold=sync_threshold,
             )
             counts[cname] = upserted
             if upserted == 0:

@@ -344,8 +344,8 @@ def test_rebuild_index_success(mock_backend_cls, mock_shutil, tmp_path):
 
     # Verify: deleted and recreated (cosine is the backend default)
     assert mock_backend.create_collection.call_args_list == [
-        call(str(tmp_path), "mempalace_drawers__repair_tmp"),
-        call(str(tmp_path), "mempalace_drawers"),
+        call(str(tmp_path), "mempalace_drawers__repair_tmp", sync_threshold=None),
+        call(str(tmp_path), "mempalace_drawers", sync_threshold=None),
     ]
     assert mock_backend.delete_collection.call_args_list == [
         call(str(tmp_path), "mempalace_drawers__repair_tmp"),
@@ -528,8 +528,8 @@ def test_rebuild_index_default_uses_configured_collection(mock_backend_cls, mock
     mock_backend.get_collection.assert_called_once_with(str(tmp_path), "custom_drawers")
     count.assert_called_once_with(str(tmp_path), "custom_drawers")
     assert mock_backend.create_collection.call_args_list == [
-        call(str(tmp_path), "custom_drawers__repair_tmp"),
-        call(str(tmp_path), "custom_drawers"),
+        call(str(tmp_path), "custom_drawers__repair_tmp", sync_threshold=None),
+        call(str(tmp_path), "custom_drawers", sync_threshold=None),
     ]
     assert mock_backend.delete_collection.call_args_list == [
         call(str(tmp_path), "custom_drawers__repair_tmp"),
@@ -1995,3 +1995,76 @@ def test_rebuild_index_calls_vacuum(mock_backend_cls, mock_shutil, tmp_path):
         args, kwargs = mock_vacuum.call_args
         assert args[0] == str(tmp_path)
         assert "progress" in kwargs
+
+
+def test_rebuild_from_sqlite_threads_sync_threshold_to_create_collection(tmp_path):
+    """Test that rebuild_from_sqlite(sync_threshold=N) passes it to create_collection."""
+    # Create a minimal source palace with SQLite data
+    source_path = tmp_path / "source"
+    dest_path = tmp_path / "dest"
+    source_path.mkdir()
+
+    # Create a minimal chroma.sqlite3 with the required schema
+    conn = sqlite3.connect(str(source_path / "chroma.sqlite3"))
+    conn.executescript(
+        """
+        CREATE TABLE collections (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+        CREATE TABLE segments (
+            id TEXT PRIMARY KEY,
+            collection INTEGER NOT NULL,
+            scope TEXT NOT NULL,
+            FOREIGN KEY(collection) REFERENCES collections(id)
+        );
+        CREATE TABLE embeddings (
+            id INTEGER PRIMARY KEY,
+            segment_id TEXT NOT NULL,
+            embedding_id TEXT NOT NULL,
+            FOREIGN KEY(segment_id) REFERENCES segments(id)
+        );
+        CREATE TABLE embedding_metadata (
+            id INTEGER PRIMARY KEY,
+            key TEXT NOT NULL,
+            string_value TEXT,
+            int_value INTEGER,
+            float_value REAL,
+            bool_value INTEGER
+        );
+        INSERT INTO collections (id, name) VALUES (1, 'drawers');
+        INSERT INTO segments (id, collection, scope) VALUES ('seg1', 1, 'METADATA');
+        """
+    )
+    conn.close()
+
+    # Mock the backend to capture create_collection calls
+    created_collections = []
+
+    with patch("mempalace.repair.ChromaBackend") as mock_backend_cls:
+        mock_backend = MagicMock()
+        mock_backend_cls.return_value = mock_backend
+
+        def capture_create(palace, name, sync_threshold=None):
+            created_collections.append(
+                {"palace": palace, "name": name, "sync_threshold": sync_threshold}
+            )
+            mock_col = MagicMock()
+            mock_col.upsert = MagicMock()
+            return mock_col
+
+        mock_backend.create_collection = capture_create
+
+        # Call rebuild_from_sqlite with sync_threshold=15
+        try:
+            repair.rebuild_from_sqlite(
+                source_palace=str(source_path),
+                dest_palace=str(dest_path),
+                sync_threshold=15,
+            )
+        except Exception:
+            # The rebuild may fail due to incomplete SQLite schema, but we
+            # only care that sync_threshold was passed to create_collection
+            pass
+
+        # Verify sync_threshold was passed through
+        assert len(created_collections) > 0
+        for call in created_collections:
+            assert call["sync_threshold"] == 15

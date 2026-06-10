@@ -4,6 +4,7 @@ import shutil
 import sqlite3
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import chromadb
 import pytest
@@ -1848,3 +1849,66 @@ def test_palace_get_collection_uses_configured_collection_name(monkeypatch):
         "collection_name": "custom_drawers",
         "create": False,
     }
+
+
+def test_chroma_create_collection_with_sync_threshold(tmp_path, monkeypatch):
+    """Test that create_collection(sync_threshold=N) passes it to metadata."""
+    backend = ChromaBackend()
+    palace_path = str(tmp_path)
+
+    # Mock the chroma client to capture the metadata passed
+    captured_metadata = {}
+
+    def mock_create_collection(name, metadata=None, **kwargs):
+        captured_metadata["metadata"] = metadata
+        return _FakeCollection()
+
+    client_mock = MagicMock()
+    client_mock.create_collection = mock_create_collection
+
+    monkeypatch.setattr(backend, "_client", lambda _: client_mock)
+
+    # Call with sync_threshold=10
+    backend.create_collection(palace_path, "test_col", sync_threshold=10)
+
+    assert captured_metadata["metadata"]["hnsw:sync_threshold"] == 10
+    assert captured_metadata["metadata"]["hnsw:batch_size"] == 10
+
+
+def test_chroma_create_collection_sync_threshold_below_2_raises(tmp_path, monkeypatch):
+    """Test that create_collection(sync_threshold < 2) raises ValueError."""
+    from mempalace.backends.chroma import ChromaBackend
+
+    backend = ChromaBackend()
+    palace_path = str(tmp_path)
+
+    client_mock = MagicMock()
+    monkeypatch.setattr(backend, "_client", lambda _: client_mock)
+
+    with pytest.raises(ValueError, match="sync_threshold must be >= 2"):
+        backend.create_collection(palace_path, "test_col", sync_threshold=1)
+
+
+def test_chroma_create_collection_env_var_fallback(tmp_path, monkeypatch):
+    """Test that MEMPALACE_HNSW_SYNC_THRESHOLD env var is used as fallback."""
+    backend = ChromaBackend()
+    palace_path = str(tmp_path)
+
+    # Mock the chroma client to capture the metadata passed
+    captured_metadata = {}
+
+    def mock_create_collection(name, metadata=None, **kwargs):
+        captured_metadata["metadata"] = metadata
+        return _FakeCollection()
+
+    client_mock = MagicMock()
+    client_mock.create_collection = mock_create_collection
+
+    monkeypatch.setattr(backend, "_client", lambda _: client_mock)
+    monkeypatch.setenv("MEMPALACE_HNSW_SYNC_THRESHOLD", "7")
+
+    # Call without sync_threshold param; should use env var
+    backend.create_collection(palace_path, "test_col")
+
+    assert captured_metadata["metadata"]["hnsw:sync_threshold"] == 7
+    assert captured_metadata["metadata"]["hnsw:batch_size"] == 7

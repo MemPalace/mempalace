@@ -280,6 +280,12 @@ def cmd_init(args):
     if getattr(args, "palace", None):
         os.environ["MEMPALACE_PALACE_PATH"] = os.path.abspath(os.path.expanduser(args.palace))
 
+    # Thread --hnsw-sync-threshold through env var so downstream create_collection
+    # calls pick it up via MEMPALACE_HNSW_SYNC_THRESHOLD fallback.
+    hnsw_sync_threshold = getattr(args, "hnsw_sync_threshold", None)
+    if hnsw_sync_threshold is not None:
+        os.environ["MEMPALACE_HNSW_SYNC_THRESHOLD"] = str(hnsw_sync_threshold)
+
     cfg = MempalaceConfig()
 
     # Resolve entity-detection languages: --lang overrides config.
@@ -956,6 +962,7 @@ def cmd_repair(args):
                 source_palace=source_path,
                 dest_palace=palace_path,
                 archive_existing_dest=archive_existing,
+                sync_threshold=getattr(args, "hnsw_sync_threshold", None),
             )
         except RebuildPartialError as exc:
             # The error itself was already printed by rebuild_from_sqlite
@@ -1419,6 +1426,13 @@ def main():
             "the external send is acceptable."
         ),
     )
+    p_init.add_argument(
+        "--hnsw-sync-threshold",
+        type=int,
+        default=None,
+        metavar="N",
+        help=("Override hnsw:sync_threshold for the initialized collection. Must be >= 2."),
+    )
 
     # mine
     p_mine = sub.add_parser("mine", help="Mine files into the palace")
@@ -1687,6 +1701,16 @@ def main():
         "--dry-run",
         action="store_true",
         help="Print detected poisoned rows and exit without mutation (--mode max-seq-id only)",
+    )
+    p_repair.add_argument(
+        "--hnsw-sync-threshold",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Override hnsw:sync_threshold for the rebuilt collection. "
+            "Only meaningful with --mode from-sqlite. Must be >= 2."
+        ),
     )
 
     # repair-status — read-only HNSW capacity health check (#1222)
