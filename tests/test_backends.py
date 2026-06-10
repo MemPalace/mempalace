@@ -1053,15 +1053,20 @@ def test_quarantine_stale_hnsw_leaves_empty_segment_without_metadata_alone(tmp_p
     assert seg.exists()
 
 
-def test_segment_without_metadata_but_with_nontrivial_data_is_unhealthy(tmp_path):
-    """Interrupted persist: link_lists written but metadata absent is unhealthy."""
+def test_segment_without_metadata_but_with_sane_ratio_is_healthy(tmp_path):
+    """Never-flushed segment: no metadata but sane link/data ratio is healthy.
+
+    Issue #1564: segments created under the old 50k batch_size guard that
+    never reached sync_threshold have no metadata but grow valid binary
+    files. The sane ratio distinguishes them from interrupted persists.
+    """
 
     seg = tmp_path / "abcd-1234-5678"
     seg.mkdir()
     (seg / "data_level0.bin").write_bytes(b"\0" * (_HNSW_MISSING_METADATA_DATA_FLOOR + 1))
     (seg / "link_lists.bin").write_bytes(b"\x01" * 128)
 
-    assert not _segment_appears_healthy(str(seg))
+    assert _segment_appears_healthy(str(seg))
 
 
 def test_segment_without_metadata_and_tiny_data_is_still_treated_as_fresh(tmp_path):
@@ -1074,8 +1079,13 @@ def test_segment_without_metadata_and_tiny_data_is_still_treated_as_fresh(tmp_pa
     assert _segment_appears_healthy(str(seg))
 
 
-def test_quarantine_stale_hnsw_renames_missing_metadata_with_nontrivial_data(tmp_path):
-    """Regression for #1274: missing pickle + link data must quarantine."""
+def test_quarantine_stale_hnsw_keeps_missing_metadata_with_sane_ratio(tmp_path):
+    """Issue #1564: never-flushed segment with sane ratio is not quarantined.
+
+    Refined behavior: missing metadata + stale mtime is not quarantined if
+    the payload has a sane link/data ratio (indicates a never-flushed
+    segment, not an interrupted persist).
+    """
 
     now = 1_700_000_000.0
     palace, seg = _make_palace_with_segment(
@@ -1090,13 +1100,12 @@ def test_quarantine_stale_hnsw_renames_missing_metadata_with_nontrivial_data(tmp
 
     moved = quarantine_stale_hnsw(str(palace), stale_seconds=3600.0)
 
-    assert len(moved) == 1
-    assert ".drift-" in moved[0]
-    assert not seg.exists()
+    # Should not quarantine because the payload ratio is sane.
+    assert len(moved) == 0
+    assert seg.exists()
 
     drift_dirs = [p for p in palace.iterdir() if ".drift-" in p.name]
-    assert len(drift_dirs) == 1
-    assert (drift_dirs[0] / "data_level0.bin").exists()
+    assert len(drift_dirs) == 0
 
 
 def test_quarantine_stale_hnsw_renames_truncated_metadata(tmp_path):

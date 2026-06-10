@@ -327,9 +327,17 @@ def _segment_appears_healthy(seg_dir: str) -> bool:
             link_has_data = os.path.isfile(link_path) and os.path.getsize(link_path) > 0
         except OSError:
             return False
-        # Both absent → sub-threshold, never persisted.
-        # link_lists written but metadata not → interrupted persist.
-        return not link_has_data
+        if not link_has_data:
+            # Both absent → sub-threshold, never persisted.
+            return True
+        # link_lists written but metadata not → could be an interrupted persist
+        # (corruption risk) or a never-flushed segment that grew past the old
+        # 50k batch_size guard (#1579) without hitting sync_threshold.
+        # Distinguish them by payload sanity: if the HNSW binary files have
+        # a normal link/data ratio, the segment is structurally valid even
+        # without metadata and should not be quarantined. An interrupted
+        # persist that corrupted the binary files would show abnormal ratios.
+        return _hnsw_payload_appears_sane(seg_dir)
 
     if not _hnsw_payload_appears_sane(seg_dir):
         return False
@@ -401,6 +409,16 @@ def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> lis
 
         payload_ratio = _hnsw_link_to_data_ratio(seg_dir)
         payload_corrupt = payload_ratio is not None and payload_ratio > _HNSW_LINK_TO_DATA_MAX_RATIO
+
+        # Re-stat sqlite to minimize the window between the two mtime reads.
+        # chroma.sqlite3 is shared across all collections; a sweep writing to
+        # one collection advances the DB mtime while other collections' HNSW
+        # files remain untouched. A stale sqlite_mtime from the top of the
+        # function body would overstate the gap.
+        try:
+            sqlite_mtime = os.path.getmtime(db_path)
+        except OSError:
+            continue
 
         if not payload_corrupt and sqlite_mtime - hnsw_mtime < stale_seconds:
             continue
