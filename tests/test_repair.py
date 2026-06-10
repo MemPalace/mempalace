@@ -361,6 +361,70 @@ def test_rebuild_index_success(mock_backend_cls, mock_shutil, tmp_path):
 
 @patch("mempalace.repair.shutil")
 @patch("mempalace.repair.ChromaBackend")
+def test_rebuild_index_patches_dim_none_pickle(mock_backend_cls, mock_shutil, tmp_path):
+    """After rebuild, dim-None pickles in segments are patched to the correct dimension."""
+    import pickle as pickle_module
+
+    # Create a valid sqlite file with dimension metadata
+    sqlite_path = tmp_path / "chroma.sqlite3"
+    with sqlite3.connect(sqlite_path) as conn:
+        conn.execute(
+            "CREATE TABLE collections(id INTEGER PRIMARY KEY, name TEXT, dimension INTEGER)"
+        )
+        conn.execute("CREATE TABLE segments(id TEXT PRIMARY KEY, collection INTEGER, scope TEXT)")
+        conn.execute(
+            "INSERT INTO collections(id, name, dimension) VALUES(1, 'mempalace_drawers', 1536)"
+        )
+        conn.execute(
+            "INSERT INTO segments(id, collection, scope) VALUES('seg-uuid-1', 1, 'VECTOR')"
+        )
+        conn.commit()
+
+    # Create a segment directory with a dim-None pickle
+    seg_dir = tmp_path / "seg-uuid-1"
+    seg_dir.mkdir()
+    pickle_path = seg_dir / "index_metadata.pickle"
+    with open(pickle_path, "wb") as f:
+        pickle_module.dump({"dimensionality": None, "other_key": "value"}, f)
+
+    mock_col = MagicMock()
+    mock_col.count.return_value = 2
+    mock_col.get.return_value = {
+        "ids": ["id1", "id2"],
+        "documents": ["doc1", "doc2"],
+        "metadatas": [{"wing": "a"}, {"wing": "b"}],
+    }
+
+    mock_new_col = MagicMock()
+    mock_new_col.count.return_value = 2
+    mock_temp_col = MagicMock()
+    mock_temp_col.count.return_value = 2
+    mock_backend = _install_mock_backend(mock_backend_cls, mock_col)
+    mock_backend.create_collection.side_effect = [mock_temp_col, mock_new_col]
+
+    def _fake_copy2(src, dst):
+        with open(dst, "w") as handle:
+            handle.write("backup")
+
+    mock_shutil.copy2.side_effect = _fake_copy2
+
+    repair.rebuild_index(palace_path=str(tmp_path))
+
+    # Verify the pickle was patched
+    with open(pickle_path, "rb") as f:
+        patched_data = pickle_module.load(f)
+    assert patched_data["dimensionality"] == 1536
+    assert patched_data["other_key"] == "value"
+
+
+def test_repair_dim_none_pickles_skips_when_no_sqlite(tmp_path):
+    """When chroma.sqlite3 is absent, _repair_dim_none_pickles returns 0 without error."""
+    result = repair._repair_dim_none_pickles(str(tmp_path), "mempalace_drawers")
+    assert result == 0
+
+
+@patch("mempalace.repair.shutil")
+@patch("mempalace.repair.ChromaBackend")
 def test_rebuild_index_ignores_missing_temp_collection_at_start(
     mock_backend_cls, mock_shutil, tmp_path
 ):

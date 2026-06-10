@@ -849,6 +849,12 @@ def rebuild_index(
         raise
 
     _close_chroma_handles(palace_path, backend=backend)
+
+    # Patch any dim-None pickles written by chromadb 1.5.8's flush bug
+    # (#1492). Must run after close so mmap handles are released but before
+    # the function returns, so the next open doesn't quarantine the fresh index.
+    _repair_dim_none_pickles(palace_path, collection_name, progress=progress)
+
     _vacuum_and_rebuild_fts5(palace_path, progress=progress)
 
     print(f"\n  Repair complete. {filed} drawers rebuilt.")
@@ -1327,6 +1333,87 @@ def _close_chroma_handles(palace_path: str, backend: "ChromaBackend | None" = No
     except Exception:
         pass
     gc.collect()
+
+
+def _repair_dim_none_pickles(palace_path: str, collection_name: str, progress=print) -> int:
+    """Patch any dim-None index_metadata.pickle files left by the chromadb 1.5.8 flush bug.
+
+    After ``_rebuild_collection_via_temp`` completes, chromadb may have written
+    ``dimensionality: None`` into the segment pickle (chroma-core/chroma#6949).
+    This function reads the true dimension from ``chroma.sqlite3``'s
+    ``collections.dimension`` column and rewrites each affected pickle atomically.
+
+    Returns the number of pickles patched.
+    """
+    import pickle
+
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return 0
+
+    # Collect segment dimensions for this collection from sqlite.
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            rows = conn.execute(
+                """
+                SELECT s.id, c.dimension
+                FROM segments s
+                JOIN collections c ON s.collection = c.id
+                WHERE c.name = ? AND s.scope = 'VECTOR'
+                """,
+                (collection_name,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return 0
+
+    dim_by_seg: dict[str, int] = {}
+    for seg_id, dim in rows:
+        if dim is not None and int(dim) > 0:
+            dim_by_seg[seg_id] = int(dim)
+
+    if not dim_by_seg:
+        return 0
+
+    patched = 0
+    try:
+        entries = os.listdir(palace_path)
+    except OSError:
+        return 0
+
+    for name in entries:
+        if name not in dim_by_seg:
+            continue
+        seg_dir = os.path.join(palace_path, name)
+        meta_path = os.path.join(seg_dir, "index_metadata.pickle")
+        if not os.path.isfile(meta_path):
+            continue
+        try:
+            with open(meta_path, "rb") as f:
+                data = pickle.load(f)  # noqa: S301
+            dim = dim_by_seg[name]
+            if isinstance(data, dict):
+                if data.get("dimensionality") == dim:
+                    continue  # already correct
+                data["dimensionality"] = dim
+            else:
+                if getattr(data, "dimensionality", None) == dim:
+                    continue
+                data.dimensionality = dim
+            tmp = meta_path + ".tmp"
+            with open(tmp, "wb") as f:
+                pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp, meta_path)
+            patched += 1
+            progress(
+                f"  Patched dim-None pickle in {name}: set dimensionality={dim} "
+                "(chromadb 1.5.8 checkpoint bug)"
+            )
+        except Exception:
+            progress(f"  WARNING: could not patch dim-None pickle in {name}; skipping")
+    return patched
 
 
 class MaxSeqIdVerificationError(RuntimeError):
