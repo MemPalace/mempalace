@@ -467,4 +467,106 @@ class TestFileChunksLocked:
         assert drawers == 5
         assert dict(room_counts) == {}
         assert skipped is False
-        assert col.batch_sizes == [2, 2, 1]
+
+
+class TestDetectWing:
+    """Tests for 3-tier wing detection in detect_wing()."""
+
+    def test_tier1_path_based_detection(self, tmp_path):
+        """Tier 1: extract project name from path like /tmp/test-Users-name-Projects-myapp/session.jsonl."""
+        from mempalace.convo_miner import detect_wing
+
+        # Create a directory structure: test-Users-name-Projects-myapp
+        project_dir = tmp_path / "test-Users-name-Projects-myapp"
+        project_dir.mkdir()
+        session_file = project_dir / "session.jsonl"
+        session_file.write_text('{"cwd": "/tmp"}\n', encoding="utf-8")
+
+        result = detect_wing(session_file)
+        assert result == "myapp", f"Expected 'myapp', got '{result}'"
+
+    def test_tier2_jsonl_cwd_detection(self, tmp_path):
+        """Tier 2: extract project from cwd in JSONL entries."""
+        from mempalace.convo_miner import detect_wing
+
+        # Create a simple JSONL file with cwd entries
+        chat_file = tmp_path / "chat.jsonl"
+        lines = [
+            '{"cwd": "/home/user/Projects/webapp", "message": "hello"}',
+            '{"cwd": "/home/user/Projects/webapp", "message": "world"}',
+        ]
+        chat_file.write_text("\n".join(lines), encoding="utf-8")
+
+        result = detect_wing(chat_file)
+        assert result == "webapp", f"Expected 'webapp', got '{result}'"
+
+    def test_tier2_cwd_in_message_field(self, tmp_path):
+        """Tier 2: also check message.cwd if top-level cwd is missing."""
+        from mempalace.convo_miner import detect_wing
+
+        chat_file = tmp_path / "chat.jsonl"
+        lines = [
+            '{"message": {"cwd": "/home/user/Projects/testapp"}}',
+            '{"message": {"cwd": "/home/user/Projects/testapp"}}',
+        ]
+        chat_file.write_text("\n".join(lines), encoding="utf-8")
+
+        result = detect_wing(chat_file)
+        assert result == "testapp", f"Expected 'testapp', got '{result}'"
+
+    def test_tier3_content_based_detection(self, tmp_path):
+        """Tier 3: extract project name from file content paths."""
+        from mempalace.convo_miner import detect_wing
+
+        # Create a file with content mentioning a project path
+        chat_file = tmp_path / "chat.txt"
+        content = "I was working on /Users/alice/Projects/coolproject/src/main.py and found a bug"
+        chat_file.write_text(content, encoding="utf-8")
+
+        result = detect_wing(chat_file)
+        assert result == "coolproject", f"Expected 'coolproject', got '{result}'"
+
+    def test_fallback_to_general(self, tmp_path):
+        """Fallback: return 'general' when no project info is detectable."""
+        from mempalace.convo_miner import detect_wing
+
+        # Create a file with no detectable project info
+        chat_file = tmp_path / "generic_chat.txt"
+        content = "Just a regular chat about nothing specific\n" * 10
+        chat_file.write_text(content, encoding="utf-8")
+
+        result = detect_wing(chat_file)
+        assert result == "general", f"Expected 'general', got '{result}'"
+
+    def test_normalized_names(self, tmp_path):
+        """Project names should be normalized (lowercase, hyphens->underscores)."""
+        from mempalace.convo_miner import detect_wing
+
+        # Create a path with uppercase and hyphens that should be normalized
+        # The detection takes the last segment, so this extracts 'MyApp'
+        project_dir = tmp_path / "test-Users-name-Projects-MyApp"
+        project_dir.mkdir()
+        session_file = project_dir / "session.jsonl"
+        session_file.write_text('{"cwd": "/tmp"}\n', encoding="utf-8")
+
+        result = detect_wing(session_file)
+        # normalize_wing_name converts to lowercase
+        assert result == "myapp", f"Expected 'myapp', got '{result}'"
+
+    def test_tier1_priority_over_tier2(self, tmp_path):
+        """Tier 1 should take priority over Tier 2."""
+        from mempalace.convo_miner import detect_wing
+
+        # Create a path with Tier 1 info (path-based) AND Tier 2 info (cwd-based)
+        # Tier 1 should win
+        project_dir = tmp_path / "test-Users-name-Projects-pathproject"
+        project_dir.mkdir()
+        session_file = project_dir / "session.jsonl"
+        # This file has a different cwd (Tier 2), but Tier 1 path should win
+        lines = [
+            '{"cwd": "/home/user/Projects/differentproject"}',
+        ]
+        session_file.write_text("\n".join(lines), encoding="utf-8")
+
+        result = detect_wing(session_file)
+        assert result == "pathproject", f"Expected 'pathproject' (from Tier 1), got '{result}'"

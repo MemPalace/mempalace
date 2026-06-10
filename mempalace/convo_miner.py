@@ -10,7 +10,9 @@ Same palace as project mining. Different ingest strategy.
 
 import os
 import sys
+import json
 import logging
+import re
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
@@ -512,6 +514,64 @@ def _resolve_wing(convo_path: Path, wing: Optional[str]) -> str:
     return normalize_wing_name(convo_path.name)
 
 
+def detect_wing(filepath: Path) -> str:
+    """3-tier wing detection for a conversation file."""
+    from .config import normalize_wing_name
+
+    # Tier 1: path-based (Claude Code encodes paths as dir names)
+    parent_name = filepath.parent.name
+    if "-" in parent_name:
+        segments = [s for s in parent_name.split("-") if s and not s.isdigit() and len(s) > 1]
+        if segments:
+            return normalize_wing_name(segments[-1])
+
+    # Tier 2: JSONL cwd-based
+    if filepath.suffix.lower() == ".jsonl":
+        try:
+            from collections import Counter
+            cwd_counts: Counter = Counter()
+            with open(filepath, encoding="utf-8", errors="replace") as f:
+                for i, line in enumerate(f):
+                    if i >= 200:
+                        break
+                    try:
+                        entry = json.loads(line)
+                        cwd = entry.get("cwd") or entry.get("message", {}).get("cwd")
+                        if cwd:
+                            p = Path(cwd)
+                            parts = [s for s in p.parts if s and s not in ("~", "/", "\\")]
+                            if parts:
+                                cwd_counts[parts[-1]] += 1
+                    except (json.JSONDecodeError, TypeError, AttributeError):
+                        continue
+            if cwd_counts:
+                winner = cwd_counts.most_common(1)[0][0]
+                if winner:
+                    return normalize_wing_name(winner)
+        except OSError:
+            pass
+
+    # Tier 3: content-based
+    try:
+        raw = filepath.read_text(encoding="utf-8", errors="replace")[:4000]
+        project_re = re.compile(
+            r"(?:/|\\)(?:Projects?|repos?|workspace|src|code|dev)(?:/|\\)([^/\\\s\"'`<>]{2,40})",
+            re.IGNORECASE,
+        )
+        from collections import Counter
+        found: Counter = Counter()
+        for m in project_re.finditer(raw):
+            candidate = m.group(1).rstrip("/\\")
+            if candidate and not candidate.startswith("."):
+                found[candidate] += 1
+        if found:
+            return normalize_wing_name(found.most_common(1)[0][0])
+    except OSError:
+        pass
+
+    return "general"
+
+
 def mine_convos(
     convo_dir: str,
     palace_path: str,
@@ -694,10 +754,16 @@ def _mine_convos_impl(
         if extract_mode != "general":
             room_counts[room] += 1
 
+        # Smart per-file wing detection: if wing is wing_api, detect the actual
+        # project/workspace from the file to avoid grouping unrelated conversations.
+        file_wing = wing
+        if wing == "wing_api":
+            file_wing = detect_wing(filepath)
+
         # Lock + purge stale + file fresh chunks. Lock serializes concurrent
         # agents; purge removes pre-v2 drawers so the schema bump applies.
         drawers_added, room_delta, skipped = _file_chunks_locked(
-            collection, source_file, chunks, wing, room, agent, extract_mode
+            collection, source_file, chunks, file_wing, room, agent, extract_mode
         )
         if skipped:
             files_skipped += 1
