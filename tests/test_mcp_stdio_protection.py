@@ -84,8 +84,9 @@ def test_mcp_server_no_stdout_noise_on_clean_exit():
 
 
 def test_main_reconfigures_all_streams_to_utf8_strict():
-    """Verify that main() reconfigures stdin, stdout, and stderr with
-    encoding='utf-8' and errors='strict' to handle non-ASCII content."""
+    """Verify that main() reconfigures stdio with per-stream error policies:
+    stdin uses surrogateescape (malformed bytes survive the read loop);
+    stdout and stderr use strict (server-controlled JSON-RPC, failures are bugs)."""
     code = textwrap.dedent(
         """
         import sys
@@ -123,7 +124,6 @@ def test_main_reconfigures_all_streams_to_utf8_strict():
             mcp_server.main()
 
         # Verify reconfigure was called on all three streams with correct args
-        expected_kwargs = {'encoding': 'utf-8', 'errors': 'strict'}
         assert len(reconfigure_calls) == 3, (
             f"Expected exactly 3 reconfigure calls, got {len(reconfigure_calls)}: {reconfigure_calls}"
         )
@@ -133,9 +133,18 @@ def test_main_reconfigures_all_streams_to_utf8_strict():
             f"Expected all three streams, got: {stream_names}"
         )
 
+        # Per-stream error policies: stdin uses surrogateescape so malformed
+        # bytes survive the read loop; stdout/stderr use strict because
+        # they carry server-controlled JSON-RPC and encode failures are bugs.
+        expected_per_stream = {
+            'stdin':  {'encoding': 'utf-8', 'errors': 'surrogateescape'},
+            'stdout': {'encoding': 'utf-8', 'errors': 'strict'},
+            'stderr': {'encoding': 'utf-8', 'errors': 'strict'},
+        }
         for stream_name, kwargs in reconfigure_calls:
-            assert kwargs == expected_kwargs, (
-                f"Stream {stream_name}: expected {expected_kwargs}, got {kwargs}"
+            expected = expected_per_stream[stream_name]
+            assert kwargs == expected, (
+                f"Stream {stream_name}: expected {expected}, got {kwargs}"
             )
 
         print("OK", file=sys.stderr)

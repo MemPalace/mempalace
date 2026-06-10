@@ -3481,10 +3481,19 @@ def main():
     # defaults stdin/stdout to the system codepage (e.g. cp1251), which
     # corrupts non-ASCII payloads and surfaces as generic -32000 errors on
     # Cyrillic/CJK content. See PEP 540.
-    for stream in (sys.stdin, sys.stdout, sys.stderr):
+    # stdin uses surrogateescape so a malformed byte from a redirected file
+    # or misbehaving client survives as a lone surrogate instead of raising
+    # UnicodeDecodeError and killing the read loop. stdout/stderr use strict
+    # because everything written there is server-controlled JSON-RPC; encode
+    # failures are real bugs the operator wants loud. See mempalace/_stdio.py.
+    for stream, errors in (
+        (sys.stdin, "surrogateescape"),
+        (sys.stdout, "strict"),
+        (sys.stderr, "strict"),
+    ):
         if hasattr(stream, "reconfigure"):
             try:
-                stream.reconfigure(encoding="utf-8", errors="strict")
+                stream.reconfigure(encoding="utf-8", errors=errors)
             except (AttributeError, OSError):
                 pass
     logger.info("MemPalace MCP Server starting...")
