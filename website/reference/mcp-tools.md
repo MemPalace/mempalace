@@ -393,3 +393,27 @@ Force a reconnect to the palace database. Use this after external scripts or CLI
 **Parameters:** None
 
 **Returns:** `{ success, message, drawers, vector_disabled[, vector_disabled_reason] }` (on no-palace: `{ success: false, message, drawers, vector_disabled }`; on exception: `{ success: false, error }`)
+
+### `hivemind_push`
+
+Push a palace wing to MinIO for team sharing. Uploads all drawers and KG facts for the specified wing under the configured user_id. Requires the `minio` optional dependency (`pip install mempalace[minio]`) and MinIO configuration in `~/.mempalace/config.json`.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `wing` | string | yes | Wing to push (e.g. `'project_alpha'`) |
+
+**Returns:** `{ success, wing, user_id, bucket, object_prefix, drawer_count, kg_fact_count, timestamp }` (on error: `{ error }`)
+
+### `hivemind_pull`
+
+Pull a palace wing from MinIO (all users) and merge into local palace. Downloads drawers and KG facts from every team member who pushed this wing, deduplicates by content hash, and makes them queryable via all other mempalace tools.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `wing` | string | yes | Wing to pull (e.g. `'project_alpha'`) |
+
+**Returns:** `{ success, wing, sources, drawers_imported, drawers_skipped, kg_facts_imported, kg_facts_skipped, timestamp }` (on error: `{ error }`)

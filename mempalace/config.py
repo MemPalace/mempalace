@@ -413,6 +413,62 @@ class MempalaceConfig:
         return str(value).strip() if value else None
 
     @property
+    def user_id(self):
+        """User identifier for multi-user push/pull sync."""
+        env_val = os.environ.get("MEMPALACE_USER_ID")
+        if env_val:
+            return env_val.strip()
+        value = self._file_config.get("user_id")
+        return str(value).strip() if value else None
+
+    @property
+    def minio_endpoint(self):
+        """MinIO server endpoint (host:port)."""
+        env_val = os.environ.get("MEMPALACE_MINIO_ENDPOINT")
+        if env_val:
+            return env_val.strip()
+        minio_cfg = self._file_config.get("minio", {})
+        return str(minio_cfg.get("endpoint", "")).strip() or None
+
+    @property
+    def minio_access_key(self):
+        """MinIO access key."""
+        env_val = os.environ.get("MEMPALACE_MINIO_ACCESS_KEY")
+        if env_val:
+            return env_val
+        minio_cfg = self._file_config.get("minio", {})
+        value = minio_cfg.get("access_key")
+        return str(value) if value else None
+
+    @property
+    def minio_secret_key(self):
+        """MinIO secret key."""
+        env_val = os.environ.get("MEMPALACE_MINIO_SECRET_KEY")
+        if env_val:
+            return env_val
+        minio_cfg = self._file_config.get("minio", {})
+        value = minio_cfg.get("secret_key")
+        return str(value) if value else None
+
+    @property
+    def minio_bucket(self):
+        """MinIO bucket for shared palace sync."""
+        env_val = os.environ.get("MEMPALACE_MINIO_BUCKET")
+        if env_val:
+            return env_val.strip()
+        minio_cfg = self._file_config.get("minio", {})
+        return str(minio_cfg.get("bucket", "mempalace-shared")).strip()
+
+    @property
+    def minio_secure(self):
+        """Whether to use TLS for MinIO connections."""
+        env_val = os.environ.get("MEMPALACE_MINIO_SECURE")
+        if env_val is not None:
+            return env_val.lower() not in ("false", "0", "no")
+        minio_cfg = self._file_config.get("minio", {})
+        return bool(minio_cfg.get("secure", True))
+
+    @property
     def people_map(self):
         """Mapping of name variants to canonical names."""
         if self._people_map_file.exists():

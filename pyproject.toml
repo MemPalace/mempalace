@@ -100,6 +100,9 @@ spellcheck = ["autocorrect>=2.0"]
 # MEMPALACE_BACKEND=pgvector / --backend pgvector; never required for the
 # default (Chroma) install.
 pgvector = ["psycopg[binary]>=3.1"]
+# Opt-in MinIO remote sync. Enables mempalace_push / mempalace_pull MCP tools
+# for sharing palace wings across team members via S3-compatible object storage.
+minio = ["minio>=7.0"]
 # Hardware acceleration for the ONNX embedding model. Install exactly one:
 #   pip install mempalace[gpu]       — NVIDIA CUDA
 #   pip install mempalace[dml]       — DirectML (Windows AMD/Intel/NVIDIA)

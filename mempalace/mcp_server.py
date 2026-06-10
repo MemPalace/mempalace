@@ -2270,6 +2270,32 @@ def tool_reconnect():
         return {"success": False, "error": str(e)}
 
 
+def tool_push(wing: str):
+    """Push a wing to MinIO for team sharing."""
+    try:
+        wing = sanitize_name(wing, "wing")
+    except ValueError as e:
+        return {"error": str(e)}
+    from .remote.push import push_wing
+
+    return push_wing(wing, _config)
+
+
+def tool_pull(wing: str):
+    """Pull a wing from MinIO (all users) and merge into local palace."""
+    try:
+        wing = sanitize_name(wing, "wing")
+    except ValueError as e:
+        return {"error": str(e)}
+    from .remote.pull import pull_wing
+
+    global _metadata_cache
+    result = pull_wing(wing, _config)
+    if result.get("success"):
+        _metadata_cache = None
+    return result
+
+
 # ==================== MCP PROTOCOL ====================
 
 TOOLS = {
@@ -2735,6 +2761,41 @@ TOOLS = {
             "properties": {},
         },
         "handler": tool_reconnect,
+    },
+    "hivemind_push": {
+        "description": (
+            "Push a palace wing to MinIO for team sharing. "
+            "Uploads all drawers and KG facts for the specified wing under the configured user_id."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "wing": {
+                    "type": "string",
+                    "description": "Wing to push (e.g. 'project_alpha')",
+                },
+            },
+            "required": ["wing"],
+        },
+        "handler": tool_push,
+    },
+    "hivemind_pull": {
+        "description": (
+            "Pull a palace wing from MinIO (all users) and merge into local palace. "
+            "Downloads drawers and KG facts from every team member who pushed this wing, "
+            "deduplicates, and makes them queryable via all other mempalace tools."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "wing": {
+                    "type": "string",
+                    "description": "Wing to pull (e.g. 'project_alpha')",
+                },
+            },
+            "required": ["wing"],
+        },
+        "handler": tool_pull,
     },
 }
 

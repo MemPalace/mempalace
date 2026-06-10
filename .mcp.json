@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "mempalace": {
+      "command": "uv",
+      "args": ["run", "mempalace-mcp"],
+      "cwd": "/Users/shubham.ghiya/Downloads/workspace/mempalace-hivemind"
+    }
+  }
+}
