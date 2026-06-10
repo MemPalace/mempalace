@@ -1366,13 +1366,17 @@ def _repair_dim_none_pickles(palace_path: str, collection_name: str, progress=pr
             ).fetchall()
         finally:
             conn.close()
-    except sqlite3.Error:
+    except sqlite3.Error as e:
+        progress(f"  WARNING: SQLite error while reading collection dimension: {e}")
         return 0
 
     dim_by_seg: dict[str, int] = {}
     for seg_id, dim in rows:
-        if dim is not None and int(dim) > 0:
-            dim_by_seg[seg_id] = int(dim)
+        try:
+            if dim is not None and int(dim) > 0:
+                dim_by_seg[seg_id] = int(dim)
+        except (ValueError, TypeError):
+            continue
 
     if not dim_by_seg:
         return 0
