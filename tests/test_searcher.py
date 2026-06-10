@@ -196,6 +196,95 @@ class TestSearchMemories:
         assert hits[0]["source_file"] == "a.md"
         assert hits[0]["matched_via"] == "drawer+closet"
 
+    def test_hash_embedding_device_routes_to_bm25_fallback(self):
+        """When embedding_device=hash, search_memories routes to BM25-only fallback."""
+        with patch("mempalace.config.MempalaceConfig") as mock_config_class, patch(
+            "mempalace.searcher._bm25_only_via_sqlite"
+        ) as mock_bm25:
+            mock_config = MagicMock()
+            mock_config.embedding_device = "hash"
+            mock_config_class.return_value = mock_config
+            mock_bm25.return_value = {
+                "query": "test",
+                "filters": {"wing": None, "room": None},
+                "total_before_filter": 1,
+                "results": [{"text": "result"}],
+                "fallback": "bm25_only_via_sqlite",
+                "fallback_reason": "vector_search_disabled",
+            }
+
+            result = search_memories("test", "/fake/path")
+
+            # Verify that _bm25_only_via_sqlite was called
+            mock_bm25.assert_called_once_with(
+                "test",
+                "/fake/path",
+                wing=None,
+                room=None,
+                n_results=5,
+                collection_name=None,
+            )
+            # Verify fallback_reason was updated
+            assert result["fallback_reason"] == "embedding_device=hash"
+            assert result["fallback"] == "bm25_only_via_sqlite"
+
+    def test_lexical_embedding_device_routes_to_bm25_fallback(self):
+        """When embedding_device=lexical, search_memories routes to BM25-only fallback."""
+        with patch("mempalace.config.MempalaceConfig") as mock_config_class, patch(
+            "mempalace.searcher._bm25_only_via_sqlite"
+        ) as mock_bm25:
+            mock_config = MagicMock()
+            mock_config.embedding_device = "lexical"
+            mock_config_class.return_value = mock_config
+            mock_bm25.return_value = {
+                "query": "test",
+                "filters": {"wing": None, "room": None},
+                "total_before_filter": 1,
+                "results": [{"text": "result"}],
+                "fallback": "bm25_only_via_sqlite",
+                "fallback_reason": "vector_search_disabled",
+            }
+
+            result = search_memories("test", "/fake/path")
+
+            # Verify that _bm25_only_via_sqlite was called
+            mock_bm25.assert_called_once_with(
+                "test",
+                "/fake/path",
+                wing=None,
+                room=None,
+                n_results=5,
+                collection_name=None,
+            )
+            # Verify fallback_reason was updated
+            assert result["fallback_reason"] == "embedding_device=lexical"
+            assert result["fallback"] == "bm25_only_via_sqlite"
+
+    def test_cpu_embedding_device_uses_vector_path(self):
+        """When embedding_device=cpu (real embedding), search_memories uses vector path."""
+        with patch("mempalace.config.MempalaceConfig") as mock_config_class, patch(
+            "mempalace.searcher.get_collection"
+        ) as mock_get_col:
+            mock_config = MagicMock()
+            mock_config.embedding_device = "cpu"
+            mock_config_class.return_value = mock_config
+
+            mock_col = MagicMock()
+            mock_col.query.return_value = {
+                "documents": [["doc"]],
+                "metadatas": [[{"wing": "w", "room": "r", "source_file": "test.txt"}]],
+                "distances": [[0.1]],
+                "ids": [["id"]],
+            }
+            mock_get_col.return_value = mock_col
+
+            result = search_memories("test", "/fake/path")
+
+            # Verify get_collection was called (vector path)
+            mock_get_col.assert_called_once()
+            # Should not go through BM25-only fallback
+            assert "fallback" not in result or result.get("fallback") != "bm25_only_via_sqlite"
+
 
 # ── BM25 internals: None / empty document safety ─────────────────────
 
@@ -233,6 +322,46 @@ class TestBM25NoneSafety:
         assert len(scores) == 3
         assert scores[1] == 0.0
         assert scores[0] > 0.0
+
+    def test_is_lexical_device_recognizes_hash(self):
+        """_is_lexical_device returns True for hash mode."""
+        from mempalace.searcher import _is_lexical_device
+
+        assert _is_lexical_device("hash") is True
+
+    def test_is_lexical_device_recognizes_lexical(self):
+        """_is_lexical_device returns True for lexical mode."""
+        from mempalace.searcher import _is_lexical_device
+
+        assert _is_lexical_device("lexical") is True
+
+    def test_is_lexical_device_rejects_cpu(self):
+        """_is_lexical_device returns False for cpu (real embedding)."""
+        from mempalace.searcher import _is_lexical_device
+
+        assert _is_lexical_device("cpu") is False
+
+    def test_is_lexical_device_handles_none(self):
+        """_is_lexical_device returns False for None or empty string."""
+        from mempalace.searcher import _is_lexical_device
+
+        assert _is_lexical_device(None) is False
+        assert _is_lexical_device("") is False
+
+    def test_is_lexical_device_handles_whitespace(self):
+        """_is_lexical_device handles leading/trailing whitespace."""
+        from mempalace.searcher import _is_lexical_device
+
+        assert _is_lexical_device("  hash  ") is True
+        assert _is_lexical_device("  LEXICAL  ") is True
+
+    def test_is_lexical_device_case_insensitive(self):
+        """_is_lexical_device is case-insensitive."""
+        from mempalace.searcher import _is_lexical_device
+
+        assert _is_lexical_device("HASH") is True
+        assert _is_lexical_device("Lexical") is True
+        assert _is_lexical_device("LeXiCaL") is True
 
 
 # ── search() (CLI print function) ─────────────────────────────────────

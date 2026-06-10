@@ -43,6 +43,18 @@ class SearchError(Exception):
 
 _TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
 
+_LEXICAL_DEVICES = frozenset({"hash", "lexical"})
+
+
+def _is_lexical_device(device: str) -> bool:
+    """Return True when the configured embedding device is hash/lexical mode.
+
+    Hash and lexical devices produce non-semantic vectors; routing to the
+    HNSW index with those vectors returns meaningless hits. Use SQLite
+    BM25 instead.
+    """
+    return (device or "").strip().lower() in _LEXICAL_DEVICES
+
 
 def _first_or_empty(results, key: str) -> list:
     """Return the first inner list of a query result field, or [].
@@ -521,6 +533,7 @@ def _bm25_only_via_sqlite(
                     WHERE embedding_fulltext_search MATCH ?
                       AND c.name = ?
                     {filter_sql}
+                    ORDER BY embedding_fulltext_search.rank
                     LIMIT ?
                     """,
                     (fts_query, collection_name, *filter_params, max_candidates),
@@ -1012,6 +1025,24 @@ def search_memories(
     # regardless of whether the call routes through the vector path or
     # the BM25-only fallback below.
     _validate_candidate_strategy(candidate_strategy)
+
+    # Hash/lexical devices produce non-semantic vectors. Route to SQLite
+    # BM25 intentionally rather than producing low-signal HNSW hits.
+    if not vector_disabled:
+        from .config import MempalaceConfig
+
+        _device = MempalaceConfig().embedding_device
+        if _is_lexical_device(_device):
+            result = _bm25_only_via_sqlite(
+                query,
+                palace_path,
+                wing=wing,
+                room=room,
+                n_results=n_results,
+                collection_name=collection_name,
+            )
+            result["fallback_reason"] = f"embedding_device={_device}"
+            return result
 
     if vector_disabled:
         return _vector_disabled_search(
