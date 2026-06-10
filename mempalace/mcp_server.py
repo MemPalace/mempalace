@@ -353,7 +353,8 @@ def _force_chroma_cache_reset() -> None:
         _palace_db_inode, \
         _palace_db_mtime, \
         _metadata_cache, \
-        _metadata_cache_time
+        _metadata_cache_time, \
+        _vector_probe_last_run
     _client_cache = None
     _collection_cache = None
     _collection_cache_backend = None
@@ -363,6 +364,7 @@ def _force_chroma_cache_reset() -> None:
     _palace_db_mtime = 0.0
     _metadata_cache = None
     _metadata_cache_time = 0
+    _vector_probe_last_run = 0.0
     try:
         from .palace import get_backend_for_palace
 
@@ -385,21 +387,32 @@ _vector_disabled_reason = ""
 # parsing happy — PEP 604 unions in annotations only became unconditional
 # at module-eval time in 3.10.
 _vector_capacity_status: Optional[dict] = None
+_vector_probe_last_run: float = 0.0
+_VECTOR_PROBE_TTL: float = 30.0
 
 
-def _refresh_vector_disabled_flag() -> None:
+def _refresh_vector_disabled_flag(*, force: bool = False) -> None:
     """Re-run the HNSW capacity probe and update the module-level flag.
 
     Called from :func:`_get_client` whenever the client cache is rebuilt
     (first open or palace replacement). Cheap — pure sqlite + pickle
     read, no chromadb interaction. Never raises: a probe that crashes
     would defeat the point.
+
+    Uses a TTL gate (default 30s) to avoid per-request I/O for the probe.
+    Set ``force=True`` to bypass the TTL and re-run immediately (used
+    during reconnects).
     """
     global _vector_disabled, _vector_disabled_reason, _vector_capacity_status
+    global _vector_probe_last_run
+    now = time.monotonic()
+    if not force and (now - _vector_probe_last_run) < _VECTOR_PROBE_TTL:
+        return
     if not _is_chroma_backend():
         _vector_disabled = False
         _vector_disabled_reason = ""
         _vector_capacity_status = None
+        _vector_probe_last_run = now
         return
     try:
         info = hnsw_capacity_status(_config.palace_path, _config.collection_name)
@@ -407,6 +420,7 @@ def _refresh_vector_disabled_flag() -> None:
         logger.debug("HNSW capacity probe raised", exc_info=True)
         return
     _vector_capacity_status = info
+    _vector_probe_last_run = now
     if info.get("diverged"):
         if not _vector_disabled:
             logger.warning(
@@ -565,7 +579,7 @@ def _get_client():
         # if the index is severely undersized, segment load can segfault
         # the whole MCP server (#1222). The probe is pure sqlite +
         # metadata read; never touches the HNSW binary files.
-        _refresh_vector_disabled_flag()
+        _refresh_vector_disabled_flag(force=True)
         if inode_changed or mtime_changed:
             ChromaBackend._quarantined_paths.discard(_config.palace_path)
         _client_cache = ChromaBackend.make_client(_config.palace_path)
@@ -2393,7 +2407,8 @@ def tool_reconnect():
         _palace_db_inode, \
         _palace_db_mtime, \
         _vector_disabled, \
-        _vector_disabled_reason
+        _vector_disabled_reason, \
+        _vector_probe_last_run
     from . import palace as palace_module
 
     close_errors = []
@@ -2453,6 +2468,7 @@ def tool_reconnect():
     _collection_open_error = None
     _palace_db_inode = 0
     _palace_db_mtime = 0.0
+    _vector_probe_last_run = 0.0
     ChromaBackend._quarantined_paths.discard(_config.palace_path)
     # Force probe re-run on next _get_client by clearing the flag now;
     # _refresh_vector_disabled_flag will re-set it if the divergence

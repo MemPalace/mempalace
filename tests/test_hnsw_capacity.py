@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import pickle
 import sqlite3
+import time
 
 import pytest
 
@@ -640,3 +641,80 @@ def test_tool_status_via_sqlite_returns_breakdown(palace_with_drawers, monkeypat
     # ops×2 (incident + repair runbook), design×1 (metaphor).
     assert out["wings"].get("ops") == 2
     assert out["wings"].get("design") == 1
+
+
+# ── Divergence probe TTL caching (#1471) ─────────────────────────────
+
+
+class TestDivergenceProbeTTL:
+    """Test that the HNSW divergence probe runs once per TTL window, not per-request."""
+
+    def test_probe_not_repeated_within_ttl(self, tmp_path, monkeypatch):
+        """Probe should not run again within the TTL window."""
+        from mempalace import mcp_server
+
+        seg = "seg-ttl-cache"
+        _seed_chroma_db(str(tmp_path), sqlite_count=1000, segment_id=seg)
+        _write_pickle(str(tmp_path), seg, hnsw_count=950)
+
+        class _Cfg:
+            palace_path = str(tmp_path)
+            collection_name = "mempalace_drawers"
+
+        # Track how many times hnsw_capacity_status is called
+        call_count = [0]
+        original_probe = mcp_server.hnsw_capacity_status
+
+        def tracked_probe(palace_path, collection_name):
+            call_count[0] += 1
+            return original_probe(palace_path, collection_name)
+
+        # Mock _is_chroma_backend to return True
+        monkeypatch.setattr(mcp_server, "_config", _Cfg())
+        monkeypatch.setattr(mcp_server, "hnsw_capacity_status", tracked_probe)
+        monkeypatch.setattr(mcp_server, "_is_chroma_backend", lambda: True)
+        # Reset probe timing state
+        monkeypatch.setattr(mcp_server, "_vector_probe_last_run", 0.0)
+
+        # First call should run the probe
+        mcp_server._refresh_vector_disabled_flag()
+        assert call_count[0] == 1
+
+        # Second call within TTL should not run the probe
+        mcp_server._refresh_vector_disabled_flag()
+        assert call_count[0] == 1
+
+    def test_force_bypasses_ttl(self, tmp_path, monkeypatch):
+        """force=True should bypass TTL and re-run the probe immediately."""
+        from mempalace import mcp_server
+
+        seg = "seg-ttl-force"
+        _seed_chroma_db(str(tmp_path), sqlite_count=1000, segment_id=seg)
+        _write_pickle(str(tmp_path), seg, hnsw_count=950)
+
+        class _Cfg:
+            palace_path = str(tmp_path)
+            collection_name = "mempalace_drawers"
+
+        # Track how many times hnsw_capacity_status is called
+        call_count = [0]
+        original_probe = mcp_server.hnsw_capacity_status
+
+        def tracked_probe(palace_path, collection_name):
+            call_count[0] += 1
+            return original_probe(palace_path, collection_name)
+
+        # Mock _is_chroma_backend to return True
+        monkeypatch.setattr(mcp_server, "_config", _Cfg())
+        monkeypatch.setattr(mcp_server, "hnsw_capacity_status", tracked_probe)
+        monkeypatch.setattr(mcp_server, "_is_chroma_backend", lambda: True)
+        # Set probe time to now (within TTL)
+        monkeypatch.setattr(mcp_server, "_vector_probe_last_run", time.monotonic())
+
+        # First call without force should not run (within TTL)
+        mcp_server._refresh_vector_disabled_flag()
+        assert call_count[0] == 0
+
+        # Second call with force=True should run despite being within TTL
+        mcp_server._refresh_vector_disabled_flag(force=True)
+        assert call_count[0] == 1
