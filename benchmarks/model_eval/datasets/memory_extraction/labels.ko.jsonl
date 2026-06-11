@@ -1,0 +1,40 @@
+{"id": "mem_001", "memories": [{"type": "decision", "content": "코사인 유사도에서 Jaccard 유사도로 주제 군집 파이프라인을 변경한다."}]}
+{"id": "mem_002", "memories": [{"type": "preference", "content": "Saela는 LaTeX를 사용해 초안을 작성하는 것을 Markdown보다 선호한다."}, {"type": "commitment", "content": "앞으로 Saela의 파일을 Markdown으로 변환하지 않을 것이다."}]}
+{"id": "mem_003", "memories": [{"type": "fact", "content": "새로운 서버실의 환경 온도는 19°C입니다."}, {"type": "fact", "content": "냉각기 사양 시트에 따르면 최적 온도는 21-23°C입니다."}]}
+{"id": "mem_004", "memories": [{"type": "opinion", "content": "이 분야는 사고 과정을 유도하는 기술을 과도하게 평가하고 있다. 수학 기준에서 효과가 나타나는 이유는 사고 과정의 추적 결과가 실제 계산과 일치하기 때문이지만, 더 어려운 사고에서는 추적 결과가 후속으로 만들어진 합리화에 불과하다."}]}
+{"id": "mem_005", "memories": [{"type": "commitment", "content": "금요일 오전에 설문 논문의 첫 번째 초안을 사용자에게 전달할 것이다."}]}
+{"id": "mem_006", "memories": [{"type": "decision", "content": "주방 정원에 합성 NPK 비료를 더 이상 사용하지 않기로 결정하고, 올 가을부터 콩과 작물과 함께 토양 보정을 위해 콩과 작물로 교체하며 겨울철 덮개 작물로 전환한다."}]}
+{"id": "mem_007", "memories": [{"type": "preference", "content": "Ivora는 주간 수익 보고서를 월요일 오전에 받는 것을 화요일 오후에 받는 것보다 선호한다."}, {"type": "commitment", "content": "주간 수익 보고서의 자동 전송 일정을 월요일 오전으로 업데이트할 것이다."}]}
+{"id": "mem_008", "memories": [{"type": "fact", "content": "Tartine Lab 저널의 제출 마감일은 3월 15일이며, 지연 제출을 받아들이지 않습니다."}]}
+{"id": "mem_009", "memories": [{"type": "commitment", "content": "손으로 스캔한 발행서류에 대한 OCR 파이프라인의 정확도를 월말까지 85%에서 97%로 개선할 것이며, 그 문서 유형에 대해 수동 검토로 되돌릴 수 있다."}]}
+{"id": "mem_010", "memories": [{"type": "opinion", "content": "행 다형성은 올바른 추상화이지만, 오류 메시지에서 도입되는 문법적 노이즈는 외부 사용자에게 배포하기 전에 진단에 대한 중요한 작업이 필요하다."}]}
+{"id": "mem_011", "memories": [{"type": "decision", "content": "사무실 구축에 대해 직선 감가상각을, 장비에 대해서는 MACRS를 사용하며, 장기적으로 사용할 것이라고 확신하는 항목에만 179조 선택을 적용한다."}]}
+{"id": "mem_012", "memories": [{"type": "preference", "content": "Karis는 정원 방문 사이에 핸드폰에서 그 내용을 읽기 때문에, 주간 업데이트를 빈 점으로 요약하는 것을 선호한다."}]}
+{"id": "mem_013", "memories": [{"type": "fact", "content": "Wendelsea Botanic Garden의 올해 첫 피어나는 날짜는 장기 평균보다 8일 더 일찍 나타났다."}, {"type": "fact", "content": "Wendelsea Botanic Garden의 첫 피어나는 기록은 18년 전부터 시작되었으며, 이는 기록상 가장 조기의 봄이다."}]}
+{"id": "mem_014", "memories": [{"type": "opinion", "content": "언어적 편견(Wends는 Drukar보다 더 부드러운 말을 한다)을 가상의 민족에 적용하면 페이지에서 단순화되고 인물들을 평평하게 만들 수 있다."}]}
+{"id": "mem_015", "memories": [{"type": "commitment", "content": "주말 종료 전에 Doreth에게 재래종 사과의 가지치기 일정을 이메일로 보내겠다."}]}
+{"id": "mem_016", "memories": [{"type": "decision", "content": "지연 비교를 위해 Mann-Whitney U에서 순열 테스트로 전환하고, 이 새로운 방법을 적용하여 이전 모든 비교를 다시 실행한다."}]}
+{"id": "mem_017", "memories": [{"type": "preference", "content": "Pol Krisat는 PR에서 스레드 기반 댓글을 통해 코드 리뷰를 선호하며, 별도의 이메일이나 채팅 메시지보다 선호한다."}, {"type": "decision", "content": "자신도 동일한 관행(스레드 기반 PR 댓글)을 도입한다."}]}
+{"id": "mem_018", "memories": [{"type": "fact", "content": "Aerwyn Capital의 신중 기간은 투자 계약서 서명 후 30일이며, 마감일은 4월 14일입니다."}]}
+{"id": "mem_019", "memories": [{"type": "opinion", "content": "Hollowmounts Institute의 비전 언어 모델 논문은 그들이 모델이 승리하는 프롬프트만 보고 있기 때문에 선택 편향이 있다. 기술적인 작업은 견고하지만 논문은 과도하게 홍보하고 있다."}]}
+{"id": "mem_020", "memories": [{"type": "commitment", "content": "수요일 오후에 수정된 예측을 Ivora에게 보내겠다."}]}
+{"id": "mem_021", "memories": [{"type": "decision", "content": "Saela가 설문 조사를 대비된 목적만으로 제한하기로 결정했다. 클러스터 기반 또는 정제 기반 접근법은 포함되지 않는다."}, {"type": "commitment", "content": "설문 개요를 더 좁은 범위에 맞추어 재구조화할 것이다."}]}
+{"id": "mem_022", "memories": [{"type": "preference", "content": "브램블은 복원 프로젝트에서 외래 식물 대신 원산지 식물만을 사용하는 것을 선호한다. 설치 속도가 외래 식물 대비 느릴 수 있지만 그럴 경우에도 원산지 식물만을 사용하는 것을 선호한다."}, {"type": "decision", "content": "미래 모든 복원 권고에 원산지 식물만 사용을 선호하는 원칙을 포함시킨다."}]}
+{"id": "mem_023", "memories": [{"type": "fact", "content": "Crestmoor Systems는 내부 서비스에 대해 OTLP HTTP를 사용하며, 버전 불일치 문제를 고려해 gRPC를 사용하지 않는다."}]}
+{"id": "mem_024", "memories": [{"type": "preference", "content": "Solas는 복잡한 우선순위 규칙을 가진 언어에 대해 생성된 파서보다 Pratt 스타일의 연산자 우선순위 파서를 선호한다."}]}
+{"id": "mem_025", "memories": [{"type": "commitment", "content": "이번 주에 AI 도움 없이 한 장을 작성하고 Wendelsea Writing Group과 비교를 공유할 것이다."}]}
+{"id": "mem_026", "memories": [{"type": "decision", "content": "읽기 중심 작업과 더 나은 캐시 성능을 고려해 새 인덱스에 B-tree를 스키피 리스트보다 선택했다."}]}
+{"id": "mem_027", "memories": [{"type": "fact", "content": "Ren Solanke의 석사 논문 논의는 5월 6일이다."}, {"type": "commitment", "content": "4월 22일까지 Ren Solanke의 초안 장을 한 라운드 피드백을 제공할 것이다."}]}
+{"id": "mem_028", "memories": [{"type": "fact", "content": "Wendelsea 지역은 석회암 기반 위에 위치해 있어 토양의 pH가 중성 또는 약간 알칼리성으로 흐르게 된다."}]}
+{"id": "mem_029", "memories": [{"type": "opinion", "content": "Aerwyn cycle의 언어 관련 부록은 마지막 장에서 소금부채 모티프의 결말에 의미 있게 기여하지만, 일부 독자들은 이러한 기록들을 과도하게 느낄 수 있다."}]}
+{"id": "mem_030", "memories": [{"type": "decision", "content": "사용자가 캡테이블을 정리하기 위해 두 번째 판매를 사분기 단위로 연기하기로 결정했다."}]}
+{"id": "mem_031", "memories": [{"type": "preference", "content": "Pell Halloran은 일반 회계 확인 질문에 대해 전화보다 이메일을 선호한다. 이는 서면 기록을 남기기 때문이다."}, {"type": "decision", "content": "일반 AR 쿼리 모두를 Pell에게 이메일로 전달할 것이며, 전화는 긴급 상황에 한하여만 사용된다."}]}
+{"id": "mem_032", "memories": [{"type": "fact", "content": "Bridgewater Community Garden의 Mason bee 군집은 올해 3월 18일에 나타났다."}, {"type": "fact", "content": "Wendelsea Orchard의 사과 꽃이 올해 3월 20일에 시작되었다."}]}
+{"id": "mem_033", "memories": [{"type": "fact", "content": "Saela의 휴가는 6월 1일에 시작된다."}, {"type": "commitment", "content": "Saela의 60페이지 완전한 초안을 6월 1일 휴가 시작 전에 검토하겠다."}]}
+{"id": "mem_034", "memories": [{"type": "opinion", "content": "агент 기반 코딩 파이프라인은 누구도 검토할 수 없이 빠르게 코드를 생성하며, 결과로 발생하는 버그는 더 어렵게 추적된다. 이해를 쌓는 데 더 느린 속도를 선호한다."}]}
+{"id": "mem_035", "memories": [{"type": "decision", "content": "인보이스 파싱 파이프라인을 Tesseract에서 PaddleOCR로 전환하며, 마이그레이션 중 약 1주일간 두 시스템을 병렬로 운영한다."}]}
+{"id": "mem_036", "memories": [{"type": "preference", "content": "Ivora는 일부 유동성을 희생하더라도 낙관적 예측보다 보수적인 현금 예측을 선호한다."}, {"type": "decision", "content": "Ivora의 선호에 맞게 모델의 보고를 보수적으로 조정한다."}]}
+{"id": "mem_037", "memories": [{"type": "preference", "content": "Karis는 Bridgewater Schools 정원 위원회 회의에 직접 참석해 주기를 원한다."}, {"type": "commitment", "content": "4월 10일 Bridgewater Schools 정원 위원회 회의에 직접 참석하기로 확정했다."}]}
+{"id": "mem_038", "memories": [{"type": "fact", "content": "사과 부스럼병 균은 낙엽 속에서 겨울을 나므로 가을 낙엽 제거가 방제에 매우 중요하다."}, {"type": "fact", "content": "사과 부스럼병에 대한 구리 살포는 꽃봉오리 팽창 시에만 효과가 있으며, 꽃봉오리가 열리면 효과가 없다."}]}
+{"id": "mem_039", "memories": [{"type": "opinion", "content": "Saela의 3막 결정은 공동 작업이 아닌 강렬한 행동의 순간이어야 한다."}]}
+{"id": "mem_040", "memories": [{"type": "commitment", "content": "Solas가 스프린트 종료(금요일)까지 Distributed Tracing 버그 수정을 배포하기로 약속했다."}, {"type": "fact", "content": "Distributed Tracing 버그가 Aerwyn Telemetry 컨소시엄을 수주째 차단하고 있다."}]}

@@ -140,7 +140,21 @@ class LLMProvider:
         # require explicit user confirmation.
         self.api_key_source = api_key_source
 
-    def classify(self, system: str, user: str, json_mode: bool = True) -> LLMResponse:
+    def classify(
+        self,
+        system: str,
+        user: str,
+        json_mode: bool = True,
+        think: Optional[bool] = None,
+    ) -> LLMResponse:
+        """Classify a (system, user) pair into a structured response.
+
+        ``think`` controls reasoning emission for thinking-capable models
+        (currently honored by ``OllamaProvider`` for Qwen 3 / DeepSeek-R1
+        style toggles). Other providers ignore it. Pass ``False`` to
+        disable reasoning when the caller wants a fast classification
+        without ``<think>`` overhead.
+        """
         raise NotImplementedError
 
     def check_available(self) -> tuple[bool, str]:
@@ -197,6 +211,7 @@ class OllamaProvider(LLMProvider):
         model: str,
         endpoint: Optional[str] = None,
         timeout: int = 180,
+        num_ctx: Optional[int] = None,
         **_: object,
     ):
         super().__init__(
@@ -204,6 +219,7 @@ class OllamaProvider(LLMProvider):
             endpoint=endpoint or self.DEFAULT_ENDPOINT,
             timeout=timeout,
         )
+        self.num_ctx = num_ctx
 
     def check_available(self) -> tuple[bool, str]:
         try:
@@ -221,7 +237,16 @@ class OllamaProvider(LLMProvider):
             )
         return True, "ok"
 
-    def classify(self, system: str, user: str, json_mode: bool = True) -> LLMResponse:
+    def classify(
+        self,
+        system: str,
+        user: str,
+        json_mode: bool = True,
+        think: Optional[bool] = None,
+    ) -> LLMResponse:
+        options: dict = {"temperature": 0.1}
+        if self.num_ctx is not None:
+            options["num_ctx"] = self.num_ctx
         body: dict = {
             "model": self.model,
             "messages": [
@@ -229,10 +254,16 @@ class OllamaProvider(LLMProvider):
                 {"role": "user", "content": user},
             ],
             "stream": False,
-            "options": {"temperature": 0.1},
+            "options": options,
         }
         if json_mode:
             body["format"] = "json"
+        if think is not None:
+            # Ollama 0.7+ supports `think` for thinking-capable models (Qwen 3
+            # family, DeepSeek-R1). Pure-instruct models ignore it. We forward
+            # only when the caller explicitly opts in/out so the wire format
+            # stays minimal for the common case.
+            body["think"] = think
         data = _http_post_json(f"{self.endpoint}/api/chat", body, headers={}, timeout=self.timeout)
         text = (data.get("message") or {}).get("content", "")
         if not text:
@@ -300,7 +331,13 @@ class OpenAICompatProvider(LLMProvider):
             return False, f"Cannot reach {self.endpoint}: {e}"
         return True, "ok"
 
-    def classify(self, system: str, user: str, json_mode: bool = True) -> LLMResponse:
+    def classify(
+        self,
+        system: str,
+        user: str,
+        json_mode: bool = True,
+        think: Optional[bool] = None,  # noqa: ARG002 — accepted for interface compat; OpenAI-compat has no thinking toggle
+    ) -> LLMResponse:
         body: dict = {
             "model": self.model,
             "messages": [
@@ -362,7 +399,13 @@ class AnthropicProvider(LLMProvider):
         # surface auth errors if the key is invalid.
         return True, "ok"
 
-    def classify(self, system: str, user: str, json_mode: bool = True) -> LLMResponse:
+    def classify(
+        self,
+        system: str,
+        user: str,
+        json_mode: bool = True,
+        think: Optional[bool] = None,  # noqa: ARG002 — accepted for interface compat; Anthropic extended thinking is configured separately
+    ) -> LLMResponse:
         if not self.api_key:
             raise LLMError("Anthropic provider requires ANTHROPIC_API_KEY env or --llm-api-key")
         sys_prompt = system
@@ -409,9 +452,14 @@ def get_provider(
     endpoint: Optional[str] = None,
     api_key: Optional[str] = None,
     timeout: int = 120,
+    **provider_kwargs: object,
 ) -> LLMProvider:
-    """Build a provider by name. Raises LLMError on unknown provider."""
+    """Build a provider by name. Raises LLMError on unknown provider.
+
+    Extra kwargs (e.g. num_ctx for Ollama) are forwarded to the provider's
+    constructor; providers that don't recognize them ignore via **_.
+    """
     cls = PROVIDERS.get(name)
     if cls is None:
         raise LLMError(f"Unknown provider '{name}'. Choices: {sorted(PROVIDERS.keys())}")
-    return cls(model=model, endpoint=endpoint, api_key=api_key, timeout=timeout)
+    return cls(model=model, endpoint=endpoint, api_key=api_key, timeout=timeout, **provider_kwargs)
