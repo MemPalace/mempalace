@@ -280,7 +280,19 @@ def get_user_approval(rooms: list) -> list:
 
 
 def save_config(project_dir: str, project_name: str, rooms: list):
+    config_path = Path(project_dir).expanduser().resolve() / "mempalace.yaml"
+
+    # Preserve existing keys that init doesn't manage (e.g. backend, storage)
+    existing: dict = {}
+    if config_path.is_file():
+        try:
+            with open(config_path, encoding="utf-8") as fh:
+                existing = yaml.safe_load(fh) or {}
+        except Exception:
+            existing = {}
+
     config = {
+        **{k: v for k, v in existing.items() if k not in ("wing", "rooms")},
         "wing": project_name,
         "rooms": [
             {
@@ -291,8 +303,7 @@ def save_config(project_dir: str, project_name: str, rooms: list):
             for r in rooms
         ],
     }
-    config_path = Path(project_dir).expanduser().resolve() / "mempalace.yaml"
-    with open(config_path, "w") as f:
+    with open(config_path, "w", encoding="utf-8") as f:
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
     print(f"\n  Config saved: {config_path}")

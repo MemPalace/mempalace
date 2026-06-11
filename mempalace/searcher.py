@@ -23,6 +23,7 @@ from .backends import (
     PalaceNotFoundError,
     UnsupportedCapabilityError,
 )
+from .backends.chroma import _resolve_persist_dir
 from .palace import (
     _open_collection_or_explain,
     get_closets_collection,
@@ -460,7 +461,7 @@ def _bm25_only_via_sqlite(
     ``max_candidates`` rows so we still return *something* rather than
     nothing.
     """
-    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    db_path = os.path.join(_resolve_persist_dir(palace_path), "chroma.sqlite3")
     if not os.path.isfile(db_path):
         return {
             "error": "No palace found",

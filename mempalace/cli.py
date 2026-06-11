@@ -977,7 +977,7 @@ def cmd_repair(args):
             sys.exit(1)
         return
 
-    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    db_path = os.path.join(ChromaBackend._resolve_persist_dir(palace_path), "chroma.sqlite3")
 
     if not os.path.isdir(palace_path):
         print(f"\n  No palace found at {palace_path}")
