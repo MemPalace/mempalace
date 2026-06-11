@@ -838,13 +838,21 @@ def cmd_purge(args):
     ``--room`` without ``--wing`` purges that room across ALL wings.
     Not idempotent — running purge twice on the same criteria prints
     "No drawers found" the second time.
+
+    Chroma-only in this release — gated by the same backend guard as
+    ``migrate`` / ``repair`` so a palace on another backend gets a clear
+    message instead of a misleading "No palace found".
     """
     from .backends.chroma import ChromaBackend
     from .migrate import confirm_destructive_action, contains_palace_database
 
+    config = MempalaceConfig()
+    collection_name = config.collection_name
     palace_path = os.path.abspath(
-        os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+        os.path.expanduser(args.palace) if args.palace else config.palace_path
     )
+    if not _maintenance_requires_chroma(palace_path, "purge"):
+        raise SystemExit(2)
 
     if not os.path.isdir(palace_path) or not contains_palace_database(palace_path):
         print(f"\n  No palace found at {palace_path}")
@@ -862,7 +870,7 @@ def cmd_purge(args):
 
     backend = ChromaBackend()
     try:
-        col = backend.get_collection(palace_path, "mempalace_drawers")
+        col = backend.get_collection(palace_path, collection_name)
     except Exception as e:
         print(f"\n  Error reading palace: {e}")
         return

@@ -214,6 +214,7 @@ def test_cmd_purge_deletes_via_where_clause(tmp_path):
     args = _make_purge_args(wing="purge-me", palace=str(palace))
     with patch("mempalace.cli.MempalaceConfig") as mock_config_cls:
         mock_config_cls.return_value.palace_path = str(palace)
+        mock_config_cls.return_value.collection_name = "mempalace_drawers"
         cmd_purge(args)
 
     # Re-open through the backend to confirm survivors and that the index
