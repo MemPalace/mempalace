@@ -1932,7 +1932,10 @@ def tool_update_drawer(
                 sanitized = sanitize_content(content)
             except ValueError as e:
                 return {"success": False, "error": str(e)}
-            new_doc = old_doc + sanitized if append else sanitized
+            # ``old_doc`` can be None when the stored drawer has no document
+            # body (Chroma returns None for such rows); guard the append path
+            # so concatenation never raises TypeError.
+            new_doc = (old_doc or "") + sanitized if append else sanitized
 
         new_meta = dict(old_meta)
         if wing is not None:
