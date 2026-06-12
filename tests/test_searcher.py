@@ -104,7 +104,9 @@ class TestSearchMemories:
 
         with (
             patch("mempalace.searcher.get_collection", side_effect=[first, second]) as get_col,
-            patch("mempalace.searcher.get_closets_collection", side_effect=RuntimeError("no closets")),
+            patch(
+                "mempalace.searcher.get_closets_collection", side_effect=RuntimeError("no closets")
+            ),
             patch("mempalace.searcher.time.sleep", return_value=None),
         ):
             result = search_memories("anything", "/fake/path")
@@ -355,7 +357,7 @@ class TestSearchCLI:
             with pytest.raises(SearchError, match="Search error"):
                 search("test", fake_palace_path)
 
-    def test_search_retries_once_on_transient_error_finding_id(self, capsys):
+    def test_search_retries_once_on_transient_error_finding_id(self, fake_palace_path, capsys):
         """CLI search should mirror MCP's one-shot recovery on transient HNSW errors."""
         first = MagicMock()
         first.metadata = {"hnsw:space": "cosine"}
@@ -375,7 +377,7 @@ class TestSearchCLI:
             patch("mempalace.searcher.get_collection", side_effect=[first, second]) as get_col,
             patch("mempalace.searcher.time.sleep", return_value=None),
         ):
-            search("anything", "/fake/path")
+            search("anything", fake_palace_path)
 
         captured = capsys.readouterr()
         assert "recovered doc" in captured.out
@@ -383,7 +385,9 @@ class TestSearchCLI:
         assert first.query.call_count == 1
         assert second.query.call_count == 1
 
-    def test_search_falls_back_to_bm25_when_transient_error_persists(self, capsys):
+    def test_search_falls_back_to_bm25_when_transient_error_persists(
+        self, fake_palace_path, capsys
+    ):
         """If transient vector error persists after retry, CLI should use BM25 fallback."""
         first = MagicMock()
         first.metadata = {"hnsw:space": "cosine"}
@@ -417,7 +421,7 @@ class TestSearchCLI:
             patch("mempalace.searcher._bm25_only_via_sqlite", return_value=bm25_payload),
             patch("mempalace.searcher.time.sleep", return_value=None),
         ):
-            search("anything", "/fake/path")
+            search("anything", fake_palace_path)
 
         captured = capsys.readouterr()
         assert "BM25-only sqlite fallback" in captured.out

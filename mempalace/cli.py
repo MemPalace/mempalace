@@ -676,15 +676,14 @@ def cmd_sync(args):
 
 
 def cmd_search(args):
-    from .repair import PalaceCorruptError, validate_palace_health
+    from .repair import PalaceCorruptError
     from .searcher import search, SearchError
 
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
-    try:
-        validate_palace_health(palace_path)
-    except PalaceCorruptError as exc:
-        print(f"\n  ERROR: {exc}", file=sys.stderr)
-        sys.exit(1)
+    # Interactive search is a hot path: do NOT run the expensive quick_check +
+    # loadability probe here. Rely on the O(1) .sqlite_corrupt sentinel guard in
+    # _prepare_palace_for_open (the sentinel is written by `status` / MCP startup),
+    # which raises PalaceCorruptError when the palace is already known-corrupt.
     try:
         search(
             query=args.query,
@@ -693,6 +692,9 @@ def cmd_search(args):
             room=args.room,
             n_results=args.results,
         )
+    except PalaceCorruptError as exc:
+        print(f"\n  ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
     except SearchError:
         sys.exit(1)
 

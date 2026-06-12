@@ -166,6 +166,9 @@ def test_cmd_search_recovers_from_transient_error_finding_id(mock_config_cls, ca
     with (
         patch("mempalace.searcher.get_collection", side_effect=[first, second]) as get_col,
         patch("mempalace.searcher.time.sleep", return_value=None),
+        patch("mempalace.searcher.os.path.isdir", return_value=True),
+        patch("mempalace.searcher.os.path.isfile", return_value=True),
+        patch("mempalace.repair.validate_palace_health", return_value=[]),
     ):
         cmd_search(args)
 
@@ -1484,7 +1487,9 @@ def test_cmd_repair_fts_rebuild_mode_exits_nonzero_when_errors_remain(
     errors = ["malformed inverted index for FTS5 table main.embedding_fulltext_search"]
     with (
         patch("mempalace.repair.sqlite_integrity_errors", return_value=errors),
-        patch("mempalace.repair.maybe_rebuild_fts_index_when_only_fts_corrupt", return_value=errors),
+        patch(
+            "mempalace.repair.maybe_rebuild_fts_index_when_only_fts_corrupt", return_value=errors
+        ),
         pytest.raises(SystemExit) as excinfo,
     ):
         cmd_repair(args)

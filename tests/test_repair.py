@@ -685,9 +685,13 @@ def test_sqlite_lock_holders_parses_lsof_output(tmp_path, monkeypatch):
 
 
 def test_status_prints_lock_holders_when_present(tmp_path, capsys):
+    # Create the sqlite file so status() reaches the final return that
+    # includes lock_holders (an absent chroma.sqlite3 causes an early return).
+    (tmp_path / "chroma.sqlite3").touch()
     with (
         patch("mempalace.repair._sqlite_lock_holders", return_value=["python pid=1234 user=alice"]),
         patch("mempalace.repair.hnsw_capacity_status") as capacity_status,
+        patch("mempalace.repair.sqlite_drawer_count", return_value=1),
     ):
         capacity_status.side_effect = [
             {
