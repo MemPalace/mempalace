@@ -93,7 +93,7 @@ from .config import (  # noqa: E402  (kept here for the legacy alias)
     DEFAULT_MIN_CHUNK_SIZE as MIN_CHUNK_SIZE,
 )
 
-DRAWER_UPSERT_BATCH_SIZE = 1000
+DRAWER_UPSERT_BATCH_SIZE = 32
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB — skip files larger than this.
 # A safety rail against pathological generated artifacts (lockfiles not in
 # SKIP_FILENAMES, vendored data dumps, etc.). Originally 500 to bound ONNX

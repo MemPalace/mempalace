@@ -135,27 +135,54 @@ _EMBEDDINGGEMMA_ONNX = "model_quantized.onnx"
 _EMBEDDINGGEMMA_PREFIX = "task: sentence similarity | query: "
 _EMBEDDINGGEMMA_DIM = 384  # Matryoshka truncation — first 384 dims of the 768
 _EMBEDDINGGEMMA_MAX_LEN = 2048
+_EMBEDDINGGEMMA_BATCH_SIZE_ENV = "MEMPALACE_EMBEDDINGGEMMA_BATCH_SIZE"
+_ONNX_CPU_MEM_ARENA_ENV = "MEMPALACE_ONNX_CPU_MEM_ARENA"
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = __import__("os").environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    raw = __import__("os").environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if value >= minimum else minimum
+
+
+def _cpu_mem_arena_enabled(providers) -> bool:
+    # ONNX Runtime's CPU BFC arena improves throughput, but it retains memory
+    # between long-running embedding calls. For CPU-only EmbeddingGemma mines,
+    # default to the OS allocator so memory can be reclaimed between batches.
+    provider_list = list(providers or [])
+    cpu_only = provider_list == ["CPUExecutionProvider"]
+    return _env_bool(_ONNX_CPU_MEM_ARENA_ENV, default=not cpu_only)
 
 
 class EmbeddinggemmaONNX:
-    """ChromaDB-compatible EF using embeddinggemma-300m ONNX (q8, MRL→384d).
+    """ChromaDB-compatible EF using embeddinggemma-300m ONNX (q8, MRL->384d).
 
     Cross-lingual cosine similarity on parallel-translated text averages 0.88
-    across DE/FR/HI/IT/KO/RU vs 0.35 for ``all-MiniLM-L6-v2``. Output dim is
-    truncated to 384 via Matryoshka Representation Learning so the model is a
-    drop-in replacement for the MiniLM-shaped 384-dim collections ChromaDB
-    creates by default — same vector width, no schema change.
+    across DE/FR/HI/IT/KO/RU vs 0.35 for ``all-MiniLM-L6-v2``.
 
-    Switching an existing palace from minilm → embeddinggemma still requires
-    re-embedding (different vector space) — collections persist the EF name
-    and ChromaDB rejects mismatched reads. Run ``mempalace repair rebuild-index``.
+    Output dim is truncated to 384 via Matryoshka Representation Learning so
+    the model is a drop-in replacement for the MiniLM-shaped 384-dim
+    collections ChromaDB creates by default. Switching an existing palace from
+    minilm to embeddinggemma still requires re-embedding because the vector
+    space changes. Run ``mempalace repair rebuild-index``.
     """
 
     @staticmethod
     def name() -> str:
         # ChromaDB persists this on the collection and refuses reads with a
-        # mismatched EF — that's the signal that forces users to rebuild_index
-        # when switching models. Keep it stable.
+        # mismatched EF. Keep it stable.
         return "embeddinggemma_300m"
 
     def __init__(self, preferred_providers=None):
@@ -170,6 +197,7 @@ class EmbeddinggemmaONNX:
     def _lazy_load(self) -> None:
         if self._session is not None:
             return
+
         try:
             import numpy as np
             import onnxruntime as ort
@@ -178,28 +206,40 @@ class EmbeddinggemmaONNX:
         except ImportError as e:
             raise ImportError(
                 "EmbeddinggemmaONNX requires huggingface_hub, tokenizers, and "
-                "numpy — these ship with mempalace core, so this error usually "
+                "numpy - these ship with mempalace core, so this error usually "
                 "means one was uninstalled or pinned to an incompatible version. "
                 "Reinstall with: pip install --upgrade --force-reinstall mempalace"
             ) from e
 
         logger.info(
-            "Downloading %s/%s (cached after first run)…",
+            "Downloading %s/%s (cached after first run)...",
             _EMBEDDINGGEMMA_REPO,
             _EMBEDDINGGEMMA_ONNX,
         )
+
         model_path = hf_hub_download(
-            _EMBEDDINGGEMMA_REPO, subfolder="onnx", filename=_EMBEDDINGGEMMA_ONNX
+            _EMBEDDINGGEMMA_REPO,
+            subfolder="onnx",
+            filename=_EMBEDDINGGEMMA_ONNX,
         )
         hf_hub_download(
-            _EMBEDDINGGEMMA_REPO, subfolder="onnx", filename=_EMBEDDINGGEMMA_ONNX + "_data"
+            _EMBEDDINGGEMMA_REPO,
+            subfolder="onnx",
+            filename=_EMBEDDINGGEMMA_ONNX + "_data",
         )
         tok_path = hf_hub_download(_EMBEDDINGGEMMA_REPO, filename="tokenizer.json")
 
-        self._session = ort.InferenceSession(model_path, providers=self._providers)
+        session_options = ort.SessionOptions()
+        session_options.enable_cpu_mem_arena = _cpu_mem_arena_enabled(self._providers)
+        self._session = ort.InferenceSession(
+            model_path,
+            sess_options=session_options,
+            providers=self._providers,
+        )
+
         out_names = [o.name for o in self._session.get_outputs()]
-        # Model card: sentence_embedding is the pooled output (last_hidden_state
-        # is the per-token output we don't want).
+        # Model card: sentence_embedding is the pooled output. last_hidden_state
+        # is the per-token output we do not want.
         self._output_idx = (
             out_names.index("sentence_embedding") if "sentence_embedding" in out_names else 1
         )
@@ -207,31 +247,45 @@ class EmbeddinggemmaONNX:
         tokenizer = Tokenizer.from_file(tok_path)
         tokenizer.enable_padding()
         tokenizer.enable_truncation(max_length=_EMBEDDINGGEMMA_MAX_LEN)
+
         self._tokenizer = tokenizer
         self._np = np
 
-    def __call__(self, input):  # noqa: A002 — ChromaDB EF protocol uses `input`
+    def __call__(self, input):  # noqa: A002 - ChromaDB EF protocol uses input
         self._lazy_load()
         np = self._np
-        texts = [_EMBEDDINGGEMMA_PREFIX + t for t in input]
-        encs = self._tokenizer.encode_batch(texts)
-        input_ids = np.asarray([e.ids for e in encs], dtype=np.int64)
-        attention_mask = np.asarray([e.attention_mask for e in encs], dtype=np.int64)
-        outputs = self._session.run(
-            None, {"input_ids": input_ids, "attention_mask": attention_mask}
-        )
-        sent_emb = outputs[self._output_idx][:, :_EMBEDDINGGEMMA_DIM]
-        # L2-normalize so cosine similarity == dot product (matches what the
-        # MTEB methodology assumes; ChromaDB's distance is configured for it).
-        norms = np.linalg.norm(sent_emb, axis=1, keepdims=True) + 1e-12
-        return (sent_emb / norms).tolist()
 
-    def embed_query(self, input: list[str]) -> list[list[float]]:  # noqa: A002 — ChromaDB EF protocol
-        """Embed query documents (ChromaDB EF protocol)."""
+        texts = [_EMBEDDINGGEMMA_PREFIX + str(t) for t in input]
+        if not texts:
+            return []
+
+        batch_size = _env_int(_EMBEDDINGGEMMA_BATCH_SIZE_ENV, default=32, minimum=1)
+
+        vectors = []
+        for start in range(0, len(texts), batch_size):
+            batch_texts = texts[start : start + batch_size]
+            encs = self._tokenizer.encode_batch(batch_texts)
+            input_ids = np.asarray([e.ids for e in encs], dtype=np.int64)
+            attention_mask = np.asarray([e.attention_mask for e in encs], dtype=np.int64)
+
+            outputs = self._session.run(
+                None,
+                {"input_ids": input_ids, "attention_mask": attention_mask},
+            )
+            sent_emb = outputs[self._output_idx][:, :_EMBEDDINGGEMMA_DIM]
+
+            # L2-normalize so cosine similarity == dot product.
+            norms = np.linalg.norm(sent_emb, axis=1, keepdims=True) + 1e-12
+            vectors.extend((sent_emb / norms).tolist())
+
+        return vectors
+
+    def embed_query(self, input: list[str]) -> list[list[float]]:  # noqa: A002
+        """Embed query documents using the ChromaDB EF protocol."""
         return self(input)
 
     def embed_documents(self, input: list[str]) -> list[list[float]]:  # noqa: A002
-        """Embed a batch of documents (ChromaDB EF protocol)."""
+        """Embed a batch of documents using the ChromaDB EF protocol."""
         return self(input)
 
 

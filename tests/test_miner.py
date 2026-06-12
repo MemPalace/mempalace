@@ -2311,3 +2311,9 @@ def test_mine_limit_summary_counts(tmp_path, capsys):
     assert "Files processed: 2" in out
     assert "Drawers filed: 6" in out
     assert "(limit: 2 new)" in out
+
+
+def test_drawer_upsert_batch_size_bounds_embedding_memory():
+    from mempalace import miner
+
+    assert miner.DRAWER_UPSERT_BATCH_SIZE <= 32
