@@ -17,6 +17,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from mempalace.config import MempalaceConfig
+
 SAVE_INTERVAL = 15
 STATE_DIR = Path.home() / ".mempalace" / "hook_state"
 PALACE_ROOT = Path.home() / ".mempalace"
@@ -99,25 +101,17 @@ def _mempalace_python() -> str:
 _RECENT_MSG_COUNT = 30  # how many recent user messages to summarize
 
 STOP_BLOCK_REASON = (
-    "AUTO-SAVE checkpoint (MemPalace). Save this session's key content:\n"
-    "1. mempalace_diary_write — session summary (what was discussed, "
-    "key decisions, current state of work)\n"
-    "2. mempalace_add_drawer — verbatim quotes, decisions, code snippets "
-    "(place in appropriate wing and room)\n"
-    "3. mempalace_kg_add — entity relationships (optional)\n"
-    "For THIS save, use MemPalace MCP tools only (not auto-memory .md files). "
-    "Use verbatim quotes where possible. Continue conversation after saving."
+    "MemPalace auto-save checkpoint. "
+    "Use mempalace_diary_write (session summary) and mempalace_add_drawer "
+    "(quotes, decisions, code) to save session content. "
+    "Do NOT use native auto-memory files."
 )
 
 PRECOMPACT_BLOCK_REASON = (
-    "COMPACTION IMMINENT (MemPalace). Save ALL session content before context is lost:\n"
-    "1. mempalace_diary_write — thorough session summary\n"
-    "2. mempalace_add_drawer — ALL verbatim quotes, decisions, code, context "
-    "(place each in appropriate wing and room)\n"
-    "3. mempalace_kg_add — entity relationships (optional)\n"
-    "For THIS save, use MemPalace MCP tools only (not auto-memory .md files). "
-    "Be thorough — after compaction this is all that survives. "
-    "Save everything to MemPalace, then allow compaction to proceed."
+    "MemPalace emergency save — compaction imminent. "
+    "Use mempalace_diary_write (thorough summary) and mempalace_add_drawer "
+    "(ALL quotes, decisions, code, context) to save ALL content before context is lost. "
+    "Do NOT use native auto-memory files."
 )
 
 
@@ -657,12 +651,16 @@ def _save_diary_direct(
     session_id: str,
     wing: str = "",
     toast: bool = False,
+    *,
+    agent_name: str,
 ) -> dict:
     """Write a diary checkpoint by calling the tool function directly (no MCP roundtrip).
 
-    If `wing` is set, the entry lands in that wing (typically the project wing
-    derived from the transcript path). Otherwise falls back to `tool_diary_write`'s
-    default of `wing_session-hook`.
+    The entry is filed under `agent_name` so the agent that later calls
+    `mempalace_diary_read(agent_name=...)` discovers it (#1693). If `wing` is
+    set, the entry lands in that wing (typically the project wing derived from
+    the transcript path); a `diary_read` with an empty wing spans every wing
+    the agent wrote to, so project-derived wings stay discoverable.
 
     Returns {"count": N, "themes": [...]} on success, {"count": 0} on failure.
     """
@@ -685,7 +683,7 @@ def _save_diary_direct(
         from .mcp_server import tool_diary_write
 
         result = tool_diary_write(
-            agent_name="session-hook",
+            agent_name=agent_name,
             entry=entry,
             topic="checkpoint",
             wing=wing,
@@ -717,8 +715,6 @@ def _ingest_transcript(transcript_path: str):
     if not path.is_file() or path.stat().st_size < 100:
         return
 
-    from .config import MempalaceConfig
-
     try:
         MempalaceConfig()  # validate config loads
     except Exception:
@@ -747,6 +743,20 @@ def _ingest_transcript(transcript_path: str):
 
 
 SUPPORTED_HARNESSES = {"claude-code", "codex"}
+
+
+def _diary_agent_for_harness(harness: str) -> str:
+    """Return the diary ``agent_name`` a session in ``harness`` reads under.
+
+    Stop-hook checkpoints must be filed beside the agent's own entries so
+    ``mempalace_diary_read(agent_name=...)`` surfaces them. The old code filed
+    them under a fixed ``"session-hook"`` identity that no reader ever queried,
+    hiding every checkpoint (#1693). A ``claude-code`` session reads its diary
+    as ``"claude"``; every other harness already reads under its own name, so
+    returning the harness name keeps a newly supported harness discoverable
+    instead of silently invisible again.
+    """
+    return "claude" if harness == "claude-code" else harness
 
 
 def _parse_harness_input(data: dict, harness: str) -> dict:
@@ -892,6 +902,11 @@ def hook_stop(data: dict, harness: str):
     stop_hook_active = parsed["stop_hook_active"]
     transcript_path = parsed["transcript_path"]
 
+    # Respect auto_save config toggle (clean opt-out)
+    if not MempalaceConfig().hooks_auto_save:
+        _output({})
+        return
+
     # If already in a block-mode save cycle, let through (infinite-loop prevention).
     # Silent mode saves directly without returning {"decision":"block"}, so there's
     # no loop to prevent — and Claude Code's plugin dispatch sets this flag on every
@@ -902,16 +917,9 @@ def hook_stop(data: dict, harness: str):
         # (v3.3.0+), so if we can't read config, behave as if it's still on.
         silent_guard = True
         try:
-            from .config import MempalaceConfig
-        except ImportError as exc:
-            _log(
-                f"WARNING: could not import MempalaceConfig for stop guard: {exc}; defaulting to silent mode"
-            )
-        else:
-            try:
-                silent_guard = MempalaceConfig().hook_silent_save
-            except AttributeError as exc:
-                _log(f"WARNING: could not read hook_silent_save: {exc}; defaulting to silent mode")
+            silent_guard = MempalaceConfig().hook_silent_save
+        except AttributeError as exc:
+            _log(f"WARNING: could not read hook_silent_save: {exc}; defaulting to silent mode")
         if not silent_guard:
             _output({})
             return
@@ -937,8 +945,6 @@ def hook_stop(data: dict, harness: str):
         _log(f"TRIGGERING SAVE at exchange {exchange_count}")
 
         # Read hook settings from config
-        from .config import MempalaceConfig
-
         try:
             config = MempalaceConfig()
             silent = config.hook_silent_save
@@ -975,7 +981,11 @@ def hook_stop(data: dict, harness: str):
             result = {"count": 0}
             if transcript_path:
                 result = _save_diary_direct(
-                    transcript_path, session_id, wing=project_wing, toast=toast
+                    transcript_path,
+                    session_id,
+                    wing=project_wing,
+                    toast=toast,
+                    agent_name=_diary_agent_for_harness(harness),
                 )
                 _ingest_transcript(transcript_path)
             _maybe_auto_ingest()
@@ -1033,13 +1043,22 @@ def hook_session_start(data: dict, harness: str):
 
 
 def hook_precompact(data: dict, harness: str):
-    """Precompact hook: mine transcript synchronously, then allow compaction."""
+    """Precompact hook: mine transcript synchronously, then allow compaction.
+
+    Respects the ``hooks.auto_save`` config toggle — when disabled, returns
+    immediately without mining.
+    """
     if not _palace_root_exists():
         _output({})
         return
     parsed = _parse_harness_input(data, harness)
     session_id = parsed["session_id"]
     transcript_path = parsed["transcript_path"]
+
+    # Respect auto_save config toggle (clean opt-out)
+    if not MempalaceConfig().hooks_auto_save:
+        _output({})
+        return
 
     _log(f"PRE-COMPACT triggered for session {session_id}")
 

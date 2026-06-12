@@ -286,3 +286,52 @@ def test_migrate_cleans_temp_palace_on_chromadb_failure(tmp_path):
     assert captured_temp_paths, "mkdtemp was never called — flow short-circuited"
     for p in captured_temp_paths:
         assert not os.path.exists(p), f"temp palace was not cleaned up: {p}"
+
+
+def test_migrate_prunes_old_pre_migrate_backups(tmp_path, monkeypatch):
+    """Repeated migrations must not accumulate full-palace copies forever.
+
+    The backup + prune happen right after copytree, before the (mocked)
+    chromadb step, so even a migration that fails afterward still trims the
+    backup set. We let copytree run for real so the fresh backup exists on
+    disk for the prune to evaluate.
+    """
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    (palace_dir / "chroma.sqlite3").write_text("db")
+
+    # Pre-seed 3 stale .pre-migrate.* sibling dirs with old mtimes.
+    for i in range(3):
+        stale = tmp_path / f"palace.pre-migrate.2026010{i}_000000"
+        stale.mkdir()
+        (stale / "chroma.sqlite3").write_text("old")
+        os.utime(stale, (1_700_000_000 + i, 1_700_000_000 + i))
+
+    monkeypatch.setenv("MEMPALACE_MAX_BACKUPS", "2")
+
+    failing_backend = MagicMock()
+    failing_backend.get_collection.side_effect = Exception("unreadable")
+    failing_backend.get_or_create_collection.side_effect = RuntimeError("chromadb boom")
+
+    import mempalace.backends.chroma as _chroma_mod
+
+    with (
+        patch("mempalace.migrate.detect_chromadb_version", return_value="0.5.x"),
+        patch(
+            "mempalace.migrate.extract_drawers_from_sqlite",
+            return_value=[{"id": "id1", "document": "doc", "metadata": {"wing": "w", "room": "r"}}],
+        ),
+        patch("builtins.input", return_value="y"),
+        patch.object(_chroma_mod, "ChromaBackend", return_value=failing_backend),
+    ):
+        try:
+            migrate(str(palace_dir), confirm=True)
+        except Exception:
+            pass
+
+    backups = sorted(p.name for p in tmp_path.glob("palace.pre-migrate.*"))
+    # 3 stale + 1 fresh = 4 created; retention keeps only the 2 newest.
+    assert len(backups) == 2
+    # The two oldest stale backups must be gone.
+    assert "palace.pre-migrate.20260100_000000" not in backups
+    assert "palace.pre-migrate.20260101_000000" not in backups

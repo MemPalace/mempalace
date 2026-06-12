@@ -1296,6 +1296,57 @@ def test_max_seq_id_backup_created(tmp_path):
     assert rows[seg["drawers_meta"]] == seg["poisoned_values"][seg["drawers_meta"]]
 
 
+def test_max_seq_id_backup_pruned_to_max_backups(tmp_path, monkeypatch):
+    """Old max-seq-id backups beyond MEMPALACE_MAX_BACKUPS are pruned after a repair.
+
+    Without retention, every repair left a full chroma.sqlite3 copy behind
+    that was never cleaned up — the unbounded disk-growth bug this guards.
+    """
+    palace = str(tmp_path / "palace")
+    _seed_poisoned_max_seq_id(palace)
+
+    # Pre-seed 4 stale backups with old mtimes so the just-created one is
+    # unambiguously the newest.
+    for i in range(4):
+        stale = os.path.join(palace, f"chroma.sqlite3.max-seq-id-backup-2026010{i}-000000")
+        with open(stale, "w") as f:
+            f.write("old")
+        os.utime(stale, (1_700_000_000 + i, 1_700_000_000 + i))
+
+    monkeypatch.setenv("MEMPALACE_MAX_BACKUPS", "2")
+
+    result = repair.repair_max_seq_id(palace, assume_yes=True)
+
+    backups = sorted(
+        fn for fn in os.listdir(palace) if fn.startswith("chroma.sqlite3.max-seq-id-backup-")
+    )
+    # 4 stale + 1 fresh = 5 written; retention keeps only the 2 newest.
+    assert len(backups) == 2
+    # The backup created by this repair must be one of the survivors.
+    assert os.path.basename(result["backup"]) in backups
+
+
+def test_max_seq_id_backup_retained_when_pruning_disabled(tmp_path, monkeypatch):
+    """max_backups=0 keeps every backup (opt-out for external retention)."""
+    palace = str(tmp_path / "palace")
+    _seed_poisoned_max_seq_id(palace)
+
+    for i in range(3):
+        stale = os.path.join(palace, f"chroma.sqlite3.max-seq-id-backup-2026010{i}-000000")
+        with open(stale, "w") as f:
+            f.write("old")
+        os.utime(stale, (1_700_000_000 + i, 1_700_000_000 + i))
+
+    monkeypatch.setenv("MEMPALACE_MAX_BACKUPS", "0")
+
+    repair.repair_max_seq_id(palace, assume_yes=True)
+
+    backups = [
+        fn for fn in os.listdir(palace) if fn.startswith("chroma.sqlite3.max-seq-id-backup-")
+    ]
+    assert len(backups) == 4
+
+
 def test_max_seq_id_rollback_on_verification_failure(tmp_path, monkeypatch):
     """If the post-update detector still sees poison, raise and leave a backup."""
     palace = str(tmp_path / "palace")
@@ -2358,7 +2409,9 @@ def test_hook_stop_skips_diary_write_when_sentinel_present(tmp_path, monkeypatch
     output_buf = []
 
     with (
-        patch("mempalace.config.MempalaceConfig", return_value=mock_config_instance),
+        # hooks_cli imports MempalaceConfig at module level, so patch the name
+        # where hook_stop looks it up (not in mempalace.config).
+        patch("mempalace.hooks_cli.MempalaceConfig", return_value=mock_config_instance),
         patch("mempalace.hooks_cli._output", side_effect=output_buf.append),
         patch("mempalace.hooks_cli._save_diary_direct", side_effect=must_not_call_save),
     ):

@@ -1,0 +1,20 @@
+{"id": "cal_001", "text": "क्या आप इस Python फ़ाइल का इंडेंटेशन ठीक कर सकते हैं?", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_002", "text": "कल बैठक कितने बजे शुरू होगी?", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_003", "text": "पूर्वानुमान के अनुसार सप्ताहांत तक बारिश होगी।", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_004", "text": "यह अविश्वसनीय है!", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_005", "text": "नमस्ते, Bramble.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_006", "text": "विस्तृत आउटपुट के साथ परीक्षण चलाएँ।", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_007", "text": "क्या आप एक छोटी सी कॉल के लिए उपलब्ध हैं?", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_008", "text": "सावधान!", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_009", "text": "सुप्रभात, टीम।", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_010", "text": "मैंने कल तिमाही समापन पूरा कर लिया।", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_011", "text": "मुझे AR aging report दिखाओ।", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_012", "text": "aarch64 पर बिल्ड क्यों फेल हुआ?", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_013", "text": "नमस्ते।", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_014", "text": "वह डिप्लॉयमेंट एक तबाही था!", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_015", "text": "परागणकर्ता सर्वेक्षण ने सात देशी मधुमक्खी प्रजातियों की पहचान की।", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_016", "text": "रिमोट से पुरानी शाखाएं हटा दें।", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_017", "text": "अरे, Aria।", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_018", "text": "वाह, latency में वो गिरावट बहुत बड़ी है!", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_019", "text": "क्या आप तीसरे पेपर का सारांश दे सकते हैं?", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_020", "text": "खातों का चार्ट अब चार-अंकीय पदानुक्रम का उपयोग करता है।", "classes": ["question", "command", "statement", "exclamation", "greeting"]}

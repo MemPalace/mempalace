@@ -9,6 +9,7 @@ import chromadb
 import pytest
 import yaml
 
+from mempalace.config import normalize_wing_name
 from mempalace.miner import detect_room, load_config, mine, scan_project, status
 from mempalace.palace import NORMALIZE_VERSION, file_already_mined, prefetch_mined_set
 
@@ -257,7 +258,12 @@ def test_load_config_uses_defaults_when_yaml_missing():
         assert isinstance(config, dict)
         assert "wing" in config
         assert "rooms" in config
-        assert config["wing"] == project_root.name
+        # The default wing is the normalized dirname, not the raw name: temp
+        # dir names can contain leading/trailing '_' (tempfile's alphabet
+        # includes it), which normalize_wing_name strips. Comparing to the raw
+        # name was flaky across platforms (it only passed when the random name
+        # had no separators).
+        assert config["wing"] == normalize_wing_name(project_root.name)
     finally:
         shutil.rmtree(tmpdir)
 
@@ -808,6 +814,133 @@ def test_status_handles_none_metadata_without_crash(tmp_path, capsys):
     # alongside the real wing=proj row.
     assert "WING: ?" in out
     assert "WING: proj" in out
+
+
+def test_status_does_not_cold_load_vector_index(palace_path, seeded_collection, capsys):
+    """#1681 regression: a healthy ``status`` must NOT open the collection.
+
+    Opening it cold-loads the HNSW vector index, which costs ~60s of CPU per
+    call on large palaces. The counts come from chroma.sqlite3 instead. If
+    anyone reroutes the happy path back through the vector index, the sentinel
+    patched over ``_open_collection_or_explain`` fires. (Revert ``status`` to
+    its pre-fix body and this test fails loudly — that's the regression it
+    guards.)
+    """
+    from unittest.mock import MagicMock, patch
+
+    sentinel = MagicMock(side_effect=AssertionError("status cold-loaded the vector index"))
+    with patch("mempalace.miner._open_collection_or_explain", sentinel):
+        status(palace_path)
+
+    sentinel.assert_not_called()
+    out = capsys.readouterr().out
+    assert "MemPalace Status — 4 drawers" in out
+    assert "WING: project" in out
+    assert "WING: notes" in out
+
+
+def test_sqlite_wing_room_counts_exact_tally(palace_path, seeded_collection):
+    """The sqlite tally must equal the seeded drawers exactly — 2 project/
+    backend, 1 project/frontend, 1 notes/planning — with no double counting.
+
+    Guards the double ``LEFT JOIN embedding_metadata`` against fan-out: if the
+    join multiplied rows (e.g. a drawer carrying several metadata keys), the
+    total would exceed 4 and the room counts would inflate.
+    """
+    from mempalace.backends.chroma import _sqlite_wing_room_counts
+
+    result = _sqlite_wing_room_counts(palace_path, "mempalace_drawers")
+    assert result is not None
+    total, wing_rooms = result
+    assert total == 4
+    assert {w: dict(r) for w, r in wing_rooms.items()} == {
+        "project": {"backend": 2, "frontend": 1},
+        "notes": {"planning": 1},
+    }
+
+
+def test_status_falls_back_to_chroma_when_sqlite_unreadable(palace_path, seeded_collection, capsys):
+    """When the sqlite fast path returns ``None`` (exotic schema / read error),
+    ``status`` must fall back to the ChromaDB client path and still report the
+    correct tally — not crash or print nothing."""
+    from unittest.mock import patch
+
+    with patch("mempalace.backends.chroma._sqlite_wing_room_counts", return_value=None):
+        status(palace_path)
+
+    out = capsys.readouterr().out
+    assert "MemPalace Status — 4 drawers" in out
+    assert "WING: project" in out
+
+
+def test_sqlite_wing_room_counts_none_when_collection_absent(palace_path):
+    """DB exists but the drawers collection was never bootstrapped -> ``None``,
+    so ``status`` routes to the 'initialized but empty' message instead of
+    printing a misleading ``0 drawers`` tally (State C, #1498)."""
+    import chromadb
+
+    from mempalace.backends.chroma import _sqlite_wing_room_counts
+
+    chromadb.PersistentClient(path=palace_path)  # creates chroma.sqlite3, no collection
+    assert _sqlite_wing_room_counts(palace_path, "mempalace_drawers") is None
+
+
+def test_sqlite_wing_room_counts_numeric_wing_not_dropped(palace_path, collection):
+    """A drawer whose wing/room is stored numerically (int_value, not
+    string_value) must be tallied under its stringified value — matching the
+    ChromaDB path, which surfaces the native number — not silently bucketed
+    under '?'. Without the int/float COALESCE this row would vanish into '?'
+    while returning a non-None result that skips the fallback."""
+    from mempalace.backends.chroma import _sqlite_wing_room_counts
+
+    collection.add(
+        ids=["drawer_numeric_meta"],
+        documents=["a drawer filed with a numeric wing and room"],
+        metadatas=[{"wing": 2026, "room": 7}],
+    )
+    result = _sqlite_wing_room_counts(palace_path, "mempalace_drawers")
+    assert result is not None
+    _, wing_rooms = result
+    assert {w: dict(r) for w, r in wing_rooms.items()} == {"2026": {"7": 1}}
+
+
+def test_sqlite_wing_room_counts_partial_metadata_buckets_question_mark(palace_path, collection):
+    """A drawer with a wing but no room (and vice versa) must be counted under
+    '?' for the missing axis, never dropped. Guards the LEFT JOINs against
+    being narrowed to inner joins, which would silently discard partial
+    drawers and undercount the total."""
+    from mempalace.backends.chroma import _sqlite_wing_room_counts
+
+    collection.add(
+        ids=["drawer_wing_only", "drawer_room_only"],
+        documents=["has a wing but no room", "has a room but no wing"],
+        metadatas=[{"wing": "alpha"}, {"room": "beta"}],
+    )
+    result = _sqlite_wing_room_counts(palace_path, "mempalace_drawers")
+    assert result is not None
+    total, wing_rooms = result
+    assert total == 2  # neither drawer dropped
+    assert {w: dict(r) for w, r in wing_rooms.items()} == {
+        "alpha": {"?": 1},
+        "?": {"beta": 1},
+    }
+
+
+def test_sqlite_wing_room_counts_returns_none_on_locked_db(palace_path, seeded_collection):
+    """A sustained sqlite lock (writer holding the DB) must degrade to ``None``
+    so ``status`` falls back to the slow-but-correct ChromaDB path rather than
+    raising. busy_timeout waits out *transient* locks; a hard lock still ends
+    here. Simulated by forcing the read to raise OperationalError."""
+    import sqlite3 as _sqlite3
+    from unittest.mock import patch
+
+    from mempalace.backends.chroma import _sqlite_wing_room_counts
+
+    with patch(
+        "mempalace.backends.chroma.sqlite3.connect",
+        side_effect=_sqlite3.OperationalError("database is locked"),
+    ):
+        assert _sqlite_wing_room_counts(palace_path, "mempalace_drawers") is None
 
 
 def test_process_file_uses_bounded_upsert_batches(tmp_path, monkeypatch):
@@ -1976,3 +2109,205 @@ class TestExtractContentDate:
         content = "Y2K reference: 25/01/00.\n"
         f.write_text(content)
         assert _extract_content_date(str(f), content) == "2000-01-25"
+
+
+def test_file_already_mined_handles_multiple_groups_under_one_source_file(tmp_path):
+    """Under the additive-mining model, a single ``source_file`` can have
+    multiple ``parent_drawer_id`` groups in the palace — one per mining pass
+    — each with its own stored ``source_mtime``. ``file_already_mined`` must
+    return True if ANY group's stored mtime matches the file's current
+    mtime, regardless of which group ChromaDB's ``get(..., limit=1)`` happens
+    to return first.
+
+    Current code uses ``collection.get(where={"source_file": X}, limit=1)``
+    which has undefined ordering across multiple matching rows. When ChromaDB
+    returns a stale group (older mining pass with a different stored mtime),
+    the function returns False, the additive miner concludes the file changed,
+    and writes yet another duplicate group for a file that has not actually
+    changed. Steady state: duplicate groups accumulate without bound.
+
+    This test pins the failure space deterministically using a MockCollection
+    that always returns the stale group on limit=1 (worst-case ordering). A
+    correct implementation iterates all groups via the paginated pattern
+    already used in the ``extract_mode is not None`` branch.
+
+    Issue: follow-up to PR #1628 (the every-bare-source_file-query audit).
+    """
+    # Create a real file with known mtime.
+    test_file = tmp_path / "doc.md"
+    test_file.write_text("content that hasn't changed since the latest mine.")
+    current_mtime = os.path.getmtime(str(test_file))
+
+    # Build a MockCollection that simulates two parent_drawer_id groups
+    # under the same source_file with DIFFERENT stored mtimes:
+    #   group_A: stale, source_mtime = current_mtime - 100  (older pass)
+    #   group_B: current, source_mtime = current_mtime      (latest pass)
+    # The mock returns group_A for limit=1 calls (worst-case ordering) and
+    # returns BOTH groups for the paginated limit=1000 calls (what the fix
+    # must use).
+    stale_meta = {
+        "source_file": str(test_file),
+        "chunk_index": 0,
+        "parent_drawer_id": "drawer_group_A",
+        "source_mtime": current_mtime - 100.0,
+        "normalize_version": NORMALIZE_VERSION,
+    }
+    current_meta = {
+        "source_file": str(test_file),
+        "chunk_index": 0,
+        "parent_drawer_id": "drawer_group_B",
+        "source_mtime": current_mtime,
+        "normalize_version": NORMALIZE_VERSION,
+    }
+
+    class MockCollection:
+        """Simulates the ChromaDB get() contract for two parent_drawer_id
+        groups sharing one source_file. Returns the STALE group when called
+        with limit=1 (the worst-case-ordering shape that triggers the bug).
+        Returns BOTH groups (paginated) when called with limit=1000 — what
+        a correctly-iterating implementation must do."""
+
+        def get(self, where=None, limit=None, offset=0, include=None):
+            if limit == 1:
+                return {"ids": ["a_0"], "metadatas": [stale_meta]}
+            if offset == 0:
+                return {"ids": ["a_0", "b_0"], "metadatas": [stale_meta, current_meta]}
+            return {"ids": [], "metadatas": []}
+
+    col = MockCollection()
+
+    # EXPECTED: file_already_mined returns True because at least one stored
+    # group's mtime matches the current file mtime.
+    # CURRENT BUG: returns False because limit=1 grabs the stale group.
+    assert file_already_mined(col, str(test_file), check_mtime=True) is True, (
+        "file_already_mined returned False even though a group with matching "
+        "mtime exists. The limit=1 query picked the stale group; the function "
+        "must iterate all groups for the source_file (mirroring the existing "
+        "paginated pattern in the extract_mode-is-set branch)."
+    )
+
+
+# ── --limit skips already-mined files (#1535) ──────────────────────────
+
+
+def test_mine_limit_skips_already_mined_files(tmp_path, capsys):
+    """--limit N should count only NEW work, not already-mined skips (#1535)."""
+    from unittest.mock import patch
+
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=10)
+    palace_path = project_root / "palace"
+
+    call_count = 0
+
+    def fake_process_file(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count <= 8:
+            return (0, "general", None)
+        return (3, "general", None)
+
+    with patch("mempalace.miner.process_file", side_effect=fake_process_file):
+        mine(str(project_root), str(palace_path), limit=5)
+
+    out = capsys.readouterr().out
+    assert "Drawers filed: 6" in out
+    assert call_count == 10
+
+
+def test_mine_limit_stops_after_n_new_files(tmp_path, capsys):
+    """--limit 3 on 5 unmined files mines exactly 3 and stops."""
+    from unittest.mock import patch
+
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=5)
+    palace_path = project_root / "palace"
+
+    call_count = 0
+
+    def fake_process_file(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return (2, "general", None)
+
+    with patch("mempalace.miner.process_file", side_effect=fake_process_file):
+        mine(str(project_root), str(palace_path), limit=3)
+
+    assert call_count == 3
+    out = capsys.readouterr().out
+    assert "Drawers filed: 6" in out
+
+
+def test_mine_limit_zero_mines_all(tmp_path, capsys):
+    """--limit 0 (default) processes every file."""
+    from unittest.mock import patch
+
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=4)
+    palace_path = project_root / "palace"
+
+    call_count = 0
+
+    def fake_process_file(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return (1, "general", None)
+
+    with patch("mempalace.miner.process_file", side_effect=fake_process_file):
+        mine(str(project_root), str(palace_path), limit=0)
+
+    assert call_count == 4
+    out = capsys.readouterr().out
+    assert "Drawers filed: 4" in out
+
+
+def test_mine_limit_dry_run(tmp_path, capsys):
+    """--dry-run --limit N counts new files toward the limit."""
+    from unittest.mock import patch
+
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=5)
+    palace_path = project_root / "palace"
+
+    call_count = 0
+
+    def fake_process_file(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return (2, "general", None)
+
+    with patch("mempalace.miner.process_file", side_effect=fake_process_file):
+        mine(str(project_root), str(palace_path), limit=3, dry_run=True)
+
+    assert call_count == 3
+
+
+def test_mine_limit_summary_counts(tmp_path, capsys):
+    """Summary arithmetic is correct when limit causes early exit."""
+    from unittest.mock import patch
+
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=8)
+    palace_path = project_root / "palace"
+
+    call_idx = 0
+
+    def fake_process_file(*args, **kwargs):
+        nonlocal call_idx
+        call_idx += 1
+        if call_idx % 2 == 0:
+            return (0, "general", None)
+        return (3, "general", None)
+
+    with patch("mempalace.miner.process_file", side_effect=fake_process_file):
+        mine(str(project_root), str(palace_path), limit=2)
+
+    out = capsys.readouterr().out
+    assert "Files processed: 2" in out
+    assert "Drawers filed: 6" in out
+    assert "(limit: 2 new)" in out
