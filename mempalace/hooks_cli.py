@@ -162,6 +162,15 @@ def _count_human_messages(transcript_path: str) -> int:
                             if "<command-message>" in content:
                                 continue
                         elif isinstance(content, list):
+                            # Skip empty content lists — no human input.
+                            if not content:
+                                continue
+                            # Skip tool results (role: "user" but not human input)
+                            if all(
+                                isinstance(b, dict) and b.get("type") == "tool_result"
+                                for b in content
+                            ):
+                                continue
                             text = " ".join(
                                 b.get("text", "") for b in content if isinstance(b, dict)
                             )
