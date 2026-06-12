@@ -1,5 +1,6 @@
 """Tests for mempalace.repair — scan, prune, and rebuild HNSW index."""
 
+import json
 import os
 import sqlite3
 import contextlib
@@ -1342,15 +1343,17 @@ def test_sqlite_integrity_errors_reports_unreadable_sqlite_file(tmp_path):
 
 
 def test_maybe_rebuild_fts_index_when_only_fts_corrupt_noop_for_non_fts_errors(tmp_path):
+    """B-tree errors must raise PalaceSqliteCorruptError, not return quietly."""
     palace = tmp_path / "palace"
     palace.mkdir()
     (palace / "chroma.sqlite3").write_bytes(b"")
     errors = ["Page 4 of B-tree 12345: database disk image is malformed"]
 
     with patch("mempalace.repair.sqlite3.connect") as mock_connect:
-        result = repair.maybe_rebuild_fts_index_when_only_fts_corrupt(str(palace), errors)
+        with pytest.raises(repair.PalaceSqliteCorruptError) as exc_info:
+            repair.maybe_rebuild_fts_index_when_only_fts_corrupt(str(palace), errors)
 
-    assert result == errors
+    assert exc_info.value.errors == errors
     mock_connect.assert_not_called()
 
 
@@ -1379,8 +1382,7 @@ def test_maybe_rebuild_fts_index_when_only_fts_corrupt_repairs_to_clean(tmp_path
     assert result == []
     conn.execute.assert_any_call("PRAGMA busy_timeout=5000")
     conn.execute.assert_any_call(
-        "INSERT INTO embedding_fulltext_search(embedding_fulltext_search) "
-        "VALUES('rebuild')"
+        "INSERT INTO embedding_fulltext_search(embedding_fulltext_search) VALUES('rebuild')"
     )
     conn.execute.assert_any_call("PRAGMA quick_check")
 
@@ -2075,3 +2077,321 @@ def test_rebuild_index_calls_vacuum(mock_backend_cls, mock_shutil, tmp_path):
         args, kwargs = mock_vacuum.call_args
         assert args[0] == str(tmp_path)
         assert "progress" in kwargs
+
+
+# ── PalaceSqliteCorruptError ──────────────────────────────────────────────────
+
+
+def test_palace_sqlite_corrupt_error_str_contains_guidance():
+    """__str__ must mention the from-sqlite recovery command."""
+    err = repair.PalaceSqliteCorruptError("/some/palace", ["database disk image is malformed"])
+    msg = str(err)
+    assert "from-sqlite" in msg
+    assert "/some/palace" in msg
+
+
+def test_palace_sqlite_corrupt_error_attributes():
+    errors = ["2nd reference to page 711020", "wrong # of entries in index"]
+    err = repair.PalaceSqliteCorruptError("/p", errors)
+    assert err.palace_path == "/p"
+    assert err.errors == errors
+
+
+# ── _is_btree_corruption ─────────────────────────────────────────────────────
+
+
+def test_is_btree_corruption_empty_returns_false():
+    assert repair._is_btree_corruption([]) is False
+
+
+def test_is_btree_corruption_fts_only_returns_false():
+    fts_error = "malformed inverted index for fts5 table main.embedding_fulltext_search"
+    assert repair._is_btree_corruption([fts_error]) is False
+    assert repair._is_btree_corruption([fts_error, fts_error]) is False
+
+
+def test_is_btree_corruption_btree_errors_returns_true():
+    assert repair._is_btree_corruption(["2nd reference to page 711020"]) is True
+    assert (
+        repair._is_btree_corruption(["2nd reference to page 711020", "wrong # of entries in index"])
+        is True
+    )
+    assert repair._is_btree_corruption(["database disk image is malformed"]) is True
+    assert repair._is_btree_corruption(["row 42 missing from index some_idx"]) is True
+
+
+def test_is_btree_corruption_mixed_fts_and_btree_returns_true():
+    """If even one error is not FTS-only, the whole list is B-tree corrupt."""
+    fts_error = "malformed inverted index for fts5 table main.embedding_fulltext_search"
+    btree_error = "2nd reference to page 3"
+    assert repair._is_btree_corruption([fts_error, btree_error]) is True
+
+
+# ── corruption_sentinel helpers ───────────────────────────────────────────────
+
+
+def test_write_read_sentinel_roundtrip(tmp_path):
+    from mempalace.corruption_sentinel import (
+        read_corruption_sentinel,
+        write_corruption_sentinel,
+    )
+
+    palace = str(tmp_path / "palace")
+    os.makedirs(palace)
+    errors = ["page 1 is wrong", "index corrupt"]
+    write_corruption_sentinel(palace, errors)
+    result = read_corruption_sentinel(palace)
+    assert result is not None
+    assert result["errors"] == errors
+    assert "detected_at" in result
+
+
+def test_read_sentinel_absent_returns_none(tmp_path):
+    from mempalace.corruption_sentinel import read_corruption_sentinel
+
+    palace = str(tmp_path / "palace")
+    os.makedirs(palace)
+    assert read_corruption_sentinel(palace) is None
+
+
+def test_clear_sentinel_removes_file(tmp_path):
+    from mempalace.corruption_sentinel import (
+        clear_corruption_sentinel,
+        read_corruption_sentinel,
+        write_corruption_sentinel,
+    )
+
+    palace = str(tmp_path / "palace")
+    os.makedirs(palace)
+    write_corruption_sentinel(palace, ["err"])
+    assert read_corruption_sentinel(palace) is not None
+    clear_corruption_sentinel(palace)
+    assert read_corruption_sentinel(palace) is None
+
+
+def test_write_sentinel_truncates_to_five_errors(tmp_path):
+    from mempalace.corruption_sentinel import (
+        read_corruption_sentinel,
+        write_corruption_sentinel,
+    )
+
+    palace = str(tmp_path / "palace")
+    os.makedirs(palace)
+    errors = [f"err{i}" for i in range(10)]
+    write_corruption_sentinel(palace, errors)
+    result = read_corruption_sentinel(palace)
+    assert len(result["errors"]) == 5
+
+
+def test_clear_sentinel_nonexistent_does_not_raise(tmp_path):
+    from mempalace.corruption_sentinel import clear_corruption_sentinel
+
+    palace = str(tmp_path / "no_sentinel_palace")
+    os.makedirs(palace)
+    # Should not raise.
+    clear_corruption_sentinel(palace)
+
+
+def test_read_sentinel_malformed_json_returns_empty_errors(tmp_path):
+    from mempalace.corruption_sentinel import (
+        CORRUPTION_SENTINEL_NAME,
+        read_corruption_sentinel,
+    )
+
+    palace = str(tmp_path / "palace")
+    os.makedirs(palace)
+    sentinel_path = os.path.join(palace, CORRUPTION_SENTINEL_NAME)
+    with open(sentinel_path, "w") as fh:
+        fh.write("not-json{{{")
+    result = read_corruption_sentinel(palace)
+    assert result == {"errors": []}
+
+
+# ── validate_palace_sqlite ───────────────────────────────────────────────────
+
+
+def test_validate_palace_sqlite_clean_palace_clears_sentinel(tmp_path):
+    """Clean quick_check must clear an existing stale sentinel."""
+    from mempalace.corruption_sentinel import (
+        read_corruption_sentinel,
+        write_corruption_sentinel,
+    )
+
+    palace = str(tmp_path / "palace")
+    os.makedirs(palace)
+    write_corruption_sentinel(palace, ["stale error"])
+
+    with patch.object(repair, "sqlite_integrity_errors", return_value=[]):
+        result = repair.validate_palace_sqlite(palace)
+
+    assert result == []
+    assert read_corruption_sentinel(palace) is None
+
+
+def test_validate_palace_sqlite_btree_errors_writes_sentinel_and_raises(tmp_path):
+    palace = str(tmp_path / "palace")
+    os.makedirs(palace)
+    btree_errors = ["2nd reference to page 711020", "wrong # of entries in index"]
+
+    with patch.object(repair, "sqlite_integrity_errors", return_value=btree_errors):
+        with pytest.raises(repair.PalaceSqliteCorruptError) as exc_info:
+            repair.validate_palace_sqlite(palace)
+
+    assert exc_info.value.errors == btree_errors
+    # Sentinel must have been written.
+    from mempalace.corruption_sentinel import read_corruption_sentinel
+
+    sentinel = read_corruption_sentinel(palace)
+    assert sentinel is not None
+    assert sentinel["errors"] == btree_errors
+
+
+def test_validate_palace_sqlite_btree_no_sentinel_when_set_sentinel_false(tmp_path):
+    palace = str(tmp_path / "palace")
+    os.makedirs(palace)
+    btree_errors = ["database disk image is malformed"]
+
+    with patch.object(repair, "sqlite_integrity_errors", return_value=btree_errors):
+        with pytest.raises(repair.PalaceSqliteCorruptError):
+            repair.validate_palace_sqlite(palace, set_sentinel=False)
+
+    from mempalace.corruption_sentinel import read_corruption_sentinel
+
+    assert read_corruption_sentinel(palace) is None
+
+
+def test_validate_palace_sqlite_fts_only_returns_errors_no_sentinel_no_raise(tmp_path):
+    """FTS-only errors: return the list, do NOT raise, do NOT set sentinel."""
+    palace = str(tmp_path / "palace")
+    os.makedirs(palace)
+    fts_errors = ["malformed inverted index for fts5 table main.embedding_fulltext_search"]
+
+    with patch.object(repair, "sqlite_integrity_errors", return_value=fts_errors):
+        result = repair.validate_palace_sqlite(palace)
+
+    assert result == fts_errors
+    from mempalace.corruption_sentinel import read_corruption_sentinel
+
+    assert read_corruption_sentinel(palace) is None
+
+
+# ── open guard (chroma.py _prepare_palace_for_open) ──────────────────────────
+
+
+def test_prepare_palace_for_open_raises_on_sentinel_without_calling_integrity_check(tmp_path):
+    """Sentinel present → raise PalaceSqliteCorruptError immediately,
+    without invoking sqlite_integrity_errors (which would be wasteful on
+    the hot path).
+    """
+    from mempalace.backends.chroma import ChromaBackend
+    from mempalace.corruption_sentinel import write_corruption_sentinel
+    from mempalace.repair import PalaceSqliteCorruptError
+
+    palace = str(tmp_path / "palace")
+    os.makedirs(palace)
+    write_corruption_sentinel(palace, ["B-tree corrupt"])
+
+    # sqlite_integrity_errors must NOT be called — patch it to fail the test
+    # if it is.
+    with patch.object(
+        repair,
+        "sqlite_integrity_errors",
+        side_effect=AssertionError("sqlite_integrity_errors must not be called"),
+    ):
+        with pytest.raises(PalaceSqliteCorruptError) as exc_info:
+            ChromaBackend._prepare_palace_for_open(palace)
+
+    assert "B-tree corrupt" in str(exc_info.value)
+
+
+# ── hook sentinel skip ────────────────────────────────────────────────────────
+
+
+def test_hook_stop_skips_diary_write_when_sentinel_present(tmp_path, monkeypatch):
+    """When .sqlite_corrupt is present, hook_stop must skip the chroma
+    write and return cleanly without calling _save_diary_direct.
+    """
+    import mempalace.hooks_cli as hooks_cli_mod
+    from mempalace.corruption_sentinel import write_corruption_sentinel
+    from mempalace.hooks_cli import SAVE_INTERVAL
+
+    # Set up an isolated hooks_cli state.
+    monkeypatch.setattr(hooks_cli_mod, "STATE_DIR", tmp_path / "hook_state")
+    monkeypatch.setattr(hooks_cli_mod, "PALACE_ROOT", tmp_path / ".mempalace")
+    (tmp_path / "hook_state").mkdir(parents=True)
+    (tmp_path / ".mempalace").mkdir(parents=True)
+
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    write_corruption_sentinel(str(palace), ["B-tree page corrupt"])
+
+    # Patch config to return the corrupt palace path. Use mempalace.config so
+    # the local `from .config import MempalaceConfig` in hooks_cli is affected.
+    mock_config_instance = MagicMock()
+    mock_config_instance.palace_path = str(palace)
+    mock_config_instance.hook_silent_save = True
+    mock_config_instance.hook_desktop_toast = False
+
+    # Make last-save counter far enough behind to trigger the save.
+    session_id = "test-session-corrupt"
+    save_file = tmp_path / "hook_state" / f"{session_id}_last_save"
+    save_file.write_text("0")
+
+    # Transcript with enough messages to clear SAVE_INTERVAL.
+    transcript_path = tmp_path / "transcript.jsonl"
+    entries = [
+        json.dumps({"type": "user", "message": {"role": "user", "content": f"msg {i}"}})
+        for i in range(SAVE_INTERVAL + 5)
+    ]
+    transcript_path.write_text("\n".join(entries))
+
+    save_diary_called = []
+
+    def must_not_call_save(*a, **kw):
+        save_diary_called.append(True)
+        raise AssertionError("_save_diary_direct must not be called when palace is corrupt")
+
+    output_buf = []
+
+    with (
+        patch("mempalace.config.MempalaceConfig", return_value=mock_config_instance),
+        patch("mempalace.hooks_cli._output", side_effect=output_buf.append),
+        patch("mempalace.hooks_cli._save_diary_direct", side_effect=must_not_call_save),
+    ):
+        from mempalace.hooks_cli import hook_stop
+
+        hook_stop(
+            {
+                "session_id": session_id,
+                "stop_hook_active": False,
+                "transcript_path": str(transcript_path),
+            },
+            "claude-code",
+        )
+
+    assert not save_diary_called, "_save_diary_direct must not be called when palace is corrupt"
+
+
+# ── from-sqlite not blocked by B-tree errors ────────────────────────────────
+
+
+def test_from_sqlite_not_blocked_by_btree_integrity_predicate():
+    """The from-sqlite CLI path does not call sqlite_integrity_errors /
+    print_sqlite_integrity_abort.  Test the gating predicate directly:
+    validate_palace_sqlite with B-tree errors raises, but rebuild_from_sqlite
+    itself does NOT call validate_palace_sqlite — it must proceed to
+    extraction even when quick_check reports B-tree corruption.
+    """
+    # Confirm rebuild_from_sqlite does not call sqlite_integrity_errors
+    # (the function used to gate the legacy path).
+    import inspect
+
+    source = inspect.getsource(repair.rebuild_from_sqlite)
+    # These are the functions that would block from-sqlite if called:
+    assert "sqlite_integrity_errors" not in source, (
+        "rebuild_from_sqlite must not call sqlite_integrity_errors "
+        "(it would block recovery from B-tree corruption)"
+    )
+    assert "print_sqlite_integrity_abort" not in source, (
+        "rebuild_from_sqlite must not call print_sqlite_integrity_abort"
+    )

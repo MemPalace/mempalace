@@ -1412,3 +1412,62 @@ def test_palace_get_collection_uses_configured_collection_name(monkeypatch):
         "collection_name": "custom_drawers",
         "create": False,
     }
+
+
+# ── sentinel-based open guard ─────────────────────────────────────────────────
+
+
+def test_prepare_palace_for_open_raises_palace_sqlite_corrupt_error_on_sentinel(tmp_path):
+    """When .sqlite_corrupt is present, _prepare_palace_for_open must raise
+    PalaceSqliteCorruptError without touching the expensive integrity-check
+    logic (sqlite_integrity_errors should NOT be called).
+    """
+    import os
+    from unittest.mock import patch
+
+    from mempalace.backends.chroma import ChromaBackend
+    from mempalace.corruption_sentinel import write_corruption_sentinel
+    from mempalace.repair import PalaceSqliteCorruptError
+    import mempalace.repair as repair_mod
+
+    palace = str(tmp_path / "sentinel_palace")
+    os.makedirs(palace)
+    write_corruption_sentinel(palace, ["database disk image is malformed"])
+
+    with patch.object(
+        repair_mod,
+        "sqlite_integrity_errors",
+        side_effect=AssertionError("sqlite_integrity_errors must not be called on hot path"),
+    ):
+        with pytest.raises(PalaceSqliteCorruptError) as exc_info:
+            ChromaBackend._prepare_palace_for_open(palace)
+
+    assert palace in str(exc_info.value)
+
+
+def test_prepare_palace_for_open_no_sentinel_proceeds_normally(tmp_path, monkeypatch):
+    """Without a sentinel the normal open-guard path (_fix_blob_seq_ids,
+    quarantine checks) must run without raising PalaceSqliteCorruptError.
+    """
+    import os
+
+    from mempalace.backends.chroma import ChromaBackend
+    from mempalace.repair import PalaceSqliteCorruptError
+
+    palace = str(tmp_path / "clean_palace")
+    os.makedirs(palace)
+
+    # Patch the expensive helpers so we don't need a real palace on disk.
+    monkeypatch.setattr("mempalace.backends.chroma._fix_blob_seq_ids", lambda p: None)
+    monkeypatch.setattr(
+        "mempalace.backends.chroma.quarantine_invalid_hnsw_metadata", lambda p: None
+    )
+    monkeypatch.setattr("mempalace.backends.chroma.quarantine_stale_hnsw", lambda p: None)
+    # Clear the quarantined set so the cold-start gate fires.
+    ChromaBackend._quarantined_paths.discard(palace)
+
+    # Should not raise.
+    try:
+        ChromaBackend._prepare_palace_for_open(palace)
+    except PalaceSqliteCorruptError:
+        pytest.fail("PalaceSqliteCorruptError raised without a sentinel")

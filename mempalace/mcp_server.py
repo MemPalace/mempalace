@@ -474,6 +474,17 @@ def _get_client():
     mtime_changed = current_mtime != 0.0 and abs(current_mtime - _palace_db_mtime) > 0.01
 
     if _client_cache is None or inode_changed or mtime_changed:
+        # O(1) sentinel check: if validate_palace_sqlite previously flagged
+        # this palace as B-tree-corrupt, raise immediately — do NOT open the
+        # Rust client, which would segfault on a corrupt page.
+        from .corruption_sentinel import read_corruption_sentinel
+        from .repair import PalaceSqliteCorruptError
+
+        sentinel = read_corruption_sentinel(_config.palace_path)
+        if sentinel is not None:
+            errors = sentinel.get("errors") or ["(no detail recorded)"]
+            raise PalaceSqliteCorruptError(_config.palace_path, errors)
+
         # Run the HNSW capacity probe BEFORE chromadb opens the segment —
         # if the index is severely undersized, segment load can segfault
         # the whole MCP server (#1222). The probe is pure sqlite +
@@ -560,7 +571,13 @@ def _get_collection(create=False):
                 _metadata_cache = None
                 _metadata_cache_time = 0
             return _collection_cache
-        except Exception:
+        except Exception as _exc:
+            from .repair import PalaceSqliteCorruptError
+
+            # Do not retry on corruption: the sentinel is set; retrying would
+            # just raise again and delay the caller's error response.
+            if isinstance(_exc, PalaceSqliteCorruptError):
+                raise
             logger.exception(
                 "_get_collection attempt %d/2 failed (palace=%s, create=%s)",
                 attempt + 1,

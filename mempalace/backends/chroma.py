@@ -678,11 +678,7 @@ def _invalid_hnsw_metadata_fresh_seconds() -> float:
         value = float(raw)
     except ValueError:
         return _INVALID_HNSW_METADATA_FRESH_SECONDS_DEFAULT
-    return (
-        value
-        if value >= 0.0
-        else _INVALID_HNSW_METADATA_FRESH_SECONDS_DEFAULT
-    )
+    return value if value >= 0.0 else _INVALID_HNSW_METADATA_FRESH_SECONDS_DEFAULT
 
 
 def _valid_dimensionality(value: object) -> bool:
@@ -814,7 +810,9 @@ def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
                 else:
                     has_labels = bool(id_to_label)
                     if has_labels and dimensionality is None:
-                        if _missing_dimensionality_appears_recoverable(persisted, id_to_label, seg_dir):
+                        if _missing_dimensionality_appears_recoverable(
+                            persisted, id_to_label, seg_dir
+                        ):
                             logger.debug(
                                 "Skipping invalid-HNSW quarantine for segment %s "
                                 "(labels present, dimensionality=None, recoverable/fresh)",
@@ -823,9 +821,11 @@ def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
                             continue
                         total = _persisted_metadata_value(persisted, "total_elements_added")
                         label_to_id = _persisted_metadata_value(persisted, "label_to_id")
-                        has_consistency_shape = isinstance(total, Integral) and not isinstance(
-                            total, bool
-                        ) and isinstance(label_to_id, dict)
+                        has_consistency_shape = (
+                            isinstance(total, Integral)
+                            and not isinstance(total, bool)
+                            and isinstance(label_to_id, dict)
+                        )
                         if (not has_consistency_shape) and _segment_recently_touched(
                             seg_dir, _invalid_hnsw_metadata_fresh_seconds()
                         ):
@@ -839,8 +839,10 @@ def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
                             "labels present but dimensionality is missing or invalid "
                             f"({dimensionality!r})"
                         )
-                    elif has_labels and dimensionality is not None and not _valid_dimensionality(
-                        dimensionality
+                    elif (
+                        has_labels
+                        and dimensionality is not None
+                        and not _valid_dimensionality(dimensionality)
                     ):
                         reason = (
                             "labels present but dimensionality is missing or invalid "
@@ -1405,6 +1407,17 @@ class ChromaBackend(BaseBackend):
         re-open a palace. The ``_quarantined_paths`` gate prevents thrash on
         hot paths (e.g. ``_client()`` is called on every backend operation).
         """
+        # O(1) sentinel check: if a previous validate_palace_sqlite call wrote
+        # the .sqlite_corrupt marker, raise immediately without opening the
+        # Rust client (which would segfault on a B-tree-corrupt database).
+        from ..corruption_sentinel import read_corruption_sentinel
+        from ..repair import PalaceSqliteCorruptError
+
+        sentinel = read_corruption_sentinel(palace_path)
+        if sentinel is not None:
+            errors = sentinel.get("errors") or ["(no detail recorded)"]
+            raise PalaceSqliteCorruptError(palace_path, errors)
+
         _fix_blob_seq_ids(palace_path)
         if palace_path not in ChromaBackend._quarantined_paths:
             quarantine_invalid_hnsw_metadata(palace_path)

@@ -587,13 +587,98 @@ def sqlite_integrity_errors(palace_path: str) -> list[str]:
     return errors
 
 
-_FTS_MALFORMED_INDEX_ERROR = "malformed inverted index for fts5 table main.embedding_fulltext_search"
+_FTS_MALFORMED_INDEX_ERROR = (
+    "malformed inverted index for fts5 table main.embedding_fulltext_search"
+)
 
 
 def _is_only_fts_malformed_index(errors: list[str]) -> bool:
     if not errors:
         return False
     return all(_FTS_MALFORMED_INDEX_ERROR in str(e).lower() for e in errors)
+
+
+def _is_btree_corruption(errors: list[str]) -> bool:
+    """Return ``True`` when *errors* contains non-FTS B-tree-level corruption.
+
+    B-tree errors include messages such as "2nd reference to page N", "wrong #
+    of entries in index", "database disk image is malformed", and "row N
+    missing from index". These cannot be fixed by an FTS rebuild or an HNSW
+    rebuild — the only recovery path is
+    ``mempalace repair --mode from-sqlite --archive-existing``.
+
+    Returns ``False`` for an empty list or when every error is the known
+    FTS-only malformed-index message (which *can* be fixed with a targeted FTS
+    rebuild without involving from-sqlite).
+    """
+    if not errors:
+        return False
+    return not _is_only_fts_malformed_index(errors)
+
+
+def validate_palace_sqlite(
+    palace_path: str,
+    *,
+    set_sentinel: bool = True,
+) -> list[str]:
+    """Run ``PRAGMA quick_check`` and classify the result.
+
+    This is the *expensive* validation path — suitable only for
+    latency-tolerant entry points (CLI ``search``, ``status``, MCP server
+    startup).  Do NOT call from the stop-hook or any path where < 500 ms
+    latency is required.
+
+    Behaviour by error class
+    ~~~~~~~~~~~~~~~~~~~~~~~~
+    * **Empty / "ok"** — palace is healthy.  Clears any stale corruption
+      sentinel so a previously-flagged palace that has been restored does not
+      remain locked.  Returns ``[]``.
+
+    * **FTS-only malformed-index** — returns the errors without raising.
+      The existing :func:`maybe_rebuild_fts_index_when_only_fts_corrupt`
+      self-heal path handles this class; we should not block the caller.
+
+    * **B-tree corruption (non-FTS errors)** — if *set_sentinel* is ``True``,
+      atomically writes the ``.sqlite_corrupt`` sentinel file before raising so
+      future cheap reads (stop-hook, MCP ``_get_client``) see the flag
+      immediately.  Always raises :class:`PalaceSqliteCorruptError`.
+
+    Parameters
+    ----------
+    palace_path:
+        Absolute path to the palace directory.
+    set_sentinel:
+        Write the ``.sqlite_corrupt`` sentinel when B-tree corruption is
+        found.  Set to ``False`` only in tests that need to inspect the
+        raise without touching the filesystem.
+
+    Returns
+    -------
+    list[str]
+        Empty on a healthy palace or when only FTS errors are present.
+
+    Raises
+    ------
+    PalaceSqliteCorruptError
+        When ``PRAGMA quick_check`` reports B-tree corruption.
+    """
+    from .corruption_sentinel import clear_corruption_sentinel, write_corruption_sentinel
+
+    errors = sqlite_integrity_errors(palace_path)
+
+    if not errors:
+        # Clean — clear any stale sentinel so a restored palace isn't locked.
+        clear_corruption_sentinel(palace_path)
+        return []
+
+    if _is_only_fts_malformed_index(errors):
+        # FTS-only: leave for the existing self-heal path.
+        return errors
+
+    # B-tree corruption.
+    if set_sentinel:
+        write_corruption_sentinel(palace_path, errors)
+    raise PalaceSqliteCorruptError(palace_path, errors)
 
 
 def maybe_rebuild_fts_index_when_only_fts_corrupt(
@@ -606,6 +691,11 @@ def maybe_rebuild_fts_index_when_only_fts_corrupt(
     original ``errors`` when this path is not applicable or rebuild fails.
     """
     if not _is_only_fts_malformed_index(errors):
+        # B-tree corruption: in-place repair cannot help.  Raise so
+        # legacy/HNSW callers route the user to from-sqlite recovery
+        # instead of dead-ending with an opaque Chroma panic.
+        if _is_btree_corruption(errors):
+            raise PalaceSqliteCorruptError(palace_path, errors)
         return errors
 
     sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
@@ -878,7 +968,11 @@ def rebuild_index(
     # corruption here lets us surface the clear recovery instructions and
     # exit cleanly before chromadb's compactor touches the disk.
     sqlite_errors = sqlite_integrity_errors(palace_path)
-    sqlite_errors = maybe_rebuild_fts_index_when_only_fts_corrupt(palace_path, sqlite_errors)
+    try:
+        sqlite_errors = maybe_rebuild_fts_index_when_only_fts_corrupt(palace_path, sqlite_errors)
+    except PalaceSqliteCorruptError as exc:
+        print_sqlite_integrity_abort(palace_path, exc.errors)
+        return
     if sqlite_errors:
         print_sqlite_integrity_abort(palace_path, sqlite_errors)
         return
@@ -999,6 +1093,43 @@ class RebuildPartialError(Exception):
         self.failed_collection = failed_collection
         self.dest_palace = dest_palace
         self.archive_path = archive_path
+
+
+class PalaceSqliteCorruptError(Exception):
+    """Raised when ``PRAGMA quick_check`` reveals B-tree-level corruption.
+
+    In-place repair (HNSW rebuild, FTS rebuild) cannot fix B-tree corruption
+    because the corruption lives in SQLite's on-disk page structures, not in
+    derived indexes.  The only fully automated recovery path is to rebuild the
+    palace from the verbatim documents still stored in the SQLite rows:
+
+        mempalace repair --mode from-sqlite --archive-existing
+
+    That command reads rows directly via SQL — bypassing HNSW and FTS — and
+    writes a fresh, structurally clean palace.
+
+    Attributes
+    ----------
+    palace_path:
+        Absolute path to the corrupt palace directory.
+    errors:
+        Non-empty list of ``quick_check`` output lines describing the
+        corruption.
+    """
+
+    def __init__(self, palace_path: str, errors: list[str]):
+        self.palace_path = palace_path
+        self.errors = errors
+        super().__init__(str(self))
+
+    def __str__(self) -> str:
+        preview = "; ".join(self.errors[:3])
+        return (
+            f"SQLite B-tree corruption detected in palace at {self.palace_path!r}: "
+            f"{preview}. "
+            "In-place repair cannot fix this. "
+            "Run: mempalace repair --mode from-sqlite --archive-existing"
+        )
 
 
 def _rebuild_one_collection(
@@ -1346,6 +1477,14 @@ def rebuild_from_sqlite(
             if archive_path is not None:
                 print(f"  Original palace archived at: {archive_path}")
             print(f"{'=' * 55}\n")
+            # Clear any corruption sentinel on the destination (live) palace so
+            # future open-guards and hook checks see a clean state.
+            try:
+                from .corruption_sentinel import clear_corruption_sentinel
+
+                clear_corruption_sentinel(dest_palace)
+            except Exception:  # noqa: BLE001
+                pass
             return counts
         finally:
             backend.close()

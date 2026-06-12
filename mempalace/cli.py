@@ -676,9 +676,15 @@ def cmd_sync(args):
 
 
 def cmd_search(args):
+    from .repair import PalaceSqliteCorruptError, validate_palace_sqlite
     from .searcher import search, SearchError
 
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    try:
+        validate_palace_sqlite(palace_path)
+    except PalaceSqliteCorruptError as exc:
+        print(f"\n  ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
     try:
         search(
             query=args.query,
@@ -742,8 +748,14 @@ def cmd_migrate(args):
 
 def cmd_status(args):
     from .miner import status
+    from .repair import PalaceSqliteCorruptError, validate_palace_sqlite
 
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    try:
+        validate_palace_sqlite(palace_path)
+    except PalaceSqliteCorruptError as exc:
+        print(f"\n  ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
     status(palace_path=palace_path)
 
 
@@ -761,6 +773,7 @@ def cmd_repair(args):
     from .backends.chroma import ChromaBackend
     from .migrate import confirm_destructive_action, contains_palace_database
     from .repair import (
+        PalaceSqliteCorruptError,
         RebuildCollectionError,
         TruncationDetected,
         _close_chroma_handles,
@@ -878,7 +891,11 @@ def cmd_repair(args):
     # here so we can surface the clear recovery instructions and exit
     # cleanly before chromadb's compactor touches the disk.
     sqlite_errors = sqlite_integrity_errors(palace_path)
-    sqlite_errors = maybe_rebuild_fts_index_when_only_fts_corrupt(palace_path, sqlite_errors)
+    try:
+        sqlite_errors = maybe_rebuild_fts_index_when_only_fts_corrupt(palace_path, sqlite_errors)
+    except PalaceSqliteCorruptError as exc:
+        print_sqlite_integrity_abort(palace_path, exc.errors)
+        sys.exit(1)
     if sqlite_errors:
         print_sqlite_integrity_abort(palace_path, sqlite_errors)
         sys.exit(1)
