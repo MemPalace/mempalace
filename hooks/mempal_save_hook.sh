@@ -87,7 +87,13 @@ INPUT=$(cat)
 # value per line, the shell reads them via ``mapfile`` and does plain
 # variable assignment — same data, smaller blast radius if the sanitizer
 # is ever bypassed (#1231 review).
-mapfile -t _mempal_parsed < <(echo "$INPUT" | "$MEMPAL_PYTHON_BIN" -c "
+# mapfile is a bash-4 builtin; macOS /bin/bash is 3.2 — a while-read loop
+# keeps the hook silent there (mapfile printed "command not found" to
+# stderr on every Stop, surfacing as a Stop-hook error in Claude Code).
+_mempal_parsed=()
+while IFS= read -r _mempal_line; do
+  _mempal_parsed+=("$_mempal_line")
+done < <(echo "$INPUT" | "$MEMPAL_PYTHON_BIN" -c "
 import sys, json, re
 data = json.load(sys.stdin)
 sid = data.get('session_id', 'unknown')
