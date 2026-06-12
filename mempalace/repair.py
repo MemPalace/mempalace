@@ -1280,7 +1280,7 @@ class PalaceSqliteCorruptError(PalaceCorruptError):
     def __str__(self) -> str:
         preview = "; ".join(self.errors[:3])
         return (
-            f"SQLite B-tree corruption detected in palace at {self.palace_path!r}: "
+            f"SQLite B-tree corruption detected in palace at '{self.palace_path}': "
             f"{preview}. "
             "In-place repair cannot fix this. "
             "Run: mempalace repair --mode from-sqlite --archive-existing"
@@ -1317,7 +1317,7 @@ class PalaceSegmentUnloadableError(PalaceCorruptError):
     def __str__(self) -> str:
         preview = "; ".join(self.errors[:3])
         return (
-            f"HNSW segment unloadable in palace at {self.palace_path!r}: "
+            f"HNSW segment unloadable in palace at '{self.palace_path}': "
             f"{preview}. "
             "SQLite is intact but the binary HNSW segment is torn/corrupt. "
             "Run: mempalace repair --mode from-sqlite --archive-existing"
