@@ -1477,6 +1477,71 @@ class TestDrawerGrepExpansion:
         assert out["drawer_index"] is None
         assert out["total_drawers"] is None
 
+    def test_expand_scopes_by_parent_drawer_id_when_present(self, palace_path):
+        """Regression for #1580: ``tool_add_drawer`` chunks created with no
+        ``source_file`` all land with ``source_file=""`` and share a
+        per-call ``parent_drawer_id``. Neighbor expansion must use
+        ``parent_drawer_id`` to scope the query so chunk 1 of drawer A
+        cannot be stitched onto chunk 0 of drawer B."""
+        col = get_collection(palace_path)
+        # Seed two logical drawers, both with source_file="" but distinct
+        # parent_drawer_id values — exactly the MCP oversized-content shape.
+        for parent, marker in (
+            ("drawer_repro_paste_AAA", "AAA"),
+            ("drawer_repro_paste_BBB", "BBB"),
+        ):
+            for ci in range(3):
+                col.upsert(
+                    ids=[f"{parent}_chunk_{ci:06d}"],
+                    documents=[f"{marker} chunk_{ci} body content"],
+                    metadatas=[
+                        {
+                            "wing": "repro",
+                            "room": "paste",
+                            "source_file": "",
+                            "chunk_index": ci,
+                            "parent_drawer_id": parent,
+                            "filed_at": "2026-04-13T00:00:00",
+                        }
+                    ],
+                )
+
+        # Expand around chunk_0 of drawer A. Without the parent_drawer_id
+        # scope, chunks of drawer B would bleed in because both share
+        # source_file="" and chunk_index=1 collides across drawers.
+        matched_meta = {
+            "source_file": "",
+            "chunk_index": 0,
+            "parent_drawer_id": "drawer_repro_paste_AAA",
+        }
+        out = _expand_with_neighbors(col, "AAA chunk_0 body content", matched_meta, radius=1)
+
+        assert out["drawer_index"] == 0
+        assert out["total_drawers"] == 3, (
+            f"total_drawers must be scoped to parent_drawer_id; got {out['total_drawers']}"
+        )
+        assert "AAA chunk_0" in out["text"]
+        assert "AAA chunk_1" in out["text"]
+        assert "BBB" not in out["text"], (
+            "chunks from sibling drawer leaked into neighbor expansion — #1580"
+        )
+
+    def test_expand_without_parent_drawer_id_keeps_source_file_scope(self, palace_path):
+        """Diary / file-backed chunks have no ``parent_drawer_id`` and rely
+        on a real ``source_file`` for scoping. The fix for #1580 must not
+        regress that path: when ``parent_drawer_id`` is absent, expansion
+        still uses the source_file-only filter."""
+        col, _ = self._seed_source_file(palace_path, "/proj/legacy.md", n_chunks=4)
+        matched_meta = {"source_file": "/proj/legacy.md", "chunk_index": 1}
+        out = _expand_with_neighbors(
+            col, "chunk_1 content about topic alpha", matched_meta, radius=1
+        )
+        assert out["drawer_index"] == 1
+        assert out["total_drawers"] == 4
+        assert "chunk_0" in out["text"]
+        assert "chunk_1" in out["text"]
+        assert "chunk_2" in out["text"]
+
     def test_hybrid_search_enrichment_populates_drawer_index_and_total(self, palace_path):
         """End-to-end: when a closet boosts a source with many drawers, the
         enrichment step runs drawer-grep across all chunks of that source

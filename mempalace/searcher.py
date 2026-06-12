@@ -270,18 +270,32 @@ def _expand_with_neighbors(drawers_col, matched_doc: str, matched_meta: dict, ra
     """
     src = matched_meta.get("source_file")
     chunk_idx = matched_meta.get("chunk_index")
-    if not src or not isinstance(chunk_idx, int):
+    parent_id = matched_meta.get("parent_drawer_id")
+    if not isinstance(chunk_idx, int):
         return {"text": matched_doc, "drawer_index": chunk_idx, "total_drawers": None}
+    # Issue #1580: chunks filed via ``tool_add_drawer`` with no ``source_file``
+    # all share ``source_file=""`` and a per-call ``parent_drawer_id``. Without
+    # the parent scope, ``_expand_with_neighbors`` would happily stitch chunk 1
+    # of an unrelated drawer onto chunk 0 of the matched drawer. When the
+    # matched chunk carries a ``parent_drawer_id``, narrow the neighbor query
+    # to that logical drawer so cross-drawer leakage cannot happen. Diary /
+    # file-backed chunks have no ``parent_drawer_id`` and rely on the
+    # ``source_file`` filter, which is unambiguous because every chunk in that
+    # path shares one real, non-empty ``source_file``. If neither scope key is
+    # available, neighbor expansion would be unbounded — fall back to the
+    # matched drawer alone.
+    if not src and not parent_id:
+        return {"text": matched_doc, "drawer_index": chunk_idx, "total_drawers": None}
+    base_filters: list[dict] = []
+    if src:
+        base_filters.append({"source_file": src})
+    if parent_id:
+        base_filters.append({"parent_drawer_id": parent_id})
 
     target_indexes = [chunk_idx + offset for offset in range(-radius, radius + 1)]
     try:
         neighbors = drawers_col.get(
-            where={
-                "$and": [
-                    {"source_file": src},
-                    {"chunk_index": {"$in": target_indexes}},
-                ]
-            },
+            where={"$and": base_filters + [{"chunk_index": {"$in": target_indexes}}]},
             include=["documents", "metadatas"],
         )
     except Exception:
@@ -299,10 +313,12 @@ def _expand_with_neighbors(drawers_col, matched_doc: str, matched_meta: dict, ra
     else:
         combined_text = "\n\n".join(doc for _, doc in indexed_docs)
 
-    # Cheap total_drawers lookup: metadata-only scan of the source file.
+    # Cheap total_drawers lookup: metadata-only scan within the same scope
+    # used for neighbor lookup (source_file, optionally parent_drawer_id).
     total_drawers = None
     try:
-        all_meta = drawers_col.get(where={"source_file": src}, include=["metadatas"])
+        scope_filter = base_filters[0] if len(base_filters) == 1 else {"$and": base_filters}
+        all_meta = drawers_col.get(where=scope_filter, include=["metadatas"])
         total_drawers = len(all_meta.ids) if all_meta.ids else None
     except Exception:
         logger.debug("total_drawers lookup failed for %s", src, exc_info=True)
