@@ -56,3 +56,41 @@ def test_cpu_arena_env_override(monkeypatch):
     monkeypatch.setenv("MEMPALACE_ONNX_CPU_MEM_ARENA", "1")
 
     assert _cpu_mem_arena_enabled(["CPUExecutionProvider"]) is True
+
+
+def test_embeddinggemma_single_string_is_one_input(monkeypatch):
+    ef = EmbeddinggemmaONNX()
+    session = _Session()
+
+    ef._session = session
+    ef._tokenizer = _Tokenizer()
+    ef._np = np
+    ef._output_idx = 0
+
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA_BATCH_SIZE", "32")
+
+    vectors = ef("hello")
+
+    assert len(vectors) == 1
+    assert session.batch_sizes == [1]
+
+
+def test_env_bool_parses_empty_and_garbage_as_safe_false(monkeypatch):
+    from mempalace.embedding import _env_bool
+
+    monkeypatch.setenv("MEMPALACE_ONNX_CPU_MEM_ARENA", "")
+    assert _env_bool("MEMPALACE_ONNX_CPU_MEM_ARENA", default=True) is False
+
+    monkeypatch.setenv("MEMPALACE_ONNX_CPU_MEM_ARENA", "definitely")
+    assert _env_bool("MEMPALACE_ONNX_CPU_MEM_ARENA", default=True) is False
+
+    monkeypatch.setenv("MEMPALACE_ONNX_CPU_MEM_ARENA", "yes")
+    assert _env_bool("MEMPALACE_ONNX_CPU_MEM_ARENA", default=False) is True
+
+
+def test_env_int_invalid_value_returns_safe_zero(monkeypatch):
+    from mempalace.embedding import _env_int
+
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA_BATCH_SIZE", "banana")
+
+    assert _env_int("MEMPALACE_EMBEDDINGGEMMA_BATCH_SIZE", default=32) == 0

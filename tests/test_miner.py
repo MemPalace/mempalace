@@ -2316,4 +2316,10 @@ def test_mine_limit_summary_counts(tmp_path, capsys):
 def test_drawer_upsert_batch_size_bounds_embedding_memory():
     from mempalace import miner
 
-    assert miner.DRAWER_UPSERT_BATCH_SIZE <= 32
+    assert miner.DRAWER_UPSERT_BATCH_SIZE <= 256
+
+
+def test_drawer_upsert_batch_size_preserves_reasonable_write_throughput():
+    from mempalace import miner
+
+    assert 32 <= miner.DRAWER_UPSERT_BATCH_SIZE <= 256

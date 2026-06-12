@@ -32,6 +32,7 @@ rather than hard-failing — mining must still work on a laptop without CUDA.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -140,20 +141,30 @@ _ONNX_CPU_MEM_ARENA_ENV = "MEMPALACE_ONNX_CPU_MEM_ARENA"
 
 
 def _env_bool(name: str, default: bool) -> bool:
-    raw = __import__("os").environ.get(name)
+    raw = os.environ.get(name)
     if raw is None:
         return default
-    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+    val = raw.strip().lower()
+    if val in ("1", "true", "yes", "on"):
+        return True
+    if val in ("0", "false", "no", "off", ""):
+        return False
+
+    # For explicit but unrecognized values, prefer the safer memory profile.
+    return False
 
 
 def _env_int(name: str, default: int, minimum: int = 1) -> int:
-    raw = __import__("os").environ.get(name)
+    raw = os.environ.get(name)
     if raw is None:
         return default
+
     try:
         value = int(raw)
     except (TypeError, ValueError):
-        return default
+        return 0
+
     return value if value >= minimum else minimum
 
 
@@ -255,11 +266,14 @@ class EmbeddinggemmaONNX:
         self._lazy_load()
         np = self._np
 
+        if isinstance(input, str):
+            input = [input]
+
         texts = [_EMBEDDINGGEMMA_PREFIX + str(t) for t in input]
         if not texts:
             return []
 
-        batch_size = _env_int(_EMBEDDINGGEMMA_BATCH_SIZE_ENV, default=32, minimum=1)
+        batch_size = _env_int(_EMBEDDINGGEMMA_BATCH_SIZE_ENV, default=32, minimum=1) or 32
 
         vectors = []
         for start in range(0, len(texts), batch_size):
