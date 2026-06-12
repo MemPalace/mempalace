@@ -31,15 +31,17 @@ Usage (from CLI):
 
 import argparse
 import contextlib
+import logging
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
+import sys
 import time
 from collections import defaultdict
 from contextlib import closing
 from datetime import datetime
-import re
 from typing import Callable, Iterator, Optional
 
 from chromadb.errors import NotFoundError as ChromaNotFoundError
@@ -681,6 +683,150 @@ def validate_palace_sqlite(
     raise PalaceSqliteCorruptError(palace_path, errors)
 
 
+_probe_logger = logging.getLogger(__name__)
+
+
+def probe_palace_loadable(palace_path: str, *, timeout: float = 120.0) -> list[str]:
+    """Run the HNSW loadability probe in a subprocess and classify the result.
+
+    Spawns ``python -m mempalace._loadprobe <palace_path>`` in a fresh
+    interpreter so that a native SIGSEGV in the chromadb Rust bindings cannot
+    kill the calling process.
+
+    Parameters
+    ----------
+    palace_path:
+        Absolute path to the palace directory to probe.
+    timeout:
+        Seconds to wait before giving up. Defaults to 120 s (generous, but
+        ``collection.count()`` on a large palace can take tens of seconds).
+
+    Returns
+    -------
+    list[str]
+        Empty list when the palace loads cleanly.  A single-element list with
+        a human-readable error string when the probe detects corruption,
+        times out, or fails to spawn.  (Never raises.)
+    """
+    sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isdir(palace_path) or not os.path.isfile(sqlite_path):
+        # Nothing to probe — palace absent or not yet initialised.
+        return []
+
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-m", "mempalace._loadprobe", palace_path],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return [f"HNSW loadability probe timed out after {timeout}s"]
+    except (FileNotFoundError, OSError) as exc:
+        _probe_logger.warning("HNSW loadability probe could not be spawned: %s", exc)
+        return []
+
+    if completed.returncode == 0:
+        return []
+
+    if completed.returncode in (-11, 139):
+        return [
+            "HNSW segment unloadable: native crash (SIGSEGV) loading the vector segment"
+            " — torn/corrupt binary segment not visible to PRAGMA quick_check"
+        ]
+
+    combined = (completed.stdout or "") + (completed.stderr or "")
+    if "error loading hnsw index" in combined.lower():
+        # Find the first line that mentions the error for a concise message.
+        for line in combined.splitlines():
+            if "error loading hnsw index" in line.lower():
+                return [f"HNSW segment unloadable: {line.strip()}"]
+        return ["HNSW segment unloadable: Error loading hnsw index (no detail)"]
+
+    # Some other non-zero exit — surface the last stderr line.
+    stderr_lines = [ln for ln in (completed.stderr or "").splitlines() if ln.strip()]
+    last = stderr_lines[-1] if stderr_lines else "unknown"
+    return [f"HNSW loadability probe failed (rc={completed.returncode}): {last}"]
+
+
+def validate_palace_health(
+    palace_path: str,
+    *,
+    set_sentinel: bool = True,
+) -> list[str]:
+    """Full latency-tolerant health check: SQLite integrity + HNSW loadability.
+
+    This is the preferred entry point for latency-tolerant paths (CLI
+    ``search``, ``status``, MCP server startup).  It supersedes the narrower
+    :func:`validate_palace_sqlite` by also running the subprocess-isolated
+    HNSW loadability probe when SQLite is clean.
+
+    Do **not** call from the stop-hook or any path where < 500 ms latency is
+    required — both the PRAGMA quick_check and the subprocess probe can take
+    several seconds on large palaces.
+
+    Behaviour
+    ~~~~~~~~~
+    1. Run ``PRAGMA quick_check`` via :func:`sqlite_integrity_errors`.
+
+       * B-tree corruption → write sentinel + raise
+         :class:`PalaceSqliteCorruptError` (probe is NOT called).
+       * FTS-only errors → fall through to probe (FTS does not affect HNSW).
+       * Clean → fall through to probe.
+
+    2. Run :func:`probe_palace_loadable` in a subprocess.
+
+       * Errors returned → write sentinel + raise
+         :class:`PalaceSegmentUnloadableError`.
+       * Clean → clear any stale sentinel, return ``[]``.
+
+    Parameters
+    ----------
+    palace_path:
+        Absolute path to the palace directory.
+    set_sentinel:
+        Write / clear the ``.sqlite_corrupt`` sentinel.  Set to ``False``
+        only in tests that must not touch the filesystem.
+
+    Returns
+    -------
+    list[str]
+        Empty when the palace is healthy.
+
+    Raises
+    ------
+    PalaceSqliteCorruptError
+        When SQLite B-tree corruption is detected.
+    PalaceSegmentUnloadableError
+        When the HNSW binary segment fails to load.
+    """
+    from .corruption_sentinel import clear_corruption_sentinel, write_corruption_sentinel
+
+    # ── Step 1: SQLite integrity ──────────────────────────────────────────────
+    errors = sqlite_integrity_errors(palace_path)
+
+    if errors and _is_btree_corruption(errors):
+        # B-tree: stop here, do not run the probe.
+        if set_sentinel:
+            write_corruption_sentinel(palace_path, errors)
+        raise PalaceSqliteCorruptError(palace_path, errors)
+
+    # errors may contain FTS-only entries — those do not affect HNSW loadability.
+
+    # ── Step 2: HNSW loadability probe ───────────────────────────────────────
+    probe_errors = probe_palace_loadable(palace_path)
+    if probe_errors:
+        if set_sentinel:
+            write_corruption_sentinel(palace_path, probe_errors)
+        raise PalaceSegmentUnloadableError(palace_path, probe_errors)
+
+    # Both checks passed — clear any stale sentinel.
+    if set_sentinel:
+        clear_corruption_sentinel(palace_path)
+
+    return []
+
+
 def maybe_rebuild_fts_index_when_only_fts_corrupt(
     palace_path: str,
     errors: list[str],
@@ -1095,7 +1241,16 @@ class RebuildPartialError(Exception):
         self.archive_path = archive_path
 
 
-class PalaceSqliteCorruptError(Exception):
+class PalaceCorruptError(Exception):
+    """Base class for all palace-corruption errors.
+
+    Catch this base to handle both SQLite B-tree corruption and torn HNSW
+    binary segment errors uniformly (e.g. in CLI entry points and the MCP
+    server open-guard).  The subclass carries the details.
+    """
+
+
+class PalaceSqliteCorruptError(PalaceCorruptError):
     """Raised when ``PRAGMA quick_check`` reveals B-tree-level corruption.
 
     In-place repair (HNSW rebuild, FTS rebuild) cannot fix B-tree corruption
@@ -1128,6 +1283,43 @@ class PalaceSqliteCorruptError(Exception):
             f"SQLite B-tree corruption detected in palace at {self.palace_path!r}: "
             f"{preview}. "
             "In-place repair cannot fix this. "
+            "Run: mempalace repair --mode from-sqlite --archive-existing"
+        )
+
+
+class PalaceSegmentUnloadableError(PalaceCorruptError):
+    """Raised when the HNSW binary segment cannot be loaded by ChromaDB.
+
+    SQLite ``PRAGMA quick_check`` passes for this failure mode — the binary
+    segment (``data_level0.bin``, ``link_lists.bin``, or
+    ``index_metadata.pickle``) is torn or corrupt but that is invisible to
+    SQLite.  The subprocess-isolated loadability probe detects it when
+    ``collection.count()`` raises ``InternalError: Error loading hnsw index``
+    or causes a native SIGSEGV in the chromadb Rust bindings.
+
+    Recovery path (same as B-tree corruption — SQLite rows remain intact):
+
+        mempalace repair --mode from-sqlite --archive-existing
+
+    Attributes
+    ----------
+    palace_path:
+        Absolute path to the palace with the unloadable segment.
+    errors:
+        List of error strings from the loadability probe.
+    """
+
+    def __init__(self, palace_path: str, errors: list[str]):
+        self.palace_path = palace_path
+        self.errors = errors
+        super().__init__(str(self))
+
+    def __str__(self) -> str:
+        preview = "; ".join(self.errors[:3])
+        return (
+            f"HNSW segment unloadable in palace at {self.palace_path!r}: "
+            f"{preview}. "
+            "SQLite is intact but the binary HNSW segment is torn/corrupt. "
             "Run: mempalace repair --mode from-sqlite --archive-existing"
         )
 

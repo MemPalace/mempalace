@@ -572,11 +572,11 @@ def _get_collection(create=False):
                 _metadata_cache_time = 0
             return _collection_cache
         except Exception as _exc:
-            from .repair import PalaceSqliteCorruptError
+            from .repair import PalaceCorruptError
 
             # Do not retry on corruption: the sentinel is set; retrying would
             # just raise again and delay the caller's error response.
-            if isinstance(_exc, PalaceSqliteCorruptError):
+            if isinstance(_exc, PalaceCorruptError):
                 raise
             logger.exception(
                 "_get_collection attempt %d/2 failed (palace=%s, create=%s)",
@@ -2851,6 +2851,20 @@ def main():
     # is visible at startup rather than on first use (#1222). Pure
     # filesystem read; never opens a chromadb client.
     _refresh_vector_disabled_flag()
+    # Full health check (SQLite integrity + subprocess HNSW loadability probe)
+    # on the latency-tolerant startup path.  Writes the sentinel on corruption
+    # so the O(1) sentinel guard in _get_client() fires on subsequent calls
+    # without re-running the expensive probe.  Errors are logged as warnings
+    # rather than crashing the server — the per-request guard will surface them
+    # to the caller with a structured error response.
+    try:
+        from .repair import PalaceCorruptError, validate_palace_health
+
+        validate_palace_health(_config.palace_path)
+    except PalaceCorruptError as _startup_exc:
+        logger.warning("Palace health check failed at startup: %s", _startup_exc)
+    except Exception as _startup_exc:
+        logger.debug("Palace health check skipped at startup: %s", _startup_exc)
     # Opt-in: pre-load the embedder so the first chromadb-write tool call
     # does not pay the ONNX/CoreML cold-load tax under the MCP client
     # timeout (#1495). Default off — preserves current startup latency.

@@ -676,13 +676,13 @@ def cmd_sync(args):
 
 
 def cmd_search(args):
-    from .repair import PalaceSqliteCorruptError, validate_palace_sqlite
+    from .repair import PalaceCorruptError, validate_palace_health
     from .searcher import search, SearchError
 
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     try:
-        validate_palace_sqlite(palace_path)
-    except PalaceSqliteCorruptError as exc:
+        validate_palace_health(palace_path)
+    except PalaceCorruptError as exc:
         print(f"\n  ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
     try:
@@ -748,12 +748,19 @@ def cmd_migrate(args):
 
 def cmd_status(args):
     from .miner import status
-    from .repair import PalaceSqliteCorruptError, validate_palace_sqlite
+    from .repair import PalaceCorruptError, PalaceSegmentUnloadableError, validate_palace_health
 
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     try:
-        validate_palace_sqlite(palace_path)
-    except PalaceSqliteCorruptError as exc:
+        validate_palace_health(palace_path)
+    except PalaceSegmentUnloadableError as exc:
+        print(
+            f"\n  ERROR: segment NOT loadable — {exc}\n"
+            "  Run: mempalace repair --mode from-sqlite --archive-existing",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    except PalaceCorruptError as exc:
         print(f"\n  ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
     status(palace_path=palace_path)
