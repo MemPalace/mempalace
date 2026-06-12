@@ -1766,6 +1766,68 @@ class TestWriteTools:
         assert deleted_logical["success"] is False
         assert "not found" in deleted_logical["error"].lower()
 
+    def test_update_drawer_append(self, monkeypatch, config, palace_path, seeded_collection, kg):
+        # append=True concatenates the delta onto the existing body instead of
+        # replacing it, so a caller updating a long drawer need only send the
+        # delta rather than re-transmitting the whole body on every edit.
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import (
+            tool_update_drawer,
+            tool_get_drawer,
+            sanitize_content,
+        )
+
+        before = tool_get_drawer("drawer_proj_backend_aaa")["content"]
+        assert before, "fixture drawer should have an existing body to append onto"
+        delta = "\n\nAppended delta line — only this was sent, not the whole body."
+
+        result = tool_update_drawer(
+            "drawer_proj_backend_aaa", content=delta, append=True
+        )
+        assert result["success"] is True
+
+        fetched = tool_get_drawer("drawer_proj_backend_aaa")["content"]
+        # the original body survives (no full rewrite) and the delta is appended
+        assert fetched == before + sanitize_content(delta)
+        assert before in fetched
+
+    def test_update_drawer_replace_is_default(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        # append defaults to False → content REPLACES, preserving prior behavior.
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_update_drawer, tool_get_drawer
+
+        tool_update_drawer("drawer_proj_backend_aaa", content="Wholly new body.")
+        fetched = tool_get_drawer("drawer_proj_backend_aaa")["content"]
+        assert fetched == "Wholly new body."
+
+    def test_update_drawer_append_tolerates_none_existing_body(self, monkeypatch, config, kg):
+        # Regression for the PR #1762 review: Chroma can return ``None`` for a
+        # stored drawer's document body. The append path must treat a missing
+        # body as empty rather than raising TypeError on ``None + str``.
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        captured = {}
+
+        class _FakeCol:
+            def get(self, ids, include=None):
+                return {"ids": list(ids), "documents": [None], "metadatas": [{}]}
+
+            def update(self, **kwargs):
+                captured.update(kwargs)
+
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda *a, **kw: _FakeCol())
+        monkeypatch.setattr(mcp_server, "_wal_log", lambda *a, **kw: None)
+
+        result = mcp_server.tool_update_drawer(
+            "drawer_none_body", content="fresh delta", append=True
+        )
+        # None body coerced to "" → no crash, stored doc is just the delta.
+        assert result["success"] is True
+        assert captured["documents"] == [mcp_server.sanitize_content("fresh delta")]
+
 
 # ── KG Tools ────────────────────────────────────────────────────────────
 
