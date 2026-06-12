@@ -210,69 +210,74 @@ def _check_kg_contradictions(text: str, palace_path: str) -> list:
         return []
 
     issues: list = []
-    for claim in claims:
-        subject = claim["subject"]
-        claim_pred = claim["predicate"]
-        claim_obj = claim["object"]
-        try:
-            facts = kg.query_entity(subject, direction="outgoing")
-        except Exception:
-            logger.debug("KG lookup failed for subject %r", subject, exc_info=True)
-            continue
-        if not facts:
-            continue
+    try:
+        for claim in claims:
+            subject = claim["subject"]
+            claim_pred = claim["predicate"]
+            claim_obj = claim["object"]
+            try:
+                facts = kg.query_entity(subject, direction="outgoing")
+            except Exception:
+                logger.debug("KG lookup failed for subject %r", subject, exc_info=True)
+                continue
+            if not facts:
+                continue
 
-        current_facts = [f for f in facts if f.get("current")]
+            current_facts = [f for f in facts if f.get("current")]
 
-        # Mismatch: KG fact about same (subject, object) pair but different predicate.
-        for fact in current_facts:
-            if not _objects_match(fact.get("object"), claim_obj):
-                continue
-            kg_pred = (fact.get("predicate") or "").lower()
-            if kg_pred and kg_pred != claim_pred:
-                issues.append(
-                    {
-                        "type": "relationship_mismatch",
-                        "detail": (
-                            f"Text says '{claim['span']}' but KG records "
-                            f"{subject} {kg_pred} {fact.get('object')}"
-                        ),
-                        "entity": subject,
-                        "claim": {
-                            "predicate": claim_pred,
-                            "object": claim_obj,
-                        },
-                        "kg_fact": {
-                            "predicate": kg_pred,
-                            "object": fact.get("object"),
-                        },
-                    }
-                )
+            # Mismatch: KG fact about same (subject, object) pair but different predicate.
+            for fact in current_facts:
+                if not _objects_match(fact.get("object"), claim_obj):
+                    continue
+                kg_pred = (fact.get("predicate") or "").lower()
+                if kg_pred and kg_pred != claim_pred:
+                    issues.append(
+                        {
+                            "type": "relationship_mismatch",
+                            "detail": (
+                                f"Text says '{claim['span']}' but KG records "
+                                f"{subject} {kg_pred} {fact.get('object')}"
+                            ),
+                            "entity": subject,
+                            "claim": {
+                                "predicate": claim_pred,
+                                "object": claim_obj,
+                            },
+                            "kg_fact": {
+                                "predicate": kg_pred,
+                                "object": fact.get("object"),
+                            },
+                        }
+                    )
 
-        # Stale fact: exact match on (subject, predicate, object) but KG
-        # closed the window in the past.
-        now_iso = datetime.now(timezone.utc).date().isoformat()
-        for fact in facts:
-            if fact.get("current"):
-                continue
-            kg_pred = (fact.get("predicate") or "").lower()
-            if kg_pred != claim_pred:
-                continue
-            if not _objects_match(fact.get("object"), claim_obj):
-                continue
-            valid_to = fact.get("valid_to")
-            if valid_to and str(valid_to) < now_iso:
-                issues.append(
-                    {
-                        "type": "stale_fact",
-                        "detail": (
-                            f"Text says '{claim['span']}' but KG marks "
-                            f"this fact closed on {valid_to}"
-                        ),
-                        "entity": subject,
-                        "valid_to": valid_to,
-                    }
-                )
+            # Stale fact: exact match on (subject, predicate, object) but KG
+            # closed the window in the past.
+            now_iso = datetime.now(timezone.utc).date().isoformat()
+            for fact in facts:
+                if fact.get("current"):
+                    continue
+                kg_pred = (fact.get("predicate") or "").lower()
+                if kg_pred != claim_pred:
+                    continue
+                if not _objects_match(fact.get("object"), claim_obj):
+                    continue
+                valid_to = fact.get("valid_to")
+                if valid_to and str(valid_to) < now_iso:
+                    issues.append(
+                        {
+                            "type": "stale_fact",
+                            "detail": (
+                                f"Text says '{claim['span']}' but KG marks "
+                                f"this fact closed on {valid_to}"
+                            ),
+                            "entity": subject,
+                            "valid_to": valid_to,
+                        }
+                    )
+    finally:
+        # Explicit close — KG no longer auto-registers atexit, so the
+        # caller is responsible for releasing the SQLite connection.
+        kg.close()
 
     return issues
 
