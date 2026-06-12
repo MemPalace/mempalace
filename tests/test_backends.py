@@ -253,6 +253,67 @@ def test_resolve_persist_dir_memoized(tmp_path):
     _resolve_persist_dir.cache_clear()
 
 
+# ---------------------------------------------------------------------------
+# Round-trip: persist_directory → mine → search/status find the DB
+# ---------------------------------------------------------------------------
+
+
+def test_persist_directory_round_trip(tmp_path):
+    """set persist_directory → mine → search and status all find the DB in the subdir.
+
+    Regression for the split-brain defect: the DB must land in the configured
+    subdir AND every reader (search, status) must look there — not in the
+    palace root.
+    """
+    import yaml
+    from mempalace.miner import mine
+    from mempalace.searcher import search_memories
+
+    _resolve_persist_dir.cache_clear()
+
+    # ── source project ───────────────────────────────────────────────────
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    (project_dir / "mempalace.yaml").write_text(
+        "wing: test_wing\nrooms:\n  - name: general\n    description: General\n",
+        encoding="utf-8",
+    )
+    # Content must be long enough to produce at least one drawer after chunking.
+    (project_dir / "notes.txt").write_text(
+        "The authentication module uses JWT tokens for session management. "
+        "Tokens expire after 24 hours and refresh tokens are stored in HttpOnly cookies. "
+        "We use PostgreSQL 15 with connection pooling via pgbouncer for the database. "
+        "The React frontend uses TanStack Query for server state management. "
+        "Sprint planning: migrate auth to passkeys by Q3. " * 6,
+        encoding="utf-8",
+    )
+
+    # ── palace with persist_directory pointing at a subdir ───────────────
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    (palace_dir / "mempalace.yaml").write_text(
+        "backend:\n  persist_directory: .db\n",
+        encoding="utf-8",
+    )
+
+    mine(str(project_dir), str(palace_dir))
+
+    # DB must be in the configured subdir, not the palace root.
+    assert (palace_dir / ".db" / "chroma.sqlite3").is_file(), (
+        "chroma.sqlite3 not found in configured persist_directory (.db)"
+    )
+    assert not (palace_dir / "chroma.sqlite3").is_file(), (
+        "chroma.sqlite3 leaked into palace root despite persist_directory being set"
+    )
+
+    # search must find the DB and return results — not "no palace" error.
+    result = search_memories("JWT tokens authentication", str(palace_dir))
+    assert "error" not in result, f"search returned error: {result.get('error')}"
+    assert result.get("results"), "search returned no results after mining"
+
+    _resolve_persist_dir.cache_clear()
+
+
 def test_chroma_lexical_search_uses_sqlite_fts_not_full_collection_scan(tmp_path):
     db_path = tmp_path / "chroma.sqlite3"
     conn = sqlite3.connect(db_path)
