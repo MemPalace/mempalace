@@ -13,8 +13,19 @@ import sys
 import threading
 from typing import Optional
 
-from .backends import BackendClosedError, CollectionNotInitializedError, PalaceNotFoundError
-from .backends.chroma import ChromaBackend
+from .backends import (
+    BackendClosedError,
+    BackendMismatchError,
+    CollectionNotInitializedError,
+    PalaceNotFoundError,
+    PalaceRef,
+    detect_backend_for_path,
+    detect_backends_for_path,
+    get_backend,
+    get_backend_class,
+    resolve_backend_for_palace,
+)
+from .backends.embedding_wrapper import EmbeddingCollection
 from .entity_detector import _apply_known_systems_prepass, _get_coca_filter
 
 logger = logging.getLogger("mempalace_mcp")
@@ -45,7 +56,8 @@ SKIP_DIRS = {
     "target",
 }
 
-_DEFAULT_BACKEND = ChromaBackend()
+_DEFAULT_BACKEND = get_backend("chroma")
+_EXPLICIT_BACKEND_ENV = "MEMPALACE_BACKEND_EXPLICIT"
 
 # Schema version for drawer normalization. Bump when the normalization
 # pipeline changes in a way that existing drawers should be rebuilt to pick up
@@ -58,26 +70,283 @@ _DEFAULT_BACKEND = ChromaBackend()
 NORMALIZE_VERSION = 2
 
 
+# (palace_id, collection_name, model_name) tuples already validated this
+# process, so the identity check (one metadata read) runs at most once per
+# collection per run — keeps the hot get_collection path cheap.
+_VALIDATED_IDENTITY: set = set()
+
+
+def _enforce_embedder_identity(collection, palace_path, collection_name, *, create) -> None:
+    """Check (and, for a brand-new collection, record) embedder identity (RFC 001).
+
+    Check at open so a model swap fails fast — before any query silently
+    returns degraded results. Record only when the collection is brand-new and
+    empty: recording the *current* model on a legacy palace that already holds
+    vectors from an unknown model would mislabel it, so populated-but-unrecorded
+    collections warn instead and are resolved with
+    ``mempalace palace set-embedder``.
+
+    Bookkeeping must never break memory operations: only the deliberate
+    identity/dimension mismatch propagates; every other error is swallowed.
+    """
+    import warnings
+
+    from .backends.base import (
+        DimensionMismatchError,
+        EmbedderIdentity,
+        EmbedderIdentityMismatchError,
+        EmbedderIdentityUnknownWarning,
+        check_embedder_identity,
+    )
+    from .embedding import current_model_name
+
+    # A server_embedder backend embeds with its own model and ignores the
+    # injected/core embedder, so its effective identity — not the configured
+    # model — is what must be checked and recorded. Fall back to the configured
+    # model name for the normal (core-embedder) case.
+    current: Optional[EmbedderIdentity] = None
+    try:
+        effective = collection.effective_embedder_identity()
+    except Exception:
+        effective = None
+    if effective is not None and getattr(effective, "model_name", ""):
+        current = effective
+    else:
+        try:
+            model_name = current_model_name()
+        except Exception:
+            return
+        if not model_name:
+            return  # nameless embedder — cannot enforce identity
+        current = EmbedderIdentity(model_name=model_name, dimension=0)
+
+    model_name = current.model_name
+    key = (str(palace_path), str(collection_name), model_name)
+    if key in _VALIDATED_IDENTITY:
+        return
+
+    try:
+        stored = collection.get_stored_embedder_identity()
+    except Exception:
+        logger.debug("embedder-identity read failed for %s", collection_name, exc_info=True)
+        return
+    try:
+        state = check_embedder_identity(stored, current)
+    except (EmbedderIdentityMismatchError, DimensionMismatchError):
+        raise  # deliberate, user-facing — the whole point of the contract
+    except Exception:
+        return
+
+    if state == "unknown" and stored is None:
+        try:
+            count = collection.count()
+        except Exception:
+            count = None
+        if count == 0:
+            if create:
+                try:
+                    collection.set_embedder_identity(current)
+                except Exception:
+                    logger.debug("embedder-identity record failed", exc_info=True)
+        elif count:
+            warnings.warn(
+                f"palace collection {collection_name!r} has no recorded embedder "
+                f"identity; assuming the current model {model_name!r}. Run "
+                "`mempalace palace set-embedder --model <name>` to record it.",
+                EmbedderIdentityUnknownWarning,
+                stacklevel=2,
+            )
+
+    _VALIDATED_IDENTITY.add(key)
+
+
 def get_collection(
     palace_path: str,
     collection_name: Optional[str] = None,
     create: bool = True,
+    backend: Optional[str] = None,
+    _skip_identity_check: bool = False,
 ):
-    """Get the palace collection through the backend layer."""
+    """Get the palace collection through the backend layer.
+
+    ``_skip_identity_check`` bypasses the embedder-identity enforcement so the
+    ``set-embedder`` override path can open a palace whose recorded model
+    differs from the current one (the very state it exists to repair).
+    """
     if collection_name is None:
         from .config import get_configured_collection_name
 
         collection_name = get_configured_collection_name()
-    return _DEFAULT_BACKEND.get_collection(
+    backend_obj = get_backend_for_palace(palace_path, explicit=backend)
+    palace_ref = PalaceRef(id=palace_path, local_path=palace_path)
+    try:
+        collection = backend_obj.get_collection(
+            palace=palace_ref,
+            collection_name=collection_name,
+            create=create,
+        )
+    except TypeError as exc:
+        if "unexpected keyword argument 'palace'" not in str(exc):
+            raise
+        collection = backend_obj.get_collection(
+            palace_path,
+            collection_name=collection_name,
+            create=create,
+        )
+    if "requires_explicit_embeddings" in getattr(backend_obj, "capabilities", frozenset()):
+        collection = EmbeddingCollection(collection)
+    if not _skip_identity_check:
+        _enforce_embedder_identity(collection, palace_path, collection_name, create=create)
+    return collection
+
+
+def set_palace_embedder_identity(
+    palace_path: str,
+    model: Optional[str] = None,
+    *,
+    force: bool = False,
+    backend: Optional[str] = None,
+    collection_name: Optional[str] = None,
+):
+    """Record (or force-override) a palace collection's embedder identity (RFC 001).
+
+    Backs ``mempalace palace set-embedder``. Returns ``(old, new)`` identities.
+    Without ``force``, refuses to overwrite an existing identity that names a
+    different model (the user must confirm they know the vectors are
+    compatible). Opens with the identity check skipped so a mismatched palace —
+    the exact state being repaired — can be opened at all.
+    """
+    from .backends.base import EmbedderIdentity, EmbedderIdentityMismatchError
+    from .config import MempalaceConfig
+    from .embedding import get_embedder_identity
+
+    configured = MempalaceConfig().embedding_model
+    target = (model or configured or "").strip().lower()
+    if not target:
+        # No model given and none configured — there is nothing to record, and
+        # recording a nameless identity is a silent no-op in every backend.
+        raise ValueError(
+            "no embedder model to record: pass --model NAME or configure MEMPALACE_EMBEDDING_MODEL"
+        )
+    if target == (configured or "").strip().lower():
+        # Recording the in-use model — probe its dimension (already loaded).
+        new = get_embedder_identity()
+    else:
+        # Explicit override of a non-configured model: record the name only,
+        # never load a foreign model (which can be a large download) just to
+        # probe a dimension. The model-name check is the actual protection.
+        new = EmbedderIdentity(model_name=target, dimension=0)
+    collection = get_collection(
         palace_path,
         collection_name=collection_name,
+        create=True,
+        backend=backend,
+        _skip_identity_check=True,
+    )
+    try:
+        old = collection.get_stored_embedder_identity()
+    except Exception:
+        old = None
+    if old is not None and old.model_name != new.model_name and not force:
+        raise EmbedderIdentityMismatchError(
+            f"palace already records embedder {old.model_name!r}; pass --force to "
+            f"overwrite it with {new.model_name!r} (only if the vectors are compatible)"
+        )
+    collection.set_embedder_identity(new)
+    # Reset the per-process validation cache so a re-open re-checks against the
+    # newly recorded identity rather than a stale verdict.
+    _VALIDATED_IDENTITY.clear()
+    return old, new
+
+
+def get_closets_collection(
+    palace_path: str,
+    create: bool = True,
+    backend: Optional[str] = None,
+):
+    """Get the closets collection — the searchable index layer."""
+    return get_collection(
+        palace_path,
+        collection_name="mempalace_closets",
         create=create,
+        backend=backend,
     )
 
 
-def get_closets_collection(palace_path: str, create: bool = True):
-    """Get the closets collection — the searchable index layer."""
-    return get_collection(palace_path, collection_name="mempalace_closets", create=create)
+def _config_backend_value(palace_path: str) -> Optional[str]:
+    try:
+        from .config import MempalaceConfig
+
+        cfg = MempalaceConfig()
+        cfg_palace = os.path.abspath(os.path.expanduser(cfg.palace_path))
+        target_palace = os.path.abspath(os.path.expanduser(palace_path))
+        if cfg_palace != target_palace:
+            return None
+        value = cfg._file_config.get("backend")
+        return str(value).strip().lower() if value else None
+    except Exception:
+        return None
+
+
+def _env_backend_value() -> Optional[str]:
+    value = os.environ.get("MEMPALACE_BACKEND")
+    return value.strip().lower() if value else None
+
+
+def resolve_backend_name(palace_path: str, explicit: Optional[str] = None) -> str:
+    """Resolve and validate the selected backend for ``palace_path``.
+
+    Public resolution order:
+
+    1. Explicit CLI/MCP flag or direct ``get_collection(..., backend=...)``.
+    2. ``backend`` in ``~/.mempalace/config.json``.
+    3. ``MEMPALACE_BACKEND``.
+    4. Detected existing palace artifacts.
+    5. ``chroma``.
+
+    If artifacts for a different backend are already present, raise
+    ``BackendMismatchError`` so normal write paths cannot silently mix storage
+    formats in one palace directory.
+    """
+    explicit = explicit or os.environ.get(_EXPLICIT_BACKEND_ENV)
+    selected = resolve_backend_for_palace(
+        explicit=explicit.strip().lower() if explicit else None,
+        config_value=_config_backend_value(palace_path),
+        env_value=_env_backend_value(),
+        palace_path=palace_path,
+        default="chroma",
+    )
+    get_backend_class(selected)
+    detected_backends = detect_backends_for_path(palace_path)
+    if len(detected_backends) > 1:
+        raise BackendMismatchError(
+            f"palace at {palace_path!r} contains multiple backend artifacts: "
+            f"{', '.join(detected_backends)}"
+        )
+    detected = detected_backends[0] if detected_backends else None
+    if detected and detected != selected:
+        raise BackendMismatchError(
+            f"palace at {palace_path!r} contains {detected!r} backend artifacts, "
+            f"but {selected!r} was selected"
+        )
+    return selected
+
+
+def get_backend_for_palace(palace_path: str, explicit: Optional[str] = None):
+    """Return the resolved backend instance for ``palace_path``."""
+    return get_backend(resolve_backend_name(palace_path, explicit=explicit))
+
+
+def _backend_artifact_label(backend_name: Optional[str]) -> str:
+    if backend_name == "chroma":
+        return "chroma.sqlite3"
+    if backend_name == "qdrant":
+        return "qdrant_backend.json"
+    if backend_name == "pgvector":
+        return "pgvector_backend.json"
+    if backend_name == "sqlite_exact":
+        return "sqlite_exact.sqlite3"
+    return "backend database"
 
 
 def _open_collection_or_explain(
@@ -85,6 +354,7 @@ def _open_collection_or_explain(
     *,
     collection_name: Optional[str] = None,
     out=None,
+    opener=None,
 ):
     """Open the palace collection or print a state-specific message and return ``None``.
 
@@ -101,11 +371,11 @@ def _open_collection_or_explain(
     first when the vector path is disabled (see PR #831 / issue #830).
 
     State A: palace dir is absent.
-    State B: dir is present but ``chroma.sqlite3`` is absent. The helper
-        short-circuits to a message before reaching the backend, because
-        ``chromadb.PersistentClient`` lazily creates the DB file on first
-        open — calling the backend on this state would silently mutate
-        the filesystem for what should be a read-only inspection.
+    State B: dir is present but no backend database artifact is present.
+        The helper short-circuits to a message before reaching the backend,
+        because some backends lazily create their DB file on first open —
+        calling the backend on this state would silently mutate the filesystem
+        for what should be a read-only inspection.
     State C: DB is present but the ``mempalace_drawers`` collection has
         never been bootstrapped (``init`` ran, ``mine`` has not).
     State D: healthy — returns the opened collection.
@@ -116,17 +386,41 @@ def _open_collection_or_explain(
     callable (e.g. a repair progress emitter) to route messages through it.
     """
     emit = out if out is not None else print
+    open_collection = opener or get_collection
 
     if not os.path.isdir(palace_path):
         emit(f"\n  No palace found at {palace_path}")
         emit("  Run: mempalace init <dir> then mempalace mine <dir>")
         return None
-    if not os.path.isfile(os.path.join(palace_path, "chroma.sqlite3")):
-        emit(f"\n  Palace dir at {palace_path} exists but has no chroma.sqlite3 yet.")
+    try:
+        backend_name = resolve_backend_name(palace_path)
+    except BackendMismatchError as e:
+        emit(f"\n  Backend mismatch at {palace_path}: {e}")
+        emit("  Select the matching backend or use a fresh palace directory.")
+        return None
+    except KeyError as e:
+        # Unknown backend name (e.g. a typo in MEMPALACE_BACKEND/--backend):
+        # resolve_backend_name -> get_backend_class raises KeyError carrying the
+        # available-backend list. Surface it as a CLI state message rather than
+        # letting it escape as a stack trace.
+        emit(f"\n  Unknown backend selected for {palace_path}: {e.args[0] if e.args else e}")
+        emit("  Set --backend or MEMPALACE_BACKEND to a registered backend.")
+        return None
+    detected = detect_backend_for_path(palace_path)
+    if detected is None:
+        emit(
+            f"\n  Palace dir at {palace_path} exists but has no "
+            f"{_backend_artifact_label(backend_name)} yet."
+        )
         emit("  Run: mempalace mine <dir>")
         return None
     try:
-        return get_collection(palace_path, collection_name=collection_name, create=False)
+        return open_collection(
+            palace_path,
+            collection_name=collection_name,
+            create=False,
+            backend=backend_name,
+        )
     except CollectionNotInitializedError:
         emit(f"\n  Palace at {palace_path} is initialized but empty (no drawers yet).")
         emit("  Run: mempalace mine <dir>")
@@ -134,6 +428,10 @@ def _open_collection_or_explain(
     except PalaceNotFoundError:
         emit(f"\n  No palace found at {palace_path}")
         emit("  Run: mempalace init <dir> then mempalace mine <dir>")
+        return None
+    except BackendMismatchError as e:
+        emit(f"\n  Backend mismatch at {palace_path}: {e}")
+        emit("  Select the matching backend or use a fresh palace directory.")
         return None
     except BackendClosedError:
         # Surface this as a programmer error, not a palace-state UX message:
@@ -484,6 +782,9 @@ def _validate_palace_fts5_after_mine(palace_path: str) -> None:
     operator sees the same recovery banner regardless of which command surfaces
     the bug.
     """
+    if resolve_backend_name(palace_path) != "chroma":
+        return
+
     # Defer-import: keeps the repair module graph out of mine's hot import path.
     from .repair import _close_chroma_handles, sqlite_integrity_errors
 

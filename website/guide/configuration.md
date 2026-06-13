@@ -8,7 +8,8 @@ Located at `~/.mempalace/config.json`:
 {
   "palace_path": "/custom/path/to/palace",
   "collection_name": "mempalace_drawers",
-  "people_map": {"Kai": "KAI", "Priya": "PRI"}
+  "people_map": {"Kai": "KAI", "Priya": "PRI"},
+  "max_backups": 10
 }
 ```
 
@@ -17,6 +18,7 @@ Located at `~/.mempalace/config.json`:
 | `palace_path` | `~/.mempalace/palace` | Where ChromaDB stores your drawers |
 | `collection_name` | `mempalace_drawers` | ChromaDB collection name |
 | `people_map` | `{}` | Entity name → AAAK code mappings |
+| `max_backups` | `10` | How many timestamped palace backups to keep before the oldest are pruned. Applies to `mempalace migrate` (`<palace>.pre-migrate.*`) and `mempalace repair max-seq-id` (`chroma.sqlite3.max-seq-id-backup-*`), which each write a full copy every run. Set to `0` to keep every backup (e.g. when an external retention policy manages cleanup). |
 
 ## Project Config
 
@@ -83,3 +85,4 @@ python -m mempalace.mcp_server --palace /custom/palace
 |----------|-------------|
 | `MEMPALACE_PALACE_PATH` | Override palace path (same as `--palace`) |
 | `MEMPAL_DIR` | Directory for auto-mining in hooks |
+| `MEMPALACE_MAX_BACKUPS` | Override `max_backups` retention count (`0` disables pruning) |

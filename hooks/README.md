@@ -2,6 +2,13 @@
 
 These hook scripts make MemPalace save automatically. No manual "save" commands needed.
 
+This file covers the **Claude Code** and **Codex CLI** hooks that live
+flat under `hooks/`. For the **Cursor IDE** hooks, see
+[`hooks/cursor/README.md`](cursor/README.md) or the rendered docs at
+[`website/guide/cursor-hooks.md`](../website/guide/cursor-hooks.md). The
+two are additive and share the same `~/.mempalace/hook_state/`
+directory.
+
 If you are trying to protect existing Claude Code transcripts immediately,
 use the short checklist first: [`website/guide/claude-code-retention.md`](../website/guide/claude-code-retention.md).
 It covers hook wiring, JSONL backup, and one-time backfill.
@@ -45,6 +52,24 @@ Make them executable:
 ```bash
 chmod +x hooks/mempal_save_hook.sh hooks/mempal_precompact_hook.sh
 ```
+
+## Install — Antigravity (Google)
+
+The Antigravity integration lives in its own subdirectory because the
+wire format (camelCase JSON, `injectSteps[]` output) and event names
+(`Stop`, `PreInvocation`) are Antigravity-specific. Use the dedicated
+installer:
+
+```bash
+bash hooks/antigravity/install.sh
+```
+
+This installs to `~/.gemini/config/plugins/mempalace/`, registers the
+MCP server, ships the `mempalace` skill, and wires the Stop +
+PreInvocation hooks. See [`hooks/antigravity/README.md`](antigravity/README.md)
+for the full guide and [`hooks/antigravity/INVESTIGATION.md`](antigravity/INVESTIGATION.md)
+for the source-of-truth audit of which Antigravity surfaces the
+integration uses.
 
 ## Install — Codex CLI (OpenAI)
 

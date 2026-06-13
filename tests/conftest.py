@@ -79,6 +79,12 @@ def _reset_mcp_cache():
 
                 mcp_server._client_cache = None
                 mcp_server._collection_cache = None
+                if hasattr(mcp_server, "_collection_cache_backend"):
+                    mcp_server._collection_cache_backend = None
+                if hasattr(mcp_server, "_collection_cache_palace"):
+                    mcp_server._collection_cache_palace = None
+                if hasattr(mcp_server, "_collection_open_error"):
+                    mcp_server._collection_open_error = None
         except AttributeError:
             pass
 

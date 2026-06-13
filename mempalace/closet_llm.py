@@ -264,7 +264,7 @@ def regenerate_closets(
         f"Regenerating closets for {len(sources)} source files via {cfg.endpoint} ({cfg.model})..."
     )
     if dry_run:
-        print("DRY RUN — no changes will be written")
+        print("DRY RUN - no changes will be written")
 
     processed = 0
     failed = 0
@@ -286,7 +286,7 @@ def regenerate_closets(
         parsed, usage = _call_llm(cfg, source, w, r, content)
         if not parsed:
             failed += 1
-            print(f"  [{i}/{len(sources)}] ✗ {os.path.basename(source)} — LLM failed")
+            print(f"  [{i}/{len(sources)}] [FAIL] {os.path.basename(source)} - LLM failed")
             continue
 
         if usage:
@@ -323,7 +323,7 @@ def regenerate_closets(
 
         processed += 1
         n_topics = len(parsed.get("topics", []))
-        print(f"  [{i}/{len(sources)}] ✓ {os.path.basename(source)} — {n_topics} topics")
+        print(f"  [{i}/{len(sources)}] [OK] {os.path.basename(source)} - {n_topics} topics")
 
     print(f"\nDone. {processed} regenerated, {failed} failed.")
     if total_input or total_output:

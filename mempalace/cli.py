@@ -51,6 +51,45 @@ _PASS_ZERO_PER_FILE_CAP = 100_000  # 100KB per file is generous for prose
 _PASS_ZERO_TOTAL_CAP = 5_000_000  # 5MB total ceiling — bounds memory
 _PASS_ZERO_LLM_PER_SAMPLE = 2_000  # for Tier 2 LLM call only
 _PASS_ZERO_LLM_MAX_SAMPLES = 20  # caps the LLM-tier sample count
+_EXPLICIT_BACKEND_ENV = "MEMPALACE_BACKEND_EXPLICIT"
+
+
+def _backend_arg(args):
+    """Return a CLI-selected backend from subcommand or global flags."""
+    return getattr(args, "backend", None) or getattr(args, "global_backend", None)
+
+
+def _apply_backend_arg(args) -> None:
+    backend = _backend_arg(args)
+    if not backend:
+        return
+    backend = str(backend).strip().lower()
+    from .backends import get_backend_class
+
+    get_backend_class(backend)
+    os.environ[_EXPLICIT_BACKEND_ENV] = backend
+    os.environ["MEMPALACE_BACKEND"] = backend
+
+
+def _selected_backend_for_palace(palace_path: str) -> str:
+    from .palace import resolve_backend_name
+
+    return resolve_backend_name(palace_path, explicit=os.environ.get(_EXPLICIT_BACKEND_ENV))
+
+
+def _maintenance_requires_chroma(palace_path: str, command_name: str) -> bool:
+    try:
+        backend_name = _selected_backend_for_palace(palace_path)
+    except Exception as exc:  # noqa: BLE001 - user-facing guard before maintenance imports
+        print(f"\n  {command_name} cannot resolve the palace backend: {exc}", file=sys.stderr)
+        return False
+    if backend_name == "chroma":
+        return True
+    print(
+        f"\n  {command_name} is Chroma-only in this release (selected backend: {backend_name}).",
+        file=sys.stderr,
+    )
+    return False
 
 
 def _gather_origin_samples(project_dir) -> list:
@@ -380,6 +419,9 @@ def cmd_init(args):
     # Pass 2: detect rooms from folder structure
     detect_rooms_local(project_dir=args.dir, yes=getattr(args, "yes", False))
     cfg.init()
+    backend = _backend_arg(args)
+    if backend:
+        cfg.set_backend(backend)
 
     # Pass 3: protect git repos from accidentally committing per-project files
     _ensure_mempalace_files_gitignored(args.dir)
@@ -615,6 +657,8 @@ def cmd_sync(args):
     """Prune drawers whose source files are gitignored, deleted, or moved (#1252)."""
     from .mcp_server import _wal_log
     from .palace import MineAlreadyRunning
+    from .backends import detect_backend_for_path
+    from .palace import _backend_artifact_label, resolve_backend_name
     from .sync import sync_palace
 
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
@@ -622,8 +666,16 @@ def cmd_sync(args):
     if not os.path.isdir(palace_path):
         print(f"\n  No palace found at {palace_path}")
         return
-    if not os.path.isfile(os.path.join(palace_path, "chroma.sqlite3")):
-        print(f"\n  Palace dir at {palace_path} exists but has no chroma.sqlite3 yet.")
+    try:
+        backend_name = resolve_backend_name(palace_path)
+    except Exception as exc:  # noqa: BLE001 - user-facing CLI guard
+        print(f"\n  Could not resolve palace backend: {exc}", file=sys.stderr)
+        return
+    if detect_backend_for_path(palace_path) is None:
+        print(
+            f"\n  Palace dir at {palace_path} exists but has no "
+            f"{_backend_artifact_label(backend_name)} yet."
+        )
         print("  Run: mempalace mine <dir>")
         return
 
@@ -748,10 +800,24 @@ def cmd_split(args):
 
 def cmd_migrate(args):
     """Migrate palace from a different ChromaDB version."""
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    if not _maintenance_requires_chroma(palace_path, "migrate"):
+        raise SystemExit(2)
     from .migrate import migrate
 
-    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     migrate(
+        palace_path=palace_path,
+        dry_run=args.dry_run,
+        confirm=getattr(args, "yes", False),
+    )
+
+
+def cmd_migrate_wings(args):
+    """Normalize legacy wing names (strip leading/trailing separators)."""
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    from .migrate import migrate_wing_names
+
+    migrate_wing_names(
         palace_path=palace_path,
         dry_run=args.dry_run,
         confirm=getattr(args, "yes", False),
@@ -765,16 +831,73 @@ def cmd_status(args):
     status(palace_path=palace_path)
 
 
+def cmd_palace_set_embedder(args):
+    """Record (or force-override) a palace's embedder identity (RFC 001).
+
+    Resolves the ``unknown`` state for a legacy palace, or records a specific
+    model with ``--model``. It records identity on the palace only; it does not
+    change the configured model — when the two differ it prints how to align
+    ``MEMPALACE_EMBEDDING_MODEL``. ``--force`` overwrites an existing,
+    differently-named identity.
+    """
+    from .backends.base import EmbedderIdentityMismatchError
+    from .palace import set_palace_embedder_identity
+
+    config = MempalaceConfig()
+    palace_path = os.path.abspath(
+        os.path.expanduser(args.palace) if args.palace else config.palace_path
+    )
+    model = getattr(args, "model", None)
+    try:
+        old, new = set_palace_embedder_identity(
+            palace_path,
+            model=model,
+            force=getattr(args, "force", False),
+            backend=_backend_arg(args),
+        )
+    except EmbedderIdentityMismatchError as exc:
+        print(f"  ✗ {exc}")
+        raise SystemExit(2) from exc
+    if old is None:
+        print(f"  ✓ recorded embedder identity: {new.model_name} (dim={new.dimension})")
+    elif old.model_name == new.model_name:
+        print(f"  ✓ embedder identity unchanged: {new.model_name} (dim={new.dimension})")
+    else:
+        print(
+            f"  ✓ embedder identity changed: {old.model_name} → {new.model_name} "
+            f"(dim={new.dimension})"
+        )
+    # set-embedder records the palace's identity; it does not change the
+    # configured model. If they differ, the next normal open would mismatch —
+    # tell the user how to align them.
+    configured = config.embedding_model
+    if new.model_name and configured and new.model_name != configured:
+        print(
+            f"  ⚠ configured model is {configured!r}; set MEMPALACE_EMBEDDING_MODEL="
+            f"{new.model_name} (or run onboarding) so normal opens of this palace match."
+        )
+
+
 def cmd_repair_status(args):
     """Read-only HNSW capacity health check (#1222)."""
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    if not _maintenance_requires_chroma(palace_path, "repair-status"):
+        raise SystemExit(2)
     from .repair import status as repair_status
 
-    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     repair_status(palace_path=palace_path)
 
 
 def cmd_repair(args):
     """Rebuild palace vector index from SQLite metadata."""
+    config = MempalaceConfig()
+    collection_name = config.collection_name
+    palace_path = os.path.abspath(
+        os.path.expanduser(args.palace) if args.palace else config.palace_path
+    )
+    if not _maintenance_requires_chroma(palace_path, "repair"):
+        raise SystemExit(2)
+
     import shutil
     from .backends.chroma import ChromaBackend
     from .migrate import confirm_destructive_action, contains_palace_database
@@ -788,12 +911,6 @@ def cmd_repair(args):
         maybe_repair_poisoned_max_seq_id_before_rebuild,
         print_sqlite_integrity_abort,
         sqlite_integrity_errors,
-    )
-
-    config = MempalaceConfig()
-    collection_name = config.collection_name
-    palace_path = os.path.abspath(
-        os.path.expanduser(args.palace) if args.palace else config.palace_path
     )
 
     if getattr(args, "mode", "legacy") == "max-seq-id":
@@ -1004,12 +1121,15 @@ def cmd_instructions(args):
 def cmd_mcp(args):
     """Show how to wire MemPalace into MCP-capable hosts."""
     base_server_cmd = "mempalace-mcp"
+    cmd_parts = [base_server_cmd]
 
     if args.palace:
         resolved_palace = str(Path(args.palace).expanduser())
-        server_cmd = f"{base_server_cmd} --palace {shlex.quote(resolved_palace)}"
-    else:
-        server_cmd = base_server_cmd
+        cmd_parts.extend(["--palace", shlex.quote(resolved_palace)])
+    backend = _backend_arg(args)
+    if backend:
+        cmd_parts.extend(["--backend", shlex.quote(str(backend).strip().lower())])
+    server_cmd = " ".join(cmd_parts)
 
     print("MemPalace MCP quick setup:")
     print(f"  claude mcp add mempalace -- {server_cmd}")
@@ -1204,12 +1324,23 @@ def main():
         default=None,
         help="Where the palace lives (default: from ~/.mempalace/config.json or ~/.mempalace/palace)",
     )
+    parser.add_argument(
+        "--backend",
+        dest="global_backend",
+        default=None,
+        help="Storage backend to use for this command (default: config/env/detected/chroma)",
+    )
 
     sub = parser.add_subparsers(dest="command")
 
     # init
     p_init = sub.add_parser("init", help="Detect rooms from your folder structure")
     p_init.add_argument("dir", help="Project directory to set up")
+    p_init.add_argument(
+        "--backend",
+        default=None,
+        help="Storage backend to persist for this palace (default: chroma)",
+    )
     p_init.add_argument(
         "--yes",
         action="store_true",
@@ -1292,6 +1423,11 @@ def main():
     # mine
     p_mine = sub.add_parser("mine", help="Mine files into the palace")
     p_mine.add_argument("dir", help="Directory to mine")
+    p_mine.add_argument(
+        "--backend",
+        default=None,
+        help="Storage backend to use for this mine (default: config/env/detected/chroma)",
+    )
     p_mine.add_argument(
         "--mode",
         choices=["projects", "convos", "extract"],
@@ -1401,6 +1537,11 @@ def main():
     # search
     p_search = sub.add_parser("search", help="Find anything, exact words")
     p_search.add_argument("query", help="What to search for")
+    p_search.add_argument(
+        "--backend",
+        default=None,
+        help="Storage backend to use for this search (default: config/env/detected/chroma)",
+    )
     p_search.add_argument("--wing", default=None, help="Limit to one project")
     p_search.add_argument("--room", default=None, help="Limit to one room")
     p_search.add_argument("--results", type=int, default=5, help="Number of results")
@@ -1555,9 +1696,14 @@ def main():
     )
 
     # mcp
-    sub.add_parser(
+    p_mcp = sub.add_parser(
         "mcp",
         help="Show MCP setup command for connecting MemPalace to your AI client",
+    )
+    p_mcp.add_argument(
+        "--backend",
+        default=None,
+        help="Storage backend to include in the MCP startup command",
     )
 
     # status
@@ -1575,9 +1721,52 @@ def main():
         "--yes", action="store_true", help="Skip confirmation for destructive changes"
     )
 
-    sub.add_parser("status", help="Show what's been filed")
+    # migrate-wings
+    p_migrate_wings = sub.add_parser(
+        "migrate-wings",
+        help="Normalize legacy wing names (strip leading/trailing separators) so pre-#1675 palaces stay discoverable",
+    )
+    p_migrate_wings.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would change without modifying the palace",
+    )
+    p_migrate_wings.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
+
+    p_status = sub.add_parser("status", help="Show what's been filed")
+    p_status.add_argument(
+        "--backend",
+        default=None,
+        help="Storage backend to use for status (default: config/env/detected/chroma)",
+    )
+
+    p_palace = sub.add_parser("palace", help="Palace maintenance commands")
+    palace_sub = p_palace.add_subparsers(dest="palace_action")
+    p_set_embedder = palace_sub.add_parser(
+        "set-embedder",
+        help="Record/override the palace's embedder identity (resolve 'unknown', or switch models)",
+    )
+    p_set_embedder.add_argument(
+        "--model",
+        default=None,
+        help="Embedder model to record (default: current configured model). "
+        "Records identity on the palace only; does not change the configured "
+        "model (prints how to align MEMPALACE_EMBEDDING_MODEL if they differ).",
+    )
+    p_set_embedder.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite an existing identity that names a different model "
+        "(only if you know the stored vectors are compatible)",
+    )
+    p_set_embedder.add_argument(
+        "--backend",
+        default=None,
+        help="Storage backend (default: config/env/detected/chroma)",
+    )
 
     args = parser.parse_args()
+    _apply_backend_arg(args)
 
     if not args.command:
         parser.print_help()
@@ -1600,6 +1789,13 @@ def main():
         cmd_instructions(args)
         return
 
+    if args.command == "palace":
+        if getattr(args, "palace_action", None) == "set-embedder":
+            cmd_palace_set_embedder(args)
+        else:
+            p_palace.print_help()
+        return
+
     dispatch = {
         "init": cmd_init,
         "mine": cmd_mine,
@@ -1613,6 +1809,7 @@ def main():
         "repair": cmd_repair,
         "repair-status": cmd_repair_status,
         "migrate": cmd_migrate,
+        "migrate-wings": cmd_migrate_wings,
         "status": cmd_status,
     }
     dispatch[args.command](args)
