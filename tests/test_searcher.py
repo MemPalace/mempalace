@@ -5,6 +5,7 @@ Uses the real ChromaDB fixtures from conftest.py for integration tests,
 plus mock-based tests for error paths.
 """
 
+import io
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -413,3 +414,16 @@ class TestSearchCLI:
         captured = capsys.readouterr()
         assert "[1]" in captured.out
         assert "[2]" in captured.out
+
+    def test_search_falls_back_on_cp1252_stdout(self, palace_path, seeded_collection):
+        buffer = io.BytesIO()
+        stream = io.TextIOWrapper(buffer, encoding="cp1252")
+
+        with patch("sys.stdout", stream):
+            search("JWT authentication", palace_path, n_results=1)
+            stream.flush()
+
+        output = buffer.getvalue().decode("cp1252")
+        assert "Results for" in output
+        assert "--------------------------------------------------------" in output
+        assert "─" not in output

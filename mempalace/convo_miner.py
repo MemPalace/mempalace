@@ -676,9 +676,9 @@ def _mine_convos_impl(
 
                 type_counts = Counter(c.get("memory_type", "general") for c in chunks)
                 types_str = ", ".join(f"{t}:{n}" for t, n in type_counts.most_common())
-                print(f"    [DRY RUN] {filepath.name} → {len(chunks)} memories ({types_str})")
+                print(f"    [DRY RUN] {filepath.name} -> {len(chunks)} memories ({types_str})")
             else:
-                print(f"    [DRY RUN] {filepath.name} → room:{room} ({len(chunks)} drawers)")
+                print(f"    [DRY RUN] {filepath.name} -> room:{room} ({len(chunks)} drawers)")
             total_drawers += len(chunks)
             # Track room counts
             if extract_mode == "general":

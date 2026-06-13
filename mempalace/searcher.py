@@ -14,6 +14,7 @@ import math
 import os
 import re
 import sqlite3
+import sys
 from pathlib import Path
 
 from .backends import (
@@ -39,6 +40,16 @@ logger = logging.getLogger("mempalace_mcp")
 
 class SearchError(Exception):
     """Raised when search cannot proceed (e.g. no palace found)."""
+
+
+def _stdout_rule(preferred: str, fallback: str, count: int) -> str:
+    """Return a terminal-safe rule, falling back to ASCII when needed."""
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    try:
+        preferred.encode(encoding)
+    except (LookupError, UnicodeEncodeError):
+        return fallback * count
+    return preferred * count
 
 
 _TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
@@ -429,7 +440,7 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
         for line in hit["text"].strip().split("\n"):
             print(f"      {line}")
         print()
-        print(f"  {'─' * 56}")
+        print(f"  {_stdout_rule('─', '-', 56)}")
 
     print()
 
