@@ -8,7 +8,7 @@ The Python package that powers MemPalace. All modules, all logic.
 |--------|-------------|
 | `cli.py` | CLI entry point — routes to mine, search, init, compress, wake-up |
 | `config.py` | Configuration loading — `~/.mempalace/config.json`, env vars, defaults |
-| `normalize.py` | Converts 5 chat formats (Claude Code JSONL, Claude.ai JSON, ChatGPT JSON, Slack JSON, plain text) to standard transcript format |
+| `normalize.py` | Converts 5 chat formats (Claude Code JSONL, Claude.ai JSON, ChatGPT JSON, Slack JSON, plain text) to standard transcript format without mutating imported transcript text by default |
 | `miner.py` | Project file ingest — scans directories, chunks by paragraph, stores to ChromaDB |
 | `convo_miner.py` | Conversation ingest — chunks by exchange pair (Q+A), detects rooms from content |
 | `searcher.py` | Semantic search via ChromaDB vectors — filters by wing/room, returns verbatim + scores |
@@ -22,7 +22,7 @@ The Python package that powers MemPalace. All modules, all logic.
 | `entity_detector.py` | Auto-detect people and projects from file content |
 | `general_extractor.py` | Classifies text into 5 memory types (decision, preference, milestone, problem, emotional) |
 | `room_detector_local.py` | Maps folders to room names using 70+ patterns — no API |
-| `spellcheck.py` | Name-aware spellcheck — won't "correct" proper nouns in your entity registry |
+| `spellcheck.py` | Optional name-aware spellcheck utility — won't "correct" proper nouns in your entity registry |
 | `split_mega_files.py` | Splits concatenated transcript files into per-session files |
 
 ## Architecture

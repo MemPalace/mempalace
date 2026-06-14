@@ -78,6 +78,84 @@ def test_normalize_whitespace_only(tmp_path):
     assert result.strip() == ""
 
 
+def test_chatgpt_export_array_normalizes_multiple_conversations(tmp_path):
+    export = [
+        {
+            "mapping": {
+                "root": {"id": "root", "parent": None, "message": None, "children": ["u1"]},
+                "u1": {
+                    "id": "u1",
+                    "parent": "root",
+                    "message": {
+                        "author": {"role": "user"},
+                        "content": {"parts": ["First question"]},
+                    },
+                    "children": ["a1"],
+                },
+                "a1": {
+                    "id": "a1",
+                    "parent": "u1",
+                    "message": {
+                        "author": {"role": "assistant"},
+                        "content": {"parts": ["First answer"]},
+                    },
+                    "children": [],
+                },
+            }
+        },
+        {"title": "broken entry"},
+        {
+            "mapping": {
+                "root": {"id": "root", "parent": None, "message": None, "children": ["u2"]},
+                "u2": {
+                    "id": "u2",
+                    "parent": "root",
+                    "message": {
+                        "author": {"role": "user"},
+                        "content": {"parts": ["Second question"]},
+                    },
+                    "children": ["a2"],
+                },
+                "a2": {
+                    "id": "a2",
+                    "parent": "u2",
+                    "message": {
+                        "author": {"role": "assistant"},
+                        "content": {"parts": ["Second answer"]},
+                    },
+                    "children": [],
+                },
+            }
+        },
+    ]
+    path = tmp_path / "conversations.json"
+    path.write_text(json.dumps(export))
+
+    result = normalize(str(path))
+
+    assert "> First question" in result
+    assert "First answer" in result
+    assert "> Second question" in result
+    assert "Second answer" in result
+    assert "\n---\n" in result
+
+
+def test_normalize_preserves_user_typos_verbatim(tmp_path):
+    path = tmp_path / "chat.json"
+    path.write_text(
+        json.dumps(
+            [
+                {"role": "user", "content": "lsresdy knoe the question befor"},
+                {"role": "assistant", "content": "I will keep it verbatim."},
+            ]
+        )
+    )
+
+    result = normalize(str(path))
+
+    assert "> lsresdy knoe the question befor" in result
+
+
 # ── _extract_content ───────────────────────────────────────────────────
 
 

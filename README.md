@@ -160,6 +160,10 @@ For Claude Code, Gemini CLI, [Antigravity](https://mempalaceofficial.com/guide/a
 MCP-compatible tools, and local models, see
 [mempalaceofficial.com/guide/getting-started](https://mempalaceofficial.com/guide/getting-started.html).
 
+Behavior note: conversation imports preserve original transcript text by
+default. MemPalace no longer spell-corrects imported chat messages during
+`--mode convos`; the spellcheck helper remains available as a separate utility.
+
 ---
 
 ## Benchmarks
