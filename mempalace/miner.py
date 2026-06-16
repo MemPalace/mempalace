@@ -191,12 +191,12 @@ def _should_skip_project_file_via_prefetch(
     if dry_run:
         return False
     source_file = str(filepath)
+    stored_mtimes = mined_mtimes.get(source_file)
+    if not stored_mtimes:
+        return False
     try:
         current_mtime = os.path.getmtime(source_file)
     except OSError:
-        return False
-    stored_mtimes = mined_mtimes.get(source_file)
-    if not stored_mtimes:
         return False
     return any(
         file_already_mined_mtime_matches(stored_mtime, current_mtime)
