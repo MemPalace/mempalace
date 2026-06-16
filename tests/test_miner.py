@@ -11,7 +11,12 @@ import yaml
 
 from mempalace.config import normalize_wing_name
 from mempalace.miner import detect_room, load_config, mine, scan_project, status
-from mempalace.palace import NORMALIZE_VERSION, file_already_mined, prefetch_mined_set
+from mempalace.palace import (
+    NORMALIZE_VERSION,
+    file_already_mined,
+    prefetch_mined_set,
+    prefetch_project_mined_mtimes,
+)
 
 
 def write_file(path: Path, content: str):
@@ -2187,7 +2192,166 @@ def test_file_already_mined_handles_multiple_groups_under_one_source_file(tmp_pa
     )
 
 
+def test_prefetch_project_mined_mtimes_collects_current_version_mtimes(tmp_path):
+    test_file = tmp_path / "doc.md"
+    test_file.write_text("hello")
+    current_mtime = os.path.getmtime(str(test_file))
+
+    class MockCollection:
+        def count(self):
+            return 4
+
+        def get(self, limit=None, offset=0, include=None):
+            if offset == 0:
+                return {
+                    "ids": ["a", "b", "c", "d"],
+                    "metadatas": [
+                        {
+                            "source_file": str(test_file),
+                            "source_mtime": current_mtime,
+                            "normalize_version": NORMALIZE_VERSION,
+                        },
+                        {
+                            "source_file": str(test_file),
+                            "source_mtime": current_mtime + 1,
+                            "normalize_version": NORMALIZE_VERSION,
+                        },
+                        {
+                            "source_file": str(test_file),
+                            "source_mtime": current_mtime + 2,
+                            "normalize_version": NORMALIZE_VERSION - 1,
+                        },
+                        {"source_file": str(test_file), "normalize_version": NORMALIZE_VERSION},
+                    ],
+                }
+            return {"ids": [], "metadatas": []}
+
+    mined = prefetch_project_mined_mtimes(MockCollection())
+    assert mined == {str(test_file): {current_mtime, current_mtime + 1}}
+
+
 # ── --limit skips already-mined files (#1535) ──────────────────────────
+
+
+def test_mine_prefetch_skips_current_mtime_hits(tmp_path, monkeypatch, capsys):
+    from mempalace import miner as miner_mod
+
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=3)
+    palace_path = project_root / "palace"
+
+    files = [project_root / f"f{i}.py" for i in range(3)]
+    prefetched = {str(path): {os.path.getmtime(str(path))} for path in files[:2]}
+
+    process_calls = []
+
+    def fake_process_file(*args, **kwargs):
+        process_calls.append(kwargs["filepath"].name)
+        return (2, "general", None)
+
+    monkeypatch.setattr(miner_mod, "PROJECT_MINE_PREFETCH_THRESHOLD", 1)
+    monkeypatch.setattr(miner_mod, "prefetch_project_mined_mtimes", lambda col: prefetched)
+    monkeypatch.setattr(miner_mod, "process_file", fake_process_file)
+
+    mine(str(project_root), str(palace_path), files=files)
+
+    out = capsys.readouterr().out
+    assert process_calls == [files[2].name]
+    assert "Files skipped (already filed or other): 2" in out
+    assert "Drawers filed: 2" in out
+
+
+def test_mine_mtime_mismatch_bypasses_prefetch_skip(tmp_path, monkeypatch, capsys):
+    from mempalace import miner as miner_mod
+
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=2)
+    palace_path = project_root / "palace"
+
+    files = [project_root / f"f{i}.py" for i in range(2)]
+    prefetched = {
+        str(files[0]): {os.path.getmtime(str(files[0])) + 10.0},
+        str(files[1]): {os.path.getmtime(str(files[1]))},
+    }
+
+    process_calls = []
+
+    def fake_process_file(*args, **kwargs):
+        process_calls.append(kwargs["filepath"].name)
+        return (1, "general", None)
+
+    monkeypatch.setattr(miner_mod, "PROJECT_MINE_PREFETCH_THRESHOLD", 1)
+    monkeypatch.setattr(miner_mod, "prefetch_project_mined_mtimes", lambda col: prefetched)
+    monkeypatch.setattr(miner_mod, "process_file", fake_process_file)
+
+    mine(str(project_root), str(palace_path), files=files)
+
+    out = capsys.readouterr().out
+    assert process_calls == [files[0].name]
+    assert "Files skipped (already filed or other): 1" in out
+    assert "Drawers filed: 1" in out
+
+
+def test_mine_small_file_set_skips_prefetch(tmp_path, monkeypatch, capsys):
+    from mempalace import miner as miner_mod
+
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=2)
+    palace_path = project_root / "palace"
+
+    files = [project_root / f"f{i}.py" for i in range(2)]
+    prefetch_calls = []
+    process_calls = []
+
+    def fake_prefetch(col):
+        prefetch_calls.append(True)
+        return {}
+
+    def fake_process_file(*args, **kwargs):
+        process_calls.append(kwargs["filepath"].name)
+        return (1, "general", None)
+
+    monkeypatch.setattr(miner_mod, "PROJECT_MINE_PREFETCH_THRESHOLD", 999)
+    monkeypatch.setattr(miner_mod, "prefetch_project_mined_mtimes", fake_prefetch)
+    monkeypatch.setattr(miner_mod, "process_file", fake_process_file)
+
+    mine(str(project_root), str(palace_path), files=files)
+
+    assert prefetch_calls == []
+    assert process_calls == [files[0].name, files[1].name]
+
+
+def test_mine_prefetch_limit_counts_only_new_files(tmp_path, monkeypatch, capsys):
+    from mempalace import miner as miner_mod
+
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=5)
+    palace_path = project_root / "palace"
+
+    files = [project_root / f"f{i}.py" for i in range(5)]
+    prefetched = {str(path): {os.path.getmtime(str(path))} for path in files[:3]}
+
+    process_calls = []
+
+    def fake_process_file(*args, **kwargs):
+        process_calls.append(kwargs["filepath"].name)
+        return (2, "general", None)
+
+    monkeypatch.setattr(miner_mod, "PROJECT_MINE_PREFETCH_THRESHOLD", 1)
+    monkeypatch.setattr(miner_mod, "prefetch_project_mined_mtimes", lambda col: prefetched)
+    monkeypatch.setattr(miner_mod, "process_file", fake_process_file)
+
+    mine(str(project_root), str(palace_path), files=files, limit=2)
+
+    out = capsys.readouterr().out
+    assert process_calls == [files[3].name, files[4].name]
+    assert "Files processed: 2" in out
+    assert "Files skipped (already filed or other): 3" in out
+    assert "Drawers filed: 4" in out
 
 
 def test_mine_limit_skips_already_mined_files(tmp_path, capsys):
@@ -2208,7 +2372,9 @@ def test_mine_limit_skips_already_mined_files(tmp_path, capsys):
             return (0, "general", None)
         return (3, "general", None)
 
-    with patch("mempalace.miner.process_file", side_effect=fake_process_file):
+    with patch("mempalace.miner.process_file", side_effect=fake_process_file), patch(
+        "mempalace.miner.PROJECT_MINE_PREFETCH_THRESHOLD", 999
+    ):
         mine(str(project_root), str(palace_path), limit=5)
 
     out = capsys.readouterr().out

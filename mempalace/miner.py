@@ -26,6 +26,7 @@ from .palace import (
     MineValidationError,
     _candidate_entity_words,
     _open_collection_or_explain,
+    _stored_mtime_matches_current as file_already_mined_mtime_matches,
     _validate_palace_fts5_after_mine,
     build_closet_lines,
     file_already_mined,
@@ -33,6 +34,7 @@ from .palace import (
     get_collection,
     mine_lock,
     mine_palace_lock,
+    prefetch_project_mined_mtimes,
     purge_file_closets,
     upsert_closet_lines,
 )
@@ -109,6 +111,7 @@ MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB — skip files larger than this.
 # `mempalace mine --max-chunks-per-file N` if you hit ONNX bad_alloc on
 # Windows; set to 0 to disable the cap entirely.
 MAX_CHUNKS_PER_FILE = 50_000
+PROJECT_MINE_PREFETCH_THRESHOLD = 200
 # Long Claude Code sessions and large transcript exports routinely exceed
 # 10 MB. The cap exists as a defensive rail against pathological binary
 # files, not as a limit on legitimate text. Per-drawer size is bounded
@@ -158,6 +161,16 @@ def _resolve_max_chunks_per_file(override: Optional[int] = None) -> int:
         )
         return MAX_CHUNKS_PER_FILE
     return val
+
+
+def _should_prefetch_project_mined_state(file_count: int) -> bool:
+    """Enable project-miner prefetch only when the candidate set is large enough.
+
+    Full-collection metadata scans are most valuable for skip-heavy runs over
+    large projects. For smaller file sets, keep the historical per-file check
+    path and avoid paying an unconditional full-palace scan.
+    """
+    return file_count >= PROJECT_MINE_PREFETCH_THRESHOLD
 
 
 # =============================================================================
@@ -1292,17 +1305,14 @@ def process_file(
 
     Returns ``(drawer_count, room_name, skip_reason)``. ``skip_reason`` is
     ``None`` on success and on every non-chunk-cap skip path: already
-    filed (pre- or post-lock re-check), unreadable (``OSError``), or
-    too-short content (below ``min_chunk_size``). It is ``"chunk_cap"``
-    when the per-file chunk cap aborted the file. Callers use the tag to
-    surface a separate counter in the mine summary (see #1455).
+    filed (lock-held re-check), unreadable (``OSError``), or too-short
+    content (below ``min_chunk_size``). It is ``"chunk_cap"`` when the
+    per-file chunk cap aborted the file. Callers use the tag to surface a
+    separate counter in the mine summary (see #1455).
     """
     effective_min = min_chunk_size if min_chunk_size is not None else MIN_CHUNK_SIZE
 
-    # Skip if already filed
     source_file = str(filepath)
-    if not dry_run and file_already_mined(collection, source_file, check_mtime=True):
-        return 0, "general", None
 
     try:
         content = filepath.read_text(encoding="utf-8", errors="replace")
@@ -1645,9 +1655,15 @@ def _mine_impl(
     if not dry_run:
         collection = get_collection(palace_path)
         closets_col = get_closets_collection(palace_path)
+        mined_mtimes = (
+            prefetch_project_mined_mtimes(collection)
+            if _should_prefetch_project_mined_state(len(files))
+            else {}
+        )
     else:
         collection = None
         closets_col = None
+        mined_mtimes = {}
 
     total_drawers = 0
     files_mined = 0
@@ -1661,6 +1677,22 @@ def _mine_impl(
     try:
         for i, filepath in enumerate(files, 1):
             try:
+                source_file = str(filepath)
+                if not dry_run:
+                    try:
+                        current_mtime = os.path.getmtime(source_file)
+                    except OSError:
+                        current_mtime = None
+                    if current_mtime is not None:
+                        stored_mtimes = mined_mtimes.get(source_file)
+                        if stored_mtimes and any(
+                            file_already_mined_mtime_matches(stored_mtime, current_mtime)
+                            for stored_mtime in stored_mtimes
+                        ):
+                            files_processed = i
+                            last_file = filepath.name
+                            files_skipped += 1
+                            continue
                 drawers, room, skip_reason = process_file(
                     filepath=filepath,
                     project_path=project_path,

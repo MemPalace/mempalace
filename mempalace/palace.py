@@ -1165,6 +1165,19 @@ def _metadata_matches_extract_mode(meta: dict, extract_mode: Optional[str]) -> b
     return stored_mode == extract_mode or (extract_mode == "exchange" and stored_mode is None)
 
 
+def _metadata_has_current_normalize_version(meta: dict) -> bool:
+    """Return True when drawer metadata is current for skip-check purposes."""
+    return (meta or {}).get("normalize_version", 1) >= NORMALIZE_VERSION
+
+
+def _stored_mtime_matches_current(stored_mtime, current_mtime: float) -> bool:
+    """Mirror project-miner mtime tolerance used by ``file_already_mined``."""
+    try:
+        return abs(float(stored_mtime) - current_mtime) < 0.001
+    except (TypeError, ValueError):
+        return False
+
+
 def file_already_mined(
     collection,
     source_file: str,
@@ -1220,15 +1233,14 @@ def file_already_mined(
                 ):
                     continue
                 # Pre-v2 drawers have no version field — treat them as stale.
-                stored_version = meta.get("normalize_version", 1)
-                if stored_version < NORMALIZE_VERSION:
+                if not _metadata_has_current_normalize_version(meta):
                     continue
                 if not check_mtime:
                     return True
                 stored_mtime = meta.get("source_mtime")
                 if stored_mtime is None:
                     continue
-                if abs(float(stored_mtime) - current_mtime) < 0.001:
+                if _stored_mtime_matches_current(stored_mtime, current_mtime):
                     return True
             if not ids:
                 break
@@ -1267,6 +1279,51 @@ def bulk_check_mined(collection) -> dict[str, float]:
     return mined
 
 
+def prefetch_project_mined_mtimes(collection) -> dict[str, set[float]]:
+    """Pre-fetch current source mtimes for project-miner skip checks.
+
+    Mirrors ``file_already_mined(..., check_mtime=True)`` in bulk form: scan the
+    collection once, keep only drawers at or above ``NORMALIZE_VERSION``, and
+    collect every valid stored ``source_mtime`` under its ``source_file``.
+
+    Project mining can then do a fast local check before calling
+    ``process_file()``, while still keeping the lock-held ``file_already_mined``
+    re-check as the final authority before any write.
+    """
+    mined: dict[str, set[float]] = {}
+    try:
+        total = collection.count()
+        offset = 0
+        while offset < total:
+            batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
+            ids = batch.get("ids") or []
+            for meta in batch.get("metadatas") or []:
+                meta = meta or {}
+                src = meta.get("source_file")
+                if not src:
+                    continue
+                if not _metadata_has_current_normalize_version(meta):
+                    continue
+                stored_mtime = meta.get("source_mtime")
+                if stored_mtime is None:
+                    continue
+                try:
+                    mined.setdefault(src, set()).add(float(stored_mtime))
+                except (TypeError, ValueError):
+                    continue
+            if not ids:
+                break
+            offset += len(ids)
+    except Exception:
+        total_mtimes = sum(len(v) for v in mined.values())
+        logger.warning(
+            "prefetch_project_mined_mtimes: partial fetch, %d files / %d mtimes loaded",
+            len(mined),
+            total_mtimes,
+        )
+    return mined
+
+
 def prefetch_mined_set(collection, extract_mode: Optional[str] = None) -> set[str]:
     """Pre-fetch the set of source_files already mined at the current NORMALIZE_VERSION.
 
@@ -1297,8 +1354,7 @@ def prefetch_mined_set(collection, extract_mode: Optional[str] = None) -> set[st
                 if not _metadata_matches_extract_mode(meta, extract_mode):
                     continue
                 # Same default as file_already_mined: missing version == 1
-                version = meta.get("normalize_version", 1)
-                if version >= NORMALIZE_VERSION:
+                if _metadata_has_current_normalize_version(meta):
                     mined.add(src)
             if not batch["ids"]:
                 break
