@@ -3812,6 +3812,57 @@ class TestKGTools:
             assert "ended" in result["error"]
             assert "YYYY-MM-DDTHH:MM:SSZ" in result["error"]
 
+    def test_kg_invalidate_accepts_long_object(self, monkeypatch, config, palace_path, kg):
+        """Invalidating a fact whose object > 128 chars must not be blocked by MAX_NAME_LENGTH.
+
+        The object parameter in kg_invalidate is a lookup key against existing
+        facts, not a new entity name.  MAX_NAME_LENGTH (128) applies to entity
+        identifiers — capping lookup keys silently blocks invalidation of any
+        legitimately long free-text fact written before the cap existed.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        long_obj = "a" * 200  # well over the 128-char entity-name cap
+
+        # Seed a fact with a long object directly (bypassing MCP write-path
+        # validation, which intentionally caps new entity names at 128 chars).
+        kg.add_triple("TestSubject", "has_note", long_obj, valid_from="2026-01-01")
+
+        from mempalace import mcp_server
+
+        result = mcp_server.tool_kg_invalidate(
+            "TestSubject",
+            "has_note",
+            long_obj,
+            ended="2026-06-16",
+        )
+
+        assert result["success"] is True, f"invalidate rejected long object: {result}"
+
+    def test_kg_invalidate_long_object_write_path_unaffected(self, monkeypatch, config, palace_path, kg):
+        """Write-path object validation is unchanged by the invalidate fix.
+
+        tool_kg_add still enforces MAX_NAME_LENGTH on the object field so that
+        new entity names remain bounded.  The invalidate fix is scoped to the
+        lookup path only.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        from mempalace import mcp_server
+
+        long_obj = "b" * 200
+
+        result = mcp_server.tool_kg_add(
+            "TestSubject",
+            "has_note",
+            long_obj,
+            valid_from="2026-01-01",
+        )
+
+        # write-path still rejects long objects
+        assert result["success"] is False
+        assert "exceeds maximum length" in result["error"]
+
     def test_kg_add_rejects_timezone_offset_datetime(self, monkeypatch, config, palace_path, kg):
         _patch_mcp_server(monkeypatch, config, kg)
 

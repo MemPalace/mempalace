@@ -3811,11 +3811,21 @@ def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = N
 
     Temporal values accept either ``YYYY-MM-DD`` or canonical UTC datetimes in
     the form ``YYYY-MM-DDTHH:MM:SSZ``.
+
+    Note: ``object`` is a lookup key against existing facts and is not subject
+    to the 128-char entity-name limit — long free-text object strings are
+    supported for invalidation.
     """
     try:
         subject = sanitize_kg_value(subject, "subject")
         predicate = sanitize_name(predicate, "predicate")
-        object = sanitize_kg_value(object, "object")
+        # object is a lookup key, not a new entity name — skip the 128-char
+        # MAX_NAME_LENGTH cap so long free-text facts can be invalidated.
+        if not isinstance(object, str) or not object.strip():
+            raise ValueError("object must be a non-empty string")
+        object = strip_lone_surrogates(object.strip())
+        if "\x00" in object:
+            raise ValueError("object contains null bytes")
         ended = sanitize_iso_temporal(ended, "ended")
     except ValueError as e:
         return {"success": False, "error": str(e)}
