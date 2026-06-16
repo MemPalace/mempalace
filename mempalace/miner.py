@@ -173,6 +173,37 @@ def _should_prefetch_project_mined_state(file_count: int) -> bool:
     return file_count >= PROJECT_MINE_PREFETCH_THRESHOLD
 
 
+def _prefetch_mined_mtimes_if_enabled(
+    collection, files: list[Path], dry_run: bool
+) -> dict[str, set[float]]:
+    """Return prefetched project-miner mtimes when the heuristic allows it."""
+    if dry_run:
+        return {}
+    if not _should_prefetch_project_mined_state(len(files)):
+        return {}
+    return prefetch_project_mined_mtimes(collection)
+
+
+def _should_skip_project_file_via_prefetch(
+    filepath: Path, dry_run: bool, mined_mtimes: dict[str, set[float]]
+) -> bool:
+    """Return True when prefetched project-mine state proves the file is current."""
+    if dry_run:
+        return False
+    source_file = str(filepath)
+    try:
+        current_mtime = os.path.getmtime(source_file)
+    except OSError:
+        return False
+    stored_mtimes = mined_mtimes.get(source_file)
+    if not stored_mtimes:
+        return False
+    return any(
+        file_already_mined_mtime_matches(stored_mtime, current_mtime)
+        for stored_mtime in stored_mtimes
+    )
+
+
 # =============================================================================
 # IGNORE MATCHING
 # =============================================================================
@@ -1655,11 +1686,7 @@ def _mine_impl(
     if not dry_run:
         collection = get_collection(palace_path)
         closets_col = get_closets_collection(palace_path)
-        mined_mtimes = (
-            prefetch_project_mined_mtimes(collection)
-            if _should_prefetch_project_mined_state(len(files))
-            else {}
-        )
+        mined_mtimes = _prefetch_mined_mtimes_if_enabled(collection, files, dry_run)
     else:
         collection = None
         closets_col = None
@@ -1677,22 +1704,11 @@ def _mine_impl(
     try:
         for i, filepath in enumerate(files, 1):
             try:
-                source_file = str(filepath)
-                if not dry_run:
-                    try:
-                        current_mtime = os.path.getmtime(source_file)
-                    except OSError:
-                        current_mtime = None
-                    if current_mtime is not None:
-                        stored_mtimes = mined_mtimes.get(source_file)
-                        if stored_mtimes and any(
-                            file_already_mined_mtime_matches(stored_mtime, current_mtime)
-                            for stored_mtime in stored_mtimes
-                        ):
-                            files_processed = i
-                            last_file = filepath.name
-                            files_skipped += 1
-                            continue
+                if _should_skip_project_file_via_prefetch(filepath, dry_run, mined_mtimes):
+                    files_processed = i
+                    last_file = filepath.name
+                    files_skipped += 1
+                    continue
                 drawers, room, skip_reason = process_file(
                     filepath=filepath,
                     project_path=project_path,

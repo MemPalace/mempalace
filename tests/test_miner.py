@@ -2372,8 +2372,9 @@ def test_mine_limit_skips_already_mined_files(tmp_path, capsys):
             return (0, "general", None)
         return (3, "general", None)
 
-    with patch("mempalace.miner.process_file", side_effect=fake_process_file), patch(
-        "mempalace.miner.PROJECT_MINE_PREFETCH_THRESHOLD", 999
+    with (
+        patch("mempalace.miner.process_file", side_effect=fake_process_file),
+        patch("mempalace.miner.PROJECT_MINE_PREFETCH_THRESHOLD", 999),
     ):
         mine(str(project_root), str(palace_path), limit=5)
 
