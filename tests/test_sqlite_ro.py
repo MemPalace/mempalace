@@ -55,6 +55,47 @@ def test_statement_timeout_is_operationalerror() -> None:
     assert issubclass(StatementTimeout, sqlite3.OperationalError)
 
 
+def test_deadline_abort_raises_statement_timeout_specifically(tiny_db: str) -> None:
+    """A deadline overrun raises StatementTimeout (not just bare
+    OperationalError), so callers can distinguish a runaway-statement timeout.
+    Covers both the connection and the cursor execute surfaces (#1650)."""
+    with pytest.raises(StatementTimeout):
+        with connect_ro(tiny_db, deadline_s=0.3) as conn:
+            conn.execute(
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c)"
+                " SELECT count(*) FROM c"
+            ).fetchall()
+    with pytest.raises(StatementTimeout):
+        with connect_ro(tiny_db, deadline_s=0.3) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c)"
+                " SELECT count(*) FROM c"
+            ).fetchall()
+
+
+def test_non_timeout_operationalerror_not_mistranslated(tiny_db: str) -> None:
+    """A write attempt under query_only fails immediately (deadline not passed),
+    so it stays a plain OperationalError, not StatementTimeout."""
+    with connect_ro(tiny_db, deadline_s=30.0) as conn:
+        with pytest.raises(sqlite3.OperationalError) as ei:
+            conn.execute("INSERT INTO t (v) VALUES ('x')")
+        assert not isinstance(ei.value, StatementTimeout)
+
+
+def test_build_uri_handles_special_chars(tmp_path: Path) -> None:
+    """Path with a '?' (valid POSIX filename char) must still open read-only —
+    f-string interpolation would have split it as a URI query (#1650)."""
+    weird = tmp_path / "od?d#name.sqlite3"
+    conn = sqlite3.connect(str(weird))
+    conn.execute("CREATE TABLE t (id INTEGER)")
+    conn.execute("INSERT INTO t (id) VALUES (7)")
+    conn.commit()
+    conn.close()
+    with connect_ro(str(weird)) as ro:
+        assert ro.execute("SELECT id FROM t").fetchone()[0] == 7
+
+
 def test_no_deadline_allows_normal_query(tiny_db: str) -> None:
     """deadline_s=None disables the ceiling; a normal query returns rows."""
     with connect_ro(tiny_db, deadline_s=None) as conn:
@@ -144,6 +185,34 @@ _READ_PATH_MODULES = [
 ]
 
 
+def _collect_sql_assignments(tree: ast.AST) -> dict:
+    """Map ``name -> value node`` for every ``name = <f-string|str-binop>``.
+
+    Lets the guard follow the one-hop indirection
+    ``sql = f"... {x} ..."; conn.execute(sql)`` that a direct first-arg-only
+    check would miss (gemini review on #1650). We only record dynamic
+    string-building values (JoinedStr / BinOp); plain literals are safe and left
+    out so they don't mask a later reassignment.
+    """
+    assigns: dict = {}
+    for node in ast.walk(tree):
+        targets = []
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+            value = node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets = [node.target]
+            value = node.value
+        else:
+            continue
+        if not isinstance(value, (ast.JoinedStr, ast.BinOp)):
+            continue
+        for tgt in targets:
+            if isinstance(tgt, ast.Name):
+                assigns[tgt.id] = value
+    return assigns
+
+
 def _execute_sql_args(tree: ast.AST):
     """Yield the first positional arg node of every .execute/.executemany call."""
     for node in ast.walk(tree):
@@ -152,27 +221,53 @@ def _execute_sql_args(tree: ast.AST):
                 yield node.func.attr, node.args[0]
 
 
+def _check_sql_node(mod_name: str, sql_arg: ast.AST, offenders: list) -> None:
+    """Flag a SQL expression node that interpolates a non-allowlisted value."""
+    if isinstance(sql_arg, ast.JoinedStr):  # f-string SQL
+        for piece in sql_arg.values:
+            if isinstance(piece, ast.FormattedValue):
+                name = _interp_name(piece.value)
+                if name not in _ALLOWED_SQL_INTERP:
+                    offenders.append(
+                        f"{mod_name}:{sql_arg.lineno} interpolates {name!r} into SQL"
+                    )
+    elif isinstance(sql_arg, ast.BinOp):  # "..." % x / "..." + x
+        offenders.append(
+            f"{mod_name}:{sql_arg.lineno} builds SQL via string operator"
+        )
+
+
 def test_read_paths_never_interpolate_user_values_into_sql() -> None:
-    offenders = []
+    offenders: list = []
     for mod in _READ_PATH_MODULES:
+        mod_name = Path(mod.__file__).name
         src = Path(mod.__file__).read_text(encoding="utf-8")
         tree = ast.parse(src)
+        assigns = _collect_sql_assignments(tree)
         for _attr, sql_arg in _execute_sql_args(tree):
-            if isinstance(sql_arg, ast.JoinedStr):  # f-string SQL
-                for piece in sql_arg.values:
-                    if isinstance(piece, ast.FormattedValue):
-                        name = _interp_name(piece.value)
-                        if name not in _ALLOWED_SQL_INTERP:
-                            offenders.append(
-                                f"{Path(mod.__file__).name}:{sql_arg.lineno} "
-                                f"interpolates {name!r} into SQL"
-                            )
-            elif isinstance(sql_arg, ast.BinOp):  # "..." % x / "..." + x
-                offenders.append(
-                    f"{Path(mod.__file__).name}:{sql_arg.lineno} "
-                    f"builds SQL via string operator"
-                )
+            # Resolve one hop of indirection: execute(sql) where sql = f"...".
+            if isinstance(sql_arg, ast.Name) and sql_arg.id in assigns:
+                sql_arg = assigns[sql_arg.id]
+            _check_sql_node(mod_name, sql_arg, offenders)
     assert not offenders, "user-value SQL interpolation found:\n" + "\n".join(offenders)
+
+
+def test_guard_catches_variable_assigned_fstring_sql() -> None:
+    """The guard must not be bypassable by assigning the f-string to a variable
+    first (the gap gemini flagged on #1650)."""
+    src = (
+        "def q(conn, user):\n"
+        "    sql = f\"SELECT * FROM t WHERE x = {user}\"\n"
+        "    return conn.execute(sql).fetchall()\n"
+    )
+    tree = ast.parse(src)
+    assigns = _collect_sql_assignments(tree)
+    offenders: list = []
+    for _attr, sql_arg in _execute_sql_args(tree):
+        if isinstance(sql_arg, ast.Name) and sql_arg.id in assigns:
+            sql_arg = assigns[sql_arg.id]
+        _check_sql_node("synthetic.py", sql_arg, offenders)
+    assert offenders and "user" in offenders[0]
 
 
 def _interp_name(node: ast.AST) -> str:

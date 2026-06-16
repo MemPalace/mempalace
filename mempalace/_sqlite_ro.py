@@ -25,6 +25,7 @@ from __future__ import annotations
 import sqlite3
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Iterator, Optional
 
 # --- Defaults -----------------------------------------------------------------
@@ -67,18 +68,95 @@ DEFAULT_TEMP_STORE_MEMORY = False  # leave PRAGMA temp_store at its default
 
 
 class StatementTimeout(sqlite3.OperationalError):
-    """A read statement exceeded its wall-clock deadline and was aborted."""
+    """A read statement exceeded its wall-clock deadline and was aborted.
+
+    When the progress handler trips, the sqlite3 driver surfaces the abort as a
+    generic :class:`sqlite3.OperationalError` ("interrupted"). The connection
+    returned by :func:`open_ro` / :func:`connect_ro` translates that specific
+    abort -- recognised by the connection's wall-clock deadline having already
+    passed -- into this subclass, so a runaway-statement timeout is catchable
+    distinctly. Every other ``OperationalError`` (locked, malformed, read-only
+    violation, …) propagates unchanged. Because it subclasses
+    ``OperationalError``, existing broad ``except sqlite3.OperationalError``
+    handlers keep working.
+    """
 
 
-def _install_deadline(conn: sqlite3.Connection, deadline_s: Optional[float]) -> None:
+def _timeout_or_original(
+    exc: sqlite3.OperationalError, deadline: Optional[float]
+) -> sqlite3.OperationalError:
+    """Map a statement abort to StatementTimeout iff the deadline has passed.
+
+    The progress-handler abort is the only OperationalError whose timing
+    coincides with the deadline; any other OperationalError raised before the
+    deadline (locked, read-only violation, malformed schema) is returned as-is.
+    """
+    if deadline is not None and time.monotonic() > deadline:
+        return StatementTimeout(
+            str(exc) or "statement exceeded its wall-clock deadline"
+        )
+    return exc
+
+
+class _RODeadlineCursor(sqlite3.Cursor):
+    """Cursor that translates a deadline-abort into :class:`StatementTimeout`."""
+
+    def execute(self, *args, **kwargs):  # type: ignore[override]
+        try:
+            return super().execute(*args, **kwargs)
+        except sqlite3.OperationalError as exc:
+            deadline = getattr(self.connection, "_ro_deadline", None)
+            raise _timeout_or_original(exc, deadline) from exc
+
+    def executemany(self, *args, **kwargs):  # type: ignore[override]
+        try:
+            return super().executemany(*args, **kwargs)
+        except sqlite3.OperationalError as exc:
+            deadline = getattr(self.connection, "_ro_deadline", None)
+            raise _timeout_or_original(exc, deadline) from exc
+
+
+class _RODeadlineConnection(sqlite3.Connection):
+    """Connection that maps a deadline-abort into :class:`StatementTimeout`.
+
+    Covers both the direct ``connection.execute(...)`` shortcut and the
+    ``connection.cursor().execute(...)`` surface (callers use both).
+    """
+
+    # Armed by _install_deadline; None when no deadline is set. Declared at
+    # class level so getattr is safe before the connection is configured.
+    _ro_deadline: Optional[float] = None
+
+    def execute(self, *args, **kwargs):  # type: ignore[override]
+        try:
+            return super().execute(*args, **kwargs)
+        except sqlite3.OperationalError as exc:
+            raise _timeout_or_original(exc, self._ro_deadline) from exc
+
+    def executemany(self, *args, **kwargs):  # type: ignore[override]
+        try:
+            return super().executemany(*args, **kwargs)
+        except sqlite3.OperationalError as exc:
+            raise _timeout_or_original(exc, self._ro_deadline) from exc
+
+    def cursor(self, factory=_RODeadlineCursor):  # type: ignore[override]
+        return super().cursor(factory)
+
+
+def _install_deadline(conn: "_RODeadlineConnection", deadline_s: Optional[float]) -> None:
     """Arm a wall-clock deadline via the progress handler.
 
     The handler returns non-zero once the deadline passes, which makes SQLite
-    abort the running statement and raise ``sqlite3.OperationalError``.
+    abort the running statement; :class:`_RODeadlineConnection` then translates
+    that abort into :class:`StatementTimeout`. The deadline is also stored on the
+    connection so the translation can tell a timeout abort from any other
+    OperationalError.
     """
     if not deadline_s or deadline_s <= 0:
+        conn._ro_deadline = None
         return
     deadline = time.monotonic() + deadline_s
+    conn._ro_deadline = deadline
 
     def _handler() -> int:  # pragma: no cover - exercised via integration
         return 1 if time.monotonic() > deadline else 0
@@ -110,7 +188,11 @@ def _apply_read_pragmas(
 
 
 def _build_uri(db_path: str, *, immutable: bool) -> str:
-    uri = f"file:{db_path}?mode=ro"
+    # Build the file: URI via Path.as_uri() rather than f-string interpolation:
+    # it produces an absolute, properly percent-encoded URI and handles Windows
+    # drive letters / backslashes and POSIX paths containing '?' or '#' (both
+    # valid in filenames) that would otherwise confuse SQLite's URI parser.
+    uri = f"{Path(db_path).absolute().as_uri()}?mode=ro"
     if immutable:
         # immutable=1 promises SQLite the file will not change while open, so
         # it can skip locking and shared-memory work for a read speedup. Valid
@@ -145,8 +227,14 @@ def open_ro(
     Raises:
         sqlite3.OperationalError: on open failure or PRAGMA failure (the
             half-open connection is closed before the exception propagates).
+        StatementTimeout: (subclass of OperationalError) when a later statement
+            on the returned connection exceeds ``deadline_s``.
     """
-    conn = sqlite3.connect(_build_uri(db_path, immutable=immutable), uri=True)
+    conn = sqlite3.connect(
+        _build_uri(db_path, immutable=immutable),
+        uri=True,
+        factory=_RODeadlineConnection,
+    )
     try:
         _apply_read_pragmas(
             conn,
@@ -189,7 +277,8 @@ def connect_ro(
         An open ``sqlite3.Connection`` in read-only mode. Always closed on exit.
 
     Raises:
-        sqlite3.OperationalError: on open failure or deadline overrun.
+        sqlite3.OperationalError: on open failure.
+        StatementTimeout: (subclass of OperationalError) on deadline overrun.
     """
     conn = open_ro(
         db_path,
