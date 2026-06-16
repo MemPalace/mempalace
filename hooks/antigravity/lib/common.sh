@@ -440,7 +440,7 @@ mempal_gc_stale_state() {
     local marker="$MEMPAL_STATE_DIR/antigravity_last_sweep"
     if [ -f "$marker" ]; then
         local mtime now
-        if mtime=$(date -r "$marker" '+%s' 2>/dev/null) \
+        if mtime=$("$MEMPAL_PYTHON_BIN" -c 'import os, sys; print(int(os.path.getmtime(sys.argv[1])))' "$marker" 2>/dev/null) \
            && now=$(date '+%s' 2>/dev/null) \
            && [ -n "$mtime" ] \
            && [ "$((now - mtime))" -lt 86400 ]; then

@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-Detailed parameter schemas for all 31 MCP tools.
+Detailed parameter schemas for all 33 MCP tools.
 
 ## Palace — Read Tools
 
