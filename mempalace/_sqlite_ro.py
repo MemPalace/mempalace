@@ -20,6 +20,7 @@ rows in the same order. The only new behaviour is that a statement exceeding its
 wall-clock deadline now raises :class:`StatementTimeout` instead of running
 unbounded. Normal queries (well under the deadline) see no behavioural change.
 """
+
 from __future__ import annotations
 
 import sqlite3
@@ -92,9 +93,7 @@ def _timeout_or_original(
     deadline (locked, read-only violation, malformed schema) is returned as-is.
     """
     if deadline is not None and time.monotonic() > deadline:
-        return StatementTimeout(
-            str(exc) or "statement exceeded its wall-clock deadline"
-        )
+        return StatementTimeout(str(exc) or "statement exceeded its wall-clock deadline")
     return exc
 
 

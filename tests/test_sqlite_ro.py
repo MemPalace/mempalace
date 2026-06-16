@@ -1,5 +1,6 @@
 """Tests for the read-only SQLite connection helper and the read-path
 parameterization regression guard (change: harden-mempalace-sqlite-timeouts)."""
+
 from __future__ import annotations
 
 import ast
@@ -30,6 +31,7 @@ def tiny_db(tmp_path: Path) -> str:
 
 
 # --- P3.3 deadline -----------------------------------------------------------
+
 
 def test_deadline_aborts_runaway_statement(tiny_db: str) -> None:
     """A deliberately infinite recursive CTE must be aborted near the deadline,
@@ -105,6 +107,7 @@ def test_no_deadline_allows_normal_query(tiny_db: str) -> None:
 
 # --- P3.4 lifecycle ----------------------------------------------------------
 
+
 def test_context_manager_closes_on_success(tiny_db: str) -> None:
     with connect_ro(tiny_db) as conn:
         conn.execute("SELECT 1").fetchone()
@@ -135,6 +138,7 @@ def test_open_ro_caller_owns_close(tiny_db: str) -> None:
 
 
 # --- read PRAGMAs applied ----------------------------------------------------
+
 
 def test_safety_floor_pragmas_always_applied(tiny_db: str) -> None:
     """query_only + busy_timeout are the always-on safety floor."""
@@ -228,13 +232,9 @@ def _check_sql_node(mod_name: str, sql_arg: ast.AST, offenders: list) -> None:
             if isinstance(piece, ast.FormattedValue):
                 name = _interp_name(piece.value)
                 if name not in _ALLOWED_SQL_INTERP:
-                    offenders.append(
-                        f"{mod_name}:{sql_arg.lineno} interpolates {name!r} into SQL"
-                    )
+                    offenders.append(f"{mod_name}:{sql_arg.lineno} interpolates {name!r} into SQL")
     elif isinstance(sql_arg, ast.BinOp):  # "..." % x / "..." + x
-        offenders.append(
-            f"{mod_name}:{sql_arg.lineno} builds SQL via string operator"
-        )
+        offenders.append(f"{mod_name}:{sql_arg.lineno} builds SQL via string operator")
 
 
 def test_read_paths_never_interpolate_user_values_into_sql() -> None:
@@ -257,7 +257,7 @@ def test_guard_catches_variable_assigned_fstring_sql() -> None:
     first (the gap gemini flagged on #1650)."""
     src = (
         "def q(conn, user):\n"
-        "    sql = f\"SELECT * FROM t WHERE x = {user}\"\n"
+        '    sql = f"SELECT * FROM t WHERE x = {user}"\n'
         "    return conn.execute(sql).fetchall()\n"
     )
     tree = ast.parse(src)
