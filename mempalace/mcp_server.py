@@ -1073,13 +1073,23 @@ def tool_status():
         "backend": _selected_backend_name(),
     }
     try:
-        all_meta = _get_cached_metadata(col)
-        for m in all_meta:
-            m = m or {}
-            w = m.get("wing", "unknown")
-            r = m.get("room", "unknown")
-            wings[w] = wings.get(w, 0) + 1
-            rooms[r] = rooms.get(r, 0) + 1
+        grouper = getattr(col, "count_by_metadata_field", None)
+        if callable(grouper):
+            # Efficient path: backends that can aggregate server-side (e.g.
+            # pgvector via SQL GROUP BY) tally wing/room counts without
+            # streaming every drawer's metadata to the client. On a large
+            # palace the client-side fetch below is O(n) memory and can take
+            # minutes (or OOM); this is a single query.
+            wings.update(grouper("wing"))
+            rooms.update(grouper("room"))
+        else:
+            all_meta = _get_cached_metadata(col)
+            for m in all_meta:
+                m = m or {}
+                w = m.get("wing", "unknown")
+                r = m.get("room", "unknown")
+                wings[w] = wings.get(w, 0) + 1
+                rooms[r] = rooms.get(r, 0) + 1
     except Exception as e:
         logger.exception("tool_status metadata fetch failed")
         result["error"] = str(e)

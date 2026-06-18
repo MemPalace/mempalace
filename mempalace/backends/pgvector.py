@@ -1058,6 +1058,21 @@ class PgVectorCollection(BaseCollection):
             return 0
         return self._client.count_rows(self._table)
 
+    def count_by_metadata_field(self, field: str) -> dict[str, int]:
+        """Return ``{value: count}`` for a top-level metadata key, aggregated in
+        SQL. Lets callers (e.g. the status overview) tally by ``wing`` / ``room``
+        without streaming every drawer's metadata to the client — O(1) memory and
+        a single query instead of O(n). ``NULL`` values bucket under ``"unknown"``."""
+        self._ensure_open()
+        if not self._table_exists():
+            return {}
+        sql = (
+            f"SELECT metadata->>%s AS k, count(*) AS c "
+            f"FROM {_quote_identifier(self._table)} GROUP BY 1"
+        )
+        rows = self._client._execute(sql, [field], fetch=True)
+        return {(r[0] if r[0] is not None else "unknown"): int(r[1]) for r in rows}
+
     def lexical_search(self, *, query: str, n_results: int = 10, where: Optional[dict] = None):
         _validate_where(where)
         pushdown = None if _requires_local_filter(where) else where
