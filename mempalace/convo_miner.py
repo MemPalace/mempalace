@@ -594,15 +594,14 @@ def _mine_convos_impl(
     wing = _resolve_wing(convo_path, wing)
 
     files = scan_convos(convo_dir)
-    if limit > 0:
-        files = files[:limit]
 
     print(f"\n{'=' * 55}")
     print("  MemPalace Mine — Conversations")
     print(f"{'=' * 55}")
     print(f"  Wing:    {wing}")
     print(f"  Source:  {convo_path}")
-    print(f"  Files:   {len(files)}")
+    limit_suffix = f" (limit: {limit} new)" if limit > 0 else ""
+    print(f"  Files:   {len(files)}{limit_suffix}")
     print(f"  Palace:  {palace_path}")
     if dry_run:
         print("  DRY RUN — nothing will be filed")
@@ -620,10 +619,13 @@ def _mine_convos_impl(
     )
 
     total_drawers = 0
+    files_mined = 0
     files_skipped = 0
+    files_processed = 0
     room_counts = defaultdict(int)
 
     for i, filepath in enumerate(files, 1):
+        files_processed = i
         source_file = str(filepath)
 
         # Skip if already filed at current NORMALIZE_VERSION
@@ -684,6 +686,9 @@ def _mine_convos_impl(
                     room_counts[c.get("memory_type", "general")] += 1
             else:
                 room_counts[room] += 1
+            files_mined += 1
+            if limit > 0 and files_mined >= limit:
+                break
             continue
 
         if extract_mode != "general":
@@ -701,14 +706,17 @@ def _mine_convos_impl(
             room_counts[r] += n
 
         total_drawers += drawers_added
+        files_mined += 1
         print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")
+        if limit > 0 and files_mined >= limit:
+            break
 
     if not dry_run:
         _validate_palace_fts5_after_mine(palace_path)
 
     print(f"\n{'=' * 55}")
     print("  Done.")
-    print(f"  Files processed: {len(files) - files_skipped}")
+    print(f"  Files processed: {files_processed - files_skipped}")
     print(f"  Files skipped (already filed): {files_skipped}")
     print(f"  Drawers filed: {total_drawers}")
     if room_counts:

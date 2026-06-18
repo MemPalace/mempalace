@@ -1,4 +1,7 @@
 import os
+import sys
+import threading
+import types
 
 import pytest
 
@@ -14,6 +17,8 @@ from mempalace.backends import (
 )
 from mempalace.backends.pgvector import (
     PgVectorBackend,
+    _PgVectorClient,
+    _PgVectorConfig,
     _matches_where,
     _vector_distance,
     _as_vector_array,
@@ -509,3 +514,140 @@ def test_pgvector_live_roundtrip_when_enabled(tmp_path):
         except Exception:
             pass
         backend.close()
+
+
+def test_client_concurrent_first_connect_single_connection(monkeypatch):
+    """Two threads racing ``_execute`` through the first ``_connect`` must end
+    up on one shared connection.
+
+    The barrier inside the fake ``psycopg.connect`` releases immediately only
+    when both threads pass the ``self._conn is None`` check together: the
+    broken interleaving, which created two connections, leaked the loser, and
+    ran the threads on different connections. With ``_connect`` under
+    ``self._lock`` the second thread blocks on the lock, the winner's barrier
+    times out, and the loser reuses the winner's connection.
+    """
+    created = []
+    barrier = threading.Barrier(2)
+
+    class _FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def execute(self, sql, params=None):
+            return None
+
+        def executemany(self, sql, params=None):
+            return None
+
+        def fetchall(self):
+            return [(1,)]
+
+    class _FakeConn:
+        def __init__(self):
+            self.closed = False
+
+        def cursor(self):
+            return _FakeCursor()
+
+        def commit(self):
+            return None
+
+        def rollback(self):
+            return None
+
+        def close(self):
+            self.closed = True
+
+    fake_psycopg = types.ModuleType("psycopg")
+
+    def racing_connect(dsn):
+        try:
+            barrier.wait(timeout=1.0)
+        except threading.BrokenBarrierError:
+            pass
+        conn = _FakeConn()
+        created.append(conn)
+        return conn
+
+    fake_psycopg.connect = racing_connect
+    monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
+
+    client = _PgVectorClient(_PgVectorConfig(dsn="postgresql://localhost/unused", namespace=None))
+    errors = []
+
+    def run_query():
+        try:
+            client.ping()
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run_query, daemon=True) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert not any(t.is_alive() for t in threads)
+    assert errors == []
+    assert len(created) == 1
+    assert client._conn is created[0]
+
+    client.close()
+    assert created[0].closed
+
+
+def test_client_execute_after_close_raises(monkeypatch):
+    """``close()`` is terminal: a stale client reference must get an error
+    instead of silently reconnecting and leaking a session nobody closes."""
+    created = []
+
+    class _FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def execute(self, sql, params=None):
+            return None
+
+        def fetchall(self):
+            return [(1,)]
+
+    class _FakeConn:
+        def __init__(self):
+            self.closed = False
+
+        def cursor(self):
+            return _FakeCursor()
+
+        def commit(self):
+            return None
+
+        def close(self):
+            self.closed = True
+
+    fake_psycopg = types.ModuleType("psycopg")
+
+    def fake_connect(dsn):
+        conn = _FakeConn()
+        created.append(conn)
+        return conn
+
+    fake_psycopg.connect = fake_connect
+    monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
+
+    client = _PgVectorClient(_PgVectorConfig(dsn="postgresql://localhost/unused", namespace=None))
+    client.ping()
+    assert len(created) == 1
+
+    client.close()
+    assert created[0].closed
+
+    with pytest.raises(BackendError, match="closed"):
+        client.ping()
+    assert len(created) == 1

@@ -768,6 +768,33 @@ def test_fix_blob_seq_ids_writes_marker_when_already_integer(tmp_path):
     assert marker.is_file(), "marker must be written even when no BLOBs found"
 
 
+def test_fix_blob_seq_ids_closes_sqlite_connection(tmp_path, monkeypatch):
+    """The migration closes sqlite connections after the pre-open probe."""
+    db_path = tmp_path / "chroma.sqlite3"
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.execute("CREATE TABLE embeddings (rowid INTEGER PRIMARY KEY, seq_id INTEGER)")
+        conn.execute("INSERT INTO embeddings (seq_id) VALUES (42)")
+        conn.commit()
+
+    closed = []
+    real_connect = sqlite3.connect
+
+    class TrackingConnection(sqlite3.Connection):
+        def close(self):
+            closed.append(True)
+            super().close()
+
+    def tracking_connect(*args, **kwargs):
+        kwargs["factory"] = TrackingConnection
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr("mempalace.backends.chroma.sqlite3.connect", tracking_connect)
+
+    _fix_blob_seq_ids(str(tmp_path))
+
+    assert closed == [True]
+
+
 def test_fix_blob_seq_ids_skips_sqlite_when_marker_present(tmp_path):
     """When the marker exists, ``_fix_blob_seq_ids`` does not open sqlite3.
 
@@ -1453,6 +1480,35 @@ def test_quarantine_invalid_hnsw_metadata_keeps_consistent_missing_dimensionalit
             {
                 "dimensionality": None,
                 "total_elements_added": 2,
+                "max_seq_id": None,
+                "id_to_label": {"a": 1, "b": 2},
+                "label_to_id": {1: "a", 2: "b"},
+                "id_to_seq_id": {},
+            },
+            f,
+        )
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert moved == []
+    assert seg.exists()
+
+
+def test_quarantine_invalid_hnsw_metadata_keeps_post_deletion_missing_dimensionality(tmp_path):
+    """A deleted-from segment has total_elements_added > live label count (the
+    counter is monotonic); that dim-None shape is recoverable, not corruption (#1710).
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    seg = palace / "abcd-1234-5678"
+    seg.mkdir()
+    (seg / "data_level0.bin").write_bytes(b"x" * 2048)
+    (seg / "link_lists.bin").write_bytes(b"x" * 128)
+    with open(seg / "index_metadata.pickle", "wb") as f:
+        pickle.dump(
+            {
+                "dimensionality": None,
+                "total_elements_added": 5,
                 "max_seq_id": None,
                 "id_to_label": {"a": 1, "b": 2},
                 "label_to_id": {1: "a", 2: "b"},

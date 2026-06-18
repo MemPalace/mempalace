@@ -24,6 +24,7 @@ from urllib import request as urlrequest
 
 import numpy as np
 
+from ._sidecar import EMBEDDER_SIDECAR_FILENAME, read_embedder_sidecar, write_embedder_sidecar
 from .base import (
     BackendClosedError,
     BackendMismatchError,
@@ -661,6 +662,14 @@ class QdrantCollection(BaseCollection):
     def _marker_exists(self) -> bool:
         return self._backend._marker_exists(self._palace)
 
+    def get_stored_embedder_identity(self):
+        return self._backend._get_embedder_identity(self._palace, self._collection_name)
+
+    def set_embedder_identity(self, identity) -> None:
+        # Sidecar-backed (see QdrantBackend), so this records even on a
+        # brand-new palace whose mismatch marker doesn't exist yet.
+        self._backend._set_embedder_identity(self._palace, self._collection_name, identity)
+
     def _remote_dimension(self) -> Optional[int]:
         try:
             info = self._client.get_collection_info(self._remote_collection)
@@ -1174,6 +1183,23 @@ class QdrantBackend(BaseBackend):
             os.chmod(marker_path, 0o600)
         except (OSError, NotImplementedError):
             pass
+
+    # Embedder identity lives in a sidecar, NOT the backend marker: the marker's
+    # presence signals "palace initialized" (reads raise CollectionNotInitialized
+    # when the marker exists but the remote collection doesn't), so recording
+    # identity at first empty open must not create it. The sidecar is unguarded,
+    # so a brand-new palace can record identity immediately.
+    @staticmethod
+    def _embedder_sidecar_path(palace: PalaceRef) -> Optional[str]:
+        if not palace.local_path:
+            return None
+        return os.path.join(palace.local_path, EMBEDDER_SIDECAR_FILENAME)
+
+    def _get_embedder_identity(self, palace: PalaceRef, collection_name: str):
+        return read_embedder_sidecar(self._embedder_sidecar_path(palace), collection_name)
+
+    def _set_embedder_identity(self, palace: PalaceRef, collection_name: str, identity) -> None:
+        write_embedder_sidecar(self._embedder_sidecar_path(palace), collection_name, identity)
 
     def _client(self, config: _QdrantConfig) -> _QdrantRESTClient:
         if self._closed:

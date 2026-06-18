@@ -9,6 +9,8 @@ tokenizers/numpy) — CI runs only core deps by default.
 """
 
 import sys
+import threading
+import time
 
 import pytest
 
@@ -160,6 +162,171 @@ def test_prefix_is_applied(patched_lazy_load, monkeypatch):
     assert all(t.startswith("task: sentence similarity | query: ") for t in captured)
     # And the raw text is preserved after the prefix.
     assert any("raw text one" in t for t in captured)
+
+
+def test_call_chunks_large_batches(patched_lazy_load, monkeypatch):
+    """A large input must be tokenized and run in bounded sub-batches.
+
+    One unchunked session.run over a repair-scale batch (5000 docs) allocates
+    attention buffers beyond available RAM and the kernel kills the process
+    (#1770) — so __call__ may never see more than _EMBEDDINGGEMMA_BATCH_SIZE
+    docs per forward pass.
+    """
+    batch_sizes = []
+    captured_texts = []
+    original_encode_batch = _FakeTokenizer.encode_batch
+
+    def recording_encode_batch(self, texts):
+        batch_sizes.append(len(texts))
+        captured_texts.extend(texts)
+        return original_encode_batch(self, texts)
+
+    monkeypatch.setattr(_FakeTokenizer, "encode_batch", recording_encode_batch)
+    ef = embedding.EmbeddinggemmaONNX()
+    n = embedding._EMBEDDINGGEMMA_BATCH_SIZE * 2 + 6
+    docs = [f"doc {i}" for i in range(n)]
+    out = ef(docs)
+
+    assert batch_sizes == [
+        embedding._EMBEDDINGGEMMA_BATCH_SIZE,
+        embedding._EMBEDDINGGEMMA_BATCH_SIZE,
+        6,
+    ], f"expected bounded sub-batches, got {batch_sizes}"
+    # Sub-batches must cover the input in order; combined with the per-chunk
+    # extend in __call__ this pins output row order to input order.
+    assert captured_texts == [embedding._EMBEDDINGGEMMA_PREFIX + d for d in docs]
+    arr = np.asarray(out)
+    assert arr.shape == (n, 384), f"chunked outputs must concatenate to (n, 384), got {arr.shape}"
+    assert np.allclose(np.linalg.norm(arr, axis=1), 1.0, atol=1e-5)
+
+
+_B = 32  # mirrors _EMBEDDINGGEMMA_BATCH_SIZE; literal so the cases read plainly
+
+
+@pytest.mark.parametrize(
+    ("n", "expected_batches"),
+    [
+        (1, [1]),
+        (_B, [_B]),
+        (_B + 1, [_B, 1]),
+        (2 * _B, [_B, _B]),
+    ],
+)
+def test_call_chunk_boundaries(patched_lazy_load, monkeypatch, n, expected_batches):
+    """Exact-multiple and off-by-one inputs produce no empty or oversized runs."""
+    assert _B == embedding._EMBEDDINGGEMMA_BATCH_SIZE, "update _B alongside the constant"
+    batch_sizes = []
+    original_encode_batch = _FakeTokenizer.encode_batch
+
+    def recording_encode_batch(self, texts):
+        batch_sizes.append(len(texts))
+        return original_encode_batch(self, texts)
+
+    monkeypatch.setattr(_FakeTokenizer, "encode_batch", recording_encode_batch)
+    ef = embedding.EmbeddinggemmaONNX()
+    out = ef([f"doc {i}" for i in range(n)])
+    assert batch_sizes == expected_batches
+    assert len(out) == n
+
+
+def test_custom_batch_size_is_honored(patched_lazy_load, monkeypatch):
+    """The constructor knob must drive the sub-batch split."""
+    batch_sizes = []
+    original_encode_batch = _FakeTokenizer.encode_batch
+
+    def recording_encode_batch(self, texts):
+        batch_sizes.append(len(texts))
+        return original_encode_batch(self, texts)
+
+    monkeypatch.setattr(_FakeTokenizer, "encode_batch", recording_encode_batch)
+    ef = embedding.EmbeddinggemmaONNX(batch_size=10)
+    out = ef([f"doc {i}" for i in range(24)])
+    assert batch_sizes == [10, 10, 4]
+    assert len(out) == 24
+
+
+def test_batch_size_below_one_is_rejected():
+    """A zero or negative batch size would loop forever or embed nothing."""
+    with pytest.raises(ValueError, match="batch_size"):
+        embedding.EmbeddinggemmaONNX(batch_size=0)
+    with pytest.raises(ValueError, match="batch_size"):
+        embedding.EmbeddinggemmaONNX(batch_size=-3)
+
+
+def test_call_empty_input_returns_empty(patched_lazy_load):
+    """Zero docs must yield zero embeddings without loading the model."""
+    ef = embedding.EmbeddinggemmaONNX()
+    assert ef([]) == []
+    assert ef(None) == []
+    assert patched_lazy_load["hf_hub_download"] == 0, "empty input must not trigger the download"
+
+
+def test_call_bare_string_is_wrapped(patched_lazy_load):
+    """A single string is one document, not a sequence of characters."""
+    ef = embedding.EmbeddinggemmaONNX()
+    out = ef("standalone document")
+    assert np.asarray(out).shape == (1, 384)
+
+
+def test_concurrent_first_calls_load_model_once(patched_lazy_load, monkeypatch):
+    """Cold concurrent calls must build exactly one session.
+
+    Instances are shared across threads via _EF_CACHE; without the load
+    lock, two cold callers would transiently hold two full model sessions.
+    """
+    import huggingface_hub
+
+    fixture_download = huggingface_hub.hf_hub_download
+
+    def slow_download(*args, **kwargs):
+        time.sleep(0.05)  # widen the race window the lock must close
+        return fixture_download(*args, **kwargs)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", slow_download)
+
+    ef = embedding.EmbeddinggemmaONNX()
+    barrier = threading.Barrier(2)
+    results = [None, None]
+
+    def worker(slot):
+        barrier.wait(timeout=5)
+        results[slot] = ef([f"doc {slot}"])
+
+    threads = [threading.Thread(target=worker, args=(slot,)) for slot in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert patched_lazy_load["InferenceSession"] == 1
+    assert all(r is not None and len(r) == 1 for r in results)
+
+
+def test_concurrent_get_embedding_function_single_instance(monkeypatch):
+    """Concurrent cache misses must converge on one shared EF instance.
+
+    The instance-level load lock is not enough on its own: if the factory's
+    check-then-construct is unsynchronized, each thread keeps its own
+    instance and each one later loads its own copy of the model.
+    """
+    monkeypatch.setattr(
+        embedding, "_resolve_providers", lambda device: (["CPUExecutionProvider"], "cpu")
+    )
+    barrier = threading.Barrier(2)
+    instances = [None, None]
+
+    def worker(slot):
+        barrier.wait(timeout=5)
+        instances[slot] = embedding.get_embedding_function(device="cpu", model="embeddinggemma")
+
+    threads = [threading.Thread(target=worker, args=(slot,)) for slot in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert instances[0] is not None, "worker thread did not complete"
+    assert instances[0] is instances[1], "factory must hand every thread the same EF"
 
 
 def test_get_embedding_function_dispatches_to_embeddinggemma(monkeypatch):

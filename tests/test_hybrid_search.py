@@ -114,11 +114,13 @@ class TestClosetMetadata:
             palace,
             drawer_id="D1",
             source_file="fixture_D1.md",
-            topics=["JWT auth tokens", "24h expiry", "authentication"],
+            topics=["JWT auth tokens", "session expiry", "authentication service"],
         )
-        result = search_memories("JWT authentication", palace, n_results=2)
+        result = search_memories("JWT auth tokens expiry", palace, n_results=2)
         top = result["results"][0]
         assert top["source_file"] == "fixture_D1.md"
+        assert top["matched_via"] == "drawer+closet"
+        assert top["closet_boost"] > 0
         assert "closet_preview" in top
 
     def test_drawer_only_hits_have_no_closet_preview(self, tmp_path):

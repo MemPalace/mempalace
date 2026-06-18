@@ -322,6 +322,36 @@ class SQLiteExactCollection(BaseCollection):
         row = cur.execute("SELECT value FROM meta WHERE key = 'fts5_available'").fetchone()
         return bool(row and row[0] == "1")
 
+    def _embedder_meta_key(self) -> str:
+        return f"embedder_model:{self._collection_name}"
+
+    def get_stored_embedder_identity(self):
+        from .base import EmbedderIdentity
+
+        with self._cursor() as cur:
+            try:
+                cid = self._collection_id(cur)
+            except CollectionNotInitializedError:
+                return None
+            row = cur.execute(
+                "SELECT value FROM meta WHERE key = ?",
+                (self._embedder_meta_key(),),
+            ).fetchone()
+            if not row or not row[0]:
+                return None
+            dim = self._collection_dimension(cur, cid) or 0
+            return EmbedderIdentity(model_name=str(row[0]), dimension=int(dim))
+
+    def set_embedder_identity(self, identity) -> None:
+        if not identity or not identity.model_name:
+            return
+        with self._cursor() as cur:
+            cur.execute(
+                "INSERT INTO meta(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (self._embedder_meta_key(), str(identity.model_name)),
+            )
+
     def _replace_fts(self, cur, collection_id: int, doc_id: str, document: str) -> None:
         if not self._fts_available(cur):
             return
@@ -710,6 +740,63 @@ class SQLiteExactCollection(BaseCollection):
             return HealthStatus.unhealthy("collection closed")
         return HealthStatus.healthy()
 
+    def maintenance_state(self) -> dict:
+        try:
+            rows = self.count()
+        except Exception:
+            rows = 0
+        # vector_index is null by design — exact cosine over every row, no ANN.
+        state = {"row_count": rows, "vector_index": None}
+        try:
+            with self._cursor() as cur:
+                page_count = cur.execute("PRAGMA page_count").fetchone()
+                freelist = cur.execute("PRAGMA freelist_count").fetchone()
+            state["page_count"] = int(page_count[0]) if page_count else 0
+            state["freelist_pages"] = int(freelist[0]) if freelist else 0
+        except Exception:
+            pass
+        return state
+
+    def run_maintenance(self, kind: str):
+        from .base import MaintenanceResult, UnsupportedMaintenanceKindError
+
+        if kind not in SQLiteExactBackend.maintenance_kinds:
+            raise UnsupportedMaintenanceKindError(
+                f"sqlite_exact does not support maintenance kind {kind!r}"
+            )
+        if kind == "analyze":
+            # Refresh planner stats. Concurrent runs serialize on the handle lock.
+            with self._cursor() as cur:
+                cur.execute("ANALYZE")
+            return MaintenanceResult(kind="analyze", status="ran")
+
+        # compact → VACUUM. It cannot run inside a transaction, so flip the
+        # connection to autocommit for the duration. The handle lock serializes
+        # concurrent runs in-process; SQLite's own write lock serializes across
+        # processes.
+        before = self.maintenance_state()
+        with self._handle.lock:
+            self._ensure_open()
+            conn = self._handle.conn
+            prev_isolation = conn.isolation_level
+            try:
+                conn.commit()
+                conn.isolation_level = None
+                conn.execute("VACUUM")
+            finally:
+                conn.isolation_level = prev_isolation
+        after = self.maintenance_state()
+        reclaimed = max(0, before.get("page_count", 0) - after.get("page_count", 0))
+        return MaintenanceResult(
+            kind="compact",
+            status="ran",
+            stats={
+                "pages_before": before.get("page_count", 0),
+                "pages_after": after.get("page_count", 0),
+                "pages_reclaimed": reclaimed,
+            },
+        )
+
 
 class SQLiteExactBackend(BaseBackend):
     name = "sqlite_exact"
@@ -724,6 +811,9 @@ class SQLiteExactBackend(BaseBackend):
             "local_mode",
         }
     )
+    # "reindex" is intentionally omitted: sqlite_exact does exact cosine over
+    # every row (no ANN index to build), so it has no analogue for it.
+    maintenance_kinds = frozenset({"analyze", "compact"})
 
     def __init__(self):
         self._clients: dict[str, _SQLiteExactHandle] = {}
@@ -746,19 +836,31 @@ class SQLiteExactBackend(BaseBackend):
                 os.chmod(palace_path, 0o700)
             except (OSError, NotImplementedError):
                 pass
+        # Hold the registry lock across cache-check + connect + schema init:
+        # two threads first-opening the same palace must not each create a
+        # connection (the loser leaked unclosed and outlived close()) nor run
+        # _init_schema concurrently on a fresh file, which surfaces transient
+        # "database is locked" errors before WAL mode is established. Only
+        # first-open pays for the I/O under the lock; cache hits are a dict
+        # probe.
         with self._clients_lock:
+            if self._closed:
+                raise BackendClosedError("SQLiteExactBackend has been closed")
             cached = self._clients.get(palace_path)
             if cached is not None and not cached.closed:
                 return cached
-        conn = sqlite3.connect(db_path, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        lock = threading.RLock()
-        handle = _SQLiteExactHandle(conn, lock)
-        with handle.lock:
-            self._init_schema(conn)
-        with self._clients_lock:
+            conn = sqlite3.connect(db_path, check_same_thread=False)
+            try:
+                conn.row_factory = sqlite3.Row
+                lock = threading.RLock()
+                handle = _SQLiteExactHandle(conn, lock)
+                with handle.lock:
+                    self._init_schema(conn)
+            except BaseException:
+                conn.close()
+                raise
             self._clients[palace_path] = handle
-        return handle
+            return handle
 
     def _init_schema(self, conn: sqlite3.Connection) -> None:
         conn.executescript(
@@ -889,14 +991,19 @@ class SQLiteExactBackend(BaseBackend):
                 cached.conn.close()
 
     def close(self) -> None:
+        # Flip _closed under the registry lock so a concurrent _connect either
+        # sees the flag or finishes before the handle snapshot is taken; a
+        # connection can no longer slip into the registry after close().
+        # Unlocked readers of _closed elsewhere are advisory fast-fails; the
+        # locked recheck in _connect is the authoritative gate.
         with self._clients_lock:
             handles = list(self._clients.values())
             self._clients.clear()
+            self._closed = True
         for handle in handles:
             with handle.lock:
                 handle.closed = True
                 handle.conn.close()
-        self._closed = True
 
     def health(self, palace: Optional[PalaceRef] = None) -> HealthStatus:
         if self._closed:

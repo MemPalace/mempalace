@@ -1,7 +1,10 @@
 import math
+import sqlite3
+import threading
 
 import pytest
 
+import mempalace.backends.sqlite_exact as sqlite_exact_module
 from mempalace.backends import (
     BackendMismatchError,
     CollectionNotInitializedError,
@@ -375,3 +378,58 @@ def test_search_vector_disabled_fallback_is_chroma_only(tmp_path, monkeypatch):
 
     assert result["unsupported_capability"] == "chroma_hnsw_fallback"
     assert result["backend"] == "sqlite_exact"
+
+
+def test_concurrent_first_open_single_connection_no_leak(tmp_path, monkeypatch):
+    """Two threads first-opening the same palace concurrently must share one
+    handle and one sqlite connection.
+
+    The barrier inside the patched ``sqlite3.connect`` releases immediately
+    only when both threads pass the cache-miss check together: the broken
+    interleaving, which also ran ``_init_schema`` concurrently on a fresh
+    file and surfaced "database is locked". With creation serialized under
+    ``_clients_lock`` the second thread waits on the lock instead, the
+    winner's barrier times out, and exactly one connection is ever created.
+    """
+    created = []
+    barrier = threading.Barrier(2)
+    real_connect = sqlite3.connect
+
+    def racing_connect(*args, **kwargs):
+        try:
+            barrier.wait(timeout=1.0)
+        except threading.BrokenBarrierError:
+            pass
+        conn = real_connect(*args, **kwargs)
+        created.append(conn)
+        return conn
+
+    monkeypatch.setattr(sqlite_exact_module.sqlite3, "connect", racing_connect)
+
+    backend = SQLiteExactBackend()
+    palace = PalaceRef(id=str(tmp_path), local_path=str(tmp_path))
+    results = [None, None]
+    errors = []
+
+    def open_collection(i):
+        try:
+            results[i] = backend.get_collection(
+                palace=palace, collection_name="drawers", create=True
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=open_collection, args=(i,), daemon=True) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert not any(t.is_alive() for t in threads)
+    assert errors == []
+    assert len(created) == 1
+    assert results[0]._handle is results[1]._handle
+
+    backend.close()
+    with pytest.raises(sqlite3.ProgrammingError):
+        created[0].execute("SELECT 1")

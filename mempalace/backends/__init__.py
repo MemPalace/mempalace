@@ -27,11 +27,13 @@ from .base import (
     HealthStatus,
     LexicalHit,
     LexicalResult,
+    MaintenanceResult,
     PalaceNotFoundError,
     PalaceRef,
     QueryResult,
     UnsupportedCapabilityError,
     UnsupportedFilterError,
+    UnsupportedMaintenanceKindError,
 )
 from .chroma import ChromaBackend, ChromaCollection
 from .pgvector import PgVectorBackend, PgVectorCollection
@@ -64,6 +66,7 @@ __all__ = [
     "HealthStatus",
     "LexicalHit",
     "LexicalResult",
+    "MaintenanceResult",
     "PalaceNotFoundError",
     "PalaceRef",
     "PgVectorBackend",
@@ -75,6 +78,7 @@ __all__ = [
     "SQLiteExactCollection",
     "UnsupportedCapabilityError",
     "UnsupportedFilterError",
+    "UnsupportedMaintenanceKindError",
     "available_backends",
     "detect_backend_for_path",
     "detect_backends_for_path",

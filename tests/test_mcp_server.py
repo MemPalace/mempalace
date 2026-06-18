@@ -9,6 +9,7 @@ via monkeypatch to avoid touching real data.
 from datetime import datetime
 import json
 import os
+from types import SimpleNamespace
 import subprocess
 import sys
 from unittest.mock import MagicMock
@@ -537,6 +538,20 @@ class TestHandleRequest:
         assert "mempalace_add_drawer" in names
         assert "mempalace_kg_add" in names
 
+    def test_no_tool_schema_uses_top_level_combinator(self):
+        """Anthropic's Messages API rejects a tool whose input schema has a
+        top-level anyOf/oneOf/allOf and drops the entire tools array with a
+        400, killing the session (#1711). Cross-tool constraints must be
+        enforced at dispatch instead.
+        """
+        from mempalace.mcp_server import handle_request
+
+        resp = handle_request({"method": "tools/list", "id": 2, "params": {}})
+        for tool in resp["result"]["tools"]:
+            schema = tool["inputSchema"]
+            for keyword in ("anyOf", "oneOf", "allOf"):
+                assert keyword not in schema, f"{tool['name']} schema has top-level {keyword}"
+
     def test_null_arguments_does_not_hang(self, monkeypatch, config, palace_path, seeded_kg):
         """Sending arguments: null should return a result, not hang (#394)."""
         _patch_mcp_server(monkeypatch, config, seeded_kg)
@@ -1054,6 +1069,38 @@ class TestSearchTool:
         assert "results" in result
         assert result.get("index_recovered") is True
 
+    def test_search_retry_preserves_collection_name(self, monkeypatch, config, kg):
+        """Retry path must query the same configured collection both times."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(
+            mcp_server,
+            "_config",
+            SimpleNamespace(
+                palace_path=config.palace_path,
+                collection_name="custom_drawers",
+            ),
+        )
+        seen_collection_names = []
+
+        def fake_search(*args, **kwargs):
+            seen_collection_names.append(kwargs.get("collection_name"))
+            if len(seen_collection_names) == 1:
+                return {
+                    "error": "Search error: Error executing plan: Internal error: Error finding id"
+                }
+            return {"results": [{"text": "ok", "wing": "w", "room": "r"}]}
+
+        monkeypatch.setattr(mcp_server, "search_memories", fake_search)
+        monkeypatch.setattr(mcp_server, "_force_chroma_cache_reset", lambda: None)
+        monkeypatch.setattr(mcp_server.time, "sleep", lambda _: None)
+
+        result = mcp_server.tool_search(query="anything", wing="wing_api")
+
+        assert "results" in result
+        assert seen_collection_names == ["custom_drawers", "custom_drawers"]
+
     def test_search_does_not_retry_on_non_transient_error(self, monkeypatch, config, kg):
         """Validation / unrelated errors must not trigger the retry path."""
         _patch_mcp_server(monkeypatch, config, kg)
@@ -1191,6 +1238,63 @@ class TestWriteTools:
         result2 = tool_add_drawer(wing="w", room="r", content=content)
         assert result2["success"] is True
         assert result2["reason"] == "already_exists"
+
+    def test_add_drawer_returns_failure_when_idempotency_precheck_raises(
+        self, monkeypatch, config, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        mock_col = MagicMock()
+        mock_col.get.side_effect = RuntimeError("precheck boom")
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: mock_col)
+
+        result = mcp_server.tool_add_drawer("w", "r", "content")
+
+        assert result["success"] is False
+        assert "Idempotency check failed before write" in result["error"]
+        assert "precheck boom" in result["error"]
+
+    def test_add_drawer_does_not_upsert_when_idempotency_precheck_raises(
+        self, monkeypatch, config, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        mock_col = MagicMock()
+        mock_col.get.side_effect = RuntimeError("precheck boom")
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: mock_col)
+
+        result = mcp_server.tool_add_drawer("w", "r", "content")
+
+        assert result["success"] is False
+        mock_col.upsert.assert_not_called()
+
+    def test_add_drawer_treats_dict_like_precheck_hit_as_already_exists(
+        self, monkeypatch, config, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        mock_col = MagicMock()
+        mock_col.get.return_value = {"ids": ["existing-drawer"]}
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: mock_col)
+
+        result = mcp_server.tool_add_drawer("w", "r", "content")
+
+        assert result["success"] is True
+        assert result["reason"] == "already_exists"
+        mock_col.upsert.assert_not_called()
+
+    def test_get_result_ids_normalizes_none_to_empty_list(self):
+        from mempalace import mcp_server
+
+        class DictLikeResult:
+            def get(self, key, default=None):
+                return None
+
+        assert mcp_server._get_result_ids({"ids": None}) == []
+        assert mcp_server._get_result_ids(DictLikeResult()) == []
 
     def test_add_drawer_fails_when_readback_misses(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -1512,6 +1616,113 @@ class TestWriteTools:
 
         assert result == {"error": msg}
 
+    # ── hallway MCP tools (mirror the tunnel pattern) ──
+
+    def _seed_hallways(self, monkeypatch, tmp_path):
+        """Point hallways resolvers at a tmp file and seed two records."""
+        from mempalace import hallways
+
+        hallway_file = tmp_path / "hallways.json"
+        monkeypatch.setattr(hallways, "_get_hallway_file", lambda *a, **kw: str(hallway_file))
+        monkeypatch.setattr(
+            hallways,
+            "_legacy_hallway_file",
+            lambda: str(tmp_path / "legacy-hallways.json"),
+        )
+        seeded = [
+            {
+                "id": "hallway_wing_a_X_Y_aaaa",
+                "wing": "wing_a",
+                "entity_a": "X",
+                "entity_b": "Y",
+                "co_occurrence_count": 3,
+                "rooms": ["room1"],
+            },
+            {
+                "id": "hallway_wing_b_X_Z_bbbb",
+                "wing": "wing_b",
+                "entity_a": "X",
+                "entity_b": "Z",
+                "co_occurrence_count": 1,
+                "rooms": ["room2"],
+            },
+        ]
+        hallways._save_hallways(seeded)
+        return seeded
+
+    def test_tool_list_hallways_returns_all_without_filter(self, monkeypatch, tmp_path):
+        """tool_list_hallways with no wing returns every record."""
+        from mempalace import mcp_server
+
+        seeded = self._seed_hallways(monkeypatch, tmp_path)
+        result = mcp_server.tool_list_hallways()
+        assert isinstance(result, list)
+        assert len(result) == len(seeded)
+        ids = {h["id"] for h in result}
+        assert ids == {h["id"] for h in seeded}
+
+    def test_tool_list_hallways_filters_by_wing(self, monkeypatch, tmp_path):
+        """tool_list_hallways with wing returns only that wing's records."""
+        from mempalace import mcp_server
+
+        self._seed_hallways(monkeypatch, tmp_path)
+        result = mcp_server.tool_list_hallways(wing="wing_a")
+        assert len(result) == 1
+        assert result[0]["wing"] == "wing_a"
+
+    def test_tool_list_hallways_rejects_invalid_wing_name(self, monkeypatch, tmp_path):
+        """Invalid wing names go through _sanitize_optional_name and return a
+        structured error rather than crashing — mirrors tool_list_tunnels."""
+        from mempalace import mcp_server
+
+        self._seed_hallways(monkeypatch, tmp_path)
+        # Forward-slash is not a valid name character per sanitize_name.
+        result = mcp_server.tool_list_hallways(wing="wing/with/slashes")
+        assert isinstance(result, dict)
+        assert "error" in result
+
+    def test_tool_delete_hallway_removes_existing_record(self, monkeypatch, tmp_path):
+        """tool_delete_hallway removes the record and returns {deleted: True}."""
+        from mempalace import mcp_server
+
+        seeded = self._seed_hallways(monkeypatch, tmp_path)
+        target_id = seeded[0]["id"]
+        result = mcp_server.tool_delete_hallway(hallway_id=target_id)
+        assert result == {"deleted": True}
+        remaining = mcp_server.tool_list_hallways()
+        assert target_id not in {h["id"] for h in remaining}
+
+    def test_tool_delete_hallway_unknown_id_returns_false(self, monkeypatch, tmp_path):
+        """Deleting an ID that doesn't exist returns {deleted: False} without error."""
+        from mempalace import mcp_server
+
+        self._seed_hallways(monkeypatch, tmp_path)
+        result = mcp_server.tool_delete_hallway(hallway_id="hallway_does_not_exist")
+        assert result == {"deleted": False}
+
+    def test_tool_delete_hallway_requires_string_id(self):
+        """Missing or non-string hallway_id surfaces a structured error."""
+        from mempalace import mcp_server
+
+        assert mcp_server.tool_delete_hallway(hallway_id="") == {"error": "hallway_id is required"}
+        assert mcp_server.tool_delete_hallway(hallway_id=None) == {
+            "error": "hallway_id is required"
+        }
+
+    def test_hallway_tools_registered_in_tools_registry(self):
+        """Both new tools must appear in the public TOOLS registry so MCP clients can dispatch them."""
+        from mempalace import mcp_server
+
+        assert "mempalace_list_hallways" in mcp_server.TOOLS
+        assert "mempalace_delete_hallway" in mcp_server.TOOLS
+        assert (
+            mcp_server.TOOLS["mempalace_list_hallways"]["handler"] is mcp_server.tool_list_hallways
+        )
+        assert (
+            mcp_server.TOOLS["mempalace_delete_hallway"]["handler"]
+            is mcp_server.tool_delete_hallway
+        )
+
     def test_add_drawer_normal_content_single_drawer(self, monkeypatch, config, palace_path, kg):
         """Regression catch: content below CHUNK_SIZE produces exactly
         one drawer with ``chunks == 1``. Pre-#1539 contract preserved."""
@@ -1634,35 +1845,88 @@ class TestWriteTools:
         assert result["chunks"] == 1
         assert "chunk_ids" not in result
 
-    def test_add_drawer_chunked_logical_id_not_fetchable_directly(
-        self, monkeypatch, config, palace_path, kg
-    ):
-        """Documented contract on the chunked path: ``tool_get_drawer``
-        and ``tool_delete_drawer`` against the returned logical
-        ``drawer_id`` report ``not found`` because no row is stored
-        under that id. Callers must iterate ``chunk_ids`` or query by
-        ``parent_drawer_id`` metadata."""
-        _patch_mcp_server(monkeypatch, config, kg)
-        _client, _col = _get_collection(palace_path, create=True)
-        del _client
-        from mempalace.mcp_server import tool_add_drawer, tool_delete_drawer, tool_get_drawer
 
-        result = tool_add_drawer(wing="w", room="r", content="P" * 4000)
-        assert result["success"] is True and result["chunks"] > 1
+def test_add_drawer_chunked_logical_id_fetches_deletes_and_lists_as_one(
+    monkeypatch, config, palace_path, kg
+):
+    """Chunk rows are internal storage; MCP tools operate on the logical id."""
+    _patch_mcp_server(monkeypatch, config, kg)
+    _client, _col = _get_collection(palace_path, create=True)
+    del _client
 
-        # tool_get_drawer against logical id: not found.
-        got_logical = tool_get_drawer(result["drawer_id"])
-        assert "error" in got_logical and "not found" in got_logical["error"].lower()
+    from mempalace.mcp_server import (
+        tool_add_drawer,
+        tool_delete_drawer,
+        tool_get_drawer,
+        tool_list_drawers,
+    )
 
-        # tool_get_drawer against the first chunk id: found, full content slice.
-        got_chunk = tool_get_drawer(result["chunk_ids"][0])
-        assert got_chunk["content"] == "P" * config.chunk_size
-        assert got_chunk["metadata"]["parent_drawer_id"] == result["drawer_id"]
+    result = tool_add_drawer(wing="w", room="r", content="P" * 4000)
 
-        # tool_delete_drawer against logical id: also not found.
-        deleted_logical = tool_delete_drawer(result["drawer_id"])
-        assert deleted_logical["success"] is False
-        assert "not found" in deleted_logical["error"].lower()
+    assert result["success"] is True
+    assert result["chunks"] > 1
+
+    logical_id = result["drawer_id"]
+
+    fetched = tool_get_drawer(logical_id)
+    assert fetched["drawer_id"] == logical_id
+    assert fetched["content"] == "P" * 4000
+    assert fetched["chunks"] == result["chunks"]
+    assert fetched["chunk_ids"] == result["chunk_ids"]
+
+    listed = tool_list_drawers(wing="w", room="r")
+    assert listed["total"] == 1
+    assert listed["count"] == 1
+    assert listed["drawers"][0]["drawer_id"] == logical_id
+    assert listed["drawers"][0]["chunks"] == result["chunks"]
+
+    deleted = tool_delete_drawer(logical_id)
+    assert deleted["success"] is True
+    assert deleted["chunks_deleted"] == result["chunks"]
+
+    missing = tool_get_drawer(logical_id)
+    assert "error" in missing
+    assert "not found" in missing["error"].lower()
+
+
+def test_update_drawer_chunked_logical_id_rewrites_group(monkeypatch, config, palace_path, kg):
+    """Updating the returned logical id rewrites the underlying chunk group."""
+    _patch_mcp_server(monkeypatch, config, kg)
+    _client, _col = _get_collection(palace_path, create=True)
+    del _client
+
+    from mempalace.mcp_server import (
+        tool_add_drawer,
+        tool_get_drawer,
+        tool_list_drawers,
+        tool_update_drawer,
+    )
+
+    result = tool_add_drawer(wing="old", room="old_room", content="A" * 2600)
+    assert result["success"] is True
+    assert result["chunks"] > 1
+
+    logical_id = result["drawer_id"]
+
+    updated = tool_update_drawer(
+        logical_id,
+        content="B" * 1800,
+        wing="new",
+        room="new_room",
+    )
+
+    assert updated["success"] is True
+    assert updated["drawer_id"] == logical_id
+
+    fetched = tool_get_drawer(logical_id)
+    assert fetched["drawer_id"] == logical_id
+    assert fetched["content"] == "B" * 1800
+    assert fetched["wing"] == "new"
+    assert fetched["room"] == "new_room"
+
+    listed = tool_list_drawers(wing="new", room="new_room")
+    assert listed["total"] == 1
+    assert listed["drawers"][0]["drawer_id"] == logical_id
 
 
 # ── KG Tools ────────────────────────────────────────────────────────────
@@ -2338,10 +2602,20 @@ class TestCacheInvalidation:
         if os.path.isfile(db_file):
             os.remove(db_file)
 
+        make_client_calls = []
+
+        def fail_if_make_client_called(path):
+            make_client_calls.append(path)
+            raise AssertionError("_get_collection(create=False) should not open missing Chroma DB")
+
+        monkeypatch.setattr(mcp_server.ChromaBackend, "make_client", fail_if_make_client_called)
+
         # Cache should be invalidated; _get_collection returns None
         # because the backend can't open a missing DB without create=True
-        mcp_server._get_collection()
+        assert mcp_server._get_collection() is None
         # The key assertion: the old cached collection was dropped
+        assert make_client_calls == []
+        assert mcp_server._collection_cache is None
         assert mcp_server._palace_db_inode == 0
         assert mcp_server._palace_db_mtime == 0.0
 

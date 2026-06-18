@@ -15,7 +15,13 @@ with patch.dict("sys.modules", {"chromadb": MagicMock()}):
 
 
 def _use_tmp_hallway_file(monkeypatch, tmp_path):
-    monkeypatch.setattr(hallways_mod, "_HALLWAY_FILE", str(tmp_path / "hallways.json"))
+    hallway_file = tmp_path / "hallways.json"
+    monkeypatch.setattr(hallways_mod, "_get_hallway_file", lambda *a, **kw: str(hallway_file))
+    monkeypatch.setattr(
+        hallways_mod,
+        "_legacy_hallway_file",
+        lambda: str(tmp_path / "legacy-hallways.json"),
+    )
 
 
 def _collection_that_rejects_where_get(drawers):

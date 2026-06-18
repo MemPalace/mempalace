@@ -8,8 +8,8 @@
     {
       "name": "mempalace",
       "source": "./.claude-plugin",
-      "description": "AI memory system — mine projects and conversations into a searchable palace. 19 MCP tools, auto-save hooks, guided setup.",
-      "version": "3.4.0",
+      "description": "AI memory system — mine projects and conversations into a searchable palace. 33 MCP tools, auto-save hooks, guided setup.",
+      "version": "3.4.1",
       "author": {
         "name": "milla-jovovich"
       }

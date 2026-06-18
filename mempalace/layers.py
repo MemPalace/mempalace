@@ -23,7 +23,12 @@ from collections import defaultdict
 
 from .config import MempalaceConfig
 from .palace import get_collection as _get_collection
-from .searcher import _first_or_empty, build_where_filter
+from .searcher import (
+    _distance_to_similarity,
+    _first_or_empty,
+    _metric_for_collection,
+    build_where_filter,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -283,11 +288,12 @@ class Layer3:
         if not docs:
             return "No results found."
 
+        metric = _metric_for_collection(col)
         lines = [f'## L3 — SEARCH RESULTS for "{query}"']
         for i, (doc, meta, dist) in enumerate(zip(docs, metas, dists), 1):
             meta = meta or {}
             doc = doc or ""
-            similarity = round(max(0.0, 1 - dist), 3)
+            similarity = round(_distance_to_similarity(dist, metric), 3)
             wing_name = meta.get("wing", "?")
             room_name = meta.get("room", "?")
             source = Path(meta.get("source_file", "")).name if meta.get("source_file") else ""
@@ -327,6 +333,7 @@ class Layer3:
         except Exception:
             return []
 
+        metric = _metric_for_collection(col)
         hits = []
         for doc, meta, dist in zip(
             _first_or_empty(results, "documents"),
@@ -346,7 +353,7 @@ class Layer3:
                     "wing": meta.get("wing", "unknown"),
                     "room": meta.get("room", "unknown"),
                     "source_file": Path(meta.get("source_file", "?")).name,
-                    "similarity": round(1 - dist, 3),
+                    "similarity": round(_distance_to_similarity(dist, metric), 3),
                     "metadata": meta,
                 }
             )

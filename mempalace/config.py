@@ -198,6 +198,12 @@ DEFAULT_PALACE_PATH = os.path.expanduser("~/.mempalace/palace")
 DEFAULT_COLLECTION_NAME = "mempalace_drawers"
 DEFAULT_BACKEND = "chroma"
 
+# How many timestamped palace backups to retain before the oldest are
+# pruned. Applies to the accumulating backups written by ``mempalace
+# migrate`` and ``mempalace repair max-seq-id`` — see
+# ``MempalaceConfig.max_backups``.
+DEFAULT_MAX_BACKUPS = 10
+
 
 @lru_cache(maxsize=1)
 def get_configured_collection_name() -> str:
@@ -325,6 +331,18 @@ class MempalaceConfig:
     def tunnel_file(self):
         """Path to the tunnel file, sibling of palace_path."""
         return os.path.join(os.path.dirname(self.palace_path), "tunnels.json")
+
+    @property
+    def hallway_file(self):
+        """Path to the hallway file, sibling of palace_path.
+
+        Mirrors ``tunnel_file`` so within-wing hallway state is scoped to the
+        configured palace and survives palace rebuilds (it does not live in
+        ChromaDB which can be recreated). Prior to this property the path was
+        hardcoded under ``~/.mempalace/hallways.json`` and multiple palaces on
+        one host silently shared one file (see ``hallways._legacy_hallway_file``).
+        """
+        return os.path.join(os.path.dirname(self.palace_path), "hallways.json")
 
     @property
     def collection_name(self):
@@ -690,6 +708,36 @@ class MempalaceConfig:
         except (TypeError, ValueError):
             parsed = 1
         return max(1, parsed)
+
+    @property
+    def max_backups(self) -> int:
+        """Number of timestamped palace backups to retain before pruning.
+
+        Applies to the accumulating, timestamped backups created by
+        ``mempalace migrate`` (``<palace>.pre-migrate.<timestamp>``) and
+        ``mempalace repair max-seq-id``
+        (``chroma.sqlite3.max-seq-id-backup-<timestamp>``). Each of those
+        commands writes a fresh full-size copy every run and historically
+        never deleted the old ones, so on a machine that mines or repairs on
+        a schedule the backup set could silently grow until it filled the
+        disk. After each backup is written, copies beyond this count (oldest
+        first) are removed.
+
+        Reads ``MEMPALACE_MAX_BACKUPS`` env first, then ``max_backups`` in
+        ``config.json``, then the default of ``10``. A value of ``0`` disables
+        pruning and keeps every backup (use when an external retention policy
+        manages cleanup). Negative or non-numeric values fall back to the
+        default rather than crashing migrate/repair.
+        """
+        env_val = os.environ.get("MEMPALACE_MAX_BACKUPS")
+        if env_val is not None:
+            coerced = self._try_coerce_int(env_val, minimum=0)
+            if coerced is not None:
+                return coerced
+        coerced = self._try_coerce_int(
+            self._file_config.get("max_backups", DEFAULT_MAX_BACKUPS), minimum=0
+        )
+        return DEFAULT_MAX_BACKUPS if coerced is None else coerced
 
     @property
     def hook_silent_save(self):

@@ -70,13 +70,109 @@ _EXPLICIT_BACKEND_ENV = "MEMPALACE_BACKEND_EXPLICIT"
 NORMALIZE_VERSION = 2
 
 
+# (palace_id, collection_name, model_name) tuples already validated this
+# process, so the identity check (one metadata read) runs at most once per
+# collection per run — keeps the hot get_collection path cheap.
+_VALIDATED_IDENTITY: set = set()
+
+
+def _enforce_embedder_identity(collection, palace_path, collection_name, *, create) -> None:
+    """Check (and, for a brand-new collection, record) embedder identity (RFC 001).
+
+    Check at open so a model swap fails fast — before any query silently
+    returns degraded results. Record only when the collection is brand-new and
+    empty: recording the *current* model on a legacy palace that already holds
+    vectors from an unknown model would mislabel it, so populated-but-unrecorded
+    collections warn instead and are resolved with
+    ``mempalace palace set-embedder``.
+
+    Bookkeeping must never break memory operations: only the deliberate
+    identity/dimension mismatch propagates; every other error is swallowed.
+    """
+    import warnings
+
+    from .backends.base import (
+        DimensionMismatchError,
+        EmbedderIdentity,
+        EmbedderIdentityMismatchError,
+        EmbedderIdentityUnknownWarning,
+        check_embedder_identity,
+    )
+    from .embedding import current_model_name
+
+    # A server_embedder backend embeds with its own model and ignores the
+    # injected/core embedder, so its effective identity — not the configured
+    # model — is what must be checked and recorded. Fall back to the configured
+    # model name for the normal (core-embedder) case.
+    current: Optional[EmbedderIdentity] = None
+    try:
+        effective = collection.effective_embedder_identity()
+    except Exception:
+        effective = None
+    if effective is not None and getattr(effective, "model_name", ""):
+        current = effective
+    else:
+        try:
+            model_name = current_model_name()
+        except Exception:
+            return
+        if not model_name:
+            return  # nameless embedder — cannot enforce identity
+        current = EmbedderIdentity(model_name=model_name, dimension=0)
+
+    model_name = current.model_name
+    key = (str(palace_path), str(collection_name), model_name)
+    if key in _VALIDATED_IDENTITY:
+        return
+
+    try:
+        stored = collection.get_stored_embedder_identity()
+    except Exception:
+        logger.debug("embedder-identity read failed for %s", collection_name, exc_info=True)
+        return
+    try:
+        state = check_embedder_identity(stored, current)
+    except (EmbedderIdentityMismatchError, DimensionMismatchError):
+        raise  # deliberate, user-facing — the whole point of the contract
+    except Exception:
+        return
+
+    if state == "unknown" and stored is None:
+        try:
+            count = collection.count()
+        except Exception:
+            count = None
+        if count == 0:
+            if create:
+                try:
+                    collection.set_embedder_identity(current)
+                except Exception:
+                    logger.debug("embedder-identity record failed", exc_info=True)
+        elif count:
+            warnings.warn(
+                f"palace collection {collection_name!r} has no recorded embedder "
+                f"identity; assuming the current model {model_name!r}. Run "
+                "`mempalace palace set-embedder --model <name>` to record it.",
+                EmbedderIdentityUnknownWarning,
+                stacklevel=2,
+            )
+
+    _VALIDATED_IDENTITY.add(key)
+
+
 def get_collection(
     palace_path: str,
     collection_name: Optional[str] = None,
     create: bool = True,
     backend: Optional[str] = None,
+    _skip_identity_check: bool = False,
 ):
-    """Get the palace collection through the backend layer."""
+    """Get the palace collection through the backend layer.
+
+    ``_skip_identity_check`` bypasses the embedder-identity enforcement so the
+    ``set-embedder`` override path can open a palace whose recorded model
+    differs from the current one (the very state it exists to repair).
+    """
     if collection_name is None:
         from .config import get_configured_collection_name
 
@@ -98,8 +194,69 @@ def get_collection(
             create=create,
         )
     if "requires_explicit_embeddings" in getattr(backend_obj, "capabilities", frozenset()):
-        return EmbeddingCollection(collection)
+        collection = EmbeddingCollection(collection)
+    if not _skip_identity_check:
+        _enforce_embedder_identity(collection, palace_path, collection_name, create=create)
     return collection
+
+
+def set_palace_embedder_identity(
+    palace_path: str,
+    model: Optional[str] = None,
+    *,
+    force: bool = False,
+    backend: Optional[str] = None,
+    collection_name: Optional[str] = None,
+):
+    """Record (or force-override) a palace collection's embedder identity (RFC 001).
+
+    Backs ``mempalace palace set-embedder``. Returns ``(old, new)`` identities.
+    Without ``force``, refuses to overwrite an existing identity that names a
+    different model (the user must confirm they know the vectors are
+    compatible). Opens with the identity check skipped so a mismatched palace —
+    the exact state being repaired — can be opened at all.
+    """
+    from .backends.base import EmbedderIdentity, EmbedderIdentityMismatchError
+    from .config import MempalaceConfig
+    from .embedding import get_embedder_identity
+
+    configured = MempalaceConfig().embedding_model
+    target = (model or configured or "").strip().lower()
+    if not target:
+        # No model given and none configured — there is nothing to record, and
+        # recording a nameless identity is a silent no-op in every backend.
+        raise ValueError(
+            "no embedder model to record: pass --model NAME or configure MEMPALACE_EMBEDDING_MODEL"
+        )
+    if target == (configured or "").strip().lower():
+        # Recording the in-use model — probe its dimension (already loaded).
+        new = get_embedder_identity()
+    else:
+        # Explicit override of a non-configured model: record the name only,
+        # never load a foreign model (which can be a large download) just to
+        # probe a dimension. The model-name check is the actual protection.
+        new = EmbedderIdentity(model_name=target, dimension=0)
+    collection = get_collection(
+        palace_path,
+        collection_name=collection_name,
+        create=True,
+        backend=backend,
+        _skip_identity_check=True,
+    )
+    try:
+        old = collection.get_stored_embedder_identity()
+    except Exception:
+        old = None
+    if old is not None and old.model_name != new.model_name and not force:
+        raise EmbedderIdentityMismatchError(
+            f"palace already records embedder {old.model_name!r}; pass --force to "
+            f"overwrite it with {new.model_name!r} (only if the vectors are compatible)"
+        )
+    collection.set_embedder_identity(new)
+    # Reset the per-process validation cache so a re-open re-checks against the
+    # newly recorded identity rather than a stale verdict.
+    _VALIDATED_IDENTITY.clear()
+    return old, new
 
 
 def get_closets_collection(
@@ -568,36 +725,183 @@ def mine_lock(source_file: str):
     Prevents multiple agents from mining the same file simultaneously,
     which causes duplicate drawers when the delete+insert cycle interleaves.
     """
-    lock_dir = os.path.join(os.path.expanduser("~"), ".mempalace", "locks")
-    os.makedirs(lock_dir, exist_ok=True)
-    lock_path = os.path.join(
-        lock_dir, hashlib.sha256(source_file.encode()).hexdigest()[:16] + ".lock"
-    )
-
-    lf = open(lock_path, "w")
+    lock_path = _mine_lock_path(source_file)
+    lf = _acquire_mine_lock_file(lock_path)
     try:
-        if os.name == "nt":
-            import msvcrt
-
-            msvcrt.locking(lf.fileno(), msvcrt.LK_LOCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(lf, fcntl.LOCK_EX)
         yield
     finally:
         try:
-            if os.name == "nt":
-                import msvcrt
-
-                msvcrt.locking(lf.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(lf, fcntl.LOCK_UN)
+            _unlock_mine_lock_file(lf)
         except Exception:
             logger.debug("Mine-lock release failed", exc_info=True)
+        try:
+            lf.close()
+        except Exception:
+            logger.debug("Mine-lock close failed", exc_info=True)
+        _cleanup_mine_lock_file(lock_path)
+
+
+def _mine_lock_path(source_file: str) -> str:
+    lock_dir = os.path.join(os.path.expanduser("~"), ".mempalace", "locks")
+    os.makedirs(lock_dir, exist_ok=True)
+    return os.path.join(lock_dir, hashlib.sha256(source_file.encode()).hexdigest()[:16] + ".lock")
+
+
+def _open_mine_lock_file(lock_path: str, *, create: bool):
+    flags = os.O_RDWR
+    if create:
+        flags |= os.O_CREAT
+    fd = os.open(lock_path, flags, 0o600)
+    return os.fdopen(fd, "r+b")
+
+
+def _lock_mine_lock_file(lock_file, *, blocking: bool) -> bool:
+    lock_file.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        mode = msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK
+        try:
+            msvcrt.locking(lock_file.fileno(), mode, 1)
+        except OSError:
+            if not blocking:
+                return False
+            raise
+        return True
+
+    import fcntl
+
+    flags = fcntl.LOCK_EX
+    if not blocking:
+        flags |= fcntl.LOCK_NB
+    try:
+        fcntl.flock(lock_file, flags)
+    except BlockingIOError:
+        if not blocking:
+            return False
+        raise
+    return True
+
+
+def _unlock_mine_lock_file(lock_file) -> None:
+    lock_file.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+def _mine_lock_file_is_current(lock_file, lock_path: str) -> bool:
+    """Return whether ``lock_file`` is still the inode reached by ``lock_path``.
+
+    POSIX advisory locks attach to the opened inode, not the pathname. If a
+    lock file is unlinked while a contender is waiting, that contender can later
+    acquire a lock on an inode no new process will use. We reject that stale
+    handle and retry on the current pathname.
+    """
+    if os.name == "nt":
+        return True
+    try:
+        path_stat = os.stat(lock_path)
+        file_stat = os.fstat(lock_file.fileno())
+    except OSError:
+        return False
+    return (path_stat.st_dev, path_stat.st_ino) == (file_stat.st_dev, file_stat.st_ino)
+
+
+def _acquire_open_mine_lock_file(lock_file, lock_path: str) -> bool:
+    """Acquire ``lock_file`` and return False if cleanup made it stale."""
+    _lock_mine_lock_file(lock_file, blocking=True)
+    if _mine_lock_file_is_current(lock_file, lock_path):
+        return True
+    try:
+        _unlock_mine_lock_file(lock_file)
+    except Exception:
+        logger.debug("Mine-lock stale-handle release failed", exc_info=True)
+    return False
+
+
+def _acquire_mine_lock_file(lock_path: str):
+    while True:
+        lf = _open_mine_lock_file(lock_path, create=True)
+        try:
+            if _acquire_open_mine_lock_file(lf, lock_path):
+                return lf
+        except Exception:
+            lf.close()
+            raise
         lf.close()
+
+
+def _cleanup_mine_lock_file(lock_path: str) -> None:
+    """Best-effort removal that preserves flock rendezvous semantics.
+
+    A plain ``os.remove(lock_path)`` after closing the critical-section lock is
+    unsafe on POSIX: a waiter may already be blocked on the old inode while a
+    later process creates and locks a new inode at the same pathname. Instead,
+    cleanup briefly re-acquires the current file nonblocking. If it wins, it can
+    unlink that inode as cleanup-only work; waiters on the old inode will detect
+    the stale handle after waking and retry on the current path.
+    """
+    try:
+        lf = _open_mine_lock_file(lock_path, create=False)
+    except FileNotFoundError:
+        return
+    except OSError:
+        logger.debug("Mine-lock cleanup open failed for %s", lock_path, exc_info=True)
+        return
+
+    acquired = False
+    closed = False
+    try:
+        try:
+            acquired = _lock_mine_lock_file(lf, blocking=False)
+        except OSError:
+            logger.debug("Mine-lock cleanup acquire failed for %s", lock_path, exc_info=True)
+            return
+        if not acquired:
+            return
+        if not _mine_lock_file_is_current(lf, lock_path):
+            return
+
+        if os.name == "nt":
+            # Windows generally cannot unlink an open locked file. Release and
+            # close first; if another process opens the file in the gap,
+            # os.remove should fail and we leave the rendezvous file in place.
+            try:
+                _unlock_mine_lock_file(lf)
+            except Exception:
+                logger.debug("Mine-lock cleanup release failed", exc_info=True)
+                acquired = False
+                return
+            acquired = False
+            lf.close()
+            closed = True
+            try:
+                os.remove(lock_path)
+            except OSError:
+                pass
+            return
+
+        try:
+            os.remove(lock_path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.debug("Mine-lock cleanup remove failed for %s", lock_path, exc_info=True)
+    finally:
+        if not closed:
+            if acquired:
+                try:
+                    _unlock_mine_lock_file(lf)
+                except Exception:
+                    logger.debug("Mine-lock cleanup release failed", exc_info=True)
+            lf.close()
 
 
 class MineAlreadyRunning(RuntimeError):

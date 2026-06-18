@@ -74,7 +74,11 @@ from .backends.chroma import (  # noqa: E402
 )
 from .backends import BackendMismatchError, PalaceRef, detect_backend_for_path  # noqa: E402
 from .query_sanitizer import sanitize_query  # noqa: E402
-from .searcher import search_memories  # noqa: E402
+from .searcher import (  # noqa: E402
+    _distance_to_similarity,
+    _metric_for_collection,
+    search_memories,
+)
 from .palace_graph import (  # noqa: E402
     traverse,
     find_tunnels,
@@ -83,6 +87,10 @@ from .palace_graph import (  # noqa: E402
     list_tunnels,
     delete_tunnel,
     follow_tunnels,
+)
+from .hallways import (  # noqa: E402
+    list_hallways,
+    delete_hallway,
 )
 
 from .knowledge_graph import KnowledgeGraph, DEFAULT_KG_PATH  # noqa: E402
@@ -154,6 +162,21 @@ def _init_logging() -> None:
 
 _init_logging()
 logger = logging.getLogger("mempalace_mcp")
+
+
+def _get_result_ids(result) -> list:
+    """Return ``get()`` result ids for both typed and dict-like collection results."""
+    if result is None:
+        return []
+    ids = getattr(result, "ids", None)
+    if ids is not None:
+        return ids
+    if isinstance(result, dict):
+        return result.get("ids") or []
+    getter = getattr(result, "get", None)
+    if callable(getter):
+        return getter("ids") or []
+    return []
 
 
 def _parse_args():
@@ -346,6 +369,7 @@ def _force_chroma_cache_reset() -> None:
         _palace_db_mtime, \
         _metadata_cache, \
         _metadata_cache_time
+    cached_client = _client_cache
     _client_cache = None
     _collection_cache = None
     _collection_cache_backend = None
@@ -361,7 +385,24 @@ def _force_chroma_cache_reset() -> None:
         backend = get_backend_for_palace(_config.palace_path)
         backend.close_palace(PalaceRef(id=_config.palace_path, local_path=_config.palace_path))
     except Exception:
-        pass
+        logger.debug("Failed to close cached Chroma backend during cache reset", exc_info=True)
+    if cached_client is not None:
+        try:
+            close = getattr(cached_client, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            logger.debug(
+                "Failed to close MCP-local Chroma client during cache reset", exc_info=True
+            )
+    try:
+        from chromadb.api.client import SharedSystemClient
+
+        clear_system_cache = getattr(SharedSystemClient, "clear_system_cache", None)
+        if callable(clear_system_cache):
+            clear_system_cache()
+    except Exception:
+        logger.debug("Failed to clear Chroma shared system cache during cache reset", exc_info=True)
 
 
 # ── Vector-search disabled flag (#1222) ──────────────────────────────────
@@ -670,6 +711,16 @@ def _get_collection(create=False):
                     "details": "Could not open the selected backend collection.",
                     "hint": "Run: mempalace status or mempalace repair-status for diagnostics.",
                 }
+        return None
+
+    db_path = os.path.join(_config.palace_path, "chroma.sqlite3")
+    if not create and not os.path.isfile(db_path):
+        _force_chroma_cache_reset()
+        _collection_open_error = {
+            "error": "Chroma database missing",
+            "details": f"Could not open missing database at {db_path}.",
+            "hint": "Run: mempalace status or mempalace repair-status for diagnostics.",
+        }
         return None
 
     for attempt in range(2):
@@ -1234,9 +1285,10 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
         )
         duplicates = []
         if results["ids"] and results["ids"][0]:
+            metric = _metric_for_collection(col)
             for i, drawer_id in enumerate(results["ids"][0]):
                 dist = results["distances"][0][i]
-                similarity = round(max(0.0, 1 - dist), 3)
+                similarity = round(_distance_to_similarity(dist, metric), 3)
                 if similarity >= threshold:
                     # Chroma 1.5.x can return None for partially-flushed rows;
                     # coerce to empty sentinels so downstream .get() is safe.
@@ -1349,6 +1401,22 @@ def tool_delete_tunnel(tunnel_id: str):
     return delete_tunnel(tunnel_id)
 
 
+def tool_list_hallways(wing: str = None):
+    """List within-wing hallway records, optionally filtered by wing."""
+    try:
+        wing = _sanitize_optional_name(wing, "wing")
+    except ValueError as e:
+        return {"error": str(e)}
+    return list_hallways(wing)
+
+
+def tool_delete_hallway(hallway_id: str):
+    """Delete a hallway record by its ID."""
+    if not hallway_id or not isinstance(hallway_id, str):
+        return {"error": "hallway_id is required"}
+    return {"deleted": delete_hallway(hallway_id)}
+
+
 def tool_follow_tunnels(wing: str, room: str):
     """Follow explicit tunnels from a room to see connected drawers in other wings."""
     try:
@@ -1363,6 +1431,250 @@ def tool_follow_tunnels(wing: str, room: str):
 
 
 # ==================== WRITE TOOLS ====================
+
+
+def _chroma_field(result, name, default=None):
+    if result is None:
+        return default
+    if isinstance(result, dict):
+        return result.get(name, default)
+    return getattr(result, name, default)
+
+
+def _chunk_index(meta):
+    try:
+        return int((meta or {}).get("chunk_index", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _response_safe_meta(meta):
+    safe_meta = _safe_meta(meta)
+    if safe_meta.get("source_file"):
+        safe_meta["source_file"] = Path(safe_meta["source_file"]).name
+    return safe_meta
+
+
+def _content_preview(content):
+    return content[:200] + "..." if len(content) > 200 else content
+
+
+def _single_drawer_record(col, drawer_id: str):
+    result = col.get(ids=[drawer_id], include=["documents", "metadatas"])
+    ids = _chroma_field(result, "ids", []) or []
+    if not ids:
+        return None
+
+    docs = _chroma_field(result, "documents", []) or []
+    metas = _chroma_field(result, "metadatas", []) or []
+    doc = docs[0] if docs else ""
+    meta = _safe_meta(metas[0] if metas else {})
+
+    return {
+        "drawer_id": ids[0],
+        "ids": [ids[0]],
+        "documents": [doc or ""],
+        "metadatas": [meta],
+        "content": doc or "",
+        "metadata": meta,
+        "chunked": False,
+    }
+
+
+def _logical_chunk_group(col, drawer_id: str):
+    try:
+        result = col.get(
+            where={"parent_drawer_id": drawer_id},
+            include=["documents", "metadatas"],
+        )
+    except Exception:
+        logger.debug("chunk group lookup failed for %s", drawer_id, exc_info=True)
+        return None
+
+    ids = _chroma_field(result, "ids", []) or []
+    if not ids:
+        return None
+
+    docs = _chroma_field(result, "documents", []) or []
+    metas = _chroma_field(result, "metadatas", []) or []
+
+    rows = []
+    for idx, chunk_id in enumerate(ids):
+        doc = docs[idx] if idx < len(docs) else ""
+        meta = _safe_meta(metas[idx] if idx < len(metas) else {})
+        rows.append((_chunk_index(meta), chunk_id, doc or "", meta))
+
+    rows.sort(key=lambda row: (row[0], row[1]))
+
+    chunk_ids = [row[1] for row in rows]
+    chunk_docs = [row[2] for row in rows]
+    chunk_metas = [row[3] for row in rows]
+    first_meta = chunk_metas[0] if chunk_metas else {}
+
+    return {
+        "drawer_id": drawer_id,
+        "ids": chunk_ids,
+        "documents": chunk_docs,
+        "metadatas": chunk_metas,
+        "content": "".join(chunk_docs),
+        "metadata": first_meta,
+        "chunked": True,
+    }
+
+
+def _logical_drawer_record(col, drawer_id: str):
+    direct = _single_drawer_record(col, drawer_id)
+    if direct is not None:
+        return direct
+    return _logical_chunk_group(col, drawer_id)
+
+
+def _drawer_payload(record):
+    safe_meta = _response_safe_meta(record["metadata"])
+
+    payload = {
+        "drawer_id": record["drawer_id"],
+        "content": record["content"],
+        "wing": safe_meta.get("wing", ""),
+        "room": safe_meta.get("room", ""),
+        "metadata": safe_meta,
+    }
+
+    if record.get("chunked"):
+        payload["chunks"] = len(record["ids"])
+        payload["chunk_ids"] = record["ids"]
+        payload["metadata"]["chunks"] = len(record["ids"])
+        payload["metadata"]["chunk_ids"] = record["ids"]
+
+    return payload
+
+
+def _fetch_drawer_rows(col, where=None, page_size: int = 1000):
+    ids = []
+    documents = []
+    metadatas = []
+    offset = 0
+
+    while True:
+        kwargs = {
+            "include": ["documents", "metadatas"],
+            "limit": page_size,
+            "offset": offset,
+        }
+        if where:
+            kwargs["where"] = where
+
+        result = col.get(**kwargs)
+        batch_ids = _chroma_field(result, "ids", []) or []
+        if not batch_ids:
+            break
+
+        batch_docs = _chroma_field(result, "documents", []) or []
+        batch_metas = _chroma_field(result, "metadatas", []) or []
+
+        ids.extend(batch_ids)
+
+        for idx in range(len(batch_ids)):
+            documents.append(batch_docs[idx] if idx < len(batch_docs) else "")
+            metadatas.append(batch_metas[idx] if idx < len(batch_metas) else {})
+
+        offset += len(batch_ids)
+        if len(batch_ids) < page_size:
+            break
+
+    return ids, documents, metadatas
+
+
+def _collapse_drawer_rows(ids, documents, metadatas):
+    groups = {}
+    singles = []
+
+    for idx, drawer_id in enumerate(ids):
+        doc = documents[idx] if idx < len(documents) else ""
+        meta = _safe_meta(metadatas[idx] if idx < len(metadatas) else {})
+        parent_id = meta.get("parent_drawer_id")
+
+        if parent_id:
+            groups.setdefault(parent_id, []).append(
+                (_chunk_index(meta), drawer_id, doc or "", meta)
+            )
+        else:
+            singles.append((drawer_id, doc or "", meta))
+
+    grouped_ids = set(groups)
+    drawers = []
+
+    for drawer_id, doc, meta in singles:
+        # If both a legacy logical row and chunks exist, display one logical row.
+        if drawer_id in grouped_ids:
+            continue
+
+        safe_meta = _response_safe_meta(meta)
+        drawers.append(
+            {
+                "drawer_id": drawer_id,
+                "wing": safe_meta.get("wing", ""),
+                "room": safe_meta.get("room", ""),
+                "content_preview": _content_preview(doc),
+                "metadata": safe_meta,
+            }
+        )
+
+    for parent_id, parts in groups.items():
+        parts.sort(key=lambda row: (row[0], row[1]))
+        chunk_ids = [row[1] for row in parts]
+        content = "".join(row[2] for row in parts)
+
+        safe_meta = _response_safe_meta(parts[0][3] if parts else {})
+        safe_meta["chunks"] = len(chunk_ids)
+        safe_meta["chunk_ids"] = chunk_ids
+
+        drawers.append(
+            {
+                "drawer_id": parent_id,
+                "wing": safe_meta.get("wing", ""),
+                "room": safe_meta.get("room", ""),
+                "content_preview": _content_preview(content),
+                "metadata": safe_meta,
+                "chunks": len(chunk_ids),
+                "chunk_ids": chunk_ids,
+            }
+        )
+
+    drawers.sort(key=lambda item: item["drawer_id"])
+    return drawers
+
+
+def _build_chunk_rows(drawer_id: str, content: str, meta: dict, chunk_size: int):
+    chunk_size = max(1, int(chunk_size or 1))
+
+    base_meta = _safe_meta(meta)
+    base_meta.pop("chunk_index", None)
+    base_meta["parent_drawer_id"] = drawer_id
+
+    spans = (
+        [(0, "")]
+        if content == ""
+        else [
+            (start, content[start : start + chunk_size])
+            for start in range(0, len(content), chunk_size)
+        ]
+    )
+
+    chunk_ids = []
+    chunk_docs = []
+    chunk_metas = []
+
+    for start, chunk_doc in spans:
+        chunk_index = start // chunk_size
+        chunk_ids.append(f"{drawer_id}_chunk_{chunk_index:06d}")
+        chunk_docs.append(chunk_doc)
+
+        chunk_meta = dict(base_meta)
+        chunk_meta["chunk_index"] = chunk_index
+        chunk_metas.append(chunk_meta)
+
+    return chunk_ids, chunk_docs, chunk_metas
 
 
 def tool_add_drawer(
@@ -1435,10 +1747,11 @@ def tool_add_drawer(
         idempotency_probe_ids = [drawer_id, f"{drawer_id}_chunk_{last_chunk_idx:06d}"]
     try:
         existing = col.get(ids=idempotency_probe_ids, include=[])
-        if existing.ids:
+        if _get_result_ids(existing):
             return {"success": True, "reason": "already_exists", "drawer_id": drawer_id}
-    except Exception:
-        logger.debug("Idempotency pre-check failed for %s", idempotency_probe_ids, exc_info=True)
+    except Exception as e:
+        logger.warning("Idempotency pre-check failed for %s", idempotency_probe_ids, exc_info=True)
+        return {"success": False, "error": f"Idempotency check failed before write: {e}"}
 
     try:
         if len(content) <= chunk_size:
@@ -1448,7 +1761,7 @@ def tool_add_drawer(
                 metadatas=[{**base_meta, "chunk_index": 0}],
             )
             inserted = col.get(ids=[drawer_id], include=[])
-            if not inserted.ids:
+            if not _get_result_ids(inserted):
                 raise RuntimeError(
                     "Drawer write was acknowledged but the new ID is not readable. "
                     "The palace index may be stale; run reconnect or repair."
@@ -1483,7 +1796,7 @@ def tool_add_drawer(
         # Probe the LAST chunk id, not the first — its presence confirms
         # the whole batch landed, not just the leading row.
         inserted = col.get(ids=[chunk_ids[-1]], include=[])
-        if not inserted.ids:
+        if not _get_result_ids(inserted):
             raise RuntimeError(
                 "Drawer write was acknowledged but the new ID is not readable. "
                 "The palace index may be stale; run reconnect or repair."
@@ -1503,36 +1816,248 @@ def tool_add_drawer(
 
 
 def tool_delete_drawer(drawer_id: str):
-    """Delete a single drawer by ID."""
+    """Delete a single logical drawer by ID."""
     global _metadata_cache
+
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
-    existing = col.get(ids=[drawer_id])
-    if not existing["ids"]:
-        return {"success": False, "error": f"Drawer not found: {drawer_id}"}
-
-    # Log the deletion with the content being removed for audit trail
-    deleted_content = existing.get("documents", [""])[0] if existing.get("documents") else ""
-    deleted_meta = _safe_meta(
-        existing.get("metadatas", [{}])[0] if existing.get("metadatas") else {}
-    )
-    _wal_log(
-        "delete_drawer",
-        {
-            "drawer_id": drawer_id,
-            "deleted_meta": deleted_meta,
-            "content_preview": deleted_content[:200],
-        },
-    )
 
     try:
-        col.delete(ids=[drawer_id])
+        record = _logical_drawer_record(col, drawer_id)
+        if record is None:
+            return {"success": False, "error": f"Drawer not found: {drawer_id}"}
+
+        _wal_log(
+            "delete_drawer",
+            {
+                "drawer_id": drawer_id,
+                "deleted_ids": record["ids"],
+                "deleted_meta": record["metadata"],
+                "content_preview": record["content"][:200],
+            },
+        )
+
+        col.delete(ids=record["ids"])
         _metadata_cache = None
-        logger.info(f"Deleted drawer: {drawer_id}")
-        return {"success": True, "drawer_id": drawer_id}
+
+        logger.info("Deleted drawer: %s (%s rows)", drawer_id, len(record["ids"]))
+
+        return {
+            "success": True,
+            "drawer_id": drawer_id,
+            "deleted_ids": record["ids"],
+            "chunks_deleted": len(record["ids"]),
+        }
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+def _capture_fd_stdout(fn):
+    """Run ``fn()`` with its stdout captured at both the Python and fd level.
+
+    The mining engines (``miner.mine`` / ``convo_miner.mine_convos`` /
+    ``format_miner.mine_formats``) print progress and a summary to stdout. In
+    the MCP server stdout is the JSON-RPC channel (``_restore_stdout`` runs once
+    in ``main`` before the protocol loop), so that output would corrupt the
+    protocol. Two layers are needed:
+
+    * ``contextlib.redirect_stdout`` captures Python-level ``print`` into a
+      buffer — this is what becomes the returned summary, and it works even when
+      ``sys.stdout`` has been swapped (e.g. under pytest capture).
+    * an ``os.dup2`` of fd 1 to a temp file contains C-level banners emitted by
+      onnxruntime / chromadb during embedding, which bypass ``sys.stdout``
+      entirely (the same reason the module redirects fd 1 at import, #225), and
+      keeps any direct fd-1 write off the live JSON-RPC channel.
+
+    Returns ``(result, captured_text)``. ``captured_text`` is handed back to the
+    caller verbatim as an opaque summary; it is never parsed into fields. Falls
+    back to Python-level capture alone on platforms without fd-level stdio
+    (embedded interpreters), matching the import-time fallback.
+    """
+    import contextlib
+    import io
+    import tempfile
+
+    buf = io.StringIO()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    try:
+        saved_fd = os.dup(1)
+    except (OSError, AttributeError):
+        with contextlib.redirect_stdout(buf):
+            result = fn()
+        return result, buf.getvalue()
+
+    try:
+        with tempfile.TemporaryFile() as tmp:
+            os.dup2(tmp.fileno(), 1)
+            try:
+                with contextlib.redirect_stdout(buf):
+                    result = fn()
+            finally:
+                sys.stdout.flush()
+                os.dup2(saved_fd, 1)
+            tmp.seek(0)
+            fd_text = tmp.read().decode("utf-8", "replace")
+        return result, buf.getvalue() + fd_text
+    finally:
+        os.close(saved_fd)
+
+
+def tool_mine(
+    source: str,
+    mode: str = "projects",
+    wing: str = None,
+    agent: str = "mempalace",
+    limit: int = 0,
+    dry_run: bool = False,
+    extract: str = "exchange",
+):
+    """Mine a directory into the palace — the MCP equivalent of ``mempalace mine``.
+
+    Lets MCP clients that cannot shell out (Claude Desktop, LM Studio, Aionui,
+    Desktop Commander) trigger indexing in-conversation (#1662). Wraps the same
+    in-process miners the CLI's ``cmd_mine`` calls; it adds no new ingestion
+    logic of its own.
+
+    mode:
+        ``"projects"`` (default) — code/docs via ``miner.mine``.
+        ``"convos"``             — chat transcripts via ``convo_miner.mine_convos``.
+        ``"extract"``            — office documents (PDF/DOCX/RTF/…) via
+                                   ``format_miner.mine_formats``; requires the
+                                   optional ``mempalace[extract]`` dependency.
+    wing:    target wing (default: derived from the source directory name).
+    agent:   recorded on every drawer (default ``"mempalace"``).
+    limit:   max files to process (0 = all).
+    dry_run: walk + chunk and report, but file nothing.
+    extract: convos extraction strategy — ``"exchange"`` (default) or
+             ``"general"``; ignored by the other modes.
+
+    Runs synchronously and mirrors the :func:`tool_sync` contract: success
+    returns ``{success: True, mode, dry_run, output[, output_truncated]}`` where ``output`` is
+    the miner's human-readable summary (captured so it cannot corrupt the
+    JSON-RPC stream); failure returns ``{success: False, error[, error_class]}``.
+    The palace write lock is held by the miners themselves, so a concurrent mine
+    surfaces as a structured already-running error. Orphan cleanup is not part of
+    mining — use ``mempalace_sync`` for that.
+    """
+    global _metadata_cache
+    from .palace import MineAlreadyRunning, MineValidationError
+
+    if not _config.palace_path:
+        np = _no_palace()
+        return {"success": False, "error": np.get("error", "no palace"), "hint": np.get("hint")}
+
+    valid_modes = ("projects", "convos", "extract")
+    if mode not in valid_modes:
+        return {
+            "success": False,
+            "error": f"invalid mode '{mode}'; expected one of: {', '.join(valid_modes)}",
+        }
+
+    src = os.path.expanduser(source) if source else ""
+    if not src or not os.path.isdir(src):
+        return {"success": False, "error": f"source directory not found: {source!r}"}
+
+    def _run():
+        if mode == "convos":
+            from .convo_miner import mine_convos
+
+            return mine_convos(
+                convo_dir=src,
+                palace_path=_config.palace_path,
+                wing=wing,
+                agent=agent,
+                limit=limit,
+                dry_run=dry_run,
+                extract_mode=extract,
+            )
+        if mode == "extract":
+            from .format_miner import mine_formats
+
+            return mine_formats(
+                format_dir=src,
+                palace_path=_config.palace_path,
+                wing=wing,
+                agent=agent,
+                limit=limit,
+                dry_run=dry_run,
+            )
+        from .miner import mine
+
+        return mine(
+            project_dir=src,
+            palace_path=_config.palace_path,
+            wing_override=wing,
+            agent=agent,
+            limit=limit,
+            dry_run=dry_run,
+        )
+
+    try:
+        try:
+            _result, output = _capture_fd_stdout(_run)
+        # Order matters: typed handlers precede the bare Exception (mirroring
+        # tool_sync) so MineAlreadyRunning / MineValidationError / ValueError
+        # don't fall into the generic "mine failed" branch.
+        except MineAlreadyRunning as exc:
+            return {
+                "success": False,
+                "error": f"another mine is in progress: {exc}",
+                "error_class": "LockHeldByOtherProcess",
+            }
+        except MineValidationError as exc:
+            return {
+                "success": False,
+                "error": f"palace integrity check failed after mine: {exc}",
+                "error_class": "MineValidationError",
+            }
+        except ImportError as exc:
+            # 'extract' mode pulls in the optional mempalace[extract] stack;
+            # name it so the caller knows to install the extra. Other modes have
+            # no optional imports, so an ImportError there is a real bug, not a
+            # missing extra — log the traceback and surface its type.
+            if mode == "extract":
+                return {
+                    "success": False,
+                    "error": f"mode 'extract' needs the mempalace[extract] extra: {exc}",
+                    "error_class": "MissingDependency",
+                }
+            logger.exception("tool_mine: unexpected ImportError (mode=%s)", mode)
+            return {"success": False, "error": f"mine failed: {exc}", "error_class": "ImportError"}
+        except ValueError as exc:
+            return {"success": False, "error": str(exc), "error_class": "ValueError"}
+        except SystemExit as exc:
+            # A library mine() must never terminate the MCP server. miner.mine
+            # converts Ctrl-C into sys.exit(130) (CLI semantics); in-process
+            # that SystemExit is a BaseException that would slip past the
+            # protocol loop's `except Exception` and kill the server with no
+            # response. Convert it to a structured error instead.
+            return {
+                "success": False,
+                "error": f"mine exited early (code {exc.code})",
+                "error_class": "Interrupted",
+            }
+        except Exception as exc:
+            logger.exception("tool_mine: mine failed (mode=%s)", mode)
+            return {
+                "success": False,
+                "error": f"mine failed: {exc}",
+                "error_class": type(exc).__name__,
+            }
+        # Cap the echoed summary so a very large mine cannot return a multi-MB
+        # payload to the MCP client. The useful summary is at the tail, so keep
+        # the end and flag the truncation (never silently).
+        payload = {"success": True, "mode": mode, "dry_run": dry_run, "output": output}
+        cap = 4000
+        if len(output) > cap:
+            payload["output"] = output[-cap:]
+            payload["output_truncated"] = True
+        return payload
+    finally:
+        if not dry_run:
+            _metadata_cache = None
 
 
 def tool_sync(project_dir: str = None, wing: str = None, apply: bool = False):
@@ -1574,88 +2099,57 @@ def tool_sync(project_dir: str = None, wing: str = None, apply: bool = False):
 
 
 def tool_get_drawer(drawer_id: str):
-    """Fetch a single drawer by ID. Returns full content and metadata."""
+    """Fetch a single logical drawer by ID."""
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
+
     try:
-        result = col.get(ids=[drawer_id], include=["documents", "metadatas"])
-        if not result["ids"]:
+        record = _logical_drawer_record(col, drawer_id)
+        if record is None:
             return {"error": f"Drawer not found: {drawer_id}"}
-        meta = _safe_meta(result["metadatas"][0])
-        doc = result["documents"][0]
-        # source_file is the absolute filesystem path written by the
-        # miners. Reduce to its basename before handing it to the MCP
-        # client — same threat model as the palace_path leak fix:
-        # nested-agent / multi-server topologies treat the client as a
-        # separate trust domain. Basename preserves citation utility.
-        # Mirrors the searcher.search_memories() return shape.
-        safe_meta = dict(meta) if meta else {}
-        if safe_meta.get("source_file"):
-            safe_meta["source_file"] = Path(safe_meta["source_file"]).name
-        return {
-            "drawer_id": drawer_id,
-            "content": doc,
-            "wing": safe_meta.get("wing", ""),
-            "room": safe_meta.get("room", ""),
-            "metadata": safe_meta,
-        }
+        return _drawer_payload(record)
     except Exception as e:
         return {"error": str(e)}
 
 
 def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offset: int = 0):
-    """List drawers with pagination. Optional wing/room filter."""
+    """List logical drawers with pagination."""
     limit = max(1, min(limit, _MAX_RESULTS))
     offset = max(0, offset)
+
     try:
         wing = _sanitize_optional_name(wing, "wing")
         room = _sanitize_optional_name(room, "room")
     except ValueError as e:
         return {"error": str(e)}
+
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
+
     try:
         where = None
         conditions = []
+
         if wing:
             conditions.append({"wing": wing})
         if room:
             conditions.append({"room": room})
+
         if len(conditions) == 1:
             where = conditions[0]
         elif len(conditions) > 1:
             where = {"$and": conditions}
 
-        kwargs = {"include": ["documents", "metadatas"], "limit": limit, "offset": offset}
-        if where:
-            kwargs["where"] = where
-        result = col.get(**kwargs)
+        ids, documents, metadatas = _fetch_drawer_rows(col, where=where)
+        drawers = _collapse_drawer_rows(ids, documents, metadatas)
+        page = drawers[offset : offset + limit]
 
-        # Compute total matching drawers for pagination.
-        if where:
-            total_result = col.get(where=where, include=[])
-            total = len(total_result["ids"])
-        else:
-            total = col.count()
-
-        drawers = []
-        for i, did in enumerate(result["ids"]):
-            meta = _safe_meta(result["metadatas"][i])
-            doc = result["documents"][i]
-            drawers.append(
-                {
-                    "drawer_id": did,
-                    "wing": meta.get("wing", ""),
-                    "room": meta.get("room", ""),
-                    "content_preview": doc[:200] + "..." if len(doc) > 200 else doc,
-                }
-            )
         return {
-            "drawers": drawers,
-            "total": total,
-            "count": len(drawers),
+            "drawers": page,
+            "total": len(drawers),
+            "count": len(page),
             "offset": offset,
             "limit": limit,
         }
@@ -1664,7 +2158,7 @@ def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offse
 
 
 def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, room: str = None):
-    """Update an existing drawer's content and/or metadata."""
+    """Update an existing logical drawer's content and/or metadata."""
     global _metadata_cache
 
     if content is None and wing is None and room is None:
@@ -1673,13 +2167,14 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
+
     try:
-        existing = col.get(ids=[drawer_id], include=["documents", "metadatas"])
-        if not existing["ids"]:
+        record = _logical_drawer_record(col, drawer_id)
+        if record is None:
             return {"success": False, "error": f"Drawer not found: {drawer_id}"}
 
-        old_meta = _safe_meta(existing["metadatas"][0])
-        old_doc = existing["documents"][0]
+        old_meta = _safe_meta(record["metadata"])
+        old_doc = record["content"]
 
         new_doc = old_doc
         if content is not None:
@@ -1689,16 +2184,22 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
                 return {"success": False, "error": str(e)}
 
         new_meta = dict(old_meta)
+
         if wing is not None:
             try:
-                new_meta["wing"] = sanitize_name(wing, "wing")
+                wing = sanitize_name(wing, "wing")
             except ValueError as e:
                 return {"success": False, "error": str(e)}
+            if wing.lower() != str(old_meta.get("wing") or "").lower():
+                new_meta["wing"] = wing
+
         if room is not None:
             try:
-                new_meta["room"] = sanitize_name(room, "room")
+                room = sanitize_name(room, "room")
             except ValueError as e:
                 return {"success": False, "error": str(e)}
+            if room.lower() != str(old_meta.get("room") or "").lower():
+                new_meta["room"] = room
 
         _wal_log(
             "update_drawer",
@@ -1713,15 +2214,47 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
             },
         )
 
-        update_kwargs = {"ids": [drawer_id]}
+        chunk_size = max(1, int(getattr(_config, "chunk_size", 800) or 800))
+        should_chunk = bool(record.get("chunked")) or len(new_doc) > chunk_size
+
+        if should_chunk:
+            chunk_ids, chunk_docs, chunk_metas = _build_chunk_rows(
+                drawer_id,
+                new_doc,
+                new_meta,
+                chunk_size,
+            )
+
+            col.upsert(ids=chunk_ids, documents=chunk_docs, metadatas=chunk_metas)
+
+            keep_ids = set(chunk_ids)
+            stale_ids = [old_id for old_id in record["ids"] if old_id not in keep_ids]
+            if stale_ids:
+                col.delete(ids=stale_ids)
+
+            _metadata_cache = None
+
+            logger.info("Updated drawer: %s (%s rows)", drawer_id, len(chunk_ids))
+
+            return {
+                "success": True,
+                "drawer_id": drawer_id,
+                "wing": new_meta.get("wing", ""),
+                "room": new_meta.get("room", ""),
+                "chunks": len(chunk_ids),
+                "chunk_ids": chunk_ids,
+            }
+
+        update_kwargs = {"ids": [record["ids"][0]]}
         if content is not None:
             update_kwargs["documents"] = [new_doc]
         update_kwargs["metadatas"] = [new_meta]
-        col.update(**update_kwargs)
 
+        col.update(**update_kwargs)
         _metadata_cache = None
 
-        logger.info(f"Updated drawer: {drawer_id}")
+        logger.info("Updated drawer: %s", drawer_id)
+
         return {
             "success": True,
             "drawer_id": drawer_id,
@@ -2472,6 +3005,30 @@ TOOLS = {
         },
         "handler": tool_delete_tunnel,
     },
+    "mempalace_list_hallways": {
+        "description": "List within-wing hallway records (entity-to-entity co-occurrence links built at mine time). Optionally filter by wing.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "wing": {
+                    "type": "string",
+                    "description": "Filter hallways by wing",
+                },
+            },
+        },
+        "handler": tool_list_hallways,
+    },
+    "mempalace_delete_hallway": {
+        "description": "Delete a hallway record by its ID. Returns {deleted: bool}.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "hallway_id": {"type": "string", "description": "Hallway ID to delete"},
+            },
+            "required": ["hallway_id"],
+        },
+        "handler": tool_delete_hallway,
+    },
     "mempalace_follow_tunnels": {
         "description": "Follow tunnels from a room to see what it connects to in other wings. Returns connected rooms with drawer previews.",
         "input_schema": {
@@ -2561,6 +3118,60 @@ TOOLS = {
             "required": ["drawer_id"],
         },
         "handler": tool_delete_drawer,
+    },
+    "mempalace_mine": {
+        "description": (
+            "Mine a directory into the palace — the MCP equivalent of `mempalace mine`. "
+            "mode='projects' (default) ingests code/docs; mode='convos' ingests chat "
+            "transcripts; mode='extract' ingests office documents (PDF/DOCX/RTF, requires "
+            "the mempalace[extract] extra). Runs synchronously and returns the miner's "
+            "summary as `output`. The palace write lock is automatic; a concurrent mine "
+            "returns a structured already-running error. Orphan cleanup is separate — use "
+            "mempalace_sync."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "description": "Directory to mine.",
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["projects", "convos", "extract"],
+                    "description": (
+                        "Ingest mode: projects (code/docs, default), convos (chat "
+                        "transcripts), extract (office docs)."
+                    ),
+                },
+                "wing": {
+                    "type": "string",
+                    "description": "Target wing (default: source directory name).",
+                },
+                "agent": {
+                    "type": "string",
+                    "description": "Recorded on every drawer (default: mempalace).",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max files to process (0 = all). Default: 0.",
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "Report what would be filed without writing. Default: false.",
+                },
+                "extract": {
+                    "type": "string",
+                    "enum": ["exchange", "general"],
+                    "description": (
+                        "Convos extraction strategy: exchange (default) or general. "
+                        "Ignored by other modes."
+                    ),
+                },
+            },
+            "required": ["source"],
+        },
+        "handler": tool_mine,
     },
     "mempalace_sync": {
         "description": "Prune drawers whose source files are gitignored, deleted, or moved. Returns dry-run report by default; pass apply=true to commit deletions.",
@@ -2662,13 +3273,10 @@ TOOLS = {
                     "description": "Alias for 'entry' — accepted because add_drawer uses 'content'. Provide either 'entry' or 'content'; 'entry' wins if both are given.",
                 },
             },
-            # agent_name is always required; 'entry' or its alias 'content' must
-            # be present (the server remaps content->entry at dispatch).
+            # 'entry' (or its alias 'content') is enforced at dispatch, not via a
+            # top-level anyOf: Anthropic rejects schemas with a top-level
+            # anyOf/oneOf/allOf and drops the whole tools array (400).
             "required": ["agent_name"],
-            "anyOf": [
-                {"required": ["entry"]},
-                {"required": ["content"]},
-            ],
         },
         "handler": tool_diary_write,
     },

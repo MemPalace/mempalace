@@ -507,7 +507,7 @@ def scan_formats(directory: Union[Path, str]) -> list[Path]:
 
 
 def _print_mine_summary(
-    files: list,
+    files_seen: int,
     files_with_text: int,
     files_skipped: int,
     files_errored: int,
@@ -523,7 +523,7 @@ def _print_mine_summary(
     print(f"\n{'=' * 55}")
     print("  Summary")
     print(f"{'-' * 55}")
-    print(f"  Files seen:        {len(files)}")
+    print(f"  Files seen:        {files_seen}")
     print(f"  Files extracted:   {files_with_text}")
     print(f"  Files skipped:     {files_skipped}")
     print(f"  Files errored:     {files_errored}")
@@ -789,9 +789,11 @@ def mine_formats(
     files: list = []
     collection = None
     total_drawers = 0
+    files_mined = 0
     files_skipped = 0
     files_with_text = 0
     files_errored = 0
+    files_processed = 0
     status_counts: dict = defaultdict(int)
 
     try:
@@ -799,15 +801,14 @@ def mine_formats(
         # ``~/docs`` and relative inputs work consistently. Per PR #1555 review
         # (Copilot #10).
         files = scan_formats(format_path)
-        if limit > 0:
-            files = files[:limit]
 
         print(f"\n{'=' * 55}")
         print("  MemPalace Mine — Format extraction")
         print(f"{'=' * 55}")
         print(f"  Wing:    {wing}")
         print(f"  Source:  {format_path}")
-        print(f"  Files:   {len(files)}")
+        limit_suffix = f" (limit: {limit} new)" if limit > 0 else ""
+        print(f"  Files:   {len(files)}{limit_suffix}")
         print(f"  Palace:  {palace_path}")
         if dry_run:
             print("  DRY RUN — nothing will be filed")
@@ -816,6 +817,7 @@ def mine_formats(
         collection = get_collection(palace_path) if not dry_run else None
 
         for i, filepath in enumerate(files, 1):
+            files_processed = i
             source_file = str(filepath)
 
             # Per-file try/except so one bad file can't crash the whole mine.
@@ -876,6 +878,9 @@ def mine_formats(
                 if dry_run:
                     print(f"    [DRY RUN] {filepath.name} → {len(chunks)} drawers")
                     total_drawers += len(chunks)
+                    files_mined += 1
+                    if limit > 0 and files_mined >= limit:
+                        break
                     continue
 
                 drawers_added, skipped = _file_chunks_locked(
@@ -893,7 +898,10 @@ def mine_formats(
                     continue
 
                 total_drawers += drawers_added
+                files_mined += 1
                 print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")
+                if limit > 0 and files_mined >= limit:
+                    break
             except Exception as exc:
                 # Log and continue — one malformed file shouldn't kill the
                 # whole mine. Mirrors miner.py's per-file recovery.
@@ -973,7 +981,7 @@ def mine_formats(
                 logger.debug("mine_formats: _cleanup_mine_pid_file failed", exc_info=True)
 
     _print_mine_summary(
-        files=files,
+        files_seen=files_processed,
         files_with_text=files_with_text,
         files_skipped=files_skipped,
         files_errored=files_errored,

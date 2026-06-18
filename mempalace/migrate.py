@@ -19,6 +19,7 @@ Usage:
 """
 
 import errno
+import glob
 import os
 import shutil
 import sqlite3
@@ -27,6 +28,9 @@ import uuid
 from collections import defaultdict
 from contextlib import closing
 from datetime import datetime
+
+from .backups import prune_backups
+from .config import MempalaceConfig
 
 
 def _restore_stale_palace(palace_path: str, stale_path: str) -> None:
@@ -292,6 +296,16 @@ def migrate(palace_path: str, dry_run: bool = False, confirm: bool = False):
     backup_path = f"{palace_path}.pre-migrate.{timestamp}"
     print(f"\n  Backing up to {backup_path}...")
     shutil.copytree(palace_path, backup_path)
+
+    # Enforce backup retention so repeated migrations cannot fill the disk
+    # with full-palace copies. The backup we just created is the newest, so
+    # it survives; only older ``.pre-migrate.*`` siblings beyond the limit
+    # are removed. Best-effort — never let cleanup fail the migration.
+    prune_backups(
+        glob.escape(palace_path) + ".pre-migrate.*",
+        MempalaceConfig().max_backups,
+        log=print,
+    )
 
     # Build fresh palace in a temp directory (avoids chromadb reading old state).
     # Wrap the whole import-and-swap dance in try/finally so the temp dir is

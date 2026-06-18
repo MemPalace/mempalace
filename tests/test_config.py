@@ -688,3 +688,63 @@ def test_hooks_auto_save_env_override_true():
         assert cfg.hooks_auto_save is True
     finally:
         del os.environ["MEMPALACE_HOOKS_AUTO_SAVE"]
+
+
+# --- max_backups (backup retention) ---
+
+
+def test_max_backups_default(monkeypatch):
+    monkeypatch.delenv("MEMPALACE_MAX_BACKUPS", raising=False)
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    assert cfg.max_backups == 10
+
+
+def test_max_backups_from_config(monkeypatch, tmp_path):
+    monkeypatch.delenv("MEMPALACE_MAX_BACKUPS", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"max_backups": 3}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.max_backups == 3
+
+
+def test_max_backups_zero_disables(monkeypatch, tmp_path):
+    """0 is a valid, explicit "keep everything" — not garbage."""
+    monkeypatch.delenv("MEMPALACE_MAX_BACKUPS", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"max_backups": 0}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.max_backups == 0
+
+
+def test_max_backups_env_overrides_config(monkeypatch, tmp_path):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"max_backups": 3}, f)
+    monkeypatch.setenv("MEMPALACE_MAX_BACKUPS", "7")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.max_backups == 7
+
+
+@pytest.mark.parametrize("bad", ["abc", "", "-5", "1.5", "true"])
+def test_max_backups_garbage_falls_back_to_default(monkeypatch, tmp_path, bad):
+    """A hand-edited bad value must never crash migrate/repair."""
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"max_backups": bad}, f)
+    monkeypatch.delenv("MEMPALACE_MAX_BACKUPS", raising=False)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.max_backups == 10
+
+
+def test_max_backups_negative_in_config_falls_back(monkeypatch, tmp_path):
+    monkeypatch.delenv("MEMPALACE_MAX_BACKUPS", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"max_backups": -3}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.max_backups == 10
+
+
+def test_max_backups_bad_env_falls_back_to_config(monkeypatch, tmp_path):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"max_backups": 4}, f)
+    monkeypatch.setenv("MEMPALACE_MAX_BACKUPS", "garbage")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.max_backups == 4

@@ -1,6 +1,6 @@
 # MCP Integration
 
-MemPalace provides 29 tools through the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/), giving any MCP-compatible AI full read/write access to your palace.
+MemPalace provides 33 tools through the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/), giving any MCP-compatible AI full read/write access to your palace.
 
 ## Setup
 
@@ -26,7 +26,7 @@ claude mcp add mempalace -- python -m mempalace.mcp_server --palace /path/to/pal
 codex mcp add mempalace -- python -m mempalace.mcp_server --palace /path/to/palace
 ```
 
-Now your AI has all 29 tools available. Ask it anything:
+Now your AI has all 33 tools available. Ask it anything:
 
 > *"What did we decide about auth last month?"*
 

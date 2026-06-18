@@ -149,21 +149,8 @@ INPUT=$(cat)
 #     ``printf '%s'`` removes the class of bug entirely.
 _mempal_parsed=$(
     umask 077
-    printf '%s' "$INPUT" | "$MEMPAL_PYTHON_BIN" -c "
-import sys, json, re
-data = json.load(sys.stdin)
-sid = data.get('session_id', '')
-sha_raw = data.get('stop_hook_active', False)
-tp = data.get('transcript_path', '')
-# Shell-safe output: only allow alphanumeric, underscore, hyphen, slash, dot, tilde
-safe = lambda s: re.sub(r'[^a-zA-Z0-9_/.\-~]', '', str(s))
-# Coerce stop_hook_active to strict boolean string
-sha = 'True' if sha_raw is True or str(sha_raw).lower() in ('true', '1', 'yes') else 'False'
-print('__MEMPAL_PARSE_OK__')
-print(safe(sid))
-print(sha)
-print(safe(tp))
-" 2>"$STATE_DIR/last_python_err.log"
+    printf '%s' "$INPUT" | "$MEMPAL_PYTHON_BIN" -m mempalace.hook_shell parse-stop \
+        2>"$STATE_DIR/last_python_err.log"
 )
 # The 2> redirect creates the file even when stderr is empty (success).
 # Remove the empty file so the state directory stays clean on the happy
@@ -239,24 +226,10 @@ fi
 # Count human messages in the JSONL transcript
 # SECURITY: Pass transcript path as sys.argv to avoid shell injection via crafted paths
 if [ -f "$TRANSCRIPT_PATH" ]; then
-    EXCHANGE_COUNT=$("$MEMPAL_PYTHON_BIN" - "$TRANSCRIPT_PATH" <<'PYEOF'
-import json, sys
-count = 0
-with open(sys.argv[1]) as f:
-    for line in f:
-        try:
-            entry = json.loads(line)
-            msg = entry.get('message', {})
-            if isinstance(msg, dict) and msg.get('role') == 'user':
-                content = msg.get('content', '')
-                if isinstance(content, str) and '<command-message>' in content:
-                    continue
-                count += 1
-        except:
-            pass
-print(count)
-PYEOF
-2>/dev/null)
+    EXCHANGE_COUNT=$("$MEMPAL_PYTHON_BIN" -m mempalace.hook_shell count-human-messages "$TRANSCRIPT_PATH" 2>/dev/null)
+elif [ -n "$TRANSCRIPT_PATH" ]; then
+    echo "[$(date '+%H:%M:%S')] WARN: transcript_path not found after normalization: $TRANSCRIPT_PATH" >> "$STATE_DIR/hook.log"
+    EXCHANGE_COUNT=0
 else
     EXCHANGE_COUNT=0
 fi
