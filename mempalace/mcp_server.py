@@ -3734,6 +3734,51 @@ def _maybe_eager_warmup_embedder() -> None:
         )
 
 
+_MCP_PARENT_WATCHDOG_ENV = "MEMPALACE_MCP_PARENT_WATCHDOG"
+
+
+def _start_parent_death_watchdog() -> None:
+    """Exit immediately if the parent (client) process dies.
+
+    The MCP stdio protocol carries no application-level liveness signal:
+    when a client crashes, force-quits, or restarts without closing stdio
+    cleanly, the child server can outlive its parent indefinitely — still
+    holding ChromaDB / HNSW / SQLite file handles. The idle watchdog only
+    catches this 8 h later; this thread catches it within seconds.
+
+    POSIX reparents an orphaned child to PID 1 (init / launchd). The
+    watchdog polls ``getppid()`` every 5 s and exits the process as soon
+    as it sees that signal.
+
+    Set ``MEMPALACE_MCP_PARENT_WATCHDOG=0`` to disable.
+    """
+    raw = os.environ.get(_MCP_PARENT_WATCHDOG_ENV, "").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return
+    initial_ppid = os.getppid()
+
+    def _watchdog() -> None:
+        while True:
+            time.sleep(5.0)
+            try:
+                current_ppid = os.getppid()
+            except OSError:
+                os._exit(0)
+            if current_ppid == 1:
+                if initial_ppid == 1:
+                    detail = "absent at startup"
+                else:
+                    detail = f"died (PPID was {initial_ppid})"
+                logger.info(
+                    "Parent process %s; exiting orphan to release file handles.",
+                    detail,
+                )
+                os._exit(0)
+
+    t = threading.Thread(target=_watchdog, name="mcp-parent-watchdog", daemon=True)
+    t.start()
+
+
 def _start_idle_exit_watchdog() -> None:
     """Start a daemon thread that exits the process after an idle period.
 
@@ -3800,6 +3845,9 @@ def main():
     # does not pay the ONNX/CoreML cold-load tax under the MCP client
     # timeout (#1495). Default off — preserves current startup latency.
     _maybe_eager_warmup_embedder()
+    # Parent-death watchdog: exit within ~5 s when the client process
+    # disappears (crash / force-quit / orphan). Catches what idle cannot.
+    _start_parent_death_watchdog()
     # Idle auto-exit: release ChromaDB file handles from stale servers
     # that outlived their Claude Code session (#1552).
     _start_idle_exit_watchdog()
