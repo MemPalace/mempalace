@@ -1119,6 +1119,27 @@ def hook_stop(data: dict, harness: str):
 
         project_wing = _wing_from_transcript_path(transcript_path)
 
+        # Cheap sentinel check: if a previous validate_palace_sqlite run flagged
+        # the palace as B-tree-corrupt, skip the chroma write entirely to avoid
+        # a ChromaDB Rust segfault on the stop-hook path.
+        try:
+            _palace_path_for_sentinel = config.palace_path
+        except Exception:
+            _palace_path_for_sentinel = None
+        if _palace_path_for_sentinel:
+            try:
+                from .corruption_sentinel import read_corruption_sentinel
+
+                if read_corruption_sentinel(_palace_path_for_sentinel) is not None:
+                    _log(
+                        "palace flagged corrupt — skipping save; "
+                        "run mempalace repair --mode from-sqlite --archive-existing"
+                    )
+                    _output({})
+                    return
+            except Exception:
+                pass
+
         if silent:
             # Save directly via Python API — systemMessage renders in terminal
             result = {"count": 0}

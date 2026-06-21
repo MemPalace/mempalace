@@ -30,14 +30,18 @@ Usage (from CLI):
 """
 
 import argparse
+import contextlib
+import logging
 import os
+import re
 import shutil
 import sqlite3
+import subprocess
+import sys
 import time
 from collections import defaultdict
 from contextlib import closing
 from datetime import datetime
-import re
 from typing import Callable, Iterator, Optional
 
 from chromadb.errors import NotFoundError as ChromaNotFoundError
@@ -74,6 +78,36 @@ def _drawers_collection_name() -> str:
         return COLLECTION_NAME
 
 
+def _sqlite_lock_holders(sqlite_path: str) -> list[str]:
+    """Return best-effort process summaries currently holding sqlite_path open."""
+    if not os.path.isfile(sqlite_path):
+        return []
+    if shutil.which("lsof") is None:
+        return []
+    try:
+        completed = subprocess.run(
+            ["lsof", sqlite_path],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+        )
+    except Exception:
+        return []
+    if completed.returncode != 0:
+        return []
+    lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+    if len(lines) <= 1:
+        return []
+    holders: list[str] = []
+    for line in lines[1:]:
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        holders.append(f"{parts[0]} pid={parts[1]} user={parts[2]}")
+    return holders
+
+
 def _recoverable_collections() -> tuple[str, ...]:
     """Collections rebuilt by ``rebuild_from_sqlite``, in upsert order.
 
@@ -100,6 +134,29 @@ def _get_palace_path():
     except Exception:
         default = os.path.join(os.path.expanduser("~"), ".mempalace", "palace")
         return default
+
+
+@contextlib.contextmanager
+def _rebuild_write_locks(source_palace: str, dest_palace: str):
+    """Acquire per-palace write locks for the full from-sqlite rebuild.
+
+    Rebuild mutates ``dest_palace`` and, for in-place mode, renames the
+    original palace before reading from the archive. Without taking the same
+    ``mine_palace_lock`` used by miners/MCP writes, concurrent writers can
+    interleave with repair and leave the destination immediately unhealthy.
+    """
+    from .palace import mine_palace_lock
+
+    paths = sorted(
+        {
+            os.path.abspath(os.path.expanduser(source_palace)),
+            os.path.abspath(os.path.expanduser(dest_palace)),
+        }
+    )
+    with contextlib.ExitStack() as stack:
+        for path in paths:
+            stack.enter_context(mine_palace_lock(path))
+        yield
 
 
 def _paginate_ids(col, where=None):
@@ -533,6 +590,302 @@ def sqlite_integrity_errors(palace_path: str) -> list[str]:
     return errors
 
 
+_FTS_MALFORMED_INDEX_ERROR = (
+    "malformed inverted index for fts5 table main.embedding_fulltext_search"
+)
+
+
+def _is_only_fts_malformed_index(errors: list[str]) -> bool:
+    if not errors:
+        return False
+    return all(_FTS_MALFORMED_INDEX_ERROR in str(e).lower() for e in errors)
+
+
+def _is_btree_corruption(errors: list[str]) -> bool:
+    """Return ``True`` when *errors* contains non-FTS B-tree-level corruption.
+
+    B-tree errors include messages such as "2nd reference to page N", "wrong #
+    of entries in index", "database disk image is malformed", and "row N
+    missing from index". These cannot be fixed by an FTS rebuild or an HNSW
+    rebuild — the only recovery path is
+    ``mempalace repair --mode from-sqlite --archive-existing``.
+
+    Returns ``False`` for an empty list or when every error is the known
+    FTS-only malformed-index message (which *can* be fixed with a targeted FTS
+    rebuild without involving from-sqlite).
+    """
+    if not errors:
+        return False
+    return not _is_only_fts_malformed_index(errors)
+
+
+def validate_palace_sqlite(
+    palace_path: str,
+    *,
+    set_sentinel: bool = True,
+) -> list[str]:
+    """Run ``PRAGMA quick_check`` and classify the result.
+
+    This is the *expensive* validation path — suitable only for
+    latency-tolerant entry points (CLI ``search``, ``status``, MCP server
+    startup).  Do NOT call from the stop-hook or any path where < 500 ms
+    latency is required.
+
+    Behaviour by error class
+    ~~~~~~~~~~~~~~~~~~~~~~~~
+    * **Empty / "ok"** — palace is healthy.  Clears any stale corruption
+      sentinel so a previously-flagged palace that has been restored does not
+      remain locked.  Returns ``[]``.
+
+    * **FTS-only malformed-index** — returns the errors without raising.
+      The existing :func:`maybe_rebuild_fts_index_when_only_fts_corrupt`
+      self-heal path handles this class; we should not block the caller.
+
+    * **B-tree corruption (non-FTS errors)** — if *set_sentinel* is ``True``,
+      atomically writes the ``.sqlite_corrupt`` sentinel file before raising so
+      future cheap reads (stop-hook, MCP ``_get_client``) see the flag
+      immediately.  Always raises :class:`PalaceSqliteCorruptError`.
+
+    Parameters
+    ----------
+    palace_path:
+        Absolute path to the palace directory.
+    set_sentinel:
+        Write the ``.sqlite_corrupt`` sentinel when B-tree corruption is
+        found.  Set to ``False`` only in tests that need to inspect the
+        raise without touching the filesystem.
+
+    Returns
+    -------
+    list[str]
+        Empty on a healthy palace or when only FTS errors are present.
+
+    Raises
+    ------
+    PalaceSqliteCorruptError
+        When ``PRAGMA quick_check`` reports B-tree corruption.
+    """
+    from .corruption_sentinel import clear_corruption_sentinel, write_corruption_sentinel
+
+    errors = sqlite_integrity_errors(palace_path)
+
+    if not errors:
+        # Clean — clear any stale sentinel so a restored palace isn't locked.
+        clear_corruption_sentinel(palace_path)
+        return []
+
+    if _is_only_fts_malformed_index(errors):
+        # FTS-only: leave for the existing self-heal path.
+        return errors
+
+    # B-tree corruption.
+    if set_sentinel:
+        write_corruption_sentinel(palace_path, errors)
+    raise PalaceSqliteCorruptError(palace_path, errors)
+
+
+_probe_logger = logging.getLogger(__name__)
+
+
+def probe_palace_loadable(palace_path: str, *, timeout: float = 120.0) -> list[str]:
+    """Run the HNSW loadability probe in a subprocess and classify the result.
+
+    Spawns ``python -m mempalace._loadprobe <palace_path>`` in a fresh
+    interpreter so that a native SIGSEGV in the chromadb Rust bindings cannot
+    kill the calling process.
+
+    Parameters
+    ----------
+    palace_path:
+        Absolute path to the palace directory to probe.
+    timeout:
+        Seconds to wait before giving up. Defaults to 120 s (generous, but
+        ``collection.count()`` on a large palace can take tens of seconds).
+
+    Returns
+    -------
+    list[str]
+        Empty list when the palace loads cleanly.  A single-element list with
+        a human-readable error string when the probe detects corruption,
+        times out, or fails to spawn.  (Never raises.)
+    """
+    sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isdir(palace_path) or not os.path.isfile(sqlite_path):
+        # Nothing to probe — palace absent or not yet initialised.
+        return []
+
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-m", "mempalace._loadprobe", palace_path],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return [f"HNSW loadability probe timed out after {timeout}s"]
+    except (FileNotFoundError, OSError) as exc:
+        _probe_logger.warning("HNSW loadability probe could not be spawned: %s", exc)
+        return []
+
+    if completed.returncode == 0:
+        return []
+
+    if completed.returncode in (-11, 139):
+        return [
+            "HNSW segment unloadable: native crash (SIGSEGV) loading the vector segment"
+            " — torn/corrupt binary segment not visible to PRAGMA quick_check"
+        ]
+
+    combined = (completed.stdout or "") + (completed.stderr or "")
+    if "error loading hnsw index" in combined.lower():
+        # Find the first line that mentions the error for a concise message.
+        for line in combined.splitlines():
+            if "error loading hnsw index" in line.lower():
+                return [f"HNSW segment unloadable: {line.strip()}"]
+        return ["HNSW segment unloadable: Error loading hnsw index (no detail)"]
+
+    # Some other non-zero exit — surface the last stderr line.
+    stderr_lines = [ln for ln in (completed.stderr or "").splitlines() if ln.strip()]
+    last = stderr_lines[-1] if stderr_lines else "unknown"
+    return [f"HNSW loadability probe failed (rc={completed.returncode}): {last}"]
+
+
+def validate_palace_health(
+    palace_path: str,
+    *,
+    set_sentinel: bool = True,
+) -> list[str]:
+    """Full latency-tolerant health check: SQLite integrity + HNSW loadability.
+
+    This is the preferred entry point for latency-tolerant paths (CLI
+    ``search``, ``status``, MCP server startup).  It supersedes the narrower
+    :func:`validate_palace_sqlite` by also running the subprocess-isolated
+    HNSW loadability probe when SQLite is clean.
+
+    Do **not** call from the stop-hook or any path where < 500 ms latency is
+    required — both the PRAGMA quick_check and the subprocess probe can take
+    several seconds on large palaces.
+
+    Behaviour
+    ~~~~~~~~~
+    1. Run ``PRAGMA quick_check`` via :func:`sqlite_integrity_errors`.
+
+       * B-tree corruption → write sentinel + raise
+         :class:`PalaceSqliteCorruptError` (probe is NOT called).
+       * FTS-only errors → fall through to probe (FTS does not affect HNSW).
+       * Clean → fall through to probe.
+
+    2. Run :func:`probe_palace_loadable` in a subprocess.
+
+       * Errors returned → write sentinel + raise
+         :class:`PalaceSegmentUnloadableError`.
+       * Clean → clear any stale sentinel, return ``[]``.
+
+    Parameters
+    ----------
+    palace_path:
+        Absolute path to the palace directory.
+    set_sentinel:
+        Write / clear the ``.sqlite_corrupt`` sentinel.  Set to ``False``
+        only in tests that must not touch the filesystem.
+
+    Returns
+    -------
+    list[str]
+        Empty when the palace is healthy.
+
+    Raises
+    ------
+    PalaceSqliteCorruptError
+        When SQLite B-tree corruption is detected.
+    PalaceSegmentUnloadableError
+        When the HNSW binary segment fails to load.
+    """
+    from .corruption_sentinel import clear_corruption_sentinel, write_corruption_sentinel
+
+    # ── Step 1: SQLite integrity ──────────────────────────────────────────────
+    errors = sqlite_integrity_errors(palace_path)
+
+    if errors and _is_btree_corruption(errors):
+        # B-tree: stop here, do not run the probe.
+        if set_sentinel:
+            write_corruption_sentinel(palace_path, errors)
+        raise PalaceSqliteCorruptError(palace_path, errors)
+
+    # errors may contain FTS-only entries — those do not affect HNSW loadability.
+
+    # ── Step 2: HNSW loadability probe ───────────────────────────────────────
+    probe_errors = probe_palace_loadable(palace_path)
+    if probe_errors:
+        if set_sentinel:
+            write_corruption_sentinel(palace_path, probe_errors)
+        raise PalaceSegmentUnloadableError(palace_path, probe_errors)
+
+    # Both checks passed — clear any stale sentinel.
+    if set_sentinel:
+        clear_corruption_sentinel(palace_path)
+
+    return []
+
+
+def maybe_rebuild_fts_index_when_only_fts_corrupt(
+    palace_path: str,
+    errors: list[str],
+) -> list[str]:
+    """Attempt targeted FTS5 rebuild when quick_check reports only FTS corruption.
+
+    Returns the post-rebuild quick_check errors (empty on success), or the
+    original ``errors`` when this path is not applicable or rebuild fails.
+    """
+    if not _is_only_fts_malformed_index(errors):
+        # B-tree corruption: in-place repair cannot help.  Raise so
+        # legacy/HNSW callers route the user to from-sqlite recovery
+        # instead of dead-ending with an opaque Chroma panic.
+        if _is_btree_corruption(errors):
+            raise PalaceSqliteCorruptError(palace_path, errors)
+        return errors
+
+    sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(sqlite_path):
+        return errors
+
+    from .palace import MineAlreadyRunning, mine_palace_lock
+
+    print("\n  Detected isolated FTS5 malformed-index errors from quick_check.")
+    print("  Attempting targeted FTS rebuild under palace lock...")
+
+    try:
+        with mine_palace_lock(palace_path):
+            with sqlite3.connect(sqlite_path) as conn:
+                conn.execute("PRAGMA busy_timeout=5000")
+                conn.execute(
+                    "INSERT INTO embedding_fulltext_search(embedding_fulltext_search) "
+                    "VALUES('rebuild')"
+                )
+                rows = conn.execute("PRAGMA quick_check").fetchall()
+    except MineAlreadyRunning as exc:
+        print(f"  FTS rebuild skipped: {exc}")
+        return errors
+    except sqlite3.Error as exc:
+        print(f"  FTS rebuild failed: {exc}")
+        return errors
+
+    post_errors: list[str] = []
+    for row in rows:
+        if not row:
+            continue
+        message = str(row[0])
+        if message.lower() != "ok":
+            post_errors.append(message)
+
+    if post_errors:
+        print("  FTS rebuild completed but quick_check still reports issues.")
+        return post_errors
+
+    print("  FTS rebuild succeeded; quick_check is now healthy.")
+    return []
+
+
 def print_sqlite_integrity_abort(palace_path: str, errors: list[str]) -> None:
     """Print a clear repair abort message for SQLite-layer corruption."""
 
@@ -775,6 +1128,11 @@ def rebuild_index(
     # corruption here lets us surface the clear recovery instructions and
     # exit cleanly before chromadb's compactor touches the disk.
     sqlite_errors = sqlite_integrity_errors(palace_path)
+    try:
+        sqlite_errors = maybe_rebuild_fts_index_when_only_fts_corrupt(palace_path, sqlite_errors)
+    except PalaceSqliteCorruptError as exc:
+        print_sqlite_integrity_abort(palace_path, exc.errors)
+        return
     if sqlite_errors:
         print_sqlite_integrity_abort(palace_path, sqlite_errors)
         return
@@ -894,6 +1252,89 @@ class RebuildPartialError(Exception):
         self.failed_collection = failed_collection
         self.dest_palace = dest_palace
         self.archive_path = archive_path
+
+
+class PalaceCorruptError(Exception):
+    """Base class for all palace-corruption errors.
+
+    Catch this base to handle both SQLite B-tree corruption and torn HNSW
+    binary segment errors uniformly (e.g. in CLI entry points and the MCP
+    server open-guard).  The subclass carries the details.
+    """
+
+
+class PalaceSqliteCorruptError(PalaceCorruptError):
+    """Raised when ``PRAGMA quick_check`` reveals B-tree-level corruption.
+
+    In-place repair (HNSW rebuild, FTS rebuild) cannot fix B-tree corruption
+    because the corruption lives in SQLite's on-disk page structures, not in
+    derived indexes.  The only fully automated recovery path is to rebuild the
+    palace from the verbatim documents still stored in the SQLite rows:
+
+        mempalace repair --mode from-sqlite --archive-existing
+
+    That command reads rows directly via SQL — bypassing HNSW and FTS — and
+    writes a fresh, structurally clean palace.
+
+    Attributes
+    ----------
+    palace_path:
+        Absolute path to the corrupt palace directory.
+    errors:
+        Non-empty list of ``quick_check`` output lines describing the
+        corruption.
+    """
+
+    def __init__(self, palace_path: str, errors: list[str]):
+        self.palace_path = palace_path
+        self.errors = errors
+        super().__init__(str(self))
+
+    def __str__(self) -> str:
+        preview = "; ".join(self.errors[:3])
+        return (
+            f"SQLite B-tree corruption detected in palace at '{self.palace_path}': "
+            f"{preview}. "
+            "In-place repair cannot fix this. "
+            "Run: mempalace repair --mode from-sqlite --archive-existing"
+        )
+
+
+class PalaceSegmentUnloadableError(PalaceCorruptError):
+    """Raised when the HNSW binary segment cannot be loaded by ChromaDB.
+
+    SQLite ``PRAGMA quick_check`` passes for this failure mode — the binary
+    segment (``data_level0.bin``, ``link_lists.bin``, or
+    ``index_metadata.pickle``) is torn or corrupt but that is invisible to
+    SQLite.  The subprocess-isolated loadability probe detects it when
+    ``collection.count()`` raises ``InternalError: Error loading hnsw index``
+    or causes a native SIGSEGV in the chromadb Rust bindings.
+
+    Recovery path (same as B-tree corruption — SQLite rows remain intact):
+
+        mempalace repair --mode from-sqlite --archive-existing
+
+    Attributes
+    ----------
+    palace_path:
+        Absolute path to the palace with the unloadable segment.
+    errors:
+        List of error strings from the loadability probe.
+    """
+
+    def __init__(self, palace_path: str, errors: list[str]):
+        self.palace_path = palace_path
+        self.errors = errors
+        super().__init__(str(self))
+
+    def __str__(self) -> str:
+        preview = "; ".join(self.errors[:3])
+        return (
+            f"HNSW segment unloadable in palace at '{self.palace_path}': "
+            f"{preview}. "
+            "SQLite is intact but the binary HNSW segment is torn/corrupt. "
+            "Run: mempalace repair --mode from-sqlite --archive-existing"
+        )
 
 
 def _rebuild_one_collection(
@@ -1181,68 +1622,77 @@ def rebuild_from_sqlite(
             return {}
 
     archive_path: Optional[str] = None
-    if in_place:
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        archive_path = f"{dest_palace}.pre-rebuild-{ts}"
-        print(f"  Archiving {dest_palace} → {archive_path}")
-        shutil.move(dest_palace, archive_path)
-        source_palace = archive_path
-        src_db = os.path.join(source_palace, "chroma.sqlite3")
+    with _rebuild_write_locks(source_palace, dest_palace):
+        if in_place:
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            archive_path = f"{dest_palace}.pre-rebuild-{ts}"
+            print(f"  Archiving {dest_palace} → {archive_path}")
+            shutil.move(dest_palace, archive_path)
+            source_palace = archive_path
+            src_db = os.path.join(source_palace, "chroma.sqlite3")
 
-        # In-place only: drop chromadb's process-wide System registry so
-        # the new client at dest_palace builds a fresh System. Without
-        # this, ``create_collection`` raises "Collection already exists"
-        # because the cached System still holds the pre-rename schema.
-        # Cross-palace mode does not need this and would needlessly
-        # invalidate other callers' clients (see docstring warning).
+            # In-place only: drop chromadb's process-wide System registry so
+            # the new client at dest_palace builds a fresh System. Without
+            # this, ``create_collection`` raises "Collection already exists"
+            # because the cached System still holds the pre-rename schema.
+            # Cross-palace mode does not need this and would needlessly
+            # invalidate other callers' clients (see docstring warning).
+            try:
+                from chromadb.api.client import SharedSystemClient
+
+                SharedSystemClient.clear_system_cache()
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"  Warning: could not clear chromadb system cache ({exc!r}); "
+                    "in-place rebuild may fail with 'Collection already exists'."
+                )
+
+        os.makedirs(dest_palace, exist_ok=True)
+
+        # Backend lifetime is wrapped in try/finally so the dest palace's
+        # PersistentClient handle (opened lazily inside ``create_collection``
+        # / ``get_collection``) is released on every exit path: success,
+        # ``RebuildPartialError``, or any unexpected exception. Without this,
+        # a long-running process that calls ``rebuild_from_sqlite`` would
+        # leak SQLite/HNSW file handles into Chroma's ``SharedSystemClient``
+        # cache, surfacing later as "Collection already exists" on the next
+        # in-place rebuild or as a Windows file-lock failure on cleanup
+        # (cf. #1285's lifecycle hardening for the legacy rebuild path).
+        backend = ChromaBackend()
+        counts: dict[str, int] = {}
         try:
-            from chromadb.api.client import SharedSystemClient
+            for cname in _recoverable_collections():
+                print(f"\n  [{cname}]")
+                upserted = _rebuild_one_collection(
+                    backend=backend,
+                    source_palace=source_palace,
+                    dest_palace=dest_palace,
+                    collection_name=cname,
+                    batch_size=batch_size,
+                    archive_path=archive_path,
+                    counts_so_far=counts,
+                )
+                counts[cname] = upserted
+                if upserted == 0:
+                    print(f"    no rows found for {cname} in source palace")
+                else:
+                    print(f"    done: {upserted} rows in {cname}")
 
-            SharedSystemClient.clear_system_cache()
-        except Exception as exc:  # noqa: BLE001
-            print(
-                f"  Warning: could not clear chromadb system cache ({exc!r}); "
-                "in-place rebuild may fail with 'Collection already exists'."
-            )
+            print(f"\n  Rebuild complete. {sum(counts.values())} total rows.")
+            if archive_path is not None:
+                print(f"  Original palace archived at: {archive_path}")
+            print(f"{'=' * 55}\n")
+            # Clear any corruption sentinel on the destination (live) palace so
+            # future open-guards and hook checks see a clean state.
+            try:
+                from .corruption_sentinel import clear_corruption_sentinel
 
-    os.makedirs(dest_palace, exist_ok=True)
-
-    # Backend lifetime is wrapped in try/finally so the dest palace's
-    # PersistentClient handle (opened lazily inside ``create_collection``
-    # / ``get_collection``) is released on every exit path: success,
-    # ``RebuildPartialError``, or any unexpected exception. Without this,
-    # a long-running process that calls ``rebuild_from_sqlite`` would
-    # leak SQLite/HNSW file handles into Chroma's ``SharedSystemClient``
-    # cache, surfacing later as "Collection already exists" on the next
-    # in-place rebuild or as a Windows file-lock failure on cleanup
-    # (cf. #1285's lifecycle hardening for the legacy rebuild path).
-    backend = ChromaBackend()
-    counts: dict[str, int] = {}
-    try:
-        for cname in _recoverable_collections():
-            print(f"\n  [{cname}]")
-            upserted = _rebuild_one_collection(
-                backend=backend,
-                source_palace=source_palace,
-                dest_palace=dest_palace,
-                collection_name=cname,
-                batch_size=batch_size,
-                archive_path=archive_path,
-                counts_so_far=counts,
-            )
-            counts[cname] = upserted
-            if upserted == 0:
-                print(f"    no rows found for {cname} in source palace")
-            else:
-                print(f"    done: {upserted} rows in {cname}")
-
-        print(f"\n  Rebuild complete. {sum(counts.values())} total rows.")
-        if archive_path is not None:
-            print(f"  Original palace archived at: {archive_path}")
-        print(f"{'=' * 55}\n")
-        return counts
-    finally:
-        backend.close()
+                clear_corruption_sentinel(dest_palace)
+            except Exception:  # noqa: BLE001
+                pass
+            return counts
+        finally:
+            backend.close()
 
 
 def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
@@ -1272,6 +1722,12 @@ def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
     if not os.path.isdir(palace_path):
         print("  No palace found.\n")
         return {"status": "unknown", "message": "no palace at path"}
+    sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
+    lock_holders = _sqlite_lock_holders(sqlite_path)
+    if lock_holders:
+        print("\n  [sqlite lock holders]")
+        for holder in lock_holders[:10]:
+            print(f"    {holder}")
 
     db_path = os.path.join(palace_path, "chroma.sqlite3")
     if not os.path.isfile(db_path):
@@ -1311,7 +1767,7 @@ def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
     if drawers["diverged"] or closets["diverged"]:
         print("\n  Recommended: run `mempalace repair` to rebuild the index.")
     print()
-    return {"drawers": drawers, "closets": closets}
+    return {"drawers": drawers, "closets": closets, "lock_holders": lock_holders}
 
 
 # ---------------------------------------------------------------------------

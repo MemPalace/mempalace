@@ -908,9 +908,14 @@ def cmd_daemon(args):
 
 
 def cmd_search(args):
+    from .repair import PalaceCorruptError
     from .searcher import search, SearchError
 
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    # Interactive search is a hot path: do NOT run the expensive quick_check +
+    # loadability probe here. Rely on the O(1) .sqlite_corrupt sentinel guard in
+    # _prepare_palace_for_open (the sentinel is written by `status` / MCP startup),
+    # which raises PalaceCorruptError when the palace is already known-corrupt.
     try:
         search(
             query=args.query,
@@ -919,6 +924,9 @@ def cmd_search(args):
             room=args.room,
             n_results=args.results,
         )
+    except PalaceCorruptError as exc:
+        print(f"\n  ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
     except SearchError:
         sys.exit(1)
 
@@ -988,8 +996,21 @@ def cmd_migrate_wings(args):
 
 def cmd_status(args):
     from .miner import status
+    from .repair import PalaceCorruptError, PalaceSegmentUnloadableError, validate_palace_health
 
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    try:
+        validate_palace_health(palace_path)
+    except PalaceSegmentUnloadableError as exc:
+        print(
+            f"\n  ERROR: segment NOT loadable — {exc}\n"
+            "  Run: mempalace repair --mode from-sqlite --archive-existing",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    except PalaceCorruptError as exc:
+        print(f"\n  ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
     status(palace_path=palace_path)
 
 
@@ -1050,6 +1071,51 @@ def cmd_repair_status(args):
     repair_status(palace_path=palace_path)
 
 
+def _cmd_repair_from_sqlite(args, palace_path):
+    """Handle ``repair --mode from-sqlite``: rebuild a fresh store from documents."""
+    from .migrate import confirm_destructive_action
+    from .palace import MineAlreadyRunning
+    from .repair import RebuildPartialError, rebuild_from_sqlite
+
+    source_path = getattr(args, "source", None)
+    source_path = os.path.abspath(os.path.expanduser(source_path)) if source_path else palace_path
+    archive_existing = getattr(args, "archive_existing", False)
+
+    # Gate any path that touches the user's existing palace dir behind
+    # confirm_destructive_action: --archive-existing renames the existing palace,
+    # and --source PATH writes into --palace which the user may not realize is also
+    # a palace. No prompt when source != dest AND dest does not exist (pure
+    # extract-into-fresh-dir is non-destructive to existing palaces).
+    is_destructive_to_dest = source_path == palace_path or os.path.exists(palace_path)
+    if is_destructive_to_dest and not confirm_destructive_action(
+        "Rebuild from SQLite", palace_path, assume_yes=getattr(args, "yes", False)
+    ):
+        return
+
+    try:
+        counts = rebuild_from_sqlite(
+            source_palace=source_path,
+            dest_palace=palace_path,
+            archive_existing_dest=archive_existing,
+        )
+    except MineAlreadyRunning as exc:
+        print(f"mempalace: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except RebuildPartialError as exc:
+        # rebuild_from_sqlite already printed the error + recovery steps; surface a
+        # non-zero exit so scripts and CI gates see the failure.
+        print(
+            "\n  Rebuild partial — see message above. "
+            f"Failed in collection: {exc.failed_collection}"
+        )
+        sys.exit(1)
+    # An empty counts dict is rebuild_from_sqlite's documented signal for a
+    # validation refusal (missing source, existing dest, in-place without
+    # --archive-existing); the library already printed an actionable message.
+    if not counts:
+        sys.exit(1)
+
+
 def cmd_repair(args):
     """Rebuild palace vector index from SQLite metadata.
 
@@ -1069,6 +1135,7 @@ def cmd_repair(args):
     from .backends.chroma import ChromaBackend
     from .migrate import confirm_destructive_action, contains_palace_database
     from .repair import (
+        PalaceSqliteCorruptError,
         RebuildCollectionError,
         TruncationDetected,
         _close_chroma_handles,
@@ -1076,6 +1143,7 @@ def cmd_repair(args):
         _post_rebuild_cleanup,
         _rebuild_collection_via_temp,
         check_extraction_safety,
+        maybe_rebuild_fts_index_when_only_fts_corrupt,
         maybe_repair_poisoned_max_seq_id_before_rebuild,
         print_sqlite_integrity_abort,
         sqlite_integrity_errors,
@@ -1095,53 +1163,20 @@ def cmd_repair(args):
         return
 
     if getattr(args, "mode", "legacy") == "from-sqlite":
-        from .migrate import confirm_destructive_action
-        from .repair import RebuildPartialError, rebuild_from_sqlite
+        _cmd_repair_from_sqlite(args, palace_path)
+        return
 
-        source_path = getattr(args, "source", None)
-        source_path = (
-            os.path.abspath(os.path.expanduser(source_path)) if source_path else palace_path
-        )
-        archive_existing = getattr(args, "archive_existing", False)
-
-        # Gate any path that touches the user's existing palace dir
-        # behind confirm_destructive_action. The legacy mode already
-        # gates; from-sqlite needs the same protection because:
-        # (a) --archive-existing renames the existing palace,
-        # (b) --source PATH writes into --palace dir which the user
-        #     may not realize is also a palace.
-        # No prompt when source != dest AND dest does not exist (pure
-        # extract-into-fresh-dir case is non-destructive to existing
-        # palaces).
-        is_destructive_to_dest = source_path == palace_path or os.path.exists(palace_path)
-        if is_destructive_to_dest and not confirm_destructive_action(
-            "Rebuild from SQLite", palace_path, assume_yes=getattr(args, "yes", False)
-        ):
+    if getattr(args, "mode", "legacy") == "fts-rebuild":
+        sqlite_errors = sqlite_integrity_errors(palace_path)
+        if not sqlite_errors:
+            print("\n  SQLite quick_check is already healthy; no FTS rebuild needed.")
             return
-
-        try:
-            counts = rebuild_from_sqlite(
-                source_palace=source_path,
-                dest_palace=palace_path,
-                archive_existing_dest=archive_existing,
-            )
-        except RebuildPartialError as exc:
-            # The error itself was already printed by rebuild_from_sqlite
-            # with recovery instructions; surface a non-zero exit so
-            # scripts and CI gates see the failure.
-            print(
-                "\n  Rebuild partial — see message above. "
-                f"Failed in collection: {exc.failed_collection}"
-            )
-            sys.exit(1)
-        # An empty counts dict is rebuild_from_sqlite's documented signal
-        # for a validation refusal (missing source, existing dest,
-        # in-place without --archive-existing). The library already
-        # printed an actionable message; exit non-zero so unattended
-        # scripts/CI distinguish "invalid inputs" from a successful
-        # rebuild that legitimately found zero rows (which still returns
-        # a populated dict with 0-valued counts).
-        if not counts:
+        post_errors = maybe_rebuild_fts_index_when_only_fts_corrupt(
+            palace_path,
+            sqlite_errors,
+        )
+        if post_errors:
+            print_sqlite_integrity_abort(palace_path, post_errors)
             sys.exit(1)
         return
 
@@ -1162,6 +1197,11 @@ def cmd_repair(args):
     # here so we can surface the clear recovery instructions and exit
     # cleanly before chromadb's compactor touches the disk.
     sqlite_errors = sqlite_integrity_errors(palace_path)
+    try:
+        sqlite_errors = maybe_rebuild_fts_index_when_only_fts_corrupt(palace_path, sqlite_errors)
+    except PalaceSqliteCorruptError as exc:
+        print_sqlite_integrity_abort(palace_path, exc.errors)
+        sys.exit(1)
     if sqlite_errors:
         print_sqlite_integrity_abort(palace_path, sqlite_errors)
         sys.exit(1)
@@ -1829,14 +1869,16 @@ def main():
     )
     p_repair.add_argument(
         "--mode",
-        choices=["legacy", "max-seq-id", "from-sqlite"],
+        choices=["legacy", "max-seq-id", "from-sqlite", "fts-rebuild"],
         default="legacy",
         help=(
             "legacy: full-palace rebuild via the chromadb client (default). "
             "max-seq-id: un-poison max_seq_id rows corrupted by the legacy 0.6.x shim. "
             "from-sqlite: rebuild by reading rows directly from chroma.sqlite3, "
             "bypassing the chromadb client. Use when legacy mode bails because the "
-            "chromadb client cannot open the collection."
+            "chromadb client cannot open the collection. "
+            "fts-rebuild: rebuild only the FTS5 index when quick_check reports "
+            "isolated malformed inverted-index errors."
         ),
     )
     p_repair.add_argument(

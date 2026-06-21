@@ -2,6 +2,7 @@ import os
 import pickle
 import shutil
 import sqlite3
+import time
 from contextlib import closing
 from pathlib import Path
 
@@ -1458,14 +1459,77 @@ def test_quarantine_invalid_hnsw_metadata_renames_missing_dimensionality(tmp_pat
     palace.mkdir()
     seg = palace / "abcd-1234-5678"
     seg.mkdir()
-    with open(seg / "index_metadata.pickle", "wb") as f:
+    meta = seg / "index_metadata.pickle"
+    with open(meta, "wb") as f:
         pickle.dump({"dimensionality": None, "id_to_label": {"a": 1}}, f)
+    # Stale missing-dimensionality metadata should still be quarantined.
+    old = time.time() - 7200
+    os.utime(meta, (old, old))
 
     moved = quarantine_invalid_hnsw_metadata(str(palace))
 
     assert len(moved) == 1
     assert ".corrupt-" in moved[0]
     assert not seg.exists()
+
+
+def test_quarantine_invalid_hnsw_metadata_skips_recent_missing_dimensionality(tmp_path):
+    """Fresh segments can temporarily have labels with dimensionality=None.
+
+    During large active ingests, chroma may materialize ``id_to_label`` before
+    a final dimensionality value lands. Quarantining that transient state causes
+    live VECTOR dirs to be repeatedly renamed out from under writers.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    seg = palace / "abcd-1234-5678"
+    seg.mkdir()
+    with open(seg / "index_metadata.pickle", "wb") as f:
+        pickle.dump({"dimensionality": None, "id_to_label": {"a": 1}}, f)
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert moved == []
+    assert seg.exists()
+
+
+def test_quarantine_invalid_hnsw_metadata_respects_configured_fresh_window(tmp_path, monkeypatch):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    seg = palace / "abcd-1234-5678"
+    seg.mkdir()
+    meta = seg / "index_metadata.pickle"
+    with open(meta, "wb") as f:
+        pickle.dump({"dimensionality": None, "id_to_label": {"a": 1}}, f)
+
+    monkeypatch.setenv("MEMPALACE_INVALID_HNSW_METADATA_FRESH_SECONDS", "1")
+    old = time.time() - 5
+    os.utime(meta, (old, old))
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert len(moved) == 1
+    assert ".corrupt-" in moved[0]
+    assert not seg.exists()
+
+
+def test_quarantine_invalid_hnsw_metadata_boundary_at_fresh_window(tmp_path, monkeypatch):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    seg = palace / "abcd-1234-5678"
+    seg.mkdir()
+    meta = seg / "index_metadata.pickle"
+    with open(meta, "wb") as f:
+        pickle.dump({"dimensionality": None, "id_to_label": {"a": 1}}, f)
+
+    monkeypatch.setenv("MEMPALACE_INVALID_HNSW_METADATA_FRESH_SECONDS", "10")
+    recent = time.time() - 5
+    os.utime(meta, (recent, recent))
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert moved == []
+    assert seg.exists()
 
 
 def test_quarantine_invalid_hnsw_metadata_keeps_consistent_missing_dimensionality(tmp_path):
@@ -1875,3 +1939,62 @@ def test_palace_get_collection_uses_configured_collection_name(monkeypatch):
         "collection_name": "custom_drawers",
         "create": False,
     }
+
+
+# ── sentinel-based open guard ─────────────────────────────────────────────────
+
+
+def test_prepare_palace_for_open_raises_palace_sqlite_corrupt_error_on_sentinel(tmp_path):
+    """When .sqlite_corrupt is present, _prepare_palace_for_open must raise
+    PalaceSqliteCorruptError without touching the expensive integrity-check
+    logic (sqlite_integrity_errors should NOT be called).
+    """
+    import os
+    from unittest.mock import patch
+
+    from mempalace.backends.chroma import ChromaBackend
+    from mempalace.corruption_sentinel import write_corruption_sentinel
+    from mempalace.repair import PalaceSqliteCorruptError
+    import mempalace.repair as repair_mod
+
+    palace = str(tmp_path / "sentinel_palace")
+    os.makedirs(palace)
+    write_corruption_sentinel(palace, ["database disk image is malformed"])
+
+    with patch.object(
+        repair_mod,
+        "sqlite_integrity_errors",
+        side_effect=AssertionError("sqlite_integrity_errors must not be called on hot path"),
+    ):
+        with pytest.raises(PalaceSqliteCorruptError) as exc_info:
+            ChromaBackend._prepare_palace_for_open(palace)
+
+    assert palace in str(exc_info.value)
+
+
+def test_prepare_palace_for_open_no_sentinel_proceeds_normally(tmp_path, monkeypatch):
+    """Without a sentinel the normal open-guard path (_fix_blob_seq_ids,
+    quarantine checks) must run without raising PalaceSqliteCorruptError.
+    """
+    import os
+
+    from mempalace.backends.chroma import ChromaBackend
+    from mempalace.repair import PalaceSqliteCorruptError
+
+    palace = str(tmp_path / "clean_palace")
+    os.makedirs(palace)
+
+    # Patch the expensive helpers so we don't need a real palace on disk.
+    monkeypatch.setattr("mempalace.backends.chroma._fix_blob_seq_ids", lambda p: None)
+    monkeypatch.setattr(
+        "mempalace.backends.chroma.quarantine_invalid_hnsw_metadata", lambda p: None
+    )
+    monkeypatch.setattr("mempalace.backends.chroma.quarantine_stale_hnsw", lambda p: None)
+    # Clear the quarantined set so the cold-start gate fires.
+    ChromaBackend._quarantined_paths.discard(palace)
+
+    # Should not raise.
+    try:
+        ChromaBackend._prepare_palace_for_open(palace)
+    except PalaceSqliteCorruptError:
+        pytest.fail("PalaceSqliteCorruptError raised without a sentinel")
