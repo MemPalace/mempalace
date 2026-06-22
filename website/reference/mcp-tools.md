@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-Detailed parameter schemas for all 45 MCP tools.
+Detailed parameter schemas for all 53 MCP tools.
 
 ## Palace — Read Tools
 
@@ -315,6 +315,146 @@ Knowledge graph overview.
 **Parameters:** None
 
 **Returns:** `{ entities, triples, current_facts, expired_facts, relationship_types }`
+
+---
+
+## Synthesis Graph Tools
+
+Synthesis nodes are drawers (`node_kind=synthesis`) that summarize two or more
+existing drawers. They form a height-ordered DAG layered on the knowledge graph:
+`synthesized-from` edges link a synthesis node to its sources, and `merged-into`
+edges redirect a node to its canonical equivalent. Height and canonical identity
+are **computed by traversal**, never stored authoritatively — the optional
+`height` metadata is only a cached hint.
+
+### `mempalace_create_synthesis_node`
+
+Create a synthesis drawer over two or more existing source drawers and link
+`synthesized-from` edges. Height is computed as `max(parent heights) + 1`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `wing` | string | **Yes** | Wing to file the synthesis node in |
+| `room` | string | **Yes** | Room to file the synthesis node in |
+| `content` | string | **Yes** | Verbatim synthesis text |
+| `source_drawer_ids` | array | **Yes** | ≥2 distinct existing drawer ids to synthesize from |
+| `desc` | string | No | Short description stored in drawer metadata |
+| `height` | integer | No | Optional override; must be ≥ the computed height |
+| `source_file` | string | No | Source file label for provenance |
+| `added_by` | string | No | Attribution tag (default: `mcp`) |
+
+**Returns:** `{ success, drawer_id, wing, room, node_kind, height, source_drawer_ids, edges_created, chunks, chunk_ids }`
+
+---
+
+### `mempalace_get_height`
+
+Compute the longest-path height of a synthesis node (cycle-guarded). Resolves the
+canonical node first.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `node_id` | string | **Yes** | Drawer id of the synthesis node |
+
+**Returns:** `{ node_id, height, stored_height, canonical_chain }`
+
+---
+
+### `mempalace_get_ancestors`
+
+Breadth-first walk over outgoing `synthesized-from` edges (a node toward its
+sources). Resolves the canonical node first.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `node_id` | string | **Yes** | Drawer id to walk from |
+| `max_depth` | integer | No | Maximum traversal depth (default: 20) |
+
+**Returns:** `{ node_id, ancestors: [{ node_id, depth, from }], count, max_depth }`
+
+---
+
+### `mempalace_get_descendants`
+
+Breadth-first walk over incoming `synthesized-from` edges (a node toward the
+synthesis nodes built from it). Resolves the canonical node first.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `node_id` | string | **Yes** | Drawer id to walk from |
+| `max_depth` | integer | No | Maximum traversal depth (default: 20) |
+
+**Returns:** `{ node_id, descendants: [{ node_id, depth, from }], count, max_depth }`
+
+---
+
+### `mempalace_resolve_canonical`
+
+Follow the `merged-into` chain to the canonical node (cycle-guarded). Idempotent
+for unmerged nodes.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `node_id` | string | **Yes** | Drawer id to resolve |
+| `max_hops` | integer | No | Maximum chain length to follow (default: 50) |
+
+**Returns:** `{ node_id, canonical_node_id, hops, chain }`
+
+---
+
+### `mempalace_find_merge_candidates`
+
+Surface synthesis nodes that look like merge candidates. Reuses
+`mempalace_check_duplicate` for similarity scoring and intersects common
+ancestors. Surfaces candidates only — it makes no merge decision.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `drawer_id` | string | No | Seed node; if omitted, scans synthesis nodes |
+| `threshold` | number | No | Similarity threshold 0–1 (default: 0.9) |
+| `limit` | integer | No | Max candidates to return (default: 20) |
+| `max_nodes` | integer | No | Max synthesis nodes to scan (default: 40) |
+| `max_depth` | integer | No | Max ancestor depth for common-ancestor check (default: 20) |
+| `wing` | string | No | Restrict scan to a wing |
+| `room` | string | No | Restrict scan to a room |
+| `require_topological_distance` | boolean | No | Require a shared ancestor (default: true) |
+
+**Returns:** `{ candidates: [{ source_node_id, target_node_id, source_canonical_node_id, target_canonical_node_id, similarity, topologically_distant, common_ancestors }], count, scanned_nodes, threshold, require_topological_distance }`
+
+---
+
+### `mempalace_find_orphan_synthesis_nodes`
+
+List synthesis nodes with structural problems: no active parents, missing parent
+drawers, stored-height mismatch, or canonical-resolution failure.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `wing` | string | No | Restrict scan to a wing |
+| `room` | string | No | Restrict scan to a room |
+| `include_merged` | boolean | No | Include nodes already merged away (default: false) |
+| `limit` | integer | No | Page size (default: 20) |
+| `offset` | integer | No | Page offset (default: 0) |
+
+**Returns:** `{ orphans: [{ node_id, canonical_node_id, issues, active_parent_ids, missing_parent_ids, stored_height, computed_height }], count, total, limit, offset }`
+
+---
+
+### `mempalace_apply_merge`
+
+Execute a decided merge by adding a `merged-into` edge from the source node to the
+canonical node. Invalidates divergent prior `merged-into` edges and (optionally)
+the source's `synthesized-from` edges. Idempotent — re-merging a node that already
+resolves to the same canonical returns `merged: false`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `source_node_id` | string | **Yes** | Node being merged away |
+| `canonical_node_id` | string | **Yes** | Canonical node to merge into |
+| `ended` | string | No | ISO timestamp for edge invalidation (default: now) |
+| `invalidate_source_edges` | boolean | No | Also invalidate the source's `synthesized-from` edges (default: true) |
+
+**Returns:** `{ success, merged, source_node_id, canonical_node_id, merged_edge_added, invalidated_prior_merged_into, invalidated_synthesized_from, ended }`
 
 ---
 
