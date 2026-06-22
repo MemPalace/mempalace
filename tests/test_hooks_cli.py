@@ -762,6 +762,14 @@ def test_safe_wing_slug_collapses_double_dots():
     assert _safe_wing_slug("..hidden..") == "hidden"
 
 
+def test_safe_wing_slug_caps_length_for_sanitize_name():
+    """sanitize_name rejects names over 128 chars; the slug stays short enough that
+    wing_<slug> never trips that limit, even for very long directory names."""
+    slug = _safe_wing_slug("a" * 500)
+    assert len(slug) <= 120
+    sanitize_name(f"wing_{slug}")  # must not raise
+
+
 def test_safe_wing_slug_falls_back_to_sessions_when_empty():
     # names made entirely of disallowed characters reduce to nothing
     assert _safe_wing_slug("+") == "sessions"
@@ -787,7 +795,7 @@ def test_wing_from_transcript_path_legacy_plus_prefixed_project():
     assert _wing_from_transcript_path(path) == "wing_app"
 
 
-@given(st.text(min_size=1, max_size=40))
+@given(st.text(min_size=1, max_size=300))
 def test_safe_wing_slug_always_yields_sanitizable_wing(name):
     """Property: for ANY non-empty input, ``wing_<slug>`` must pass sanitize_name —
     the entire contract of the helper (a rejected wing silently breaks auto-save)."""
