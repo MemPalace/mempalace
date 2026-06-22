@@ -951,6 +951,21 @@ _ENCODED_PARENT_PREFIXES = (
 )
 
 
+def _safe_wing_slug(name: str) -> str:
+    """Normalize a project directory name into a wing slug ``sanitize_name`` accepts.
+
+    Besides the historical space/hyphen handling, collapse any run of non-word
+    characters to ``_`` and trim leading/trailing underscores. Without this, a
+    folder containing a character outside the validator's set (e.g. ``+`` in
+    ``+project``) produced ``wing_+project``, which ``sanitize_name`` rejects,
+    silently breaking diary auto-save for that project. Falls back to ``sessions``
+    when a name reduces to nothing (e.g. ``+``).
+    """
+    slug = name.lower().replace(" ", "_").replace("-", "_")
+    slug = re.sub(r"\W+", "_", slug).strip("_")
+    return slug or "sessions"
+
+
 def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
     """Read ``cwd`` from the first JSONL line that records it.
 
@@ -984,8 +999,7 @@ def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
                     continue
                 project = cwd_norm.rsplit("/", 1)[-1]
                 if project:
-                    slug = project.lower().replace(" ", "_").replace("-", "_")
-                    return f"wing_{slug}"
+                    return f"wing_{_safe_wing_slug(project)}"
     except OSError:
         pass
     return None
@@ -1042,15 +1056,12 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
             if encoded.startswith(prefix):
                 encoded = encoded[len(prefix) :]
                 break
-        project = encoded.lower().replace(" ", "_").replace("-", "_")
-        if project:
-            return f"wing_{project}"
+        return f"wing_{_safe_wing_slug(encoded)}"
 
     # 3. Legacy — explicit -Projects-<name> segment
     match = re.search(r"-Projects-([^/]+?)(?:/|$)", normalized)
     if match:
-        project = match.group(1).lower().replace(" ", "_").replace("-", "_")
-        return f"wing_{project}"
+        return f"wing_{_safe_wing_slug(match.group(1))}"
 
     # 4. Default
     return "wing_sessions"
