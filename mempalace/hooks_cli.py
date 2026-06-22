@@ -954,15 +954,18 @@ _ENCODED_PARENT_PREFIXES = (
 def _safe_wing_slug(name: str) -> str:
     """Normalize a project directory name into a wing slug ``sanitize_name`` accepts.
 
-    Besides the historical space/hyphen handling, collapse any run of non-word
-    characters to ``_`` and trim leading/trailing underscores. Without this, a
-    folder containing a character outside the validator's set (e.g. ``+`` in
-    ``+project``) produced ``wing_+project``, which ``sanitize_name`` rejects,
-    silently breaking diary auto-save for that project. Falls back to ``sessions``
-    when a name reduces to nothing (e.g. ``+``).
+    Builds on the historical space/hyphen handling: map characters outside
+    ``sanitize_name``'s set to ``_`` while keeping ``.`` and ``'`` so existing wings
+    for names like ``my.app`` are preserved (renaming a wing would orphan diary
+    entries already filed under it), collapse ``..`` which the validator rejects as
+    path traversal, and trim edge separators it won't accept. Without this a folder
+    containing e.g. a leading ``+`` produced ``wing_+project``, which ``sanitize_name``
+    rejects — silently breaking diary auto-save. Falls back to ``sessions`` when a
+    name reduces to nothing (e.g. ``+``).
     """
     slug = name.lower().replace(" ", "_").replace("-", "_")
-    slug = re.sub(r"\W+", "_", slug).strip("_")
+    slug = re.sub(r"[^\w.']+", "_", slug)
+    slug = re.sub(r"\.{2,}", ".", slug).strip("_.'")
     return slug or "sessions"
 
 

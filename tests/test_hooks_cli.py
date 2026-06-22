@@ -745,6 +745,23 @@ def test_safe_wing_slug_preserves_space_and_hyphen_behavior():
     assert _safe_wing_slug("claude-code") == "claude_code"
 
 
+def test_safe_wing_slug_preserves_existing_valid_names():
+    """Backward compatibility: a name that already produced a valid wing keeps the
+    same slug, so previously-filed diary entries aren't orphaned (AGENTS.md: never
+    destroy existing data). ``.`` and ``'`` are both accepted by sanitize_name and
+    must survive."""
+    assert _safe_wing_slug("myapp") == "myapp"
+    assert _safe_wing_slug("my.app") == "my.app"
+    assert _safe_wing_slug("v1.2.3") == "v1.2.3"
+    assert _safe_wing_slug("o'brien") == "o'brien"
+
+
+def test_safe_wing_slug_collapses_double_dots():
+    """``..`` must collapse — sanitize_name rejects it as path traversal."""
+    assert _safe_wing_slug("my..app") == "my.app"
+    assert _safe_wing_slug("..hidden..") == "hidden"
+
+
 def test_safe_wing_slug_falls_back_to_sessions_when_empty():
     # names made entirely of disallowed characters reduce to nothing
     assert _safe_wing_slug("+") == "sessions"
