@@ -4155,18 +4155,24 @@ class TestKGTools:
             height=2,
         )
 
-        def _fake_check_duplicate(content, threshold=0.9):
-            if content == "syn-a":
-                return {
-                    "is_duplicate": True,
-                    "matches": [
+        def _fake_batch_matches(_collection, seed_records, _threshold):
+            assert [r["drawer_id"] for r in seed_records] == [synth_a["drawer_id"]]
+            return (
+                {
+                    synth_a["drawer_id"]: [
                         {"id": synth_b["drawer_id"], "similarity": 0.96},
                         {"id": synth_c["drawer_id"], "similarity": 0.94},
-                    ],
-                }
-            return {"is_duplicate": False, "matches": []}
+                        {"id": synth_a["drawer_id"], "similarity": 1.0},
+                    ]
+                },
+                None,
+            )
 
-        monkeypatch.setattr(mcp_server, "tool_check_duplicate", _fake_check_duplicate)
+        monkeypatch.setattr(
+            mcp_server,
+            "_batch_duplicate_matches_for_records",
+            _fake_batch_matches,
+        )
 
         strict = mcp_server.tool_find_merge_candidates(
             drawer_id=synth_a["drawer_id"],

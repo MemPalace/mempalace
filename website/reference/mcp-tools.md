@@ -338,7 +338,7 @@ Create a synthesis drawer over two or more existing source drawers and link
 | `room` | string | **Yes** | Room to file the synthesis node in |
 | `content` | string | **Yes** | Verbatim synthesis text |
 | `source_drawer_ids` | array | **Yes** | ≥2 distinct existing drawer ids to synthesize from |
-| `desc` | string | No | Short description stored in drawer metadata |
+| `desc` | string | **Yes** | Short description stored in drawer metadata |
 | `height` | integer | No | Optional override; must be ≥ the computed height |
 | `source_file` | string | No | Source file label for provenance |
 | `added_by` | string | No | Attribution tag (default: `mcp`) |
@@ -417,7 +417,7 @@ ancestors. Surfaces candidates only — it makes no merge decision.
 | `max_depth` | integer | No | Max ancestor depth for common-ancestor check (default: 20) |
 | `wing` | string | No | Restrict scan to a wing |
 | `room` | string | No | Restrict scan to a room |
-| `require_topological_distance` | boolean | No | Require a shared ancestor (default: true) |
+| `require_topological_distance` | boolean | No | Require no shared ancestors (topologically distant nodes) (default: true) |
 
 **Returns:** `{ candidates: [{ source_node_id, target_node_id, source_canonical_node_id, target_canonical_node_id, similarity, topologically_distant, common_ancestors }], count, scanned_nodes, threshold, require_topological_distance }`
 

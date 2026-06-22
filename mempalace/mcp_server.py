@@ -45,68 +45,72 @@ sys.stdout = sys.stderr
 
 import argparse  # noqa: E402  (deferred until after stdio protection above)
 import contextlib  # noqa: E402
+import hashlib  # noqa: E402
+import hmac  # noqa: E402
 import json  # noqa: E402
 import logging  # noqa: E402
 import re  # noqa: E402
-import hashlib  # noqa: E402
-import hmac  # noqa: E402
 import sqlite3  # noqa: E402
 import threading  # noqa: E402
 import time  # noqa: E402
+from collections import deque  # noqa: E402
 from datetime import date, datetime, timezone  # noqa: E402
 from pathlib import Path  # noqa: E402
 from typing import Optional  # noqa: E402
 from urllib.parse import urlparse  # noqa: E402
 
-from .config import (  # noqa: E402
-    MempalaceConfig,
-    sanitize_kg_value,
-    sanitize_name,
-    sanitize_content,
-    sanitize_iso_temporal,
-    sqlite_read_uri,
-    strip_lone_surrogates,
-)
-from .version import __version__  # noqa: E402
 from chromadb.errors import NotFoundError as _ChromaNotFoundError  # noqa: E402
 
+from .backends import BackendMismatchError, PalaceRef, detect_backend_for_path  # noqa: E402
 from .backends.chroma import (  # noqa: E402
+    _HNSW_WRITE_DEFAULTS,
     ChromaBackend,
     ChromaCollection,
-    _HNSW_WRITE_DEFAULTS,
     _pin_hnsw_threads,
     hnsw_capacity_status,
     reset_hnsw_capacity_cache,
 )
-from .backends import BackendMismatchError, PalaceRef, detect_backend_for_path  # noqa: E402
+from .collision_scan import assert_no_collisions  # noqa: E402
+from .config import (  # noqa: E402
+    MempalaceConfig,
+    sanitize_content,
+    sanitize_iso_temporal,
+    sanitize_kg_value,
+    sanitize_name,
+    sqlite_read_uri,
+    strip_lone_surrogates,
+)
 from .date_window import filed_at_in_window, parse_date_bound  # noqa: E402
+from .hallways import (  # noqa: E402
+    delete_hallway,
+    list_hallways,
+)
+from .ids import ID_RECIPE, make_drawer_id_from_content  # noqa: E402
+from .knowledge_graph import DEFAULT_KG_PATH, KnowledgeGraph  # noqa: E402
+from .logstream import LOGSTREAM_DB_FILENAME, Logstream  # noqa: E402
+from .palace_graph import (
+    _load_tunnels as _load_graph_tunnels,
+)
+from .palace_graph import (  # noqa: E402
+    create_tunnel,
+    delete_tunnel,
+    find_tunnels,
+    follow_tunnels,
+    graph_stats,
+    list_tunnels,
+    traverse,
+)
 from .query_sanitizer import sanitize_query  # noqa: E402
 from .searcher import (  # noqa: E402
     SearchError,
     _distance_to_similarity,
     _metric_for_collection,
-    search as cli_search,
     search_memories,
 )
-from .palace_graph import (  # noqa: E402
-    traverse,
-    find_tunnels,
-    graph_stats,
-    create_tunnel,
-    list_tunnels,
-    delete_tunnel,
-    follow_tunnels,
-    _load_tunnels as _load_graph_tunnels,
+from .searcher import (
+    search as cli_search,
 )
-from .hallways import (  # noqa: E402
-    list_hallways,
-    delete_hallway,
-)
-
-from .knowledge_graph import KnowledgeGraph, DEFAULT_KG_PATH  # noqa: E402
-from .logstream import LOGSTREAM_DB_FILENAME, Logstream  # noqa: E402
-from .collision_scan import assert_no_collisions  # noqa: E402
-from .ids import ID_RECIPE, make_drawer_id_from_content  # noqa: E402
+from .version import __version__  # noqa: E402
 
 
 class _MempalaceLogFilter(logging.Filter):
@@ -4578,12 +4582,12 @@ def _kg_active_facts(node_id: str, predicate: str, direction: str) -> list[dict]
 
 def _ancestor_closure(node_id: str, max_depth: int) -> set[str]:
     """Return all synthesized-from ancestors reachable within max_depth."""
-    queue = [(node_id, 0)]
+    queue = deque([(node_id, 0)])
     seen = {node_id}
     ancestors = set()
 
     while queue:
-        current, depth = queue.pop(0)
+        current, depth = queue.popleft()
         if depth >= max_depth:
             continue
         parents = sorted(
@@ -4608,7 +4612,11 @@ def _ancestor_closure(node_id: str, max_depth: int) -> set[str]:
 
 def _synthesis_node_ids(col, wing: str = None, room: str = None) -> list[str]:
     """List logical drawer ids marked as synthesis nodes."""
-    ids, docs, metas = _fetch_drawer_rows(col, where={"node_kind": "synthesis"})
+    ids, docs, metas = _fetch_drawer_rows(
+        col,
+        where={"node_kind": "synthesis"},
+        include_documents=False,
+    )
     drawers = _collapse_drawer_rows(ids, docs, metas)
 
     filtered = []
@@ -4665,12 +4673,12 @@ def tool_get_ancestors(node_id: str, max_depth: int = 20):
     start = resolved["canonical_node_id"]
     max_depth = max(1, min(int(max_depth or 20), 100))
 
-    queue = [(start, 0)]
+    queue = deque([(start, 0)])
     seen = {start}
     ancestors = []
 
     while queue:
-        current, depth = queue.pop(0)
+        current, depth = queue.popleft()
         if depth >= max_depth:
             continue
         parents = sorted(
@@ -4707,12 +4715,12 @@ def tool_get_descendants(node_id: str, max_depth: int = 20):
     start = resolved["canonical_node_id"]
     max_depth = max(1, min(int(max_depth or 20), 100))
 
-    queue = [(start, 0)]
+    queue = deque([(start, 0)])
     seen = {start}
     descendants = []
 
     while queue:
-        current, depth = queue.pop(0)
+        current, depth = queue.popleft()
         if depth >= max_depth:
             continue
         children = sorted(
@@ -4790,6 +4798,102 @@ def tool_get_height(node_id: str):
     }
 
 
+def _batch_duplicate_matches_for_records(
+    col,
+    seed_records: list[dict],
+    threshold: float,
+) -> tuple[dict[str, list[dict]], dict | None]:
+    """Run one batched vector query and map thresholded matches by seed drawer ID."""
+    try:
+        batch_results = col.query(
+            query_texts=[rec["content"] for rec in seed_records],
+            n_results=5,
+            include=["distances"],
+        )
+    except Exception as e:
+        return {}, {"error": f"Batch query failed: {e}"}
+
+    metric = _metric_for_collection(col)
+    ids_rows = batch_results.get("ids") or []
+    dist_rows = batch_results.get("distances") or []
+
+    matches_by_seed = {}
+    for idx, seed_record in enumerate(seed_records):
+        seed = seed_record["drawer_id"]
+        matches = []
+        if idx < len(ids_rows) and ids_rows[idx]:
+            row_dists = dist_rows[idx] if idx < len(dist_rows) else []
+            for i, match_id in enumerate(ids_rows[idx]):
+                if i >= len(row_dists):
+                    continue
+                dist = row_dists[i]
+                similarity = round(_distance_to_similarity(dist, metric), 3)
+                if similarity >= threshold:
+                    matches.append({"id": match_id, "similarity": similarity})
+        matches_by_seed[seed] = matches
+
+    return matches_by_seed, None
+
+
+def _resolve_canonical_cached(node: str, canonical_cache: dict[str, str | None]) -> str | None:
+    """Resolve canonical node ID with memoization and error-to-None normalization."""
+    if node in canonical_cache:
+        return canonical_cache[node]
+    resolved = tool_resolve_canonical(node)
+    if "error" in resolved:
+        canonical_cache[node] = None
+        return None
+    canonical = resolved["canonical_node_id"]
+    canonical_cache[node] = canonical
+    return canonical
+
+
+def _logical_drawer_ids_for_any_ids(
+    col,
+    drawer_ids: list[str],
+    page_size: int = 500,
+) -> dict[str, str]:
+    """Resolve row/chunk IDs to logical drawer IDs in one or more batched reads."""
+    normalized = []
+    seen = set()
+    for raw_id in drawer_ids or []:
+        if not isinstance(raw_id, str) or not raw_id or raw_id in seen:
+            continue
+        seen.add(raw_id)
+        normalized.append(raw_id)
+
+    if not normalized:
+        return {}
+
+    resolved = {drawer_id: drawer_id for drawer_id in normalized}
+    page_size = max(1, int(page_size or 500))
+
+    for start in range(0, len(normalized), page_size):
+        batch = normalized[start : start + page_size]
+        result = col.get(ids=batch, include=["metadatas"])
+        ids = _chroma_field(result, "ids", []) or []
+        metadatas = _chroma_field(result, "metadatas", []) or []
+
+        for idx, row_id in enumerate(ids):
+            meta = _safe_meta(metadatas[idx] if idx < len(metadatas) else {})
+            parent_id = meta.get("parent_drawer_id")
+            if isinstance(parent_id, str) and parent_id:
+                resolved[row_id] = parent_id
+
+    return resolved
+
+
+def _collect_match_ids(matches_by_seed: dict[str, list[dict]]) -> list[str]:
+    """Collect non-empty string match IDs from batched duplicate results."""
+    all_match_ids = []
+    for match_rows in matches_by_seed.values():
+        for match in match_rows:
+            match_id = match.get("id")
+            if isinstance(match_id, str) and match_id:
+                all_match_ids.append(match_id)
+    return all_match_ids
+
+
 def tool_find_merge_candidates(
     drawer_id: str = None,
     threshold: float = 0.9,
@@ -4838,45 +4942,67 @@ def tool_find_merge_candidates(
             "require_topological_distance": bool(require_topological_distance),
         }
 
+    _refresh_vector_disabled_flag()
+    if _vector_disabled:
+        return {
+            "candidates": [],
+            "count": 0,
+            "scanned_nodes": len(seeds),
+            "threshold": threshold,
+            "require_topological_distance": bool(require_topological_distance),
+            "vector_disabled": True,
+            "vector_disabled_reason": _vector_disabled_reason,
+        }
+
+    seed_records = []
+    for seed in seeds:
+        rec = _logical_drawer_record(col, seed)
+        if rec:
+            seed_records.append(rec)
+
+    if not seed_records:
+        return {
+            "candidates": [],
+            "count": 0,
+            "scanned_nodes": len(seeds),
+            "threshold": threshold,
+            "require_topological_distance": bool(require_topological_distance),
+        }
+
+    matches_by_seed, batch_error = _batch_duplicate_matches_for_records(
+        col,
+        seed_records,
+        threshold,
+    )
+    if batch_error:
+        return batch_error
+
+    all_match_ids = _collect_match_ids(matches_by_seed)
+    match_logical_ids = _logical_drawer_ids_for_any_ids(col, all_match_ids)
+
     canonical_cache = {}
     ancestor_cache = {}
     seen_pairs = set()
     candidates = []
 
-    def _canonical(node: str):
-        if node in canonical_cache:
-            return canonical_cache[node]
-        resolved = tool_resolve_canonical(node)
-        if "error" in resolved:
-            canonical_cache[node] = None
-            return None
-        canonical = resolved["canonical_node_id"]
-        canonical_cache[node] = canonical
-        return canonical
-
-    for seed in seeds:
-        seed_record = _logical_drawer_record(col, seed)
-        if seed_record is None:
-            continue
-
-        duplicate_result = tool_check_duplicate(seed_record["content"], threshold=threshold)
-        if duplicate_result.get("vector_disabled"):
-            return duplicate_result
-
-        seed_canonical = _canonical(seed)
+    for seed_record in seed_records:
+        seed = seed_record["drawer_id"]
+        seed_canonical = _resolve_canonical_cached(seed, canonical_cache)
         if not seed_canonical:
             continue
 
-        for match in duplicate_result.get("matches", []):
+        matches = matches_by_seed.get(seed, [])
+
+        for match in matches:
             match_id = match.get("id")
             if not isinstance(match_id, str) or not match_id:
                 continue
 
-            match_logical_id = _logical_drawer_id_for_any_id(col, match_id)
+            match_logical_id = match_logical_ids.get(match_id, match_id)
             if match_logical_id == seed:
                 continue
 
-            target_canonical = _canonical(match_logical_id)
+            target_canonical = _resolve_canonical_cached(match_logical_id, canonical_cache)
             if not target_canonical or target_canonical == seed_canonical:
                 continue
 
@@ -4949,12 +5075,65 @@ def tool_find_orphan_synthesis_nodes(
     node_ids = _synthesis_node_ids(col, wing=wing, room=room)
     issues = []
 
+    record_cache = {}
+    canonical_result_cache = {}
+    height_memo = {}
+
+    def _record_cached(drawer_id: str):
+        if drawer_id in record_cache:
+            return record_cache[drawer_id]
+        record = _logical_drawer_record(col, drawer_id)
+        record_cache[drawer_id] = record
+        return record
+
+    def _canonical_result_cached(drawer_id: str):
+        if drawer_id in canonical_result_cache:
+            return canonical_result_cache[drawer_id]
+        resolved = tool_resolve_canonical(drawer_id)
+        canonical_result_cache[drawer_id] = resolved
+        return resolved
+
+    def _height_cached(node_id: str):
+        resolved = _canonical_result_cached(node_id)
+        if "error" in resolved:
+            return None
+
+        start = resolved["canonical_node_id"]
+
+        def _height(current: str, trail: set[str]) -> int:
+            if current in height_memo:
+                return height_memo[current]
+            if current in trail:
+                return 0
+
+            parents = sorted(
+                set(
+                    _kg_related_nodes(
+                        current,
+                        predicate="synthesized-from",
+                        direction="outgoing",
+                        field="object",
+                    )
+                )
+            )
+            if not parents:
+                height_memo[current] = 0
+                return 0
+
+            next_trail = set(trail)
+            next_trail.add(current)
+            computed = max(_height(parent, next_trail) for parent in parents) + 1
+            height_memo[current] = computed
+            return computed
+
+        return _height(start, set())
+
     for node_id in node_ids:
-        record = _logical_drawer_record(col, node_id)
+        record = _record_cached(node_id)
         if record is None:
             continue
 
-        canonical = tool_resolve_canonical(node_id)
+        canonical = _canonical_result_cached(node_id)
         if "error" in canonical:
             issues.append(
                 {
@@ -4979,7 +5158,7 @@ def tool_find_orphan_synthesis_nodes(
                 )
             )
         )
-        missing_parents = [pid for pid in parent_ids if _logical_drawer_record(col, pid) is None]
+        missing_parents = [pid for pid in parent_ids if _record_cached(pid) is None]
 
         found_issues = []
         if not parent_ids:
@@ -4987,7 +5166,7 @@ def tool_find_orphan_synthesis_nodes(
         if missing_parents:
             found_issues.append("missing_parent_drawers")
 
-        computed_height = tool_get_height(node_id).get("height")
+        computed_height = _height_cached(node_id)
         stored_height = _height_from_record(record)
         if isinstance(computed_height, int) and stored_height != computed_height:
             found_issues.append("stored_height_mismatch")
