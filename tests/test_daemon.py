@@ -1,4 +1,5 @@
 import os
+import subprocess
 import threading
 import time
 
@@ -855,3 +856,50 @@ def test_get_client_if_running_uses_short_probe_timeout(monkeypatch):
     client = daemon.get_client_if_running("/p", health_timeout=daemon.HOOK_PROBE_TIMEOUT)
     assert client is not None
     assert captured["timeout"] == daemon.HOOK_PROBE_TIMEOUT
+
+
+# --- _detached_kwargs ---
+
+
+def test_detached_kwargs_posix(tmp_path, monkeypatch):
+    monkeypatch.setattr("mempalace.daemon.os.name", "posix")
+    kwargs = daemon._detached_kwargs(tmp_path / "daemon.log")
+    fh = kwargs["stdout"]
+    try:
+        assert kwargs.get("start_new_session") is True
+        assert kwargs.get("stdin") is subprocess.DEVNULL
+        assert kwargs.get("close_fds") is True
+        assert "creationflags" not in kwargs
+    finally:
+        fh.close()
+
+
+def test_detached_kwargs_windows(tmp_path, monkeypatch):
+    monkeypatch.setattr("mempalace.daemon.os.name", "nt")
+    monkeypatch.setattr("mempalace.daemon.subprocess.CREATE_NO_WINDOW", 0x08000000, raising=False)
+    monkeypatch.setattr("mempalace.daemon.subprocess.DETACHED_PROCESS", 0x00000008, raising=False)
+    monkeypatch.setattr(
+        "mempalace.daemon.subprocess.CREATE_NEW_PROCESS_GROUP", 0x00000200, raising=False
+    )
+    monkeypatch.setattr(
+        "mempalace.daemon.subprocess.CREATE_BREAKAWAY_FROM_JOB", 0x01000000, raising=False
+    )
+    kwargs = daemon._detached_kwargs(tmp_path / "daemon.log")
+    fh = kwargs["stdout"]
+    try:
+        flags = kwargs.get("creationflags", 0)
+        assert flags & 0x08000000, "CREATE_NO_WINDOW must be set"
+        assert not (flags & 0x00000008), (
+            "DETACHED_PROCESS must NOT be set (it suppresses CREATE_NO_WINDOW)"
+        )
+        assert flags & 0x00000200, "CREATE_NEW_PROCESS_GROUP preserved (Ctrl-Break group isolation)"
+        assert flags & 0x01000000, (
+            "CREATE_BREAKAWAY_FROM_JOB preserved (survive parent Job-Object close)"
+        )
+        assert kwargs.get("stdin") is subprocess.DEVNULL
+        assert kwargs.get("close_fds") is True
+        # creationflags + start_new_session are mutually exclusive on Windows
+        # (Popen raises ValueError); the nt branch must not set the latter.
+        assert "start_new_session" not in kwargs
+    finally:
+        fh.close()
