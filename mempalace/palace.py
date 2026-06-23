@@ -969,9 +969,28 @@ def _validate_palace_fts5_after_mine(palace_path: str) -> None:
 # "we hold it" semantically — the child must reacquire. The pid check clears
 # stale state so a forked child correctly hits the fcntl path. Access is guarded
 # by ``_palace_lock_guard`` because the set is now shared across threads.
+#
+# Fork safety: ``_palace_lock_guard`` is a real ``threading.Lock``, so a child
+# forked while another thread held it would inherit it locked (the holder thread
+# does not exist in the child) and deadlock on the next acquire. An at-fork
+# handler (registered below) replaces the guard with a fresh unlocked lock and
+# clears state in the child, which must reacquire the flock anyway.
 _palace_lock_guard = threading.Lock()
 _palace_lock_pid = None
 _palace_lock_keys = set()
+
+
+def _reset_palace_lock_state_after_fork() -> None:
+    """Reset lock state in a forked child to avoid an inherited-locked deadlock."""
+    global _palace_lock_guard, _palace_lock_pid, _palace_lock_keys
+    _palace_lock_guard = threading.Lock()
+    _palace_lock_keys = set()
+    _palace_lock_pid = os.getpid()
+
+
+# Availability: Unix (no-op elsewhere — Windows has no fork()).
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_palace_lock_state_after_fork)
 
 
 def _holder_keys_locked():
