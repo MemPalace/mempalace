@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import threading
 import time
 import sys
 
@@ -66,6 +67,45 @@ def _hold_lock(palace_path: str, ready_flag: str, release_flag: str) -> int:
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+def test_mine_palace_lock_reentrant_across_threads_same_process(tmp_path):
+    """Process-wide re-entrancy: a second acquisition from a *different thread*
+    of the same process passes through instead of self-conflicting.
+
+    Regression for the MCP HTTP transport (ThreadingHTTPServer): the writer
+    lease is acquired on one thread (mcp_server._acquire_mcp_writer_lock) but
+    write requests are dispatched on other worker threads. With the old
+    thread-local re-entrancy those handlers re-acquired the process-held flock
+    and raised MineAlreadyRunning ("palace ... is held by PID <self>").
+    Re-entrancy is now process-wide, so same-process cross-thread acquisition is
+    a pass-through.
+    """
+    palace = str(tmp_path / "palace")
+    os.makedirs(palace, exist_ok=True)
+
+    outer = mine_palace_lock(palace)
+    outer.__enter__()  # main thread holds the lease, like the MCP writer-lease
+    try:
+        result: dict = {}
+
+        def worker():
+            try:
+                with mine_palace_lock(palace):
+                    result["acquired"] = True
+            except MineAlreadyRunning as exc:  # pragma: no cover - failure path
+                result["error"] = str(exc)
+
+        t = threading.Thread(target=worker)
+        t.start()
+        t.join(timeout=5)
+
+        assert not t.is_alive(), "worker thread hung acquiring the palace lock"
+        assert result.get("acquired") is True, (
+            f"cross-thread same-process acquisition should pass through, got: {result}"
+        )
+    finally:
+        outer.__exit__(None, None, None)
 
 
 def test_single_acquire_succeeds(tmp_path, monkeypatch):
