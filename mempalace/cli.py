@@ -17,6 +17,7 @@ Commands:
     mempalace mine <dir> --mode extract   Mine binary office documents (PDF/DOCX/etc.)
     mempalace search "query"              Find anything, exact words
     mempalace mcp                         Show MCP setup command
+    mempalace mcp-health                  Diagnose MCP transport availability
     mempalace wake-up                     Show L0 + L1 wake-up context
     mempalace wake-up --wing my_app       Wake-up for a specific project
     mempalace status                      Show what's been filed
@@ -33,6 +34,10 @@ import os
 import sys
 import shlex
 import argparse
+import json
+import subprocess
+import threading
+from queue import Empty, Queue
 from pathlib import Path
 
 from .config import MempalaceConfig
@@ -1324,12 +1329,214 @@ def cmd_mcp(args):
     print(f"  codex mcp add mempalace -- {server_cmd}")
     print("\nRun the server directly:")
     print(f"  {server_cmd}")
+    print("\nDiagnose MCP transport:")
+    print("  mempalace mcp-health --json")
 
     if not args.palace:
         print("\nOptional custom palace:")
         print(f"  claude mcp add mempalace -- {base_server_cmd} --palace /path/to/palace")
         print(f"  codex mcp add mempalace -- {base_server_cmd} --palace /path/to/palace")
         print(f"  {base_server_cmd} --palace /path/to/palace")
+
+
+def _mcp_health_server_command(args) -> list[str]:
+    if args.server_command:
+        return shlex.split(args.server_command)
+
+    cmd = ["mempalace-mcp"]
+    if args.palace:
+        cmd.extend(["--palace", str(Path(args.palace).expanduser())])
+    backend = _backend_arg(args)
+    if backend:
+        cmd.extend(["--backend", str(backend).strip().lower()])
+    return cmd
+
+
+def _mcp_health_cli_status_command(args) -> str:
+    cmd = ["mempalace"]
+    if args.palace:
+        cmd.extend(["--palace", str(Path(args.palace).expanduser())])
+    backend = _backend_arg(args)
+    if backend:
+        cmd.extend(["--backend", str(backend).strip().lower()])
+    cmd.append("status")
+    return " ".join(shlex.quote(part) for part in cmd)
+
+
+def _readline_with_timeout(stream, timeout: float) -> str:
+    q: Queue = Queue(maxsize=1)
+
+    def _reader():
+        try:
+            q.put(stream.readline())
+        except Exception as exc:  # noqa: BLE001 - surfaced as transport diagnostic
+            q.put(exc)
+
+    threading.Thread(target=_reader, daemon=True).start()
+    try:
+        result = q.get(timeout=timeout)
+    except Empty as exc:
+        raise TimeoutError(f"timed out waiting for MCP response after {timeout:g}s") from exc
+    if isinstance(result, BaseException):
+        raise result
+    return result
+
+
+def _mcp_health_request(proc, payload: dict, timeout: float) -> dict:
+    if proc.stdin is None or proc.stdout is None:
+        raise RuntimeError("MCP process was not started with stdio pipes")
+
+    try:
+        proc.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        proc.stdin.flush()
+    except BrokenPipeError as exc:
+        raise ConnectionError("MCP transport closed while sending request") from exc
+
+    line = _readline_with_timeout(proc.stdout, timeout)
+    if line == "":
+        raise ConnectionError("MCP transport closed before a response was returned")
+    return json.loads(line)
+
+
+def _mcp_health_fallback_payload(args, command: list[str], exc: BaseException, stderr: str) -> dict:
+    return {
+        "mcp_transport": "transport_unavailable",
+        "failure_mode": "mcp_transport_closed"
+        if isinstance(exc, (ConnectionError, BrokenPipeError))
+        else "mcp_transport_timeout"
+        if isinstance(exc, TimeoutError)
+        else "mcp_transport_error",
+        "error_class": type(exc).__name__,
+        "message": str(exc),
+        "server_command": " ".join(shlex.quote(part) for part in command),
+        "server_stderr": stderr[-4000:] if stderr else "",
+        "fallback": {
+            "needed": True,
+            "classification": "MCP transport unavailable",
+            "cli_status_command": _mcp_health_cli_status_command(args),
+            "reconnect_tool": "mempalace_reconnect",
+        },
+        "agent_guidance": (
+            "mcp_transport_unavailable_not_empty_palace: do not classify this as "
+            "an empty or stale wing. Use CLI fallback commands, report a runtime "
+            "MCP transport failure, and only retry MCP after the host restarts or "
+            "mempalace_reconnect is callable again."
+        ),
+    }
+
+
+def cmd_mcp_health(args):
+    """Check whether the MemPalace MCP stdio transport is reachable.
+
+    This is intentionally a CLI-side probe, not an MCP tool. When a Codex
+    thread reports "Transport closed", the model cannot call any MemPalace MCP
+    tool, including ``mempalace_reconnect``. This command gives the agent a
+    shell fallback that distinguishes transport failure from "palace empty".
+    """
+
+    command = _mcp_health_server_command(args)
+    env = os.environ.copy()
+    if args.palace:
+        env["MEMPALACE_PALACE_PATH"] = str(Path(args.palace).expanduser())
+    backend = _backend_arg(args)
+    if backend:
+        env[_EXPLICIT_BACKEND_ENV] = str(backend).strip().lower()
+        env["MEMPALACE_BACKEND"] = str(backend).strip().lower()
+
+    proc = None
+    stderr_tail = ""
+    try:
+        proc = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+        )
+        init = _mcp_health_request(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": "mempalace-mcp-health-init",
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "clientInfo": {"name": "mempalace-mcp-health", "version": __version__},
+                },
+            },
+            args.timeout,
+        )
+        if "error" in init:
+            raise RuntimeError(f"initialize failed: {init['error']}")
+        tools = _mcp_health_request(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": "mempalace-mcp-health-tools",
+                "method": "tools/list",
+            },
+            args.timeout,
+        )
+        if "error" in tools:
+            raise RuntimeError(f"tools/list failed: {tools['error']}")
+
+        tool_names = {
+            tool.get("name")
+            for tool in tools.get("result", {}).get("tools", [])
+            if isinstance(tool, dict)
+        }
+        payload = {
+            "mcp_transport": "ok",
+            "failure_mode": None,
+            "server_command": " ".join(shlex.quote(part) for part in command),
+            "server": init.get("result", {}).get("serverInfo", {}),
+            "tools": {
+                "count": len(tool_names),
+                "has_status": "mempalace_status" in tool_names,
+                "has_reconnect": "mempalace_reconnect" in tool_names,
+            },
+            "fallback": {
+                "needed": False,
+                "cli_status_command": _mcp_health_cli_status_command(args),
+                "reconnect_tool": "mempalace_reconnect",
+            },
+        }
+        exit_code = 0
+    except Exception as exc:  # noqa: BLE001 - diagnostic command must classify broadly
+        if proc is not None and proc.stderr is not None:
+            try:
+                proc.terminate()
+                stderr_tail = proc.communicate(timeout=1)[1] or ""
+            except Exception:
+                proc.kill()
+                stderr_tail = proc.communicate(timeout=1)[1] or ""
+        payload = _mcp_health_fallback_payload(args, command, exc, stderr_tail)
+        exit_code = 2
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.communicate(timeout=1)
+            except Exception:
+                proc.kill()
+                proc.communicate(timeout=1)
+
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        if payload["mcp_transport"] == "ok":
+            print("MemPalace MCP transport: ok")
+            print(f"Server: {payload['server'].get('name', 'unknown')}")
+            print(f"Tools: {payload['tools']['count']}")
+        else:
+            print("MemPalace MCP transport: unavailable")
+            print(f"Failure mode: {payload['failure_mode']}")
+            print(f"Fallback: {payload['fallback']['cli_status_command']}")
+            print(payload["agent_guidance"])
+    raise SystemExit(exit_code)
 
 
 def cmd_compress(args):
@@ -1934,6 +2141,33 @@ def main():
         help="Storage backend to include in the MCP startup command",
     )
 
+    # mcp-health
+    p_mcp_health = sub.add_parser(
+        "mcp-health",
+        help="Probe the MemPalace MCP stdio transport and print fallback diagnostics",
+    )
+    p_mcp_health.add_argument(
+        "--backend",
+        default=None,
+        help="Storage backend to use for the default MCP startup command",
+    )
+    p_mcp_health.add_argument(
+        "--server-command",
+        default=None,
+        help="Override the MCP server command to probe (default: mempalace-mcp plus global flags)",
+    )
+    p_mcp_health.add_argument(
+        "--timeout",
+        type=float,
+        default=10.0,
+        help="Seconds to wait for each JSON-RPC response (default: 10)",
+    )
+    p_mcp_health.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON diagnostics",
+    )
+
     # status
     # migrate
     p_migrate = sub.add_parser(
@@ -2039,6 +2273,7 @@ def main():
         "sweep": cmd_sweep,
         "sync": cmd_sync,
         "mcp": cmd_mcp,
+        "mcp-health": cmd_mcp_health,
         "compress": cmd_compress,
         "wake-up": cmd_wakeup,
         "repair": cmd_repair,

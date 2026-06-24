@@ -28,7 +28,9 @@ question-driven, not reflexive.
 
 ## The protocol
 
-1. **On wake-up** (if a session-start hook injected context, honour its wing scoping / `additional_context`): scope recall to the wing inferred from the workspace, then continue.
+1. **On wake-up**: if a session-start hook injected context, honour its
+   wing scoping / `additional_context`; scope recall to the wing inferred
+   from the workspace, then continue.
 2. **Before responding** about people, projects, past events, or prior
    decisions: call `mempalace_search` first. For relational or temporal
    facts ("who reported to whom in March", "what was true then"), call
@@ -47,12 +49,12 @@ question-driven, not reflexive.
 ## Tool selection
 
 | You need | Tool |
-|---|---|
+| --- | --- |
 | Find any memory by meaning | `mempalace_search` (start here) |
 | Relational / time-bound facts about an entity | `mempalace_kg_query` |
 | The chronological story of an entity | `mempalace_kg_timeline` |
 | Recent session continuity | `mempalace_diary_read` |
-| Which wings / rooms exist (when scope unknown) | `mempalace_list_wings`, `mempalace_list_rooms` |
+| Wing / room inventory | `mempalace_list_wings`, `mempalace_list_rooms` |
 | Record this session | `mempalace_diary_write` |
 
 `mempalace_search` takes a short natural-language `query` (keywords or a
@@ -64,9 +66,15 @@ question — not a system prompt or pasted conversation) plus optional
 - **Empty results.** Say the palace has nothing on this; do not invent an
   answer to fill the gap. Offer to widen the search (drop the wing
   filter) or to file the new information.
-- **MCP unavailable / tool error.** Surface the error plainly and suggest
-  the user verify the server (`mempalace status`, or re-run install).
-  Do not silently fall back to guessing from model memory.
+- **MCP unavailable / tool error.** Surface the error plainly. If the
+  host reports `Transport closed` or the MCP tool namespace disappears,
+  classify it as transport failure, not as an empty or stale palace. Run
+  `mempalace mcp-health --json` from the shell to verify whether a fresh
+  MemPalace MCP process can answer over stdio, then use
+  `mempalace status` / `mempalace search` as CLI fallback while reporting
+  the MCP runtime failure. If MCP still answers but cached handles look
+  stale, call `mempalace_reconnect` before retrying. Do not silently fall
+  back to guessing from model memory.
 - **Palace index corrupt / compactor error.** When the server returns an
   error mentioning the HNSW segment writer, a ChromaDB compaction
   failure, or a stuck "Not connected" state after a write, the on-disk
@@ -90,8 +98,10 @@ from the agent (it can break other live clients):
    host editor).
 2. Optional backup of the palace directory (`--archive-existing` already
    moves the old palace aside, so this is belt-and-suspenders):
-   - macOS / Linux: `cp -a ~/.mempalace/palace ~/.mempalace/palace.bak.$(date +%F)`
-   - Windows (PowerShell): `Copy-Item -Recurse "$env:USERPROFILE\.mempalace\palace" "$env:USERPROFILE\.mempalace\palace.bak"`
+   - macOS / Linux:
+     `cp -a ~/.mempalace/palace ~/.mempalace/palace.bak.$(date +%F)`
+   - Windows PowerShell:
+     `Copy-Item -Recurse "$env:USERPROFILE\.mempalace\palace" "$env:USERPROFILE\.mempalace\palace.bak"`
 3. Rebuild from SQLite:
    `mempalace repair --mode from-sqlite --archive-existing --yes`
 4. Verify: `mempalace repair-status` (divergence should read 0).
