@@ -1641,11 +1641,15 @@ def tool_get_taxonomy():
     result = {"taxonomy": taxonomy}
     try:
         if _supports_metadata_facets(col):
-            for wing in col.facet_counts("wing"):
-                taxonomy[wing] = col.facet_counts(
-                    "room",
-                    where={"wing": wing},
-                )
+            from concurrent.futures import ThreadPoolExecutor
+            wings = list(col.facet_counts("wing").keys())
+            with ThreadPoolExecutor() as executor:
+                futures = {
+                    wing: executor.submit(col.facet_counts, "room", where={"wing": wing})
+                    for wing in wings
+                }
+                for wing, future in futures.items():
+                    taxonomy[wing] = future.result()
         else:
             all_meta = _get_cached_metadata(col)
             for m in all_meta:
