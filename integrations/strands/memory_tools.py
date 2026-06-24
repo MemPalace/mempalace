@@ -4,7 +4,7 @@ Gives any Strands-based agent long-term memory via three tools:
 
     mp_kb_search     — semantic search in a knowledge base wing
     mp_memory_recall — recall past conversations (per-user isolated)
-    mp_memory_store  — store important facts for future recall
+    mp_memory_store  — store user content verbatim for future recall
 
 Usage:
     from memory_tools import MEMORY_TOOLS
@@ -133,9 +133,9 @@ def mp_kb_search(query: str, wing: str = "default") -> str:
         text = hit.get("text", "").strip()
         source = hit.get("source_file", "unknown")
         if text:
-            passages.append(f"[{i}] ({source}):\\n{text}")
+            passages.append(f"[{i}] ({source}):\n{text}")
 
-    return "\\n\\n---\\n\\n".join(passages)
+    return "\n\n---\n\n".join(passages)
 
 
 @tool(context=True)
@@ -180,46 +180,57 @@ def mp_memory_recall(query: str, tool_context: ToolContext) -> str:
         if text:
             memories.append(f"\u2022 {text}")
 
-    return "From memory:\\n" + "\\n".join(memories)
+    return "From memory:\n" + "\n".join(memories)
 
 
 @tool(context=True)
-def mp_memory_store(fact: str, tool_context: ToolContext) -> str:
-    """Store an important fact or user preference for future recall.
+def mp_memory_store(content: str, tool_context: ToolContext) -> str:
+    """Store user-provided content verbatim in their memory drawer.
 
-    Use ONLY when the user expresses a clear preference or states an
-    important fact that should be remembered across sessions.
+    The content is filed exactly as provided — no summarization, no
+    rewriting, no extraction. The stored drawer document will be
+    byte-for-byte identical to the input.
 
-    DO store: preferences, decisions, important facts about people/projects.
-    DO NOT store: routine queries, temporary data, numbers from reports.
+    Use when the user expresses a preference, states an important fact,
+    or explicitly asks you to remember something for future sessions.
 
     Args:
-        fact: Concise statement to remember (one sentence).
+        content: Text to store verbatim in the user's memory drawer.
     """
     col = _get_collection()
     if col is False:
-        return "Memory unavailable \u2014 fact not stored."
+        return "Memory unavailable \u2014 content not stored."
 
     invocation_state = getattr(tool_context, "invocation_state", None) or {}
     user_id = invocation_state.get("user_id") or "default"
 
     try:
-        ts = datetime.now(timezone.utc).isoformat()
-        drawer_id = hashlib.sha256(f"{fact}{ts}".encode()).hexdigest()[:16]
+        from mempalace.palace import mine_lock, NORMALIZE_VERSION
+    except ImportError:
+        # Fallback if mine_lock not available (older mempalace versions)
+        from contextlib import nullcontext as mine_lock
+        NORMALIZE_VERSION = 2
 
-        col.add(
-            ids=[f"memory_{drawer_id}"],
-            documents=[fact],
-            metadatas=[{
-                "wing": "conversations",
-                "room": f"user-{user_id}",
-                "source_file": "strands_agent_memory",
-                "filed_at": ts,
-                "type": "user_preference",
-            }],
-        )
-        logger.info("Memory stored for user %s: %s", user_id, fact[:50])
-        return f"Remembered: {fact}"
+    try:
+        ts = datetime.now(timezone.utc).isoformat()
+        drawer_id = hashlib.sha256(f"{content}{ts}".encode()).hexdigest()[:16]
+        source_ref = f"strands_agent_memory/{user_id}"
+
+        with mine_lock(source_ref):
+            col.add(
+                ids=[f"memory_{drawer_id}"],
+                documents=[content],
+                metadatas=[{
+                    "wing": "conversations",
+                    "room": f"user-{user_id}",
+                    "source_file": source_ref,
+                    "filed_at": ts,
+                    "normalize_version": NORMALIZE_VERSION,
+                    "type": "user_memory",
+                }],
+            )
+        logger.info("Memory stored for user %s: %s", user_id, content[:50])
+        return f"Stored verbatim: {content[:100]}"
 
     except Exception as exc:
         logger.error("mp_memory_store error: %s", exc)

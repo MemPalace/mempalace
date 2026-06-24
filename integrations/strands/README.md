@@ -22,7 +22,7 @@ agent = Agent(
     tools=MEMORY_TOOLS,
 )
 
-# Agent stores a fact (calls mp_memory_store internally)
+# Agent stores content (calls mp_memory_store internally)
 agent("Remember that I prefer dark mode.", user_id="alice")
 
 # Later — agent recalls (calls mp_memory_recall internally)
@@ -38,7 +38,7 @@ Works with any Strands-compatible model: Bedrock (Nova, Claude, Titan), OpenAI, 
 |------|---------|--------|
 | `mp_kb_search` | No | Search knowledge base (docs, guides, reference material) |
 | `mp_memory_recall` | Yes | Recall past conversations and preferences (per-user) |
-| `mp_memory_store` | Yes | Store important facts for future sessions (per-user) |
+| `mp_memory_store` | Yes | Store user content verbatim for future sessions (per-user) |
 
 ### mp_kb_search
 
@@ -59,10 +59,10 @@ Searches the `conversations` wing, scoped to the current user's room. Returns me
 ### mp_memory_store
 
 ```python
-mp_memory_store(fact="User prefers CSV over Excel for exports", tool_context=...)
+mp_memory_store(content="User prefers CSV over Excel for exports", tool_context=...)
 ```
 
-Stores a fact in the `conversations` wing under the current user's room. Available in all future sessions.
+Stores content **verbatim** in the `conversations` wing under the current user's room. The drawer document is byte-for-byte identical to the input — no summarization, no rewriting. Available in all future sessions.
 
 ## User Isolation
 
@@ -97,7 +97,7 @@ Any LLM (Bedrock / OpenAI / vLLM / Ollama)
          ▼
    Strands Agent (decides when to remember/recall)
          │
-         ├── mp_kb_search ──────────┐
+         ├── mp_kb_search ────────────┐
          ├── mp_memory_recall ──────┤── MemPalace Python API
          └── mp_memory_store ───────┘
                                     │
@@ -112,6 +112,7 @@ Any LLM (Bedrock / OpenAI / vLLM / Ollama)
 - **Lazy loading**: The embedding model (~300 MB) loads on first tool call, not on import.
 - **Graceful degradation**: If mempalace is not installed, tools return clear error messages (agent continues working without memory).
 - **Thread safety**: Palace operations are safe for concurrent access (ChromaDB WAL mode).
+- **Write locking**: Store operations use `mine_lock` to prevent duplicate drawers from concurrent agents.
 - **Backup**: Palace is a directory — back it up with any file-level tool (rsync, tar, etc.).
 
 ## Pre-loading Knowledge
@@ -130,4 +131,4 @@ MIT — same as MemPalace.
 
 ---
 
-Built with gratitude by [ARE5 Technologies](https://github.com/are5ai) — production-tested in a live AI business assistant handling 900+ operations daily.
+Built with gratitude by [ARE5 Technologies](https://github.com/CraftySaaS) — production-tested in a live AI business assistant handling 900+ operations daily.
