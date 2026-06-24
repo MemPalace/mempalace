@@ -660,6 +660,11 @@ def _mine_sync():
                     stdout=log_f,
                     stderr=log_f,
                     timeout=60,
+                    # Windows: hide the conhost window this sync mine would
+                    # otherwise flash on every fire. Mirrors the async paths
+                    # (_spawn_mine / _desktop_toast) via _detached_popen_kwargs().
+                    # 0 is a no-op off-Windows.
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
         except (OSError, subprocess.TimeoutExpired):
             pass
