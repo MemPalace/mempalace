@@ -1141,6 +1141,12 @@ def _fetch_all_metadata(col, where=None):
     return all_meta
 
 
+def _supports_metadata_facets(col) -> bool:
+    """Return True if the collection's backend implements metadata facets."""
+    backend = getattr(col, "_backend", None)
+    return backend is not None and "supports_metadata_facets" in backend.capabilities
+
+
 _metadata_cache = None
 _metadata_cache_time = 0
 _METADATA_CACHE_TTL = 5.0  # seconds
@@ -1506,13 +1512,17 @@ def tool_status():
         "backend": _selected_backend_name(),
     }
     try:
-        all_meta = _get_cached_metadata(col)
-        for m in all_meta:
-            m = m or {}
-            w = m.get("wing", "unknown")
-            r = m.get("room", "unknown")
-            wings[w] = wings.get(w, 0) + 1
-            rooms[r] = rooms.get(r, 0) + 1
+        if _supports_metadata_facets(col):
+            wings.update(col.facet_counts("wing"))
+            rooms.update(col.facet_counts("room"))
+        else:
+            all_meta = _get_cached_metadata(col)
+            for m in all_meta:
+                m = m or {}
+                w = m.get("wing", "unknown")
+                r = m.get("room", "unknown")
+                wings[w] = wings.get(w, 0) + 1
+                rooms[r] = rooms.get(r, 0) + 1
     except Exception as e:
         logger.exception("tool_status metadata fetch failed")
         result["error"] = str(e)
@@ -1567,11 +1577,14 @@ def tool_list_wings():
     wings = {}
     result = {"wings": wings}
     try:
-        all_meta = _get_cached_metadata(col)
-        for m in all_meta:
-            m = m or {}
-            w = m.get("wing", "unknown")
-            wings[w] = wings.get(w, 0) + 1
+        if _supports_metadata_facets(col):
+            wings.update(col.facet_counts("wing"))
+        else:
+            all_meta = _get_cached_metadata(col)
+            for m in all_meta:
+                m = m or {}
+                w = m.get("wing", "unknown")
+                wings[w] = wings.get(w, 0) + 1
     except Exception as e:
         logger.exception("tool_list_wings metadata fetch failed")
         result["error"] = str(e)
@@ -1599,13 +1612,16 @@ def tool_list_rooms(wing: str = None):
         return _collection_error_or_no_palace()
     rooms = {}
     result = {"wing": wing or "all", "rooms": rooms}
+    where = {"wing": wing} if wing else None
     try:
-        where = {"wing": wing} if wing else None
-        all_meta = _fetch_all_metadata(col, where=where)
-        for m in all_meta:
-            m = m or {}
-            r = m.get("room", "unknown")
-            rooms[r] = rooms.get(r, 0) + 1
+        if _supports_metadata_facets(col):
+            rooms.update(col.facet_counts("room", where=where))
+        else:
+            all_meta = _fetch_all_metadata(col, where=where)
+            for m in all_meta:
+                m = m or {}
+                r = m.get("room", "unknown")
+                rooms[r] = rooms.get(r, 0) + 1
     except Exception as e:
         logger.exception("tool_list_rooms metadata fetch failed")
         result["error"] = str(e)
@@ -1624,14 +1640,21 @@ def tool_get_taxonomy():
     taxonomy = {}
     result = {"taxonomy": taxonomy}
     try:
-        all_meta = _get_cached_metadata(col)
-        for m in all_meta:
-            m = m or {}
-            w = m.get("wing", "unknown")
-            r = m.get("room", "unknown")
-            if w not in taxonomy:
-                taxonomy[w] = {}
-            taxonomy[w][r] = taxonomy[w].get(r, 0) + 1
+        if _supports_metadata_facets(col):
+            for wing in col.facet_counts("wing"):
+                taxonomy[wing] = col.facet_counts(
+                    "room",
+                    where={"wing": wing},
+                )
+        else:
+            all_meta = _get_cached_metadata(col)
+            for m in all_meta:
+                m = m or {}
+                w = m.get("wing", "unknown")
+                r = m.get("room", "unknown")
+                if w not in taxonomy:
+                    taxonomy[w] = {}
+                taxonomy[w][r] = taxonomy[w].get(r, 0) + 1
     except Exception as e:
         logger.exception("tool_get_taxonomy metadata fetch failed")
         result["error"] = str(e)

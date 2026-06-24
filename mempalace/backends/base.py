@@ -501,6 +501,14 @@ class BaseCollection(ABC):
             offset += len(batch_meta)
         return all_meta
 
+    def facet_counts(
+        self,
+        field: str,
+        where: Optional[dict] = None,
+    ) -> dict[str, int]:
+        """Return counts for each distinct value of a metadata field."""
+        raise UnsupportedCapabilityError("backend does not support facet_counts")
+
     def maintenance_state(self) -> dict:
         """Return a structured snapshot of this collection's maintenance state.
 
