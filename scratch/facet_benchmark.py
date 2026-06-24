@@ -1,134 +1,124 @@
+import random
 import time
 import uuid
-import numpy as np
 
 from mempalace.backends.qdrant import QdrantBackend
 from mempalace.backends.base import PalaceRef
 
+N = 100_000
 
-# -----------------------------
-# CONFIG
-# -----------------------------
-NUM_POINTS = 100_000
-DIM = 2
+backend = QdrantBackend()
+# Using a shared local path so data persists if you switch branches
+palace = PalaceRef(id="benchmark", local_path="/tmp/benchmark")
 
-
-def make_collection():
-    backend = QdrantBackend()
-    palace = PalaceRef(id="benchmark_palace", local_path="/tmp")
-    col = backend.get_collection(
-        palace=palace,
-        collection_name="facet_benchmark",
-        create=True,
-    )
-    return backend, col
+collection = backend.get_collection(
+    palace=palace,
+    collection_name="benchmark",
+    create=True,
+)
 
 
-def create_payload_indexes(col):
-    print("Creating payload indexes...")
+# ---------------------------------------------------------------------
+# 1. Setup Keyword Indexes (Required for Qdrant Faceting)
+# ---------------------------------------------------------------------
+# We explicitly create payload indexes for BOTH naming conventions
+# to ensure the server-side engine works perfectly regardless of the branch logic.
+def ensure_indexes():
+    for field in ["wing", "metadata.wing", "room", "metadata.room"]:
+        try:
+            collection._client.request(
+                "PUT",
+                f"/collections/{collection._remote_collection}/index",
+                body={"field_name": field, "field_schema": "keyword"},
+            )
+        except Exception:
+            pass
 
-    def create(field):
-        col._client.request(
-            "PUT",
-            f"/collections/{col._remote_collection}/index",
-            body={
-                "field_name": field,
-                "field_schema": "keyword",
+
+ensure_indexes()
+
+# ---------------------------------------------------------------------
+# 2. Populate Data Once
+# ---------------------------------------------------------------------
+if collection.count() == 0:
+    print(f"Inserting {N:,} points...")
+
+    ids = [str(uuid.uuid4()) for _ in range(N)]
+    docs = ["doc"] * N
+    embeddings = [[1.0, 0.0]] * N
+
+    wings = ["engineering", "research", "personal", "knowledge", "archive"]
+
+    # We provide both nested and flat metadata patterns so that
+    # no matter how your branch extracts the "wing" key, it finds it.
+    metadata = [
+        {
+            "wing": choice,
+            "room": f"room-{random.randint(1, 25)}",
+            "metadata": {
+                "wing": choice,
+                "room": f"room-{random.randint(1, 25)}",
             },
-        )
+        }
+        for _ in range(N)
+        for choice in [random.choice(wings)]
+    ]
 
-    try:
-        create("metadata.wing")
-        create("metadata.room")
-        print("Indexes created.")
-    except Exception as e:
-        print("Index creation skipped (may already exist):", e)
-
-
-def insert_data(col):
-    print("Inserting points...")
-
-    wings = ["alpha", "beta", "gamma", "delta"]
-    rooms = ["r1", "r2", "r3"]
-
-    ids = []
-    docs = []
-    metas = []
-    vectors = []
-
-    for i in range(NUM_POINTS):
-        ids.append(str(uuid.uuid4()))
-        docs.append(f"doc-{i}")
-        metas.append(
-            {
-                "wing": wings[i % len(wings)],
-                "room": rooms[i % len(rooms)],
-            }
-        )
-        vectors.append(np.random.rand(DIM).tolist())
-
-    col.upsert(
+    collection.upsert(
         ids=ids,
         documents=docs,
-        metadatas=metas,
-        embeddings=vectors,
+        metadatas=metadata,
+        embeddings=embeddings,
     )
-
-    print("Inserted.")
-
-
-def client_side_count(col):
-    """
-    O(n) baseline
-    """
-    t0 = time.time()
-
-    all_meta = col.get(include=["metadatas"])
-    counter = {}
-
-    for m in all_meta.metadatas:
-        if not m:
-            continue
-        w = m.get("wing")
-        if w:
-            counter[w] = counter.get(w, 0) + 1
-
-    t1 = time.time()
-    return counter, t1 - t0
+    print("Finished inserting.\n")
+else:
+    print(f"Using existing {collection.count():,} points.\n")
 
 
-def facet_count(col):
-    """
-    O(1-ish server aggregation via Qdrant facet API
-    """
-    t0 = time.time()
+# ---------------------------------------------------------------------
+# 3. Dynamic Baseline Benchmark (Works on both branches)
+# ---------------------------------------------------------------------
+print("--- BENCHMARK START ---")
+start = time.perf_counter()
 
-    wings = col.facet_counts("metadata.wing")
+counts = {}
 
-    t1 = time.time()
-    return wings, t1 - t0
+# Dynamic inspection: Uses main branch generator if available, falls back to direct get
+if hasattr(collection, "get_all_metadata"):
+    metadata_iterator = collection.get_all_metadata()
+elif hasattr(collection, "get"):
+    metadata_iterator = collection.get(include=["metadatas"]).metadatas
+else:
+    metadata_iterator = []
+
+for meta in metadata_iterator:
+    if not meta:
+        continue
+    # Safe lookup: handles both flat metadata and nested metadata architectures
+    wing = meta.get("wing") or meta.get("metadata", {}).get("wing", "unknown")
+    counts[wing] = counts.get(wing, 0) + 1
+
+elapsed_baseline = time.perf_counter() - start
+print(f"Client-side counting (Baseline) : {elapsed_baseline:.3f} sec")
 
 
-def main():
-    backend, col = make_collection()
+# ---------------------------------------------------------------------
+# 4. Dynamic Optimized Benchmark (Gracefully handles branch absence)
+# ---------------------------------------------------------------------
+if hasattr(collection, "facet_counts"):
+    start = time.perf_counter()
 
-    insert_data(col)
-
-    print("\n--- BENCHMARK START ---")
-
-    client_counts, t_client = client_side_count(col)
-    print(f"Client-side counting: {t_client:.3f}s")
-
+    # Tries both namespace variations dynamically based on what your branch expects
     try:
-        facet_counts, t_facet = facet_count(col)
-        print(f"Facet counting     : {t_facet:.3f}s")
+        facet_results = collection.facet_counts("wing")
+    except Exception:
+        facet_results = collection.facet_counts("metadata.wing")
 
-        print("\nSpeedup:", round(t_client / max(t_facet, 1e-9), 2), "x")
+    elapsed_facet = time.perf_counter() - start
+    print(f"Server-side facets (Optimized)  : {elapsed_facet:.3f} sec")
 
-    except Exception as e:
-        print("\nFacet failed (this is expected on develop branch):")
-        print(e)
-
-
-if __name__ == "__main__":
-    main()
+    # Calculate performance gains automatically
+    speedup = elapsed_baseline / max(elapsed_facet, 1e-9)
+    print(f"\n🚀 Speedup Factor: {speedup:.2f}x faster")
+else:
+    print("Server-side facets (Optimized)  : Not available on this branch (Main Baseline)")
