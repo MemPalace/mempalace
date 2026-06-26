@@ -79,11 +79,9 @@ READ_TOOLS = frozenset(
         "mempalace_kg_stats",
         "mempalace_kg_timeline",
         "mempalace_resolve_canonical",
-        "mempalace_get_ancestors",
-        "mempalace_get_descendants",
         "mempalace_get_height",
         "mempalace_find_merge_candidates",
-        "mempalace_find_orphan_synthesis_nodes",
+        "mempalace_find_closet_lineage_issues",
     }
 )
 
@@ -91,7 +89,6 @@ WRITE_TOOLS = frozenset(
     {
         "mempalace_add_drawer",
         "mempalace_checkpoint",
-        "mempalace_create_synthesis_node",
         "mempalace_apply_merge",
         "mempalace_delete_by_source",
         "mempalace_delete_drawer",

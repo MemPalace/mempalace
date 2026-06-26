@@ -54,7 +54,7 @@ import sqlite3  # noqa: E402
 import threading  # noqa: E402
 import time  # noqa: E402
 from collections import deque  # noqa: E402
-from datetime import date, datetime, timezone  # noqa: E402
+from datetime import date, datetime  # noqa: E402
 from pathlib import Path  # noqa: E402
 from typing import Optional  # noqa: E402
 from urllib.parse import urlparse  # noqa: E402
@@ -3421,175 +3421,6 @@ def _height_from_record(record) -> int:
     return _coerce_non_negative_int(meta.get("height"), default=0)
 
 
-def _active_synthesis_parents(drawer_id: str) -> set[str]:
-    """Return active incoming synthesized-from parent node IDs for one drawer."""
-    try:
-        facts = _call_kg(lambda kg: kg.query_entity(drawer_id, direction="incoming"))
-    except Exception:
-        logger.debug("synthesis parent lookup failed for %s", drawer_id, exc_info=True)
-        return set()
-
-    parents = set()
-    for fact in facts:
-        if not isinstance(fact, dict):
-            continue
-        if fact.get("predicate") != "synthesized-from":
-            continue
-        if fact.get("current") is False:
-            continue
-        subject = fact.get("subject")
-        if isinstance(subject, str) and subject:
-            parents.add(subject)
-    return parents
-
-
-def tool_create_synthesis_node(
-    wing: str,
-    room: str,
-    content: str,
-    source_drawer_ids: list,
-    desc: str,
-    height: int = None,
-    source_file: str = None,
-    added_by: str = "mcp",
-):
-    """Create a synthesis node and link it to source drawers via KG edges.
-
-    Structural guarantees:
-    - Requires a non-empty DESC string.
-    - Requires at least two distinct existing source drawers.
-    - Rejects creation when all sources already share an active immediate
-      synthesis parent (deterministic empty-inflation pre-gate).
-    """
-    try:
-        wing = sanitize_name(wing, "wing")
-        room = sanitize_name(room, "room")
-        content = sanitize_content(content)
-        desc = sanitize_content(desc)
-        if source_file:
-            source_file = strip_lone_surrogates(source_file)
-        added_by = strip_lone_surrogates(added_by)
-    except ValueError as e:
-        return {"success": False, "error": str(e)}
-
-    if not isinstance(source_drawer_ids, list):
-        return {"success": False, "error": "source_drawer_ids must be a list of drawer IDs"}
-
-    cleaned_source_ids = []
-    seen = set()
-    for raw in source_drawer_ids:
-        if not isinstance(raw, str):
-            continue
-        drawer_id = strip_lone_surrogates(raw).strip()
-        if not drawer_id or drawer_id in seen:
-            continue
-        seen.add(drawer_id)
-        cleaned_source_ids.append(drawer_id)
-
-    if len(cleaned_source_ids) < 2:
-        return {
-            "success": False,
-            "error": "synthesis nodes require at least two distinct source_drawer_ids",
-        }
-
-    col = _get_collection(create=True)
-    if not col:
-        return _collection_error_or_no_palace()
-
-    source_records = {}
-    for source_id in cleaned_source_ids:
-        record = _logical_drawer_record(col, source_id)
-        if record is None:
-            return {
-                "success": False,
-                "error": f"source drawer not found: {source_id}",
-            }
-        source_records[source_id] = record
-
-    shared_parent_ids = None
-    for source_id in cleaned_source_ids:
-        parent_ids = _active_synthesis_parents(source_id)
-        if shared_parent_ids is None:
-            shared_parent_ids = parent_ids
-        else:
-            shared_parent_ids &= parent_ids
-        if not shared_parent_ids:
-            break
-    if shared_parent_ids:
-        return {
-            "success": False,
-            "error": (
-                "sources already share an active synthesis parent; "
-                "empty-inflation guard blocked a redundant node"
-            ),
-            "existing_parent_ids": sorted(shared_parent_ids),
-        }
-
-    computed_height = max(_height_from_record(source_records[sid]) for sid in cleaned_source_ids) + 1
-    resolved_height = computed_height
-    if height is not None:
-        try:
-            resolved_height = int(height)
-        except (TypeError, ValueError):
-            return {"success": False, "error": "height must be an integer when provided"}
-        if resolved_height < computed_height:
-            return {
-                "success": False,
-                "error": (
-                    f"height={resolved_height} is below computed minimum "
-                    f"{computed_height} for the provided source drawers"
-                ),
-            }
-
-    add_result = tool_add_drawer(
-        wing=wing,
-        room=room,
-        content=content,
-        source_file=source_file,
-        added_by=added_by,
-        _extra_metadata={
-            "node_kind": "synthesis",
-            "height": resolved_height,
-            "desc": desc,
-        },
-    )
-    if not add_result.get("success"):
-        return add_result
-
-    synthesis_id = add_result["drawer_id"]
-
-    try:
-        for source_id in cleaned_source_ids:
-            _call_kg(
-                lambda kg, src=source_id: kg.add_triple(
-                    synthesis_id,
-                    "synthesized-from",
-                    src,
-                    source_drawer_id=synthesis_id,
-                )
-            )
-    except Exception as e:
-        return {
-            "success": False,
-            "error": f"synthesis node created but edge linking failed: {e}",
-            "drawer_id": synthesis_id,
-            "source_drawer_ids": cleaned_source_ids,
-        }
-
-    return {
-        "success": True,
-        "drawer_id": synthesis_id,
-        "wing": wing,
-        "room": room,
-        "node_kind": "synthesis",
-        "height": resolved_height,
-        "source_drawer_ids": cleaned_source_ids,
-        "edges_created": len(cleaned_source_ids),
-        "chunks": add_result.get("chunks", 1),
-        "chunk_ids": add_result.get("chunk_ids", []),
-    }
-
-
 def tool_delete_drawer(drawer_id: str):
     """Delete a single logical drawer by ID."""
     global _metadata_cache
@@ -4333,59 +4164,149 @@ def _fact_interval_bucket(row: dict, now_key: str) -> str:
     return "active"
 
 
-def tool_kg_query(entity: str, as_of: str = None, direction: str = "both"):
-    """Query the knowledge graph for an entity's relationships."""
+def tool_kg_query(
+    entity: str,
+    as_of: str = None,
+    direction: str = "both",
+    predicate: str = None,
+    recurse: bool = False,
+    max_depth: int = 20,
+):
+    """Query the knowledge graph for an entity's relationships.
+
+    By default this is one-hop behavior (direct facts only). When ``recurse`` is
+    true, perform breadth-first traversal in the requested direction and return
+    de-duplicated facts discovered up to ``max_depth`` hops.
+    """
     try:
         entity = sanitize_kg_value(entity, "entity")
         as_of = sanitize_iso_temporal(as_of, "as_of")
+        predicate = sanitize_name(predicate, "predicate") if predicate else None
     except ValueError as e:
         return {"error": str(e)}
 
     if direction not in ("outgoing", "incoming", "both"):
         return {"error": "direction must be 'outgoing', 'incoming', or 'both'"}
 
-    results = _call_kg(lambda kg: kg.query_entity(entity, as_of=as_of, direction=direction))
-    if as_of is None:
-        now_key = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        active = []
-        historical = []
-        future = []
-        for row in results:
-            bucket = _fact_interval_bucket(row, now_key)
-            if bucket == "future":
-                future.append(row)
-            elif bucket == "historical":
-                historical.append(row)
-            else:
-                active.append(row)
-    else:
-        active = results
-        historical = []
-        future = []
+    recurse = bool(recurse)
+    max_depth = max(1, min(int(max_depth or 20), 100))
+
+    def _filtered_facts(node_id: str) -> list[dict]:
+        facts = _call_kg(lambda kg: kg.query_entity(node_id, as_of=as_of, direction=direction))
+        if not predicate:
+            return [fact for fact in facts if isinstance(fact, dict)]
+        return [
+            fact for fact in facts if isinstance(fact, dict) and fact.get("predicate") == predicate
+        ]
+
+    if not recurse:
+        results = _filtered_facts(entity)
+        if as_of is None:
+            now_key = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+            active = []
+            historical = []
+            future = []
+            for row in results:
+                bucket = _fact_interval_bucket(row, now_key)
+                if bucket == "future":
+                    future.append(row)
+                elif bucket == "historical":
+                    historical.append(row)
+                else:
+                    active.append(row)
+        else:
+            active = results
+            historical = []
+            future = []
+
+        payload = {
+            "entity": entity,
+            "as_of": as_of,
+            "direction": direction,
+            "predicate": predicate,
+            "recurse": False,
+            "active_facts": active,
+            "historical_facts": historical,
+            "future_facts": future,
+            "facts": results,
+            "count": len(results),
+        }
+
+        if results:
+            resolved_names = {
+                r.get("subject") if r.get("direction") == "outgoing" else r.get("object")
+                for r in results
+            }
+            resolved_names.discard(None)
+            if len(resolved_names) == 1:
+                resolved = next(iter(resolved_names))
+                if resolved != entity:
+                    payload["resolved_from"] = entity
+                    payload["entity"] = resolved
+        else:
+            candidates = _call_kg(lambda kg: kg.find_entity_candidates(entity))
+            if candidates:
+                payload["candidates"] = candidates
+
+        return payload
+
+    queue = deque([(entity, 0)])
+    seen_nodes = {entity}
+    seen_facts = set()
+    traversed = []
+
+    while queue:
+        current, depth = queue.popleft()
+        for fact in _filtered_facts(current):
+            subject = fact.get("subject")
+            predicate_value = fact.get("predicate")
+            object_value = fact.get("object")
+            fact_key = (
+                subject,
+                predicate_value,
+                object_value,
+                fact.get("valid_from"),
+                fact.get("valid_to"),
+                fact.get("current"),
+            )
+            if fact_key not in seen_facts:
+                seen_facts.add(fact_key)
+                enriched = dict(fact)
+                enriched["depth"] = depth
+                traversed.append(enriched)
+
+            if depth >= max_depth:
+                continue
+
+            neighbors = []
+            if direction in ("outgoing", "both") and isinstance(object_value, str) and object_value:
+                neighbors.append(object_value)
+            if direction in ("incoming", "both") and isinstance(subject, str) and subject:
+                neighbors.append(subject)
+
+            for neighbor in neighbors:
+                if neighbor in seen_nodes:
+                    continue
+                seen_nodes.add(neighbor)
+                queue.append((neighbor, depth + 1))
+
     payload = {
         "entity": entity,
         "as_of": as_of,
-        "active_facts": active,
-        "historical_facts": historical,
-        "future_facts": future,
-        "facts": results,
-        "count": len(results),
+        "direction": direction,
+        "predicate": predicate,
+        "recurse": True,
+        "max_depth": max_depth,
+        "visited_nodes": len(seen_nodes),
+        "facts": traversed,
+        "count": len(traversed),
     }
-    if results:
-        resolved_names = {
-            r.get("subject") if r.get("direction") == "outgoing" else r.get("object")
-            for r in results
-        }
-        resolved_names.discard(None)
-        if len(resolved_names) == 1:
-            resolved = next(iter(resolved_names))
-            if resolved != entity:
-                payload["resolved_from"] = entity
-                payload["entity"] = resolved
-    else:
+
+    if not traversed:
         candidates = _call_kg(lambda kg: kg.find_entity_candidates(entity))
         if candidates:
             payload["candidates"] = candidates
+
     return payload
 
 
@@ -4610,13 +4531,9 @@ def _ancestor_closure(node_id: str, max_depth: int) -> set[str]:
     return ancestors
 
 
-def _synthesis_node_ids(col, wing: str = None, room: str = None) -> list[str]:
-    """List logical drawer ids marked as synthesis nodes."""
-    ids, docs, metas = _fetch_drawer_rows(
-        col,
-        where={"node_kind": "synthesis"},
-        include_documents=False,
-    )
+def _merge_scan_node_ids(col, wing: str = None, room: str = None) -> list[str]:
+    """List logical drawer IDs available for graph-level merge analysis."""
+    ids, docs, metas = _fetch_drawer_rows(col, include_documents=False)
     drawers = _collapse_drawer_rows(ids, docs, metas)
 
     filtered = []
@@ -4628,6 +4545,228 @@ def _synthesis_node_ids(col, wing: str = None, room: str = None) -> list[str]:
         filtered.append(drawer["drawer_id"])
 
     return sorted(filtered)
+
+
+def _closet_records(wing: str = None, room: str = None) -> list[dict]:
+    """List closet records with minimal metadata for graph-validity checks."""
+    from .palace import get_closets_collection
+
+    try:
+        closets_col = get_closets_collection(_config.palace_path, create=False)
+    except Exception:
+        logger.debug("closet collection lookup failed", exc_info=True)
+        return []
+
+    if closets_col is None:
+        return []
+
+    where = {}
+    if wing:
+        where["wing"] = wing
+    if room:
+        where["room"] = room
+
+    get_kwargs = {"include": ["metadatas"]}
+    if where:
+        get_kwargs["where"] = where
+
+    try:
+        results = closets_col.get(**get_kwargs)
+    except Exception:
+        logger.debug("closet scan failed", exc_info=True)
+        return []
+
+    ids = _get_result_ids(results)
+    metadatas = _chroma_field(results, "metadatas", []) or []
+
+    records = []
+    for idx, closet_id in enumerate(ids):
+        records.append(
+            {
+                "closet_id": closet_id,
+                "metadata": _safe_meta(metadatas[idx] if idx < len(metadatas) else {}),
+            }
+        )
+    return records
+
+
+def _entity_exists_as_drawer_or_closet(col, entity_id: str) -> bool:
+    """Return True when an entity id resolves to a drawer row or a closet row."""
+    if _logical_drawer_record(col, entity_id) is not None:
+        return True
+
+    from .palace import get_closets_collection
+
+    try:
+        closets_col = get_closets_collection(_config.palace_path, create=False)
+    except Exception:
+        logger.debug("closet collection lookup failed", exc_info=True)
+        return False
+
+    if closets_col is None:
+        return False
+
+    try:
+        result = closets_col.get(ids=[entity_id], include=[])
+        return bool(_get_result_ids(result))
+    except Exception:
+        logger.debug("closet existence probe failed for %s", entity_id, exc_info=True)
+        return False
+
+
+def tool_find_closet_lineage_issues(
+    wing: str = None,
+    room: str = None,
+    include_merged: bool = False,
+    limit: int = 20,
+    offset: int = 0,
+):
+    """Validate closet lineage integrity from active KG edges.
+
+    Targets closet IDs and checks lineage modeled via active
+    ``synthesized-from`` facts. Flags:
+    - missing or unresolvable source references,
+    - stale source references that resolve to a different canonical node,
+    - stored/computed height mismatches when closet metadata includes height.
+
+    Ordinary closets with no lineage participation are skipped to avoid
+    false positives; this tool focuses on lineage-aware closet records.
+    """
+    try:
+        wing = _sanitize_optional_name(wing, "wing")
+        room = _sanitize_optional_name(room, "room")
+    except ValueError as e:
+        return {"error": str(e)}
+
+    limit = max(1, min(int(limit or 20), 500))
+    offset = max(0, int(offset or 0))
+
+    col = _get_collection()
+    if not col:
+        return _collection_error_or_no_palace()
+
+    closet_records = _closet_records(wing=wing, room=room)
+    if not closet_records:
+        return {
+            "orphans": [],
+            "count": 0,
+            "total": 0,
+            "limit": limit,
+            "offset": offset,
+            "target": "closets",
+        }
+
+    issues = []
+    for record in closet_records:
+        closet_id = record["closet_id"]
+        meta = record["metadata"]
+
+        canonical = tool_resolve_canonical(closet_id)
+        if "error" in canonical:
+            issues.append(
+                {
+                    "closet_id": closet_id,
+                    "wing": meta.get("wing", ""),
+                    "room": meta.get("room", ""),
+                    "issues": ["canonical_resolution_failed"],
+                    "canonical_error": canonical.get("error"),
+                }
+            )
+            continue
+
+        canonical_id = canonical["canonical_node_id"]
+        if not include_merged and canonical_id != closet_id:
+            continue
+
+        # Guard against false positives for ordinary mined closets that do not
+        # participate in lineage edges at all.
+        participates = bool(
+            _call_kg(lambda kg, cid=closet_id: kg.query_entity(cid, direction="both"))
+        )
+        if not participates:
+            continue
+
+        source_facts = _kg_active_facts(closet_id, "synthesized-from", direction="outgoing")
+        source_ids = sorted(
+            {
+                fact.get("object")
+                for fact in source_facts
+                if isinstance(fact.get("object"), str) and fact.get("object")
+            }
+        )
+
+        found_issues = []
+        missing_sources = []
+        unresolvable_sources = []
+        stale_sources = []
+
+        if not source_ids:
+            found_issues.append("no_active_sources")
+
+        for source_id in source_ids:
+            resolved_source = tool_resolve_canonical(source_id)
+            if "error" in resolved_source:
+                unresolvable_sources.append(source_id)
+                continue
+
+            canonical_source_id = resolved_source["canonical_node_id"]
+            if canonical_source_id != source_id:
+                stale_sources.append(
+                    {"source_node_id": source_id, "canonical_node_id": canonical_source_id}
+                )
+
+            if not _entity_exists_as_drawer_or_closet(col, canonical_source_id):
+                missing_sources.append(
+                    {"source_node_id": source_id, "canonical_node_id": canonical_source_id}
+                )
+
+        if missing_sources:
+            found_issues.append("missing_source_nodes")
+        if unresolvable_sources:
+            found_issues.append("unresolvable_sources")
+        if stale_sources:
+            found_issues.append("stale_source_references")
+
+        stored_height = meta.get("height")
+        computed_height = tool_get_height(closet_id)
+        computed_value = None
+        if isinstance(computed_height, dict) and "error" not in computed_height:
+            computed_value = _coerce_non_negative_int(computed_height.get("height"), default=0)
+
+        if stored_height is not None and computed_value is not None:
+            stored_value = _coerce_non_negative_int(stored_height, default=0)
+            if stored_value != computed_value:
+                found_issues.append("stored_height_mismatch")
+        else:
+            stored_value = None
+
+        if found_issues:
+            issues.append(
+                {
+                    "closet_id": closet_id,
+                    "canonical_node_id": canonical_id,
+                    "wing": meta.get("wing", ""),
+                    "room": meta.get("room", ""),
+                    "issues": found_issues,
+                    "active_source_ids": source_ids,
+                    "missing_sources": missing_sources,
+                    "unresolvable_source_ids": unresolvable_sources,
+                    "stale_sources": stale_sources,
+                    "stored_height": stored_value,
+                    "computed_height": computed_value,
+                }
+            )
+
+    total = len(issues)
+    page = issues[offset : offset + limit]
+    return {
+        "orphans": page,
+        "count": len(page),
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "target": "closets",
+    }
 
 
 def tool_resolve_canonical(node_id: str, max_hops: int = 50):
@@ -4643,7 +4782,11 @@ def tool_resolve_canonical(node_id: str, max_hops: int = 50):
     current = node_id
     for _ in range(max_hops):
         next_nodes = sorted(
-            set(_kg_related_nodes(current, predicate="merged-into", direction="outgoing", field="object"))
+            set(
+                _kg_related_nodes(
+                    current, predicate="merged-into", direction="outgoing", field="object"
+                )
+            )
         )
         if not next_nodes:
             break
@@ -4664,92 +4807,13 @@ def tool_resolve_canonical(node_id: str, max_hops: int = 50):
     }
 
 
-def tool_get_ancestors(node_id: str, max_depth: int = 20):
-    """Traverse active synthesized-from edges upward from a node."""
-    resolved = tool_resolve_canonical(node_id)
-    if "error" in resolved:
-        return resolved
-
-    start = resolved["canonical_node_id"]
-    max_depth = max(1, min(int(max_depth or 20), 100))
-
-    queue = deque([(start, 0)])
-    seen = {start}
-    ancestors = []
-
-    while queue:
-        current, depth = queue.popleft()
-        if depth >= max_depth:
-            continue
-        parents = sorted(
-            set(
-                _kg_related_nodes(
-                    current,
-                    predicate="synthesized-from",
-                    direction="outgoing",
-                    field="object",
-                )
-            )
-        )
-        for parent in parents:
-            if parent in seen:
-                continue
-            seen.add(parent)
-            ancestors.append({"node_id": parent, "depth": depth + 1, "from": current})
-            queue.append((parent, depth + 1))
-
-    return {
-        "node_id": start,
-        "ancestors": ancestors,
-        "count": len(ancestors),
-        "max_depth": max_depth,
-    }
-
-
-def tool_get_descendants(node_id: str, max_depth: int = 20):
-    """Traverse active synthesized-from edges downward from a node."""
-    resolved = tool_resolve_canonical(node_id)
-    if "error" in resolved:
-        return resolved
-
-    start = resolved["canonical_node_id"]
-    max_depth = max(1, min(int(max_depth or 20), 100))
-
-    queue = deque([(start, 0)])
-    seen = {start}
-    descendants = []
-
-    while queue:
-        current, depth = queue.popleft()
-        if depth >= max_depth:
-            continue
-        children = sorted(
-            set(
-                _kg_related_nodes(
-                    current,
-                    predicate="synthesized-from",
-                    direction="incoming",
-                    field="subject",
-                )
-            )
-        )
-        for child in children:
-            if child in seen:
-                continue
-            seen.add(child)
-            descendants.append({"node_id": child, "depth": depth + 1, "from": current})
-            queue.append((child, depth + 1))
-
-    return {
-        "node_id": start,
-        "descendants": descendants,
-        "count": len(descendants),
-        "max_depth": max_depth,
-    }
-
-
 def tool_get_height(node_id: str):
-    """Compute synthesis height as longest synthesized-from path to a leaf source."""
+    """Compute canonical lineage height over active ``synthesized-from`` edges.
+
+    Height is defined as the longest outgoing path from the canonical node to a
+    leaf source (no outgoing lineage edges). Returns both computed height and
+    any stored metadata hint for observability.
+    """
     resolved = tool_resolve_canonical(node_id)
     if "error" in resolved:
         return resolved
@@ -4904,7 +4968,7 @@ def tool_find_merge_candidates(
     room: str = None,
     require_topological_distance: bool = True,
 ):
-    """Find semantically near synthesis-node pairs with optional topology filtering."""
+    """Find semantically near node pairs with optional topology filtering."""
     try:
         wing = _sanitize_optional_name(wing, "wing")
         room = _sanitize_optional_name(room, "room")
@@ -4930,9 +4994,12 @@ def tool_find_merge_candidates(
         if not isinstance(drawer_id, str) or not drawer_id.strip():
             return {"error": "drawer_id must be a non-empty string when provided"}
         seed = _logical_drawer_id_for_any_id(col, strip_lone_surrogates(drawer_id.strip()))
+        seed_record = _logical_drawer_record(col, seed)
+        if seed_record is None:
+            return {"error": f"drawer_id not found: {drawer_id.strip()}"}
         seeds = [seed]
     else:
-        seeds = _synthesis_node_ids(col, wing=wing, room=room)[:max_nodes]
+        seeds = _merge_scan_node_ids(col, wing=wing, room=room)[:max_nodes]
 
     if not seeds:
         return {
@@ -4955,10 +5022,13 @@ def tool_find_merge_candidates(
         }
 
     seed_records = []
-    for seed in seeds:
-        rec = _logical_drawer_record(col, seed)
-        if rec:
-            seed_records.append(rec)
+    if drawer_id is not None:
+        seed_records = [seed_record]
+    else:
+        for seed in seeds:
+            rec = _logical_drawer_record(col, seed)
+            if rec:
+                seed_records.append(rec)
 
     if not seed_records:
         return {
@@ -4987,6 +5057,7 @@ def tool_find_merge_candidates(
 
     for seed_record in seed_records:
         seed = seed_record["drawer_id"]
+
         seed_canonical = _resolve_canonical_cached(seed, canonical_cache)
         if not seed_canonical:
             continue
@@ -5051,150 +5122,6 @@ def tool_find_merge_candidates(
     }
 
 
-def tool_find_orphan_synthesis_nodes(
-    wing: str = None,
-    room: str = None,
-    include_merged: bool = False,
-    limit: int = 20,
-    offset: int = 0,
-):
-    """Find synthesis nodes with structural graph issues."""
-    try:
-        wing = _sanitize_optional_name(wing, "wing")
-        room = _sanitize_optional_name(room, "room")
-    except ValueError as e:
-        return {"error": str(e)}
-
-    limit = max(1, min(int(limit or 20), 500))
-    offset = max(0, int(offset or 0))
-
-    col = _get_collection()
-    if not col:
-        return _collection_error_or_no_palace()
-
-    node_ids = _synthesis_node_ids(col, wing=wing, room=room)
-    issues = []
-
-    record_cache = {}
-    canonical_result_cache = {}
-    height_memo = {}
-
-    def _record_cached(drawer_id: str):
-        if drawer_id in record_cache:
-            return record_cache[drawer_id]
-        record = _logical_drawer_record(col, drawer_id)
-        record_cache[drawer_id] = record
-        return record
-
-    def _canonical_result_cached(drawer_id: str):
-        if drawer_id in canonical_result_cache:
-            return canonical_result_cache[drawer_id]
-        resolved = tool_resolve_canonical(drawer_id)
-        canonical_result_cache[drawer_id] = resolved
-        return resolved
-
-    def _height_cached(node_id: str):
-        resolved = _canonical_result_cached(node_id)
-        if "error" in resolved:
-            return None
-
-        start = resolved["canonical_node_id"]
-
-        def _height(current: str, trail: set[str]) -> int:
-            if current in height_memo:
-                return height_memo[current]
-            if current in trail:
-                return 0
-
-            parents = sorted(
-                set(
-                    _kg_related_nodes(
-                        current,
-                        predicate="synthesized-from",
-                        direction="outgoing",
-                        field="object",
-                    )
-                )
-            )
-            if not parents:
-                height_memo[current] = 0
-                return 0
-
-            next_trail = set(trail)
-            next_trail.add(current)
-            computed = max(_height(parent, next_trail) for parent in parents) + 1
-            height_memo[current] = computed
-            return computed
-
-        return _height(start, set())
-
-    for node_id in node_ids:
-        record = _record_cached(node_id)
-        if record is None:
-            continue
-
-        canonical = _canonical_result_cached(node_id)
-        if "error" in canonical:
-            issues.append(
-                {
-                    "node_id": node_id,
-                    "issues": ["canonical_resolution_failed"],
-                    "canonical_error": canonical.get("error"),
-                }
-            )
-            continue
-
-        canonical_id = canonical["canonical_node_id"]
-        if not include_merged and canonical_id != node_id:
-            continue
-
-        parent_ids = sorted(
-            set(
-                _kg_related_nodes(
-                    node_id,
-                    predicate="synthesized-from",
-                    direction="outgoing",
-                    field="object",
-                )
-            )
-        )
-        missing_parents = [pid for pid in parent_ids if _record_cached(pid) is None]
-
-        found_issues = []
-        if not parent_ids:
-            found_issues.append("no_active_parents")
-        if missing_parents:
-            found_issues.append("missing_parent_drawers")
-
-        computed_height = _height_cached(node_id)
-        stored_height = _height_from_record(record)
-        if isinstance(computed_height, int) and stored_height != computed_height:
-            found_issues.append("stored_height_mismatch")
-
-        if found_issues:
-            issues.append(
-                {
-                    "node_id": node_id,
-                    "canonical_node_id": canonical_id,
-                    "issues": found_issues,
-                    "active_parent_ids": parent_ids,
-                    "missing_parent_ids": missing_parents,
-                    "stored_height": stored_height,
-                    "computed_height": computed_height,
-                }
-            )
-
-    total = len(issues)
-    paged = issues[offset : offset + limit]
-    return {
-        "orphans": paged,
-        "count": len(paged),
-        "total": total,
-        "limit": limit,
-        "offset": offset,
-    }
-
-
 def tool_apply_merge(
     source_node_id: str,
     canonical_node_id: str,
@@ -5224,9 +5151,12 @@ def tool_apply_merge(
     source_logical = _logical_drawer_id_for_any_id(col, source_node_id)
     canonical_logical = _logical_drawer_id_for_any_id(col, canonical_node_id)
 
-    if _logical_drawer_record(col, source_logical) is None:
+    source_record = _logical_drawer_record(col, source_logical)
+    if source_record is None:
         return {"success": False, "error": f"source node not found: {source_node_id}"}
-    if _logical_drawer_record(col, canonical_logical) is None:
+
+    target_record = _logical_drawer_record(col, canonical_logical)
+    if target_record is None:
         return {"success": False, "error": f"canonical node not found: {canonical_node_id}"}
 
     source_resolved = tool_resolve_canonical(source_logical)
@@ -5239,6 +5169,7 @@ def tool_apply_merge(
 
     source_canonical = source_resolved["canonical_node_id"]
     target_canonical = target_resolved["canonical_node_id"]
+
     if source_canonical == target_canonical:
         return {
             "success": True,
@@ -5283,9 +5214,11 @@ def tool_apply_merge(
             }
         merged_edge_added = True
 
-    invalidated_synthesized_from = 0
+    invalidated_lineage_edges = 0
     if invalidate_source_edges:
-        active_synth_edges = _kg_active_facts(source_canonical, "synthesized-from", direction="outgoing")
+        active_synth_edges = _kg_active_facts(
+            source_canonical, "synthesized-from", direction="outgoing"
+        )
         for fact in active_synth_edges:
             object_id = fact.get("object")
             if not isinstance(object_id, str) or not object_id:
@@ -5297,7 +5230,7 @@ def tool_apply_merge(
                 ended=ended,
             )
             if invalidate.get("success"):
-                invalidated_synthesized_from += 1
+                invalidated_lineage_edges += 1
 
     return {
         "success": True,
@@ -5306,7 +5239,7 @@ def tool_apply_merge(
         "canonical_node_id": target_canonical,
         "merged_edge_added": merged_edge_added,
         "invalidated_prior_merged_into": invalidated_prior_merged_into,
-        "invalidated_synthesized_from": invalidated_synthesized_from,
+        "invalidated_lineage_edges": invalidated_lineage_edges,
         "ended": ended or date.today().isoformat(),
     }
 
@@ -6188,7 +6121,7 @@ TOOLS = {
         "handler": tool_get_aaak_spec,
     },
     "mempalace_kg_query": {
-        "description": "Query the knowledge graph for an entity's relationships. Returns typed facts with temporal validity. E.g. 'Max' → child_of Alice, loves chess, does swimming. Filter by date with as_of to see what was true at a point in time.",
+        "description": "Query the knowledge graph for an entity's relationships. Default behavior is one-hop. Set recurse=true to traverse recursively with optional predicate filtering.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -6203,6 +6136,18 @@ TOOLS = {
                 "direction": {
                     "type": "string",
                     "description": "outgoing (entity→?), incoming (?→entity), or both (default: both)",
+                },
+                "predicate": {
+                    "type": "string",
+                    "description": "Optional predicate filter (e.g. 'synthesized-from', 'merged-into').",
+                },
+                "recurse": {
+                    "type": "boolean",
+                    "description": "When true, breadth-first traversal continues beyond one hop (default: false).",
+                },
+                "max_depth": {
+                    "type": "integer",
+                    "description": "Maximum traversal depth when recurse=true (default 20).",
                 },
             },
             "required": ["entity"],
@@ -6316,38 +6261,8 @@ TOOLS = {
         },
         "handler": tool_resolve_canonical,
     },
-    "mempalace_get_ancestors": {
-        "description": "Traverse active synthesized-from edges upward from a node.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "node_id": {"type": "string", "description": "Node ID to start from"},
-                "max_depth": {
-                    "type": "integer",
-                    "description": "Maximum traversal depth (default 20)",
-                },
-            },
-            "required": ["node_id"],
-        },
-        "handler": tool_get_ancestors,
-    },
-    "mempalace_get_descendants": {
-        "description": "Traverse active synthesized-from edges downward from a node.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "node_id": {"type": "string", "description": "Node ID to start from"},
-                "max_depth": {
-                    "type": "integer",
-                    "description": "Maximum traversal depth (default 20)",
-                },
-            },
-            "required": ["node_id"],
-        },
-        "handler": tool_get_descendants,
-    },
     "mempalace_get_height": {
-        "description": "Compute synthesis height for a node as longest synthesized-from path to a source leaf.",
+        "description": "Compute lineage height for a node as longest synthesized-from path to a source leaf.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -6358,13 +6273,13 @@ TOOLS = {
         "handler": tool_get_height,
     },
     "mempalace_find_merge_candidates": {
-        "description": "Find semantically near synthesis-node pairs, optionally requiring topological distance (no common synthesized-from ancestry).",
+        "description": "Find semantically near drawer-node pairs, optionally requiring topological distance (no common synthesized-from ancestry).",
         "input_schema": {
             "type": "object",
             "properties": {
                 "drawer_id": {
                     "type": "string",
-                    "description": "Optional seed node ID to evaluate; omitted scans synthesis nodes.",
+                    "description": "Optional seed node ID to evaluate; omitted scans drawer nodes.",
                 },
                 "threshold": {
                     "type": "number",
@@ -6376,7 +6291,7 @@ TOOLS = {
                 },
                 "max_nodes": {
                     "type": "integer",
-                    "description": "When drawer_id is omitted, maximum synthesis nodes to scan (default 40).",
+                    "description": "When drawer_id is omitted, maximum drawer nodes to scan (default 40).",
                 },
                 "max_depth": {
                     "type": "integer",
@@ -6384,11 +6299,11 @@ TOOLS = {
                 },
                 "wing": {
                     "type": "string",
-                    "description": "Optional wing filter when scanning synthesis nodes.",
+                    "description": "Optional wing filter when scanning drawer nodes.",
                 },
                 "room": {
                     "type": "string",
-                    "description": "Optional room filter when scanning synthesis nodes.",
+                    "description": "Optional room filter when scanning drawer nodes.",
                 },
                 "require_topological_distance": {
                     "type": "boolean",
@@ -6398,34 +6313,34 @@ TOOLS = {
         },
         "handler": tool_find_merge_candidates,
     },
-    "mempalace_find_orphan_synthesis_nodes": {
-        "description": "Find synthesis nodes with structural issues (no active parents, missing parent drawers, height mismatches).",
+    "mempalace_find_closet_lineage_issues": {
+        "description": "Validate closet lineage: report broken sources, stale merged references, and stored-height mismatches.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "wing": {
                     "type": "string",
-                    "description": "Optional wing filter.",
+                    "description": "Optional wing filter for closet records.",
                 },
                 "room": {
                     "type": "string",
-                    "description": "Optional room filter.",
+                    "description": "Optional room filter for closet records.",
                 },
                 "include_merged": {
                     "type": "boolean",
-                    "description": "Include nodes already merged into another canonical node (default false).",
+                    "description": "Include closets that already resolve to another canonical node (default false).",
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum items to return (default 20).",
+                    "description": "Maximum orphan rows to return (default 20, max 500).",
                 },
                 "offset": {
                     "type": "integer",
-                    "description": "Pagination offset (default 0).",
+                    "description": "Pagination offset for orphan rows (default 0).",
                 },
             },
         },
-        "handler": tool_find_orphan_synthesis_nodes,
+        "handler": tool_find_closet_lineage_issues,
     },
     "mempalace_traverse": {
         "description": "Walk the palace graph from a room. Shows connected ideas across wings — the tunnels. Like following a thread through the palace: start at 'chromadb-setup' in wing_code, discover it connects to wing_myproject (planning) and wing_user (feelings about it).",
@@ -6700,45 +6615,8 @@ TOOLS = {
         },
         "handler": tool_checkpoint,
     },
-    "mempalace_create_synthesis_node": {
-        "description": "Create a synthesis drawer node with enforced source links. Requires DESC and at least two distinct source_drawer_ids.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "wing": {"type": "string", "description": "Target wing for the synthesis node"},
-                "room": {"type": "string", "description": "Target room for the synthesis node"},
-                "content": {
-                    "type": "string",
-                    "description": "Verbatim synthesis content to store",
-                },
-                "source_drawer_ids": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Source drawer IDs this synthesis is built from (min 2 distinct)",
-                },
-                "desc": {
-                    "type": "string",
-                    "description": "Required synthesis descriptor used for structural gating",
-                },
-                "height": {
-                    "type": "integer",
-                    "description": "Optional explicit height (must be >= computed minimum)",
-                },
-                "source_file": {
-                    "type": "string",
-                    "description": "Optional provenance source path",
-                },
-                "added_by": {
-                    "type": "string",
-                    "description": "Who is filing this synthesis node (default: mcp)",
-                },
-            },
-            "required": ["wing", "room", "content", "source_drawer_ids", "desc"],
-        },
-        "handler": tool_create_synthesis_node,
-    },
     "mempalace_apply_merge": {
-        "description": "Apply a deterministic merge: link source to canonical via merged-into and optionally invalidate source synthesized-from edges.",
+        "description": "Apply a deterministic merge between nodes: link source to canonical via merged-into and optionally invalidate source synthesized-from edges.",
         "input_schema": {
             "type": "object",
             "properties": {

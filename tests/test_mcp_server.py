@@ -424,7 +424,7 @@ class TestColdStartDiagnostics:
         extra = (
             "from mempalace import mcp_server\n"
             "def _boom(create=False):\n"
-            "    raise RuntimeError('synthetic-collection-open-fail-1495')\n"
+            "    raise RuntimeError('simulated-collection-open-fail-1495')\n"
             "mcp_server._get_collection = _boom\n"
         )
         result = self._run_main(
@@ -433,7 +433,7 @@ class TestColdStartDiagnostics:
         )
         assert result.returncode == 0, f"stderr={result.stderr!r}"
         assert "collection open failed" in result.stderr, result.stderr
-        assert "synthetic-collection-open-fail-1495" in result.stderr, result.stderr
+        assert "simulated-collection-open-fail-1495" in result.stderr, result.stderr
         # palace + error class included in the diagnostic
         assert f"palace={palace}" in result.stderr, result.stderr
         assert "error=RuntimeError" in result.stderr, result.stderr
@@ -449,7 +449,7 @@ class TestColdStartDiagnostics:
             "from mempalace import mcp_server\n"
             "class _BadCol:\n"
             "    def query(self, **kwargs):\n"
-            "        raise RuntimeError('synthetic-query-fail-1495')\n"
+            "        raise RuntimeError('simulated-query-fail-1495')\n"
             "mcp_server._get_collection = lambda create=False: _BadCol()\n"
         )
         result = self._run_main(
@@ -462,13 +462,13 @@ class TestColdStartDiagnostics:
         )
         assert result.returncode == 0, f"stderr={result.stderr!r}"
         assert "warmup query failed" in result.stderr, result.stderr
-        assert "synthetic-query-fail-1495" in result.stderr, result.stderr
+        assert "simulated-query-fail-1495" in result.stderr, result.stderr
         assert f"palace={palace}" in result.stderr, result.stderr
         assert "error=RuntimeError" in result.stderr, result.stderr
         assert log_path.exists(), f"log file not created; stderr={result.stderr!r}"
         body = log_path.read_text(encoding="utf-8")
         assert "warmup query failed" in body, body
-        assert "synthetic-query-fail-1495" in body, body
+        assert "simulated-query-fail-1495" in body, body
 
     def test_log_file_path_with_embedded_newline_does_not_crash(self, tmp_path):
         """``MEMPALACE_LOG_FILE`` containing a newline (rare misconfig from
@@ -2879,23 +2879,6 @@ class TestWriteTools:
         assert result["room"] == "backend"
         assert "JWT tokens" in result["content"]
 
-    def test_get_drawer_increments_retrieval_counters(self, monkeypatch, config, palace_path, kg):
-        _patch_mcp_server(monkeypatch, config, kg)
-        _client, _col = _get_collection(palace_path, create=True)
-        del _client
-
-        from mempalace.mcp_server import tool_add_drawer, tool_get_drawer
-
-        added = tool_add_drawer(wing="project", room="reads", content="retrieval counter probe")
-        drawer_id = added["drawer_id"]
-
-        first = tool_get_drawer(drawer_id)
-        second = tool_get_drawer(drawer_id)
-
-        assert first["metadata"]["retrieval_count"] == 1
-        assert second["metadata"]["retrieval_count"] == 2
-        assert second["metadata"]["last_retrieved"]
-
     def test_get_drawer_not_found(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace.mcp_server import tool_get_drawer
@@ -3508,94 +3491,6 @@ class TestWriteTools:
         assert result["chunks"] == 1
         assert "chunk_ids" not in result
 
-    def test_create_synthesis_node_links_sources_and_sets_height(
-        self, monkeypatch, config, palace_path, kg
-    ):
-        _patch_mcp_server(monkeypatch, config, kg)
-        _client, _col = _get_collection(palace_path, create=True)
-        del _client
-
-        from mempalace.mcp_server import (
-            tool_add_drawer,
-            tool_create_synthesis_node,
-            tool_get_drawer,
-            tool_kg_query,
-        )
-
-        s1 = tool_add_drawer(wing="graph", room="raw", content="source alpha")
-        s2 = tool_add_drawer(wing="graph", room="raw", content="source beta")
-
-        created = tool_create_synthesis_node(
-            wing="graph",
-            room="synthesis",
-            content="alpha and beta share a single operational risk",
-            source_drawer_ids=[s1["drawer_id"], s2["drawer_id"]],
-            desc="cross-source operational risk synthesis",
-        )
-
-        assert created["success"] is True
-        assert created["node_kind"] == "synthesis"
-        assert created["height"] == 1
-
-        fetched = tool_get_drawer(created["drawer_id"])
-        assert fetched["metadata"].get("node_kind") == "synthesis"
-        assert fetched["metadata"].get("height") == 1
-
-        facts = tool_kg_query(entity=created["drawer_id"], direction="outgoing")
-        linked = [f for f in facts["facts"] if f.get("predicate") == "synthesized-from"]
-        assert len(linked) == 2
-
-    def test_create_synthesis_node_requires_distinct_sources(
-        self, monkeypatch, config, palace_path, kg
-    ):
-        _patch_mcp_server(monkeypatch, config, kg)
-        _client, _col = _get_collection(palace_path, create=True)
-        del _client
-
-        from mempalace.mcp_server import tool_add_drawer, tool_create_synthesis_node
-
-        src = tool_add_drawer(wing="graph", room="raw", content="single source only")
-        result = tool_create_synthesis_node(
-            wing="graph",
-            room="synthesis",
-            content="invalid synthesis",
-            source_drawer_ids=[src["drawer_id"], src["drawer_id"]],
-            desc="must fail because not distinct",
-        )
-        assert result["success"] is False
-        assert "at least two distinct" in result["error"]
-
-    def test_create_synthesis_node_empty_inflation_guard(
-        self, monkeypatch, config, palace_path, kg
-    ):
-        _patch_mcp_server(monkeypatch, config, kg)
-        _client, _col = _get_collection(palace_path, create=True)
-        del _client
-
-        from mempalace.mcp_server import tool_add_drawer, tool_create_synthesis_node
-
-        s1 = tool_add_drawer(wing="graph", room="raw", content="source one")
-        s2 = tool_add_drawer(wing="graph", room="raw", content="source two")
-
-        first = tool_create_synthesis_node(
-            wing="graph",
-            room="synthesis",
-            content="first synthesis",
-            source_drawer_ids=[s1["drawer_id"], s2["drawer_id"]],
-            desc="first synthesis desc",
-        )
-        assert first["success"] is True
-
-        second = tool_create_synthesis_node(
-            wing="graph",
-            room="synthesis",
-            content="second synthesis should be blocked",
-            source_drawer_ids=[s1["drawer_id"], s2["drawer_id"]],
-            desc="second synthesis desc",
-        )
-        assert second["success"] is False
-        assert "empty-inflation guard" in second["error"]
-
 
 def test_add_drawer_chunked_logical_id_fetches_deletes_and_lists_as_one(
     monkeypatch, config, palace_path, kg
@@ -4006,17 +3901,19 @@ class TestDeleteBySource:
 
 
 class TestKGTools:
-    def test_synthesis_and_traversal_tools_registered(self):
-        from mempalace import mcp_server
+    @staticmethod
+    def _add_closet_row(palace_path, closet_id, wing="g", room="syn", extra_meta=None):
+        from mempalace.palace import get_closets_collection
 
-        assert "mempalace_create_synthesis_node" in mcp_server.TOOLS
-        assert "mempalace_resolve_canonical" in mcp_server.TOOLS
-        assert "mempalace_get_ancestors" in mcp_server.TOOLS
-        assert "mempalace_get_descendants" in mcp_server.TOOLS
-        assert "mempalace_get_height" in mcp_server.TOOLS
-        assert "mempalace_find_merge_candidates" in mcp_server.TOOLS
-        assert "mempalace_find_orphan_synthesis_nodes" in mcp_server.TOOLS
-        assert "mempalace_apply_merge" in mcp_server.TOOLS
+        closets_col = get_closets_collection(palace_path, create=True)
+        metadata = {"wing": wing, "room": room, "source_file": f"{closet_id}.txt"}
+        if extra_meta:
+            metadata.update(extra_meta)
+        closets_col.add(
+            ids=[closet_id],
+            documents=[f"closet content for {closet_id}"],
+            metadatas=[metadata],
+        )
 
     def test_kg_add(self, monkeypatch, config, palace_path, kg):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -4036,6 +3933,28 @@ class TestKGTools:
 
         result = tool_kg_query(entity="Max")
         assert result["count"] > 0
+
+    def test_kg_query_recursive_predicate_filter(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        mcp_server.tool_kg_add(subject="node-c", predicate="synthesized-from", object="node-b")
+        mcp_server.tool_kg_add(subject="node-b", predicate="synthesized-from", object="node-a")
+        mcp_server.tool_kg_add(subject="node-b", predicate="related-to", object="noise")
+
+        result = mcp_server.tool_kg_query(
+            entity="node-c",
+            direction="outgoing",
+            predicate="synthesized-from",
+            recurse=True,
+            max_depth=5,
+        )
+
+        assert result["recurse"] is True
+        edges = {(fact["subject"], fact["predicate"], fact["object"]) for fact in result["facts"]}
+        assert ("node-c", "synthesized-from", "node-b") in edges
+        assert ("node-b", "synthesized-from", "node-a") in edges
+        assert all(fact["predicate"] == "synthesized-from" for fact in result["facts"])
 
     def test_kg_invalidate(self, monkeypatch, config, palace_path, seeded_kg):
         _patch_mcp_server(monkeypatch, config, seeded_kg)
@@ -4084,9 +4003,7 @@ class TestKGTools:
         assert resolved["canonical_node_id"] == "node-a"
         assert resolved["chain"] == ["node-c", "node-b", "node-a"]
 
-    def test_get_height_and_ancestors_on_synthesis_chain(
-        self, monkeypatch, config, palace_path, kg
-    ):
+    def test_get_height_on_synthesized_from_chain(self, monkeypatch, config, palace_path, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         _client, _col = _get_collection(palace_path, create=True)
         del _client
@@ -4096,28 +4013,24 @@ class TestKGTools:
         s2 = mcp_server.tool_add_drawer(wing="g", room="raw", content="src-2")
         s3 = mcp_server.tool_add_drawer(wing="g", room="raw", content="src-3")
 
-        synth_1 = mcp_server.tool_create_synthesis_node(
-            wing="g",
-            room="syn",
-            content="synth one",
-            source_drawer_ids=[s1["drawer_id"], s2["drawer_id"]],
-            desc="layer 1",
+        n1 = mcp_server.tool_add_drawer(wing="g", room="syn", content="node-1")
+        n2 = mcp_server.tool_add_drawer(wing="g", room="syn", content="node-2")
+
+        mcp_server.tool_kg_add(
+            subject=n1["drawer_id"], predicate="synthesized-from", object=s1["drawer_id"]
         )
-        synth_2 = mcp_server.tool_create_synthesis_node(
-            wing="g",
-            room="syn",
-            content="synth two",
-            source_drawer_ids=[synth_1["drawer_id"], s3["drawer_id"]],
-            desc="layer 2",
+        mcp_server.tool_kg_add(
+            subject=n1["drawer_id"], predicate="synthesized-from", object=s2["drawer_id"]
+        )
+        mcp_server.tool_kg_add(
+            subject=n2["drawer_id"], predicate="synthesized-from", object=n1["drawer_id"]
+        )
+        mcp_server.tool_kg_add(
+            subject=n2["drawer_id"], predicate="synthesized-from", object=s3["drawer_id"]
         )
 
-        height = mcp_server.tool_get_height(synth_2["drawer_id"])
+        height = mcp_server.tool_get_height(n2["drawer_id"])
         assert height["height"] == 2
-
-        ancestors = mcp_server.tool_get_ancestors(synth_2["drawer_id"])
-        ancestor_ids = {a["node_id"] for a in ancestors["ancestors"]}
-        assert synth_1["drawer_id"] in ancestor_ids
-        assert s3["drawer_id"] in ancestor_ids
 
     def test_find_merge_candidates_filters_by_topological_distance(
         self, monkeypatch, config, palace_path, kg
@@ -4132,37 +4045,37 @@ class TestKGTools:
         s3 = mcp_server.tool_add_drawer(wing="g", room="raw", content="src-3")
         s4 = mcp_server.tool_add_drawer(wing="g", room="raw", content="src-4")
 
-        synth_a = mcp_server.tool_create_synthesis_node(
-            wing="g",
-            room="syn",
-            content="syn-a",
-            source_drawer_ids=[s1["drawer_id"], s2["drawer_id"]],
-            desc="pair a",
+        node_a = mcp_server.tool_add_drawer(wing="g", room="syn", content="node-a")
+        node_b = mcp_server.tool_add_drawer(wing="g", room="syn", content="node-b")
+        node_c = mcp_server.tool_add_drawer(wing="g", room="syn", content="node-c")
+
+        mcp_server.tool_kg_add(
+            subject=node_a["drawer_id"], predicate="synthesized-from", object=s1["drawer_id"]
         )
-        synth_b = mcp_server.tool_create_synthesis_node(
-            wing="g",
-            room="syn",
-            content="syn-b",
-            source_drawer_ids=[s3["drawer_id"], s4["drawer_id"]],
-            desc="pair b",
+        mcp_server.tool_kg_add(
+            subject=node_a["drawer_id"], predicate="synthesized-from", object=s2["drawer_id"]
         )
-        synth_c = mcp_server.tool_create_synthesis_node(
-            wing="g",
-            room="syn",
-            content="syn-c",
-            source_drawer_ids=[s1["drawer_id"], s3["drawer_id"]],
-            desc="pair c",
-            height=2,
+        mcp_server.tool_kg_add(
+            subject=node_b["drawer_id"], predicate="synthesized-from", object=s3["drawer_id"]
+        )
+        mcp_server.tool_kg_add(
+            subject=node_b["drawer_id"], predicate="synthesized-from", object=s4["drawer_id"]
+        )
+        mcp_server.tool_kg_add(
+            subject=node_c["drawer_id"], predicate="synthesized-from", object=s1["drawer_id"]
+        )
+        mcp_server.tool_kg_add(
+            subject=node_c["drawer_id"], predicate="synthesized-from", object=s3["drawer_id"]
         )
 
         def _fake_batch_matches(_collection, seed_records, _threshold):
-            assert [r["drawer_id"] for r in seed_records] == [synth_a["drawer_id"]]
+            assert [r["drawer_id"] for r in seed_records] == [node_a["drawer_id"]]
             return (
                 {
-                    synth_a["drawer_id"]: [
-                        {"id": synth_b["drawer_id"], "similarity": 0.96},
-                        {"id": synth_c["drawer_id"], "similarity": 0.94},
-                        {"id": synth_a["drawer_id"], "similarity": 1.0},
+                    node_a["drawer_id"]: [
+                        {"id": node_b["drawer_id"], "similarity": 0.96},
+                        {"id": node_c["drawer_id"], "similarity": 0.94},
+                        {"id": node_a["drawer_id"], "similarity": 1.0},
                     ]
                 },
                 None,
@@ -4175,23 +4088,23 @@ class TestKGTools:
         )
 
         strict = mcp_server.tool_find_merge_candidates(
-            drawer_id=synth_a["drawer_id"],
+            drawer_id=node_a["drawer_id"],
             require_topological_distance=True,
         )
         assert strict["count"] == 1
-        assert strict["candidates"][0]["target_node_id"] == synth_b["drawer_id"]
+        assert strict["candidates"][0]["target_node_id"] == node_b["drawer_id"]
         assert strict["candidates"][0]["topologically_distant"] is True
 
         relaxed = mcp_server.tool_find_merge_candidates(
-            drawer_id=synth_a["drawer_id"],
+            drawer_id=node_a["drawer_id"],
             require_topological_distance=False,
         )
         assert relaxed["count"] == 2
         by_target = {c["target_node_id"]: c for c in relaxed["candidates"]}
-        assert by_target[synth_c["drawer_id"]]["topologically_distant"] is False
-        assert by_target[synth_c["drawer_id"]]["common_ancestor_count"] >= 1
+        assert by_target[node_c["drawer_id"]]["topologically_distant"] is False
+        assert by_target[node_c["drawer_id"]]["common_ancestor_count"] >= 1
 
-    def test_find_orphan_synthesis_nodes_flags_missing_structure(
+    def test_find_closet_lineage_issues_reports_missing_sources(
         self, monkeypatch, config, palace_path, kg
     ):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -4199,38 +4112,23 @@ class TestKGTools:
         del _client
         from mempalace import mcp_server
 
-        s1 = mcp_server.tool_add_drawer(wing="g", room="raw", content="src-1")
-        s2 = mcp_server.tool_add_drawer(wing="g", room="raw", content="src-2")
+        self._add_closet_row(palace_path, "closet_bad_missing")
+        self._add_closet_row(palace_path, "closet_plain")
 
-        synth = mcp_server.tool_create_synthesis_node(
-            wing="g",
-            room="syn",
-            content="syn",
-            source_drawer_ids=[s1["drawer_id"], s2["drawer_id"]],
-            desc="pair",
-        )
-
-        mcp_server.tool_kg_invalidate(
-            subject=synth["drawer_id"],
-            predicate="synthesized-from",
-            object=s1["drawer_id"],
-        )
-        mcp_server.tool_kg_invalidate(
-            subject=synth["drawer_id"],
-            predicate="synthesized-from",
-            object=s2["drawer_id"],
-        )
         mcp_server.tool_kg_add(
-            subject=synth["drawer_id"],
+            subject="closet_bad_missing",
             predicate="synthesized-from",
-            object="drawer_missing_parent",
+            object="drawer_missing_source",
         )
 
-        result = mcp_server.tool_find_orphan_synthesis_nodes()
-        by_id = {item["node_id"]: item for item in result["orphans"]}
-        assert synth["drawer_id"] in by_id
-        issues = set(by_id[synth["drawer_id"]]["issues"])
-        assert "missing_parent_drawers" in issues
+        result = mcp_server.tool_find_closet_lineage_issues()
+
+        assert result["target"] == "closets"
+        assert result["total"] == 1
+        orphan = result["orphans"][0]
+        assert orphan["closet_id"] == "closet_bad_missing"
+        assert "missing_source_nodes" in orphan["issues"]
+        assert orphan["active_source_ids"] == ["drawer_missing_source"]
 
     def test_apply_merge_sets_canonical_and_invalidates_source_edges(
         self, monkeypatch, config, palace_path, kg
@@ -4245,19 +4143,20 @@ class TestKGTools:
         s3 = mcp_server.tool_add_drawer(wing="g", room="raw", content="src-3")
         s4 = mcp_server.tool_add_drawer(wing="g", room="raw", content="src-4")
 
-        source = mcp_server.tool_create_synthesis_node(
-            wing="g",
-            room="syn",
-            content="source",
-            source_drawer_ids=[s1["drawer_id"], s2["drawer_id"]],
-            desc="source",
+        source = mcp_server.tool_add_drawer(wing="g", room="syn", content="source")
+        canonical = mcp_server.tool_add_drawer(wing="g", room="syn", content="canonical")
+
+        mcp_server.tool_kg_add(
+            subject=source["drawer_id"], predicate="synthesized-from", object=s1["drawer_id"]
         )
-        canonical = mcp_server.tool_create_synthesis_node(
-            wing="g",
-            room="syn",
-            content="canonical",
-            source_drawer_ids=[s3["drawer_id"], s4["drawer_id"]],
-            desc="canonical",
+        mcp_server.tool_kg_add(
+            subject=source["drawer_id"], predicate="synthesized-from", object=s2["drawer_id"]
+        )
+        mcp_server.tool_kg_add(
+            subject=canonical["drawer_id"], predicate="synthesized-from", object=s3["drawer_id"]
+        )
+        mcp_server.tool_kg_add(
+            subject=canonical["drawer_id"], predicate="synthesized-from", object=s4["drawer_id"]
         )
 
         merged = mcp_server.tool_apply_merge(
@@ -4267,7 +4166,7 @@ class TestKGTools:
         )
         assert merged["success"] is True
         assert merged["merged"] is True
-        assert merged["invalidated_synthesized_from"] == 2
+        assert merged["invalidated_lineage_edges"] == 2
 
         resolved = mcp_server.tool_resolve_canonical(source["drawer_id"])
         assert resolved["canonical_node_id"] == canonical["drawer_id"]
@@ -4286,6 +4185,37 @@ class TestKGTools:
         )
         assert repeat["success"] is True
         assert repeat["merged"] is False
+
+    def test_apply_merge_requires_existing_nodes(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace import mcp_server
+
+        existing = mcp_server.tool_add_drawer(wing="g", room="raw", content="exists")
+
+        bad_source = mcp_server.tool_apply_merge(
+            source_node_id="drawer_missing", canonical_node_id=existing["drawer_id"]
+        )
+        assert bad_source["success"] is False
+        assert "source node not found" in bad_source["error"]
+
+        bad_target = mcp_server.tool_apply_merge(
+            source_node_id=existing["drawer_id"], canonical_node_id="drawer_missing_target"
+        )
+        assert bad_target["success"] is False
+        assert "canonical node not found" in bad_target["error"]
+
+    def test_find_merge_candidates_rejects_missing_seed(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace import mcp_server
+
+        result = mcp_server.tool_find_merge_candidates(drawer_id="drawer_missing")
+
+        assert "error" in result
+        assert "drawer_id not found" in result["error"]
 
     def test_kg_add_forwards_valid_to(self, monkeypatch, config, palace_path, kg):
         """Regression #1314 case 1: valid_to must round-trip through kg_add."""

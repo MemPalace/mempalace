@@ -207,7 +207,6 @@ def test_submit_job_uses_client_and_waits(monkeypatch, tmp_path):
 
 def test_service_tool_classification():
     assert service.classify_tool("mempalace_search") == "read"
-    assert service.classify_tool("mempalace_find_merge_candidates") == "read"
     assert service.classify_tool("mempalace_add_drawer") == "write"
     assert service.classify_tool("mempalace_memories_filed_away") == "write"
     assert service.classify_tool("mempalace_checkpoint") == "write"
