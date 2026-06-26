@@ -545,6 +545,79 @@ def _maybe_run_mine_after_init(args, cfg) -> None:
         sys.exit(1)
 
 
+def _mine_via_source_adapter(args, palace_path):
+    """Route ``mine --source NAME`` through the RFC 002 source-adapter registry.
+
+    Opt-in seam: when an explicit ``--source`` names a registered adapter, mine
+    resolves it from ``mempalace.sources.registry``, runs its ``ingest()``, and
+    files each ``DrawerRecord`` through a ``PalaceContext``. When no ``--source``
+    is given, ``cmd_mine`` keeps its legacy ``--mode`` dispatch — the
+    filesystem/conversations miners have not moved onto the contract yet, so the
+    registry path stays opt-in and changes no existing behavior. This wires the
+    registry the spec reserves.
+    """
+    from .knowledge_graph import KnowledgeGraph
+    from .palace import MineAlreadyRunning, get_collection, mine_palace_lock
+    from .sources.base import DrawerRecord, SourceItemMetadata, SourceRef
+    from .sources.context import PalaceContext
+    from .sources.registry import get_adapter, resolve_adapter_for_source
+
+    name = resolve_adapter_for_source(explicit=args.source)
+    try:
+        adapter = get_adapter(name)
+    except KeyError as exc:
+        print(f"mempalace: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+    # Routing precedence (§2.5): explicit --wing flows to the adapter via
+    # SourceRef.options; the adapter honors it. Secrets never go here (§2.2).
+    options = {}
+    if getattr(args, "wing", None):
+        options["wing"] = args.wing
+    ref = SourceRef(local_path=os.path.abspath(os.path.expanduser(args.dir)), options=options)
+
+    filed = 0
+    skipped = 0
+    try:
+        with mine_palace_lock(palace_path):
+            collection = get_collection(palace_path, create=True)
+            kg = KnowledgeGraph(db_path=os.path.join(palace_path, "knowledge_graph.sqlite3"))
+            ctx = PalaceContext(
+                drawer_collection=collection,
+                knowledge_graph=kg,
+                palace_path=palace_path,
+                config=MempalaceConfig(),
+                adapter_name=getattr(adapter, "name", name),
+                adapter_version=getattr(adapter, "adapter_version", ""),
+            )
+
+            skip_item = False
+            for result in adapter.ingest(source=ref, palace=ctx):
+                if isinstance(result, SourceItemMetadata):
+                    skip_item = False
+                    ctx._skip_requested = False
+                    existing = collection.get(where={"source_file": result.source_file}, limit=1)
+                    metas = (existing or {}).get("metadatas") or []
+                    if adapter.is_current(item=result, existing_metadata=metas[0] if metas else None):
+                        ctx.skip_current_item()
+                        skip_item = True
+                elif isinstance(result, DrawerRecord):
+                    if skip_item or ctx._skip_requested:
+                        skipped += 1
+                        continue
+                    if not args.dry_run:
+                        ctx.upsert_drawer(result)
+                    filed += 1
+            adapter.close()
+    except MineAlreadyRunning as exc:
+        print(f"mempalace: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    verb = "Would file" if args.dry_run else "Drawers filed:"
+    tail = f"  (skipped {skipped} up-to-date)" if skipped else ""
+    print(f"  source={name}  {verb} {filed}{tail}")
+
+
 def cmd_mine(args):
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     include_ignored = []
@@ -553,6 +626,10 @@ def cmd_mine(args):
 
     if getattr(args, "background", False) and not getattr(args, "daemon", False):
         print("mempalace: --background requires --daemon", file=sys.stderr)
+        sys.exit(2)
+
+    if getattr(args, "source", None) and getattr(args, "daemon", False):
+        print("mempalace: --source does not support --daemon yet", file=sys.stderr)
         sys.exit(2)
 
     if getattr(args, "daemon", False):
@@ -581,6 +658,12 @@ def cmd_mine(args):
             palace_dir=palace_path,
             llm_provider=None,
         )
+
+    # RFC 002 source-adapter seam: an explicit --source routes mine through the
+    # registry; absent it, the legacy --mode dispatch below runs unchanged.
+    if getattr(args, "source", None):
+        _mine_via_source_adapter(args, palace_path)
+        return
 
     from .palace import MineAlreadyRunning, MineValidationError
 
@@ -1811,6 +1894,16 @@ def main():
             "Ingest mode: 'projects' for code/docs (default), 'convos' for chat "
             "exports, 'extract' for office documents (PDF/DOCX/RTF/etc., requires "
             "mempalace[extract])"
+        ),
+    )
+    p_mine.add_argument(
+        "--source",
+        default=None,
+        metavar="NAME",
+        help=(
+            "RFC 002 source adapter to mine through (e.g. a third-party "
+            "mempalace-source-<name> package). Explicit selection only — no "
+            "auto-detect. Omit to use the legacy --mode dispatch."
         ),
     )
     p_mine.add_argument("--wing", default=None, help="Wing name (default: directory name)")
