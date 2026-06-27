@@ -1513,16 +1513,30 @@ def tool_status():
     }
     try:
         if _supports_metadata_facets(col):
-            wings.update(col.facet_counts("wing"))
-            rooms.update(col.facet_counts("room"))
+            try:
+                wings.update(col.facet_counts("wing"))
+                try:
+                    unknown_wings = col.count() - sum(wings.values())
+                    if unknown_wings > 0:
+                        wings["unknown"] = unknown_wings
+                except (TypeError, ValueError):
+                    pass
+
+            except Exception as e:
+                logger.warning(
+                    "Failed to fetch metadata facets, falling back to client-side loop: %s", e
+                )
+                all_meta = _get_cached_metadata(col)
+                for m in all_meta:
+                    m = m or {}
+                    w = m.get("wing", "unknown")
+                    wings[w] = wings.get(w, 0) + 1
         else:
             all_meta = _get_cached_metadata(col)
             for m in all_meta:
                 m = m or {}
                 w = m.get("wing", "unknown")
-                r = m.get("room", "unknown")
                 wings[w] = wings.get(w, 0) + 1
-                rooms[r] = rooms.get(r, 0) + 1
     except Exception as e:
         logger.exception("tool_status metadata fetch failed")
         result["error"] = str(e)
@@ -1642,6 +1656,7 @@ def tool_get_taxonomy():
     try:
         if _supports_metadata_facets(col):
             from concurrent.futures import ThreadPoolExecutor
+
             wings = list(col.facet_counts("wing").keys())
             with ThreadPoolExecutor() as executor:
                 futures = {
