@@ -1045,11 +1045,15 @@ class TestMetadataFacets:
 
         col = MagicMock()
 
-        col.facet_counts.side_effect = [
-            {"wing_a": 2, "wing_b": 1},
-            {"room1": 2},
-            {"room2": 1},
-        ]
+        def facet_counts_mock(field, where=None):
+            if field == "wing":
+                return {"wing_a": 2, "wing_b": 1}
+            if field == "room" and where == {"wing": "wing_a"}:
+                return {"room1": 2}
+            if field == "room" and where == {"wing": "wing_b"}:
+                return {"room2": 1}
+            return {}
+        col.facet_counts.side_effect = facet_counts_mock
 
         monkeypatch.setattr(mcp, "_get_collection", lambda: col)
 
