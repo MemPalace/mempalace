@@ -196,10 +196,10 @@ class _FakeQdrantClient:
         for point in points:
             print(point)
             metadata = point["payload"].get("metadata", {})
-            value = metadata.get(field)
+            actual_field = field.split(".", 1)[-1] if field.startswith("metadata.") else field
+            value = metadata.get(actual_field)
 
             if value is None:
-                continue
 
             counts[value] = counts.get(value, 0) + 1
 
