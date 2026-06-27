@@ -1080,7 +1080,7 @@ class QdrantCollection(BaseCollection):
 
         return self._client.facet_counts(
             self._remote_collection,
-            field=field,
+            field=f"{_PAYLOAD_METADATA}.{field}",
             qdrant_filter=q_filter,
         )
 
