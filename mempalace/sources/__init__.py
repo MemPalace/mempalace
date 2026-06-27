@@ -35,6 +35,7 @@ from .base import (
     TransformationViolationError,
 )
 from .context import PalaceContext, ProgressHook
+from .ndjson import NdjsonSourceAdapter
 from .registry import (
     available_adapters,
     get_adapter,
@@ -45,6 +46,11 @@ from .registry import (
     unregister,
 )
 
+# First-party in-tree adapters register on import (RFC 002 §3.2 — explicit
+# registration, not the third-party entry-point group). This makes
+# ``mine --source ndjson`` resolve without an install step.
+register(NdjsonSourceAdapter.name, NdjsonSourceAdapter)
+
 __all__ = [
     "AdapterClosedError",
     "AdapterSchema",
@@ -54,6 +60,7 @@ __all__ = [
     "FieldSpec",
     "IngestMode",
     "IngestResult",
+    "NdjsonSourceAdapter",
     "PalaceContext",
     "ProgressHook",
     "RouteHint",
