@@ -200,7 +200,7 @@ class _FakeQdrantClient:
             value = metadata.get(actual_field)
 
             if value is None:
-
+                continue
             counts[value] = counts.get(value, 0) + 1
 
         return counts
