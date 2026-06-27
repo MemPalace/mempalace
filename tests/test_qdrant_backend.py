@@ -637,7 +637,7 @@ def test_qdrant_facet_counts_passes_filter(tmp_path, fake_qdrant):
     client = fake_qdrant.instances[0]
     assert len(client.facet_calls) == 1
     field, qfilter = client.facet_calls[0]
-    assert field == "room"
+    assert field == "metadata.room"
     assert qfilter == {
         "must": [
             {
