@@ -468,3 +468,36 @@ class TestFileChunksLocked:
         assert dict(room_counts) == {}
         assert skipped is False
         assert col.batch_sizes == [2, 2, 1]
+
+    def test_populates_entities_metadata(self, monkeypatch):
+        import mempalace.convo_miner as convo_miner
+
+        class FakeCol:
+            def __init__(self):
+                self.metas = []
+
+            def delete(self, *args, **kwargs):
+                pass
+
+            def get(self, ids=None, include=None, **kwargs):
+                return {"ids": [], "metadatas": []}
+
+            def upsert(self, documents, ids, metadatas):
+                self.metas.extend(metadatas)
+
+        chunks = [
+            {"content": "We changed `MemoryStack` in rag/foo.py via do_thing_now().", "chunk_index": 0}
+        ]
+        col = FakeCol()
+        monkeypatch.setattr(
+            convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
+        )
+        monkeypatch.setattr(convo_miner, "mine_lock", lambda source_file: contextlib.nullcontext())
+        monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda content: "conversations")
+
+        _file_chunks_locked(col, "chat.txt", chunks, "wing", "general", "agent", "exchange")
+
+        entities = col.metas[0]["entities"].split(";")
+        assert "MemoryStack" in entities
+        assert "rag/foo.py" in entities
+        assert "do_thing_now" in entities

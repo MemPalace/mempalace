@@ -1001,6 +1001,21 @@ def cmd_migrate_wings(args):
     )
 
 
+def cmd_hallways(args):
+    """List within-wing entity hallways (the auto-built associative graph)."""
+    from .hallways import list_hallways
+
+    rows = list_hallways(getattr(args, "wing", None))
+    if not rows:
+        print("No hallways yet — they are built from drawer entities when you mine.")
+        return
+    rows.sort(key=lambda h: h.get("co_occurrence_count", 0), reverse=True)
+    print(f"  {len(rows)} hallway(s):")
+    for h in rows[: args.limit]:
+        label = h.get("label") or f"{h.get('entity_a', '?')} <-> {h.get('entity_b', '?')}"
+        print(f"    {label}")
+
+
 def cmd_status(args):
     from .miner import status
 
@@ -1977,6 +1992,9 @@ def main():
     )
     p_migrate_wings.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
 
+    p_hallways = sub.add_parser("hallways", help="List entity hallways (associative graph)")
+    p_hallways.add_argument("--wing", default=None, help="Filter to one wing")
+    p_hallways.add_argument("--limit", type=int, default=50, help="Max hallways to show")
     p_status = sub.add_parser("status", help="Show what's been filed")
     p_status.add_argument(
         "--backend",
@@ -2061,6 +2079,7 @@ def main():
         "repair-status": cmd_repair_status,
         "migrate": cmd_migrate,
         "migrate-wings": cmd_migrate_wings,
+        "hallways": cmd_hallways,
         "status": cmd_status,
     }
     dispatch[args.command](args)
