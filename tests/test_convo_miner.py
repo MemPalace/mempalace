@@ -416,3 +416,41 @@ def test_resolve_wing_empty_string_treated_as_no_wing(tmp_path):
     target = tmp_path / ".gemini" / "tmp"
     target.mkdir(parents=True)
     assert _resolve_wing(target, wing="") == "wing_api"
+
+
+def test_mine_convos_limit_skips_already_mined(capsys):
+    """--limit N counts only new work, not already-mined skips (#1535)."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        convo_text = (
+            "> What is topic {i}?\n"
+            "Topic {i} is about something important and interesting enough "
+            "to produce at least one exchange chunk for the test.\n\n"
+            "> Tell me more about topic {i}.\n"
+            "Sure, topic {i} has many facets worth exploring in detail.\n"
+        )
+        for i in range(4):
+            with open(os.path.join(tmpdir, f"chat_{i}.txt"), "w") as f:
+                f.write(convo_text.format(i=i))
+
+        palace_path = os.path.join(tmpdir, "palace")
+
+        mine_convos(tmpdir, palace_path, wing="test")
+        capsys.readouterr()
+
+        for i in range(4, 7):
+            with open(os.path.join(tmpdir, f"chat_{i}.txt"), "w") as f:
+                f.write(convo_text.format(i=i))
+
+        mine_convos(tmpdir, palace_path, wing="test", limit=2)
+        out = capsys.readouterr().out
+
+        assert "Files processed: 2" in out
+        assert "Drawers filed:" in out
+        for line in out.split("\n"):
+            if "Drawers filed:" in line:
+                filed = int(line.split(":")[1].strip())
+                assert filed > 0, f"limit=2 should mine new files, got {filed}"
+                break
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)

@@ -30,7 +30,13 @@ jobs:
           python-version: "3.13"
           cache: 'pip'
       - run: pip install -e ".[dev]"
-      - run: python -m pytest tests/ -v --ignore=tests/benchmarks --cov=mempalace --cov-report=term-missing --cov-fail-under=80 --durations=10
+      # ChromaDB's rust HNSW core intermittently fails compaction on Windows
+      # ("Failed to apply logs to the hnsw segment writer") regardless of our
+      # code — a long-standing, non-reproducible-on-Linux/macOS flake. Retry
+      # ONLY that specific transient error (via --only-rerun) so real,
+      # deterministic failures still fail on the first run. Linux/macOS jobs
+      # deliberately run with no reruns so genuine regressions surface there.
+      - run: python -m pytest tests/ -v --ignore=tests/benchmarks --cov=mempalace --cov-report=term-missing --cov-fail-under=80 --durations=10 --reruns 2 --reruns-delay 5 --only-rerun "Failed to apply logs to the hnsw segment writer"
 
   test-macos:
     runs-on: macos-latest

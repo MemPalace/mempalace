@@ -37,8 +37,13 @@ def normalize_wing_name(name: str) -> str:
     The same rule is applied by ``init`` when persisting `topics_by_wing`
     and when writing `mempalace.yaml`, so the miner's lookup matches at
     mine time regardless of the source dirname.
+
+    Leading/trailing separators are stripped so a path-encoded dirname like
+    ``-home-user-proj`` yields ``home_user_proj`` rather than a leading-
+    underscore slug that ``sanitize_name`` (and thus the MCP write tools)
+    would reject.
     """
-    return name.lower().replace(" ", "_").replace("-", "_")
+    return name.lower().replace(" ", "_").replace("-", "_").strip("_")
 
 
 def sanitize_name(value: str, field_name: str = "name") -> str:
@@ -191,6 +196,28 @@ def sanitize_content(value: str, max_length: int = 100_000) -> str:
 
 DEFAULT_PALACE_PATH = os.path.expanduser("~/.mempalace/palace")
 DEFAULT_COLLECTION_NAME = "mempalace_drawers"
+DEFAULT_BACKEND = "chroma"
+
+# How many timestamped palace backups to retain before the oldest are
+# pruned. Applies to the accumulating backups written by ``mempalace
+# migrate`` and ``mempalace repair max-seq-id`` — see
+# ``MempalaceConfig.max_backups``.
+DEFAULT_MAX_BACKUPS = 10
+
+
+def sqlite_read_uri(db_path: str) -> str:
+    """Return a read-only ``file:`` URI for ``sqlite3.connect(..., uri=True)``.
+
+    A bare ``f"file:{db_path}?mode=ro"`` mis-parses paths containing spaces or
+    other URI-reserved characters — common in real home directories (a Windows
+    user folder like ``First Last``, many macOS paths). ``pathname2url``
+    percent-encodes the path and normalizes separators so the database opens on
+    every platform.
+    """
+    from urllib.request import pathname2url
+
+    db_path = os.fspath(db_path)
+    return f"file:{pathname2url(db_path)}?mode=ro"
 
 
 @lru_cache(maxsize=1)
@@ -321,9 +348,102 @@ class MempalaceConfig:
         return os.path.join(os.path.dirname(self.palace_path), "tunnels.json")
 
     @property
+    def hallway_file(self):
+        """Path to the hallway file, sibling of palace_path.
+
+        Mirrors ``tunnel_file`` so within-wing hallway state is scoped to the
+        configured palace and survives palace rebuilds (it does not live in
+        ChromaDB which can be recreated). Prior to this property the path was
+        hardcoded under ``~/.mempalace/hallways.json`` and multiple palaces on
+        one host silently shared one file (see ``hallways._legacy_hallway_file``).
+        """
+        return os.path.join(os.path.dirname(self.palace_path), "hallways.json")
+
+    @property
     def collection_name(self):
         """ChromaDB collection name."""
         return self._file_config.get("collection_name", DEFAULT_COLLECTION_NAME)
+
+    @property
+    def backend(self):
+        """Storage backend name.
+
+        Read from ``config.json`` first, then ``MEMPALACE_BACKEND``, then
+        ``"chroma"`` for backwards compatibility with existing palaces.
+        """
+        cfg_val = self._file_config.get("backend")
+        if cfg_val:
+            return str(cfg_val).strip().lower()
+        env_val = os.environ.get("MEMPALACE_BACKEND")
+        if env_val:
+            return env_val.strip().lower()
+        return DEFAULT_BACKEND
+
+    @property
+    def qdrant_url(self):
+        """Qdrant endpoint for the opt-in ``qdrant`` backend.
+
+        Defaults to localhost so selecting Qdrant never silently sends memory
+        to a remote service. Users can point at a LAN or cloud endpoint via
+        config or ``MEMPALACE_QDRANT_URL`` when they deliberately choose that.
+        """
+        env_val = os.environ.get("MEMPALACE_QDRANT_URL")
+        if env_val:
+            return env_val.strip()
+        return str(self._file_config.get("qdrant_url", "http://localhost:6333")).strip()
+
+    @property
+    def qdrant_api_key(self):
+        """API key for the opt-in ``qdrant`` backend, if configured."""
+        env_val = os.environ.get("MEMPALACE_QDRANT_API_KEY")
+        if env_val:
+            return env_val
+        value = self._file_config.get("qdrant_api_key")
+        return str(value) if value else None
+
+    @property
+    def qdrant_namespace(self):
+        """Optional Qdrant collection namespace/prefix."""
+        env_val = os.environ.get("MEMPALACE_QDRANT_NAMESPACE")
+        if env_val:
+            return env_val.strip()
+        value = self._file_config.get("qdrant_namespace")
+        return str(value).strip() if value else None
+
+    @property
+    def qdrant_timeout(self):
+        """Qdrant HTTP timeout in seconds."""
+        env_val = os.environ.get("MEMPALACE_QDRANT_TIMEOUT")
+        raw = env_val if env_val is not None else self._file_config.get("qdrant_timeout", 10.0)
+        try:
+            timeout = float(raw)
+        except (TypeError, ValueError):
+            timeout = 10.0
+        return timeout if timeout > 0 else 10.0
+
+    @property
+    def pgvector_dsn(self):
+        """Postgres DSN for the opt-in ``pgvector`` backend.
+
+        Defaults to a localhost DSN so selecting pgvector never silently sends
+        memory to a remote database. Point at a LAN or cloud Postgres via config
+        or ``MEMPALACE_PGVECTOR_DSN`` only when deliberately chosen.
+        """
+        env_val = os.environ.get("MEMPALACE_PGVECTOR_DSN")
+        if env_val:
+            return env_val.strip()
+        return str(
+            self._file_config.get("pgvector_dsn", "postgresql://localhost:5432/mempalace")
+        ).strip()
+
+    @property
+    def pgvector_namespace(self):
+        """Optional pgvector table namespace/prefix for multi-tenant isolation."""
+        env_val = os.environ.get("MEMPALACE_PGVECTOR_NAMESPACE")
+        if env_val:
+            return env_val.strip()
+        value = self._file_config.get("pgvector_namespace")
+        return str(value).strip() if value else None
 
     @property
     def people_map(self):
@@ -540,6 +660,37 @@ class MempalaceConfig:
             return env_val.strip().lower()
         return str(self._file_config.get("embedding_model", "minilm")).strip().lower()
 
+    @property
+    def embedding_threads(self) -> int:
+        """Cap on the embedder's ONNX Runtime intra-op thread pool (#1068).
+
+        ChromaDB's ONNX embedder builds its ``InferenceSession`` with no thread
+        cap, so the intra-op pool defaults to the physical core count and a
+        background ``mine`` pins every core — stacked Stop-hook fires turn into
+        thermal events. ``OMP_NUM_THREADS`` is inert here (ORT owns its own
+        pool), so the cap is applied via ``SessionOptions`` in
+        :mod:`mempalace.embedding`.
+
+        Read from env ``MEMPALACE_EMBEDDING_THREADS`` first, then
+        ``embedding_threads`` in ``config.json``. Semantics:
+
+        - unset / ``"auto"`` → half the logical CPUs (min 1), so a background
+          mine leaves the machine usable out of the box.
+        - a positive integer → exactly that many intra-op threads.
+        - ``0`` or negative → uncapped: ORT's default (physical core count),
+          for users who want maximum indexing throughput.
+        """
+        raw = os.environ.get("MEMPALACE_EMBEDDING_THREADS")
+        if raw is None:
+            raw = self._file_config.get("embedding_threads")
+        if raw is None or str(raw).strip().lower() in ("", "auto"):
+            return max(1, (os.cpu_count() or 2) // 2)
+        try:
+            val = int(str(raw).strip())
+        except (TypeError, ValueError):
+            return max(1, (os.cpu_count() or 2) // 2)
+        return val if val > 0 else 0
+
     def set_embedding_model(self, model: str) -> None:
         """Persist the embedding-model choice to ``config.json``.
 
@@ -549,6 +700,24 @@ class MempalaceConfig:
         minilm for unrecognized values).
         """
         self._file_config["embedding_model"] = str(model).strip().lower()
+        self._config_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(self._config_file, "w", encoding="utf-8") as f:
+                json.dump(self._file_config, f, indent=2, ensure_ascii=False)
+        except OSError:
+            pass
+        try:
+            self._config_file.chmod(0o600)
+        except (OSError, NotImplementedError):
+            pass
+
+    def set_backend(self, backend: str) -> None:
+        """Persist the storage backend choice to ``config.json``."""
+        backend = str(backend).strip().lower()
+        from .backends import get_backend_class
+
+        get_backend_class(backend)
+        self._file_config["backend"] = backend
         self._config_dir.mkdir(parents=True, exist_ok=True)
         try:
             with open(self._config_file, "w", encoding="utf-8") as f:
@@ -587,6 +756,36 @@ class MempalaceConfig:
         return max(1, parsed)
 
     @property
+    def max_backups(self) -> int:
+        """Number of timestamped palace backups to retain before pruning.
+
+        Applies to the accumulating, timestamped backups created by
+        ``mempalace migrate`` (``<palace>.pre-migrate.<timestamp>``) and
+        ``mempalace repair max-seq-id``
+        (``chroma.sqlite3.max-seq-id-backup-<timestamp>``). Each of those
+        commands writes a fresh full-size copy every run and historically
+        never deleted the old ones, so on a machine that mines or repairs on
+        a schedule the backup set could silently grow until it filled the
+        disk. After each backup is written, copies beyond this count (oldest
+        first) are removed.
+
+        Reads ``MEMPALACE_MAX_BACKUPS`` env first, then ``max_backups`` in
+        ``config.json``, then the default of ``10``. A value of ``0`` disables
+        pruning and keeps every backup (use when an external retention policy
+        manages cleanup). Negative or non-numeric values fall back to the
+        default rather than crashing migrate/repair.
+        """
+        env_val = os.environ.get("MEMPALACE_MAX_BACKUPS")
+        if env_val is not None:
+            coerced = self._try_coerce_int(env_val, minimum=0)
+            if coerced is not None:
+                return coerced
+        coerced = self._try_coerce_int(
+            self._file_config.get("max_backups", DEFAULT_MAX_BACKUPS), minimum=0
+        )
+        return DEFAULT_MAX_BACKUPS if coerced is None else coerced
+
+    @property
     def hook_silent_save(self):
         """Whether the stop hook saves directly (True) or blocks for MCP calls (False)."""
         return self._file_config.get("hooks", {}).get("silent_save", True)
@@ -595,6 +794,19 @@ class MempalaceConfig:
     def hook_desktop_toast(self):
         """Whether the stop hook shows a desktop notification via notify-send."""
         return self._file_config.get("hooks", {}).get("desktop_toast", False)
+
+    @property
+    def hook_use_daemon(self):
+        """Whether hooks should submit save/mine work to the opt-in daemon."""
+        env_val = os.environ.get("MEMPALACE_HOOKS_DAEMON")
+        if env_val is not None:
+            return env_val.lower() in ("true", "1", "yes", "on")
+        value = self._file_config.get("hooks", {}).get("daemon", False)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.lower() in ("true", "1", "yes", "on")
+        return value == 1
 
     def set_hook_setting(self, key: str, value: bool):
         """Update a hook setting and write config to disk."""

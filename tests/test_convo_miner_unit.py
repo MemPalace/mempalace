@@ -186,6 +186,64 @@ class TestChunkExchanges:
         assert chunks[1]["content"] == "b" * CHUNK_SIZE
         assert chunks[2]["content"] == "c" * CHUNK_SIZE
 
+    def test_ai_response_preserves_blank_lines(self):
+        """Blank lines inside an AI response must survive ingestion (verbatim principle).
+
+        A response with paragraph breaks separates distinct ideas; collapsing the
+        blank lines loses that boundary and fuses unrelated content.
+        """
+        # Three `>` turns route through _chunk_by_exchange (the exchange-pair path).
+        content = (
+            "> explain the architecture\n"
+            "First paragraph introducing the system.\n"
+            "\n"
+            "Second paragraph about the data layer.\n"
+            "\n"
+            "Third paragraph about retrieval.\n"
+            "\n"
+            "> what about caching?\n"
+            "Cache lives in memory and is invalidated on write.\n"
+            "\n"
+            "> and persistence?\n"
+            "Persistence lives on disk via SQLite and Chroma.\n"
+        )
+        chunks = chunk_exchanges(content)
+        assert len(chunks) >= 1
+        stored = "\n".join(c["content"] for c in chunks)
+        # Paragraph break between the three bodies must survive as `\n\n`.
+        assert "First paragraph introducing the system.\n\nSecond paragraph" in stored
+        assert "Second paragraph about the data layer.\n\nThird paragraph" in stored
+
+    def test_ai_response_preserves_line_structure(self):
+        """Line-oriented content (lists, code fences, tables) must keep newlines.
+
+        Joining lines with a single space fuses structurally distinct tokens,
+        breaks downstream search, and destroys code blocks.
+        """
+        content = (
+            "> show me the steps\n"
+            "1. First step\n"
+            "2. Second step\n"
+            "3. Third step\n"
+            "```python\n"
+            "def hello():\n"
+            "    return 'world'\n"
+            "```\n"
+            "\n"
+            "> what next?\n"
+            "Run the test suite.\n"
+            "\n"
+            "> anything else?\n"
+            "Ship the feature.\n"
+        )
+        chunks = chunk_exchanges(content)
+        assert len(chunks) >= 1
+        stored = "\n".join(c["content"] for c in chunks)
+        # Each list item keeps its own line (not "1. First step 2. Second step").
+        assert "1. First step\n2. Second step\n3. Third step" in stored
+        # Code fence survives intact, with indentation preserved.
+        assert "```python\ndef hello():\n    return 'world'\n```" in stored
+
 
 class TestEmitBounded:
     """Direct unit tests for the chunk-size-enforcement helper."""
@@ -384,6 +442,11 @@ class TestFileChunksLocked:
 
             def delete(self, *args, **kwargs):
                 pass
+
+            def get(self, ids=None, include=None, **kwargs):
+                # Pre-mining collision scan probes the collection; empty
+                # palace under test, so nothing matches.
+                return {"ids": [], "metadatas": []}
 
             def upsert(self, documents, ids, metadatas):
                 self.batch_sizes.append(len(documents))

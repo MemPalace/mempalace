@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "hooks": {
+    "stop": [
+      {
+        "command": "$HOME/.mempalace/hooks/cursor/mempal_save_hook_cursor.sh",
+        "loop_limit": 1
+      }
+    ]
+  }
+}

@@ -11,8 +11,11 @@ from mempalace.normalize import (
     _try_claude_ai_json,
     _try_claude_code_jsonl,
     _try_codex_jsonl,
+    _try_gemini_json,
     _try_gemini_jsonl,
+    _try_continue_json,
     _try_normalize_json,
+    _try_pi_jsonl,
     _try_slack_json,
     normalize,
     strip_noise,
@@ -613,6 +616,167 @@ def test_gemini_jsonl_messages_before_session_metadata_discarded():
     assert "real A" in result
 
 
+# ── _try_gemini_json ──────────────────────────────────────────────────
+
+
+class TestGeminiJson:
+    """Tests for the Gemini JSON parser (Layouts 1, 2a, 2b).
+
+    Layouts:
+      1.  ``{"contents": [...]}``                      — Gemini API / CLI session JSON
+      2a. ``{"messages": [...]}``                      — Wrapper variant
+      2b. ``[{"role": ...}, ...]``                     — Flat top-level list
+
+    The parser must:
+      • Treat ``role="model"`` as the assistant role.
+      • Reject inputs without any ``role="model"`` entry (so it doesn't
+        false-positive against Claude / ChatGPT exports).
+      • Run *before* ``_try_claude_ai_json`` in the dispatch chain so the
+        Layout 2a (messages-wrapper) form isn't silently claimed by the
+        Claude parser, which would drop the model turns.
+      • Concatenate multi-part text within a single message.
+      • Skip non-text parts (``inline_data``, ``function_call``, …).
+    """
+
+    def test_contents_format(self, tmp_path):
+        """Layout 1: ``{"contents": [...]}`` with ``parts`` arrays parses correctly."""
+        data = {
+            "contents": [
+                {"role": "user", "parts": [{"text": "Capital of France?"}]},
+                {"role": "model", "parts": [{"text": "Paris."}]},
+            ]
+        }
+        f = tmp_path / "gemini.json"
+        f.write_text(json.dumps(data))
+        result = normalize(str(f))
+        assert "> Capital of France?" in result
+        assert "Paris." in result
+
+    def test_messages_wrapper_format(self, tmp_path):
+        """Layout 2a: ``{"messages": [...]}`` (the bug-fix case for review #1).
+
+        Without the parser-precedence fix, ``_try_claude_ai_json`` would
+        silently claim this input and drop all ``role="model"`` turns,
+        producing a user-only transcript. After the fix, ``_try_gemini_json``
+        runs first and recognises the ``model`` role.
+        """
+        data = {
+            "messages": [
+                {"role": "user", "content": "What is Python?"},
+                {"role": "model", "content": "A programming language."},
+                {"role": "user", "content": "And Java?"},
+                {"role": "model", "content": "Also a programming language."},
+            ]
+        }
+        f = tmp_path / "gemini_messages.json"
+        f.write_text(json.dumps(data))
+        result = normalize(str(f))
+        assert "> What is Python?" in result
+        assert "A programming language." in result
+        assert "> And Java?" in result
+        assert "Also a programming language." in result
+
+    def test_flat_list_format(self, tmp_path):
+        """Layout 2b: top-level ``[...]`` list with ``role="model"`` parses correctly."""
+        data = [
+            {"role": "user", "content": "Hi"},
+            {"role": "model", "content": "Hello! How can I help?"},
+            {"role": "user", "content": "Tell me a joke"},
+            {"role": "model", "content": "Why did the chicken cross the road?"},
+        ]
+        f = tmp_path / "gemini_flat.json"
+        f.write_text(json.dumps(data))
+        result = normalize(str(f))
+        assert "> Hi" in result
+        assert "Hello! How can I help?" in result
+        assert "Why did the chicken cross the road?" in result
+
+    def test_multi_part_text_joined(self):
+        """Multiple text parts within a single message are joined with spaces."""
+        data = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {"text": "Part one."},
+                        {"text": "Part two."},
+                    ],
+                },
+                {"role": "model", "parts": [{"text": "Got it."}]},
+            ]
+        }
+        result = _try_gemini_json(data)
+        assert result is not None
+        assert "Part one. Part two." in result
+
+    def test_non_text_parts_skipped(self):
+        """``inline_data`` / ``function_call`` parts are skipped; only ``text`` is extracted."""
+        data = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {"text": "Look at this image"},
+                        {"inline_data": {"mime_type": "image/png", "data": "..."}},
+                    ],
+                },
+                {"role": "model", "parts": [{"text": "I see it"}]},
+            ]
+        }
+        result = _try_gemini_json(data)
+        assert result is not None
+        assert "Look at this image" in result
+        assert "I see it" in result
+        # The inline_data shouldn't bleed into the transcript.
+        assert "image/png" not in result
+
+    def test_rejects_without_model_role(self):
+        """Without any ``role="model"`` entry the parser must return ``None``.
+
+        This is the disambiguator that prevents the Gemini parser from
+        false-positiving against Claude / ChatGPT exports that use the
+        ``"assistant"`` role.
+        """
+        data = [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello"},
+        ]
+        assert _try_gemini_json(data) is None
+
+    def test_rejects_too_few_messages(self):
+        """Inputs with fewer than 2 entries return ``None`` (not enough conversation)."""
+        data = {"contents": [{"role": "user", "parts": [{"text": "Just one"}]}]}
+        assert _try_gemini_json(data) is None
+
+    def test_rejects_non_dict_non_list(self):
+        """Scalar / unsupported inputs return ``None`` cleanly."""
+        assert _try_gemini_json("not a dict") is None
+        assert _try_gemini_json(42) is None
+        assert _try_gemini_json(None) is None
+
+    def test_messages_wrapper_does_not_get_claimed_by_claude(self, tmp_path):
+        """Regression test for review #1: the full ``normalize()`` pipeline must
+        route the ``{"messages":[..., model, ...]}`` form to the Gemini parser,
+        not to ``_try_claude_ai_json``. Both user and model turns must survive.
+        """
+        data = {
+            "messages": [
+                {"role": "user", "content": "Q1"},
+                {"role": "model", "content": "A1"},
+                {"role": "user", "content": "Q2"},
+                {"role": "model", "content": "A2"},
+            ]
+        }
+        f = tmp_path / "ambiguous.json"
+        f.write_text(json.dumps(data))
+        result = normalize(str(f))
+        # All four turns must appear — proves the Claude parser didn't eat this.
+        assert "A1" in result
+        assert "A2" in result
+        assert "> Q1" in result
+        assert "> Q2" in result
+
+
 # ── _try_claude_ai_json ───────────────────────────────────────────────
 
 
@@ -1015,6 +1179,268 @@ def test_slack_json_sanitizes_speaker_id():
     assert "\n> fake" not in result
 
 
+# ── _try_continue_json ─────────────────────────────────────────────────
+
+
+def test_continue_json_valid_multi_turn():
+    data = {
+        "history": [
+            {"role": "user", "content": "What is Python?"},
+            {"role": "assistant", "content": "Python is a programming language."},
+            {"role": "user", "content": "How do I install it?"},
+            {"role": "assistant", "content": "Use your package manager."},
+        ],
+        "title": "Python help",
+        "sessionId": "abc-123",
+        "dateCreated": "2025-01-15T10:30:00Z",
+    }
+    result = _try_continue_json(data)
+    assert result is not None
+    assert "> What is Python?" in result
+    assert "Python is a programming language." in result
+    assert "> How do I install it?" in result
+    assert "Use your package manager." in result
+
+
+def test_continue_json_with_system_messages():
+    """System messages are skipped."""
+    data = {
+        "history": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there"},
+        ]
+    }
+    result = _try_continue_json(data)
+    assert result is not None
+    assert "> Hello" in result
+    assert "helpful assistant" not in result
+
+
+def test_continue_json_with_tool_messages():
+    """Tool messages are appended to the previous assistant turn."""
+    data = {
+        "history": [
+            {"role": "user", "content": "List files"},
+            {"role": "assistant", "content": "Let me check."},
+            {"role": "tool", "content": "file1.py\nfile2.py"},
+            {"role": "assistant", "content": "I found two files."},
+        ]
+    }
+    result = _try_continue_json(data)
+    assert result is not None
+    assert "> List files" in result
+    assert "Let me check." in result
+    assert "[tool] file1.py" in result
+    assert "I found two files." in result
+
+
+def test_continue_json_with_code_blocks():
+    """Code blocks in content are preserved."""
+    data = {
+        "history": [
+            {"role": "user", "content": "Show me a hello world"},
+            {
+                "role": "assistant",
+                "content": "Here you go:\n```python\nprint('Hello, world!')\n```",
+            },
+        ]
+    }
+    result = _try_continue_json(data)
+    assert result is not None
+    assert "```python" in result
+    assert "print('Hello, world!')" in result
+
+
+def test_continue_json_list_content_blocks():
+    """Content as a list of typed blocks (text blocks)."""
+    data = {
+        "history": [
+            {"role": "user", "content": [{"type": "text", "text": "Help me"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "Sure thing"}]},
+        ]
+    }
+    result = _try_continue_json(data)
+    assert result is not None
+    assert "> Help me" in result
+    assert "Sure thing" in result
+
+
+def test_continue_json_empty_history():
+    """Empty history returns None."""
+    data = {"history": []}
+    result = _try_continue_json(data)
+    assert result is None
+
+
+def test_continue_json_single_message():
+    """Too few messages returns None."""
+    data = {"history": [{"role": "user", "content": "Hello"}]}
+    result = _try_continue_json(data)
+    assert result is None
+
+
+def test_continue_json_no_history_key():
+    """Missing history key returns None."""
+    data = {"title": "Some session", "sessionId": "abc"}
+    result = _try_continue_json(data)
+    assert result is None
+
+
+def test_continue_json_not_a_dict():
+    """Non-dict input returns None."""
+    result = _try_continue_json([1, 2, 3])
+    assert result is None
+    result = _try_continue_json("not a dict")
+    assert result is None
+
+
+def test_continue_json_history_not_a_list():
+    """history key that isn't a list returns None."""
+    data = {"history": "not a list"}
+    result = _try_continue_json(data)
+    assert result is None
+
+
+def test_continue_json_malformed_entries():
+    """Non-dict entries in history are skipped."""
+    data = {
+        "history": [
+            "not a dict",
+            42,
+            {"role": "user", "content": "Q"},
+            {"role": "assistant", "content": "A"},
+        ]
+    }
+    result = _try_continue_json(data)
+    assert result is not None
+    assert "> Q" in result
+
+
+def test_continue_json_missing_role():
+    """Entries without a role are skipped."""
+    data = {
+        "history": [
+            {"content": "orphan text"},
+            {"role": "user", "content": "Q"},
+            {"role": "assistant", "content": "A"},
+        ]
+    }
+    result = _try_continue_json(data)
+    assert result is not None
+    assert "orphan" not in result
+
+
+def test_continue_json_missing_content():
+    """Entries without content are skipped."""
+    data = {
+        "history": [
+            {"role": "user"},
+            {"role": "user", "content": "Real question"},
+            {"role": "assistant", "content": "Real answer"},
+        ]
+    }
+    result = _try_continue_json(data)
+    assert result is not None
+    assert "> Real question" in result
+
+
+def test_continue_json_empty_content():
+    """Entries with empty/whitespace content are skipped."""
+    data = {
+        "history": [
+            {"role": "user", "content": ""},
+            {"role": "user", "content": "   "},
+            {"role": "user", "content": "Actual question"},
+            {"role": "assistant", "content": "Actual answer"},
+        ]
+    }
+    result = _try_continue_json(data)
+    assert result is not None
+    user_turns = [line for line in result.split("\n") if line.strip().startswith(">")]
+    assert len(user_turns) == 1
+
+
+def test_continue_json_unicode_cjk():
+    """Unicode and CJK content is handled correctly."""
+    data = {
+        "history": [
+            {"role": "user", "content": "Python\u306e\u4f7f\u3044\u65b9\u3092\u6559\u3048\u3066"},
+            {
+                "role": "assistant",
+                "content": "\u306f\u3044\u3001Python\u306f\u7d20\u6674\u3089\u3057\u3044\u8a00\u8a9e\u3067\u3059\u3002\ud83d\ude80",
+            },
+            {"role": "user", "content": "\u8c22\u8c22\uff01\u975e\u5e38\u6709\u5e2e\u52a9"},
+            {"role": "assistant", "content": "\u4e0d\u5ba2\u6c14 \ud83d\ude0a"},
+        ]
+    }
+    result = _try_continue_json(data)
+    assert result is not None
+    assert "\u306e\u4f7f\u3044\u65b9" in result
+    assert "\u8c22\u8c22" in result
+    assert "\ud83d\ude80" in result
+
+
+def test_continue_json_very_long_message():
+    """Very long messages are handled without error."""
+    long_text = "x" * 50000
+    data = {
+        "history": [
+            {"role": "user", "content": "Summarize this: " + long_text},
+            {"role": "assistant", "content": "That's a lot of x's."},
+        ]
+    }
+    result = _try_continue_json(data)
+    assert result is not None
+    assert "Summarize this:" in result
+
+
+def test_continue_json_non_string_content_skipped():
+    """Non-string, non-list content (e.g. int, None) is skipped."""
+    data = {
+        "history": [
+            {"role": "user", "content": 42},
+            {"role": "assistant", "content": None},
+            {"role": "user", "content": "Real Q"},
+            {"role": "assistant", "content": "Real A"},
+        ]
+    }
+    result = _try_continue_json(data)
+    assert result is not None
+    assert "> Real Q" in result
+
+
+def test_continue_json_tool_without_preceding_assistant():
+    """Tool message without a preceding assistant turn is ignored."""
+    data = {
+        "history": [
+            {"role": "tool", "content": "orphan tool output"},
+            {"role": "user", "content": "Q"},
+            {"role": "assistant", "content": "A"},
+        ]
+    }
+    result = _try_continue_json(data)
+    assert result is not None
+    assert "orphan" not in result
+
+
+def test_continue_json_integration_via_normalize(tmp_path):
+    """Continue.dev JSON is detected and parsed via the top-level normalize()."""
+    data = {
+        "history": [
+            {"role": "user", "content": "What is MemPalace?"},
+            {"role": "assistant", "content": "A memory system for AI."},
+        ],
+        "title": "MemPalace overview",
+        "sessionId": "session-001",
+    }
+    f = tmp_path / "session.json"
+    f.write_text(json.dumps(data))
+    result = normalize(str(f))
+    assert "> What is MemPalace?" in result
+    assert "A memory system for AI." in result
+
+
 # ── _try_normalize_json ────────────────────────────────────────────────
 
 
@@ -1403,3 +1829,115 @@ class TestStripNoiseRemovesSystemChrome:
         assert "line two" in out
         # Should collapse to no more than 3 newlines
         assert "\n\n\n\n" not in out
+
+
+# ── _try_pi_jsonl ──────────────────────────────────────────────────────
+#
+# Pi agent stores sessions as JSONL under
+# ``~/.config/pi/agent/sessions/{cwd}/{timestamp}_{uuid}.jsonl``. The
+# schema (per github.com/badlogic/pi-mono session.md):
+#
+#   {"type": "session", "version": "1", ...}
+#   {"type": "message", "message": {"role": "user", "content": "Q"}}
+#   {"type": "message", "message": {"role": "assistant",
+#       "content": [{"type": "text", "text": "A"}]}}
+#
+# Detection requires a ``session`` record with a ``version`` field so the
+# parser does not false-positive against Codex / Gemini / Claude Code
+# JSONL routed through the same dispatch chain.
+
+
+def test_pi_jsonl_valid_string_content():
+    """User content as a plain string is captured."""
+    lines = [
+        json.dumps({"type": "session", "version": "1"}),
+        json.dumps({"type": "message", "message": {"role": "user", "content": "Q"}}),
+        json.dumps({"type": "message", "message": {"role": "assistant", "content": "A"}}),
+    ]
+    result = _try_pi_jsonl("\n".join(lines))
+    assert result is not None
+    assert "> Q" in result
+    assert "A" in result
+
+
+def test_pi_jsonl_valid_block_content():
+    """Assistant content as [{type, text}] blocks is captured."""
+    lines = [
+        json.dumps({"type": "session", "version": "1"}),
+        json.dumps({"type": "message", "message": {"role": "user", "content": "Q"}}),
+        json.dumps(
+            {
+                "type": "message",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "Assistant reply"}],
+                },
+            }
+        ),
+    ]
+    result = _try_pi_jsonl("\n".join(lines))
+    assert result is not None
+    assert "Assistant reply" in result
+
+
+def test_pi_jsonl_no_session_header():
+    """Without a ``session`` record, parser returns None — protects against
+    false-positives on other JSONL formats that share a ``type=message`` shape."""
+    lines = [
+        json.dumps({"type": "message", "message": {"role": "user", "content": "Q"}}),
+        json.dumps({"type": "message", "message": {"role": "assistant", "content": "A"}}),
+    ]
+    result = _try_pi_jsonl("\n".join(lines))
+    assert result is None
+
+
+def test_pi_jsonl_session_without_version():
+    """A ``session`` record missing ``version`` is not a Pi header."""
+    lines = [
+        json.dumps({"type": "session"}),
+        json.dumps({"type": "message", "message": {"role": "user", "content": "Q"}}),
+        json.dumps({"type": "message", "message": {"role": "assistant", "content": "A"}}),
+    ]
+    result = _try_pi_jsonl("\n".join(lines))
+    assert result is None
+
+
+def test_pi_jsonl_skips_tool_results():
+    """toolResult role records are skipped (they are operational, not conversation)."""
+    lines = [
+        json.dumps({"type": "session", "version": "1"}),
+        json.dumps({"type": "message", "message": {"role": "user", "content": "Q"}}),
+        json.dumps(
+            {
+                "type": "message",
+                "message": {"role": "toolResult", "content": "tool output"},
+            }
+        ),
+        json.dumps({"type": "message", "message": {"role": "assistant", "content": "A"}}),
+    ]
+    result = _try_pi_jsonl("\n".join(lines))
+    assert result is not None
+    assert "tool output" not in result
+
+
+def test_pi_jsonl_under_two_messages_returns_none():
+    """A session with fewer than 2 captured turns is not considered valid."""
+    lines = [
+        json.dumps({"type": "session", "version": "1"}),
+        json.dumps({"type": "message", "message": {"role": "user", "content": "Q"}}),
+    ]
+    result = _try_pi_jsonl("\n".join(lines))
+    assert result is None
+
+
+def test_pi_jsonl_invalid_lines_skipped():
+    """Malformed JSON lines and non-dict entries are tolerated, not fatal."""
+    lines = [
+        "not json",
+        json.dumps([1, 2, 3]),  # list, not dict
+        json.dumps({"type": "session", "version": "1"}),
+        json.dumps({"type": "message", "message": {"role": "user", "content": "Q"}}),
+        json.dumps({"type": "message", "message": {"role": "assistant", "content": "A"}}),
+    ]
+    result = _try_pi_jsonl("\n".join(lines))
+    assert result is not None

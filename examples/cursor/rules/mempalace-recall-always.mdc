@@ -1,0 +1,25 @@
+---
+description: Always-on MemPalace recall — search the palace before answering about past work, people, projects, or prior decisions.
+alwaysApply: true
+---
+
+# MemPalace recall (always on)
+
+This is the aggressive variant of the recall rule: `alwaysApply: true`
+loads it into every conversation in scope, on every turn, regardless of
+whether Cursor's matcher thinks recall is relevant.
+
+Before answering anything that may already be in the user's memory
+palace — past work, prior decisions, a person, a project, or "what did
+we do / decide / discuss last time?" — search the palace first:
+
+1. Call `mempalace_search` with a short keyword query. Use
+   `mempalace_kg_query` for relational or time-bound facts.
+2. Quote the drawer's **verbatim** text. Never summarize or paraphrase
+   stored content.
+3. If results are empty, say so — do not invent an answer. If the MCP
+   server is unavailable, surface the error; do not fall back to guessing.
+
+Even with this rule always loaded, only actually call the tools when the
+question touches memory. Do not search on pure greenfield work
+(renaming a variable, fixing a typo).

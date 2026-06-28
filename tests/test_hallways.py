@@ -20,18 +20,37 @@ with patch.dict("sys.modules", {"chromadb": MagicMock()}):
 
 
 def _use_tmp_hallway_file(monkeypatch, tmp_path):
-    """Redirect hallway persistence to a per-test JSON file."""
+    """Redirect both the hallway-file resolver and the legacy-file check at the
+    tmp_path so existing tests stay in the configured-path branch and don't
+    accidentally trip the new legacy-file warning branch in _load_hallways.
+    Mirrors the analogous helper in ``tests/test_palace_graph_tunnels.py``.
+    """
     hallway_file = tmp_path / "hallways.json"
-    monkeypatch.setattr(hallways_mod, "_HALLWAY_FILE", str(hallway_file))
+    monkeypatch.setattr(hallways_mod, "_get_hallway_file", lambda *a, **kw: str(hallway_file))
+    monkeypatch.setattr(
+        hallways_mod,
+        "_legacy_hallway_file",
+        lambda: str(tmp_path / "legacy-hallways.json"),
+    )
     return hallway_file
 
 
 def _fake_collection(drawers):
-    """Build a MagicMock collection whose .get() returns the given drawer set."""
+    """Build a MagicMock collection over ``drawers`` that supports the paginated
+    fetch (``count()`` + ``get(limit=, offset=)``) that compute_hallways_for_wing
+    uses to stay under SQLite's variable limit (#1619)."""
     col = MagicMock()
-    metadatas = [d for d in drawers]
-    ids = [f"drawer_{i}" for i in range(len(drawers))]
-    col.get.return_value = {"ids": ids, "metadatas": metadatas}
+    metas = [d for d in drawers]
+    col.count.return_value = len(metas)
+
+    def _get(limit=None, offset=0, include=None, where=None, ids=None, **kwargs):
+        page = metas[offset : offset + limit] if limit is not None else metas
+        return {
+            "ids": [f"drawer_{i}" for i in range(offset, offset + len(page))],
+            "metadatas": page,
+        }
+
+    col.get.side_effect = _get
     return col
 
 

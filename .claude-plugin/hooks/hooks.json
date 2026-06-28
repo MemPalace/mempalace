@@ -12,6 +12,17 @@
         ]
       }
     ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/mempal-session-end-hook.sh\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "PreCompact": [
       {
         "hooks": [
