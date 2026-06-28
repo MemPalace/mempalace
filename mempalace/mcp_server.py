@@ -1514,21 +1514,23 @@ def tool_status():
     try:
         if _supports_metadata_facets(col):
             try:
-                wings.update(col.facet_counts("wing"))
+                temp_wings = col.facet_counts("wing")
                 try:
-                    unknown_wings = col.count() - sum(wings.values())
+                    unknown_wings = col.count() - sum(temp_wings.values())
                     if unknown_wings > 0:
                         wings["unknown"] = unknown_wings
                 except (TypeError, ValueError):
                     pass
 
-                rooms.update(col.facet_counts("room"))
+                temp_rooms = col.facet_counts("room")
                 try:
-                    unknown_rooms = col.count() - sum(rooms.values())
+                    unknown_rooms = col.count() - sum(temp_rooms.values())
                     if unknown_rooms > 0:
                         rooms["unknown"] = unknown_rooms
                 except (TypeError, ValueError):
                     pass
+                wings.update(temp_wings)
+                rooms.update(temp_rooms)
 
             except Exception as e:
                 logger.warning(
@@ -1606,16 +1608,19 @@ def tool_list_wings():
         try:
             if not _supports_metadata_facets(col):
                 raise ValueError("facets not supported")
-            wings.update(col.facet_counts("wing"))
+            temp_wings = col.facet_counts("wing")
             try:
-                unknown_wings = col.count() - sum(wings.values())
+                unknown_wings = col.count() - sum(temp_wings.values())
                 if unknown_wings > 0:
-                    wings["unknown"] = unknown_wings
+                    temp_wings["unknown"] = unknown_wings
             except (TypeError, ValueError):
                 pass
+            wings.update(temp_wings)
         except Exception as e:
             if _supports_metadata_facets(col):
-                logger.warning("Failed to fetch metadata facets, falling back to client-side loop: %s", e)
+                logger.warning(
+                    "Failed to fetch metadata facets, falling back to client-side loop: %s", e
+                )
             all_meta = _get_cached_metadata(col)
             for m in all_meta:
                 m = m or {}
@@ -1653,17 +1658,18 @@ def tool_list_rooms(wing: str = None):
         try:
             if not _supports_metadata_facets(col):
                 raise ValueError("facets not supported")
-            rooms.update(col.facet_counts("room", where=where))
+            temp_rooms = col.facet_counts("room", where=where)
             try:
                 if wing:
                     wing_count = col.facet_counts("wing", where={"wing": wing}).get(wing, 0)
-                    unknown_rooms = wing_count - sum(rooms.values())
+                    unknown_rooms = wing_count - sum(temp_rooms.values())
                 else:
-                    unknown_rooms = col.count() - sum(rooms.values())
+                    unknown_rooms = col.count() - sum(temp_rooms.values())
                 if unknown_rooms > 0:
-                    rooms["unknown"] = unknown_rooms
+                    temp_rooms["unknown"] = unknown_rooms
             except (TypeError, ValueError):
                 pass
+            rooms.update(temp_rooms)
         except Exception as e:
             if _supports_metadata_facets(col):
                 logger.warning(
@@ -1699,6 +1705,7 @@ def tool_get_taxonomy():
 
             wing_counts = col.facet_counts("wing")
             wings = list(wing_counts.keys())
+            temp_taxonomy = {}
             with ThreadPoolExecutor() as executor:
                 futures = {
                     wing: executor.submit(col.facet_counts, "room", where={"wing": wing})
@@ -1712,7 +1719,8 @@ def tool_get_taxonomy():
                             room_counts["unknown"] = unknown_rooms
                     except (TypeError, ValueError):
                         pass
-                    taxonomy[wing] = room_counts
+                    temp_taxonomy[wing] = room_counts
+                taxonomy.update(temp_taxonomy)
         except Exception as e:
             if _supports_metadata_facets(col):
                 logger.warning(

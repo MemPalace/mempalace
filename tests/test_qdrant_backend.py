@@ -194,7 +194,7 @@ class _FakeQdrantClient:
         points = [point for point in points if _fake_match_filter(point, qdrant_filter)]
 
         for point in points:
-            metadata = point['payload'].get('metadata', {})
+            metadata = point["payload"].get("metadata", {})
             actual_field = field.split(".", 1)[-1] if field.startswith("metadata.") else field
             value = metadata.get(actual_field)
 

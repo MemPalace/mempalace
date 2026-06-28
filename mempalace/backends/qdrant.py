@@ -1072,9 +1072,11 @@ class QdrantCollection(BaseCollection):
         where: Optional[dict] = None,
     ) -> dict[str, int]:
         self._ensure_open()
-
+        if not self._remote_exists():
+            if self._marker_exists():
+                raise CollectionNotInitializedError(self._collection_name)
+            return {}
         _validate_where(where)
-
         if _requires_local_filter(where, None):
             raise UnsupportedCapabilityError("facet_counts does not support local-only filters")
 
