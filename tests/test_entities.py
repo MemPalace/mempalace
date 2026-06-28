@@ -44,6 +44,22 @@ def test_respects_max_entities():
     assert len(extract_structural_entities(text, max_entities=10)) == 10
 
 
+def test_extracts_leading_underscore_snake_in_plain_text():
+    # Not in backticks — must still be caught by the snake-case pattern.
+    ents = extract_structural_entities("we called _extract_authored_at and _do_thing here")
+    assert "_extract_authored_at" in ents
+    assert "_do_thing" in ents
+
+
+def test_semicolon_in_entity_does_not_corrupt_metadata():
+    # A backtick span containing ';' must not split the ;-joined metadata field.
+    md = entities_metadata("see `a(); b()` and TwoThing")
+    parts = md.split(";")
+    # Every part is a whole entity — no fragment is a bare separator artifact.
+    assert all(p.strip() for p in parts)
+    assert "TwoThing" in parts
+
+
 def test_metadata_is_semicolon_joined():
     text = "`one_thing` and TwoThing"
     md = entities_metadata(text)

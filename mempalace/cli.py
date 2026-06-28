@@ -1011,7 +1011,7 @@ def cmd_hallways(args):
         return
     rows.sort(key=lambda h: h.get("co_occurrence_count", 0), reverse=True)
     print(f"  {len(rows)} hallway(s):")
-    for h in rows[: args.limit]:
+    for h in rows[: max(0, args.limit)]:
         label = h.get("label") or f"{h.get('entity_a', '?')} <-> {h.get('entity_b', '?')}"
         print(f"    {label}")
 

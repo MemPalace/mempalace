@@ -22,8 +22,10 @@ _PATH = re.compile(r"\b[\w.-]+/[\w./-]*\.[A-Za-z][A-Za-z0-9]{0,4}\b")
 _QUALIFIED = re.compile(r"\b[A-Za-z][A-Za-z0-9_]+(?:\.[A-Za-z][A-Za-z0-9_]+)+\b")
 # CamelCase with >=2 humps — strongly code-specific: ChromaBackend, MemoryStack.
 _CAMEL = re.compile(r"\b[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]+)+\b")
-# snake_case (must contain an underscore, so it can't match plain English): do_thing.
-_SNAKE = re.compile(r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b")
+# snake_case (must contain an underscore, so it can't match plain English): do_thing,
+# _extract_authored_at. The optional leading/trailing `_?` matches dunder-style names
+# whose underscore would otherwise fall outside the `\b` boundary (`_` is a word char).
+_SNAKE = re.compile(r"\b_?[a-z][a-z0-9]*(?:_[a-z0-9]+)+_?\b")
 
 _MAX_ENTITIES = 24
 _MIN_LEN = 2
@@ -31,7 +33,9 @@ _MAX_LEN = 64
 
 
 def _clean(token):
-    return token.strip().strip("`.,:;()[]{}<>\"'").strip()
+    # `;` is the entities-metadata separator, so it must never survive inside an entity
+    # (e.g. a URL query string or a backtick span) or it would split the field.
+    return token.replace(";", " ").strip().strip("`.,:()[]{}<>\"'").strip()
 
 
 def extract_structural_entities(text, max_entities=_MAX_ENTITIES):

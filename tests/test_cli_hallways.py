@@ -29,6 +29,17 @@ def test_respects_limit(monkeypatch, capsys):
     assert capsys.readouterr().out.count("<->") == 2
 
 
+def test_negative_limit_shows_nothing_not_tail(monkeypatch, capsys):
+    rows = [
+        {"entity_a": f"E{i}", "entity_b": "X", "co_occurrence_count": i, "label": f"E{i} <-> X"}
+        for i in range(5)
+    ]
+    monkeypatch.setattr(hallways_mod, "list_hallways", lambda wing=None: list(rows))
+    cmd_hallways(Namespace(wing=None, limit=-2))
+    # A negative limit must not slice from the end (which would print all-but-2).
+    assert capsys.readouterr().out.count("<->") == 0
+
+
 def test_empty_message(monkeypatch, capsys):
     monkeypatch.setattr(hallways_mod, "list_hallways", lambda wing=None: [])
     cmd_hallways(Namespace(wing="x", limit=50))
