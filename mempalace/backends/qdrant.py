@@ -1075,13 +1075,17 @@ class QdrantCollection(BaseCollection):
         limit: int = 1000,
     ) -> dict[str, int]:
         self._ensure_open()
+        # Validate the filter before the existence short-circuit so an
+        # unsupported local-only filter raises regardless of whether the
+        # collection has been materialized yet — matching the order used by
+        # get()/lexical_search() above (#1835 review).
+        _validate_where(where)
+        if _requires_local_filter(where):
+            raise UnsupportedCapabilityError("facet_counts does not support local-only filters")
         if not self._remote_exists():
             if self._marker_exists():
                 raise CollectionNotInitializedError(self._collection_name)
             return {}
-        _validate_where(where)
-        if _requires_local_filter(where):
-            raise UnsupportedCapabilityError("facet_counts does not support local-only filters")
 
         q_filter = _qdrant_filter(where)
 

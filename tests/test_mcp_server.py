@@ -1202,10 +1202,13 @@ class TestMetadataFacets:
 
         result = mcp.tool_get_taxonomy()
         assert col.facet_counts.call_args_list[0] == call("wing")
-        assert set(col.facet_counts.call_args_list[1:]) == {
-            call("room", where={"wing": "wing_a"}),
-            call("room", where={"wing": "wing_b"}),
-        }
+        # Per-wing room facets run concurrently (ThreadPoolExecutor), so order is
+        # non-deterministic. Compare order-independently without a set() — a
+        # ``call`` carrying a dict kwarg is unhashable, so membership (==) is used.
+        room_calls = col.facet_counts.call_args_list[1:]
+        assert len(room_calls) == 2
+        assert call("room", where={"wing": "wing_a"}) in room_calls
+        assert call("room", where={"wing": "wing_b"}) in room_calls
 
         assert result["taxonomy"] == {
             "wing_a": {
