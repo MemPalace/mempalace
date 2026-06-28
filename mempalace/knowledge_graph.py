@@ -35,7 +35,6 @@ Usage:
     kg.invalidate("Max", "has_issue", "sports_injury", ended="2026-02-15")
 """
 
-import hashlib
 import json
 import os
 import sqlite3
@@ -44,6 +43,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 from .config import sanitize_iso_temporal
+from .ids import make_triple_id
 
 
 DEFAULT_KG_PATH = os.path.expanduser("~/.mempalace/knowledge_graph.sqlite3")
@@ -302,7 +302,9 @@ class KnowledgeGraph:
                 if existing:
                     return existing["id"]  # Already exists and still valid
 
-                triple_id = f"t_{sub_id}_{pred}_{obj_id}_{hashlib.sha256(f'{valid_from}{datetime.now().isoformat()}'.encode()).hexdigest()[:12]}"
+                triple_id = make_triple_id(
+                    sub_id, pred, obj_id, valid_from, datetime.now().isoformat()
+                )
                 conn.execute(
                     """INSERT INTO triples (
                         id, subject, predicate, object, valid_from, valid_to,

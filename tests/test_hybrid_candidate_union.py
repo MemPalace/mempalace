@@ -213,6 +213,26 @@ class TestCandidateUnion:
             f"(basename collision would drop one); got sources={sources}"
         )
 
+    def test_union_respects_source_file_filter(self, tmp_path):
+        """Union pulls BM25 candidates from sqlite FTS5 directly; the
+        source_file filter must constrain that pool too, not just the vector
+        path — otherwise union silently re-injects other sources (#1815)."""
+        palace = str(tmp_path / "palace")
+        _seed_drawers(palace)
+        result = search_memories(
+            _NARRATIVE_QUERY,
+            palace,
+            n_results=5,
+            candidate_strategy="union",
+            source_file="ticket_D2.md",
+        )
+        sources = {h["source_file"] for h in result["results"]}
+        assert sources <= {"ticket_D2.md"}, (
+            f"union must honor source_file on the BM25 pool; got {sources}"
+        )
+        # The BM25-strong brand-voice doc must NOT leak past the filter.
+        assert "brand_voice_D4.md" not in sources
+
 
 class TestHybridRankTolerantOfMissingDistance:
     """``_hybrid_rank`` accepts ``distance=None`` — required for BM25-only

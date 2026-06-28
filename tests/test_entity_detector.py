@@ -166,6 +166,148 @@ def test_coca_wordlist_contains_all_known_aya_false_positives():
     assert not missing, f"COCA wordlist missing known false positives: {missing!r}"
 
 
+# ── Known-systems lexicon + compound matcher (Tier 3 linguistics cleanup) ─
+
+
+def test_extract_candidates_detects_claude_code_as_atomic_compound():
+    """The flagship Tier 3 case: 'Claude Code' must be detected as a single
+    atomic compound, NOT decomposed into 'Claude' + 'Code' (where 'Code'
+    would then get COCA-filtered, leaving 'Claude' alone with wrong count).
+    """
+    text = (
+        "Claude Code helped fix the bug. Claude Code refactored the loop. "
+        "Claude Code wrote the tests. Claude Code shipped clean."
+    )
+    result = extract_candidates(text)
+    assert "Claude Code" in result, (
+        f"'Claude Code' must be detected as a single compound; got: {list(result.keys())!r}"
+    )
+    assert result["Claude Code"] >= 4
+
+
+def test_extract_candidates_does_not_decompose_known_compound():
+    """When 'Claude Code' appears as a compound, the single-word 'Claude'
+    and 'Code' must NOT appear in results (would be wrong attribution +
+    COCA-filtered respectively)."""
+    text = (
+        "Claude Code wrote the patch. Claude Code reviewed it. "
+        "Claude Code ran the tests. Claude Code merged. Claude Code shipped."
+    )
+    result = extract_candidates(text)
+    assert "Claude Code" in result
+    assert "Claude" not in result, (
+        f"'Claude' alone should NOT appear when only mentioned as part of "
+        f"'Claude Code'; got: {list(result.keys())!r}"
+    )
+    # 'Code' would be COCA-filtered anyway, but assert defensively.
+    assert "Code" not in result
+
+
+def test_extract_candidates_compound_matching_is_case_insensitive():
+    """'claude code' (lowercase) and 'CLAUDE CODE' (uppercase) and mixed
+    case all match the canonical 'Claude Code' compound."""
+    text = (
+        "claude code is great. CLAUDE CODE works. Claude Code rocks. "
+        "Claude code rules. CLaudE coDe wins."
+    )
+    result = extract_candidates(text)
+    assert "Claude Code" in result, (
+        f"Case-insensitive compound matching must work; got: {list(result.keys())!r}"
+    )
+
+
+def test_extract_candidates_real_single_word_name_still_detected():
+    """Tier 3 does NOT regress single-word proper-noun detection.
+    'Aya' appearing as a standalone name 3+ times still gets detected."""
+    text = "Aya wrote the spec. Aya reviewed Cedar's PR. Aya shipped to develop."
+    result = extract_candidates(text)
+    assert "Aya" in result, (
+        f"Single-word real name 'Aya' should still be detected; got: {list(result.keys())!r}"
+    )
+
+
+def test_extract_candidates_single_word_code_still_coca_filtered():
+    """Tier 3 must not regress Tier 2. 'Code' alone is still a content
+    word and filtered by COCA, regardless of the compound pre-pass."""
+    text = "Code is fun. Code works. Code helps. Code rules. Code wins."
+    result = extract_candidates(text)
+    assert "Code" not in result, (
+        f"'Code' standalone should still be COCA-filtered; got: {list(result.keys())!r}"
+    )
+
+
+def test_extract_candidates_detects_multiple_distinct_compounds():
+    """Multiple known compounds in the same text are each detected
+    independently."""
+    text = (
+        "Claude Code wrote the code. Claude Code reviewed.\n"
+        "GitHub Copilot suggested a fix. GitHub Copilot autocompleted.\n"
+        "Claude Code merged. GitHub Copilot helped.\n"
+    )
+    result = extract_candidates(text)
+    assert "Claude Code" in result, f"'Claude Code' missing; got: {list(result.keys())!r}"
+    assert "GitHub Copilot" in result, f"'GitHub Copilot' missing; got: {list(result.keys())!r}"
+
+
+def test_known_systems_file_loads_with_expected_shape():
+    """The data file ships with a stable schema."""
+    import json
+    from pathlib import Path
+    import mempalace
+
+    pkg_dir = Path(mempalace.__file__).parent
+    p = pkg_dir / "data" / "known_systems.json"
+    assert p.exists(), f"known_systems.json must exist at {p}"
+    d = json.loads(p.read_text(encoding="utf-8"))
+    assert d.get("schema_version") == 1, (
+        f"schema_version must be 1; got {d.get('schema_version')!r}"
+    )
+    compounds = d.get("compounds")
+    assert isinstance(compounds, list), (
+        f"'compounds' must be a list; got {type(compounds).__name__}"
+    )
+    assert len(compounds) >= 20, f"known_systems must have >=20 entries; got {len(compounds)}"
+    # Every entry must be multi-token (space or hyphen separated)
+    single_word = [c for c in compounds if " " not in c and "-" not in c]
+    assert not single_word, (
+        f"All entries must be multi-token compounds; single-word entries found: {single_word[:5]!r}"
+    )
+
+
+def test_known_systems_file_contains_expected_high_value_entries():
+    """The file must contain the most-common AI/dev product compounds
+    users mention in real palaces."""
+    import json
+    from pathlib import Path
+    import mempalace
+
+    pkg_dir = Path(mempalace.__file__).parent
+    p = pkg_dir / "data" / "known_systems.json"
+    compounds = set(json.loads(p.read_text(encoding="utf-8"))["compounds"])
+    must_have = [
+        "Claude Code",
+        "GitHub Copilot",
+        "Visual Studio Code",
+        "Gemini Code Assist",
+        "Docker Desktop",
+        "GitHub Actions",
+    ]
+    missing = [c for c in must_have if c not in compounds]
+    assert not missing, f"known_systems missing high-value entries: {missing!r}"
+
+
+def test_extract_candidates_unknown_two_word_phrase_still_works():
+    """Tier 3 does NOT regress the multi-word regex path. A two-word
+    proper-noun phrase NOT in known_systems still gets detected via
+    the existing multi-word pattern."""
+    text = "Jane Smith wrote it. Jane Smith reviewed. Jane Smith shipped. Jane Smith merged."
+    result = extract_candidates(text)
+    assert "Jane Smith" in result, (
+        f"Unknown compound 'Jane Smith' should still be detected via "
+        f"multi-word regex; got: {list(result.keys())!r}"
+    )
+
+
 # ── score_entity ────────────────────────────────────────────────────────
 
 

@@ -9,6 +9,9 @@ Supported:
     - Claude Code JSONL (with tool_use/tool_result block capture)
     - OpenAI Codex CLI JSONL
     - Gemini CLI JSONL (~/.gemini/tmp/<project_hash>/chats/session-*.jsonl)
+    - Pi agent JSONL
+    - Gemini CLI / Google AI Studio JSON sessions (contents / messages / flat list)
+    - Continue.dev session JSON (~/.continue/sessions/*.json)
     - Slack JSON export
     - Plain text (pass through for paragraph chunking)
 
@@ -122,7 +125,7 @@ def normalize(filepath: str) -> str:
     if file_size > 500 * 1024 * 1024:  # 500 MB safety limit
         raise IOError(f"File too large ({file_size // (1024 * 1024)} MB): {filepath}")
     try:
-        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+        with open(filepath, "r", encoding="utf-8-sig", errors="replace") as f:
             content = f.read()
     except OSError as e:
         raise IOError(f"Could not read {filepath}: {e}") from e
@@ -162,12 +165,22 @@ def _try_normalize_json(content: str) -> Optional[str]:
     if normalized:
         return normalized
 
+    normalized = _try_pi_jsonl(content)
+    if normalized:
+        return normalized
+
     try:
         data = json.loads(content)
     except json.JSONDecodeError:
         return None
 
-    for parser in (_try_claude_ai_json, _try_chatgpt_json, _try_slack_json):
+    for parser in (
+        _try_gemini_json,
+        _try_claude_ai_json,
+        _try_chatgpt_json,
+        _try_continue_json,
+        _try_slack_json,
+    ):
         normalized = parser(data)
         if normalized:
             return normalized
@@ -353,6 +366,135 @@ def _try_gemini_jsonl(content: str) -> Optional[str]:
     return None
 
 
+def _try_pi_jsonl(content: str) -> Optional[str]:
+    """Pi agent sessions (~/.config/pi/agent/sessions/{cwd}/{timestamp}_{uuid}.jsonl).
+
+    Pi stores sessions as JSONL with a tree-structured message history.
+    User messages have role "user" with content as string or [{type, text}] blocks.
+    Assistant messages have role "assistant" with content as [{type, text}] blocks
+    (may also include "thinking" blocks which are skipped by _extract_content).
+    Tool results (role "toolResult") are skipped — operational, not conversation.
+
+    Format documented at github.com/badlogic/pi-mono session.md.
+    """
+    lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
+    messages = []
+    has_session_header = False
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+
+        entry_type = entry.get("type", "")
+        if entry_type == "session" and "version" in entry:
+            has_session_header = True
+            continue
+
+        if entry_type != "message":
+            continue
+
+        message = entry.get("message", {})
+        if not isinstance(message, dict):
+            continue
+
+        role = message.get("role", "")
+        text = _extract_content(message.get("content", ""))
+
+        if role == "user" and text:
+            messages.append(("user", text))
+        elif role == "assistant" and text:
+            messages.append(("assistant", text))
+
+    if len(messages) >= 2 and has_session_header:
+        return _messages_to_transcript(messages)
+    return None
+
+
+def _try_gemini_json(data) -> Optional[str]:
+    """Gemini CLI / Google AI Studio JSON sessions.
+
+    Handles three layouts:
+
+    1. **Gemini API contents format** — used by Gemini CLI session files
+       (``~/.gemini/sessions/*.json``):
+       ``{"contents": [{"role": "user", "parts": [{"text": "..."}]}, ...]}``
+
+    2. **Messages wrapper** — exports that wrap the conversation under a
+       ``messages`` key:
+       ``{"messages": [{"role": "user", "content": "..."}, {"role": "model", "content": "..."}]}``
+
+    3. **Flat messages list** — top-level array form:
+       ``[{"role": "user", "content": "..."}, {"role": "model", "content": "..."}]``
+
+    Gemini uses ``"model"`` as the assistant role (not ``"assistant"``).
+    Detection requires at least one ``role="model"`` entry to disambiguate
+    from Claude/ChatGPT exports that use ``"assistant"``. This parser is
+    placed *before* ``_try_claude_ai_json`` in the dispatch chain so that
+    the layout-2 ``{"messages": [...]}`` wrapper does not get silently
+    claimed by the Claude parser, which would drop the model turns.
+    """
+    contents = None
+
+    # Layout 1: {"contents": [...]}
+    if isinstance(data, dict) and "contents" in data:
+        contents = data["contents"]
+    # Layout 2a: {"messages": [...]}
+    elif isinstance(data, dict) and "messages" in data:
+        contents = data["messages"]
+    # Layout 2b: top-level list
+    elif isinstance(data, list):
+        contents = data
+
+    if not isinstance(contents, list) or len(contents) < 2:
+        return None
+
+    messages = []
+    has_model_role = False
+    for item in contents:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role", "")
+
+        # Extract text — try "parts" first (Gemini API), then "content" (flat).
+        text = ""
+        parts = item.get("parts")
+        if isinstance(parts, list):
+            text_parts = []
+            for p in parts:
+                if isinstance(p, str):
+                    text_parts.append(p)
+                elif isinstance(p, dict) and "text" in p:
+                    text_parts.append(p["text"])
+            text = " ".join(text_parts).strip()
+        else:
+            text = _extract_content(item.get("content", ""))
+
+        if not text:
+            continue
+
+        if role == "user":
+            messages.append(("user", text))
+        elif role == "model":
+            messages.append(("assistant", text))
+            has_model_role = True
+        elif role == "assistant":
+            # Defensive: some hand-crafted exports use "assistant" even
+            # for Gemini sessions. Accept but don't flip has_model_role.
+            messages.append(("assistant", text))
+
+    # Disambiguator: must have seen at least one role="model" entry.
+    # This prevents the Gemini parser from claiming Claude/ChatGPT data.
+    if not has_model_role:
+        return None
+
+    if len(messages) >= 2:
+        return _messages_to_transcript(messages)
+    return None
+
+
 def _try_claude_ai_json(data) -> Optional[str]:
     """Claude.ai JSON export: flat messages list or privacy export with chat_messages."""
     if isinstance(data, dict):
@@ -485,6 +627,61 @@ def _try_slack_json(data) -> Optional[str]:
     return None
 
 
+def _try_continue_json(data) -> Optional[str]:
+    """Continue.dev session JSON (~/.continue/sessions/*.json).
+
+    Sessions contain a ``history`` array of ``{role, content}`` message objects,
+    plus optional metadata (``title``, ``sessionId``, ``dateCreated``).
+    System messages are skipped.  Tool-call messages (role ``tool``) are
+    formatted inline when they contain text content.
+    """
+    if not isinstance(data, dict) or "history" not in data:
+        return None
+    history = data["history"]
+    if not isinstance(history, list):
+        return None
+
+    messages = []
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role", "")
+        content = item.get("content", "")
+
+        # Extract text from string or list-of-blocks content
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "text":
+                        parts.append(block.get("text", ""))
+                elif isinstance(block, str):
+                    parts.append(block)
+            text = "\n".join(p for p in parts if p).strip()
+        elif isinstance(content, str):
+            text = content.strip()
+        else:
+            continue
+
+        if not text:
+            continue
+
+        if role == "user":
+            messages.append(("user", text))
+        elif role == "assistant":
+            messages.append(("assistant", text))
+        elif role == "tool":
+            # Append tool output to the previous assistant turn if possible
+            if messages and messages[-1][0] == "assistant":
+                prev_role, prev_text = messages[-1]
+                messages[-1] = (prev_role, prev_text + "\n" + f"[tool] {text}")
+        # Skip system and other roles
+
+    if len(messages) >= 2:
+        return _messages_to_transcript(messages)
+    return None
+
+
 def _extract_content(content, tool_use_map: dict = None) -> str:
     """Pull text from content — handles str, list of blocks, or dict.
 
@@ -523,6 +720,8 @@ def _format_tool_use(block: dict) -> str:
     """Format a tool_use block into a human-readable one-liner."""
     name = block.get("name", "Unknown")
     inp = block.get("input", {})
+    if isinstance(inp, list):
+        inp = {}
 
     if name == "Bash":
         cmd = inp.get("command", "")

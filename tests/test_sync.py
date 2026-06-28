@@ -1355,16 +1355,16 @@ class TestSyncCli:
     def test_cli_emits_wal_on_apply(self, monkeypatch, synced_world):
         """F8 regression: cmd_sync must wire `_wal_log` so CLI deletes are
         audited. Without this, scripted CLI invocations leave no trail."""
-        from mempalace import cli, mcp_server
+        from mempalace import cli, wal
 
         seen = []
-        original = mcp_server._wal_log
+        original = wal._wal_log
 
         def recording_wal(operation, params, result=None):
             seen.append((operation, params, result))
             original(operation, params, result)
 
-        monkeypatch.setattr(mcp_server, "_wal_log", recording_wal)
+        monkeypatch.setattr(wal, "_wal_log", recording_wal)
 
         argv = [
             "mempalace",
@@ -1397,3 +1397,93 @@ class TestSyncCli:
         with pytest.raises(SystemExit) as exc_info:
             cli.main()
         assert exc_info.value.code == 2
+
+
+class TestServiceRunSyncReport:
+    """Daemon path (service.run_sync) must render the same report shape as the
+    direct CLI path, with no KeyError on report['deleted'] (regression: the old
+    code read a non-existent 'deleted' key and dropped no_source/out_of_scope/
+    by_source and the Re-run/Removed hints).
+
+    sync_palace is mocked so the test exercises only run_sync's report
+    formatting — opening the real Chroma collection reinitializes the embedder,
+    which disturbs sys.stdout and defeats capsys.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _cache_mcp_server_import(self):
+        """run_sync lazily imports mempalace.mcp_server, whose import initializes
+        the embedder and rebinds sys.stdout — defeating capsys for any prints
+        after sync_palace returns. Lazy-load it here, scoped to just these report
+        tests (not the whole module at collection time), so the import is a cached
+        no-op by the time run_sync runs and its report output stays capturable.
+        """
+        import mempalace.mcp_server  # noqa: F401
+
+        yield
+
+    def _fake_report(self, **overrides):
+        report = {
+            "scanned": 6,
+            "kept": 1,
+            "gitignored": 2,
+            "missing": 1,
+            "no_source": 1,
+            "out_of_scope": 1,
+            "removed_drawers": 0,
+            "removed_closets": 0,
+            "dry_run": True,
+            "by_source": {"src/a.py": 2, "src/b.py": 1},
+        }
+        report.update(overrides)
+        return report
+
+    def test_dry_run_renders_full_report(self, monkeypatch, tmp_dir, capsys):
+        import mempalace.sync as sync_module
+        from mempalace import service
+
+        palace = os.path.join(tmp_dir, "palace")
+        os.makedirs(palace)
+        # Satisfy run_sync's detect_backend_for_path guard without spinning up
+        # the real Chroma/embedder stack (which would disturb sys.stdout).
+        Path(palace, "chroma.sqlite3").touch()
+        monkeypatch.setattr(
+            sync_module,
+            "sync_palace",
+            lambda **kw: self._fake_report(dry_run=True),
+        )
+        result = service.run_sync({"palace_path": palace, "dir": tmp_dir, "dry_run": True})
+        assert result["success"] is True
+        out = capsys.readouterr().out
+        # The fields the stripped daemon report used to drop.
+        assert "No source:" in out
+        assert "Out of scope:" in out
+        # by_source top sources block.
+        assert "Top sources to remove" in out
+        assert "src/a.py  (2)" in out
+        # Re-run hint fires when there is something to remove.
+        assert "Re-run with --apply" in out
+        # The old KeyError line must not be present.
+        assert "Deleted:" not in out
+
+    def test_apply_renders_removed_counts(self, monkeypatch, tmp_dir, capsys):
+        import mempalace.sync as sync_module
+        from mempalace import service
+
+        palace = os.path.join(tmp_dir, "palace")
+        os.makedirs(palace)
+        Path(palace, "chroma.sqlite3").touch()
+        monkeypatch.setattr(
+            sync_module,
+            "sync_palace",
+            lambda **kw: self._fake_report(
+                dry_run=False, removed_drawers=3, removed_closets=2, by_source={"src/a.py": 3}
+            ),
+        )
+        result = service.run_sync({"palace_path": palace, "dir": tmp_dir, "dry_run": False})
+        assert result["success"] is True
+        out = capsys.readouterr().out
+        # Apply mode prints the removed-drawers/closets line, not the Re-run hint.
+        assert "Removed 3 drawers, 2 closets" in out
+        assert "Top sources removed" in out
+        assert "Re-run with --apply" not in out

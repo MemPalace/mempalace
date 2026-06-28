@@ -78,6 +78,98 @@ def _get_coca_filter() -> frozenset[str]:
         return frozenset()
 
 
+# ==================== KNOWN-SYSTEMS COMPOUND LEXICON (Tier 3 linguistics cleanup) ====================
+#
+# Multi-word product / system names that must be detected atomically — NOT
+# decomposed into their constituent words. When "Claude Code" appears in
+# content, the entity detector counts the compound, not the parts. Without
+# this pre-pass, the single-word loop would split "Claude Code" into
+# "Claude" + "Code", and the COCA filter (Tier 2) would drop "Code" as a
+# content word — leaving "Claude" alone with the wrong attribution.
+#
+# Data file: ``mempalace/data/known_systems.json``. Loaded once on first
+# call via ``_get_known_systems``. Matching is case-insensitive with word
+# boundaries.
+
+
+@functools.lru_cache(maxsize=1)
+def _get_known_systems() -> tuple[tuple[str, "re.Pattern[str]"], ...]:
+    """Return the known-systems compound tuple — pairs of (canonical name,
+    pre-compiled case-insensitive word-bounded regex).
+
+    Loads ``mempalace/data/known_systems.json`` on first call, compiles a
+    regex for each valid compound, and caches the resulting tuple of
+    pairs. Subsequent calls are O(1) and skip both the disk read AND the
+    regex compilation. Returns an empty tuple if the data file is missing
+    or malformed — extraction behavior then degrades gracefully
+    (compounds detected only by the existing multi-word regex) rather
+    than crashing.
+
+    Entries are sorted by length descending so the compound matcher
+    prefers longer matches first (e.g. "Visual Studio Code" wins over
+    a hypothetical "Visual Studio" if both were in the lexicon).
+    """
+    data_path = Path(__file__).parent / "data" / "known_systems.json"
+    try:
+        raw = json.loads(data_path.read_text(encoding="utf-8"))
+        compounds = raw.get("compounds", [])
+        valid = [c for c in compounds if isinstance(c, str) and c.strip()]
+        # Sort by length descending so longest-match-wins during the
+        # pre-pass scan (longer compounds get masked first, so a shorter
+        # compound contained within a longer one doesn't double-count).
+        sorted_compounds = sorted(valid, key=len, reverse=True)
+
+        compiled: list[tuple[str, re.Pattern[str]]] = []
+        for c in sorted_compounds:
+            # Word-boundary, case-insensitive. Compound may contain
+            # hyphens or spaces — re.escape handles special chars; word
+            # boundaries on each side prevent partial-word matches
+            # (e.g. "GPT-4" must not match "GPT-40").
+            pattern = r"(?<!\w)" + re.escape(c) + r"(?!\w)"
+            try:
+                compiled.append((c, re.compile(pattern, re.IGNORECASE)))
+            except re.error:
+                continue
+        return tuple(compiled)
+    except (OSError, json.JSONDecodeError, AttributeError, TypeError):
+        return ()
+
+
+def _apply_known_systems_prepass(text: str) -> tuple[str, dict[str, int]]:
+    """Scan ``text`` for known-systems compounds, return a working copy
+    with matched spans masked to whitespace plus a dict of detected
+    compound counts.
+
+    Returning the counts (instead of mutating a caller-supplied container)
+    lets the three call sites (``extract_candidates`` at init-time,
+    ``palace.build_closet_lines`` at closet construction, and
+    ``miner._extract_entities_for_metadata`` at per-drawer tagging) use
+    whichever container shape they already maintain.
+
+    Compounds are matched case-insensitively with word boundaries; the
+    canonical (lexicon) casing is what gets counted, regardless of how
+    the compound appears in the source text. Regexes are pre-compiled
+    once in ``_get_known_systems`` so this function does no compilation.
+    """
+    compounds = _get_known_systems()
+    if not compounds:
+        return text, {}
+    working = text
+    compound_counts: dict[str, int] = {}
+    for compound, rx in compounds:
+        matches = list(rx.finditer(working))
+        if not matches:
+            continue
+        compound_counts[compound] = compound_counts.get(compound, 0) + len(matches)
+        # Mask matched spans with spaces so the subsequent regex passes
+        # don't re-decompose. Replacing right-to-left keeps earlier
+        # indices stable.
+        for m in reversed(matches):
+            start, end = m.span()
+            working = working[:start] + (" " * (end - start)) + working[end:]
+    return working, compound_counts
+
+
 # ==================== LANGUAGE-AWARE PATTERN LOADING ====================
 
 
@@ -194,13 +286,21 @@ def extract_candidates(text: str, languages=("en",)) -> dict:
 
     counts: defaultdict = defaultdict(int)
 
+    # Tier 3 — known-systems compound pre-pass. Find compound product names
+    # ("Claude Code", "GitHub Copilot", ...) FIRST and mask them out of the
+    # working text so the subsequent single-word + multi-word loops don't
+    # re-decompose them into their constituent tokens.
+    working_text, compound_counts = _apply_known_systems_prepass(text)
+    for compound, n in compound_counts.items():
+        counts[compound] += n
+
     # Single-word candidates — one pre-wrapped pattern per language
     for wrapped_pat in patterns["candidate_patterns"]:
         try:
             rx = re.compile(wrapped_pat)
         except re.error:
             continue
-        for word in rx.findall(text):
+        for word in rx.findall(working_text):
             wl = word.lower()
             if wl in stopwords:
                 continue
@@ -214,13 +314,16 @@ def extract_candidates(text: str, languages=("en",)) -> dict:
                 continue
             counts[word] += 1
 
-    # Multi-word candidates — one pre-wrapped pattern per language
+    # Multi-word candidates — one pre-wrapped pattern per language.
+    # Runs against the working_text (compounds already masked) so an
+    # unknown two-word phrase like "Jane Smith" still gets caught by
+    # the regex without competing with known compounds.
     for wrapped_pat in patterns["multi_word_patterns"]:
         try:
             rx = re.compile(wrapped_pat)
         except re.error:
             continue
-        for phrase in rx.findall(text):
+        for phrase in rx.findall(working_text):
             if any(w.lower() in stopwords for w in phrase.split()):
                 continue
             counts[phrase] += 1

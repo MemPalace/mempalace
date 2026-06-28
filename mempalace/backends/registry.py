@@ -125,6 +125,38 @@ def get_backend(name: str) -> BaseBackend:
         return inst
 
 
+def detect_backends_for_path(path: str) -> list[str]:
+    """Return all registered backend names whose artifacts are present at ``path``.
+
+    Detection is a migration/protection aid for local palaces. Backends are
+    checked in registry-name order so callers get deterministic diagnostics if
+    a broken directory contains artifacts from more than one backend.
+    """
+    _discover_entry_points()
+    detected = []
+    for name in sorted(_registry):
+        cls = _registry[name]
+        try:
+            if cls.detect(path):
+                detected.append(name)
+        except Exception:
+            logger.exception("detect() raised on backend %r", name)
+    return detected
+
+
+def detect_backend_for_path(path: str) -> Optional[str]:
+    """Return the single detected backend at ``path``, or ``None``.
+
+    If multiple backend artifacts are present, the first name in registry order
+    is returned for backward compatibility. Callers that enforce mismatch
+    protection should use :func:`detect_backends_for_path`.
+    """
+    detected = detect_backends_for_path(path)
+    if detected:
+        return detected[0]
+    return None
+
+
 def reset_backends() -> None:
     """Close and drop all cached backend instances (primarily for tests)."""
     with _lock:
@@ -161,14 +193,9 @@ def resolve_backend_for_palace(
             return candidate
 
     _discover_entry_points()
-    if palace_path:
-        for name, cls in _registry.items():
-            try:
-                if cls.detect(palace_path):
-                    return name
-            except Exception:
-                logger.exception("detect() raised on backend %r", name)
-                continue
+    detected = detect_backend_for_path(palace_path) if palace_path else None
+    if detected:
+        return detected
     return default
 
 
@@ -180,10 +207,19 @@ def resolve_backend_for_palace(
 def _register_builtins() -> None:
     """Register chroma as the in-tree default."""
     from .chroma import ChromaBackend
+    from .pgvector import PgVectorBackend
+    from .qdrant import QdrantBackend
+    from .sqlite_exact import SQLiteExactBackend
 
     # Use setdefault semantics so a caller that pre-registered for tests wins.
     if "chroma" not in _registry:
         _registry["chroma"] = ChromaBackend
+    if "qdrant" not in _registry:
+        _registry["qdrant"] = QdrantBackend
+    if "sqlite_exact" not in _registry:
+        _registry["sqlite_exact"] = SQLiteExactBackend
+    if "pgvector" not in _registry:
+        _registry["pgvector"] = PgVectorBackend
 
 
 _register_builtins()

@@ -13,8 +13,10 @@ import mempalace.hooks_cli as hooks_cli_mod
 from mempalace.hooks_cli import (
     SAVE_INTERVAL,
     _count_human_messages,
+    _diary_agent_for_harness,
     _extract_recent_messages,
     _get_mine_targets,
+    _hooks_daemon_enabled,
     _log,
     _maybe_auto_ingest,
     _mempalace_python,
@@ -22,10 +24,12 @@ from mempalace.hooks_cli import (
     _mine_sync,
     _parse_harness_input,
     _sanitize_session_id,
+    _save_diary_direct,
     _validate_transcript_path,
     _wing_from_transcript_path,
     hook_stop,
     hook_session_start,
+    hook_session_end,
     hook_precompact,
     run_hook,
     _claim_mine_slot,
@@ -336,7 +340,9 @@ def test_stop_hook_saves_silently_at_interval(tmp_path):
     assert result["systemMessage"].startswith("\u2726 15 memories woven into the palace")
     assert "hooks" in result["systemMessage"]
     # tmp_path has no "-Projects-" segment, so _wing_from_transcript_path falls back to "wing_sessions"
-    mock_save.assert_called_once_with(str(transcript), "test", wing="wing_sessions", toast=False)
+    mock_save.assert_called_once_with(
+        str(transcript), "test", wing="wing_sessions", toast=False, agent_name="claude"
+    )
 
 
 def test_stop_hook_derives_wing_from_transcript_path(tmp_path):
@@ -355,7 +361,9 @@ def test_stop_hook_derives_wing_from_transcript_path(tmp_path):
             {"session_id": "test", "stop_hook_active": False, "transcript_path": str(transcript)},
             state_dir=tmp_path,
         )
-    mock_save.assert_called_once_with(str(transcript), "test", wing="wing_myproject", toast=False)
+    mock_save.assert_called_once_with(
+        str(transcript), "test", wing="wing_myproject", toast=False, agent_name="claude"
+    )
 
 
 def test_stop_hook_tracks_save_point(tmp_path):
@@ -381,6 +389,123 @@ def test_stop_hook_tracks_save_point(tmp_path):
         result = _capture_hook_output(hook_stop, data, state_dir=tmp_path)
     assert result == {}
     mock_save.assert_not_called()
+
+
+# --- #1693: hook checkpoints must be discoverable by diary_read ---
+
+
+def test_diary_agent_for_harness_maps_known_harnesses():
+    assert _diary_agent_for_harness("claude-code") == "claude"
+    assert _diary_agent_for_harness("codex") == "codex"
+
+
+def test_diary_agent_for_harness_unknown_falls_back_to_name():
+    """A future harness must never collapse to the legacy 'session-hook'
+    identity, which no diary_read(agent_name=...) call ever matches (#1693)."""
+    assert _diary_agent_for_harness("cursor") == "cursor"
+    for harness in ("claude-code", "codex", "cursor", "gemini"):
+        assert _diary_agent_for_harness(harness) != "session-hook"
+
+
+@pytest.mark.parametrize(
+    "harness,expected_agent",
+    [("claude-code", "claude"), ("codex", "codex")],
+)
+def test_stop_hook_files_checkpoint_under_harness_agent(tmp_path, harness, expected_agent):
+    """The Stop hook must file checkpoints under the agent identity that the
+    session's harness reads with, not the legacy hardcoded 'session-hook'
+    (#1693)."""
+    # _save_diary_direct is mocked below, so the transcript format is irrelevant
+    # here: _count_human_messages counts both harness shapes, and we assert only
+    # the harness -> agent_name routing, not transcript parsing.
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
+    )
+    with patch(
+        "mempalace.hooks_cli._save_diary_direct", return_value={"count": 5, "themes": []}
+    ) as mock_save:
+        _capture_hook_output(
+            hook_stop,
+            {"session_id": "test", "stop_hook_active": False, "transcript_path": str(transcript)},
+            harness=harness,
+            state_dir=tmp_path,
+        )
+    assert mock_save.call_args.kwargs["agent_name"] == expected_agent
+
+
+def test_stop_hook_checkpoint_visible_to_diary_read(monkeypatch, config, palace_path, kg, tmp_path):
+    """End-to-end regression for #1693: a checkpoint written by the Stop hook
+    save path is discoverable via diary_read under the harness agent identity,
+    and is not siloed under the legacy 'session-hook' identity."""
+    import chromadb
+
+    from mempalace import mcp_server
+    from mempalace.mcp_server import tool_diary_read
+
+    monkeypatch.setattr(mcp_server, "_config", config)
+    monkeypatch.setattr(mcp_server, "_get_kg", lambda *a, **kw: kg)
+    client = chromadb.PersistentClient(path=palace_path)
+    client.get_or_create_collection("mempalace_drawers", metadata={"hnsw:space": "cosine"})
+    del client
+
+    transcript = tmp_path / "session.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(5)],
+    )
+
+    agent = _diary_agent_for_harness("claude-code")
+    res = _save_diary_direct(str(transcript), "sess1", wing="wing_.claude", agent_name=agent)
+    assert res["count"] > 0
+
+    visible = tool_diary_read(agent_name="claude")
+    assert visible.get("total", 0) >= 1
+    assert "CHECKPOINT" in visible["entries"][0]["content"]
+
+    # The legacy identity no longer captures hook checkpoints.
+    legacy = tool_diary_read(agent_name="session-hook")
+    assert legacy.get("entries") == []
+
+
+def test_save_diary_direct_daemon_opt_in_submits_job(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"message {i}"}} for i in range(3)],
+    )
+    env = {"MEMPALACE_HOOKS_DAEMON": "yes", "MEMPALACE_PALACE_PATH": str(palace_dir)}
+    job = {"id": "job", "state": "succeeded", "result": {"success": True, "entry_id": "e1"}}
+
+    with patch.dict("os.environ", env):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli._daemon_available", return_value=True):
+                with patch("mempalace.daemon.submit_job", return_value=job) as mock_submit:
+                    result = _save_diary_direct(
+                        str(transcript),
+                        "sess1",
+                        wing="wing_project",
+                        agent_name="claude",
+                    )
+
+    assert result["count"] == 3
+    mock_submit.assert_called_once()
+    assert mock_submit.call_args.args[0] == "diary_write"
+    payload = mock_submit.call_args.args[1]
+    assert payload["agent_name"] == "claude"
+    assert payload["wing"] == "wing_project"
+    assert payload["topic"] == "checkpoint"
+    assert (tmp_path / "last_checkpoint").exists()
+
+
+def test_hooks_daemon_enabled_requires_explicit_true():
+    with patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls:
+        assert _hooks_daemon_enabled() is False
+        mock_cfg_cls.return_value.hook_use_daemon = True
+        assert _hooks_daemon_enabled() is True
 
 
 # --- hook_session_start ---
@@ -704,6 +829,33 @@ def test_maybe_auto_ingest_with_env(tmp_path):
                     assert cmd[cmd.index("--mode") + 1] == "projects"
 
 
+def test_maybe_auto_ingest_daemon_opt_in_submits_job(tmp_path):
+    """Daemon-enabled hooks submit a background mine instead of spawning one."""
+    mempal_dir = tmp_path / "project"
+    palace_dir = tmp_path / "palace"
+    mempal_dir.mkdir()
+    palace_dir.mkdir()
+    env = {
+        "MEMPAL_DIR": str(mempal_dir),
+        "MEMPALACE_HOOKS_DAEMON": "yes",
+        "MEMPALACE_PALACE_PATH": str(palace_dir),
+    }
+    with patch.dict("os.environ", env):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli._daemon_available", return_value=True):
+                with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                    with patch(
+                        "mempalace.daemon.submit_job", return_value={"id": "job"}
+                    ) as mock_submit:
+                        _maybe_auto_ingest()
+
+    mock_popen.assert_not_called()
+    mock_submit.assert_called_once()
+    assert mock_submit.call_args.args[0] == "mine"
+    assert mock_submit.call_args.args[1]["source"] == str(mempal_dir.resolve())
+    assert mock_submit.call_args.kwargs["wait"] is False
+
+
 def test_maybe_auto_ingest_uses_mempalace_python(tmp_path):
     """Spawned mine command uses _mempalace_python(), not bare sys.executable.
 
@@ -884,17 +1036,26 @@ def test_detached_popen_kwargs_posix(monkeypatch):
 
 
 def test_detached_popen_kwargs_windows(monkeypatch):
-    """On Windows, kwargs include creationflags that fully detach the child.
+    """On Windows, the miner child gets a hidden console (CREATE_NO_WINDOW),
+    not a detached/no-console child (DETACHED_PROCESS).
 
-    Without these, the parent hook hangs at session end on Windows because
-    the child's inherited stdout/stderr handles keep the parent's exit
-    blocked (#1268 root cause for the Python hook path).
+    DETACHED_PROCESS gave the child no console at all, which caused any
+    console grandchild it spawned to allocate a fresh *visible* window
+    (#1783). CREATE_NO_WINDOW gives a real-but-invisible console that all
+    descendants inherit, so nothing flashes — while still fixing the
+    #1268 hang (stdin=DEVNULL, close_fds, explicit stdout/stderr redirect,
+    and CREATE_NEW_PROCESS_GROUP for the signal boundary are unchanged).
+    Per the Win32 CreateProcess docs CREATE_NO_WINDOW is ignored when OR'd
+    with DETACHED_PROCESS, so the two must be mutually exclusive.
     """
     from mempalace.hooks_cli import _detached_popen_kwargs
 
     monkeypatch.setattr("mempalace.hooks_cli.os.name", "nt")
-    # Simulate Windows-only Popen flag constants. Patch on the imported
-    # subprocess module within hooks_cli so getattr() picks them up.
+    # Simulate Windows-only Popen flag constants on the imported subprocess
+    # module so getattr() picks them up cross-platform.
+    monkeypatch.setattr(
+        "mempalace.hooks_cli.subprocess.CREATE_NO_WINDOW", 0x08000000, raising=False
+    )
     monkeypatch.setattr(
         "mempalace.hooks_cli.subprocess.DETACHED_PROCESS", 0x00000008, raising=False
     )
@@ -905,7 +1066,10 @@ def test_detached_popen_kwargs_windows(monkeypatch):
     assert kwargs.get("stdin") is subprocess.DEVNULL
     assert kwargs.get("close_fds") is True
     flags = kwargs.get("creationflags", 0)
-    assert flags & 0x00000008, "DETACHED_PROCESS must be set"
+    assert flags & 0x08000000, "CREATE_NO_WINDOW must be set"
+    assert not (flags & 0x00000008), (
+        "DETACHED_PROCESS must NOT be set (it suppresses CREATE_NO_WINDOW)"
+    )
     assert flags & 0x00000200, "CREATE_NEW_PROCESS_GROUP must be set"
 
 
@@ -1028,6 +1192,31 @@ def test_ingest_transcript_uses_detached_kwargs(tmp_path):
                 kwargs = mock_popen.call_args.kwargs
                 assert kwargs.get("stdin") is subprocess.DEVNULL
                 assert kwargs.get("close_fds") is True
+
+
+def test_ingest_transcript_daemon_opt_in_submits_job(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    transcript.write_text("x" * 200)
+    env = {"MEMPALACE_HOOKS_DAEMON": "yes", "MEMPALACE_PALACE_PATH": str(palace_dir)}
+    with patch.dict("os.environ", env):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli._daemon_available", return_value=True):
+                with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                    with patch(
+                        "mempalace.daemon.submit_job", return_value={"id": "job"}
+                    ) as mock_submit:
+                        from mempalace.hooks_cli import _ingest_transcript
+
+                        _ingest_transcript(str(transcript))
+
+    mock_popen.assert_not_called()
+    mock_submit.assert_called_once()
+    payload = mock_submit.call_args.args[1]
+    assert payload["source"] == str(tmp_path)
+    assert payload["mode"] == "convos"
+    assert payload["wing"] == "sessions"
 
 
 def test_ingest_transcript_skips_when_target_running(tmp_path):
@@ -1695,6 +1884,284 @@ def test_hook_stop_does_not_create_palace_dir_when_absent(tmp_path, monkeypatch)
         )
     assert json.loads(buf.getvalue() or "{}") == {}
     assert not fake_root.exists()
+
+
+# ── session-end hook (#1341) ──────────────────────────────────────────────
+
+
+def test_run_hook_dispatches_session_end():
+    stdin_data = json.dumps({"session_id": "run-test"})
+    with patch("sys.stdin", io.StringIO(stdin_data)):
+        with patch("mempalace.hooks_cli.hook_session_end") as mock_hook:
+            run_hook("session-end", "claude-code")
+    mock_hook.assert_called_once_with({"session_id": "run-test"}, "claude-code")
+
+
+def test_session_end_uses_detached_paths_not_sync_mine(tmp_path):
+    """SessionEnd must spawn the detached ingest/auto-ingest and NEVER call the
+    synchronous ``_mine_sync``: the foreground SessionEnd budget (~1.5s, which a
+    plugin-provided per-hook timeout cannot raise) would kill a synchronous mine
+    before it saved anything.
+    """
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(3)],
+    )
+    last_save_file = tmp_path / "sess_last_save"
+    last_save_file.write_text("2", encoding="utf-8")
+    with patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls:
+        mock_cfg_cls.return_value.hooks_auto_save = True
+        mock_cfg_cls.return_value.hook_desktop_toast = False
+        with (
+            patch(
+                "mempalace.hooks_cli._save_diary_direct",
+                return_value={"count": 3, "themes": ["exit"]},
+            ) as mock_save,
+            patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest,
+            patch("mempalace.hooks_cli._maybe_auto_ingest") as mock_auto,
+            patch("mempalace.hooks_cli._mine_sync") as mock_sync,
+        ):
+            result = _capture_hook_output(
+                hook_session_end,
+                {"session_id": "sess", "transcript_path": str(transcript)},
+                state_dir=tmp_path,
+            )
+    assert result == {}
+    expected_path = str(transcript.resolve())
+    mock_ingest.assert_called_once_with(expected_path)
+    mock_auto.assert_called_once()
+    mock_sync.assert_not_called()
+    mock_save.assert_called_once_with(
+        expected_path, "sess", wing="wing_sessions", toast=False, agent_name="claude"
+    )
+    # The session is over; its per-session save marker is cleared.
+    assert not last_save_file.exists()
+
+
+def test_session_end_disabled_by_config_clears_marker(tmp_path):
+    last_save_file = tmp_path / "sess_last_save"
+    last_save_file.write_text("15", encoding="utf-8")
+    with patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls:
+        mock_cfg_cls.return_value.hooks_auto_save = False
+        with (
+            patch("mempalace.hooks_cli._save_diary_direct") as mock_save,
+            patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest,
+            patch("mempalace.hooks_cli._maybe_auto_ingest") as mock_auto,
+        ):
+            result = _capture_hook_output(
+                hook_session_end,
+                {"session_id": "sess", "transcript_path": ""},
+                state_dir=tmp_path,
+            )
+    assert result == {}
+    mock_save.assert_not_called()
+    mock_ingest.assert_not_called()
+    mock_auto.assert_not_called()
+    assert not last_save_file.exists()
+
+
+def test_session_end_defaults_to_saving_when_config_unreadable(tmp_path):
+    """A corrupt/unreadable config must not lose the final save: the handler
+    defaults to auto-save on (toasts off) instead of crashing the hook."""
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(transcript, [{"message": {"role": "user", "content": "hi"}}])
+    with patch("mempalace.hooks_cli.MempalaceConfig", side_effect=RuntimeError("corrupt config")):
+        with (
+            patch(
+                "mempalace.hooks_cli._save_diary_direct",
+                return_value={"count": 1, "themes": []},
+            ) as mock_save,
+            patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest,
+            patch("mempalace.hooks_cli._maybe_auto_ingest") as mock_auto,
+        ):
+            result = _capture_hook_output(
+                hook_session_end,
+                {"session_id": "cfg", "transcript_path": str(transcript)},
+                state_dir=tmp_path,
+            )
+    assert result == {}
+    mock_save.assert_called_once()
+    mock_ingest.assert_called_once()
+    mock_auto.assert_called_once()
+
+
+def test_session_end_clears_marker_even_if_capture_raises(tmp_path):
+    """Marker cleanup runs in a ``finally`` so a failing ingest still cleans up
+    and never wedges the per-session marker on."""
+    last_save_file = tmp_path / "boom_last_save"
+    last_save_file.write_text("5", encoding="utf-8")
+    with patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls:
+        mock_cfg_cls.return_value.hooks_auto_save = True
+        mock_cfg_cls.return_value.hook_desktop_toast = False
+        with (
+            patch("mempalace.hooks_cli.STATE_DIR", tmp_path),
+            patch(
+                "mempalace.hooks_cli._ingest_transcript",
+                side_effect=RuntimeError("boom"),
+            ),
+            patch("mempalace.hooks_cli._output"),
+        ):
+            with pytest.raises(RuntimeError):
+                hook_session_end(
+                    {"session_id": "boom", "transcript_path": str(tmp_path / "x.jsonl")},
+                    "claude-code",
+                )
+    assert not last_save_file.exists()
+
+
+def test_session_end_clears_marker_on_parse_failure(tmp_path):
+    """A non-dict payload makes _parse_harness_input raise, but parsing now runs
+    inside the try, so the finally still clears the default-session marker
+    instead of skipping cleanup entirely."""
+    last_save_file = tmp_path / "unknown_last_save"
+    last_save_file.write_text("5", encoding="utf-8")
+    with (
+        patch("mempalace.hooks_cli.STATE_DIR", tmp_path),
+        patch("mempalace.hooks_cli._output"),
+    ):
+        with pytest.raises(AttributeError):
+            hook_session_end(["not", "a", "dict"], "claude-code")
+    assert not last_save_file.exists()
+
+
+def test_hook_session_end_does_not_create_palace_dir_when_absent(tmp_path, monkeypatch):
+    fake_root = _redirect_palace_root(monkeypatch, tmp_path)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        hook_session_end({"session_id": "absent", "transcript_path": ""}, "claude-code")
+    assert json.loads(buf.getvalue() or "{}") == {}
+    assert not fake_root.exists()
+
+
+def test_session_end_auto_ingest_only_when_no_transcript(tmp_path):
+    """auto_save on but no transcript: project mine still fires, transcript-only
+    paths are skipped, and the marker is still cleared. Guards against wrapping
+    ``_maybe_auto_ingest`` inside the ``if transcript_path`` block by mistake."""
+    last_save_file = tmp_path / "sess_last_save"
+    last_save_file.write_text("3", encoding="utf-8")
+    with patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls:
+        mock_cfg_cls.return_value.hooks_auto_save = True
+        mock_cfg_cls.return_value.hook_desktop_toast = False
+        with (
+            patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest,
+            patch("mempalace.hooks_cli._maybe_auto_ingest") as mock_auto,
+            patch("mempalace.hooks_cli._save_diary_direct") as mock_save,
+            patch("mempalace.hooks_cli._mine_sync") as mock_sync,
+        ):
+            result = _capture_hook_output(
+                hook_session_end,
+                {"session_id": "sess", "transcript_path": ""},
+                state_dir=tmp_path,
+            )
+    assert result == {}
+    mock_auto.assert_called_once()
+    mock_ingest.assert_not_called()
+    mock_save.assert_not_called()
+    mock_sync.assert_not_called()
+    assert not last_save_file.exists()
+
+
+def test_session_end_rejects_invalid_transcript_path(tmp_path):
+    """A traversal / wrong-suffix transcript_path is rejected by the validator:
+    no transcript ingest or diary write fires (the independent project mine
+    still runs), and the per-session marker is still cleared."""
+    last_save_file = tmp_path / "bad_last_save"
+    last_save_file.write_text("5", encoding="utf-8")
+    with patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls:
+        mock_cfg_cls.return_value.hooks_auto_save = True
+        mock_cfg_cls.return_value.hook_desktop_toast = False
+        with (
+            patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest,
+            patch("mempalace.hooks_cli._save_diary_direct") as mock_save,
+            patch("mempalace.hooks_cli._maybe_auto_ingest") as mock_auto,
+        ):
+            result = _capture_hook_output(
+                hook_session_end,
+                {"session_id": "bad", "transcript_path": "../../etc/passwd"},
+                state_dir=tmp_path,
+            )
+    assert result == {}
+    mock_ingest.assert_not_called()
+    mock_save.assert_not_called()
+    mock_auto.assert_called_once()  # project mine is independent of the transcript
+    assert not last_save_file.exists()
+
+
+def test_session_end_accepts_full_sessionend_payload(tmp_path):
+    """The handler tolerates the real Claude Code SessionEnd stdin (reason,
+    hook_event_name, cwd) — extra keys ignored, behavior unchanged. Pins the
+    contract so a future strict-parse or reason-branching regression is caught."""
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(transcript, [{"message": {"role": "user", "content": "hi"}}])
+    with patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls:
+        mock_cfg_cls.return_value.hooks_auto_save = True
+        mock_cfg_cls.return_value.hook_desktop_toast = False
+        with (
+            patch(
+                "mempalace.hooks_cli._save_diary_direct",
+                return_value={"count": 1, "themes": []},
+            ),
+            patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest,
+            patch("mempalace.hooks_cli._maybe_auto_ingest") as mock_auto,
+            patch("mempalace.hooks_cli._mine_sync") as mock_sync,
+        ):
+            result = _capture_hook_output(
+                hook_session_end,
+                {
+                    "session_id": "sess",
+                    "transcript_path": str(transcript),
+                    "hook_event_name": "SessionEnd",
+                    "reason": "logout",
+                    "cwd": str(tmp_path),
+                },
+                state_dir=tmp_path,
+            )
+    assert result == {}
+    mock_ingest.assert_called_once_with(str(transcript.resolve()))
+    mock_auto.assert_called_once()
+    mock_sync.assert_not_called()
+
+
+def test_session_end_checkpoint_visible_to_diary_read(
+    monkeypatch, config, palace_path, kg, tmp_path
+):
+    """The SessionEnd in-process diary checkpoint is real and discoverable via
+    diary_read (not mocked) — the diary half of #1341's clean-exit capture,
+    mirroring test_stop_hook_checkpoint_visible_to_diary_read."""
+    import chromadb
+
+    from mempalace import mcp_server
+    from mempalace.mcp_server import tool_diary_read
+
+    monkeypatch.setattr(mcp_server, "_config", config)
+    monkeypatch.setattr(mcp_server, "_get_kg", lambda *a, **kw: kg)
+    client = chromadb.PersistentClient(path=palace_path)
+    client.get_or_create_collection("mempalace_drawers", metadata={"hnsw:space": "cosine"})
+    del client
+
+    transcript = tmp_path / "session.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(5)],
+    )
+
+    with patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls:
+        mock_cfg_cls.return_value.hooks_auto_save = True
+        mock_cfg_cls.return_value.hook_desktop_toast = False
+        # Mock only the detached subprocess mines; run the REAL diary write.
+        with (
+            patch("mempalace.hooks_cli._ingest_transcript"),
+            patch("mempalace.hooks_cli._maybe_auto_ingest"),
+        ):
+            hook_session_end(
+                {"session_id": "sessX", "transcript_path": str(transcript)},
+                "claude-code",
+            )
+
+    visible = tool_diary_read(agent_name="claude")
+    assert visible.get("total", 0) >= 1
+    assert "CHECKPOINT" in visible["entries"][0]["content"]
 
 
 def test_hook_precompact_does_not_create_palace_dir_when_absent(tmp_path, monkeypatch):

@@ -312,6 +312,32 @@ def test_rebuild_index_empty_palace(mock_backend_cls, mock_shutil, tmp_path):
     mock_backend.delete_collection.assert_not_called()
 
 
+@patch("mempalace.repair.ChromaBackend")
+def test_rebuild_index_read_failure_points_to_from_sqlite(mock_backend_cls, tmp_path):
+    """A chromadb HNSW compactor failure makes the first ``count()`` read
+    raise; rebuild_index cannot recover it, so it must direct the user to
+    ``repair --mode from-sqlite`` (rows are intact in chroma.sqlite3) rather
+    than re-mining from source files, which drops MCP-added drawers (#1843)."""
+    sqlite3.connect(str(tmp_path / "chroma.sqlite3")).close()
+    mock_col = MagicMock()
+    mock_col.count.side_effect = Exception("Failed to apply logs to the hnsw segment writer")
+    mock_backend_cls.return_value.get_collection.return_value = mock_col
+    msgs: list[str] = []
+    repair.rebuild_index(palace_path=str(tmp_path), progress=msgs.append)
+    out = "\n".join(msgs)
+    assert "mempalace repair --mode from-sqlite --archive-existing" in out
+    assert "may need to be re-mined" not in out
+
+
+def test_index_read_recovery_guidance_recommends_from_sqlite():
+    """The shared guidance helper names the from-sqlite recovery command in
+    full and never tells the user the palace ``may need to be re-mined`` —
+    the harmful pre-#1843 advice that silently drops MCP-added drawers."""
+    msg = repair.index_read_recovery_guidance()
+    assert "mempalace repair --mode from-sqlite --archive-existing" in msg
+    assert "may need to be re-mined" not in msg
+
+
 @patch("mempalace.repair.shutil")
 @patch("mempalace.repair.ChromaBackend")
 def test_rebuild_index_success(mock_backend_cls, mock_shutil, tmp_path):
@@ -1240,6 +1266,57 @@ def test_max_seq_id_backup_created(tmp_path):
     assert rows[seg["drawers_meta"]] == seg["poisoned_values"][seg["drawers_meta"]]
 
 
+def test_max_seq_id_backup_pruned_to_max_backups(tmp_path, monkeypatch):
+    """Old max-seq-id backups beyond MEMPALACE_MAX_BACKUPS are pruned after a repair.
+
+    Without retention, every repair left a full chroma.sqlite3 copy behind
+    that was never cleaned up — the unbounded disk-growth bug this guards.
+    """
+    palace = str(tmp_path / "palace")
+    _seed_poisoned_max_seq_id(palace)
+
+    # Pre-seed 4 stale backups with old mtimes so the just-created one is
+    # unambiguously the newest.
+    for i in range(4):
+        stale = os.path.join(palace, f"chroma.sqlite3.max-seq-id-backup-2026010{i}-000000")
+        with open(stale, "w") as f:
+            f.write("old")
+        os.utime(stale, (1_700_000_000 + i, 1_700_000_000 + i))
+
+    monkeypatch.setenv("MEMPALACE_MAX_BACKUPS", "2")
+
+    result = repair.repair_max_seq_id(palace, assume_yes=True)
+
+    backups = sorted(
+        fn for fn in os.listdir(palace) if fn.startswith("chroma.sqlite3.max-seq-id-backup-")
+    )
+    # 4 stale + 1 fresh = 5 written; retention keeps only the 2 newest.
+    assert len(backups) == 2
+    # The backup created by this repair must be one of the survivors.
+    assert os.path.basename(result["backup"]) in backups
+
+
+def test_max_seq_id_backup_retained_when_pruning_disabled(tmp_path, monkeypatch):
+    """max_backups=0 keeps every backup (opt-out for external retention)."""
+    palace = str(tmp_path / "palace")
+    _seed_poisoned_max_seq_id(palace)
+
+    for i in range(3):
+        stale = os.path.join(palace, f"chroma.sqlite3.max-seq-id-backup-2026010{i}-000000")
+        with open(stale, "w") as f:
+            f.write("old")
+        os.utime(stale, (1_700_000_000 + i, 1_700_000_000 + i))
+
+    monkeypatch.setenv("MEMPALACE_MAX_BACKUPS", "0")
+
+    repair.repair_max_seq_id(palace, assume_yes=True)
+
+    backups = [
+        fn for fn in os.listdir(palace) if fn.startswith("chroma.sqlite3.max-seq-id-backup-")
+    ]
+    assert len(backups) == 4
+
+
 def test_max_seq_id_rollback_on_verification_failure(tmp_path, monkeypatch):
     """If the post-update detector still sees poison, raise and leave a backup."""
     palace = str(tmp_path / "palace")
@@ -1944,3 +2021,26 @@ def test_rebuild_index_calls_vacuum(mock_backend_cls, mock_shutil, tmp_path):
         args, kwargs = mock_vacuum.call_args
         assert args[0] == str(tmp_path)
         assert "progress" in kwargs
+
+
+def test_rebuild_from_sqlite_preserves_knowledge_graph_sidecar(tmp_path):
+    """The from-sqlite repair path must not drop the KG SQLite sidecar."""
+    src = tmp_path / "source"
+    dest = tmp_path / "dest"
+    src.mkdir()
+    dest.mkdir()
+
+    (src / "knowledge_graph.sqlite3").write_text("kg-db", encoding="utf-8")
+    (src / "knowledge_graph.sqlite3-wal").write_text("kg-wal", encoding="utf-8")
+    (src / "knowledge_graph.sqlite3-shm").write_text("kg-shm", encoding="utf-8")
+
+    copied = repair._preserve_knowledge_graph_sqlite(str(src), str(dest))
+
+    assert copied == [
+        "knowledge_graph.sqlite3",
+        "knowledge_graph.sqlite3-wal",
+        "knowledge_graph.sqlite3-shm",
+    ]
+    assert (dest / "knowledge_graph.sqlite3").read_text(encoding="utf-8") == "kg-db"
+    assert (dest / "knowledge_graph.sqlite3-wal").read_text(encoding="utf-8") == "kg-wal"
+    assert (dest / "knowledge_graph.sqlite3-shm").read_text(encoding="utf-8") == "kg-shm"

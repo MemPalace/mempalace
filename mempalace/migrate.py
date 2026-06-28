@@ -19,6 +19,7 @@ Usage:
 """
 
 import errno
+import glob
 import os
 import shutil
 import sqlite3
@@ -27,6 +28,9 @@ import uuid
 from collections import defaultdict
 from contextlib import closing
 from datetime import datetime
+
+from .backups import prune_backups
+from .config import MempalaceConfig
 
 
 def _restore_stale_palace(palace_path: str, stale_path: str) -> None:
@@ -293,6 +297,16 @@ def migrate(palace_path: str, dry_run: bool = False, confirm: bool = False):
     print(f"\n  Backing up to {backup_path}...")
     shutil.copytree(palace_path, backup_path)
 
+    # Enforce backup retention so repeated migrations cannot fill the disk
+    # with full-palace copies. The backup we just created is the newest, so
+    # it survives; only older ``.pre-migrate.*`` siblings beyond the limit
+    # are removed. Best-effort — never let cleanup fail the migration.
+    prune_backups(
+        glob.escape(palace_path) + ".pre-migrate.*",
+        MempalaceConfig().max_backups,
+        log=print,
+    )
+
     # Build fresh palace in a temp directory (avoids chromadb reading old state).
     # Wrap the whole import-and-swap dance in try/finally so the temp dir is
     # cleaned up if any of the chromadb writes, the verify count, or the
@@ -359,4 +373,219 @@ def migrate(palace_path: str, dry_run: bool = False, confirm: bool = False):
         print(f"  WARNING: Expected {len(drawers)}, got {final_count}")
 
     print(f"\n{'=' * 60}\n")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Wing-name normalization migration (#1675 follow-up)
+# ---------------------------------------------------------------------------
+#
+# normalize_wing_name now strips leading/trailing separators, so a path-encoded
+# dirname like ``-home-user-proj`` derives ``home_user_proj`` instead of
+# ``_home_user_proj``. Palaces built before that rule filed drawers under the
+# old, leading-underscore wing, which the new derivation no longer matches —
+# searches and diary reads under the new name miss the old memories.
+#
+# This migration re-keys the ``wing`` metadata field on drawers and closets to
+# the normalized form, merging collisions. Drawer/closet IDs embed the wing as
+# an opaque prefix that is never decoded back into a wing (verified: nothing
+# splits a wing out of an ID; mining idempotency keys on ``source_file``), so
+# the IDs are left untouched — closet ``→drawer_id`` pointers stay valid and
+# future mining still skips already-mined files. Tunnels resolve via existing
+# read-time normalization and need no rewrite. The pass is idempotent.
+
+
+def _normalized_wing_target(wing):
+    """Return the normalized wing if it differs from ``wing``, else ``None``.
+
+    ``None`` means "no migration needed" — either the value is not a non-empty
+    string, normalization is a no-op, or it would normalize to empty.
+    """
+    from .config import normalize_wing_name
+
+    if not isinstance(wing, str) or not wing:
+        return None
+    # Apply the full normalization and explicitly strip leading/trailing
+    # separators. The strip is this migration's whole purpose (#1675); doing it
+    # here rather than relying on normalize_wing_name keeps the migration correct
+    # even when run against a build whose normalize_wing_name predates #1675, and
+    # matches the post-#1675 derivation exactly.
+    target = normalize_wing_name(wing).strip("_")
+    if not target or target == wing:
+        return None
+    return target
+
+
+def plan_wing_renames(items):
+    """Pure planner over ``(id, metadata)`` pairs.
+
+    Returns ``(summary, updates)`` where ``summary`` is ``{(old, new): count}``
+    and ``updates`` is ``[(id, new_metadata), ...]`` for only the records whose
+    wing changes. Metadata is copied; only the ``wing`` key is rewritten.
+    """
+    summary = defaultdict(int)
+    updates = []
+    for rec_id, meta in items:
+        meta = dict(meta or {})
+        target = _normalized_wing_target(meta.get("wing"))
+        if target is None:
+            continue
+        summary[(meta["wing"], target)] += 1
+        meta["wing"] = target
+        updates.append((rec_id, meta))
+    return summary, updates
+
+
+def _iter_collection_items(col, batch_size=1000):
+    """Yield ``(id, metadata)`` for every record in a backend collection."""
+    total = col.count()
+    offset = 0
+    while offset < total:
+        batch = col.get(limit=batch_size, offset=offset, include=["metadatas"])
+        ids = batch.ids if hasattr(batch, "ids") else batch["ids"]
+        metas = batch.metadatas if hasattr(batch, "metadatas") else batch["metadatas"]
+        if not ids:
+            break
+        for rec_id, meta in zip(ids, metas):
+            yield rec_id, meta
+        offset += len(ids)
+
+
+def _apply_wing_updates(col, updates, batch_size=500):
+    """Re-label the ``wing`` metadata field in place for the planned updates."""
+    for i in range(0, len(updates), batch_size):
+        chunk = updates[i : i + batch_size]
+        col.update(ids=[u[0] for u in chunk], metadatas=[u[1] for u in chunk])
+
+
+def _plan_topics_by_wing_renames():
+    """Return ``{old_wing: new_wing}`` for ``topics_by_wing`` keys to normalize."""
+    try:
+        from .miner import _load_known_entities_raw
+
+        reg = _load_known_entities_raw()
+    except Exception:
+        return {}
+    tbw = reg.get("topics_by_wing")
+    if not isinstance(tbw, dict):
+        return {}
+    renames = {}
+    for wing in list(tbw.keys()):
+        target = _normalized_wing_target(wing)
+        if target is not None:
+            renames[wing] = target
+    return renames
+
+
+def _apply_topics_by_wing_renames(renames):
+    """Re-key ``topics_by_wing`` in known_entities.json, merging on collision."""
+    if not renames:
+        return
+    import json
+
+    from .miner import _ENTITY_REGISTRY_PATH, _load_known_entities_raw
+
+    try:
+        reg = _load_known_entities_raw()
+    except Exception:
+        return
+    tbw = reg.get("topics_by_wing")
+    if not isinstance(tbw, dict):
+        return
+    for old, new in renames.items():
+        if old not in tbw:
+            continue
+        old_topics = tbw.pop(old) or []
+        if new in tbw:
+            merged = list(tbw[new])
+            for topic in old_topics:
+                if topic not in merged:
+                    merged.append(topic)
+            tbw[new] = merged
+        else:
+            tbw[new] = old_topics
+    reg["topics_by_wing"] = tbw
+    os.makedirs(os.path.dirname(_ENTITY_REGISTRY_PATH), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(_ENTITY_REGISTRY_PATH), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(reg, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, _ENTITY_REGISTRY_PATH)
+    except Exception:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+
+
+def migrate_wing_names(palace_path: str, dry_run: bool = False, confirm: bool = False) -> bool:
+    """Normalize legacy wing names in ``palace_path`` (strip leading/trailing
+    separators), so palaces built before #1675 keep their memories discoverable.
+
+    Re-keys the ``wing`` metadata on drawers and closets in place (IDs untouched)
+    and the ``topics_by_wing`` registry, merging collisions. Idempotent.
+
+    Returns True if anything was (or, in dry-run, would be) migrated.
+    """
+    from .palace import get_closets_collection, get_collection
+
+    try:
+        drawers = get_collection(palace_path, create=False)
+    except Exception as exc:
+        print(f"  No drawer collection found at {palace_path} ({exc}).")
+        return False
+
+    d_items = list(_iter_collection_items(drawers))
+    all_wings = {(m or {}).get("wing") for _, m in d_items if (m or {}).get("wing")}
+    d_summary, d_updates = plan_wing_renames(d_items)
+
+    closets = None
+    c_summary, c_updates = defaultdict(int), []
+    try:
+        closets = get_closets_collection(palace_path, create=False)
+        c_summary, c_updates = plan_wing_renames(_iter_collection_items(closets))
+    except Exception:
+        closets = None
+
+    topic_renames = _plan_topics_by_wing_renames()
+
+    if not d_updates and not c_updates and not topic_renames:
+        print("  All wing names are already normalized — nothing to migrate.")
+        return False
+
+    print("\n  Wing-name migration plan:")
+    merged = defaultdict(lambda: [0, 0])
+    for key, count in d_summary.items():
+        merged[key][0] = count
+    for key, count in c_summary.items():
+        merged[key][1] = count
+    for (old, new), (d_count, c_count) in sorted(merged.items()):
+        note = "  (MERGE into existing wing)" if new in all_wings else ""
+        print(f"    {old!r} -> {new!r}: {d_count} drawer(s), {c_count} closet(s){note}")
+    if topic_renames:
+        print(f"    topics_by_wing: {len(topic_renames)} key(s) re-keyed")
+
+    if dry_run:
+        print("\n  DRY RUN — no changes made.\n")
+        return True
+
+    if not confirm:
+        try:
+            resp = input("  Apply this wing-name migration? [y/N] ").strip().lower()
+        except EOFError:
+            resp = ""
+        if resp not in ("y", "yes"):
+            print("  Aborted.")
+            return False
+
+    _apply_wing_updates(drawers, d_updates)
+    if closets is not None and c_updates:
+        _apply_wing_updates(closets, c_updates)
+    _apply_topics_by_wing_renames(topic_renames)
+
+    parts = [f"{len(d_updates)} drawer(s)"]
+    if c_updates:
+        parts.append(f"{len(c_updates)} closet(s)")
+    if topic_renames:
+        parts.append(f"{len(topic_renames)} topic key(s)")
+    print(f"\n  Migrated {', '.join(parts)}.\n")
     return True

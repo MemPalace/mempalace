@@ -19,6 +19,9 @@ Also pins the three feature contracts:
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -260,32 +263,45 @@ class TestCheckTextContract:
 
 
 class TestCLI:
-    def test_exits_nonzero_when_issues_found(self, tmp_path, monkeypatch, capsys):
+    def test_exits_nonzero_when_issues_found(self, tmp_path):
         """The CLI exit code is how shell scripts / hooks know to act —
-        pin it explicitly."""
-        registry = tmp_path / "known_entities.json"
-        registry.write_text(json.dumps({"people": ["Milla", "Mila"]}))
-        from mempalace import fact_checker, miner
+        pin it explicitly.
 
-        monkeypatch.setattr(miner, "_ENTITY_REGISTRY_PATH", str(registry))
-        miner._ENTITY_REGISTRY_CACHE.update({"mtime": None, "names": frozenset(), "raw": {}})
-
-        # Simulate argv: "Mila said hi"
-        monkeypatch.setattr(
-            "sys.argv",
-            ["fact_checker", "Mila said hi", "--palace", str(tmp_path / "palace")],
+        Uses a fresh subprocess so that the already-imported
+        ``mempalace.fact_checker`` module in the test process does not
+        collide with runpy re-executing it as ``__main__``, which produced
+        a spurious RuntimeWarning from <frozen runpy>.
+        """
+        # Place the registry where the subprocess's miner will find it:
+        # $HOME/.mempalace/known_entities.json.  We give the subprocess a
+        # private HOME so we don't touch the developer's real registry.
+        fake_home = tmp_path / "home"
+        mempalace_dir = fake_home / ".mempalace"
+        mempalace_dir.mkdir(parents=True)
+        (mempalace_dir / "known_entities.json").write_text(
+            json.dumps({"people": ["Milla", "Mila"]})
         )
-        with pytest.raises(SystemExit) as excinfo:
-            # Re-exec the __main__ block via runpy.
-            import runpy
 
-            runpy.run_module("mempalace.fact_checker", run_name="__main__")
+        env = {**os.environ, "HOME": str(fake_home), "USERPROFILE": str(fake_home)}
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "mempalace.fact_checker",
+                "Mila said hi",
+                "--palace",
+                str(tmp_path / "palace"),
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
         # Issues found → exit code 1.
-        assert excinfo.value.code == 1
-        out = capsys.readouterr().out
-        assert "similar_name" in out
-        # Silence unused import warning.
-        _ = (MagicMock, patch, fact_checker)
+        assert result.returncode == 1
+        assert "similar_name" in result.stdout
+        # Silence unused import warning (MagicMock, patch still used by
+        # other tests in the class).
+        _ = (MagicMock, patch)
 
     def test_reconfigures_stdio_to_utf8_on_windows(self):
         """Windows fact_checker --stdin must decode payload as UTF-8.

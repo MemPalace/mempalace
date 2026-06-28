@@ -119,16 +119,8 @@ INPUT=$(cat)
 # backslashes are not mangled by echo flag parsing.
 _mempal_parsed=$(
     umask 077
-    printf '%s' "$INPUT" | "$MEMPAL_PYTHON_BIN" -c "
-import sys, json, re
-data = json.load(sys.stdin)
-sid = data.get('session_id', '')
-tp = data.get('transcript_path', '')
-safe = lambda s: re.sub(r'[^a-zA-Z0-9_/.\-~]', '', str(s))
-print('__MEMPAL_PARSE_OK__')
-print(safe(sid))
-print(safe(tp))
-" 2>"$STATE_DIR/last_python_err.log"
+    printf '%s' "$INPUT" | "$MEMPAL_PYTHON_BIN" -m mempalace.hook_shell parse-precompact \
+        2>"$STATE_DIR/last_python_err.log"
 )
 # Drop the empty file on success; chmod 600 on failure to mirror
 # last_input.log's privacy contract.
@@ -193,7 +185,7 @@ if is_valid_transcript_path "$TRANSCRIPT_PATH" && [ -f "$TRANSCRIPT_PATH" ]; the
     mempalace mine "$(dirname "$TRANSCRIPT_PATH")" --mode convos \
         >> "$STATE_DIR/hook.log" 2>&1
 elif [ -n "$TRANSCRIPT_PATH" ]; then
-    echo "[$(date '+%H:%M:%S')] Skipping invalid transcript path: $TRANSCRIPT_PATH" \
+    echo "[$(date '+%H:%M:%S')] Skipping missing or invalid transcript path after normalization: $TRANSCRIPT_PATH" \
         >> "$STATE_DIR/hook.log"
 fi
 if [ -n "$MEMPAL_DIR" ] && [ -d "$MEMPAL_DIR" ]; then
