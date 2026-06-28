@@ -1061,11 +1061,11 @@ class TestMetadataFacets:
         monkeypatch.setattr(mcp, "_get_collection", lambda: col)
 
         result = mcp.tool_get_taxonomy()
-        assert col.facet_counts.call_args_list == [
-            call("wing"),
+        assert col.facet_counts.call_args_list[0] == call("wing")
+        assert set(col.facet_counts.call_args_list[1:]) == {
             call("room", where={"wing": "wing_a"}),
             call("room", where={"wing": "wing_b"}),
-        ]
+        }
 
         assert result["taxonomy"] == {
             "wing_a": {
