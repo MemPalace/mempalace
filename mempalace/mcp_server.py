@@ -1634,7 +1634,7 @@ def tool_list_rooms(wing: str = None):
             rooms.update(col.facet_counts("room", where=where))
             try:
                 if wing:
-                    wing_count = col.facet_counts("wing").get(wing, 0)
+                    wing_count = col.facet_counts("wing", where={"wing": wing}).get(wing, 0)
                     unknown_rooms = wing_count - sum(rooms.values())
                 else:
                     unknown_rooms = col.count() - sum(rooms.values())
