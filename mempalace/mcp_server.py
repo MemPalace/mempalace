@@ -1524,7 +1524,7 @@ def tool_status():
 
                 temp_rooms = col.facet_counts("room")
                 try:
-                    unknown_rooms = col.count() - sum(temp_rooms.values())
+                    unknown_rooms = count - sum(temp_rooms.values())
                     if unknown_rooms > 0:
                         rooms["unknown"] = unknown_rooms
                 except (TypeError, ValueError):
