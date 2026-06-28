@@ -1031,10 +1031,11 @@ class TestMetadataFacets:
             "room2": 3,
         }
 
-        col.facet_counts.assert_called_once_with(
-            "room",
-            where={"wing": "engineering"},
-        )
+        from unittest.mock import call
+        assert col.facet_counts.call_args_list == [
+            call("room", where={"wing": "engineering"}),
+            call("wing", where={"wing": "engineering"}),
+        ]
 
     def test_tool_get_taxonomy_uses_metadata_facets(self, monkeypatch):
         from unittest.mock import MagicMock, call
