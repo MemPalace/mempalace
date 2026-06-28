@@ -550,10 +550,12 @@ class _QdrantRESTClient:
         *,
         field: str,
         qdrant_filter: Optional[dict] = None,
+        limit: int = 1000,
     ) -> dict[str, int]:
         body: dict[str, Any] = {
             "key": field,
             "exact": True,
+            "limit": limit,
         }
 
         if qdrant_filter:
@@ -1070,6 +1072,7 @@ class QdrantCollection(BaseCollection):
         self,
         field: str,
         where: Optional[dict] = None,
+        limit: int = 1000,
     ) -> dict[str, int]:
         self._ensure_open()
         if not self._remote_exists():
@@ -1086,6 +1089,7 @@ class QdrantCollection(BaseCollection):
             self._remote_collection,
             field=f"{_PAYLOAD_METADATA}.{field}",
             qdrant_filter=q_filter,
+            limit=limit,
         )
 
     def delete(self, *, ids=None, where=None):

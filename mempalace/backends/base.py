@@ -505,6 +505,7 @@ class BaseCollection(ABC):
         self,
         field: str,
         where: Optional[dict] = None,
+        limit: int = 1000,
     ) -> dict[str, int]:
         """Return counts for each distinct value of a metadata field."""
         raise UnsupportedCapabilityError("backend does not support facet_counts")
