@@ -894,16 +894,23 @@ class PgVectorCollection(BaseCollection):
         that meant ``mempalace_status`` transferred O(n × document_size)
         bytes per call, dominating wall time. With ``with_document=False``
         the SELECT replaces document with NULL, dropping the per-row payload
-        to id + metadata.
+        to id + metadata for every caller of this method.
 
-        Filtered fetches (``where`` set) fall back to the base implementation
-        so the ``_matches_where`` post-filter for array/object values keeps
-        running unchanged — same correctness contract as #1840's filtered
-        path. Status, the hot caller, passes no filter.
+        Filtered fetches still need the ``_matches_where`` post-filter for
+        non-pushdown semantics (array/object values where ``metadata @> ...``
+        is broader than the exact match the caller asked for — same
+        correctness contract as #1840's filtered ``get`` path). Since that
+        post-filter only reads ``metadata``, we keep the single-scroll +
+        ``with_document=False`` fast path and just apply the filter locally
+        on the metadata dicts before returning. This extends the wire-byte
+        win to filtered callers as well.
         """
-        if where is not None:
-            return super().get_all_metadata(where=where)
-        return [row["metadata"] for row in self._scroll(with_document=False)]
+        _validate_where(where)
+        pushdown = None if _requires_local_filter(where) else where
+        rows = self._scroll(where=pushdown, with_document=False)
+        if where is None:
+            return [row["metadata"] for row in rows]
+        return [row["metadata"] for row in rows if _matches_where(row["metadata"], where)]
 
     def _rows(
         self,

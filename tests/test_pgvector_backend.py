@@ -533,12 +533,13 @@ def test_pgvector_get_all_metadata_skips_document_column(tmp_path, fake_pgvector
     ]
 
 
-def test_pgvector_get_all_metadata_filtered_falls_back_to_base(tmp_path, fake_pgvector):
-    """Filtered get_all_metadata keeps the base offset-loop + _matches_where path.
+def test_pgvector_get_all_metadata_filtered_uses_fast_path(tmp_path, fake_pgvector):
+    """Filtered get_all_metadata uses the single-pass metadata-only fast path.
 
-    The metadata @> ... pushdown is broader than _matches_where for array/object
-    values (same correctness contract as #1840's filtered path), so the post-filter
-    must run. Falling back to super() preserves it.
+    ``_matches_where`` only reads ``metadata``, so we keep ``with_document=False``
+    and apply the post-filter locally on the metadata dicts. SQL pushdown still
+    happens when the filter is pushdownable; the local ``_matches_where`` re-runs
+    for array/object semantics #1840's filtered path required.
     """
     _backend, col = _collection(tmp_path)
     col.add(
@@ -552,9 +553,11 @@ def test_pgvector_get_all_metadata_filtered_falls_back_to_base(tmp_path, fake_pg
 
     metas = col.get_all_metadata(where={"wing": "x"})
 
-    # Filtered path goes through base get() pagination, so documents ARE pulled
-    # (with_document=True). Correctness > perf for filtered queries.
-    assert all(call["with_document"] is True for call in client.scroll_calls)
+    # Exactly one scroll with with_document=False — pushdown forwards the
+    # equality filter to SQL; no document text on the wire.
+    assert client.scroll_calls == [
+        {"where": {"wing": "x"}, "limit": None, "offset": None, "with_document": False}
+    ]
     assert sorted(metas, key=lambda m: m["wing"]) == [{"wing": "x"}, {"wing": "x"}]
 
 
