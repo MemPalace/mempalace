@@ -10,7 +10,7 @@ Three ways to ingest:
 Same palace. Same search. Different ingest strategies.
 
 Commands:
-    mempalace init <dir>                  Detect rooms from folder structure
+    mempalace init [dir]                  Detect rooms from folder structure
     mempalace split <dir>                 Split concatenated mega-files into per-session files
     mempalace mine <dir>                  Mine project files (default)
     mempalace mine <dir> --mode convos    Mine conversation exports
@@ -1470,25 +1470,17 @@ def _reconfigure_stdio_utf8_on_windows():
     reconfigure_stdio_utf8_on_windows(stdout_errors="replace", stderr_errors="replace")
 
 
-def main():
-    """CLI entry point for the ``mempalace`` console script.
+p_hook = None
+p_instructions = None
+p_palace = None
 
-    Side effect: pops ``PYTHONPATH`` from ``os.environ`` (see #1423) so
-    any subprocess this CLI spawns inherits a clean env. Host applications
-    that call ``main()`` programmatically should be aware that the parent
-    process loses ``PYTHONPATH`` as well. Library imports
-    (``import mempalace.searcher`` from a host app) do NOT trigger this
-    side effect; only the CLI/MCP entry points pop the env var.
-    """
-    # Drop leaked PYTHONPATH so any subprocess the CLI spawns (mine workers,
-    # repair tooling) starts with a clean env. The sys.path filter in
-    # mempalace/__init__.py already protects this process from the same
-    # ABI mismatch; here we extend the protection to children.
-    os.environ.pop("PYTHONPATH", None)
 
-    _reconfigure_stdio_utf8_on_windows()
+def build_parser(version_label=None):
+    """Build the argument parser for the mempalace CLI."""
+    global p_hook, p_instructions, p_palace
 
-    version_label = f"MemPalace {__version__}"
+    if version_label is None:
+        version_label = f"MemPalace {__version__}"
     parser = argparse.ArgumentParser(
         description="MemPalace — Give your AI a memory. No API key required.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1516,7 +1508,7 @@ def main():
 
     # init
     p_init = sub.add_parser("init", help="Detect rooms from your folder structure")
-    p_init.add_argument("dir", help="Project directory to set up")
+    p_init.add_argument("dir", nargs="?", default=".", help="Project directory to set up (default: current directory)")
     p_init.add_argument(
         "--backend",
         default=None,
@@ -1986,7 +1978,29 @@ def main():
         help="Storage backend (default: config/env/detected/chroma)",
     )
 
-    args = parser.parse_args()
+    return parser
+
+
+def main(argv=None):
+    """CLI entry point for the ``mempalace`` console script.
+
+    Side effect: pops ``PYTHONPATH`` from ``os.environ`` (see #1423) so
+    any subprocess this CLI spawns inherits a clean env. Host applications
+    that call ``main()`` programmatically should be aware that the parent
+    process loses ``PYTHONPATH`` as well. Library imports
+    (``import mempalace.searcher`` from a host app) do NOT trigger this
+    side effect; only the CLI/MCP entry points pop the env var.
+    """
+    # Drop leaked PYTHONPATH so any subprocess the CLI spawns (mine workers,
+    # repair tooling) starts with a clean env. The sys.path filter in
+    # mempalace/__init__.py already protects this process from the same
+    # ABI mismatch; here we extend the protection to children.
+    os.environ.pop("PYTHONPATH", None)
+
+    _reconfigure_stdio_utf8_on_windows()
+
+    parser = build_parser()
+    args = parser.parse_args(argv)
     _apply_backend_arg(args)
 
     if not args.command:
