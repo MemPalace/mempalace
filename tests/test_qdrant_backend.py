@@ -184,6 +184,7 @@ class _FakeQdrantClient:
         *,
         field,
         qdrant_filter=None,
+        limit=1000,
     ):
         self.facet_calls.append((field, qdrant_filter))
 
