@@ -674,13 +674,19 @@ class _PgVectorClient:
         *,
         where: Optional[dict] = None,
         with_embedding: bool = False,
+        with_document: bool = True,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
     ) -> list[dict]:
         qi = _quote_identifier(table)
         params: list = []
         where_sql = _where_to_sql(where, params) if where else "TRUE"
-        cols = "id, document, metadata"
+        # Project NULL into the document slot when the caller only needs
+        # metadata (e.g. mempalace_status's wing/room tally). Keeps the
+        # positional _row parser unchanged — document remains record[1] —
+        # while avoiding O(n × document_size) bytes over the wire on remote
+        # pgvector deployments. Follow-up to #1840.
+        cols = "id, document, metadata" if with_document else "id, NULL::text, metadata"
         if with_embedding:
             cols += ", embedding"
         sql = f"SELECT {cols} FROM {qi} WHERE {where_sql}"
@@ -855,7 +861,15 @@ class PgVectorCollection(BaseCollection):
                 )
             self._known_dimension = existing_dim or dimension
 
-    def _scroll(self, *, where=None, with_embedding=False, limit=None, offset=None) -> list[dict]:
+    def _scroll(
+        self,
+        *,
+        where=None,
+        with_embedding=False,
+        with_document=True,
+        limit=None,
+        offset=None,
+    ) -> list[dict]:
         self._ensure_open()
         if not self._table_exists():
             if self._marker_exists():
@@ -865,9 +879,31 @@ class PgVectorCollection(BaseCollection):
             self._table,
             where=where,
             with_embedding=with_embedding,
+            with_document=with_document,
             limit=limit,
             offset=offset,
         )
+
+    def get_all_metadata(self, where=None) -> list[dict]:
+        """Single-pass metadata-only fetch — projects out the document column.
+
+        The base implementation pages through ``get(include=["metadatas"])``,
+        which routes here via ``_scroll`` and (pre-this-override) always sent
+        the ``document`` text over the wire even when nothing consumed it.
+        For pgvector deployments where the client is remote (TLS over WAN),
+        that meant ``mempalace_status`` transferred O(n × document_size)
+        bytes per call, dominating wall time. With ``with_document=False``
+        the SELECT replaces document with NULL, dropping the per-row payload
+        to id + metadata.
+
+        Filtered fetches (``where`` set) fall back to the base implementation
+        so the ``_matches_where`` post-filter for array/object values keeps
+        running unchanged — same correctness contract as #1840's filtered
+        path. Status, the hot caller, passes no filter.
+        """
+        if where is not None:
+            return super().get_all_metadata(where=where)
+        return [row["metadata"] for row in self._scroll(with_document=False)]
 
     def _rows(
         self,
