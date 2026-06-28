@@ -1516,7 +1516,7 @@ def tool_status():
             try:
                 temp_wings = col.facet_counts("wing")
                 try:
-                    unknown_wings = col.count() - sum(temp_wings.values())
+                    unknown_wings = count - sum(temp_wings.values())
                     if unknown_wings > 0:
                         wings["unknown"] = unknown_wings
                 except (TypeError, ValueError):
