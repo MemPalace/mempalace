@@ -1144,7 +1144,10 @@ def _fetch_all_metadata(col, where=None):
 def _supports_metadata_facets(col) -> bool:
     """Return True if the collection's backend implements metadata facets."""
     backend = getattr(col, "_backend", None)
-    return backend is not None and "supports_metadata_facets" in backend.capabilities
+    if backend is None:
+        return False
+    capabilities = getattr(backend, "capabilities", None)
+    return isinstance(capabilities, (set, frozenset)) and "supports_metadata_facets" in capabilities
 
 
 _metadata_cache = None
