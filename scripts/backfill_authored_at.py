@@ -30,6 +30,7 @@ In Docker (the MCP image), mount the volume and your session dirs read-only:
       /tmp/backfill.py --palace /data/.mempalace/palace \
         --sessions /sessions/claude --sessions /sessions/codex --apply
 """
+
 import argparse
 import glob
 import os
@@ -110,11 +111,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--palace", required=True, help="Path to the ChromaDB palace dir")
     parser.add_argument(
-        "--sessions", action="append", default=[], required=True,
+        "--sessions",
+        action="append",
+        default=[],
+        required=True,
         help="Directory holding .jsonl transcripts (repeatable)",
     )
     parser.add_argument(
-        "--apply", action="store_true",
+        "--apply",
+        action="store_true",
         help="Write changes (default is a dry run that only reports counts)",
     )
     args = parser.parse_args()

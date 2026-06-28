@@ -1,4 +1,5 @@
 """Integration tests for the authored_at backfill migration (scripts/)."""
+
 import importlib.util
 import uuid
 from pathlib import Path

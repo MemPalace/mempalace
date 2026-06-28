@@ -442,7 +442,9 @@ def _extract_authored_at(filepath):
     return latest
 
 
-def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extract_mode, authored_at=None):
+def _file_chunks_locked(
+    collection, source_file, chunks, wing, room, agent, extract_mode, authored_at=None
+):
     """Lock the source file, purge stale drawers, and upsert fresh chunks.
 
     Combines the per-file serialization that prevents concurrent agents from
@@ -761,7 +763,13 @@ def _mine_convos_impl(
         # Lock + purge stale + file fresh chunks. Lock serializes concurrent
         # agents; purge removes pre-v2 drawers so the schema bump applies.
         drawers_added, room_delta, skipped = _file_chunks_locked(
-            collection, source_file, chunks, wing, room, agent, extract_mode,
+            collection,
+            source_file,
+            chunks,
+            wing,
+            room,
+            agent,
+            extract_mode,
             authored_at=_extract_authored_at(filepath),
         )
         if skipped:
