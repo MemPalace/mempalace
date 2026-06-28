@@ -1628,9 +1628,25 @@ def tool_list_rooms(wing: str = None):
     result = {"wing": wing or "all", "rooms": rooms}
     where = {"wing": wing} if wing else None
     try:
-        if _supports_metadata_facets(col):
+        try:
+            if not _supports_metadata_facets(col):
+                raise ValueError("facets not supported")
             rooms.update(col.facet_counts("room", where=where))
-        else:
+            try:
+                if wing:
+                    wing_count = col.facet_counts("wing").get(wing, 0)
+                    unknown_rooms = wing_count - sum(rooms.values())
+                else:
+                    unknown_rooms = col.count() - sum(rooms.values())
+                if unknown_rooms > 0:
+                    rooms["unknown"] = unknown_rooms
+            except (TypeError, ValueError):
+                pass
+        except Exception as e:
+            if _supports_metadata_facets(col):
+                logger.warning(
+                    "Failed to fetch metadata facets, falling back to client-side loop: %s", e
+                )
             all_meta = _fetch_all_metadata(col, where=where)
             for m in all_meta:
                 m = m or {}
@@ -1654,18 +1670,32 @@ def tool_get_taxonomy():
     taxonomy = {}
     result = {"taxonomy": taxonomy}
     try:
-        if _supports_metadata_facets(col):
+        try:
+            if not _supports_metadata_facets(col):
+                raise ValueError("facets not supported")
             from concurrent.futures import ThreadPoolExecutor
 
-            wings = list(col.facet_counts("wing").keys())
+            wing_counts = col.facet_counts("wing")
+            wings = list(wing_counts.keys())
             with ThreadPoolExecutor() as executor:
                 futures = {
                     wing: executor.submit(col.facet_counts, "room", where={"wing": wing})
                     for wing in wings
                 }
                 for wing, future in futures.items():
-                    taxonomy[wing] = future.result()
-        else:
+                    room_counts = future.result()
+                    try:
+                        unknown_rooms = wing_counts[wing] - sum(room_counts.values())
+                        if unknown_rooms > 0:
+                            room_counts["unknown"] = unknown_rooms
+                    except (TypeError, ValueError):
+                        pass
+                    taxonomy[wing] = room_counts
+        except Exception as e:
+            if _supports_metadata_facets(col):
+                logger.warning(
+                    "Failed to fetch metadata facets, falling back to client-side loop: %s", e
+                )
             all_meta = _get_cached_metadata(col)
             for m in all_meta:
                 m = m or {}

@@ -569,7 +569,7 @@ class _QdrantRESTClient:
         hits = result.get("hits") or []
 
         return {
-            str(hit["value"]): int(hit.get("count", 0))
+            str(hit["value"]): int(hit.get("count") or 0)
             for hit in hits
             if hit.get("value") is not None
         }
