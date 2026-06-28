@@ -1539,6 +1539,8 @@ def tool_status():
                 logger.warning(
                     "Failed to fetch metadata facets, falling back to client-side loop: %s", e
                 )
+                rooms.clear()
+                wings.clear()
                 all_meta = _get_cached_metadata(col)
                 for m in all_meta:
                     m = m or {}
@@ -1624,6 +1626,7 @@ def tool_list_wings():
                 logger.warning(
                     "Failed to fetch metadata facets, falling back to client-side loop: %s", e
                 )
+            wings.clear()
             all_meta = _get_cached_metadata(col)
             for m in all_meta:
                 m = m or {}
@@ -1678,6 +1681,7 @@ def tool_list_rooms(wing: str = None):
                 logger.warning(
                     "Failed to fetch metadata facets, falling back to client-side loop: %s", e
                 )
+            rooms.clear()
             all_meta = _fetch_all_metadata(col, where=where)
             for m in all_meta:
                 m = m or {}
