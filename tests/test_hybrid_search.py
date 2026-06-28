@@ -12,7 +12,7 @@ from mempalace.palace import (
     get_collection,
     upsert_closet_lines,
 )
-from mempalace.searcher import search_memories
+from mempalace.searcher import _hybrid_rank, search_memories
 
 
 def _seed_drawers(palace_path):
@@ -173,3 +173,34 @@ class TestSourceFileFilter:
         ids = [h["source_file"] for h in result["results"]]
         assert "fixture_D1.md" not in ids
         assert set(ids) <= {"fixture_D4.md"}
+
+
+def test_hybrid_rank_breaks_score_ties_by_authored_at():
+    """Identical-content hits get identical vector + BM25 scores; the tie must break
+    toward the more recently authored drawer, not arbitrary backend order."""
+    older = {
+        "text": "alpha beta gamma",
+        "distance": 0.2,
+        "metadata": {"authored_at": "2026-06-21T10:00:00.000Z"},
+    }
+    newer = {
+        "text": "alpha beta gamma",
+        "distance": 0.2,
+        "metadata": {"authored_at": "2026-06-27T10:00:00.000Z"},
+    }
+    # Input order puts the older drawer first; the tiebreak should reorder it.
+    results = [older, newer]
+    _hybrid_rank(results, "alpha beta gamma")
+    assert results[0]["metadata"]["authored_at"] == "2026-06-27T10:00:00.000Z"
+    assert results[1]["metadata"]["authored_at"] == "2026-06-21T10:00:00.000Z"
+
+
+def test_hybrid_rank_tiebreak_handles_top_level_authored_at():
+    """The search_memories path puts authored_at at the top level (no `metadata`
+    nesting); the tie-break must read it there too."""
+    older = {"text": "alpha beta gamma", "distance": 0.2, "authored_at": "2026-06-21T10:00:00.000Z"}
+    newer = {"text": "alpha beta gamma", "distance": 0.2, "authored_at": "2026-06-27T10:00:00.000Z"}
+    results = [older, newer]
+    _hybrid_rank(results, "alpha beta gamma")
+    assert results[0]["authored_at"] == "2026-06-27T10:00:00.000Z"
+    assert results[1]["authored_at"] == "2026-06-21T10:00:00.000Z"

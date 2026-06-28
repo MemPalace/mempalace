@@ -93,8 +93,19 @@ class _FakePgVectorClient:
             out.append(item)
         return out
 
-    def scroll_rows(self, table, *, where=None, with_embedding=False, limit=None, offset=None):
-        self.scroll_calls.append({"where": where, "limit": limit, "offset": offset})
+    def scroll_rows(
+        self,
+        table,
+        *,
+        where=None,
+        with_embedding=False,
+        with_document=True,
+        limit=None,
+        offset=None,
+    ):
+        self.scroll_calls.append(
+            {"where": where, "limit": limit, "offset": offset, "with_document": with_document}
+        )
         rows = self._filtered(table, where)
         if limit is not None or offset:
             # Mirror the real backend: ORDER BY id, then LIMIT/OFFSET.
@@ -108,7 +119,9 @@ class _FakePgVectorClient:
             out.append(
                 {
                     "id": row["id"],
-                    "document": row["document"],
+                    # Match the real backend: NULL document becomes empty string
+                    # via the SELECT NULL::text projection when with_document=False.
+                    "document": row["document"] if with_document else "",
                     "metadata": row.get("metadata") or {},
                     "embedding": row.get("embedding") if with_embedding else None,
                     "distance": None,
@@ -390,7 +403,7 @@ def test_pgvector_get_unfiltered_page_pushes_limit_offset(tmp_path, fake_pgvecto
 
     # An unfiltered page is pushed to SQL as LIMIT/OFFSET instead of fetching
     # the whole table and slicing in Python (the O(rows x pages) path).
-    assert client.scroll_calls == [{"where": None, "limit": 2, "offset": 1}]
+    assert client.scroll_calls == [{"where": None, "limit": 2, "offset": 1, "with_document": True}]
     # ORDER BY id, then OFFSET 1 LIMIT 2 -> b, c.
     assert page.ids == ["b", "c"]
 
@@ -410,7 +423,9 @@ def test_pgvector_get_filtered_page_stays_on_full_scan(tmp_path, fake_pgvector):
 
     # A filtered get keeps the full-scan path (no LIMIT/OFFSET pushed) so the
     # exact _matches_where re-filter runs before pagination.
-    assert client.scroll_calls == [{"where": {"wing": "x"}, "limit": None, "offset": None}]
+    assert client.scroll_calls == [
+        {"where": {"wing": "x"}, "limit": None, "offset": None, "with_document": True}
+    ]
     assert page.ids == ["c"]
 
 
@@ -427,13 +442,17 @@ def test_pgvector_get_offset_only_and_limit_only_push(tmp_path, fake_pgvector):
     # offset-only (limit=None) is pushed.
     client.scroll_calls.clear()
     page = col.get(offset=2, include=["metadatas"])
-    assert client.scroll_calls == [{"where": None, "limit": None, "offset": 2}]
+    assert client.scroll_calls == [
+        {"where": None, "limit": None, "offset": 2, "with_document": True}
+    ]
     assert page.ids == ["c", "d"]
 
     # limit-only (offset=None) is pushed.
     client.scroll_calls.clear()
     page = col.get(limit=2, include=["metadatas"])
-    assert client.scroll_calls == [{"where": None, "limit": 2, "offset": None}]
+    assert client.scroll_calls == [
+        {"where": None, "limit": 2, "offset": None, "with_document": True}
+    ]
     assert page.ids == ["a", "b"]
 
 
@@ -451,7 +470,9 @@ def test_pgvector_get_negative_bounds_use_python_slice(tmp_path, fake_pgvector):
     # A negative offset must not reach SQL (OFFSET -1 would error); it falls
     # through to the unchanged full-scan + Python-slice path.
     page = col.get(offset=-1, include=["metadatas"])
-    assert client.scroll_calls == [{"where": None, "limit": None, "offset": None}]
+    assert client.scroll_calls == [
+        {"where": None, "limit": None, "offset": None, "with_document": True}
+    ]
     assert page.ids == ["c"]
 
 
@@ -471,6 +492,73 @@ def test_pgvector_get_pages_tile_without_overlap(tmp_path, fake_pgvector):
     assert p2 == ["c", "d"]
     assert p3 == ["e"]
     assert p1 + p2 + p3 == ["a", "b", "c", "d", "e"]
+
+
+def test_pgvector_get_all_metadata_skips_document_column(tmp_path, fake_pgvector):
+    """The metadata-only fast path must NOT pull document text over the wire.
+
+    Default base ``get_all_metadata`` pages through ``get(include=["metadatas"])``,
+    which used to route here via scroll_rows with documents always selected — the
+    "separate follow-up" #1840 flagged. This override calls scroll_rows with
+    with_document=False so the SELECT projects NULL into the document slot,
+    dropping per-row payload for remote (TLS over WAN) clients where status
+    otherwise dominates wall time.
+    """
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a", "b", "c"],
+        documents=["doc_a", "doc_b", "doc_c"],
+        metadatas=[
+            {"wing": "p", "room": "backend"},
+            {"wing": "p", "room": "frontend"},
+            {"wing": "q", "room": "backend"},
+        ],
+        embeddings=[[1, 0], [0, 1], [0.5, 0.5]],
+    )
+    client = fake_pgvector.instances[0]
+    client.scroll_calls.clear()
+
+    metas = col.get_all_metadata()
+
+    # Exactly one scroll, with_document=False (no document text on the wire).
+    assert client.scroll_calls == [
+        {"where": None, "limit": None, "offset": None, "with_document": False}
+    ]
+    # Returns just the metadata dicts (full set, any order — sort by wing+room for stability).
+    metas_sorted = sorted(metas, key=lambda m: (m["wing"], m["room"]))
+    assert metas_sorted == [
+        {"wing": "p", "room": "backend"},
+        {"wing": "p", "room": "frontend"},
+        {"wing": "q", "room": "backend"},
+    ]
+
+
+def test_pgvector_get_all_metadata_filtered_uses_fast_path(tmp_path, fake_pgvector):
+    """Filtered get_all_metadata uses the single-pass metadata-only fast path.
+
+    ``_matches_where`` only reads ``metadata``, so we keep ``with_document=False``
+    and apply the post-filter locally on the metadata dicts. SQL pushdown still
+    happens when the filter is pushdownable; the local ``_matches_where`` re-runs
+    for array/object semantics #1840's filtered path required.
+    """
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a", "b", "c"],
+        documents=["doc_a", "doc_b", "doc_c"],
+        metadatas=[{"wing": "x"}, {"wing": "y"}, {"wing": "x"}],
+        embeddings=[[1, 0], [0, 1], [0.5, 0.5]],
+    )
+    client = fake_pgvector.instances[0]
+    client.scroll_calls.clear()
+
+    metas = col.get_all_metadata(where={"wing": "x"})
+
+    # Exactly one scroll with with_document=False — pushdown forwards the
+    # equality filter to SQL; no document text on the wire.
+    assert client.scroll_calls == [
+        {"where": {"wing": "x"}, "limit": None, "offset": None, "with_document": False}
+    ]
+    assert sorted(metas, key=lambda m: m["wing"]) == [{"wing": "x"}, {"wing": "x"}]
 
 
 def test_pgvector_delete_by_where_pushdown_and_local(tmp_path, fake_pgvector):

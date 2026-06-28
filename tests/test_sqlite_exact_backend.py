@@ -4,6 +4,8 @@ import threading
 
 import pytest
 
+from _chroma_palace_helper import make_minimal_chroma_sqlite, make_minimal_sqlite_exact_sqlite
+
 import mempalace.backends.sqlite_exact as sqlite_exact_module
 from mempalace.backends import (
     BackendMismatchError,
@@ -410,7 +412,7 @@ def test_palace_wrapper_embeds_for_sqlite_exact(tmp_path, monkeypatch):
 def test_backend_mismatch_protection(tmp_path, monkeypatch):
     from mempalace.palace import get_collection
 
-    (tmp_path / "chroma.sqlite3").write_bytes(b"")
+    make_minimal_chroma_sqlite(tmp_path)
     monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "sqlite_exact")
 
     with pytest.raises(BackendMismatchError):
@@ -420,12 +422,44 @@ def test_backend_mismatch_protection(tmp_path, monkeypatch):
 def test_mixed_backend_artifacts_are_rejected_even_when_chroma_selected(tmp_path, monkeypatch):
     from mempalace.palace import resolve_backend_name
 
-    (tmp_path / "chroma.sqlite3").write_bytes(b"")
-    (tmp_path / "sqlite_exact.sqlite3").write_bytes(b"")
+    make_minimal_chroma_sqlite(tmp_path)
+    make_minimal_sqlite_exact_sqlite(tmp_path)
     monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "chroma")
 
     with pytest.raises(BackendMismatchError):
         resolve_backend_name(str(tmp_path))
+
+
+def test_sqlite_exact_detect_matches_palace_with_sqlite_header(tmp_path):
+    """A real SQLite database at ``<path>/sqlite_exact.sqlite3`` registers
+    as sqlite_exact. Mirrors the chroma analog at
+    ``test_chroma_detect_matches_palace_with_sqlite_header``.
+    """
+    make_minimal_sqlite_exact_sqlite(tmp_path)
+    assert SQLiteExactBackend.detect(str(tmp_path)) is True
+    assert SQLiteExactBackend.detect(str(tmp_path.parent)) is False
+
+
+def test_sqlite_exact_detect_rejects_empty_sqlite_exact_sqlite(tmp_path):
+    """A 0-byte ``sqlite_exact.sqlite3`` is not a sqlite_exact palace (#1893).
+
+    Same root cause as the chroma side: bare ``sqlite3.connect()`` against
+    a missing path leaves a 0-byte file behind because the SQLite header is
+    written on the first statement, not on connect. Detection must reject
+    that artifact so it cannot trip ``BackendMismatchError`` against a real
+    non-sqlite_exact backend marker in the same directory.
+    """
+    (tmp_path / "sqlite_exact.sqlite3").write_bytes(b"")
+    assert SQLiteExactBackend.detect(str(tmp_path)) is False
+
+
+def test_sqlite_exact_detect_rejects_non_sqlite_file(tmp_path):
+    """A non-SQLite file at the ``sqlite_exact.sqlite3`` path is not
+    sqlite_exact. Defends against partial writes / garbage content / anything
+    that lands at the canonical path but isn't actually a SQLite database.
+    """
+    (tmp_path / "sqlite_exact.sqlite3").write_bytes(b"not a sqlite file" * 4)
+    assert SQLiteExactBackend.detect(str(tmp_path)) is False
 
 
 def test_sqlite_exact_exact_ranking_uses_cosine(tmp_path):

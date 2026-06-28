@@ -660,6 +660,11 @@ def _mine_sync():
                     stdout=log_f,
                     stderr=log_f,
                     timeout=60,
+                    # Windows: hide the conhost window this sync mine would
+                    # otherwise flash on every fire. Mirrors the async paths
+                    # (_spawn_mine / _desktop_toast) via _detached_popen_kwargs().
+                    # 0 is a no-op off-Windows.
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
         except (OSError, subprocess.TimeoutExpired):
             pass
@@ -851,8 +856,13 @@ def _save_diary_direct(
 
 def _ingest_transcript(transcript_path: str):
     """Mine a Claude Code session transcript into the palace as a conversation."""
-    path = Path(transcript_path).expanduser()
-    if not path.is_file() or path.stat().st_size < 100:
+    path = _validate_transcript_path(transcript_path)
+    if path is None:
+        return
+    try:
+        if not path.is_file() or path.stat().st_size < 100:
+            return
+    except OSError:
         return
 
     try:
@@ -951,6 +961,26 @@ _ENCODED_PARENT_PREFIXES = (
 )
 
 
+def _safe_wing_slug(name: str) -> str:
+    """Normalize a project directory name into a wing slug ``sanitize_name`` accepts.
+
+    Builds on the historical space/hyphen handling: map characters outside
+    ``sanitize_name``'s set to ``_`` while keeping ``.`` and ``'`` so existing wings
+    for names like ``my.app`` are preserved (renaming a wing would orphan diary
+    entries already filed under it), collapse ``..`` which the validator rejects as
+    path traversal, trim edge separators it won't accept, and cap the length so
+    ``wing_<slug>`` stays within ``sanitize_name``'s 128-character limit. Without
+    this a folder containing e.g. a leading ``+`` produced ``wing_+project``, which
+    ``sanitize_name`` rejects — silently breaking diary auto-save. Falls back to
+    ``sessions`` when a name reduces to nothing (e.g. ``+``).
+    """
+    slug = name.lower().replace(" ", "_").replace("-", "_")
+    slug = re.sub(r"[^\w.']+", "_", slug)
+    slug = re.sub(r"\.{2,}", ".", slug)
+    slug = slug[:120].strip("_.'")
+    return slug or "sessions"
+
+
 def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
     """Read ``cwd`` from the first JSONL line that records it.
 
@@ -984,8 +1014,7 @@ def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
                     continue
                 project = cwd_norm.rsplit("/", 1)[-1]
                 if project:
-                    slug = project.lower().replace(" ", "_").replace("-", "_")
-                    return f"wing_{slug}"
+                    return f"wing_{_safe_wing_slug(project)}"
     except OSError:
         pass
     return None
@@ -1042,15 +1071,12 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
             if encoded.startswith(prefix):
                 encoded = encoded[len(prefix) :]
                 break
-        project = encoded.lower().replace(" ", "_").replace("-", "_")
-        if project:
-            return f"wing_{project}"
+        return f"wing_{_safe_wing_slug(encoded)}"
 
     # 3. Legacy — explicit -Projects-<name> segment
     match = re.search(r"-Projects-([^/]+?)(?:/|$)", normalized)
     if match:
-        project = match.group(1).lower().replace(" ", "_").replace("-", "_")
-        return f"wing_{project}"
+        return f"wing_{_safe_wing_slug(match.group(1))}"
 
     # 4. Default
     return "wing_sessions"

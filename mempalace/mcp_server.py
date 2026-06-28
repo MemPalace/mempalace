@@ -101,63 +101,127 @@ from .collision_scan import assert_no_collisions  # noqa: E402
 from .ids import ID_RECIPE, make_drawer_id_from_content  # noqa: E402
 
 
-def _init_logging() -> None:
-    """Root-logger init: always stderr, optionally append to ``MEMPALACE_LOG_FILE``.
+class _MempalaceLogFilter(logging.Filter):
+    """Pass only records emitted by mempalace's own loggers.
 
-    Stderr-only is the default. When ``MEMPALACE_LOG_FILE`` is set, a
-    ``FileHandler`` is attached so MCP-client failures that the client
-    does not surface (e.g. the ``-32000`` cold-load timeout in #1495)
-    remain diagnosable from the file.
+    Lets the ``MEMPALACE_LOG_FILE`` handler attach to an already-configured
+    root logger (a host app embedding the server, #1860) without copying the
+    host's — or a third-party library's — records into mempalace's diagnostic
+    file. mempalace loggers are ``mempalace`` / ``mempalace.*`` (the dotted
+    ``__name__`` family) plus the flat ``mempalace_mcp`` /
+    ``mempalace_format_miner`` / ``mempalace_hallways`` / ``mempalace_graph``
+    loggers — every one is prefixed ``mempalace``.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        name = record.name
+        return name == "mempalace" or name.startswith(("mempalace.", "mempalace_"))
+
+
+# Preserved across importlib.reload via globals(): a reload re-executes this
+# module body, so a plain ``= False`` would reset the guard and let
+# _init_logging() stack a duplicate file handler. globals().get keeps the prior
+# True so the guard survives reload (#1885 review).
+_logging_configured = globals().get("_logging_configured", False)
+
+
+def _init_logging() -> None:
+    """Configure mempalace logging: stderr by default, optional file append.
+
+    ``MEMPALACE_LOG_FILE``, when set, attaches a ``FileHandler`` so MCP-client
+    failures the client never surfaces (e.g. the ``-32000`` cold-load timeout
+    in #1495) stay diagnosable from the file.
+
+    Root-logger ownership (#1860). The server must not hijack a host
+    application's logging, so the two cases are handled differently:
+
+    * **Root unconfigured** (standalone ``mempalace-mcp``): own it — a stderr
+      handler (plus the optional file handler) via ``basicConfig`` at INFO.
+      The historical behaviour.
+    * **Root already configured** (an app imported ``mempalace.mcp_server``
+      after setting up its own logging): leave the host's level, format, and
+      handlers untouched. Attach only the file handler, filtered to
+      mempalace's own records (`_MempalaceLogFilter`), so the host's logs do
+      not bleed into mempalace's file. With ``MEMPALACE_LOG_FILE`` unset the
+      root logger is not touched at all.
+
+    Previously this called ``logging.basicConfig(..., force=True)``, which
+    reset root's handlers/level/format unconditionally and silently clobbered
+    any host app that had configured logging first (#1860). ``force`` existed
+    (#1495) only to stop ``basicConfig`` no-op'ing when handlers already
+    existed; the filtered additive handler preserves that diagnostic contract
+    without the collateral reset.
+
+    The file handler is mempalace-filtered in both paths, so the file is a
+    clean mempalace-only stream. In the embedded path mempalace's records are
+    still subject to the host's root level — a host wanting INFO diagnostics in
+    the file should not raise root above INFO. The standalone path pins INFO.
 
     Failure modes:
 
-    * Invalid path (missing directory, no perms, Windows NUL byte) →
-      stderr-only with a warning. The env var must not become a new
-      server-start failure surface — that would defeat the diagnostic
-      goal. ``ValueError`` is included in the catch because Windows
-      raises it for paths with embedded NUL bytes, not ``OSError``.
-    * Root logger already configured (host app embedding the server,
-      transitive imports touching ``logging``) → ``force=True`` resets
-      the handlers so MEMPALACE_LOG_FILE's contract holds regardless
-      of what touched root logging first. Without ``force=True``,
-      ``basicConfig`` is a no-op when handlers exist and the env var
-      silently does nothing — exactly the diagnostic black hole #1495
-      exists to close.
-    * Concurrent writers (multiple ``mempalace-mcp`` processes pointing
-      at the same path) interleave at the line level. The handler uses
-      append mode so nothing is overwritten, but operators running
-      Claude Code + Claude Desktop simultaneously should give each
-      process its own log path.
+    * Invalid path (missing directory, no perms, Windows NUL byte) → the file
+      handler is skipped with a warning naming ``MEMPALACE_LOG_FILE``; the
+      server still starts. ``ValueError`` is in the catch because Windows
+      raises it for embedded-NUL paths, not ``OSError``.
+    * Concurrent writers (multiple ``mempalace-mcp`` processes at one path)
+      interleave at the line level; append mode means nothing is overwritten,
+      but give each process its own path.
 
-    ``delay=True`` is intentionally NOT set: deferring the open means an
-    invalid path raises at ``emit()`` time (unhandled), defeating the
-    fail-soft contract. With eager open the same error surfaces inside
-    ``FileHandler.__init__`` and lands in our ``except`` below.
+    ``delay=True`` is intentionally NOT set: deferring the open moves an
+    invalid-path error to ``emit()`` time (unhandled), defeating the fail-soft
+    contract. Eager open lands the same error in ``FileHandler.__init__`` and
+    our ``except`` below.
 
-    Module-level invocation: this function runs at import time, preserving
-    the side effect of the previous module-level ``logging.basicConfig``
-    call. Callers that import ``mempalace.mcp_server`` for introspection
-    (``TOOLS`` dict, handler functions) inherit the reset; this matches
-    pre-PR behaviour and is intentional for an MCP entry-point module.
+    Runs at import time (module-level call below) so importing the module for
+    introspection (``TOOLS`` dict, handler functions) configures logging once.
     """
-    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
+    global _logging_configured
+    if _logging_configured:
+        # Idempotent: a second call (e.g. importlib.reload) must not add a
+        # duplicate file handler in the embedded path.
+        return
+    _logging_configured = True
+
     # MEMPALACE_LOG_FILE is operator-supplied and opt-in; this is a
     # local-first server (CLAUDE.md design principle), so no path
     # sanitization — the operator's process UID is the trust boundary.
     log_file = os.environ.get("MEMPALACE_LOG_FILE", "").strip()
+    file_handler: logging.Handler | None = None
     file_handler_error: Exception | None = None
     if log_file:
         try:
-            handlers.append(logging.FileHandler(log_file, mode="a", encoding="utf-8"))
+            file_handler = logging.FileHandler(log_file, mode="a", encoding="utf-8")
+            # Pin the format: the embedded path never calls basicConfig, so set
+            # it here instead of relying on logging's default formatter. The
+            # default already renders "%(message)s", but the explicit set makes
+            # both paths identical and independent of that default (#1885 review).
+            file_handler.setFormatter(logging.Formatter("%(message)s"))
+            # File is a mempalace-only diagnostic stream; keep host / library
+            # records out so it stays useful when the handler rides on a
+            # host-owned root logger (#1860).
+            file_handler.addFilter(_MempalaceLogFilter())
         except (OSError, ValueError) as exc:
             # Fail-soft: see "Invalid path" failure mode above. Broad on
             # (OSError, ValueError) because Windows raises ValueError for
             # NUL-byte paths while POSIX uses OSError for missing-dir / EPERM.
             file_handler_error = exc
-    logging.basicConfig(level=logging.INFO, format="%(message)s", handlers=handlers, force=True)
+
+    root = logging.getLogger()
+    if root.handlers:
+        # A host app (or a transitive import) already owns root logging. Do
+        # NOT reset it (#1860) — only add our filtered file handler, if any.
+        if file_handler is not None:
+            root.addHandler(file_handler)
+    else:
+        # Standalone server: own the unconfigured root logger as before.
+        handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
+        if file_handler is not None:
+            handlers.append(file_handler)
+        logging.basicConfig(level=logging.INFO, format="%(message)s", handlers=handlers)
+
     if file_handler_error is not None:
         logging.getLogger("mempalace_mcp").warning(
-            "MEMPALACE_LOG_FILE=%r could not be opened (%s); using stderr only",
+            "MEMPALACE_LOG_FILE=%r could not be opened (%s); file logging disabled",
             log_file,
             file_handler_error,
         )
@@ -1213,6 +1277,77 @@ def _sanitize_optional_source_file(value: str = None) -> str:
             f"source_file exceeds maximum length of {_MAX_SOURCE_FILE_LENGTH} characters"
         )
     return value
+
+
+def _parse_date_filter(value: Optional[str] = None, field_name: str = "date") -> Optional[datetime]:
+    """Parse an optional ISO-8601 date/datetime filter bound (#1128).
+
+    Accepts a date (``"2026-04-01"``), a naive timestamp
+    (``"2026-04-01T09:30:00"``), or one carrying a ``Z``/``+HH:MM`` offset.
+    Returns a naive ``datetime`` for wall-clock
+    comparison against drawer ``filed_at`` values, which are stored as naive
+    local ISO strings (``datetime.now().isoformat()``). Any timezone offset on
+    the input is dropped so an aware bound never raises a ``TypeError`` against
+    a naive ``filed_at``. Comparison is therefore wall-clock, which is what the
+    local-first single-machine model wants; an offset bound is matched on its
+    wall-clock fields, not its absolute instant, so a bound whose offset differs
+    from the zone ``filed_at`` was recorded in is matched by clock time.
+    The accepted grammar is a date, an ISO timestamp (optionally fractional),
+    and an optional ``Z``/``±HH:MM`` offset; other ISO 8601 forms (basic format,
+    week dates) are outside the contract and are rejected on the Python 3.9 floor
+    even where a newer ``fromisoformat`` would accept them.
+    Blank / whitespace-only means "no filter" (``None``).
+    Raises ``ValueError`` on an unparseable value so the caller can surface a
+    clear error, mirroring the wing/room sanitizers.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be an ISO date string")
+    value = value.strip()
+    if not value:
+        return None
+    # datetime.fromisoformat before Python 3.11 rejects a trailing "Z" (Zulu),
+    # and appending "+00:00" would break a date-only value on 3.9/3.10
+    # ("2026-04-01+00:00" is rejected there). Any offset is dropped below for
+    # wall-clock comparison anyway, so just strip a trailing Z/z; both date and
+    # date-time Zulu inputs then parse on the 3.9 floor.
+    iso = value[:-1] if value.endswith(("Z", "z")) else value
+    try:
+        parsed = datetime.fromisoformat(iso)
+    except ValueError as exc:
+        raise ValueError(
+            f"{field_name} must be an ISO date string "
+            f"(e.g. '2026-04-01' or '2026-04-01T09:30:00'), got {value!r}"
+        ) from exc
+    if parsed.tzinfo is not None:
+        parsed = parsed.replace(tzinfo=None)
+    return parsed
+
+
+def _filed_at_in_window(
+    filed_at, since_dt: Optional[datetime], before_dt: Optional[datetime]
+) -> bool:
+    """True if a drawer's ``filed_at`` falls in ``[since, before)`` (#1128).
+
+    ``since`` is inclusive and ``before`` is exclusive, matching the issue spec.
+    Parsing (``Z``/offset normalization, tz drop) is delegated to
+    ``_parse_date_filter`` so a bound and a ``filed_at`` are compared
+    identically. A drawer whose ``filed_at`` is missing or unparseable cannot
+    be confirmed in-window, so it is EXCLUDED whenever a bound is active — a
+    date-filtered listing must never silently include rows of unknown age.
+    """
+    try:
+        filed_dt = _parse_date_filter(filed_at, "filed_at")
+    except ValueError:
+        return False
+    if filed_dt is None:
+        return False
+    if since_dt is not None and filed_dt < since_dt:
+        return False
+    if before_dt is not None and filed_dt >= before_dt:
+        return False
+    return True
 
 
 # ==================== READ TOOLS ====================
@@ -2838,14 +2973,34 @@ def tool_get_drawer(drawer_id: str):
         return {"error": str(e)}
 
 
-def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offset: int = 0):
-    """List logical drawers with pagination."""
+def tool_list_drawers(
+    wing: str = None,
+    room: str = None,
+    since: str = None,
+    before: str = None,
+    limit: int = 20,
+    offset: int = 0,
+):
+    """List logical drawers with pagination.
+
+    Optional ``since`` / ``before`` filter by drawer ``filed_at`` (ISO date or
+    timestamp): ``since`` is inclusive, ``before`` is exclusive (#1128). A
+    drawer whose ``filed_at`` is missing or unparseable is excluded while a
+    date bound is active. The filter is applied in Python after the rows are
+    fetched — ChromaDB rejects string operands for ``$gte``/``$lt`` (1.5.7),
+    and ``filed_at`` is stored as an ISO string, so a server-side ``where``
+    comparison is not available.
+    """
     limit = max(1, min(limit, _MAX_RESULTS))
     offset = max(0, offset)
 
     try:
         wing = _sanitize_optional_name(wing, "wing")
         room = _sanitize_optional_name(room, "room")
+        since_dt = _parse_date_filter(since, "since")
+        before_dt = _parse_date_filter(before, "before")
+        if since_dt is not None and before_dt is not None and since_dt >= before_dt:
+            raise ValueError(f"since ({since!r}) must be earlier than before ({before!r})")
     except ValueError as e:
         return {"error": str(e)}
 
@@ -2869,6 +3024,14 @@ def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offse
 
         ids, documents, metadatas = _fetch_drawer_rows(col, where=where)
         drawers = _collapse_drawer_rows(ids, documents, metadatas)
+
+        if since_dt is not None or before_dt is not None:
+            drawers = [
+                d
+                for d in drawers
+                if _filed_at_in_window(d.get("metadata", {}).get("filed_at"), since_dt, before_dt)
+            ]
+
         page = drawers[offset : offset + limit]
 
         return {
@@ -2879,6 +3042,7 @@ def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offse
             "limit": limit,
         }
     except Exception as e:
+        logger.exception("tool_list_drawers failed")
         return {"error": str(e)}
 
 
@@ -4092,12 +4256,20 @@ TOOLS = {
         "handler": tool_get_drawer,
     },
     "mempalace_list_drawers": {
-        "description": "List drawers with pagination. Optional wing/room filter. Returns IDs, wings, rooms, content previews, and total matching count for pagination.",
+        "description": "List drawers with pagination. Optional wing/room filter and since/before date filter on filed_at (since inclusive, before exclusive; drawers without a parseable filed_at are excluded when a date bound is set). Returns IDs, wings, rooms, content previews, and total matching count for pagination.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "wing": {"type": "string", "description": "Filter by wing (optional)"},
                 "room": {"type": "string", "description": "Filter by room (optional)"},
+                "since": {
+                    "type": "string",
+                    "description": "Only drawers filed on or after this ISO date/time, inclusive (e.g. '2026-04-01'). Optional.",
+                },
+                "before": {
+                    "type": "string",
+                    "description": "Only drawers filed before this ISO date/time, exclusive (e.g. '2026-05-01'). Optional.",
+                },
                 "limit": {
                     "type": "integer",
                     "description": "Max results per page (default 20, max 100)",
@@ -4681,6 +4853,7 @@ _HTTP_MAX_REQUEST_BYTES = 16 * 1024 * 1024
 # bind is loopback (skip the network-exposure warning) and to pin the Host
 # header against DNS rebinding when serving on loopback.
 _HTTP_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1", "[::1]")
+_HTTP_ALLOW_INSECURE_NO_TOKEN_ENV = "MEMPALACE_MCP_HTTP_ALLOW_INSECURE_NO_TOKEN"
 
 
 def _http_is_loopback(host: str) -> bool:
@@ -4737,6 +4910,16 @@ def _build_http_server(host: str, port: int):
     from urllib.parse import urlparse
 
     auth_token = os.environ.get("MEMPALACE_MCP_HTTP_TOKEN", "").strip()
+    if (
+        not _http_is_loopback(host)
+        and not auth_token
+        and not _truthy_env(_HTTP_ALLOW_INSECURE_NO_TOKEN_ENV)
+    ):
+        raise ValueError(
+            "MEMPALACE_MCP_HTTP_TOKEN is required when binding MCP HTTP to a "
+            f"non-loopback host. Set {_HTTP_ALLOW_INSECURE_NO_TOKEN_ENV}=1 only "
+            "when a trusted fronting layer provides access control."
+        )
 
     class _MCPHTTPServer(ThreadingHTTPServer):
         daemon_threads = True
@@ -4873,18 +5056,25 @@ def _serve_http(host: str, port: int) -> None:
     """
     try:
         httpd = _build_http_server(host, port)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         logger.error("Failed to start MCP HTTP server on %s:%s: %s", host, port, exc)
         sys.exit(1)
 
     bound_port = httpd.server_address[1]
     if not _http_is_loopback(host):
-        logger.warning(
-            "MemPalace MCP HTTP server bound to non-loopback host %s — the palace "
-            "is now reachable from the network and /mcp is unauthenticated unless "
-            "you set MEMPALACE_MCP_HTTP_TOKEN. Bind 127.0.0.1 to keep it local.",
-            host,
-        )
+        if httpd.auth_token:
+            logger.warning(
+                "MemPalace MCP HTTP server bound to non-loopback host %s; /mcp "
+                "requires the configured bearer token.",
+                host,
+            )
+        else:
+            logger.warning(
+                "MemPalace MCP HTTP server bound to non-loopback host %s without "
+                "a bearer token because %s is set.",
+                host,
+                _HTTP_ALLOW_INSECURE_NO_TOKEN_ENV,
+            )
     with httpd:
         logger.info("MemPalace MCP HTTP server listening on http://%s:%s/mcp", host, bound_port)
         try:

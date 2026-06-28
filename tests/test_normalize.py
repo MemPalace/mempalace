@@ -1,4 +1,5 @@
 import json
+import stat
 from unittest.mock import patch
 
 from mempalace.normalize import (
@@ -1680,11 +1681,23 @@ def test_claude_code_jsonl_thinking_blocks_ignored():
     assert "A" in result
 
 
-def test_normalize_rejects_large_file():
-    """Files over 500 MB should raise IOError before reading."""
-    with patch("mempalace.normalize.os.path.getsize", return_value=600 * 1024 * 1024):
+def test_normalize_rejects_large_file(tmp_path):
+    """Files over the 500 MB safety limit raise IOError instead of being read.
+
+    Size is checked via ``os.fstat`` on the already-open descriptor (no TOCTOU
+    gap), so we stub fstat to report a huge regular file rather than mocking the
+    pre-open ``os.path.getsize``.
+    """
+    big = tmp_path / "huge_file.txt"
+    big.write_text("not actually huge")
+
+    class _HugeStat:
+        st_mode = stat.S_IFREG | 0o644
+        st_size = 600 * 1024 * 1024
+
+    with patch("mempalace.normalize.os.fstat", return_value=_HugeStat()):
         try:
-            normalize("/fake/huge_file.txt")
+            normalize(str(big))
             assert False, "Should have raised IOError"
         except IOError as e:
             assert "too large" in str(e).lower()

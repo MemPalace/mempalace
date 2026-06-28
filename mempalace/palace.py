@@ -947,45 +947,79 @@ def _validate_palace_fts5_after_mine(palace_path: str) -> None:
         raise MineValidationError(palace_path, errors)
 
 
-# Per-thread record of palaces this thread already holds the lock for. Used by
-# `mine_palace_lock` to short-circuit re-entrant acquisition from the same
-# thread (e.g. miner.mine() acquires the outer lock then calls
+# Process-wide record of palaces this PROCESS already holds the lock for. Used
+# by `mine_palace_lock` to short-circuit re-entrant acquisition from the same
+# process (e.g. miner.mine() acquires the outer lock then calls
 # ChromaCollection.upsert which now also tries to acquire). Without this guard
 # the inner call would block on its own outer flock (Linux fcntl locks are per
-# open file description, so a same-thread second open of the lock file is a
-# distinct lock and self-deadlocks).
+# open file description, so a second open of the lock file from the same process
+# is a distinct lock and self-conflicts / EWOULDBLOCKs).
 #
-# The holder set is tagged with ``pid`` so that a forked child does NOT
-# inherit re-entrant credit from its parent: the OS-level flock IS NOT
-# inherited as a "we hold it" semantically — the child must reacquire — but
-# Python's ``threading.local`` IS inherited across fork. The pid check
-# clears stale state so a forked child correctly hits the fcntl path.
-_palace_lock_holders = threading.local()
+# This MUST be process-wide, not thread-local: the MCP HTTP transport
+# (ThreadingHTTPServer) acquires the long-lived writer-lease on one thread
+# (`mcp_server._acquire_mcp_writer_lock`) but dispatches each write request on a
+# different worker thread. A thread-local guard makes those handlers fail to see
+# the process-held lease, re-acquire the flock, and self-conflict
+# ("palace ... is held by PID <self>"). flock is per-process and HTTP writes are
+# serialized by `_HTTP_REQUEST_LOCK`, so the process is the correct re-entrancy
+# boundary.
+#
+# The holder set is tagged with ``pid`` so that a forked child does NOT inherit
+# re-entrant credit from its parent: the OS-level flock IS NOT inherited as a
+# "we hold it" semantically — the child must reacquire. The pid check clears
+# stale state so a forked child correctly hits the fcntl path. Access is guarded
+# by ``_palace_lock_guard`` because the set is now shared across threads.
+#
+# Fork safety: ``_palace_lock_guard`` is a real ``threading.Lock``, so a child
+# forked while another thread held it would inherit it locked (the holder thread
+# does not exist in the child) and deadlock on the next acquire. An at-fork
+# handler (registered below) replaces the guard with a fresh unlocked lock and
+# clears state in the child, which must reacquire the flock anyway.
+_palace_lock_guard = threading.Lock()
+_palace_lock_pid = None
+_palace_lock_keys = set()
 
 
-def _holder_state():
-    """Return the per-thread (pid, keys) record, refreshing after fork."""
-    keys = getattr(_palace_lock_holders, "keys", None)
-    pid = getattr(_palace_lock_holders, "pid", None)
+def _reset_palace_lock_state_after_fork() -> None:
+    """Reset lock state in a forked child to avoid an inherited-locked deadlock."""
+    global _palace_lock_guard, _palace_lock_pid, _palace_lock_keys
+    _palace_lock_guard = threading.Lock()
+    _palace_lock_keys = set()
+    _palace_lock_pid = os.getpid()
+
+
+# Availability: Unix (no-op elsewhere — Windows has no fork()).
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_palace_lock_state_after_fork)
+
+
+def _holder_keys_locked():
+    """Return the process-wide held-key set, refreshing after fork.
+
+    Caller MUST hold ``_palace_lock_guard``.
+    """
+    global _palace_lock_pid, _palace_lock_keys
     current_pid = os.getpid()
-    if keys is None or pid != current_pid:
-        keys = set()
-        _palace_lock_holders.keys = keys
-        _palace_lock_holders.pid = current_pid
-    return keys
+    if _palace_lock_pid != current_pid:
+        _palace_lock_keys = set()
+        _palace_lock_pid = current_pid
+    return _palace_lock_keys
 
 
-def _held_by_this_thread(lock_key: str) -> bool:
-    """Return True if this thread already holds ``mine_palace_lock`` for ``lock_key``."""
-    return lock_key in _holder_state()
+def _held_by_this_process(lock_key: str) -> bool:
+    """Return True if this process already holds ``mine_palace_lock`` for ``lock_key``."""
+    with _palace_lock_guard:
+        return lock_key in _holder_keys_locked()
 
 
 def _mark_held(lock_key: str) -> None:
-    _holder_state().add(lock_key)
+    with _palace_lock_guard:
+        _holder_keys_locked().add(lock_key)
 
 
 def _mark_released(lock_key: str) -> None:
-    _holder_state().discard(lock_key)
+    with _palace_lock_guard:
+        _holder_keys_locked().discard(lock_key)
 
 
 def _format_lock_holder(content: str) -> str:
@@ -1064,11 +1098,13 @@ def mine_palace_lock(palace_path: str):
     raise MineAlreadyRunning so the caller can exit cleanly instead of
     piling up as a waiting worker.
 
-    Re-entrant: if the current thread already holds the lock for the same
+    Re-entrant: if the current process already holds the lock for the same
     palace, the context manager passes through without re-acquiring. This
     lets ChromaCollection write methods (which acquire the lock themselves
     to protect MCP/direct callers) compose with miner.mine() (which holds
-    the outer lock for the entire mine pipeline) without self-deadlock.
+    the outer lock for the entire mine pipeline) without self-deadlock, and
+    lets the threaded MCP HTTP transport write from a worker thread while the
+    long-lived writer-lease is held on another thread of the same process.
     """
     lock_dir = os.path.join(os.path.expanduser("~"), ".mempalace", "locks")
     os.makedirs(lock_dir, exist_ok=True)
@@ -1077,8 +1113,8 @@ def mine_palace_lock(palace_path: str):
     palace_key = hashlib.sha256(lock_key_source.encode()).hexdigest()[:16]
     lock_path = os.path.join(lock_dir, f"mine_palace_{palace_key}.lock")
 
-    if _held_by_this_thread(palace_key):
-        # Same thread already holds the lock for this palace — pass through.
+    if _held_by_this_process(palace_key):
+        # This process already holds the lock for this palace — pass through.
         yield
         return
 

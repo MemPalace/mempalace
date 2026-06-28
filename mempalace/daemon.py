@@ -963,6 +963,21 @@ def get_client_if_running(palace_path: str, *, health_timeout: float = 5.0) -> D
 
 
 def _detached_kwargs(log_path: Path) -> dict[str, Any]:
+    """Kwargs that spawn the daemon with a hidden console, detached from the CLI.
+
+    Shares the Windows flag logic with ``hooks_cli._detached_popen_kwargs``
+    (which takes no args and opens no log file). On Windows we use
+    ``CREATE_NO_WINDOW`` rather than ``DETACHED_PROCESS``: the latter gives the
+    child no console, so a console-subsystem grandchild later allocates a fresh
+    *visible* window (#1783); ``CREATE_NO_WINDOW`` gives a hidden console that
+    descendants inherit instead. Surviving the launching terminal is carried by
+    ``CREATE_BREAKAWAY_FROM_JOB`` (escapes the parent Job Object's kill-on-close)
+    plus the daemon never being attached to that console -- not by the console
+    flag -- while ``CREATE_NEW_PROCESS_GROUP`` isolates Ctrl-C/Ctrl-Break routing.
+    ``CREATE_NO_WINDOW`` is ignored when OR'd with ``DETACHED_PROCESS``, so this
+    replaces that flag rather than adding it. ``stdin=DEVNULL`` and stdout/stderr
+    redirected to the log avoid the #1268 parent hang.
+    """
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_fh = open(log_path, "a", encoding="utf-8")
     # The daemon log may capture verbatim content in tracebacks — owner-only.
@@ -975,7 +990,7 @@ def _detached_kwargs(log_path: Path) -> dict[str, Any]:
     }
     if os.name == "nt":
         flags = 0
-        for name in ("DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP", "CREATE_BREAKAWAY_FROM_JOB"):
+        for name in ("CREATE_NO_WINDOW", "CREATE_NEW_PROCESS_GROUP", "CREATE_BREAKAWAY_FROM_JOB"):
             flags |= getattr(subprocess, name, 0)
         if flags:
             kwargs["creationflags"] = flags

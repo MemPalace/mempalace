@@ -182,14 +182,14 @@ echo "[$(date '+%H:%M:%S')] PRE-COMPACT triggered for session $SESSION_ID" >> "$
 #   1. TRANSCRIPT_PATH (from Claude Code) → parent dir, --mode convos
 #   2. MEMPAL_DIR → --mode projects
 if is_valid_transcript_path "$TRANSCRIPT_PATH" && [ -f "$TRANSCRIPT_PATH" ]; then
-    mempalace mine "$(dirname "$TRANSCRIPT_PATH")" --mode convos \
+    "$MEMPAL_PYTHON_BIN" -m mempalace mine "$(dirname "$TRANSCRIPT_PATH")" --mode convos \
         >> "$STATE_DIR/hook.log" 2>&1
 elif [ -n "$TRANSCRIPT_PATH" ]; then
     echo "[$(date '+%H:%M:%S')] Skipping missing or invalid transcript path after normalization: $TRANSCRIPT_PATH" \
         >> "$STATE_DIR/hook.log"
 fi
 if [ -n "$MEMPAL_DIR" ] && [ -d "$MEMPAL_DIR" ]; then
-    mempalace mine "$MEMPAL_DIR" --mode projects \
+    "$MEMPAL_PYTHON_BIN" -m mempalace mine "$MEMPAL_DIR" --mode projects \
         >> "$STATE_DIR/hook.log" 2>&1
 fi
 
