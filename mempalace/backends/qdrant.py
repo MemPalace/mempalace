@@ -1080,7 +1080,7 @@ class QdrantCollection(BaseCollection):
                 raise CollectionNotInitializedError(self._collection_name)
             return {}
         _validate_where(where)
-        if _requires_local_filter(where, None):
+        if _requires_local_filter(where):
             raise UnsupportedCapabilityError("facet_counts does not support local-only filters")
 
         q_filter = _qdrant_filter(where)
