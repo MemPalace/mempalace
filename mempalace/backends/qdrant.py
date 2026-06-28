@@ -570,8 +570,8 @@ class _QdrantRESTClient:
 
         return {
             str(hit["value"]): int(hit.get("count") or 0)
-        return {
-            str(hit["value"]): int(hit.get("count") or 0) for hit in hits if hit.get("value") is not None
+            for hit in hits
+            if hit.get("value") is not None
         }
 
     def delete_collection(self, collection: str) -> None:

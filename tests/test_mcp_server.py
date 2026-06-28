@@ -1032,6 +1032,7 @@ class TestMetadataFacets:
         }
 
         from unittest.mock import call
+
         assert col.facet_counts.call_args_list == [
             call("room", where={"wing": "engineering"}),
             call("wing", where={"wing": "engineering"}),
