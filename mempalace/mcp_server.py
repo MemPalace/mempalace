@@ -1591,9 +1591,19 @@ def tool_list_wings():
     wings = {}
     result = {"wings": wings}
     try:
-        if _supports_metadata_facets(col):
+        try:
+            if not _supports_metadata_facets(col):
+                raise ValueError("facets not supported")
             wings.update(col.facet_counts("wing"))
-        else:
+            try:
+                unknown_wings = col.count() - sum(wings.values())
+                if unknown_wings > 0:
+                    wings["unknown"] = unknown_wings
+            except (TypeError, ValueError):
+                pass
+        except Exception as e:
+            if _supports_metadata_facets(col):
+                logger.warning("Failed to fetch metadata facets, falling back to client-side loop: %s", e)
             all_meta = _get_cached_metadata(col)
             for m in all_meta:
                 m = m or {}
