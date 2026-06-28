@@ -1522,6 +1522,14 @@ def tool_status():
                 except (TypeError, ValueError):
                     pass
 
+                rooms.update(col.facet_counts("room"))
+                try:
+                    unknown_rooms = col.count() - sum(rooms.values())
+                    if unknown_rooms > 0:
+                        rooms["unknown"] = unknown_rooms
+                except (TypeError, ValueError):
+                    pass
+
             except Exception as e:
                 logger.warning(
                     "Failed to fetch metadata facets, falling back to client-side loop: %s", e
@@ -1530,13 +1538,17 @@ def tool_status():
                 for m in all_meta:
                     m = m or {}
                     w = m.get("wing", "unknown")
+                    r = m.get("room", "unknown")
                     wings[w] = wings.get(w, 0) + 1
+                    rooms[r] = rooms.get(r, 0) + 1
         else:
             all_meta = _get_cached_metadata(col)
             for m in all_meta:
                 m = m or {}
                 w = m.get("wing", "unknown")
+                r = m.get("room", "unknown")
                 wings[w] = wings.get(w, 0) + 1
+                rooms[r] = rooms.get(r, 0) + 1
     except Exception as e:
         logger.exception("tool_status metadata fetch failed")
         result["error"] = str(e)

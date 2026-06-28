@@ -1053,6 +1053,7 @@ class TestMetadataFacets:
             if field == "room" and where == {"wing": "wing_b"}:
                 return {"room2": 1}
             return {}
+
         col.facet_counts.side_effect = facet_counts_mock
 
         monkeypatch.setattr(mcp, "_get_collection", lambda: col)
