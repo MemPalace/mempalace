@@ -224,8 +224,15 @@ def _hybrid_rank(
     # Break exact score ties toward the more recently authored drawer so equal-score
     # candidates rank chronologically instead of in arbitrary backend order. ISO-8601
     # ``authored_at`` strings sort chronologically; missing dates sort oldest.
+    # authored_at lives at the top level on the search_memories path and nested under
+    # "metadata" on the candidate-union path; check both so the tie-break works for each.
     scored.sort(
-        key=lambda pair: (pair[0], pair[1].get("metadata", {}).get("authored_at", "")),
+        key=lambda pair: (
+            pair[0],
+            pair[1].get("authored_at")
+            or pair[1].get("metadata", {}).get("authored_at")
+            or "",
+        ),
         reverse=True,
     )
     results[:] = [r for _, r in scored]

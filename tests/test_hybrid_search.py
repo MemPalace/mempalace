@@ -193,3 +193,14 @@ def test_hybrid_rank_breaks_score_ties_by_authored_at():
     _hybrid_rank(results, "alpha beta gamma")
     assert results[0]["metadata"]["authored_at"] == "2026-06-27T10:00:00.000Z"
     assert results[1]["metadata"]["authored_at"] == "2026-06-21T10:00:00.000Z"
+
+
+def test_hybrid_rank_tiebreak_handles_top_level_authored_at():
+    """The search_memories path puts authored_at at the top level (no `metadata`
+    nesting); the tie-break must read it there too."""
+    older = {"text": "alpha beta gamma", "distance": 0.2, "authored_at": "2026-06-21T10:00:00.000Z"}
+    newer = {"text": "alpha beta gamma", "distance": 0.2, "authored_at": "2026-06-27T10:00:00.000Z"}
+    results = [older, newer]
+    _hybrid_rank(results, "alpha beta gamma")
+    assert results[0]["authored_at"] == "2026-06-27T10:00:00.000Z"
+    assert results[1]["authored_at"] == "2026-06-21T10:00:00.000Z"

@@ -433,7 +433,9 @@ def _extract_authored_at(filepath):
                     ts = json.loads(line).get("timestamp")
                 except (ValueError, TypeError, AttributeError):
                     continue
-                if ts and (latest is None or ts > latest):
+                # ISO-8601 timestamps are strings; guard against a non-string
+                # ``timestamp`` so a malformed line can't raise TypeError on compare.
+                if isinstance(ts, str) and (latest is None or ts > latest):
                     latest = ts
     except OSError:
         return None

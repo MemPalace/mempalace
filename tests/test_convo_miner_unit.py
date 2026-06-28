@@ -515,3 +515,18 @@ class TestExtractAuthoredAt:
 
     def test_none_for_missing_file(self, tmp_path):
         assert _extract_authored_at(tmp_path / "absent.jsonl") is None
+
+    def test_non_string_timestamp_does_not_crash(self, tmp_path):
+        # A non-string timestamp must be skipped, not raise TypeError on compare.
+        f = tmp_path / "session.jsonl"
+        f.write_text(
+            '{"type": "user", "timestamp": 1234567890}\n'
+            '{"type": "assistant", "timestamp": {"nested": true}}\n'
+            '{"type": "user", "timestamp": "2026-06-24T00:00:00.000Z"}\n'
+        )
+        assert _extract_authored_at(f) == "2026-06-24T00:00:00.000Z"
+
+    def test_only_non_string_timestamps_returns_none(self, tmp_path):
+        f = tmp_path / "session.jsonl"
+        f.write_text('{"timestamp": 1}\n{"timestamp": false}\n')
+        assert _extract_authored_at(f) is None
