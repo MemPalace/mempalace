@@ -1339,6 +1339,32 @@ def cmd_mcp(args):
         print(f"  {base_server_cmd} --palace /path/to/palace")
 
 
+def cmd_visualize(args):
+    """Render knowledge graph as interactive web page."""
+    from .visualize_server import serve
+    from .visualizer import render_kg_web
+
+    kg_path = args.kg_path
+    if not kg_path:
+        kg_path = os.path.expanduser("~/.mempalace/knowledge_graph.sqlite3")
+
+    # Default to server mode; --static generates HTML file
+    if args.static:
+        output_path = render_kg_web(
+            kg_path=kg_path,
+            output_html=args.output,
+            limit=args.limit,
+            as_of=args.as_of,
+        )
+        print(f"  Generated: {output_path}")
+        print(f"  Open in browser: file://{output_path}")
+    else:
+        serve(
+            kg_path=kg_path,
+            port=args.port,
+        )
+
+
 def cmd_compress(args):
     """Compress drawers in a wing using AAAK Dialect."""
     from .dialect import Dialect
@@ -2009,6 +2035,49 @@ def main():
         help="Storage backend (default: config/env/detected/chroma)",
     )
 
+    # visualize
+    p_visualize = sub.add_parser("visualize", help="Render knowledge graph as interactive web page")
+    p_visualize.add_argument(
+        "target",
+        nargs="?",
+        default="kg",
+        choices=["kg"],
+        help="What to visualize (default: kg for knowledge graph)",
+    )
+    p_visualize.add_argument(
+        "--output",
+        "-o",
+        default="kg_mindmap.html",
+        help="Output HTML file (default: kg_mindmap.html)",
+    )
+    p_visualize.add_argument(
+        "--kg-path",
+        default=None,
+        help="Path to knowledge graph (default: ~/.mempalace/knowledge_graph.sqlite3)",
+    )
+    p_visualize.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Maximum number of triples to render",
+    )
+    p_visualize.add_argument(
+        "--as-of",
+        default=None,
+        help="Filter to triples valid on this date (YYYY-MM-DD)",
+    )
+    p_visualize.add_argument(
+        "--static",
+        action="store_true",
+        help="Generate static HTML file instead of starting server",
+    )
+    p_visualize.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="Port for server (default: 8765)",
+    )
+
     args = parser.parse_args()
     _apply_backend_arg(args)
 
@@ -2062,6 +2131,7 @@ def main():
         "migrate": cmd_migrate,
         "migrate-wings": cmd_migrate_wings,
         "status": cmd_status,
+        "visualize": cmd_visualize,
     }
     dispatch[args.command](args)
 
