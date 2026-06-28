@@ -10,6 +10,7 @@ Same palace as project mining. Different ingest strategy.
 
 import os
 import sys
+import json
 import logging
 import stat
 from pathlib import Path
@@ -408,7 +409,38 @@ def scan_convos(convo_dir: str) -> list:
 # =============================================================================
 
 
-def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extract_mode):
+def _extract_authored_at(filepath):
+    """Most-recent message timestamp in a transcript, used as the drawer's authored date.
+
+    Both Claude Code and Codex JSONL transcripts carry a top-level ISO-8601
+    ``timestamp`` on each line. We take the max so ``authored_at`` reflects when the
+    content was actually written, independent of when it was mined (``filed_at``).
+    This restores chronology: a session from days ago keeps its real date even when
+    re-mined today, instead of every drawer collapsing to ingest time. Returns None
+    for formats without per-line timestamps (e.g. plain ``.md``).
+    """
+    path = Path(filepath)
+    if path.suffix != ".jsonl":
+        return None
+    latest = None
+    try:
+        with path.open(encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ts = json.loads(line).get("timestamp")
+                except (ValueError, TypeError, AttributeError):
+                    continue
+                if ts and (latest is None or ts > latest):
+                    latest = ts
+    except OSError:
+        return None
+    return latest
+
+
+def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extract_mode, authored_at=None):
     """Lock the source file, purge stale drawers, and upsert fresh chunks.
 
     Combines the per-file serialization that prevents concurrent agents from
@@ -463,6 +495,7 @@ def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extr
                         "chunk_index": chunk["chunk_index"],
                         "added_by": agent,
                         "filed_at": filed_at,
+                        "authored_at": authored_at if authored_at is not None else filed_at,
                         "ingest_mode": "convos",
                         "extract_mode": extract_mode,
                         "normalize_version": NORMALIZE_VERSION,
@@ -726,7 +759,8 @@ def _mine_convos_impl(
         # Lock + purge stale + file fresh chunks. Lock serializes concurrent
         # agents; purge removes pre-v2 drawers so the schema bump applies.
         drawers_added, room_delta, skipped = _file_chunks_locked(
-            collection, source_file, chunks, wing, room, agent, extract_mode
+            collection, source_file, chunks, wing, room, agent, extract_mode,
+            authored_at=_extract_authored_at(filepath),
         )
         if skipped:
             files_skipped += 1
