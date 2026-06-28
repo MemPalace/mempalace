@@ -1270,6 +1270,77 @@ def _sanitize_optional_source_file(value: str = None) -> str:
     return value
 
 
+def _parse_date_filter(value: Optional[str] = None, field_name: str = "date") -> Optional[datetime]:
+    """Parse an optional ISO-8601 date/datetime filter bound (#1128).
+
+    Accepts a date (``"2026-04-01"``), a naive timestamp
+    (``"2026-04-01T09:30:00"``), or one carrying a ``Z``/``+HH:MM`` offset.
+    Returns a naive ``datetime`` for wall-clock
+    comparison against drawer ``filed_at`` values, which are stored as naive
+    local ISO strings (``datetime.now().isoformat()``). Any timezone offset on
+    the input is dropped so an aware bound never raises a ``TypeError`` against
+    a naive ``filed_at``. Comparison is therefore wall-clock, which is what the
+    local-first single-machine model wants; an offset bound is matched on its
+    wall-clock fields, not its absolute instant, so a bound whose offset differs
+    from the zone ``filed_at`` was recorded in is matched by clock time.
+    The accepted grammar is a date, an ISO timestamp (optionally fractional),
+    and an optional ``Z``/``±HH:MM`` offset; other ISO 8601 forms (basic format,
+    week dates) are outside the contract and are rejected on the Python 3.9 floor
+    even where a newer ``fromisoformat`` would accept them.
+    Blank / whitespace-only means "no filter" (``None``).
+    Raises ``ValueError`` on an unparseable value so the caller can surface a
+    clear error, mirroring the wing/room sanitizers.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be an ISO date string")
+    value = value.strip()
+    if not value:
+        return None
+    # datetime.fromisoformat before Python 3.11 rejects a trailing "Z" (Zulu),
+    # and appending "+00:00" would break a date-only value on 3.9/3.10
+    # ("2026-04-01+00:00" is rejected there). Any offset is dropped below for
+    # wall-clock comparison anyway, so just strip a trailing Z/z; both date and
+    # date-time Zulu inputs then parse on the 3.9 floor.
+    iso = value[:-1] if value.endswith(("Z", "z")) else value
+    try:
+        parsed = datetime.fromisoformat(iso)
+    except ValueError as exc:
+        raise ValueError(
+            f"{field_name} must be an ISO date string "
+            f"(e.g. '2026-04-01' or '2026-04-01T09:30:00'), got {value!r}"
+        ) from exc
+    if parsed.tzinfo is not None:
+        parsed = parsed.replace(tzinfo=None)
+    return parsed
+
+
+def _filed_at_in_window(
+    filed_at, since_dt: Optional[datetime], before_dt: Optional[datetime]
+) -> bool:
+    """True if a drawer's ``filed_at`` falls in ``[since, before)`` (#1128).
+
+    ``since`` is inclusive and ``before`` is exclusive, matching the issue spec.
+    Parsing (``Z``/offset normalization, tz drop) is delegated to
+    ``_parse_date_filter`` so a bound and a ``filed_at`` are compared
+    identically. A drawer whose ``filed_at`` is missing or unparseable cannot
+    be confirmed in-window, so it is EXCLUDED whenever a bound is active — a
+    date-filtered listing must never silently include rows of unknown age.
+    """
+    try:
+        filed_dt = _parse_date_filter(filed_at, "filed_at")
+    except ValueError:
+        return False
+    if filed_dt is None:
+        return False
+    if since_dt is not None and filed_dt < since_dt:
+        return False
+    if before_dt is not None and filed_dt >= before_dt:
+        return False
+    return True
+
+
 # ==================== READ TOOLS ====================
 
 
@@ -2793,14 +2864,34 @@ def tool_get_drawer(drawer_id: str):
         return {"error": str(e)}
 
 
-def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offset: int = 0):
-    """List logical drawers with pagination."""
+def tool_list_drawers(
+    wing: str = None,
+    room: str = None,
+    since: str = None,
+    before: str = None,
+    limit: int = 20,
+    offset: int = 0,
+):
+    """List logical drawers with pagination.
+
+    Optional ``since`` / ``before`` filter by drawer ``filed_at`` (ISO date or
+    timestamp): ``since`` is inclusive, ``before`` is exclusive (#1128). A
+    drawer whose ``filed_at`` is missing or unparseable is excluded while a
+    date bound is active. The filter is applied in Python after the rows are
+    fetched — ChromaDB rejects string operands for ``$gte``/``$lt`` (1.5.7),
+    and ``filed_at`` is stored as an ISO string, so a server-side ``where``
+    comparison is not available.
+    """
     limit = max(1, min(limit, _MAX_RESULTS))
     offset = max(0, offset)
 
     try:
         wing = _sanitize_optional_name(wing, "wing")
         room = _sanitize_optional_name(room, "room")
+        since_dt = _parse_date_filter(since, "since")
+        before_dt = _parse_date_filter(before, "before")
+        if since_dt is not None and before_dt is not None and since_dt >= before_dt:
+            raise ValueError(f"since ({since!r}) must be earlier than before ({before!r})")
     except ValueError as e:
         return {"error": str(e)}
 
@@ -2824,6 +2915,14 @@ def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offse
 
         ids, documents, metadatas = _fetch_drawer_rows(col, where=where)
         drawers = _collapse_drawer_rows(ids, documents, metadatas)
+
+        if since_dt is not None or before_dt is not None:
+            drawers = [
+                d
+                for d in drawers
+                if _filed_at_in_window(d.get("metadata", {}).get("filed_at"), since_dt, before_dt)
+            ]
+
         page = drawers[offset : offset + limit]
 
         return {
@@ -2834,6 +2933,7 @@ def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offse
             "limit": limit,
         }
     except Exception as e:
+        logger.exception("tool_list_drawers failed")
         return {"error": str(e)}
 
 
@@ -4047,12 +4147,20 @@ TOOLS = {
         "handler": tool_get_drawer,
     },
     "mempalace_list_drawers": {
-        "description": "List drawers with pagination. Optional wing/room filter. Returns IDs, wings, rooms, content previews, and total matching count for pagination.",
+        "description": "List drawers with pagination. Optional wing/room filter and since/before date filter on filed_at (since inclusive, before exclusive; drawers without a parseable filed_at are excluded when a date bound is set). Returns IDs, wings, rooms, content previews, and total matching count for pagination.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "wing": {"type": "string", "description": "Filter by wing (optional)"},
                 "room": {"type": "string", "description": "Filter by room (optional)"},
+                "since": {
+                    "type": "string",
+                    "description": "Only drawers filed on or after this ISO date/time, inclusive (e.g. '2026-04-01'). Optional.",
+                },
+                "before": {
+                    "type": "string",
+                    "description": "Only drawers filed before this ISO date/time, exclusive (e.g. '2026-05-01'). Optional.",
+                },
                 "limit": {
                     "type": "integer",
                     "description": "Max results per page (default 20, max 100)",

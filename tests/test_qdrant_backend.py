@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from _backend_conformance import assert_partition_isolation
+from _chroma_palace_helper import make_minimal_chroma_sqlite
 
 from mempalace.backends import (
     BackendError,
@@ -362,7 +363,7 @@ def test_qdrant_marker_participates_in_backend_mismatch(tmp_path, monkeypatch, f
     backend, col = _collection(tmp_path)
     col.upsert(ids=["a"], documents=["one"], metadatas=[{}], embeddings=[[1, 0]])
     backend.close()
-    (tmp_path / "chroma.sqlite3").write_bytes(b"")
+    make_minimal_chroma_sqlite(tmp_path)
     monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "chroma")
 
     with pytest.raises(BackendMismatchError):

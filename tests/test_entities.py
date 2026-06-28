@@ -1,4 +1,5 @@
 """Tests for no-LLM structural entity extraction."""
+
 from mempalace.entities import entities_metadata, extract_structural_entities
 
 

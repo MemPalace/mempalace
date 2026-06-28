@@ -1045,7 +1045,23 @@ class SQLiteExactBackend(BaseBackend):
 
     @classmethod
     def detect(cls, path: str) -> bool:
-        return os.path.isfile(os.path.join(path, _DB_FILENAME))
+        """Return True when ``path`` looks like a sqlite_exact palace.
+
+        Verifies the SQLite magic header rather than file presence alone, for
+        the same reason as :py:meth:`mempalace.backends.chroma.ChromaBackend.detect`:
+        bare ``sqlite3.connect()`` against a missing path leaves a 0-byte file
+        behind because the SQLite header is written on the first statement,
+        not on connection. The 16-byte ``SQLite format 3\\x00`` magic prefix
+        accepts every real palace while rejecting empty / garbage files. See #1893.
+        """
+        db_path = os.path.join(path, _DB_FILENAME)
+        if not os.path.isfile(db_path):
+            return False
+        try:
+            with open(db_path, "rb") as f:
+                return f.read(16) == b"SQLite format 3\x00"
+        except OSError:
+            return False
 
     def create_collection(self, palace_path: str, collection_name: str) -> SQLiteExactCollection:
         return self.get_collection(palace_path, collection_name, create=True)

@@ -16,6 +16,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from _chroma_palace_helper import make_minimal_chroma_sqlite
+
 
 # ── MCP entry point: PYTHONPATH stripping ────────────────────────────────
 
@@ -210,7 +212,7 @@ class TestColdStartDiagnostics:
         """
         palace = tmp_path / "palace"
         palace.mkdir()
-        (palace / "chroma.sqlite3").touch()
+        make_minimal_chroma_sqlite(palace)
         return str(palace)
 
     @staticmethod
@@ -1972,6 +1974,141 @@ class TestWriteTools:
 
         result = tool_list_drawers(offset=-5)
         assert result["offset"] == 0
+
+    def test_list_drawers_since_filter_inclusive(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_list_drawers
+
+        # seeded filed_at values: 2026-01-01..2026-01-04; since is inclusive.
+        result = tool_list_drawers(since="2026-01-03")
+        assert result["total"] == 2
+        assert result["count"] == 2
+        filed = sorted(d["metadata"]["filed_at"] for d in result["drawers"])
+        assert filed == ["2026-01-03T00:00:00", "2026-01-04T00:00:00"]
+
+    def test_list_drawers_before_filter_exclusive(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_list_drawers
+
+        # before is exclusive: 2026-01-03 keeps only 01 and 02.
+        result = tool_list_drawers(before="2026-01-03")
+        assert result["total"] == 2
+        filed = sorted(d["metadata"]["filed_at"] for d in result["drawers"])
+        assert filed == ["2026-01-01T00:00:00", "2026-01-02T00:00:00"]
+
+    def test_list_drawers_since_and_before_window(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_list_drawers
+
+        # [since, before): 02 and 03 kept, 01 below, 04 at/above the bound.
+        result = tool_list_drawers(since="2026-01-02", before="2026-01-04")
+        assert result["total"] == 2
+        filed = sorted(d["metadata"]["filed_at"] for d in result["drawers"])
+        assert filed == ["2026-01-02T00:00:00", "2026-01-03T00:00:00"]
+
+    def test_list_drawers_date_window_single_day(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_list_drawers
+
+        # since inclusive + before exclusive isolates exactly 2026-01-02.
+        result = tool_list_drawers(since="2026-01-02", before="2026-01-03")
+        assert result["total"] == 1
+        assert result["drawers"][0]["metadata"]["filed_at"] == "2026-01-02T00:00:00"
+
+    def test_list_drawers_date_filter_combines_with_wing(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_list_drawers
+
+        # project wing = 01,02,03; since 2026-01-02 narrows to 02,03.
+        result = tool_list_drawers(wing="project", since="2026-01-02")
+        assert result["total"] == 2
+        assert all(d["wing"] == "project" for d in result["drawers"])
+
+    def test_list_drawers_no_date_filter_unchanged(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_list_drawers
+
+        # Omitting since/before leaves the full set (regression guard).
+        assert tool_list_drawers()["total"] == 4
+
+    def test_list_drawers_rejects_invalid_since(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_list_drawers
+
+        result = tool_list_drawers(since="not-a-date")
+        assert "error" in result
+        assert "since" in result["error"]
+
+    def test_list_drawers_rejects_invalid_before(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_list_drawers
+
+        result = tool_list_drawers(before="2026-99-99")
+        assert "error" in result
+        assert "before" in result["error"]
+
+    def test_list_drawers_rejects_inverted_window(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_list_drawers
+
+        # since must be earlier than before; inverted bounds are a clear error,
+        # not a silently empty result.
+        result = tool_list_drawers(since="2026-06-01", before="2026-01-01")
+        assert "error" in result
+        assert "since" in result["error"]
+        assert "before" in result["error"]
+
+    def test_list_drawers_excludes_undated_drawer_when_filtered(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_list_drawers
+
+        # A drawer with no filed_at is present unfiltered but excluded once a
+        # date bound is active (its age cannot be confirmed in-window).
+        seeded_collection.add(
+            ids=["drawer_no_filed_at"],
+            documents=["A drawer without a filed_at timestamp."],
+            metadatas=[{"wing": "project", "room": "backend"}],
+        )
+        assert tool_list_drawers()["total"] == 5
+        filtered = tool_list_drawers(since="2026-01-01")
+        ids = [d["drawer_id"] for d in filtered["drawers"]]
+        assert "drawer_no_filed_at" not in ids
+        assert filtered["total"] == 4
+
+    def test_list_drawers_date_filter_paginates_on_filtered_total(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_list_drawers
+
+        # window [01-01, 01-04) keeps 01, 02, 03; pagination runs on that
+        # filtered total, not the grand total of 4.
+        page1 = tool_list_drawers(since="2026-01-01", before="2026-01-04", limit=2, offset=0)
+        page2 = tool_list_drawers(since="2026-01-01", before="2026-01-04", limit=2, offset=2)
+        assert page1["total"] == 3
+        assert page1["count"] == 2
+        assert page2["total"] == 3
+        assert page2["count"] == 1
 
     def test_update_drawer_content(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -4727,3 +4864,119 @@ def test_sqlite_integrity_refusal_handles_none_palace_path(monkeypatch):
     assert result["error"]["data"]["palace"] == ""
     assert result["error"]["data"]["sqlite_path"] == ""
     assert result["error"]["data"]["tool"] == "mempalace_kg_add"
+
+
+class TestListDrawersDateFilters:
+    """Unit tests for the #1128 date-filter helpers in mcp_server."""
+
+    def test_parse_date_filter_none_and_blank(self):
+        from mempalace.mcp_server import _parse_date_filter
+
+        assert _parse_date_filter(None, "since") is None
+        assert _parse_date_filter("   ", "since") is None
+
+    def test_parse_date_filter_date_only(self):
+        from datetime import datetime
+
+        from mempalace.mcp_server import _parse_date_filter
+
+        assert _parse_date_filter("2026-04-01", "since") == datetime(2026, 4, 1)
+
+    def test_parse_date_filter_full_timestamp(self):
+        from datetime import datetime
+
+        from mempalace.mcp_server import _parse_date_filter
+
+        assert _parse_date_filter("2026-04-01T09:30:00", "since") == datetime(2026, 4, 1, 9, 30)
+
+    def test_parse_date_filter_drops_timezone(self):
+        from datetime import datetime
+
+        from mempalace.mcp_server import _parse_date_filter
+
+        # tz offset dropped -> naive wall-clock, never raises vs naive filed_at.
+        parsed = _parse_date_filter("2026-04-01T09:30:00+02:00", "since")
+        assert parsed == datetime(2026, 4, 1, 9, 30)
+        assert parsed.tzinfo is None
+
+    def test_parse_date_filter_rejects_garbage(self):
+        import pytest
+
+        from mempalace.mcp_server import _parse_date_filter
+
+        with pytest.raises(ValueError, match="since"):
+            _parse_date_filter("not-a-date", "since")
+
+    def test_parse_date_filter_rejects_impossible_date(self):
+        import pytest
+
+        from mempalace.mcp_server import _parse_date_filter
+
+        with pytest.raises(ValueError):
+            _parse_date_filter("2026-13-40", "before")
+
+    def test_filed_at_in_window_since_inclusive(self):
+        from datetime import datetime
+
+        from mempalace.mcp_server import _filed_at_in_window
+
+        since = datetime(2026, 1, 2)
+        assert _filed_at_in_window("2026-01-02T00:00:00", since, None) is True
+        assert _filed_at_in_window("2026-01-01T23:59:59", since, None) is False
+
+    def test_filed_at_in_window_before_exclusive(self):
+        from datetime import datetime
+
+        from mempalace.mcp_server import _filed_at_in_window
+
+        before = datetime(2026, 1, 3)
+        assert _filed_at_in_window("2026-01-02T23:59:59", None, before) is True
+        assert _filed_at_in_window("2026-01-03T00:00:00", None, before) is False
+
+    def test_filed_at_in_window_missing_or_malformed_excluded(self):
+        from datetime import datetime
+
+        from mempalace.mcp_server import _filed_at_in_window
+
+        since = datetime(2026, 1, 1)
+        assert _filed_at_in_window(None, since, None) is False
+        assert _filed_at_in_window("", since, None) is False
+        assert _filed_at_in_window("garbage", since, None) is False
+        assert _filed_at_in_window(12345, since, None) is False
+
+    def test_filed_at_in_window_tz_aware_wall_clock(self):
+        from datetime import datetime
+
+        from mempalace.mcp_server import _filed_at_in_window
+
+        # tz dropped on both sides -> wall-clock compare, no TypeError raised.
+        since = datetime(2026, 1, 2)
+        assert _filed_at_in_window("2026-01-02T08:00:00+05:00", since, None) is True
+
+    def test_parse_date_filter_accepts_zulu_suffix(self):
+        from datetime import datetime
+
+        from mempalace.mcp_server import _parse_date_filter
+
+        # "Z" is not accepted by datetime.fromisoformat before 3.11; the helper
+        # strips it so Zulu inputs parse on the 3.9 floor, tz then dropped.
+        parsed = _parse_date_filter("2026-04-01T09:30:00Z", "since")
+        assert parsed == datetime(2026, 4, 1, 9, 30)
+        assert parsed.tzinfo is None
+
+        # Date-only with a Zulu suffix must also parse on 3.9/3.10 (appending
+        # "+00:00" would have raised there; stripping Z does not).
+        parsed_date = _parse_date_filter("2026-04-01Z", "since")
+        assert parsed_date == datetime(2026, 4, 1)
+        assert parsed_date.tzinfo is None
+
+        # Lowercase z is tolerated too.
+        assert _parse_date_filter("2026-04-01t09:30:00z", "since") == datetime(2026, 4, 1, 9, 30)
+
+    def test_filed_at_in_window_accepts_zulu_filed_at(self):
+        from datetime import datetime
+
+        from mempalace.mcp_server import _filed_at_in_window
+
+        since = datetime(2026, 1, 2)
+        assert _filed_at_in_window("2026-01-02T08:00:00Z", since, None) is True

@@ -9,6 +9,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from _chroma_palace_helper import make_minimal_chroma_sqlite
+
 from mempalace.searcher import SearchError, build_where_filter, search, search_memories
 
 
@@ -349,7 +351,7 @@ def fake_palace_path(tmp_path):
     backend instead of raising on State A / State B."""
     p = tmp_path / "palace"
     p.mkdir()
-    (p / "chroma.sqlite3").touch()
+    make_minimal_chroma_sqlite(p)
     return str(p)
 
 

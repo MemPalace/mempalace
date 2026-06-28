@@ -9,6 +9,7 @@ referred to") over recall.
 
 The output format matches what ``hallways._parse_entities`` expects: a ``;``-joined string.
 """
+
 import re
 
 # Author-quoted code spans are the highest-signal structural marker: `foo`, `obj.method()`.
