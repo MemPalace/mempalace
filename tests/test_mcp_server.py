@@ -16,6 +16,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from _chroma_palace_helper import make_minimal_chroma_sqlite
+
 
 # ── MCP entry point: PYTHONPATH stripping ────────────────────────────────
 
@@ -210,7 +212,7 @@ class TestColdStartDiagnostics:
         """
         palace = tmp_path / "palace"
         palace.mkdir()
-        (palace / "chroma.sqlite3").touch()
+        make_minimal_chroma_sqlite(palace)
         return str(palace)
 
     @staticmethod

@@ -5,6 +5,8 @@ import time
 
 import pytest
 
+from _chroma_palace_helper import make_minimal_chroma_sqlite
+
 from mempalace import daemon
 from mempalace import service
 
@@ -728,7 +730,7 @@ def test_run_sync_structured_errors_on_sync_failures(tmp_path, monkeypatch):
 
     palace = tmp_path / "palace"
     palace.mkdir()
-    (palace / "chroma.sqlite3").touch()
+    make_minimal_chroma_sqlite(palace)
 
     def _raise(exc):
         def fn(**kw):

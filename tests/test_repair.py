@@ -7,6 +7,8 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
+from _chroma_palace_helper import make_minimal_chroma_sqlite
+
 from mempalace import repair
 
 
@@ -583,7 +585,7 @@ def test_status_returns_empty_when_db_present_no_drawers(tmp_path, capsys):
     'uninitialized' (#1498). Mocks sqlite_drawer_count to assert the
     return-shape contract; see the real-disk sibling below for the
     no-chromadb-client invariant."""
-    (tmp_path / "chroma.sqlite3").touch()
+    make_minimal_chroma_sqlite(tmp_path)
     with patch("mempalace.repair.sqlite_drawer_count", return_value=0):
         result = repair.status(palace_path=str(tmp_path))
 
@@ -622,7 +624,7 @@ def test_status_falls_through_to_capacity_when_sqlite_count_unreadable(tmp_path)
     """When sqlite_drawer_count returns None (schema drift / locked file),
     repair.status must fall through to hnsw_capacity_status instead of
     short-circuiting on 'empty' (#1498)."""
-    (tmp_path / "chroma.sqlite3").touch()
+    make_minimal_chroma_sqlite(tmp_path)
     with (
         patch("mempalace.repair.sqlite_drawer_count", return_value=None),
         patch("mempalace.repair.hnsw_capacity_status") as capacity_status,
@@ -658,7 +660,7 @@ def test_status_default_uses_configured_drawer_collection(tmp_path):
     # Provide the on-disk preconditions the stratified state helper (#1498)
     # checks before reaching the capacity probe: chroma.sqlite3 file exists
     # and sqlite_drawer_count returns a positive number (palace not empty).
-    (tmp_path / "chroma.sqlite3").touch()
+    make_minimal_chroma_sqlite(tmp_path)
     with (
         patch("mempalace.repair._drawers_collection_name", return_value="custom_drawers"),
         patch("mempalace.repair.sqlite_drawer_count", return_value=1),

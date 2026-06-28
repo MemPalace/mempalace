@@ -2,6 +2,8 @@
 
 import chromadb
 
+from _chroma_palace_helper import make_minimal_chroma_sqlite
+
 from mempalace.backends import CollectionNotInitializedError, PalaceNotFoundError
 from mempalace.palace import _open_collection_or_explain, get_collection
 
@@ -94,7 +96,7 @@ def test_open_collection_or_explain_state_e_unexpected_error(tmp_path, monkeypat
     emit, lines = _capture()
     palace = tmp_path / "palace"
     palace.mkdir()
-    (palace / "chroma.sqlite3").touch()  # pass the isfile guard
+    make_minimal_chroma_sqlite(palace)  # pass the isfile guard
 
     def boom(*args, **kwargs):
         raise RuntimeError("disk on fire")
@@ -125,7 +127,7 @@ def test_open_collection_or_explain_propagates_palace_not_found_from_backend(tmp
     emit, lines = _capture()
     palace = tmp_path / "palace"
     palace.mkdir()
-    (palace / "chroma.sqlite3").touch()
+    make_minimal_chroma_sqlite(palace)
 
     def raise_pnf(*args, **kwargs):
         raise PalaceNotFoundError(str(palace))
@@ -151,7 +153,7 @@ def test_open_collection_or_explain_reraises_backend_closed_error(tmp_path, monk
 
     palace = tmp_path / "palace"
     palace.mkdir()
-    (palace / "chroma.sqlite3").touch()
+    make_minimal_chroma_sqlite(palace)
 
     def raise_closed(*args, **kwargs):
         raise BackendClosedError("ChromaBackend has been closed")
@@ -171,7 +173,7 @@ def test_open_collection_or_explain_distinguishes_collection_subclass(tmp_path, 
     emit, lines = _capture()
     palace = tmp_path / "palace"
     palace.mkdir()
-    (palace / "chroma.sqlite3").touch()
+    make_minimal_chroma_sqlite(palace)
 
     def raise_cnie(*args, **kwargs):
         raise CollectionNotInitializedError(str(palace))

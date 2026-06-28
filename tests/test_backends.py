@@ -178,10 +178,42 @@ def test_resolve_backend_priority_order(tmp_path):
     assert resolve_backend_for_palace() == "chroma"
 
 
-def test_chroma_detect_matches_palace_with_chroma_sqlite(tmp_path):
-    (tmp_path / "chroma.sqlite3").write_bytes(b"")
+def test_chroma_detect_matches_palace_with_sqlite_header(tmp_path):
+    """A real SQLite database at ``<path>/chroma.sqlite3`` registers as chroma.
+
+    Uses ``sqlite3.connect`` + a write so the SQLite magic header is actually
+    on disk — the only thing detection looks at.
+    """
+    db_path = tmp_path / "chroma.sqlite3"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE detect_smoke(x)")
+    conn.commit()
+    conn.close()
     assert ChromaBackend.detect(str(tmp_path)) is True
     assert ChromaBackend.detect(str(tmp_path.parent)) is False
+
+
+def test_chroma_detect_rejects_empty_chroma_sqlite(tmp_path):
+    """A 0-byte ``chroma.sqlite3`` is not a chroma palace (closes #1893).
+
+    Bare ``sqlite3.connect()`` against a missing path leaves a 0-byte file
+    behind because the SQLite header is written on the first statement, not
+    on connect. Detection must reject that artifact so it cannot trip
+    ``BackendMismatchError`` against a real non-chroma backend marker in the
+    same directory.
+    """
+    (tmp_path / "chroma.sqlite3").write_bytes(b"")
+    assert ChromaBackend.detect(str(tmp_path)) is False
+
+
+def test_chroma_detect_rejects_non_sqlite_file(tmp_path):
+    """A non-SQLite file at the ``chroma.sqlite3`` path is not chroma.
+
+    Defends against partial writes / garbage content / anything that lands at
+    the canonical path but isn't actually a SQLite database.
+    """
+    (tmp_path / "chroma.sqlite3").write_bytes(b"not a sqlite file" * 4)
+    assert ChromaBackend.detect(str(tmp_path)) is False
 
 
 def test_chroma_lexical_search_uses_sqlite_fts_not_full_collection_scan(tmp_path):

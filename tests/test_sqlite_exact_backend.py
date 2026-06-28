@@ -4,6 +4,8 @@ import threading
 
 import pytest
 
+from _chroma_palace_helper import make_minimal_chroma_sqlite
+
 import mempalace.backends.sqlite_exact as sqlite_exact_module
 from mempalace.backends import (
     BackendMismatchError,
@@ -410,7 +412,7 @@ def test_palace_wrapper_embeds_for_sqlite_exact(tmp_path, monkeypatch):
 def test_backend_mismatch_protection(tmp_path, monkeypatch):
     from mempalace.palace import get_collection
 
-    (tmp_path / "chroma.sqlite3").write_bytes(b"")
+    make_minimal_chroma_sqlite(tmp_path)
     monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "sqlite_exact")
 
     with pytest.raises(BackendMismatchError):
@@ -420,7 +422,7 @@ def test_backend_mismatch_protection(tmp_path, monkeypatch):
 def test_mixed_backend_artifacts_are_rejected_even_when_chroma_selected(tmp_path, monkeypatch):
     from mempalace.palace import resolve_backend_name
 
-    (tmp_path / "chroma.sqlite3").write_bytes(b"")
+    make_minimal_chroma_sqlite(tmp_path)
     (tmp_path / "sqlite_exact.sqlite3").write_bytes(b"")
     monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "chroma")
 
