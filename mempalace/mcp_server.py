@@ -1515,22 +1515,22 @@ def tool_status():
         if _supports_metadata_facets(col):
             try:
                 temp_wings = col.facet_counts("wing")
+                wings.update(temp_wings)
                 try:
                     unknown_wings = count - sum(temp_wings.values())
                     if unknown_wings > 0:
-                        wings["unknown"] = unknown_wings
+                        wings["unknown"] = wings.get("unknown", 0) + unknown_wings
                 except (TypeError, ValueError):
                     pass
 
                 temp_rooms = col.facet_counts("room")
+                rooms.update(temp_rooms)
                 try:
                     unknown_rooms = count - sum(temp_rooms.values())
                     if unknown_rooms > 0:
-                        rooms["unknown"] = unknown_rooms
+                        rooms["unknown"] = rooms.get("unknown", 0) + unknown_rooms
                 except (TypeError, ValueError):
                     pass
-                wings.update(temp_wings)
-                rooms.update(temp_rooms)
 
             except Exception as e:
                 logger.warning(
@@ -1609,13 +1609,13 @@ def tool_list_wings():
             if not _supports_metadata_facets(col):
                 raise ValueError("facets not supported")
             temp_wings = col.facet_counts("wing")
+            wings.update(temp_wings)
             try:
                 unknown_wings = col.count() - sum(temp_wings.values())
                 if unknown_wings > 0:
-                    temp_wings["unknown"] = unknown_wings
+                    wings["unknown"] = wings.get("unknown", 0) + unknown_wings
             except (TypeError, ValueError):
                 pass
-            wings.update(temp_wings)
         except Exception as e:
             if _supports_metadata_facets(col):
                 logger.warning(
@@ -1659,6 +1659,7 @@ def tool_list_rooms(wing: str = None):
             if not _supports_metadata_facets(col):
                 raise ValueError("facets not supported")
             temp_rooms = col.facet_counts("room", where=where)
+            rooms.update(temp_rooms)
             try:
                 if wing:
                     wing_count = col.facet_counts("wing", where={"wing": wing}).get(wing, 0)
@@ -1666,10 +1667,9 @@ def tool_list_rooms(wing: str = None):
                 else:
                     unknown_rooms = col.count() - sum(temp_rooms.values())
                 if unknown_rooms > 0:
-                    temp_rooms["unknown"] = unknown_rooms
+                    rooms["unknown"] = rooms.get("unknown", 0) + unknown_rooms
             except (TypeError, ValueError):
                 pass
-            rooms.update(temp_rooms)
         except Exception as e:
             if _supports_metadata_facets(col):
                 logger.warning(
@@ -1716,7 +1716,7 @@ def tool_get_taxonomy():
                     try:
                         unknown_rooms = wing_counts[wing] - sum(room_counts.values())
                         if unknown_rooms > 0:
-                            room_counts["unknown"] = unknown_rooms
+                            room_counts["unknown"] = room_counts.get("unknown", 0) + unknown_rooms
                     except (TypeError, ValueError):
                         pass
                     temp_taxonomy[wing] = room_counts
