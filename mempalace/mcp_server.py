@@ -1706,7 +1706,7 @@ def tool_get_taxonomy():
             wing_counts = col.facet_counts("wing")
             wings = list(wing_counts.keys())
             temp_taxonomy = {}
-            with ThreadPoolExecutor(max_workers=min(8, len(wings))) as executor:
+            with ThreadPoolExecutor(max_workers=max(1, min(8, len(wings)))) as executor:
                 futures = {
                     wing: executor.submit(col.facet_counts, "room", where={"wing": wing})
                     for wing in wings
