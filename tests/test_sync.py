@@ -11,6 +11,8 @@ from pathlib import Path
 import chromadb
 import pytest
 
+from _chroma_palace_helper import make_minimal_chroma_sqlite
+
 
 def _seed_drawers(palace_path, repo_path, deleted_path, elsewhere_path):
     """Populate the drawers collection with 6 entries covering all buckets."""
@@ -1446,7 +1448,7 @@ class TestServiceRunSyncReport:
         os.makedirs(palace)
         # Satisfy run_sync's detect_backend_for_path guard without spinning up
         # the real Chroma/embedder stack (which would disturb sys.stdout).
-        Path(palace, "chroma.sqlite3").touch()
+        make_minimal_chroma_sqlite(palace)
         monkeypatch.setattr(
             sync_module,
             "sync_palace",
@@ -1472,7 +1474,7 @@ class TestServiceRunSyncReport:
 
         palace = os.path.join(tmp_dir, "palace")
         os.makedirs(palace)
-        Path(palace, "chroma.sqlite3").touch()
+        make_minimal_chroma_sqlite(palace)
         monkeypatch.setattr(
             sync_module,
             "sync_palace",

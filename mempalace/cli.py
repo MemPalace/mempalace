@@ -313,7 +313,16 @@ def cmd_init(args):
                 endpoint=getattr(args, "llm_endpoint", None),
                 api_key=getattr(args, "llm_api_key", None),
             )
-            ok, msg = candidate.check_available()
+            if (
+                provider_name == "openai-compat"
+                and getattr(candidate, "api_key_source", None) == "env"
+                and candidate.is_external_service
+            ):
+                ok = False
+                msg = "external openai-compat init requires explicit --llm-api-key"
+                print(f"  LLM skipped: {msg}")
+            else:
+                ok, msg = candidate.check_available()
             if ok:
                 llm_provider = candidate
                 print(f"  LLM enabled: {provider_name}/{provider_model}")
@@ -1083,10 +1092,15 @@ def cmd_repair(args):
         _rebuild_collection_via_temp,
         check_extraction_safety,
         index_read_recovery_guidance,
+        maybe_autoheal_fts5_index,
         maybe_repair_poisoned_max_seq_id_before_rebuild,
         print_sqlite_integrity_abort,
         sqlite_integrity_errors,
     )
+
+    if getattr(args, "repair_action", None) == "rebuild-index":
+        args.mode = "from-sqlite"
+        args.archive_existing = True
 
     if getattr(args, "mode", "legacy") == "max-seq-id":
         from .repair import repair_max_seq_id
@@ -1169,6 +1183,8 @@ def cmd_repair(args):
     # here so we can surface the clear recovery instructions and exit
     # cleanly before chromadb's compactor touches the disk.
     sqlite_errors = sqlite_integrity_errors(palace_path)
+    if sqlite_errors:
+        sqlite_errors = maybe_autoheal_fts5_index(palace_path, sqlite_errors)
     if sqlite_errors:
         print_sqlite_integrity_abort(palace_path, sqlite_errors)
         sys.exit(1)
@@ -1822,6 +1838,15 @@ def main():
     )
     p_repair.add_argument(
         "--yes", action="store_true", help="Skip confirmation for destructive changes"
+    )
+    p_repair.add_argument(
+        "repair_action",
+        nargs="?",
+        choices=["rebuild-index"],
+        help=(
+            "Re-embed the palace from SQLite using the current embedding model "
+            "(alias for --mode from-sqlite --archive-existing)."
+        ),
     )
     p_repair.add_argument(
         "--confirm-truncation-ok",

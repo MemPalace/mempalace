@@ -221,7 +221,18 @@ def _hybrid_rank(
         r["bm25_score"] = round(raw, 3)
         scored.append((vector_weight * vec_sim + bm25_weight * norm, r))
 
-    scored.sort(key=lambda pair: pair[0], reverse=True)
+    # Break exact score ties toward the more recently authored drawer so equal-score
+    # candidates rank chronologically instead of in arbitrary backend order. ISO-8601
+    # ``authored_at`` strings sort chronologically; missing dates sort oldest.
+    # authored_at lives at the top level on the search_memories path and nested under
+    # "metadata" on the candidate-union path; check both so the tie-break works for each.
+    scored.sort(
+        key=lambda pair: (
+            pair[0],
+            pair[1].get("authored_at") or pair[1].get("metadata", {}).get("authored_at") or "",
+        ),
+        reverse=True,
+    )
     results[:] = [r for _, r in scored]
     return results
 
@@ -681,6 +692,7 @@ def _bm25_only_via_sqlite(
                 "source_file": Path(full_source).name if full_source else "?",
                 "source_path": full_source,
                 "created_at": meta.get("filed_at", "unknown"),
+                "authored_at": meta.get("authored_at", meta.get("filed_at", "unknown")),
                 # No vector distance available in BM25-only mode.
                 "similarity": None,
                 "distance": None,
@@ -783,6 +795,7 @@ def _merge_bm25_union_candidates(
                 "source_file": Path(full_source).name if full_source else "?",
                 "source_path": full_source,
                 "created_at": meta.get("filed_at", "unknown"),
+                "authored_at": meta.get("authored_at", meta.get("filed_at", "unknown")),
                 "similarity": None,
                 "distance": None,
                 "effective_distance": None,
@@ -1198,6 +1211,7 @@ def search_memories(
             "source_file": Path(source).name if source else "?",
             "source_path": source,
             "created_at": meta.get("filed_at", "unknown"),
+            "authored_at": meta.get("authored_at", meta.get("filed_at", "unknown")),
             "similarity": round(_distance_to_similarity(effective_dist, metric), 3),
             "distance": round(dist, 4),
             "effective_distance": round(effective_dist, 4),

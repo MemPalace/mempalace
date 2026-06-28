@@ -340,7 +340,7 @@ class MempalaceConfig:
             # code path (mcp_server.py:62) and prevent surprise redirection
             # when the env var contains unresolved components.
             return os.path.abspath(os.path.expanduser(env_val))
-        return self._file_config.get("palace_path", DEFAULT_PALACE_PATH)
+        return os.path.expanduser(self._file_config.get("palace_path", DEFAULT_PALACE_PATH))
 
     @property
     def tunnel_file(self):

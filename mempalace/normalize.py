@@ -21,6 +21,7 @@ No API key. No internet. Everything local.
 import json
 import os
 import re
+import stat
 from pathlib import Path
 from typing import Optional
 
@@ -118,17 +119,28 @@ def normalize(filepath: str) -> str:
     Load a file and normalize to transcript format if it's a chat export.
     Plain text files pass through unchanged.
     """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    if os.path.islink(filepath):
+        raise IOError(f"Could not read {filepath}: symlinked files are skipped")
+    fd = -1
     try:
-        file_size = os.path.getsize(filepath)
-    except OSError as e:
-        raise IOError(f"Could not read {filepath}: {e}") from e
-    if file_size > 500 * 1024 * 1024:  # 500 MB safety limit
-        raise IOError(f"File too large ({file_size // (1024 * 1024)} MB): {filepath}")
-    try:
-        with open(filepath, "r", encoding="utf-8-sig", errors="replace") as f:
+        fd = os.open(filepath, flags)
+        file_stat = os.fstat(fd)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise IOError(f"Could not read {filepath}: not a regular file")
+        if file_stat.st_size > 500 * 1024 * 1024:  # 500 MB safety limit
+            raise IOError(f"File too large ({file_stat.st_size // (1024 * 1024)} MB): {filepath}")
+        with os.fdopen(fd, "r", encoding="utf-8-sig", errors="replace") as f:
+            fd = -1
             content = f.read()
     except OSError as e:
         raise IOError(f"Could not read {filepath}: {e}") from e
+    finally:
+        if fd != -1:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
     if not content.strip():
         return content

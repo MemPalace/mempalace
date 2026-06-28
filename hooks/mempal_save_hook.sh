@@ -265,14 +265,14 @@ if [ "$SINCE_LAST" -ge "$SAVE_INTERVAL" ] && [ "$EXCHANGE_COUNT" -gt 0 ]; then
     # MEMPAL_DIR is *additive*, not an override: a user with MEMPAL_DIR
     # pointed at their project still gets the active conversation mined.
     if is_valid_transcript_path "$TRANSCRIPT_PATH" && [ -f "$TRANSCRIPT_PATH" ]; then
-        mempalace mine "$(dirname "$TRANSCRIPT_PATH")" --mode convos \
+        "$MEMPAL_PYTHON_BIN" -m mempalace mine "$(dirname "$TRANSCRIPT_PATH")" --mode convos \
             >> "$STATE_DIR/hook.log" 2>&1 &
     elif [ -n "$TRANSCRIPT_PATH" ]; then
         echo "[$(date '+%H:%M:%S')] Skipping invalid transcript path: $TRANSCRIPT_PATH" \
             >> "$STATE_DIR/hook.log"
     fi
     if [ -n "$MEMPAL_DIR" ] && [ -d "$MEMPAL_DIR" ]; then
-        mempalace mine "$MEMPAL_DIR" --mode projects \
+        "$MEMPAL_PYTHON_BIN" -m mempalace mine "$MEMPAL_DIR" --mode projects \
             >> "$STATE_DIR/hook.log" 2>&1 &
     fi
 
