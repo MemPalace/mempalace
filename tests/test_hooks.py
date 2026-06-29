@@ -16,6 +16,7 @@ def test_hooks_dir_contains_scripts():
     scripts = {f.name for f in hooks_dir().iterdir() if f.suffix == ".sh"}
     assert "mempal_save_hook.sh" in scripts
     assert "mempal_precompact_hook.sh" in scripts
+    assert "mempal_session_end_hook.sh" in scripts
 
 
 def test_hook_path_returns_existing_file():
@@ -24,13 +25,24 @@ def test_hook_path_returns_existing_file():
     assert p.name == "mempal_save_hook.sh"
 
 
+def test_hook_path_returns_nested_file():
+    p = hook_path("cursor/install.sh")
+    assert p.is_file()
+    assert p.name == "install.sh"
+
+
 def test_hook_path_raises_for_missing():
     with pytest.raises(FileNotFoundError):
         hook_path("nonexistent_hook.sh")
 
 
+def test_hook_path_raises_for_path_traversal():
+    with pytest.raises(FileNotFoundError):
+        hook_path("../pyproject.toml")
+
+
 def test_hook_scripts_are_executable():
-    for name in ("mempal_save_hook.sh", "mempal_precompact_hook.sh"):
+    for name in ("mempal_save_hook.sh", "mempal_precompact_hook.sh", "mempal_session_end_hook.sh"):
         p = hook_path(name)
         mode = p.stat().st_mode
         assert mode & stat.S_IXUSR, f"{name} should be executable"
@@ -56,6 +68,7 @@ def test_cli_hooks_install_claude():
     config = json.loads(result.stdout)
     assert "hooks" in config
     assert "Stop" in config["hooks"]
+    assert "SessionEnd" in config["hooks"]
     assert "PreCompact" in config["hooks"]
 
 

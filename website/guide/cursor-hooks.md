@@ -63,19 +63,19 @@ The fastest path is the installer that ships in the repo.
 Preview the change first (writes nothing, just prints the would-be JSON):
 
 ```bash
-hooks/cursor/install.sh --scope user --dry-run
+mempalace/hooks/cursor/install.sh --scope user --dry-run
 ```
 
 User scope — applies globally, writes `~/.cursor/hooks.json`:
 
 ```bash
-hooks/cursor/install.sh --scope user
+mempalace/hooks/cursor/install.sh --scope user
 ```
 
 Or project scope — only this repo, writes `<repo>/.cursor/hooks.json`:
 
 ```bash
-hooks/cursor/install.sh --scope project --target /path/to/your/repo
+mempalace/hooks/cursor/install.sh --scope project --target /path/to/your/repo
 ```
 
 The installer copies the three hook scripts to `~/.mempalace/hooks/cursor/`,
@@ -91,16 +91,16 @@ MemPalace entries (leaves other hooks intact).
   "version": 1,
   "hooks": {
     "sessionStart": [
-      { "command": "/absolute/path/to/hooks/cursor/mempal_wake_hook_cursor.sh" }
+      { "command": "/absolute/path/to/mempalace/hooks/cursor/mempal_wake_hook_cursor.sh" }
     ],
     "stop": [
       {
-        "command": "/absolute/path/to/hooks/cursor/mempal_save_hook_cursor.sh",
+        "command": "/absolute/path/to/mempalace/hooks/cursor/mempal_save_hook_cursor.sh",
         "loop_limit": 1
       }
     ],
     "preCompact": [
-      { "command": "/absolute/path/to/hooks/cursor/mempal_precompact_hook_cursor.sh" }
+      { "command": "/absolute/path/to/mempalace/hooks/cursor/mempal_precompact_hook_cursor.sh" }
     ]
   }
 }
@@ -115,9 +115,9 @@ project hooks.
 Make the scripts executable once:
 
 ```bash
-chmod +x hooks/cursor/mempal_save_hook_cursor.sh \
-         hooks/cursor/mempal_precompact_hook_cursor.sh \
-         hooks/cursor/mempal_wake_hook_cursor.sh
+chmod +x mempalace/hooks/cursor/mempal_save_hook_cursor.sh \
+         mempalace/hooks/cursor/mempal_precompact_hook_cursor.sh \
+         mempalace/hooks/cursor/mempal_wake_hook_cursor.sh
 ```
 
 Cursor watches `hooks.json` and reloads automatically after a save. If
@@ -361,7 +361,7 @@ default flips to silent to match Claude.
 
 - [Auto-Save Hooks (Claude Code + Codex)](/guide/hooks) — the analogous
   feature for those tools.
-- [`hooks/cursor/STDIN_SHAPE.md`](https://github.com/MemPalace/mempalace/blob/develop/hooks/cursor/STDIN_SHAPE.md)
+- [`mempalace/hooks/cursor/STDIN_SHAPE.md`](https://github.com/MemPalace/mempalace/blob/develop/mempalace/hooks/cursor/STDIN_SHAPE.md)
   — per-event JSON schema with citations.
 - [Claude Code Retention](/guide/claude-code-retention) — broader
   setup checklist if you mix Cursor with Claude Code.

@@ -14,7 +14,11 @@ def hook_path(name: str) -> Path:
 
     Raises FileNotFoundError if the named hook does not exist.
     """
-    p = hooks_dir() / name
-    if not p.exists():
+    relative = Path(name)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise FileNotFoundError(f"Hook not found: {name}")
+    root = hooks_dir().resolve()
+    p = (root / relative).resolve()
+    if not p.is_relative_to(root) or not p.exists():
         raise FileNotFoundError(f"Hook not found: {p}")
     return p

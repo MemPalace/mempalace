@@ -17,7 +17,7 @@ Add this to `~/.claude/settings.local.json` (global) or `.claude/settings.local.
         "matcher": "*", 
         "hooks": [{
           "type": "command",
-          "command": "/absolute/path/to/hooks/mempal_save_hook.sh",
+          "command": "/absolute/path/to/mempalace/hooks/mempal_save_hook.sh",
           "timeout": 30
         }]
       }
@@ -26,7 +26,7 @@ Add this to `~/.claude/settings.local.json` (global) or `.claude/settings.local.
       {
         "hooks": [{
           "type": "command",
-          "command": "/absolute/path/to/hooks/mempal_precompact_hook.sh",
+          "command": "/absolute/path/to/mempalace/hooks/mempal_precompact_hook.sh",
           "timeout": 30
         }]
       }
@@ -37,11 +37,11 @@ Add this to `~/.claude/settings.local.json` (global) or `.claude/settings.local.
 
 Make the hooks executable:
 ```bash
-chmod +x /absolute/path/to/hooks/mempal_save_hook.sh
-chmod +x /absolute/path/to/hooks/mempal_precompact_hook.sh
+chmod +x /absolute/path/to/mempalace/hooks/mempal_save_hook.sh
+chmod +x /absolute/path/to/mempalace/hooks/mempal_precompact_hook.sh
 ```
 
-**Note:** Replace `/absolute/path/to/hooks/` with the actual path where you cloned the MemPalace repository (e.g., `~/projects/mempalace/hooks/`).
+**Note:** Replace `/absolute/path/to/mempalace/hooks/` with the actual path where you cloned the MemPalace repository (e.g., `~/projects/mempalace/mempalace/hooks/`).
 
 ### 3. What changed (v3.1.0+)
 

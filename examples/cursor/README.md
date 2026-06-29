@@ -43,13 +43,13 @@ substitute the absolute path before saving the file. Pick one:
 Project scope — writes `<repo>/.cursor/hooks.json`:
 
 ```bash
-hooks/cursor/install.sh --scope project --target /path/to/your/repo
+mempalace/hooks/cursor/install.sh --scope project --target /path/to/your/repo
 ```
 
 User scope — writes `~/.cursor/hooks.json`, applies to every Cursor workspace:
 
 ```bash
-hooks/cursor/install.sh --scope user
+mempalace/hooks/cursor/install.sh --scope user
 ```
 
 The installer copies the hook scripts to `~/.mempalace/hooks/cursor/`,
@@ -81,7 +81,7 @@ If you actually want MemPalace's hooks armed when working on the
 MemPalace repo itself, run:
 
 ```bash
-hooks/cursor/install.sh --scope project --target .
+mempalace/hooks/cursor/install.sh --scope project --target .
 ```
 
 That will write `./.cursor/hooks.json` for the repo workspace
@@ -98,13 +98,13 @@ The two install paths are orthogonal — install whichever you want, in any orde
 |---------------------------------------------------------------------------|----------------------------------------------------------|
 | MCP tools (`mempalace_search`, `mempalace_add_drawer`, …) + slash commands | The plugin — see [`.cursor-plugin/README.md`](../../.cursor-plugin/README.md) |
 | Auto-save every N turns + sessionStart memory recall                       | The hooks here — see Option A above                      |
-| Both                                                                       | Install the plugin AND run `hooks/cursor/install.sh`     |
+| Both                                                                       | Install the plugin AND run `mempalace/hooks/cursor/install.sh`     |
 
 Hooks are deliberately **not** bundled into the plugin because Cursor's hooks system is configured per-user/per-project (in `~/.cursor/hooks.json` or `.cursor/hooks.json`), not per-plugin — so the installer here owns that file with idempotent merge semantics, while the plugin owns the MCP+commands+skill side.
 
 ## See also
 
-- [`hooks/cursor/README.md`](../../hooks/cursor/README.md) — full reference for hooks
-- [`hooks/cursor/STDIN_SHAPE.md`](../../hooks/cursor/STDIN_SHAPE.md) — per-event schema with citations
+- [`mempalace/hooks/cursor/README.md`](../../mempalace/hooks/cursor/README.md) — full reference for hooks
+- [`mempalace/hooks/cursor/STDIN_SHAPE.md`](../../mempalace/hooks/cursor/STDIN_SHAPE.md) — per-event schema with citations
 - [`website/guide/cursor-hooks.md`](../../website/guide/cursor-hooks.md) — rendered docs
 - [`.cursor-plugin/README.md`](../../.cursor-plugin/README.md) — Cursor plugin (MCP + commands + skill)

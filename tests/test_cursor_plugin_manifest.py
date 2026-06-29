@@ -517,11 +517,11 @@ class TestReadme:
 
     def test_readme_cross_references_hooks_install_path(self):
         """Hooks are deliberately NOT part of the plugin (they're wired
-        via hooks/cursor/install.sh). The README must tell users where
+        via mempalace/hooks/cursor/install.sh). The README must tell users where
         to go for that, otherwise users will assume the plugin already
         installed the hooks and wonder why nothing saves.
         """
         text = README_PATH.read_text(encoding="utf-8")
-        assert "hooks/cursor/install.sh" in text, (
-            "README must reference hooks/cursor/install.sh so users know how to enable auto-save"
+        assert "mempalace/hooks/cursor/install.sh" in text, (
+            "README must reference mempalace/hooks/cursor/install.sh so users know how to enable auto-save"
         )

@@ -22,14 +22,14 @@ Add to `.claude/settings.local.json`:
       "matcher": "*",
       "hooks": [{
         "type": "command",
-        "command": "/absolute/path/to/hooks/mempal_save_hook.sh",
+        "command": "/absolute/path/to/mempalace/hooks/mempal_save_hook.sh",
         "timeout": 30
       }]
     }],
     "PreCompact": [{
       "hooks": [{
         "type": "command",
-        "command": "/absolute/path/to/hooks/mempal_precompact_hook.sh",
+        "command": "/absolute/path/to/mempalace/hooks/mempal_precompact_hook.sh",
         "timeout": 30
       }]
     }]
@@ -39,7 +39,7 @@ Add to `.claude/settings.local.json`:
 
 Make them executable:
 ```bash
-chmod +x hooks/mempal_save_hook.sh hooks/mempal_precompact_hook.sh
+chmod +x mempalace/hooks/mempal_save_hook.sh mempalace/hooks/mempal_precompact_hook.sh
 ```
 
 ## Install — Codex CLI
@@ -50,12 +50,12 @@ Add to `.codex/hooks.json`:
 {
   "Stop": [{
     "type": "command",
-    "command": "/absolute/path/to/hooks/mempal_save_hook.sh",
+    "command": "/absolute/path/to/mempalace/hooks/mempal_save_hook.sh",
     "timeout": 30
   }],
   "PreCompact": [{
     "type": "command",
-    "command": "/absolute/path/to/hooks/mempal_precompact_hook.sh",
+    "command": "/absolute/path/to/mempalace/hooks/mempal_precompact_hook.sh",
     "timeout": 30
   }]
 }

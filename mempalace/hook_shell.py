@@ -3,7 +3,8 @@
 The shell hooks intentionally stay small and portable, but parsing Claude
 hook JSON and counting UTF-8 JSONL transcripts is safer in Python than in
 inline shell snippets. This module centralizes that behavior for both
-hooks/mempal_save_hook.sh and hooks/mempal_precompact_hook.sh.
+mempalace/hooks/mempal_save_hook.sh and
+mempalace/hooks/mempal_precompact_hook.sh.
 """
 
 from __future__ import annotations

@@ -82,7 +82,7 @@ Add a `PreCompress` hook to `~/.gemini/settings.json`:
 
 Make sure the hook scripts are executable:
 ```bash
-chmod +x hooks/*.sh
+chmod +x mempalace/hooks/*.sh
 ```
 
 ## Usage

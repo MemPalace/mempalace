@@ -1,6 +1,6 @@
 """Regression tests for the bash 3.2 compatibility fix (#1440).
 
-The legacy hooks/*.sh scripts run on the user's system. On stock macOS
+The legacy mempalace/hooks/*.sh scripts run on the user's system. On stock macOS
 that is GNU bash 3.2.57 (Apple GPLv3 freeze, 2006). Using bash 4.0-only
 builtins like ``mapfile`` silently breaks parsing: every JSON field
 falls back to its default, the hook logs ``Session unknown: 0 exchanges``,
@@ -25,9 +25,10 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SAVE_HOOK = REPO_ROOT / "hooks" / "mempal_save_hook.sh"
-PRECOMPACT_HOOK = REPO_ROOT / "hooks" / "mempal_precompact_hook.sh"
-SESSION_END_HOOK = REPO_ROOT / "hooks" / "mempal_session_end_hook.sh"
+HOOKS_DIR = REPO_ROOT / "mempalace" / "hooks"
+SAVE_HOOK = HOOKS_DIR / "mempal_save_hook.sh"
+PRECOMPACT_HOOK = HOOKS_DIR / "mempal_precompact_hook.sh"
+SESSION_END_HOOK = HOOKS_DIR / "mempal_session_end_hook.sh"
 PLUGIN_SESSION_END_HOOK = REPO_ROOT / ".claude-plugin" / "hooks" / "mempal-session-end-hook.sh"
 
 _SESSION_END_HOOKS = pytest.mark.parametrize(
