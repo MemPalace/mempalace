@@ -5,6 +5,32 @@ if __name__ != "mempalace.mcp_server":
 
 # ==================== KNOWLEDGE GRAPH ====================
 
+# Max facts returned by a single kg_query response. A broad query (e.g. a hub
+# entity with thousands of relationships) can otherwise return hundreds of
+# thousands of characters and overflow the caller's context window. Override
+# via MEMPALACE_KG_RESULT_CAP.
+try:
+    KG_RESULT_CAP = max(1, int(os.environ.get("MEMPALACE_KG_RESULT_CAP", "100")))
+except (ValueError, TypeError):
+    KG_RESULT_CAP = 100
+
+
+def _cap_facts(results: list, *, narrow_hint: str) -> tuple[list, Optional[str]]:
+    """Cap a fact list to ``KG_RESULT_CAP``; return (kept, truncation_notice).
+
+    Returns the full list unchanged (and ``None`` notice) when within the cap.
+    Over the cap, returns the first ``KG_RESULT_CAP`` facts plus a notice the
+    caller surfaces in the response so truncation is never silent.
+    """
+    if not isinstance(results, list) or len(results) <= KG_RESULT_CAP:
+        return results, None
+    omitted = len(results) - KG_RESULT_CAP
+    notice = (
+        f"{omitted} more fact(s) omitted (showing first {KG_RESULT_CAP} of "
+        f"{len(results)}); {narrow_hint}"
+    )
+    return results[:KG_RESULT_CAP], notice
+
 
 def _temporal_bound_key(value, *, end: bool = False) -> Optional[str]:
     if not value:
@@ -37,12 +63,19 @@ def tool_kg_query(entity: str, as_of: str = None, direction: str = "both"):
         return {"error": "direction must be 'outgoing', 'incoming', or 'both'"}
 
     results = _call_kg(lambda kg: kg.query_entity(entity, as_of=as_of, direction=direction))
+    total = len(results) if isinstance(results, list) else None
+    # Cap before bucketing: the active / historical / future split and the flat
+    # facts list are all views of the same rows, so capping only one of them
+    # would leave the response as large as it was. One capped set feeds all four.
+    facts, notice = _cap_facts(
+        results, narrow_hint="narrow with as_of= or direction= to see the rest"
+    )
     if as_of is None:
         now_key = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         active = []
         historical = []
         future = []
-        for row in results:
+        for row in facts:
             bucket = _fact_interval_bucket(row, now_key)
             if bucket == "future":
                 future.append(row)
@@ -51,7 +84,7 @@ def tool_kg_query(entity: str, as_of: str = None, direction: str = "both"):
             else:
                 active.append(row)
     else:
-        active = results
+        active = facts
         historical = []
         future = []
     payload = {
@@ -60,13 +93,16 @@ def tool_kg_query(entity: str, as_of: str = None, direction: str = "both"):
         "active_facts": active,
         "historical_facts": historical,
         "future_facts": future,
-        "facts": results,
-        "count": len(results),
+        "facts": facts,
+        "count": len(facts),
     }
-    if results:
+    if notice is not None:
+        payload["total"] = total
+        payload["truncated"] = True
+        payload["notice"] = notice
+    if facts:
         resolved_names = {
-            r.get("subject") if r.get("direction") == "outgoing" else r.get("object")
-            for r in results
+            r.get("subject") if r.get("direction") == "outgoing" else r.get("object") for r in facts
         }
         resolved_names.discard(None)
         if len(resolved_names) == 1:

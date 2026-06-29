@@ -3,6 +3,15 @@ if __name__ != "mempalace.mcp_server":
     raise ImportError(f"{__name__} is an implementation fragment; import mempalace.mcp_server")
 
 
+# Hard ceiling (in characters) on any single serialized tool response, applied
+# at the dispatch chokepoint as a backstop against context overflow. ~50KB.
+# Override via MEMPALACE_MAX_RESPONSE_CHARS.
+try:
+    MAX_RESPONSE_CHARS = max(1000, int(os.environ.get("MEMPALACE_MAX_RESPONSE_CHARS", "50000")))
+except (ValueError, TypeError):
+    MAX_RESPONSE_CHARS = 50000
+
+
 def _internal_tool_error(req_id, tool_name: str, exc: BaseException = None) -> dict:
     logger.exception(f"Tool error in {tool_name}")
     error: dict = {"code": -32000, "message": "Internal tool error"}
@@ -834,15 +843,22 @@ def handle_request(request):
                 result = _decorate_mcp_tool_result(
                     tool_name, TOOLS[tool_name]["handler"](**tool_args)
                 )
-
+            text = json.dumps(result, indent=2, ensure_ascii=False)
+            # Backstop against any tool returning an oversized payload that
+            # would overflow the caller's context (one real incident: a broad
+            # kg_query returned ~675K chars). Per-tool caps (e.g. _cap_facts)
+            # handle the common cases gracefully; this is the last line of
+            # defense for everything else. Truncation is announced, not silent.
+            if len(text) > MAX_RESPONSE_CHARS:
+                text = (
+                    text[:MAX_RESPONSE_CHARS]
+                    + f"\n\n... [response truncated: {len(text)} chars exceeded the "
+                    + f"{MAX_RESPONSE_CHARS}-char cap; narrow your query]"
+                )
             return {
                 "jsonrpc": "2.0",
                 "id": req_id,
-                "result": {
-                    "content": [
-                        {"type": "text", "text": json.dumps(result, indent=2, ensure_ascii=False)}
-                    ]
-                },
+                "result": {"content": [{"type": "text", "text": text}]},
             }
         except TypeError as e:
             # Qualname match prevents leaking internal helper/param names raised
