@@ -89,34 +89,45 @@ and needs no extra.
 
 ## 3. Serve MCP over HTTP
 
-The MCP server speaks JSON-RPC over `POST /mcp` and exposes an unauthenticated
-`GET /healthz` liveness probe for orchestrators. Binding to a **non-loopback**
-host requires a bearer token — MemPalace refuses to start otherwise.
+One command — `mempalace serve` — runs the server with secure defaults. On a
+network-exposed (`0.0.0.0`) bind it **auto-generates a strong bearer token**
+(stored `0600` under `~/.mempalace/server/`, printed once), prints a
+ready-to-paste client config, and runs in the foreground so Docker/systemd own
+the lifecycle.
 
 ```bash
-export MEMPALACE_MCP_HTTP_TOKEN="$(openssl rand -hex 32)"
-
-mempalace-mcp --transport http --host 0.0.0.0 --port 8765 --backend qdrant
+mempalace serve --host 0.0.0.0 --port 8765 --backend qdrant
 ```
 
-| Flag / variable | Default | Purpose |
+Output includes the token and the exact client command. Useful flags:
+
+| Flag | Default | Purpose |
 |---|---|---|
-| `--transport http` | `stdio` | Serve over HTTP instead of stdio |
 | `--host` | `127.0.0.1` | Bind address (`0.0.0.0` to accept remote clients) |
 | `--port` | `8765` | Listen port |
-| `MEMPALACE_MCP_HTTP_TOKEN` | _(none)_ | **Required** for non-loopback binds; clients send `Authorization: Bearer <token>` |
+| `--backend` | config/env | Storage backend (e.g. `qdrant`) |
+| `--tls-cert` / `--tls-key` | _(none)_ | PEM cert + key to terminate **TLS natively** (server speaks `https`) |
+| `--read-only` | off | Expose recall only — the mutating tools are hidden and refused |
+| `--token` | auto | Use a specific bearer token instead of the generated one |
+| `--allow-insecure` | off | Permit a non-loopback bind with no token (only behind a trusted proxy) |
 
-The server protects against DNS-rebinding with a `Host` allowlist and an
-`Origin` loopback check, and serializes concurrent writes — so multiple
-teammates can write to the shared palace at once over HTTP.
+The token always travels via the environment, never the command line, so it
+can't leak through `ps`. Binding to a non-loopback host with no token and no
+`--allow-insecure` refuses to start. The server also guards against
+DNS-rebinding with a `Host` allowlist and an `Origin` loopback check, and
+serializes concurrent writes — so multiple teammates can write to the shared
+palace at once over HTTP.
 
-::: danger Put TLS in front of it
-The HTTP server is plaintext. For anything beyond a trusted private network,
-run it behind a reverse proxy (nginx/Caddy/Traefik) terminating TLS, and keep
-the bearer token secret. Only set
-`MEMPALACE_MCP_HTTP_ALLOW_INSECURE_NO_TOKEN=1` when a trusted fronting layer
-already enforces access control — never on a directly-exposed port.
+::: tip TLS
+Pass `--tls-cert`/`--tls-key` to terminate TLS in the server itself
+(`https://…`). Otherwise the server is plaintext and you should front it with a
+TLS-terminating reverse proxy (nginx/Caddy/Traefik) — never expose plaintext
+`/mcp` beyond a trusted private network.
 :::
+
+The underlying server is `mempalace-mcp --transport http` (the same flags exist
+there if you'd rather wire the token/TLS yourself); `mempalace serve` is the
+turnkey wrapper over it.
 
 ## 4. Connect a client
 
@@ -150,6 +161,29 @@ whole team.
   works as a load-balancer/Kubernetes liveness probe.
 - **Backups** are now your storage backend's responsibility (Qdrant snapshots
   / Postgres backups) rather than a single laptop's palace directory.
+
+## One-command deployments
+
+The repo ships ready-to-edit deployment files under
+[`deploy/`](https://github.com/MemPalace/mempalace/tree/main/deploy):
+
+**Docker Compose (server + Qdrant):**
+
+```bash
+cp deploy/server.env.example deploy/.env      # set MEMPALACE_MCP_HTTP_TOKEN
+docker compose -f deploy/docker-compose.server.yml --env-file deploy/.env up -d
+```
+
+This brings up a Qdrant container and a MemPalace server running
+`serve --host 0.0.0.0 --backend qdrant`, with a `/healthz` healthcheck and
+persistent volumes. Embeddings stay local to the MemPalace container.
+
+**systemd:**
+
+`deploy/mempalace-server.service` is a hardened unit template
+(`NoNewPrivileges`, `ProtectSystem=strict`, dedicated user) that runs
+`mempalace serve` with its config from `/etc/mempalace/server.env`. Install
+steps are in the file's header comment.
 
 ## See also
 

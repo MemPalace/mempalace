@@ -275,6 +275,23 @@ def _parse_args():
         default=8765,
         help="HTTP port to bind when --transport=http (default: 8765)",
     )
+    parser.add_argument(
+        "--tls-cert",
+        metavar="PATH",
+        help="PEM certificate to terminate TLS on the HTTP transport "
+        "(requires --tls-key; env MEMPALACE_MCP_TLS_CERT)",
+    )
+    parser.add_argument(
+        "--tls-key",
+        metavar="PATH",
+        help="PEM private key matching --tls-cert (env MEMPALACE_MCP_TLS_KEY)",
+    )
+    parser.add_argument(
+        "--read-only",
+        action="store_true",
+        help="Serve a read-only tool surface: the mutating tools are hidden from "
+        "tools/list and refused at dispatch (env MEMPALACE_MCP_READ_ONLY)",
+    )
     args, unknown = parser.parse_known_args()
     if unknown:
         logger.debug("Ignoring unknown args: %s", unknown)
@@ -294,6 +311,14 @@ if _args.backend:
     os.environ["MEMPALACE_BACKEND"] = backend_name
 
 _config = MempalaceConfig()
+
+# Read-only server mode: when on, the mutating tools are hidden from tools/list
+# and refused at dispatch (-32003). Resolved once at startup from --read-only or
+# MEMPALACE_MCP_READ_ONLY. Computed inline (not via _truthy_env, defined below)
+# so it is available to the request path regardless of import order.
+_READ_ONLY = bool(getattr(_args, "read_only", False)) or os.environ.get(
+    "MEMPALACE_MCP_READ_ONLY", ""
+).strip().lower() in {"1", "true", "yes", "on"}
 
 _kg_by_path: dict[str, KnowledgeGraph] = {}
 _kg_cache_lock = threading.Lock()
@@ -4426,8 +4451,35 @@ def _internal_tool_error(req_id, tool_name: str, exc: BaseException = None) -> d
     }
 
 
+def _mcp_read_only_refusal(req_id, tool_name: str):
+    """Refuse mutating tools when the server runs in read-only mode (#1877).
+
+    Read-only is an operator-set server mode (``--read-only`` /
+    ``MEMPALACE_MCP_READ_ONLY``), distinct from the dynamic peer-writer lock:
+    it is an unconditional gate so a shared team server can expose recall
+    without write access. Enforced at dispatch, not merely hidden from
+    tools/list, so a client that calls a mutating tool by name is still refused.
+    """
+    if not _READ_ONLY or tool_name not in _MUTATING_TOOLS:
+        return None
+
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {
+            "code": -32003,
+            "message": "Server is in read-only mode; this tool is disabled",
+            "data": {"tool": tool_name},
+        },
+    }
+
+
 def _mcp_tool_preflight_refusal(req_id, tool_name: str):
     """Run MCP request preflight gates outside handle_request complexity."""
+
+    read_only_error = _mcp_read_only_refusal(req_id, tool_name)
+    if read_only_error is not None:
+        return read_only_error
 
     sqlite_integrity_error = _mcp_sqlite_integrity_refusal(req_id, tool_name)
     if sqlite_integrity_error is not None:
@@ -4480,6 +4532,8 @@ def handle_request(request):
         # Notifications (no id) never get a response per JSON-RPC spec
         return None
     elif method == "tools/list":
+        # In read-only mode, hide the mutating tools so clients don't advertise
+        # write capabilities they can't use (dispatch also refuses them, #1877).
         return {
             "jsonrpc": "2.0",
             "id": req_id,
@@ -4487,6 +4541,7 @@ def handle_request(request):
                 "tools": [
                     {"name": n, "description": t["description"], "inputSchema": t["input_schema"]}
                     for n, t in TOOLS.items()
+                    if not (_READ_ONLY and n in _MUTATING_TOOLS)
                 ]
             },
         }
@@ -4856,6 +4911,37 @@ _HTTP_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1", "[::1]")
 _HTTP_ALLOW_INSECURE_NO_TOKEN_ENV = "MEMPALACE_MCP_HTTP_ALLOW_INSECURE_NO_TOKEN"
 
 
+def _resolve_tls_paths() -> tuple:
+    """Resolve the TLS cert/key from --tls-cert/--tls-key or env, or (None, None).
+
+    Flags take precedence over ``MEMPALACE_MCP_TLS_CERT`` / ``MEMPALACE_MCP_TLS_KEY``.
+    Both must be given together; one without the other is a configuration error
+    (raised here, before any bind, so it fails loudly at startup).
+    """
+    cert = (
+        getattr(_args, "tls_cert", None) or os.environ.get("MEMPALACE_MCP_TLS_CERT", "")
+    ).strip()
+    key = (getattr(_args, "tls_key", None) or os.environ.get("MEMPALACE_MCP_TLS_KEY", "")).strip()
+    if bool(cert) != bool(key):
+        raise ValueError("TLS requires both --tls-cert and --tls-key (or the matching env vars)")
+    if not cert:
+        return None, None
+    for label, path in (("--tls-cert", cert), ("--tls-key", key)):
+        if not os.path.isfile(path):
+            raise ValueError(f"{label} file not found: {path!r}")
+    return cert, key
+
+
+def _wrap_tls(sock, cert: str, key: str):
+    """Wrap a server socket in a TLS 1.2+ context. Raises on bad cert/key."""
+    import ssl
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(certfile=cert, keyfile=key)
+    return ctx.wrap_socket(sock, server_side=True)
+
+
 def _http_is_loopback(host: str) -> bool:
     """Whether ``host`` binds only to this machine."""
     return (host or "").strip().lower() in _HTTP_LOOPBACK_HOSTS
@@ -4920,6 +5006,11 @@ def _build_http_server(host: str, port: int):
             f"non-loopback host. Set {_HTTP_ALLOW_INSECURE_NO_TOKEN_ENV}=1 only "
             "when a trusted fronting layer provides access control."
         )
+
+    # Resolve TLS before bind so a bad cert/key fails loudly rather than at the
+    # first request. TLS is transport encryption only — the bearer-token guard
+    # above still applies on a non-loopback bind.
+    tls_cert, tls_key = _resolve_tls_paths()
 
     class _MCPHTTPServer(ThreadingHTTPServer):
         daemon_threads = True
@@ -5043,6 +5134,10 @@ def _build_http_server(host: str, port: int):
     httpd.enforce_host_pin = _http_is_loopback(host)
     httpd.allowed_hosts = _http_allowed_host_values(host, bound_port)
     httpd.auth_token = auth_token
+    httpd.scheme = "http"
+    if tls_cert:
+        httpd.socket = _wrap_tls(httpd.socket, tls_cert, tls_key)
+        httpd.scheme = "https"
     return httpd
 
 
@@ -5076,7 +5171,14 @@ def _serve_http(host: str, port: int) -> None:
                 _HTTP_ALLOW_INSECURE_NO_TOKEN_ENV,
             )
     with httpd:
-        logger.info("MemPalace MCP HTTP server listening on http://%s:%s/mcp", host, bound_port)
+        logger.info(
+            "MemPalace MCP HTTP server listening on %s://%s:%s/mcp%s%s",
+            getattr(httpd, "scheme", "http"),
+            host,
+            bound_port,
+            " (TLS)" if getattr(httpd, "scheme", "http") == "https" else "",
+            " (read-only)" if _READ_ONLY else "",
+        )
         try:
             httpd.serve_forever(poll_interval=0.5)
         except KeyboardInterrupt:
