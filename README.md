@@ -214,6 +214,31 @@ cross-wing navigation, drawer management, and agent diaries. Installation
 and the full tool list:
 [mempalaceofficial.com/reference/mcp-tools](https://mempalaceofficial.com/reference/mcp-tools.html).
 
+### Audit telemetry (opt-in)
+
+Opt-in per-request audit telemetry for the HTTP transport, **off by default** —
+no behaviour change and nothing is written to disk unless you enable it:
+
+- **Audit telemetry** (`MEMPALACE_AUDIT=1`) — appends a per-request JSONL event
+  (method, tool, latency, fingerprinted args, result summary) to
+  `~/.mempalace/service_logs/mcp_audit.jsonl` (override with
+  `MEMPALACE_AUDIT_FILE`). Sensitive content is stored as a length plus a
+  truncated SHA-256 fingerprint (first 16 hex chars), never raw, unless
+  `MEMPALACE_AUDIT_SEARCH_RESPONSE_TEXT=1` is also set — and even then the raw
+  text is bounded by `MEMPALACE_AUDIT_SEARCH_RESPONSE_MAX_CHARS`. Summarise the
+  log with `mempalace audit`.
+
+| Env var | Default | Effect |
+|---|---|---|
+| `MEMPALACE_AUDIT` | off | Enable per-request audit telemetry |
+| `MEMPALACE_AUDIT_FILE` | `~/.mempalace/service_logs/mcp_audit.jsonl` | Audit log path |
+| `MEMPALACE_AUDIT_SEARCH_RESPONSE_TEXT` | off | Also store raw search-response snippets (default: fingerprint only) |
+| `MEMPALACE_AUDIT_SEARCH_RESPONSE_MAX_CHARS` | `2000` | Max chars of raw search-response text kept when the above is on |
+| `MEMPALACE_AUDIT_TEXT_PREVIEW` | off | Also store a short raw preview of sensitive args (`content`, `text`, `context`, …); off keeps them fingerprint-only |
+
+Telemetry sits behind the transport's existing Host/Origin policy and the
+optional `MEMPALACE_MCP_HTTP_TOKEN` bearer auth.
+
 ## Agents
 
 Each specialist agent gets its own wing and diary in the palace.

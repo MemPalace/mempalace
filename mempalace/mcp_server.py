@@ -232,6 +232,277 @@ _init_logging()
 logger = logging.getLogger("mempalace_mcp")
 
 
+# MCP audit telemetry is opt-in (default off): set MEMPALACE_AUDIT=1 to record a
+# per-request JSONL log of memory-tool usage (method, tool, latency, fingerprinted
+# args). Intended for operators who want a usage/compliance trail; it never runs
+# and never touches disk unless explicitly enabled.
+_AUDIT_ENABLED = os.environ.get("MEMPALACE_AUDIT", "").strip().lower() in {"1", "true", "yes", "on"}
+
+_AUDIT_FILE = Path(
+    os.environ.get(
+        "MEMPALACE_AUDIT_FILE",
+        os.path.expanduser("~/.mempalace/service_logs/mcp_audit.jsonl"),
+    )
+)
+
+_AUDIT_TEXT_PREVIEW = os.environ.get("MEMPALACE_AUDIT_TEXT_PREVIEW", "0") == "1"
+_AUDIT_MAX_TEXT = 250
+_AUDIT_SEARCH_RESPONSE_MAX_CHARS_DEFAULT = 2000
+
+
+def _audit_positive_int_env(name: str, default: int) -> int:
+    """Parse a positive int env var, returning ``default`` for a missing, blank,
+    non-integer, or non-positive value. Keeps a misconfigured env var from
+    crashing the server at import time."""
+    try:
+        value = int(os.environ.get(name, "").strip())
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+# Privacy-conservative default: store only a length + truncated SHA-256
+# fingerprint of search-response text. Set MEMPALACE_AUDIT_SEARCH_RESPONSE_TEXT=1
+# to also store the raw snippet, always bounded by
+# MEMPALACE_AUDIT_SEARCH_RESPONSE_MAX_CHARS (default 2000) so the log can never
+# grow without limit even when raw capture is enabled.
+_AUDIT_SEARCH_RESPONSE_TEXT = os.environ.get("MEMPALACE_AUDIT_SEARCH_RESPONSE_TEXT", "0") == "1"
+_AUDIT_SEARCH_RESPONSE_MAX_CHARS = _audit_positive_int_env(
+    "MEMPALACE_AUDIT_SEARCH_RESPONSE_MAX_CHARS", _AUDIT_SEARCH_RESPONSE_MAX_CHARS_DEFAULT
+)
+_AUDIT_SENSITIVE_KEYS = frozenset(
+    {
+        "content",
+        "content_preview",
+        "context",
+        "document",
+        "documents",
+        "entry",
+        "entry_preview",
+        "text",
+    }
+)
+
+
+def _short_hash(value: str) -> str:
+    # Truncated SHA-256: the first 16 hex chars (64 bits) are enough to
+    # correlate identical content without storing it, while keeping the log
+    # compact. Recorded under the honestly-named ``sha256_16`` field.
+    return hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def _text_fingerprint(value: str, include_preview: bool = False) -> dict:
+    info = {"chars": len(value), "sha256_16": _short_hash(value)}
+    if include_preview:
+        info["preview"] = value[:_AUDIT_MAX_TEXT]
+    return info
+
+
+def _audit_search_response_text(value: str) -> dict:
+    info = _text_fingerprint(value)
+    if not _AUDIT_SEARCH_RESPONSE_TEXT:
+        return info
+    max_chars = _AUDIT_SEARCH_RESPONSE_MAX_CHARS
+    if max_chars > 0 and len(value) > max_chars:
+        info["text"] = value[:max_chars]
+        info["truncated"] = True
+    else:
+        info["text"] = value
+        info["truncated"] = False
+    return info
+
+
+def _audit_value(key: str, value):
+    if isinstance(value, str):
+        if key == "query":
+            return value[:_AUDIT_MAX_TEXT]
+        if key in _AUDIT_SENSITIVE_KEYS:
+            return _text_fingerprint(value, include_preview=_AUDIT_TEXT_PREVIEW)
+        return value[:_AUDIT_MAX_TEXT]
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    if isinstance(value, list):
+        return [_audit_value(key, item) for item in value[:10]]
+    if isinstance(value, dict):
+        return {str(k): _audit_value(str(k), v) for k, v in value.items()}
+    return str(value)[:_AUDIT_MAX_TEXT]
+
+
+def _audit_args(params: dict) -> dict:
+    args = params.get("arguments") or {}
+    if not isinstance(args, dict):
+        return {"arguments_type": type(args).__name__}
+    return {str(k): _audit_value(str(k), v) for k, v in args.items()}
+
+
+def _summarize_search_result(result: dict) -> dict:
+    hits = result.get("results") or []
+    top = []
+    for rank, hit in enumerate(hits[:5], start=1):
+        hit = hit or {}
+        text = hit.get("text") or ""
+        top.append(
+            {
+                "rank": rank,
+                "drawer_id": hit.get("id") or hit.get("drawer_id"),
+                "wing": hit.get("wing"),
+                "room": hit.get("room"),
+                "source_file": hit.get("source_file"),
+                "similarity": hit.get("similarity"),
+                "distance": hit.get("distance"),
+                "effective_distance": hit.get("effective_distance"),
+                "closet_boost": hit.get("closet_boost"),
+                "matched_via": hit.get("matched_via"),
+                "text_chars": len(text) if isinstance(text, str) else None,
+                "response_text": _audit_search_response_text(text) if isinstance(text, str) else None,
+                "drawer_index": hit.get("drawer_index"),
+                "total_drawers": hit.get("total_drawers"),
+            }
+        )
+    return {
+        "query": result.get("query"),
+        "filters": result.get("filters"),
+        "result_count": len(hits),
+        "total_before_filter": result.get("total_before_filter"),
+        "query_sanitized": bool(result.get("query_sanitized")),
+        "top_results": top,
+    }
+
+
+def _summarize_tool_result(tool_name: str, result) -> dict:
+    if not isinstance(result, dict):
+        return {"result_type": type(result).__name__}
+    if "error" in result:
+        return {"error": str(result.get("error"))[:_AUDIT_MAX_TEXT]}
+
+    if tool_name == "mempalace_search":
+        return _summarize_search_result(result)
+    if tool_name == "mempalace_status":
+        return {
+            "total_drawers": result.get("total_drawers"),
+            "wing_count": len(result.get("wings") or {}),
+            "room_count": len(result.get("rooms") or {}),
+            "palace_path": result.get("palace_path"),
+        }
+    if tool_name in {"mempalace_list_wings", "mempalace_list_rooms"}:
+        key = "wings" if "wings" in result else "rooms"
+        values = result.get(key) or {}
+        return {f"{key}_count": len(values), "top": dict(list(values.items())[:10])}
+    if tool_name == "mempalace_get_taxonomy":
+        taxonomy = result.get("taxonomy") or {}
+        room_count = sum(len(rooms or {}) for rooms in taxonomy.values())
+        return {"wing_count": len(taxonomy), "room_count": room_count}
+    if tool_name == "mempalace_get_drawer":
+        content = result.get("content") or ""
+        return {
+            "drawer_id": result.get("drawer_id"),
+            "wing": result.get("wing"),
+            "room": result.get("room"),
+            "content_chars": len(content) if isinstance(content, str) else None,
+        }
+    if tool_name == "mempalace_list_drawers":
+        drawers = result.get("drawers") or []
+        return {
+            "count": result.get("count"),
+            "offset": result.get("offset"),
+            "limit": result.get("limit"),
+            "top_drawers": [
+                {
+                    "drawer_id": drawer.get("drawer_id"),
+                    "wing": drawer.get("wing"),
+                    "room": drawer.get("room"),
+                }
+                for drawer in drawers[:10]
+                if isinstance(drawer, dict)
+            ],
+        }
+    if tool_name in {
+        "mempalace_add_drawer",
+        "mempalace_checkpoint",
+        "mempalace_create_tunnel",
+        "mempalace_delete_by_source",
+        "mempalace_delete_drawer",
+        "mempalace_delete_tunnel",
+        "mempalace_diary_write",
+        "mempalace_kg_add",
+        "mempalace_kg_invalidate",
+        "mempalace_update_drawer",
+    }:
+        allowed = {
+            "agent",
+            "diary_id",
+            "drawer_id",
+            "error",
+            "fact",
+            "invalidated",
+            "reason",
+            "room",
+            "success",
+            "topic",
+            "triple_id",
+            "wing",
+        }
+        return {k: _audit_value(k, v) for k, v in result.items() if k in allowed}
+    if "count" in result:
+        return {"count": result.get("count")}
+    if "success" in result:
+        return {"success": result.get("success"), "error": result.get("error")}
+    return {"keys": sorted(str(k) for k in result.keys())[:20]}
+
+
+def _response_error(response) -> dict | None:
+    if not isinstance(response, dict):
+        return None
+    error = response.get("error")
+    if not isinstance(error, dict):
+        return None
+    return {
+        "code": error.get("code"),
+        "message": str(error.get("message", ""))[:_AUDIT_MAX_TEXT],
+    }
+
+
+def _extract_tool_result(response):
+    try:
+        text = response["result"]["content"][0]["text"]
+        return json.loads(text)
+    except Exception:
+        return None
+
+
+def _audit_log(event: dict) -> None:
+    if not _AUDIT_ENABLED:
+        return
+    try:
+        _AUDIT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            _AUDIT_FILE.parent.chmod(0o700)
+        except (OSError, NotImplementedError):
+            pass
+        fd = os.open(str(_AUDIT_FILE), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        # The 0o600 mode above only applies when this call creates the file; an
+        # already-existing log keeps its own perms. Best-effort tighten so a
+        # pre-existing audit file can't stay broader than intended.
+        try:
+            os.chmod(_AUDIT_FILE, 0o600)
+        except (OSError, NotImplementedError):
+            pass
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, default=str, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        logger.error("MCP audit write failed: %s", exc)
+
+
+def _audit_context_from_http(handler, body_len: int, path: str) -> dict:
+    return {
+        "remote": handler.client_address[0] if handler.client_address else None,
+        "user_agent": handler.headers.get("user-agent"),
+        "session_id": handler.headers.get("mcp-session-id"),
+        "content_length": body_len,
+        "path": path,
+    }
+
+
 def _get_result_ids(result) -> list:
     """Return ``get()`` result ids for both typed and dict-like collection results."""
     if result is None:
@@ -4717,7 +4988,7 @@ def _decorate_mcp_tool_result(tool_name: str, result):
     return result
 
 
-def handle_request(request):
+def _handle_request_impl(request):
     global _last_request_time
     if not isinstance(request, dict):
         return {
@@ -4904,6 +5175,81 @@ def handle_request(request):
         "id": req_id,
         "error": {"code": -32601, "message": f"Unknown method: {method}"},
     }
+
+
+def handle_request(request, audit_context: dict | None = None):
+    # Fast path when auditing is off: add zero overhead — no timer, no event
+    # construction, no extra dict work — just dispatch straight through.
+    if not _AUDIT_ENABLED:
+        return _handle_request_impl(request)
+
+    start = time.perf_counter()
+    if isinstance(request, dict):
+        method = request.get("method") or ""
+        params = request.get("params") or {}
+        req_id = request.get("id")
+    else:
+        method = ""
+        params = {}
+        req_id = None
+    tool_name = params.get("name") if isinstance(params, dict) else None
+    response = None
+    raised = None
+
+    try:
+        response = _handle_request_impl(request)
+        return response
+    except Exception as exc:
+        raised = exc
+        raise
+    finally:
+        # Telemetry must never disrupt the request: any failure building or
+        # writing the audit event is logged and swallowed here, never raised
+        # out of this finally (which would mask the real response or exception).
+        try:
+            latency_ms = round((time.perf_counter() - start) * 1000, 3)
+            error = (
+                {"code": "exception", "message": str(raised)[:_AUDIT_MAX_TEXT]}
+                if raised is not None
+                else _response_error(response)
+            )
+            event = {
+                "timestamp": datetime.now().isoformat(),
+                "event": "mcp_request",
+                "method": method,
+                "request_id": req_id,
+                "ok": error is None,
+                "latency_ms": latency_ms,
+            }
+            if audit_context:
+                event.update(audit_context)
+            if tool_name:
+                event["tool"] = tool_name
+                event["tool_args"] = _audit_args(params if isinstance(params, dict) else {})
+                tool_result = _extract_tool_result(response)
+                if tool_result is not None:
+                    event["result"] = _summarize_tool_result(tool_name, tool_result)
+            if error:
+                event["error"] = error
+            elif response is None:
+                event["notification"] = True
+            elif isinstance(response, dict) and "result" in response and method != "tools/call":
+                result = response.get("result")
+                if method == "tools/list" and isinstance(result, dict):
+                    event["result"] = {"tool_count": len(result.get("tools") or [])}
+                elif method == "initialize" and isinstance(result, dict):
+                    event["result"] = {
+                        "protocolVersion": result.get("protocolVersion"),
+                        "serverInfo": result.get("serverInfo"),
+                    }
+                    if isinstance(params, dict):
+                        event["client"] = {
+                            "protocolVersion": params.get("protocolVersion"),
+                            "clientInfo": _audit_value("clientInfo", params.get("clientInfo")),
+                        }
+            _audit_log(event)
+        except Exception as exc:
+            logger.error("MCP audit telemetry failed: %s", exc)
 
 
 def _restore_stdout():
@@ -5203,7 +5549,7 @@ def _http_origin_allowed(origin: str) -> bool:
     return host in ("127.0.0.1", "localhost", "::1")
 
 
-def _build_http_server(host: str, port: int):
+def _build_http_server(host: str, port: int):  # noqa: C901
     """Construct (but do not start) the MCP HTTP server.
 
     Split out from :func:`_serve_http` so tests can bind an ephemeral port,
@@ -5278,6 +5624,16 @@ def _build_http_server(host: str, port: int):
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self._send_bytes(status, body, "application/json; charset=utf-8")
 
+        def _discard_small_request_body(self) -> None:
+            if self.command != "POST":
+                return
+            try:
+                content_length = int(self.headers.get("Content-Length", "0") or "0")
+            except (TypeError, ValueError):
+                return
+            if 0 < content_length <= 65536:
+                self.rfile.read(content_length)
+
         def _request_rejected(self, require_auth: bool) -> bool:
             """Enforce the transport's access policy before any dispatch.
 
@@ -5291,27 +5647,30 @@ def _build_http_server(host: str, port: int):
                 host_hdr = (self.headers.get("Host") or "").strip().lower()
                 if host_hdr not in srv.allowed_hosts:
                     logger.warning("HTTP request rejected: Host %r not allowed", host_hdr)
+                    self._discard_small_request_body()
                     self.send_error(403, "Forbidden")
                     return True
             origin = self.headers.get("Origin")
             if origin and not _http_origin_allowed(origin):
                 logger.warning("HTTP request rejected: cross-origin %r", origin)
+                self._discard_small_request_body()
                 self.send_error(403, "Forbidden")
                 return True
             if require_auth and srv.auth_token:
                 provided = self.headers.get("Authorization", "")
                 if not hmac.compare_digest(provided, f"Bearer {srv.auth_token}"):
                     logger.warning("HTTP request rejected: missing/invalid bearer token")
+                    self._discard_small_request_body()
                     self.send_error(401, "Unauthorized")
                     return True
             return False
 
         def do_GET(self):
+            path = urlparse(self.path).path
             # Liveness probe is policy-gated for Host/Origin but never requires
             # the token, so an orchestrator's health check works without creds.
-            if self._request_rejected(require_auth=False):
+            if self._request_rejected(require_auth=(path != "/healthz")):
                 return
-            path = urlparse(self.path).path
             if path == "/healthz":
                 self._send_bytes(200, b"ok\n", "text/plain; charset=utf-8")
                 return
@@ -5322,14 +5681,16 @@ def _build_http_server(host: str, port: int):
             if self._request_rejected(require_auth=True):
                 return
             path = urlparse(self.path).path
-            if path != "/mcp":
-                self.send_error(404, "Not Found")
-                return
-
             try:
                 content_length = int(self.headers.get("Content-Length", "0") or "0")
             except (TypeError, ValueError):
                 content_length = 0
+
+            if path != "/mcp":
+                if 0 < content_length <= 65536:
+                    self.rfile.read(content_length)
+                self._send_bytes(404, b"not found\n", "text/plain; charset=utf-8")
+                return
 
             if content_length < 0 or content_length > _HTTP_MAX_REQUEST_BYTES:
                 self._send_json(
@@ -5342,11 +5703,23 @@ def _build_http_server(host: str, port: int):
                 )
                 return
 
+            audit_context = _audit_context_from_http(self, max(content_length, 0), path)
             try:
                 raw = self.rfile.read(content_length)
+                audit_context["content_length"] = len(raw)
                 request = json.loads(raw.decode("utf-8"))
             except Exception as exc:
                 logger.warning("HTTP JSON-RPC read or parse error: %s", exc)
+                _audit_log(
+                    {
+                        "timestamp": datetime.now().isoformat(),
+                        "event": "mcp_parse_error",
+                        "method": None,
+                        "ok": False,
+                        **audit_context,
+                        "error": {"code": -32700, "message": "Parse error"},
+                    }
+                )
                 self._send_json(400, _json_rpc_parse_error())
                 return
 
@@ -5354,7 +5727,7 @@ def _build_http_server(host: str, port: int):
             # stdio deployments rely on. HTTP gives us a safer transport, not
             # concurrent Chroma/HNSW mutation.
             with _HTTP_REQUEST_LOCK:
-                response = handle_request(request)
+                response = handle_request(request, audit_context)
 
             if response is None:
                 # JSON-RPC notifications intentionally have no response body.

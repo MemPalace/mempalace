@@ -1340,6 +1340,24 @@ class TestNoneMetadataSafety:
         stub_col.delete.assert_called_once_with(ids=["drawer_none_meta"])
 
 
+# ── Audit env parsing ───────────────────────────────────────────────────
+
+
+def test_audit_positive_int_env_falls_back_on_bad_values(monkeypatch):
+    from mempalace import mcp_server
+
+    for bad in ("not-a-number", "", "0", "-5", "3.5"):
+        monkeypatch.setenv("MEMPALACE_TEST_AUDIT_INT", bad)
+        # A typo'd or non-positive value must never crash; it returns the default.
+        assert mcp_server._audit_positive_int_env("MEMPALACE_TEST_AUDIT_INT", 2000) == 2000
+
+    monkeypatch.setenv("MEMPALACE_TEST_AUDIT_INT", "  512  ")
+    assert mcp_server._audit_positive_int_env("MEMPALACE_TEST_AUDIT_INT", 2000) == 512
+
+    monkeypatch.delenv("MEMPALACE_TEST_AUDIT_INT", raising=False)
+    assert mcp_server._audit_positive_int_env("MEMPALACE_TEST_AUDIT_INT", 2000) == 2000
+
+
 # ── Search Tool ─────────────────────────────────────────────────────────
 
 
@@ -1354,6 +1372,123 @@ class TestSearchTool:
         # Top result should be the auth drawer
         top = result["results"][0]
         assert "JWT" in top["text"] or "authentication" in top["text"].lower()
+
+    def test_audit_log_records_tool_calls_without_content(self, monkeypatch, config, kg, tmp_path):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        audit_file = tmp_path / "mcp_audit.jsonl"
+        monkeypatch.setattr(mcp_server, "_AUDIT_FILE", audit_file)
+        monkeypatch.setattr(mcp_server, "_AUDIT_ENABLED", True)
+
+        resp = mcp_server.handle_request(
+            {
+                "method": "tools/call",
+                "id": 42,
+                "params": {
+                    "name": "mempalace_check_duplicate",
+                    "arguments": {"content": "private background note"},
+                },
+            },
+            {"remote": "127.0.0.1", "user_agent": "pytest"},
+        )
+
+        assert resp["id"] == 42
+        entry = json.loads(audit_file.read_text().strip())
+        assert entry["method"] == "tools/call"
+        assert entry["tool"] == "mempalace_check_duplicate"
+        assert entry["ok"] is True
+        assert entry["remote"] == "127.0.0.1"
+        assert entry["tool_args"]["content"]["chars"] == len("private background note")
+        assert "private background note" not in audit_file.read_text()
+
+    def test_audit_search_summary_records_result_text(
+        self, monkeypatch, config, seeded_collection, seeded_kg, tmp_path
+    ):
+        del seeded_collection
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        from mempalace import mcp_server
+
+        audit_file = tmp_path / "mcp_audit.jsonl"
+        monkeypatch.setattr(mcp_server, "_AUDIT_FILE", audit_file)
+        monkeypatch.setattr(mcp_server, "_AUDIT_ENABLED", True)
+        monkeypatch.setattr(mcp_server, "_AUDIT_SEARCH_RESPONSE_TEXT", True)
+
+        resp = mcp_server.handle_request(
+            {
+                "method": "tools/call",
+                "id": 7,
+                "params": {
+                    "name": "mempalace_search",
+                    "arguments": {"query": "JWT tokens", "limit": 2},
+                },
+            }
+        )
+
+        assert "result" in resp
+        entry = json.loads(audit_file.read_text().strip())
+        assert entry["tool"] == "mempalace_search"
+        assert entry["result"]["query"] == "JWT tokens"
+        assert entry["result"]["result_count"] >= 1
+        assert entry["result"]["top_results"][0]["wing"] == "project"
+        response_text = entry["result"]["top_results"][0]["response_text"]
+        assert response_text["chars"] > 0
+        assert response_text["sha256_16"]
+        assert "JWT tokens" in response_text["text"]
+        assert response_text["truncated"] is False
+
+    def test_audit_disabled_writes_nothing(self, monkeypatch, config, kg, tmp_path):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        audit_file = tmp_path / "mcp_audit.jsonl"
+        monkeypatch.setattr(mcp_server, "_AUDIT_FILE", audit_file)
+        # _AUDIT_ENABLED left at its default (False) -> no telemetry is written.
+
+        resp = mcp_server.handle_request(
+            {
+                "method": "tools/call",
+                "id": 99,
+                "params": {
+                    "name": "mempalace_check_duplicate",
+                    "arguments": {"content": "private background note"},
+                },
+            },
+            {"remote": "127.0.0.1", "user_agent": "pytest"},
+        )
+
+        assert resp["id"] == 99
+        assert not audit_file.exists()
+
+    def test_audit_search_response_fingerprint_only_by_default(
+        self, monkeypatch, config, seeded_collection, seeded_kg, tmp_path
+    ):
+        del seeded_collection
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        from mempalace import mcp_server
+
+        audit_file = tmp_path / "mcp_audit.jsonl"
+        monkeypatch.setattr(mcp_server, "_AUDIT_FILE", audit_file)
+        monkeypatch.setattr(mcp_server, "_AUDIT_ENABLED", True)
+        # _AUDIT_SEARCH_RESPONSE_TEXT stays at its default (False) -> fingerprint only.
+
+        resp = mcp_server.handle_request(
+            {
+                "method": "tools/call",
+                "id": 8,
+                "params": {
+                    "name": "mempalace_search",
+                    "arguments": {"query": "JWT tokens", "limit": 2},
+                },
+            }
+        )
+
+        assert "result" in resp
+        entry = json.loads(audit_file.read_text().strip())
+        response_text = entry["result"]["top_results"][0]["response_text"]
+        assert response_text["chars"] > 0
+        assert response_text["sha256_16"]
+        assert "text" not in response_text
 
     def test_search_with_wing_filter(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)

@@ -1090,6 +1090,18 @@ def cmd_repair_status(args):
     repair_status(palace_path=palace_path)
 
 
+def cmd_audit(args):
+    from .audit import print_summary
+
+    print_summary(
+        Path(args.file).expanduser() if args.file else None,
+        hours=args.hours,
+        limit=args.limit,
+        show_text=args.show_text,
+        text_chars=args.text_chars,
+    )
+
+
 def cmd_repair(args):
     """Rebuild palace vector index from SQLite metadata.
 
@@ -2199,6 +2211,15 @@ def main():
         help="Storage backend to use for status (default: config/env/detected/chroma)",
     )
 
+    p_audit = sub.add_parser("audit", help="Summarise MCP memory usage telemetry")
+    p_audit.add_argument("--file", default=None, help="Audit JSONL file to read")
+    p_audit.add_argument("--hours", type=float, default=24, help="Hours to include; 0 = all")
+    p_audit.add_argument("--limit", type=int, default=10, help="Rows to print per section")
+    p_audit.add_argument(
+        "--show-text", action="store_true", help="Print stored search-response text snippets"
+    )
+    p_audit.add_argument("--text-chars", type=int, default=500, help="Characters per response snippet")
+
     p_palace = sub.add_parser("palace", help="Palace maintenance commands")
     palace_sub = p_palace.add_subparsers(dest="palace_action")
     p_set_embedder = palace_sub.add_parser(
@@ -2279,6 +2300,7 @@ def main():
         "migrate-wings": cmd_migrate_wings,
         "hallways": cmd_hallways,
         "status": cmd_status,
+        "audit": cmd_audit,
     }
     dispatch[args.command](args)
 

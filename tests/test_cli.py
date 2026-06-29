@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 
 from mempalace.cli import (
+    cmd_audit,
     cmd_compress,
     cmd_hook,
     cmd_init,
@@ -145,6 +146,31 @@ def test_cmd_search_error_exits(mock_config_cls):
         with pytest.raises(SystemExit) as exc_info:
             cmd_search(args)
         assert exc_info.value.code == 1
+
+
+# ── cmd_audit ──────────────────────────────────────────────────────────
+
+
+def test_cmd_audit_calls_print_summary():
+    args = argparse.Namespace(
+        file=None, hours=24, limit=10, show_text=False, text_chars=500
+    )
+    with patch("mempalace.audit.print_summary") as mock_summary:
+        cmd_audit(args)
+        mock_summary.assert_called_once_with(
+            None, hours=24, limit=10, show_text=False, text_chars=500
+        )
+
+
+def test_cmd_audit_expands_file_path():
+    args = argparse.Namespace(
+        file="~/audit.jsonl", hours=0, limit=5, show_text=True, text_chars=200
+    )
+    with patch("mempalace.audit.print_summary") as mock_summary:
+        cmd_audit(args)
+        called_path = mock_summary.call_args.args[0]
+        assert isinstance(called_path, Path)
+        assert "~" not in str(called_path)
 
 
 # ── cmd_instructions ───────────────────────────────────────────────────
@@ -827,6 +853,15 @@ def test_main_init_dispatches():
     with (
         patch("sys.argv", ["mempalace", "init", "/some/dir"]),
         patch("mempalace.cli.cmd_init") as mock_cmd,
+    ):
+        main()
+        mock_cmd.assert_called_once()
+
+
+def test_main_audit_dispatches():
+    with (
+        patch("sys.argv", ["mempalace", "audit"]),
+        patch("mempalace.cli.cmd_audit") as mock_cmd,
     ):
         main()
         mock_cmd.assert_called_once()
