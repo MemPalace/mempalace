@@ -190,8 +190,22 @@ def _init_logging() -> None:
     # MEMPALACE_LOG_FILE is operator-supplied and opt-in; this is a
     # local-first server (CLAUDE.md design principle), so no path
     # sanitization — the operator's process UID is the trust boundary.
+    # When unset, default to ~/.mempalace/mcp_server.log so an unhandled
+    # crash leaves a persistent record on disk — the MCP client swallows
+    # stderr, so stderr-only is a silent-death black hole.
+    #
+    # Critical: only attach the default file handler if ~/.mempalace ALREADY
+    # exists. The module must never create the palace root on import — a
+    # missing ~/.mempalace is the documented kill-switch (#1676;
+    # hooks_cli._palace_root_exists()) for disabling autosave/mining hooks,
+    # and recreating it would silently re-arm them. When the dir is absent we
+    # stay stderr-only, which matches the kill-switch intent.
     log_file = os.environ.get("MEMPALACE_LOG_FILE", "").strip()
     file_handler: logging.Handler | None = None
+    if not log_file:
+        default_log_dir = Path(os.path.expanduser("~/.mempalace"))
+        if default_log_dir.is_dir():
+            log_file = str(default_log_dir / "mcp_server.log")
     file_handler_error: Exception | None = None
     if log_file:
         try:
@@ -234,6 +248,27 @@ def _init_logging() -> None:
 
 _init_logging()
 logger = logging.getLogger("mempalace_mcp")
+
+
+def _log_uncaught(exc_type, exc_value, exc_tb) -> None:
+    """sys.excepthook: log the full traceback before the process dies.
+
+    The MCP client does not surface a crashed server's stderr, so an
+    unhandled exception escaping ``main()`` (or raised during the import /
+    startup path) otherwise leaves no record — the silent-death failure
+    mode. Routing it through ``logger`` ensures the persistent logfile
+    (see ``_init_logging``) captures a full stack trace. KeyboardInterrupt
+    is delegated to the default hook so Ctrl-C stays clean.
+    """
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+        return
+    logger.critical(
+        "Uncaught exception — server is exiting", exc_info=(exc_type, exc_value, exc_tb)
+    )
+
+
+sys.excepthook = _log_uncaught
 
 
 def _get_result_ids(result) -> list:
@@ -3729,6 +3764,40 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
 
 # ==================== KNOWLEDGE GRAPH ====================
 
+# Max facts returned by a single kg_query / kg_timeline response. A broad
+# query (e.g. a hub entity with thousands of relationships) can otherwise
+# return hundreds of thousands of characters and overflow the caller's
+# context window. Override via MEMPALACE_KG_RESULT_CAP.
+try:
+    KG_RESULT_CAP = max(1, int(os.environ.get("MEMPALACE_KG_RESULT_CAP", "100")))
+except (ValueError, TypeError):
+    KG_RESULT_CAP = 100
+
+# Hard ceiling (in characters) on any single serialized tool response, applied
+# at the dispatch chokepoint as a backstop against context overflow. ~50KB.
+# Override via MEMPALACE_MAX_RESPONSE_CHARS.
+try:
+    MAX_RESPONSE_CHARS = max(1000, int(os.environ.get("MEMPALACE_MAX_RESPONSE_CHARS", "50000")))
+except (ValueError, TypeError):
+    MAX_RESPONSE_CHARS = 50000
+
+
+def _cap_facts(results: list, *, narrow_hint: str) -> tuple[list, Optional[str]]:
+    """Cap a fact list to ``KG_RESULT_CAP``; return (kept, truncation_notice).
+
+    Returns the full list unchanged (and ``None`` notice) when within the cap.
+    Over the cap, returns the first ``KG_RESULT_CAP`` facts plus a notice the
+    caller surfaces in the response so truncation is never silent.
+    """
+    if not isinstance(results, list) or len(results) <= KG_RESULT_CAP:
+        return results, None
+    omitted = len(results) - KG_RESULT_CAP
+    notice = (
+        f"{omitted} more fact(s) omitted (showing first {KG_RESULT_CAP} of "
+        f"{len(results)}); {narrow_hint}"
+    )
+    return results[:KG_RESULT_CAP], notice
+
 
 def tool_kg_query(entity: str, as_of: str = None, direction: str = "both"):
     """Query the knowledge graph for an entity's relationships."""
@@ -3742,7 +3811,16 @@ def tool_kg_query(entity: str, as_of: str = None, direction: str = "both"):
         return {"error": "direction must be 'outgoing', 'incoming', or 'both'"}
 
     results = _call_kg(lambda kg: kg.query_entity(entity, as_of=as_of, direction=direction))
-    return {"entity": entity, "as_of": as_of, "facts": results, "count": len(results)}
+    total = len(results) if isinstance(results, list) else None
+    facts, notice = _cap_facts(
+        results, narrow_hint="narrow with as_of= or direction= to see the rest"
+    )
+    response = {"entity": entity, "as_of": as_of, "facts": facts, "count": len(facts)}
+    if notice is not None:
+        response["total"] = total
+        response["truncated"] = True
+        response["notice"] = notice
+    return response
 
 
 def tool_kg_add(
@@ -3909,7 +3987,16 @@ def tool_kg_timeline(entity: str = None):
         except ValueError as e:
             return {"error": str(e)}
     results = _call_kg(lambda kg: kg.timeline(entity))
-    return {"entity": entity or "all", "timeline": results, "count": len(results)}
+    total = len(results) if isinstance(results, list) else None
+    timeline, notice = _cap_facts(
+        results, narrow_hint="pass entity= to scope the timeline to one entity"
+    )
+    response = {"entity": entity or "all", "timeline": timeline, "count": len(timeline)}
+    if notice is not None:
+        response["total"] = total
+        response["truncated"] = True
+        response["notice"] = notice
+    return response
 
 
 def tool_kg_stats():
@@ -6389,15 +6476,22 @@ def handle_request(request):
                 result = _decorate_mcp_tool_result(
                     tool_name, TOOLS[tool_name]["handler"](**tool_args)
                 )
-
+            text = json.dumps(result, indent=2, ensure_ascii=False)
+            # Backstop against any tool returning an oversized payload that
+            # would overflow the caller's context (one real incident: a broad
+            # kg_query returned ~675K chars). Per-tool caps (e.g. _cap_facts)
+            # handle the common cases gracefully; this is the last line of
+            # defense for everything else. Truncation is announced, not silent.
+            if len(text) > MAX_RESPONSE_CHARS:
+                text = (
+                    text[:MAX_RESPONSE_CHARS]
+                    + f"\n\n... [response truncated: {len(text)} chars exceeded the "
+                    + f"{MAX_RESPONSE_CHARS}-char cap; narrow your query]"
+                )
             return {
                 "jsonrpc": "2.0",
                 "id": req_id,
-                "result": {
-                    "content": [
-                        {"type": "text", "text": json.dumps(result, indent=2, ensure_ascii=False)}
-                    ]
-                },
+                "result": {"content": [{"type": "text", "text": text}]},
             }
         except TypeError as e:
             # Qualname match prevents leaking internal helper/param names raised
@@ -7964,8 +8058,11 @@ def _run_stdio_loop() -> None:
                 payload = json.dumps(response, ensure_ascii=False)
         except KeyboardInterrupt:
             break
-        except Exception as e:
-            logger.error(f"Server error: {e}")
+        except Exception:
+            # Log the FULL traceback, not just str(e): a one-line message is
+            # the silent-death black hole this guard exists to close. The
+            # per-iteration catch keeps the loop alive across one bad request.
+            logger.exception("Server error handling request")
             continue
 
         if payload is None:
