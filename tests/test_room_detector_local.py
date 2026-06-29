@@ -59,6 +59,82 @@ def test_detect_rooms_from_folders_empty_dir(tmp_path):
     assert any(r["name"] == "general" for r in rooms)
 
 
+def test_detect_rooms_from_folders_skips_oserror_at_top_level(tmp_path):
+    """Windows reparse points (junctions, untrusted mount points) raise OSError
+    when stat()'d.  The scanner must skip them and continue — not crash.
+
+    Reproduces WinError 448: "The path cannot be traversed because it contains
+    an untrusted mount point", seen on Windows when a project folder contains
+    a git-submodule junction or a dev-drive reparse point.
+    """
+    (tmp_path / "frontend").mkdir()
+    bad = tmp_path / "untrusted_junction"
+    bad.mkdir()
+
+    original_is_dir = bad.__class__.is_dir
+
+    def patched_is_dir(self):
+        if self == bad:
+            raise OSError(
+                "[WinError 448] The path cannot be traversed because it contains an untrusted mount point"
+            )
+        return original_is_dir(self)
+
+    with patch.object(bad.__class__, "is_dir", patched_is_dir):
+        rooms = detect_rooms_from_folders(str(tmp_path))
+
+    room_names = {r["name"] for r in rooms}
+    assert "frontend" in room_names
+
+
+def test_detect_rooms_from_folders_skips_oserror_nested(tmp_path):
+    """Same WinError 448 guard applies one level deeper (nested iterdir pass)."""
+    skills = tmp_path / "skills"
+    skills.mkdir()
+    (skills / "docs").mkdir()
+    bad = skills / "bad_junction"
+    bad.mkdir()
+
+    original_is_dir = bad.__class__.is_dir
+
+    def patched_is_dir(self):
+        if self == bad:
+            raise OSError(
+                "[WinError 448] The path cannot be traversed because it contains an untrusted mount point"
+            )
+        return original_is_dir(self)
+
+    with patch.object(bad.__class__, "is_dir", patched_is_dir):
+        rooms = detect_rooms_from_folders(str(tmp_path))
+
+    room_names = {r["name"] for r in rooms}
+    assert "documentation" in room_names
+
+
+def test_detect_rooms_from_folders_skips_iterdir_oserror(tmp_path):
+    """iterdir() itself can raise OSError on some Windows reparse points even
+    when is_dir() succeeds.  The nested pass must guard the iterdir() call too."""
+    outer = tmp_path / "src"
+    outer.mkdir()
+    (tmp_path / "docs").mkdir()
+
+    original_iterdir = outer.__class__.iterdir
+
+    def patched_iterdir(self):
+        if self == outer:
+            raise OSError(
+                "[WinError 448] The path cannot be traversed because it contains an untrusted mount point"
+            )
+        return original_iterdir(self)
+
+    with patch.object(outer.__class__, "iterdir", patched_iterdir):
+        rooms = detect_rooms_from_folders(str(tmp_path))
+
+    room_names = {r["name"] for r in rooms}
+    # docs is accessible; src fails on iterdir — neither should crash
+    assert "documentation" in room_names
+
+
 def test_detect_rooms_from_folders_skips_git(tmp_path):
     (tmp_path / ".git").mkdir()
     (tmp_path / "node_modules").mkdir()

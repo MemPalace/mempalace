@@ -1,12 +1,12 @@
 {
   "name": "mempalace",
-  "version": "3.0.14",
-  "description": "Give your AI a memory — mine projects and conversations into a searchable palace. 19 MCP tools, auto-save hooks, and guided setup.",
+  "version": "3.5.0",
+  "description": "Give your AI a memory — mine projects and conversations into a searchable palace. 35 MCP tools, auto-save hooks, and guided setup.",
   "author": {
     "name": "milla-jovovich"
   },
-  "homepage": "https://github.com/milla-jovovich/mempalace",
-  "repository": "https://github.com/milla-jovovich/mempalace",
+  "homepage": "https://github.com/MemPalace/mempalace",
+  "repository": "https://github.com/MemPalace/mempalace",
   "license": "MIT",
   "keywords": [
     "memory",
@@ -21,17 +21,13 @@
   "hooks": "./hooks.json",
   "mcpServers": {
     "mempalace": {
-      "command": "python3",
-      "args": [
-        "-m",
-        "mempalace.mcp_server"
-      ]
+      "command": "mempalace-mcp"
     }
   },
   "interface": {
     "displayName": "MemPalace",
     "shortDescription": "AI memory system for Codex",
-    "longDescription": "Give your AI a persistent memory — mine projects and conversations into a searchable palace backed by ChromaDB, with 19 MCP tools, auto-save hooks, and guided skills.",
+    "longDescription": "Give your AI a persistent memory — mine projects and conversations into a searchable palace backed by ChromaDB, with 35 MCP tools, auto-save hooks, and guided skills.",
     "developerName": "milla-jovovich",
     "category": "Coding",
     "capabilities": [
@@ -39,9 +35,9 @@
       "Read",
       "Write"
     ],
-    "websiteURL": "https://github.com/milla-jovovich/mempalace",
-    "privacyPolicyURL": "https://github.com/milla-jovovich/mempalace",
-    "termsOfServiceURL": "https://github.com/milla-jovovich/mempalace",
+    "websiteURL": "https://github.com/MemPalace/mempalace",
+    "privacyPolicyURL": "https://github.com/MemPalace/mempalace",
+    "termsOfServiceURL": "https://github.com/MemPalace/mempalace",
     "defaultPrompt": [
       "Search my memories for recent decisions",
       "Mine this project into my memory palace",

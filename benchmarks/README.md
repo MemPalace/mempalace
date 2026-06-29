@@ -1,13 +1,13 @@
-# MemPal Benchmarks — Reproduction Guide
+# MemPalace Benchmarks — Reproduction Guide
 
 Run the exact same benchmarks we report. Clone, install, run.
 
 ## Setup
 
 ```bash
-git clone -b ben/benchmarking https://github.com/aya-thekeeper/mempal.git
-cd mempal
-pip install chromadb pyyaml
+git clone https://github.com/MemPalace/mempalace.git
+cd mempalace
+uv sync --extra dev   # or: pip install -e ".[dev]"
 ```
 
 ## Benchmark 1: LongMemEval (500 questions)

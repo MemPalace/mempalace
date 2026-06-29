@@ -1,0 +1,13 @@
+# Default owners for everything
+* @milla-jovovich @bensig @igorls
+
+# Core library
+mempalace/ @milla-jovovich @bensig
+
+# CI and workflows
+.github/ @bensig
+
+# Plugins and integrations
+.claude-plugin/ @bensig
+.codex-plugin/ @bensig
+integrations/ @bensig

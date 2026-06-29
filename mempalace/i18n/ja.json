@@ -1,0 +1,44 @@
+{
+  "lang": "ja",
+  "label": "日本語",
+  "terms": {
+    "palace": "宮殿",
+    "wing": "棟",
+    "hall": "廊下",
+    "closet": "クローゼット",
+    "drawer": "引き出し",
+    "mine": "採掘",
+    "search": "検索",
+    "status": "状態",
+    "init": "初期化",
+    "repair": "修復",
+    "migrate": "移行",
+    "entity": "エンティティ",
+    "topic": "トピック"
+  },
+  "cli": {
+    "mine_start": "{path} を採掘中...",
+    "mine_complete": "完了。クローゼット {closets}個、引き出し {drawers}個 作成。",
+    "mine_skip": "採掘済み。再実行するには --force を使用。",
+    "search_no_results": "結果なし: {query}",
+    "search_results": "{count}件の結果:",
+    "status_palace": "宮殿: {path}",
+    "status_wings": "棟 {count}個",
+    "status_closets": "クローゼット {count}個",
+    "status_drawers": "引き出し {count}個",
+    "init_complete": "{path} に宮殿を初期化しました",
+    "init_exists": "{path} に宮殿は既に存在します",
+    "repair_complete": "修復完了。{fixed}件の問題を修正。",
+    "migrate_complete": "移行完了。",
+    "no_palace": "宮殿が見つかりません。実行: mempalace init <ディレクトリ>"
+  },
+  "aaak": {
+    "instruction": "日本語で圧縮してください。概念間はパイプ(|)、単語間はハイフン(-)。助詞と接続詞は省略。固有名詞と数値は正確に保持。"
+  },
+  "regex": {
+    "topic_pattern": "[\\u30A0-\\u30FF]{3,}|[\\u4E00-\\u9FFF]{2,}|[A-Za-z][A-Za-z0-9_]{2,}",
+    "stop_words": "は が を に で と も の へ から まで より した します している されて です ます ました こと もの ため それ これ その この あの ない なく ある いる する",
+    "quote_pattern": "「([^」]{10,100})」",
+    "action_pattern": "(構築|修正|追加|削除|確認|作成|実装|修復|書き直し|テスト|検証|更新|設定|起動|停止)(?:し|した|して|する|します)"
+  }
+}

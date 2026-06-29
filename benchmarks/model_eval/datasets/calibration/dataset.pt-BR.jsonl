@@ -1,0 +1,20 @@
+{"id": "cal_001", "text": "Você poderia corrigir o recuo neste arquivo Python?", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_002", "text": "A que horas começa a reunião amanhã?", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_003", "text": "A previsão é de chuva durante o fim de semana.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_004", "text": "É incrível!", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_005", "text": "Olá, Bramble.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_006", "text": "Execute os testes com saída detalhada.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_007", "text": "Você está disponível para uma ligação rápida?", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_008", "text": "Atenção!", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_009", "text": "Bom dia, equipe.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_010", "text": "Terminei o fechamento trimestral ontem.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_011", "text": "Mostre-me o relatório de envelhecimento AR.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_012", "text": "Por que a compilação falhou no aarch64?", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_013", "text": "Olá.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_014", "text": "Essa implantação foi um desastre!", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_015", "text": "O levantamento de polinizadores identificou sete espécies de abelhas nativas.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_016", "text": "Exclua as ramificações obsoletas do controle remoto.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_017", "text": "Olá, Aria.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_018", "text": "Uau, essa queda de latência é enorme!", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_019", "text": "Você pode resumir o terceiro artigo?", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_020", "text": "O plano de contas agora usa uma hierarquia de quatro dígitos.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}

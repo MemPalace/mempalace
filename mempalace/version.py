@@ -1,3 +1,3 @@
 """Single source of truth for the MemPalace package version."""
 
-__version__ = "3.0.14"
+__version__ = "3.5.0"

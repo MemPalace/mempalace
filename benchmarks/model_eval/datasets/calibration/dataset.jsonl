@@ -1,0 +1,20 @@
+{"id": "cal_001", "text": "Could you fix the indentation on this Python file?", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_002", "text": "What time does the meeting start tomorrow?", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_003", "text": "The forecast shows rain through the weekend.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_004", "text": "That's incredible!", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_005", "text": "Hello, Bramble.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_006", "text": "Run the tests with verbose output.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_007", "text": "Are you available for a quick call?", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_008", "text": "Watch out!", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_009", "text": "Good morning, team.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_010", "text": "I finished the quarterly close yesterday.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_011", "text": "Show me the AR aging report.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_012", "text": "Why did the build fail on aarch64?", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_013", "text": "Hi there.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_014", "text": "That deployment was a disaster!", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_015", "text": "The pollinator survey identified seven native bee species.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_016", "text": "Delete the stale branches from the remote.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_017", "text": "Hey, Aria.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_018", "text": "Wow, that latency drop is huge!", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_019", "text": "Can you summarize the third paper?", "classes": ["question", "command", "statement", "exclamation", "greeting"]}
+{"id": "cal_020", "text": "The chart of accounts now uses a four-digit hierarchy.", "classes": ["question", "command", "statement", "exclamation", "greeting"]}

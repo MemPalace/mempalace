@@ -1,0 +1,2116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>MemPalace — Memory is identity.</title>
+<meta name="description" content="A memory palace for AI. Verbatim. Local-first. Permanent. 100% recall by design." />
+<meta name="theme-color" content="#07090C" />
+
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;0,600;0,700;1,300;1,400&family=Geist:wght@300;400;500;600&family=JetBrains+Mono:wght@300;400;500&display=swap" rel="stylesheet" />
+
+<style>
+  /* =========================================================
+     MEMPALACE — THE CRYSTALLINE PALACE
+     A landing page rendered as a structure of light in the dark.
+     ========================================================= */
+
+  :root {
+    /* Palette */
+    --void:        #05070A;
+    --obsidian:    #0A0D12;
+    --obsidian-2:  #11151C;
+    --ink:         #181D26;
+    --hair:        rgba(158, 216, 255, 0.14);
+    --hair-strong: rgba(158, 216, 255, 0.28);
+    --ice:         #EAF4FF;
+    --ice-dim:     #B8C7D9;
+    --ice-ghost:   rgba(234, 244, 255, 0.56);
+    --prism:       #9ED8FF;
+    --prism-core:  #4AA3FF;
+    --refract:     #A8B5FF;
+    --stellar:     #F3E7B0;
+    --ember:       #E28A6B;
+
+    /* Type */
+    --f-display: "Cormorant Garamond", "Times New Roman", serif;
+    --f-body:    "Geist", ui-sans-serif, system-ui, sans-serif;
+    --f-mono:    "JetBrains Mono", ui-monospace, monospace;
+
+    /* Metrics */
+    --measure: 68ch;
+    --gutter: clamp(1.25rem, 3vw, 2.5rem);
+    --rule: 1px;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--void);
+    color: var(--ice);
+    font-family: var(--f-body);
+    font-weight: 300;
+    font-size: 16px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    overflow-x: hidden;
+  }
+
+  ::selection { background: var(--prism-core); color: var(--void); }
+
+  /* ---------- Global background field ---------- */
+  body::before {
+    /* subtle cold light-wash */
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    background:
+      radial-gradient(80% 60% at 50% -10%, rgba(74,163,255,0.18), transparent 60%),
+      radial-gradient(40% 40% at 85% 20%, rgba(168,181,255,0.08), transparent 70%),
+      radial-gradient(50% 50% at 15% 80%, rgba(158,216,255,0.06), transparent 70%);
+    z-index: 0;
+  }
+
+  body::after {
+    /* fine grain */
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 1;
+    opacity: 0.35;
+    mix-blend-mode: overlay;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0.62 0 0 0 0 0.85 0 0 0 0 1 0 0 0 0.07 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+  }
+
+  /* ---------- Structure ---------- */
+  .page { position: relative; z-index: 2; padding-top: 54px; }
+
+  main, header, footer { position: relative; }
+
+  /* Running folio — manuscript-style header bar */
+  .folio {
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    z-index: 40;
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    align-items: center;
+    gap: 2rem;
+    padding: 14px var(--gutter);
+    font-family: var(--f-mono);
+    font-size: 11px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--ice-ghost);
+    background: linear-gradient(to bottom, rgba(5,7,10,0.92), rgba(5,7,10,0.72) 70%, rgba(5,7,10,0.4));
+    backdrop-filter: blur(10px) saturate(140%);
+    -webkit-backdrop-filter: blur(10px) saturate(140%);
+    border-bottom: var(--rule) solid var(--hair);
+  }
+  .folio .left  { justify-self: start; }
+  .folio .right { justify-self: end; display: flex; gap: 1.5rem; }
+  .folio .mark {
+    justify-self: center;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.55rem;
+    color: var(--ice);
+  }
+  .folio .mark svg { width: 14px; height: 14px; }
+  .folio .mark img {
+    width: 22px; height: 22px;
+    object-fit: contain;
+    filter: drop-shadow(0 0 8px rgba(74,163,255,0.45));
+  }
+  .folio a {
+    color: var(--ice-ghost);
+    text-decoration: none;
+    transition: color 0.25s ease;
+  }
+  .folio a:hover { color: var(--prism); }
+  .folio .dot {
+    width: 4px; height: 4px; border-radius: 50%;
+    background: var(--prism);
+    box-shadow: 0 0 10px var(--prism-core), 0 0 24px var(--prism-core);
+    animation: breathe 4s ease-in-out infinite;
+    display: inline-block;
+    margin-right: 0.5rem;
+    vertical-align: middle;
+  }
+
+  @keyframes breathe {
+    0%, 100% { opacity: 0.5; }
+    50% { opacity: 1; }
+  }
+
+  /* ---------- Typography helpers ---------- */
+  .eyebrow {
+    font-family: var(--f-mono);
+    font-size: 11px;
+    letter-spacing: 0.26em;
+    text-transform: uppercase;
+    color: var(--prism);
+    display: inline-flex;
+    align-items: center;
+    gap: 0.75rem;
+  }
+  .eyebrow::before {
+    content: "";
+    display: inline-block;
+    width: 36px; height: 1px;
+    background: var(--prism);
+    opacity: 0.6;
+  }
+  .eyebrow.no-rule::before { display: none; }
+
+  .display {
+    font-family: var(--f-display);
+    font-weight: 400;
+    letter-spacing: -0.01em;
+    line-height: 0.95;
+    color: var(--ice);
+  }
+
+  .display em {
+    font-style: italic;
+    color: var(--prism);
+  }
+
+  .lede {
+    font-family: var(--f-display);
+    font-style: italic;
+    font-weight: 300;
+    color: var(--ice-dim);
+    font-size: clamp(1.2rem, 1.8vw, 1.55rem);
+    line-height: 1.45;
+    max-width: 46ch;
+  }
+
+  .small-caps {
+    font-family: var(--f-mono);
+    font-size: 11px;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    color: var(--ice-ghost);
+  }
+
+  .call-number {
+    font-family: var(--f-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.18em;
+    color: var(--prism);
+    opacity: 0.75;
+  }
+
+  /* Section shell */
+  section {
+    position: relative;
+    padding: clamp(4.5rem, 9vw, 8rem) var(--gutter);
+  }
+  section + section { border-top: var(--rule) solid var(--hair); }
+
+  .section-mark {
+    position: absolute;
+    top: clamp(1.5rem, 3vw, 2.5rem);
+    left: var(--gutter);
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    font-family: var(--f-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.24em;
+    text-transform: uppercase;
+    color: var(--ice-ghost);
+  }
+  .section-mark .roman {
+    font-family: var(--f-display);
+    font-style: italic;
+    font-size: 1.1rem;
+    color: var(--prism);
+    letter-spacing: 0;
+  }
+
+  /* Corner ticks (architectural drawing marks) */
+  .corner-ticks {
+    position: absolute;
+    inset: clamp(1rem, 2vw, 2rem);
+    pointer-events: none;
+    z-index: 0;
+  }
+  .corner-ticks::before,
+  .corner-ticks::after,
+  .corner-ticks > span::before,
+  .corner-ticks > span::after {
+    content: "";
+    position: absolute;
+    width: 14px; height: 14px;
+    border: var(--rule) solid var(--hair-strong);
+  }
+  .corner-ticks::before { top: 0; left: 0; border-right: 0; border-bottom: 0; }
+  .corner-ticks::after  { top: 0; right: 0; border-left: 0; border-bottom: 0; }
+  .corner-ticks > span::before { bottom: 0; left: 0; border-right: 0; border-top: 0; }
+  .corner-ticks > span::after  { bottom: 0; right: 0; border-left: 0; border-top: 0; }
+
+  /* =========================================================
+     HERO
+     ========================================================= */
+  .hero {
+    min-height: calc(100vh - 54px);
+    max-height: 900px;
+    display: grid;
+    grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr);
+    gap: clamp(2rem, 4vw, 4rem);
+    align-items: center;
+    padding-top: clamp(2rem, 4vw, 3.5rem);
+    padding-bottom: clamp(2rem, 4vw, 3.5rem);
+    overflow: hidden;
+  }
+
+  .hero-copy { position: relative; z-index: 3; }
+
+  .hero h1 {
+    font-size: clamp(2.75rem, 7vw, 6rem);
+    margin: 1.25rem 0 1.5rem;
+  }
+
+  .hero h1 .line { display: block; }
+  .hero h1 .line-2 { font-style: italic; color: var(--prism); font-weight: 300; }
+
+  .hero .lede { margin-bottom: 2rem; }
+
+  .hero-cta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1rem;
+    margin-top: 2rem;
+    align-items: center;
+  }
+
+  /* Buttons */
+  .btn {
+    --bg: transparent;
+    --fg: var(--ice);
+    --bd: var(--hair-strong);
+    display: inline-flex;
+    align-items: center;
+    gap: 0.8rem;
+    padding: 0.95rem 1.4rem;
+    border: var(--rule) solid var(--bd);
+    background: var(--bg);
+    color: var(--fg);
+    text-decoration: none;
+    font-family: var(--f-mono);
+    font-size: 12px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    cursor: pointer;
+    transition: background 0.3s ease, border-color 0.3s ease, color 0.3s ease, transform 0.3s ease;
+    position: relative;
+    overflow: hidden;
+  }
+  .btn::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(120% 60% at 50% 120%, rgba(74,163,255,0.35), transparent 70%);
+    opacity: 0;
+    transition: opacity 0.3s ease;
+    pointer-events: none;
+  }
+  .btn:hover { border-color: var(--prism); color: var(--ice); }
+  .btn:hover::after { opacity: 1; }
+  .btn svg { width: 14px; height: 14px; }
+
+  .btn-primary {
+    --bg: rgba(158,216,255,0.08);
+    --bd: var(--prism);
+    color: var(--prism);
+    box-shadow: inset 0 0 0 1px rgba(158,216,255,0.2),
+                0 0 0 1px rgba(74,163,255,0.15),
+                0 20px 60px -20px rgba(74,163,255,0.35);
+  }
+  .btn-primary:hover { background: rgba(158,216,255,0.14); color: var(--ice); }
+
+  .hero-stats {
+    margin-top: 2.25rem;
+    display: grid;
+    grid-template-columns: repeat(3, auto);
+    gap: clamp(1.5rem, 4vw, 3rem);
+    padding-top: 1.4rem;
+    border-top: var(--rule) solid var(--hair);
+    max-width: 560px;
+  }
+  .hero-stats dt {
+    font-family: var(--f-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    color: var(--ice-ghost);
+    margin-bottom: 0.4rem;
+  }
+  .hero-stats dd {
+    margin: 0;
+    font-family: var(--f-display);
+    font-size: clamp(1.25rem, 2.2vw, 1.75rem);
+    color: var(--ice);
+    letter-spacing: -0.01em;
+  }
+  .hero-stats dd em { font-style: italic; color: var(--prism); }
+
+  /* ---------- Palace visual ---------- */
+  .palace-stage {
+    position: relative;
+    aspect-ratio: 1 / 1.05;
+    width: 100%;
+    max-width: 640px;
+    justify-self: end;
+    z-index: 2;
+  }
+
+  .palace-stage .halo {
+    position: absolute;
+    inset: -12% -8% -5% -12%;
+    background: radial-gradient(50% 45% at 50% 55%, rgba(74,163,255,0.45), transparent 70%);
+    filter: blur(30px);
+    opacity: 0.7;
+    animation: haloPulse 7s ease-in-out infinite;
+    z-index: 0;
+  }
+  @keyframes haloPulse {
+    0%, 100% { opacity: 0.55; transform: scale(1); }
+    50%      { opacity: 0.9;  transform: scale(1.06); }
+  }
+
+  .palace-stage svg.palace {
+    position: relative;
+    z-index: 2;
+    width: 100%;
+    height: 100%;
+    overflow: visible;
+  }
+
+  .palace-stage .stars {
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+    pointer-events: none;
+  }
+  .palace-stage .stars i {
+    position: absolute;
+    width: 2px; height: 2px;
+    background: var(--ice);
+    border-radius: 50%;
+    opacity: 0;
+    box-shadow: 0 0 6px rgba(234,244,255,0.8);
+    animation: twinkle var(--t, 5s) ease-in-out infinite;
+    animation-delay: var(--d, 0s);
+  }
+  @keyframes twinkle {
+    0%, 100% { opacity: 0; transform: scale(0.6); }
+    50%      { opacity: 0.9; transform: scale(1); }
+  }
+
+  /* Palace SVG animation */
+  .palace .float {
+    transform-origin: 50% 55%;
+    animation: float 9s ease-in-out infinite, yaw 60s linear infinite;
+  }
+  @keyframes float {
+    0%, 100% { transform: translateY(0); }
+    50%      { transform: translateY(-10px); }
+  }
+  @keyframes yaw {
+    0%   { transform: translateY(0) rotate(-1.5deg); }
+    50%  { transform: translateY(-10px) rotate(1.5deg); }
+    100% { transform: translateY(0) rotate(-1.5deg); }
+  }
+
+  .palace .edge      { stroke: var(--prism); stroke-width: 1.1; fill: none; }
+  .palace .edge-soft { stroke: var(--prism); stroke-width: 0.7; fill: none; opacity: 0.35; }
+  .palace .facet-fill-front { fill: url(#facetFront); }
+  .palace .facet-fill-right { fill: url(#facetRight); }
+  .palace .facet-fill-left  { fill: url(#facetLeft);  }
+  .palace .beam      { stroke: url(#beam); stroke-width: 1.5; }
+  .palace .core      { fill: url(#core); }
+
+  .palace .draw {
+    stroke-dasharray: 600;
+    stroke-dashoffset: 600;
+    animation: draw 2.2s ease-out 0.3s forwards;
+  }
+  @keyframes draw {
+    to { stroke-dashoffset: 0; }
+  }
+
+  .palace .beam-flare {
+    animation: beamPulse 5s ease-in-out infinite;
+    transform-origin: 50% 100%;
+  }
+  @keyframes beamPulse {
+    0%, 100% { opacity: 0.45; transform: scaleY(1); }
+    50%      { opacity: 0.9;  transform: scaleY(1.1); }
+  }
+
+  /* Hero label tags drifting around the palace */
+  .palace-tag {
+    position: absolute;
+    z-index: 3;
+    font-family: var(--f-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--ice-ghost);
+    padding: 0.35rem 0.7rem;
+    border: var(--rule) solid var(--hair-strong);
+    background: rgba(10,13,18,0.55);
+    backdrop-filter: blur(6px);
+    white-space: nowrap;
+  }
+  .palace-tag::before {
+    content: "";
+    position: absolute;
+    width: 30px; height: 1px;
+    background: var(--hair-strong);
+  }
+  .palace-tag .n { color: var(--prism); margin-right: 0.5rem; }
+  .palace-tag.tag-1 { top: 12%;  left: -8%;  }
+  .palace-tag.tag-1::before { right: -30px; top: 50%; }
+  .palace-tag.tag-2 { top: 48%;  right: -10%; }
+  .palace-tag.tag-2::before { left: -30px;  top: 50%; }
+  .palace-tag.tag-3 { bottom: 12%; left: 6%;  }
+  .palace-tag.tag-3::before { right: -30px; top: 50%; }
+
+  /* =========================================================
+     THE FORGETTING
+     ========================================================= */
+  .forgetting {
+    display: flex;
+    flex-direction: column;
+    gap: clamp(2.5rem, 5vw, 4rem);
+  }
+  .forgetting-head {
+    max-width: 820px;
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: end;
+    gap: 2rem;
+  }
+  .forgetting-head .copy { max-width: 62ch; }
+  .forgetting-head h2 {
+    font-size: clamp(2rem, 4.5vw, 3.6rem);
+    margin: 1rem 0 1.25rem;
+  }
+  .forgetting-head .replay {
+    background: none;
+    border: var(--rule) solid var(--hair-strong);
+    color: var(--ice-ghost);
+    font-family: var(--f-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    padding: 0.6rem 0.9rem;
+    cursor: pointer;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.3s, color 0.2s, border-color 0.2s;
+    display: inline-flex; align-items: center; gap: 0.5rem;
+    white-space: nowrap;
+  }
+  .forgetting-head .replay.visible { opacity: 1; pointer-events: auto; }
+  .forgetting-head .replay:hover { color: var(--prism); border-color: var(--prism); }
+  .forgetting-head .replay svg { width: 11px; height: 11px; }
+
+  .forgetting-compare {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 1px minmax(0, 1fr);
+    gap: 0;
+    border: var(--rule) solid var(--hair-strong);
+    background: linear-gradient(180deg, rgba(17,21,28,0.65), rgba(10,13,18,0.35));
+    min-height: 540px;
+    position: relative;
+    overflow: hidden;
+  }
+  .forgetting-compare .divider {
+    background: linear-gradient(180deg, transparent, var(--hair-strong) 20%, var(--hair-strong) 80%, transparent);
+    position: relative;
+  }
+  .forgetting-compare .divider::before {
+    content: "vs";
+    position: absolute;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    font-family: var(--f-display);
+    font-style: italic;
+    font-size: 14px;
+    color: var(--ice-ghost);
+    background: var(--void);
+    padding: 6px 10px;
+    border: var(--rule) solid var(--hair-strong);
+    border-radius: 50%;
+    width: 34px; height: 34px;
+    display: flex; align-items: center; justify-content: center;
+    box-sizing: border-box;
+  }
+
+  .demo-pane {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    padding: 1.25rem 1.5rem 1.75rem;
+    min-height: 540px;
+  }
+  .demo-pane > header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    padding-bottom: 0.9rem;
+    margin-bottom: 1.25rem;
+    border-bottom: var(--rule) solid var(--hair);
+    gap: 1rem;
+  }
+  .demo-pane .pane-tag {
+    font-family: var(--f-mono);
+    font-size: 11px;
+    letter-spacing: 0.24em;
+    text-transform: uppercase;
+    color: var(--ice);
+    display: inline-flex; align-items: center; gap: 0.6rem;
+  }
+  .demo-pane.demo-forget .pane-tag::before {
+    content: "";
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--ember);
+    box-shadow: 0 0 6px var(--ember);
+  }
+  .demo-pane.demo-remember .pane-tag::before {
+    content: "";
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--prism);
+    box-shadow: 0 0 6px var(--prism-core);
+  }
+  .demo-pane .pane-meta {
+    font-family: var(--f-mono);
+    font-size: 10px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--ice-ghost);
+    text-align: right;
+  }
+  .demo-pane.demo-forget .pane-meta em    { color: var(--ember); font-style: normal; }
+  .demo-pane.demo-remember .pane-meta em  { color: var(--prism); font-style: normal; }
+
+  .chat {
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 0.95rem;
+    position: relative;
+    overflow: hidden; /* so dust can't escape the pane */
+    min-height: 380px;
+  }
+
+  .msg {
+    display: flex;
+    gap: 0.85rem;
+    font-size: 14.5px;
+    line-height: 1.55;
+    color: var(--ice-dim);
+    position: relative;
+    opacity: 0;
+    transform: translateY(6px);
+    animation: msg-in 0.4s cubic-bezier(0.2, 0.7, 0.2, 1) forwards;
+  }
+  .msg.you { color: var(--ice); }
+  .msg.ai  { color: var(--ice-dim); }
+  .msg .who {
+    font-family: var(--f-mono);
+    font-size: 10px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    flex: 0 0 52px;
+    padding-top: 3px;
+    color: var(--prism);
+    opacity: 0.85;
+  }
+  .msg.ai .who { color: var(--ember); }
+  .demo-remember .msg.ai .who { color: var(--prism); }
+  .msg .body {
+    flex: 1 1 auto;
+    min-width: 0;
+    position: relative;
+  }
+  .msg .body strong {
+    color: var(--prism);
+    font-weight: 500;
+    background: linear-gradient(180deg, transparent 60%, rgba(158,216,255,0.2) 60%);
+    padding: 0 1px;
+  }
+  .demo-forget .msg.ai .body { color: var(--ember); }
+  .demo-remember .msg.ai .body { color: var(--ice); }
+
+  @keyframes msg-in {
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .msg.typing .body::after {
+    content: "";
+    display: inline-block;
+    width: 7px; height: 1.1em;
+    margin-left: 3px;
+    background: currentColor;
+    vertical-align: -2px;
+    animation: caret 0.9s steps(2) infinite;
+  }
+  @keyframes caret { 50% { opacity: 0; } }
+
+  .chat .divider-time {
+    font-family: var(--f-display);
+    font-style: italic;
+    color: var(--ice-ghost);
+    font-size: 0.95rem;
+    text-align: center;
+    padding: 0.4rem 0;
+    position: relative;
+    opacity: 0;
+    animation: msg-in 0.5s ease 0.05s forwards;
+  }
+  .chat .divider-time::before,
+  .chat .divider-time::after {
+    content: "";
+    display: inline-block;
+    width: 24px; height: 1px;
+    background: var(--hair-strong);
+    vertical-align: middle;
+    margin: 0 0.8rem;
+  }
+
+  .chat .retrieval {
+    display: grid;
+    grid-template-columns: 52px 1fr auto;
+    gap: 0.85rem;
+    align-items: center;
+    padding: 0.55rem 0.75rem;
+    border: 1px dashed var(--hair-strong);
+    background: rgba(74,163,255,0.05);
+    font-family: var(--f-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--ice-ghost);
+    opacity: 0;
+    transform: translateY(4px);
+    animation: msg-in 0.5s ease forwards;
+  }
+  .chat .retrieval .who { color: var(--prism); }
+  .chat .retrieval .l   { color: var(--ice); letter-spacing: 0.22em; }
+  .chat .retrieval .r   { color: var(--prism); }
+
+  .chat .stamp {
+    margin-top: auto;
+    padding-top: 0.9rem;
+    border-top: var(--rule) solid var(--hair);
+    font-family: var(--f-display);
+    font-style: italic;
+    font-size: 1.15rem;
+    opacity: 0;
+    animation: msg-in 0.6s ease forwards;
+    display: flex; justify-content: space-between; align-items: baseline;
+  }
+  .chat .stamp .call {
+    font-family: var(--f-mono);
+    font-style: normal;
+    font-size: 10px;
+    letter-spacing: 0.22em;
+    color: var(--ice-ghost);
+    text-transform: uppercase;
+  }
+  .demo-forget   .chat .stamp { color: var(--ember); }
+  .demo-remember .chat .stamp { color: var(--prism); }
+
+  /* Dust overlay — particles fly out of disintegrated messages */
+  .dust-overlay {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    z-index: 5;
+    overflow: visible;
+  }
+  .dust-overlay .dust {
+    position: absolute;
+    will-change: transform, opacity, filter;
+    transition-property: transform, opacity, filter;
+    transition-timing-function: cubic-bezier(0.2, 0.55, 0.3, 1);
+  }
+
+  /* =========================================================
+     ANATOMY
+     ========================================================= */
+  .anatomy { padding-top: clamp(5rem, 9vw, 7rem); }
+  .anatomy-head {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 3rem;
+    margin-bottom: clamp(3rem, 6vw, 5rem);
+    align-items: end;
+  }
+  .anatomy h2 {
+    font-size: clamp(2.25rem, 5vw, 4.2rem);
+    margin: 1rem 0 0;
+  }
+  .anatomy h2 em { font-style: italic; color: var(--prism); }
+
+  .anatomy-diagram {
+    position: relative;
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: clamp(1rem, 3vw, 2.5rem);
+    padding: 2rem 0;
+  }
+
+  .stratum {
+    position: relative;
+    border: var(--rule) solid var(--hair);
+    padding: 2rem 1.5rem;
+    background: linear-gradient(180deg, rgba(17,21,28,0.6), rgba(10,13,18,0.2));
+    min-height: 360px;
+    display: flex;
+    flex-direction: column;
+    transition: border-color 0.4s ease, transform 0.4s ease;
+  }
+  .stratum:hover { border-color: var(--prism); transform: translateY(-4px); }
+  .stratum::before {
+    content: "";
+    position: absolute;
+    top: -1px; left: 24px; right: 24px;
+    height: 2px;
+    background: var(--prism);
+    opacity: 0.4;
+  }
+  .stratum .n {
+    font-family: var(--f-mono);
+    font-size: 11px;
+    letter-spacing: 0.22em;
+    color: var(--prism);
+  }
+  .stratum h3 {
+    font-family: var(--f-display);
+    font-weight: 400;
+    font-size: 2.4rem;
+    letter-spacing: -0.01em;
+    margin: 1.5rem 0 0.25rem;
+    color: var(--ice);
+  }
+  .stratum h3 em { font-style: italic; color: var(--prism); font-weight: 300; }
+  .stratum .sub {
+    font-family: var(--f-display);
+    font-style: italic;
+    font-size: 1.05rem;
+    color: var(--ice-dim);
+    margin-bottom: 1.5rem;
+  }
+  .stratum p {
+    color: var(--ice-dim);
+    font-size: 14.5px;
+    margin: 0 0 1.5rem;
+  }
+  .stratum .diagram {
+    margin-top: auto;
+    height: 90px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-top: var(--rule) solid var(--hair);
+    padding-top: 1rem;
+  }
+  .stratum .diagram svg { width: 100%; height: 100%; }
+
+  /* =========================================================
+     TENETS
+     ========================================================= */
+  .tenets { position: relative; }
+  .tenets-head {
+    max-width: 780px;
+    margin-bottom: clamp(3rem, 6vw, 5rem);
+  }
+  .tenets h2 {
+    font-size: clamp(2.25rem, 5vw, 4rem);
+    margin: 1rem 0 1.5rem;
+  }
+
+  .tenets-list {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0;
+    border-top: var(--rule) solid var(--hair);
+  }
+  .tenet {
+    display: grid;
+    grid-template-columns: 90px minmax(0, 1fr) minmax(0, 2fr) auto;
+    gap: clamp(1rem, 3vw, 2.5rem);
+    align-items: baseline;
+    padding: 2rem 0;
+    border-bottom: var(--rule) solid var(--hair);
+    transition: background 0.3s ease;
+  }
+  .tenet:hover { background: linear-gradient(90deg, transparent, rgba(158,216,255,0.04), transparent); }
+
+  .tenet .num {
+    font-family: var(--f-display);
+    font-style: italic;
+    font-weight: 400;
+    color: var(--prism);
+    font-size: 1.6rem;
+    letter-spacing: 0.04em;
+  }
+  .tenet .title {
+    font-family: var(--f-display);
+    font-size: clamp(1.4rem, 2.4vw, 1.9rem);
+    color: var(--ice);
+    font-weight: 400;
+    letter-spacing: -0.005em;
+    line-height: 1.15;
+  }
+  .tenet .title em { font-style: italic; color: var(--prism); font-weight: 300; }
+  .tenet .body {
+    color: var(--ice-dim);
+    font-size: 15px;
+    line-height: 1.65;
+  }
+  .tenet .tag {
+    font-family: var(--f-mono);
+    font-size: 10px;
+    letter-spacing: 0.2em;
+    color: var(--ice-ghost);
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+
+  /* =========================================================
+     AAAK DIALECT
+     ========================================================= */
+  .dialect-head { max-width: 780px; margin-bottom: clamp(3rem, 6vw, 5rem); }
+  .dialect-head h2 { font-size: clamp(2.25rem, 5vw, 4rem); margin: 1rem 0 1.5rem; }
+
+  .dialect-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 56px minmax(0, 1fr);
+    gap: 0;
+    align-items: stretch;
+  }
+
+  .slab {
+    position: relative;
+    border: var(--rule) solid var(--hair);
+    padding: clamp(1.5rem, 2.5vw, 2rem);
+    background: linear-gradient(180deg, rgba(17,21,28,0.65), rgba(10,13,18,0.35));
+    min-height: 420px;
+  }
+  .slab .card-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-bottom: var(--rule) solid var(--hair);
+    padding-bottom: 0.9rem;
+    margin-bottom: 1.4rem;
+    font-family: var(--f-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    color: var(--ice-ghost);
+  }
+  .slab .card-head .l { color: var(--prism); }
+  .slab .label {
+    font-family: var(--f-display);
+    font-style: italic;
+    color: var(--ice);
+    font-size: 1.4rem;
+    margin-bottom: 1.25rem;
+  }
+  .slab p {
+    font-family: var(--f-display);
+    font-size: 1.05rem;
+    line-height: 1.55;
+    color: var(--ice-dim);
+    margin: 0 0 1rem;
+  }
+  .slab p strong {
+    color: var(--ice);
+    font-weight: 500;
+    font-style: italic;
+  }
+
+  .slab.mono pre {
+    font-family: var(--f-mono);
+    font-size: 13px;
+    line-height: 1.75;
+    color: var(--ice-dim);
+    margin: 0;
+    white-space: pre-wrap;
+  }
+  .slab.mono pre .k { color: var(--prism); }
+  .slab.mono pre .t { color: var(--refract); }
+  .slab.mono pre .v { color: var(--stellar); }
+  .slab.mono pre .c { color: var(--ice-ghost); opacity: 0.6; }
+
+  .dialect-arrow {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.75rem;
+    border-top: var(--rule) solid var(--hair);
+    border-bottom: var(--rule) solid var(--hair);
+  }
+  .dialect-arrow svg { width: 28px; height: 28px; color: var(--prism); }
+  .dialect-arrow span {
+    writing-mode: vertical-rl;
+    transform: rotate(180deg);
+    font-family: var(--f-mono);
+    font-size: 10px;
+    letter-spacing: 0.3em;
+    text-transform: uppercase;
+    color: var(--ice-ghost);
+  }
+
+  .dialect-caption {
+    margin-top: 1.5rem;
+    font-family: var(--f-display);
+    font-style: italic;
+    color: var(--ice-ghost);
+    font-size: 1rem;
+    max-width: 60ch;
+  }
+
+  /* =========================================================
+     HOW IT WORKS
+     ========================================================= */
+  .mechanics-head { max-width: 780px; margin-bottom: clamp(3rem, 6vw, 5rem); }
+  .mechanics-head h2 { font-size: clamp(2.25rem, 5vw, 4rem); margin: 1rem 0 1.5rem; }
+
+  .mechanics {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 0;
+    border: var(--rule) solid var(--hair);
+  }
+  .mech {
+    position: relative;
+    padding: clamp(1.5rem, 2.5vw, 2rem);
+    border-right: var(--rule) solid var(--hair);
+    min-height: 320px;
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+    transition: background 0.4s ease;
+  }
+  .mech:last-child { border-right: 0; }
+  .mech:hover { background: rgba(158,216,255,0.03); }
+  .mech .n { color: var(--prism); }
+  .mech h3 {
+    font-family: var(--f-display);
+    font-weight: 400;
+    font-size: 1.75rem;
+    margin: 0.5rem 0 0;
+    letter-spacing: -0.005em;
+  }
+  .mech h3 em { font-style: italic; color: var(--prism); }
+  .mech p {
+    color: var(--ice-dim);
+    font-size: 14px;
+    line-height: 1.6;
+    margin: 0;
+  }
+  .mech .icon {
+    width: 48px; height: 48px;
+    color: var(--prism);
+    opacity: 0.85;
+  }
+  .mech .icon svg { width: 100%; height: 100%; }
+  .mech .metric {
+    margin-top: auto;
+    padding-top: 1rem;
+    border-top: var(--rule) solid var(--hair);
+    font-family: var(--f-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.2em;
+    color: var(--ice-ghost);
+    text-transform: uppercase;
+  }
+  .mech .metric b { color: var(--prism); font-weight: 500; }
+
+  /* =========================================================
+     INSTALL
+     ========================================================= */
+  .install {
+    text-align: center;
+    padding: clamp(6rem, 12vw, 10rem) var(--gutter);
+    background:
+      radial-gradient(60% 80% at 50% 100%, rgba(74,163,255,0.18), transparent 70%);
+  }
+  .install h2 {
+    font-size: clamp(2.75rem, 7vw, 5.5rem);
+    margin: 1rem 0 1.5rem;
+  }
+  .install h2 em { font-style: italic; color: var(--prism); }
+  .install .lede { margin: 0 auto 3rem; }
+
+  .terminal {
+    max-width: 720px;
+    margin: 0 auto 2.5rem;
+    border: var(--rule) solid var(--hair-strong);
+    background: linear-gradient(180deg, rgba(17,21,28,0.9), rgba(10,13,18,0.7));
+    text-align: left;
+    box-shadow:
+      inset 0 1px 0 rgba(234,244,255,0.04),
+      0 30px 80px -30px rgba(74,163,255,0.3),
+      0 0 0 1px rgba(158,216,255,0.06);
+  }
+  .terminal-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.7rem 1rem;
+    border-bottom: var(--rule) solid var(--hair);
+    font-family: var(--f-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.2em;
+    color: var(--ice-ghost);
+    text-transform: uppercase;
+  }
+  .terminal-head .lights { display: flex; gap: 6px; }
+  .terminal-head .lights i {
+    display: block; width: 8px; height: 8px; border-radius: 50%;
+    border: 1px solid rgba(158,216,255,0.25);
+    background: rgba(158,216,255,0.08);
+  }
+  .terminal pre {
+    margin: 0;
+    padding: 1.5rem 1.5rem 2rem;
+    font-family: var(--f-mono);
+    font-size: 14px;
+    line-height: 1.9;
+    color: var(--ice);
+    white-space: pre-wrap;
+  }
+  .terminal .prompt { color: var(--prism); user-select: none; }
+  .terminal .c      { color: var(--ice-ghost); }
+  .terminal .ok     { color: var(--prism); }
+  .terminal .dim    { color: var(--ice-ghost); }
+
+  .install-cta {
+    display: inline-flex;
+    gap: 1rem;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+
+  /* =========================================================
+     FOOTER — catalog card
+     ========================================================= */
+  footer.catalog {
+    position: relative;
+    padding: clamp(3rem, 6vw, 4.5rem) var(--gutter);
+    border-top: var(--rule) solid var(--hair);
+  }
+  .catalog-card {
+    display: grid;
+    grid-template-columns: 2fr 1fr 1fr 1fr;
+    gap: 2rem;
+    padding: 2rem 0;
+    border-top: var(--rule) solid var(--hair-strong);
+    border-bottom: var(--rule) solid var(--hair-strong);
+  }
+  .catalog-card h4 {
+    font-family: var(--f-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    color: var(--ice-ghost);
+    margin: 0 0 1rem;
+    font-weight: 400;
+  }
+  .catalog-card ul {
+    list-style: none;
+    margin: 0; padding: 0;
+  }
+  .catalog-card li {
+    font-family: var(--f-display);
+    font-size: 1.05rem;
+    line-height: 1.5;
+    color: var(--ice-dim);
+  }
+  .catalog-card li a {
+    color: var(--ice-dim);
+    text-decoration: none;
+    border-bottom: 1px solid transparent;
+    transition: color 0.25s, border-color 0.25s;
+  }
+  .catalog-card li a:hover { color: var(--prism); border-color: var(--prism); }
+  .catalog-title {
+    font-family: var(--f-display);
+    font-size: clamp(1.5rem, 3vw, 2.25rem);
+    color: var(--ice);
+    line-height: 1.2;
+    margin: 0 0 0.75rem;
+  }
+  .catalog-title em { font-style: italic; color: var(--prism); }
+  .catalog-desc {
+    font-family: var(--f-display);
+    font-style: italic;
+    color: var(--ice-dim);
+    font-size: 1rem;
+    margin: 0;
+    max-width: 38ch;
+  }
+
+  .colophon {
+    margin-top: 2rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 1rem;
+    font-family: var(--f-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    color: var(--ice-ghost);
+  }
+  .colophon .tags { display: flex; gap: 1.5rem; flex-wrap: wrap; }
+  .colophon em { color: var(--prism); font-style: normal; }
+
+  /* =========================================================
+     RESPONSIVE
+     ========================================================= */
+  @media (max-width: 1100px) {
+    .mechanics { grid-template-columns: repeat(2, 1fr); }
+    .mech:nth-child(2) { border-right: 0; }
+    .mech:nth-child(1),
+    .mech:nth-child(2) { border-bottom: var(--rule) solid var(--hair); }
+  }
+
+  @media (max-width: 900px) {
+    .hero { grid-template-columns: 1fr; gap: 3rem; }
+    .palace-stage { justify-self: center; max-width: 480px; }
+    .anatomy-head { grid-template-columns: 1fr; }
+    .forgetting-head { grid-template-columns: 1fr; }
+    .forgetting-compare { grid-template-columns: 1fr; min-height: 0; }
+    .forgetting-compare .divider { display: none; }
+    .demo-pane { min-height: 0; }
+    .demo-pane + .demo-pane { border-top: var(--rule) solid var(--hair-strong); }
+    .palace-walker { aspect-ratio: 4 / 5; }
+    .scene-rooms .rooms-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .drawer { grid-template-columns: 66px 1fr auto; }
+    .drawer .dpull { display: none; }
+    .dialect-grid { grid-template-columns: 1fr; }
+    .dialect-arrow { padding: 1rem 0; border-left: 0; border-right: 0; }
+    .dialect-arrow span { writing-mode: initial; transform: none; }
+    .catalog-card { grid-template-columns: 1fr 1fr; }
+  }
+
+  @media (max-width: 600px) {
+    .folio { grid-template-columns: auto 1fr; }
+    .folio .right { display: none; }
+    .hero-stats { grid-template-columns: 1fr 1fr; }
+    .catalog-card { grid-template-columns: 1fr; }
+    .palace-tag { display: none; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.001s !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.001s !important;
+    }
+  }
+</style>
+</head>
+<body>
+
+<div class="page">
+
+  <!-- =============================================================
+       FOLIO — running head
+       ============================================================= -->
+  <header class="folio" role="banner">
+    <div class="left">
+      <span class="dot" aria-hidden="true"></span>
+      Local · No telemetry
+    </div>
+    <div class="mark" aria-label="MemPalace">
+      <img src="mempalace_logo.png" alt="" aria-hidden="true" />
+      <span>MemPalace</span>
+    </div>
+    <nav class="right" aria-label="Primary">
+      <a href="#anatomy">Anatomy</a>
+      <a href="#dialect">Dialect</a>
+      <a href="#mechanics">Mechanics</a>
+      <a href="#install">Install</a>
+      <a href="https://github.com/MemPalace/mempalace">GitHub ↗</a>
+    </nav>
+  </header>
+
+  <!-- =============================================================
+       HERO
+       ============================================================= -->
+  <section class="hero" id="hero">
+    <span class="corner-ticks" aria-hidden="true"><span></span></span>
+
+    <div class="hero-copy">
+      <span class="eyebrow">MP-001 &middot; fol. i &middot; a memory palace for ai</span>
+      <h1 class="display">
+        <span class="line">Memory is</span>
+        <span class="line line-2">identity.</span>
+      </h1>
+      <p class="lede">
+        An AI that forgets cannot know you. MemPalace keeps every word you have
+        shared — verbatim, on your machine, forever available. One hundred
+        percent recall by design.
+      </p>
+      <div class="hero-cta">
+        <a href="#install" class="btn btn-primary">
+          Begin
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+        </a>
+        <a href="https://github.com/MemPalace/mempalace" class="btn">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 .5C5.73.5.5 5.73.5 12a11.5 11.5 0 0 0 7.86 10.92c.58.11.79-.25.79-.56v-2c-3.2.7-3.88-1.37-3.88-1.37-.53-1.34-1.29-1.7-1.29-1.7-1.05-.72.08-.7.08-.7 1.17.08 1.78 1.2 1.78 1.2 1.04 1.78 2.72 1.27 3.38.97.1-.75.41-1.27.74-1.57-2.55-.29-5.24-1.28-5.24-5.7 0-1.26.45-2.29 1.19-3.1-.12-.3-.52-1.49.11-3.1 0 0 .97-.31 3.18 1.18a11 11 0 0 1 5.79 0c2.2-1.49 3.17-1.18 3.17-1.18.64 1.61.24 2.8.12 3.1.74.81 1.19 1.84 1.19 3.1 0 4.43-2.69 5.4-5.26 5.69.42.37.8 1.1.8 2.22v3.29c0 .31.21.68.8.56A11.5 11.5 0 0 0 23.5 12C23.5 5.73 18.27.5 12 .5Z"/></svg>
+          View on GitHub
+        </a>
+      </div>
+
+      <dl class="hero-stats">
+        <div>
+          <dt>Recall</dt>
+          <dd><em>100</em>%</dd>
+        </div>
+        <div>
+          <dt>API keys required</dt>
+          <dd><em>0</em></dd>
+        </div>
+        <div>
+          <dt>Hook budget</dt>
+          <dd>&lt;<em>500</em>ms</dd>
+        </div>
+      </dl>
+    </div>
+
+    <!-- Crystalline palace visual -->
+    <div class="palace-stage" aria-hidden="true">
+      <div class="halo"></div>
+
+      <div class="stars">
+        <!-- generated procedurally but safe to hard-code a handful -->
+        <i style="top:12%; left:22%;  --t:5s;   --d:0.0s"></i>
+        <i style="top:18%; left:74%;  --t:6s;   --d:1.2s"></i>
+        <i style="top:34%; left:8%;   --t:4s;   --d:0.6s"></i>
+        <i style="top:44%; left:88%;  --t:7s;   --d:0.3s"></i>
+        <i style="top:62%; left:14%;  --t:5.5s; --d:1.8s"></i>
+        <i style="top:72%; left:82%;  --t:4.5s; --d:0.9s"></i>
+        <i style="top:82%; left:38%;  --t:6.2s; --d:2.4s"></i>
+        <i style="top:28%; left:52%;  --t:5.2s; --d:3.0s"></i>
+        <i style="top:88%; left:60%;  --t:4.8s; --d:1.5s"></i>
+        <i style="top:6%;  left:48%;  --t:6.8s; --d:0.4s"></i>
+      </div>
+
+      <svg class="palace" viewBox="-200 -240 400 440" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <linearGradient id="facetFront" x1="0" y1="-150" x2="0" y2="90" gradientUnits="userSpaceOnUse">
+            <stop offset="0"   stop-color="#9ED8FF" stop-opacity="0.22"/>
+            <stop offset="1"   stop-color="#4AA3FF" stop-opacity="0.02"/>
+          </linearGradient>
+          <linearGradient id="facetRight" x1="0" y1="-120" x2="150" y2="60" gradientUnits="userSpaceOnUse">
+            <stop offset="0"   stop-color="#A8B5FF" stop-opacity="0.18"/>
+            <stop offset="1"   stop-color="#4AA3FF" stop-opacity="0.02"/>
+          </linearGradient>
+          <linearGradient id="facetLeft" x1="0" y1="-120" x2="-150" y2="60" gradientUnits="userSpaceOnUse">
+            <stop offset="0"   stop-color="#9ED8FF" stop-opacity="0.14"/>
+            <stop offset="1"   stop-color="#4AA3FF" stop-opacity="0.02"/>
+          </linearGradient>
+          <radialGradient id="core" cx="0" cy="0" r="30" gradientUnits="userSpaceOnUse">
+            <stop offset="0"   stop-color="#EAF4FF" stop-opacity="1"/>
+            <stop offset="0.5" stop-color="#9ED8FF" stop-opacity="0.5"/>
+            <stop offset="1"   stop-color="#4AA3FF" stop-opacity="0"/>
+          </radialGradient>
+          <linearGradient id="beam" x1="0" y1="-240" x2="0" y2="-150" gradientUnits="userSpaceOnUse">
+            <stop offset="0"   stop-color="#9ED8FF" stop-opacity="0"/>
+            <stop offset="0.7" stop-color="#9ED8FF" stop-opacity="0.55"/>
+            <stop offset="1"   stop-color="#EAF4FF" stop-opacity="1"/>
+          </linearGradient>
+          <filter id="softGlow" x="-50%" y="-50%" width="200%" height="200%">
+            <feGaussianBlur stdDeviation="2.5" result="blur"/>
+            <feMerge>
+              <feMergeNode in="blur"/>
+              <feMergeNode in="SourceGraphic"/>
+            </feMerge>
+          </filter>
+          <filter id="strongGlow" x="-50%" y="-50%" width="200%" height="200%">
+            <feGaussianBlur stdDeviation="5" result="blur"/>
+            <feMerge>
+              <feMergeNode in="blur"/>
+              <feMergeNode in="SourceGraphic"/>
+            </feMerge>
+          </filter>
+        </defs>
+
+        <g class="float" filter="url(#softGlow)">
+          <!-- beam rising from apex -->
+          <g class="beam-flare">
+            <line class="beam" x1="0" y1="-140" x2="0" y2="-235" filter="url(#strongGlow)"/>
+            <line class="beam" x1="0" y1="-140" x2="0" y2="-210" stroke-width="3" opacity="0.3"/>
+          </g>
+
+          <!-- back (hidden) facets — slightly visible for crystal effect -->
+          <polygon class="edge-soft draw" points="0,-140 0,-20 130,30" />
+          <polygon class="edge-soft draw" points="0,-140 0,-20 -130,30" />
+          <polygon class="edge-soft draw" points="0,-140 -130,30 0,80 130,30" />
+
+          <!-- base rhombus -->
+          <polygon class="edge draw" points="0,80 130,30 0,-20 -130,30" opacity="0.85"/>
+
+          <!-- front-left facet -->
+          <polygon class="facet-fill-left" points="0,-140 -130,30 0,80"/>
+          <polygon class="edge draw" points="0,-140 -130,30 0,80"/>
+
+          <!-- front-right facet -->
+          <polygon class="facet-fill-right" points="0,-140 130,30 0,80"/>
+          <polygon class="edge draw" points="0,-140 130,30 0,80"/>
+
+          <!-- inner crystal lines -->
+          <line class="edge-soft draw" x1="0" y1="-140" x2="0" y2="80"/>
+          <line class="edge-soft draw" x1="-130" y1="30" x2="130" y2="30"/>
+
+          <!-- inner nested pyramid -->
+          <g opacity="0.55">
+            <polygon class="edge-soft draw" points="0,-80 70,15 0,50 -70,15"/>
+            <line class="edge-soft draw" x1="0" y1="-80" x2="0" y2="50"/>
+          </g>
+
+          <!-- core -->
+          <circle class="core" cx="0" cy="0" r="28"/>
+          <circle cx="0" cy="0" r="2.5" fill="#EAF4FF" filter="url(#strongGlow)"/>
+        </g>
+      </svg>
+
+    </div>
+  </section>
+
+  <!-- =============================================================
+       THE FORGETTING
+       ============================================================= -->
+  <section id="forgetting" class="forgetting">
+    <div class="section-mark"><span class="roman">i</span> <span>the forgetting</span></div>
+
+    <header class="forgetting-head">
+      <div class="copy">
+        <span class="eyebrow">before &middot; after</span>
+        <h2 class="display">
+          The same conversation, <em>twice.</em>
+        </h2>
+        <p class="lede" style="margin:0;">
+          Scroll down and watch. On the left, a model without memory. On the right,
+          the same model with MemPalace. The words are identical — until two weeks
+          pass.
+        </p>
+      </div>
+      <button class="replay" id="replay-demo" type="button" aria-label="Replay the demo">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M4 4v6h6"/><path d="M20 20v-6h-6"/><path d="M4 10a8 8 0 0114-5l2 3"/><path d="M20 14a8 8 0 01-14 5l-2-3"/></svg>
+        replay
+      </button>
+    </header>
+
+    <div class="forgetting-compare" id="forgetting-compare" aria-label="Comparison demo">
+      <article class="demo-pane demo-forget">
+        <header>
+          <span class="pane-tag">without mempalace</span>
+          <span class="pane-meta">session <em>resets</em> &middot; no recall</span>
+        </header>
+        <div class="chat" data-pane="forget" aria-live="polite"></div>
+      </article>
+
+      <div class="divider" aria-hidden="true"></div>
+
+      <article class="demo-pane demo-remember">
+        <header>
+          <span class="pane-tag">with mempalace</span>
+          <span class="pane-meta">verbatim &middot; retrieved &lt;<em>50&nbsp;ms</em></span>
+        </header>
+        <div class="chat" data-pane="remember" aria-live="polite"></div>
+      </article>
+    </div>
+  </section>
+
+  <!-- =============================================================
+       ANATOMY OF A PALACE
+       ============================================================= -->
+  <section id="anatomy" class="anatomy">
+    <div class="section-mark"><span class="roman">ii</span> <span>anatomy of a palace</span></div>
+
+    <div class="anatomy-head">
+      <div>
+        <span class="eyebrow">the method of loci, updated</span>
+        <h2 class="display">
+          Wings. Rooms. <em>Drawers.</em>
+        </h2>
+      </div>
+      <p class="lede">
+        A two-thousand-year-old memory technique, reworked for a machine.
+        Broad categories nest time-based groupings; time-based groupings hold
+        verbatim drawers. A symbolic index lets the model scan thousands of
+        drawers in a single breath and open only the ones it needs.
+      </p>
+    </div>
+
+    <div class="anatomy-diagram">
+      <article class="stratum">
+        <span class="n">W — wing</span>
+        <h3>The <em>Wing</em></h3>
+        <p class="sub">people · projects · topics</p>
+        <p>A broad region of the palace, keyed to a real entity — a person by name, a project by codename, a domain of your life. Entity-first, always.</p>
+        <div class="diagram">
+          <svg viewBox="0 0 200 80" fill="none" stroke="currentColor" stroke-width="1" style="color:var(--prism);">
+            <rect x="5" y="20" width="190" height="50" opacity="0.4"/>
+            <rect x="15" y="28" width="50" height="34" />
+            <rect x="75" y="28" width="50" height="34" />
+            <rect x="135" y="28" width="50" height="34" />
+            <line x1="5" y1="12" x2="195" y2="12" stroke-dasharray="2 3" opacity="0.5"/>
+          </svg>
+        </div>
+      </article>
+
+      <article class="stratum">
+        <span class="n">R — room</span>
+        <h3>The <em>Room</em></h3>
+        <p class="sub">days · sessions · threads</p>
+        <p>Inside a wing sit rooms — discrete units of time. One room per day, or one per session. Walk the corridor and the palace unfolds chronologically, room by room.</p>
+        <div class="diagram">
+          <svg viewBox="0 0 200 80" fill="none" stroke="currentColor" stroke-width="1" style="color:var(--prism);">
+            <rect x="10" y="20" width="36" height="44" />
+            <rect x="56" y="20" width="36" height="44" />
+            <rect x="102" y="20" width="36" height="44" />
+            <rect x="148" y="20" width="36" height="44" />
+            <line x1="10" y1="70" x2="184" y2="70" stroke-dasharray="1 3" opacity="0.6"/>
+          </svg>
+        </div>
+      </article>
+
+      <article class="stratum">
+        <span class="n">D — drawer</span>
+        <h3>The <em>Drawer</em></h3>
+        <p class="sub">verbatim · permanent · exact</p>
+        <p>Each room holds drawers. A drawer is a single chunk of verbatim content — the exact words, untouched. The palace's promise is kept here.</p>
+        <div class="diagram">
+          <svg viewBox="0 0 200 80" fill="none" stroke="currentColor" stroke-width="1" style="color:var(--prism);">
+            <rect x="40" y="14" width="120" height="16" />
+            <rect x="40" y="34" width="120" height="16" />
+            <rect x="40" y="54" width="120" height="16" />
+            <circle cx="150" cy="22" r="1.5" fill="currentColor"/>
+            <circle cx="150" cy="42" r="1.5" fill="currentColor"/>
+            <circle cx="150" cy="62" r="1.5" fill="currentColor"/>
+          </svg>
+        </div>
+      </article>
+    </div>
+  </section>
+
+  <!-- =============================================================
+       DIALECT
+       ============================================================= -->
+  <section id="dialect" class="dialect">
+    <div class="section-mark"><span class="roman">iii</span> <span>the aaak dialect</span></div>
+
+    <div class="dialect-head">
+      <span class="eyebrow">index &larr; verbatim</span>
+      <h2 class="display">
+        A compressed symbolic language <em>for finding</em>, not remembering.
+      </h2>
+      <p class="lede">
+        The content stays verbatim — always. The <em>index</em> above it is written
+        in AAAK: a dense symbolic dialect an LLM can scan at a glance. Tens of
+        thousands of entries, one pass, exact drawer located.
+      </p>
+    </div>
+
+    <div class="dialect-grid">
+      <!-- Verbatim slab -->
+      <article class="slab">
+        <header class="card-head">
+          <span class="l">drawer · D-007</span>
+          <span>verbatim · exact · permanent</span>
+        </header>
+        <p class="label">The drawer, as stored.</p>
+        <p>
+          "My son's name is <strong>Noah</strong>. He turns <strong>six</strong>
+          on <strong>September 12th</strong>. He loves dinosaurs —
+          especially the <strong>therizinosaurus</strong> because of the
+          claws. We want to do a small party at <strong>the park on Glebe
+          Point Road</strong>, maybe eight kids."
+        </p>
+        <p style="color:var(--ice-ghost); font-size: 13.5px; font-family: var(--f-mono); letter-spacing: 0.05em; margin-top:1.5rem;">
+          &mdash; kept as spoken. never rewritten.
+        </p>
+      </article>
+
+      <div class="dialect-arrow" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.3">
+          <path d="M12 3v18M7 8l5-5 5 5M7 16l5 5 5-5"/>
+        </svg>
+        <span>index · AAAK</span>
+      </div>
+
+      <!-- AAAK slab -->
+      <article class="slab mono">
+        <header class="card-head">
+          <span class="l">index · AAAK</span>
+          <span>indexes · compressed · addressable</span>
+        </header>
+        <p class="label">The pointer, as indexed.</p>
+<pre><span class="c">§ W-042/R-11/D-007</span>
+<span class="k">@p</span> <span class="t">noah</span>~<span class="v">son.age=6</span>~<span class="v">dob=09-12</span>
+<span class="k">@l</span> <span class="t">glebe-pt-rd.park</span>
+<span class="k">@e</span> <span class="t">birthday</span>~<span class="v">party(n≈8)</span>
+<span class="k">@i</span> <span class="t">therizinosaurus</span>~<span class="v">claws</span>
+<span class="k">@t</span> <span class="v">2026-04-14T09:41</span>
+<span class="c">§ ptr → D-007 (verbatim)</span></pre>
+      </article>
+    </div>
+
+    <p class="dialect-caption">
+      Ninety-plus percent compression on the pointer layer. One hundred percent
+      fidelity on the content layer. You get speed without ever losing a word.
+    </p>
+  </section>
+
+  <!-- =============================================================
+       MECHANICS
+       ============================================================= -->
+  <section id="mechanics">
+    <div class="section-mark"><span class="roman">iv</span> <span>how it works</span></div>
+
+    <div class="mechanics-head">
+      <span class="eyebrow">mechanism · architecture</span>
+      <h2 class="display">
+        Four pieces. <em>No cloud.</em> No keys.
+      </h2>
+    </div>
+
+    <div class="mechanics">
+      <article class="mech">
+        <div class="icon" aria-hidden="true">
+          <svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.3">
+            <rect x="8" y="10" width="32" height="22" rx="1"/>
+            <path d="M8 16h32"/>
+            <path d="M14 24h20M14 28h12"/>
+            <path d="M16 38h16M20 32v6M28 32v6"/>
+          </svg>
+        </div>
+        <span class="eyebrow no-rule"><span class="n">— 01</span></span>
+        <h3>Local-<em>first</em></h3>
+        <p>ChromaDB on disk. SQLite for the knowledge graph. Nothing is uploaded. Nothing is synced. Your palace lives under a single directory on your machine.</p>
+        <div class="metric">path · <b>~/.mempalace</b></div>
+      </article>
+
+      <article class="mech">
+        <div class="icon" aria-hidden="true">
+          <svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.3">
+            <circle cx="24" cy="24" r="14"/>
+            <path d="M16 24h16M24 16v16"/>
+            <path d="M10 10l28 28" stroke-width="1.5"/>
+          </svg>
+        </div>
+        <span class="eyebrow no-rule"><span class="n">— 02</span></span>
+        <h3>Zero <em>API</em></h3>
+        <p>Extraction, chunking, and embedding all run locally. No OpenAI key, no Anthropic key, no sentence-transformers endpoint. The memory works even offline, on a plane.</p>
+        <div class="metric">keys required · <b>none</b></div>
+      </article>
+
+      <article class="mech">
+        <div class="icon" aria-hidden="true">
+          <svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.3">
+            <path d="M8 36V18l8-8h16l8 8v18"/>
+            <path d="M8 36h32"/>
+            <circle cx="24" cy="26" r="4"/>
+            <path d="M24 22v-4M24 30v4M20 26h-4M28 26h4"/>
+          </svg>
+        </div>
+        <span class="eyebrow no-rule"><span class="n">— 03</span></span>
+        <h3>Background <em>hooks</em></h3>
+        <p>Filing and indexing happen silently through Claude Code hooks. On session end, on pre-compaction. You write. The palace fills itself behind the curtain.</p>
+        <div class="metric">hook budget · <b>&lt;500 ms</b></div>
+      </article>
+
+      <article class="mech">
+        <div class="icon" aria-hidden="true">
+          <svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.3">
+            <circle cx="10" cy="12" r="3"/>
+            <circle cx="38" cy="10" r="3"/>
+            <circle cx="24" cy="26" r="3"/>
+            <circle cx="12" cy="38" r="3"/>
+            <circle cx="38" cy="36" r="3"/>
+            <path d="M12 14l10 10M36 12L26 24M14 36l8-8M36 34l-10-6" opacity="0.6"/>
+          </svg>
+        </div>
+        <span class="eyebrow no-rule"><span class="n">— 04</span></span>
+        <h3>Temporal <em>graph</em></h3>
+        <p>Relationships across entities with valid-from and valid-to dates. Who worked on what. When did this change. Facts that were true then, and may not be now.</p>
+        <div class="metric">store · <b>sqlite</b></div>
+      </article>
+    </div>
+  </section>
+
+  <!-- =============================================================
+       INSTALL
+       ============================================================= -->
+  <section id="install" class="install">
+    <div class="section-mark" style="left:50%; transform:translateX(-50%);"><span class="roman">v</span> <span>begin</span></div>
+    <span class="eyebrow" style="justify-content:center;">open a drawer</span>
+    <h2 class="display">
+      Build your <em>palace.</em>
+    </h2>
+    <p class="lede" style="margin-left:auto;margin-right:auto;text-align:center;">
+      One command to install. One to initialize. Your words — yours, permanent,
+      instantly recallable — from that moment on.
+    </p>
+
+    <div class="terminal" role="figure" aria-label="Installation commands">
+      <div class="terminal-head">
+        <span class="lights"><i></i><i></i><i></i></span>
+        <span>~/mempalace &middot; bash</span>
+      </div>
+<pre><span class="prompt">$</span> pip install -e <span class="dim">".[dev]"</span>
+<span class="c">Successfully installed mempalace</span>
+<span class="prompt">$</span> mempalace init
+<span class="ok">  ✓</span> palace created at <span class="dim">~/.mempalace</span>
+<span class="ok">  ✓</span> hooks registered <span class="dim">(stop, precompact)</span>
+<span class="ok">  ✓</span> knowledge graph initialized
+<span class="prompt">$</span> mempalace remember <span class="dim">"memory is identity."</span>
+<span class="ok">  ✓</span> filed · <span class="c">W-001/R-01/D-001</span></pre>
+    </div>
+
+    <div class="install-cta">
+      <a href="https://github.com/MemPalace/mempalace" class="btn btn-primary">
+        Visit the repository
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+      </a>
+      <a href="https://github.com/MemPalace/mempalace/blob/main/README.md" class="btn">
+        Read the manual
+      </a>
+    </div>
+  </section>
+
+  <!-- =============================================================
+       FOOTER — catalog card
+       ============================================================= -->
+  <footer class="catalog">
+    <div class="catalog-card">
+      <div>
+        <h4>No. MP-001</h4>
+        <p class="catalog-title">MemPalace <em>&mdash;</em> a memory palace for AI.</p>
+        <p class="catalog-desc">Verbatim storage, local-first, zero telemetry. Built for people who believe their words are theirs.</p>
+      </div>
+      <div>
+        <h4>The project</h4>
+        <ul>
+          <li><a href="https://github.com/MemPalace/mempalace">GitHub</a></li>
+          <li><a href="https://github.com/MemPalace/mempalace/blob/main/README.md">Readme</a></li>
+          <li><a href="https://github.com/MemPalace/mempalace/blob/main/ROADMAP.md">Roadmap</a></li>
+          <li><a href="https://github.com/MemPalace/mempalace/blob/main/CHANGELOG.md">Changelog</a></li>
+        </ul>
+      </div>
+      <div>
+        <h4>Learn</h4>
+        <ul>
+          <li><a href="https://github.com/MemPalace/mempalace/blob/main/MISSION.md">Mission</a></li>
+          <li><a href="https://github.com/MemPalace/mempalace/blob/main/CLAUDE.md">For Claude</a></li>
+          <li><a href="https://github.com/MemPalace/mempalace/blob/main/CONTRIBUTING.md">Contributing</a></li>
+          <li><a href="#anatomy">Anatomy</a></li>
+        </ul>
+      </div>
+      <div>
+        <h4>Filed under</h4>
+        <ul>
+          <li>memory</li>
+          <li>locality</li>
+          <li>permanence</li>
+          <li>verbatim</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="colophon">
+      <div class="tags">
+        <span><em>◇</em> MP-001 &middot; fol. lxxii</span>
+        <span>apache-2.0</span>
+        <span>no telemetry</span>
+      </div>
+      <div class="tags">
+        <span>made offline &middot; on a quiet machine</span>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<script>
+  // Minor enhancement: subtle parallax on the palace
+  (function(){
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    const stage = document.querySelector('.palace-stage');
+    if (!stage) return;
+    const svg = stage.querySelector('svg.palace');
+    const halo = stage.querySelector('.halo');
+    let targetX = 0, targetY = 0, x = 0, y = 0, raf;
+
+    function onMove(e){
+      const rect = stage.getBoundingClientRect();
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top + rect.height / 2;
+      targetX = ((e.clientX - cx) / rect.width) * 14;
+      targetY = ((e.clientY - cy) / rect.height) * 10;
+      if (!raf) raf = requestAnimationFrame(tick);
+    }
+    function tick(){
+      x += (targetX - x) * 0.08;
+      y += (targetY - y) * 0.08;
+      if (svg)  svg.style.transform  = 'translate(' + x + 'px,' + y + 'px)';
+      if (halo) halo.style.transform = 'translate(' + (x*0.5) + 'px,' + (y*0.5) + 'px)';
+      if (Math.abs(x - targetX) > 0.05 || Math.abs(y - targetY) > 0.05){
+        raf = requestAnimationFrame(tick);
+      } else { raf = null; }
+    }
+    window.addEventListener('mousemove', onMove, { passive: true });
+  })();
+
+  // Reveal-on-scroll for tenets
+  (function(){
+    if (!('IntersectionObserver' in window)) return;
+    const items = document.querySelectorAll('.tenet, .stratum, .mech, .slab');
+    items.forEach(el => {
+      el.style.opacity = '0';
+      el.style.transform = 'translateY(20px)';
+      el.style.transition = 'opacity 0.9s ease, transform 0.9s ease';
+    });
+    const io = new IntersectionObserver((entries) => {
+      entries.forEach((entry, i) => {
+        if (entry.isIntersecting){
+          const idx = [...entry.target.parentElement.children].indexOf(entry.target);
+          entry.target.style.transitionDelay = (idx * 80) + 'ms';
+          entry.target.style.opacity = '1';
+          entry.target.style.transform = 'translateY(0)';
+          io.unobserve(entry.target);
+        }
+      });
+    }, { rootMargin: '0px 0px -80px 0px' });
+    items.forEach(el => io.observe(el));
+  })();
+
+  /* ============================================================
+     FORGETTING DEMO — scripted before/after, one-shot on scroll.
+     Both panes run in parallel. Left disintegrates; right retrieves.
+     ============================================================ */
+  (function initForgettingDemo(){
+    const compare = document.getElementById('forgetting-compare');
+    if (!compare) return;
+    const leftChat  = compare.querySelector('[data-pane="forget"]');
+    const rightChat = compare.querySelector('[data-pane="remember"]');
+    const replayBtn = document.getElementById('replay-demo');
+    const reduced   = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+    const delay = ms => new Promise(r => setTimeout(r, reduced ? Math.min(ms, 60) : ms));
+
+    function clear() {
+      leftChat.innerHTML = '';
+      rightChat.innerHTML = '';
+      if (replayBtn) replayBtn.classList.remove('visible');
+    }
+
+    function addMsg(chat, who, opts = {}) {
+      const row = document.createElement('div');
+      row.className = 'msg ' + (who === 'You' ? 'you' : 'ai');
+      if (opts.id) row.dataset.id = opts.id;
+      row.innerHTML = '<span class="who">' + who + '</span><span class="body"></span>';
+      chat.appendChild(row);
+      chat.scrollTop = chat.scrollHeight;
+      return row;
+    }
+
+    async function typeInto(row, text, speed = 14) {
+      const body = row.querySelector('.body');
+      const parts = text.split(/(<[^>]+>)/);
+      row.classList.add('typing');
+      for (const part of parts) {
+        if (!part) continue;
+        if (part.startsWith('<')) { body.insertAdjacentHTML('beforeend', part); continue; }
+        for (const ch of part) {
+          body.insertAdjacentText('beforeend', ch);
+          if (!reduced) await delay(speed + (Math.random() < 0.08 ? 40 : 0));
+        }
+      }
+      row.classList.remove('typing');
+    }
+
+    function addDivider(chat, text) {
+      const d = document.createElement('div');
+      d.className = 'divider-time';
+      d.textContent = '— ' + text + ' —';
+      chat.appendChild(d);
+      return d;
+    }
+
+    function addRetrieval(chat, callNumber, ms) {
+      const row = document.createElement('div');
+      row.className = 'retrieval';
+      row.innerHTML =
+        '<span class="who">mem</span>' +
+        '<span class="l">retrieved &middot; <span class="r">' + callNumber + '</span></span>' +
+        '<span>' + ms + '&nbsp;ms</span>';
+      chat.appendChild(row);
+      return row;
+    }
+
+    function addStamp(chat, text, callNumber) {
+      const el = document.createElement('div');
+      el.className = 'stamp';
+      el.innerHTML = '<span>— ' + text + '</span>' +
+        (callNumber ? '<span class="call">' + callNumber + '</span>' : '');
+      chat.appendChild(el);
+      return el;
+    }
+
+    /* Disintegration: clone each visible character into a positioned span
+       inside a pane-level overlay, then transition translate + opacity so
+       the sentence falls apart like dust. */
+    function disintegrate(target) {
+      return new Promise(resolve => {
+        const parent = target.closest('.chat');
+        if (!parent) { resolve(); return; }
+        const parentRect = parent.getBoundingClientRect();
+        const style = getComputedStyle(target);
+        const font = style.font ||
+          (style.fontStyle + ' ' + style.fontWeight + ' ' + style.fontSize + '/' + style.lineHeight + ' ' + style.fontFamily);
+        const color = style.color;
+
+        let overlay = parent.querySelector('.dust-overlay');
+        if (!overlay) {
+          overlay = document.createElement('div');
+          overlay.className = 'dust-overlay';
+          parent.appendChild(overlay);
+        }
+
+        const walker = document.createTreeWalker(target, NodeFilter.SHOW_TEXT);
+        const range = document.createRange();
+        const spans = [];
+        let node;
+        while ((node = walker.nextNode())) {
+          const chars = node.textContent;
+          for (let i = 0; i < chars.length; i++) {
+            if (chars[i] === ' ') continue;
+            range.setStart(node, i);
+            range.setEnd(node, i + 1);
+            const r = range.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) continue;
+            const span = document.createElement('span');
+            span.className = 'dust';
+            span.textContent = chars[i];
+            span.style.left = (r.left - parentRect.left) + 'px';
+            span.style.top  = (r.top  - parentRect.top)  + 'px';
+            span.style.width  = r.width  + 'px';
+            span.style.height = r.height + 'px';
+            span.style.font = font;
+            span.style.color = color;
+            span.style.opacity = '1';
+            span.style.transform = 'translate(0,0)';
+            span.style.transitionDuration = (1500 + Math.random() * 900) + 'ms';
+            overlay.appendChild(span);
+            spans.push(span);
+          }
+        }
+
+        // Fade out the original
+        target.style.transition = 'color 0.35s ease, opacity 0.35s ease';
+        target.style.color = 'transparent';
+
+        // Force reflow, then kick off staggered animations
+        void overlay.offsetHeight;
+        const cx = parentRect.width / 2;
+        spans.forEach((s) => {
+          s.style.transitionDelay = (Math.random() * 500) + 'ms';
+          const x0 = parseFloat(s.style.left);
+          const dx = (x0 - cx) * 0.06 + (Math.random() - 0.5) * 36;
+          const dy = 30 + Math.random() * 80;
+          const rot = (Math.random() - 0.5) * 44;
+          s.style.transform = 'translate(' + dx + 'px,' + dy + 'px) rotate(' + rot + 'deg)';
+          s.style.opacity = '0';
+          s.style.filter = 'blur(2px)';
+        });
+
+        setTimeout(() => {
+          spans.forEach(s => s.remove());
+          resolve();
+        }, reduced ? 200 : 2600);
+      });
+    }
+
+    // ---- Scripted conversation ----
+    const NOAH_TEXT = "My son's name is Noah. He turns six on September 12th.";
+
+    async function runForget() {
+      const you1 = addMsg(leftChat, 'You', { id: 'noah' });
+      await delay(200);
+      await typeInto(you1, NOAH_TEXT, 16);
+
+      await delay(500);
+      const ai1 = addMsg(leftChat, 'Model');
+      await typeInto(ai1, "Noted. I'll remember that for next time we talk.", 14);
+
+      await delay(900);
+      addDivider(leftChat, 'two weeks later');
+
+      await delay(700);
+      const you2 = addMsg(leftChat, 'You');
+      await typeInto(you2, "Help me plan Noah's birthday.", 18);
+
+      await delay(700);
+      const target = leftChat.querySelector('.msg[data-id="noah"] .body');
+      if (target) await disintegrate(target);
+
+      await delay(250);
+      const ai2 = addMsg(leftChat, 'Model');
+      await typeInto(ai2, "Of course. Who is Noah? How old is he turning?", 16);
+
+      await delay(500);
+      addStamp(leftChat, 'forgotten.');
+    }
+
+    async function runRemember() {
+      const you1 = addMsg(rightChat, 'You', { id: 'noah' });
+      await delay(200);
+      await typeInto(you1, NOAH_TEXT, 16);
+
+      await delay(500);
+      const ai1 = addMsg(rightChat, 'Model');
+      await typeInto(ai1, "Noted. Filed — <strong>W-042/R-01/D-003</strong>.", 14);
+
+      await delay(900);
+      addDivider(rightChat, 'two weeks later');
+
+      await delay(700);
+      const you2 = addMsg(rightChat, 'You');
+      await typeInto(you2, "Help me plan Noah's birthday.", 18);
+
+      await delay(600);
+      addRetrieval(rightChat, 'W-042/R-01/D-003', 42);
+
+      await delay(700);
+      const ai2 = addMsg(rightChat, 'Model');
+      await typeInto(ai2,
+        "Of course — <strong>Noah</strong> turns <strong>six</strong> on <strong>September 12th</strong>. " +
+        "You mentioned he loves the <strong>therizinosaurus</strong>, and a park on " +
+        "<strong>Glebe Point Road</strong>. Shall we build from there?",
+        11);
+
+      await delay(500);
+      addStamp(rightChat, 'remembered.', 'W-042/R-01/D-003');
+    }
+
+    let running = { forget: false, remember: false };
+    let started = { forget: false, remember: false };
+
+    async function runBoth() {
+      if (running.forget || running.remember) return;
+      running.forget = running.remember = true;
+      started.forget = started.remember = true;
+      clear();
+      await delay(200);
+      await Promise.all([runForget(), runRemember()]);
+      running.forget = running.remember = false;
+      if (replayBtn) replayBtn.classList.add('visible');
+    }
+
+    async function runSide(side) {
+      if (running[side] || started[side]) return;
+      running[side] = true;
+      started[side] = true;
+      const chat = side === 'forget' ? leftChat : rightChat;
+      chat.innerHTML = '';
+      await delay(200);
+      await (side === 'forget' ? runForget() : runRemember());
+      running[side] = false;
+      if (started.forget && started.remember && !running.forget && !running.remember && replayBtn) {
+        replayBtn.classList.add('visible');
+      }
+    }
+
+    function resetAll() {
+      started.forget = started.remember = false;
+      clear();
+    }
+
+    // Stacked layout = vertical on mobile; matches the 900px media query.
+    const stackedMQ = window.matchMedia('(max-width: 900px)');
+    const isStacked = () => stackedMQ.matches;
+
+    // Fire once when an element is mostly visible in the viewport.
+    // Handles tall elements that never reach 100% intersection by also checking
+    // whether the element dominates the viewport height.
+    function observeOnce(el, onReach) {
+      if (!('IntersectionObserver' in window)) { onReach(); return null; }
+      let done = false;
+      const io = new IntersectionObserver((entries) => {
+        entries.forEach(entry => {
+          if (done || !entry.isIntersecting) return;
+          const rect = entry.boundingClientRect;
+          const elementCoverage  = entry.intersectionRatio;
+          const viewportCoverage = entry.intersectionRect.height / window.innerHeight;
+          const mostlyVisible  = elementCoverage >= 0.65;
+          const dominatesView  = viewportCoverage >= 0.60 && rect.top <= window.innerHeight * 0.15;
+          if (mostlyVisible || dominatesView) {
+            done = true;
+            onReach();
+            io.disconnect();
+          }
+        });
+      }, {
+        threshold: [0.1, 0.25, 0.4, 0.55, 0.7, 0.85, 1.0],
+        rootMargin: '-8% 0px -8% 0px'
+      });
+      io.observe(el);
+      return io;
+    }
+
+    // Keep handles so we can tear down/re-arm on replay.
+    let observers = [];
+    function disconnectObservers() {
+      observers.forEach(io => io && io.disconnect());
+      observers = [];
+    }
+
+    function armObservers() {
+      disconnectObservers();
+      if (isStacked()) {
+        // Mobile — each pane fires independently as the user scrolls to it.
+        // If a pane is already in view at arm-time, it will fire immediately.
+        observers.push(observeOnce(compare.querySelector('.demo-forget'),   () => runSide('forget')));
+        observers.push(observeOnce(compare.querySelector('.demo-remember'), () => runSide('remember')));
+      } else {
+        // Desktop — both panes run in parallel once the comparison is in view.
+        observers.push(observeOnce(compare, runBoth));
+      }
+    }
+
+    if (replayBtn) replayBtn.addEventListener('click', () => {
+      resetAll();
+      armObservers();
+    });
+
+    armObservers();
+  })();
+</script>
+
+</body>
+</html>

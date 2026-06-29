@@ -510,11 +510,20 @@ def palace_assign_rooms(sessions, sample_id, api_key, cache, model="claude-haiku
 
 
 def llm_rerank_locomo(
-    question, retrieved_ids, retrieved_docs, api_key, top_k=10, model="claude-sonnet-4-6"
+    question,
+    retrieved_ids,
+    retrieved_docs,
+    api_key,
+    top_k=10,
+    model="claude-sonnet-4-6",
+    backend="anthropic",
+    base_url="",
 ):
     """
     Ask LLM to pick the single most relevant document for this question.
     Returns reordered retrieved_ids with the best candidate first.
+
+    Supports backend="anthropic" (default) or "ollama" (OpenAI-compat endpoint).
     """
     candidates = retrieved_ids[:top_k]
     candidate_docs = retrieved_docs[:top_k]
@@ -522,7 +531,6 @@ def llm_rerank_locomo(
     if len(candidates) <= 1:
         return retrieved_ids
 
-    # Build numbered list of candidates
     lines = []
     for i, (cid, doc) in enumerate(zip(candidates, candidate_docs), 1):
         snippet = doc[:300].replace("\n", " ")
@@ -534,35 +542,51 @@ def llm_rerank_locomo(
         f"Reply with just the number (1-{len(candidates)}).\n\n" + "\n".join(lines)
     )
 
-    payload = json.dumps(
-        {
-            "model": model,
-            "max_tokens": 8,
-            "messages": [{"role": "user", "content": prompt}],
-        }
-    ).encode("utf-8")
-
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=payload,
-        headers={
+    if backend == "ollama":
+        url = (base_url or "http://localhost:11434").rstrip("/") + "/v1/chat/completions"
+        payload = json.dumps(
+            {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 1024,
+                "temperature": 0.0,
+            }
+        ).encode("utf-8")
+        headers = {"content-type": "application/json"}
+        if api_key:
+            headers["authorization"] = f"Bearer {api_key}"
+    else:
+        url = "https://api.anthropic.com/v1/messages"
+        payload = json.dumps(
+            {
+                "model": model,
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": prompt}],
+            }
+        ).encode("utf-8")
+        headers = {
             "x-api-key": api_key,
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
-        },
-        method="POST",
-    )
+        }
+
+    req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
 
     import socket as _socket
 
     for _attempt in range(3):
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=120 if backend == "ollama" else 30) as resp:
                 result = json.loads(resp.read())
-            raw = result["content"][0]["text"].strip()
-            m = re.search(r"\b(\d+)\b", raw)
+            if backend == "ollama":
+                msg = result["choices"][0]["message"]
+                raw = (msg.get("content") or "").strip() or (msg.get("reasoning") or "").strip()
+            else:
+                raw = result["content"][0]["text"].strip()
+            # Take LAST integer — reasoning models often count candidates first
+            m = re.search(r"\b(\d+)\b", raw[::-1])
             if m:
-                pick = int(m.group(1))
+                pick = int(m.group(1)[::-1])
                 if 1 <= pick <= len(candidates):
                     chosen_id = candidates[pick - 1]
                     reordered = [chosen_id] + [cid for cid in retrieved_ids if cid != chosen_id]
@@ -580,29 +604,12 @@ def llm_rerank_locomo(
 
 
 def _load_api_key(key_arg):
+    """Load API key from --llm-key arg or ANTHROPIC_API_KEY env var."""
     if key_arg:
         return key_arg
     env_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if env_key:
         return env_key
-    keys_path = os.path.expanduser("~/.config/lu/keys.json")
-    if os.path.exists(keys_path):
-        try:
-            with open(keys_path) as f:
-                keys = json.load(f)
-            for name in ("lu_key", "anthropic_milla", "anthropic_claude_code_main"):
-                val = keys.get(name, "")
-                if isinstance(val, str) and val.startswith("sk-ant-"):
-                    return val
-            for section in ("anthropic", "anthropic_milla", "anthropic_claude_code_main"):
-                sec = keys.get(section, {})
-                if isinstance(sec, dict):
-                    for subkey in ("lu_key", "key", "api_key"):
-                        val = sec.get(subkey, "")
-                        if isinstance(val, str) and val.startswith("sk-ant-"):
-                            return val
-        except Exception:
-            pass
     return ""
 
 
@@ -625,6 +632,8 @@ def run_benchmark(
     palace_cache_file=None,
     palace_model="claude-haiku-4-5-20251001",
     embed_model="default",
+    llm_backend="anthropic",
+    llm_base_url="",
 ):
     """Run LoCoMo retrieval benchmark."""
     with open(data_file) as f:
@@ -636,8 +645,12 @@ def run_benchmark(
     api_key = ""
     if llm_rerank_enabled or mode == "palace":
         api_key = _load_api_key(llm_key)
-        if not api_key:
-            print(f"ERROR: --mode {mode} requires an API key (--llm-key or ANTHROPIC_API_KEY).")
+        # Ollama backend doesn't require an Anthropic key. Palace mode still does
+        # (it uses Anthropic for room-assignment indexing) — so only relax the
+        # requirement when rerank is the ONLY llm use and backend is ollama.
+        needs_key = mode == "palace" or (llm_rerank_enabled and llm_backend == "anthropic")
+        if needs_key and not api_key:
+            print(f"ERROR: --mode {mode} / --llm-rerank (anthropic) requires an API key.")
             sys.exit(1)
 
     # Palace mode: load or create room assignment cache
@@ -905,6 +918,8 @@ def run_benchmark(
                         api_key,
                         top_k=rerank_pool,
                         model=llm_model,
+                        backend=llm_backend,
+                        base_url=llm_base_url,
                     )
 
                 # Compute recall
@@ -1031,6 +1046,18 @@ if __name__ == "__main__":
     )
     parser.add_argument("--llm-key", default="", help="API key (or set ANTHROPIC_API_KEY env var)")
     parser.add_argument(
+        "--llm-backend",
+        choices=["anthropic", "ollama"],
+        default="anthropic",
+        help="Which API for --llm-rerank. 'anthropic' (default) or 'ollama' "
+        "(OpenAI-compat /v1/chat/completions — works for local + Ollama Cloud).",
+    )
+    parser.add_argument(
+        "--llm-base-url",
+        default="",
+        help="Override base URL for --llm-backend ollama. Default: http://localhost:11434.",
+    )
+    parser.add_argument(
         "--hybrid-weight",
         type=float,
         default=0.30,
@@ -1066,4 +1093,6 @@ if __name__ == "__main__":
         palace_cache_file=args.palace_cache,
         palace_model=args.palace_model,
         embed_model=args.embed_model,
+        llm_backend=args.llm_backend,
+        llm_base_url=args.llm_base_url,
     )

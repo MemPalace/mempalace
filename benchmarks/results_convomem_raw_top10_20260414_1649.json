@@ -1,0 +1,2752 @@
+[
+  {
+    "question": "What color do I use for hot leads in my personal spreadsheet?",
+    "answer": "Green",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What was the new CRM password you set last week?",
+    "answer": "Innovate$2024!Lead",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm preparing for my follow-up call with Quantum Solutions. What was the name of the key decision-maker I identified there?",
+    "answer": "The name of the decision-maker you identified at Quantum Solutions is Mr. Abernathy.",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What is the new SaaS feature I decided to focus on pitching this month?",
+    "answer": "SyncFlow Analytics",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm reviewing my weekly performance stats. What did I mention my daily call quota was set to?",
+    "answer": "You mentioned your daily call quota was set to 120 calls.",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Who is my direct team lead at InnovateLeads?",
+    "answer": "Sarah Jenkins",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm trying to remember the name of that first B2B sales company I worked at, the really high-pressure one. What was it called again?",
+    "answer": "The first B2B sales company you worked for was called StapleSource.",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What was the name of the late-night campus radio show you hosted during university?",
+    "answer": "Midnight Musings",
+    "category": "user_evidence",
+    "recall": 0.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 0
+    }
+  },
+  {
+    "question": "What is the name of the custom CRM field I use to log the date for my next follow-up call?",
+    "answer": "NextActionDate",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "How many scoops of coffee grounds do I use for my French press each morning?",
+    "answer": "3 scoops",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What was the personal conversion rate goal you set for this quarter?",
+    "answer": "15%",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What was the name of the PR firm where you did your unpaid internship after graduation?",
+    "answer": "City Voice Media",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What industry did I mention I dislike cold-calling the most?",
+    "answer": "Legacy manufacturing",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm updating my professional profile and need to get the wording just right. Can you remind me of the exact title of the degree I received from university?",
+    "answer": "You received a Bachelor of Arts in Communications.",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I was just thinking about my early career struggles after college. Do you remember the name of the local newspaper I told you I worked for as a copy editor?",
+    "answer": "You mentioned that you worked as a copy editor for a local newspaper called the Downtown Chronicle.",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm getting ready to start my calls for the day. What's the specific opening line I told you I was going to use?",
+    "answer": "You decided to use the following opening line: 'Hi, this is Alex from InnovateLeads, calling about optimizing your lead generation process.'",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I remember mentioning a specific competitor that we lost a deal to. Can you remind me which company I identified?",
+    "answer": "You identified the competitor as LeadGenius Pro.",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What is the exact length of the voicemail you decided on for your strategy?",
+    "answer": "22 seconds",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Remind me, how many enterprise-level demos did I say I needed to lock in for my bonus this quarter?",
+    "answer": "You said you need to secure 5 enterprise-level demos to get your quarterly bonus.",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm about to call that major prospect, Quantum Solutions, again. I remember making a note about the gatekeeper's name. What was the executive assistant's name?",
+    "answer": "The executive assistant's name is Brenda.",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What did my personal data indicate as the optimal time to call prospects in the tech sector?",
+    "answer": "Tuesdays at 10:30 AM",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm prepping for a call with a new prospect who seems like a perfect fit. I remember telling you which product tier I find most straightforward to pitch. Can you remind me which one I said was the easiest for me to sell?",
+    "answer": "You mentioned that the InnovateLeads Gold Tier is the easiest product for you to sell.",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm running late for my weekly team meeting, what's the conference call number I asked you to save?",
+    "answer": "The conference call number for your weekly team meeting is 1-800-555-1234.",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm following up with the IT department about that bug in our CRM. What was the case number they gave me?",
+    "answer": "The internal IT case number you were given for the CRM bug is #78-B45.",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm planning my day, can you remind me of the deadline for my weekly performance report?",
+    "answer": "You mentioned that your weekly performance report is due every Friday by 4 PM.",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm preparing for my upcoming one-on-one with my manager, Sarah. I remember she gave me some positive feedback about my notes, but I can't recall the exact wording. What did she say?",
+    "answer": "Your manager, Sarah, gave you feedback that your 'lead qualification notes are exceptionally detailed'.",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What was the name of the mandatory training module you recently completed?",
+    "answer": "Advanced Objection Handling",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm updating my email signature again and want to keep it consistent. Can you remind me which specific case study I decided to add a link to last time?",
+    "answer": "You decided to add a link to the case study about the Acme Corp integration.",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm reviewing my performance metrics. I know conversions are always number one, but what did I say was the other key metric that's most important for my role?",
+    "answer": "You said that besides conversions, the other key metric that is most important for your role is 'average talk time'.",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What day and time did I tell you the mandatory all-hands meeting was scheduled for?",
+    "answer": "You said the mandatory all-hands meeting is scheduled for next Wednesday at 2 PM EST.",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What is the monthly price for the InnovateLeads Gold Tier that I mentioned?",
+    "answer": "$249 per month",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Do you recall the specific spreadsheet function I mentioned was my favorite for managing my personal lead tracker?",
+    "answer": "You said that your favorite function for managing your lead tracker is VLOOKUP, as you find it essential for cross-referencing information.",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Who was the contact from CloudSync that Alex met at the virtual networking event?",
+    "answer": "David from CloudSync",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Remind me, what is the standard follow-up cadence I established for warm leads?",
+    "answer": "You set your standard follow-up cadence for warm leads as Day 1, Day 3, Day 7, and Day 14.",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What was the cost of the new noise-cancelling headset I mentioned earlier?",
+    "answer": "$89.99",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I just got a lead from a region I don't think is mine. Can you remind me, what did I tell you my assigned sales territory was for this year?",
+    "answer": "You mentioned that your assigned sales territory for this year is the Pacific Northwest.",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What was the name of the company where I had a really bad call yesterday?",
+    "answer": "Retro Inc.",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What is the name of the Slack channel where Alex gets the best sales tips?",
+    "answer": "#sales-wins",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What was the motivational quote I wrote on my monitor during my time at StapleSource?",
+    "answer": "Efficiency is currency.",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What were the two email subject lines I mentioned I was A/B testing for my follow-up emails?",
+    "answer": "'Quick Question' and 'Following Up on InnovateLeads'",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "During a company all-hands meeting, I noted down the founder's name. What was the name I recorded for the founder of InnovateLeads?",
+    "answer": "You noted down the founder's name as Jian Li.",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "My colleague is asking about my holiday availability. What start date did I mention for my upcoming annual leave?",
+    "answer": "You mentioned that your annual leave starts on December 20th.",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm putting together some notes for my calls tomorrow. Remind me, what was that specific common objection I mentioned I've been getting lately?",
+    "answer": "The common objection you mentioned you've been getting is, 'Your SaaS solution is too expensive for our current budget.'",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What was the mascot of the state university I attended?",
+    "answer": "Gryphons",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What was the specific client success story involving the 'Acme Corp integration' that I mentioned was very effective in my calls?",
+    "answer": "The 'Acme Corp integration' success story that Alex mentioned was very effective in his calls.",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Which client did I mention gave me my best referral last month?",
+    "answer": "DataWeavers Inc.",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What date did I mention as my work anniversary at InnovateLeads?",
+    "answer": "May 15th",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What is one of the special characters required by the new company password policy that I mentioned?",
+    "answer": "!",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Remind me, what was the collective demo goal I mentioned the team is aiming for this month?",
+    "answer": "You mentioned the team's collective goal is to schedule 80 total demos for the month.",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What time zone did I note for the Pacific Ventures lead?",
+    "answer": "PST",
+    "category": "user_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm finally getting around to that productivity hack you mentioned last week. Can you remind me of the specific automation tool and method you suggested for integrating my color-coded spreadsheet with our company's Salesforce CRM?",
+    "answer": "I suggested using Zapier to create an automation. The method involves setting up a 'Zap' where the trigger is a 'New or Updated Spreadsheet Row' in your sheet, and the action is to 'Create or Update a Record' in Salesforce, mapping your spreadsheet columns to the corresponding Salesforce fields.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Can you remind me of the specific opening line you suggested for my SaaS cold calls?",
+    "answer": "Hi [Prospect Name], this is Alex from InnovateLeads. The reason I'm calling is that I noticed your company is in a high-growth phase, and firms like yours often find our lead-gen tools can help scale without increasing headcount.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Can you remind me of the three-step framework you suggested for handling pricing objections?",
+    "answer": "The three-step framework for handling pricing objections is: Acknowledge, Reframe, Justify.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm drafting another follow-up for a lead that's gone cold. You gave me a great subject line for this situation before, one that was short and had a high open rate. What was it again?",
+    "answer": "The subject line I recommended was 'Quick question about our last chat'.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Can you remind me of the humming exercise you recommended for vocal warm-ups?",
+    "answer": "You should hum scales to warm up your voice before calls.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Can you remind me of the specific work and break intervals you recommended for the Pomodoro Technique last time?",
+    "answer": "The Pomodoro Technique involves 25 minutes of focused work followed by a 5-minute break.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm preparing for that follow-up call. Can you remind me of the simple terms you used to explain 'microservices architecture'?",
+    "answer": "Microservices architecture is an approach to building a single application as a suite of small, independent services. A helpful analogy is building with LEGOs, where each piece is a service, instead of carving the entire application from a single block of wood.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Can you remind me of the key differentiator you mentioned for InnovateLeads compared to LeadFlow?",
+    "answer": "The key differentiator for InnovateLeads' product is its superior real-time analytics dashboard.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Can you remind me of the exact `INDEX MATCH` formula syntax you provided for optimizing my lead tracking spreadsheet?",
+    "answer": "The `INDEX MATCH` formula syntax I provided is: `=INDEX(A:A, MATCH(E2, B:B, 0))`.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Can you remind me of the LinkedIn connection request template you suggested that avoids a direct sales pitch?",
+    "answer": "Hi [Name], I came across your profile and was impressed by your work in [Industry/Field]. I'd love to connect and learn more about your insights on [specific topic].",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm about to log that last call in the CRM. What was that specific 3-point structure you recommended I use for my notes to keep them efficient?",
+    "answer": "The 3-point structure I recommended for your CRM notes is: 1. Key Discussion Points, 2. Next Actions, and 3. Personal Details.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm trying to remember that sales quote you gave me a while back, the one by Zig Ziglar about the five obstacles. What was it again?",
+    "answer": "Every sale has five basic obstacles: no need, no money, no hurry, no desire, no trust.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Hey, back when we were talking about my old job at StapleSource, you brought up a specific feature that makes modern CRMs so much more efficient. What was that term you used?",
+    "answer": "The term used for the key efficiency feature in modern CRMs is 'workflow automation'.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Can you remind me of the rhetorical principle you mentioned that I could use in my sales scripts?",
+    "answer": "Pathos",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm about to follow up with a lead and I want to make sure I'm talking to all the right people. What was that specific qualifying question you suggested I use to identify every decision-maker involved?",
+    "answer": "Who else on your team is involved in evaluating new software?",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 9,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "You previously recommended a podcast for someone in SaaS sales and mentioned a specific episode about product demos that was a must-listen. Can you remind me of the name of the podcast and that specific episode?",
+    "answer": "The podcast I recommended is called 'SaaS Tapes', and the specific episode on demos is titled 'Mastering the Demo'.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Remind me, what was that specific productivity structure you recommended for organizing my day around major and minor tasks?",
+    "answer": "The structure I recommended was to set one 'Major Impact Task' and three 'Minor Support Tasks' per day.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm about to hop on a promising call. What was that specific example phrase you suggested I use for the 'Summary Close' technique?",
+    "answer": "Based on our conversation, it seems like our solution aligns with your goals for X and Y. Does it make sense to move forward with the next steps?",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm having trouble getting past a gatekeeper for one of my leads. A while back, you suggested a specific phrase to use with receptionists to sound more collaborative and less like a typical salesperson. What was that phrase again?",
+    "answer": "I was hoping you could point me in the right direction.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What was the negotiation book by the ex-FBI agent that you recommended to me?",
+    "answer": "'Never Split the Difference' by Chris Voss",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What specific metric from my personal spreadsheet did you recommend I highlight for my performance review?",
+    "answer": "Highlight your 'call-to-demo conversion rate' from your personal spreadsheet.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "You mentioned a 5-minute mental prep routine yesterday to help with my call reluctance. What did you say the very first step was?",
+    "answer": "The first step is to review one 'win' from the previous day.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Can you remind me of the 4-email follow-up sequence over 10 days that you suggested?",
+    "answer": "The 4-email sequence over 10 days includes: Day 1 - Introduction and value proposition, Day 3 - Case study or testimonial, Day 7 - Follow-up with additional insights, Day 10 - Final reminder and call to action.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm about to jump on a demo and need to explain our predictive lead scoring feature. You gave me a great analogy for it before, something about a research assistant. Can you remind me what it was exactly?",
+    "answer": "It's like an expert research assistant who reads all your customer interactions and flags the most promising ones.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 8,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Could you remind me of the exact value proposition we crafted together for sales teams?",
+    "answer": "We help sales teams close more deals by automatically identifying their most engaged leads.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Can you remind me of the blog you mentioned that's great for staying updated on SaaS industry news and founder interviews?",
+    "answer": "SaaStr",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Can you remind me of the de-escalation phrase you suggested for handling difficult calls?",
+    "answer": "I understand your frustration, it sounds like you've had a bad experience before.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Can you remind me of the tip you gave for naturally joining a conversation at the networking event?",
+    "answer": "Listen for a question and offer an answer.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm drafting that weekly report email for my manager. What was that concise, three-part reporting format you suggested I use?",
+    "answer": "The reporting format I suggested was: Highlights, Lowlights, and Plan for Next Week.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm trying to remember the exact wording you used before when I asked for a simple definition. How did you define 'Customer Acquisition Cost' (CAC) for me?",
+    "answer": "The total cost of your sales and marketing efforts that are required to acquire a single new customer.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm about to start my next block of calls. Can you remind me of that sub-20-second voicemail script you gave me? The one that was designed to boost callbacks by pointing them to an email.",
+    "answer": "Hi [Prospect Name], Alex Chen calling from InnovateLeads. I have a specific idea on how we can help [Prospect Company] improve its lead generation process. I\u2019ve sent you a short email with the details. No need to call back\u2014just reply to that email if it\u2019s of interest. Thanks.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 9,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Can you remind me of the specific idea you suggested for building my personal brand on LinkedIn?",
+    "answer": "You could build a personal brand on LinkedIn by sharing your meticulous, data-driven approach to telemarketing via short posts.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What was the final step in the 10-minute shutdown ritual I suggested to help you disconnect from work?",
+    "answer": "The final step is to physically close your laptop.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm putting together the training plan for the new telemarketer. You gave me some advice earlier on where to start. What was the single most important skill you recommended I teach them first?",
+    "answer": "You recommended that the first and most important skill to teach the new hire is 'active listening', before moving on to topics like scripting.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Can you remind me of the keyboard shortcut you mentioned for quickly creating a new lead record in the CRM?",
+    "answer": "The keyboard shortcut for creating a new lead record in the CRM is Ctrl + N.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "You made a connection between my campus radio show experience and my current telemarketing role. What was the specific vocal skill you said was directly transferable to sales calls?",
+    "answer": "The specific vocal skill was using pacing and pausing for dramatic effect.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Can you remind me exactly how the 'labeling' technique helps in showing empathy during calls?",
+    "answer": "The 'labeling' technique involves identifying and verbalizing the emotions or perspectives of the person you're speaking with, which helps in building rapport and showing empathy.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm explaining this contract to a new team member and want to get the wording right. How did you describe what a 'Limitation of Liability' clause is?",
+    "answer": "It's a clause that acts as a financial safety net in a contract. It caps the maximum amount of money a party is responsible for paying if they are found to be at fault, often limiting it to the amount paid for the service.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 9,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm on this big team conference call and I want to jump in. Remind me, what was that specific tip you gave me for making a point memorable in a large group?",
+    "answer": "The recommended technique was to state your name, make your point concisely, and then state your name again.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 9,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Remind me, what was the primary motivation you identified for the new FinTech startup buyer persona?",
+    "answer": "The primary motivation for the FinTech startup buyer persona is speed to market.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What positive trait did you say I likely developed from my time as a copy editor?",
+    "answer": "A strong attention to detail.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "You previously gave me a clear way to distinguish between the 'Awareness' and 'Consideration' stages of the sales funnel. Can you remind me what that specific distinction was?",
+    "answer": "The distinction is that in the 'Awareness' stage, the lead knows they have a problem but isn't yet aware of specific solutions, whereas in the 'Consideration' stage, they are actively researching and comparing different solutions to that problem.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm about to present my monthly performance review. You gave me a specific tip for the opening. Can you remind me what you suggested I start with to grab everyone's attention?",
+    "answer": "I suggested that you open the presentation by sharing a surprising statistic from your monthly results.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Can you remind me of the exact phrase you suggested for introducing the new add-on product during a call?",
+    "answer": "Based on what you've told me, you might also be interested in...",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What was the specific question you advised me to ask myself when a deal doesn't go through?",
+    "answer": "What was the one thing I could have done differently?",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "You previously suggested a Mac app for my menu bar to help me keep track of different time zones for my calls. Can you remind me of its name?",
+    "answer": "The time zone visualization app I recommended for your Mac is called Clocker.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "You explained the difference between horizontal and vertical SaaS really clearly before. Can you remind me of that simple distinction you made?",
+    "answer": "Horizontal SaaS serves a wide range of industries, like a general-purpose tool, while Vertical SaaS is specialized for a single, specific industry, like a custom tool for one job.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 9,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Yesterday I was feeling pretty down about work and you suggested a mental reframing technique for handling rejection. What was that technique again?",
+    "answer": "View rejection not as failure, but as data that helps you disqualify the wrong prospects faster.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Which section of a company's website did you recommend I check for conversation starters before a call?",
+    "answer": "You should check the 'Recent News' or 'Press Releases' section of their website.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Can you remind me what the 'Customer Success Manager' role you mentioned involves and why you think I might be a good fit for it?",
+    "answer": "A Customer Success Manager role involves ensuring that customers are satisfied with the products and services they receive, helping them achieve their goals, and maintaining a strong relationship with them. Your skills in communication, strategic thinking, and relationship building from telemarketing would be a great fit for this role.",
+    "category": "assistant_facts_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What is the direct contact phone number for the 'QuantumCorp' lead that Alex mentioned?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What is the specific numerical target for new leads or call volume that Alex needs to hit next quarter, as outlined in the recent team meeting?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 0.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 2,
+      "found": 0
+    }
+  },
+  {
+    "question": "Can you tell me the specific month and year Alex achieved his personal best in sales at StapleSource?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 0.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 0
+    }
+  },
+  {
+    "question": "When is InnovateLeads planning to fully release the new CRM update with the enhanced lead scoring module?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Could you list the exact steps, including specific field names or button clicks, Alex uses to log a call outcome in the company CRM?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What type of flooring does Alex have in his living room?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 2,
+      "found": 2
+    }
+  },
+  {
+    "question": "What brand of dog food does Alex feed Cooper?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 0.5,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 2,
+      "found": 1
+    }
+  },
+  {
+    "question": "What specific grit sandpaper is Alex currently using on the old oak writing desk he's restoring?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Can you tell me the name of the specific street food vendor in Hanoi where you had that memorable pho?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 0.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 2,
+      "found": 0
+    }
+  },
+  {
+    "question": "What brand of coffee beans does Alex use for his French press?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Based on my call notes, what was the name of the client from the tech startup I spoke with last Tuesday? I noted it was a very productive call regarding our lead generation package.",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What was the specific conversion rate for the last marketing campaign discussed in the team meeting?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Based on my call log with Maria Garcia from TechCorp Solutions, which specific SaaS product from InnovateLeads was she interested in?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What time is my follow-up call scheduled with Jane Doe from TechSolutions Inc. today?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Regarding the 'InnovateLeads Q3 Outreach' campaign we discussed, what specific target demographic were we focusing on with those outbound calls?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What specific feature of the software was the client interested in during the conversation?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What specific discount did I offer the client during our call?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm preparing my notes for a follow-up and drawing a blank. What was the name of the large corporation I had a call with yesterday where the senior manager was asking about our CRM integration?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Can you tell me what industry the client was from during the successful call I logged?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Can you tell me the location of the company we discussed partnering with?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Based on our last discussion, what was the exact launch date for SalesStream's new 'Prospector Pro' feature?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What was the specific budget the client mentioned during our last conversation?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What specific service was the client interested in according to Alex's notes?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "When did the client say they would make a decision on the proposal?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What specific feedback did the client give on the product during the call?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What was the name of the competitor mentioned by the client during the call?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What was the specific requirement mentioned by the client during the call?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "According to my call summary, what is the projected timeline for the European market expansion mentioned by the contact at Quantum Solutions?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What specific new feature was the client interested in during the call?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Based on our conversation about my big call from last week, what was the name of the potential client who expressed interest in a partnership with InnovateLeads?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Based on my call log with John Miller from TechSolutions, which specific pricing tier was he interested in receiving a quote for?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Regarding my conversation with the client from Quantum Solutions, what was the specific timeline she gave for their planned implementation?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What was the specific client feedback from MegaCorp Solutions on the 'InnovateLeads Boost' campaign that I mentioned I had logged in the CRM?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What specific challenge did the client mention during the conversation?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Regarding my call with the new lead, Quantum Dynamics, what was the specific platform feature that I mentioned had piqued their interest?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Regarding my recent call with Sarah from FutureTech Solutions where we discussed their Q3 spending, what was the specific budget amount she approved?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What specific service was the client interested in during the call?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "When exactly did the client say they would make a decision regarding the proposal?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What specific feedback did the client give on the product during the call?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "In my call log summary regarding the conversation with the client from Quantum Dynamics, what was the specific name of the competitor they mentioned they were evaluating?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What was the specific requirement mentioned by the client during the call?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 0.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 0
+    }
+  },
+  {
+    "question": "Based on my call notes, what is the specific timeline Acuity Dynamics provided for their European market expansion?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What specific new feature was the client interested in during the call?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What was the name of the potential client interested in a partnership?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Regarding my call notes about the conversation with the client from InnovateLeads, which specific pricing plan did they express interest in?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Regarding my conversation with the client from GlobalConnect Solutions, what specific timeline did they give for their implementation plan?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What specific feedback did the client give on the recent marketing campaign?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "In my last call log regarding Sarah from OmniCorp, I noted she mentioned a key business challenge they were facing. What specific challenge did she bring up?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Regarding my call with GlobalCorp Solutions last week, what specific integration feature did I mention they were most interested in?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Regarding my call with Sarah from Nexus Solutions about their Q3 software upgrade, what was the specific budget amount she confirmed they had allocated?",
+    "answer": "There is no information in prior conversations to answer this question",
+    "category": "abstention_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What CRM functionalities should I look into if I want a more visual way to manage my lead pipeline instead of using a spreadsheet?",
+    "answer": "The answer must recommend CRM features that allow for visual, customizable lead tracking to replace a spreadsheet. It should specifically suggest functionalities like Kanban-style boards, customizable deal stages, or visual pipelines that can be color-coded to represent different lead statuses (e.g., hot, follow-up, do not call). Examples of good recommendations include features like Salesforce's Path or HubSpot's custom deal stages. The response should NOT suggest generic CRM features like basic contact logging or standard reporting tools, as these do not address the user's stated preference for a specific, visual management system.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I've completely hit a wall this afternoon and my energy is flagging. What's a good way to structure the rest of my workday to power through my call list?",
+    "answer": "The response must recommend structuring the afternoon using the Pomodoro Technique. Specifically, it should suggest breaking tasks, like making calls, into focused 25-minute work periods separated by short 5-minute breaks. The recommendation should be actionable and explicitly mention this 25/5 minute split. Generic productivity advice (e.g., 'prioritize your tasks', 'take a longer walk') or suggesting significantly different time management methods (e.g., 90-minute deep work blocks) without acknowledging the user's stated preference would be considered incorrect.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I made a few important calls last week. Can you help me lay out a schedule for when I should send the follow-up emails for calls made on Monday, Wednesday, and Friday?",
+    "answer": "The response must generate a schedule that adheres to the user's stated preference for follow-up timing. For each call day provided, the corresponding follow-up email must be scheduled for exactly two business days later, in the morning. Specifically: the follow-up for the Monday call should be on Wednesday morning; the follow-up for the Wednesday call should be on Friday morning; and the follow-up for the Friday call should be on the following Tuesday morning. The response should not suggest follow-ups on weekends, on incorrect days (e.g., one day or three days later), or at times other than the morning.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I have a lead at a fintech company who's gone silent after our initial call. What's an effective follow-up strategy?",
+    "answer": "The user prefers a 'value-add' follow-up strategy. The response must recommend providing tangible value to the lead. Specifically, it should suggest finding and sending content relevant to the lead's industry, such as a recent article on fintech trends, a case study, or a white paper addressing a potential business challenge. The response should actively discourage generic, low-effort follow-ups like 'just checking in,' 'bumping this up,' or asking for an update without providing new information.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "My manager wants to see my quarterly performance. How can I create a compelling report of my lead conversion rates?",
+    "answer": "The response must recommend a solution that involves exporting raw data from the CRM for external analysis. It should specifically suggest using spreadsheet software like Google Sheets or Microsoft Excel. The ideal answer will mention creating detailed, custom reports, pivot tables, or cross-referencing data within these external tools, aligning with the user's preference for detailed analysis that their CRM's built-in dashboard cannot provide. The response should AVOID suggesting to primarily or solely use the built-in reporting features of the CRM.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I need to send a follow-up email to a new prospect to schedule a product demo. Could you help me draft it?",
+    "answer": "The AI's response should generate an email draft that is concise, direct, and action-oriented, reflecting the user's admired 'no-fluff' communication style. A correct answer must adhere to the following rubric:\n- **MUST:** The email must be extremely direct, with a clear and concise purpose stated in the first sentence (e.g., scheduling a demo).\n- **MUST:** The body of the email must be very short, ideally 2-4 sentences.\n- **MUST NOT:** The draft must not contain conversational pleasantries or filler phrases like 'I hope this email finds you well,' 'Hope you are having a great week,' or 'I just wanted to touch base.'\n- **MUST NOT:** The email should not use an overly enthusiastic or salesy tone. The style should be professional and efficient, not effusive.\n- **Example of a GOOD draft:** A subject like 'Demo Scheduling' and a body like: 'Hi [Prospect Name], Following up on our conversation, I'd like to schedule a 30-minute demo. Are you available Tuesday at 10 AM or Thursday at 2 PM? Let me know what works best. Best, Alex.'\n- **Example of a BAD draft:** A draft that begins with 'Hi [Prospect Name], I hope you're having a fantastic week! I was so excited to hear about your team's goals and would love to find some time to show you how our platform can help achieve them.'",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "How can I optimize my computer setup for more efficient sales calls?",
+    "answer": "The response must recommend solutions that consolidate information into a single, unified view to minimize tab-switching. Correct answers will suggest either: (1) using a second monitor to display different data sources simultaneously, or (2) adopting a software tool that creates a single dashboard view by integrating data from multiple sources (e.g., a sales intelligence platform). The response should explicitly mention the benefit of having all information visible at once. Suggestions that only focus on general productivity tips or CRM features without addressing the single-screen data consolidation preference are considered incorrect.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I have a bunch of raw notes from a sales call. What's the best way to organize them for my CRM entry?",
+    "answer": "The answer must recommend a text-based templating or formatting approach (e.g., using Markdown, simple key-value pairs, or a structured text block) that is explicitly designed for use within a plain text editor. The recommendation should focus on creating a structure that is easy to copy and paste into a CRM. The answer must NOT suggest using or switching to dedicated, feature-rich note-taking applications such as OneNote, Evernote, or Notion. It should respect the user's stated preference for speed and a distraction-free environment found in tools like Sublime Text or Notepad++.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I have a new high-value lead, a VP of Marketing at a company I haven't called before. What should my top research priority be before the first outreach call?",
+    "answer": "The response must prioritize research strategies focused on the individual executive over general corporate information. A correct answer will explicitly recommend investigating the person's LinkedIn profile to find personal rapport-building information. The rubric is met if the recommendation suggests searching for specific details such as recent posts, shared articles, work history, educational background, or mutual connections. The response should de-emphasize or advise against relying primarily on generic corporate materials like 'About Us' pages or company mission statements for the initial rapport-building stage.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "My company just started a new sales contest. What's a good way to approach it to improve my performance?",
+    "answer": "The response must suggest strategies that reframe the sales contest from a competition into a tool for personal performance tracking. It should explicitly recommend focusing on intrinsic motivation and self-improvement metrics, such as 'improving your personal call-to-demo ratio' or 'tracking your own conversion rate week-over-week'. The rubric is met if the answer advises the user to set and track personal goals independent of the leaderboard rankings. The response must NOT recommend focusing on rank, 'beating' other team members, or using the competitive leaderboard as the primary source of motivation.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Just got off a really draining sales call and I'm feeling pretty discouraged. Any ideas on how to reset and get my head back in the game before the next one?",
+    "answer": "The answer must recommend that the user take a short walk outside to reset. An ideal response would specifically suggest a '10-minute walk' or 'stepping outside for a few minutes,' directly referencing the user's stated effective coping mechanism. The rubric fails if the model suggests methods related to 'powering through' (e.g., 'just dial the next number,' 'review your script') or offers only generic, non-actionable advice that keeps the user at their desk (e.g., 'take a few deep breaths and focus').",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "How can I rephrase 'conducted outbound calls' on my resume to make it sound more impactful?",
+    "answer": "The user would prefer responses that reframe the task away from simple, high-volume activity and towards strategy, analysis, and communication. The rubric must check for the presence of suggestions that use strategic and analytical language. Good responses will include phrases like 'Developed targeted outreach strategies,' 'Applied data analysis to prioritize high-value leads,' or 'Synthesized customer information to craft personalized communication.' The response should avoid recommending simple, task-based descriptions like 'Made a high volume of outbound calls,' 'Logged call information,' or 'Followed a pre-defined script.'",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm preparing for a sales call with a new lead in Austin, Texas. What kind of local information would be useful for building rapport?",
+    "answer": "The response must recommend researching local information that facilitates personal connection. It should specifically suggest looking into major local universities, such as the University of Texas at Austin, as a primary point of connection, mirroring the user's own background. The response should also suggest researching well-known local landmarks, cultural hubs, or distinct neighborhoods that could serve as conversational icebreakers. Recommendations for generic sales tactics or purely corporate-level data (e.g., 'list major tech companies in Austin', 'focus on their business needs') would not satisfy the user's preference for personal connection points.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm trying to optimize my CRM homepage for efficiency. Do you have any suggestions on how to configure the layout?",
+    "answer": "The correct response must apply the user's previously stated preference for a minimalist dashboard. The rubric requires the model to recommend personalizing the CRM homepage to prioritize or exclusively show the 'My Open Tasks' and 'Upcoming Demos' widgets. The answer must guide the user on how to hide, remove, or minimize other distracting widgets by referencing dashboard customization or layout settings. The response will be considered incorrect if it suggests adding new widgets, provides a generic tour of all dashboard features without focusing on simplification, or fails to mention hiding/removing elements for a cleaner view.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm putting together a proposal for a prospect who seems hesitant about the cost. What's the best way to present the pricing for our top-tier plan?",
+    "answer": "The response must recommend a value-based pricing presentation strategy. It should specifically advise the user to: 1. Reframe the total annual price into a smaller, recurring monthly cost. 2. Directly connect the monthly cost to the client's projected monthly Return on Investment (ROI), emphasizing the value gained. The response should avoid recommending simply stating the lump-sum annual price, offering a generic discount without reframing, or focusing only on features.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm looking into a new company to prospect called 'Innovatech Solutions'. Where can I find some solid analysis of their business strategy?",
+    "answer": "The answer should recommend sources and methods that provide deep, strategic business analysis, consistent with the user's appreciation for 'Stratechery'. It must suggest looking for long-form analytical content, like that found in high-quality tech newsletters or blogs. Specific, good recommendations would include searching the 'Stratechery' archives or checking similar analytical publications (e.g., The Generalist, Above Avalon). The response should NOT suggest surface-level sources like generic news aggregators, press release websites, or simply looking at the company's homepage without further context. The focus should be on understanding business models and market positioning, not just product features or funding announcements.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm prepping for a call with a prospect who is known to be budget-conscious. What's a good strategy if they say our price is too high?",
+    "answer": "The response must structure its advice using the 'feel, felt, found' objection handling framework. The recommended script or strategy must contain three distinct parts mirroring this structure: 1) Empathizing with the prospect's concern about price ('feel'). 2) Normalizing this concern by mentioning that other customers had similar initial thoughts ('felt'). 3) Pivoting to the value and positive outcomes that those customers ultimately experienced ('found'). The response should explicitly avoid direct argumentative rebuttals or immediately suggesting a discount without first applying this framework.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "This discovery call went really well and they seem very interested. What's the best way to wrap this up to secure the demo?",
+    "answer": "The answer should recommend a 'next-step' or 'assumptive close' technique, aligning with the user's preference for avoiding high-pressure tactics. The ideal response would suggest specific phrasing that confirms the next action, such as 'I'll send over the calendar invite for the demo immediately' or 'Great, I'm putting the demo on our calendars for [Day] at [Time].' The rubric should explicitly advise against suggesting traditional 'hard close' questions like 'Are you ready to commit to a demo?' or 'What would it take to get you to agree to a demo today?'",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm looking for AI tools that can help me with my sales outreach. What would you recommend?",
+    "answer": "The response must prioritize recommendations for AI tools focused on data analysis and insight generation for sales. It should suggest tools such as sales intelligence platforms (e.g., ZoomInfo, Lusha) that provide prospect data and talking points, or conversation intelligence tools (e.g., Gong, Chorus.ai) that analyze calls. The response must specifically avoid recommending tools whose primary feature is the automatic generation of sales emails or outreach copy (e.g., Jasper, Lavender), as this directly conflicts with the user's expressed skepticism towards 'robotic' AI-written content.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What's a good way to track and visualize sales performance metrics for a quarter?",
+    "answer": "The answer must recommend creating a visualization that shows trends over time. It should specifically suggest or prioritize using a line chart to plot performance metrics (like conversion rate or calls made) on a week-by-week or daily basis for the quarter. The response should emphasize analyzing changes and patterns over the time period. Recommendations for static, compositional charts like pie charts or donut charts as the primary method for visualization would be incorrect as they do not align with the user's stated preference for seeing trends.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I just got a Slack message from a colleague that I need to handle later. What's a good way to keep track of it so I don't forget to reply?",
+    "answer": "The response must recommend using Slack's native 'Remind me about this' feature. The recommendation should be specific, either by name or by describing how to set a reminder directly on a message within Slack. The rubric is failed if the primary recommendation is a generic or external method, such as setting a calendar reminder, using a third-party to-do app, or creating a formal task in a CRM, which the user has previously found less intuitive for this context.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "My brain feels completely scattered after all those calls today. What's a simple, immediate action I can take to help me disconnect and feel like the workday is actually over?",
+    "answer": "The response must recommend that the user perform their specific, previously stated wind-down ritual. The rubric for a correct answer is as follows:\n1. The primary suggestion MUST be the act of methodically closing all work-related browser tabs and computer applications.\n2. The response should ideally frame this action as a way to create a 'clean break' or 'signal the end of the day,' acknowledging the user's goal to disconnect.\n3. The response is considered INCORRECT if it ONLY offers generic wellness advice (e.g., 'go for a walk,' 'listen to music,' 'meditate,' 'do some stretches') without first suggesting the user's known preference. While such advice can be supplementary, failing to mention the tab-closing ritual constitutes a memory failure.",
+    "category": "preference_evidence",
+    "recall": 0.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 0
+    }
+  },
+  {
+    "question": "I need to prepare for a performance review. What are some effective strategies for justifying performance when key metrics don't tell the whole story?",
+    "answer": "The response must advise the user to shift the narrative away from the 'talk time' metric and focus on the 'number of demos set' metric, which the user previously identified as the most important indicator of success. The rubric is met if the response specifically suggests: 1. Creating a visual aid, such as a chart or graph, to compare the trend of 'talk time' against the 'number of demos set'. 2. Highlighting how a decrease in talk time may correlate with an increase or stabilization in demos set, framing it as an improvement in efficiency or call quality. 3. Using language that emphasizes 'high-impact outcomes' or 'quality over quantity'. The response should NOT recommend strategies for increasing talk time or offer generic apologies for the lower metric.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm working on restoring an old oak desk and want to give it a dark, rich finish. What wood stain products would you suggest?",
+    "answer": "The response must recommend specific wood stain colors from the Minwax brand product line. It should suggest dark, rich colors suitable for oak, such as 'Minwax Wood Finish in Jacobean', 'Ebony', or 'Dark Walnut'. The answer should prioritize the Minwax brand due to the user's stated preference for their color consistency. Recommendations for other brands (e.g., Varathane, Behr, General Finishes) are incorrect.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What's an effective strategy for unpacking a house after moving?",
+    "answer": "The answer must recommend a systematic, methodical, and efficient unpacking strategy. It should include specific tactics such as creating a prioritized plan, tackling the house on a room-by-room basis (e.g., kitchen and bedroom first), and implementing an organizational system like color-coding labels for boxes. The tone should be pragmatic and process-oriented, aligning with the user's preference for structure. The answer should NOT suggest unstructured or emotionally-driven approaches like 'just do what feels right' or 'unpack a little bit each day without a plan'.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm looking for a good movie to watch tonight, any recommendations?",
+    "answer": "The response must recommend films that align with the user's preference for slow, methodical, and visually-driven cinema. The rubric for a correct answer is as follows:\n\n**Preferred Recommendations:**\n- **Style:** The AI should suggest films that are contemplative, atmospheric, philosophical, and known for their strong cinematography and deliberate pacing.\n- **Specific Directors:** Recommendations should include or be similar in style to directors like Andrei Tarkovsky, Terrence Malick, Ingmar Bergman, Bela Tarr, or Yasujir\u014d Ozu.\n- **Specific Film Examples:** Good examples would be 'Stalker' (1979), 'The Tree of Life' (2011), 'Persona' (1966), or 'Tokyo Story' (1953).\n- **Keywords:** The justification for the recommendations should use terms like 'visually stunning', 'meditative', 'atmospheric', 'methodical pacing', or 'philosophical'.\n\n**Recommendations to Avoid:**\n- **Genres:** The AI must not suggest films from genres like action blockbusters, superhero movies, broad comedies, or fast-paced thrillers.\n- **Specific Examples:** The AI should avoid recommending films such as anything from the Marvel Cinematic Universe, the 'Fast & Furious' franchise, or mainstream comedies like those starring Adam Sandler or Kevin Hart.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I need to buy some new dog treats for training. What do you recommend?",
+    "answer": "The response must recommend dog treats that are explicitly described as small, low-calorie, and suitable for repetitive training sessions. It should preferably suggest the user stick with 'Zuke's Mini Naturals' or recommend other similar brands known for training treats, such as 'Pet Botanics Training Rewards' or 'Wellness Soft Puppy Bites'. The answer should NOT recommend large, high-calorie biscuits like 'Milk-Bone Original Biscuits', dental chews, or other high-calorie treats that are inappropriate for frequent rewarding during training.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm looking to start a small herb garden. What are some herbs you'd recommend planting?",
+    "answer": "The response must recommend herbs that are explicitly described as low-maintenance, hardy, and suitable for beginners. It should suggest specific herbs known for these qualities, such as Mint, Rosemary, Thyme, Sage, Chives, or Oregano. The answer should connect the recommendations back to the user's stated need for low-maintenance options (e.g., 'Mint is great for beginners because it's very resilient'). The response should NOT recommend delicate or finicky herbs that require significant attention or specific growing conditions, such as Cilantro (which bolts easily) or Basil (sensitive to watering), without strong caveats about their higher-maintenance nature.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm trying to find a bookshelf for my living room. Any suggestions on where to look?",
+    "answer": "The model's response should recommend sources for secondhand, vintage, or antique furniture. Appropriate recommendations include physical locations like flea markets, antique shops, and consignment stores. The response can also suggest online platforms for used goods, such as Facebook Marketplace, Craigslist, or Chairish. The response must NOT recommend retailers known for new, mass-produced, or flat-pack furniture, specifically avoiding names like IKEA, Wayfair, Target, or Amazon.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm looking to buy a new pair of running shoes for jogging. Do you have any recommendations?",
+    "answer": "The model must recommend running shoes from the 'Brooks' brand, specifically highlighting the 'Ghost' line (e.g., the Brooks Ghost 15) for its neutral support. Recommendations for other neutral support shoes from Brooks, such as the 'Glycerin' line, are also acceptable. The response should NOT primarily recommend shoes from other brands like Hoka, Asics, or New Balance unless it first addresses the stated preference for Brooks. The response must avoid recommending shoes designed for stability or motion control.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm planning to cook something special this weekend, any suggestions for a good recipe to try?",
+    "answer": "The response must recommend recipes that are complex, time-consuming, and involve multiple distinct stages or components, framing the cooking experience as a 'project'. Appropriate recommendations include dishes like Beef Wellington, homemade ramen from scratch (including broth and toppings), cassoulet, or a complex multi-layer lasagna. The response must NOT suggest simple or quick recipes, such as '30-minute meals', sheet-pan dinners, simple stir-fries, or basic pasta dishes.",
+    "category": "preference_evidence",
+    "recall": 0.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 0
+    }
+  },
+  {
+    "question": "I feel like I'm in a music rut. What's something great I should check out?",
+    "answer": "The correct answer must recommend one or more specific, complete musical albums, identifying both the album title and the artist. The recommendation should treat the album as a cohesive work. For example, suggesting 'You should listen to the album 'A Moon Shaped Pool' by Radiohead' is a correct response. The answer must NOT recommend playlists (e.g., 'a playlist of 90s alternative'), radio stations, individual songs, or broad genres without a specific album suggestion. The core of the evaluation is whether the model applies the user's preference for full-album listening experiences over fragmented or algorithmic suggestions.",
+    "category": "preference_evidence",
+    "recall": 0.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 0
+    }
+  },
+  {
+    "question": "I'm thinking about getting into journaling. What are the essential supplies someone should get to start?",
+    "answer": "The response must provide recommendations that directly cater to the user's expressed preference for fine-tipped gel pens. An ideal response will explicitly recommend the 'Pilot G2 0.5mm' pen or pens with very similar characteristics (e.g., Uni-ball Signo 0.5mm). It must also suggest high-quality notebooks suitable for gel ink to prevent bleed-through, specifying brands known for this quality like 'Leuchtturm1917', 'Rhodia', 'Clairefontaine', or notebooks with a paper weight of 80gsm or higher. The response must prioritize recommendations for fine-tipped (0.5mm or smaller) gel pens. Recommending only ballpoint pens, fountain pens, or generic composition notebooks would be considered an incorrect application of the user's preference.",
+    "category": "preference_evidence",
+    "recall": 0.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 0
+    }
+  },
+  {
+    "question": "I just moved and I'm looking for a new veterinarian for my dog, what's the best way to find a good one?",
+    "answer": "The rubric for a correct answer requires that the model's response provides a strategy for identifying a veterinarian based on their communication style. The response must suggest reading online reviews and explicitly recommend searching for keywords or phrases that indicate a collaborative and communicative approach. Acceptable keywords to suggest include 'takes time to explain', 'answers all questions', 'collaborative', 'discusses options', and 'partner in care'. The response should prioritize the process of evaluating a vet's communication style. Responses that solely focus on generic criteria like location, price, or overall star ratings without addressing the user's expressed need for a communicative partner are considered incorrect.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm trying to figure out where to go for my next international vacation. Any suggestions?",
+    "answer": "The response must recommend international travel destinations known primarily for their natural beauty, tranquility, and extensive opportunities for hiking. The rubric requires suggestions that align with the user's explicit preference for a 'less chaotic' environment with 'long, quiet hikes'. Preferred recommendations include places like New Zealand (Fiordland National Park), Patagonia (Torres del Paine National Park), the Scottish Highlands, or the Canadian Rockies (Banff/Jasper). The response should emphasize features like scenic trails, vast landscapes, and peaceful settings. The response must AVOID recommending destinations characterized by bustling, chaotic city life, such as Tokyo, Bangkok, Mumbai, or revisiting major urban centers in Vietnam. Recommendations focused on dense urban exploration, crowded markets, or vibrant nightlife are incorrect as they directly contradict the user's stated preference.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm looking for some good options for a warm, non-caffeinated drink to have in the afternoon. What would you recommend?",
+    "answer": "The response must recommend non-caffeinated herbal teas with earthy or spicy flavor profiles. It should prioritize suggestions like ginger tea, rooibos chai, turmeric tea, or cinnamon spice blends. The response must explicitly avoid recommending fruity teas (e.g., berry, peach, apple) or teas that feature hibiscus as a primary ingredient.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm planning to make some cocktails for friends this weekend. Can you suggest a good recipe to try out?",
+    "answer": "The response should recommend spirit-forward cocktails that are generally considered bitter, bittersweet, or strong, and not overly sweet. Specific preferred recommendations include a Boulevardier, an Old Fashioned, a Manhattan, a Sazerac, or a classic Martini. The response must avoid recommending sweet, fruity, or creamy cocktails such as a Pi\u00f1a Colada, a Cosmopolitan, a Mai Tai, or a White Russian. The rubric is satisfied if the recommendations align with the user's stated preference for bitter, spirit-forward drinks like the Negroni.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm thinking about starting a new fitness routine to get in better shape. What are some effective options?",
+    "answer": "The response must recommend fitness activities that can be performed alone and avoid suggestions related to social or group settings. It should prioritize options like running/jogging outdoors, cycling, or at-home workout programs. Specific app-based recommendations like Peloton Digital or Apple Fitness+ are highly appropriate. The rubric must explicitly penalize any recommendations for gym memberships, group fitness classes (e.g., CrossFit, yoga studios, spin classes), or team sports, as these conflict with the user's stated aversion to 'performative' social environments.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What's a good daily walking schedule for an energetic beagle?",
+    "answer": "The answer must propose a walking schedule that places the longest walk (e.g., 45-60 minutes) in the late afternoon, specifically around 5 PM, aligning with the user's preference to use it as a way to decompress after work. The schedule should also include a shorter walk in the morning to avoid disrupting the user's stated peak productivity time. The response should NOT suggest making the morning walk the primary or longest exercise session of the day.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I found a recipe online I want to try. What's the best way to use it while I'm actually cooking in the kitchen?",
+    "answer": "The rubric must verify that the response acknowledges the user's previously stated frustration with device screens turning off during cooking. An appropriate answer must recommend one or both of the following solutions: 1) Printing the recipe out to have a physical copy. 2) Using a specialized recipe management application that includes a 'cook mode' or a feature designed to prevent the screen from sleeping or locking (e.g., Paprika, AnyList, Recipe Keeper). The response should NOT simply suggest using a standard tablet or phone without addressing the screen-off issue, nor should it recommend generic solutions like buying a tablet stand as the primary fix.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Could you brainstorm some effective opening lines for a cold call to a SaaS prospect? I'm looking for something that is disarming and builds rapport quickly.",
+    "answer": "The response must provide opening lines that use simple, direct, and conversational English. The recommendations should focus on authentic, human-centric phrasing. The response must explicitly AVOID corporate jargon and buzzwords. Specifically, the answer should NOT include words like 'synergy', 'leverage', 'paradigm shift', 'optimize', 'value-add', or 'touch base'. Recommended lines should be verifiable for their lack of this specific jargon and their conversational tone, for example, suggesting lines like 'Hi [Name], I saw you're the [Job Title] at [Company], I was hoping you could point me in the right direction,' instead of 'I'm calling to discuss a value-add solution to optimize your vertical.'",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "My company is thinking about starting a podcast for marketing, and I might be involved. What kind of equipment and software would you suggest for a good-quality, entry-level podcasting setup?",
+    "answer": "The response must recommend equipment and software that prioritizes simplicity, ease-of-use, and a low learning curve. For microphones, it must suggest 'plug-and-play' USB microphones (e.g., Blue Yeti, Rode NT-USB, Audio-Technica AT2020 USB+) and explicitly avoid XLR microphones that require an audio interface (e.g., Shure SM7B, Electro-Voice RE20). For software, it must suggest user-friendly editors like Audacity, Descript, or GarageBand, and explicitly avoid complex professional Digital Audio Workstations (DAWs) like Pro Tools, Adobe Audition, or Logic Pro X.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Which sales certifications are known to have the most significant impact on salary for professionals in the SaaS industry?",
+    "answer": "The response must prioritize recommendations based on quantifiable financial return and salary impact. It should favor technical certifications with a clear link to higher-paying roles, such as Salesforce Certified Administrator, Salesforce Certified Sales Cloud Consultant, or AWS Certified Cloud Practitioner, explaining that these open doors to more lucrative technical sales or solutions architect positions. The rubric is met if the answer explicitly references salary data, ROI, or earning potential as the primary justification. The response should deprioritize or advise against certifications focused on generalist skills or leadership theory (e.g., CSLP) unless it can provide strong evidence of a direct and significant salary increase associated with them.",
+    "category": "preference_evidence",
+    "recall": 0.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 0
+    }
+  },
+  {
+    "question": "What are some good resources for staying up-to-date on trends in the SaaS industry?",
+    "answer": "The ideal response must prioritize and recommend text-based resources like daily or weekly email newsletters, blogs, or online publications that offer concise information. Recommendations should explicitly focus on readable formats. Examples of appropriate recommendations would include newsletters like 'SaaStr Daily', 'For Entrepreneurs' by David Skok, or the blog of Tomasz Tunguz. The response must NOT recommend or suggest video-based content, such as YouTube channels, webinar series, or long-form video interviews, as this directly contradicts the user's expressed preference for reading over watching tedious video content.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm looking for tools that can automatically generate end-of-day summary reports by pulling data from both a CRM and my Google Calendar. What would you suggest?",
+    "answer": "The response must prioritize recommendations for no-code or low-code automation platforms. It should highlight tools known for their visual workflow builders and extensive pre-built integrations, minimizing the need for custom scripting or complex API configuration. Recommendations should align with the user's preference for platforms like Zapier or IFTTT. The response should AVOID suggesting solutions that primarily require writing custom code, using SDKs, or are developer-centric platforms that demand significant technical setup.",
+    "category": "preference_evidence",
+    "recall": 0.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 0
+    }
+  },
+  {
+    "question": "What are some top podcasts for learning about business strategy and company histories?",
+    "answer": "The response must recommend podcasts that focus on narrative-driven, deep-dive case studies of specific companies, mirroring the style of podcasts like 'Acquired' or 'Business Wars'. Good examples to suggest include 'How I Built This', 'The Dropout', or 'WeCrashed'. The response must AVOID recommending podcasts that are primarily theoretical, instructional, or offer abstract business advice without a strong narrative focus on a single company's history. Examples of podcasts to avoid recommending include 'HBR IdeaCast', 'The Tim Ferriss Show', or 'Marketing School'.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What are some good email automation tools for creating personalized, multi-step sales follow-up sequences?",
+    "answer": "The user would prefer responses that recommend sales automation tools with strong, explicit integration with Google Sheets or robust CSV import/export functionality. The response should specifically highlight these data integration features when making a recommendation. Examples of preferred tools include Lemlist, Mailshake, or Woodpecker, noting their capabilities for syncing with spreadsheets. The response should NOT prioritize tools that are known as closed ecosystems with limited data export options or fail to mention data integration as a key feature.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What are some good tools for creating simple animated audiograms for social media posts?",
+    "answer": "The user would prefer responses that recommend simple, web-based, or template-driven audiogram creation tools. Recommendations should prioritize ease of use and a shallow learning curve. Specific examples of appropriate recommendations include Headliner, Wavve, Descript, or Canva. The response should explicitly AVOID recommending professional, complex video editing or motion graphics software such as Adobe After Effects, Adobe Premiere Pro, Final Cut Pro, or DaVinci Resolve, as these conflict with the user's stated preference for tools that can be learned and used quickly without extensive tutorials.",
+    "category": "preference_evidence",
+    "recall": 0.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 0
+    }
+  },
+  {
+    "question": "I'm looking to get some new puzzle toys for my high-energy beagle. Any suggestions?",
+    "answer": "The response must recommend durable, advanced-level dog puzzle toys. It should prioritize recommendations for 'expert' or 'level 3/4' difficulty toys from brands known for complexity, such as Nina Ottosson by Outward Hound (e.g., Dog Casino, Multipuzzle) or Trixie (e.g., Mad Scientist). The response should explicitly mention the advanced difficulty and challenging nature of the toys. It should NOT suggest beginner/intermediate (level 1/2) toys, simple treat-dispensing balls, or basic enrichment items like lick mats.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Any good travel documentaries about Vietnam you could recommend?",
+    "answer": "The response must recommend travel documentaries or series about Vietnam that align with the user's stated preference for authenticity and a focus on street-level culture and food, similar to 'Anthony Bourdain: Parts Unknown'. A correct answer will suggest shows known for their unscripted, immersive, and culinary-focused style. For example, recommending 'Somebody Feed Phil' (specifically noting its food focus) or content from creators like Mark Wiens would be appropriate. The response should avoid recommending highly-produced, sensationalized travel shows that focus on luxury experiences, major tourist landmarks without cultural depth, or feel like generic travel guides.",
+    "category": "preference_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I need to get the new team-wide kick-off call on the calendar for next Tuesday. What would be a good time to schedule it for everyone?",
+    "answer": "A good response should acknowledge the previously mentioned time zone difference and propose meeting times that are considerate of all team members. It should suggest times that fall within reasonable business hours for both Alex's local time and the West Coast time zone (PST/PDT), which is 3 hours behind. For example, it could suggest a time like 11:00 AM or 12:00 PM in Alex's time zone, which would be 8:00 AM or 9:00 AM for the West Coast team. The response must avoid suggesting times that would be very early for the West Coast members (e.g., 9 AM for Alex, which is 6 AM for them) or late for Alex.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What should I focus on in my performance summary this month?",
+    "answer": "A good response should emphasize metrics that are quantifiable and data-driven, such as conversion rates, number of calls made, and follow-up success rates, considering the interim manager's preference for hard data.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 8,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What's a good tool to help streamline my email follow-ups?",
+    "answer": "A good response should acknowledge the current budget constraints and suggest free or existing tools that can be utilized without incurring additional costs. It should also consider recommending methods to optimize current processes using available resources.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "When is the best time to make my follow-up calls on Fridays?",
+    "answer": "A good response should consider Alex's mandatory training session on Friday afternoons and suggest times outside of this period, ideally in the morning or early afternoon before the training begins.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "How can I ensure my data stays up-to-date without hitting any limits?",
+    "answer": "A good response should recognize the need to manage API call limits while maintaining data accuracy. It should suggest solutions like scheduling syncs during off-peak hours, batching updates, or using a more efficient data transfer method to avoid hitting the API call limit.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What would be a good tool for brainstorming sales strategies?",
+    "answer": "A good response should suggest mind-mapping applications that are effective and can be used without requiring installation on a work laptop, considering the user's IT constraints.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 8,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Okay, I need to make sure my calls for tomorrow are as effective as possible. Can you review my plan and suggest some high-impact improvements?",
+    "answer": "A good response should acknowledge the user's stated goal of improving effectiveness and provide concrete, actionable suggestions for his call plan. Crucially, the advice should be framed in a supportive and reassuring tone, focusing on reliable, proven strategies rather than high-risk, experimental ones. The response must implicitly recognize the user's underlying anxiety about performance scrutiny by offering suggestions that aim to build confidence and ensure solid, defensible results.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What's the best way to get a quick update from this prospect?",
+    "answer": "A good response should suggest using the communication method that the prospect is most responsive to, which in this case is email, as noted from previous interactions.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Can you help me script an opening for my call with Jane?",
+    "answer": "A good response should acknowledge Jane's preference for direct communication by suggesting an opening that is concise and to the point, avoiding any unnecessary small talk or pleasantries. The response should also consider the professional context and aim to immediately address the purpose of the call.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Can you suggest some strategies to improve my sales performance?",
+    "answer": "A good response should consider Alex's dislike for aggressive sales tactics from his past experience at StapleSource. The response should suggest strategies that align with his preference for efficiency and meticulousness, such as refining his lead tracking system or enhancing customer engagement through personalized communication, rather than resorting to high-pressure tactics.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Alright, I'm about to wrap up for the day. What are the last three things I should do before logging off?",
+    "answer": "A good response should prioritize tasks related to the user's job responsibilities and implicitly acknowledge the high-stakes nature of CRM data entry mentioned previously. It must recommend double-checking and completing all call logs in the CRM as a top priority before logging off, recognizing that this is a critical task for him due to his manager's strict standards. Other suggestions can be more generic end-of-day tasks, but the CRM check is non-negotiable for a correct answer.",
+    "category": "implicit_connection_evidence",
+    "recall": 0.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 0
+    }
+  },
+  {
+    "question": "How can I make my sales pitch sound more engaging?",
+    "answer": "A good response should suggest techniques that leverage vocal variety and expressiveness, such as varying pitch, tone, and pace, while also incorporating storytelling elements. The response should subtly acknowledge the user's past experience with voice modulation, perhaps by suggesting they draw on their 'radio voice' skills to enhance their pitch delivery.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "My manager just pinged me for a pipeline status update. What's the fastest way for me to pull together a comprehensive overview of my sales pipeline for this month?",
+    "answer": "A good response should prioritize suggesting that Alex use his personal, color-coded spreadsheet. It should recognize this as his preferred, more detailed, and efficient tool for tracking leads, based on his prior complaint about the company CRM. The answer should frame the spreadsheet as the best source for a 'fast' and 'comprehensive' overview, directly addressing the user's need while implicitly recalling his established workflow.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What strategies should I focus on to maximize my productivity this month?",
+    "answer": "A good response should consider the seasonal slowdown in the industry during late December and suggest strategies that capitalize on the current period of higher activity. It should recommend focusing on tasks that can be completed before the slowdown, such as reaching out to potential leads, scheduling follow-ups, and preparing for the upcoming quieter period. The response should also acknowledge the importance of planning ahead to ensure a smooth transition into the slower season.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Okay, I have my call list for this morning and it's a mix of different company sizes: 'Innovate Corp', 'Global Logistics Partners', 'Smith's Local Garage', and 'Main Street Bakery'. To be most effective with my time, which of these leads should I call first?",
+    "answer": "A good response should prioritize the leads that fit the description of mid-market companies ('Innovate Corp', 'Global Logistics Partners') over the small, local businesses ('Smith's Local Garage', 'Main Street Bakery'). The recommendation must be based on the implicit context that the user's company has shifted its strategy to target mid-market clients, a detail the user shared in a previous session.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "How should I handle this new lead from Montreal?",
+    "answer": "A good response should acknowledge the language barrier and suggest strategies for effective communication, such as preparing key phrases in French, using translation tools, or involving a colleague who speaks French to assist with the call.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I've just qualified a lead that's a dead end for my quota, but it's a perfect fit for my colleague Sarah's product line. What's the best move here?",
+    "answer": "A good response should recommend that Alex pass the lead directly to Sarah. The advice should be framed as a strategic, collaborative action that benefits the entire team. It should implicitly recognize that due to the new team-based commission structure for the quarter, Sarah closing the deal will contribute to Alex's own compensation, making it the most logical and profitable move for him personally, as well as for the team.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Okay, so that company bowling night is tonight. What's the best strategy to make a good impression but still get out of there early?",
+    "answer": "A good response should acknowledge the user's desire to leave early and provide a strategic, efficient plan for making a positive impression. The advice should focus on high-impact, low-duration interactions, such as having a brief, positive chat with a manager, playing one game enthusiastically, and then having a polite reason to depart. The tone should be pragmatic and goal-oriented, respecting the user's implied view of the event as a professional obligation rather than a social pleasure, without explicitly mentioning their previously stated dislike for it.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What are some good hobbies I can do in the evening to unwind?",
+    "answer": "A good response should suggest hobbies that are relaxing and do not involve screens, considering Alex's attempt to reduce screen time before bed to help with his insomnia. Suggestions could include activities like reading physical books, practicing meditation, engaging in light exercise such as yoga, or pursuing a hands-on hobby like woodworking or furniture restoration, which aligns with his existing interests.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm looking for something interesting to do this weekend. Any ideas?",
+    "answer": "A good response should suggest activities that are engaging yet free or very low-cost, considering Alex's recent financial constraint due to the unexpected vet bill.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Morning. I'm dragging today. What should I drink to get me going?",
+    "answer": "A good response should avoid suggesting high-caffeine beverages like regular coffee, recalling the user's recent mention of a doctor's advice to reduce caffeine intake due to anxiety. It should instead recommend low-caffeine or caffeine-free alternatives for a morning energy boost, such as decaf coffee, herbal tea, chicory root coffee, or a fruit smoothie, while acknowledging his feeling of tiredness.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "My friend from college now lives out in Seattle, and we want to catch up on the phone sometime this week. What time would be good for us to schedule a call?",
+    "answer": "A good response should infer the 3-hour time difference between the user (implied ET) and their friend (Seattle is PT). It must avoid suggesting times that conflict with the user's strict, non-negotiable evening routine from 6 PM until roughly 7:30 PM their time. The response should propose call times that respect both individuals' likely schedules, such as late in the user's workday (e.g., 4-5 PM ET / 1-2 PM PT) or after their evening routine is complete (e.g., after 8 PM ET / 5 PM PT).",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 2,
+      "found": 2
+    }
+  },
+  {
+    "question": "What are some effective ways to reduce my electricity usage at home?",
+    "answer": "A good response should suggest energy-saving methods that do not involve purchasing new smart home gadgets, considering Alex's pragmatic view on such technology. Recommendations could include using energy-efficient light bulbs, unplugging devices when not in use, or optimizing heating and cooling settings.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "My coffee maker just broke. I need to buy a new one today, what should I get?",
+    "answer": "A good response should infer from the user's previous mention of their morning ritual that their broken coffee maker was a French press. Recommendations should prioritize replacing the French press, perhaps suggesting more durable models like those made of stainless steel. The response may also suggest similar manual brewing methods that produce strong coffee, such as an AeroPress or pour-over kit, but it should not lead with or exclusively recommend dissimilar types like automatic drip or pod-based machines.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What advice should I give my cousin about starting a career?",
+    "answer": "A good response should acknowledge the challenges of unpaid internships in media, suggest exploring alternative paths that offer practical experience and financial stability, and encourage maintaining a balance between passion and pragmatism.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 8,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What should I do tonight to unwind after a hectic week?",
+    "answer": "A good response should suggest activities that are calming and align with Alex's interests, such as engaging in his furniture restoration hobby, which he finds meditative. The response should avoid suggesting activities that are high-energy or social, as these may not align with his need to relax and his preference for solitary hobbies.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What kind of class should I consider joining at the community center on Saturdays?",
+    "answer": "A good response should suggest classes that align with Alex's preference for solitary and creative activities, such as woodworking or furniture restoration workshops, rather than highly social or team-based activities.",
+    "category": "implicit_connection_evidence",
+    "recall": 0.5,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 2,
+      "found": 1
+    }
+  },
+  {
+    "question": "What are some tips for getting my weekend chores done more quickly?",
+    "answer": "A good response should suggest strategies that leverage Alex's skills in efficiency and organization, such as creating a detailed plan or schedule for chores, using tools or systems to streamline tasks, and possibly incorporating breaks to maintain energy. The response should also consider Alex's preference for structured, methodical approaches, similar to his work habits.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What hobby could I start that would be both creative and affordable?",
+    "answer": "A good response should suggest hobbies that are creative and low-cost, taking into account Alex's interest in creative outlets and his current financial considerations. The response should also consider hobbies that can be pursued at home, given Alex's recent move to a suburban neighborhood and his enjoyment of solitary activities.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 2,
+      "found": 2
+    }
+  },
+  {
+    "question": "What's a simple yet impressive dish I can prepare for a special dinner at home?",
+    "answer": "A good response should suggest a dish that is elegant and impressive but not overly complex or intimidating to prepare, considering Alex's pragmatic approach to cooking and his preference for simplicity. The response should also take into account Alex's interest in impressing a date, so the dish should have a 'wow' factor without requiring advanced culinary skills.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Where should I start my vegetable garden in my yard?",
+    "answer": "A good response should consider the presence of Cooper, the dog, who loves to dig holes. The response should suggest placing the vegetable garden in an area of the yard that can be protected from the dog, perhaps using fencing or choosing a location that is less accessible to Cooper, to prevent him from disturbing the plants.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Finally finished restoring that oak desk. It came out great, but now my garage feels a bit empty. Any ideas for what I should do next?",
+    "answer": "A good response should suggest new projects that align with the user's previously stated motivation for his hobby: the need for a tangible, creative act to balance the abstract, ephemeral nature of his telemarketing job. The response should prioritize suggestions for hands-on, solitary projects that result in a concrete, physical outcome. Examples could include finding another piece of furniture to restore, or branching into related crafts like leatherworking, bookbinding, or building custom shelving.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Hey, I just realized I have a three-day weekend coming up. Got any suggestions for what I should do?",
+    "answer": "A good response should recognize the user's weariness from his socially demanding job and suggest activities that are restorative and solitary. The response should prioritize quiet, low-energy options over large social gatherings or performance-based activities. It should avoid recommending things like parties, networking events, or busy public venues. Bonus points for suggesting activities that align with his known interests, such as working on his furniture restoration project or other hands-on, meditative hobbies.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What's a small task I can do today to improve my living space?",
+    "answer": "A good response should suggest an activity that is manageable and aligns with Alex's interests or current situation, such as unpacking a specific box related to his hobbies or setting up a cozy area for relaxation, considering his recent move and the stress of unpacked boxes.",
+    "category": "implicit_connection_evidence",
+    "recall": 0.5,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 2,
+      "found": 1
+    }
+  },
+  {
+    "question": "A friend of mine is about to move into my old downtown neighborhood. I want to give him some useful, real-world advice. What are some important tips I should pass along about living there?",
+    "answer": "A good response should provide general tips for downtown living but must also implicitly incorporate Alex's own stated reasons for leaving. The response should advise him to mention challenges like the limited space in typical apartments and the difficulties of owning a pet, especially a dog, without easy access to a yard or large parks.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What are some engaging topics to discuss at a dinner with new acquaintances?",
+    "answer": "A good response should suggest conversation topics that allow Alex to share personal stories or interests that reflect his true self, such as his love for travel, his hobby of restoring furniture, or his recent move to a quieter neighborhood. The response should avoid topics that reinforce the feeling of 'playing a role' and instead encourage genuine connection.",
+    "category": "implicit_connection_evidence",
+    "recall": 0.6666666666666666,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 3,
+      "found": 2
+    }
+  },
+  {
+    "question": "I've got a free weekend coming up and was thinking of trying to pick up a new hobby. Any suggestions for something interesting to get into?",
+    "answer": "A good response should acknowledge the user's previously mentioned screen fatigue from their tech support job and recommend hobbies that are primarily offline and non-digital. Suggestions should focus on activities that allow the user to disconnect from screens, such as outdoor activities (hiking, gardening), hands-on crafts (woodworking, painting, pottery), physical activities (sports, martial arts), or social hobbies (board games, cooking classes). The response should explicitly avoid suggesting screen-based hobbies like video games, learning to code, or watching new series.",
+    "category": "implicit_connection_evidence",
+    "recall": 0.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 0
+    }
+  },
+  {
+    "question": "The internal job board just listed an opening for a Tier 2 support engineer. The pay jump is pretty significant. Do you think I should throw my hat in the ring?",
+    "answer": "A good response should acknowledge the financial incentive of the Tier 2 position while also considering Jordan's past experiences. The response must reference the high-stress nature commonly associated with Tier 2 roles and implicitly connect it to his previously stated deep anxiety about financial instability and his prioritization of job security, prompting him to weigh the higher pay against the potential for burnout and stress.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What are some fun things to do in the Bay Area this weekend?",
+    "answer": "A good response should suggest activities that are enjoyable yet avoid large, noisy crowds, considering Jordan's preference for quieter environments. Recommendations might include outdoor activities like hiking in quieter parks, visiting museums during off-peak hours, or exploring scenic drives. The response should demonstrate an understanding of Jordan's discomfort with crowds, especially post-pandemic.",
+    "category": "implicit_connection_evidence",
+    "recall": 0.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 0
+    }
+  },
+  {
+    "question": "What are some good team-building event ideas for a group of about 15 people?",
+    "answer": "A good response should suggest team-building activities that are structured and suitable for introverts, avoiding large, unstructured social events. The activities should foster collaboration and engagement without overwhelming participants who may find large gatherings exhausting.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "So I've decided it's time to start looking for a different car. Any suggestions for reliable used models that are good for commuting and get great gas mileage?",
+    "answer": "A good response should recommend used car models that are known for reliability and good gas mileage, while also being budget-friendly and having low long-term maintenance costs. The recommendations should avoid luxury brands or newer, more expensive models, implicitly acknowledging the user's previously mentioned financial constraints and anxiety over expensive repairs.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "How do the career prospects and benefits compare between working at a major tech firm and a young startup?",
+    "answer": "A good response should consider the user's previous negative experience with a startup, highlighting the potential for greater stability and structured benefits at a major tech firm. It should also acknowledge the user's career aspirations and financial concerns, suggesting that a major tech firm might offer more predictable career growth and financial security.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "My manager tasked me with researching potential replacements for our current CRM. Can you suggest a few good options for a small-to-mid-sized tech support team?",
+    "answer": "A good response should recommend several popular CRM platforms suitable for a tech support team. Crucially, it must either A) completely avoid recommending 'DataFlow Systems' CRM due to the user's previously stated negative experience with it, or B) if 'DataFlow Systems' is mentioned as a market option, the response must acknowledge the user's past negative feedback about the platform's performance and his history with the company.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "How can I ensure my performance review is constructive and helps me improve?",
+    "answer": "A good response should provide strategies for requesting specific examples of performance, suggest ways to ask for actionable feedback, and encourage a dialogue that focuses on growth and development. The response should also consider the user's past experience with vague feedback and suggest ways to address this issue proactively.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "My family is bugging me about planning a vacation soon. What are some cool US vacation spots we could reasonably drive to from California?",
+    "answer": "A good response should suggest US vacation destinations that are comfortably reachable by car from California. The response should prioritize driving-focused trips, such as road trips to national parks (like Zion, Bryce Canyon, Grand Canyon), cities in neighboring states (like Las Vegas, Phoenix, or Portland), or scenic coastal drives within California itself. It should avoid suggesting locations that are technically drivable but impractical for a typical vacation (e.g., driving to the East Coast) and should not mention flying as an alternative, acknowledging the user's implicit preference for ground travel.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "Can you suggest some resources to improve my communication skills in technical support?",
+    "answer": "A good response should recommend resources that focus on developing empathy and active listening skills, as these are critical for effective communication in technical support roles. The response should consider the user's self-identified struggle with 'soft skills' and suggest materials that provide practical strategies for improving customer empathy and interaction.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "What are some ways to improve my performance in my current role?",
+    "answer": "A good response should suggest actions that demonstrate initiative without requiring significant risk or overstepping boundaries. It should consider the user's past experience with micromanagement and suggest ways to take initiative that are subtle and within the scope of a Tier 1 support role, such as proposing small process improvements, volunteering for additional responsibilities, or enhancing documentation practices.",
+    "category": "implicit_connection_evidence",
+    "recall": 0.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 0
+    }
+  },
+  {
+    "question": "How can I optimize my workday to be more productive while handling support tickets?",
+    "answer": "A good response should suggest structuring the workday to include dedicated focus blocks for uninterrupted work, while also ensuring responsiveness to support tickets. It should consider the need for balance between focused work and the demands of a support role, possibly by recommending specific time management techniques or schedule adjustments.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm looking for some new lunch ideas. Something healthy I can meal prep on Sunday that isn't a sandwich. Got any suggestions?",
+    "answer": "A good response should suggest healthy, easy-to-prepare lunch ideas that are explicitly budget-friendly or use inexpensive staple ingredients like rice, beans, lentils, or seasonal vegetables. The response must avoid suggesting expensive ingredients, specialty items, or services like meal delivery kits, implicitly acknowledging the user's previously stated goal of saving money.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  },
+  {
+    "question": "I'm looking for suggestions on some relaxing evening routines that don't involve screens. Any ideas?",
+    "answer": "A good response should suggest specific, screen-free evening activities. The suggestions should be tailored towards activities known to help calm the mind and de-stress, implicitly addressing the user's previously mentioned difficulty in 'switching off' after work and their habit of scrolling on their phone late at night. For example, recommending activities like reading a physical book, meditation, light stretching, or listening to a podcast/calm music would be appropriate.",
+    "category": "implicit_connection_evidence",
+    "recall": 1.0,
+    "details": {
+      "retrieved_count": 10,
+      "evidence_count": 1,
+      "found": 1
+    }
+  }
+]

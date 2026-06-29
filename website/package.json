@@ -1,0 +1,17 @@
+{
+  "name": "mempalace-docs",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "docs:dev": "vitepress dev",
+    "docs:build": "vitepress build",
+    "docs:preview": "vitepress preview"
+  },
+  "devDependencies": {
+    "@lucide/vue": "^1.8.0",
+    "mermaid": "^11.14.0",
+    "vitepress": "^1.6.4",
+    "vitepress-plugin-mermaid": "^2.0.17",
+    "vue": "^3.5.32"
+  }
+}

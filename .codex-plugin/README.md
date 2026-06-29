@@ -1,12 +1,12 @@
 # MemPalace - Codex CLI Plugin
 
-Give your AI a persistent memory -- mine projects and conversations into a searchable palace backed by ChromaDB, with 19 MCP tools, auto-save hooks, and guided skills.
+Give your AI a persistent memory -- mine projects and conversations into a searchable palace backed by ChromaDB, with 35 MCP tools, auto-save hooks, and guided skills.
 
 ## Prerequisites
 
 - Python 3.9+
 - Codex CLI installed and configured
-- `pip install mempalace`
+- `uv tool install mempalace` (recommended) or `pip install mempalace`
 
 ## Installation
 
@@ -35,15 +35,20 @@ codex /init
 1. Clone the MemPalace repository:
 
 ```bash
-git clone https://github.com/milla-jovovich/mempalace.git
+git clone https://github.com/MemPalace/mempalace.git
 cd mempalace
 ```
 
-2. Install the Python package:
+2. Install the Python package so the `mempalace-mcp` script lands on
+   your PATH (the bundled `plugin.json` invokes it by bare name):
 
 ```bash
-pip install -e .
+uv tool install --editable .   # or: pip install -e .
 ```
+
+   Plain `uv sync` is **not** enough here — it installs the scripts into
+   `.venv/bin/`, which Codex will not find unless you activate the venv
+   before launching Codex.
 
 3. The `.codex-plugin` directory is already in the repo root. Codex CLI will detect it automatically when you run Codex from inside the repository.
 
@@ -71,5 +76,5 @@ Set the `MEMPAL_DIR` environment variable to a directory path to automatically r
 
 ## Support
 
-- Repository: https://github.com/milla-jovovich/mempalace
-- Issues: https://github.com/milla-jovovich/mempalace/issues
+- Repository: https://github.com/MemPalace/mempalace
+- Issues: https://github.com/MemPalace/mempalace/issues

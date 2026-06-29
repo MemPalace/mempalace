@@ -2763,7 +2763,15 @@ def build_palace_and_retrieve_diary(
 
 
 def llm_rerank(
-    question, rankings, corpus, corpus_ids, api_key, top_k=10, model="claude-haiku-4-5-20251001"
+    question,
+    rankings,
+    corpus,
+    corpus_ids,
+    api_key,
+    top_k=10,
+    model="claude-haiku-4-5-20251001",
+    backend="anthropic",
+    base_url="",
 ):
     """
     Use an LLM to re-rank the top-k retrieved sessions.
@@ -2772,19 +2780,22 @@ def llm_rerank(
     which single session is most relevant to the question. That session
     is promoted to rank 1; the rest stay in their existing order.
 
-    This closes the gap for "preference" and jargon-dense "assistant"
-    failures where the right session is in top-10 semantically but not
-    top-5 — because the semantic gap (battery life ↔ phone hardware) is
-    too large for embeddings to bridge.
+    Supports two backends:
+      - "anthropic": hits https://api.anthropic.com/v1/messages with x-api-key.
+      - "ollama":    hits {base_url}/v1/chat/completions (OpenAI-compat) —
+                     works for local Ollama (default http://localhost:11434)
+                     and Ollama Cloud (:cloud model tags).
 
     Args:
-        question:    The benchmark question string
-        rankings:    Current ranked list of corpus indices (from any mode)
-        corpus:      List of document strings
-        corpus_ids:  List of corpus IDs (parallel to corpus)
-        api_key:     Anthropic API key string
-        top_k:       How many top sessions to send to LLM (default: 10)
-        model:       Claude model ID for reranking (default: haiku)
+        question:   The benchmark question string
+        rankings:   Current ranked list of corpus indices (from any mode)
+        corpus:     List of document strings
+        corpus_ids: List of corpus IDs (parallel to corpus)
+        api_key:    Anthropic API key (only required for backend="anthropic")
+        top_k:      How many top sessions to send to LLM (default: 10)
+        model:      Model id (Claude model for anthropic, e.g. "minimax-m2.7:cloud" for ollama)
+        backend:    "anthropic" or "ollama"
+        base_url:   Override base URL (ollama default: http://localhost:11434)
 
     Returns:
         Reordered rankings list with LLM's best pick promoted to rank 1.
@@ -2796,7 +2807,6 @@ def llm_rerank(
     if not candidates:
         return rankings
 
-    # Format sessions for the prompt — first 500 chars each, labelled 1..N
     session_blocks = []
     for rank, idx in enumerate(candidates):
         text = corpus[idx][:500].replace("\n", " ").strip()
@@ -2813,80 +2823,79 @@ def llm_rerank(
         f"Most relevant session number:"
     )
 
-    payload = json.dumps(
-        {
-            "model": model,
-            "max_tokens": 8,
-            "messages": [{"role": "user", "content": prompt}],
-        }
-    ).encode("utf-8")
-
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=payload,
-        headers={
+    if backend == "ollama":
+        url = (base_url or "http://localhost:11434").rstrip("/") + "/v1/chat/completions"
+        payload = json.dumps(
+            {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 1024,
+                "temperature": 0.0,
+            }
+        ).encode("utf-8")
+        headers = {"content-type": "application/json"}
+        if api_key:
+            headers["authorization"] = f"Bearer {api_key}"
+    else:
+        url = "https://api.anthropic.com/v1/messages"
+        payload = json.dumps(
+            {
+                "model": model,
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": prompt}],
+            }
+        ).encode("utf-8")
+        headers = {
             "x-api-key": api_key,
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
-        },
-        method="POST",
-    )
+        }
+
+    req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
 
     import socket as _socket
 
     for _attempt in range(3):
         try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            with urllib.request.urlopen(req, timeout=120 if backend == "ollama" else 20) as resp:
                 result = json.loads(resp.read())
-            raw = result["content"][0]["text"].strip()
-            # Parse just the first integer from Haiku's response
-            m = re.search(r"\b(\d+)\b", raw)
+            if backend == "ollama":
+                msg = result["choices"][0]["message"]
+                # Reasoning models (e.g. minimax-m2.7) may emit final answer in "content"
+                # or embed it in "reasoning". Try content first, fall back to reasoning.
+                raw = (msg.get("content") or "").strip()
+                if not raw:
+                    raw = (msg.get("reasoning") or "").strip()
+            else:
+                raw = result["content"][0]["text"].strip()
+            m = re.search(
+                r"\b(\d+)\b", raw[::-1]
+            )  # take LAST integer (rerank models often reason first)
             if m:
-                pick = int(m.group(1))
+                pick = int(m.group(1)[::-1])
                 if 1 <= pick <= len(candidates):
                     chosen_idx = candidates[pick - 1]
                     reordered = [chosen_idx] + [i for i in rankings if i != chosen_idx]
                     return reordered
-            break  # Got a response, even if unparseable — don't retry
+            break
         except (_socket.timeout, TimeoutError):
             if _attempt < 2:
                 import time as _time
 
-                _time.sleep(3)  # brief pause then retry
-            # else fall through to return rankings
+                _time.sleep(3)
         except (urllib.error.URLError, KeyError, ValueError, IndexError, OSError):
-            break  # Non-timeout error — fall back immediately
+            break
 
     return rankings
 
 
 def _load_api_key(key_arg):
-    """Load API key from --llm-key arg, env var, or ~/.config/lu/keys.json."""
+    """Load API key from --llm-key arg or ANTHROPIC_API_KEY env var."""
     if key_arg:
         return key_arg
     env_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if env_key:
         return env_key
-    keys_path = os.path.expanduser("~/.config/lu/keys.json")
-    if os.path.exists(keys_path):
-        try:
-            with open(keys_path) as f:
-                keys = json.load(f)
-            # Flat string keys
-            for name in ("lu_key", "anthropic_milla", "anthropic_claude_code_main"):
-                val = keys.get(name, "")
-                if isinstance(val, str) and val.startswith("sk-ant-"):
-                    return val
-            # Nested dict: keys["anthropic"]["lu_key"]
-            for section in ("anthropic", "anthropic_milla", "anthropic_claude_code_main"):
-                sec = keys.get(section, {})
-                if isinstance(sec, dict):
-                    for subkey in ("lu_key", "key", "api_key"):
-                        val = sec.get(subkey, "")
-                        if isinstance(val, str) and val.startswith("sk-ant-"):
-                            return val
-        except Exception:
-            pass
     return ""
 
 
@@ -2939,6 +2948,8 @@ def run_benchmark(
     skip_precompute=False,
     split_file=None,
     split_subset=None,
+    llm_backend="anthropic",
+    llm_base_url="",
 ):
     """Run the full benchmark.
 
@@ -2967,11 +2978,14 @@ def run_benchmark(
     api_key = ""
     if llm_rerank_enabled or mode == "diary":
         api_key = _load_api_key(llm_key)
-        if not api_key:
+        # Ollama backend doesn't require an Anthropic API key; a local/cloud Ollama
+        # daemon with the requested model pulled is enough. Diary mode is always anthropic.
+        needs_key = (llm_backend == "anthropic") or (mode == "diary")
+        if needs_key and not api_key:
             print(
-                "ERROR: --llm-rerank / --mode diary requires an API key. "
-                "Set ANTHROPIC_API_KEY, use --llm-key, "
-                "or store in ~/.config/lu/keys.json as 'lu_key'."
+                "ERROR: --llm-rerank (anthropic backend) / --mode diary requires an API key. "
+                "Set ANTHROPIC_API_KEY or use --llm-key. For ollama backend, pass "
+                "--llm-backend ollama."
             )
             sys.exit(1)
 
@@ -3121,7 +3135,15 @@ def run_benchmark(
         if llm_rerank_enabled:
             rerank_pool = 20 if mode in ("hybrid_v3", "hybrid_v4", "palace") else 10
             rankings = llm_rerank(
-                question, rankings, corpus, corpus_ids, api_key, top_k=rerank_pool, model=llm_model
+                question,
+                rankings,
+                corpus,
+                corpus_ids,
+                api_key,
+                top_k=rerank_pool,
+                model=llm_model,
+                backend=llm_backend,
+                base_url=llm_base_url,
             )
 
         # Evaluate at session level
@@ -3290,15 +3312,28 @@ if __name__ == "__main__":
     parser.add_argument(
         "--llm-key",
         default="",
-        help="Anthropic API key for LLM re-ranking. Falls back to ANTHROPIC_API_KEY "
-        "env var or ~/.config/lu/keys.json 'lu_key' field if not provided.",
+        help="Anthropic API key for LLM re-ranking. Falls back to ANTHROPIC_API_KEY env var.",
     )
     parser.add_argument(
         "--llm-model",
         default="claude-haiku-4-5-20251001",
         help="Model for LLM re-ranking and diary ingest "
         "(default: claude-haiku-4-5-20251001). "
-        "Use 'claude-sonnet-4-6' for Sonnet comparison.",
+        "Use 'claude-sonnet-4-6' for Sonnet comparison. "
+        "With --llm-backend ollama, use an Ollama model tag like 'minimax-m2.7:cloud'.",
+    )
+    parser.add_argument(
+        "--llm-backend",
+        choices=["anthropic", "ollama"],
+        default="anthropic",
+        help="Which API to hit for --llm-rerank. 'anthropic' (default) uses Anthropic's "
+        "/v1/messages endpoint. 'ollama' uses Ollama's OpenAI-compatible "
+        "/v1/chat/completions endpoint (works with local Ollama and Ollama Cloud).",
+    )
+    parser.add_argument(
+        "--llm-base-url",
+        default="",
+        help="Override base URL for --llm-backend ollama. Defaults to http://localhost:11434.",
     )
     parser.add_argument(
         "--diary-cache",
@@ -3402,4 +3437,6 @@ if __name__ == "__main__":
         args.skip_precompute,
         split_file=args.split_file,
         split_subset=split_subset,
+        llm_backend=args.llm_backend,
+        llm_base_url=args.llm_base_url,
     )

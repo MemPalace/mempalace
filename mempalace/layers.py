@@ -21,9 +21,14 @@ import sys
 from pathlib import Path
 from collections import defaultdict
 
-import chromadb
-
 from .config import MempalaceConfig
+from .palace import get_collection as _get_collection
+from .searcher import (
+    _distance_to_similarity,
+    _first_or_empty,
+    _metric_for_collection,
+    build_where_filter,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +87,7 @@ class Layer1:
 
     MAX_DRAWERS = 15  # at most 15 moments in wake-up
     MAX_CHARS = 3200  # hard cap on total L1 text (~800 tokens)
+    MAX_SCAN = 2000  # don't scan more than this for L1 generation
 
     def __init__(self, palace_path: str = None, wing: str = None):
         cfg = MempalaceConfig()
@@ -91,8 +97,7 @@ class Layer1:
     def generate(self) -> str:
         """Pull top drawers from ChromaDB and format as compact L1 text."""
         try:
-            client = chromadb.PersistentClient(path=self.palace_path)
-            col = client.get_collection("mempalace_drawers")
+            col = _get_collection(self.palace_path, create=False)
         except Exception:
             return "## L1 — No palace found. Run: mempalace mine <dir>"
 
@@ -115,7 +120,7 @@ class Layer1:
             docs.extend(batch_docs)
             metas.extend(batch_metas)
             offset += len(batch_docs)
-            if len(batch_docs) < _BATCH:
+            if len(batch_docs) < _BATCH or len(docs) >= self.MAX_SCAN:
                 break
 
         if not docs:
@@ -124,6 +129,8 @@ class Layer1:
         # Score each drawer: prefer high importance, recent filing
         scored = []
         for doc, meta in zip(docs, metas):
+            meta = meta or {}
+            doc = doc or ""
             importance = 3
             # Try multiple metadata keys that might carry weight info
             for key in ("importance", "emotional_weight", "weight"):
@@ -155,7 +162,7 @@ class Layer1:
             lines.append(room_line)
             total_len += len(room_line)
 
-            for imp, meta, doc in entries:
+            for _imp, meta, doc in entries:
                 source = Path(meta.get("source_file", "")).name if meta.get("source_file") else ""
 
                 # Truncate doc to keep L1 compact
@@ -196,18 +203,11 @@ class Layer2:
     def retrieve(self, wing: str = None, room: str = None, n_results: int = 10) -> str:
         """Retrieve drawers filtered by wing and/or room."""
         try:
-            client = chromadb.PersistentClient(path=self.palace_path)
-            col = client.get_collection("mempalace_drawers")
+            col = _get_collection(self.palace_path, create=False)
         except Exception:
             return "No palace found."
 
-        where = {}
-        if wing and room:
-            where = {"$and": [{"wing": wing}, {"room": room}]}
-        elif wing:
-            where = {"wing": wing}
-        elif room:
-            where = {"room": room}
+        where = build_where_filter(wing, room)
 
         kwargs = {"include": ["documents", "metadatas"], "limit": n_results}
         if where:
@@ -229,6 +229,8 @@ class Layer2:
 
         lines = [f"## L2 — ON-DEMAND ({len(docs)} drawers)"]
         for doc, meta in zip(docs[:n_results], metas[:n_results]):
+            meta = meta or {}
+            doc = doc or ""
             room_name = meta.get("room", "?")
             source = Path(meta.get("source_file", "")).name if meta.get("source_file") else ""
             snippet = doc.strip().replace("\n", " ")
@@ -260,18 +262,11 @@ class Layer3:
     def search(self, query: str, wing: str = None, room: str = None, n_results: int = 5) -> str:
         """Semantic search, returns compact result text."""
         try:
-            client = chromadb.PersistentClient(path=self.palace_path)
-            col = client.get_collection("mempalace_drawers")
+            col = _get_collection(self.palace_path, create=False)
         except Exception:
             return "No palace found."
 
-        where = {}
-        if wing and room:
-            where = {"$and": [{"wing": wing}, {"room": room}]}
-        elif wing:
-            where = {"wing": wing}
-        elif room:
-            where = {"room": room}
+        where = build_where_filter(wing, room)
 
         kwargs = {
             "query_texts": [query],
@@ -286,16 +281,19 @@ class Layer3:
         except Exception as e:
             return f"Search error: {e}"
 
-        docs = results["documents"][0]
-        metas = results["metadatas"][0]
-        dists = results["distances"][0]
+        docs = _first_or_empty(results, "documents")
+        metas = _first_or_empty(results, "metadatas")
+        dists = _first_or_empty(results, "distances")
 
         if not docs:
             return "No results found."
 
+        metric = _metric_for_collection(col)
         lines = [f'## L3 — SEARCH RESULTS for "{query}"']
         for i, (doc, meta, dist) in enumerate(zip(docs, metas, dists), 1):
-            similarity = round(1 - dist, 3)
+            meta = meta or {}
+            doc = doc or ""
+            similarity = round(_distance_to_similarity(dist, metric), 3)
             wing_name = meta.get("wing", "?")
             room_name = meta.get("room", "?")
             source = Path(meta.get("source_file", "")).name if meta.get("source_file") else ""
@@ -308,6 +306,9 @@ class Layer3:
             lines.append(f"      {snippet}")
             if source:
                 lines.append(f"      src: {source}")
+            authored = (meta.get("authored_at") or "")[:10]
+            if authored:
+                lines.append(f"      authored: {authored}")
 
         return "\n".join(lines)
 
@@ -316,18 +317,11 @@ class Layer3:
     ) -> list:
         """Return raw dicts instead of formatted text."""
         try:
-            client = chromadb.PersistentClient(path=self.palace_path)
-            col = client.get_collection("mempalace_drawers")
+            col = _get_collection(self.palace_path, create=False)
         except Exception:
             return []
 
-        where = {}
-        if wing and room:
-            where = {"$and": [{"wing": wing}, {"room": room}]}
-        elif wing:
-            where = {"wing": wing}
-        elif room:
-            where = {"room": room}
+        where = build_where_filter(wing, room)
 
         kwargs = {
             "query_texts": [query],
@@ -342,19 +336,27 @@ class Layer3:
         except Exception:
             return []
 
+        metric = _metric_for_collection(col)
         hits = []
         for doc, meta, dist in zip(
-            results["documents"][0],
-            results["metadatas"][0],
-            results["distances"][0],
+            _first_or_empty(results, "documents"),
+            _first_or_empty(results, "metadatas"),
+            _first_or_empty(results, "distances"),
         ):
+            # ChromaDB may return None for doc/meta when a drawer's HNSW entry
+            # exists but its metadata/document rows haven't been materialized
+            # (partial-flush states, mid-delete, schema upgrade boundaries).
+            # Degrade gracefully — the hit still appears with real distance;
+            # storage fields show their fallback where content is missing.
+            meta = meta or {}
+            doc = doc or ""
             hits.append(
                 {
                     "text": doc,
                     "wing": meta.get("wing", "unknown"),
                     "room": meta.get("room", "unknown"),
                     "source_file": Path(meta.get("source_file", "?")).name,
-                    "similarity": round(1 - dist, 3),
+                    "similarity": round(_distance_to_similarity(dist, metric), 3),
                     "metadata": meta,
                 }
             )
@@ -437,8 +439,7 @@ class MemoryStack:
 
         # Count drawers
         try:
-            client = chromadb.PersistentClient(path=self.palace_path)
-            col = client.get_collection("mempalace_drawers")
+            col = _get_collection(self.palace_path, create=False)
             count = col.count()
             result["total_drawers"] = count
         except Exception:

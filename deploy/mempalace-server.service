@@ -1,0 +1,48 @@
+# MemPalace remote MCP server — systemd unit template.
+#
+# Install:
+#   sudo useradd --system --home /var/lib/mempalace --shell /usr/sbin/nologin mempalace
+#   sudo install -d -o mempalace -g mempalace -m 750 /var/lib/mempalace /etc/mempalace
+#   sudo cp deploy/server.env.example /etc/mempalace/server.env   # then edit + chmod 600
+#   sudo install -m 600 -o mempalace -g mempalace /etc/mempalace/server.env /etc/mempalace/server.env
+#   # install mempalace into a venv on PATH, or adjust ExecStart to its absolute path
+#   sudo cp deploy/mempalace-server.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now mempalace-server
+#
+# This binds 0.0.0.0:8765 and requires MEMPALACE_MCP_HTTP_TOKEN (set in the
+# EnvironmentFile). Front it with a TLS-terminating reverse proxy, or set
+# MEMPALACE_MCP_TLS_CERT / _KEY in the EnvironmentFile for native TLS.
+
+[Unit]
+Description=MemPalace remote MCP server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=mempalace
+Group=mempalace
+EnvironmentFile=/etc/mempalace/server.env
+ExecStart=mempalace serve --host 0.0.0.0 --port 8765
+Restart=on-failure
+RestartSec=2
+
+# --- Hardening ---------------------------------------------------------------
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+# The palace and any local state live here; everything else is read-only.
+ReadWritePaths=/var/lib/mempalace
+StateDirectory=mempalace
+
+[Install]
+WantedBy=multi-user.target

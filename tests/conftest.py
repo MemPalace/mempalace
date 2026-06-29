@@ -33,17 +33,101 @@ import pytest  # noqa: E402
 from mempalace.config import MempalaceConfig  # noqa: E402
 from mempalace.knowledge_graph import KnowledgeGraph  # noqa: E402
 
+# Redirect ChromaDB's ONNX model cache back to the real user's cache so tests
+# don't re-download the 79 MB model on every run. The HOME redirect above
+# would otherwise point ONNXMiniLM_L6_V2.DOWNLOAD_PATH at the empty temp dir.
+try:
+    from pathlib import Path  # noqa: E402
+    from chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2 import (  # noqa: E402
+        ONNXMiniLM_L6_V2,
+    )
+
+    _real_home = _original_env.get("USERPROFILE") or _original_env.get("HOME")
+    if _real_home:
+        _real_cache = Path(_real_home) / ".cache" / "chroma" / "onnx_models" / "all-MiniLM-L6-v2"
+        if _real_cache.exists():
+            ONNXMiniLM_L6_V2.DOWNLOAD_PATH = _real_cache
+except ImportError:
+    pass
+
 
 @pytest.fixture(autouse=True)
 def _reset_mcp_cache():
-    """Reset the MCP server's cached ChromaDB client/collection between tests."""
+    """Reset cached MCP state between tests without importing mcp_server.
+
+    If mempalace.mcp_server is already imported, close/clear its KG cache and
+    Chroma client cache. If it has not been imported, leave it unloaded so
+    fork/spawn-based tests do not inherit extra Chroma/SQLite state.
+    """
 
     def _clear_cache():
         try:
-            from mempalace import mcp_server
+            import sys
 
-            mcp_server._client_cache = None
-            mcp_server._collection_cache = None
+            mcp_server = sys.modules.get("mempalace.mcp_server")
+            if mcp_server is not None:
+                for kg in list(getattr(mcp_server, "_kg_by_path", {}).values()):
+                    close = getattr(kg, "close", None)
+                    if close is not None:
+                        try:
+                            close()
+                        except Exception:
+                            pass
+
+                if hasattr(mcp_server, "_kg_by_path"):
+                    mcp_server._kg_by_path.clear()
+
+                # Close (not just dereference) the cached chromadb client so its
+                # rust-side file handles are released; on Windows a bare deref
+                # leaves them locked and leaks across the session (#1128).
+                cached_client = getattr(mcp_server, "_client_cache", None)
+                if cached_client is not None:
+                    close = getattr(cached_client, "close", None)
+                    if callable(close):
+                        try:
+                            close()
+                        except Exception:
+                            pass
+                mcp_server._client_cache = None
+                mcp_server._collection_cache = None
+                if hasattr(mcp_server, "_collection_cache_backend"):
+                    mcp_server._collection_cache_backend = None
+                if hasattr(mcp_server, "_collection_cache_palace"):
+                    mcp_server._collection_cache_palace = None
+                if hasattr(mcp_server, "_collection_open_error"):
+                    mcp_server._collection_open_error = None
+        except AttributeError:
+            pass
+
+        try:
+            # Reset the per-process quarantine gate so tests don't leak
+            # state through ChromaBackend._quarantined_paths.
+            from mempalace.backends.chroma import ChromaBackend
+
+            ChromaBackend._quarantined_paths.clear()
+        except (ImportError, AttributeError):
+            pass
+
+        # Release chromadb clients opened through the backend layer. Many tests
+        # reach the store via palace.get_collection() (sweep, repair, CLI, ...),
+        # which caches one PersistentClient per palace_path on the long-lived
+        # backend singleton and never closes it. chromadb frees the rust-side
+        # SQLite/HNSW file handles only on client.close(); on POSIX the open
+        # handles are harmless, but on Windows they stay locked and accumulate
+        # across the session until a later test's HNSW segment write fails
+        # (#1128 Windows CI). close_palace() closes the client and drops the
+        # handle without marking the backend closed, so it stays reusable.
+        try:
+            from mempalace import palace as _palace
+
+            backend = getattr(_palace, "_DEFAULT_BACKEND", None)
+            clients = getattr(backend, "_clients", None)
+            if clients:
+                for path in list(clients):
+                    try:
+                        backend.close_palace(path)
+                    except Exception:
+                        pass
         except (ImportError, AttributeError):
             pass
 
@@ -101,10 +185,14 @@ def config(tmp_dir, palace_path):
 def collection(palace_path):
     """A ChromaDB collection pre-seeded in the temp palace."""
     client = chromadb.PersistentClient(path=palace_path)
-    col = client.get_or_create_collection("mempalace_drawers")
+    col = client.get_or_create_collection("mempalace_drawers", metadata={"hnsw:space": "cosine"})
     yield col
     client.delete_collection("mempalace_drawers")
-    del client
+    # close() (not a bare dereference) releases chromadb's rust-side SQLite/HNSW
+    # file handles. On Windows a mere `del` leaves them locked, so the temp
+    # palace cannot be removed and handles leak across the whole test session
+    # until a later test's HNSW write fails (#1128 Windows CI).
+    client.close()
 
 
 @pytest.fixture
@@ -169,7 +257,9 @@ def seeded_collection(collection):
 def kg(tmp_dir):
     """An isolated KnowledgeGraph using a temp SQLite file."""
     db_path = os.path.join(tmp_dir, "test_kg.sqlite3")
-    return KnowledgeGraph(db_path=db_path)
+    graph = KnowledgeGraph(db_path=db_path)
+    yield graph
+    graph.close()
 
 
 @pytest.fixture

@@ -71,16 +71,14 @@ def test_layer0_default_path():
 
 
 def _mock_chromadb_for_layer(docs, metas, monkeypatch=None):
-    """Return a mock PersistentClient whose collection.get returns docs/metas."""
+    """Return a mock collection whose get() returns docs/metas."""
     mock_col = MagicMock()
     # First batch returns data, second batch returns empty (end of pagination)
     mock_col.get.side_effect = [
         {"documents": docs, "metadatas": metas},
         {"documents": [], "metadatas": []},
     ]
-    mock_client = MagicMock()
-    mock_client.get_collection.return_value = mock_col
-    return mock_client
+    return mock_col
 
 
 def test_layer1_no_palace():
@@ -101,11 +99,11 @@ def test_layer1_generates_essential_story():
         {"room": "decisions", "source_file": "meeting.txt", "importance": 5},
         {"room": "architecture", "source_file": "design.txt", "importance": 4},
     ]
-    mock_client = _mock_chromadb_for_layer(docs, metas)
+    mock_col = _mock_chromadb_for_layer(docs, metas)
 
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers._get_collection", return_value=mock_col),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer1(palace_path="/fake")
@@ -118,12 +116,9 @@ def test_layer1_generates_essential_story():
 def test_layer1_empty_palace():
     mock_col = MagicMock()
     mock_col.get.return_value = {"documents": [], "metadatas": []}
-    mock_client = MagicMock()
-    mock_client.get_collection.return_value = mock_col
-
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers._get_collection", return_value=mock_col),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer1(palace_path="/fake")
@@ -135,11 +130,11 @@ def test_layer1_empty_palace():
 def test_layer1_with_wing_filter():
     docs = ["Memory about project X"]
     metas = [{"room": "general", "source_file": "x.txt", "importance": 3}]
-    mock_client = _mock_chromadb_for_layer(docs, metas)
+    mock_col = _mock_chromadb_for_layer(docs, metas)
 
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers._get_collection", return_value=mock_col),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer1(palace_path="/fake", wing="project_x")
@@ -147,18 +142,18 @@ def test_layer1_with_wing_filter():
 
     assert "ESSENTIAL STORY" in result
     # Verify wing filter was passed
-    call_kwargs = mock_client.get_collection.return_value.get.call_args_list[0][1]
+    call_kwargs = mock_col.get.call_args_list[0][1]
     assert call_kwargs.get("where") == {"wing": "project_x"}
 
 
 def test_layer1_truncates_long_snippets():
     docs = ["A" * 300]
     metas = [{"room": "general", "source_file": "long.txt"}]
-    mock_client = _mock_chromadb_for_layer(docs, metas)
+    mock_col = _mock_chromadb_for_layer(docs, metas)
 
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers._get_collection", return_value=mock_col),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer1(palace_path="/fake")
@@ -171,11 +166,11 @@ def test_layer1_respects_max_chars():
     """L1 stops adding entries once MAX_CHARS is reached."""
     docs = [f"Memory number {i} with substantial content padding here" for i in range(30)]
     metas = [{"room": "general", "source_file": f"f{i}.txt", "importance": 5} for i in range(30)]
-    mock_client = _mock_chromadb_for_layer(docs, metas)
+    mock_col = _mock_chromadb_for_layer(docs, metas)
 
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers._get_collection", return_value=mock_col),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer1(palace_path="/fake")
@@ -193,11 +188,11 @@ def test_layer1_importance_from_various_keys():
         {"room": "r", "weight": 1},
         {"room": "r"},  # no weight key, defaults to 3
     ]
-    mock_client = _mock_chromadb_for_layer(docs, metas)
+    mock_col = _mock_chromadb_for_layer(docs, metas)
 
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers._get_collection", return_value=mock_col),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer1(palace_path="/fake")
@@ -213,12 +208,9 @@ def test_layer1_batch_exception_breaks():
         {"documents": ["doc1"], "metadatas": [{"room": "r"}]},
         RuntimeError("batch error"),
     ]
-    mock_client = MagicMock()
-    mock_client.get_collection.return_value = mock_col
-
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers._get_collection", return_value=mock_col),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer1(palace_path="/fake")
@@ -244,12 +236,9 @@ def test_layer2_retrieve_with_wing():
         "documents": ["Some memory about the project"],
         "metadatas": [{"room": "backend", "source_file": "notes.txt"}],
     }
-    mock_client = MagicMock()
-    mock_client.get_collection.return_value = mock_col
-
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers._get_collection", return_value=mock_col),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer2(palace_path="/fake")
@@ -265,12 +254,9 @@ def test_layer2_retrieve_with_room():
         "documents": ["Backend architecture notes"],
         "metadatas": [{"room": "architecture", "source_file": "arch.txt"}],
     }
-    mock_client = MagicMock()
-    mock_client.get_collection.return_value = mock_col
-
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers._get_collection", return_value=mock_col),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer2(palace_path="/fake")
@@ -285,12 +271,9 @@ def test_layer2_retrieve_wing_and_room():
         "documents": ["Filtered result"],
         "metadatas": [{"room": "backend", "source_file": "x.txt"}],
     }
-    mock_client = MagicMock()
-    mock_client.get_collection.return_value = mock_col
-
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers._get_collection", return_value=mock_col),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer2(palace_path="/fake")
@@ -304,12 +287,9 @@ def test_layer2_retrieve_wing_and_room():
 def test_layer2_retrieve_empty():
     mock_col = MagicMock()
     mock_col.get.return_value = {"documents": [], "metadatas": []}
-    mock_client = MagicMock()
-    mock_client.get_collection.return_value = mock_col
-
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers._get_collection", return_value=mock_col),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer2(palace_path="/fake")
@@ -321,12 +301,9 @@ def test_layer2_retrieve_empty():
 def test_layer2_retrieve_no_filter():
     mock_col = MagicMock()
     mock_col.get.return_value = {"documents": [], "metadatas": []}
-    mock_client = MagicMock()
-    mock_client.get_collection.return_value = mock_col
-
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers._get_collection", return_value=mock_col),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer2(palace_path="/fake")
@@ -340,12 +317,9 @@ def test_layer2_retrieve_no_filter():
 def test_layer2_retrieve_error():
     mock_col = MagicMock()
     mock_col.get.side_effect = RuntimeError("db error")
-    mock_client = MagicMock()
-    mock_client.get_collection.return_value = mock_col
-
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers._get_collection", return_value=mock_col),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer2(palace_path="/fake")
@@ -360,12 +334,9 @@ def test_layer2_truncates_long_snippets():
         "documents": ["B" * 400],
         "metadatas": [{"room": "r", "source_file": "s.txt"}],
     }
-    mock_client = MagicMock()
-    mock_client.get_collection.return_value = mock_col
-
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers._get_collection", return_value=mock_col),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer2(palace_path="/fake")
@@ -408,12 +379,9 @@ def test_layer3_search_with_results():
         [{"wing": "project", "room": "backend", "source_file": "notes.txt"}],
         [0.2],
     )
-    mock_client = MagicMock()
-    mock_client.get_collection.return_value = mock_col
-
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers._get_collection", return_value=mock_col),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer3(palace_path="/fake")
@@ -427,12 +395,9 @@ def test_layer3_search_with_results():
 def test_layer3_search_no_results():
     mock_col = MagicMock()
     mock_col.query.return_value = _mock_query_results([], [], [])
-    mock_client = MagicMock()
-    mock_client.get_collection.return_value = mock_col
-
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers._get_collection", return_value=mock_col),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer3(palace_path="/fake")
@@ -448,12 +413,9 @@ def test_layer3_search_with_wing_filter():
         [{"wing": "proj", "room": "r"}],
         [0.1],
     )
-    mock_client = MagicMock()
-    mock_client.get_collection.return_value = mock_col
-
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers._get_collection", return_value=mock_col),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer3(palace_path="/fake")
@@ -470,12 +432,9 @@ def test_layer3_search_with_room_filter():
         [{"wing": "w", "room": "backend"}],
         [0.1],
     )
-    mock_client = MagicMock()
-    mock_client.get_collection.return_value = mock_col
-
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers._get_collection", return_value=mock_col),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer3(palace_path="/fake")
@@ -492,12 +451,9 @@ def test_layer3_search_with_wing_and_room():
         [{"wing": "proj", "room": "backend"}],
         [0.1],
     )
-    mock_client = MagicMock()
-    mock_client.get_collection.return_value = mock_col
-
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers._get_collection", return_value=mock_col),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer3(palace_path="/fake")
@@ -510,12 +466,9 @@ def test_layer3_search_with_wing_and_room():
 def test_layer3_search_error():
     mock_col = MagicMock()
     mock_col.query.side_effect = RuntimeError("search failed")
-    mock_client = MagicMock()
-    mock_client.get_collection.return_value = mock_col
-
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers._get_collection", return_value=mock_col),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer3(palace_path="/fake")
@@ -531,12 +484,9 @@ def test_layer3_search_truncates_long_docs():
         [{"wing": "w", "room": "r", "source_file": "s.txt"}],
         [0.1],
     )
-    mock_client = MagicMock()
-    mock_client.get_collection.return_value = mock_col
-
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers._get_collection", return_value=mock_col),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer3(palace_path="/fake")
@@ -552,12 +502,9 @@ def test_layer3_search_raw_returns_dicts():
         [{"wing": "proj", "room": "backend", "source_file": "f.txt"}],
         [0.3],
     )
-    mock_client = MagicMock()
-    mock_client.get_collection.return_value = mock_col
-
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers._get_collection", return_value=mock_col),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer3(palace_path="/fake")
@@ -577,12 +524,9 @@ def test_layer3_search_raw_with_filters():
         [{"wing": "w", "room": "r"}],
         [0.1],
     )
-    mock_client = MagicMock()
-    mock_client.get_collection.return_value = mock_col
-
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers._get_collection", return_value=mock_col),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer3(palace_path="/fake")
@@ -595,12 +539,9 @@ def test_layer3_search_raw_with_filters():
 def test_layer3_search_raw_error():
     mock_col = MagicMock()
     mock_col.query.side_effect = RuntimeError("fail")
-    mock_client = MagicMock()
-    mock_client.get_collection.return_value = mock_col
-
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers._get_collection", return_value=mock_col),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         layer = Layer3(palace_path="/fake")
@@ -701,12 +642,9 @@ def test_memory_stack_status_with_palace(tmp_path):
 
     mock_col = MagicMock()
     mock_col.count.return_value = 42
-    mock_client = MagicMock()
-    mock_client.get_collection.return_value = mock_col
-
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
-        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+        patch("mempalace.layers._get_collection", return_value=mock_col),
     ):
         mock_cfg.return_value.palace_path = "/fake"
         stack = MemoryStack(
@@ -717,3 +655,72 @@ def test_memory_stack_status_with_palace(tmp_path):
 
     assert result["total_drawers"] == 42
     assert result["L0_identity"]["exists"] is True
+
+
+# ── Layer1 / Layer2 None-metadata guards ───────────────────────────────
+#
+# Chroma 1.5.x can return ``None`` inside the ``metadatas`` / ``documents``
+# lists for partially-flushed rows. The Layer1.generate() and
+# Layer2.retrieve() loops previously called ``meta.get(...)`` without
+# coercing, raising ``AttributeError: 'NoneType' object has no attribute
+# 'get'`` and blowing up the whole wake-up render. These tests guard that
+# the loops tolerate the None entries and render the rest of the result.
+
+
+def test_layer1_handles_none_metadata():
+    """Layer1.generate tolerates None entries in the metadatas list."""
+    docs = ["important memory", "another memory"]
+    metas = [{"room": "decisions", "source_file": "a.txt"}, None]
+    mock_col = _mock_chromadb_for_layer(docs, metas)
+
+    with (
+        patch("mempalace.layers.MempalaceConfig") as mock_cfg,
+        patch("mempalace.layers._get_collection", return_value=mock_col),
+    ):
+        mock_cfg.return_value.palace_path = "/fake"
+        layer = Layer1(palace_path="/fake")
+        # Should not raise AttributeError on the None entry.
+        result = layer.generate()
+
+    assert "ESSENTIAL STORY" in result
+    assert "important memory" in result
+
+
+def test_layer1_handles_none_document():
+    """Layer1.generate tolerates None entries in the documents list."""
+    docs = ["first doc", None]
+    metas = [
+        {"room": "r", "source_file": "a.txt"},
+        {"room": "r", "source_file": "b.txt"},
+    ]
+    mock_col = _mock_chromadb_for_layer(docs, metas)
+
+    with (
+        patch("mempalace.layers.MempalaceConfig") as mock_cfg,
+        patch("mempalace.layers._get_collection", return_value=mock_col),
+    ):
+        mock_cfg.return_value.palace_path = "/fake"
+        layer = Layer1(palace_path="/fake")
+        result = layer.generate()
+
+    assert result  # Render succeeded despite the None document.
+
+
+def test_layer2_handles_none_metadata():
+    """Layer2.retrieve tolerates None entries in the metadatas list."""
+    mock_col = MagicMock()
+    mock_col.get.return_value = {
+        "documents": ["first doc", "second doc"],
+        "metadatas": [{"room": "r", "source_file": "a.txt"}, None],
+    }
+
+    with (
+        patch("mempalace.layers.MempalaceConfig") as mock_cfg,
+        patch("mempalace.layers._get_collection", return_value=mock_col),
+    ):
+        mock_cfg.return_value.palace_path = "/fake"
+        layer = Layer2(palace_path="/fake")
+        # Should not raise AttributeError on the None entry.
+        result = layer.retrieve()
+
+    assert "L2 — ON-DEMAND" in result

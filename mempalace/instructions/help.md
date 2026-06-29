@@ -29,6 +29,7 @@ AI memory system. Store everything, find anything. Local, free, no API key.
 
 ### Palace (write)
 - mempalace_add_drawer -- Add a new memory (drawer)
+- mempalace_checkpoint -- Save a whole session in one call (dedup + file + diary)
 - mempalace_delete_drawer -- Delete a memory (drawer)
 
 ### Knowledge Graph
@@ -60,6 +61,7 @@ AI memory system. Store everything, find anything. Local, free, no API key.
     mempalace compress                    Compress palace storage
     mempalace status                      Show palace status
     mempalace repair                      Rebuild vector index
+    mempalace mcp                         Show MCP setup command
     mempalace hook run                    Run hook logic (for harness integration)
     mempalace instructions <name>         Output skill instructions
 
