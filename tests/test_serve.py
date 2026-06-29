@@ -8,6 +8,7 @@ server; we intercept ``os.execve`` to capture the child invocation instead.
 """
 
 import argparse
+import os
 import stat
 
 import pytest
@@ -31,18 +32,23 @@ def isolated_home(tmp_path, monkeypatch):
 
 @pytest.fixture
 def capture_exec(monkeypatch):
-    """Capture the child argv/env cmd_serve would exec, instead of running it."""
+    """Capture the child argv/env cmd_serve would launch, instead of running it.
+
+    cmd_serve takes the os.execve branch on POSIX and the subprocess.run branch
+    on Windows. Patch both (rather than forcing os.name, which breaks
+    Path.home() on Windows) so the test is platform-agnostic.
+    """
+    import subprocess
+
     captured = {}
 
-    def fake_execve(path, argv, env):
-        captured["path"] = path
+    def _capture(argv, env):
         captured["argv"] = argv
         captured["env"] = env
         raise _ExecCalled()
 
-    # Force the POSIX exec branch deterministically on every runner.
-    monkeypatch.setattr(cli.os, "name", "posix")
-    monkeypatch.setattr(cli.os, "execve", fake_execve)
+    monkeypatch.setattr(cli.os, "execve", lambda path, argv, env: _capture(argv, env))
+    monkeypatch.setattr(subprocess, "run", lambda argv, env=None, **kw: _capture(argv, env))
     return captured
 
 
@@ -71,10 +77,12 @@ def test_token_helper_creates_0600_and_reuses(isolated_home):
 
     path = cli._server_token_path(palace)
     assert path.exists()
-    mode = stat.S_IMODE(path.stat().st_mode)
-    assert mode == 0o600, oct(mode)
-    dir_mode = stat.S_IMODE(path.parent.stat().st_mode)
-    assert dir_mode == 0o700, oct(dir_mode)
+    if os.name == "posix":
+        # POSIX permission bits aren't meaningful on Windows (files report 0o666).
+        mode = stat.S_IMODE(path.stat().st_mode)
+        assert mode == 0o600, oct(mode)
+        dir_mode = stat.S_IMODE(path.parent.stat().st_mode)
+        assert dir_mode == 0o700, oct(dir_mode)
 
     token2, created2 = cli._load_or_create_server_token(palace)
     assert created2 is False
@@ -101,10 +109,11 @@ def test_non_loopback_autogenerates_token_in_env_not_argv(isolated_home, capture
     # Security: the token rides in the env, never on the command line.
     assert all(token not in part for part in argv)
     assert "--token" not in argv
-    # And it was persisted 0600 for reuse on the next start.
+    # And it was persisted for reuse on the next start (0600 on POSIX).
     path = cli._server_token_path(str(isolated_home / "palace"))
     assert path.exists()
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    if os.name == "posix":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 def test_allow_insecure_skips_token_and_sets_escape_hatch(isolated_home, capture_exec):
