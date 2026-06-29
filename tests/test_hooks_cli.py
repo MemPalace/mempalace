@@ -397,7 +397,13 @@ def test_stop_hook_mempalace_wing_env_overrides_path_derivation(tmp_path, monkey
             state_dir=tmp_path,
         )
     # Override wins over the "wing_myproject" path-derivation
-    mock_save.assert_called_once_with(str(transcript), "test", wing="my_real_wing", toast=False)
+    mock_save.assert_called_once_with(
+        str(transcript),
+        "test",
+        wing="my_real_wing",
+        toast=False,
+        agent_name="claude",
+    )
 
 
 def test_stop_hook_tracks_save_point(tmp_path):
