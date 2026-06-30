@@ -626,7 +626,9 @@ def _get_kg(canonical_path=None) -> KnowledgeGraph:
     with _kg_cache_lock:
         kg = _kg_by_path.get(path)
         if kg is None:
-            kg = KnowledgeGraph(db_path=path)
+            from .kg_store import get_kg_store
+
+            kg = get_kg_store(db_path=path)
             _kg_by_path[path] = kg
     return kg
 

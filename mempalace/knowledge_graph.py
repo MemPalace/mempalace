@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Optional
 from .config import sanitize_iso_temporal
 from .ids import make_triple_id
+from .kg_store import BaseKGStore
 
 
 DEFAULT_KG_PATH = os.path.expanduser("~/.mempalace/knowledge_graph.sqlite3")
@@ -126,7 +127,9 @@ def _temporal_filter_sql(as_of: str) -> tuple[str, list[str]]:
     )
 
 
-class KnowledgeGraph:
+class KnowledgeGraph(BaseKGStore):
+    name = "sqlite"
+
     def __init__(self, db_path: str = None):
         self.db_path = db_path or DEFAULT_KG_PATH
         db_parent = Path(self.db_path).parent
