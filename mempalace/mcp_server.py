@@ -4791,10 +4791,12 @@ def _run_stdio_loop() -> None:
     # defaults stdin/stdout to the system codepage (e.g. cp1251), which
     # corrupts non-ASCII payloads and surfaces as generic -32000 errors on
     # Cyrillic/CJK content. See PEP 540.
+    # Also pin newline="\n": Windows text-mode stdout translates \n -> \r\n,
+    # injecting stray \r into the newline-framed JSON-RPC stream.
     for stream in (sys.stdin, sys.stdout):
         if hasattr(stream, "reconfigure"):
             try:
-                stream.reconfigure(encoding="utf-8", errors="replace")
+                stream.reconfigure(encoding="utf-8", errors="replace", newline="\n")
             except (AttributeError, OSError):
                 pass
 
