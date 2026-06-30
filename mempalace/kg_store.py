@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 import os
 from abc import ABC, abstractmethod
@@ -17,9 +19,18 @@ class BaseKGStore(ABC):
 
     name: str = "base"
 
+    def __init__(self, db_path: str | None = None, **kwargs) -> None:
+        self.db_path = db_path
+
+    def __enter__(self) -> BaseKGStore:
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
     @abstractmethod
     def add_entity(
-        self, name: str, entity_type: str = "unknown", properties: dict = None
+        self, name: str, entity_type: str = "unknown", properties: dict | None = None
     ) -> str: ...
     @abstractmethod
     def add_triple(
@@ -27,24 +38,28 @@ class BaseKGStore(ABC):
         subject: str,
         predicate: str,
         obj: str,
-        valid_from: str = None,
-        valid_to: str = None,
+        valid_from: str | None = None,
+        valid_to: str | None = None,
         confidence: float = 1.0,
-        source_closet: str = None,
-        source_file: str = None,
-        source_drawer_id: str = None,
-        adapter_name: str = None,
+        source_closet: str | None = None,
+        source_file: str | None = None,
+        source_drawer_id: str | None = None,
+        adapter_name: str | None = None,
     ) -> str: ...
     @abstractmethod
-    def query_entity(self, name: str, as_of: str = None, direction: str = "outgoing") -> list: ...
+    def query_entity(
+        self, name: str, as_of: str | None = None, direction: str = "outgoing"
+    ) -> list: ...
     @abstractmethod
-    def query_relationship(self, predicate: str, as_of: str = None) -> list: ...
+    def query_relationship(self, predicate: str, as_of: str | None = None) -> list: ...
     @abstractmethod
-    def invalidate(self, subject: str, predicate: str, obj: str, ended: str = None) -> None: ...
+    def invalidate(
+        self, subject: str, predicate: str, obj: str, ended: str | None = None
+    ) -> None: ...
     @abstractmethod
     def seed_from_entity_facts(self, entity_facts: dict) -> None: ...
     @abstractmethod
-    def timeline(self, entity_name: str = None) -> list: ...
+    def timeline(self, entity_name: str | None = None) -> list: ...
     @abstractmethod
     def stats(self) -> dict: ...
     @abstractmethod
@@ -99,7 +114,7 @@ def _discover():
         _KG_DISCOVERED = True
 
 
-def get_kg_store(db_path=None, *, explicit=None, backend=None) -> "BaseKGStore":
+def get_kg_store(db_path=None, *, explicit=None, backend=None) -> BaseKGStore:
     from .knowledge_graph import KnowledgeGraph
 
     name = explicit or backend or os.environ.get("MEMPALACE_KG_BACKEND") or "sqlite"
