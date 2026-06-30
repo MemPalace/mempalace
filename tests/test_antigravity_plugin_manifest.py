@@ -34,6 +34,15 @@ HOOKS_TMPL = PLUGIN_DIR / "hooks.json.tmpl"
 SKILL_MD = PLUGIN_DIR / "skills" / "mempalace" / "SKILL.md"
 PLUGIN_README = PLUGIN_DIR / "README.md"
 
+# Recall layer (mirrors the Cursor branch's recall skill + rule + shared protocol)
+RECALL_SKILL_MD = PLUGIN_DIR / "skills" / "mempalace-recall" / "SKILL.md"
+RECALL_RULE_MD = PLUGIN_DIR / "rules" / "mempalace-recall.md"
+SHARED_PROTOCOL = REPO_ROOT / "integrations" / "shared" / "recall-protocol.md"
+INSTALL_SH = REPO_ROOT / "hooks" / "antigravity" / "install.sh"
+SHARED_PROTOCOL_REF = (
+    "https://github.com/MemPalace/mempalace/blob/main/integrations/shared/recall-protocol.md"
+)
+
 EXPECTED_HOOKS = {
     "Stop": {
         "script_basename": "mempal_save_hook_antigravity.sh",
@@ -226,3 +235,124 @@ def test_plugin_readme_present_and_substantive() -> None:
     # that drops the operational links.
     for needle in ("plugin.json", "mcp_config.json", "hooks.json"):
         assert needle in body, f"README.md must mention {needle}"
+
+
+# ── Recall layer: skill, rule, shared protocol ───────────────────────
+#
+# Mirrors the three-layer recall wiring added for Cursor on
+# feat/cursor-hooks-support, adapted for Antigravity's plugin surface.
+# The wake hook (PreInvocation) is the eager layer; these files are the
+# on-demand layers (skill + optional rule), both anchored to the single
+# canonical protocol so they can never drift.
+
+
+def test_shared_protocol_exists() -> None:
+    """The canonical recall protocol is the single source of truth.
+
+    The recall skill and rule both link here rather than restating the
+    protocol, so the rule can never drift from the skill.
+    """
+    assert SHARED_PROTOCOL.is_file(), f"missing: {SHARED_PROTOCOL}"
+    body = SHARED_PROTOCOL.read_text(encoding="utf-8")
+    assert "MemPalace Recall Protocol" in body, "shared protocol must carry its canonical title"
+
+
+def test_recall_skill_exists() -> None:
+    """The recall-only skill must be a real file at the discovery path."""
+    assert RECALL_SKILL_MD.is_file(), f"missing: {RECALL_SKILL_MD}"
+    assert not RECALL_SKILL_MD.is_symlink(), (
+        f"{RECALL_SKILL_MD} must be a real file, not a symlink — installers "
+        "that cp without -L would otherwise carry the symlink into the install."
+    )
+
+
+def test_recall_skill_has_required_frontmatter() -> None:
+    """The recall skill must carry YAML frontmatter with a non-empty description.
+
+    Antigravity's skill loader uses `description` for progressive
+    disclosure, exactly like the ops `mempalace` skill.
+    """
+    body = RECALL_SKILL_MD.read_text(encoding="utf-8")
+    assert body.startswith("---\n"), "recall SKILL.md must begin with YAML frontmatter"
+    end = body.find("\n---\n", 4)
+    assert end > 0, "recall SKILL.md frontmatter is missing the closing fence"
+    front = body[4:end]
+    desc_match = re.search(r"^description:\s*(.+)$", front, re.MULTILINE)
+    assert desc_match is not None, "recall SKILL.md frontmatter missing `description` key"
+    assert desc_match.group(1).strip(), "recall SKILL.md `description` is empty"
+
+
+def test_recall_skill_has_required_sections() -> None:
+    """The recall skill must carry the load-bearing protocol sections."""
+    body = RECALL_SKILL_MD.read_text(encoding="utf-8")
+    for section in (
+        "When to recall",
+        "Protocol",
+        "Tool selection",
+        "Unhappy paths",
+        "Anti-patterns",
+    ):
+        assert section in body, f"recall SKILL.md must contain a '{section}' section"
+
+
+def test_recall_skill_links_to_shared_protocol() -> None:
+    """The recall skill must defer to the canonical protocol, not restate it."""
+    body = RECALL_SKILL_MD.read_text(encoding="utf-8")
+    assert SHARED_PROTOCOL_REF in body, (
+        f"recall SKILL.md must reference {SHARED_PROTOCOL_REF} so the protocol stays single-sourced"
+    )
+
+
+def test_recall_rule_exists() -> None:
+    """The optional recall rule must be a real file under the plugin rules dir."""
+    assert RECALL_RULE_MD.is_file(), f"missing: {RECALL_RULE_MD}"
+    assert not RECALL_RULE_MD.is_symlink(), f"{RECALL_RULE_MD} must be a real file"
+
+
+def test_recall_rule_is_plain_markdown_not_mdc() -> None:
+    """Antigravity rules are plain `.md` with no YAML frontmatter.
+
+    Per https://antigravity.google/docs plugins use `rules/<name>.md`
+    (no `.mdc`, no Cursor-style `alwaysApply` frontmatter). Pin the
+    plain-markdown shape so nobody copies the Cursor `.mdc` verbatim.
+    """
+    assert RECALL_RULE_MD.suffix == ".md", "Antigravity rule must use the .md extension"
+    assert not (RECALL_RULE_MD.parent / "mempalace-recall.mdc").exists(), (
+        "an .mdc rule leaked in; Antigravity rules are plain .md"
+    )
+    body = RECALL_RULE_MD.read_text(encoding="utf-8")
+    assert not body.startswith("---"), (
+        "Antigravity rule must NOT carry YAML frontmatter (no Cursor-style "
+        "`alwaysApply`); it is plain markdown"
+    )
+
+
+def test_recall_rule_references_shared_protocol() -> None:
+    """The rule must point at the canonical protocol and the deeper skill."""
+    body = RECALL_RULE_MD.read_text(encoding="utf-8")
+    assert SHARED_PROTOCOL_REF in body, f"recall rule must reference {SHARED_PROTOCOL_REF}"
+
+
+def test_installer_creates_rules_dir() -> None:
+    """install.sh must create the skills/mempalace-recall and rules dirs."""
+    body = INSTALL_SH.read_text(encoding="utf-8")
+    assert '"$INSTALL_DIR/rules"' in body, "install.sh mkdir block must create the rules/ directory"
+    assert '"$INSTALL_DIR/skills/mempalace-recall"' in body, (
+        "install.sh mkdir block must create the skills/mempalace-recall/ directory"
+    )
+
+
+def test_installer_copies_recall_skill() -> None:
+    """install.sh must copy the recall skill into the install dir."""
+    body = INSTALL_SH.read_text(encoding="utf-8")
+    assert "skills/mempalace-recall/SKILL.md" in body, (
+        "install.sh must copy_file the mempalace-recall skill"
+    )
+
+
+def test_installer_copies_recall_rule() -> None:
+    """install.sh must copy the recall rule into the install dir."""
+    body = INSTALL_SH.read_text(encoding="utf-8")
+    assert "rules/mempalace-recall.md" in body, (
+        "install.sh must copy_file the mempalace-recall rule"
+    )

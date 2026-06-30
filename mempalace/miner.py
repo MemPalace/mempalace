@@ -14,6 +14,7 @@ import shlex
 import hashlib
 import fnmatch
 import logging
+import stat
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
@@ -47,6 +48,66 @@ from .ids import ID_RECIPE, make_drawer_id_from_chunk
 
 logger = logging.getLogger("mempalace_mcp")
 
+
+def _path_within_root(path: Path, root: Path) -> bool:
+    try:
+        path.expanduser().resolve().relative_to(root.expanduser().resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _read_text_no_follow(filepath: Path, root: Path) -> Optional[str]:
+    if not _path_within_root(filepath, root):
+        return None
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = -1
+    try:
+        fd = os.open(filepath, flags)
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_FILE_SIZE:
+            return None
+        with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as f:
+            fd = -1
+            return f.read()
+    except OSError:
+        return None
+    finally:
+        if fd != -1:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+PHP_EXTENSIONS = {
+    # Compound Blade templates such as ``view.blade.php`` are covered by the
+    # final ``.php`` suffix.
+    ".php",
+    ".php3",
+    ".php4",
+    ".php5",
+    ".php7",
+    ".php8",
+    ".phtml",
+    ".phps",
+    ".phpt",
+    ".inc",
+    ".aw",
+    ".fcgi",
+    ".ctp",
+    ".module",
+    ".install",
+    ".profile",
+    ".theme",
+    ".engine",
+    ".twig",
+    ".blade",
+    ".tpl",
+    ".latte",
+    ".volt",
+}
+
 READABLE_EXTENSIONS = {
     ".txt",
     ".md",
@@ -64,12 +125,21 @@ READABLE_EXTENSIONS = {
     ".java",
     ".go",
     ".rs",
+    ".swift",
+    ".kt",
+    ".kts",
     ".rb",
     ".sh",
     ".csv",
     ".sql",
     ".toml",
-}
+    # C# / .NET
+    ".cs",
+    ".csproj",
+    ".sln",
+    ".razor",
+    ".cshtml",
+} | PHP_EXTENSIONS
 
 SKIP_FILENAMES = {
     "entities.json",
@@ -1304,9 +1374,8 @@ def process_file(
     if not dry_run and file_already_mined(collection, source_file, check_mtime=True):
         return 0, "general", None
 
-    try:
-        content = filepath.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    content = _read_text_no_follow(filepath, project_path)
+    if content is None:
         return 0, "general", None
 
     content = content.strip()

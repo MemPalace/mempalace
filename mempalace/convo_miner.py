@@ -12,6 +12,7 @@ import os
 import sys
 import json
 import logging
+import stat
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
@@ -20,6 +21,7 @@ from typing import Optional
 from .collision_scan import assert_no_collisions
 from .ids import ID_RECIPE, make_convo_drawer_id, make_convo_sentinel_id
 from .normalize import normalize
+from .entities import entities_metadata
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
@@ -76,6 +78,33 @@ MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB — skip files larger than this.
 # more drawers and therefore more embedding/storage work — and content
 # is normalized and loaded fully into memory before chunking, so memory
 # use also scales with source size.
+
+
+def _path_within_root(path: Path, root: Path) -> bool:
+    try:
+        path.expanduser().resolve().relative_to(root.expanduser().resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _is_regular_source_file(filepath: Path, root: Path) -> bool:
+    if not _path_within_root(filepath, root):
+        return False
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = -1
+    try:
+        fd = os.open(filepath, flags)
+        st = os.fstat(fd)
+        return stat.S_ISREG(st.st_mode) and st.st_size <= MAX_FILE_SIZE
+    except OSError:
+        return False
+    finally:
+        if fd != -1:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 def _register_file(collection, source_file: str, wing: str, agent: str, extract_mode: str):
@@ -370,10 +399,7 @@ def scan_convos(convo_dir: str) -> list:
                     except OSError:
                         pass
                     continue
-                try:
-                    if filepath.stat().st_size > MAX_FILE_SIZE:
-                        continue
-                except OSError:
+                if not _is_regular_source_file(filepath, convo_path):
                     continue
                 files.append(filepath)
     return files
@@ -384,7 +410,42 @@ def scan_convos(convo_dir: str) -> list:
 # =============================================================================
 
 
-def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extract_mode):
+def _extract_authored_at(filepath):
+    """Most-recent message timestamp in a transcript, used as the drawer's authored date.
+
+    Both Claude Code and Codex JSONL transcripts carry a top-level ISO-8601
+    ``timestamp`` on each line. We take the max so ``authored_at`` reflects when the
+    content was actually written, independent of when it was mined (``filed_at``).
+    This restores chronology: a session from days ago keeps its real date even when
+    re-mined today, instead of every drawer collapsing to ingest time. Returns None
+    for formats without per-line timestamps (e.g. plain ``.md``).
+    """
+    path = Path(filepath)
+    if path.suffix != ".jsonl":
+        return None
+    latest = None
+    try:
+        with path.open(encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ts = json.loads(line).get("timestamp")
+                except (ValueError, TypeError, AttributeError):
+                    continue
+                # ISO-8601 timestamps are strings; guard against a non-string
+                # ``timestamp`` so a malformed line can't raise TypeError on compare.
+                if isinstance(ts, str) and (latest is None or ts > latest):
+                    latest = ts
+    except OSError:
+        return None
+    return latest
+
+
+def _file_chunks_locked(
+    collection, source_file, chunks, wing, room, agent, extract_mode, authored_at=None
+):
     """Lock the source file, purge stale drawers, and upsert fresh chunks.
 
     Combines the per-file serialization that prevents concurrent agents from
@@ -439,6 +500,8 @@ def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extr
                         "chunk_index": chunk["chunk_index"],
                         "added_by": agent,
                         "filed_at": filed_at,
+                        "entities": entities_metadata(chunk["content"]),
+                        "authored_at": authored_at if authored_at is not None else filed_at,
                         "ingest_mode": "convos",
                         "extract_mode": extract_mode,
                         "normalize_version": NORMALIZE_VERSION,
@@ -639,6 +702,22 @@ def mine_convos(
         )
 
 
+def _compute_hallways_for_wing_safe(wing, collection, drawers_filed):
+    """Auto-populate the associative graph from the entities just mined.
+
+    Best-effort: hallway computation must never fail an otherwise-good mine, and is
+    skipped when nothing new was filed.
+    """
+    if drawers_filed <= 0:
+        return
+    try:
+        from .hallways import compute_hallways_for_wing
+
+        compute_hallways_for_wing(wing, col=collection)
+    except Exception as exc:
+        print(f"  (hallways skipped: {exc})")
+
+
 def _mine_convos_impl(
     convo_dir: str,
     palace_path: str,
@@ -706,6 +785,10 @@ def _mine_convos_impl(
             files_skipped += 1
             continue
 
+        if not _is_regular_source_file(filepath, Path(convo_dir).expanduser().resolve()):
+            files_skipped += 1
+            continue
+
         # Normalize format
         try:
             content = normalize(str(filepath))
@@ -770,7 +853,14 @@ def _mine_convos_impl(
         # Lock + purge stale + file fresh chunks. Lock serializes concurrent
         # agents; purge removes pre-v2 drawers so the schema bump applies.
         drawers_added, room_delta, skipped = _file_chunks_locked(
-            collection, source_file, chunks, wing, room, agent, extract_mode
+            collection,
+            source_file,
+            chunks,
+            wing,
+            room,
+            agent,
+            extract_mode,
+            authored_at=_extract_authored_at(filepath),
         )
         if skipped:
             files_skipped += 1
@@ -785,6 +875,10 @@ def _mine_convos_impl(
             break
 
     if not dry_run:
+        # Compute hallways before the FTS5 validation: the latter opens a direct sqlite
+        # connection to the Chroma DB, which can invalidate the live collection handle on
+        # some Chroma builds and make the hallway fetch fail.
+        _compute_hallways_for_wing_safe(wing, collection, total_drawers)
         _validate_palace_fts5_after_mine(palace_path)
 
     print(f"\n{'=' * 55}")

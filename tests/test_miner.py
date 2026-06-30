@@ -10,7 +10,15 @@ import pytest
 import yaml
 
 from mempalace.config import normalize_wing_name
-from mempalace.miner import detect_room, load_config, mine, scan_project, status
+from mempalace.miner import (
+    PHP_EXTENSIONS,
+    READABLE_EXTENSIONS,
+    detect_room,
+    load_config,
+    mine,
+    scan_project,
+    status,
+)
 from mempalace.palace import NORMALIZE_VERSION, file_already_mined, prefetch_mined_set
 
 
@@ -22,6 +30,24 @@ def write_file(path: Path, content: str):
 def scanned_files(project_root: Path, **kwargs):
     files = scan_project(str(project_root), **kwargs)
     return sorted(path.relative_to(project_root).as_posix() for path in files)
+
+
+def test_php_ecosystem_extensions_are_readable():
+    assert PHP_EXTENSIONS <= READABLE_EXTENSIONS
+
+
+def test_scan_project_includes_php_ecosystem_files(tmp_path):
+    expected = []
+    for index, extension in enumerate(sorted(PHP_EXTENSIONS)):
+        filename = f"example_{index}{extension}"
+        write_file(tmp_path / filename, "<?php echo 'verbatim';\n")
+        expected.append(filename)
+
+    # Extension matching is deliberately case-insensitive.
+    write_file(tmp_path / "uppercase.PHP", "<?php echo 'uppercase';\n")
+    expected.append("uppercase.PHP")
+
+    assert scanned_files(tmp_path) == sorted(expected)
 
 
 def test_project_mining():
@@ -294,6 +320,33 @@ def test_scan_project_skips_mempalace_generated_files():
         write_file(project_root / "notes.md", "real user content\n" * 10)
 
         assert scanned_files(project_root) == ["notes.md"]
+
+
+def test_scan_project_includes_swift_files():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        project_root = Path(tmpdir).resolve()
+        write_file(
+            project_root / "Sources" / "App.swift",
+            "struct App {}\n" * 20,
+        )
+        assert scanned_files(project_root) == ["Sources/App.swift"]
+
+
+def test_scan_project_includes_kotlin_files():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        project_root = Path(tmpdir).resolve()
+        write_file(
+            project_root / "src" / "Main.kt",
+            "fun main() {}\n" * 20,
+        )
+        write_file(
+            project_root / "settings.gradle.kts",
+            'rootProject.name = "demo"\n' * 20,
+        )
+        assert scanned_files(project_root) == [
+            "settings.gradle.kts",
+            "src/Main.kt",
+        ]
 
 
 def test_scan_project_respects_gitignore():

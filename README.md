@@ -225,7 +225,7 @@ Usage and tool reference:
 
 ## MCP server
 
-29 MCP tools cover palace reads/writes, knowledge-graph operations,
+35 MCP tools cover palace reads/writes, knowledge-graph operations,
 cross-wing navigation, drawer management, and agent diaries. Installation
 and the full tool list:
 [mempalaceofficial.com/reference/mcp-tools](https://mempalaceofficial.com/reference/mcp-tools.html).
@@ -239,8 +239,14 @@ system prompt:
 
 ## Auto-save hooks
 
-Two Claude Code hooks save periodically and before context compression:
-[mempalaceofficial.com/guide/hooks](https://mempalaceofficial.com/guide/hooks.html).
+Auto-save hooks for **Claude Code, Codex CLI, and Cursor IDE** save
+periodically and before context compression:
+
+- Claude Code + Codex →
+  [mempalaceofficial.com/guide/hooks](https://mempalaceofficial.com/guide/hooks.html)
+- Cursor IDE (adds session-start recall and a transcript snapshot before
+  compaction) →
+  [mempalaceofficial.com/guide/cursor-hooks](https://mempalaceofficial.com/guide/cursor-hooks.html)
 
 If you are installing under time pressure, start with the
 [Claude Code retention setup checklist](https://mempalaceofficial.com/guide/claude-code-retention.html):
@@ -279,7 +285,7 @@ PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 MIT — see [LICENSE](LICENSE).
 
 <!-- Link Definitions -->
-[version-shield]: https://img.shields.io/badge/version-3.4.0-4dc9f6?style=flat-square&labelColor=0a0e14
+[version-shield]: https://img.shields.io/badge/version-3.5.0-4dc9f6?style=flat-square&labelColor=0a0e14
 [release-link]: https://github.com/MemPalace/mempalace/releases
 [python-shield]: https://img.shields.io/badge/python-3.9+-7dd8f8?style=flat-square&labelColor=0a0e14&logo=python&logoColor=7dd8f8
 [python-link]: https://www.python.org/

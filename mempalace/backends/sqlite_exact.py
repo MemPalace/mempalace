@@ -496,19 +496,32 @@ class SQLiteExactCollection(BaseCollection):
                 )
                 self._replace_fts(cur, collection_id, doc_id, doc)
 
-    def _rows(self, cur, *, where=None, where_document=None) -> list[dict]:
+    def _rows(self, cur, *, where=None, where_document=None, limit=None, offset=None) -> list[dict]:
         _validate_where(where)
         _validate_where(where_document)
         collection_id = self._collection_id(cur)
-        rows = cur.execute(
-            """
-            SELECT id, document, metadata_json, embedding
-            FROM documents
-            WHERE collection_id = ?
-            ORDER BY rowid
-            """,
-            (collection_id,),
-        ).fetchall()
+        sql = (
+            "SELECT id, document, metadata_json, embedding\n"
+            "FROM documents\n"
+            "WHERE collection_id = ?\n"
+            "ORDER BY rowid"
+        )
+        params = [collection_id]
+        # Emit SQL LIMIT/OFFSET only on an unfiltered page. With a
+        # where/where_document the post-filter loop below drops rows *after*
+        # this scan, so a SQL LIMIT/OFFSET would cut the wrong rows; those
+        # callers scan in full and paginate in Python. SQLite requires a LIMIT
+        # before OFFSET, so an offset-only page uses "LIMIT -1" (unbounded).
+        if where is None and where_document is None and (limit is not None or offset):
+            if limit is not None:
+                sql += "\nLIMIT ?"
+                params.append(int(limit))
+            elif offset:
+                sql += "\nLIMIT -1"
+            if offset:
+                sql += "\nOFFSET ?"
+                params.append(int(offset))
+        rows = cur.execute(sql, params).fetchall()
         out = []
         for doc_id, doc, meta_json, emb_blob in rows:
             meta = _json_loads(meta_json)
@@ -603,15 +616,33 @@ class SQLiteExactCollection(BaseCollection):
         include=None,
     ) -> GetResult:
         spec = _IncludeSpec.resolve(include, default_distances=False)
+        # Fast path for the common unfiltered page (e.g. the prefetch_mined_set
+        # and status sweeps): push LIMIT/OFFSET into the scan instead of
+        # materializing the whole collection and slicing in Python. Safe only
+        # with no post-filter (ids/where/where_document drop rows after the
+        # scan) and non-negative bounds: SQLite does not honor a negative LIMIT
+        # or OFFSET the way a Python slice does, so those keep the slice path.
+        push_page = (
+            ids is None
+            and where is None
+            and where_document is None
+            and (limit is None or limit >= 0)
+            and (offset is None or offset >= 0)
+            and (limit is not None or offset)
+        )
         with self._cursor() as cur:
-            rows = self._rows(cur, where=where, where_document=where_document)
-        if ids is not None:
-            by_id = {row["id"]: row for row in rows}
-            rows = [by_id[doc_id] for doc_id in ids if doc_id in by_id]
-        if offset:
-            rows = rows[offset:]
-        if limit is not None:
-            rows = rows[:limit]
+            if push_page:
+                rows = self._rows(cur, limit=limit, offset=offset)
+            else:
+                rows = self._rows(cur, where=where, where_document=where_document)
+        if not push_page:
+            if ids is not None:
+                by_id = {row["id"]: row for row in rows}
+                rows = [by_id[doc_id] for doc_id in ids if doc_id in by_id]
+            if offset:
+                rows = rows[offset:]
+            if limit is not None:
+                rows = rows[:limit]
         return GetResult(
             ids=[row["id"] for row in rows],
             documents=[row["document"] for row in rows] if spec.documents else [],
@@ -836,19 +867,31 @@ class SQLiteExactBackend(BaseBackend):
                 os.chmod(palace_path, 0o700)
             except (OSError, NotImplementedError):
                 pass
+        # Hold the registry lock across cache-check + connect + schema init:
+        # two threads first-opening the same palace must not each create a
+        # connection (the loser leaked unclosed and outlived close()) nor run
+        # _init_schema concurrently on a fresh file, which surfaces transient
+        # "database is locked" errors before WAL mode is established. Only
+        # first-open pays for the I/O under the lock; cache hits are a dict
+        # probe.
         with self._clients_lock:
+            if self._closed:
+                raise BackendClosedError("SQLiteExactBackend has been closed")
             cached = self._clients.get(palace_path)
             if cached is not None and not cached.closed:
                 return cached
-        conn = sqlite3.connect(db_path, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        lock = threading.RLock()
-        handle = _SQLiteExactHandle(conn, lock)
-        with handle.lock:
-            self._init_schema(conn)
-        with self._clients_lock:
+            conn = sqlite3.connect(db_path, check_same_thread=False)
+            try:
+                conn.row_factory = sqlite3.Row
+                lock = threading.RLock()
+                handle = _SQLiteExactHandle(conn, lock)
+                with handle.lock:
+                    self._init_schema(conn)
+            except BaseException:
+                conn.close()
+                raise
             self._clients[palace_path] = handle
-        return handle
+            return handle
 
     def _init_schema(self, conn: sqlite3.Connection) -> None:
         conn.executescript(
@@ -979,14 +1022,19 @@ class SQLiteExactBackend(BaseBackend):
                 cached.conn.close()
 
     def close(self) -> None:
+        # Flip _closed under the registry lock so a concurrent _connect either
+        # sees the flag or finishes before the handle snapshot is taken; a
+        # connection can no longer slip into the registry after close().
+        # Unlocked readers of _closed elsewhere are advisory fast-fails; the
+        # locked recheck in _connect is the authoritative gate.
         with self._clients_lock:
             handles = list(self._clients.values())
             self._clients.clear()
+            self._closed = True
         for handle in handles:
             with handle.lock:
                 handle.closed = True
                 handle.conn.close()
-        self._closed = True
 
     def health(self, palace: Optional[PalaceRef] = None) -> HealthStatus:
         if self._closed:
@@ -997,7 +1045,23 @@ class SQLiteExactBackend(BaseBackend):
 
     @classmethod
     def detect(cls, path: str) -> bool:
-        return os.path.isfile(os.path.join(path, _DB_FILENAME))
+        """Return True when ``path`` looks like a sqlite_exact palace.
+
+        Verifies the SQLite magic header rather than file presence alone, for
+        the same reason as :py:meth:`mempalace.backends.chroma.ChromaBackend.detect`:
+        bare ``sqlite3.connect()`` against a missing path leaves a 0-byte file
+        behind because the SQLite header is written on the first statement,
+        not on connection. The 16-byte ``SQLite format 3\\x00`` magic prefix
+        accepts every real palace while rejecting empty / garbage files. See #1893.
+        """
+        db_path = os.path.join(path, _DB_FILENAME)
+        if not os.path.isfile(db_path):
+            return False
+        try:
+            with open(db_path, "rb") as f:
+                return f.read(16) == b"SQLite format 3\x00"
+        except OSError:
+            return False
 
     def create_collection(self, palace_path: str, collection_name: str) -> SQLiteExactCollection:
         return self.get_collection(palace_path, collection_name, create=True)

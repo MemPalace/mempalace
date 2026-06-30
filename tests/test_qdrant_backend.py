@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from _backend_conformance import assert_partition_isolation
+from _chroma_palace_helper import make_minimal_chroma_sqlite
 
 from mempalace.backends import (
     BackendError,
@@ -12,6 +13,7 @@ from mempalace.backends import (
     CollectionNotInitializedError,
     DimensionMismatchError,
     PalaceRef,
+    UnsupportedCapabilityError,
     available_backends,
 )
 from mempalace.backends.qdrant import QdrantBackend
@@ -82,6 +84,7 @@ class _FakeQdrantClient:
         self.query_calls = []
         self.scroll_calls = []
         self.created_indexes = []
+        self.facet_calls = []
         _FakeQdrantClient.instances.append(self)
 
     def request(self, *_args, **_kwargs):
@@ -175,6 +178,33 @@ class _FakeQdrantClient:
 
     def delete_collection(self, collection):
         self.collections.pop(collection, None)
+
+    def facet_counts(
+        self,
+        collection,
+        *,
+        field,
+        qdrant_filter=None,
+        limit=1000,
+    ):
+        self.facet_calls.append((field, qdrant_filter))
+
+        counts = {}
+
+        points = list(self.collections.get(collection, {"points": {}})["points"].values())
+
+        points = [point for point in points if _fake_match_filter(point, qdrant_filter)]
+
+        for point in points:
+            metadata = point["payload"].get("metadata", {})
+            actual_field = field.split(".", 1)[-1] if field.startswith("metadata.") else field
+            value = metadata.get(actual_field)
+
+            if value is None:
+                continue
+            counts[value] = counts.get(value, 0) + 1
+
+        return counts
 
 
 @pytest.fixture
@@ -362,7 +392,7 @@ def test_qdrant_marker_participates_in_backend_mismatch(tmp_path, monkeypatch, f
     backend, col = _collection(tmp_path)
     col.upsert(ids=["a"], documents=["one"], metadatas=[{}], embeddings=[[1, 0]])
     backend.close()
-    (tmp_path / "chroma.sqlite3").write_bytes(b"")
+    make_minimal_chroma_sqlite(tmp_path)
     monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "chroma")
 
     with pytest.raises(BackendMismatchError):
@@ -527,3 +557,112 @@ def test_qdrant_live_rest_roundtrip_when_enabled(tmp_path):
         except Exception:
             pass
         backend.close()
+
+
+def test_qdrant_facet_counts(tmp_path, fake_qdrant):
+    _, collection = _collection(tmp_path)
+    collection.upsert(
+        ids=["1", "2", "3", "4"],
+        documents=["a", "b", "c", "d"],
+        metadatas=[
+            {"wing": "alpha"},
+            {"wing": "alpha"},
+            {"wing": "beta"},
+            {"wing": "gamma"},
+        ],
+        embeddings=[
+            [1, 0],
+            [1, 0],
+            [1, 0],
+            [1, 0],
+        ],
+    )
+    assert collection.facet_counts("wing") == {
+        "alpha": 2,
+        "beta": 1,
+        "gamma": 1,
+    }
+
+
+def test_qdrant_facet_counts_where(tmp_path, fake_qdrant):
+    _, collection = _collection(tmp_path)
+    collection.upsert(
+        ids=["1", "2", "3"],
+        documents=["a", "b", "c"],
+        metadatas=[
+            {"wing": "engineering", "room": "backend"},
+            {"wing": "engineering", "room": "frontend"},
+            {"wing": "design", "room": "ux"},
+        ],
+        embeddings=[
+            [1, 0],
+            [1, 0],
+            [1, 0],
+        ],
+    )
+    assert collection.facet_counts(
+        "room",
+        where={"wing": "engineering"},
+    ) == {
+        "backend": 1,
+        "frontend": 1,
+    }
+
+
+def test_qdrant_facet_counts_rejects_local_filters(tmp_path, fake_qdrant):
+    _, collection = _collection(tmp_path)
+    with pytest.raises(UnsupportedCapabilityError):
+        collection.facet_counts(
+            "room",
+            where={
+                "$or": [
+                    {"wing": "a"},
+                    {"wing": "b"},
+                ]
+            },
+        )
+
+
+def test_qdrant_facet_counts_passes_filter(tmp_path, fake_qdrant):
+    _, collection = _collection(tmp_path)
+    collection.upsert(
+        ids=["1"],
+        documents=["doc"],
+        metadatas=[{"wing": "engineering", "room": "backend"}],
+        embeddings=[[1, 0]],
+    )
+    collection.facet_counts(
+        "room",
+        where={"wing": "engineering"},
+    )
+    client = fake_qdrant.instances[0]
+    assert len(client.facet_calls) == 1
+    field, qfilter = client.facet_calls[0]
+    assert field == "metadata.room"
+    assert qfilter == {
+        "must": [
+            {
+                "key": "metadata.wing",
+                "match": {"value": "engineering"},
+            }
+        ]
+    }
+
+
+def test_qdrant_facet_counts_ignores_missing_metadata(tmp_path, fake_qdrant):
+    _, collection = _collection(tmp_path)
+    collection.upsert(
+        ids=["1", "2"],
+        documents=["a", "b"],
+        metadatas=[
+            {"wing": "alpha"},
+            {},
+        ],
+        embeddings=[
+            [1, 0],
+            [1, 0],
+        ],
+    )
+    assert collection.facet_counts("wing") == {
+        "alpha": 1,
+    }

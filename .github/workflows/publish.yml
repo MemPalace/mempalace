@@ -73,7 +73,7 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "Resolved tag: $tag"
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # Fully-qualified refs/tags/ so an unqualified name can't resolve to a
           # same-named *branch* instead of the tag (checkout prefers branches).

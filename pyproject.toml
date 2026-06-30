@@ -1,6 +1,6 @@
 [project]
 name = "mempalace"
-version = "3.4.0"
+version = "3.5.0"
 description = "Give your AI a memory — mine projects and conversations into a searchable palace. No API key required."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -74,7 +74,11 @@ sqlite_exact = "mempalace.backends.sqlite_exact:SQLiteExactBackend"
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
-    "ruff==0.15.15",
+    # Retries known-transient ChromaDB-on-Windows HNSW compaction failures in CI
+    # (wired only into the test-windows job in ci.yml, scoped to the specific
+    # error). Local/Linux/macOS runs never rerun, so real failures stay loud.
+    "pytest-rerunfailures>=12.0",
+    "ruff==0.15.20",
     "psutil>=5.9",
     # Property-based testing — generates hundreds of random inputs per
     # test to find counterexamples the hand-written positive tests miss.
@@ -131,7 +135,11 @@ extract = [
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
-    "ruff==0.15.15",
+    # Retries known-transient ChromaDB-on-Windows HNSW compaction failures in CI
+    # (wired only into the test-windows job in ci.yml, scoped to the specific
+    # error). Local/Linux/macOS runs never rerun, so real failures stay loud.
+    "pytest-rerunfailures>=12.0",
+    "ruff==0.15.20",
     "psutil>=5.9",
     "hypothesis>=6.0",
     "pre-commit>=3.0",

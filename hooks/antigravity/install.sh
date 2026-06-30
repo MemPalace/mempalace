@@ -305,6 +305,8 @@ log info "install dir: $INSTALL_DIR"
 # ── Install: directories ─────────────────────────────────────────────
 run mkdir -p "$INSTALL_DIR" \
     "$INSTALL_DIR/skills/mempalace" \
+    "$INSTALL_DIR/skills/mempalace-recall" \
+    "$INSTALL_DIR/rules" \
     "$INSTALL_DIR/hooks" \
     "$INSTALL_DIR/hooks/lib"
 
@@ -313,9 +315,22 @@ copy_file "$PLUGIN_SRC/plugin.json"     "$INSTALL_DIR/plugin.json"
 copy_file "$PLUGIN_SRC/mcp_config.json" "$INSTALL_DIR/mcp_config.json"
 copy_file "$PLUGIN_SRC/README.md"       "$INSTALL_DIR/README.md"
 
-# ── Install: skill (real file, no symlinks at the discovery path) ────
+# ── Install: skills (real files, no symlinks at the discovery path) ──
 copy_file "$PLUGIN_SRC/skills/mempalace/SKILL.md" \
     "$INSTALL_DIR/skills/mempalace/SKILL.md"
+copy_file "$PLUGIN_SRC/skills/mempalace-recall/SKILL.md" \
+    "$INSTALL_DIR/skills/mempalace-recall/SKILL.md"
+
+# ── Install: optional recall rule ────────────────────────────────────
+#
+# Antigravity discovers markdown rules under the plugin's rules/
+# directory. This one is recall-only and intentionally lightweight —
+# it complements the mempalace-recall skill. Shipping it as a plugin
+# rule (not an always-on global rule) keeps it scoped to recall-
+# relevant turns, honouring MemPalace's "memory should feel instant"
+# budget.
+copy_file "$PLUGIN_SRC/rules/mempalace-recall.md" \
+    "$INSTALL_DIR/rules/mempalace-recall.md"
 
 # ── Install: hooks ───────────────────────────────────────────────────
 copy_file "$HOOKS_SRC/lib/common.sh"                    "$INSTALL_DIR/hooks/lib/common.sh"

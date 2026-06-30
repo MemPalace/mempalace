@@ -8,6 +8,7 @@ import pytest
 from mempalace.convo_miner import (
     CHUNK_SIZE,
     _emit_bounded,
+    _extract_authored_at,
     _file_chunks_locked,
     chunk_exchanges,
     detect_convo_room,
@@ -468,3 +469,100 @@ class TestFileChunksLocked:
         assert dict(room_counts) == {}
         assert skipped is False
         assert col.batch_sizes == [2, 2, 1]
+
+    def test_populates_entities_metadata(self, monkeypatch):
+        import mempalace.convo_miner as convo_miner
+
+        class FakeCol:
+            def __init__(self):
+                self.metas = []
+
+            def delete(self, *args, **kwargs):
+                pass
+
+            def get(self, ids=None, include=None, **kwargs):
+                return {"ids": [], "metadatas": []}
+
+            def upsert(self, documents, ids, metadatas):
+                self.metas.extend(metadatas)
+
+        chunks = [
+            {
+                "content": "We changed `MemoryStack` in rag/foo.py via do_thing_now().",
+                "chunk_index": 0,
+            }
+        ]
+        col = FakeCol()
+        monkeypatch.setattr(
+            convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
+        )
+        monkeypatch.setattr(convo_miner, "mine_lock", lambda source_file: contextlib.nullcontext())
+        monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda content: "conversations")
+
+        _file_chunks_locked(col, "chat.txt", chunks, "wing", "general", "agent", "exchange")
+
+        entities = col.metas[0]["entities"].split(";")
+        assert "MemoryStack" in entities
+        assert "rag/foo.py" in entities
+        assert "do_thing_now" in entities
+
+
+class TestExtractAuthoredAt:
+    """authored_at = max per-line ``timestamp`` in a transcript (real authored date,
+    independent of mine time). Both Claude Code and Codex JSONL carry a top-level
+    ISO-8601 ``timestamp`` per line."""
+
+    def test_returns_latest_timestamp(self, tmp_path):
+        f = tmp_path / "session.jsonl"
+        f.write_text(
+            '{"type": "user", "timestamp": "2026-06-21T10:00:00.000Z"}\n'
+            '{"type": "assistant", "timestamp": "2026-06-23T14:30:00.000Z"}\n'
+            '{"type": "user", "timestamp": "2026-06-22T09:00:00.000Z"}\n'
+        )
+        assert _extract_authored_at(f) == "2026-06-23T14:30:00.000Z"
+
+    def test_ignores_lines_without_timestamp(self, tmp_path):
+        f = tmp_path / "session.jsonl"
+        f.write_text(
+            '{"type": "summary", "summary": "x"}\n'
+            '{"type": "assistant", "timestamp": "2026-06-23T14:30:00.000Z"}\n'
+        )
+        assert _extract_authored_at(f) == "2026-06-23T14:30:00.000Z"
+
+    def test_tolerates_blank_and_malformed_lines(self, tmp_path):
+        f = tmp_path / "session.jsonl"
+        f.write_text(
+            "\n"
+            "not json\n"
+            "[1, 2, 3]\n"  # valid JSON, but no .get()
+            '{"timestamp": "2026-06-25T00:00:00.000Z"}\n'
+        )
+        assert _extract_authored_at(f) == "2026-06-25T00:00:00.000Z"
+
+    def test_none_for_non_jsonl(self, tmp_path):
+        f = tmp_path / "notes.md"
+        f.write_text("# heading\n")
+        assert _extract_authored_at(f) is None
+
+    def test_none_when_no_timestamps(self, tmp_path):
+        f = tmp_path / "session.jsonl"
+        f.write_text('{"type": "user", "content": "hi"}\n')
+        assert _extract_authored_at(f) is None
+
+    def test_none_for_missing_file(self, tmp_path):
+        assert _extract_authored_at(tmp_path / "absent.jsonl") is None
+
+    def test_non_string_timestamp_does_not_crash(self, tmp_path):
+        # A non-string timestamp must be skipped, not raise TypeError on compare.
+        f = tmp_path / "session.jsonl"
+        f.write_text(
+            '{"type": "user", "timestamp": 1234567890}\n'
+            '{"type": "assistant", "timestamp": {"nested": true}}\n'
+            '{"type": "user", "timestamp": "2026-06-24T00:00:00.000Z"}\n'
+        )
+        assert _extract_authored_at(f) == "2026-06-24T00:00:00.000Z"
+
+    def test_only_non_string_timestamps_returns_none(self, tmp_path):
+        f = tmp_path / "session.jsonl"
+        f.write_text('{"timestamp": 1}\n{"timestamp": false}\n')
+        assert _extract_authored_at(f) is None
