@@ -228,8 +228,9 @@ def test_enforcement_legacy_with_data_warns(tmp_path, monkeypatch, clear_identit
 
     _seed_sqlite_with_identity(tmp_path, None)  # data, but no recorded identity
     P._VALIDATED_IDENTITY.clear()
-    with pytest.warns(EmbedderIdentityUnknownWarning):
+    with pytest.warns(EmbedderIdentityUnknownWarning) as warning:
         P.get_collection(str(tmp_path), collection_name="mempalace_drawers", create=False)
+    assert "--collection mempalace_drawers" in str(warning[0].message)
 
 
 def test_enforcement_nameless_model_is_a_noop(tmp_path, monkeypatch, clear_identity_cache):

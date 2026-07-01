@@ -13,8 +13,9 @@ import sys
 import json
 import logging
 import stat
+import sqlite3
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import defaultdict
 from typing import Optional
 
@@ -64,11 +65,12 @@ CONVO_EXTENSIONS = {
     ".json",
     ".jsonl",
 }
+_CODEX_CONVO_EXTENSIONS = {".jsonl"}
+_CLAUDE_CODE_CONVO_EXTENSIONS = {".jsonl"}
+_GEMINI_CONVO_EXTENSIONS = {".json", ".jsonl"}
 
 MIN_CHUNK_SIZE = 30
 CHUNK_SIZE = 800  # chars per drawer — align with miner.py
-_LINE_GROUP_SIZE = 25  # lines per fallback group when no paragraph breaks
-_LINE_FALLBACK_MIN_NEWLINES = 20  # trigger line-group fallback above this newline count
 DRAWER_UPSERT_BATCH_SIZE = 1000
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB — skip files larger than this.
 # Matches miner.py at 500 MB. Long Claude Code sessions, multi-year
@@ -78,6 +80,11 @@ MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB — skip files larger than this.
 # more drawers and therefore more embedding/storage work — and content
 # is normalized and loaded fully into memory before chunking, so memory
 # use also scales with source size.
+_BOUNDARY_SEARCH_FLOOR_RATIO = 0.6
+_SOFT_BOUNDARY_CHARS = frozenset("/\\:;,.!?)]}-_")
+_OPENCODE_DB_FILENAME = "opencode.db"
+_OPENCODE_REQUIRED_TABLES = frozenset({"session", "message", "part"})
+_OPENCODE_SOURCE_PREFIX = "opencode://session/"
 
 
 def _path_within_root(path: Path, root: Path) -> bool:
@@ -107,6 +114,76 @@ def _is_regular_source_file(filepath: Path, root: Path) -> bool:
                 pass
 
 
+def _convo_extensions_for_root(root: Path) -> set[str]:
+    """Return allowed conversation file extensions for a source root.
+
+    Generic export folders can be plain text or Markdown transcripts. Known
+    agent storage roots are stricter: their adjacent ``memory/*.md``,
+    ``tool-results/*.txt``, and workflow ``*.json`` files are sidecars, not
+    canonical conversation transcripts.
+    """
+    try:
+        parts = root.resolve().parts
+    except (OSError, RuntimeError):
+        return CONVO_EXTENSIONS
+
+    if ".codex" in parts:
+        return _CODEX_CONVO_EXTENSIONS
+    if ".gemini" in parts:
+        return _GEMINI_CONVO_EXTENSIONS
+    for i in range(len(parts) - 1):
+        if parts[i] == ".claude" and parts[i + 1] == "projects":
+            return _CLAUDE_CODE_CONVO_EXTENSIONS
+    return CONVO_EXTENSIONS
+
+
+def _is_opencode_db_file(filepath: Path) -> bool:
+    """Return True for an OpenCode SQLite session database.
+
+    OpenCode stores local conversations in ``~/.local/share/opencode/opencode.db``.
+    Treating that DB as a first-class conversation source lets users backfill
+    OpenCode without exporting every session to a transient JSON file.
+    """
+    if filepath.name != _OPENCODE_DB_FILENAME or not filepath.is_file():
+        return False
+    try:
+        from .config import sqlite_read_uri
+
+        conn = sqlite3.connect(sqlite_read_uri(str(filepath)), uri=True)
+        try:
+            rows = conn.execute("select name from sqlite_master where type = 'table'").fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
+    tables = {str(row[0]) for row in rows}
+    return _OPENCODE_REQUIRED_TABLES <= tables
+
+
+def _resolve_opencode_db_path(convo_path: Path) -> Optional[Path]:
+    """Resolve a direct OpenCode DB path or its containing data directory."""
+    if convo_path.is_file() and _is_opencode_db_file(convo_path):
+        return convo_path
+    candidate = convo_path / _OPENCODE_DB_FILENAME
+    if candidate.is_file() and _is_opencode_db_file(candidate):
+        return candidate
+    return None
+
+
+def _is_ai_tool_sidecar_file(filepath: Path, source_root: Path) -> bool:
+    """Return True for known agent-store files that are not transcripts."""
+    try:
+        parts = source_root.resolve().parts
+    except (OSError, RuntimeError):
+        return False
+
+    if filepath.name == "journal.jsonl":
+        for i in range(len(parts) - 1):
+            if parts[i] == ".claude" and parts[i + 1] == "projects":
+                return True
+    return False
+
+
 def _register_file(collection, source_file: str, wing: str, agent: str, extract_mode: str):
     """Write a sentinel so file_already_mined() returns True for 0-chunk files.
 
@@ -132,6 +209,19 @@ def _register_file(collection, source_file: str, wing: str, agent: str, extract_
             }
         ],
     )
+
+
+def _register_file_unless_dry_run(
+    collection,
+    *,
+    dry_run: bool,
+    source_file: str,
+    wing: str,
+    agent: str,
+    extract_mode: str,
+) -> None:
+    if not dry_run:
+        _register_file(collection, source_file, wing, agent, extract_mode)
 
 
 def _source_file_delete_ids(collection, source_file: str, extract_mode: str) -> list[str]:
@@ -258,26 +348,37 @@ def _emit_bounded(
     """
     if len(content.strip()) <= min_chunk_size:
         return
-    for i in range(0, len(content), chunk_size):
-        chunks.append({"content": content[i : i + chunk_size], "chunk_index": len(chunks)})
+    start = 0
+    content_len = len(content)
+    while start < content_len:
+        end = min(start + chunk_size, content_len)
+        if end < content_len:
+            end = _find_chunk_boundary(content, start, end)
+        chunks.append({"content": content[start:end], "chunk_index": len(chunks)})
+        start = end
+
+
+def _find_chunk_boundary(content: str, start: int, hard_end: int) -> int:
+    """Prefer ending a chunk on whitespace without dropping any content."""
+    floor = start + max(1, int((hard_end - start) * _BOUNDARY_SEARCH_FLOOR_RATIO))
+    for idx in range(hard_end, floor, -1):
+        if content[idx - 1].isspace():
+            return idx
+    for idx in range(hard_end, floor, -1):
+        if content[idx - 1] in _SOFT_BOUNDARY_CHARS:
+            return idx
+    return hard_end
 
 
 def _chunk_by_paragraph(content: str, chunk_size: int, min_chunk_size: int) -> list:
-    """Fallback: chunk by paragraph breaks."""
+    """Fallback for non-exchange transcripts.
+
+    Preserve the source text as one contiguous stream. Earlier versions split
+    on paragraph/line groups and stripped each piece, which silently removed
+    separators between neighboring fallback chunks.
+    """
     chunks = []
-    paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
-
-    # If no paragraph breaks and long content, chunk by line groups
-    if len(paragraphs) <= 1 and content.count("\n") > _LINE_FALLBACK_MIN_NEWLINES:
-        lines = content.split("\n")
-        for i in range(0, len(lines), _LINE_GROUP_SIZE):
-            group = "\n".join(lines[i : i + _LINE_GROUP_SIZE]).strip()
-            _emit_bounded(chunks, group, chunk_size, min_chunk_size)
-        return chunks
-
-    for para in paragraphs:
-        _emit_bounded(chunks, para, chunk_size, min_chunk_size)
-
+    _emit_bounded(chunks, content.rstrip("\n"), chunk_size, min_chunk_size)
     return chunks
 
 
@@ -383,6 +484,7 @@ def scan_convos(convo_dir: str) -> list:
     caller can tell why an apparent conversation directory yielded no files.
     """
     convo_path = Path(convo_dir).expanduser().resolve()
+    allowed_extensions = _convo_extensions_for_root(convo_path)
     files = []
     for root, dirs, filenames in os.walk(convo_path):
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
@@ -390,7 +492,9 @@ def scan_convos(convo_dir: str) -> list:
             if filename.endswith(".meta.json"):
                 continue
             filepath = Path(root) / filename
-            if filepath.suffix.lower() in CONVO_EXTENSIONS:
+            if _is_ai_tool_sidecar_file(filepath, convo_path):
+                continue
+            if filepath.suffix.lower() in allowed_extensions:
                 # Skip symlinks and oversized files
                 if filepath.is_symlink():
                     rel = filepath.relative_to(convo_path).as_posix()
@@ -441,6 +545,199 @@ def _extract_authored_at(filepath):
     except OSError:
         return None
     return latest
+
+
+def _opencode_ms_to_iso(value) -> Optional[str]:
+    try:
+        millis = int(value)
+    except (TypeError, ValueError):
+        return None
+    if millis <= 0:
+        return None
+    return (
+        datetime.fromtimestamp(millis / 1000, tz=timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _opencode_source_file(session_id: str) -> str:
+    return f"{_OPENCODE_SOURCE_PREFIX}{session_id}"
+
+
+def _project_wing_from_directory(directory: str, fallback_wing: str) -> str:
+    from .config import normalize_wing_name
+
+    if isinstance(directory, str) and directory.strip():
+        project = directory.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+        if project:
+            return normalize_wing_name(project)
+    return fallback_wing
+
+
+def _opencode_part_text(part_data: str) -> str:
+    try:
+        part = json.loads(part_data)
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(part, dict) or part.get("type") != "text":
+        return ""
+    text = part.get("text", "")
+    return text if isinstance(text, str) else ""
+
+
+def _opencode_message_role(message_data: str) -> str:
+    try:
+        message = json.loads(message_data)
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(message, dict):
+        return ""
+    role = message.get("role", "")
+    return role if isinstance(role, str) else ""
+
+
+def _messages_to_verbatim_transcript(messages: list[tuple[str, str]]) -> str:
+    """Convert role/text pairs to the miner transcript shape without spellcheck."""
+    lines = []
+    for role, text in messages:
+        if role == "user":
+            lines.append(f"> {text}")
+        else:
+            lines.append(text)
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _opencode_session_authored_at(conn: sqlite3.Connection, session_row) -> Optional[str]:
+    times = [
+        session_row["time_created"],
+        session_row["time_updated"],
+    ]
+    for table in ("message", "part"):
+        try:
+            row = conn.execute(
+                f"select max(time_updated) from {table} where session_id = ?",
+                (session_row["id"],),
+            ).fetchone()
+        except sqlite3.Error:
+            continue
+        if row and row[0] is not None:
+            times.append(row[0])
+    return _opencode_ms_to_iso(max(times))
+
+
+def _opencode_session_transcript(conn: sqlite3.Connection, session_id: str) -> str:
+    messages: list[tuple[str, str]] = []
+    rows = conn.execute(
+        """
+        select id, data
+        from message
+        where session_id = ?
+        order by time_created, id
+        """,
+        (session_id,),
+    ).fetchall()
+    for message_row in rows:
+        role = _opencode_message_role(message_row["data"])
+        if role not in ("user", "assistant"):
+            continue
+        part_rows = conn.execute(
+            """
+            select data
+            from part
+            where session_id = ? and message_id = ?
+            order by time_created, id
+            """,
+            (session_id, message_row["id"]),
+        ).fetchall()
+        parts = [_opencode_part_text(part_row["data"]) for part_row in part_rows]
+        text = "\n".join(part for part in parts if part)
+        if text.strip():
+            messages.append((role, text))
+    if len(messages) < 2:
+        return ""
+    return _messages_to_verbatim_transcript(messages)
+
+
+def _iter_opencode_sessions(db_path: Path):
+    from .config import sqlite_read_uri
+
+    conn = sqlite3.connect(sqlite_read_uri(str(db_path)), uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        session_rows = conn.execute(
+            """
+            select id, directory, title, version, agent, model, time_created, time_updated
+            from session
+            order by time_created, id
+            """
+        ).fetchall()
+        for row in session_rows:
+            session_id = row["id"]
+            if not isinstance(session_id, str) or not session_id.strip():
+                continue
+            yield {
+                "id": session_id,
+                "directory": row["directory"] or "",
+                "title": row["title"] or "",
+                "version": row["version"] or "",
+                "agent": row["agent"] or "",
+                "model": row["model"] or "",
+                "source_file": _opencode_source_file(session_id),
+                "authored_at": _opencode_session_authored_at(conn, row),
+                "content": _opencode_session_transcript(conn, session_id),
+            }
+    finally:
+        conn.close()
+
+
+def _project_wing_from_jsonl_cwd(filepath: Path) -> Optional[str]:
+    """Return a stable project wing from the first recorded transcript cwd.
+
+    Agent transcript stores are machine/path-specific, but shared recall
+    needs a project namespace that survives across machines. When a JSONL
+    transcript records cwd, use the cwd leaf (normalized the same way as
+    project mining) as the wing. The absolute path stays in source metadata;
+    it must not become the shared namespace.
+    """
+    if filepath.suffix != ".jsonl":
+        return None
+    from .config import normalize_wing_name
+
+    try:
+        with filepath.open(encoding="utf-8", errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if i >= 200:
+                    break
+                if '"cwd"' not in line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except (TypeError, ValueError):
+                    continue
+                cwd = data.get("cwd")
+                if not isinstance(cwd, str) or not cwd.strip():
+                    continue
+                project = cwd.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+                if project:
+                    return normalize_wing_name(project)
+    except OSError:
+        return None
+    return None
+
+
+def _resolve_wing_for_file(filepath: Path, root_wing: str, explicit_wing: Optional[str]) -> str:
+    """Resolve the filing wing for one transcript file.
+
+    Explicit ``--wing`` still wins. Otherwise, agent transcripts that record
+    cwd file under a normalized project wing (``mempalace``, ``wormdb``),
+    while generic folders and cwd-less transcripts fall back to the root
+    wing chosen by ``_resolve_wing``.
+    """
+    if explicit_wing:
+        return explicit_wing
+    return _project_wing_from_jsonl_cwd(filepath) or root_wing
 
 
 def _file_chunks_locked(
@@ -533,8 +830,9 @@ def _is_ai_tool_path(path: Path) -> bool:
         ``.claude`` alone is NOT matched — that is the settings/config dir,
         not a conversation source.
 
-    Used by ``_resolve_wing`` to default the destination wing to
-    ``wing_api`` when the user hasn't passed an explicit ``--wing``.
+    Used by ``_resolve_wing`` to default the destination wing to a
+    harness-specific conversations wing when the user hasn't passed an
+    explicit ``--wing``.
     """
     try:
         parts = path.resolve().parts
@@ -551,6 +849,23 @@ def _is_ai_tool_path(path: Path) -> bool:
     return False
 
 
+def _ai_tool_default_wing(path: Path) -> Optional[str]:
+    """Return a harness-specific conversations wing for known AI-tool paths."""
+    try:
+        parts = path.resolve().parts
+    except (OSError, RuntimeError):
+        return None
+
+    if ".codex" in parts:
+        return "codex_conversations"
+    if ".gemini" in parts:
+        return "gemini_conversations"
+    for i in range(len(parts) - 1):
+        if parts[i] == ".claude" and parts[i + 1] == "projects":
+            return "claude_conversations"
+    return None
+
+
 def _resolve_wing(convo_path: Path, wing: Optional[str]) -> str:
     """Determine the destination wing for ``mine_convos``.
 
@@ -558,9 +873,9 @@ def _resolve_wing(convo_path: Path, wing: Optional[str]) -> str:
 
       1. Explicit ``wing`` argument from the user — always wins, even on
          an AI-tool path. Empty string is treated as "no wing".
-      2. AI-tool path detection — defaults to ``wing_api`` so Claude
-         Code / Codex / Gemini conversations group under a single wing
-         dedicated to API-sourced content.
+      2. AI-tool path detection — defaults to a harness-specific
+         conversations wing (for example ``codex_conversations``) so
+         backfilled agent histories stay discoverable by source.
       3. Basename fallback — sanitized via ``config.normalize_wing_name``
          (lowercase, spaces/hyphens collapsed to underscores). Shared
          single source of truth with ``cmd_init``,
@@ -571,8 +886,9 @@ def _resolve_wing(convo_path: Path, wing: Optional[str]) -> str:
 
     if wing:
         return wing
-    if _is_ai_tool_path(convo_path):
-        return "wing_api"
+    ai_tool_wing = _ai_tool_default_wing(convo_path)
+    if ai_tool_wing:
+        return ai_tool_wing
     return normalize_wing_name(convo_path.name)
 
 
@@ -646,6 +962,158 @@ def _compute_hallways_for_wing_safe(wing, collection, drawers_filed):
         print(f"  (hallways skipped: {exc})")
 
 
+def _mine_opencode_db_impl(
+    db_path: Path,
+    palace_path: str,
+    root_wing: str,
+    explicit_wing: Optional[str],
+    agent: str,
+    limit: int,
+    dry_run: bool,
+    extract_mode: str,
+    chunk_size: int,
+    min_chunk_size: int,
+):
+    sessions = list(_iter_opencode_sessions(db_path))
+
+    print(f"\n{'=' * 55}")
+    print("  MemPalace Mine — OpenCode Conversations")
+    print(f"{'=' * 55}")
+    print(f"  Wing:    {explicit_wing or 'project directory'}")
+    print(f"  Source:  {db_path}")
+    limit_suffix = f" (limit: {limit} new)" if limit > 0 else ""
+    print(f"  Sessions:{len(sessions)}{limit_suffix}")
+    print(f"  Palace:  {palace_path}")
+    if dry_run:
+        print("  DRY RUN — nothing will be filed")
+    print("  Note:    importing text turns only; reasoning/tool traces are skipped")
+    print(f"{'-' * 55}\n")
+
+    collection = get_collection(palace_path) if not dry_run else None
+    mined_set: set[str] = (
+        prefetch_mined_set(collection, extract_mode=extract_mode) if not dry_run else set()
+    )
+
+    total_drawers = 0
+    sessions_mined = 0
+    sessions_skipped = 0
+    sessions_processed = 0
+    room_counts = defaultdict(int)
+    filed_wings: set[str] = set()
+
+    for i, session in enumerate(sessions, 1):
+        source_file = session["source_file"]
+        session_wing = (
+            explicit_wing
+            if explicit_wing
+            else _project_wing_from_directory(session.get("directory", ""), root_wing)
+        )
+        content = session.get("content", "")
+
+        if not dry_run and source_file in mined_set:
+            sessions_skipped += 1
+            continue
+
+        sessions_processed += 1
+
+        if not content or len(content.strip()) < min_chunk_size:
+            _register_file_unless_dry_run(
+                collection,
+                dry_run=dry_run,
+                source_file=source_file,
+                wing=session_wing,
+                agent=agent,
+                extract_mode=extract_mode,
+            )
+            continue
+
+        if extract_mode == "general":
+            from .general_extractor import extract_memories
+
+            chunks = extract_memories(content, chunk_size=chunk_size)
+        else:
+            chunks = chunk_exchanges(
+                content,
+                chunk_size=chunk_size,
+                min_chunk_size=min_chunk_size,
+            )
+
+        if not chunks:
+            _register_file_unless_dry_run(
+                collection,
+                dry_run=dry_run,
+                source_file=source_file,
+                wing=session_wing,
+                agent=agent,
+                extract_mode=extract_mode,
+            )
+            continue
+
+        room = detect_convo_room(content) if extract_mode != "general" else None
+
+        if dry_run:
+            if extract_mode == "general":
+                from collections import Counter
+
+                type_counts = Counter(c.get("memory_type", "general") for c in chunks)
+                types_str = ", ".join(f"{t}:{n}" for t, n in type_counts.most_common())
+                print(f"    [DRY RUN] {session['id']} → {len(chunks)} memories ({types_str})")
+            else:
+                print(
+                    f"    [DRY RUN] {session['id']} → wing:{session_wing} room:{room} ({len(chunks)} drawers)"
+                )
+                room_counts[room] += 1
+            total_drawers += len(chunks)
+            sessions_mined += 1
+            if limit > 0 and sessions_mined >= limit:
+                break
+            continue
+
+        if extract_mode != "general":
+            room_counts[room] += 1
+
+        drawers_added, room_delta, skipped = _file_chunks_locked(
+            collection,
+            source_file,
+            chunks,
+            session_wing,
+            room,
+            agent,
+            extract_mode,
+            authored_at=session.get("authored_at"),
+        )
+        if skipped:
+            sessions_skipped += 1
+            continue
+        for r, n in room_delta.items():
+            room_counts[r] += n
+
+        total_drawers += drawers_added
+        filed_wings.add(session_wing)
+        sessions_mined += 1
+        title = session.get("title") or session["id"]
+        print(f"  + [{i:4}/{len(sessions)}] {title[:50]:50} +{drawers_added}")
+        if limit > 0 and sessions_mined >= limit:
+            break
+
+    if not dry_run:
+        for filed_wing in sorted(filed_wings or {root_wing}):
+            _compute_hallways_for_wing_safe(filed_wing, collection, total_drawers)
+        _validate_palace_fts5_after_mine(palace_path)
+
+    print(f"\n{'=' * 55}")
+    print("  Done.")
+    print(f"  Sessions processed: {sessions_processed}")
+    print(f"  Sessions skipped (already filed): {sessions_skipped}")
+    print(f"  Drawers filed: {total_drawers}")
+    if room_counts:
+        print("\n  By room:")
+        for room, count in sorted(room_counts.items(), key=lambda x: x[1], reverse=True):
+            print(f"    {room:20} {count} sessions")
+    print('\n  Next: mempalace search "what you\'re looking for"')
+    print(f"{'=' * 55}\n")
+
+
 def _mine_convos_impl(
     convo_dir: str,
     palace_path: str,
@@ -671,14 +1139,30 @@ def _mine_convos_impl(
     cfg_min_chunk_size = explicit_min if explicit_min is not None else MIN_CHUNK_SIZE
 
     convo_path = Path(convo_dir).expanduser().resolve()
-    wing = _resolve_wing(convo_path, wing)
+    opencode_db_path = _resolve_opencode_db_path(convo_path)
+    if opencode_db_path is not None:
+        root_wing = _resolve_wing(opencode_db_path.parent, wing)
+        return _mine_opencode_db_impl(
+            opencode_db_path,
+            palace_path,
+            root_wing=root_wing,
+            explicit_wing=wing,
+            agent=agent,
+            limit=limit,
+            dry_run=dry_run,
+            extract_mode=extract_mode,
+            chunk_size=cfg_chunk_size,
+            min_chunk_size=cfg_min_chunk_size,
+        )
+
+    root_wing = _resolve_wing(convo_path, wing)
 
     files = scan_convos(convo_dir)
 
     print(f"\n{'=' * 55}")
     print("  MemPalace Mine — Conversations")
     print(f"{'=' * 55}")
-    print(f"  Wing:    {wing}")
+    print(f"  Wing:    {root_wing}")
     print(f"  Source:  {convo_path}")
     limit_suffix = f" (limit: {limit} new)" if limit > 0 else ""
     print(f"  Files:   {len(files)}{limit_suffix}")
@@ -703,10 +1187,12 @@ def _mine_convos_impl(
     files_skipped = 0
     files_processed = 0
     room_counts = defaultdict(int)
+    filed_wings: set[str] = set()
 
     for i, filepath in enumerate(files, 1):
         files_processed = i
         source_file = str(filepath)
+        file_wing = _resolve_wing_for_file(filepath, root_wing, wing)
 
         # Skip if already filed at current NORMALIZE_VERSION
         if not dry_run and source_file in mined_set:
@@ -721,13 +1207,25 @@ def _mine_convos_impl(
         try:
             content = normalize(str(filepath))
         except (OSError, ValueError):
-            if not dry_run:
-                _register_file(collection, source_file, wing, agent, extract_mode)
+            _register_file_unless_dry_run(
+                collection,
+                dry_run=dry_run,
+                source_file=source_file,
+                wing=file_wing,
+                agent=agent,
+                extract_mode=extract_mode,
+            )
             continue
 
         if not content or len(content.strip()) < cfg_min_chunk_size:
-            if not dry_run:
-                _register_file(collection, source_file, wing, agent, extract_mode)
+            _register_file_unless_dry_run(
+                collection,
+                dry_run=dry_run,
+                source_file=source_file,
+                wing=file_wing,
+                agent=agent,
+                extract_mode=extract_mode,
+            )
             continue
 
         # Chunk — either exchange pairs or general extraction
@@ -744,8 +1242,14 @@ def _mine_convos_impl(
             )
 
         if not chunks:
-            if not dry_run:
-                _register_file(collection, source_file, wing, agent, extract_mode)
+            _register_file_unless_dry_run(
+                collection,
+                dry_run=dry_run,
+                source_file=source_file,
+                wing=file_wing,
+                agent=agent,
+                extract_mode=extract_mode,
+            )
             continue
 
         # Detect room from content (general mode uses memory_type instead)
@@ -784,7 +1288,7 @@ def _mine_convos_impl(
             collection,
             source_file,
             chunks,
-            wing,
+            file_wing,
             room,
             agent,
             extract_mode,
@@ -797,6 +1301,7 @@ def _mine_convos_impl(
             room_counts[r] += n
 
         total_drawers += drawers_added
+        filed_wings.add(file_wing)
         files_mined += 1
         print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")
         if limit > 0 and files_mined >= limit:
@@ -806,7 +1311,8 @@ def _mine_convos_impl(
         # Compute hallways before the FTS5 validation: the latter opens a direct sqlite
         # connection to the Chroma DB, which can invalidate the live collection handle on
         # some Chroma builds and make the hallway fetch fail.
-        _compute_hallways_for_wing_safe(wing, collection, total_drawers)
+        for filed_wing in sorted(filed_wings or {root_wing}):
+            _compute_hallways_for_wing_safe(filed_wing, collection, total_drawers)
         _validate_palace_fts5_after_mine(palace_path)
 
     print(f"\n{'=' * 55}")

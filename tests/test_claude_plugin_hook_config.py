@@ -6,7 +6,9 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-HOOK_CONFIG = REPO_ROOT / ".claude-plugin" / "hooks" / "hooks.json"
+PLUGIN_ROOT = REPO_ROOT / ".claude-plugin"
+HOOK_CONFIG = PLUGIN_ROOT / "hooks" / "hooks.json"
+PLUGIN_CONFIG = PLUGIN_ROOT / "plugin.json"
 
 # Per-event hook-level timeout bounds (seconds): (floor, ceiling).
 #
@@ -111,3 +113,9 @@ def test_session_end_hook_uses_background_wrapper(hook_config: dict) -> None:
 
     assert any("mempal-session-end-hook.sh" in command for command in commands)
     assert not any("mempal-precompact-hook.sh" in command for command in commands)
+
+
+def test_plugin_manifest_declares_mempalace_server() -> None:
+    """Claude plugin discovery reads MCP servers from the plugin manifest."""
+    data = json.loads(PLUGIN_CONFIG.read_text(encoding="utf-8"))
+    assert data["mcpServers"]["mempalace"]["command"] == "mempalace-mcp"

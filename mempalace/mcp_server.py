@@ -58,6 +58,7 @@ from typing import Optional  # noqa: E402
 
 from .config import (  # noqa: E402
     MempalaceConfig,
+    normalize_wing_name,
     sanitize_kg_value,
     sanitize_name,
     sanitize_content,
@@ -96,7 +97,7 @@ from .hallways import (  # noqa: E402
     delete_hallway,
 )
 
-from .knowledge_graph import KnowledgeGraph, DEFAULT_KG_PATH  # noqa: E402
+from .knowledge_graph import KnowledgeGraph  # noqa: E402
 from .collision_scan import assert_no_collisions  # noqa: E402
 from .ids import ID_RECIPE, make_drawer_id_from_content  # noqa: E402
 
@@ -459,6 +460,15 @@ def _mcp_peer_writer_refusal(req_id, tool_name: str):
                 "tool": tool_name,
                 "palace": _config.palace_path,
                 "reason": reason,
+                "hint": (
+                    "For multiple agents sharing one palace, connect them to one shared "
+                    "MemPalace MCP HTTP server instead of launching separate stdio "
+                    "mempalace-mcp writers (for example: mempalace serve --host "
+                    "127.0.0.1 --port 8765). For a local stdio setup, close stale "
+                    "agent sessions so only one mempalace-mcp owns the writer lease. "
+                    "Do not set the override unless you explicitly accept the Chroma "
+                    "stale-state/corruption risk."
+                ),
                 "override_env": _MCP_ALLOW_PEER_WRITER_ENV,
             },
         },
@@ -586,9 +596,8 @@ def _mcp_idle_timeout_secs() -> float:
 
 
 def _resolve_kg_path() -> str:
-    if _palace_flag_given:
-        return os.path.join(_config.palace_path, "knowledge_graph.sqlite3")
-    return DEFAULT_KG_PATH
+    palace_path = getattr(_config, "palace_path", None) or MempalaceConfig().palace_path
+    return os.path.join(os.path.expanduser(palace_path), "knowledge_graph.sqlite3")
 
 
 def _canonicalize_kg_path(path: str) -> str:
@@ -1269,6 +1278,18 @@ def _sanitize_optional_name(value: str = None, field_name: str = "name") -> str:
     return sanitize_name(value, field_name)
 
 
+def _sanitize_wing_name(value: str, field_name: str = "wing") -> str:
+    """Normalize and validate project wing names at the MCP boundary."""
+    return sanitize_name(normalize_wing_name(value), field_name)
+
+
+def _sanitize_optional_wing_name(value: str = None, field_name: str = "wing") -> str:
+    """Validate optional wing filters after project-name normalization."""
+    if value is None or not value.strip():
+        return None
+    return _sanitize_wing_name(value, field_name)
+
+
 # Bounds the whole stored source_file string (often an absolute path), so it is
 # Linux PATH_MAX rather than the 128-char wing/room NAME limit.
 _MAX_SOURCE_FILE_LENGTH = 4096
@@ -1801,7 +1822,7 @@ def tool_list_wings():
 
 def tool_list_rooms(wing: str = None):
     try:
-        wing = _sanitize_optional_name(wing, "wing")
+        wing = _sanitize_optional_wing_name(wing, "wing")
     except ValueError as e:
         return {"error": str(e)}
     fast = _sqlite_taxonomy()
@@ -1914,13 +1935,13 @@ def tool_search(
     wing: str = None,
     room: str = None,
     source_file: str = None,
-    max_distance: float = 1.5,
+    max_distance: float = 0.0,
     min_similarity: float = None,
     context: str = None,
 ):
     limit = max(1, min(limit, _MAX_RESULTS))
     try:
-        wing = _sanitize_optional_name(wing, "wing")
+        wing = _sanitize_optional_wing_name(wing, "wing")
         room = _sanitize_optional_name(room, "room")
         source_file = _sanitize_optional_source_file(source_file)
     except ValueError as e:
@@ -2056,8 +2077,8 @@ def tool_traverse_graph(start_room: str, max_hops: int = 2):
 def tool_find_tunnels(wing_a: str = None, wing_b: str = None):
     """Find rooms that bridge two wings — the hallways connecting domains."""
     try:
-        wing_a = _sanitize_optional_name(wing_a, "wing_a")
-        wing_b = _sanitize_optional_name(wing_b, "wing_b")
+        wing_a = _sanitize_optional_wing_name(wing_a, "wing_a")
+        wing_b = _sanitize_optional_wing_name(wing_b, "wing_b")
     except ValueError as e:
         return {"error": str(e)}
     col = _get_collection()
@@ -2121,7 +2142,7 @@ def tool_create_tunnel(
 def tool_list_tunnels(wing: str = None):
     """List all explicit cross-wing tunnels, optionally filtered by wing."""
     try:
-        wing = _sanitize_optional_name(wing, "wing")
+        wing = _sanitize_optional_wing_name(wing, "wing")
     except ValueError as e:
         return {"error": str(e)}
     return list_tunnels(wing)
@@ -2137,7 +2158,7 @@ def tool_delete_tunnel(tunnel_id: str):
 def tool_list_hallways(wing: str = None):
     """List within-wing hallway records, optionally filtered by wing."""
     try:
-        wing = _sanitize_optional_name(wing, "wing")
+        wing = _sanitize_optional_wing_name(wing, "wing")
     except ValueError as e:
         return {"error": str(e)}
     return list_hallways(wing)
@@ -2153,7 +2174,7 @@ def tool_delete_hallway(hallway_id: str):
 def tool_follow_tunnels(wing: str, room: str):
     """Follow explicit tunnels from a room to see connected drawers in other wings."""
     try:
-        wing = sanitize_name(wing, "wing")
+        wing = _sanitize_wing_name(wing, "wing")
         room = sanitize_name(room, "room")
     except ValueError as e:
         return {"error": str(e)}
@@ -2427,7 +2448,7 @@ def tool_add_drawer(
     """
     global _metadata_cache
     try:
-        wing = sanitize_name(wing, "wing")
+        wing = _sanitize_wing_name(wing, "wing")
         room = sanitize_name(room, "room")
         content = sanitize_content(content)
         if source_file:
@@ -3020,7 +3041,7 @@ def tool_list_drawers(
     offset = max(0, offset)
 
     try:
-        wing = _sanitize_optional_name(wing, "wing")
+        wing = _sanitize_optional_wing_name(wing, "wing")
         room = _sanitize_optional_name(room, "room")
         since_dt = _parse_date_filter(since, "since")
         before_dt = _parse_date_filter(before, "before")
@@ -3101,7 +3122,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
 
         if wing is not None:
             try:
-                wing = sanitize_name(wing, "wing")
+                wing = _sanitize_wing_name(wing, "wing")
             except ValueError as e:
                 return {"success": False, "error": str(e)}
             if wing.lower() != str(old_meta.get("wing") or "").lower():
@@ -3331,7 +3352,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
         return {"success": False, "error": str(e)}
 
     if wing:
-        wing = sanitize_name(wing)
+        wing = _sanitize_wing_name(wing)
     else:
         wing = f"wing_{agent_name.replace(' ', '_')}"
     room = "diary"
@@ -3382,6 +3403,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
                 "success": True,
                 "entry_id": entry_id,
                 "agent": agent_name,
+                "wing": wing,
                 "topic": topic,
                 "timestamp": now.isoformat(),
                 "chunks": 1,
@@ -3426,6 +3448,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
             "success": True,
             "entry_id": entry_id,
             "agent": agent_name,
+            "wing": wing,
             "topic": topic,
             "timestamp": now.isoformat(),
             "chunks": len(chunk_ids),
@@ -3454,7 +3477,7 @@ def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
     try:
         agent_name = sanitize_name(agent_name, "agent_name").lower()
         if wing:
-            wing = sanitize_name(wing)
+            wing = _sanitize_wing_name(wing)
     except ValueError as e:
         return {"error": str(e)}
     last_n = max(1, min(last_n, 100))
@@ -4075,7 +4098,7 @@ TOOLS = {
                 },
                 "max_distance": {
                     "type": "number",
-                    "description": "Max cosine distance threshold (0=identical, 2=opposite). Results further than this are dropped. Lower = stricter. Default 1.5. Set to 0 to disable.",
+                    "description": "Max cosine distance threshold (0=identical, 2=opposite). Results further than this are dropped. Lower = stricter. Default 0 disables filtering so lexical/exact matches can be recalled.",
                 },
                 "context": {
                     "type": "string",

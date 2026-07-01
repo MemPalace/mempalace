@@ -524,6 +524,88 @@ def test_search_union_uses_sqlite_exact_lexical_search(tmp_path, monkeypatch):
     assert result["results"][0]["matched_via"] == "bm25_backend"
 
 
+def test_search_auto_uses_lexical_union_by_default(tmp_path, monkeypatch):
+    import mempalace.backends.embedding_wrapper as embedding_wrapper
+    from mempalace.palace import get_collection
+    from mempalace.searcher import search_memories
+
+    def fake_embed(texts):
+        vectors = []
+        for text in texts:
+            if text == "rareterm":
+                vectors.append([1.0, 0.0])
+            elif "rareterm" in text:
+                vectors.append([0.0, 1.0])
+            else:
+                vectors.append([0.5, math.sqrt(0.75)])
+        return vectors
+
+    monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "sqlite_exact")
+    monkeypatch.setattr(embedding_wrapper, "_embed_texts", fake_embed)
+
+    col = get_collection(str(tmp_path), create=True)
+    col.add(
+        ids=["d1", "d2", "d3", "rare"],
+        documents=[
+            "ordinary support note",
+            "ordinary billing note",
+            "ordinary project note",
+            "rareterm rareterm rareterm policy note",
+        ],
+        metadatas=[
+            {"wing": "w", "room": "r", "source_file": "/tmp/d1.md", "chunk_index": 0},
+            {"wing": "w", "room": "r", "source_file": "/tmp/d2.md", "chunk_index": 0},
+            {"wing": "w", "room": "r", "source_file": "/tmp/d3.md", "chunk_index": 0},
+            {"wing": "w", "room": "r", "source_file": "/tmp/rare.md", "chunk_index": 0},
+        ],
+    )
+
+    result = search_memories("rareterm", str(tmp_path), n_results=1)
+
+    assert result["results"][0]["source_file"] == "rare.md"
+    assert result["results"][0]["matched_via"] == "bm25_backend"
+
+
+def test_search_auto_keeps_lexical_hits_without_source_file(tmp_path, monkeypatch):
+    import mempalace.backends.embedding_wrapper as embedding_wrapper
+    from mempalace.palace import get_collection
+    from mempalace.searcher import search_memories
+
+    def fake_embed(texts):
+        vectors = []
+        for text in texts:
+            if text == "source less canary":
+                vectors.append([1.0, 0.0])
+            elif "source less canary" in text:
+                vectors.append([0.0, 1.0])
+            else:
+                vectors.append([0.5, math.sqrt(0.75)])
+        return vectors
+
+    monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "sqlite_exact")
+    monkeypatch.setattr(embedding_wrapper, "_embed_texts", fake_embed)
+
+    col = get_collection(str(tmp_path), create=True)
+    col.add(
+        ids=["ordinary", "source-less"],
+        documents=[
+            "ordinary support note",
+            "source less canary drawer from an MCP write",
+        ],
+        metadatas=[
+            {"wing": "w", "room": "r", "source_file": "/tmp/ordinary.md", "chunk_index": 0},
+            {"wing": "shared", "room": "canaries"},
+        ],
+    )
+
+    result = search_memories("source less canary", str(tmp_path), n_results=1)
+
+    top = result["results"][0]
+    assert top["wing"] == "shared"
+    assert top["source_file"] == "?"
+    assert top["matched_via"] == "bm25_backend"
+
+
 def test_search_union_reports_unsupported_lexical_capability(monkeypatch, tmp_path):
     import mempalace.searcher as searcher
 

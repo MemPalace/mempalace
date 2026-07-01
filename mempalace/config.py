@@ -711,6 +711,30 @@ class MempalaceConfig:
         except (OSError, NotImplementedError):
             pass
 
+    def set_palace_path(self, palace_path: str) -> str:
+        """Persist the default palace path to ``config.json``.
+
+        Returns the normalized absolute path that was written. Environment
+        variables still have higher precedence at read time; this setter only
+        updates the durable config-file default.
+        """
+        if not isinstance(palace_path, str) or not palace_path.strip():
+            raise ValueError("palace_path must be a non-empty string")
+        resolved = os.path.abspath(os.path.expanduser(palace_path.strip()))
+        self._file_config["palace_path"] = resolved
+        self._config_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self._config_dir.chmod(0o700)
+        except (OSError, NotImplementedError):
+            pass
+        with open(self._config_file, "w", encoding="utf-8") as f:
+            json.dump(self._file_config, f, indent=2, ensure_ascii=False)
+        try:
+            self._config_file.chmod(0o600)
+        except (OSError, NotImplementedError):
+            pass
+        return resolved
+
     def set_backend(self, backend: str) -> None:
         """Persist the storage backend choice to ``config.json``."""
         backend = str(backend).strip().lower()
@@ -813,10 +837,19 @@ class MempalaceConfig:
         if "hooks" not in self._file_config:
             self._file_config["hooks"] = {}
         self._file_config["hooks"][key] = value
+        self._config_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self._config_dir.chmod(0o700)
+        except (OSError, NotImplementedError):
+            pass
         try:
             with open(self._config_file, "w", encoding="utf-8") as f:
                 json.dump(self._file_config, f, indent=2, ensure_ascii=False)
         except OSError:
+            pass
+        try:
+            self._config_file.chmod(0o600)
+        except (OSError, NotImplementedError):
             pass
 
     def init(self):

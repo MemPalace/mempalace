@@ -1895,6 +1895,38 @@ class TestWriteTools:
         assert all(a["success"] for a in result["added"])
         assert result["diary"]["success"] is True
 
+    def test_checkpoint_normalizes_project_wing_names(self, monkeypatch, config, palace_path, kg):
+        """MCP writes must use the same project wing slug as transcript miners."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        client, col = _get_collection(palace_path, create=True)
+        del client
+        from mempalace.mcp_server import tool_checkpoint
+
+        result = tool_checkpoint(
+            items=[
+                {
+                    "wing": "liquid-llm",
+                    "room": "debugging",
+                    "content": "Snake case decoding broke the Ollama model picker.",
+                }
+            ],
+            diary={
+                "agent_name": "opencode",
+                "wing": "liquid-llm",
+                "entry": "SESSION|liquid.llm.debugged|★",
+            },
+        )
+
+        assert len(result["added"]) == 1
+        assert result["added"][0]["wing"] == "liquid_llm"
+        assert result["diary"]["wing"] == "liquid_llm"
+
+        rows = col.get(where={"wing": "liquid_llm"})
+        docs = "\n".join(rows["documents"])
+        assert "Snake case decoding broke the Ollama model picker." in docs
+        assert "SESSION|liquid.llm.debugged|★" in docs
+        assert not col.get(where={"wing": "liquid-llm"})["ids"]
+
     def test_checkpoint_skips_semantic_duplicates(self, monkeypatch, config, kg):
         from mempalace import mcp_server
 
@@ -3885,6 +3917,21 @@ class TestKGLazyCache:
         assert kg1 is kg2
         assert len(mcp_server._kg_by_path) == 1
 
+    def test_resolve_kg_path_uses_configured_palace_without_flag(self, tmp_path, monkeypatch):
+        """MCP clients launched from config must use the active palace sidecar.
+
+        The old fallback used ``~/.mempalace/knowledge_graph.sqlite3`` unless
+        the server was launched with --palace, which split KG facts away from
+        the drawer palace for configured clients like Hermes Desktop.
+        """
+        from mempalace import mcp_server
+
+        palace = tmp_path / "palace"
+        monkeypatch.setattr(mcp_server, "_palace_flag_given", False)
+        monkeypatch.setattr(mcp_server, "_config", type("C", (), {"palace_path": str(palace)})())
+
+        assert mcp_server._resolve_kg_path() == str(palace / "knowledge_graph.sqlite3")
+
     def test_get_kg_different_paths_different_instances(self, tmp_path, monkeypatch):
         """Different palace paths map to different KG instances."""
         from mempalace import mcp_server
@@ -4780,6 +4827,8 @@ def test_peer_writer_guard_refuses_mutating_tool_before_handler(monkeypatch):
     assert response["error"]["code"] == -32001
     assert "read-only" in response["error"]["message"]
     assert response["error"]["data"]["tool"] == "mempalace_add_drawer"
+    assert "shared MemPalace MCP HTTP server" in response["error"]["data"]["hint"]
+    assert "stale-state/corruption risk" in response["error"]["data"]["hint"]
 
 
 def test_peer_writer_guard_does_not_gate_read_tool(monkeypatch):

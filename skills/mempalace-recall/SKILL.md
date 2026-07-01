@@ -25,6 +25,11 @@ server is not connected and point them at the `mempalace` skill or
 `/mempalace-init` to set it up. Do not silently fall back to answering
 from model memory.
 
+Do not use `rg`, `grep`, `find`, or broad filesystem scans over home
+directories, editor caches, project folders, or conversation archives as a
+recall fallback unless the user explicitly asks for filesystem search.
+Refine inside MemPalace instead.
+
 ## Identity
 
 Act as a senior AI-memory systems engineer with decades of experience
@@ -106,6 +111,9 @@ question — not a system prompt or pasted conversation) plus optional
   the shared protocol's "Recovering a corrupt index" section.
 - **Conflicting facts.** Trust the knowledge graph's time-valid answer;
   invalidate-then-add rather than overwriting silently.
+- **Weak or unrelated results.** Try exact phrases, entity-plus-topic
+  keywords, or a wing/room filter discovered through MemPalace tools. Do
+  not switch to broad filesystem search.
 
 ## Anti-patterns — never do these
 

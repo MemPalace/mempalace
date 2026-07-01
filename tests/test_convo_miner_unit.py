@@ -40,8 +40,8 @@ class TestChunkExchanges:
         chunks = chunk_exchanges(content)
         assert len(chunks) >= 2
 
-    def test_paragraph_line_group_fallback(self):
-        """Long content with no paragraph breaks chunks by line groups.
+    def test_paragraph_fallback_long_lines_respect_chunk_size(self):
+        """Long content with no paragraph breaks still respects chunk size.
 
         Each emitted drawer must respect CHUNK_SIZE. Before #1534 the
         fallback chunker emitted one drawer per 25-line group without
@@ -55,18 +55,14 @@ class TestChunkExchanges:
         max_len = max(len(c["content"]) for c in chunks)
         assert max_len <= CHUNK_SIZE, f"oversized chunk: max_len={max_len}"
 
-    def test_line_group_fallback_drops_sub_min_trailing_group(self):
-        """A trailing line-group whose stripped length is at or below
-        MIN_CHUNK_SIZE must be dropped, not emitted as a tiny drawer."""
+    def test_paragraph_fallback_preserves_short_trailing_lines(self):
+        """Line-based fallback must not drop a short trailing line."""
         lines = [f"Line {i}" for i in range(51)]
         content = "\n".join(lines)
         chunks = chunk_exchanges(content)
-        from mempalace.convo_miner import MIN_CHUNK_SIZE
 
-        assert len(chunks) == 2, (
-            f"expected 2 drawers (groups 0-24 and 25-49); got {len(chunks)}; "
-            f"the single-line tail group should drop below MIN_CHUNK_SIZE={MIN_CHUNK_SIZE}"
-        )
+        assert "".join(chunk["content"] for chunk in chunks) == content
+        assert chunks[-1]["content"].endswith("Line 50")
 
     def test_empty_content(self):
         chunks = chunk_exchanges("")
@@ -136,9 +132,7 @@ class TestChunkExchanges:
         max_len = max(len(c["content"]) for c in chunks)
         assert max_len <= CHUNK_SIZE, f"oversized chunk: max_len={max_len}"
         assert len(chunks) > 1, "5000-char content should produce multiple drawers"
-        assert chunks[-1]["content"] == tail, (
-            "trailing paragraph must be preserved as the last drawer"
-        )
+        assert "".join(c["content"] for c in chunks) == content
 
     def test_custom_chunk_size_propagates_to_paragraph_path(self):
         """User-supplied chunk_size must govern the paragraph chunker, not

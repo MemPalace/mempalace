@@ -1,5 +1,6 @@
 {
   "name": "mempalace",
+  "description": "MemPalace plugins for local AI memory, search, and auto-save hooks.",
   "owner": {
     "name": "milla-jovovich",
     "url": "https://github.com/MemPalace"

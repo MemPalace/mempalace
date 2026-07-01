@@ -447,7 +447,7 @@ def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> lis
         # Chroma flushes HNSW asynchronously. A healthy metadata file proves the
         # ordinary stale-by-mtime case is just flush lag.
         if not payload_corrupt and _segment_appears_healthy(seg_dir):
-            logger.info(
+            logger.debug(
                 "HNSW mtime gap %.0fs on %s exceeds threshold but segment "
                 "metadata and payload size are intact — flush-lag, not "
                 "corruption. Leaving in place.",
@@ -1693,7 +1693,11 @@ class ChromaCollection(BaseCollection):
         try:
             if tokens:
                 fts_query = " OR ".join(tokens)
-                # If a metadata filter is present, do not cap before filtering:
+                # Order by SQLite FTS rank before applying the unfiltered cap.
+                # Without this, FTS returns rowid order; newer exact matches
+                # can fall outside the first window and global recall misses
+                # them even though a wing-scoped search finds them. If a
+                # metadata filter is present, do not cap before filtering:
                 # otherwise a common term can fill the window with wrong-scope
                 # rows and hide valid scoped hits later in the FTS result set.
                 limit_sql = "" if where else "LIMIT ?"
@@ -1710,6 +1714,7 @@ class ChromaCollection(BaseCollection):
                         JOIN collections c ON s.collection = c.id
                         WHERE embedding_fulltext_search MATCH ?
                           AND c.name = ?
+                        ORDER BY rank
                         {limit_sql}
                         """,
                         params,

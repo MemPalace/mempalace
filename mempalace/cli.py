@@ -554,6 +554,13 @@ def cmd_mine(args):
         sys.exit(2)
 
     if getattr(args, "daemon", False):
+        if getattr(args, "kg_extract", False):
+            print(
+                "mempalace: --kg-extract is not yet supported with --daemon; "
+                "run `mempalace kg-extract` after the daemon mine completes",
+                file=sys.stderr,
+            )
+            sys.exit(2)
         payload = {
             "source": args.dir,
             "mode": args.mode,
@@ -620,6 +627,9 @@ def cmd_mine(args):
                 include_ignored=include_ignored,
                 max_chunks_per_file=getattr(args, "max_chunks_per_file", None),
             )
+
+        if getattr(args, "kg_extract", False) and not args.dry_run:
+            _run_kg_extract_from_args(args, palace_path)
     except MineAlreadyRunning as exc:
         # A live MCP server or another mine is already writing to this
         # palace. Surface the holder identity so the operator knows what
@@ -645,6 +655,101 @@ def cmd_mine(args):
             file=sys.stderr,
         )
         sys.exit(1)
+
+
+def _run_kg_extract_from_args(args, palace_path: str):
+    from .kg_extractor import LLMConfig, extract_kg_triples
+
+    timeout_s = float(getattr(args, "kg_timeout", 60.0))
+    if timeout_s <= 0:
+        print("mempalace: KG extraction timeout must be greater than 0", file=sys.stderr)
+        sys.exit(2)
+    max_tokens = getattr(args, "kg_max_tokens", None)
+    if max_tokens is not None and max_tokens <= 0:
+        print("mempalace: KG extraction max tokens must be greater than 0", file=sys.stderr)
+        sys.exit(2)
+
+    cfg = LLMConfig(
+        endpoint=getattr(args, "kg_endpoint", None),
+        key=getattr(args, "kg_key", None),
+        model=getattr(args, "kg_model", None),
+        provider=getattr(args, "kg_provider", None),
+        no_think=getattr(args, "kg_no_think", None),
+        max_output_tokens=getattr(args, "kg_max_tokens", None),
+    )
+    result = extract_kg_triples(
+        palace_path,
+        wing=getattr(args, "kg_wing", None) or getattr(args, "wing", None),
+        room=getattr(args, "kg_room", None),
+        limit=getattr(args, "kg_limit", 0) or 0,
+        dry_run=getattr(args, "dry_run", False),
+        min_confidence=getattr(args, "kg_min_confidence", 0.0),
+        cfg=cfg,
+        show_facts=getattr(args, "kg_show_facts", False),
+        show_rejected=getattr(args, "kg_show_rejected", False),
+        include_diary=getattr(args, "kg_include_diary", False),
+        timeout_s=timeout_s,
+    )
+    if not result.get("success"):
+        sys.exit(130 if result.get("interrupted") else 1)
+
+
+def cmd_kg_extract(args):
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    _run_kg_extract_from_args(args, palace_path)
+
+
+def _parse_kg_model_args(values: list[str] | None) -> list[str]:
+    models: list[str] = []
+    for value in values or []:
+        for item in str(value).split(","):
+            model = item.strip()
+            if model:
+                models.append(model)
+    if not models:
+        env_model = os.environ.get("LLM_MODEL", "").strip()
+        if env_model:
+            models.append(env_model)
+    return models
+
+
+def cmd_kg_benchmark(args):
+    from .kg_extractor import benchmark_kg_models
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    timeout_s = float(getattr(args, "kg_timeout", 30.0))
+    if timeout_s <= 0:
+        print("mempalace: KG benchmark timeout must be greater than 0", file=sys.stderr)
+        sys.exit(2)
+    samples = int(getattr(args, "kg_samples", 3))
+    if samples <= 0:
+        print("mempalace: KG benchmark samples must be greater than 0", file=sys.stderr)
+        sys.exit(2)
+    max_tokens = getattr(args, "kg_max_tokens", None)
+    if max_tokens is not None and max_tokens <= 0:
+        print("mempalace: KG benchmark max tokens must be greater than 0", file=sys.stderr)
+        sys.exit(2)
+
+    result = benchmark_kg_models(
+        palace_path,
+        models=_parse_kg_model_args(getattr(args, "kg_models", None)),
+        endpoint=getattr(args, "kg_endpoint", None),
+        key=getattr(args, "kg_key", None),
+        provider=getattr(args, "kg_provider", None),
+        wing=getattr(args, "kg_wing", None),
+        room=getattr(args, "kg_room", None),
+        samples=samples,
+        min_confidence=getattr(args, "kg_min_confidence", 0.0),
+        no_think=getattr(args, "kg_no_think", None),
+        max_output_tokens=max_tokens,
+        include_diary=getattr(args, "kg_include_diary", False),
+        timeout_s=timeout_s,
+        show_details=getattr(args, "kg_show_details", False),
+        show_facts=getattr(args, "kg_show_facts", False),
+        show_rejected=getattr(args, "kg_show_rejected", False),
+    )
+    if not result.get("success"):
+        sys.exit(130 if result.get("interrupted") else 1)
 
 
 def cmd_sweep(args):
@@ -1040,12 +1145,14 @@ def cmd_palace_set_embedder(args):
         os.path.expanduser(args.palace) if args.palace else config.palace_path
     )
     model = getattr(args, "model", None)
+    collection_name = _normalize_embedder_collection_arg(getattr(args, "collection", None))
     try:
         old, new = set_palace_embedder_identity(
             palace_path,
             model=model,
             force=getattr(args, "force", False),
             backend=_backend_arg(args),
+            collection_name=collection_name,
         )
     except EmbedderIdentityMismatchError as exc:
         print(f"  ✗ {exc}")
@@ -1068,6 +1175,27 @@ def cmd_palace_set_embedder(args):
             f"  ⚠ configured model is {configured!r}; set MEMPALACE_EMBEDDING_MODEL="
             f"{new.model_name} (or run onboarding) so normal opens of this palace match."
         )
+
+
+def _normalize_embedder_collection_arg(value: str | None) -> str | None:
+    """Normalize user-friendly collection aliases for `palace set-embedder`."""
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    aliases = {
+        "drawers": "mempalace_drawers",
+        "drawer": "mempalace_drawers",
+        "mempalace_drawers": "mempalace_drawers",
+        "closets": "mempalace_closets",
+        "closet": "mempalace_closets",
+        "mempalace_closets": "mempalace_closets",
+    }
+    if normalized not in aliases:
+        raise SystemExit(
+            "  ✗ --collection must be one of: drawers, closets, "
+            "mempalace_drawers, mempalace_closets"
+        )
+    return aliases[normalized]
 
 
 def cmd_repair_status(args):
@@ -1326,6 +1454,75 @@ def cmd_instructions(args):
     from .instructions_cli import run_instructions
 
     run_instructions(name=args.name)
+
+
+_CONFIG_HOOK_KEYS = {
+    "hooks.auto-save": "auto_save",
+    "hooks.silent-save": "silent_save",
+    "hooks.desktop-toast": "desktop_toast",
+    "hooks.daemon": "daemon",
+}
+
+
+def _parse_config_bool(value: str) -> bool:
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError("expected true/false, yes/no, on/off, or 1/0")
+
+
+def cmd_config(args):
+    """Show or update the user's MemPalace config."""
+    cfg = MempalaceConfig()
+    action = getattr(args, "config_action", None)
+
+    if action == "show":
+        config_file = getattr(cfg, "_config_file", Path.home() / ".mempalace" / "config.json")
+        print("MemPalace config:")
+        print(f"  file: {config_file}")
+        print(f"  palace_path: {cfg.palace_path}")
+        print(f"  backend: {cfg.backend}")
+        print(f"  embedding_model: {cfg.embedding_model}")
+        print(f"  hooks.auto_save: {str(cfg.hooks_auto_save).lower()}")
+        print(f"  hooks.silent_save: {str(cfg.hook_silent_save).lower()}")
+        print(f"  hooks.desktop_toast: {str(cfg.hook_desktop_toast).lower()}")
+        print(f"  hooks.daemon: {str(cfg.hook_use_daemon).lower()}")
+        return
+
+    if action == "set":
+        key = args.key
+        value = args.value
+        try:
+            if key == "palace-path":
+                written = cfg.set_palace_path(value)
+                print(f"palace_path = {written}")
+                if os.environ.get("MEMPALACE_PALACE_PATH") or os.environ.get("MEMPAL_PALACE_PATH"):
+                    print(
+                        "Note: MEMPALACE_PALACE_PATH/MEMPAL_PALACE_PATH is set and "
+                        "overrides config in this process.",
+                        file=sys.stderr,
+                    )
+            elif key == "backend":
+                cfg.set_backend(value)
+                print(f"backend = {str(value).strip().lower()}")
+            elif key == "embedding-model":
+                cfg.set_embedding_model(value)
+                print(f"embedding_model = {str(value).strip().lower()}")
+            elif key in _CONFIG_HOOK_KEYS:
+                parsed = _parse_config_bool(value)
+                cfg.set_hook_setting(_CONFIG_HOOK_KEYS[key], parsed)
+                print(f"{key} = {str(parsed).lower()}")
+            else:
+                raise ValueError(f"unsupported config key: {key}")
+        except ValueError as exc:
+            print(f"mempalace: {exc}", file=sys.stderr)
+            sys.exit(2)
+        return
+
+    print("mempalace: unknown config action", file=sys.stderr)
+    sys.exit(2)
 
 
 def cmd_mcp(args):
@@ -1857,6 +2054,274 @@ def main():
             f"Windows if you hit ONNX bad_alloc (#1455)."
         ),
     )
+    p_mine.add_argument(
+        "--kg-extract",
+        action="store_true",
+        help=(
+            "After a successful mine, derive knowledge-graph triples from the "
+            "newly available drawers using the configured LLM. Opt-in only."
+        ),
+    )
+    p_mine.add_argument(
+        "--kg-endpoint",
+        default=None,
+        help="LLM base URL for --kg-extract (overrides $LLM_ENDPOINT)",
+    )
+    p_mine.add_argument(
+        "--kg-model",
+        default=None,
+        help="LLM model for --kg-extract (overrides $LLM_MODEL)",
+    )
+    p_mine.add_argument(
+        "--kg-key",
+        default=None,
+        help="LLM bearer token for --kg-extract (overrides $LLM_KEY; optional for local LLMs)",
+    )
+    p_mine.add_argument(
+        "--kg-provider",
+        choices=["openai", "ollama"],
+        default=None,
+        help="LLM API provider for --kg-extract: openai-compatible or native Ollama",
+    )
+    p_mine.add_argument(
+        "--kg-no-think",
+        action="store_true",
+        default=None,
+        help="Prepend /no_think for local thinking models during --kg-extract",
+    )
+    p_mine.add_argument(
+        "--kg-max-tokens",
+        type=int,
+        default=None,
+        help="Maximum completion tokens for each --kg-extract LLM call (default 512)",
+    )
+    p_mine.add_argument(
+        "--kg-limit",
+        type=int,
+        default=0,
+        help="Maximum drawers to process during --kg-extract (0 = all matching drawers)",
+    )
+    p_mine.add_argument(
+        "--kg-room",
+        default=None,
+        help="Limit --kg-extract to one room",
+    )
+    p_mine.add_argument(
+        "--kg-min-confidence",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum LLM confidence for extracted facts. Default 0.0 because "
+            "local-model self-confidence is not calibrated; structural gates do the filtering."
+        ),
+    )
+    p_mine.add_argument(
+        "--kg-timeout",
+        type=float,
+        default=60.0,
+        help="Seconds to wait for each --kg-extract LLM call before failing that drawer",
+    )
+    p_mine.add_argument(
+        "--kg-show-facts",
+        action="store_true",
+        help="Print accepted facts during --kg-extract",
+    )
+    p_mine.add_argument(
+        "--kg-show-rejected",
+        action="store_true",
+        help="Print rejected fact candidates and reasons during --kg-extract",
+    )
+    p_mine.add_argument(
+        "--kg-include-diary",
+        action="store_true",
+        help="Include diary/checkpoint rooms in --kg-extract (skipped by default)",
+    )
+
+    # kg-extract
+    p_kg_extract = sub.add_parser(
+        "kg-extract",
+        help="Derive knowledge-graph triples from existing drawers via an explicit LLM",
+    )
+    p_kg_extract.add_argument("--wing", dest="kg_wing", default=None, help="Limit to one wing")
+    p_kg_extract.add_argument("--room", dest="kg_room", default=None, help="Limit to one room")
+    p_kg_extract.add_argument(
+        "--limit", dest="kg_limit", type=int, default=0, help="Maximum drawers to process"
+    )
+    p_kg_extract.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Call the LLM and show counts without writing triples",
+    )
+    p_kg_extract.add_argument(
+        "--endpoint",
+        dest="kg_endpoint",
+        default=None,
+        help="LLM base URL (overrides $LLM_ENDPOINT), e.g. http://localhost:11434/v1",
+    )
+    p_kg_extract.add_argument(
+        "--model",
+        dest="kg_model",
+        default=None,
+        help="LLM model name (overrides $LLM_MODEL)",
+    )
+    p_kg_extract.add_argument(
+        "--key",
+        dest="kg_key",
+        default=None,
+        help="LLM bearer token (overrides $LLM_KEY; optional for local LLMs)",
+    )
+    p_kg_extract.add_argument(
+        "--provider",
+        dest="kg_provider",
+        choices=["openai", "ollama"],
+        default=None,
+        help="LLM API provider: openai-compatible or native Ollama",
+    )
+    p_kg_extract.add_argument(
+        "--no-think",
+        dest="kg_no_think",
+        action="store_true",
+        default=None,
+        help="Prepend /no_think for local thinking models",
+    )
+    p_kg_extract.add_argument(
+        "--max-tokens",
+        dest="kg_max_tokens",
+        type=int,
+        default=None,
+        help="Maximum completion tokens for each LLM call (default 512)",
+    )
+    p_kg_extract.add_argument(
+        "--min-confidence",
+        dest="kg_min_confidence",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum LLM confidence for extracted facts. Default 0.0 because "
+            "local-model self-confidence is not calibrated; structural gates do the filtering."
+        ),
+    )
+    p_kg_extract.add_argument(
+        "--timeout",
+        dest="kg_timeout",
+        type=float,
+        default=60.0,
+        help="Seconds to wait for each LLM call before failing that drawer",
+    )
+    p_kg_extract.add_argument(
+        "--show-facts",
+        dest="kg_show_facts",
+        action="store_true",
+        help="Print accepted facts with their verbatim evidence",
+    )
+    p_kg_extract.add_argument(
+        "--show-rejected",
+        dest="kg_show_rejected",
+        action="store_true",
+        help="Print rejected candidates and rejection reasons",
+    )
+    p_kg_extract.add_argument(
+        "--include-diary",
+        dest="kg_include_diary",
+        action="store_true",
+        help="Include diary/checkpoint rooms (skipped by default)",
+    )
+
+    # kg-benchmark
+    p_kg_benchmark = sub.add_parser(
+        "kg-benchmark",
+        help="Benchmark KG extraction quality and latency across local LLMs",
+    )
+    p_kg_benchmark.add_argument("--wing", dest="kg_wing", default=None, help="Limit to one wing")
+    p_kg_benchmark.add_argument("--room", dest="kg_room", default=None, help="Limit to one room")
+    p_kg_benchmark.add_argument(
+        "--samples",
+        dest="kg_samples",
+        type=int,
+        default=3,
+        help="Number of matching drawers to benchmark (default 3)",
+    )
+    p_kg_benchmark.add_argument(
+        "--endpoint",
+        dest="kg_endpoint",
+        default=None,
+        help="LLM base URL (overrides $LLM_ENDPOINT), e.g. http://localhost:11434/v1",
+    )
+    p_kg_benchmark.add_argument(
+        "--model",
+        dest="kg_models",
+        action="append",
+        default=[],
+        help="Model to benchmark; repeat or comma-separate (falls back to $LLM_MODEL)",
+    )
+    p_kg_benchmark.add_argument(
+        "--key",
+        dest="kg_key",
+        default=None,
+        help="LLM bearer token (overrides $LLM_KEY; optional for local LLMs)",
+    )
+    p_kg_benchmark.add_argument(
+        "--provider",
+        dest="kg_provider",
+        choices=["openai", "ollama"],
+        default=None,
+        help="LLM API provider: openai-compatible or native Ollama",
+    )
+    p_kg_benchmark.add_argument(
+        "--no-think",
+        dest="kg_no_think",
+        action="store_true",
+        default=None,
+        help="Prepend /no_think for local thinking models",
+    )
+    p_kg_benchmark.add_argument(
+        "--max-tokens",
+        dest="kg_max_tokens",
+        type=int,
+        default=None,
+        help="Maximum completion tokens for each LLM call (default 512)",
+    )
+    p_kg_benchmark.add_argument(
+        "--min-confidence",
+        dest="kg_min_confidence",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum LLM confidence for extracted facts. Default 0.0 because "
+            "local-model self-confidence is not calibrated; structural gates do the filtering."
+        ),
+    )
+    p_kg_benchmark.add_argument(
+        "--timeout",
+        dest="kg_timeout",
+        type=float,
+        default=30.0,
+        help="Seconds to wait for each LLM call before failing that drawer",
+    )
+    p_kg_benchmark.add_argument(
+        "--show-details",
+        dest="kg_show_details",
+        action="store_true",
+        help="Print per-drawer benchmark results",
+    )
+    p_kg_benchmark.add_argument(
+        "--show-facts",
+        dest="kg_show_facts",
+        action="store_true",
+        help="With --show-details, print accepted facts and verbatim evidence",
+    )
+    p_kg_benchmark.add_argument(
+        "--show-rejected",
+        dest="kg_show_rejected",
+        action="store_true",
+        help="With --show-details, print rejected candidates and reasons",
+    )
+    p_kg_benchmark.add_argument(
+        "--include-diary",
+        dest="kg_include_diary",
+        action="store_true",
+        help="Include diary/checkpoint rooms (skipped by default)",
+    )
 
     # sweep
     p_sweep = sub.add_parser(
@@ -1990,6 +2455,26 @@ def main():
     instructions_sub = p_instructions.add_subparsers(dest="instructions_name")
     for instr_name in ["init", "search", "mine", "help", "status"]:
         instructions_sub.add_parser(instr_name, help=f"Output {instr_name} instructions")
+
+    # config
+    p_config = sub.add_parser("config", help="Show or update MemPalace config")
+    config_sub = p_config.add_subparsers(dest="config_action")
+    config_sub.add_parser("show", help="Show effective config values")
+    p_config_set = config_sub.add_parser("set", help="Persist a config value")
+    p_config_set.add_argument(
+        "key",
+        choices=[
+            "palace-path",
+            "backend",
+            "embedding-model",
+            "hooks.auto-save",
+            "hooks.silent-save",
+            "hooks.desktop-toast",
+            "hooks.daemon",
+        ],
+        help="Config key to update",
+    )
+    p_config_set.add_argument("value", help="Value to persist")
 
     # repair
     p_repair = sub.add_parser(
@@ -2202,6 +2687,11 @@ def main():
         "(only if you know the stored vectors are compatible)",
     )
     p_set_embedder.add_argument(
+        "--collection",
+        default=None,
+        help="Collection to record: drawers or closets (default: drawers)",
+    )
+    p_set_embedder.add_argument(
         "--backend",
         default=None,
         help="Storage backend (default: config/env/detected/chroma)",
@@ -2231,6 +2721,13 @@ def main():
         cmd_instructions(args)
         return
 
+    if args.command == "config":
+        if not getattr(args, "config_action", None):
+            p_config.print_help()
+            return
+        cmd_config(args)
+        return
+
     if args.command == "palace":
         if getattr(args, "palace_action", None) == "set-embedder":
             cmd_palace_set_embedder(args)
@@ -2248,6 +2745,8 @@ def main():
     dispatch = {
         "init": cmd_init,
         "mine": cmd_mine,
+        "kg-extract": cmd_kg_extract,
+        "kg-benchmark": cmd_kg_benchmark,
         "split": cmd_split,
         "search": cmd_search,
         "sweep": cmd_sweep,

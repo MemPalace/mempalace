@@ -213,6 +213,36 @@ class TestCandidateUnion:
             f"(basename collision would drop one); got sources={sources}"
         )
 
+    def test_union_dedups_sourceless_manual_drawer_by_id(self, tmp_path):
+        """A manually added drawer has no source_file metadata, so the
+        chunk-precise (full_path, chunk_index) dedup key is unavailable.
+        When the same stored chunk is a candidate on both the vector path
+        and the backend BM25 path, dedup must fall back to the stored id —
+        otherwise the drawer appears twice and burns a recall slot.
+        """
+        palace = str(tmp_path / "palace")
+        col = get_collection(palace, create=True)
+        col.upsert(
+            ids=["drawer_manual_1"],
+            documents=[
+                "Shared brain topology decision: one mempalace serve process "
+                "is the single writer hub for every agent."
+            ],
+            metadatas=[{"wing": "notes", "room": "technical", "added_by": "agent"}],
+        )
+        result = search_memories(
+            "shared brain single writer hub",
+            palace,
+            n_results=5,
+            candidate_strategy="union",
+        )
+        matches = [h for h in result["results"] if "single writer hub" in h["text"]]
+        assert len(matches) == 1, (
+            f"sourceless manual drawer must dedup by stored id across the "
+            f"vector and BM25 union paths; got {len(matches)} copies"
+        )
+        assert matches[0].get("id") == "drawer_manual_1"
+
     def test_union_respects_source_file_filter(self, tmp_path):
         """Union pulls BM25 candidates from sqlite FTS5 directly; the
         source_file filter must constrain that pool too, not just the vector
@@ -251,3 +281,43 @@ class TestHybridRankTolerantOfMissingDistance:
         assert all("bm25_score" in r for r in ranked), "rerank should add bm25_score"
         # Both must survive — neither should crash on distance=None.
         assert len(ranked) == 2
+
+    def test_curated_drawer_beats_mempalace_search_echo(self):
+        """A failed search transcript should not become the top memory.
+
+        Shared-agent dogfood exposed a loop where Claude's failed canary
+        search was mined into the palace. That transcript repeated the query
+        and MemPalace JSON output often enough to outrank the actual curated
+        canary drawer on the next recall attempt.
+        """
+        from mempalace.searcher import _hybrid_rank
+
+        echo = {
+            "text": (
+                "> Do you remember the copper lighthouse canary? Use MemPalace.\n"
+                "[mcp__plugin_mempalace_mempalace__mempalace_search] "
+                '{"query":"copper lighthouse canary","limit":10} -> '
+                '{"total_before_filter":15,"results":[]}\n'
+                "No. I searched MemPalace and there is no drawer."
+            ),
+            "distance": None,
+            "added_by": "mempalace",
+            "ingest_mode": "convos",
+            "source_file": "failed-search.jsonl",
+        }
+        curated = {
+            "text": (
+                "Claude wrote the return canary on 2026-06-30. "
+                "The passphrase is copper lighthouse. This proves Claude can "
+                "write into the shared palace for Codex to recall."
+            ),
+            "distance": None,
+            "added_by": "claude",
+            "ingest_mode": "",
+            "source_file": "?",
+        }
+
+        ranked = _hybrid_rank([echo, curated], "copper lighthouse canary")
+
+        assert ranked[0] is curated
+        assert ranked[1] is echo

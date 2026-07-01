@@ -43,3 +43,14 @@ def test_run_instructions_missing_md_file(capsys, tmp_path):
             assert exc_info.value.code == 1
             captured = capsys.readouterr()
             assert "Instructions file not found" in captured.err
+
+
+def test_search_instructions_preserve_verbatim_recall_contract():
+    """Search instructions must not invite lossy summaries or home-dir grep."""
+    body = (INSTRUCTIONS_DIR / "search.md").read_text(encoding="utf-8").lower()
+
+    assert "quote the exact drawer text" in body
+    assert "do not summarize or paraphrase" in body
+    assert "broad filesystem scans" in body
+    assert "unless the user explicitly asks for filesystem search" in body
+    assert "quote or summarize" not in body
