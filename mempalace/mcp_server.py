@@ -4797,7 +4797,7 @@ def _run_stdio_loop() -> None:
         if hasattr(stream, "reconfigure"):
             try:
                 stream.reconfigure(encoding="utf-8", errors="replace", newline="\n")
-            except (AttributeError, OSError):
+            except (AttributeError, OSError, TypeError):
                 pass
 
     logger.info("MemPalace MCP Server starting...")
