@@ -5241,6 +5241,111 @@ def _serve_http(host: str, port: int) -> None:
                     logger.debug("Failed to clear hub serverinfo", exc_info=True)
 
 
+# Stdio→hub proxying. When a long-lived HTTP hub (`mempalace serve`) owns
+# this palace, a stdio server spawned by an agent harness must not open its
+# own Chroma handles: it could only ever be a read-only peer (writer lease,
+# #1818), and racing writers are exactly what corrupted FTS5 indexes in the
+# wild. Instead the stdio process forwards every JSON-RPC request to the hub
+# verbatim, adding the local bearer token. This makes stdio-only harnesses
+# (plugins, desktop apps) share the hub with zero client-side reconfiguration.
+# Shares the CLI forwarder's kill switch (MEMPALACE_HUB_FORWARD=0).
+_HUB_FORWARD_ENV = "MEMPALACE_HUB_FORWARD"
+_HUB_PROXY_TIMEOUT_S = 600.0
+_hub_proxy_announced = False
+
+
+def _hub_proxy_target():
+    """Return (base_url, headers) for a live hub serving our palace, or None."""
+    global _hub_proxy_announced
+    if _truthy_env_off(_HUB_FORWARD_ENV):
+        return None
+    try:
+        from . import server_registry
+
+        info = server_registry.read_live_serverinfo(_config.palace_path)
+        if not info or info.get("pid") == os.getpid():
+            return None
+        base_url = server_registry.client_base_url(info)
+        headers = {"Content-Type": "application/json"}
+        token = server_registry.load_server_token(_config.palace_path)
+    except Exception:
+        logger.debug("hub discovery failed; serving locally", exc_info=True)
+        return None
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if not _hub_proxy_announced:
+        _hub_proxy_announced = True
+        logger.info("Live palace hub detected at %s; proxying stdio requests to it", base_url)
+    return base_url, headers
+
+
+def _truthy_env_off(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"0", "false", "no", "off"}
+
+
+def _forward_request_to_hub(base_url: str, headers: dict, request: dict):
+    """POST one JSON-RPC request to the hub; None for notifications (202)."""
+    import urllib.request
+
+    body = json.dumps(request, ensure_ascii=False).encode("utf-8")
+    http_request = urllib.request.Request(f"{base_url}/mcp", data=body, headers=headers)
+    with urllib.request.urlopen(http_request, timeout=_HUB_PROXY_TIMEOUT_S) as resp:
+        raw = resp.read()
+    if not raw:
+        return None
+    return json.loads(raw.decode("utf-8"))
+
+
+def _request_is_mutating(request: dict) -> bool:
+    if request.get("method") != "tools/call":
+        return False
+    name = ((request.get("params") or {}).get("name")) or ""
+    return name in _MUTATING_TOOLS
+
+
+def _dispatch_stdio_request(request: dict):
+    """Route one stdio request: live hub first, local handling otherwise.
+
+    The hub check runs per request (a tiny local JSON read), so a hub that
+    starts, restarts on a new port, or dies mid-session is picked up without
+    restarting this process. Fallback to local handling is allowed only when
+    the failure provably happened before the hub accepted the request — a
+    mutating call that failed mid-flight must NOT be replayed locally (the
+    hub may still be executing it), so it surfaces as a JSON-RPC error.
+    """
+    import urllib.error
+
+    target = _hub_proxy_target()
+    if target is None:
+        return handle_request(request)
+    base_url, headers = target
+    try:
+        return _forward_request_to_hub(base_url, headers, request)
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
+        reached_hub = isinstance(exc, urllib.error.HTTPError)
+        if not reached_hub and not _request_is_mutating(request):
+            logger.warning("Hub at %s unreachable (%s); handling request locally", base_url, exc)
+            return handle_request(request)
+        if request.get("id") is None:
+            return None
+        return {
+            "jsonrpc": "2.0",
+            "id": request.get("id"),
+            "error": {
+                "code": -32000,
+                "message": f"palace hub proxy failed: {exc}",
+                "data": {
+                    "hub": base_url,
+                    "hint": (
+                        "The palace hub did not complete this request. Mutating tools "
+                        "are not replayed locally — the hub may still be executing the "
+                        "call. Check the hub process, then retry."
+                    ),
+                },
+            },
+        }
+
+
 def _run_stdio_loop() -> None:
     _restore_stdout()
 
@@ -5283,7 +5388,7 @@ def _run_stdio_loop() -> None:
                 continue
 
             request = json.loads(line)
-            response = handle_request(request)
+            response = _dispatch_stdio_request(request)
 
             if response is not None:
                 sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")

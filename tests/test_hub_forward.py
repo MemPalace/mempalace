@@ -286,6 +286,140 @@ class TestForwardability:
         assert cli._mine_args_forwardable(args, include_ignored) is False
 
 
+class TestStdioProxy:
+    """`mempalace-mcp` (stdio) must delegate to a live hub instead of opening
+    its own Chroma handles — this is what lets stdio-only harnesses (plugins,
+    desktop apps) share one writer with zero client-side reconfiguration."""
+
+    @pytest.fixture
+    def proxied_palace(self, isolated_home, monkeypatch):
+        palace = str(isolated_home / "palace")
+        monkeypatch.setenv("MEMPALACE_PALACE_PATH", palace)
+        return palace
+
+    def _local_sentinel(self, monkeypatch):
+        from mempalace import mcp_server
+
+        calls = []
+
+        def fake_local(request):
+            calls.append(request)
+            return {"jsonrpc": "2.0", "id": request.get("id"), "result": "local"}
+
+        monkeypatch.setattr(mcp_server, "handle_request", fake_local)
+        return calls
+
+    @staticmethod
+    def _disown_record(palace):
+        """Re-stamp the serverinfo pid so the record looks like another
+        process's hub — write_serverinfo records our own pid, which the
+        proxy correctly refuses to dial. PID 1 (launchd/init) is always
+        alive and never ours."""
+        path = server_registry.serverinfo_path(palace)
+        record = json.loads(path.read_text())
+        record["pid"] = 1
+        path.write_text(json.dumps(record))
+
+    def test_forwards_request_to_live_hub(self, proxied_palace, fake_hub, monkeypatch):
+        from mempalace import mcp_server
+
+        local_calls = self._local_sentinel(monkeypatch)
+        _register_hub(proxied_palace, fake_hub)
+        self._disown_record(proxied_palace)
+        request = {
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {"name": "mempalace_search", "arguments": {"query": "x"}},
+        }
+        response = mcp_server._dispatch_stdio_request(request)
+        assert local_calls == [], "must not handle locally while a hub is live"
+        assert fake_hub.requests == [request]
+        assert response["id"] == 7
+        assert "result" in response
+
+    def test_no_hub_handles_locally(self, proxied_palace, monkeypatch):
+        from mempalace import mcp_server
+
+        local_calls = self._local_sentinel(monkeypatch)
+        request = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+        response = mcp_server._dispatch_stdio_request(request)
+        assert local_calls == [request]
+        assert response["result"] == "local"
+
+    def test_own_process_record_is_not_a_proxy_target(self, proxied_palace, monkeypatch):
+        from mempalace import mcp_server
+
+        local_calls = self._local_sentinel(monkeypatch)
+        server_registry.write_serverinfo(
+            proxied_palace, host="127.0.0.1", port=1, scheme="http", read_only=False
+        )
+        request = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+        mcp_server._dispatch_stdio_request(request)
+        assert local_calls == [request], "the hub itself must never proxy to itself"
+
+    def test_kill_switch_disables_proxying(self, proxied_palace, fake_hub, monkeypatch):
+        from mempalace import mcp_server
+
+        local_calls = self._local_sentinel(monkeypatch)
+        _register_hub(proxied_palace, fake_hub)
+        self._disown_record(proxied_palace)
+        monkeypatch.setenv("MEMPALACE_HUB_FORWARD", "0")
+        request = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+        mcp_server._dispatch_stdio_request(request)
+        assert local_calls == [request]
+        assert fake_hub.requests == []
+
+    def _register_dead_hub(self, palace):
+        probe = ThreadingHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
+        dead_port = probe.server_address[1]
+        probe.server_close()
+        server_registry.write_serverinfo(
+            palace, host="127.0.0.1", port=dead_port, scheme="http", read_only=False
+        )
+        self._disown_record(palace)
+
+    def test_unreachable_hub_read_request_falls_back_locally(self, proxied_palace, monkeypatch):
+        from mempalace import mcp_server
+
+        local_calls = self._local_sentinel(monkeypatch)
+        self._register_dead_hub(proxied_palace)
+        request = {"jsonrpc": "2.0", "id": 3, "method": "tools/list"}
+        response = mcp_server._dispatch_stdio_request(request)
+        assert local_calls == [request]
+        assert response["result"] == "local"
+
+    def test_unreachable_hub_mutating_request_errors_without_local_replay(
+        self, proxied_palace, monkeypatch
+    ):
+        from mempalace import mcp_server
+
+        local_calls = self._local_sentinel(monkeypatch)
+        self._register_dead_hub(proxied_palace)
+        request = {
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": {"name": "mempalace_add_drawer", "arguments": {"content": "x"}},
+        }
+        response = mcp_server._dispatch_stdio_request(request)
+        assert local_calls == [], "a mutating call must never be replayed locally"
+        assert response["error"]["code"] == -32000
+        assert "hub" in response["error"]["message"]
+
+    def test_unreachable_hub_notification_returns_none(self, proxied_palace, monkeypatch):
+        from mempalace import mcp_server
+
+        self._local_sentinel(monkeypatch)
+        self._register_dead_hub(proxied_palace)
+        notification = {
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {"name": "mempalace_add_drawer", "arguments": {"content": "x"}},
+        }
+        assert mcp_server._dispatch_stdio_request(notification) is None
+
+
 class TestServeHttpRegistersServerinfo:
     def test_serve_http_writes_then_clears_serverinfo(self, isolated_home, monkeypatch):
         from mempalace import mcp_server
