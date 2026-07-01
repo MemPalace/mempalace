@@ -43,6 +43,12 @@ class SearchError(Exception):
 
 
 _TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
+_GENERIC_AGENT_TRANSCRIPT_WINGS = {
+    "sessions",
+    "claude_conversations",
+    "codex_conversations",
+}
+_GENERIC_AGENT_ECHO_PENALTY = 0.55
 
 
 def _first_or_empty(results, key: str) -> list:
@@ -161,6 +167,25 @@ def _distance_to_similarity(distance, metric: str = "cosine") -> float:
         return 1.0 / (1.0 + math.exp(min(60.0, distance)))
     # cosine (default)
     return max(0.0, 1.0 - distance)
+
+
+def _candidate_meta(result: dict) -> dict:
+    """Return the metadata shape for either API or CLI ranking candidates."""
+    meta = result.get("metadata")
+    return meta if isinstance(meta, dict) else result
+
+
+def _is_generic_agent_transcript(result: dict) -> bool:
+    """True for mined agent-session echoes, not project/source memories.
+
+    Generic transcript wings are valuable recall evidence, but when a query
+    also finds a project-specific wing they often represent a prior agent
+    repeating the answer it found. Rank those echoes below the original source
+    drawers so "successful recall" transcripts do not become the top answer.
+    """
+    meta = _candidate_meta(result)
+    wing = str(meta.get("wing") or "").lower()
+    return wing in _GENERIC_AGENT_TRANSCRIPT_WINGS
 
 
 def _metric_for_collection(col) -> str:
@@ -296,6 +321,9 @@ def _hybrid_rank(
     bm25_raw = _bm25_scores(query, docs)
     max_bm25 = max(bm25_raw) if bm25_raw else 0.0
     bm25_norm = [s / max_bm25 for s in bm25_raw] if max_bm25 > 0 else [0.0] * len(bm25_raw)
+    has_generic_agent_transcripts = any(_is_generic_agent_transcript(r) for r in results)
+    has_source_or_project_drawers = any(not _is_generic_agent_transcript(r) for r in results)
+    apply_echo_penalty = has_generic_agent_transcripts and has_source_or_project_drawers
 
     scored = []
     for r, raw, norm in zip(results, bm25_raw, bm25_norm):
@@ -304,9 +332,14 @@ def _hybrid_rank(
         base_score = vector_weight * vec_sim + bm25_weight * norm
         echo_penalty = _rank_echo_penalty(r)
         provenance_boost = _rank_provenance_boost(r)
+        generic_agent_penalty = (
+            _GENERIC_AGENT_ECHO_PENALTY
+            if apply_echo_penalty and _is_generic_agent_transcript(r)
+            else 0.0
+        )
         r["_rank_echo_penalty"] = echo_penalty
         r["_rank_provenance_boost"] = provenance_boost
-        scored.append((base_score * echo_penalty + provenance_boost, r))
+        scored.append((base_score * echo_penalty + provenance_boost - generic_agent_penalty, r))
 
     # Break exact score ties toward the more recently authored drawer so equal-score
     # candidates rank chronologically instead of in arbitrary backend order. ISO-8601
@@ -1412,7 +1445,7 @@ def search_memories(
         scored.append(entry)
 
     scored.sort(key=lambda h: h["_sort_key"])
-    hits = scored[:n_results]
+    hits = scored
 
     # Drawer-grep enrichment: for closet-boosted hits whose source has
     # multiple drawers, return the keyword-best chunk + its immediate

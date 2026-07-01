@@ -11,7 +11,7 @@ import pytest
 
 from _chroma_palace_helper import make_minimal_chroma_sqlite
 
-from mempalace.searcher import SearchError, build_where_filter, search, search_memories
+from mempalace.searcher import SearchError, _hybrid_rank, build_where_filter, search, search_memories
 
 
 # ── build_where_filter (unit) ──────────────────────────────────────────
@@ -405,6 +405,88 @@ class TestSearchMemories:
         # the boost still wins, but it no longer flips the ranking.
         assert hits[0]["source_file"] == "a.md"
         assert hits[0]["matched_via"] == "drawer+closet"
+
+    def test_project_source_drawer_outranks_generic_recall_echo(self):
+        """A successful agent recall transcript can contain the query verbatim
+        and embed closer than the original source. In mixed candidate sets,
+        project/source drawers should outrank generic ``sessions`` echoes so
+        search returns the remembered thing, not a later agent talking about
+        remembering it.
+        """
+        results = [
+            {
+                "text": "Use MemPalace to search for small Swift local LLM client OpenCode.",
+                "wing": "sessions",
+                "room": "technical",
+                "distance": 0.1,
+            },
+            {
+                "text": "Architecture: Swift local LLM client for OpenCode with OllamaService.",
+                "wing": "liquid_llm",
+                "room": "technical",
+                "distance": 0.5,
+            },
+        ]
+
+        ranked = _hybrid_rank(results, "small Swift local LLM client OpenCode")
+
+        assert ranked[0]["wing"] == "liquid_llm"
+
+    def test_search_memories_reranks_before_slicing_to_n_results(self):
+        """Regression for early distance-only slicing: the API used to sort by
+        vector/closet distance, keep only ``n_results`` rows, and only then run
+        the final BM25 hybrid rerank. That let generic recall echoes crowd out
+        the original source before ranking had a chance to rescue it.
+        """
+        drawers_col = MagicMock()
+        drawers_col.query.return_value = {
+            "documents": [
+                [
+                    "Use MemPalace to search for small Swift local LLM client OpenCode.",
+                    "Invoke the mempalace skill: Swift local LLM client OpenCode.",
+                    "Architecture: Swift local LLM client for OpenCode with OllamaService.",
+                ]
+            ],
+            "metadatas": [
+                [
+                    {
+                        "source_file": "/sessions/a.jsonl",
+                        "wing": "sessions",
+                        "room": "technical",
+                        "ingest_mode": "convos",
+                    },
+                    {
+                        "source_file": "/sessions/b.jsonl",
+                        "wing": "sessions",
+                        "room": "technical",
+                        "ingest_mode": "convos",
+                    },
+                    {
+                        "source_file": "opencode://session/liquid-llm",
+                        "wing": "liquid_llm",
+                        "room": "technical",
+                        "ingest_mode": "convos",
+                    },
+                ]
+            ],
+            "distances": [[0.1, 0.2, 0.5]],
+            "ids": [["echo-a", "echo-b", "source"]],
+        }
+
+        with (
+            patch("mempalace.searcher.get_collection", return_value=drawers_col),
+            patch(
+                "mempalace.searcher.get_closets_collection",
+                side_effect=RuntimeError("no closets"),
+            ),
+        ):
+            result = search_memories(
+                "small Swift local LLM client OpenCode",
+                "/fake/path",
+                n_results=2,
+            )
+
+        assert [h["wing"] for h in result["results"]][0] == "liquid_llm"
 
 
 # ── BM25 internals: None / empty document safety ─────────────────────
