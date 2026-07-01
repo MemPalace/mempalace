@@ -325,3 +325,27 @@ def test_loopback_and_origin_helpers():
     assert not mcp._http_origin_allowed("garbage")
     allowed = mcp._http_allowed_host_values("127.0.0.1", 8765)
     assert "127.0.0.1:8765" in allowed and "localhost" in allowed
+
+
+def test_extra_allowed_hosts_extend_the_loopback_pin(monkeypatch):
+    """A loopback-bound server behind a fronting proxy (tailscale serve, nginx)
+    receives the public name in Host; the operator allowlists it via env."""
+    monkeypatch.setenv(
+        "MEMPALACE_MCP_EXTRA_ALLOWED_HOSTS",
+        "mybox.tail1234.ts.net, Proxy.Example:8443",
+    )
+    allowed = mcp._http_allowed_host_values("127.0.0.1", 8765)
+    # Bare hostname matches with and without the bound port.
+    assert "mybox.tail1234.ts.net" in allowed
+    assert "mybox.tail1234.ts.net:8765" in allowed
+    # host:port entries match exactly (lowercased); no bound-port variant added.
+    assert "proxy.example:8443" in allowed
+    assert "proxy.example" not in allowed
+    # The loopback pin itself is unchanged.
+    assert "127.0.0.1:8765" in allowed
+
+
+def test_extra_allowed_hosts_default_empty(monkeypatch):
+    monkeypatch.delenv("MEMPALACE_MCP_EXTRA_ALLOWED_HOSTS", raising=False)
+    allowed = mcp._http_allowed_host_values("127.0.0.1", 8765)
+    assert not any("ts.net" in v for v in allowed)

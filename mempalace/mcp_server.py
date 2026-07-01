@@ -4970,6 +4970,9 @@ def _http_is_loopback(host: str) -> bool:
     return (host or "").strip().lower() in _HTTP_LOOPBACK_HOSTS
 
 
+_HTTP_EXTRA_ALLOWED_HOSTS_ENV = "MEMPALACE_MCP_EXTRA_ALLOWED_HOSTS"
+
+
 def _http_allowed_host_values(bind_host: str, port: int) -> set:
     """Host-header values accepted when Host pinning is enforced.
 
@@ -4978,6 +4981,13 @@ def _http_allowed_host_values(bind_host: str, port: int) -> set:
     so we pin ``Host`` to the loopback literals (and the bound host) with and
     without the port. Computed from the *actual* bound port so an ephemeral
     ``port=0`` bind (tests) still matches.
+
+    ``MEMPALACE_MCP_EXTRA_ALLOWED_HOSTS`` (comma-separated ``host`` or
+    ``host:port`` values) extends the pin for the documented fronting-proxy
+    pattern ("terminate TLS at a proxy"): a loopback-bound server behind
+    ``tailscale serve``/nginx receives the *public* name in ``Host``, which
+    the loopback pin would otherwise reject. Entries are matched exactly
+    (lowercased); a bare hostname also matches ``host:<bound port>``.
     """
     names = set(_HTTP_LOOPBACK_HOSTS)
     if bind_host:
@@ -4986,6 +4996,13 @@ def _http_allowed_host_values(bind_host: str, port: int) -> set:
     for name in names:
         values.add(name)
         values.add(f"{name}:{port}")
+    for raw in os.environ.get(_HTTP_EXTRA_ALLOWED_HOSTS_ENV, "").split(","):
+        entry = raw.strip().lower()
+        if not entry:
+            continue
+        values.add(entry)
+        if ":" not in entry:
+            values.add(f"{entry}:{port}")
     return values
 
 

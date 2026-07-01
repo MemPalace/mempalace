@@ -165,6 +165,22 @@ whole team.
   processes at the same backend collection.
 - **Health checks**: `GET /healthz` returns `200 ok` without a token, so it
   works as a load-balancer/Kubernetes liveness probe.
+- **Fronting proxies (Tailscale, nginx)**: the recommended personal-fleet
+  setup is a loopback bind behind a tailnet-only proxy — nothing touches the
+  physical LAN and the tailnet provides encryption plus device identity:
+
+  ```bash
+  MEMPALACE_MCP_HTTP_TOKEN="$(cat ~/.mempalace/server/<key>/token)" \
+  MEMPALACE_MCP_EXTRA_ALLOWED_HOSTS="yourbox.your-tailnet.ts.net" \
+    mempalace serve --host 127.0.0.1 --port 8765
+  tailscale serve --bg --https=443 http://127.0.0.1:8765
+  ```
+
+  Clients connect to `https://yourbox.your-tailnet.ts.net/mcp` with the same
+  bearer token. `MEMPALACE_MCP_EXTRA_ALLOWED_HOSTS` (comma-separated `host`
+  or `host:port` values) is required because proxies preserve the public
+  name in the `Host` header, which the loopback bind's DNS-rebinding pin
+  would otherwise reject.
 - **Backups** are now your storage backend's responsibility (Qdrant snapshots
   / Postgres backups) rather than a single laptop's palace directory.
 
