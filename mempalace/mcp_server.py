@@ -5179,6 +5179,31 @@ def _serve_http(host: str, port: int) -> None:
         sys.exit(1)
 
     bound_port = httpd.server_address[1]
+
+    # Register this process as the palace's hub so local short-lived writers
+    # (save hooks, plain `mempalace mine`) forward their writes here instead
+    # of colliding with the MCP writer lease. Best-effort: discovery is an
+    # optimization, serving must not fail because the record could not be
+    # written.
+    _registered_palace = _config.palace_path
+    if _registered_palace:
+        try:
+            from . import server_registry
+
+            server_registry.write_serverinfo(
+                _registered_palace,
+                host=host,
+                port=bound_port,
+                scheme=getattr(httpd, "scheme", "http"),
+                read_only=_READ_ONLY,
+            )
+            import atexit
+
+            atexit.register(server_registry.clear_serverinfo, _registered_palace)
+        except Exception:
+            logger.debug("Failed to write hub serverinfo", exc_info=True)
+            _registered_palace = None
+
     if not _http_is_loopback(host):
         if httpd.auth_token:
             logger.warning(
@@ -5206,6 +5231,14 @@ def _serve_http(host: str, port: int) -> None:
             httpd.serve_forever(poll_interval=0.5)
         except KeyboardInterrupt:
             logger.info("MemPalace MCP HTTP server shutting down")
+        finally:
+            if _registered_palace:
+                try:
+                    from . import server_registry
+
+                    server_registry.clear_serverinfo(_registered_palace)
+                except Exception:
+                    logger.debug("Failed to clear hub serverinfo", exc_info=True)
 
 
 def _run_stdio_loop() -> None:

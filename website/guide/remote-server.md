@@ -153,7 +153,13 @@ whole team.
 ## Operating notes
 
 - **Mining** still happens via the CLI (`mempalace mine …`) on the server host
-  against the same backend, so the central palace stays populated.
+  against the same backend, so the central palace stays populated. While the
+  server is running it owns the palace's writer lease, so the CLI (and the
+  save hooks, which spawn it) automatically detect the live server and hand
+  the mine to it over HTTP instead of being refused. This needs nothing from
+  you — the server records its endpoint under `~/.mempalace/server/` at
+  startup. Set `MEMPALACE_HUB_FORWARD=0` to force direct mines (they will be
+  refused while the server holds the lease).
 - **One writer-lease per process**: a single `mempalace-mcp --transport http`
   process safely handles concurrent reads and writes. Don't point two server
   processes at the same backend collection.
