@@ -146,6 +146,9 @@ def sync_with_peer(ls, url: str, token: str = "") -> dict:
         "pulled_events": pulled_events,
         "pulled_artifacts": pulled_artifacts,
         "per_origin": per_origin,
+        # The peer's vector at round start — consumers (the /sync/peers
+        # estate endpoint, PalaceMind's mesh view) compute drift from it.
+        "remote_version_vector": remote_vector,
     }
 
 

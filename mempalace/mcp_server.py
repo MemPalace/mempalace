@@ -6051,10 +6051,96 @@ def _http_serve_sync(handler, path: str) -> bool:
             else:
                 handler._send_json(200, {"artifact": artifact})
             return True
+        if path == "/sync/peers":
+            handler._send_json(200, _mesh_peers_payload())
+            return True
     except (ValueError, TypeError) as exc:
         handler._send_json(400, {"error": str(exc)})
         return True
     return False
+
+
+# Estate data (RFC 004 A.1): what the mesh looks like from THIS replica.
+# Written by the sync loop after every round, read by /sync/peers. Values
+# are whole-entry replacements under the GIL, so readers never see a
+# half-updated peer record.
+_PEER_SYNC_STATE: dict = {}
+
+
+def _record_peer_sync(stats: dict) -> None:
+    """Fold one peer's round outcome into the estate state."""
+    name = stats.get("peer_name") or stats.get("peer_url") or "?"
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    prior = _PEER_SYNC_STATE.get(name) or {}
+    if stats.get("error"):
+        entry = {
+            "url": stats.get("peer_url") or prior.get("url"),
+            "replica_id": prior.get("replica_id"),
+            "reachable": False,
+            "last_error": stats["error"],
+            "last_error_at": now,
+            "last_success_at": prior.get("last_success_at"),
+            "remote_version_vector": prior.get("remote_version_vector"),
+        }
+    else:
+        entry = {
+            "url": stats.get("peer_url"),
+            "replica_id": stats.get("peer_replica"),
+            "reachable": True,
+            "last_error": None,
+            "last_error_at": prior.get("last_error_at"),
+            "last_success_at": now,
+            "last_pulled_events": stats.get("pulled_events", 0),
+            "last_pulled_artifacts": stats.get("pulled_artifacts", 0),
+            "remote_version_vector": stats.get("remote_version_vector") or {},
+        }
+    _PEER_SYNC_STATE[name] = entry
+
+
+def _mesh_peers_payload() -> dict:
+    """The estate answer for one replica: who its peers are, whether they
+    were reachable last round, their vectors (drift is peer vector vs
+    self vector — computed by the consumer), and origins known only
+    transitively. peers.json tokens are NEVER included.
+    """
+    import socket
+
+    from .logsync import load_peers
+
+    replica_id = _call_logstream(lambda ls: ls.replica_id)
+    local_vector = _call_logstream(lambda ls: ls.version_vector())
+    try:
+        configured = load_peers(getattr(_config, "palace_path", None) or "")
+    except (ValueError, TypeError):
+        configured = []
+    named_origins = {replica_id}
+    peers = []
+    for peer in configured:
+        name = peer.get("name") or peer["url"]
+        state = dict(_PEER_SYNC_STATE.get(name) or {})
+        state.pop("url", None)  # peers.json is authoritative for the url
+        if state.get("replica_id"):
+            named_origins.add(state["replica_id"])
+        peers.append({"name": name, "url": peer["url"], **state})
+    return {
+        "self": {
+            "replica_id": replica_id,
+            "name": socket.gethostname(),
+            "version_vector": local_vector,
+        },
+        "peers": peers,
+        # Origins present in the local log but not configured as peers —
+        # replicas this node only knows transitively (gossip carriers).
+        "unnamed_origins": sorted(set(local_vector) - named_origins),
+        "sync_interval_s": _peer_sync_interval_s(),
+    }
+
+
+def _peer_sync_interval_s() -> float:
+    try:
+        return float(os.environ.get("MEMPALACE_SYNC_INTERVAL", "") or 15)
+    except ValueError:
+        return 15.0
 
 
 def _start_peer_sync_thread() -> None:
@@ -6070,10 +6156,7 @@ def _start_peer_sync_thread() -> None:
     palace_path = getattr(_config, "palace_path", None)
     if not palace_path:
         return
-    try:
-        interval = float(os.environ.get("MEMPALACE_SYNC_INTERVAL", "") or 15)
-    except ValueError:
-        interval = 15.0
+    interval = _peer_sync_interval_s()
     if interval <= 0:
         return
     try:
@@ -6089,6 +6172,7 @@ def _start_peer_sync_thread() -> None:
             try:
                 ls = _get_logstream()
                 for stats in sync_all(ls, palace_path):
+                    _record_peer_sync(stats)
                     if stats.get("error"):
                         logger.warning("peer sync %s: %s", stats.get("peer_name"), stats["error"])
                     elif stats.get("pulled_events"):

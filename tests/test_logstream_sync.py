@@ -400,6 +400,92 @@ class TestSyncOverHttp:
         status, bad = self._get(port, "/sync/ops?origin=&after=0")
         assert status == 400
 
+    def test_sync_peers_estate_endpoint(self, server, palace_path):
+        """/sync/peers: names + reachability + vectors, NEVER the token,
+        and transitively-known origins surface as unnamed."""
+        port, mcp = server
+        with open(os.path.join(palace_path, "peers.json"), "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "peers": [
+                        {"name": "windows", "url": "http://peer.example:8765", "token": "S3CRET"}
+                    ]
+                },
+                f,
+            )
+        mcp._PEER_SYNC_STATE.clear()
+        mcp._record_peer_sync(
+            {
+                "peer_name": "windows",
+                "peer_url": "http://peer.example:8765",
+                "peer_replica": "rep_bbbbbbbbbbbb",
+                "pulled_events": 3,
+                "pulled_artifacts": 1,
+                "remote_version_vector": {"rep_bbbbbbbbbbbb": 49},
+            }
+        )
+        local = mcp.tool_event_append(
+            type="status.update", stream="s", room="r", from_agent="a", body="mine"
+        )["event"]
+        # A third replica this node never configured — known only because
+        # its op arrived through a carrier (the blade-via-windows case).
+        mcp._call_logstream(
+            lambda ls: ls.apply_remote_event(
+                {
+                    "id": "evt_foreign_1",
+                    "type": "status.update",
+                    "stream": "s",
+                    "room": "r",
+                    "from_agent": "b",
+                    "created_at": "2026-07-02T00:00:00Z",
+                    "origin_replica": "rep_cccccccccccc",
+                    "origin_seq": 5,
+                    "hlc": "1783000000000-000000-rep_cccccccccccc",
+                }
+            )
+        )
+
+        status, payload = self._get(port, "/sync/peers")
+        assert status == 200
+        assert payload["self"]["replica_id"] == local["origin_replica"]
+        assert payload["self"]["name"]
+        assert payload["self"]["version_vector"][local["origin_replica"]] == local["origin_seq"]
+
+        (peer,) = payload["peers"]
+        assert peer["name"] == "windows"
+        assert peer["url"] == "http://peer.example:8765"
+        assert peer["replica_id"] == "rep_bbbbbbbbbbbb"
+        assert peer["reachable"] is True
+        assert peer["remote_version_vector"] == {"rep_bbbbbbbbbbbb": 49}
+
+        assert payload["unnamed_origins"] == ["rep_cccccccccccc"]
+        assert "S3CRET" not in json.dumps(payload)
+
+    def test_record_peer_sync_error_preserves_last_known_state(self):
+        from mempalace import mcp_server as mcp
+
+        mcp._PEER_SYNC_STATE.clear()
+        mcp._record_peer_sync(
+            {
+                "peer_name": "w",
+                "peer_url": "http://peer.example:8765",
+                "peer_replica": "rep_bbbbbbbbbbbb",
+                "pulled_events": 0,
+                "pulled_artifacts": 0,
+                "remote_version_vector": {"rep_bbbbbbbbbbbb": 7},
+            }
+        )
+        succeeded = dict(mcp._PEER_SYNC_STATE["w"])
+        mcp._record_peer_sync({"peer_name": "w", "error": "connection refused"})
+        entry = mcp._PEER_SYNC_STATE["w"]
+        assert entry["reachable"] is False
+        assert entry["last_error"] == "connection refused"
+        assert entry["last_success_at"] == succeeded["last_success_at"]
+        assert entry["replica_id"] == "rep_bbbbbbbbbbbb"
+        assert entry["remote_version_vector"] == {"rep_bbbbbbbbbbbb": 7}
+        assert entry["url"] == "http://peer.example:8765"
+        mcp._PEER_SYNC_STATE.clear()
+
     def test_cli_sync_pulls_from_peer_over_http(self, server, tmp_dir, capsys):
         port, mcp = server
         mcp.tool_event_append(
