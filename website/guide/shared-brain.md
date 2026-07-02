@@ -264,6 +264,15 @@ first delegations:
   is made — and say so ("saving this decision to the shared brain") rather
   than filing silently. Transparency is what makes a fleet the user cannot
   directly inspect trustworthy.
+- **The event body is the work order.** Workers execute exactly what the
+  `task.request` body says — branch, base commit, definition of done — not
+  what chat history or memory drawers suggest. Claim first, then follow the
+  body; if the body is ambiguous, reply asking rather than improvising.
+- **Mind cross-platform workers.** A Windows worker hits quoting, CRLF, and
+  path differences a Unix requester never sees: generate diffs with LF
+  endings, expect Unix-specific tests (bash paths, file-mode assertions) to
+  need platform guards, and state the OS in replies so failures triage
+  fast.
 
 ## Hard rules
 
@@ -297,6 +306,15 @@ The same non-negotiables that govern memory govern coordination:
   MemPalace version) appear fleet-wide after a **hub restart**. Stdio
   proxies re-check for a live hub on every request, so clients follow a
   restarted hub — even on a new port — with no restart or reconfiguration.
+  MCP *clients* cache tool lists, though: after a hub upgrade, have each
+  agent refresh its tools, and when one reports a tool "missing", make it
+  state the exact set it can see — a stale client cache looks identical to
+  a hub problem otherwise.
+- **Debug connections outside the agent first**: when a remote agent can't
+  reach the hub, check `healthz` (no token) and then an authenticated
+  `mempalace_status` from a plain `curl` before touching any agent config.
+  Tailnet, TLS, and token failures otherwise masquerade as agent or plugin
+  bugs.
 - **Monitoring**: `GET /healthz` is a token-free liveness probe.
   `GET /statusz` (follows the bearer-token policy) returns JSON with
   version, uptime, request counters, SQLite integrity, writer mode, and
