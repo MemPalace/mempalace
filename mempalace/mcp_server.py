@@ -5796,10 +5796,27 @@ def _http_serve_snapshot(handler, path: str) -> bool:
         return True
 
     if path == "/snapshot/manifest":
+        from .vector_cache import VECTOR_CACHE_FILENAME, VectorCache
+
         with _HTTP_REQUEST_LOCK:
             col = _get_collection()
             drawer_count = col.count() if col else 0
         kg_stats = _call_kg(lambda kg: kg.stats())
+        vector_models = {}
+        if _config.palace_path and os.path.exists(
+            os.path.join(os.path.expanduser(_config.palace_path), VECTOR_CACHE_FILENAME)
+        ):
+            cache = VectorCache(_config.palace_path)
+            try:
+                with cache._lock:
+                    rows = (
+                        cache._conn()
+                        .execute("SELECT embedder, count(*) AS n FROM vectors GROUP BY embedder")
+                        .fetchall()
+                    )
+                vector_models = {row["embedder"]: row["n"] for row in rows}
+            finally:
+                cache.close()
         handler._send_json(
             200,
             {
@@ -5810,6 +5827,7 @@ def _http_serve_snapshot(handler, path: str) -> bool:
                     "triples": kg_stats.get("triples", 0),
                 },
                 "collection": _config.collection_name,
+                "vector_cache": vector_models,
             },
         )
         return True
@@ -5834,11 +5852,33 @@ def _http_serve_snapshot(handler, path: str) -> bool:
             for i, d, m in zip(ids, docs, metas)
             if not (m or {}).get(REPLICA_ORIGIN_KEY)
         ]
+        # Distributed derivation (RFC 004): ship cached vectors alongside
+        # content when the caller names an embedder identity, so the fold
+        # side can insert without re-deriving. Missing vectors are simply
+        # omitted; the fold falls back to local embedding per item.
+        vectors_model = query.get("vectors") or ""
+        if vectors_model and items:
+            from .vector_cache import VectorCache, vector_to_b64
+
+            cache = VectorCache(_config.palace_path)
+            try:
+                found = cache.get_many(vectors_model, [item["id"] for item in items])
+            finally:
+                cache.close()
+            for item in items:
+                vector = found.get(item["id"])
+                if vector is not None:
+                    item["vector_b64"] = vector_to_b64(vector)
+            items_with = sum(1 for item in items if "vector_b64" in item)
+        else:
+            items_with = 0
         handler._send_json(
             200,
             {
                 "items": items,
                 "count": len(items),
+                "vectors_included": items_with,
+                "vectors_model": vectors_model or None,
                 "offset": offset,
                 # Raw advance: pages may return fewer items than scanned.
                 "next_offset": offset + len(ids) if ids else None,

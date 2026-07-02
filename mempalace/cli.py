@@ -1520,6 +1520,35 @@ def cmd_replica(args):
 
     as_json = getattr(args, "json", False)
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    if args.replica_action == "embed-cache":
+        from .embedding import get_embedder_identity
+        from .vector_cache import build_cache
+
+        model = args.model or get_embedder_identity().model_name
+
+        def progress(done, scanned):
+            if not as_json and done % 5120 < args.batch:
+                print(f"  embedded {done} (scanned {scanned})", flush=True)
+
+        try:
+            stats = build_cache(
+                palace_path,
+                model,
+                batch_size=args.batch,
+                authored_only=not args.all,
+                progress=progress,
+            )
+        except Exception as exc:
+            _logstream_fail(str(exc), as_json)
+        if as_json:
+            print(json.dumps(stats, indent=2, ensure_ascii=False))
+        else:
+            print(
+                f"  model={stats['model']}: embedded {stats['embedded']} "
+                f"(cached {stats['skipped_cached']}, total in cache {stats['cache_total']})"
+            )
+        return
+
     if args.replica_action == "pull":
         from .replica_sync import pull_from_peers, pull_memory
 
@@ -1532,10 +1561,15 @@ def cmd_replica(args):
                         args.token or "",
                         reconcile_deletes=not args.no_reconcile,
                         pull_kg=not getattr(args, "no_kg", False),
+                        with_vectors=getattr(args, "with_vectors", False),
                     )
                 ]
             else:
-                results = pull_from_peers(palace_path, pull_kg=not getattr(args, "no_kg", False))
+                results = pull_from_peers(
+                    palace_path,
+                    pull_kg=not getattr(args, "no_kg", False),
+                    with_vectors=getattr(args, "with_vectors", False),
+                )
                 if not results:
                     _logstream_fail(
                         f"no peers configured ({palace_path}/peers.json) and no --peer given",
@@ -3243,7 +3277,28 @@ def main():
         action="store_true",
         help="Skip knowledge-graph rows (use when the peer replicates your own KG back)",
     )
+    p_rep_pull.add_argument(
+        "--with-vectors",
+        action="store_true",
+        help="Use vectors precomputed by the origin under this palace's embedder "
+        "identity (insert-only fold; origin must have run embed-cache)",
+    )
     p_rep_pull.add_argument("--json", action="store_true", help="Machine-readable output")
+    p_rep_embed = replica_sub.add_parser(
+        "embed-cache",
+        help="Bulk-embed local documents into the portable vector cache "
+        "(distributed derivation: compute here, fold anywhere)",
+    )
+    p_rep_embed.add_argument(
+        "--model", default=None, help="Embedder identity (default: this palace's identity)"
+    )
+    p_rep_embed.add_argument("--batch", type=int, default=256, help="Embedding batch size")
+    p_rep_embed.add_argument(
+        "--all",
+        action="store_true",
+        help="Embed everything (default: authored-only — the set peers pull from us)",
+    )
+    p_rep_embed.add_argument("--json", action="store_true", help="Machine-readable output")
 
     p_palace = sub.add_parser("palace", help="Palace maintenance commands")
     palace_sub = p_palace.add_subparsers(dest="palace_action")

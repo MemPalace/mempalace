@@ -303,3 +303,128 @@ class TestReplicaPull:
         )
         results = json.loads(capsys.readouterr().out)
         assert results[0]["drawers_upserted"] == 3
+
+
+class TestDistributedVectors:
+    """RFC 004 distributed derivation: vectors computed at the origin under
+    the puller's embedder identity, folded insert-only."""
+
+    @pytest.fixture
+    def fake_identity(self, monkeypatch):
+        import types
+
+        import mempalace.embedding as embedding
+
+        def fake_ef_factory(device=None, model=None):
+            def ef(input):
+                return [[1.0, 0.0] if "canary" in t else [0.0, 1.0] for t in input]
+
+            return ef
+
+        monkeypatch.setattr(embedding, "get_embedding_function", fake_ef_factory)
+        monkeypatch.setattr(
+            embedding,
+            "get_embedder_identity",
+            lambda device=None, model=None: types.SimpleNamespace(model_name="minilm", dimension=2),
+        )
+
+    def test_cache_roundtrip_and_wire_format(self, replica_palace):
+        from mempalace.vector_cache import VectorCache, b64_to_vector, vector_to_b64
+
+        cache = VectorCache(replica_palace)
+        try:
+            cache.put_many("minilm", [("d1", [0.25, -1.5]), ("d2", [3.0, 4.0])])
+            got = cache.get_many("minilm", ["d1", "d2", "d3"])
+            assert got["d1"] == [0.25, -1.5]
+            assert "d3" not in got
+            assert cache.missing_ids("minilm", ["d1", "d3"]) == ["d3"]
+            assert cache.count("minilm") == 2
+            assert cache.count("other-model") == 0
+            assert b64_to_vector(vector_to_b64([0.5, 0.5])) == [0.5, 0.5]
+        finally:
+            cache.close()
+
+    def test_build_cache_authored_only_and_resumable(
+        self, origin_server, fake_identity, fake_embedder
+    ):
+        from mempalace.vector_cache import build_cache
+
+        url, origin_palace, _ = origin_server
+        stats = build_cache(origin_palace, "minilm", batch_size=2)
+        assert stats["embedded"] == 3  # the 3 seeded (authored) drawers
+        assert stats["cache_total"] == 3
+        again = build_cache(origin_palace, "minilm", batch_size=2)
+        assert again["embedded"] == 0
+        assert again["skipped_cached"] == 3
+
+    def test_endpoint_ships_vectors_and_manifest_advertises(
+        self, origin_server, fake_identity, fake_embedder
+    ):
+        from mempalace.vector_cache import b64_to_vector, build_cache
+
+        url, origin_palace, _ = origin_server
+        build_cache(origin_palace, "minilm")
+        status, manifest = _get(url, "/snapshot/manifest")
+        assert manifest["vector_cache"] == {"minilm": 3}
+        status, page = _get(url, "/snapshot/drawers?offset=0&limit=10&vectors=minilm")
+        assert status == 200
+        assert page["vectors_included"] == 3
+        assert page["vectors_model"] == "minilm"
+        canary = next(i for i in page["items"] if "canary" in i["document"])
+        assert b64_to_vector(canary["vector_b64"]) == [1.0, 0.0]
+
+    def test_pull_with_vectors_is_insert_only(
+        self, origin_server, replica_palace, fake_identity, fake_embedder, monkeypatch
+    ):
+        from mempalace.vector_cache import build_cache
+
+        url, origin_palace, _ = origin_server
+        build_cache(origin_palace, "minilm")
+
+        # Any local embedding during the fold is a failure of the design.
+        import mempalace.backends.embedding_wrapper as embedding_wrapper
+
+        def forbid(texts):
+            raise AssertionError(f"local embedding invoked for {len(texts)} docs")
+
+        monkeypatch.setattr(embedding_wrapper, "_embed_texts", forbid)
+
+        stats = pull_memory(replica_palace, url, with_vectors=True, pull_kg=False)
+        assert stats["vectors_used"] == 3
+        assert stats["locally_embedded"] == 0
+
+        # Folded vectors are live in the local index: vector search works.
+        from mempalace.palace import get_collection
+
+        col = get_collection(replica_palace)
+        result = col.query(query_embeddings=[[1.0, 0.0]], n_results=1)
+        assert "canary" in result["documents"][0][0]
+
+    def test_pull_with_vectors_refuses_when_peer_has_no_cache(
+        self, origin_server, replica_palace, fake_identity, fake_embedder
+    ):
+        from mempalace.logsync import SyncPeerError
+
+        url, _, _ = origin_server
+        with pytest.raises(SyncPeerError, match="no vector cache"):
+            pull_memory(replica_palace, url, with_vectors=True, pull_kg=False)
+
+    def test_partial_cache_falls_back_locally(
+        self, origin_server, replica_palace, fake_identity, fake_embedder
+    ):
+        from mempalace.vector_cache import VectorCache, build_cache
+
+        url, origin_palace, _ = origin_server
+        build_cache(origin_palace, "minilm")
+        # Simulate one drawer missing from the origin's cache.
+        cache = VectorCache(origin_palace)
+        try:
+            with cache._lock:
+                with cache._conn() as conn:
+                    conn.execute("DELETE FROM vectors WHERE drawer_id = 'drawer_w_r_bbb'")
+        finally:
+            cache.close()
+
+        stats = pull_memory(replica_palace, url, with_vectors=True, pull_kg=False)
+        assert stats["vectors_used"] == 2
+        assert stats["locally_embedded"] == 1

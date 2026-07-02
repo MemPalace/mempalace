@@ -35,19 +35,44 @@ _PAGE = 500
 REPLICA_ORIGIN_KEY = "replica_origin"
 
 
-def _pull_drawers(col, url: str, token: str, origin_id: str) -> int:
+def _pull_drawers(col, url: str, token: str, origin_id: str, vectors_model: str = None) -> dict:
+    """Page and fold remote drawers. With ``vectors_model``, request served
+    vectors and upsert them explicitly (insert-only fold, RFC 004
+    distributed derivation); items the peer has no cached vector for fall
+    back to local embedding. Returns fold stats."""
+    from .vector_cache import b64_to_vector
+
     upserted = 0
+    vectors_used = 0
+    locally_embedded = 0
     offset = 0
     while True:
-        page = _peer_get(url, token, "/snapshot/drawers", {"offset": offset, "limit": _PAGE})
+        params = {"offset": offset, "limit": _PAGE}
+        if vectors_model:
+            params["vectors"] = vectors_model
+        page = _peer_get(url, token, "/snapshot/drawers", params)
         items = page.get("items") or []
         if items:
-            ids = [item["id"] for item in items]
-            documents = [item["document"] for item in items]
-            metadatas = [
-                {**(item.get("metadata") or {}), REPLICA_ORIGIN_KEY: origin_id} for item in items
-            ]
-            col.upsert(ids=ids, documents=documents, metadatas=metadatas)
+            with_vec = [item for item in items if item.get("vector_b64")]
+            without_vec = [item for item in items if not item.get("vector_b64")]
+            for group, explicit in ((with_vec, True), (without_vec, False)):
+                if not group:
+                    continue
+                ids = [item["id"] for item in group]
+                documents = [item["document"] for item in group]
+                metadatas = [
+                    {**(item.get("metadata") or {}), REPLICA_ORIGIN_KEY: origin_id}
+                    for item in group
+                ]
+                if explicit:
+                    embeddings = [b64_to_vector(item["vector_b64"]) for item in group]
+                    col.upsert(
+                        ids=ids, documents=documents, metadatas=metadatas, embeddings=embeddings
+                    )
+                    vectors_used += len(group)
+                else:
+                    col.upsert(ids=ids, documents=documents, metadatas=metadatas)
+                    locally_embedded += len(group)
             upserted += len(items)
         # Authored-only serving can return sparse pages: advance by the
         # server's raw scan cursor, not by the filtered item count.
@@ -55,7 +80,11 @@ def _pull_drawers(col, url: str, token: str, origin_id: str) -> int:
         if next_offset is None:
             break
         offset = next_offset
-    return upserted
+    return {
+        "upserted": upserted,
+        "vectors_used": vectors_used,
+        "locally_embedded": locally_embedded,
+    }
 
 
 def _pull_remote_ids(url: str, token: str) -> set:
@@ -120,6 +149,7 @@ def pull_memory(
     token: str = "",
     reconcile_deletes: bool = True,
     pull_kg: bool = True,
+    with_vectors: bool = False,
 ) -> dict:
     """One full read-replica pass against one origin. Returns fold stats.
 
@@ -132,11 +162,29 @@ def pull_memory(
     manifest = _peer_get(url, token, "/snapshot/manifest")
     origin_id = manifest.get("replica_id") or "unknown-origin"
 
+    vectors_model = None
+    if with_vectors:
+        # Served vectors are only usable under the LOCAL embedder identity —
+        # a vector from a different model poisons the index silently, so the
+        # identity gate is loud and mandatory (RFC 001 meets RFC 004).
+        from .embedding import get_embedder_identity
+
+        identity = get_embedder_identity()
+        vectors_model = identity.model_name
+        peer_cache = (manifest.get("vector_cache") or {}).get(vectors_model, 0)
+        if not peer_cache:
+            raise SyncPeerError(
+                f"peer has no vector cache for local embedder identity "
+                f"{vectors_model!r} — run 'mempalace replica embed-cache' on the "
+                "origin first, or pull without --with-vectors"
+            )
+
     col = get_collection(palace_path, create=True)
     if col is None:
         raise SyncPeerError(f"could not open local collection in {palace_path!r}")
 
-    upserted = _pull_drawers(col, url, token, origin_id)
+    fold = _pull_drawers(col, url, token, origin_id, vectors_model=vectors_model)
+    upserted = fold["upserted"]
     deleted = 0
     if reconcile_deletes:
         deleted = _reconcile_deletes(col, _pull_remote_ids(url, token), origin_id)
@@ -164,19 +212,27 @@ def pull_memory(
         "manifest": manifest,
         "drawers_upserted": upserted,
         "drawers_deleted": deleted,
+        "vectors_used": fold["vectors_used"],
+        "locally_embedded": fold["locally_embedded"],
         "kg_entities": kg_counts["entities"],
         "kg_triples": kg_counts["triples"],
     }
 
 
-def pull_from_peers(palace_path: str, pull_kg: bool = True) -> list:
+def pull_from_peers(palace_path: str, pull_kg: bool = True, with_vectors: bool = False) -> list:
     """Run a pull against every peers.json entry; per-peer errors reported,
     never raised (a dead origin must not block the others)."""
     results = []
     for peer in load_peers(palace_path):
         name = peer.get("name") or peer["url"]
         try:
-            stats = pull_memory(palace_path, peer["url"], peer.get("token", ""), pull_kg=pull_kg)
+            stats = pull_memory(
+                palace_path,
+                peer["url"],
+                peer.get("token", ""),
+                pull_kg=pull_kg,
+                with_vectors=with_vectors,
+            )
             stats["peer_name"] = name
             results.append(stats)
         except (SyncPeerError, ValueError) as exc:
