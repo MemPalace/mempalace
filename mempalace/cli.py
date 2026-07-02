@@ -1404,6 +1404,40 @@ def cmd_logstream(args):
                         _print_event_line(event)
             if result.get("timed_out"):
                 sys.exit(2)
+        elif args.logstream_action == "sync":
+            from .logsync import load_peers, sync_all, sync_with_peer
+
+            palace_path = (
+                os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+            )
+            try:
+                if args.peer:
+                    results = [sync_with_peer(ls, args.peer, args.token or "")]
+                else:
+                    if not load_peers(palace_path):
+                        _logstream_fail(
+                            f"no peers configured ({palace_path}/peers.json) and no --peer given",
+                            as_json,
+                        )
+                    results = sync_all(ls, palace_path)
+            except Exception as exc:
+                _logstream_fail(str(exc), as_json)
+            if as_json:
+                print(json.dumps(results, indent=2, ensure_ascii=False))
+            else:
+                for stats in results:
+                    if stats.get("error"):
+                        print(
+                            f"  {stats.get('peer_name', stats['peer_url'])}: ERROR {stats['error']}"
+                        )
+                    else:
+                        print(
+                            f"  {stats.get('peer_name', stats['peer_url'])} "
+                            f"({stats['peer_replica']}): +{stats['pulled_events']} events, "
+                            f"+{stats['pulled_artifacts']} artifacts"
+                        )
+            if any(s.get("error") for s in results):
+                sys.exit(1)
         elif args.logstream_action == "ack":
             try:
                 event = ls.ack_event(
@@ -3104,6 +3138,15 @@ def main():
     )
     p_ls_ack.add_argument("--body", default=None, help="Verbatim ack notes")
     p_ls_ack.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    p_ls_sync = logstream_sub.add_parser(
+        "sync", help="Pull missing events/artifacts from peer replicas (RFC 004)"
+    )
+    p_ls_sync.add_argument(
+        "--peer", default=None, help="Peer base URL (default: all peers in peers.json)"
+    )
+    p_ls_sync.add_argument("--token", default=None, help="Bearer token for --peer")
+    p_ls_sync.add_argument("--json", action="store_true", help="Machine-readable output")
 
     # artifact (RFC 003 exact content exchange)
     p_artifact = sub.add_parser(

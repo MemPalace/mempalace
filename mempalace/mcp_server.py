@@ -5732,6 +5732,132 @@ def _http_dispatch(request):
         return handle_request(request)
 
 
+def _http_handle_get(handler) -> None:
+    """Route GET requests. Module-level (like the other _http_* helpers) to
+    keep _build_http_server under the C901 complexity ceiling.
+
+    /healthz is the only credential-free route (liveness probes); everything
+    else follows the bearer policy because it exposes palace/ops metadata.
+    """
+    path = urlparse(handler.path).path
+    if path == "/healthz":
+        if not handler._request_rejected(require_auth=False):
+            handler._send_bytes(200, b"ok\n", "text/plain; charset=utf-8")
+        return
+    if path == "/statusz":
+        if not handler._request_rejected(require_auth=True):
+            handler._send_json(200, handler._status_payload())
+        return
+    if path == "/logstream/stream":
+        # Events and artifacts expose work metadata and patch contents;
+        # the stream always follows the bearer policy.
+        if not handler._request_rejected(require_auth=True):
+            _http_serve_logstream_stream(handler)
+        return
+    if path.startswith("/sync/"):
+        if handler._request_rejected(require_auth=True):
+            return
+        if not _http_serve_sync(handler, path):
+            handler.send_error(404, "Not Found")
+        return
+    if handler._request_rejected(require_auth=False):
+        return
+    handler.send_error(404, "Not Found")
+
+
+def _http_serve_sync(handler, path: str) -> bool:
+    """RFC 004 step 0: pull-based anti-entropy endpoints for peer replicas.
+
+    GET /sync/version_vector           → {replica_id, version_vector}
+    GET /sync/ops?origin=&after=&limit → {origin, events, count} (author order)
+    GET /sync/artifact?id=             → {artifact} (exact content + sha256)
+
+    Bearer policy enforced by the caller; served lock-free like all
+    logstream traffic. Returns False when the path is not a sync route.
+    """
+    from urllib.parse import parse_qsl
+
+    query = dict(parse_qsl(urlparse(handler.path).query))
+    try:
+        if path == "/sync/version_vector":
+            handler._send_json(
+                200,
+                {
+                    "replica_id": _call_logstream(lambda ls: ls.replica_id),
+                    "version_vector": _call_logstream(lambda ls: ls.version_vector()),
+                },
+            )
+            return True
+        if path == "/sync/ops":
+            origin = query.get("origin") or ""
+            after = int(query.get("after", "0") or 0)
+            limit = int(query.get("limit", "500") or 500)
+            events = _call_logstream(lambda ls: ls.list_ops(origin, after_seq=after, limit=limit))
+            handler._send_json(200, {"origin": origin, "events": events, "count": len(events)})
+            return True
+        if path == "/sync/artifact":
+            artifact_id = query.get("id") or ""
+            artifact = _call_logstream(lambda ls: ls.get_artifact(artifact_id))
+            if artifact is None:
+                handler._send_json(404, {"error": f"artifact {artifact_id!r} not found"})
+            else:
+                handler._send_json(200, {"artifact": artifact})
+            return True
+    except (ValueError, TypeError) as exc:
+        handler._send_json(400, {"error": str(exc)})
+        return True
+    return False
+
+
+def _start_peer_sync_thread() -> None:
+    """Background anti-entropy loop when peers.json exists (RFC 004 step 0).
+
+    Runs in the serving process so a hub with configured peers converges
+    with zero extra processes. Interval via MEMPALACE_SYNC_INTERVAL
+    (seconds, default 15; 0 disables). Errors are logged, never fatal —
+    a dead peer must not take the loop down (R1).
+    """
+    from .logsync import load_peers, sync_all
+
+    palace_path = getattr(_config, "palace_path", None)
+    if not palace_path:
+        return
+    try:
+        interval = float(os.environ.get("MEMPALACE_SYNC_INTERVAL", "") or 15)
+    except ValueError:
+        interval = 15.0
+    if interval <= 0:
+        return
+    try:
+        if not load_peers(palace_path):
+            return
+    except ValueError as exc:
+        logger.error("peers.json is malformed; peer sync disabled: %s", exc)
+        return
+
+    def _loop():
+        while True:
+            time.sleep(interval)
+            try:
+                ls = _get_logstream()
+                for stats in sync_all(ls, palace_path):
+                    if stats.get("error"):
+                        logger.warning("peer sync %s: %s", stats.get("peer_name"), stats["error"])
+                    elif stats.get("pulled_events"):
+                        logger.info(
+                            "peer sync %s: pulled %d event(s), %d artifact(s)",
+                            stats.get("peer_name"),
+                            stats["pulled_events"],
+                            stats["pulled_artifacts"],
+                        )
+            except Exception:
+                logger.warning("peer sync round failed", exc_info=True)
+
+    thread = threading.Thread(target=_loop, name="mempalace-logsync", daemon=True)
+    thread.start()
+    logger.info("peer sync thread started (interval %.0fs)", interval)
+
+
 def _sse_acquire_slot(httpd) -> bool:
     with httpd.sse_lock:
         if httpd.sse_clients >= httpd.sse_max_clients:
@@ -5916,30 +6042,7 @@ def _build_http_server(host: str, port: int):
             return _http_request_rejected(self, require_auth)
 
         def do_GET(self):
-            # Liveness probe is policy-gated for Host/Origin but never requires
-            # the token, so an orchestrator's health check works without creds.
-            path = urlparse(self.path).path
-            if path == "/healthz":
-                if self._request_rejected(require_auth=False):
-                    return
-                self._send_bytes(200, b"ok\n", "text/plain; charset=utf-8")
-                return
-            if path == "/statusz":
-                if self._request_rejected(require_auth=True):
-                    return
-                self._send_json(200, self._status_payload())
-                return
-            if path == "/logstream/stream":
-                # Events and artifacts expose work metadata and patch
-                # contents; the stream always follows the bearer policy.
-                if self._request_rejected(require_auth=True):
-                    return
-                _http_serve_logstream_stream(self)
-                return
-            if self._request_rejected(require_auth=False):
-                return
-
-            self.send_error(404, "Not Found")
+            _http_handle_get(self)
 
         def do_POST(self):
             if self._request_rejected(require_auth=True):
@@ -6069,6 +6172,10 @@ def _serve_http(host: str, port: int) -> None:
                 host,
                 _HTTP_ALLOW_INSECURE_NO_TOKEN_ENV,
             )
+
+    # RFC 004 step 0: converge with peer replicas when peers.json exists.
+    _start_peer_sync_thread()
+
     with httpd:
         logger.info(
             "MemPalace MCP HTTP server listening on %s://%s:%s/mcp%s%s",

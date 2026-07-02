@@ -181,7 +181,10 @@ class Logstream:
         db_path: str,
         max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
         max_artifact_bytes: int = DEFAULT_MAX_ARTIFACT_BYTES,
+        replica_id: str = None,
     ):
+        from .replica import get_replica_id
+
         self.db_path = str(db_path)
         self.max_body_bytes = max_body_bytes
         self.max_artifact_bytes = max_artifact_bytes
@@ -191,11 +194,16 @@ class Logstream:
             db_parent.chmod(0o700)
         except (OSError, NotImplementedError):
             pass
+        # RFC 004 provenance: every op is stamped with the replica that authored it.
+        # replica.json lives in the palace dir (the db's parent).
+        self.replica_id = replica_id or get_replica_id(str(db_parent))
         self._connection = None
         self._lock = threading.Lock()
         self._init_db()
 
     def _init_db(self):
+        from .hlc import HybridLogicalClock
+
         conn = self._conn()
         conn.executescript("""
             PRAGMA journal_mode=WAL;
@@ -213,7 +221,10 @@ class Logstream:
                 status TEXT,
                 body TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
-                metadata_json TEXT NOT NULL DEFAULT '{}'
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                origin_replica TEXT,
+                origin_seq INTEGER,
+                hlc TEXT
             );
 
             CREATE INDEX IF NOT EXISTS events_stream_created_idx
@@ -233,7 +244,8 @@ class Logstream:
                 content TEXT NOT NULL,
                 created_by TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                metadata_json TEXT NOT NULL DEFAULT '{}'
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                origin_replica TEXT
             );
 
             CREATE INDEX IF NOT EXISTS artifacts_sha256_idx ON artifacts(sha256);
@@ -244,7 +256,65 @@ class Logstream:
                 PRIMARY KEY (event_id, artifact_id)
             );
         """)
+        self._migrate_replication_schema(conn)
         conn.commit()
+        # Seed the HLC from the newest stamp in the log so monotonicity
+        # survives restarts (RFC 004 op envelope).
+        row = conn.execute("SELECT max(hlc) AS last FROM events").fetchone()
+        self._clock = HybridLogicalClock(self.replica_id, last=row["last"] if row else None)
+
+    def _migrate_replication_schema(self, conn):
+        """RFC 004 step 0: add provenance columns to pre-replication logs.
+
+        Fresh databases get the columns from the canonical CREATE TABLE; this
+        path upgrades logs created before step 0. Backfill stamps existing
+        rows as authored by THIS replica (they were: pre-replication, only
+        one copy existed) with origin_seq = rowid and an HLC derived from
+        created_at + rowid, preserving their original total order.
+        """
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(events)")}
+        if "origin_replica" not in existing:
+            conn.execute("ALTER TABLE events ADD COLUMN origin_replica TEXT")
+        if "origin_seq" not in existing:
+            conn.execute("ALTER TABLE events ADD COLUMN origin_seq INTEGER")
+        if "hlc" not in existing:
+            conn.execute("ALTER TABLE events ADD COLUMN hlc TEXT")
+        art_existing = {row["name"] for row in conn.execute("PRAGMA table_info(artifacts)")}
+        if "origin_replica" not in art_existing:
+            conn.execute("ALTER TABLE artifacts ADD COLUMN origin_replica TEXT")
+
+        from .hlc import render as hlc_render
+
+        rows = conn.execute(
+            "SELECT rowid, created_at FROM events WHERE origin_replica IS NULL"
+        ).fetchall()
+        for row in rows:
+            try:
+                ms = int(
+                    datetime.strptime(row["created_at"], "%Y-%m-%dT%H:%M:%SZ")
+                    .replace(tzinfo=timezone.utc)
+                    .timestamp()
+                    * 1000
+                )
+            except ValueError:
+                ms = 0
+            conn.execute(
+                "UPDATE events SET origin_replica = ?, origin_seq = rowid, hlc = ? WHERE rowid = ?",
+                (
+                    self.replica_id,
+                    hlc_render(ms, min(row["rowid"], 0xFFFFFF), self.replica_id),
+                    row["rowid"],
+                ),
+            )
+        conn.execute(
+            "UPDATE artifacts SET origin_replica = ? WHERE origin_replica IS NULL",
+            (self.replica_id,),
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS events_origin_seq_idx "
+            "ON events(origin_replica, origin_seq)"
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS events_hlc_idx ON events(hlc)")
 
     def _conn(self):
         if self._connection is None:
@@ -277,6 +347,12 @@ class Logstream:
         return {
             "id": row["id"],
             "seq": row["rowid"],
+            # RFC 004 additive fields — committed compat surface. `seq` stays
+            # the LOCAL arrival cursor; `origin_seq` is the author's counter;
+            # `hlc` is the cross-replica display/merge order.
+            "origin_replica": row["origin_replica"],
+            "origin_seq": row["origin_seq"],
+            "hlc": row["hlc"],
             "type": row["type"],
             "stream": row["stream"],
             "room": row["room"],
@@ -350,6 +426,7 @@ class Logstream:
 
         event_id = _new_id("evt")
         created_at = _utc_now_iso()
+        hlc = self._clock.tick()
 
         with self._lock:
             conn = self._conn()
@@ -362,10 +439,11 @@ class Logstream:
                         raise ValueError(
                             f"artifact_ids references unknown artifact {artifact_id!r}"
                         )
-                conn.execute(
+                cursor = conn.execute(
                     "INSERT INTO events (id, type, stream, room, from_agent, to_agent,"
                     " correlation_id, branch, base_commit, status, body, created_at,"
-                    " metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " metadata_json, origin_replica, hlc)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         event_id,
                         type,
@@ -380,7 +458,15 @@ class Logstream:
                         body,
                         created_at,
                         metadata_json,
+                        self.replica_id,
+                        hlc,
                     ),
+                )
+                # Locally-authored ops use the local rowid as their per-origin
+                # counter — strictly monotonic, gap-free enough for cursors.
+                conn.execute(
+                    "UPDATE events SET origin_seq = rowid WHERE rowid = ?",
+                    (cursor.lastrowid,),
                 )
                 for artifact_id in artifact_ids:
                     conn.execute(
@@ -457,7 +543,8 @@ class Logstream:
             with conn:
                 conn.execute(
                     "INSERT INTO artifacts (id, kind, sha256, size_bytes, content,"
-                    " created_by, created_at, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    " created_by, created_at, metadata_json, origin_replica)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         artifact_id,
                         kind,
@@ -467,6 +554,7 @@ class Logstream:
                         created_by,
                         created_at,
                         metadata_json,
+                        self.replica_id,
                     ),
                 )
         record = {
@@ -476,6 +564,7 @@ class Logstream:
             "size_bytes": len(raw),
             "created_by": created_by,
             "created_at": created_at,
+            "origin_replica": self.replica_id,
         }
         warnings = self._patch_content_warnings(kind, content)
         if warnings:
@@ -580,6 +669,7 @@ class Logstream:
             "content": row["content"],
             "created_by": row["created_by"],
             "created_at": row["created_at"],
+            "origin_replica": row["origin_replica"],
             "metadata": metadata,
         }
 
@@ -709,3 +799,170 @@ class Logstream:
                 delay = base * (0.75 + random.random() * 0.25)
             time.sleep(min(delay, remaining))
             attempt += 1
+
+    # ── Replication (RFC 004 step 0: logstream multi-master) ─────────────
+
+    def version_vector(self) -> dict:
+        """{origin_replica: highest origin_seq applied locally}.
+
+        The complete description of this replica's knowledge — peers diff
+        their vectors to compute exactly which op ranges are missing.
+        """
+        with self._lock:
+            conn = self._conn()
+            rows = conn.execute(
+                "SELECT origin_replica, max(origin_seq) AS top FROM events "
+                "WHERE origin_replica IS NOT NULL GROUP BY origin_replica"
+            ).fetchall()
+        return {row["origin_replica"]: row["top"] for row in rows}
+
+    def list_ops(self, origin: str, after_seq: int = 0, limit: int = 500) -> list[dict]:
+        """Events authored by ``origin`` with origin_seq > after_seq, in
+        author order. The anti-entropy pull unit."""
+        origin = _sanitize_routing(origin, "origin")
+        if not isinstance(after_seq, int) or after_seq < 0:
+            raise ValueError("after_seq must be a non-negative integer")
+        if not isinstance(limit, int) or limit < 1:
+            raise ValueError("limit must be a positive integer")
+        limit = min(limit, MAX_LIST_LIMIT)
+        with self._lock:
+            conn = self._conn()
+            rows = conn.execute(
+                "SELECT rowid, * FROM events WHERE origin_replica = ? AND origin_seq > ? "
+                "ORDER BY origin_seq ASC LIMIT ?",
+                (origin, after_seq, limit),
+            ).fetchall()
+            events = [self._event_dict(row) for row in rows]
+            return self._attach_artifact_ids(conn, events)
+
+    def apply_remote_event(self, event: dict) -> bool:
+        """Fold one remote op into the local log, idempotently.
+
+        Verbatim rule: the event is stored exactly as authored (id,
+        created_at, hlc, origin stamps untouched); only the local rowid —
+        the arrival cursor — is ours. Referenced artifacts must already be
+        applied (sync pulls artifacts first) so readers never see a dangling
+        id, same invariant as append_event. Returns True if inserted, False
+        if we already had it. Raises ValueError on malformed input or a
+        missing artifact.
+        """
+        for key in (
+            "id",
+            "type",
+            "stream",
+            "room",
+            "from_agent",
+            "created_at",
+            "origin_replica",
+            "origin_seq",
+            "hlc",
+        ):
+            if not event.get(key):
+                raise ValueError(f"remote event is missing required field {key!r}")
+        if event["origin_replica"] == self.replica_id:
+            return False  # our own op echoed back — by definition already present
+        artifact_ids = list(dict.fromkeys(event.get("artifact_ids") or []))
+        metadata_json = _sanitize_metadata(event.get("metadata"))
+
+        with self._lock:
+            conn = self._conn()
+            with conn:
+                dup = conn.execute(
+                    "SELECT 1 FROM events WHERE id = ? OR (origin_replica = ? AND origin_seq = ?)",
+                    (event["id"], event["origin_replica"], event["origin_seq"]),
+                ).fetchone()
+                if dup:
+                    return False
+                for artifact_id in artifact_ids:
+                    found = conn.execute(
+                        "SELECT 1 FROM artifacts WHERE id = ?", (artifact_id,)
+                    ).fetchone()
+                    if not found:
+                        raise ValueError(
+                            f"remote event {event['id']!r} references artifact "
+                            f"{artifact_id!r} not yet applied locally"
+                        )
+                conn.execute(
+                    "INSERT INTO events (id, type, stream, room, from_agent, to_agent,"
+                    " correlation_id, branch, base_commit, status, body, created_at,"
+                    " metadata_json, origin_replica, origin_seq, hlc)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        event["id"],
+                        event["type"],
+                        event["stream"],
+                        event["room"],
+                        event["from_agent"],
+                        event.get("to_agent"),
+                        event.get("correlation_id"),
+                        event.get("branch"),
+                        event.get("base_commit"),
+                        event.get("status"),
+                        event.get("body") or "",
+                        event["created_at"],
+                        metadata_json,
+                        event["origin_replica"],
+                        event["origin_seq"],
+                        event["hlc"],
+                    ),
+                )
+                for artifact_id in artifact_ids:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO event_artifacts (event_id, artifact_id)"
+                        " VALUES (?, ?)",
+                        (event["id"], artifact_id),
+                    )
+        # Absorb the remote instant so our next local op sorts after it.
+        self._clock.observe(event["hlc"])
+        return True
+
+    def has_artifact(self, artifact_id: str) -> bool:
+        """Cheap existence probe (no content transfer) for the sync engine."""
+        artifact_id = _sanitize_routing(artifact_id, "artifact_id")
+        with self._lock:
+            conn = self._conn()
+            row = conn.execute("SELECT 1 FROM artifacts WHERE id = ?", (artifact_id,)).fetchone()
+        return row is not None
+
+    def apply_remote_artifact(self, artifact: dict) -> bool:
+        """Fold one remote artifact in, idempotently, verifying its hash.
+
+        Content is verbatim; the sha256 must match or the artifact is
+        rejected — a corrupt transfer must never enter the store.
+        """
+        for key in ("id", "kind", "sha256", "content", "created_by", "created_at"):
+            if not artifact.get(key):
+                raise ValueError(f"remote artifact is missing required field {key!r}")
+        content = artifact["content"]
+        digest = sha256(content.encode("utf-8")).hexdigest()
+        if digest != artifact["sha256"]:
+            raise ValueError(
+                f"remote artifact {artifact['id']!r} failed hash verification "
+                f"(claimed {artifact['sha256'][:16]}..., computed {digest[:16]}...)"
+            )
+        metadata_json = _sanitize_metadata(artifact.get("metadata"))
+        with self._lock:
+            conn = self._conn()
+            with conn:
+                dup = conn.execute(
+                    "SELECT 1 FROM artifacts WHERE id = ?", (artifact["id"],)
+                ).fetchone()
+                if dup:
+                    return False
+                conn.execute(
+                    "INSERT INTO artifacts (id, kind, sha256, size_bytes, content,"
+                    " created_by, created_at, metadata_json, origin_replica)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        artifact["id"],
+                        artifact["kind"],
+                        artifact["sha256"],
+                        len(content.encode("utf-8")),
+                        content,
+                        artifact["created_by"],
+                        artifact["created_at"],
+                        metadata_json,
+                        artifact.get("origin_replica"),
+                    ),
+                )
+        return True
