@@ -64,6 +64,7 @@ export default withMermaid(
               { text: 'Cursor IDE Hooks', link: '/guide/cursor-hooks' },
               { text: 'Configuration', link: '/guide/configuration' },
               { text: 'Remote / Team Server', link: '/guide/remote-server' },
+              { text: 'Shared Brain', link: '/guide/shared-brain' },
             ],
           },
         ],
