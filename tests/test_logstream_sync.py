@@ -199,6 +199,19 @@ class TestMigration:
 # ── Sync primitives ───────────────────────────────────────────────────────
 
 
+class TestHttpTimeout:
+    def test_default_and_env_override(self, monkeypatch):
+        from mempalace.logsync import _HTTP_TIMEOUT_S, _http_timeout_s
+
+        monkeypatch.delenv("MEMPALACE_SYNC_HTTP_TIMEOUT", raising=False)
+        assert _http_timeout_s() == float(_HTTP_TIMEOUT_S)
+        monkeypatch.setenv("MEMPALACE_SYNC_HTTP_TIMEOUT", "180")
+        assert _http_timeout_s() == 180.0
+        # Garbage degrades to the default rather than wedging every sync.
+        monkeypatch.setenv("MEMPALACE_SYNC_HTTP_TIMEOUT", "not-a-number")
+        assert _http_timeout_s() == float(_HTTP_TIMEOUT_S)
+
+
 class TestSyncPrimitives:
     def test_append_stamps_origin_fields(self, ls_a):
         event = _append(ls_a)

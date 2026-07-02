@@ -35,6 +35,21 @@ _HTTP_TIMEOUT_S = 30
 _PULL_BATCH = 500
 
 
+def _http_timeout_s() -> float:
+    """Per-request timeout for peer HTTP calls, env-tunable.
+
+    The default suits logstream syncs (small pages), but a deep-offset
+    snapshot page — Chroma's get(offset=N) scans N rows — behind a TLS
+    proxy can legitimately exceed 30s on a large palace (first hit in
+    production: a 31k-drawer bootstrap timing out at offset 27500). Set
+    MEMPALACE_SYNC_HTTP_TIMEOUT to raise it for bootstrap pulls.
+    """
+    try:
+        return float(os.environ.get("MEMPALACE_SYNC_HTTP_TIMEOUT", "") or _HTTP_TIMEOUT_S)
+    except ValueError:
+        return float(_HTTP_TIMEOUT_S)
+
+
 class SyncPeerError(Exception):
     """A peer was unreachable or answered outside the protocol."""
 
@@ -65,7 +80,7 @@ def _peer_get(base_url: str, token: str, path: str, params: dict = None) -> dict
     if token:
         request.add_header("Authorization", f"Bearer {token}")
     try:
-        with urllib.request.urlopen(request, timeout=_HTTP_TIMEOUT_S) as response:
+        with urllib.request.urlopen(request, timeout=_http_timeout_s()) as response:
             return json.loads(response.read().decode("utf-8"))
     except (urllib.error.URLError, TimeoutError, ValueError) as exc:
         raise SyncPeerError(f"{url}: {exc}") from None
