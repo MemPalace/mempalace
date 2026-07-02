@@ -60,7 +60,10 @@ class TestServerRegistry:
         path = server_registry.write_serverinfo(
             palace, host="127.0.0.1", port=8765, scheme="http", read_only=False
         )
-        assert oct(os.stat(path).st_mode & 0o777) == "0o600"
+        if os.name != "nt":
+            assert oct(os.stat(path).st_mode & 0o777) == "0o600"
+        else:
+            assert path.exists()
         info = server_registry.read_live_serverinfo(palace)
         assert info is not None
         assert info["pid"] == os.getpid()
@@ -313,11 +316,13 @@ class TestStdioProxy:
     def _disown_record(palace):
         """Re-stamp the serverinfo pid so the record looks like another
         process's hub — write_serverinfo records our own pid, which the
-        proxy correctly refuses to dial. PID 1 (launchd/init) is always
-        alive and never ours."""
+        proxy correctly refuses to dial."""
         path = server_registry.serverinfo_path(palace)
         record = json.loads(path.read_text())
-        record["pid"] = 1
+        parent_pid = os.getppid()
+        assert parent_pid != os.getpid()
+        assert server_registry._pid_alive(parent_pid)
+        record["pid"] = parent_pid
         path.write_text(json.dumps(record))
 
     def test_forwards_request_to_live_hub(self, proxied_palace, fake_hub, monkeypatch):
