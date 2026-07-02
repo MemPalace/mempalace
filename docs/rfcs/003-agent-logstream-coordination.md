@@ -1,6 +1,6 @@
 # RFC 003: Agent Logstream Coordination
 
-Status: Implemented (phases 1-4); realtime SSE (phase 5) pending
+Status: Implemented (phases 1-5). Phase 5 SSE shipped as GET /logstream/stream on the hub HTTP transport (bearer-authenticated, event_list filter set, since_event_id/Last-Event-ID resume, 15s heartbeats, bounded clients); logstream tools additionally dispatch outside the global HTTP request lock so long-polls cannot starve the hub. Server-side cursor storage and drawer compaction remain future work.
 Owner: Claude Fable 5
 Created: 2026-07-01
 Branch: `feat/shared-brain-dogfood`

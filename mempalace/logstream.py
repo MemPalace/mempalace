@@ -662,6 +662,17 @@ class Logstream:
             events = [self._event_dict(row) for row in rows]
             return self._attach_artifact_ids(conn, events)
 
+    def latest_event_id(self) -> Optional[str]:
+        """Id of the newest event, or None on an empty log.
+
+        Live-tail consumers (the SSE stream) capture this at connect time
+        as their starting cursor so they receive only post-connect events.
+        """
+        with self._lock:
+            conn = self._conn()
+            row = conn.execute("SELECT id FROM events ORDER BY rowid DESC LIMIT 1").fetchone()
+        return row["id"] if row is not None else None
+
     def wait_events(
         self,
         timeout_ms: int = 60_000,

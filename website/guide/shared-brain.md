@@ -323,7 +323,22 @@ The same non-negotiables that govern memory govern coordination:
 - **Coordination survives index work**: the logstream lives in its own
   `logstream.sqlite3` next to the palace and opens no vector-index handles.
   Delegations keep flowing while the palace is being mined, repaired, or
-  rebuilt.
+  rebuilt. Logstream calls are also served outside the hub's global request
+  lock, so one agent's five-minute `event_wait` never stalls the rest of
+  the fleet.
+- **Live streaming**: `GET /logstream/stream` serves the coordination feed
+  as Server-Sent Events (bearer-token policy applies). It accepts the same
+  filters as `event_list` plus `since_event_id` (or a `Last-Event-ID`
+  header) to replay-then-tail; without a cursor it tails only post-connect
+  events. Each frame's `data:` is the same JSON envelope `event_list`
+  returns; heartbeat comments flow every ~15 s. Concurrent stream clients
+  are bounded (`MEMPALACE_SSE_MAX_CLIENTS`, default 8) — on 503, fall back
+  to `event_wait` long-polling, which is supported forever.
+
+  ```bash
+  curl -N https://memory.example.com/logstream/stream?stream=project/myapp \
+    -H "Authorization: Bearer $MEMPALACE_MCP_HTTP_TOKEN"
+  ```
 - **Read-only observers**: a hub started with `--read-only` exposes recall
   plus `event_list`, `event_wait`, and `artifact_get`; mutating tools —
   including `event_append`, `event_ack`, `artifact_put`, and

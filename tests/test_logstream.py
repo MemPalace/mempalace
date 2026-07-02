@@ -236,6 +236,12 @@ class TestFilters:
         with pytest.raises(ValueError, match="since_created_at"):
             seeded.list_events(since_created_at="yesterday")
 
+    def test_latest_event_id_tracks_newest(self, logstream):
+        assert logstream.latest_event_id() is None
+        _append(logstream, body="first")
+        newest = _append(logstream, body="second")
+        assert logstream.latest_event_id() == newest["id"]
+
 
 # ── Wait ──────────────────────────────────────────────────────────────────
 

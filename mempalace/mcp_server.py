@@ -5445,6 +5445,32 @@ def _json_rpc_parse_error(req_id=None):
 _HTTP_REQUEST_LOCK = threading.Lock()
 _HTTP_MAX_REQUEST_BYTES = 16 * 1024 * 1024
 _HTTP_ACTIVE_CLIENT_WINDOW_S = 120.0
+
+# RFC 003 phase 5: logstream tools touch only logstream.sqlite3 (its own WAL
+# database with internal locking) — never Chroma or the KG. Dispatching them
+# outside _HTTP_REQUEST_LOCK keeps a five-minute mempalace_event_wait
+# long-poll from stalling every other agent on a shared hub, and lets the
+# SSE stream coexist with normal tool traffic.
+_HTTP_LOCK_FREE_TOOLS = frozenset(
+    {
+        "mempalace_event_append",
+        "mempalace_event_list",
+        "mempalace_event_wait",
+        "mempalace_event_ack",
+        "mempalace_artifact_put",
+        "mempalace_artifact_get",
+        "mempalace_patch_submit",
+    }
+)
+
+# SSE stream limits (GET /logstream/stream). Each connected client holds one
+# handler thread, so the cap is a thread-exhaustion guard, not a rate limit.
+_SSE_MAX_CLIENTS_ENV = "MEMPALACE_SSE_MAX_CLIENTS"
+_SSE_MAX_CLIENTS_DEFAULT = 8
+_SSE_HEARTBEAT_S = 15.0
+_SSE_POLL_BASE_S = 0.3
+_SSE_POLL_JITTER_S = 0.4
+_SSE_BATCH_LIMIT = 500
 _HTTP_RECENT_CLIENT_LIMIT = 50
 # Host literals that always denote this machine. Used both to decide whether a
 # bind is loopback (skip the network-exposure warning) and to pin the Host
@@ -5679,6 +5705,150 @@ def _http_request_rejected(handler, require_auth: bool) -> bool:
     return False
 
 
+def _sse_max_clients() -> int:
+    try:
+        return max(0, int(os.environ.get(_SSE_MAX_CLIENTS_ENV, "") or _SSE_MAX_CLIENTS_DEFAULT))
+    except ValueError:
+        return _SSE_MAX_CLIENTS_DEFAULT
+
+
+def _http_dispatch(request):
+    """Dispatch one JSON-RPC request with the transport's locking policy.
+
+    The global request lock preserves the single-process / single-palace-
+    handle behavior stdio deployments rely on. Logstream tools are the one
+    exception: they never touch Chroma/KG state and carry their own database
+    lock, and serializing them would let one agent's event_wait long-poll
+    (up to 5 minutes) starve the whole hub.
+    """
+    if (
+        isinstance(request, dict)
+        and request.get("method") == "tools/call"
+        and isinstance(request.get("params"), dict)
+        and request["params"].get("name") in _HTTP_LOCK_FREE_TOOLS
+    ):
+        return handle_request(request)
+    with _HTTP_REQUEST_LOCK:
+        return handle_request(request)
+
+
+def _sse_acquire_slot(httpd) -> bool:
+    with httpd.sse_lock:
+        if httpd.sse_clients >= httpd.sse_max_clients:
+            return False
+        httpd.sse_clients += 1
+        return True
+
+
+def _sse_release_slot(httpd) -> None:
+    with httpd.sse_lock:
+        httpd.sse_clients -= 1
+
+
+def _http_serve_logstream_stream(handler) -> None:
+    """RFC 003 phase 5: live logstream tail over Server-Sent Events.
+
+    Query params are exactly the ``event_list`` filters plus
+    ``since_event_id`` (or the standard ``Last-Event-ID`` header): with a
+    cursor the server replays everything after it, then tails live; without
+    one it tails only post-connect events. Each event is one SSE frame
+    (``id:`` = event id, ``event: logstream``, ``data:`` = the same JSON
+    envelope event_list returns), with a ``: ping`` comment every ~15s so
+    proxies keep the pipe open. Never touches _HTTP_REQUEST_LOCK — the
+    stream must coexist with normal tool traffic, not starve it. Defined at
+    module level (like the other _http_* helpers) to keep
+    _build_http_server under the C901 complexity ceiling.
+    """
+    import random
+    from urllib.parse import parse_qsl
+
+    global _last_request_time
+
+    query = dict(parse_qsl(urlparse(handler.path).query))
+    filters = {
+        key: (query.get(key) or None)
+        for key in (
+            "stream",
+            "room",
+            "type",
+            "to_agent",
+            "from_agent",
+            "correlation_id",
+            "status",
+        )
+    }
+    cursor = query.get("since_event_id") or handler.headers.get("Last-Event-ID") or None
+
+    def _list_after(after_id):
+        return _call_logstream(
+            lambda ls: ls.list_events(since_event_id=after_id, limit=_SSE_BATCH_LIMIT, **filters)
+        )
+
+    try:
+        if cursor is None:
+            # Live tail: only post-connect events. On an empty log the
+            # cursor stays None and the whole log is post-connect.
+            cursor = _call_logstream(lambda ls: ls.latest_event_id())
+        # Validate filters (and an explicit cursor) before committing to a
+        # streaming response — errors must be a clean 400, not a half-open
+        # stream.
+        if cursor:
+            _list_after(cursor)
+        else:
+            _call_logstream(lambda ls: ls.list_events(limit=1, **filters))
+    except ValueError as exc:
+        handler._send_json(400, {"error": str(exc)})
+        return
+
+    if not _sse_acquire_slot(handler.server):
+        handler._record_request(503)
+        handler.send_response(503)
+        handler.send_header("Retry-After", "5")
+        handler.send_header("Content-Length", "0")
+        handler.send_header("Connection", "close")
+        handler.end_headers()
+        handler.close_connection = True
+        return
+
+    try:
+        handler._record_request(200)
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        handler.send_header("Cache-Control", "no-cache")
+        handler.send_header("X-Accel-Buffering", "no")
+        handler.end_headers()
+
+        last_write = time.monotonic()
+        while True:
+            _last_request_time = time.monotonic()
+            events = (
+                _list_after(cursor)
+                if cursor
+                else _call_logstream(lambda ls: ls.list_events(limit=_SSE_BATCH_LIMIT, **filters))
+            )
+            for event in events:
+                frame = (
+                    f"id: {event['id']}\n"
+                    f"event: logstream\n"
+                    f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                )
+                handler.wfile.write(frame.encode("utf-8"))
+                cursor = event["id"]
+                last_write = time.monotonic()
+            if events:
+                handler.wfile.flush()
+            elif time.monotonic() - last_write >= _SSE_HEARTBEAT_S:
+                handler.wfile.write(b": ping\n\n")
+                handler.wfile.flush()
+                last_write = time.monotonic()
+            time.sleep(_SSE_POLL_BASE_S + random.random() * _SSE_POLL_JITTER_S)
+    except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+        pass  # client went away — the normal way an SSE stream ends
+    finally:
+        _sse_release_slot(handler.server)
+        handler.close_connection = True
+
+
 def _build_http_server(host: str, port: int):
     """Construct (but do not start) the MCP HTTP server.
 
@@ -5759,6 +5929,13 @@ def _build_http_server(host: str, port: int):
                     return
                 self._send_json(200, self._status_payload())
                 return
+            if path == "/logstream/stream":
+                # Events and artifacts expose work metadata and patch
+                # contents; the stream always follows the bearer policy.
+                if self._request_rejected(require_auth=True):
+                    return
+                _http_serve_logstream_stream(self)
+                return
             if self._request_rejected(require_auth=False):
                 return
 
@@ -5796,11 +5973,9 @@ def _build_http_server(host: str, port: int):
                 self._send_json(400, _json_rpc_parse_error())
                 return
 
-            # Preserve the single-process / single-palace-handle behavior that
-            # stdio deployments rely on. HTTP gives us a safer transport, not
-            # concurrent Chroma/HNSW mutation.
-            with _HTTP_REQUEST_LOCK:
-                response = handle_request(request)
+            # Locking policy lives in _http_dispatch: global lock for
+            # Chroma-touching tools, lock-free for logstream tools.
+            response = _http_dispatch(request)
 
             if response is None:
                 # JSON-RPC notifications intentionally have no response body.
@@ -5831,6 +6006,9 @@ def _build_http_server(host: str, port: int):
     httpd.request_count = 0
     httpd.status_counts = {}
     httpd.recent_clients = {}
+    httpd.sse_lock = threading.Lock()
+    httpd.sse_clients = 0
+    httpd.sse_max_clients = _sse_max_clients()
     if tls_cert:
         httpd.socket = _wrap_tls(httpd.socket, tls_cert, tls_key)
         httpd.scheme = "https"

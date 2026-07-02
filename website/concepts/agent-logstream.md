@@ -116,6 +116,11 @@ mempalace artifact get art_... | git apply --3way
 `--json` makes every command scriptable; `wait` exits `2` on timeout so
 shell loops can retry.
 
+For push-based consumers (dashboards, live viewers), the hub also serves
+the stream over Server-Sent Events at `GET /logstream/stream` — same
+filters, same JSON envelope, `since_event_id` resume — see
+[Shared Brain](/guide/shared-brain#operating-the-shared-brain).
+
 ## Coordination vs. memory
 
 The logstream complements the palace; it does not replace it:
