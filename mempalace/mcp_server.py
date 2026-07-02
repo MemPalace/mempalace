@@ -99,6 +99,7 @@ from .hallways import (  # noqa: E402
 )
 
 from .knowledge_graph import KnowledgeGraph  # noqa: E402
+from .logstream import LOGSTREAM_DB_FILENAME, Logstream  # noqa: E402
 from .collision_scan import assert_no_collisions  # noqa: E402
 from .ids import ID_RECIPE, make_drawer_id_from_content  # noqa: E402
 
@@ -324,6 +325,9 @@ _READ_ONLY = bool(getattr(_args, "read_only", False)) or os.environ.get(
 
 _kg_by_path: dict[str, KnowledgeGraph] = {}
 _kg_cache_lock = threading.Lock()
+
+_logstream_by_path: dict[str, Logstream] = {}
+_logstream_cache_lock = threading.Lock()
 _palace_flag_given: bool = bool(_args.palace)
 
 # MCP server idle auto-exit (#1552).  Stale MCP servers from ended Claude
@@ -349,6 +353,16 @@ _SQLITE_INTEGRITY_ALLOWED_TOOLS = frozenset(
     {
         "mempalace_status",
         "mempalace_reconnect",
+        # RFC 003: logstream lives in its own logstream.sqlite3 with no
+        # Chroma/FTS5 dependency, so agent coordination stays available
+        # even while the main palace index is corrupt and under repair.
+        "mempalace_event_append",
+        "mempalace_event_list",
+        "mempalace_event_wait",
+        "mempalace_event_ack",
+        "mempalace_artifact_put",
+        "mempalace_artifact_get",
+        "mempalace_patch_submit",
     }
 )
 
@@ -379,6 +393,26 @@ _MUTATING_TOOLS = frozenset(
         "mempalace_sync",
         "mempalace_update_drawer",
         "mempalace_diary_write",
+        "mempalace_event_append",
+        "mempalace_event_ack",
+        "mempalace_artifact_put",
+        "mempalace_patch_submit",
+    }
+)
+
+# Logstream mutating tools (RFC 003) write only to logstream.sqlite3 — an
+# independent WAL database with no Chroma/HNSW in-memory state — so the
+# peer-writer lease that protects Chroma does not apply to them. Exempting
+# them keeps agent coordination alive while a CLI mine or a peer stdio
+# writer holds the palace lock. They remain in _MUTATING_TOOLS so operator
+# read-only mode (--read-only / MEMPALACE_MCP_READ_ONLY) still hides and
+# refuses them.
+_PEER_WRITER_EXEMPT_TOOLS = frozenset(
+    {
+        "mempalace_event_append",
+        "mempalace_event_ack",
+        "mempalace_artifact_put",
+        "mempalace_patch_submit",
     }
 )
 
@@ -444,7 +478,7 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
 
 
 def _mcp_peer_writer_refusal(req_id, tool_name: str):
-    if tool_name not in _MUTATING_TOOLS:
+    if tool_name not in _MUTATING_TOOLS or tool_name in _PEER_WRITER_EXEMPT_TOOLS:
         return None
 
     ok, reason = _acquire_mcp_writer_lock()
@@ -679,6 +713,62 @@ def _call_kg(op):
                 with _kg_cache_lock:
                     if _kg_by_path.get(path) is kg:
                         _kg_by_path.pop(path, None)
+                continue
+            raise
+
+
+def _resolve_logstream_path() -> str:
+    """Resolve the RFC 003 logstream database path in the active palace.
+
+    Fails clearly (ValueError) when no palace path is configured — the
+    logstream must never silently write outside the palace directory.
+    """
+    palace_path = getattr(_config, "palace_path", None) or MempalaceConfig().palace_path
+    if not palace_path:
+        raise ValueError("no palace path configured; run mempalace init first")
+    return os.path.join(os.path.expanduser(palace_path), LOGSTREAM_DB_FILENAME)
+
+
+def _get_logstream(canonical_path=None) -> Logstream:
+    """Return the cached ``Logstream`` for the resolved palace.
+
+    Same canonical-key contract as :func:`_get_kg`: callers inside a retry
+    loop pass the captured key through so insert and evict keys cannot
+    drift apart under palace-path rotation.
+    """
+    path = (
+        canonical_path
+        if canonical_path is not None
+        else _canonicalize_kg_path(_resolve_logstream_path())
+    )
+    ls = _logstream_by_path.get(path)
+    if ls is not None:
+        return ls
+    with _logstream_cache_lock:
+        ls = _logstream_by_path.get(path)
+        if ls is None:
+            ls = Logstream(db_path=path)
+            _logstream_by_path[path] = ls
+    return ls
+
+
+def _call_logstream(op):
+    """Run ``op(logstream)`` with one-shot retry on a closed connection.
+
+    Mirrors :func:`_call_kg`: ``tool_reconnect`` on another thread can
+    close the cached handle between lookup and use; evict the stale entry
+    and retry once with a fresh instance.
+    """
+    path = _canonicalize_kg_path(_resolve_logstream_path())
+    for attempt in range(2):
+        ls = _get_logstream(path)
+        try:
+            return op(ls)
+        except sqlite3.ProgrammingError:
+            if attempt == 0:
+                with _logstream_cache_lock:
+                    if _logstream_by_path.get(path) is ls:
+                        _logstream_by_path.pop(path, None)
                 continue
             raise
 
@@ -3699,6 +3789,13 @@ def tool_reconnect():
             except Exception:
                 pass
         _kg_by_path.clear()
+    with _logstream_cache_lock:
+        for ls in _logstream_by_path.values():
+            try:
+                ls.close()
+            except Exception:
+                pass
+        _logstream_by_path.clear()
     _refresh_sqlite_integrity_status()
     if _sqlite_integrity_errors:
         result = {
@@ -3825,6 +3922,186 @@ def tool_checkpoint(items, diary=None, dedup_threshold=0.9):
                     wing=diary.get("wing", ""),
                 )
     return out
+
+
+# ==================== LOGSTREAM TOOLS (RFC 003) ====================
+#
+# Agent coordination over the shared hub: durable append-only events plus
+# exact artifacts, stored in logstream.sqlite3 in the active palace dir.
+# No Chroma dependency and no vector index open — these handlers must never
+# call _get_collection().
+
+
+def tool_event_append(
+    type: str,
+    stream: str,
+    room: str,
+    from_agent: str,
+    to_agent: str = None,
+    correlation_id: str = None,
+    branch: str = None,
+    base_commit: str = None,
+    status: str = None,
+    body: str = "",
+    metadata: dict = None,
+    artifact_ids: list = None,
+):
+    """Append one immutable coordination event."""
+    try:
+        event = _call_logstream(
+            lambda ls: ls.append_event(
+                type=type,
+                stream=stream,
+                room=room,
+                from_agent=from_agent,
+                to_agent=to_agent,
+                correlation_id=correlation_id,
+                branch=branch,
+                base_commit=base_commit,
+                status=status,
+                body=body,
+                metadata=metadata,
+                artifact_ids=artifact_ids,
+            )
+        )
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+    return {"success": True, "event": event}
+
+
+def tool_event_list(
+    stream: str = None,
+    room: str = None,
+    type: str = None,
+    to_agent: str = None,
+    from_agent: str = None,
+    correlation_id: str = None,
+    status: str = None,
+    since_event_id: str = None,
+    since_created_at: str = None,
+    limit: int = 50,
+):
+    """List coordination events with structured filters, oldest first."""
+    try:
+        events = _call_logstream(
+            lambda ls: ls.list_events(
+                stream=stream,
+                room=room,
+                type=type,
+                to_agent=to_agent,
+                from_agent=from_agent,
+                correlation_id=correlation_id,
+                status=status,
+                since_event_id=since_event_id,
+                since_created_at=since_created_at,
+                limit=limit,
+            )
+        )
+    except ValueError as e:
+        return {"error": str(e)}
+    return {"events": events, "count": len(events)}
+
+
+def tool_event_wait(
+    stream: str = None,
+    room: str = None,
+    type: str = None,
+    to_agent: str = None,
+    from_agent: str = None,
+    correlation_id: str = None,
+    status: str = None,
+    since_event_id: str = None,
+    since_created_at: str = None,
+    timeout_ms: int = 60000,
+):
+    """Block until a matching event exists or the timeout expires."""
+    try:
+        result = _call_logstream(
+            lambda ls: ls.wait_events(
+                timeout_ms=timeout_ms,
+                stream=stream,
+                room=room,
+                type=type,
+                to_agent=to_agent,
+                from_agent=from_agent,
+                correlation_id=correlation_id,
+                status=status,
+                since_event_id=since_event_id,
+                since_created_at=since_created_at,
+            )
+        )
+    except ValueError as e:
+        return {"error": str(e)}
+    result["count"] = len(result["events"])
+    return result
+
+
+def tool_event_ack(event_id: str, from_agent: str, status: str = None, body: str = ""):
+    """Append an event.ack referencing a prior event (never mutates it)."""
+    try:
+        event = _call_logstream(
+            lambda ls: ls.ack_event(event_id, from_agent=from_agent, status=status, body=body)
+        )
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+    return {"success": True, "event": event}
+
+
+def tool_artifact_put(kind: str, content: str, created_by: str, metadata: dict = None):
+    """Store exact artifact content (patch, file, log, json, note)."""
+    try:
+        artifact = _call_logstream(
+            lambda ls: ls.put_artifact(
+                kind=kind, content=content, created_by=created_by, metadata=metadata
+            )
+        )
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+    return {"success": True, "artifact": artifact}
+
+
+def tool_artifact_get(artifact_id: str):
+    """Fetch an artifact by id — exact content and metadata."""
+    try:
+        artifact = _call_logstream(lambda ls: ls.get_artifact(artifact_id))
+    except ValueError as e:
+        return {"error": str(e)}
+    if artifact is None:
+        return {"error": f"artifact {artifact_id!r} not found"}
+    return {"artifact": artifact}
+
+
+def tool_patch_submit(
+    content: str,
+    from_agent: str,
+    stream: str,
+    room: str = "patches",
+    to_agent: str = None,
+    correlation_id: str = None,
+    branch: str = None,
+    base_commit: str = None,
+    body: str = "",
+    metadata: dict = None,
+):
+    """Store a patch artifact and append its patch.ready event in one call."""
+    try:
+        result = _call_logstream(
+            lambda ls: ls.submit_patch(
+                content=content,
+                from_agent=from_agent,
+                stream=stream,
+                room=room,
+                to_agent=to_agent,
+                correlation_id=correlation_id,
+                branch=branch,
+                base_commit=base_commit,
+                body=body,
+                metadata=metadata,
+            )
+        )
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+    return {"success": True, "artifact": result["artifact"], "event": result["event"]}
 
 
 # ==================== MCP PROTOCOL ====================
@@ -4448,6 +4725,234 @@ TOOLS = {
             "properties": {},
         },
         "handler": tool_reconnect,
+    },
+    "mempalace_event_append": {
+        "description": (
+            "Append an immutable agent-coordination event to the logstream (RFC 003). Use for"
+            " delegating work (task.request), replying (task.reply), and announcing artifacts"
+            " (patch.ready). Events are append-only; corrections are new events."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "description": "Event type, e.g. 'task.request', 'task.reply', 'patch.ready'",
+                },
+                "stream": {
+                    "type": "string",
+                    "description": "Logical stream, e.g. 'project/mempalace' or 'shared_agent_brain'",
+                },
+                "room": {
+                    "type": "string",
+                    "description": "Sub-channel, e.g. 'delegation', 'patches', 'reviews', 'status'",
+                },
+                "from_agent": {"type": "string", "description": "Writer agent identity"},
+                "to_agent": {
+                    "type": "string",
+                    "description": "Target agent, or '*' for broadcast (optional)",
+                },
+                "correlation_id": {
+                    "type": "string",
+                    "description": "Task/conversation id tying request and reply events (optional)",
+                },
+                "branch": {"type": "string", "description": "Git branch, when relevant (optional)"},
+                "base_commit": {
+                    "type": "string",
+                    "description": "Git commit the work started from (optional)",
+                },
+                "status": {
+                    "type": "string",
+                    "description": (
+                        "One of: open, claimed, ready, applied, blocked, failed, superseded"
+                        " (optional)"
+                    ),
+                },
+                "body": {
+                    "type": "string",
+                    "description": "Verbatim human-readable content (optional, max 256 KiB)",
+                },
+                "metadata": {
+                    "type": "object",
+                    "description": "Extra structured fields, stored verbatim (optional)",
+                },
+                "artifact_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Ids of already-stored artifacts to reference (optional)",
+                },
+            },
+            "required": ["type", "stream", "room", "from_agent"],
+        },
+        "handler": tool_event_append,
+    },
+    "mempalace_event_list": {
+        "description": (
+            "List agent-coordination events with structured filters, oldest first. Use"
+            " since_event_id as the precise resume cursor (strictly after that event)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "stream": {"type": "string", "description": "Filter by stream (optional)"},
+                "room": {"type": "string", "description": "Filter by room (optional)"},
+                "type": {"type": "string", "description": "Filter by event type (optional)"},
+                "to_agent": {
+                    "type": "string",
+                    "description": "Filter by target agent; also matches '*' broadcasts (optional)",
+                },
+                "from_agent": {"type": "string", "description": "Filter by writer (optional)"},
+                "correlation_id": {
+                    "type": "string",
+                    "description": "Filter by correlation id (optional)",
+                },
+                "status": {"type": "string", "description": "Filter by status (optional)"},
+                "since_event_id": {
+                    "type": "string",
+                    "description": "Return only events strictly after this event id (optional)",
+                },
+                "since_created_at": {
+                    "type": "string",
+                    "description": (
+                        "Return events created at or after this time"
+                        " (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ, optional)"
+                    ),
+                },
+                "limit": {"type": "integer", "description": "Max events to return (default 50)"},
+            },
+        },
+        "handler": tool_event_list,
+    },
+    "mempalace_event_wait": {
+        "description": (
+            "Block until a matching coordination event exists or the timeout expires (max 5"
+            " minutes). Returns {timed_out: true, events: []} on timeout instead of an error."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "stream": {"type": "string", "description": "Filter by stream (optional)"},
+                "room": {"type": "string", "description": "Filter by room (optional)"},
+                "type": {"type": "string", "description": "Filter by event type (optional)"},
+                "to_agent": {
+                    "type": "string",
+                    "description": "Filter by target agent; also matches '*' broadcasts (optional)",
+                },
+                "from_agent": {"type": "string", "description": "Filter by writer (optional)"},
+                "correlation_id": {
+                    "type": "string",
+                    "description": "Filter by correlation id (optional)",
+                },
+                "status": {"type": "string", "description": "Filter by status (optional)"},
+                "since_event_id": {
+                    "type": "string",
+                    "description": "Only match events strictly after this event id (optional)",
+                },
+                "since_created_at": {
+                    "type": "string",
+                    "description": (
+                        "Only match events created at or after this time"
+                        " (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ, optional)"
+                    ),
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "description": "How long to wait in milliseconds (default 60000, max 300000)",
+                },
+            },
+        },
+        "handler": tool_event_wait,
+    },
+    "mempalace_event_ack": {
+        "description": (
+            "Acknowledge a coordination event: appends a new event.ack routed back to the"
+            " original writer with the correlation id copied. Never mutates the target event."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "event_id": {"type": "string", "description": "Id of the event to acknowledge"},
+                "from_agent": {"type": "string", "description": "Acknowledging agent identity"},
+                "status": {
+                    "type": "string",
+                    "description": (
+                        "One of: open, claimed, ready, applied, blocked, failed, superseded"
+                        " (optional)"
+                    ),
+                },
+                "body": {"type": "string", "description": "Verbatim ack notes (optional)"},
+            },
+            "required": ["event_id", "from_agent"],
+        },
+        "handler": tool_event_ack,
+    },
+    "mempalace_artifact_put": {
+        "description": (
+            "Store exact artifact content (unified diff patch, file, log, json, note) for agent"
+            " handoffs. Returns id, sha256, and size_bytes. UTF-8 text only, max 4 MiB."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "description": "One of: patch, file, log, json, note",
+                },
+                "content": {"type": "string", "description": "Exact artifact content"},
+                "created_by": {"type": "string", "description": "Writer agent identity"},
+                "metadata": {
+                    "type": "object",
+                    "description": "Extra structured fields, e.g. branch/base_commit (optional)",
+                },
+            },
+            "required": ["kind", "content", "created_by"],
+        },
+        "handler": tool_artifact_put,
+    },
+    "mempalace_artifact_get": {
+        "description": (
+            "Fetch a coordination artifact by id — exact content plus sha256 for verification."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "artifact_id": {"type": "string", "description": "Artifact id to fetch"},
+            },
+            "required": ["artifact_id"],
+        },
+        "handler": tool_artifact_get,
+    },
+    "mempalace_patch_submit": {
+        "description": (
+            "Convenience: store a patch artifact and append its patch.ready event in one call."
+            " Use when handing completed work to another agent."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "string", "description": "Unified diff content"},
+                "from_agent": {"type": "string", "description": "Submitting agent identity"},
+                "stream": {
+                    "type": "string",
+                    "description": "Logical stream, e.g. 'project/mempalace'",
+                },
+                "room": {"type": "string", "description": "Sub-channel (default 'patches')"},
+                "to_agent": {"type": "string", "description": "Target agent or '*' (optional)"},
+                "correlation_id": {
+                    "type": "string",
+                    "description": "Task id tying this patch to its request (optional)",
+                },
+                "branch": {"type": "string", "description": "Git branch (optional)"},
+                "base_commit": {
+                    "type": "string",
+                    "description": "Git commit the patch applies to (optional)",
+                },
+                "body": {"type": "string", "description": "Verbatim notes (optional)"},
+                "metadata": {"type": "object", "description": "Extra structured fields (optional)"},
+            },
+            "required": ["content", "from_agent", "stream"],
+        },
+        "handler": tool_patch_submit,
     },
 }
 
