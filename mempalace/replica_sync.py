@@ -169,14 +169,14 @@ def pull_memory(
     }
 
 
-def pull_from_peers(palace_path: str) -> list:
+def pull_from_peers(palace_path: str, pull_kg: bool = True) -> list:
     """Run a pull against every peers.json entry; per-peer errors reported,
     never raised (a dead origin must not block the others)."""
     results = []
     for peer in load_peers(palace_path):
         name = peer.get("name") or peer["url"]
         try:
-            stats = pull_memory(palace_path, peer["url"], peer.get("token", ""))
+            stats = pull_memory(palace_path, peer["url"], peer.get("token", ""), pull_kg=pull_kg)
             stats["peer_name"] = name
             results.append(stats)
         except (SyncPeerError, ValueError) as exc:

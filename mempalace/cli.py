@@ -1535,7 +1535,7 @@ def cmd_replica(args):
                     )
                 ]
             else:
-                results = pull_from_peers(palace_path)
+                results = pull_from_peers(palace_path, pull_kg=not getattr(args, "no_kg", False))
                 if not results:
                     _logstream_fail(
                         f"no peers configured ({palace_path}/peers.json) and no --peer given",
