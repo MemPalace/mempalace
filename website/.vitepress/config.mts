@@ -76,6 +76,7 @@ export default withMermaid(
               { text: 'AAAK Dialect', link: '/concepts/aaak-dialect' },
               { text: 'Knowledge Graph', link: '/concepts/knowledge-graph' },
               { text: 'Specialist Agents', link: '/concepts/agents' },
+              { text: 'Agent Logstream', link: '/concepts/agent-logstream' },
               { text: 'Contradiction Detection', link: '/concepts/contradiction-detection' },
             ],
           },

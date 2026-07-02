@@ -152,6 +152,13 @@ Once connected, all of MemPalace's [MCP tools](/guide/mcp-integration) operate
 against the shared palace — searches and saved memories are visible to the
 whole team.
 
+A shared hub also gives your agents a coordination channel: the
+[agent logstream](/concepts/agent-logstream) lets one agent delegate work
+(`mempalace_event_append`), another long-poll for it
+(`mempalace_event_wait`), and patches move as verified artifacts
+(`mempalace_patch_submit` / `mempalace_artifact_get`) — no human relaying
+messages between machines.
+
 ## Operating notes
 
 - **Mining** still happens via the CLI (`mempalace mine …`) on the server host
