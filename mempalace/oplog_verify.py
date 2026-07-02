@@ -80,7 +80,14 @@ def fold_expected(ops: list) -> dict:
 
 
 def _result_ids(result) -> list:
-    return list(result.get("ids") or []) if isinstance(result, dict) else []
+    # Duck-typed: backend collections return GetResult (a dict-compatible
+    # dataclass, not a dict), test fakes return plain dicts — both expose
+    # ``.get``. An isinstance(dict) guard here silently dropped every real
+    # backend result, caught live in the first production verify run.
+    getter = getattr(result, "get", None)
+    if getter is None:
+        return []
+    return list(getter("ids") or [])
 
 
 def read_logical_drawer(col, drawer_id: str) -> Optional[dict]:

@@ -252,7 +252,13 @@ class TestKnowledgeGraphShadow:
 
 
 class _FakeCollection:
-    """Duck-typed stand-in for a palace collection: id + parent group reads."""
+    """Stand-in for a palace collection: id + parent group reads.
+
+    Returns real ``GetResult`` instances — NOT plain dicts — because that is
+    what backend collections return, and a dict-shaped fake hid exactly the
+    bug the first production verify run hit (an ``isinstance(result, dict)``
+    guard dropping every live result).
+    """
 
     def __init__(self):
         self.rows = {}  # id -> (document, metadata)
@@ -261,6 +267,8 @@ class _FakeCollection:
         self.rows[doc_id] = (document, metadata or {})
 
     def get(self, ids=None, where=None, include=None):
+        from mempalace.backends.base import GetResult
+
         if ids is not None:
             hits = [(i, *self.rows[i]) for i in ids if i in self.rows]
         elif where:
@@ -270,11 +278,12 @@ class _FakeCollection:
             ]
         else:
             hits = [(i, doc, meta) for i, (doc, meta) in self.rows.items()]
-        return {
-            "ids": [h[0] for h in hits],
-            "documents": [h[1] for h in hits],
-            "metadatas": [h[2] for h in hits],
-        }
+        return GetResult(
+            ids=[h[0] for h in hits],
+            documents=[h[1] for h in hits],
+            metadatas=[h[2] for h in hits],
+            embeddings=None,
+        )
 
 
 class TestShadowVerify:
