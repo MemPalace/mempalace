@@ -1268,6 +1268,214 @@ def cmd_status(args):
     status(palace_path=palace_path)
 
 
+# ── Logstream (RFC 003 agent coordination) ────────────────────────────────
+
+
+def _open_logstream(args):
+    """Open the palace logstream database for a CLI command.
+
+    Direct SQLite access is safe alongside a running hub: logstream.sqlite3
+    is WAL-mode and independent of Chroma, so CLI writes are immediately
+    visible to hub readers without the mine-style forwarding Chroma needs.
+    """
+    from .logstream import LOGSTREAM_DB_FILENAME, Logstream
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    return Logstream(db_path=os.path.join(palace_path, LOGSTREAM_DB_FILENAME))
+
+
+def _logstream_fail(message: str, as_json: bool):
+    import json
+
+    if as_json:
+        print(json.dumps({"error": message}))
+    else:
+        print(f"Error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def _read_text_arg(inline, file_arg, default=""):
+    """Resolve inline text vs --*-file (with '-' meaning stdin)."""
+    if inline is not None and file_arg is not None:
+        raise ValueError("pass inline text or a file, not both")
+    if file_arg is not None:
+        if file_arg == "-":
+            return sys.stdin.read()
+        return Path(os.path.expanduser(file_arg)).read_text(encoding="utf-8")
+    if inline is not None:
+        return inline
+    return default
+
+
+def _parse_metadata_arg(raw):
+    import json
+
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw)
+    except ValueError as exc:
+        raise ValueError(f"--metadata is not valid JSON: {exc}") from None
+    if not isinstance(value, dict):
+        raise ValueError("--metadata must be a JSON object")
+    return value
+
+
+def _print_event_line(event):
+    target = event["to_agent"] or "*"
+    corr = f" corr={event['correlation_id']}" if event["correlation_id"] else ""
+    status = f" [{event['status']}]" if event["status"] else ""
+    arts = f" artifacts={len(event['artifact_ids'])}" if event["artifact_ids"] else ""
+    body = event["body"].replace("\n", " ")
+    if len(body) > 80:
+        body = body[:77] + "..."
+    body = f" :: {body}" if body else ""
+    print(
+        f"  {event['id']}  {event['created_at']}  {event['type']}  "
+        f"{event['stream']}/{event['room']}  {event['from_agent']}->{target}"
+        f"{status}{corr}{arts}{body}"
+    )
+
+
+def cmd_logstream(args):
+    import json
+
+    as_json = getattr(args, "json", False)
+    try:
+        ls = _open_logstream(args)
+    except Exception as exc:
+        _logstream_fail(str(exc), as_json)
+    try:
+        if args.logstream_action == "append":
+            try:
+                body = _read_text_arg(args.body, args.body_file)
+                event = ls.append_event(
+                    type=args.type,
+                    stream=args.stream,
+                    room=args.room,
+                    from_agent=args.from_agent,
+                    to_agent=args.to_agent,
+                    correlation_id=args.correlation_id,
+                    branch=args.branch,
+                    base_commit=args.base_commit,
+                    status=args.status,
+                    body=body,
+                    metadata=_parse_metadata_arg(args.metadata),
+                    artifact_ids=args.artifact_id or None,
+                )
+            except (ValueError, OSError) as exc:
+                _logstream_fail(str(exc), as_json)
+            if as_json:
+                print(json.dumps(event, indent=2, ensure_ascii=False))
+            else:
+                print("Appended:")
+                _print_event_line(event)
+        elif args.logstream_action in ("list", "wait"):
+            filters = {
+                "stream": args.stream,
+                "room": args.room,
+                "type": args.type,
+                "to_agent": args.to_agent,
+                "from_agent": args.from_agent,
+                "correlation_id": args.correlation_id,
+                "status": args.status,
+                "since_event_id": args.since_event_id,
+                "since_created_at": args.since_created_at,
+            }
+            try:
+                if args.logstream_action == "list":
+                    events = ls.list_events(limit=args.limit, **filters)
+                    result = {"events": events, "count": len(events)}
+                else:
+                    result = ls.wait_events(timeout_ms=args.timeout_ms, **filters)
+                    result["count"] = len(result["events"])
+            except ValueError as exc:
+                _logstream_fail(str(exc), as_json)
+            if as_json:
+                print(json.dumps(result, indent=2, ensure_ascii=False))
+            else:
+                if result.get("timed_out"):
+                    print("Timed out; no matching events.")
+                elif not result["events"]:
+                    print("No matching events.")
+                else:
+                    print(f"{result['count']} event(s):")
+                    for event in result["events"]:
+                        _print_event_line(event)
+            if result.get("timed_out"):
+                sys.exit(2)
+        elif args.logstream_action == "ack":
+            try:
+                event = ls.ack_event(
+                    args.event_id,
+                    from_agent=args.from_agent,
+                    status=args.status,
+                    body=args.body or "",
+                )
+            except ValueError as exc:
+                _logstream_fail(str(exc), as_json)
+            if as_json:
+                print(json.dumps(event, indent=2, ensure_ascii=False))
+            else:
+                print("Acknowledged:")
+                _print_event_line(event)
+    finally:
+        ls.close()
+
+
+def cmd_artifact(args):
+    import json
+
+    as_json = getattr(args, "json", False)
+    try:
+        ls = _open_logstream(args)
+    except Exception as exc:
+        _logstream_fail(str(exc), as_json)
+    try:
+        if args.artifact_action == "put":
+            try:
+                content = _read_text_arg(args.content, args.file, default=None)
+                if content is None:
+                    content = sys.stdin.read()
+                artifact = ls.put_artifact(
+                    kind=args.kind,
+                    content=content,
+                    created_by=args.created_by,
+                    metadata=_parse_metadata_arg(args.metadata),
+                )
+            except (ValueError, OSError) as exc:
+                _logstream_fail(str(exc), as_json)
+            if as_json:
+                print(json.dumps(artifact, indent=2, ensure_ascii=False))
+            else:
+                print(f"Stored {artifact['id']}  kind={artifact['kind']}")
+                print(f"  sha256={artifact['sha256']}")
+                print(f"  size={artifact['size_bytes']} bytes")
+        elif args.artifact_action == "get":
+            try:
+                artifact = ls.get_artifact(args.artifact_id)
+            except ValueError as exc:
+                _logstream_fail(str(exc), as_json)
+            if artifact is None:
+                _logstream_fail(f"artifact {args.artifact_id!r} not found", as_json)
+            if args.out:
+                Path(os.path.expanduser(args.out)).write_text(artifact["content"], encoding="utf-8")
+            if as_json:
+                if args.out:
+                    artifact = {**artifact, "content_written_to": args.out}
+                    artifact.pop("content")
+                print(json.dumps(artifact, indent=2, ensure_ascii=False))
+            elif args.out:
+                print(f"Wrote {artifact['size_bytes']} bytes to {args.out}")
+                print(f"  sha256={artifact['sha256']}")
+            else:
+                # Exact content on stdout so `mempalace artifact get ID | git apply`
+                # works; metadata would corrupt the stream.
+                sys.stdout.write(artifact["content"])
+    finally:
+        ls.close()
+
+
 def cmd_palace_set_embedder(args):
     """Record (or force-override) a palace's embedder identity (RFC 001).
 
@@ -2807,6 +3015,114 @@ def main():
         help="Storage backend to use for status (default: config/env/detected/chroma)",
     )
 
+    # logstream (RFC 003 agent coordination)
+    p_logstream = sub.add_parser(
+        "logstream",
+        help="Agent coordination events — delegate work, wait for replies (RFC 003)",
+    )
+    logstream_sub = p_logstream.add_subparsers(dest="logstream_action")
+
+    def _add_logstream_filters(p):
+        p.add_argument("--stream", default=None, help="Stream, e.g. project/mempalace")
+        p.add_argument("--room", default=None, help="Room, e.g. delegation, patches")
+        p.add_argument("--type", default=None, help="Event type, e.g. task.request")
+        p.add_argument("--to-agent", default=None, help="Target agent (also matches '*')")
+        p.add_argument("--from-agent", default=None, help="Writer agent")
+        p.add_argument("--correlation-id", default=None, help="Task/conversation id")
+        p.add_argument(
+            "--status",
+            default=None,
+            help="open|claimed|ready|applied|blocked|failed|superseded",
+        )
+        p.add_argument("--since-event-id", default=None, help="Only events strictly after this id")
+        p.add_argument(
+            "--since-created-at",
+            default=None,
+            help="Only events at/after this time (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ)",
+        )
+
+    p_ls_append = logstream_sub.add_parser("append", help="Append a coordination event")
+    p_ls_append.add_argument("--type", required=True, help="Event type, e.g. task.request")
+    p_ls_append.add_argument("--stream", required=True, help="Stream, e.g. project/mempalace")
+    p_ls_append.add_argument("--room", required=True, help="Room, e.g. delegation")
+    p_ls_append.add_argument("--from-agent", required=True, help="Writer agent identity")
+    p_ls_append.add_argument("--to-agent", default=None, help="Target agent or '*'")
+    p_ls_append.add_argument("--correlation-id", default=None, help="Task/conversation id")
+    p_ls_append.add_argument("--branch", default=None, help="Git branch")
+    p_ls_append.add_argument("--base-commit", default=None, help="Git commit work started from")
+    p_ls_append.add_argument(
+        "--status",
+        default=None,
+        help="open|claimed|ready|applied|blocked|failed|superseded",
+    )
+    p_ls_append.add_argument("--body", default=None, help="Verbatim body text")
+    p_ls_append.add_argument(
+        "--body-file", default=None, help="Read body from file ('-' for stdin)"
+    )
+    p_ls_append.add_argument("--metadata", default=None, help="Extra fields as a JSON object")
+    p_ls_append.add_argument(
+        "--artifact-id",
+        action="append",
+        default=None,
+        help="Reference an already-stored artifact (repeatable)",
+    )
+    p_ls_append.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    p_ls_list = logstream_sub.add_parser("list", help="List events, oldest first")
+    _add_logstream_filters(p_ls_list)
+    p_ls_list.add_argument("--limit", type=int, default=50, help="Max events (default 50)")
+    p_ls_list.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    p_ls_wait = logstream_sub.add_parser(
+        "wait", help="Block until a matching event exists (exit 2 on timeout)"
+    )
+    _add_logstream_filters(p_ls_wait)
+    p_ls_wait.add_argument(
+        "--timeout-ms",
+        type=int,
+        default=60000,
+        help="How long to wait in ms (default 60000, max 300000)",
+    )
+    p_ls_wait.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    p_ls_ack = logstream_sub.add_parser(
+        "ack", help="Acknowledge an event (appends event.ack, never mutates)"
+    )
+    p_ls_ack.add_argument("event_id", help="Event id to acknowledge")
+    p_ls_ack.add_argument("--from-agent", required=True, help="Acknowledging agent identity")
+    p_ls_ack.add_argument(
+        "--status",
+        default=None,
+        help="open|claimed|ready|applied|blocked|failed|superseded",
+    )
+    p_ls_ack.add_argument("--body", default=None, help="Verbatim ack notes")
+    p_ls_ack.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    # artifact (RFC 003 exact content exchange)
+    p_artifact = sub.add_parser(
+        "artifact", help="Exact artifact exchange for agent handoffs (RFC 003)"
+    )
+    artifact_sub = p_artifact.add_subparsers(dest="artifact_action")
+
+    p_art_put = artifact_sub.add_parser("put", help="Store exact artifact content")
+    p_art_put.add_argument("--kind", required=True, help="patch|file|log|json|note")
+    p_art_put.add_argument("--created-by", required=True, help="Writer agent identity")
+    p_art_put.add_argument("--content", default=None, help="Inline content")
+    p_art_put.add_argument(
+        "--file", default=None, help="Read content from file ('-' for stdin; default stdin)"
+    )
+    p_art_put.add_argument("--metadata", default=None, help="Extra fields as a JSON object")
+    p_art_put.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    p_art_get = artifact_sub.add_parser(
+        "get", help="Fetch exact artifact content (stdout pipes into git apply)"
+    )
+    p_art_get.add_argument("artifact_id", help="Artifact id")
+    p_art_get.add_argument("--out", default=None, help="Write content to this file instead")
+    p_art_get.add_argument(
+        "--json", action="store_true", help="Metadata as JSON (content omitted with --out)"
+    )
+
     p_palace = sub.add_parser("palace", help="Palace maintenance commands")
     palace_sub = p_palace.add_subparsers(dest="palace_action")
     p_set_embedder = palace_sub.add_parser(
@@ -2873,6 +3189,20 @@ def main():
             cmd_palace_set_embedder(args)
         else:
             p_palace.print_help()
+        return
+
+    if args.command == "logstream":
+        if not getattr(args, "logstream_action", None):
+            p_logstream.print_help()
+            return
+        cmd_logstream(args)
+        return
+
+    if args.command == "artifact":
+        if not getattr(args, "artifact_action", None):
+            p_artifact.print_help()
+            return
+        cmd_artifact(args)
         return
 
     if args.command == "daemon":
