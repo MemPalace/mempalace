@@ -432,7 +432,17 @@ machine.
    fragility to N machines). Cheap availability for recall; builds the R6
    snapshot machinery.
 2. **Canonical op-log + v4 id migration** — §6 in full; backends demoted to
-   derived consumers. Two commitments this step MUST honor:
+   derived consumers. Decided 2026-07-02 (Igor): ships as **2a**
+   (drawers + KG ops — the waiting customers: mining promotion and the
+   multi-writer foundation) followed by **2b** (registry + hallways/tunnels
+   op conversion); superseded revisions are kept **forever** (verbatim
+   maximalism — search surfaces head revisions only; no GC path exists);
+   the v4 migration runs **staged on a palace copy first**, validated, then
+   live with a timestamped backup and a brief read-only window; the mac
+   origin runs a **dual-write shadow period** (Chroma writes + op emission,
+   divergence detectable) before cutover. Step 3's write-flip on remote
+   replicas begins only **after the local-capture promotion validates**
+   end-to-end. Two commitments this step MUST honor:
    - **Local-capture promotion.** A step-1 replica may mine machine-local
      data (projects, conversations) into its own palace before step 2
      exists — such drawers carry no `replica_origin` stamp, so read-replica
@@ -524,7 +534,10 @@ offsite snapshots remain a separate mechanism, out of this layer's scope.
 ## Open Questions
 
 - HLC skew bounds and how loudly to surface clock anomalies.
-- Op-log compaction policy (R6): checkpoint cadence, tombstone retention.
+- Op-log compaction policy (R6): checkpoint cadence for snapshot bootstrap.
+  (Content-revision retention is settled: superseded revisions are kept
+  forever; compaction only concerns op-replay bootstrap cost, never
+  content.)
 - Does the E2EE cloud courier ship in v1 or wait for demand?
 - Partial replicas for phone-class devices (deferred; Non-Goals).
 - Federation bridge: can a personal replica project shadow wings into a
