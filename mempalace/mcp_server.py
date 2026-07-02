@@ -368,6 +368,7 @@ _MUTATING_TOOLS = frozenset(
     {
         "mempalace_kg_add",
         "mempalace_kg_invalidate",
+        "mempalace_kg_supersede",
         "mempalace_create_tunnel",
         "mempalace_delete_tunnel",
         "mempalace_delete_hallway",
@@ -1732,7 +1733,7 @@ PALACE_PROTOCOL = """IMPORTANT — MemPalace Memory Protocol:
 2. BEFORE RESPONDING about any person, project, or past event: call mempalace_kg_query or mempalace_search FIRST. Never guess — verify.
 3. IF UNSURE about a fact (name, gender, age, relationship): say "let me check" and query the palace. Wrong is worse than slow.
 4. AFTER EACH SESSION: call mempalace_diary_write to record what happened, what you learned, what matters.
-5. WHEN FACTS CHANGE: call mempalace_kg_invalidate on the old fact, mempalace_kg_add for the new one.
+5. WHEN A SINGLE-VALUED FACT CHANGES (model, employer, address): call mempalace_kg_supersede(subject, predicate, old, new) to replace it atomically at one boundary — do NOT hand-roll invalidate + add, which leaves the old and new values overlapping at the boundary. Use mempalace_kg_invalidate for a fact that simply ended, and mempalace_kg_add to add an independent (possibly concurrent) fact.
 
 This protocol ensures the AI KNOWS before it speaks. Storage is not memory — but storage + this protocol = memory."""
 
@@ -3292,6 +3293,53 @@ def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = N
     }
 
 
+def tool_kg_supersede(
+    subject: str,
+    predicate: str,
+    old_object: str,
+    new_object: str,
+    at: str = None,
+):
+    """Atomically replace one fact with another at a single shared boundary.
+
+    Closes ``(subject, predicate, old_object)`` and opens
+    ``(subject, predicate, new_object)`` at one shared instant, so a
+    point-in-time query at the boundary returns only the new value. Use this
+    instead of a separate ``kg_invalidate`` + ``kg_add`` when a single-valued
+    fact changes (e.g. a model, employer, or address changes).
+
+    ``at`` accepts ``YYYY-MM-DD`` or a canonical UTC datetime
+    (``YYYY-MM-DDTHH:MM:SSZ``) and defaults to the current UTC instant.
+    """
+    try:
+        subject = sanitize_kg_value(subject, "subject")
+        predicate = sanitize_name(predicate, "predicate")
+        old_object = sanitize_kg_value(old_object, "old_object")
+        new_object = sanitize_kg_value(new_object, "new_object")
+        at = sanitize_iso_temporal(at, "at")
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+
+    _wal_log(
+        "kg_supersede",
+        {
+            "subject": subject,
+            "predicate": predicate,
+            "old_object": old_object,
+            "new_object": new_object,
+            "at": at,
+        },
+    )
+
+    triple_id = _call_kg(lambda kg: kg.supersede(subject, predicate, old_object, new_object, at=at))
+    return {
+        "success": True,
+        "triple_id": triple_id,
+        "fact": f"{subject} → {predicate} → {new_object}",
+        "superseded": old_object,
+    }
+
+
 def tool_kg_timeline(entity: str = None):
     """Get chronological timeline of facts, optionally for one entity."""
     if entity is not None:
@@ -3910,6 +3958,27 @@ TOOLS = {
             "required": ["subject", "predicate", "object"],
         },
         "handler": tool_kg_invalidate,
+    },
+    "mempalace_kg_supersede": {
+        "description": "Atomically replace a fact with its successor at a shared boundary. Use when a single-valued fact changes (model, employer, address) instead of separate kg_invalidate + kg_add — a point-in-time query at the boundary then returns only the new value.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "subject": {"type": "string", "description": "The entity whose fact is changing"},
+                "predicate": {
+                    "type": "string",
+                    "description": "The relationship type (e.g. 'uses_model', 'works_at')",
+                },
+                "old_object": {"type": "string", "description": "The value being replaced"},
+                "new_object": {"type": "string", "description": "The new value"},
+                "at": {
+                    "type": "string",
+                    "description": "Boundary instant (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ, optional; defaults to now UTC)",
+                },
+            },
+            "required": ["subject", "predicate", "old_object", "new_object"],
+        },
+        "handler": tool_kg_supersede,
     },
     "mempalace_kg_timeline": {
         "description": "Chronological timeline of facts. Shows the story of an entity (or everything) in order.",

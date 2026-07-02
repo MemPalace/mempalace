@@ -322,3 +322,71 @@ class TestKnowledgeGraphConnectionCleanup:
         assert kg._connection is None
         with pytest.raises(sqlite3.ProgrammingError):
             conn.execute("SELECT 1")
+
+
+class TestSupersessionBoundary:
+    """Regression coverage for the as-of boundary double-count (issue #1913):
+    an as-of query at the instant one fact ends and its successor begins must
+    return only the successor for a single-valued predicate."""
+
+    def _models(self, kg, as_of):
+        return sorted(
+            f["object"]
+            for f in kg.query_entity("Bot", as_of=as_of, direction="outgoing")
+            if f["predicate"] == "uses_model"
+        )
+
+    def test_exact_datetime_boundary_returns_only_successor(self, kg):
+        # Two facts sharing a precise instant: half-open upper bound (strict >)
+        # means the fact ending at T no longer matches at T.
+        kg.add_triple(
+            "Bot",
+            "uses_model",
+            "A",
+            valid_from="2026-05-01T00:00:00Z",
+            valid_to="2026-06-02T12:00:00Z",
+        )
+        kg.add_triple("Bot", "uses_model", "B", valid_from="2026-06-02T12:00:00Z")
+
+        assert self._models(kg, "2026-06-02T11:59:59Z") == ["A"]
+        assert self._models(kg, "2026-06-02T12:00:00Z") == ["B"]
+        assert self._models(kg, "2026-06-02T12:00:01Z") == ["B"]
+
+    def test_supersede_date_only_resolves_to_successor(self, kg):
+        kg.add_triple("Bot", "uses_model", "claude-opus-4-7", valid_from="2026-05-01")
+        kg.supersede("Bot", "uses_model", "claude-opus-4-7", "claude-opus-4-8", at="2026-06-02")
+
+        assert self._models(kg, "2026-06-01") == ["claude-opus-4-7"]
+        assert self._models(kg, "2026-06-02") == ["claude-opus-4-8"]
+        assert self._models(kg, "2026-06-03") == ["claude-opus-4-8"]
+
+    def test_supersede_datetime_boundary_resolves_to_successor(self, kg):
+        kg.add_triple("Bot", "uses_model", "A", valid_from="2026-05-01T00:00:00Z")
+        kg.supersede("Bot", "uses_model", "A", "B", at="2026-06-02T12:00:00Z")
+
+        assert self._models(kg, "2026-06-02T11:59:59Z") == ["A"]
+        assert self._models(kg, "2026-06-02T12:00:00Z") == ["B"]
+
+    def test_supersede_default_now_closes_old_and_opens_new(self, kg):
+        kg.add_triple("Bot", "uses_model", "A", valid_from="2026-05-01")
+        kg.supersede("Bot", "uses_model", "A", "B")
+        # A far-future as-of sees only the successor; the old fact was closed.
+        assert self._models(kg, "2099-01-01") == ["B"]
+
+    def test_supersede_degrades_to_add_when_no_open_old(self, kg):
+        tid = kg.supersede("Bot", "uses_model", "missing", "B", at="2026-01-01")
+        assert tid.startswith("t_bot_uses_model_b_")
+        assert self._models(kg, "2099-01-01") == ["B"]
+
+    def test_supersede_rejects_boundary_before_valid_from(self, kg):
+        kg.add_triple("Bot", "uses_model", "A", valid_from="2026-06-01")
+        with pytest.raises(ValueError, match="before valid_from"):
+            kg.supersede("Bot", "uses_model", "A", "B", at="2026-05-01")
+
+    def test_standalone_date_only_end_stays_valid_all_day(self, kg):
+        # Half-open change must NOT shrink a standalone date-only fact: it stays
+        # valid through the end of its final day (whole-day expansion retained).
+        kg.add_triple("Bot", "uses_model", "A", valid_from="2026-05-01", valid_to="2026-06-02")
+        assert self._models(kg, "2026-06-02") == ["A"]
+        assert self._models(kg, "2026-06-02T23:00:00Z") == ["A"]
+        assert self._models(kg, "2026-06-03") == []
