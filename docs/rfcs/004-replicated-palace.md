@@ -432,7 +432,20 @@ machine.
    fragility to N machines). Cheap availability for recall; builds the R6
    snapshot machinery.
 2. **Canonical op-log + v4 id migration** — §6 in full; backends demoted to
-   derived consumers.
+   derived consumers. Two commitments this step MUST honor:
+   - **Local-capture promotion.** A step-1 replica may mine machine-local
+     data (projects, conversations) into its own palace before step 2
+     exists — such drawers carry no `replica_origin` stamp, so read-replica
+     reconciliation cannot touch them. Step 2 ships a one-time promotion
+     pass: every unstamped local drawer becomes a `drawer.add` op under the
+     replica's identity and flows to the whole mesh. Capture-now is
+     forward-compatible by contract, not by luck; nothing mined early is
+     ever re-mined or lost.
+   - **v4 ids are the cross-machine dedup.** Content-pure identity means
+     the same content mined on two machines yields the same drawer id; the
+     grow-only merge collapses duplicates into one drawer with multiple
+     provenance records. The migration is the dedup mechanism — no separate
+     dedup pass across origins.
 3. **Full multi-writer** — every replica captures locally, all converge.
 
 Each step ships value alone; none blocks on Layer 1 choice (seam, §5).
