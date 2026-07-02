@@ -2881,25 +2881,6 @@ class TestKGTools:
         ]
         assert models == ["new"]
 
-    def test_kg_supersede_returns_structured_error_on_inverted_interval(
-        self, monkeypatch, config, palace_path, kg
-    ):
-        """A boundary before the old fact's valid_from must surface as a clean
-        {success: False, error} response, not an unhandled JSON-RPC error."""
-        _patch_mcp_server(monkeypatch, config, kg)
-        from mempalace.mcp_server import tool_kg_supersede
-
-        kg.add_triple("Bot", "uses_model", "old", valid_from="2026-06-01")
-        result = tool_kg_supersede(
-            subject="Bot",
-            predicate="uses_model",
-            old_object="old",
-            new_object="new",
-            at="2026-05-01",
-        )
-        assert result["success"] is False
-        assert "before valid_from" in result["error"]
-
     def test_kg_add_forwards_valid_to(self, monkeypatch, config, palace_path, kg):
         """Regression #1314 case 1: valid_to must round-trip through kg_add."""
         _patch_mcp_server(monkeypatch, config, kg)

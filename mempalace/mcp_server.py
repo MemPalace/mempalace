@@ -3331,12 +3331,11 @@ def tool_kg_supersede(
         },
     )
 
-    try:
-        triple_id = _call_kg(
-            lambda kg: kg.supersede(subject, predicate, old_object, new_object, at=at)
-        )
-    except ValueError as e:
-        return {"success": False, "error": str(e)}
+    # Domain ValueErrors from kg.supersede (e.g. inverted boundary) are left to
+    # bubble to the dispatcher, matching tool_kg_add / tool_kg_invalidate: the
+    # -32000 response carries error_class + message in error.data. Only input
+    # sanitization above returns the {success: False} envelope.
+    triple_id = _call_kg(lambda kg: kg.supersede(subject, predicate, old_object, new_object, at=at))
     return {
         "success": True,
         "triple_id": triple_id,
