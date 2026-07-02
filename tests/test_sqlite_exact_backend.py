@@ -603,7 +603,14 @@ def test_search_auto_keeps_lexical_hits_without_source_file(tmp_path, monkeypatc
     top = result["results"][0]
     assert top["wing"] == "shared"
     assert top["source_file"] == "?"
-    assert top["matched_via"] == "bm25_backend"
+    # The contract is that the sourceless drawer surfaces at all. Which
+    # union candidate survives id-based dedup depends on how many vector
+    # hits reach the merge: since the echo-ranking change keeps the full
+    # scored list (hits are no longer truncated to n_results before the
+    # union merge), the vector hit for this drawer is present and the
+    # BM25 duplicate is dropped, so provenance reads "drawer". A pool
+    # where vector misses it still injects the "bm25_backend" candidate.
+    assert top["matched_via"] in ("drawer", "bm25_backend")
 
 
 def test_search_union_reports_unsupported_lexical_capability(monkeypatch, tmp_path):
