@@ -269,3 +269,40 @@ def test_backfill_classify_wing_delegates_to_live_provider():
     # "available" into the ai wing.
     assert backfill.classify_wing("She said rain is available", wing_config) == "wing_general"
     assert backfill.classify_wing("write some ai bindings", wing_config) == "wing_ai"
+
+
+def test_backfill_rerun_does_not_duplicate(tmp_path):
+    """Re-running backfill over the same sessions must not re-file drawers.
+
+    Exchange drawer ids are salted with ``filed_at``, so without the
+    ``file_already_mined`` guard every re-run of ``mempalace hermes
+    install`` would re-file every exchange under fresh ids — the exact
+    duplicated-dedup failure flagged in the PR #1684 review.
+    """
+    import json
+
+    backfill = _load_backfill_module()
+
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    (sessions / "sess1.json").write_text(
+        json.dumps(
+            [
+                {"role": "user", "content": "let's plan the Q3 roadmap in detail"},
+                {"role": "assistant", "content": "here is the detailed plan"},
+            ]
+        )
+    )
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    assert backfill.backfill(sessions, str(palace)) == 1
+
+    from mempalace.backends.chroma import ChromaBackend
+
+    col = ChromaBackend().get_or_create_collection(str(palace), "mempalace_drawers")
+    count_after_first = col.count()
+    assert count_after_first == 1
+
+    assert backfill.backfill(sessions, str(palace)) == 0
+    assert col.count() == count_after_first
