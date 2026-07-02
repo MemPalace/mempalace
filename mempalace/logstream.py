@@ -390,6 +390,33 @@ class Logstream:
             row = conn.execute("SELECT rowid, * FROM events WHERE id = ?", (event_id,)).fetchone()
         return self._event_dict(row, artifact_ids=list(artifact_ids))
 
+    @staticmethod
+    def _patch_content_warnings(kind: str, content: str) -> list[str]:
+        """Advisory checks for ``kind=patch`` content. Never mutates content.
+
+        Verbatim storage means we store exactly what the producer sent —
+        but a diff that ``git apply`` will reject as corrupt is a broken
+        handoff, so warn at store time where the producer can still fix it.
+        Found in the wild during the first RFC 003 dogfood: a patch stored
+        without its final trailing newline truncates the last hunk line.
+        """
+        if kind != "patch":
+            return []
+        warnings = []
+        if not content.endswith("\n"):
+            warnings.append(
+                "patch content does not end with a trailing newline; "
+                "git apply will reject the final hunk as corrupt — "
+                "store the diff byte-exactly including its trailing newline"
+            )
+        if "\r" in content:
+            warnings.append(
+                "patch content contains carriage returns (CRLF line endings); "
+                "git apply often rejects CRLF diffs — generate the diff with "
+                "LF endings"
+            )
+        return warnings
+
     def put_artifact(
         self,
         kind: str,
@@ -401,6 +428,9 @@ class Logstream:
 
         Returns the artifact record without echoing ``content`` back —
         callers already hold the content; readers use :meth:`get_artifact`.
+        For ``kind=patch``, a ``warnings`` list is included when the diff
+        looks unappliable (missing trailing newline, CRLF endings); the
+        content itself is still stored verbatim.
         """
         if not isinstance(kind, str) or kind not in ARTIFACT_KINDS:
             allowed = ", ".join(sorted(ARTIFACT_KINDS))
@@ -439,7 +469,7 @@ class Logstream:
                         metadata_json,
                     ),
                 )
-        return {
+        record = {
             "id": artifact_id,
             "kind": kind,
             "sha256": digest,
@@ -447,6 +477,10 @@ class Logstream:
             "created_by": created_by,
             "created_at": created_at,
         }
+        warnings = self._patch_content_warnings(kind, content)
+        if warnings:
+            record["warnings"] = warnings
+        return record
 
     def ack_event(
         self,

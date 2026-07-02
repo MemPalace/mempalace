@@ -1451,6 +1451,10 @@ def cmd_artifact(args):
                 print(f"Stored {artifact['id']}  kind={artifact['kind']}")
                 print(f"  sha256={artifact['sha256']}")
                 print(f"  size={artifact['size_bytes']} bytes")
+            # Warnings go to stderr in both modes so `--json | jq` stays
+            # clean while interactive callers still can't miss them.
+            for warning in artifact.get("warnings", []):
+                print(f"Warning: {warning}", file=sys.stderr)
         elif args.artifact_action == "get":
             try:
                 artifact = ls.get_artifact(args.artifact_id)

@@ -338,6 +338,49 @@ class TestArtifacts:
         assert listed[0]["artifact_ids"] == [artifact["id"]]
 
 
+class TestPatchContentWarnings:
+    """Advisory guards for unappliable diffs, found in the first dogfood:
+    a patch stored without its trailing newline is rejected by git apply."""
+
+    def test_patch_without_trailing_newline_warns(self, logstream):
+        artifact = logstream.put_artifact(
+            kind="patch",
+            content="diff --git a/x b/x\n+no trailing newline",
+            created_by="windows-codex",
+        )
+        assert any("trailing newline" in w for w in artifact["warnings"])
+        # Content is still stored verbatim — the warning never mutates it.
+        assert logstream.get_artifact(artifact["id"])["content"].endswith("newline")
+
+    def test_patch_with_crlf_warns(self, logstream):
+        artifact = logstream.put_artifact(
+            kind="patch",
+            content="diff --git a/x b/x\r\n+crlf\r\n",
+            created_by="windows-codex",
+        )
+        assert any("carriage returns" in w for w in artifact["warnings"])
+
+    def test_clean_patch_has_no_warnings_key(self, logstream):
+        artifact = logstream.put_artifact(
+            kind="patch", content=TestArtifacts.PATCH, created_by="windows-codex"
+        )
+        assert "warnings" not in artifact
+
+    def test_non_patch_kinds_never_warn(self, logstream):
+        artifact = logstream.put_artifact(
+            kind="log", content="no trailing newline", created_by="windows-codex"
+        )
+        assert "warnings" not in artifact
+
+    def test_submit_patch_propagates_warnings(self, logstream):
+        result = logstream.submit_patch(
+            content="diff --git a/x b/x\n+truncated",
+            from_agent="windows-codex",
+            stream="project/mempalace",
+        )
+        assert any("trailing newline" in w for w in result["artifact"]["warnings"])
+
+
 # ── Ack ───────────────────────────────────────────────────────────────────
 
 
