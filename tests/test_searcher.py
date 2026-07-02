@@ -11,7 +11,13 @@ import pytest
 
 from _chroma_palace_helper import make_minimal_chroma_sqlite
 
-from mempalace.searcher import SearchError, _hybrid_rank, build_where_filter, search, search_memories
+from mempalace.searcher import (
+    SearchError,
+    _hybrid_rank,
+    build_where_filter,
+    search,
+    search_memories,
+)
 
 
 # ── build_where_filter (unit) ──────────────────────────────────────────
