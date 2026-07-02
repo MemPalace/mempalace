@@ -144,6 +144,8 @@ Other MCP clients use the same two ingredients — the `…/mcp` URL and an
 
 ```bash
 curl https://memory.example.com/healthz        # -> ok
+curl https://memory.example.com/statusz \
+  -H "Authorization: Bearer $MEMPALACE_MCP_HTTP_TOKEN"
 ```
 
 Once connected, all of MemPalace's [MCP tools](/guide/mcp-integration) operate
@@ -164,7 +166,11 @@ whole team.
   process safely handles concurrent reads and writes. Don't point two server
   processes at the same backend collection.
 - **Health checks**: `GET /healthz` returns `200 ok` without a token, so it
-  works as a load-balancer/Kubernetes liveness probe.
+  works as a load-balancer/Kubernetes liveness probe. For machine-readable
+  server state, `GET /statusz` returns JSON with version, uptime, request
+  counters, SQLite integrity, writer mode, and recent observed MCP clients.
+  `/statusz` follows the bearer-token policy because it exposes operational
+  metadata; it is not a public liveness probe.
 - **Fronting proxies (Tailscale, nginx)**: the recommended personal-fleet
   setup is a loopback bind behind a tailnet-only proxy — nothing touches the
   physical LAN and the tailnet provides encryption plus device identity:

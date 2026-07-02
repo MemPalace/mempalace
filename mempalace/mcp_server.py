@@ -55,6 +55,7 @@ import time  # noqa: E402
 from datetime import date, datetime  # noqa: E402
 from pathlib import Path  # noqa: E402
 from typing import Optional  # noqa: E402
+from urllib.parse import urlparse  # noqa: E402
 
 from .config import (  # noqa: E402
     MempalaceConfig,
@@ -4927,6 +4928,8 @@ def _json_rpc_parse_error(req_id=None):
 # can reference them as free names without a NameError.
 _HTTP_REQUEST_LOCK = threading.Lock()
 _HTTP_MAX_REQUEST_BYTES = 16 * 1024 * 1024
+_HTTP_ACTIVE_CLIENT_WINDOW_S = 120.0
+_HTTP_RECENT_CLIENT_LIMIT = 50
 # Host literals that always denote this machine. Used both to decide whether a
 # bind is loopback (skip the network-exposure warning) and to pin the Host
 # header against DNS rebinding when serving on loopback.
@@ -5023,6 +5026,143 @@ def _http_origin_allowed(origin: str) -> bool:
     return host in ("127.0.0.1", "localhost", "::1")
 
 
+def _http_client_identity(handler) -> tuple[str, dict]:
+    headers = handler.headers
+    peer = handler.client_address[0] if handler.client_address else ""
+    forwarded_for = (headers.get("X-Forwarded-For") or "").split(",", 1)[0].strip()
+    real_ip = (headers.get("X-Real-IP") or "").strip()
+    tailnet_user = (headers.get("Tailscale-User-Login") or "").strip()
+    user_agent = (headers.get("User-Agent") or "").strip()
+    host_hdr = (headers.get("Host") or "").strip()
+    peer_hint = forwarded_for or real_ip or peer
+    basis = "|".join([peer_hint, tailnet_user, user_agent, host_hdr])
+    client_id = hashlib.sha256(basis.encode("utf-8", "replace")).hexdigest()[:16]
+    return client_id, {
+        "client_id": client_id,
+        "peer": peer,
+        "peer_hint": peer_hint,
+        "host": host_hdr,
+        "user_agent": user_agent[:160],
+        "tailscale_user": tailnet_user[:160],
+    }
+
+
+def _http_record_request(httpd, handler, status: int) -> None:
+    now = time.time()
+    now_iso = datetime.now().isoformat()
+    client_id, identity = _http_client_identity(handler)
+    with httpd.stats_lock:
+        httpd.request_count += 1
+        httpd.status_counts[str(status)] = httpd.status_counts.get(str(status), 0) + 1
+        entry = dict(httpd.recent_clients.get(client_id, identity))
+        entry.update(identity)
+        entry["last_seen"] = now_iso
+        entry["last_seen_monotonic"] = now
+        entry["request_count"] = int(entry.get("request_count", 0)) + 1
+        entry["last_method"] = handler.command
+        entry["last_path"] = urlparse(handler.path).path
+        entry["last_status"] = status
+        entry["authenticated"] = bool(
+            httpd.auth_token
+            and hmac.compare_digest(
+                handler.headers.get("Authorization", ""), f"Bearer {httpd.auth_token}"
+            )
+        )
+        httpd.recent_clients[client_id] = entry
+        overflow = len(httpd.recent_clients) - _HTTP_RECENT_CLIENT_LIMIT
+        if overflow > 0:
+            oldest = sorted(
+                httpd.recent_clients.items(),
+                key=lambda item: item[1].get("last_seen_monotonic", 0.0),
+            )
+            for stale_id, _entry in oldest[:overflow]:
+                httpd.recent_clients.pop(stale_id, None)
+
+
+def _http_status_payload(httpd) -> dict:
+    now = time.time()
+    with httpd.stats_lock:
+        recent = sorted(
+            (dict(entry) for entry in httpd.recent_clients.values()),
+            key=lambda entry: entry.get("last_seen_monotonic", 0.0),
+            reverse=True,
+        )
+        request_count = httpd.request_count
+        status_counts = dict(httpd.status_counts)
+
+    active = []
+    for entry in recent:
+        last_seen_monotonic = entry.pop("last_seen_monotonic", 0.0)
+        if now - last_seen_monotonic <= _HTTP_ACTIVE_CLIENT_WINDOW_S:
+            active.append(dict(entry))
+
+    writer = {
+        "read_only": _READ_ONLY,
+        "peer_writer_read_only": _MCP_WRITER_READ_ONLY,
+        "peer_writer_lock_failed": _MCP_WRITER_LOCK_FAILED,
+    }
+    if _MCP_WRITER_LOCK_ERROR:
+        writer["peer_writer_lock_error"] = _MCP_WRITER_LOCK_ERROR
+
+    integrity = _sqlite_integrity_payload()
+    palace_path = (
+        os.path.abspath(os.path.expanduser(_config.palace_path)) if _config.palace_path else ""
+    )
+    return {
+        "ok": bool(integrity.get("ok")),
+        "server": {
+            "name": "mempalace",
+            "version": __version__,
+            "transport": "http",
+            "scheme": getattr(httpd, "scheme", "http"),
+            "bind_host": httpd.bind_host,
+            "port": httpd.server_address[1],
+            "started_at": httpd.started_at,
+            "uptime_seconds": round(time.monotonic() - httpd.started_monotonic, 3),
+        },
+        "palace": {
+            "path_hash": hashlib.sha256(palace_path.encode("utf-8")).hexdigest()[:16]
+            if _config.palace_path
+            else "",
+            "backend": _config.backend,
+            "sqlite_integrity": integrity,
+        },
+        "writer": writer,
+        "requests": {
+            "total": request_count,
+            "by_status": status_counts,
+        },
+        "clients": {
+            "active_window_seconds": _HTTP_ACTIVE_CLIENT_WINDOW_S,
+            "active": active,
+            "recent": recent,
+        },
+    }
+
+
+def _http_request_rejected(handler, require_auth: bool) -> bool:
+    """Enforce HTTP Host/Origin/auth policy before dispatching a request."""
+    srv = handler.server
+    if srv.enforce_host_pin:
+        host_hdr = (handler.headers.get("Host") or "").strip().lower()
+        if host_hdr not in srv.allowed_hosts:
+            logger.warning("HTTP request rejected: Host %r not allowed", host_hdr)
+            handler.send_error(403, "Forbidden")
+            return True
+    origin = handler.headers.get("Origin")
+    if origin and not _http_origin_allowed(origin):
+        logger.warning("HTTP request rejected: cross-origin %r", origin)
+        handler.send_error(403, "Forbidden")
+        return True
+    if require_auth and srv.auth_token:
+        provided = handler.headers.get("Authorization", "")
+        if not hmac.compare_digest(provided, f"Bearer {srv.auth_token}"):
+            logger.warning("HTTP request rejected: missing/invalid bearer token")
+            handler.send_error(401, "Unauthorized")
+            return True
+    return False
+
+
 def _build_http_server(host: str, port: int):
     """Construct (but do not start) the MCP HTTP server.
 
@@ -5033,7 +5173,6 @@ def _build_http_server(host: str, port: int):
     allowlist, Origin check, optional bearer token) is attached as attributes.
     """
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-    from urllib.parse import urlparse
 
     auth_token = os.environ.get("MEMPALACE_MCP_HTTP_TOKEN", "").strip()
     if (
@@ -5063,7 +5202,18 @@ def _build_http_server(host: str, port: int):
         def log_message(self, fmt, *args):
             logger.info("HTTP %s - " + fmt, self.client_address[0], *args)
 
+        def send_error(self, code, message=None, explain=None):
+            self._record_request(code)
+            return super().send_error(code, message, explain)
+
+        def _record_request(self, status: int) -> None:
+            _http_record_request(self.server, self, status)
+
+        def _status_payload(self) -> dict:
+            return _http_status_payload(self.server)
+
         def _send_bytes(self, status: int, body: bytes, content_type: str) -> None:
+            self._record_request(status)
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
@@ -5077,41 +5227,23 @@ def _build_http_server(host: str, port: int):
             self._send_bytes(status, body, "application/json; charset=utf-8")
 
         def _request_rejected(self, require_auth: bool) -> bool:
-            """Enforce the transport's access policy before any dispatch.
-
-            The palace is the most sensitive data MemPalace holds and ``/mcp``
-            is unauthenticated by default, so this guards the two ways a local
-            HTTP server leaks to the network: DNS rebinding (Host/Origin) and,
-            when the operator opts in, a missing/incorrect bearer token.
-            """
-            srv = self.server
-            if srv.enforce_host_pin:
-                host_hdr = (self.headers.get("Host") or "").strip().lower()
-                if host_hdr not in srv.allowed_hosts:
-                    logger.warning("HTTP request rejected: Host %r not allowed", host_hdr)
-                    self.send_error(403, "Forbidden")
-                    return True
-            origin = self.headers.get("Origin")
-            if origin and not _http_origin_allowed(origin):
-                logger.warning("HTTP request rejected: cross-origin %r", origin)
-                self.send_error(403, "Forbidden")
-                return True
-            if require_auth and srv.auth_token:
-                provided = self.headers.get("Authorization", "")
-                if not hmac.compare_digest(provided, f"Bearer {srv.auth_token}"):
-                    logger.warning("HTTP request rejected: missing/invalid bearer token")
-                    self.send_error(401, "Unauthorized")
-                    return True
-            return False
+            return _http_request_rejected(self, require_auth)
 
         def do_GET(self):
             # Liveness probe is policy-gated for Host/Origin but never requires
             # the token, so an orchestrator's health check works without creds.
-            if self._request_rejected(require_auth=False):
-                return
             path = urlparse(self.path).path
             if path == "/healthz":
+                if self._request_rejected(require_auth=False):
+                    return
                 self._send_bytes(200, b"ok\n", "text/plain; charset=utf-8")
+                return
+            if path == "/statusz":
+                if self._request_rejected(require_auth=True):
+                    return
+                self._send_json(200, self._status_payload())
+                return
+            if self._request_rejected(require_auth=False):
                 return
 
             self.send_error(404, "Not Found")
@@ -5156,6 +5288,7 @@ def _build_http_server(host: str, port: int):
 
             if response is None:
                 # JSON-RPC notifications intentionally have no response body.
+                self._record_request(202)
                 self.send_response(202)
                 self.send_header("Content-Length", "0")
                 self.send_header("Connection", "close")
@@ -5175,6 +5308,13 @@ def _build_http_server(host: str, port: int):
     httpd.allowed_hosts = _http_allowed_host_values(host, bound_port)
     httpd.auth_token = auth_token
     httpd.scheme = "http"
+    httpd.bind_host = host
+    httpd.started_at = datetime.now().isoformat()
+    httpd.started_monotonic = time.monotonic()
+    httpd.stats_lock = threading.Lock()
+    httpd.request_count = 0
+    httpd.status_counts = {}
+    httpd.recent_clients = {}
     if tls_cert:
         httpd.socket = _wrap_tls(httpd.socket, tls_cert, tls_key)
         httpd.scheme = "https"
