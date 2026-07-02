@@ -418,7 +418,11 @@ class KnowledgeGraph:
         with self._lock:
             conn = self._conn()
             with conn:
-                for name, eid in ((subject, sub_id), (old_obj, old_id), (new_obj, new_id)):
+                # Only create entities we actually open a fact for. old_obj is
+                # matched by id in the UPDATE below whether or not its row
+                # exists, so inserting it would just orphan an entity when no
+                # open old fact is present (the degrade-to-add path).
+                for name, eid in ((subject, sub_id), (new_obj, new_id)):
                     conn.execute(
                         "INSERT OR IGNORE INTO entities (id, name) VALUES (?, ?)",
                         (eid, name),

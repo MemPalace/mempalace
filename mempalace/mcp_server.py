@@ -3331,7 +3331,12 @@ def tool_kg_supersede(
         },
     )
 
-    triple_id = _call_kg(lambda kg: kg.supersede(subject, predicate, old_object, new_object, at=at))
+    try:
+        triple_id = _call_kg(
+            lambda kg: kg.supersede(subject, predicate, old_object, new_object, at=at)
+        )
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
     return {
         "success": True,
         "triple_id": triple_id,
