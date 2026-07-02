@@ -521,6 +521,7 @@ Block until a matching event exists or the timeout expires (long-poll; max 5 min
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `timeout_ms` | integer | No | Wait duration in ms (default 60000, clamped to 300000) |
+| `limit` | integer | No | Max events to return on match (default 50) |
 
 **Returns:** `{ timed_out, events: [...], count }` — timeout is a normal result, not an error.
 

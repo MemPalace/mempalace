@@ -60,7 +60,6 @@ def _list_args(palace, **overrides):
 def _wait_args(palace, **overrides):
     args = _list_args(palace, **overrides)
     args.logstream_action = "wait"
-    del args.limit
     if not hasattr(args, "timeout_ms"):
         args.timeout_ms = 100
     return args

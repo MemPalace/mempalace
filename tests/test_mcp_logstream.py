@@ -136,6 +136,27 @@ class TestDispatch:
         assert result["timed_out"] is True
         assert result["events"] == []
 
+    def test_wait_accepts_limit_like_list(self, patched_server):
+        """wait and list accept the same filter set — windows-codex hit a
+        -32602 'Unknown parameter limit' calling wait with list's filters."""
+        for i in range(3):
+            _result(
+                _call(
+                    patched_server,
+                    "mempalace_event_append",
+                    dict(APPEND_ARGS, body=f"event {i}"),
+                )
+            )
+        result = _result(
+            _call(
+                patched_server,
+                "mempalace_event_wait",
+                {"correlation_id": "task_mcp", "timeout_ms": 5000, "limit": 2},
+            )
+        )
+        assert result["timed_out"] is False
+        assert result["count"] == 2
+
     def test_artifact_put_get_round_trip(self, patched_server):
         patch = "diff --git a/x b/x\n+1\n"
         put = _result(

@@ -1387,7 +1387,7 @@ def cmd_logstream(args):
                     events = ls.list_events(limit=args.limit, **filters)
                     result = {"events": events, "count": len(events)}
                 else:
-                    result = ls.wait_events(timeout_ms=args.timeout_ms, **filters)
+                    result = ls.wait_events(timeout_ms=args.timeout_ms, limit=args.limit, **filters)
                     result["count"] = len(result["events"])
             except ValueError as exc:
                 _logstream_fail(str(exc), as_json)
@@ -3086,6 +3086,9 @@ def main():
         type=int,
         default=60000,
         help="How long to wait in ms (default 60000, max 300000)",
+    )
+    p_ls_wait.add_argument(
+        "--limit", type=int, default=50, help="Max events to return on match (default 50)"
     )
     p_ls_wait.add_argument("--json", action="store_true", help="Machine-readable output")
 

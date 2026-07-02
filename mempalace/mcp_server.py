@@ -4013,8 +4013,14 @@ def tool_event_wait(
     since_event_id: str = None,
     since_created_at: str = None,
     timeout_ms: int = 60000,
+    limit: int = 50,
 ):
-    """Block until a matching event exists or the timeout expires."""
+    """Block until a matching event exists or the timeout expires.
+
+    ``limit`` mirrors ``event_list`` so the two tools accept the same
+    filter set — agents kept tripping over wait rejecting a parameter
+    that list accepts (reported by windows-codex during dogfood).
+    """
     try:
         result = _call_logstream(
             lambda ls: ls.wait_events(
@@ -4028,6 +4034,7 @@ def tool_event_wait(
                 status=status,
                 since_event_id=since_event_id,
                 since_created_at=since_created_at,
+                limit=limit,
             )
         )
     except ValueError as e:
@@ -4858,6 +4865,10 @@ TOOLS = {
                 "timeout_ms": {
                     "type": "integer",
                     "description": "How long to wait in milliseconds (default 60000, max 300000)",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max events to return when matches exist (default 50)",
                 },
             },
         },
