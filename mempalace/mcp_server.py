@@ -5814,6 +5814,8 @@ def _http_serve_snapshot(handler, path: str) -> bool:
         )
         return True
     if path == "/snapshot/drawers":
+        from .replica_sync import REPLICA_ORIGIN_KEY
+
         with _HTTP_REQUEST_LOCK:
             col = _get_collection()
             if col is None:
@@ -5823,18 +5825,47 @@ def _http_serve_snapshot(handler, path: str) -> bool:
         ids = batch.get("ids") or []
         docs = batch.get("documents") or []
         metas = batch.get("metadatas") or []
-        items = [{"id": i, "document": d, "metadata": m or {}} for i, d, m in zip(ids, docs, metas)]
-        handler._send_json(200, {"items": items, "count": len(items), "offset": offset})
+        # Authored-only: a snapshot serves the facts THIS replica authors.
+        # Drawers folded from another origin (replica_origin-stamped) are
+        # excluded, or bidirectional pull-pairs would echo each other's
+        # content back re-stamped, corrupting provenance and reconciliation.
+        items = [
+            {"id": i, "document": d, "metadata": m or {}}
+            for i, d, m in zip(ids, docs, metas)
+            if not (m or {}).get(REPLICA_ORIGIN_KEY)
+        ]
+        handler._send_json(
+            200,
+            {
+                "items": items,
+                "count": len(items),
+                "offset": offset,
+                # Raw advance: pages may return fewer items than scanned.
+                "next_offset": offset + len(ids) if ids else None,
+            },
+        )
         return True
     if path == "/snapshot/ids":
+        from .replica_sync import REPLICA_ORIGIN_KEY
+
         with _HTTP_REQUEST_LOCK:
             col = _get_collection()
             if col is None:
                 handler._send_json(503, {"error": "no palace collection available"})
                 return True
-            batch = col.get(limit=limit, offset=offset)
-        ids = batch.get("ids") or []
-        handler._send_json(200, {"ids": ids, "count": len(ids), "offset": offset})
+            batch = col.get(limit=limit, offset=offset, include=["metadatas"])
+        raw_ids = batch.get("ids") or []
+        metas = batch.get("metadatas") or []
+        ids = [i for i, m in zip(raw_ids, metas) if not (m or {}).get(REPLICA_ORIGIN_KEY)]
+        handler._send_json(
+            200,
+            {
+                "ids": ids,
+                "count": len(ids),
+                "offset": offset,
+                "next_offset": offset + len(raw_ids) if raw_ids else None,
+            },
+        )
         return True
     if path == "/snapshot/kg":
         table = query.get("table") or ""

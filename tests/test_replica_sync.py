@@ -102,6 +102,17 @@ def _get(url, path):
         conn.close()
 
 
+class _ConfigProxy:
+    """Config stand-in pointing the served palace at a different directory."""
+
+    def __init__(self, palace_path, base):
+        self.palace_path = palace_path
+        self.collection_name = base.collection_name
+
+    def __getattr__(self, name):
+        raise AttributeError(name)
+
+
 class TestSnapshotEndpoints:
     def test_manifest_counts(self, origin_server):
         url, _, _ = origin_server
@@ -224,6 +235,55 @@ class TestReplicaPull:
             assert not any(f["object"] == "MemPalace" for f in live_now)
         finally:
             kg.close()
+
+    def test_bidirectional_two_origin_pull_has_no_echo(
+        self, origin_server, replica_palace, fake_embedder, monkeypatch
+    ):
+        """Option C from the fleet: each machine authors its own history and
+        pulls the other's. Snapshots serve authored-only content, so a pull
+        pair must never echo a replica's own drawers back re-stamped."""
+        url, origin_palace, mcp = origin_server
+        pull_memory(replica_palace, url)  # replica now holds origin's 3 drawers
+
+        # Replica authors net-new local content (the Windows mining case).
+        from mempalace.palace import get_collection
+
+        replica_col = get_collection(replica_palace)
+        replica_col.upsert(
+            ids=["drawer_win_convo_001"],
+            documents=["windows conversation canary from the second origin"],
+            metadatas=[{"wing": "claude_conversations_windows", "room": "technical"}],
+        )
+
+        # Reverse direction: serve the REPLICA palace, pull into the origin.
+        monkeypatch.setattr(mcp, "_config", _ConfigProxy(replica_palace, mcp._config))
+        monkeypatch.setattr(mcp, "_collection_cache", None)
+        monkeypatch.setattr(mcp, "_client_cache", None)
+        monkeypatch.setattr(mcp, "_logstream_by_path", {})
+        import threading
+
+        httpd = mcp._build_http_server("127.0.0.1", 0)
+        port = httpd.server_address[1]
+        thread = threading.Thread(
+            target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+        )
+        thread.start()
+        try:
+            stats = pull_memory(origin_palace, f"http://127.0.0.1:{port}", pull_kg=False)
+            # Only the replica-AUTHORED drawer crosses; the origin's own 3
+            # drawers are not echoed back.
+            assert stats["drawers_upserted"] == 1
+            origin_col = get_collection(origin_palace)
+            copy = origin_col.get(ids=["drawer_win_convo_001"], include=["documents", "metadatas"])
+            assert copy["documents"][0] == "windows conversation canary from the second origin"
+            assert copy["metadatas"][0][REPLICA_ORIGIN_KEY].startswith("rep_")
+            # Origin's own drawers keep clean provenance (no stamp).
+            own = origin_col.get(ids=["drawer_w_r_aaa"], include=["metadatas"])
+            assert REPLICA_ORIGIN_KEY not in (own["metadatas"][0] or {})
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
 
     def test_cli_replica_pull(self, origin_server, replica_palace, fake_embedder, capsys):
         url, _, _ = origin_server

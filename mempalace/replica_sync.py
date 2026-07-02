@@ -41,16 +41,20 @@ def _pull_drawers(col, url: str, token: str, origin_id: str) -> int:
     while True:
         page = _peer_get(url, token, "/snapshot/drawers", {"offset": offset, "limit": _PAGE})
         items = page.get("items") or []
-        if not items:
+        if items:
+            ids = [item["id"] for item in items]
+            documents = [item["document"] for item in items]
+            metadatas = [
+                {**(item.get("metadata") or {}), REPLICA_ORIGIN_KEY: origin_id} for item in items
+            ]
+            col.upsert(ids=ids, documents=documents, metadatas=metadatas)
+            upserted += len(items)
+        # Authored-only serving can return sparse pages: advance by the
+        # server's raw scan cursor, not by the filtered item count.
+        next_offset = page.get("next_offset")
+        if next_offset is None:
             break
-        ids = [item["id"] for item in items]
-        documents = [item["document"] for item in items]
-        metadatas = [
-            {**(item.get("metadata") or {}), REPLICA_ORIGIN_KEY: origin_id} for item in items
-        ]
-        col.upsert(ids=ids, documents=documents, metadatas=metadatas)
-        upserted += len(items)
-        offset += len(items)
+        offset = next_offset
     return upserted
 
 
@@ -59,11 +63,11 @@ def _pull_remote_ids(url: str, token: str) -> set:
     offset = 0
     while True:
         page = _peer_get(url, token, "/snapshot/ids", {"offset": offset, "limit": 1000})
-        ids = page.get("ids") or []
-        if not ids:
+        remote_ids.update(page.get("ids") or [])
+        next_offset = page.get("next_offset")
+        if next_offset is None:
             break
-        remote_ids.update(ids)
-        offset += len(ids)
+        offset = next_offset
     return remote_ids
 
 
@@ -115,6 +119,7 @@ def pull_memory(
     url: str,
     token: str = "",
     reconcile_deletes: bool = True,
+    pull_kg: bool = True,
 ) -> dict:
     """One full read-replica pass against one origin. Returns fold stats.
 
@@ -138,13 +143,20 @@ def pull_memory(
 
     import os
 
-    kg = KnowledgeGraph(
-        db_path=os.path.join(os.path.expanduser(palace_path), "knowledge_graph.sqlite3")
-    )
-    try:
-        kg_counts = _pull_kg(kg, url, token)
-    finally:
-        kg.close()
+    # KG rows carry no origin stamp, so a reverse pull could overwrite a
+    # newer local row with the peer's stale replicated copy (INSERT OR
+    # REPLACE has no freshness check). Until step 2a gives KG facts real
+    # op provenance, disable KG on pulls from peers that merely replicate
+    # your KG back (pull_kg=False / CLI --no-kg).
+    kg_counts = {"entities": 0, "triples": 0}
+    if pull_kg:
+        kg = KnowledgeGraph(
+            db_path=os.path.join(os.path.expanduser(palace_path), "knowledge_graph.sqlite3")
+        )
+        try:
+            kg_counts = _pull_kg(kg, url, token)
+        finally:
+            kg.close()
 
     return {
         "origin_url": url,
