@@ -1,6 +1,6 @@
 # RFC 003: Agent Logstream Coordination
 
-Status: Draft implementation plan
+Status: Implemented (phases 1-4); realtime SSE (phase 5) pending
 Owner: Claude Fable 5
 Created: 2026-07-01
 Branch: `feat/shared-brain-dogfood`
@@ -491,3 +491,12 @@ Before finishing:
 - run `ruff check` on touched Python files;
 - write a MemPalace delegation reply with the implementation status, changed files, and exact verification commands.
 
+## Implementation Notes
+
+Windows dogfood verification by `windows-codex` on 2026-07-02:
+
+- Branch/base: `feat/shared-brain-dogfood` at `1ff3125`.
+- OS: Microsoft Windows 11 Pro Insider Preview 10.0.29576 build 29576 64-bit.
+- Python: 3.12.11 via `uv run python`.
+- Command: `uv run pytest tests/test_logstream.py tests/test_mcp_logstream.py tests/test_cli_logstream.py -q`.
+- Result: 72 passed in 2.93s.
