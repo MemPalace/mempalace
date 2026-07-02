@@ -39,7 +39,7 @@ import json
 import os
 import sqlite3
 import threading
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
 from .config import sanitize_iso_temporal
@@ -127,8 +127,16 @@ def _temporal_filter_sql(as_of: str) -> tuple[str, list[str]]:
 
 
 class KnowledgeGraph:
-    def __init__(self, db_path: str = None):
+    def __init__(self, db_path: str = None, oplog=None):
+        """``oplog`` (an :class:`mempalace.oplog.OpLog`) enables the RFC 004
+        step-2a dual-write shadow: every KG mutation that actually changes
+        state also emits a kg.* op. Emission lives inside this class because
+        only the write methods know whether state changed — ``add_triple``'s
+        dedup short-circuit and a zero-match ``invalidate`` must emit
+        nothing. ``None`` (the default) keeps every existing caller
+        op-log-free."""
         self.db_path = db_path or DEFAULT_KG_PATH
+        self._oplog = oplog
         db_parent = Path(self.db_path).parent
         db_parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -138,6 +146,13 @@ class KnowledgeGraph:
         self._connection = None
         self._lock = threading.Lock()
         self._init_db()
+
+    def _shadow_emit(self, kind: str, payload: dict, author_agent: str) -> None:
+        if self._oplog is None:
+            return
+        from .oplog import shadow_append
+
+        shadow_append(self._oplog, kind, payload, author_agent=author_agent)
 
     def _init_db(self):
         conn = self._conn()
@@ -221,7 +236,13 @@ class KnowledgeGraph:
 
     # ── Write operations ──────────────────────────────────────────────────
 
-    def add_entity(self, name: str, entity_type: str = "unknown", properties: dict = None):
+    def add_entity(
+        self,
+        name: str,
+        entity_type: str = "unknown",
+        properties: dict = None,
+        author_agent: str = "mcp",
+    ):
         """Add or update an entity node."""
         eid = self._entity_id(name)
         props = json.dumps(properties or {})
@@ -232,6 +253,18 @@ class KnowledgeGraph:
                     "INSERT OR REPLACE INTO entities (id, name, type, properties) VALUES (?, ?, ?, ?)",
                     (eid, name, entity_type, props),
                 )
+        # LWW-by-HLC per entity key (RFC 004 §6.2) — REPLACE always mutates,
+        # so an explicit upsert always emits.
+        self._shadow_emit(
+            "kg.entity.upsert",
+            {
+                "entity_id": eid,
+                "name": name,
+                "type": entity_type,
+                "properties": properties or {},
+            },
+            author_agent,
+        )
         return eid
 
     def add_triple(
@@ -246,6 +279,7 @@ class KnowledgeGraph:
         source_file: str = None,
         source_drawer_id: str = None,
         adapter_name: str = None,
+        author_agent: str = "mcp",
     ):
         """
         Add a relationship triple: subject → predicate → object.
@@ -281,6 +315,10 @@ class KnowledgeGraph:
         obj_id = self._entity_id(obj)
         pred = predicate.lower().replace(" ", "_")
 
+        # Explicit so the emitted op carries the exact stored value; matches
+        # the format SQLite's CURRENT_TIMESTAMP default produced before.
+        extracted_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
         # Auto-create entities if they don't exist
         with self._lock:
             conn = self._conn()
@@ -300,34 +338,69 @@ class KnowledgeGraph:
                     (sub_id, pred, obj_id),
                 ).fetchone()
                 if existing:
-                    return existing["id"]  # Already exists and still valid
+                    created = False
+                    triple_id = existing["id"]  # Already exists and still valid
+                else:
+                    created = True
+                    triple_id = make_triple_id(
+                        sub_id, pred, obj_id, valid_from, datetime.now().isoformat()
+                    )
+                    conn.execute(
+                        """INSERT INTO triples (
+                            id, subject, predicate, object, valid_from, valid_to,
+                            confidence, source_closet, source_file,
+                            source_drawer_id, adapter_name, extracted_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            triple_id,
+                            sub_id,
+                            pred,
+                            obj_id,
+                            valid_from,
+                            valid_to,
+                            confidence,
+                            source_closet,
+                            source_file,
+                            source_drawer_id,
+                            adapter_name,
+                            extracted_at,
+                        ),
+                    )
+        if created:
+            # G-set assert (RFC 004 §6.2). The payload carries the full row
+            # so a fold can reproduce it — including the auto-created
+            # entities, which are re-derivable from the names and therefore
+            # get no op of their own.
+            self._shadow_emit(
+                "kg.assert",
+                {
+                    "triple_id": triple_id,
+                    "subject": sub_id,
+                    "subject_name": subject,
+                    "predicate": pred,
+                    "object": obj_id,
+                    "object_name": obj,
+                    "valid_from": valid_from,
+                    "valid_to": valid_to,
+                    "confidence": confidence,
+                    "source_closet": source_closet,
+                    "source_file": source_file,
+                    "source_drawer_id": source_drawer_id,
+                    "adapter_name": adapter_name,
+                    "extracted_at": extracted_at,
+                },
+                author_agent,
+            )
+        return triple_id
 
-                triple_id = make_triple_id(
-                    sub_id, pred, obj_id, valid_from, datetime.now().isoformat()
-                )
-                conn.execute(
-                    """INSERT INTO triples (
-                        id, subject, predicate, object, valid_from, valid_to,
-                        confidence, source_closet, source_file,
-                        source_drawer_id, adapter_name
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        triple_id,
-                        sub_id,
-                        pred,
-                        obj_id,
-                        valid_from,
-                        valid_to,
-                        confidence,
-                        source_closet,
-                        source_file,
-                        source_drawer_id,
-                        adapter_name,
-                    ),
-                )
-                return triple_id
-
-    def invalidate(self, subject: str, predicate: str, obj: str, ended: str = None):
+    def invalidate(
+        self,
+        subject: str,
+        predicate: str,
+        obj: str,
+        ended: str = None,
+        author_agent: str = "mcp",
+    ):
         """Mark a relationship as no longer valid (set valid_to date/time)."""
         sub_id = self._entity_id(subject)
         obj_id = self._entity_id(obj)
@@ -358,8 +431,40 @@ class KnowledgeGraph:
                     "WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
                     (ended, sub_id, pred, obj_id),
                 )
+        closed_triple_ids = [row["id"] for row in rows]
+        if closed_triple_ids:
+            # Interval-close (RFC 004 §6.2): idempotent, min valid_to wins.
+            # A zero-match invalidate changed nothing and emits nothing.
+            self._shadow_emit(
+                "kg.close",
+                {
+                    "subject": sub_id,
+                    "subject_name": subject,
+                    "predicate": pred,
+                    "object": obj_id,
+                    "object_name": obj,
+                    "ended": ended,
+                    "closed_triple_ids": closed_triple_ids,
+                },
+                author_agent,
+            )
 
     # ── Query operations ──────────────────────────────────────────────────
+
+    def get_triple(self, triple_id: str) -> Optional[dict]:
+        """Fetch one triple row by id, or None. Used by the RFC 004 step-2a
+        shadow verifier to compare op-log expectations against stored state."""
+        with self._lock:
+            conn = self._conn()
+            row = conn.execute("SELECT * FROM triples WHERE id = ?", (triple_id,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_entity(self, entity_id: str) -> Optional[dict]:
+        """Fetch one entity row by id, or None."""
+        with self._lock:
+            conn = self._conn()
+            row = conn.execute("SELECT * FROM entities WHERE id = ?", (entity_id,)).fetchone()
+        return dict(row) if row is not None else None
 
     def query_entity(self, name: str, as_of: str = None, direction: str = "outgoing"):
         """

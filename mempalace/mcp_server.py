@@ -670,7 +670,7 @@ def _get_kg(canonical_path=None) -> KnowledgeGraph:
     with _kg_cache_lock:
         kg = _kg_by_path.get(path)
         if kg is None:
-            kg = KnowledgeGraph(db_path=path)
+            kg = KnowledgeGraph(db_path=path, oplog=_get_shadow_oplog())
             _kg_by_path[path] = kg
     return kg
 
@@ -918,6 +918,38 @@ def _refresh_vector_disabled_flag() -> None:
 # this module, whose import installs MCP stdio protection (os.dup2(2, 1) and
 # sys.stdout = sys.stderr) that would misroute their output.
 from .wal import _wal_log  # noqa: E402
+
+
+def _emit_memory_op(kind: str, payload: dict, author_agent: str = "mcp") -> None:
+    """RFC 004 step-2a dual-write shadow: record a palace mutation as an op.
+
+    During the shadow period the vector store remains the system of record
+    and this is bookkeeping beside it — ``emit_op`` in shadow posture never
+    raises (failures are logged loudly and surface in
+    ``mempalace oplog verify``), so a broken op-log can never break a
+    memory write. Sits beside ``_wal_log`` at each semantic write site:
+    the WAL is the forensic trail, the op is the replicable fact.
+    """
+    from .oplog import emit_op
+
+    palace_path = getattr(_config, "palace_path", None)
+    if not palace_path:
+        return
+    emit_op(palace_path, kind, payload, author_agent=author_agent)
+
+
+def _get_shadow_oplog():
+    """OpLog for the active palace (KG constructor injection), or None."""
+    palace_path = getattr(_config, "palace_path", None)
+    if not palace_path:
+        return None
+    try:
+        from .oplog import get_oplog
+
+        return get_oplog(palace_path)
+    except Exception:
+        logger.debug("op-log unavailable; KG shadow emission disabled", exc_info=True)
+        return None
 
 
 def _get_client():
@@ -2612,6 +2644,21 @@ def tool_add_drawer(
                     "The palace index may be stale; run reconnect or repair."
                 )
             _metadata_cache = None
+            _emit_memory_op(
+                "drawer.add",
+                {
+                    "drawer_id": drawer_id,
+                    "wing": wing,
+                    "room": room,
+                    "content": content,
+                    "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                    "source_file": source_file or "",
+                    "filed_at": base_meta["filed_at"],
+                    "id_recipe": ID_RECIPE,
+                    "chunks": 1,
+                },
+                author_agent=added_by,
+            )
             logger.info(f"Filed drawer: {drawer_id} → {wing}/{room}")
             return {
                 "success": True,
@@ -2647,6 +2694,21 @@ def tool_add_drawer(
                 "The palace index may be stale; run reconnect or repair."
             )
         _metadata_cache = None
+        _emit_memory_op(
+            "drawer.add",
+            {
+                "drawer_id": drawer_id,
+                "wing": wing,
+                "room": room,
+                "content": content,
+                "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                "source_file": source_file or "",
+                "filed_at": base_meta["filed_at"],
+                "id_recipe": ID_RECIPE,
+                "chunks": len(chunk_ids),
+            },
+            author_agent=added_by,
+        )
         logger.info(f"Filed drawer: {drawer_id} → {wing}/{room} ({len(chunk_ids)} chunks)")
         return {
             "success": True,
@@ -2685,6 +2747,23 @@ def tool_delete_drawer(drawer_id: str):
 
         col.delete(ids=record["ids"])
         _metadata_cache = None
+
+        # Tombstone hides, never deletes (RFC 004 merge table): during the shadow
+        # period Chroma still physically deletes, so the op carries the full
+        # verbatim content — nothing the store destroys is lost to history.
+        deleted_meta = _safe_meta(record["metadata"])
+        _emit_memory_op(
+            "drawer.tombstone",
+            {
+                "drawer_id": drawer_id,
+                "reason": "user_delete",
+                "content": record["content"],
+                "content_sha256": hashlib.sha256(record["content"].encode("utf-8")).hexdigest(),
+                "wing": deleted_meta.get("wing", ""),
+                "room": deleted_meta.get("room", ""),
+                "deleted_ids": record["ids"],
+            },
+        )
 
         logger.info("Deleted drawer: %s (%s rows)", drawer_id, len(record["ids"]))
 
@@ -3240,6 +3319,19 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
             },
         )
 
+        # drawer.revise per the RFC 004 mutable-state mapping — content-addressed
+        # revision carrying the full new state; the prior sha ties the
+        # revision chain together for the v4 migration.
+        revise_payload = {
+            "drawer_id": drawer_id,
+            "content": new_doc,
+            "content_sha256": hashlib.sha256(new_doc.encode("utf-8")).hexdigest(),
+            "prior_content_sha256": hashlib.sha256(old_doc.encode("utf-8")).hexdigest(),
+            "wing": new_meta.get("wing", ""),
+            "room": new_meta.get("room", ""),
+            "content_changed": content is not None,
+        }
+
         chunk_size = max(1, int(getattr(_config, "chunk_size", 800) or 800))
         should_chunk = bool(record.get("chunked")) or len(new_doc) > chunk_size
 
@@ -3259,6 +3351,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
                 col.delete(ids=stale_ids)
 
             _metadata_cache = None
+            _emit_memory_op("drawer.revise", revise_payload)
 
             logger.info("Updated drawer: %s (%s rows)", drawer_id, len(chunk_ids))
 
@@ -3278,6 +3371,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
 
         col.update(**update_kwargs)
         _metadata_cache = None
+        _emit_memory_op("drawer.revise", revise_payload)
 
         logger.info("Updated drawer: %s", drawer_id)
 

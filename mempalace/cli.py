@@ -1596,6 +1596,68 @@ def cmd_replica(args):
             sys.exit(1)
 
 
+def cmd_oplog(args):
+    """RFC 004 step 2a: canonical memory op-log — status + shadow verify."""
+    import json
+
+    as_json = getattr(args, "json", False)
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+
+    if args.oplog_action == "status":
+        from .oplog import OPLOG_DB_FILENAME, OpLog
+
+        db_path = os.path.join(palace_path, OPLOG_DB_FILENAME)
+        if not os.path.exists(db_path):
+            _logstream_fail(f"no op-log at {db_path} (no ops have been emitted yet)", as_json)
+        with OpLog(db_path) as log:
+            report = {
+                "palace": palace_path,
+                "replica_id": log.replica_id,
+                "ops": log.count(),
+                "by_kind": log.kind_histogram(),
+                "version_vector": log.version_vector(),
+            }
+        if as_json:
+            print(json.dumps(report, indent=2, ensure_ascii=False))
+        else:
+            print(f"  op-log for {palace_path} ({report['replica_id']}): {report['ops']} ops")
+            for kind, count in sorted(report["by_kind"].items()):
+                print(f"    {kind}: {count}")
+            for origin, top in sorted(report["version_vector"].items()):
+                print(f"  origin {origin}: highest seq {top}")
+        return
+
+    if args.oplog_action == "verify":
+        from .oplog_verify import verify_shadow
+
+        try:
+            report = verify_shadow(palace_path)
+        except Exception as exc:
+            _logstream_fail(str(exc), as_json)
+        if as_json:
+            print(json.dumps(report, indent=2, ensure_ascii=False))
+        else:
+            drawers = report["drawers"]
+            kg = report["kg"]
+            print(f"  {report['ops']} ops replayed against {report['palace']}")
+            print(f"  drawers: {drawers.get('ok', 0)}/{drawers.get('checked', 0)} ok")
+            for bucket in ("missing", "diverged", "not_tombstoned"):
+                count = drawers.get(f"{bucket}_count", 0)
+                if count:
+                    print(f"    {bucket}: {count} — sample {drawers.get(bucket)}")
+            print(f"  kg: {kg.get('ok', 0)}/{kg.get('checked', 0)} ok")
+            for bucket in ("missing", "diverged", "entity_missing"):
+                count = kg.get(f"{bucket}_count", 0)
+                if count:
+                    print(f"    {bucket}: {count} — sample {kg.get(bucket)}")
+            if report["clean"]:
+                print("  CLEAN — every op is reflected in the store")
+            else:
+                print("  DIVERGED — the shadow found store/op-log disagreement")
+        if not report["clean"]:
+            sys.exit(1)
+
+
 def cmd_palace_set_embedder(args):
     """Record (or force-override) a palace's embedder identity (RFC 001).
 
@@ -3300,6 +3362,22 @@ def main():
     )
     p_rep_embed.add_argument("--json", action="store_true", help="Machine-readable output")
 
+    # oplog (RFC 004 step 2a — canonical memory op-log)
+    p_oplog = sub.add_parser(
+        "oplog", help="Canonical memory op-log — dual-write shadow status and verification"
+    )
+    oplog_sub = p_oplog.add_subparsers(dest="oplog_action")
+    p_oplog_status = oplog_sub.add_parser(
+        "status", help="Op counts, kind histogram, and version vector"
+    )
+    p_oplog_status.add_argument("--json", action="store_true", help="Machine-readable output")
+    p_oplog_verify = oplog_sub.add_parser(
+        "verify",
+        help="Replay the op-log against the live store and report divergence "
+        "(the step-2a cutover gate; exits 1 on divergence)",
+    )
+    p_oplog_verify.add_argument("--json", action="store_true", help="Machine-readable output")
+
     p_palace = sub.add_parser("palace", help="Palace maintenance commands")
     palace_sub = p_palace.add_subparsers(dest="palace_action")
     p_set_embedder = palace_sub.add_parser(
@@ -3387,6 +3465,13 @@ def main():
             p_replica.print_help()
             return
         cmd_replica(args)
+        return
+
+    if args.command == "oplog":
+        if not getattr(args, "oplog_action", None):
+            p_oplog.print_help()
+            return
+        cmd_oplog(args)
         return
 
     if args.command == "daemon":

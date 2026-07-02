@@ -4434,7 +4434,7 @@ class TestStructuredErrors:
         constructed: list = []
 
         class _StubKG:
-            def __init__(self, db_path=None):
+            def __init__(self, db_path=None, oplog=None):
                 constructed.append(db_path)
 
         monkeypatch.setattr(mcp_server, "_kg_by_path", {})
