@@ -129,6 +129,15 @@ Supported config keys (also exposed via `MempalaceProvider.get_config_schema()`)
 | `wing` | `MEMPALACE_WING` | auto-classify via `wing_config.json` |
 | `n_prefetch` | — | `3` (clamped to 1-20) |
 
+**Invalid wing/room names never drop a turn.** Wing and room names are
+validated with the same `sanitize_name` rules the MCP write tools use
+(no `/`, `..`, null bytes, over-length names). But unlike the MCP
+tools — which return an error to the caller — live filing *falls back*
+instead: an invalid wing files under `wing_general`, an invalid room
+under `conversations`, and a warning is logged. A config typo in
+`MEMPALACE_WING` or `wing_config.json` must not silently lose
+conversation turns; misrouted-but-recallable beats gone.
+
 `collection_name` is intentionally **not** user-configurable on this
 side. Writes go through this provider's collection; reads from
 `prefetch` / `_tool_search` go through `search_memories`, which reads
