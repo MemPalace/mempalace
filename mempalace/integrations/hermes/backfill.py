@@ -314,6 +314,25 @@ def backfill(
     total_skipped = 0
 
     for i, session_file in enumerate(session_files, 1):
+        # Exchange drawer ids are salted with filed_at, so re-filing the
+        # same session mints fresh ids instead of overwriting — without
+        # this guard a re-run of ``mempalace hermes install`` duplicates
+        # every exchange. Same per-source idempotency check the convo
+        # miner uses; extract_mode scoping matches the drawers
+        # ``file_conversation_exchange`` writes.
+        if collection is not None:
+            from mempalace.palace import file_already_mined
+
+            if file_already_mined(collection, str(session_file), extract_mode="exchange"):
+                if verbose:
+                    logger.info(
+                        "  [%d/%d] %s — already backfilled",
+                        i,
+                        len(session_files),
+                        session_file.name,
+                    )
+                continue
+
         exchanges = parse_session_file(session_file)
         if not exchanges:
             if verbose:
