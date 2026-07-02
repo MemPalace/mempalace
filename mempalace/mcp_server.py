@@ -5760,9 +5760,92 @@ def _http_handle_get(handler) -> None:
         if not _http_serve_sync(handler, path):
             handler.send_error(404, "Not Found")
         return
+    if path.startswith("/snapshot/"):
+        if handler._request_rejected(require_auth=True):
+            return
+        if not _http_serve_snapshot(handler, path):
+            handler.send_error(404, "Not Found")
+        return
     if handler._request_rejected(require_auth=False):
         return
     handler.send_error(404, "Not Found")
+
+
+def _http_serve_snapshot(handler, path: str) -> bool:
+    """RFC 004 step 1: content-snapshot endpoints for memory read replicas.
+
+    GET /snapshot/manifest                → {replica_id, drawers, kg, collection}
+    GET /snapshot/drawers?offset=&limit=  → {items: [{id, document, metadata}]}
+    GET /snapshot/ids?offset=&limit=      → {ids: [...]} (delete reconciliation)
+    GET /snapshot/kg?table=&after=&limit= → {rows: [...]} (rowid-paged)
+
+    Facts only — verbatim documents, metadata, and KG rows. Vector indexes
+    are never served: the replica derives its own (RFC 004 layer 3). Chroma
+    access happens under the global request lock like every other
+    Chroma-touching request; pages are small enough to keep holds short.
+    """
+    from urllib.parse import parse_qsl
+
+    query = dict(parse_qsl(urlparse(handler.path).query))
+    try:
+        limit = max(1, min(int(query.get("limit", "500") or 500), 1000))
+        offset = max(0, int(query.get("offset", "0") or 0))
+        after = max(0, int(query.get("after", "0") or 0))
+    except (TypeError, ValueError):
+        handler._send_json(400, {"error": "limit/offset/after must be integers"})
+        return True
+
+    if path == "/snapshot/manifest":
+        with _HTTP_REQUEST_LOCK:
+            col = _get_collection()
+            drawer_count = col.count() if col else 0
+        kg_stats = _call_kg(lambda kg: kg.stats())
+        handler._send_json(
+            200,
+            {
+                "replica_id": _call_logstream(lambda ls: ls.replica_id),
+                "drawers": drawer_count,
+                "kg": {
+                    "entities": kg_stats.get("entities", 0),
+                    "triples": kg_stats.get("triples", 0),
+                },
+                "collection": _config.collection_name,
+            },
+        )
+        return True
+    if path == "/snapshot/drawers":
+        with _HTTP_REQUEST_LOCK:
+            col = _get_collection()
+            if col is None:
+                handler._send_json(503, {"error": "no palace collection available"})
+                return True
+            batch = col.get(limit=limit, offset=offset, include=["documents", "metadatas"])
+        ids = batch.get("ids") or []
+        docs = batch.get("documents") or []
+        metas = batch.get("metadatas") or []
+        items = [{"id": i, "document": d, "metadata": m or {}} for i, d, m in zip(ids, docs, metas)]
+        handler._send_json(200, {"items": items, "count": len(items), "offset": offset})
+        return True
+    if path == "/snapshot/ids":
+        with _HTTP_REQUEST_LOCK:
+            col = _get_collection()
+            if col is None:
+                handler._send_json(503, {"error": "no palace collection available"})
+                return True
+            batch = col.get(limit=limit, offset=offset)
+        ids = batch.get("ids") or []
+        handler._send_json(200, {"ids": ids, "count": len(ids), "offset": offset})
+        return True
+    if path == "/snapshot/kg":
+        table = query.get("table") or ""
+        try:
+            rows = _call_kg(lambda kg: kg.dump_rows(table, after_rowid=after, limit=limit))
+        except ValueError as exc:
+            handler._send_json(400, {"error": str(exc)})
+            return True
+        handler._send_json(200, {"table": table, "rows": rows, "count": len(rows)})
+        return True
+    return False
 
 
 def _http_serve_sync(handler, path: str) -> bool:

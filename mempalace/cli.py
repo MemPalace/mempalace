@@ -1514,6 +1514,53 @@ def cmd_artifact(args):
         ls.close()
 
 
+def cmd_replica(args):
+    """RFC 004 step 1: read-replica operations for memory (drawers + KG)."""
+    import json
+
+    as_json = getattr(args, "json", False)
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    if args.replica_action == "pull":
+        from .replica_sync import pull_from_peers, pull_memory
+
+        try:
+            if args.peer:
+                results = [
+                    pull_memory(
+                        palace_path,
+                        args.peer,
+                        args.token or "",
+                        reconcile_deletes=not args.no_reconcile,
+                    )
+                ]
+            else:
+                results = pull_from_peers(palace_path)
+                if not results:
+                    _logstream_fail(
+                        f"no peers configured ({palace_path}/peers.json) and no --peer given",
+                        as_json,
+                    )
+        except Exception as exc:
+            _logstream_fail(str(exc), as_json)
+        if as_json:
+            print(json.dumps(results, indent=2, ensure_ascii=False))
+        else:
+            for stats in results:
+                if stats.get("error"):
+                    print(
+                        f"  {stats.get('peer_name', stats['origin_url'])}: ERROR {stats['error']}"
+                    )
+                else:
+                    print(
+                        f"  {stats.get('peer_name', stats['origin_url'])} "
+                        f"({stats['origin_replica']}): {stats['drawers_upserted']} drawers folded, "
+                        f"{stats['drawers_deleted']} reconciled away, "
+                        f"KG +{stats['kg_entities']} entities / +{stats['kg_triples']} triples"
+                    )
+        if any(s.get("error") for s in results):
+            sys.exit(1)
+
+
 def cmd_palace_set_embedder(args):
     """Record (or force-override) a palace's embedder identity (RFC 001).
 
@@ -3173,6 +3220,25 @@ def main():
         "--json", action="store_true", help="Metadata as JSON (content omitted with --out)"
     )
 
+    # replica (RFC 004 read replicas)
+    p_replica = sub.add_parser(
+        "replica", help="Memory read-replica operations — pull facts from an origin palace"
+    )
+    replica_sub = p_replica.add_subparsers(dest="replica_action")
+    p_rep_pull = replica_sub.add_parser(
+        "pull", help="Pull drawers + KG from the origin; derive the vector index locally"
+    )
+    p_rep_pull.add_argument(
+        "--peer", default=None, help="Origin base URL (default: all peers in peers.json)"
+    )
+    p_rep_pull.add_argument("--token", default=None, help="Bearer token for --peer")
+    p_rep_pull.add_argument(
+        "--no-reconcile",
+        action="store_true",
+        help="Skip deleting local copies whose upstream original is gone",
+    )
+    p_rep_pull.add_argument("--json", action="store_true", help="Machine-readable output")
+
     p_palace = sub.add_parser("palace", help="Palace maintenance commands")
     palace_sub = p_palace.add_subparsers(dest="palace_action")
     p_set_embedder = palace_sub.add_parser(
@@ -3253,6 +3319,13 @@ def main():
             p_artifact.print_help()
             return
         cmd_artifact(args)
+        return
+
+    if args.command == "replica":
+        if not getattr(args, "replica_action", None):
+            p_replica.print_help()
+            return
+        cmd_replica(args)
         return
 
     if args.command == "daemon":
