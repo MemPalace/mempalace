@@ -17,73 +17,35 @@ hub bearer token. Peers are configured in ``peers.json`` in the palace dir:
       ]
     }
 
-Pure stdlib (urllib) — the sync layer takes no new dependencies.
+This module lives ABOVE the RFC 004 transport seam (mempalace/transport.py):
+peers come from the transport's membership snapshot and every wire call goes
+through its ``request``. Swapping the link (HTTPS bearer today, MeshGuard
+next) never touches the sync logic here.
 """
 
-import json
 import logging
-import os
-import urllib.error
-import urllib.parse
-import urllib.request
-from pathlib import Path
+
+from .transport import (
+    PEERS_FILENAME,  # noqa: F401 — re-exported for existing importers
+    TransportError,
+    get_transport,
+    http_request,
+    load_peers,
+)
 
 logger = logging.getLogger("mempalace.logsync")
 
-PEERS_FILENAME = "peers.json"
-_HTTP_TIMEOUT_S = 30
 _PULL_BATCH = 500
 
-
-def _http_timeout_s() -> float:
-    """Per-request timeout for peer HTTP calls, env-tunable.
-
-    The default suits logstream syncs (small pages), but a deep-offset
-    snapshot page — Chroma's get(offset=N) scans N rows — behind a TLS
-    proxy can legitimately exceed 30s on a large palace (first hit in
-    production: a 31k-drawer bootstrap timing out at offset 27500). Set
-    MEMPALACE_SYNC_HTTP_TIMEOUT to raise it for bootstrap pulls.
-    """
-    try:
-        return float(os.environ.get("MEMPALACE_SYNC_HTTP_TIMEOUT", "") or _HTTP_TIMEOUT_S)
-    except ValueError:
-        return float(_HTTP_TIMEOUT_S)
-
-
-class SyncPeerError(Exception):
-    """A peer was unreachable or answered outside the protocol."""
-
-
-def load_peers(palace_path: str) -> list[dict]:
-    """Read peers.json; [] when absent. Malformed files fail loudly."""
-    path = Path(os.path.expanduser(palace_path)) / PEERS_FILENAME
-    if not path.exists():
-        return []
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        peers = data["peers"]
-    except (ValueError, KeyError, TypeError) as exc:
-        raise ValueError(f"{path} is malformed: {exc}") from None
-    if not isinstance(peers, list):
-        raise ValueError(f"{path}: 'peers' must be a list")
-    for peer in peers:
-        if not isinstance(peer, dict) or not peer.get("url"):
-            raise ValueError(f"{path}: every peer needs at least a 'url'")
-    return peers
+# Historical names, kept so existing importers (replica_sync, CLI, tests)
+# keep working: the error class moved below the seam with the wire code.
+SyncPeerError = TransportError
+__all__ = ["PEERS_FILENAME", "SyncPeerError", "load_peers", "sync_all", "sync_with_peer"]
 
 
 def _peer_get(base_url: str, token: str, path: str, params: dict = None) -> dict:
-    url = base_url.rstrip("/") + path
-    if params:
-        url += "?" + urllib.parse.urlencode(params)
-    request = urllib.request.Request(url)
-    if token:
-        request.add_header("Authorization", f"Bearer {token}")
-    try:
-        with urllib.request.urlopen(request, timeout=_http_timeout_s()) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
-        raise SyncPeerError(f"{url}: {exc}") from None
+    """Compat shim for raw url+token callers (replica_sync, CLI --peer)."""
+    return http_request(base_url, token, path, params)
 
 
 def sync_with_peer(ls, url: str, token: str = "") -> dict:
@@ -152,17 +114,18 @@ def sync_with_peer(ls, url: str, token: str = "") -> dict:
     }
 
 
-def sync_all(ls, palace_path: str) -> list[dict]:
-    """One round against every configured peer; per-peer errors are
-    reported, never raised — one dead peer must not block the others (R1:
-    only convergence waits)."""
+def sync_all(ls, palace_path: str, transport=None) -> list[dict]:
+    """One round against every peer in the transport's membership snapshot;
+    per-peer errors are reported, never raised — one dead peer must not
+    block the others (R1: only convergence waits)."""
+    transport = transport or get_transport(palace_path)
     results = []
-    for peer in load_peers(palace_path):
-        name = peer.get("name") or peer["url"]
+    for peer in transport.peers():
+        name = peer.get("name") or peer.get("url") or "?"
         try:
             stats = sync_with_peer(ls, peer["url"], peer.get("token", ""))
             stats["peer_name"] = name
             results.append(stats)
-        except (SyncPeerError, ValueError) as exc:
-            results.append({"peer_name": name, "peer_url": peer["url"], "error": str(exc)})
+        except (TransportError, ValueError) as exc:
+            results.append({"peer_name": name, "peer_url": peer.get("url"), "error": str(exc)})
     return results

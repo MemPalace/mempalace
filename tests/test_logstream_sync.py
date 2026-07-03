@@ -201,7 +201,7 @@ class TestMigration:
 
 class TestHttpTimeout:
     def test_default_and_env_override(self, monkeypatch):
-        from mempalace.logsync import _HTTP_TIMEOUT_S, _http_timeout_s
+        from mempalace.transport import _HTTP_TIMEOUT_S, _http_timeout_s
 
         monkeypatch.delenv("MEMPALACE_SYNC_HTTP_TIMEOUT", raising=False)
         assert _http_timeout_s() == float(_HTTP_TIMEOUT_S)
