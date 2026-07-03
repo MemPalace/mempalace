@@ -363,6 +363,11 @@ _SQLITE_INTEGRITY_ALLOWED_TOOLS = frozenset(
         "mempalace_artifact_put",
         "mempalace_artifact_get",
         "mempalace_patch_submit",
+        # RFC 004: the estate is observability — logstream + sync state +
+        # peers.json, no FTS5 dependency (the profile's drawer count
+        # degrades gracefully). A damaged palace is exactly when mesh
+        # visibility matters most; caught live on the third replica.
+        "mempalace_mesh_peers",
     }
 )
 

@@ -663,3 +663,10 @@ class TestNodeProfile:
             local.close()
         assert isinstance(stats["remote_profile"]["roles"], list)
         assert stats["remote_profiles"][stats["peer_replica"]] == stats["remote_profile"]
+
+    def test_mesh_peers_is_exempt_from_the_integrity_gate(self):
+        # The estate is observability: it must answer while the palace
+        # index is corrupt and under repair (caught live on the blade).
+        from mempalace import mcp_server as mcp
+
+        assert "mempalace_mesh_peers" in mcp._SQLITE_INTEGRITY_ALLOWED_TOOLS
