@@ -740,8 +740,25 @@ def _resolve_wing_for_file(filepath: Path, root_wing: str, explicit_wing: Option
     return _project_wing_from_jsonl_cwd(filepath) or root_wing
 
 
+def _shadow_oplog(palace_path: str, dry_run: bool):
+    """Open the palace op-log for dual-write shadow emission, or None.
+
+    Best-effort: a dry run emits nothing, and a mine must never fail because
+    the op-log is unavailable.
+    """
+    if dry_run:
+        return None
+    try:
+        from .oplog import get_oplog
+
+        return get_oplog(palace_path)
+    except Exception:
+        logger.debug("op-log unavailable; mining convos without op emission", exc_info=True)
+        return None
+
+
 def _file_chunks_locked(
-    collection, source_file, chunks, wing, room, agent, extract_mode, authored_at=None
+    collection, source_file, chunks, wing, room, agent, extract_mode, authored_at=None, oplog=None
 ):
     """Lock the source file, purge stale drawers, and upsert fresh chunks.
 
@@ -763,6 +780,22 @@ def _file_chunks_locked(
         # Purge stale drawers first. When the normalize schema bumps,
         # file_already_mined() returned False for pre-v2 drawers — clean
         # them out so the source doesn't end up with mixed old/new drawers.
+        # Snapshot existing drawers BEFORE the purge so the op-log can tombstone
+        # any chunk id a shrinking re-mine drops (RFC 004 2a). Only when emitting.
+        prior_drawers: dict = {}
+        if oplog is not None:
+            try:
+                res = collection.get(
+                    where={"source_file": source_file}, include=["documents", "metadatas"]
+                )
+                p_ids = list((res.get("ids") if hasattr(res, "get") else None) or [])
+                p_docs = list((res.get("documents") if hasattr(res, "get") else None) or [])
+                p_metas = list((res.get("metadatas") if hasattr(res, "get") else None) or [])
+                for p_id, p_doc, p_meta in zip(p_ids, p_docs, p_metas):
+                    prior_drawers[p_id] = (p_doc or "", p_meta or {})
+            except Exception:
+                logger.debug("op-log prior-drawer read failed for %s", source_file, exc_info=True)
+
         try:
             delete_ids = _source_file_delete_ids(collection, source_file, extract_mode)
             if delete_ids:
@@ -775,6 +808,7 @@ def _file_chunks_locked(
         # one filed_at per source file so all transcript drawers share an
         # ingest timestamp.
         filed_at = datetime.now().isoformat()
+        emitted_drawers: list = []  # (drawer_id, content, meta) for op emission
         for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
             batch_docs: list = []
             batch_ids: list = []
@@ -813,9 +847,20 @@ def _file_chunks_locked(
                     metadatas=batch_metas,
                 )
                 drawers_added += len(batch_docs)
+                if oplog is not None:
+                    emitted_drawers.extend(zip(batch_ids, batch_docs, batch_metas))
             except Exception as e:
                 if "already exists" not in str(e).lower():
                     raise
+
+        # Dual-write shadow op emission (RFC 004 2a): revise each mined chunk,
+        # tombstone any prior chunk id a shrinking re-mine dropped.
+        if oplog is not None:
+            from .op_emit import emit_miner_writes
+
+            emit_miner_writes(
+                oplog, source_file, prior_drawers, emitted_drawers, author_agent=agent
+            )
     return drawers_added, room_counts_delta, False
 
 
@@ -990,6 +1035,8 @@ def _mine_opencode_db_impl(
     print(f"{'-' * 55}\n")
 
     collection = get_collection(palace_path) if not dry_run else None
+    oplog = _shadow_oplog(palace_path, dry_run)
+
     mined_set: set[str] = (
         prefetch_mined_set(collection, extract_mode=extract_mode) if not dry_run else set()
     )
@@ -1081,6 +1128,7 @@ def _mine_opencode_db_impl(
             agent,
             extract_mode,
             authored_at=session.get("authored_at"),
+            oplog=oplog,
         )
         if skipped:
             sessions_skipped += 1
@@ -1172,6 +1220,7 @@ def _mine_convos_impl(
     print(f"{'-' * 55}\n")
 
     collection = get_collection(palace_path) if not dry_run else None
+    oplog = _shadow_oplog(palace_path, dry_run)
 
     # Bulk pre-fetch already-mined set in one paginated pass instead of
     # `len(files)` separate WHERE-source_file queries. On a 150k-drawer
@@ -1293,6 +1342,7 @@ def _mine_convos_impl(
             agent,
             extract_mode,
             authored_at=_extract_authored_at(filepath),
+            oplog=oplog,
         )
         if skipped:
             files_skipped += 1

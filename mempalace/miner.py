@@ -1359,6 +1359,7 @@ def process_file(
     chunk_overlap: int = None,
     min_chunk_size: int = None,
     max_chunks_per_file: Optional[int] = None,
+    oplog=None,
 ) -> tuple:
     """Read, chunk, route, and file one file.
 
@@ -1420,6 +1421,23 @@ def process_file(
         if file_already_mined(collection, source_file, check_mtime=True):
             return 0, room, None
 
+        # Snapshot this file's existing drawers BEFORE the purge so the op-log
+        # can tombstone any chunk id that a shrinking re-mine drops (RFC 004 2a).
+        # Empty for a first mine; only read when op emission is active.
+        prior_drawers: dict = {}
+        if oplog is not None:
+            try:
+                res = collection.get(
+                    where={"source_file": source_file}, include=["documents", "metadatas"]
+                )
+                p_ids = list((res.get("ids") if hasattr(res, "get") else None) or [])
+                p_docs = list((res.get("documents") if hasattr(res, "get") else None) or [])
+                p_metas = list((res.get("metadatas") if hasattr(res, "get") else None) or [])
+                for p_id, p_doc, p_meta in zip(p_ids, p_docs, p_metas):
+                    prior_drawers[p_id] = (p_doc or "", p_meta or {})
+            except Exception:
+                logger.debug("op-log prior-drawer read failed for %s", source_file, exc_info=True)
+
         # Purge stale drawers for this file before re-inserting the fresh chunks.
         # Converts modified-file re-mines from upsert-over-existing-IDs (which hits
         # hnswlib's thread-unsafe updatePoint path and can segfault on macOS ARM
@@ -1452,6 +1470,7 @@ def process_file(
         # in production and the 4-segment pointer form lives only in tests.
         # Per PR #1584 review (Igor, 2026-05-22).
         all_metas: list = []
+        emitted_drawers: list = []  # (drawer_id, content, meta) for op emission
         for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
             batch_docs: list = []
             batch_ids: list = []
@@ -1482,6 +1501,18 @@ def process_file(
             )
             drawers_added += len(batch_docs)
             all_metas.extend(batch_metas)
+            if oplog is not None:
+                emitted_drawers.extend(zip(batch_ids, batch_docs, batch_metas))
+
+        # Dual-write shadow op emission (RFC 004 2a): revise each mined chunk
+        # (add-if-absent / LWW-update on peers) and tombstone any prior chunk id
+        # a shrinking re-mine dropped. After the store write, best-effort.
+        if oplog is not None:
+            from .op_emit import emit_miner_writes
+
+            emit_miner_writes(
+                oplog, source_file, prior_drawers, emitted_drawers, author_agent=agent
+            )
 
         # Build closet — the searchable index pointing to these drawers.
         # Purge first: a re-mine (mtime change or normalize_version bump) must
@@ -1716,9 +1747,20 @@ def _mine_impl(
     if not dry_run:
         collection = get_collection(palace_path)
         closets_col = get_closets_collection(palace_path)
+        # Dual-write shadow op-log (RFC 004 2a): every mined chunk also emits a
+        # memory op so mined content replicates. Best-effort — a mine must not
+        # fail because the op-log is unavailable.
+        try:
+            from .oplog import get_oplog
+
+            oplog = get_oplog(palace_path)
+        except Exception:
+            logger.debug("op-log unavailable; mining without op emission", exc_info=True)
+            oplog = None
     else:
         collection = None
         closets_col = None
+        oplog = None
 
     total_drawers = 0
     files_mined = 0
@@ -1741,6 +1783,7 @@ def _mine_impl(
                     agent=agent,
                     dry_run=dry_run,
                     closets_col=closets_col,
+                    oplog=oplog,
                     chunk_size=cfg_chunk_size,
                     chunk_overlap=cfg_chunk_overlap,
                     min_chunk_size=cfg_min_chunk_size,
