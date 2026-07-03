@@ -385,6 +385,17 @@ sleeping. `GET /sync/peers` on any hub shows the estate: which peers were
 reachable last round, their version vectors, and any replicas known only
 through gossip.
 
+::: tip Already have a palace on that machine?
+Joining the mesh is **additive**. An existing palace — even one built
+long before replication existed — keeps every drawer it has: nothing is
+re-mined, nothing is lost, and the bootstrap pull folds *around* your
+existing content. Your machine's history becomes part of the shared brain
+in the other direction too: run `mempalace replica embed-cache` once and
+every peer can pull your palace's full past, vectors included, in minutes.
+Capture-now is forward-compatible by contract — memory filed years before
+the mesh is a first-class citizen of it.
+:::
+
 ## See also
 
 - [The Replicated Palace](/concepts/replicated-palace) — one palace, every machine: ops, clocks, folds
