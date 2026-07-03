@@ -252,6 +252,7 @@ fold into their stores.
 mempalace oplog status --json    # counts, kind histogram, version vector
 mempalace oplog sync             # pull missing ops from peers
 mempalace oplog fold             # apply pulled ops to the local store (hub stopped)
+mempalace oplog promote          # one-time: pre-oplog drawers become drawer.add ops
 mempalace oplog verify           # replay ops vs the live store — the cutover gate
 ```
 
@@ -260,7 +261,13 @@ mempalace oplog verify           # replay ops vs the live store — the cutover 
 | `status` | Op counts, per-kind histogram, and this replica's version vector |
 | `sync` | Anti-entropy pull of missing memory ops (`--peer URL --token T`, or all peers) |
 | `fold` | Apply pulled remote ops to the local store — stop the hub first; a running hub folds on its own sync cadence |
+| `promote` | Emit `drawer.add` ops for locally-authored drawers that predate the op-log (mined sets, pre-shadow captures). Idempotent and resumable (`--dry-run`, `--limit N`); safe alongside a live hub — reads the store, writes only the op-log |
 | `verify` | Replay the op-log against the live store; exits `1` on divergence |
+
+Promotion is how an **existing palace's history** becomes op-carried: after
+one clean `promote`, the op-log covers everything the replica ever authored,
+and future replicas receive that history as ops instead of snapshot pulls.
+Remote-stamped copies are never promoted — each origin promotes its own.
 
 A running hub does all of this automatically every `MEMPALACE_SYNC_INTERVAL`
 seconds (default 15): logstream sync, memory-op sync, then the fold. The CLI

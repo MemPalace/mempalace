@@ -330,6 +330,22 @@ class OpLog:
                     (consumer, seq),
                 )
 
+    def distinct_subjects(self, kinds=None) -> set:
+        """Every subject_id present in the log, optionally restricted to
+        a set of kinds — the promotion pass's already-op-carried check."""
+        where = ["subject_id IS NOT NULL"]
+        params: list = []
+        if kinds:
+            kinds = sorted(set(kinds))
+            where.append(f"kind IN ({','.join('?' for _ in kinds)})")
+            params.extend(kinds)
+        with self._lock:
+            conn = self._conn()
+            rows = conn.execute(
+                f"SELECT DISTINCT subject_id FROM ops WHERE {' AND '.join(where)}", params
+            ).fetchall()
+        return {row["subject_id"] for row in rows}
+
     def subject_head_hlc(self, subject_id: str) -> Optional[str]:
         """Highest HLC seen for a merge subject across ALL origins — the
         LWW head the fold consumer compares against."""

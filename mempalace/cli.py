@@ -1705,6 +1705,50 @@ def _cmd_oplog_fold(palace_path, as_json):
         sys.exit(1)
 
 
+def _cmd_oplog_promote(args, palace_path, as_json):
+    import json
+
+    from .oplog import OPLOG_DB_FILENAME, OpLog
+    from .oppromote import promote_local_rows
+    from .palace import get_collection
+
+    try:
+        collection = get_collection(palace_path, create=False)
+        with OpLog(os.path.join(palace_path, OPLOG_DB_FILENAME)) as log:
+            stats = promote_local_rows(
+                log,
+                collection,
+                dry_run=args.dry_run,
+                limit=args.limit,
+                batch=max(1, args.batch),
+            )
+    except Exception as exc:
+        _logstream_fail(str(exc), as_json)
+    if as_json:
+        print(json.dumps(stats, indent=2, ensure_ascii=False))
+    else:
+        verb = "would promote" if stats["dry_run"] else "promoted"
+        print(
+            f"  {verb} {stats['promoted']} drawer(s) as {stats['replica_id']} "
+            f"({stats['logical_drawers']} logical from {stats['rows_scanned']} rows; "
+            f"already op-carried {stats['already_op_carried']}, "
+            f"remote-owned {stats['remote_skipped']}, "
+            f"registry {stats['registry_skipped']})"
+        )
+        if stats["skipped_empty"]:
+            print(f"  empty drawers skipped: {stats['skipped_empty']}")
+            print(f"    sample: {stats['empty_sample']}")
+        if stats["remaining"]:
+            print(
+                f"  --limit reached; {stats['remaining']} candidate(s) remain — rerun to continue"
+            )
+        if stats["errors"]:
+            print(f"  ERRORS: {stats['errors']}")
+            print(f"    sample: {stats['error_sample']}")
+    if stats.get("errors"):
+        sys.exit(1)
+
+
 def _cmd_oplog_verify(palace_path, as_json):
     import json
 
@@ -1749,6 +1793,8 @@ def cmd_oplog(args):
         _cmd_oplog_sync(args, palace_path, as_json)
     elif args.oplog_action == "fold":
         _cmd_oplog_fold(palace_path, as_json)
+    elif args.oplog_action == "promote":
+        _cmd_oplog_promote(args, palace_path, as_json)
     elif args.oplog_action == "verify":
         _cmd_oplog_verify(palace_path, as_json)
 
@@ -3487,6 +3533,22 @@ def main():
         "a running hub folds on its own sync cadence)",
     )
     p_oplog_fold.add_argument("--json", action="store_true", help="Machine-readable output")
+    p_oplog_promote = oplog_sub.add_parser(
+        "promote",
+        help="One-time local-capture promotion: emit drawer.add ops for every "
+        "locally-authored drawer that predates the op-log (safe alongside a "
+        "live hub — reads the store, writes only the op-log; idempotent)",
+    )
+    p_oplog_promote.add_argument(
+        "--dry-run", action="store_true", help="Count what would be promoted without emitting"
+    )
+    p_oplog_promote.add_argument(
+        "--limit", type=int, default=None, help="Promote at most N drawers (rerun to continue)"
+    )
+    p_oplog_promote.add_argument(
+        "--batch", type=int, default=2000, help="Store scan page size (default 2000)"
+    )
+    p_oplog_promote.add_argument("--json", action="store_true", help="Machine-readable output")
 
     p_palace = sub.add_parser("palace", help="Palace maintenance commands")
     palace_sub = p_palace.add_subparsers(dest="palace_action")
