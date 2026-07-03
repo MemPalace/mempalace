@@ -9,29 +9,31 @@ tunnels) that a rewrite would have to remap.
 
 from mempalace.backends.base import GetResult
 from mempalace.ids import make_drawer_id_content_pure
-from mempalace.migrate_v4 import plan_v4_migration
+from mempalace.migrate_v4 import apply_v4_migration, plan_v4_migration
 
 
 class _FakeCollection:
     def __init__(self):
-        self.rows = {}
+        self.rows = {}  # id -> (doc, meta, emb)
 
     def get(self, ids=None, where=None, include=None, limit=None, offset=None):
-        hits = [(i, d, m) for i, (d, m) in self.rows.items()]
+        hits = [(i, d, m, e) for i, (d, m, e) in self.rows.items()]
         if offset:
             hits = hits[offset:]
         if limit is not None:
             hits = hits[:limit]
+        want_emb = include is not None and "embeddings" in include
         return GetResult(
             ids=[h[0] for h in hits],
             documents=[h[1] for h in hits],
             metadatas=[h[2] for h in hits],
-            embeddings=None,
+            embeddings=[h[3] for h in hits] if want_emb else None,
         )
 
-    def upsert(self, ids, documents, metadatas):
-        for i, doc, meta in zip(ids, documents, metadatas):
-            self.rows[i] = (doc, meta)
+    def upsert(self, ids, documents, metadatas, embeddings=None):
+        embeddings = embeddings if embeddings is not None else [None] * len(ids)
+        for i, doc, meta, emb in zip(ids, documents, metadatas, embeddings):
+            self.rows[i] = (doc, meta, emb)
 
 
 def test_distinct_content_aliases_every_changing_drawer():
@@ -131,3 +133,99 @@ def test_paged_scan_covers_all_rows():
     plan = plan_v4_migration(col, batch=3)
     assert plan["logical_drawers"] == 7
     assert plan["changing"] == 7
+
+
+class TestApplier:
+    def test_single_row_rewrite_copies_vector_and_stamps_v4(self):
+        src = _FakeCollection()
+        src.upsert(
+            ids=["drawer_w_r_x"],
+            documents=["migrate me"],
+            metadatas=[{"wing": "w", "room": "r", "source_file": "/f"}],
+            embeddings=[[0.1, 0.2, 0.3]],
+        )
+        tgt = _FakeCollection()
+        stats = apply_v4_migration(src, tgt)
+        v4 = make_drawer_id_content_pure("migrate me")
+        assert stats["written"] == 1 and stats["merged_away"] == 0
+        assert v4 in tgt.rows
+        doc, meta, emb = tgt.rows[v4]
+        assert doc == "migrate me"
+        assert emb == [0.1, 0.2, 0.3]  # vector copied, not re-derived
+        assert meta["id_recipe"] == "v4"
+        assert meta["wing"] == "w" and meta["source_file"] == "/f"  # provenance kept as metadata
+        assert "drawer_w_r_x" not in tgt.rows  # source unchanged; old id not written
+
+    def test_collision_merges_into_one_v4_drawer(self):
+        src = _FakeCollection()
+        # Identical content in two wings; latest filed_at wins the placement.
+        src.upsert(
+            ids=["drawer_projects_d_a"],
+            documents=["the same body"],
+            metadatas=[{"wing": "projects", "room": "d", "filed_at": "2026-01-01"}],
+            embeddings=[[1.0]],
+        )
+        src.upsert(
+            ids=["drawer_people_d_b"],
+            documents=["the same body"],
+            metadatas=[{"wing": "people", "room": "d", "filed_at": "2026-07-01"}],
+            embeddings=[[1.0]],
+        )
+        tgt = _FakeCollection()
+        stats = apply_v4_migration(src, tgt)
+        v4 = make_drawer_id_content_pure("the same body")
+        assert stats["written"] == 1 and stats["merged_away"] == 1
+        assert stats["alias"]["drawer_projects_d_a"] == v4
+        assert stats["alias"]["drawer_people_d_b"] == v4
+        assert len([k for k in tgt.rows if not k.endswith("_chunk")]) == 1
+        # Latest filed_at (people) won the placement.
+        assert tgt.rows[v4][1]["wing"] == "people"
+
+    def test_chunked_drawer_rewrites_parent_and_chunk_ids(self):
+        src = _FakeCollection()
+        src.upsert(
+            ids=["drawer_w_r_big_chunk_000000", "drawer_w_r_big_chunk_000001"],
+            documents=["part one ", "part two"],
+            metadatas=[
+                {"chunk_index": 0, "parent_drawer_id": "drawer_w_r_big", "wing": "w"},
+                {"chunk_index": 1, "parent_drawer_id": "drawer_w_r_big", "wing": "w"},
+            ],
+            embeddings=[[0.1], [0.2]],
+        )
+        tgt = _FakeCollection()
+        apply_v4_migration(src, tgt)
+        v4 = make_drawer_id_content_pure("part one part two")
+        assert f"{v4}_chunk_000000" in tgt.rows
+        assert f"{v4}_chunk_000001" in tgt.rows
+        c0 = tgt.rows[f"{v4}_chunk_000000"]
+        assert c0[0] == "part one " and c0[2] == [0.1]  # content + vector preserved
+        assert c0[1]["parent_drawer_id"] == v4 and c0[1]["id_recipe"] == "v4"
+
+    def test_dry_run_writes_nothing_but_reports(self):
+        src = _FakeCollection()
+        src.upsert(
+            ids=["drawer_w_r_a", "drawer_w_r_b"],
+            documents=["dup", "dup"],
+            metadatas=[{"wing": "w"}, {"wing": "w"}],
+            embeddings=[[1.0], [1.0]],
+        )
+        tgt = _FakeCollection()
+        stats = apply_v4_migration(src, tgt, dry_run=True)
+        assert stats["written"] == 1 and stats["merged_away"] == 1
+        assert tgt.rows == {}  # nothing written on a dry run
+
+    def test_migrated_palace_replans_to_zero_changes(self):
+        # Idempotency: applying, then planning the target, shows all v4.
+        src = _FakeCollection()
+        src.upsert(
+            ids=["drawer_w_r_x", "drawer_w_r_y"],
+            documents=["one", "two"],
+            metadatas=[{"wing": "w", "room": "r"}, {"wing": "w", "room": "r"}],
+            embeddings=[[0.1], [0.2]],
+        )
+        tgt = _FakeCollection()
+        apply_v4_migration(src, tgt)
+        plan = plan_v4_migration(tgt)
+        assert plan["logical_drawers"] == 2
+        assert plan["already_v4"] == 2
+        assert plan["changing"] == 0

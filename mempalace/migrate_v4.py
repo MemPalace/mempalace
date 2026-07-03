@@ -149,6 +149,125 @@ def plan_v4_migration(collection, kg_source_ids=None, tunnel_drawer_ids=None, ba
     }
 
 
+def _scan_rows(collection, batch, with_embeddings):
+    """Group physical rows into logical drawers, keeping per-row detail.
+
+    Returns ``{logical_id: {"rows": [(index, row_id, content, meta, emb)],
+    "meta": winner_meta}}``. ``emb`` is None when embeddings are not requested.
+    """
+    include = ["documents", "metadatas"] + (["embeddings"] if with_embeddings else [])
+    groups: dict = {}
+    offset = 0
+    while True:
+        res = collection.get(limit=batch, offset=offset, include=include)
+        ids = list((res.get("ids") if hasattr(res, "get") else None) or [])
+        docs = list((res.get("documents") if hasattr(res, "get") else None) or [])
+        metas = list((res.get("metadatas") if hasattr(res, "get") else None) or [])
+        embs = (res.get("embeddings") if hasattr(res, "get") else None) if with_embeddings else None
+        embs = list(embs) if embs is not None else [None] * len(ids)
+        if not ids:
+            break
+        for row_id, doc, meta, emb in zip(ids, docs, metas, embs):
+            meta = meta or {}
+            if row_id.startswith("_reg_") or meta.get("ingest_mode") == "registry":
+                continue
+            parent = meta.get("parent_drawer_id")
+            logical_id = parent or row_id
+            index = meta.get("chunk_index")
+            index = index if isinstance(index, int) else 0
+            g = groups.setdefault(logical_id, {"rows": [], "meta": None})
+            g["rows"].append((index, row_id, doc or "", meta, emb))
+            if g["meta"] is None or index == 0:
+                g["meta"] = meta
+        if len(ids) < batch:
+            break
+        offset += len(ids)
+    return groups
+
+
+def _placement_key(meta: dict):
+    """Winner-selection key for a content-collision group. Latest filed_at wins
+    (mirroring the org.file last-writer-wins placement register), preferring a
+    drawer that actually carries a wing+room; ties broken deterministically by
+    the caller's stable id sort."""
+    meta = meta or {}
+    has_place = 1 if (meta.get("wing") and meta.get("room")) else 0
+    return (has_place, str(meta.get("filed_at") or ""))
+
+
+def apply_v4_migration(source_col, target_col, batch: int = 2000, dry_run: bool = False) -> dict:
+    """Rewrite ``source_col`` into ``target_col`` under content-pure v4 ids.
+
+    Copy-first and non-destructive: the source is only read; the operator gives
+    a fresh target and swaps after validating. Vectors are COPIED, never
+    re-derived. Content-identical drawers merge into one v4 drawer (the winner
+    chosen by :func:`_placement_key`); every merged-away id still maps to the v4
+    id in the returned alias so inbound references can be repointed.
+
+    Returns ``{"logical_drawers", "written", "merged_away", "rows_written",
+    "alias": {old_id: v4_id}}``.
+    """
+    groups = _scan_rows(source_col, batch, with_embeddings=not dry_run)
+
+    # Bucket source logical drawers by their v4 id (content collisions merge).
+    by_v4: dict = {}
+    alias: dict = {}
+    for logical_id, g in groups.items():
+        content = "".join(doc for _i, _rid, doc, _m, _e in sorted(g["rows"]))
+        if not content:
+            continue
+        v4_id = make_drawer_id_content_pure(content)
+        alias[logical_id] = v4_id
+        by_v4.setdefault(v4_id, []).append((logical_id, g))
+
+    stats = {
+        "logical_drawers": len(alias),
+        "written": 0,
+        "merged_away": 0,
+        "rows_written": 0,
+        "alias": alias,
+    }
+
+    for v4_id, members in by_v4.items():
+        # Deterministic winner: best placement, then stable id sort.
+        winner_id, winner = sorted(
+            members, key=lambda m: (_placement_key(m[1]["meta"]), m[0]), reverse=True
+        )[0]
+        stats["merged_away"] += len(members) - 1
+        stats["written"] += 1
+        if dry_run:
+            continue
+
+        rows = sorted(winner["rows"])
+        chunked = len(rows) > 1 or (rows and rows[0][3].get("parent_drawer_id"))
+        out_ids, out_docs, out_metas, out_embs = [], [], [], []
+        any_emb = False
+        for index, _old_row_id, content, meta, emb in rows:
+            new_row_id = f"{v4_id}_chunk_{index:06d}" if chunked else v4_id
+            new_meta = dict(meta)
+            new_meta["id_recipe"] = "v4"
+            if chunked:
+                new_meta["parent_drawer_id"] = v4_id
+                new_meta["chunk_index"] = index
+            out_ids.append(new_row_id)
+            out_docs.append(content)
+            out_metas.append(new_meta)
+            out_embs.append(emb)
+            if emb is not None:
+                any_emb = True
+        if any_emb and all(e is not None for e in out_embs):
+            target_col.upsert(
+                ids=out_ids, documents=out_docs, metadatas=out_metas, embeddings=out_embs
+            )
+        else:
+            # Missing a vector somewhere — let the target embed on write rather
+            # than upsert a half-vectored batch.
+            target_col.upsert(ids=out_ids, documents=out_docs, metadatas=out_metas)
+        stats["rows_written"] += len(out_ids)
+
+    return stats
+
+
 def read_kg_source_ids(kg) -> set:
     """Distinct non-null ``source_drawer_id`` values in the knowledge graph."""
     try:
@@ -163,3 +282,25 @@ def read_kg_source_ids(kg) -> set:
         logger.debug("could not read KG source_drawer_id set", exc_info=True)
         return set()
     return {row[0] for row in rows if row and row[0]}
+
+
+def remap_kg_source_ids(kg, alias: dict) -> int:
+    """Repoint knowledge-graph ``source_drawer_id`` provenance at the v4 ids.
+
+    Every triple whose ``source_drawer_id`` is an old id becomes the v4 id, so a
+    triple's "which drawer did I come from" survives the rewrite. Returns the
+    number of triples updated. Deterministic and idempotent (an id already v4 is
+    not in ``alias`` and is left alone).
+    """
+    if not alias:
+        return 0
+    conn = kg._conn() if hasattr(kg, "_conn") else kg.conn
+    updated = 0
+    with conn:
+        for old_id, new_id in alias.items():
+            cur = conn.execute(
+                "UPDATE triples SET source_drawer_id = ? WHERE source_drawer_id = ?",
+                (new_id, old_id),
+            )
+            updated += cur.rowcount or 0
+    return updated
