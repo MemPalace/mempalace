@@ -2224,6 +2224,14 @@ def tool_graph_stats():
     return graph_stats(col=col)
 
 
+def tool_mesh_peers():
+    """Mesh estate snapshot — the committed compat surface for PalaceMind's
+    mesh view: exactly the GET /sync/peers payload, produced by the same
+    function so the tool and the endpoint can never drift. Read-only;
+    peers.json tokens are never included."""
+    return _mesh_peers_payload()
+
+
 def tool_create_tunnel(
     source_wing: str,
     source_room: str,
@@ -4365,6 +4373,11 @@ TOOLS = {
         "input_schema": {"type": "object", "properties": {}},
         "handler": tool_graph_stats,
     },
+    "mempalace_mesh_peers": {
+        "description": "Mesh estate snapshot (RFC 004): this replica's identity, version vector and node profile; each configured peer's reachability, last sync outcome, remote version vector and advertised profile; origins known only transitively; and origin_profiles keyed by replica_id. Exactly the GET /sync/peers payload — tokens are never included.",
+        "input_schema": {"type": "object", "properties": {}},
+        "handler": tool_mesh_peers,
+    },
     "mempalace_create_tunnel": {
         "description": "Create a cross-wing tunnel linking two palace locations. Use when content in one project relates to another — e.g., an API design in project_api connects to a database schema in project_database.",
         "input_schema": {
@@ -6033,6 +6046,12 @@ def _http_serve_sync(handler, path: str) -> bool:
                 {
                     "replica_id": _call_logstream(lambda ls: ls.replica_id),
                     "version_vector": _call_logstream(lambda ls: ls.version_vector()),
+                    # Node-profile advertisement (additive): our own
+                    # self-description plus every profile we can relay, so
+                    # carriers propagate profiles for transitively-known
+                    # origins. Old peers ignore these fields.
+                    "profile": _node_profile(),
+                    "profiles": _known_profiles_snapshot(),
                 },
             )
             return True
@@ -6087,6 +6106,94 @@ def _http_serve_sync(handler, path: str) -> bool:
 # half-updated peer record.
 _PEER_SYNC_STATE: dict = {}
 
+# Node profiles learned from peers (their self-descriptions, relayed
+# transitively), keyed by replica_id. LWW by advertised_at. The estate
+# renders roles/accelerator/counts from these instead of UI guesses.
+_KNOWN_PROFILES: dict = {}
+
+# Self profile is recomputed at most every TTL seconds — peers request it
+# every sync round and the drawer count / provider probe should not run
+# per request.
+_NODE_PROFILE_TTL_S = 60.0
+_node_profile_cache: dict = {}
+
+_ACCELERATOR_NAMES = {"cuda": "CUDA", "dml": "DirectML", "coreml": "CoreML", "cpu": "CPU"}
+
+
+def _node_profile() -> dict:
+    """This node's self-described profile — every field is pure derivation
+    (palace presence, logstream authorship, resolved onnxruntime provider),
+    never configuration, so the estate can render truth without guesses."""
+    import platform
+
+    cached = _node_profile_cache.get("profile")
+    if cached and time.monotonic() - _node_profile_cache.get("at", 0) < _NODE_PROFILE_TTL_S:
+        return cached
+
+    roles = []
+    drawers = None
+    try:
+        col = _get_collection(create=False)
+        if col is not None:
+            drawers = col.count()
+            roles.append("replica")
+    except Exception:
+        logger.debug("node profile: drawer count unavailable", exc_info=True)
+    try:
+        authored = _call_logstream(lambda ls: ls.version_vector().get(ls.replica_id, 0))
+        if authored:
+            roles.append("agents")
+    except Exception:
+        logger.debug("node profile: logstream authorship unavailable", exc_info=True)
+    accelerator = None
+    try:
+        from .embedding import _resolve_providers, current_model_name
+
+        device = getattr(_config, "embedding_device", None) or "auto"
+        _providers, effective = _resolve_providers(device)
+        accelerator = {
+            "provider": _ACCELERATOR_NAMES.get(effective, effective),
+            "embedder": current_model_name(),
+        }
+        roles.append("compute")
+    except Exception:
+        logger.debug("node profile: embedder resolution unavailable", exc_info=True)
+
+    profile = {
+        "roles": roles,
+        "accelerator": accelerator,
+        "drawers": drawers,
+        "hardware": platform.platform(),
+        "advertised_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    _node_profile_cache["profile"] = profile
+    _node_profile_cache["at"] = time.monotonic()
+    return profile
+
+
+def _merge_known_profiles(profiles: dict) -> None:
+    """Fold relayed profiles in, last-writer-wins by advertised_at."""
+    if not isinstance(profiles, dict):
+        return
+    for origin, profile in profiles.items():
+        if not isinstance(origin, str) or not isinstance(profile, dict):
+            continue
+        prior = _KNOWN_PROFILES.get(origin)
+        if prior and (prior.get("advertised_at") or "") >= (profile.get("advertised_at") or ""):
+            continue
+        _KNOWN_PROFILES[origin] = profile
+
+
+def _known_profiles_snapshot() -> dict:
+    """Every origin profile this node can vouch for having seen — learned
+    ones first, own fresh self-profile last so it always wins for self."""
+    snapshot = dict(_KNOWN_PROFILES)
+    try:
+        snapshot[_call_logstream(lambda ls: ls.replica_id)] = _node_profile()
+    except Exception:
+        logger.debug("node profile: self profile unavailable", exc_info=True)
+    return snapshot
+
 
 def _record_peer_sync(stats: dict) -> None:
     """Fold one peer's round outcome into the estate state."""
@@ -6102,6 +6209,9 @@ def _record_peer_sync(stats: dict) -> None:
             "last_error_at": now,
             "last_success_at": prior.get("last_success_at"),
             "remote_version_vector": prior.get("remote_version_vector"),
+            # Unreachable peers keep their last advertised profile — the
+            # estate renders "last seen as", never a blank node.
+            "profile": prior.get("profile"),
         }
     else:
         entry = {
@@ -6114,7 +6224,11 @@ def _record_peer_sync(stats: dict) -> None:
             "last_pulled_events": stats.get("pulled_events", 0),
             "last_pulled_artifacts": stats.get("pulled_artifacts", 0),
             "remote_version_vector": stats.get("remote_version_vector") or {},
+            "profile": stats.get("remote_profile") or prior.get("profile"),
         }
+        _merge_known_profiles(stats.get("remote_profiles") or {})
+        if stats.get("remote_profile") and stats.get("peer_replica"):
+            _merge_known_profiles({stats["peer_replica"]: stats["remote_profile"]})
     _PEER_SYNC_STATE[name] = entry
 
 
@@ -6148,11 +6262,15 @@ def _mesh_peers_payload() -> dict:
             "replica_id": replica_id,
             "name": socket.gethostname(),
             "version_vector": local_vector,
+            "profile": _node_profile(),
         },
         "peers": peers,
         # Origins present in the local log but not configured as peers —
         # replicas this node only knows transitively (gossip carriers).
         "unnamed_origins": sorted(set(local_vector) - named_origins),
+        # Every self-described profile known here, keyed by replica_id —
+        # including profiles of unnamed origins relayed through carriers.
+        "origin_profiles": _known_profiles_snapshot(),
         "sync_interval_s": _peer_sync_interval_s(),
     }
 

@@ -587,3 +587,26 @@ Convenience: store a patch artifact and append its `patch.ready` event in one ca
 | `metadata` | object | No | Extra structured fields |
 
 **Returns:** `{ success, artifact, event }`
+
+---
+
+### `mempalace_mesh_peers`
+
+Mesh estate snapshot (see [The Replicated Palace](/concepts/replicated-palace)):
+this replica's identity, version vector and self-derived node profile; each
+configured peer's reachability, last sync outcome, remote version vector and
+advertised profile; origins known only transitively; and `origin_profiles`
+keyed by replica id. Exactly the `GET /sync/peers` payload, produced by the
+same function — the committed compat surface for mesh dashboards. Bearer
+tokens are never included.
+
+**Parameters:** None
+
+**Returns:** `{ self: { replica_id, name, version_vector, profile }, peers: [ { name, url, replica_id, reachable, last_success_at, last_error, remote_version_vector, profile } ], unnamed_origins, origin_profiles, sync_interval_s }`
+
+A node `profile` is pure derivation, never configuration: `roles` (subset of
+`replica` / `agents` / `compute`), `accelerator` (`{ provider, embedder }`
+from the resolved onnxruntime provider — CUDA, DirectML, CoreML or CPU),
+`drawers` (live store count), `hardware` (platform string), `advertised_at`.
+Profiles propagate over the sync surfaces, so carriers relay them for
+replicas they only know transitively.

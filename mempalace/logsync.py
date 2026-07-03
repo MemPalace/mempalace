@@ -111,6 +111,11 @@ def sync_with_peer(ls, url: str, token: str = "") -> dict:
         # The peer's vector at round start — consumers (the /sync/peers
         # estate endpoint, PalaceMind's mesh view) compute drift from it.
         "remote_version_vector": remote_vector,
+        # Node-profile advertisement riding the same fetch: the peer's own
+        # self-description plus profiles it relays for origins it knows
+        # (absent from pre-profile peers — consumers treat None as unknown).
+        "remote_profile": remote.get("profile"),
+        "remote_profiles": remote.get("profiles") or {},
     }
 
 

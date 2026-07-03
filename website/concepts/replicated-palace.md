@@ -145,6 +145,15 @@ reachability, last sync outcome and remote vector, and — the interesting
 part — `unnamed_origins`: replicas it knows about *only through gossip*.
 Drift between any two machines is one vector comparison. This endpoint is
 what mesh dashboards draw from; tokens are never included in the payload.
+The same payload is exposed as the `mempalace_mesh_peers` MCP tool, so
+desktop apps consume the estate through the bridge they already have.
+
+Every node also advertises a **profile** — roles (`replica` / `agents` /
+`compute`), resolved accelerator and embedder, live drawer count, hardware
+string — derived entirely from what the daemon can observe about itself,
+never from configuration. Profiles ride the sync surfaces, so a carrier
+relays them for replicas it only knows transitively: dashboards render
+what each machine *reported about itself*, not what a UI guessed.
 
 ## Trust, today and next
 

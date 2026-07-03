@@ -342,36 +342,41 @@ class TestConvergence:
 # ── HTTP endpoints + CLI (real wire) ─────────────────────────────────────
 
 
+@pytest.fixture
+def server(monkeypatch, config, palace_path):
+    from mempalace import mcp_server as mcp
+
+    monkeypatch.setattr(mcp, "_config", config)
+    monkeypatch.setattr(mcp, "_logstream_by_path", {})
+    httpd = mcp._build_http_server("127.0.0.1", 0)
+    port = httpd.server_address[1]
+    thread = threading.Thread(
+        target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+    )
+    thread.start()
+    try:
+        yield port, mcp
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+        for ls in mcp._logstream_by_path.values():
+            ls.close()
+
+
+def _http_get(port, path):
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    try:
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        return resp.status, json.loads(resp.read() or b"{}")
+    finally:
+        conn.close()
+
+
 class TestSyncOverHttp:
-    @pytest.fixture
-    def server(self, monkeypatch, config, palace_path):
-        from mempalace import mcp_server as mcp
-
-        monkeypatch.setattr(mcp, "_config", config)
-        monkeypatch.setattr(mcp, "_logstream_by_path", {})
-        httpd = mcp._build_http_server("127.0.0.1", 0)
-        port = httpd.server_address[1]
-        thread = threading.Thread(
-            target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
-        )
-        thread.start()
-        try:
-            yield port, mcp
-        finally:
-            httpd.shutdown()
-            httpd.server_close()
-            thread.join(timeout=5)
-            for ls in mcp._logstream_by_path.values():
-                ls.close()
-
     def _get(self, port, path):
-        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-        try:
-            conn.request("GET", path)
-            resp = conn.getresponse()
-            return resp.status, json.loads(resp.read() or b"{}")
-        finally:
-            conn.close()
+        return _http_get(port, path)
 
     def test_endpoints_roundtrip(self, server):
         port, mcp = server
@@ -538,3 +543,123 @@ class TestSyncOverHttp:
             assert local.list_events()[0]["body"] == "pull me"
         finally:
             local.close()
+
+
+class TestNodeProfile:
+    """The self-described node profile (estate truth, never UI guesses):
+    pure derivation, advertisement on /sync/version_vector, transit relay
+    via profiles, and the mempalace_mesh_peers tool as the same payload."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_profile_state(self):
+        from mempalace import mcp_server as mcp
+
+        mcp._KNOWN_PROFILES.clear()
+        mcp._node_profile_cache.clear()
+        mcp._PEER_SYNC_STATE.clear()
+        yield
+        mcp._KNOWN_PROFILES.clear()
+        mcp._node_profile_cache.clear()
+        mcp._PEER_SYNC_STATE.clear()
+
+    def _profile(self, origin, advertised_at, roles=None):
+        return {
+            "roles": roles or ["replica"],
+            "accelerator": {"provider": "CUDA", "embedder": "minilm"},
+            "drawers": 42,
+            "hardware": f"test-{origin}",
+            "advertised_at": advertised_at,
+        }
+
+    def test_self_profile_is_pure_derivation(self, server):
+        port, mcp = server
+        mcp.tool_event_append(
+            type="status.update", stream="s", room="r", from_agent="a", body="authored"
+        )
+        profile = mcp._node_profile()
+        assert "agents" in profile["roles"]  # locally-authored events exist
+        assert profile["hardware"]
+        assert profile["advertised_at"]
+        # Cached within the TTL: same object, no recompute per request.
+        assert mcp._node_profile() is profile
+
+    def test_version_vector_advertises_profile_and_relays(self, server):
+        port, mcp = server
+        mcp.tool_event_append(type="status.update", stream="s", room="r", from_agent="a", body="x")
+        mcp._merge_known_profiles({"rep_cccccccccccc": self._profile("c", "2026-07-03T00:00:00Z")})
+        _status, payload = _http_get(port, "/sync/version_vector")
+        assert isinstance(payload["profile"]["roles"], list)
+        self_id = payload["replica_id"]
+        assert payload["profiles"][self_id] == payload["profile"]
+        assert payload["profiles"]["rep_cccccccccccc"]["hardware"] == "test-c"
+
+    def test_merge_known_profiles_is_lww_by_advertised_at(self):
+        from mempalace import mcp_server as mcp
+
+        newer = self._profile("b", "2026-07-03T02:00:00Z")
+        older = self._profile("b", "2026-07-03T01:00:00Z")
+        mcp._merge_known_profiles({"rep_b": newer})
+        mcp._merge_known_profiles({"rep_b": older})
+        assert mcp._KNOWN_PROFILES["rep_b"] == newer
+        mcp._merge_known_profiles({"rep_b": self._profile("b", "2026-07-03T03:00:00Z")})
+        assert mcp._KNOWN_PROFILES["rep_b"]["advertised_at"] == "2026-07-03T03:00:00Z"
+
+    def test_estate_carries_peer_and_relayed_profiles(self, server, palace_path):
+        port, mcp = server
+        with open(os.path.join(palace_path, "peers.json"), "w", encoding="utf-8") as f:
+            json.dump(
+                {"peers": [{"name": "w", "url": "http://peer.example:8765", "token": "S3CRET"}]},
+                f,
+            )
+        peer_profile = self._profile("b", "2026-07-03T01:00:00Z", roles=["replica", "compute"])
+        relayed = self._profile("c", "2026-07-03T00:30:00Z")
+        mcp._record_peer_sync(
+            {
+                "peer_name": "w",
+                "peer_url": "http://peer.example:8765",
+                "peer_replica": "rep_bbbbbbbbbbbb",
+                "pulled_events": 0,
+                "pulled_artifacts": 0,
+                "remote_version_vector": {"rep_bbbbbbbbbbbb": 7},
+                "remote_profile": peer_profile,
+                "remote_profiles": {"rep_cccccccccccc": relayed},
+            }
+        )
+        status, payload = _http_get(port, "/sync/peers")
+        assert status == 200
+        (peer,) = payload["peers"]
+        assert peer["profile"] == peer_profile
+        assert payload["origin_profiles"]["rep_bbbbbbbbbbbb"] == peer_profile
+        assert payload["origin_profiles"]["rep_cccccccccccc"] == relayed
+        assert (
+            payload["origin_profiles"][payload["self"]["replica_id"]]
+            == (payload["self"]["profile"])
+        )
+        assert "S3CRET" not in json.dumps(payload)
+
+        # Unreachable peers keep their last advertised profile.
+        mcp._record_peer_sync({"peer_name": "w", "error": "connection refused"})
+        status, payload = _http_get(port, "/sync/peers")
+        (peer,) = payload["peers"]
+        assert peer["reachable"] is False
+        assert peer["profile"] == peer_profile
+
+    def test_mesh_peers_tool_is_the_endpoint_payload(self, server, palace_path):
+        port, mcp = server
+        mcp.tool_event_append(type="status.update", stream="s", room="r", from_agent="a", body="x")
+        status, endpoint_payload = _http_get(port, "/sync/peers")
+        assert status == 200
+        assert mcp.tool_mesh_peers() == endpoint_payload
+
+    def test_sync_with_peer_captures_remote_profile(self, server, tmp_dir):
+        port, mcp = server
+        mcp.tool_event_append(type="status.update", stream="s", room="r", from_agent="a", body="x")
+        from mempalace.logsync import sync_with_peer
+
+        local = Logstream(db_path=os.path.join(tmp_dir, "local", "logstream.sqlite3"))
+        try:
+            stats = sync_with_peer(local, f"http://127.0.0.1:{port}")
+        finally:
+            local.close()
+        assert isinstance(stats["remote_profile"]["roles"], list)
+        assert stats["remote_profiles"][stats["peer_replica"]] == stats["remote_profile"]
