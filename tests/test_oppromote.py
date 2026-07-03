@@ -213,6 +213,24 @@ class TestPromote:
         assert stats["dry_run"] is True
         assert oplog.count() == 0
 
+    def test_dry_run_reads_no_content(self, oplog):
+        # Perf contract: a dry run counts candidates from the scan alone and
+        # must NOT issue a get-by-id per drawer — that one-read-per-drawer
+        # cost turned a 156k dry run into a 40-minute grind. Here get(ids=)
+        # would raise, so any content read fails the test.
+        class _NoReadCollection(_FakeCollection):
+            def get(self, ids=None, where=None, include=None, limit=None, offset=None):
+                if ids is not None:
+                    raise AssertionError("dry run must not read content by id")
+                return super().get(where=where, include=include, limit=limit, offset=offset)
+
+        col = _NoReadCollection()
+        for i in range(50):
+            col.upsert(ids=[f"d_{i}"], documents=[f"c{i}"], metadatas=[_meta()])
+        stats = promote_local_rows(oplog, col, dry_run=True)
+        assert stats["promoted"] == 50
+        assert oplog.count() == 0
+
     def test_empty_content_skipped_not_emitted(self, oplog):
         col = _FakeCollection()
         col.upsert(ids=["d_empty"], documents=[""], metadatas=[_meta()])

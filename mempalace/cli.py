@@ -1735,6 +1735,11 @@ def _cmd_oplog_promote(args, palace_path, as_json):
             f"remote-owned {stats['remote_skipped']}, "
             f"registry {stats['registry_skipped']})"
         )
+        if stats["dry_run"]:
+            print(
+                "  (estimate — a dry run counts candidates without reading content; "
+                "a real run additionally skips any empty drawers)"
+            )
         if stats["skipped_empty"]:
             print(f"  empty drawers skipped: {stats['skipped_empty']}")
             print(f"    sample: {stats['empty_sample']}")

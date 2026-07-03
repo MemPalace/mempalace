@@ -180,6 +180,14 @@ def promote_local_rows(
         if limit is not None and stats["promoted"] >= limit:
             stats["remaining"] += 1
             continue
+        if dry_run:
+            # A dry run only needs the candidate COUNT, so it must not read
+            # content: one get-by-id per drawer turned a 156k-drawer dry run
+            # into a 40-minute grind. Empties aren't excluded here (they're
+            # rare and only detectable by reading content) — the count is an
+            # upper bound on what a real run promotes.
+            stats["promoted"] += 1
+            continue
         try:
             content = _read_content(collection, info)
             if not content:
@@ -202,8 +210,7 @@ def promote_local_rows(
             }
             author = meta.get("added_by")
             author = author.strip() if isinstance(author, str) and author.strip() else None
-            if not dry_run:
-                oplog.append("drawer.add", payload, author_agent=author or PROMOTE_AUTHOR_FALLBACK)
+            oplog.append("drawer.add", payload, author_agent=author or PROMOTE_AUTHOR_FALLBACK)
             stats["promoted"] += 1
         except Exception as exc:
             stats["errors"] += 1
