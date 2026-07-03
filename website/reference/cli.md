@@ -193,6 +193,7 @@ mempalace logstream ack evt_... --from-agent mac --status applied
 | `list` | List events, oldest first (all routing fields as filters, `--since-event-id`, `--limit`) |
 | `wait` | Long-poll until a match or timeout (`--timeout-ms`, max 300000; exits `2` on timeout) |
 | `ack` | Append an `event.ack` for an event (`--from-agent` required, `--status`, `--body`) |
+| `sync` | Pull missing events/artifacts from peer replicas (`--peer URL --token T`, or all peers in `peers.json`) |
 
 All subcommands accept `--json` for scriptable output.
 
@@ -211,3 +212,56 @@ mempalace artifact get art_... --out /tmp/handoff.patch
 |------------|-------------|
 | `put` | Store content (`--kind patch\|file\|log\|json\|note`, `--created-by` required; `--content`, `--file`, or stdin) |
 | `get` | Print exact content to stdout, or `--out FILE`; `--json` for metadata |
+
+## `mempalace replica`
+
+Memory replication across your machines (RFC 004; see
+[The Replicated Palace](/concepts/replicated-palace)). Bootstraps a new
+replica from its peers and moves precomputed vectors between machines.
+
+```bash
+# Bootstrap: fold every peer's authored content into this palace.
+# STOP the local hub first — this writes the palace directly.
+mempalace replica pull --with-vectors
+
+# One specific origin instead of peers.json:
+mempalace replica pull --peer https://desktop.example.com --token "$TOKEN"
+
+# Precompute vectors into the portable cache (safe alongside a live hub):
+mempalace replica embed-cache --batch 512 --json
+```
+
+| Subcommand | Description |
+|------------|-------------|
+| `pull` | Fold drawers + knowledge graph from origins (`--peer`/`--token` or `peers.json`; `--with-vectors` uses origin-precomputed vectors, `--no-kg`, `--no-reconcile`) |
+| `embed-cache` | Bulk-embed local content into `vector_cache.sqlite3` so peers can pull `--with-vectors` (`--model`, `--batch`, `--all`) |
+
+`pull` requires the local hub to be stopped (single-writer rule) and the
+origins to be quiescent (no active mines). Pulls are insert-only and
+resumable — re-running heals any gap. Raise
+`MEMPALACE_SYNC_HTTP_TIMEOUT` (seconds, default 30) for large bootstraps.
+
+## `mempalace oplog`
+
+The canonical memory op-log (RFC 004 step 2a — currently in dual-write
+shadow). Every drawer and knowledge-graph write also lands as a
+provenance-stamped op in `oplog.sqlite3`; ops travel between replicas and
+fold into their stores.
+
+```bash
+mempalace oplog status --json    # counts, kind histogram, version vector
+mempalace oplog sync             # pull missing ops from peers
+mempalace oplog fold             # apply pulled ops to the local store (hub stopped)
+mempalace oplog verify           # replay ops vs the live store — the cutover gate
+```
+
+| Subcommand | Description |
+|------------|-------------|
+| `status` | Op counts, per-kind histogram, and this replica's version vector |
+| `sync` | Anti-entropy pull of missing memory ops (`--peer URL --token T`, or all peers) |
+| `fold` | Apply pulled remote ops to the local store — stop the hub first; a running hub folds on its own sync cadence |
+| `verify` | Replay the op-log against the live store; exits `1` on divergence |
+
+A running hub does all of this automatically every `MEMPALACE_SYNC_INTERVAL`
+seconds (default 15): logstream sync, memory-op sync, then the fold. The CLI
+verbs exist for bootstraps, offline machines, and inspection.

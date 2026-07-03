@@ -345,9 +345,50 @@ The same non-negotiables that govern memory govern coordination:
   `patch_submit` — are hidden and refused. Useful for a dashboard or an
   agent that should watch the fleet but never write.
 
+## From hub to mesh
+
+Everything above uses one hub as the fleet's shared memory — which also
+makes that machine a single point of failure: when it sleeps, every other
+machine loses recall, capture, and coordination at once. The next stage
+removes that dependency: **every machine runs its own hub over a full local
+replica, and the hubs converge with each other** ([The Replicated
+Palace](/concepts/replicated-palace) explains the architecture).
+
+Joining the mesh is three steps per machine:
+
+1. **Run a hub locally** (same `mempalace serve` as above, LaunchAgent /
+   systemd unit recommended) — agents on that machine now point at
+   `127.0.0.1` instead of a remote hub.
+2. **Name the peers** in `peers.json` in the palace directory — each entry
+   is a `name`, the peer hub's `url`, and its bearer `token` (exchange
+   tokens out-of-band; never through the coordination stream):
+
+   ```json
+   {
+     "peers": [
+       { "name": "desktop", "url": "https://desktop.example.com", "token": "..." }
+     ]
+   }
+   ```
+
+   The hub's background loop picks up `peers.json` changes within one sync
+   cycle — coordination events, memory ops, and the fold all converge every
+   `MEMPALACE_SYNC_INTERVAL` seconds (default 15) with no further action.
+3. **Bootstrap the memory** once, with the local hub stopped:
+   `mempalace replica pull --with-vectors` folds every peer's authored
+   content — and their precomputed vectors — into the local palace. See the
+   [CLI reference](/reference/cli#mempalace-replica).
+
+After that, delegation works exactly as described in this guide — but an
+agent's inbox, and the palace behind it, survive any single machine
+sleeping. `GET /sync/peers` on any hub shows the estate: which peers were
+reachable last round, their version vectors, and any replicas known only
+through gossip.
+
 ## See also
 
+- [The Replicated Palace](/concepts/replicated-palace) — one palace, every machine: ops, clocks, folds
 - [Agent Logstream](/concepts/agent-logstream) — the event/artifact model in depth
 - [Remote / Team Server](/guide/remote-server) — full hub deployment: tokens, TLS, backends, Docker/systemd
 - [MCP Integration](/guide/mcp-integration) — the memory tools every connected agent gets
-- [CLI Reference](/reference/cli#mempalace-logstream) — `mempalace logstream` and `mempalace artifact` flags
+- [CLI Reference](/reference/cli#mempalace-logstream) — `mempalace logstream`, `mempalace artifact`, `mempalace replica`, `mempalace oplog`
