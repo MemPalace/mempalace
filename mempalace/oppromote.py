@@ -127,16 +127,62 @@ def scan_logical_drawers(collection, batch: int = 2000) -> dict:
     }
 
 
+def _drawer_row_ids(info: dict) -> list:
+    """The row ids of a logical drawer, in content order."""
+    if info["direct_row"] is not None:
+        return [info["direct_row"]]
+    return [row_id for _index, row_id in sorted(info["rows"])]
+
+
 def _read_content(collection, info: dict) -> str:
     """Reassemble a logical drawer's content exactly as the verifier
     reads it: direct row wins; otherwise chunks joined in index order."""
-    if info["direct_row"] is not None:
-        row_ids = [info["direct_row"]]
-    else:
-        row_ids = [row_id for _index, row_id in sorted(info["rows"])]
+    row_ids = _drawer_row_ids(info)
     ids, docs, _metas = _result_lists(collection.get(ids=row_ids, include=["documents"]))
     by_id = dict(zip(ids, docs))
     return "".join(by_id.get(row_id) or "" for row_id in row_ids)
+
+
+def _batch_read_contents(collection, items: list, page_size: int) -> dict:
+    """Reassemble content for many logical drawers with FEW backend reads.
+
+    One get-by-id per drawer near-scans a large content store (388 MB/s per
+    read at 156k scale on the reporting replica). Instead, collect every row id
+    across ``items`` and fetch them in ``page_size`` batches — the backend hits
+    its id index once per page, not once per drawer. Returns
+    ``{logical_id: content}``.
+    """
+    order = {logical_id: _drawer_row_ids(info) for logical_id, info in items}
+    all_ids = [rid for rids in order.values() for rid in rids]
+    doc_by_id: dict = {}
+    for start in range(0, len(all_ids), page_size):
+        page = all_ids[start : start + page_size]
+        ids, docs, _metas = _result_lists(collection.get(ids=page, include=["documents"]))
+        for rid, doc in zip(ids, docs):
+            doc_by_id[rid] = doc or ""
+    return {
+        logical_id: "".join(doc_by_id.get(rid, "") for rid in rids)
+        for logical_id, rids in order.items()
+    }
+
+
+def _emit_promotion(oplog, logical_id, info, content, stats):
+    meta = info["meta"] or {}
+    payload = {
+        "drawer_id": logical_id,
+        "wing": meta.get("wing", ""),
+        "room": meta.get("room", ""),
+        "content": content,
+        "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        "source_file": meta.get("source_file", ""),
+        "filed_at": meta.get("filed_at") or datetime.now().isoformat(),
+        "id_recipe": meta.get("id_recipe", ""),
+        "chunks": 1 if info["direct_row"] is not None else len(info["rows"]),
+        "promoted": True,
+    }
+    author = meta.get("added_by")
+    author = author.strip() if isinstance(author, str) and author.strip() else None
+    oplog.append("drawer.add", payload, author_agent=author or PROMOTE_AUTHOR_FALLBACK)
 
 
 def promote_local_rows(
@@ -145,12 +191,19 @@ def promote_local_rows(
     dry_run: bool = False,
     limit: int = None,
     batch: int = 2000,
+    content_batch: int = 500,
 ) -> dict:
     """Emit a ``drawer.add`` op for every op-less locally-authored drawer.
 
     Idempotent: drawers whose id already appears as a drawer-op subject
     are skipped, so a rerun after a partial pass (crash, ``--limit``)
     promotes only the remainder.
+
+    Content reads are BATCHED (``content_batch`` row ids per backend call): a
+    per-drawer get near-scanned a large content store, collapsing a 156k-drawer
+    run to ~1 op/s. Candidates are filtered on cheap metadata first, then their
+    content is fetched in bounded blocks so the promote is index-bound, not
+    scan-bound, and memory stays flat.
     """
     scan = scan_logical_drawers(collection, batch=batch)
     already_promoted = oplog.distinct_subjects(kinds=_DRAWER_KINDS)
@@ -169,52 +222,52 @@ def promote_local_rows(
         "error_sample": [],
         "remaining": 0,
     }
+
+    # First pass — cheap metadata filter to the drawers we will actually
+    # promote (no content reads). A dry run stops here: the count is what it
+    # needs, and reading content would be the very cost this avoids.
+    to_promote = []
     for logical_id in sorted(scan["drawers"]):
         info = scan["drawers"][logical_id]
         if info["stamped"]:
             stats["remote_skipped"] += 1
-            continue
-        if logical_id in already_promoted:
+        elif logical_id in already_promoted:
             stats["already_op_carried"] += 1
-            continue
-        if limit is not None and stats["promoted"] >= limit:
+        elif limit is not None and stats["promoted"] + len(to_promote) >= limit:
             stats["remaining"] += 1
-            continue
-        if dry_run:
-            # A dry run only needs the candidate COUNT, so it must not read
-            # content: one get-by-id per drawer turned a 156k-drawer dry run
-            # into a 40-minute grind. Empties aren't excluded here (they're
-            # rare and only detectable by reading content) — the count is an
-            # upper bound on what a real run promotes.
+        elif dry_run:
             stats["promoted"] += 1
-            continue
+        else:
+            to_promote.append((logical_id, info))
+
+    # Second pass — batch-read content for the candidates in memory-bounded
+    # blocks and emit. Each block does ~block/content_batch backend reads
+    # instead of one per drawer.
+    block_size = max(content_batch, 1) * 4
+    for start in range(0, len(to_promote), block_size):
+        block = to_promote[start : start + block_size]
         try:
-            content = _read_content(collection, info)
-            if not content:
-                stats["skipped_empty"] += 1
-                if len(stats["empty_sample"]) < SAMPLE_CAP:
-                    stats["empty_sample"].append(logical_id)
-                continue
-            meta = info["meta"] or {}
-            payload = {
-                "drawer_id": logical_id,
-                "wing": meta.get("wing", ""),
-                "room": meta.get("room", ""),
-                "content": content,
-                "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
-                "source_file": meta.get("source_file", ""),
-                "filed_at": meta.get("filed_at") or datetime.now().isoformat(),
-                "id_recipe": meta.get("id_recipe", ""),
-                "chunks": 1 if info["direct_row"] is not None else len(info["rows"]),
-                "promoted": True,
-            }
-            author = meta.get("added_by")
-            author = author.strip() if isinstance(author, str) and author.strip() else None
-            oplog.append("drawer.add", payload, author_agent=author or PROMOTE_AUTHOR_FALLBACK)
-            stats["promoted"] += 1
-        except Exception as exc:
-            stats["errors"] += 1
-            if len(stats["error_sample"]) < SAMPLE_CAP:
-                stats["error_sample"].append({"drawer_id": logical_id, "error": str(exc)})
-            logger.error("promotion failed for drawer %s", logical_id, exc_info=True)
+            contents = _batch_read_contents(collection, block, content_batch)
+        except Exception:
+            logger.error("promotion batch content read failed; falling back per-drawer")
+            contents = None
+        for logical_id, info in block:
+            try:
+                content = (
+                    contents[logical_id]
+                    if contents is not None
+                    else _read_content(collection, info)
+                )
+                if not content:
+                    stats["skipped_empty"] += 1
+                    if len(stats["empty_sample"]) < SAMPLE_CAP:
+                        stats["empty_sample"].append(logical_id)
+                    continue
+                _emit_promotion(oplog, logical_id, info, content, stats)
+                stats["promoted"] += 1
+            except Exception as exc:
+                stats["errors"] += 1
+                if len(stats["error_sample"]) < SAMPLE_CAP:
+                    stats["error_sample"].append({"drawer_id": logical_id, "error": str(exc)})
+                logger.error("promotion failed for drawer %s", logical_id, exc_info=True)
     return stats

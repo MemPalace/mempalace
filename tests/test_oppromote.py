@@ -213,6 +213,29 @@ class TestPromote:
         assert stats["dry_run"] is True
         assert oplog.count() == 0
 
+    def test_content_reads_are_batched_not_per_drawer(self, oplog):
+        # Perf contract: a real run must batch content reads, not issue one
+        # get-by-id per drawer (that near-scanned a 1GB store at ~1 op/s on the
+        # reporting replica). Count get(ids=...) calls: 20 drawers with
+        # content_batch=5 -> ceil(20/5)=4 batched reads, not 20.
+        class _CountingCollection(_FakeCollection):
+            id_get_calls = 0
+
+            def get(self, ids=None, where=None, include=None, limit=None, offset=None):
+                if ids is not None:
+                    type(self).id_get_calls += 1
+                return super().get(
+                    ids=ids, where=where, include=include, limit=limit, offset=offset
+                )
+
+        col = _CountingCollection()
+        for i in range(20):
+            col.upsert(ids=[f"d_{i:02d}"], documents=[f"body {i}"], metadatas=[_meta()])
+        stats = promote_local_rows(oplog, col, content_batch=5)
+        assert stats["promoted"] == 20
+        assert _CountingCollection.id_get_calls == 4  # 20/5 batched, not 20 per-drawer
+        assert oplog.count() == 20
+
     def test_dry_run_reads_no_content(self, oplog):
         # Perf contract: a dry run counts candidates from the scan alone and
         # must NOT issue a get-by-id per drawer — that one-read-per-drawer
