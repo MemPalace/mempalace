@@ -131,6 +131,92 @@ class TestOpLogCore:
         assert len(set(op_ids)) == len(op_ids) == 80
 
 
+class TestLegacySchemaMigration:
+    def test_opens_pre_subject_id_oplog(self, palace_path):
+        """A production op-log created before the fold consumer (no
+        subject_id column, no fold_state table) must open and migrate.
+
+        Regression: the canonical init script created the subject_id index
+        BEFORE the migration could add the column, so every pre-existing
+        op-log failed at open — and the abandoned half-open constructor
+        leaked one fd per sync round until the hub exhausted its table.
+        Fresh test databases always had the column, which is why 3,513
+        green tests missed it.
+        """
+        import sqlite3 as sqlite3_mod
+
+        db_path = os.path.join(palace_path, OPLOG_DB_FILENAME)
+        legacy = sqlite3_mod.connect(db_path)
+        legacy.executescript("""
+            PRAGMA journal_mode=WAL;
+            CREATE TABLE ops (
+                op_id TEXT NOT NULL UNIQUE,
+                origin_replica TEXT NOT NULL,
+                origin_seq INTEGER,
+                hlc TEXT NOT NULL,
+                author_agent TEXT NOT NULL,
+                authored_at TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX ops_origin_seq_idx ON ops(origin_replica, origin_seq);
+            CREATE INDEX ops_kind_idx ON ops(kind);
+            CREATE INDEX ops_hlc_idx ON ops(hlc);
+        """)
+        legacy.execute(
+            "INSERT INTO ops (op_id, origin_replica, origin_seq, hlc, author_agent,"
+            " authored_at, kind, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "op_rep_aaaaaaaaaaaa_1",
+                "rep_aaaaaaaaaaaa",
+                1,
+                "1783000000000-000000-rep_aaaaaaaaaaaa",
+                "mcp",
+                "2026-07-02T20:00:00Z",
+                "drawer.add",
+                '{"drawer_id": "d_legacy", "content": "x"}',
+            ),
+        )
+        legacy.commit()
+        legacy.close()
+
+        log = OpLog(db_path=db_path)
+        try:
+            # Migration backfilled the merge key and the log is fully usable.
+            assert log.subject_head_hlc("d_legacy") == "1783000000000-000000-rep_aaaaaaaaaaaa"
+            assert log.fold_cursor() == 0
+            fresh = log.append("drawer.add", {"drawer_id": "d_new"})
+            assert fresh["origin_seq"] == 2
+        finally:
+            log.close()
+
+    def test_failed_init_does_not_leak_or_poison(self, palace_path, monkeypatch):
+        """If init fails, the connection closes and the next attempt retries
+        cleanly (no cached half-open instance, no fd left behind)."""
+        db_path = os.path.join(palace_path, OPLOG_DB_FILENAME)
+        closed = []
+        original_close = OpLog.close
+
+        def tracking_close(self):
+            closed.append(True)
+            original_close(self)
+
+        monkeypatch.setattr(OpLog, "close", tracking_close)
+        monkeypatch.setattr(
+            OpLog, "_migrate_subject_column", lambda self, conn: 1 / 0, raising=True
+        )
+        with pytest.raises(ZeroDivisionError):
+            OpLog(db_path=db_path)
+        assert closed  # the failing constructor released its connection
+
+        monkeypatch.undo()
+        log = OpLog(db_path=db_path)  # clean retry succeeds
+        try:
+            assert log.count() == 0
+        finally:
+            log.close()
+
+
 class TestApplyRemoteOp:
     def test_apply_and_idempotency(self, oplog):
         op = _remote_op(seq=1)

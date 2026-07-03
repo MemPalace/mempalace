@@ -150,7 +150,14 @@ class OpLog:
         self.replica_id = replica_id or get_replica_id(str(db_parent))
         self._connection = None
         self._lock = threading.Lock()
-        self._init_db()
+        try:
+            self._init_db()
+        except BaseException:
+            # A failed init must not leak its connection: abandoned-open
+            # constructors retried every sync round exhausted the hub's fd
+            # table in production (the subject_id migration-order bug).
+            self.close()
+            raise
 
     def _init_db(self):
         from .hlc import HybridLogicalClock
@@ -175,7 +182,6 @@ class OpLog:
                 ON ops(origin_replica, origin_seq);
             CREATE INDEX IF NOT EXISTS ops_kind_idx ON ops(kind);
             CREATE INDEX IF NOT EXISTS ops_hlc_idx ON ops(hlc);
-            CREATE INDEX IF NOT EXISTS ops_subject_idx ON ops(subject_id);
 
             CREATE TABLE IF NOT EXISTS fold_state (
                 consumer TEXT PRIMARY KEY,
@@ -183,6 +189,11 @@ class OpLog:
             );
         """)
         self._migrate_subject_column(conn)
+        # Only after the migration guarantees the column exists — an index
+        # on subject_id inside the canonical script above broke every
+        # pre-migration op-log at open (fresh DBs have the column, existing
+        # ones gain it in the migration; tests only ever saw fresh DBs).
+        conn.execute("CREATE INDEX IF NOT EXISTS ops_subject_idx ON ops(subject_id)")
         conn.commit()
         # Seed the HLC from the newest stamp so monotonicity survives restarts.
         row = conn.execute("SELECT max(hlc) AS last FROM ops").fetchone()
@@ -198,7 +209,6 @@ class OpLog:
         existing = {row["name"] for row in conn.execute("PRAGMA table_info(ops)")}
         if "subject_id" not in existing:
             conn.execute("ALTER TABLE ops ADD COLUMN subject_id TEXT")
-            conn.execute("CREATE INDEX IF NOT EXISTS ops_subject_idx ON ops(subject_id)")
         rows = conn.execute(
             "SELECT rowid, kind, payload FROM ops WHERE subject_id IS NULL"
         ).fetchall()
