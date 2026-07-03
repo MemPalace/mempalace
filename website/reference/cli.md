@@ -272,3 +272,46 @@ Remote-stamped copies are never promoted — each origin promotes its own.
 A running hub does all of this automatically every `MEMPALACE_SYNC_INTERVAL`
 seconds (default 15): logstream sync, memory-op sync, then the fold. The CLI
 verbs exist for bootstraps, offline machines, and inspection.
+
+## `mempalace migrate-ids`
+
+The v4 content-pure id migration (RFC 004 id purity). Rewrites drawer ids from
+the location-addressed forms (`drawer_<wing>_<room>_<hash>`) to content-pure
+`drawer_<hash(content)>`, so organization (wing/room) becomes plain metadata and
+the same content anywhere in the mesh is the same drawer — content-addressed
+cross-machine dedup.
+
+```bash
+mempalace migrate-ids                              # dry-run plan (writes nothing)
+mempalace migrate-ids --json                       # machine-readable plan
+mempalace migrate-ids --apply --target ~/palace-v4 # materialize a v4 palace (copy-first)
+```
+
+| Option | Description |
+|--------|-------------|
+| *(none)* | Dry-run plan: drawers that change, content-collision groups that will MERGE, and KG/tunnel refs to remap. Writes nothing. |
+| `--apply` | Materialize the migration. Requires `--target`. |
+| `--target <path>` | Fresh palace path to write the migrated v4 palace into (must differ from the source — the source is never mutated). |
+| `--json` | Machine-readable plan output |
+
+The migration is **copy-first**: `--apply` reads the source and writes a new v4
+palace into `--target`, copying vectors (never re-deriving them) and merging
+content-identical drawers into one. The source palace is left untouched.
+
+Content collisions **merge**: when several drawers hold identical content they
+collapse to one v4 drawer (placement chosen by latest `filed_at`), and every
+merged-away id is repointed so the knowledge graph's `source_drawer_id`
+provenance and any tunnels still resolve.
+
+Because a v4 id is a pure function of content, every replica migrates
+independently and converges on identical ids — no migration is ever synced.
+
+Full runbook (run against the target, validate, then swap it in):
+
+```bash
+mempalace migrate-ids --apply --target ~/palace-v4
+mempalace --palace ~/palace-v4 compress        # rebuild the closet index at v4 ids
+mempalace --palace ~/palace-v4 oplog promote   # build the v4 op-log
+mempalace --palace ~/palace-v4 oplog verify    # must report CLEAN
+mempalace --palace ~/palace-v4 search "..."    # confirm recall
+```

@@ -1335,10 +1335,11 @@ def cmd_migrate_ids(args):
         f"({stats['merged_away']:,} merged away, {stats['rows_written']:,} rows), "
         f"KG refs repointed: {kg_updated}"
     )
-    print(
-        "  NEXT: rebuild the index layer in the target — `mempalace --palace "
-        f"{target} compress` — then validate search before swapping it in."
-    )
+    print("\n  NEXT (run against the target, validate, then swap it in):")
+    print(f"    mempalace --palace {target} compress        # rebuild the closet index at v4 ids")
+    print(f"    mempalace --palace {target} oplog promote    # build the v4 op-log")
+    print(f"    mempalace --palace {target} oplog verify     # must report CLEAN")
+    print(f"    mempalace --palace {target} search \"...\"      # confirm recall")
 
 
 def cmd_status(args):
