@@ -1,0 +1,133 @@
+"""
+test_migrate_v4.py — the v4 content-pure id migration planner (RFC 004 id purity).
+
+The planner is read-only: it reassembles logical drawers, computes each one's
+content-pure v4 id, and reports the alias map, content-collision groups (drawers
+that merge), already-v4 drawers, and the inbound references (KG source_drawer_id,
+tunnels) that a rewrite would have to remap.
+"""
+
+from mempalace.backends.base import GetResult
+from mempalace.ids import make_drawer_id_content_pure
+from mempalace.migrate_v4 import plan_v4_migration
+
+
+class _FakeCollection:
+    def __init__(self):
+        self.rows = {}
+
+    def get(self, ids=None, where=None, include=None, limit=None, offset=None):
+        hits = [(i, d, m) for i, (d, m) in self.rows.items()]
+        if offset:
+            hits = hits[offset:]
+        if limit is not None:
+            hits = hits[:limit]
+        return GetResult(
+            ids=[h[0] for h in hits],
+            documents=[h[1] for h in hits],
+            metadatas=[h[2] for h in hits],
+            embeddings=None,
+        )
+
+    def upsert(self, ids, documents, metadatas):
+        for i, doc, meta in zip(ids, documents, metadatas):
+            self.rows[i] = (doc, meta)
+
+
+def test_distinct_content_aliases_every_changing_drawer():
+    col = _FakeCollection()
+    col.upsert(
+        ids=["drawer_w_r_aaa", "drawer_w_r_bbb"],
+        documents=["alpha content", "beta content"],
+        metadatas=[{"wing": "w", "room": "r"}, {"wing": "w", "room": "r"}],
+    )
+    plan = plan_v4_migration(col)
+    assert plan["logical_drawers"] == 2
+    assert plan["changing"] == 2
+    assert plan["collision_groups"] == 0
+    assert plan["_alias"]["drawer_w_r_aaa"] == make_drawer_id_content_pure("alpha content")
+
+
+def test_identical_content_collides_into_one_v4_drawer():
+    col = _FakeCollection()
+    # Same content mined into two wings — two v3 ids, one v4 id (dedup).
+    col.upsert(
+        ids=["drawer_projects_day_x", "drawer_people_day_y"],
+        documents=["the exact same note", "the exact same note"],
+        metadatas=[{"wing": "projects"}, {"wing": "people"}],
+    )
+    plan = plan_v4_migration(col)
+    assert plan["collision_groups"] == 1
+    assert plan["collision_drawers"] == 2
+    v4 = make_drawer_id_content_pure("the exact same note")
+    assert sorted(plan["_collisions"][v4]) == ["drawer_people_day_y", "drawer_projects_day_x"]
+
+
+def test_chunked_drawer_hashes_full_reassembled_content():
+    col = _FakeCollection()
+    col.upsert(
+        ids=["drawer_w_r_big_chunk_000000", "drawer_w_r_big_chunk_000001"],
+        documents=["part one ", "part two"],
+        metadatas=[
+            {"chunk_index": 0, "parent_drawer_id": "drawer_w_r_big"},
+            {"chunk_index": 1, "parent_drawer_id": "drawer_w_r_big"},
+        ],
+    )
+    plan = plan_v4_migration(col)
+    assert plan["logical_drawers"] == 1
+    assert plan["_alias"]["drawer_w_r_big"] == make_drawer_id_content_pure("part one part two")
+
+
+def test_already_v4_drawer_is_not_changing():
+    col = _FakeCollection()
+    v4_id = make_drawer_id_content_pure("already migrated body")
+    col.upsert(
+        ids=[v4_id],
+        documents=["already migrated body"],
+        metadatas=[{"wing": "w", "id_recipe": "v4"}],
+    )
+    plan = plan_v4_migration(col)
+    assert plan["already_v4"] == 1
+    assert plan["changing"] == 0
+
+
+def test_registry_sentinels_and_empty_drawers_excluded():
+    col = _FakeCollection()
+    col.upsert(
+        ids=["_reg_abc", "drawer_w_r_empty", "drawer_w_r_real"],
+        documents=["[registry] /f", "", "real body"],
+        metadatas=[{"ingest_mode": "registry"}, {"wing": "w"}, {"wing": "w"}],
+    )
+    plan = plan_v4_migration(col)
+    assert plan["registry_skipped"] == 1
+    assert plan["empty_drawers"] == 1
+    assert plan["empty_sample"] == ["drawer_w_r_empty"]
+    assert plan["changing"] == 1  # only the real drawer
+
+
+def test_inbound_ref_remap_and_dangling_counts():
+    col = _FakeCollection()
+    col.upsert(
+        ids=["drawer_w_r_src"],
+        documents=["source of a triple"],
+        metadatas=[{"wing": "w"}],
+    )
+    plan = plan_v4_migration(
+        col,
+        kg_source_ids={"drawer_w_r_src", "drawer_gone_deleted"},
+        tunnel_drawer_ids={"drawer_w_r_src"},
+    )
+    # The live ref remaps; the ref to a no-longer-present drawer is dangling.
+    assert plan["kg_refs_remapped"] == 1
+    assert plan["kg_refs_remapped_sample"] == ["drawer_w_r_src"]
+    assert plan["kg_refs_dangling"] == 1
+    assert plan["tunnel_refs_remapped"] == 1
+
+
+def test_paged_scan_covers_all_rows():
+    col = _FakeCollection()
+    for i in range(7):
+        col.upsert(ids=[f"drawer_w_r_{i}"], documents=[f"body {i}"], metadatas=[{"wing": "w"}])
+    plan = plan_v4_migration(col, batch=3)
+    assert plan["logical_drawers"] == 7
+    assert plan["changing"] == 7

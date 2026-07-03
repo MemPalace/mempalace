@@ -80,6 +80,28 @@ def make_drawer_id_from_content(wing: str, room: str, content: str) -> str:
     return f"drawer_{wing}_{room}_{_delimited_sha256((wing, room, content), _HASH_TRUNC_DRAWER)}"
 
 
+# v4 content-pure recipe (the RFC 004 id-purity design). Identity is the verbatim content
+# ALONE — wing/room (organization) and source_file (provenance) become plain
+# metadata, so the same content anywhere in the mesh is the same drawer
+# (content-addressed cross-machine dedup, and org becomes op-carried). Not yet
+# the default ID_RECIPE: the write paths keep minting v3 until the staged
+# migration + write-flip cut over. The hash is 128-bit (32 hex) because these
+# ids are global rather than wing/room-scoped.
+V4_RECIPE: str = "v4"
+_HASH_TRUNC_V4: int = 32
+
+
+def make_drawer_id_content_pure(content: str) -> str:
+    """v4 content-pure drawer id: ``drawer_<hash(content)>`` (the RFC 004 id-purity design).
+
+    The hash covers the drawer's full logical content and nothing else, so two
+    replicas that hold identical content converge on the same id without ever
+    exchanging placement. Chunk rows keep the existing ``_chunk_NNNNNN`` suffix
+    on this id.
+    """
+    return f"drawer_{_delimited_sha256((content,), _HASH_TRUNC_V4)}"
+
+
 def make_convo_drawer_id(
     wing: str, room: str, source_file: str, extract_mode: str, chunk_index: int
 ) -> str:
