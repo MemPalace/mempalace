@@ -1627,6 +1627,46 @@ def cmd_oplog(args):
                 print(f"  origin {origin}: highest seq {top}")
         return
 
+    if args.oplog_action == "sync":
+        from .oplog import OPLOG_DB_FILENAME, OpLog
+        from .opsync import sync_all_memops, sync_memops_with_peer
+
+        try:
+            if args.peer:
+                from .transport import HttpsBearerTransport
+
+                with OpLog(os.path.join(palace_path, OPLOG_DB_FILENAME)) as log:
+                    stats = sync_memops_with_peer(
+                        log,
+                        HttpsBearerTransport(palace_path),
+                        {"name": args.peer, "url": args.peer, "token": args.token or ""},
+                    )
+                    stats["peer_name"] = args.peer
+                    results = [stats]
+            else:
+                results = sync_all_memops(palace_path)
+                if not results:
+                    _logstream_fail(
+                        f"no peers configured ({palace_path}/peers.json) and no --peer given",
+                        as_json,
+                    )
+        except Exception as exc:
+            _logstream_fail(str(exc), as_json)
+        if as_json:
+            print(json.dumps(results, indent=2, ensure_ascii=False))
+        else:
+            for stats in results:
+                if stats.get("error"):
+                    print(f"  {stats['peer_name']}: ERROR {stats['error']}")
+                else:
+                    print(
+                        f"  {stats['peer_name']} ({stats['peer_replica']}): "
+                        f"+{stats['pulled_ops']} ops {stats['per_origin']}"
+                    )
+        if any(s.get("error") for s in results):
+            sys.exit(1)
+        return
+
     if args.oplog_action == "verify":
         from .oplog_verify import verify_shadow
 
@@ -3377,6 +3417,14 @@ def main():
         "(the step-2a cutover gate; exits 1 on divergence)",
     )
     p_oplog_verify.add_argument("--json", action="store_true", help="Machine-readable output")
+    p_oplog_sync = oplog_sub.add_parser(
+        "sync", help="Pull missing memory ops from peer replicas (RFC 004 anti-entropy)"
+    )
+    p_oplog_sync.add_argument(
+        "--peer", default=None, help="Peer base URL (default: all peers in peers.json)"
+    )
+    p_oplog_sync.add_argument("--token", default=None, help="Bearer token for --peer")
+    p_oplog_sync.add_argument("--json", action="store_true", help="Machine-readable output")
 
     p_palace = sub.add_parser("palace", help="Palace maintenance commands")
     palace_sub = p_palace.add_subparsers(dest="palace_action")

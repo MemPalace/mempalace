@@ -6054,6 +6054,27 @@ def _http_serve_sync(handler, path: str) -> bool:
         if path == "/sync/peers":
             handler._send_json(200, _mesh_peers_payload())
             return True
+        if path == "/sync/memops/version_vector":
+            oplog = _get_shadow_oplog()
+            if oplog is None:
+                handler._send_json(503, {"error": "no active palace; op-log unavailable"})
+                return True
+            handler._send_json(
+                200,
+                {"replica_id": oplog.replica_id, "version_vector": oplog.version_vector()},
+            )
+            return True
+        if path == "/sync/memops":
+            oplog = _get_shadow_oplog()
+            if oplog is None:
+                handler._send_json(503, {"error": "no active palace; op-log unavailable"})
+                return True
+            origin = query.get("origin") or ""
+            after = int(query.get("after", "0") or 0)
+            limit = int(query.get("limit", "500") or 500)
+            ops = oplog.list_ops(origin, after_seq=after, limit=limit)
+            handler._send_json(200, {"origin": origin, "ops": ops, "count": len(ops)})
+            return True
     except (ValueError, TypeError) as exc:
         handler._send_json(400, {"error": str(exc)})
         return True
@@ -6184,6 +6205,23 @@ def _start_peer_sync_thread() -> None:
                         )
             except Exception:
                 logger.warning("peer sync round failed", exc_info=True)
+            try:
+                # Memory ops ride the same cadence and peers (RFC 004 2a).
+                # Op transport only — the fold consumer applies them to the
+                # store in its own stage.
+                from .opsync import sync_all_memops
+
+                for stats in sync_all_memops(palace_path):
+                    if stats.get("error"):
+                        logger.warning("memop sync %s: %s", stats.get("peer_name"), stats["error"])
+                    elif stats.get("pulled_ops"):
+                        logger.info(
+                            "memop sync %s: pulled %d op(s)",
+                            stats.get("peer_name"),
+                            stats["pulled_ops"],
+                        )
+            except Exception:
+                logger.warning("memop sync round failed", exc_info=True)
 
     thread = threading.Thread(target=_loop, name="mempalace-logsync", daemon=True)
     thread.start()

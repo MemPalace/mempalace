@@ -461,6 +461,29 @@ class TestSyncOverHttp:
         assert payload["unnamed_origins"] == ["rep_cccccccccccc"]
         assert "S3CRET" not in json.dumps(payload)
 
+    def test_memops_endpoints_roundtrip(self, server, palace_path):
+        port, mcp = server
+        from mempalace.oplog import get_oplog
+
+        op = get_oplog(palace_path).append(
+            "drawer.add", {"drawer_id": "d1", "content": "hello"}, author_agent="tester"
+        )
+
+        status, vector = self._get(port, "/sync/memops/version_vector")
+        assert status == 200
+        assert vector["replica_id"] == op["origin_replica"]
+        assert vector["version_vector"] == {op["origin_replica"]: op["origin_seq"]}
+
+        status, ops = self._get(
+            port, f"/sync/memops?origin={op['origin_replica']}&after=0&limit=10"
+        )
+        assert status == 200
+        assert [o["op_id"] for o in ops["ops"]] == [op["op_id"]]
+        assert ops["ops"][0]["payload"] == {"drawer_id": "d1", "content": "hello"}
+
+        status, bad = self._get(port, "/sync/memops?origin=&after=0")
+        assert status == 400
+
     def test_record_peer_sync_error_preserves_last_known_state(self):
         from mempalace import mcp_server as mcp
 
