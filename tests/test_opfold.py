@@ -132,6 +132,24 @@ class TestDrawerFold:
         # Cursor advanced past it — the next fold round is a no-op.
         assert rig["b"].fold_cursor(FOLD_CONSUMER) == rig["b"].count()
 
+    def test_max_ops_bounds_the_drain_and_resumes(self, rig):
+        # The hub sync loop folds in bounded batches so a large backlog can't
+        # monopolize the request lock. fold_ops(max_ops=N) must process at
+        # most N ops, advance the durable cursor, and resume where it left
+        # off — draining the same final state as one unbounded fold.
+        for i in range(5):
+            _ship(rig, "drawer.add", {"drawer_id": f"d{i}", "content": f"c{i}"})
+        rounds = 0
+        while rig["b"].fold_cursor(FOLD_CONSUMER) < rig["b"].count():
+            before = rig["b"].fold_cursor(FOLD_CONSUMER)
+            _fold(rig, max_ops=2)
+            after = rig["b"].fold_cursor(FOLD_CONSUMER)
+            assert 0 < after - before <= 2  # bounded, and always progresses
+            rounds += 1
+            assert rounds <= 5  # 5 ops / 2 per round -> 3 rounds, never spins
+        assert rounds == 3
+        assert {f"d{i}" for i in range(5)} <= set(rig["col"].rows)
+
     def test_refold_is_idempotent(self, rig):
         _ship(rig, "drawer.add", {"drawer_id": "d1", "content": "x"})
         assert _fold(rig)["applied_adds"] == 1

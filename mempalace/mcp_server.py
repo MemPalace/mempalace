@@ -6287,6 +6287,35 @@ def _peer_sync_interval_s() -> float:
         return 15.0
 
 
+# The fold drains the op backlog into the store in BOUNDED batches, releasing
+# _HTTP_REQUEST_LOCK between each so POST /mcp and the rest of the sync loop
+# interleave. A single unbounded fold of a large backlog (a promotion-pass
+# backfill of tens of thousands of ops) held the lock for HOURS on a
+# CPU-bound host — every /mcp request starved and the sync loop never returned
+# to logstream/memop, freezing coordination convergence. Per-lock batch keeps
+# each hold short; per-round cap lets the loop cycle mid-drain. Both are
+# env-tunable for slow hosts; the fold is crash-safe and resumes from its
+# durable cursor.
+_FOLD_OPS_PER_LOCK_DEFAULT = 50
+_FOLD_MAX_OPS_PER_ROUND_DEFAULT = 1000
+
+
+def _fold_ops_per_lock() -> int:
+    try:
+        return max(1, int(os.environ.get("MEMPALACE_FOLD_OPS_PER_LOCK", "") or _FOLD_OPS_PER_LOCK_DEFAULT))
+    except ValueError:
+        return _FOLD_OPS_PER_LOCK_DEFAULT
+
+
+def _fold_max_ops_per_round() -> int:
+    try:
+        return max(
+            1, int(os.environ.get("MEMPALACE_FOLD_MAX_OPS_PER_ROUND", "") or _FOLD_MAX_OPS_PER_ROUND_DEFAULT)
+        )
+    except ValueError:
+        return _FOLD_MAX_OPS_PER_ROUND_DEFAULT
+
+
 def _start_peer_sync_thread() -> None:
     """Background anti-entropy loop when peers.json exists (RFC 004 step 0).
 
@@ -6349,31 +6378,46 @@ def _start_peer_sync_thread() -> None:
                 # Fold pulled ops into the local store (RFC 004 2a). The hub
                 # owns the writer lease; the request lock serializes these
                 # Chroma writes against HTTP handlers exactly like any tool.
+                # BOUNDED so a large backlog can't monopolize the lock: fold at
+                # most _fold_ops_per_lock() ops per acquisition, release, and
+                # stop after _fold_max_ops_per_round() so the loop returns to
+                # logstream/memop. The fold resumes from its durable cursor.
                 oplog = _get_shadow_oplog()
                 if oplog is not None and oplog.count() > oplog.fold_cursor():
                     from .opfold import fold_ops
 
-                    with _HTTP_REQUEST_LOCK:
-                        col = _get_collection(create=True)
-                        fold_stats = (
-                            fold_ops(
+                    chunk_size = max(1, int(getattr(_config, "chunk_size", 800) or 800))
+                    lock_batch = _fold_ops_per_lock()
+                    round_cap = _fold_max_ops_per_round()
+                    folded = 0
+                    while folded < round_cap:
+                        before = oplog.fold_cursor()
+                        with _HTTP_REQUEST_LOCK:
+                            col = _get_collection(create=True)
+                            if not col:
+                                break
+                            fold_stats = fold_ops(
                                 oplog,
                                 col,
                                 _get_kg(),
-                                chunk_size=max(1, int(getattr(_config, "chunk_size", 800) or 800)),
+                                chunk_size=chunk_size,
+                                max_ops=lock_batch,
                             )
-                            if col
-                            else None
-                        )
-                    if fold_stats:
-                        applied = (
-                            fold_stats["applied_adds"]
-                            + fold_stats["applied_revises"]
-                            + fold_stats["applied_tombstones"]
-                            + fold_stats["applied_kg"]
-                        )
-                        if applied or fold_stats["conflicts"] or fold_stats["errors"]:
-                            logger.info("op fold: %s", fold_stats)
+                        if fold_stats:
+                            applied = (
+                                fold_stats["applied_adds"]
+                                + fold_stats["applied_revises"]
+                                + fold_stats["applied_tombstones"]
+                                + fold_stats["applied_kg"]
+                            )
+                            if applied or fold_stats["conflicts"] or fold_stats["errors"]:
+                                logger.info("op fold: %s", fold_stats)
+                            if fold_stats["errors"]:
+                                break  # poison op — stop, next round retries it
+                        after = oplog.fold_cursor()
+                        if after <= before:
+                            break  # no progress: caught up or nothing appliable
+                        folded += after - before
             except Exception:
                 logger.warning("op fold round failed", exc_info=True)
 
