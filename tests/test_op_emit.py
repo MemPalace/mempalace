@@ -123,6 +123,40 @@ class TestBulkTombstones:
         assert emit_bulk_tombstones(None, [("d", "x", {})]) == 0
 
 
+class TestDedupEmitsTombstones:
+    def test_dedup_delete_emits_tombstone(self, oplog):
+        from mempalace.dedup import dedup_source_group
+
+        col = _FakeCollection()
+        # A too-short drawer (< 20 chars) is deleted outright — no query needed.
+        col.upsert(
+            ids=["keep", "drop"],
+            documents=["a long enough drawer body to be kept as canonical", "tiny"],
+            metadatas=[{"wing": "w", "room": "r"}, {"wing": "w", "room": "r"}],
+        )
+        kept, deleted = dedup_source_group(col, ["keep", "drop"], dry_run=False, oplog=oplog)
+        assert deleted == ["drop"] and "drop" not in col.rows
+        ops = oplog.list_all()
+        assert [o["kind"] for o in ops] == ["drawer.tombstone"]
+        assert ops[0]["payload"]["drawer_id"] == "drop"
+        assert ops[0]["payload"]["content"] == "tiny"
+        assert ops[0]["payload"]["reason"] == "dedup"
+        assert ops[0]["author_agent"] == "dedup"
+
+    def test_dedup_dry_run_emits_nothing(self, oplog):
+        from mempalace.dedup import dedup_source_group
+
+        col = _FakeCollection()
+        col.upsert(
+            ids=["keep", "drop"],
+            documents=["a long enough drawer body to be kept as canonical", "tiny"],
+            metadatas=[{"wing": "w"}, {"wing": "w"}],
+        )
+        dedup_source_group(col, ["keep", "drop"], dry_run=True, oplog=oplog)
+        assert oplog.count() == 0
+        assert "drop" in col.rows  # dry run deletes nothing
+
+
 class TestReadLogicalDrawersWhere:
     def test_rejoins_chunk_groups(self):
         col = _FakeCollection()

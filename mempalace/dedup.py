@@ -78,7 +78,7 @@ def get_source_groups(col, min_count=MIN_DRAWERS_TO_CHECK, source_pattern=None, 
     return {src: ids for src, ids in groups.items() if len(ids) >= min_count}
 
 
-def dedup_source_group(col, drawer_ids, threshold=DEFAULT_THRESHOLD, dry_run=True):
+def dedup_source_group(col, drawer_ids, threshold=DEFAULT_THRESHOLD, dry_run=True, oplog=None):
     """Dedup drawers within one source_file group.
 
     Greedy: sort by doc length (longest first), keep if not too similar
@@ -123,6 +123,23 @@ def dedup_source_group(col, drawer_ids, threshold=DEFAULT_THRESHOLD, dry_run=Tru
             kept.append((did, doc))
 
     if to_delete and not dry_run:
+        # Tombstone the removed drawers before deleting so the dedup replicates
+        # (RFC 004 2a). Content + meta come from the group read above.
+        if oplog is not None:
+            from .op_emit import emit_bulk_tombstones
+
+            by_id = {
+                i: (d, m) for i, d, m in zip(data["ids"], data["documents"], data["metadatas"])
+            }
+            emit_bulk_tombstones(
+                oplog,
+                (
+                    (did, by_id.get(did, ("", {}))[0], by_id.get(did, ("", {}))[1])
+                    for did in to_delete
+                ),
+                author_agent="dedup",
+                reason="dedup",
+            )
         for i in range(0, len(to_delete), 500):
             col.delete(ids=to_delete[i : i + 500])
 
@@ -166,6 +183,17 @@ def dedup_palace(
 
     col = get_collection(palace_path, COLLECTION_NAME)
 
+    # Dual-write shadow op-log (RFC 004 2a): a live dedup tombstones the drawers
+    # it removes so the removal replicates. Skipped on dry runs and never fatal.
+    oplog = None
+    if not dry_run:
+        try:
+            from .oplog import get_oplog
+
+            oplog = get_oplog(palace_path)
+        except Exception:
+            pass
+
     print(f"  Palace: {palace_path}")
     print(f"  Drawers: {col.count():,}")
     print(f"  Threshold: {threshold}")
@@ -184,7 +212,7 @@ def dedup_palace(
     sorted_groups = sorted(groups.items(), key=lambda x: len(x[1]), reverse=True)
 
     for i, (src, drawer_ids) in enumerate(sorted_groups):
-        kept, deleted = dedup_source_group(col, drawer_ids, threshold, dry_run)
+        kept, deleted = dedup_source_group(col, drawer_ids, threshold, dry_run, oplog=oplog)
         total_kept += len(kept)
         total_deleted += len(deleted)
 

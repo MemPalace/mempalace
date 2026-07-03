@@ -3123,6 +3123,18 @@ def tool_delete_by_source(source_file: str, dry_run: bool = True):
         "delete_by_source",
         {"source_file": source_file, "match_count": match_count, "sample": sample},
     )
+    # Tombstone each logical drawer before the purge so the deletion replicates
+    # (RFC 004 2a). Read + group the matched rows into logical drawers first —
+    # the tombstone carries the verbatim content, so nothing is lost to history.
+    try:
+        from .op_emit import emit_bulk_tombstones, read_logical_drawers_where
+
+        oplog = _get_shadow_oplog()
+        if oplog is not None:
+            drawers = read_logical_drawers_where(col, where)
+            emit_bulk_tombstones(oplog, drawers, author_agent="mcp", reason="delete_by_source")
+    except Exception:
+        logger.error("op emission for delete_by_source failed", exc_info=True)
     try:
         col.delete(where=where)
         _metadata_cache = None
@@ -6302,7 +6314,9 @@ _FOLD_MAX_OPS_PER_ROUND_DEFAULT = 1000
 
 def _fold_ops_per_lock() -> int:
     try:
-        return max(1, int(os.environ.get("MEMPALACE_FOLD_OPS_PER_LOCK", "") or _FOLD_OPS_PER_LOCK_DEFAULT))
+        return max(
+            1, int(os.environ.get("MEMPALACE_FOLD_OPS_PER_LOCK", "") or _FOLD_OPS_PER_LOCK_DEFAULT)
+        )
     except ValueError:
         return _FOLD_OPS_PER_LOCK_DEFAULT
 
@@ -6310,7 +6324,11 @@ def _fold_ops_per_lock() -> int:
 def _fold_max_ops_per_round() -> int:
     try:
         return max(
-            1, int(os.environ.get("MEMPALACE_FOLD_MAX_OPS_PER_ROUND", "") or _FOLD_MAX_OPS_PER_ROUND_DEFAULT)
+            1,
+            int(
+                os.environ.get("MEMPALACE_FOLD_MAX_OPS_PER_ROUND", "")
+                or _FOLD_MAX_OPS_PER_ROUND_DEFAULT
+            ),
         )
     except ValueError:
         return _FOLD_MAX_OPS_PER_ROUND_DEFAULT
