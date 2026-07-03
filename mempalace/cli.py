@@ -1261,6 +1261,86 @@ def cmd_hallways(args):
         print(f"    {label}")
 
 
+def cmd_migrate_ids(args):
+    """v4 content-pure id migration (RFC 004 id purity). Dry-run plan by default;
+    --apply materializes a v4 palace into a fresh --target (copy-first)."""
+    import json as _json
+
+    from .knowledge_graph import KnowledgeGraph
+    from .migrate_v4 import (
+        apply_v4_migration,
+        plan_v4_migration,
+        read_kg_source_ids,
+        remap_kg_source_ids,
+    )
+    from .palace import get_collection
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    as_json = getattr(args, "json", False)
+    src = get_collection(palace_path, create=False)
+    if not src:
+        print(f"  No palace collection at {palace_path}")
+        sys.exit(1)
+
+    kg_path = os.path.join(palace_path, "knowledge_graph.sqlite3")
+    kg_ids = set()
+    if os.path.exists(kg_path):
+        with KnowledgeGraph(db_path=kg_path) as kg:
+            kg_ids = read_kg_source_ids(kg)
+
+    plan = plan_v4_migration(src, kg_source_ids=kg_ids)
+    summary = {k: v for k, v in plan.items() if not k.startswith("_") and "sample" not in k}
+    if as_json:
+        print(_json.dumps(summary, indent=2))
+    else:
+        print(f"\n  v4 id migration plan for {palace_path}")
+        print(f"    logical drawers:     {plan['logical_drawers']:,}")
+        print(
+            f"    would change to v4:  {plan['changing']:,}  (already v4: {plan['already_v4']:,})"
+        )
+        print(
+            f"    content collisions:  {plan['collision_groups']:,} group(s) covering "
+            f"{plan['collision_drawers']:,} drawer(s) — these MERGE (content dedup)"
+        )
+        print(f"    KG refs to remap:    {plan['kg_refs_remapped']:,}")
+        print(f"    tunnel refs to remap:{plan['tunnel_refs_remapped']:,}")
+        if plan["empty_drawers"]:
+            print(f"    empty drawers:       {plan['empty_drawers']:,} (skipped)")
+
+    if not getattr(args, "apply", False):
+        print(
+            "\n  DRY RUN — nothing written. Re-run with --apply --target <new-palace> to migrate."
+        )
+        return
+
+    target = os.path.expanduser(args.target) if args.target else None
+    if not target:
+        _logstream_fail("--apply requires --target <new-palace-path> (copy-first)", as_json)
+    if os.path.abspath(target) == os.path.abspath(palace_path):
+        _logstream_fail("--target must differ from the source palace (copy-first)", as_json)
+    os.makedirs(target, exist_ok=True)
+    tgt = get_collection(target, create=True)
+    stats = apply_v4_migration(src, tgt)
+    # Provenance: copy the source KG into the target, then repoint its refs.
+    kg_updated = 0
+    if os.path.exists(kg_path):
+        import shutil
+
+        tgt_kg_path = os.path.join(target, "knowledge_graph.sqlite3")
+        shutil.copy2(kg_path, tgt_kg_path)
+        with KnowledgeGraph(db_path=tgt_kg_path) as tkg:
+            kg_updated = remap_kg_source_ids(tkg, stats["alias"])
+    print(
+        f"\n  MIGRATED into {target}: {stats['written']:,} v4 drawer(s) "
+        f"({stats['merged_away']:,} merged away, {stats['rows_written']:,} rows), "
+        f"KG refs repointed: {kg_updated}"
+    )
+    print(
+        "  NEXT: rebuild the index layer in the target — `mempalace --palace "
+        f"{target} compress` — then validate search before swapping it in."
+    )
+
+
 def cmd_status(args):
     from .miner import status
 
@@ -3343,6 +3423,20 @@ def main():
         help="Storage backend to use for status (default: config/env/detected/chroma)",
     )
 
+    # migrate-ids (RFC 004 id purity — v4 content-pure drawer ids)
+    p_migrate_ids = sub.add_parser(
+        "migrate-ids",
+        help="Plan/apply the v4 content-pure id migration (dry-run by default; "
+        "--apply materializes a v4 palace into a fresh --target, copy-first)",
+    )
+    p_migrate_ids.add_argument(
+        "--apply", action="store_true", help="Materialize the migration (needs --target)"
+    )
+    p_migrate_ids.add_argument(
+        "--target", default=None, help="Fresh palace path to write the migrated v4 palace into"
+    )
+    p_migrate_ids.add_argument("--json", action="store_true", help="Machine-readable plan output")
+
     # logstream (RFC 003 agent coordination)
     p_logstream = sub.add_parser(
         "logstream",
@@ -3675,6 +3769,7 @@ def main():
         "repair-status": cmd_repair_status,
         "migrate": cmd_migrate,
         "migrate-wings": cmd_migrate_wings,
+        "migrate-ids": cmd_migrate_ids,
         "hallways": cmd_hallways,
         "status": cmd_status,
     }
