@@ -628,6 +628,95 @@ class KnowledgeGraph:
         ),
     }
 
+    def apply_assert_op(self, payload: dict) -> bool:
+        """Fold one replicated kg.assert op: G-set semantics, keyed by
+        triple id (RFC 004 merge table). Entities are re-derivable from the
+        payload names, so they are auto-created exactly as add_triple does.
+        Never emits ops — this IS the application of one. Returns True if
+        the triple row was inserted, False if it already existed."""
+        triple_id = payload.get("triple_id")
+        if not triple_id:
+            raise ValueError("kg.assert payload is missing 'triple_id'")
+        with self._lock:
+            conn = self._conn()
+            with conn:
+                for eid, name in (
+                    (payload.get("subject"), payload.get("subject_name")),
+                    (payload.get("object"), payload.get("object_name")),
+                ):
+                    if eid:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO entities (id, name) VALUES (?, ?)",
+                            (eid, name or eid),
+                        )
+                cursor = conn.execute(
+                    """INSERT OR IGNORE INTO triples (
+                        id, subject, predicate, object, valid_from, valid_to,
+                        confidence, source_closet, source_file,
+                        source_drawer_id, adapter_name, extracted_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        triple_id,
+                        payload.get("subject"),
+                        payload.get("predicate"),
+                        payload.get("object"),
+                        payload.get("valid_from"),
+                        payload.get("valid_to"),
+                        payload.get("confidence", 1.0),
+                        payload.get("source_closet"),
+                        payload.get("source_file"),
+                        payload.get("source_drawer_id"),
+                        payload.get("adapter_name"),
+                        payload.get("extracted_at"),
+                    ),
+                )
+                return cursor.rowcount > 0
+
+    def apply_close_op(self, payload: dict) -> int:
+        """Fold one replicated kg.close op: interval-close, idempotent,
+        min valid_to wins (RFC 004 merge table). Returns rows changed."""
+        ended = payload.get("ended")
+        if not ended:
+            raise ValueError("kg.close payload is missing 'ended'")
+        ended_key = _temporal_end_key(ended)
+        changed = 0
+        with self._lock:
+            conn = self._conn()
+            with conn:
+                for triple_id in payload.get("closed_triple_ids") or []:
+                    row = conn.execute(
+                        "SELECT valid_to FROM triples WHERE id = ?", (triple_id,)
+                    ).fetchone()
+                    if row is None:
+                        continue  # assert not yet folded; a later round closes it
+                    current = row["valid_to"]
+                    if current is not None and _temporal_end_key(current) <= ended_key:
+                        continue  # already closed at least as early — min wins
+                    conn.execute("UPDATE triples SET valid_to = ? WHERE id = ?", (ended, triple_id))
+                    changed += 1
+        return changed
+
+    def apply_entity_upsert_op(self, payload: dict) -> None:
+        """Fold one replicated kg.entity.upsert op: LWW register per entity
+        key — callers fold ops in order, so last applied wins."""
+        entity_id = payload.get("entity_id")
+        if not entity_id:
+            raise ValueError("kg.entity.upsert payload is missing 'entity_id'")
+        props = json.dumps(payload.get("properties") or {})
+        with self._lock:
+            conn = self._conn()
+            with conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO entities (id, name, type, properties)"
+                    " VALUES (?, ?, ?, ?)",
+                    (
+                        entity_id,
+                        payload.get("name") or entity_id,
+                        payload.get("type") or "unknown",
+                        props,
+                    ),
+                )
+
     def dump_rows(self, table: str, after_rowid: int = 0, limit: int = 500) -> list:
         """Page KG rows in rowid order for snapshot replication.
 

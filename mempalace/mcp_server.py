@@ -6222,6 +6222,37 @@ def _start_peer_sync_thread() -> None:
                         )
             except Exception:
                 logger.warning("memop sync round failed", exc_info=True)
+            try:
+                # Fold pulled ops into the local store (RFC 004 2a). The hub
+                # owns the writer lease; the request lock serializes these
+                # Chroma writes against HTTP handlers exactly like any tool.
+                oplog = _get_shadow_oplog()
+                if oplog is not None and oplog.count() > oplog.fold_cursor():
+                    from .opfold import fold_ops
+
+                    with _HTTP_REQUEST_LOCK:
+                        col = _get_collection(create=True)
+                        fold_stats = (
+                            fold_ops(
+                                oplog,
+                                col,
+                                _get_kg(),
+                                chunk_size=max(1, int(getattr(_config, "chunk_size", 800) or 800)),
+                            )
+                            if col
+                            else None
+                        )
+                    if fold_stats:
+                        applied = (
+                            fold_stats["applied_adds"]
+                            + fold_stats["applied_revises"]
+                            + fold_stats["applied_tombstones"]
+                            + fold_stats["applied_kg"]
+                        )
+                        if applied or fold_stats["conflicts"] or fold_stats["errors"]:
+                            logger.info("op fold: %s", fold_stats)
+            except Exception:
+                logger.warning("op fold round failed", exc_info=True)
 
     thread = threading.Thread(target=_loop, name="mempalace-logsync", daemon=True)
     thread.start()

@@ -90,6 +90,30 @@ def _sanitize_agent(value, field_name: str = "author_agent") -> str:
     return value
 
 
+def subject_from(kind: str, payload: dict) -> Optional[str]:
+    """The per-subject merge key for an op (RFC 004 merge table).
+
+    Drawer ops merge per drawer id, KG asserts per triple id, entity
+    upserts per entity id. kg.close carries a LIST of closed triple ids
+    and merges idempotently (min valid_to wins), so it gets the triple-key
+    string instead — head lookups for closes go through the payload.
+    """
+    if kind.startswith("drawer.") or kind.startswith("org."):
+        value = payload.get("drawer_id")
+    elif kind == "kg.assert":
+        value = payload.get("triple_id")
+    elif kind == "kg.close":
+        value = payload.get("subject"), payload.get("predicate"), payload.get("object")
+        value = "|".join(str(part) for part in value if part) or None
+    elif kind == "kg.entity.upsert":
+        value = payload.get("entity_id")
+    elif kind == "registry.entity.upsert":
+        value = payload.get("entity_id")
+    else:
+        value = None
+    return value if isinstance(value, str) and value else None
+
+
 def _sanitize_payload(value) -> str:
     """Validate the payload dict and return its canonical JSON text."""
     if not isinstance(value, dict):
@@ -143,18 +167,51 @@ class OpLog:
                 author_agent TEXT NOT NULL,
                 authored_at TEXT NOT NULL,
                 kind TEXT NOT NULL,
-                payload TEXT NOT NULL
+                payload TEXT NOT NULL,
+                subject_id TEXT
             );
 
             CREATE UNIQUE INDEX IF NOT EXISTS ops_origin_seq_idx
                 ON ops(origin_replica, origin_seq);
             CREATE INDEX IF NOT EXISTS ops_kind_idx ON ops(kind);
             CREATE INDEX IF NOT EXISTS ops_hlc_idx ON ops(hlc);
+            CREATE INDEX IF NOT EXISTS ops_subject_idx ON ops(subject_id);
+
+            CREATE TABLE IF NOT EXISTS fold_state (
+                consumer TEXT PRIMARY KEY,
+                last_seq INTEGER NOT NULL
+            );
         """)
+        self._migrate_subject_column(conn)
         conn.commit()
         # Seed the HLC from the newest stamp so monotonicity survives restarts.
         row = conn.execute("SELECT max(hlc) AS last FROM ops").fetchone()
         self._clock = HybridLogicalClock(self.replica_id, last=row["last"] if row else None)
+
+    def _migrate_subject_column(self, conn):
+        """Backfill subject_id on op-logs created before the fold consumer.
+
+        Merge rules (the RFC 004 merge table) are per-subject — drawer id,
+        triple id, entity id — so head lookups need an indexed merge key.
+        Fresh databases get the column from the canonical CREATE TABLE.
+        """
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(ops)")}
+        if "subject_id" not in existing:
+            conn.execute("ALTER TABLE ops ADD COLUMN subject_id TEXT")
+            conn.execute("CREATE INDEX IF NOT EXISTS ops_subject_idx ON ops(subject_id)")
+        rows = conn.execute(
+            "SELECT rowid, kind, payload FROM ops WHERE subject_id IS NULL"
+        ).fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(row["payload"])
+            except (ValueError, TypeError):
+                continue
+            subject = subject_from(row["kind"], payload)
+            if subject:
+                conn.execute(
+                    "UPDATE ops SET subject_id = ? WHERE rowid = ?", (subject, row["rowid"])
+                )
 
     def _conn(self):
         if self._connection is None:
@@ -210,6 +267,7 @@ class OpLog:
         author_agent = _sanitize_agent(author_agent)
         payload_json = _sanitize_payload(payload)
         authored_at = _utc_now_iso()
+        subject_id = subject_from(kind, payload)
         hlc = self._clock.tick()
 
         placeholder = f"pending_{secrets.token_hex(8)}"
@@ -218,8 +276,8 @@ class OpLog:
             with conn:
                 cursor = conn.execute(
                     "INSERT INTO ops (op_id, origin_replica, origin_seq, hlc,"
-                    " author_agent, authored_at, kind, payload)"
-                    " VALUES (?, ?, NULL, ?, ?, ?, ?, ?)",
+                    " author_agent, authored_at, kind, payload, subject_id)"
+                    " VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)",
                     (
                         placeholder,
                         self.replica_id,
@@ -228,6 +286,7 @@ class OpLog:
                         authored_at,
                         kind,
                         payload_json,
+                        subject_id,
                     ),
                 )
                 rowid = cursor.lastrowid
@@ -237,6 +296,41 @@ class OpLog:
                 )
             row = conn.execute("SELECT rowid, * FROM ops WHERE rowid = ?", (rowid,)).fetchone()
         return self._op_dict(row)
+
+    # ── Fold-consumer support (RFC 004 step 2a) ──────────────────────────
+
+    def fold_cursor(self, consumer: str = "store") -> int:
+        """Last local seq (rowid) this consumer has folded; 0 when fresh."""
+        with self._lock:
+            conn = self._conn()
+            row = conn.execute(
+                "SELECT last_seq FROM fold_state WHERE consumer = ?", (consumer,)
+            ).fetchone()
+        return row["last_seq"] if row else 0
+
+    def set_fold_cursor(self, seq: int, consumer: str = "store") -> None:
+        if not isinstance(seq, int) or seq < 0:
+            raise ValueError("seq must be a non-negative integer")
+        with self._lock:
+            conn = self._conn()
+            with conn:
+                conn.execute(
+                    "INSERT INTO fold_state (consumer, last_seq) VALUES (?, ?)"
+                    " ON CONFLICT(consumer) DO UPDATE SET last_seq = excluded.last_seq",
+                    (consumer, seq),
+                )
+
+    def subject_head_hlc(self, subject_id: str) -> Optional[str]:
+        """Highest HLC seen for a merge subject across ALL origins — the
+        LWW head the fold consumer compares against."""
+        if not isinstance(subject_id, str) or not subject_id:
+            raise ValueError("subject_id must be a non-empty string")
+        with self._lock:
+            conn = self._conn()
+            row = conn.execute(
+                "SELECT max(hlc) AS head FROM ops WHERE subject_id = ?", (subject_id,)
+            ).fetchone()
+        return row["head"] if row else None
 
     # ── Read / replication surface (mirrors Logstream step 0) ────────────
 
@@ -348,8 +442,8 @@ class OpLog:
                     return False
                 conn.execute(
                     "INSERT INTO ops (op_id, origin_replica, origin_seq, hlc,"
-                    " author_agent, authored_at, kind, payload)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    " author_agent, authored_at, kind, payload, subject_id)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         op["op_id"],
                         op["origin_replica"],
@@ -359,6 +453,7 @@ class OpLog:
                         op["authored_at"],
                         op["kind"],
                         payload_json,
+                        subject_from(op["kind"], op["payload"]),
                     ),
                 )
         # Absorb the remote instant so our next local op sorts after it.

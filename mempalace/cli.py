@@ -1596,106 +1596,161 @@ def cmd_replica(args):
             sys.exit(1)
 
 
-def cmd_oplog(args):
-    """RFC 004 step 2a: canonical memory op-log — status + shadow verify."""
+def _cmd_oplog_status(palace_path, as_json):
     import json
 
+    from .oplog import OPLOG_DB_FILENAME, OpLog
+
+    db_path = os.path.join(palace_path, OPLOG_DB_FILENAME)
+    if not os.path.exists(db_path):
+        _logstream_fail(f"no op-log at {db_path} (no ops have been emitted yet)", as_json)
+    with OpLog(db_path) as log:
+        report = {
+            "palace": palace_path,
+            "replica_id": log.replica_id,
+            "ops": log.count(),
+            "by_kind": log.kind_histogram(),
+            "version_vector": log.version_vector(),
+        }
+    if as_json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        print(f"  op-log for {palace_path} ({report['replica_id']}): {report['ops']} ops")
+        for kind, count in sorted(report["by_kind"].items()):
+            print(f"    {kind}: {count}")
+        for origin, top in sorted(report["version_vector"].items()):
+            print(f"  origin {origin}: highest seq {top}")
+
+
+def _cmd_oplog_sync(args, palace_path, as_json):
+    import json
+
+    from .oplog import OPLOG_DB_FILENAME, OpLog
+    from .opsync import sync_all_memops, sync_memops_with_peer
+
+    try:
+        if args.peer:
+            from .transport import HttpsBearerTransport
+
+            with OpLog(os.path.join(palace_path, OPLOG_DB_FILENAME)) as log:
+                stats = sync_memops_with_peer(
+                    log,
+                    HttpsBearerTransport(palace_path),
+                    {"name": args.peer, "url": args.peer, "token": args.token or ""},
+                )
+                stats["peer_name"] = args.peer
+                results = [stats]
+        else:
+            results = sync_all_memops(palace_path)
+            if not results:
+                _logstream_fail(
+                    f"no peers configured ({palace_path}/peers.json) and no --peer given",
+                    as_json,
+                )
+    except Exception as exc:
+        _logstream_fail(str(exc), as_json)
+    if as_json:
+        print(json.dumps(results, indent=2, ensure_ascii=False))
+    else:
+        for stats in results:
+            if stats.get("error"):
+                print(f"  {stats['peer_name']}: ERROR {stats['error']}")
+            else:
+                print(
+                    f"  {stats['peer_name']} ({stats['peer_replica']}): "
+                    f"+{stats['pulled_ops']} ops {stats['per_origin']}"
+                )
+    if any(s.get("error") for s in results):
+        sys.exit(1)
+
+
+def _cmd_oplog_fold(palace_path, as_json):
+    import json
+
+    from .knowledge_graph import KnowledgeGraph
+    from .oplog import OPLOG_DB_FILENAME, OpLog
+    from .opfold import fold_ops
+    from .palace import get_collection
+
+    try:
+        with OpLog(os.path.join(palace_path, OPLOG_DB_FILENAME)) as log:
+            collection = get_collection(palace_path, create=True)
+            with KnowledgeGraph(db_path=os.path.join(palace_path, "knowledge_graph.sqlite3")) as kg:
+                chunk_size = max(1, int(MempalaceConfig().chunk_size or 800))
+                stats = fold_ops(log, collection, kg, chunk_size=chunk_size)
+    except Exception as exc:
+        _logstream_fail(str(exc), as_json)
+    if as_json:
+        print(json.dumps(stats, indent=2, ensure_ascii=False))
+    else:
+        applied = (
+            stats["applied_adds"]
+            + stats["applied_revises"]
+            + stats["applied_tombstones"]
+            + stats["applied_kg"]
+        )
+        print(
+            f"  folded {applied} op(s) (adds {stats['applied_adds']}, "
+            f"revises {stats['applied_revises']}, tombstones {stats['applied_tombstones']}, "
+            f"kg {stats['applied_kg']}); skipped own {stats['skipped_own']}, "
+            f"existing {stats['skipped_existing']}, stale {stats['skipped_stale']}"
+        )
+        if stats["conflicts"]:
+            print(f"  shadow-guard conflicts held: {stats['conflicts']}")
+            print(f"    sample: {stats['conflict_sample']}")
+        if stats["errors"]:
+            print(f"  ERRORS: {stats['errors']} — fold stopped for retry")
+            print(f"    sample: {stats['error_sample']}")
+    if stats.get("errors"):
+        sys.exit(1)
+
+
+def _cmd_oplog_verify(palace_path, as_json):
+    import json
+
+    from .oplog_verify import verify_shadow
+
+    try:
+        report = verify_shadow(palace_path)
+    except Exception as exc:
+        _logstream_fail(str(exc), as_json)
+    if as_json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        drawers = report["drawers"]
+        kg = report["kg"]
+        print(f"  {report['ops']} ops replayed against {report['palace']}")
+        print(f"  drawers: {drawers.get('ok', 0)}/{drawers.get('checked', 0)} ok")
+        for bucket in ("missing", "diverged", "not_tombstoned"):
+            count = drawers.get(f"{bucket}_count", 0)
+            if count:
+                print(f"    {bucket}: {count} — sample {drawers.get(bucket)}")
+        print(f"  kg: {kg.get('ok', 0)}/{kg.get('checked', 0)} ok")
+        for bucket in ("missing", "diverged", "entity_missing"):
+            count = kg.get(f"{bucket}_count", 0)
+            if count:
+                print(f"    {bucket}: {count} — sample {kg.get(bucket)}")
+        if report["clean"]:
+            print("  CLEAN — every op is reflected in the store")
+        else:
+            print("  DIVERGED — the shadow found store/op-log disagreement")
+    if not report["clean"]:
+        sys.exit(1)
+
+
+def cmd_oplog(args):
+    """RFC 004 step 2a: canonical memory op-log — status, sync, fold, verify."""
     as_json = getattr(args, "json", False)
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
 
     if args.oplog_action == "status":
-        from .oplog import OPLOG_DB_FILENAME, OpLog
-
-        db_path = os.path.join(palace_path, OPLOG_DB_FILENAME)
-        if not os.path.exists(db_path):
-            _logstream_fail(f"no op-log at {db_path} (no ops have been emitted yet)", as_json)
-        with OpLog(db_path) as log:
-            report = {
-                "palace": palace_path,
-                "replica_id": log.replica_id,
-                "ops": log.count(),
-                "by_kind": log.kind_histogram(),
-                "version_vector": log.version_vector(),
-            }
-        if as_json:
-            print(json.dumps(report, indent=2, ensure_ascii=False))
-        else:
-            print(f"  op-log for {palace_path} ({report['replica_id']}): {report['ops']} ops")
-            for kind, count in sorted(report["by_kind"].items()):
-                print(f"    {kind}: {count}")
-            for origin, top in sorted(report["version_vector"].items()):
-                print(f"  origin {origin}: highest seq {top}")
-        return
-
-    if args.oplog_action == "sync":
-        from .oplog import OPLOG_DB_FILENAME, OpLog
-        from .opsync import sync_all_memops, sync_memops_with_peer
-
-        try:
-            if args.peer:
-                from .transport import HttpsBearerTransport
-
-                with OpLog(os.path.join(palace_path, OPLOG_DB_FILENAME)) as log:
-                    stats = sync_memops_with_peer(
-                        log,
-                        HttpsBearerTransport(palace_path),
-                        {"name": args.peer, "url": args.peer, "token": args.token or ""},
-                    )
-                    stats["peer_name"] = args.peer
-                    results = [stats]
-            else:
-                results = sync_all_memops(palace_path)
-                if not results:
-                    _logstream_fail(
-                        f"no peers configured ({palace_path}/peers.json) and no --peer given",
-                        as_json,
-                    )
-        except Exception as exc:
-            _logstream_fail(str(exc), as_json)
-        if as_json:
-            print(json.dumps(results, indent=2, ensure_ascii=False))
-        else:
-            for stats in results:
-                if stats.get("error"):
-                    print(f"  {stats['peer_name']}: ERROR {stats['error']}")
-                else:
-                    print(
-                        f"  {stats['peer_name']} ({stats['peer_replica']}): "
-                        f"+{stats['pulled_ops']} ops {stats['per_origin']}"
-                    )
-        if any(s.get("error") for s in results):
-            sys.exit(1)
-        return
-
-    if args.oplog_action == "verify":
-        from .oplog_verify import verify_shadow
-
-        try:
-            report = verify_shadow(palace_path)
-        except Exception as exc:
-            _logstream_fail(str(exc), as_json)
-        if as_json:
-            print(json.dumps(report, indent=2, ensure_ascii=False))
-        else:
-            drawers = report["drawers"]
-            kg = report["kg"]
-            print(f"  {report['ops']} ops replayed against {report['palace']}")
-            print(f"  drawers: {drawers.get('ok', 0)}/{drawers.get('checked', 0)} ok")
-            for bucket in ("missing", "diverged", "not_tombstoned"):
-                count = drawers.get(f"{bucket}_count", 0)
-                if count:
-                    print(f"    {bucket}: {count} — sample {drawers.get(bucket)}")
-            print(f"  kg: {kg.get('ok', 0)}/{kg.get('checked', 0)} ok")
-            for bucket in ("missing", "diverged", "entity_missing"):
-                count = kg.get(f"{bucket}_count", 0)
-                if count:
-                    print(f"    {bucket}: {count} — sample {kg.get(bucket)}")
-            if report["clean"]:
-                print("  CLEAN — every op is reflected in the store")
-            else:
-                print("  DIVERGED — the shadow found store/op-log disagreement")
-        if not report["clean"]:
-            sys.exit(1)
+        _cmd_oplog_status(palace_path, as_json)
+    elif args.oplog_action == "sync":
+        _cmd_oplog_sync(args, palace_path, as_json)
+    elif args.oplog_action == "fold":
+        _cmd_oplog_fold(palace_path, as_json)
+    elif args.oplog_action == "verify":
+        _cmd_oplog_verify(palace_path, as_json)
 
 
 def cmd_palace_set_embedder(args):
@@ -3425,6 +3480,13 @@ def main():
     )
     p_oplog_sync.add_argument("--token", default=None, help="Bearer token for --peer")
     p_oplog_sync.add_argument("--json", action="store_true", help="Machine-readable output")
+    p_oplog_fold = oplog_sub.add_parser(
+        "fold",
+        help="Apply pulled remote ops to the local store (STOP the hub first — "
+        "this writes the palace directly, same single-writer rule as replica pull; "
+        "a running hub folds on its own sync cadence)",
+    )
+    p_oplog_fold.add_argument("--json", action="store_true", help="Machine-readable output")
 
     p_palace = sub.add_parser("palace", help="Palace maintenance commands")
     palace_sub = p_palace.add_subparsers(dest="palace_action")
