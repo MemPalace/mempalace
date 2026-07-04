@@ -113,6 +113,48 @@ class TestDispatch:
         assert listed["count"] == 1
         assert listed["events"][0]["body"] == APPEND_ARGS["body"]
 
+    def test_preview_truncates_long_bodies(self, patched_server):
+        long_body = "x" * 5000
+        _result(
+            _call(
+                patched_server,
+                "mempalace_event_append",
+                {**APPEND_ARGS, "body": long_body},
+            )
+        )
+        # Full (default): the whole verbatim body comes back.
+        full = _result(
+            _call(patched_server, "mempalace_event_list", {"correlation_id": "task_mcp"})
+        )
+        assert full["events"][0]["body"] == long_body
+        assert "body_truncated" not in full["events"][0]
+        # Preview: body trimmed to the excerpt, with the length marker.
+        prev = _result(
+            _call(
+                patched_server,
+                "mempalace_event_list",
+                {"correlation_id": "task_mcp", "preview": True},
+            )
+        )
+        ev = prev["events"][0]
+        assert ev["body"] == long_body[: mcp_server._PREVIEW_BODY_CHARS]
+        assert ev["body_truncated"] is True
+        assert ev["body_length"] == 5000
+        # Routing fields survive the preview so the stream stays scannable.
+        assert ev["correlation_id"] == "task_mcp" and ev["from_agent"] == "mac-codex"
+
+    def test_preview_leaves_short_bodies_intact(self, patched_server):
+        _result(_call(patched_server, "mempalace_event_append", APPEND_ARGS))
+        prev = _result(
+            _call(
+                patched_server,
+                "mempalace_event_list",
+                {"correlation_id": "task_mcp", "preview": True},
+            )
+        )
+        assert prev["events"][0]["body"] == APPEND_ARGS["body"]
+        assert "body_truncated" not in prev["events"][0]
+
     def test_wait_returns_existing_event(self, patched_server):
         _result(_call(patched_server, "mempalace_event_append", APPEND_ARGS))
         result = _result(

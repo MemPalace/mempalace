@@ -4088,6 +4088,27 @@ def tool_event_append(
     return {"success": True, "event": event}
 
 
+_PREVIEW_BODY_CHARS = 200
+
+
+def _preview_event(event: dict) -> dict:
+    """Truncate a verbatim body to a scannable excerpt (preview mode).
+
+    Event bodies are stored verbatim and fleet status updates run to several
+    KB, so listing many events full-body is a large payload. Preview keeps all
+    routing/metadata fields and trims only ``body`` — enough to scan the stream
+    and decide which events to re-fetch in full (a targeted ``since_event_id``
+    call returns the untouched body)."""
+    body = event.get("body") or ""
+    if len(body) <= _PREVIEW_BODY_CHARS:
+        return event
+    out = dict(event)
+    out["body"] = body[:_PREVIEW_BODY_CHARS]
+    out["body_truncated"] = True
+    out["body_length"] = len(body)
+    return out
+
+
 def tool_event_list(
     stream: str = None,
     room: str = None,
@@ -4099,8 +4120,15 @@ def tool_event_list(
     since_event_id: str = None,
     since_created_at: str = None,
     limit: int = 50,
+    preview: bool = False,
 ):
-    """List coordination events with structured filters, oldest first."""
+    """List coordination events with structured filters, oldest first.
+
+    ``preview=True`` truncates each event's verbatim body to a short excerpt
+    (marking ``body_truncated`` + ``body_length``) so scanning many events
+    stays cheap; re-fetch a specific event's full body with a targeted
+    ``since_event_id``.
+    """
     try:
         events = _call_logstream(
             lambda ls: ls.list_events(
@@ -4118,6 +4146,8 @@ def tool_event_list(
         )
     except ValueError as e:
         return {"error": str(e)}
+    if preview:
+        events = [_preview_event(e) for e in events]
     return {"events": events, "count": len(events)}
 
 
@@ -4950,6 +4980,14 @@ TOOLS = {
                     ),
                 },
                 "limit": {"type": "integer", "description": "Max events to return (default 50)"},
+                "preview": {
+                    "type": "boolean",
+                    "description": (
+                        "Truncate each event body to a short excerpt (marks body_truncated +"
+                        " body_length) so scanning many events stays cheap; re-fetch a specific"
+                        " event's full body with a targeted since_event_id (default false)"
+                    ),
+                },
             },
         },
         "handler": tool_event_list,
