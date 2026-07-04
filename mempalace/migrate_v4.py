@@ -21,10 +21,11 @@ mandates — **plan first, on a copy**:
   ``source_drawer_id``, tunnel endpoints) point at drawers that will be
   renamed. Nothing is written.
 
-- The applier (separate, copy-first, vectors copied not re-derived) consumes a
-  validated plan. It is intentionally not in this first cut: you do not rewrite
-  a six-figure palace before seeing the plan's collision count and blast radius
-  on the real data.
+- :func:`apply_v4_migration` (copy-first, vectors copied not re-derived) runs
+  once a plan is validated. It is two-pass and streaming — content+metadata to
+  decide winners, then a second pass that carries vectors to the target a write
+  batch at a time — so a six-figure palace rewrites in bounded memory rather
+  than materializing every drawer and vector at once.
 """
 
 import logging
@@ -149,42 +150,6 @@ def plan_v4_migration(collection, kg_source_ids=None, tunnel_drawer_ids=None, ba
     }
 
 
-def _scan_rows(collection, batch, with_embeddings):
-    """Group physical rows into logical drawers, keeping per-row detail.
-
-    Returns ``{logical_id: {"rows": [(index, row_id, content, meta, emb)],
-    "meta": winner_meta}}``. ``emb`` is None when embeddings are not requested.
-    """
-    include = ["documents", "metadatas"] + (["embeddings"] if with_embeddings else [])
-    groups: dict = {}
-    offset = 0
-    while True:
-        res = collection.get(limit=batch, offset=offset, include=include)
-        ids = list((res.get("ids") if hasattr(res, "get") else None) or [])
-        docs = list((res.get("documents") if hasattr(res, "get") else None) or [])
-        metas = list((res.get("metadatas") if hasattr(res, "get") else None) or [])
-        embs = (res.get("embeddings") if hasattr(res, "get") else None) if with_embeddings else None
-        embs = list(embs) if embs is not None else [None] * len(ids)
-        if not ids:
-            break
-        for row_id, doc, meta, emb in zip(ids, docs, metas, embs):
-            meta = meta or {}
-            if row_id.startswith("_reg_") or meta.get("ingest_mode") == "registry":
-                continue
-            parent = meta.get("parent_drawer_id")
-            logical_id = parent or row_id
-            index = meta.get("chunk_index")
-            index = index if isinstance(index, int) else 0
-            g = groups.setdefault(logical_id, {"rows": [], "meta": None})
-            g["rows"].append((index, row_id, doc or "", meta, emb))
-            if g["meta"] is None or index == 0:
-                g["meta"] = meta
-        if len(ids) < batch:
-            break
-        offset += len(ids)
-    return groups
-
-
 def _placement_key(meta: dict):
     """Winner-selection key for a content-collision group. Latest filed_at wins
     (mirroring the org.file last-writer-wins placement register), preferring a
@@ -195,7 +160,51 @@ def _placement_key(meta: dict):
     return (has_place, str(meta.get("filed_at") or ""))
 
 
-def apply_v4_migration(source_col, target_col, batch: int = 2000, dry_run: bool = False) -> dict:
+def _plan_winners(collection, batch):
+    """Pass 1 (no embeddings): reassemble logical drawers, bucket by v4 id, and
+    pick each content-collision group's winner.
+
+    Returns ``(winners, alias, counts)`` where ``winners`` maps the WINNING
+    logical id -> v4 id (the drawers whose rows get written) and ``alias`` maps
+    EVERY changing/merging logical id -> v4 id (so inbound references can be
+    repointed). Vectors are never read here — the palace's ~GB of embeddings
+    stay on disk until the write pass streams them a batch at a time.
+    """
+    drawers, _rows_scanned, _reg = _scan_logical_drawers(collection, batch)
+    by_v4: dict = {}
+    alias: dict = {}
+    for logical_id, info in drawers.items():
+        content = info["content"]
+        if not content:
+            continue
+        v4_id = make_drawer_id_content_pure(content)
+        alias[logical_id] = v4_id
+        by_v4.setdefault(v4_id, []).append((logical_id, info["meta"] or {}))
+    winners: dict = {}
+    written = merged_away = 0
+    for v4_id, members in by_v4.items():
+        # Deterministic winner: best placement, then stable id sort.
+        winner_id, _meta = sorted(
+            members, key=lambda m: (_placement_key(m[1]), m[0]), reverse=True
+        )[0]
+        winners[winner_id] = v4_id
+        written += 1
+        merged_away += len(members) - 1
+    return (
+        winners,
+        alias,
+        {"logical_drawers": len(alias), "written": written, "merged_away": merged_away},
+    )
+
+
+def _get_lists(res, key):
+    raw = res.get(key) if hasattr(res, "get") else None
+    return list(raw) if raw is not None else None
+
+
+def apply_v4_migration(
+    source_col, target_col, batch: int = 2000, write_batch: int = 1000, dry_run: bool = False
+) -> dict:
     """Rewrite ``source_col`` into ``target_col`` under content-pure v4 ids.
 
     Copy-first and non-destructive: the source is only read; the operator gives
@@ -204,67 +213,92 @@ def apply_v4_migration(source_col, target_col, batch: int = 2000, dry_run: bool 
     chosen by :func:`_placement_key`); every merged-away id still maps to the v4
     id in the returned alias so inbound references can be repointed.
 
+    Two-pass and streaming so a six-figure palace migrates in bounded memory:
+    pass 1 (:func:`_plan_winners`) reads content + metadata only to decide the
+    winners and alias; pass 2 re-streams the source WITH embeddings and upserts
+    the winners' rows to the target in blocks of ``write_batch``. Peak memory is
+    one write batch of vectors, not the whole source — the earlier all-in-RAM
+    materialization peaked at multiple GB on the real palace. Batched upserts
+    also cut the per-call + index-build overhead that dominated the write phase.
+
     Returns ``{"logical_drawers", "written", "merged_away", "rows_written",
     "alias": {old_id: v4_id}}``.
     """
-    groups = _scan_rows(source_col, batch, with_embeddings=not dry_run)
-
-    # Bucket source logical drawers by their v4 id (content collisions merge).
-    by_v4: dict = {}
-    alias: dict = {}
-    for logical_id, g in groups.items():
-        content = "".join(doc for _i, _rid, doc, _m, _e in sorted(g["rows"]))
-        if not content:
-            continue
-        v4_id = make_drawer_id_content_pure(content)
-        alias[logical_id] = v4_id
-        by_v4.setdefault(v4_id, []).append((logical_id, g))
-
+    winners, alias, counts = _plan_winners(source_col, batch)
     stats = {
-        "logical_drawers": len(alias),
-        "written": 0,
-        "merged_away": 0,
+        "logical_drawers": counts["logical_drawers"],
+        "written": counts["written"],
+        "merged_away": counts["merged_away"],
         "rows_written": 0,
         "alias": alias,
     }
+    if dry_run:
+        return stats
 
-    for v4_id, members in by_v4.items():
-        # Deterministic winner: best placement, then stable id sort.
-        winner_id, winner = sorted(
-            members, key=lambda m: (_placement_key(m[1]["meta"]), m[0]), reverse=True
-        )[0]
-        stats["merged_away"] += len(members) - 1
-        stats["written"] += 1
-        if dry_run:
-            continue
+    # Rows carrying a copied vector and rows without are upserted separately: a
+    # single upsert can't mix present and absent embeddings, and a row with no
+    # vector is left for the target to embed on write.
+    emb_ids, emb_docs, emb_metas, emb_vecs = [], [], [], []
+    plain_ids, plain_docs, plain_metas = [], [], []
 
-        rows = sorted(winner["rows"])
-        chunked = len(rows) > 1 or (rows and rows[0][3].get("parent_drawer_id"))
-        out_ids, out_docs, out_metas, out_embs = [], [], [], []
-        any_emb = False
-        for index, _old_row_id, content, meta, emb in rows:
-            new_row_id = f"{v4_id}_chunk_{index:06d}" if chunked else v4_id
+    def flush():
+        if emb_ids:
+            target_col.upsert(
+                ids=emb_ids, documents=emb_docs, metadatas=emb_metas, embeddings=emb_vecs
+            )
+            stats["rows_written"] += len(emb_ids)
+            emb_ids.clear(), emb_docs.clear(), emb_metas.clear(), emb_vecs.clear()
+        if plain_ids:
+            target_col.upsert(ids=plain_ids, documents=plain_docs, metadatas=plain_metas)
+            stats["rows_written"] += len(plain_ids)
+            plain_ids.clear(), plain_docs.clear(), plain_metas.clear()
+
+    offset = 0
+    while True:
+        res = source_col.get(
+            limit=batch, offset=offset, include=["documents", "metadatas", "embeddings"]
+        )
+        ids = _get_lists(res, "ids") or []
+        if not ids:
+            break
+        docs = _get_lists(res, "documents") or [""] * len(ids)
+        metas = _get_lists(res, "metadatas") or [{}] * len(ids)
+        embs = _get_lists(res, "embeddings")
+        embs = embs if embs is not None else [None] * len(ids)
+        for row_id, doc, meta, emb in zip(ids, docs, metas, embs):
+            meta = meta or {}
+            if row_id.startswith("_reg_") or meta.get("ingest_mode") == "registry":
+                continue
+            parent = meta.get("parent_drawer_id")
+            logical_id = parent or row_id
+            v4_id = winners.get(logical_id)
+            if v4_id is None:
+                continue  # a merged-away loser, an empty drawer, or not a drawer
             new_meta = dict(meta)
             new_meta["id_recipe"] = "v4"
-            if chunked:
+            if parent:
+                index = meta.get("chunk_index")
+                index = index if isinstance(index, int) else 0
+                new_row_id = f"{v4_id}_chunk_{index:06d}"
                 new_meta["parent_drawer_id"] = v4_id
                 new_meta["chunk_index"] = index
-            out_ids.append(new_row_id)
-            out_docs.append(content)
-            out_metas.append(new_meta)
-            out_embs.append(emb)
+            else:
+                new_row_id = v4_id
             if emb is not None:
-                any_emb = True
-        if any_emb and all(e is not None for e in out_embs):
-            target_col.upsert(
-                ids=out_ids, documents=out_docs, metadatas=out_metas, embeddings=out_embs
-            )
-        else:
-            # Missing a vector somewhere — let the target embed on write rather
-            # than upsert a half-vectored batch.
-            target_col.upsert(ids=out_ids, documents=out_docs, metadatas=out_metas)
-        stats["rows_written"] += len(out_ids)
-
+                emb_ids.append(new_row_id)
+                emb_docs.append(doc or "")
+                emb_metas.append(new_meta)
+                emb_vecs.append(emb)
+            else:
+                plain_ids.append(new_row_id)
+                plain_docs.append(doc or "")
+                plain_metas.append(new_meta)
+            if len(emb_ids) >= write_batch or len(plain_ids) >= write_batch:
+                flush()
+        if len(ids) < batch:
+            break
+        offset += len(ids)
+    flush()
     return stats
 
 

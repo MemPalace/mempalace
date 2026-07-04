@@ -214,6 +214,73 @@ class TestApplier:
         assert stats["written"] == 1 and stats["merged_away"] == 1
         assert tgt.rows == {}  # nothing written on a dry run
 
+    def test_pass_one_reads_no_embeddings_and_writes_are_batched(self):
+        # The refactor's whole point: the winner-planning pass must not pull the
+        # palace's vectors into RAM, and the write pass must upsert in bounded
+        # blocks — not one giant all-vectors call, not one call per drawer.
+        class _SpyCollection(_FakeCollection):
+            def __init__(self):
+                super().__init__()
+                self.get_includes = []  # include= for every get() (the scans)
+                self.upsert_sizes = []  # row count of every upsert (the writes)
+
+            def get(self, ids=None, where=None, include=None, limit=None, offset=None):
+                self.get_includes.append(list(include or []))
+                return super().get(
+                    ids=ids, where=where, include=include, limit=limit, offset=offset
+                )
+
+            def upsert(self, ids, documents, metadatas, embeddings=None):
+                self.upsert_sizes.append(len(ids))
+                super().upsert(ids, documents, metadatas, embeddings=embeddings)
+
+        src = _SpyCollection()
+        for i in range(25):  # 25 distinct single-row drawers, each with a vector
+            src.upsert(
+                ids=[f"drawer_w_r_{i}"],
+                documents=[f"body number {i}"],
+                metadatas=[{"wing": "w", "room": "r"}],
+                embeddings=[[float(i)]],
+            )
+        tgt = _SpyCollection()
+        stats = apply_v4_migration(src, tgt, batch=100, write_batch=10)
+
+        assert stats["written"] == 25 and stats["rows_written"] == 25
+        # Pass 1 scanned content+metadata but NEVER embeddings.
+        pass_one = [inc for inc in src.get_includes if "embeddings" not in inc]
+        assert pass_one, "expected an embedding-free planning scan"
+        assert all("documents" in inc and "metadatas" in inc for inc in pass_one)
+        # Pass 2 did read embeddings (to copy them).
+        assert any("embeddings" in inc for inc in src.get_includes)
+        # Writes are batched at write_batch, not one-per-drawer, not one-giant.
+        assert max(tgt.upsert_sizes) <= 10
+        assert len(tgt.upsert_sizes) == 3  # 25 rows / 10 -> 10 + 10 + 5
+
+    def test_row_missing_vector_is_written_for_target_to_embed(self):
+        # A drawer whose vector didn't come back is still migrated — upserted
+        # without an embedding so the target derives one, kept out of the
+        # vector-carrying batch.
+        src = _FakeCollection()
+        src.upsert(
+            ids=["drawer_w_r_hasvec"],
+            documents=["has a vector"],
+            metadatas=[{"wing": "w"}],
+            embeddings=[[0.5]],
+        )
+        src.upsert(
+            ids=["drawer_w_r_novec"],
+            documents=["missing a vector"],
+            metadatas=[{"wing": "w"}],
+            embeddings=[None],
+        )
+        tgt = _FakeCollection()
+        stats = apply_v4_migration(src, tgt)
+        assert stats["rows_written"] == 2
+        v_has = make_drawer_id_content_pure("has a vector")
+        v_no = make_drawer_id_content_pure("missing a vector")
+        assert tgt.rows[v_has][2] == [0.5]  # vector copied
+        assert tgt.rows[v_no][2] is None  # left for the target to embed
+
     def test_migrated_palace_replans_to_zero_changes(self):
         # Idempotency: applying, then planning the target, shows all v4.
         src = _FakeCollection()
