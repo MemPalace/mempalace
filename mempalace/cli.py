@@ -1335,11 +1335,18 @@ def cmd_migrate_ids(args):
         f"({stats['merged_away']:,} merged away, {stats['rows_written']:,} rows), "
         f"KG refs repointed: {kg_updated}"
     )
+    unreadable = stats.get("vectors_unreadable", 0)
+    if unreadable:
+        print(
+            f"  ⚠ {unreadable:,} row(s) had an unreadable source vector (localized index "
+            f"damage in the source) — migrated without a vector; the target re-embeds them. "
+            f"Consider `mempalace --palace <source> repair` on the source palace."
+        )
     print("\n  NEXT (run against the target, validate, then swap it in):")
     print(f"    mempalace --palace {target} compress        # rebuild the closet index at v4 ids")
     print(f"    mempalace --palace {target} oplog promote    # build the v4 op-log")
     print(f"    mempalace --palace {target} oplog verify     # must report CLEAN")
-    print(f"    mempalace --palace {target} search \"...\"      # confirm recall")
+    print(f'    mempalace --palace {target} search "..."      # confirm recall')
 
 
 def cmd_status(args):

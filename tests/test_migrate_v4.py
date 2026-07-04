@@ -15,14 +15,21 @@ from mempalace.migrate_v4 import apply_v4_migration, plan_v4_migration
 class _FakeCollection:
     def __init__(self):
         self.rows = {}  # id -> (doc, meta, emb)
+        self.unreadable = set()  # ids whose embedding read raises (index damage)
 
     def get(self, ids=None, where=None, include=None, limit=None, offset=None):
-        hits = [(i, d, m, e) for i, (d, m, e) in self.rows.items()]
-        if offset:
-            hits = hits[offset:]
-        if limit is not None:
-            hits = hits[:limit]
+        if ids is not None:
+            hits = [(i, *self.rows[i]) for i in ids if i in self.rows]
+        else:
+            hits = [(i, d, m, e) for i, (d, m, e) in self.rows.items()]
+            if offset:
+                hits = hits[offset:]
+            if limit is not None:
+                hits = hits[:limit]
         want_emb = include is not None and "embeddings" in include
+        if want_emb and any(h[0] in self.unreadable for h in hits):
+            # ChromaDB fails the whole batch when any row's vector is unfindable.
+            raise RuntimeError("Error finding id")
         return GetResult(
             ids=[h[0] for h in hits],
             documents=[h[1] for h in hits],
@@ -280,6 +287,40 @@ class TestApplier:
         v_no = make_drawer_id_content_pure("missing a vector")
         assert tgt.rows[v_has][2] == [0.5]  # vector copied
         assert tgt.rows[v_no][2] is None  # left for the target to embed
+
+    def test_unreadable_vector_is_re_embedded_not_fatal(self):
+        # A real six-figure palace can have localized vector-index damage: a row
+        # whose metadata is present but whose embedding read raises. The
+        # migration must migrate that row without its vector (target re-embeds),
+        # count it, and keep going — never crash the whole run.
+        src = _FakeCollection()
+        src.upsert(
+            ids=["drawer_w_r_good"],
+            documents=["healthy row"],
+            metadatas=[{"wing": "w"}],
+            embeddings=[[0.9]],
+        )
+        src.upsert(
+            ids=["diary_w_r_damaged_chunk_000000", "diary_w_r_damaged_chunk_000001"],
+            documents=["damaged ", "vector"],
+            metadatas=[
+                {"parent_drawer_id": "diary_w_r_damaged", "chunk_index": 0, "wing": "w"},
+                {"parent_drawer_id": "diary_w_r_damaged", "chunk_index": 1, "wing": "w"},
+            ],
+            embeddings=[[0.1], [0.2]],
+        )
+        # One of the damaged drawer's chunks can't have its vector read.
+        src.unreadable.add("diary_w_r_damaged_chunk_000001")
+
+        tgt = _FakeCollection()
+        stats = apply_v4_migration(src, tgt, write_batch=1000)
+        assert stats["vectors_unreadable"] == 1
+        assert stats["rows_written"] == 3  # every row still migrated
+        v_good = make_drawer_id_content_pure("healthy row")
+        v_dmg = make_drawer_id_content_pure("damaged vector")
+        assert tgt.rows[v_good][2] == [0.9]  # healthy vector copied
+        assert tgt.rows[f"{v_dmg}_chunk_000000"][2] == [0.1]  # readable chunk copied
+        assert tgt.rows[f"{v_dmg}_chunk_000001"][2] is None  # damaged chunk re-embeds
 
     def test_migrated_palace_replans_to_zero_changes(self):
         # Idempotency: applying, then planning the target, shows all v4.
