@@ -220,6 +220,82 @@ class TestDrawerFold:
         assert rig["b"].fold_cursor(FOLD_CONSUMER) < rig["b"].count()
 
 
+class _ScanBanCollection(_FakeCollection):
+    """A store that forbids the parent_drawer_id where-scan. get-by-ids is an
+    indexed primary-key lookup; a where-filter scans + metadata-decodes every
+    row, which drove fold drain to hours on large palaces. The fold must reach
+    a chunked drawer's rows through the index alone."""
+
+    def __init__(self):
+        super().__init__()
+        self.id_gets = 0
+
+    def get(self, ids=None, where=None, include=None):
+        if where is not None:
+            raise AssertionError(f"fold triggered a full-collection where-scan: {where}")
+        if ids is not None:
+            self.id_gets += 1
+        return super().get(ids=ids, where=where, include=include)
+
+
+class TestFoldNeverScans:
+    """Regression pin for the fold-throughput fix (RFC 004 2a): resolving a
+    chunked drawer's presence, provenance, and physical rows must never fall
+    back to a parent_drawer_id where-scan — one scan per fold op is O(N) per op
+    and collapsed fold to a ~13h drain on a 156k-drawer palace."""
+
+    @pytest.fixture
+    def rig(self, tmp_dir):
+        paths = {n: os.path.join(tmp_dir, f"palace_{n}") for n in ("a", "b")}
+        for p in paths.values():
+            os.makedirs(p)
+        a = OpLog(db_path=os.path.join(paths["a"], OPLOG_DB_FILENAME))
+        b = OpLog(db_path=os.path.join(paths["b"], OPLOG_DB_FILENAME))
+        kg = KnowledgeGraph(db_path=os.path.join(paths["b"], "kg.sqlite3"))
+        yield {"a": a, "b": b, "kg": kg, "col": _ScanBanCollection(), "paths": paths}
+        a.close()
+        b.close()
+        kg.close()
+
+    def test_chunked_add_revise_tombstone_uses_only_indexed_gets(self, rig):
+        # A large (multi-chunk) drawer through its whole lifecycle: add, then a
+        # revise that rewrites the chunk layout, then a tombstone. Every step
+        # must resolve rows by id — the _ScanBanCollection raises on any where.
+        big = "0123456789" * 4  # chunk_size=10 -> 4 chunks
+        _ship(rig, "drawer.add", {"drawer_id": "big", "content": big})
+        assert _fold(rig)["applied_adds"] == 1
+        assert rig["col"].logical_content("big") == big
+
+        _ship(rig, "drawer.revise", {"drawer_id": "big", "content": "0123456789" * 6})
+        assert _fold(rig)["applied_revises"] == 1
+        assert rig["col"].logical_content("big") == "0123456789" * 6
+        # The revise shrank/grew the chunk set; no stale chunk rows survive.
+        live = {i for i in rig["col"].rows if i.startswith("big_chunk_")}
+        assert live == {_chunk_id_str("big", i) for i in range(6)}
+
+        _ship(rig, "drawer.tombstone", {"drawer_id": "big"})
+        assert _fold(rig)["applied_tombstones"] == 1
+        assert rig["col"].logical_content("big") is None
+        assert not any(i.startswith("big") for i in rig["col"].rows)
+
+    def test_single_row_drawer_resolves_in_one_get(self, rig):
+        # A short (unchunked) add-skip is the fold's hot path: presence must
+        # cost exactly one indexed get, never a probe for chunks it lacks.
+        _ship(rig, "drawer.add", {"drawer_id": "d1", "content": "short"})
+        _fold(rig)
+        before = rig["col"].id_gets
+        # A duplicate add for the same drawer (a fresh op, new op_id) the fold
+        # must process and skip as already-present.
+        _ship(rig, "drawer.add", {"drawer_id": "d1", "content": "short"})
+        stats = _fold(rig)
+        assert stats["skipped_existing"] == 1
+        assert rig["col"].id_gets - before == 1  # single presence get, no more
+
+
+def _chunk_id_str(drawer_id: str, index: int) -> str:
+    return f"{drawer_id}_chunk_{index:06d}"
+
+
 class TestKgFold:
     def test_assert_close_entity_flow(self, rig):
         _ship(

@@ -63,22 +63,62 @@ def _result_lists(result):
     )
 
 
+# Chunk ids are contiguous from 0, so an unknown-length chunked drawer's
+# physical rows are reconstructed by indexed get-by-ids in blocks — never a
+# full-collection scan. One block covers any realistically-sized drawer.
+_CHUNK_PROBE = 256
+
+
+def _chunk_id(drawer_id: str, index: int) -> str:
+    return f"{drawer_id}_chunk_{index:06d}"
+
+
 def _logical_state(collection, drawer_id: str):
-    """Presence + provenance of a logical drawer: its physical row ids,
-    the replica_origin stamp, and the last folded op_hlc."""
-    ids, _docs, metas = _result_lists(collection.get(ids=[drawer_id], include=["metadatas"]))
-    if not ids:
-        ids, _docs, metas = _result_lists(
-            collection.get(where={"parent_drawer_id": drawer_id}, include=["metadatas"])
-        )
+    """Presence + provenance of a logical drawer: whether it is a single row
+    or chunked, its replica_origin stamp, and the last folded op_hlc.
+
+    A drawer is stored EITHER as one row under its bare id (content at or under
+    the chunk limit) OR as contiguous ``_chunk_000000..`` rows. Both cases are
+    resolved by a single indexed get of the bare id and chunk 0 — never a
+    full-collection where-scan over ``parent_drawer_id`` (which decoded every
+    row's metadata per fold op and drove fold drain to hours on large palaces).
+    The full physical id set is resolved lazily by ``_physical_ids`` only when
+    an op actually mutates the store, keeping the hot add-skip path to one get.
+    """
+    ids, _docs, metas = _result_lists(
+        collection.get(ids=[drawer_id, _chunk_id(drawer_id, 0)], include=["metadatas"])
+    )
     if not ids:
         return None
-    meta = metas[0] or {}
+    single = drawer_id in ids
+    # Provenance is identical across a drawer's rows; read it off whichever row
+    # came back (the bare id for a single-row drawer, else chunk 0).
+    meta = (metas[ids.index(drawer_id)] if single else metas[0]) or {}
     return {
-        "ids": ids,
+        "single": single,
         "replica_origin": meta.get(REPLICA_ORIGIN_KEY) or None,
         "op_hlc": meta.get(OP_HLC_KEY) or None,
     }
+
+
+def _physical_ids(collection, drawer_id: str, state: dict) -> list[str]:
+    """The physical row ids of a present logical drawer, resolved through the
+    (collection, id) index. Called only at mutation sites (tombstone delete,
+    revise stale-cleanup), so the add-skip path never pays for it."""
+    if state["single"]:
+        return [drawer_id]
+    found: list[str] = []
+    start = 0
+    while True:
+        block = [_chunk_id(drawer_id, i) for i in range(start, start + _CHUNK_PROBE)]
+        got, _docs, _metas = _result_lists(collection.get(ids=block, include=["metadatas"]))
+        gotset = set(got)
+        run = [cid for cid in block if cid in gotset]
+        found.extend(run)
+        if len(run) < _CHUNK_PROBE:  # a gap ends the contiguous chunk run
+            break
+        start += _CHUNK_PROBE
+    return found
 
 
 def _chunk_rows(drawer_id: str, content: str, base_meta: dict, chunk_size: int):
@@ -128,7 +168,7 @@ def _apply_drawer_op(op: dict, collection, chunk_size: int, stats: dict) -> None
         if state is None:
             stats["skipped_existing"] += 1  # already absent — idempotent
             return
-        collection.delete(ids=state["ids"])
+        collection.delete(ids=_physical_ids(collection, drawer_id, state))
         stats["applied_tombstones"] += 1
         return
 
@@ -152,7 +192,12 @@ def _apply_drawer_op(op: dict, collection, chunk_size: int, stats: dict) -> None
     ids, docs, metas = _chunk_rows(drawer_id, content, base_meta, chunk_size)
     collection.upsert(ids=ids, documents=docs, metadatas=metas)
     if state is not None:
-        stale = [row_id for row_id in state["ids"] if row_id not in set(ids)]
+        new_ids = set(ids)
+        stale = [
+            row_id
+            for row_id in _physical_ids(collection, drawer_id, state)
+            if row_id not in new_ids
+        ]
         if stale:
             collection.delete(ids=stale)
         stats["applied_revises"] += 1
