@@ -7,9 +7,16 @@ that merge), already-v4 drawers, and the inbound references (KG source_drawer_id
 tunnels) that a rewrite would have to remap.
 """
 
+import json
+import os
+
 from mempalace.backends.base import GetResult
 from mempalace.ids import make_drawer_id_content_pure
-from mempalace.migrate_v4 import apply_v4_migration, plan_v4_migration
+from mempalace.migrate_v4 import (
+    apply_v4_migration,
+    copy_replica_sidecars,
+    plan_v4_migration,
+)
 
 
 class _FakeCollection:
@@ -337,3 +344,61 @@ class TestApplier:
         assert plan["logical_drawers"] == 2
         assert plan["already_v4"] == 2
         assert plan["changing"] == 0
+
+
+class TestReplicaSidecars:
+    """The live-swap contract: the migrated target must be the SAME replica.
+
+    ``copy_replica_sidecars`` carries identity + coordination state
+    (replica.json, logstream, peers, embedder config) and deliberately never
+    carries the op-log (rebuilt by re-promotion in the coordinated fleet
+    window) or the derived vector cache.
+    """
+
+    def _source(self, tmp_dir):
+        src = os.path.join(tmp_dir, "src_palace")
+        os.makedirs(src)
+        with open(os.path.join(src, "replica.json"), "w", encoding="utf-8") as f:
+            json.dump({"replica_id": "rep_aaaabbbbcccc", "minted_at_note": "test"}, f)
+        for name in (
+            "logstream.sqlite3",
+            "logstream.sqlite3-wal",
+            "peers.json",
+            "mempalace_embedder.json",
+            "oplog.sqlite3",
+            "vector_cache.sqlite3",
+        ):
+            with open(os.path.join(src, name), "w", encoding="utf-8") as f:
+                f.write(f"payload of {name}")
+        return src
+
+    def test_carries_identity_and_state_never_oplog_or_cache(self, tmp_dir):
+        src = self._source(tmp_dir)
+        tgt = os.path.join(tmp_dir, "tgt_palace")
+        result = copy_replica_sidecars(src, tgt)
+
+        assert result["replica_id"] == "rep_aaaabbbbcccc"
+        assert "replica.json" in result["carried"]
+        assert "logstream.sqlite3" in result["carried"]
+        assert "peers.json" in result["carried"]
+        assert "mempalace_embedder.json" in result["carried"]
+        # The swap-ready target is the same replica with its state...
+        with open(os.path.join(tgt, "replica.json"), encoding="utf-8") as f:
+            assert json.load(f)["replica_id"] == "rep_aaaabbbbcccc"
+        with open(os.path.join(tgt, "logstream.sqlite3"), encoding="utf-8") as f:
+            assert f.read() == "payload of logstream.sqlite3"
+        # ...but NEVER inherits the old op-log or the derived cache.
+        assert not os.path.exists(os.path.join(tgt, "oplog.sqlite3"))
+        assert not os.path.exists(os.path.join(tgt, "vector_cache.sqlite3"))
+        # And the SOURCE is untouched (copy-first): its op-log is still there.
+        assert os.path.exists(os.path.join(src, "oplog.sqlite3"))
+
+    def test_missing_sidecars_tolerated_and_reported(self, tmp_dir):
+        # A validation copy may lack most sidecars; only report, never fail.
+        src = os.path.join(tmp_dir, "bare_palace")
+        os.makedirs(src)
+        tgt = os.path.join(tmp_dir, "bare_target")
+        result = copy_replica_sidecars(src, tgt)
+        assert result["carried"] == []
+        assert result["replica_id"] is None
+        assert "replica.json" in result["missing"]

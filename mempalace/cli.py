@@ -1269,6 +1269,7 @@ def cmd_migrate_ids(args):
     from .knowledge_graph import KnowledgeGraph
     from .migrate_v4 import (
         apply_v4_migration,
+        copy_replica_sidecars,
         plan_v4_migration,
         read_kg_source_ids,
         remap_kg_source_ids,
@@ -1330,6 +1331,11 @@ def cmd_migrate_ids(args):
         shutil.copy2(kg_path, tgt_kg_path)
         with KnowledgeGraph(db_path=tgt_kg_path) as tkg:
             kg_updated = remap_kg_source_ids(tkg, stats["alias"])
+    # Carry the replica's sidecar identity/state so the target is swap-ready:
+    # same replica id, same logstream, same peers, same embedder. The op-log is
+    # deliberately NOT carried — it is rebuilt by re-promotion in the
+    # coordinated fleet window (see migrate_v4.SIDECAR_EXCLUDE rationale).
+    sidecars = copy_replica_sidecars(palace_path, target)
     print(
         f"\n  MIGRATED into {target}: {stats['written']:,} v4 drawer(s) "
         f"({stats['merged_away']:,} merged away, {stats['rows_written']:,} rows), "
@@ -1341,6 +1347,17 @@ def cmd_migrate_ids(args):
             f"  ⚠ {unreadable:,} row(s) had an unreadable source vector (localized index "
             f"damage in the source) — migrated without a vector; the target re-embeds them. "
             f"Consider `mempalace --palace <source> repair` on the source palace."
+        )
+    if sidecars["replica_id"]:
+        print(
+            f"  Replica identity preserved: {sidecars['replica_id']} "
+            f"(sidecars carried: {', '.join(sidecars['carried'])})"
+        )
+    else:
+        print(
+            "  ⚠ No replica.json in the source — the target will mint a NEW replica "
+            "identity on first promote. Fine for a validation copy; do NOT live-swap "
+            "a target without the source's identity."
         )
     print("\n  NEXT (run against the target, validate, then swap it in):")
     print(f"    mempalace --palace {target} compress        # rebuild the closet index at v4 ids")

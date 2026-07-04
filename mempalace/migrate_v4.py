@@ -28,7 +28,10 @@ mandates — **plan first, on a copy**:
   than materializing every drawer and vector at once.
 """
 
+import json
 import logging
+import os
+from pathlib import Path
 
 from .ids import make_drawer_id_content_pure
 
@@ -375,3 +378,93 @@ def remap_kg_source_ids(kg, alias: dict) -> int:
             )
             updated += cur.rowcount or 0
     return updated
+
+
+# ── Replica sidecar state (the live-swap contract) ────────────────────────
+#
+# A palace directory is more than its collection: it carries the replica's
+# identity and coordination state as sidecar files. For the migrated target to
+# be a drop-in replacement (swap it over the live palace and the mesh sees the
+# SAME replica, not a stranger), these must be carried:
+#
+#   replica.json              — the replica identity (``origin_replica`` of
+#                               every op this seat authors). Without it the
+#                               target mints a fresh id on first promote and
+#                               forks the palace's provenance.
+#   logstream.sqlite3 (+wal/shm) — the RFC 003 coordination log. Event ids are
+#                               drawer-id-independent; history carries over
+#                               verbatim.
+#   peers.json                — mesh peer configuration.
+#   mempalace_embedder.json   — the embedder identity, so vectors the target
+#                               re-derives (and every future embed) come from
+#                               the same model as the copied ones.
+#
+# Deliberately NOT carried:
+#
+#   oplog.sqlite3             — the shadow op-log is REBUILT by re-promotion
+#                               after migration, per the RFC 004 cutover plan.
+#                               It cannot be carried: its drawer ops reference
+#                               v3 ids that no longer exist (verify would go
+#                               dirty), and it cannot be rebuilt unilaterally
+#                               either — op_ids are ``op_<replica>_<rowid>``
+#                               and peers hold version-vector watermarks at the
+#                               OLD origin_seq heights, so a lone rebuilt log
+#                               would re-mint already-seen op_ids with
+#                               different payloads at seqs below every peer's
+#                               cursor. The rebuild is only sound as the
+#                               coordinated fleet-wide step: every replica
+#                               migrates and rebuilds in the same window, so
+#                               all cursors reset together (shadow posture
+#                               makes discarding the old log safe — it was
+#                               never authoritative).
+#   vector_cache.sqlite3      — derived cache; the target rebuilds it.
+
+SIDECAR_CARRY = (
+    "replica.json",
+    "logstream.sqlite3",
+    "logstream.sqlite3-wal",
+    "logstream.sqlite3-shm",
+    "peers.json",
+    "mempalace_embedder.json",
+)
+
+SIDECAR_EXCLUDE = ("oplog.sqlite3", "vector_cache.sqlite3")
+
+
+def copy_replica_sidecars(source_palace: str, target_palace: str) -> dict:
+    """Carry the replica's sidecar state so the target is swap-ready.
+
+    Copies each :data:`SIDECAR_CARRY` file that exists in ``source_palace``
+    into ``target_palace`` (overwriting — the target is the migration's fresh
+    output, its sidecars can only be accidental). Never copies the excluded
+    files. Returns ``{"carried": [names], "missing": [names],
+    "replica_id": str|None}`` — ``replica_id`` read back from the copied
+    ``replica.json`` so callers can print/assert the preserved identity.
+    """
+    import shutil
+
+    src = Path(os.path.expanduser(source_palace))
+    dst = Path(os.path.expanduser(target_palace))
+    dst.mkdir(parents=True, exist_ok=True)
+    carried, missing = [], []
+    for name in SIDECAR_CARRY:
+        s = src / name
+        if s.exists():
+            shutil.copy2(s, dst / name)
+            carried.append(name)
+        else:
+            missing.append(name)
+    replica_id = None
+    rj = dst / "replica.json"
+    if rj.exists():
+        try:
+            replica_id = json.loads(rj.read_text(encoding="utf-8")).get("replica_id")
+        except (ValueError, OSError):
+            logger.warning("copied replica.json is unreadable", exc_info=True)
+    if "replica.json" in missing:
+        logger.warning(
+            "source palace %s has no replica.json — the target will mint a NEW "
+            "replica identity on first promote; a live swap would fork provenance",
+            source_palace,
+        )
+    return {"carried": carried, "missing": missing, "replica_id": replica_id}
