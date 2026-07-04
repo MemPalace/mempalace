@@ -279,19 +279,30 @@ def test_sqlite_exact_get_offset_zero_is_a_full_scan(tmp_path):
     assert "OFFSET" not in selects[0]
 
 
-def test_sqlite_exact_get_ids_with_page_slices_in_python(tmp_path):
+def test_sqlite_exact_get_ids_uses_indexed_lookup_not_scan(tmp_path):
     _backend, col = _collection(tmp_path)
     _seed(col, 5)
 
-    # ids force the Python path even with a page: the requested order is kept,
-    # then offset/limit slice the reordered list with no SQL LIMIT/OFFSET.
-    result, selects = _doc_select_sql(
-        col, lambda: col.get(ids=["d4", "d3", "d2", "d1"], offset=1, limit=2)
-    )
+    # get-by-ids fetches through the (collection_id, id) primary key — an
+    # indexed IN query, NEVER the ORDER BY rowid full-collection scan that
+    # near-scanned a multi-GB store on every call. Requested order and
+    # offset/limit are still honored in Python (no SQL LIMIT/OFFSET).
+    statements = []
+    conn = col._handle.conn
+    conn.set_trace_callback(statements.append)
+    try:
+        result = col.get(ids=["d4", "d3", "d2", "d1"], offset=1, limit=2)
+    finally:
+        conn.set_trace_callback(None)
+
     assert result.ids == ["d3", "d2"]
-    assert len(selects) == 1
-    assert "LIMIT" not in selects[0]
-    assert "OFFSET" not in selects[0]
+    doc_selects = [
+        s for s in statements if "FROM documents" in s and s.lstrip().upper().startswith("SELECT")
+    ]
+    assert doc_selects, "expected a documents SELECT"
+    assert not any("ORDER BY rowid" in s for s in doc_selects), "must not full-scan on a get-by-ids"
+    assert any("id IN" in s for s in doc_selects), "must fetch through the id index"
+    assert all("LIMIT" not in s and "OFFSET" not in s for s in doc_selects)
 
 
 def test_sqlite_exact_upsert_delete_and_multi_collection_isolation(tmp_path):
