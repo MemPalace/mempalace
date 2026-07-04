@@ -1799,8 +1799,10 @@ def main():
     p_mine.add_argument("--wing", default=None, help="Wing name (default: directory name)")
     p_mine.add_argument(
         "--no-gitignore",
+        "--no-mempalaceignore",
+        dest="no_gitignore",
         action="store_true",
-        help="Don't respect .gitignore files when scanning project files",
+        help="Don't respect .mempalaceignore / .gitignore files when scanning project files",
     )
     p_mine.add_argument(
         "--include-ignored",

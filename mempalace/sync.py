@@ -16,7 +16,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Callable, Optional, TypedDict
 
-from .miner import is_gitignored, load_gitignore_matcher
+from .miner import detect_ignore_filename, is_gitignored, load_gitignore_matcher
 from .palace import (
     MineAlreadyRunning,
     get_closets_collection,
@@ -69,13 +69,16 @@ def _ancestor_matchers(source_file: Path, root: Path, matcher_cache: dict) -> li
         parts = source_file.relative_to(root).parts
     except ValueError:
         return matchers
+    # Prune with the same ignore convention the miner used on the way in:
+    # .mempalaceignore if the project declares one, else .gitignore.
+    ignore_filename = detect_ignore_filename(root)
     cursor = root
-    matcher = load_gitignore_matcher(cursor, matcher_cache)
+    matcher = load_gitignore_matcher(cursor, matcher_cache, filename=ignore_filename)
     if matcher is not None:
         matchers.append(matcher)
     for part in parts[:-1]:
         cursor = cursor / part
-        matcher = load_gitignore_matcher(cursor, matcher_cache)
+        matcher = load_gitignore_matcher(cursor, matcher_cache, filename=ignore_filename)
         if matcher is not None:
             matchers.append(matcher)
     return matchers
