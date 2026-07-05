@@ -53,8 +53,8 @@ class TestStripNulBytes:
 
     def test_preserves_real_content_around_nuls(self):
         assert (
-            strip_nul_bytes("[scheduler] Registered job\x00\x00\x00next line")
-            == "[scheduler] Registered job���next line"
+            strip_nul_bytes("ordinary log line one\x00\x00\x00ordinary log line two")
+            == "ordinary log line one���ordinary log line two"
         )
 
 
