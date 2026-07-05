@@ -1366,6 +1366,47 @@ def cmd_migrate_ids(args):
     print(f'    mempalace --palace {target} search "..."      # confirm recall')
 
 
+def cmd_reconcile_ids(args):
+    """RFC 004 write-flip PART B: drain legacy v3-keyed ghost drawers in place —
+    rewrite each to its content-hash v4 id (never delete un-twinned content)."""
+    import json as _json
+
+    from .palace import get_collection
+    from .reconcile_v3 import apply_v3_reconcile, plan_v3_reconcile
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    as_json = getattr(args, "json", False)
+    col = get_collection(palace_path, create=False)
+    if not col:
+        print(f"  No palace collection at {palace_path}")
+        sys.exit(1)
+
+    if not getattr(args, "apply", False):
+        plan = plan_v3_reconcile(col)
+        if as_json:
+            print(_json.dumps({k: v for k, v in plan.items() if k != "sample"}, indent=2))
+        else:
+            print(f"\n  v3 ghost reconcile plan for {palace_path}")
+            print(f"    legacy v3-keyed ghost drawers:            {plan['ghost_drawers']:,}")
+            print(f"    would REWRITE to content-hash v4 id:      {plan['rewrite']:,}")
+            print(f"    would DROP (content already v4-present):  {plan['drop']:,}")
+            for s in plan["sample"][:10]:
+                print(f"      {s['old']} -> {s['new']}")
+            print("\n  DRY RUN — nothing written. Re-run with --apply to reconcile.")
+        return
+
+    stats = apply_v3_reconcile(col)
+    if as_json:
+        print(_json.dumps(stats, indent=2))
+    else:
+        print(
+            f"\n  RECONCILED {palace_path}: rewrote {stats['rewritten']:,} ghost(s) "
+            f"({stats['rows_rewritten']:,} rows) to content-hash v4 ids; "
+            f"dropped {stats['dropped']:,} content-dup(s). Legacy v3 drawers remaining: 0."
+        )
+        print(f"  Confirm: mempalace --palace {palace_path} oplog verify   # should be CLEAN")
+
+
 def cmd_status(args):
     from .miner import status
 
@@ -3504,6 +3545,18 @@ def main():
     )
     p_migrate_ids.add_argument("--json", action="store_true", help="Machine-readable plan output")
 
+    # reconcile-ids (RFC 004 write-flip PART B — drain legacy v3-keyed ghosts)
+    p_reconcile_ids = sub.add_parser(
+        "reconcile-ids",
+        help="Drain legacy v3-keyed 'ghost' drawers to their content-hash v4 id, "
+        "in place (dry-run by default; --apply rewrites them, never deletes "
+        "un-twinned content)",
+    )
+    p_reconcile_ids.add_argument(
+        "--apply", action="store_true", help="Rewrite the ghosts (default is a dry-run report)"
+    )
+    p_reconcile_ids.add_argument("--json", action="store_true", help="Machine-readable output")
+
     # logstream (RFC 003 agent coordination)
     p_logstream = sub.add_parser(
         "logstream",
@@ -3837,6 +3890,7 @@ def main():
         "migrate": cmd_migrate,
         "migrate-wings": cmd_migrate_wings,
         "migrate-ids": cmd_migrate_ids,
+        "reconcile-ids": cmd_reconcile_ids,
         "hallways": cmd_hallways,
         "status": cmd_status,
     }
