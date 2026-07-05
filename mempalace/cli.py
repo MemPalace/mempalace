@@ -2480,6 +2480,23 @@ def cmd_serve(args):
         sys.exit(completed.returncode)
 
 
+def _compress_store_batch() -> int:
+    """Closet-store upsert batch size (env-tunable).
+
+    Batches the compressed-drawer upserts so the embedder sees N documents per
+    call instead of one — the win is largest on GPU embedders (DirectML/CUDA)
+    that batch-accelerate. Default 500; override with
+    ``MEMPALACE_COMPRESS_STORE_BATCH``. Clamped to at least 1.
+    """
+    raw = os.environ.get("MEMPALACE_COMPRESS_STORE_BATCH", "").strip()
+    if not raw:
+        return 500
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 500
+
+
 def cmd_compress(args):
     """Compress drawers in a wing using AAAK Dialect."""
     from .dialect import Dialect
@@ -2583,17 +2600,42 @@ def cmd_compress(args):
             # _DEFAULT_BACKEND is reused (avoids a redundant ChromaBackend
             # instance and its potential WAL-lock contention on Windows).
             comp_col = get_closets_collection(palace_path, create=True)
+            # Batch the upserts. A per-drawer upsert embeds one document at a
+            # time; on a GPU embedder (e.g. Windows DirectML) that leaves the
+            # device almost idle and made a six-figure compress run for hours.
+            # One upsert of N docs embeds N at once (EmbeddingCollection passes
+            # the whole batch to _embed_texts) and cuts per-call insert overhead.
+            store_batch = _compress_store_batch()
+            total = len(compressed_entries)
+            b_ids: list = []
+            b_docs: list = []
+            b_metas: list = []
+            stored = 0
+
+            def _flush_closets():
+                nonlocal stored
+                if not b_ids:
+                    return
+                comp_col.upsert(ids=list(b_ids), documents=list(b_docs), metadatas=list(b_metas))
+                stored += len(b_ids)
+                b_ids.clear()
+                b_docs.clear()
+                b_metas.clear()
+                print(f"    stored {stored:,}/{total:,}...", flush=True)
+
             for doc_id, compressed, meta, stats in compressed_entries:
                 comp_meta = dict(meta)
                 comp_meta["compression_ratio"] = round(stats["size_ratio"], 1)
                 comp_meta["original_tokens"] = stats["original_tokens_est"]
-                comp_col.upsert(
-                    ids=[doc_id],
-                    documents=[compressed],
-                    metadatas=[comp_meta],
-                )
+                b_ids.append(doc_id)
+                b_docs.append(compressed)
+                b_metas.append(comp_meta)
+                if len(b_ids) >= store_batch:
+                    _flush_closets()
+            _flush_closets()
             print(
-                f"  Stored {len(compressed_entries)} compressed drawers in 'mempalace_closets' collection."
+                f"  Stored {total:,} compressed drawers in 'mempalace_closets' collection "
+                f"(batched {store_batch}/upsert)."
             )
         except Exception as e:
             print(f"  Error storing compressed drawers: {e}")

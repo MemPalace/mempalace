@@ -1601,6 +1601,55 @@ def test_cmd_compress_dry_run(mock_config_cls, capsys):
 
 
 @patch("mempalace.cli.MempalaceConfig")
+def test_cmd_compress_batches_closet_upserts(mock_config_cls, capsys):
+    """The closet store must upsert in batches, not one call per drawer — a
+    per-drawer upsert embeds one doc at a time and made a six-figure compress
+    take hours on a GPU embedder."""
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    args = argparse.Namespace(palace=None, wing=None, dry_run=False, config=None)
+    n = 1200  # -> read in 500-batches, stored in 500-batches
+
+    def _read(**kwargs):
+        off, lim = kwargs.get("offset", 0), kwargs.get("limit", 500)
+        if off >= n:
+            return {"documents": [], "metadatas": [], "ids": []}
+        rng = range(off, min(off + lim, n))
+        return {
+            "documents": [f"doc {i}" for i in rng],
+            "metadatas": [{"wing": "w", "room": "r", "source_file": "f"} for _ in rng],
+            "ids": [f"id{i}" for i in rng],
+        }
+
+    read_col = MagicMock()
+    read_col.get.side_effect = lambda **k: _read(**k)
+    closets = MagicMock()
+
+    mock_dialect = MagicMock()
+    mock_dialect.compress.return_value = "c"
+    mock_dialect.compression_stats.return_value = {
+        "original_chars": 10,
+        "summary_chars": 3,
+        "original_tokens_est": 2,
+        "summary_tokens_est": 1,
+        "size_ratio": 3.0,
+        "note": "",
+    }
+    mock_dialect_mod = _make_mock_dialect_module(mock_dialect)
+
+    with (
+        patch("mempalace.palace._open_collection_or_explain", return_value=read_col),
+        patch("mempalace.palace.get_closets_collection", return_value=closets),
+        patch.dict("sys.modules", {"mempalace.dialect": mock_dialect_mod}),
+    ):
+        cmd_compress(args)
+
+    # 1200 drawers / 500 batch -> 3 upserts of 500/500/200, NOT 1200 calls.
+    sizes = [len(call.kwargs["ids"]) for call in closets.upsert.call_args_list]
+    assert sizes == [500, 500, 200]
+    assert sum(sizes) == n  # every drawer stored exactly once
+
+
+@patch("mempalace.cli.MempalaceConfig")
 def test_cmd_compress_with_config(mock_config_cls, tmp_path, capsys):
     mock_config_cls.return_value.palace_path = "/fake/palace"
     config_file = tmp_path / "entities.json"
