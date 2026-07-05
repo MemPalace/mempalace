@@ -6445,7 +6445,9 @@ def _start_peer_sync_thread() -> None:
                     chunk_size = max(1, int(getattr(_config, "chunk_size", 800) or 800))
                     lock_batch = _fold_ops_per_lock()
                     round_cap = _fold_max_ops_per_round()
+                    backlog_start = oplog.count() - oplog.fold_cursor()
                     folded = 0
+                    errored = False
                     while folded < round_cap:
                         before = oplog.fold_cursor()
                         with _HTTP_REQUEST_LOCK:
@@ -6469,11 +6471,38 @@ def _start_peer_sync_thread() -> None:
                             if applied or fold_stats["conflicts"] or fold_stats["errors"]:
                                 logger.info("op fold: %s", fold_stats)
                             if fold_stats["errors"]:
+                                errored = True
                                 break  # poison op — stop, next round retries it
                         after = oplog.fold_cursor()
                         if after <= before:
                             break  # no progress: caught up or nothing appliable
                         folded += after - before
+                    # Progress accounting: a silent no-progress fold round under a
+                    # real backlog is invisible — windows hit exactly this (fold
+                    # starved to zero progress by concurrent readers holding the
+                    # write lock, under OPS_PER_LOCK=1, logging nothing). Make the
+                    # drain visible and warn loudly when the backlog can't advance.
+                    remaining = oplog.count() - oplog.fold_cursor()
+                    if folded:
+                        logger.info(
+                            "op fold round: drained %d/%d op(s) (cursor now %d, %d remaining)",
+                            folded,
+                            backlog_start,
+                            oplog.fold_cursor(),
+                            remaining,
+                        )
+                    elif remaining > 0 and not errored:
+                        logger.warning(
+                            "op fold round made NO PROGRESS with %d op(s) still un-folded "
+                            "(cursor %d, count %d, ops_per_lock=%d) — likely write-lock "
+                            "contention from concurrent readers or a too-small "
+                            "MEMPALACE_FOLD_OPS_PER_LOCK; the backlog is NOT self-healing "
+                            "this round",
+                            remaining,
+                            oplog.fold_cursor(),
+                            oplog.count(),
+                            lock_batch,
+                        )
             except Exception:
                 logger.warning("op fold round failed", exc_info=True)
 
