@@ -5009,8 +5009,56 @@ def test_refresh_sqlite_integrity_status_records_quick_check_errors(monkeypatch)
     mcp_server._refresh_sqlite_integrity_status()
 
     assert mcp_server._sqlite_integrity_checked is True
+    # The startup gate attempts the in-place FTS5 auto-heal; against a fake
+    # palace (no chroma.sqlite3) the heal returns the errors unchanged, so the
+    # gate still records them.
     assert len(mcp_server._sqlite_integrity_errors) == 1
     assert "malformed inverted index" in mcp_server._sqlite_integrity_errors[0]
+
+
+def test_refresh_sqlite_integrity_self_heals_isolated_fts5(monkeypatch):
+    """Isolated FTS5 corruption on startup is auto-healed in place, not gated —
+    a six-figure chroma v4 migration+compress reliably malforms the index (seen
+    on mac AND blade), and it rebuilds losslessly from the intact content table."""
+    from mempalace import mcp_server, repair
+
+    monkeypatch.setattr(mcp_server, "_is_chroma_backend", lambda: True)
+    monkeypatch.setattr(
+        repair,
+        "sqlite_integrity_errors",
+        lambda p: ["malformed inverted index for FTS5 table main.embedding_fulltext_search"],
+    )
+    healed = {}
+
+    def _heal(palace_path, errors, *, progress=print):
+        healed["called"] = True
+        return []  # rebuild cleared quick_check
+
+    monkeypatch.setattr(repair, "maybe_autoheal_fts5_index", _heal)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", False)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", ["stale"])
+
+    mcp_server._refresh_sqlite_integrity_status()
+
+    assert healed.get("called") is True
+    assert mcp_server._sqlite_integrity_errors == []  # gate cleared — writes not refused
+
+
+def test_refresh_sqlite_integrity_still_gates_when_heal_cannot_clear(monkeypatch):
+    """Broader corruption (or a heal that can't clear) still gates writes."""
+    from mempalace import mcp_server, repair
+
+    errs = ["database disk image is malformed"]
+    monkeypatch.setattr(mcp_server, "_is_chroma_backend", lambda: True)
+    monkeypatch.setattr(repair, "sqlite_integrity_errors", lambda p: errs)
+    # Non-isolated corruption: the real auto-heal returns errors unchanged.
+    monkeypatch.setattr(repair, "maybe_autoheal_fts5_index", lambda p, e, *, progress=print: e)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", False)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", [])
+
+    mcp_server._refresh_sqlite_integrity_status()
+
+    assert mcp_server._sqlite_integrity_errors == errs  # still gated
 
 
 def test_sqlite_integrity_refusal_handles_none_palace_path(monkeypatch):

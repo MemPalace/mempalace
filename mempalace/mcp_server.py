@@ -544,7 +544,25 @@ def _refresh_sqlite_integrity_status() -> None:
         )
         _sqlite_integrity_errors = [_sqlite_integrity_check_error]
     else:
-        _sqlite_integrity_errors = [str(error) for error in errors if str(error)]
+        errors = [str(error) for error in errors if str(error)]
+        # Self-heal isolated FTS5 inverted-index corruption on startup instead of
+        # gating every write: a six-figure v4 migration + compress on the chroma
+        # backend reliably leaves the FTS5 index malformed (seen on mac AND blade
+        # post-migration), and it rebuilds losslessly from the intact content
+        # shadow table. maybe_autoheal_fts5_index self-guards — it only touches
+        # the isolated-FTS5 case; broader corruption still gates below.
+        if errors:
+            try:
+                from .repair import maybe_autoheal_fts5_index
+
+                errors = maybe_autoheal_fts5_index(
+                    _config.palace_path,
+                    errors,
+                    progress=lambda m: logger.info("integrity auto-heal: %s", m),
+                )
+            except Exception:
+                logger.warning("FTS5 auto-heal attempt raised; leaving gate up", exc_info=True)
+        _sqlite_integrity_errors = errors
         _sqlite_integrity_check_error = ""
 
     _sqlite_integrity_checked = True
