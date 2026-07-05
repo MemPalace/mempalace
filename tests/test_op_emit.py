@@ -16,6 +16,7 @@ from mempalace.op_emit import (
     emit_bulk_tombstones,
     emit_miner_writes,
     read_logical_drawers_where,
+    stamp_op_hlc,
 )
 
 
@@ -49,6 +50,13 @@ class _FakeCollection:
     def upsert(self, ids, documents, metadatas):
         for i, doc, meta in zip(ids, documents, metadatas):
             self.rows[i] = (doc, meta)
+
+    def update(self, *, ids, documents=None, metadatas=None, embeddings=None):
+        # Metadata-merge, like the real backend (no re-embed).
+        for i, m in zip(ids, metadatas or []):
+            if i in self.rows:
+                doc, meta = self.rows[i]
+                self.rows[i] = (doc, {**(meta or {}), **(m or {})})
 
     def delete(self, ids=None, where=None):
         for i in ids or []:
@@ -207,3 +215,48 @@ class TestReadLogicalDrawersWhere:
             stats = fold_ops(b, peer_col, kg=None)
             assert stats["applied_tombstones"] == 1
             assert "d_x" not in peer_col.rows
+
+
+class TestStampOpHlc:
+    """The write-flip stamps op_hlc (the LWW head) on locally-authored drawers
+    so a later cross-replica revise resolves by HLC instead of being held."""
+
+    def test_stamp_adds_op_hlc_only_not_replica_origin(self):
+        col = _FakeCollection()
+        col.rows["d1"] = ("body", {"wing": "w", "room": "r"})
+        stamp_op_hlc(col, ["d1"], {"hlc": "1783250000000-000000-rep_local001"})
+        _doc, meta = col.rows["d1"]
+        assert meta["op_hlc"] == "1783250000000-000000-rep_local001"
+        # replica_origin stays ABSENT — "no stamp = locally authored" is
+        # load-bearing in vector_cache / oppromote / replica_sync.
+        assert "replica_origin" not in meta
+        assert meta["wing"] == "w"  # existing metadata preserved (merge, not replace)
+
+    def test_stamp_all_chunk_rows(self):
+        col = _FakeCollection()
+        col.rows["d_chunk_000000"] = ("a", {"parent_drawer_id": "d"})
+        col.rows["d_chunk_000001"] = ("b", {"parent_drawer_id": "d"})
+        stamp_op_hlc(col, ["d_chunk_000000", "d_chunk_000001"], {"hlc": "h1"})
+        assert col.rows["d_chunk_000000"][1]["op_hlc"] == "h1"
+        assert col.rows["d_chunk_000001"][1]["op_hlc"] == "h1"
+
+    def test_stamp_noops_on_missing_op_or_ids(self):
+        col = _FakeCollection()
+        col.rows["d1"] = ("body", {})
+        stamp_op_hlc(col, ["d1"], None)  # emit failed -> op is None
+        stamp_op_hlc(col, ["d1"], {})  # no hlc
+        stamp_op_hlc(col, [], {"hlc": "h"})  # no ids
+        assert "op_hlc" not in col.rows["d1"][1]
+
+    def test_emit_miner_writes_returns_ops_for_stamping(self, oplog):
+        new = [("d_0", "one", {"wing": "w"}), ("d_1", "two", {"wing": "w"})]
+        stamped = emit_miner_writes(oplog, "/src/f.md", {}, new, author_agent="miner")
+        assert {did for did, _op in stamped} == {"d_0", "d_1"}
+        assert all(op.get("hlc") for _did, op in stamped)
+        # And stamping through them versions every mined drawer.
+        col = _FakeCollection()
+        col.rows["d_0"] = ("one", {"wing": "w"})
+        col.rows["d_1"] = ("two", {"wing": "w"})
+        for did, op in stamped:
+            stamp_op_hlc(col, [did], op)
+        assert col.rows["d_0"][1]["op_hlc"] and col.rows["d_1"][1]["op_hlc"]

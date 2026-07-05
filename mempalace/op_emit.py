@@ -34,8 +34,36 @@ from .oplog import OpLog, shadow_append
 logger = logging.getLogger("mempalace.op_emit")
 
 
+OP_HLC_KEY = "op_hlc"
+
+
 def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def stamp_op_hlc(collection, row_ids, op) -> None:
+    """Stamp locally-authored drawer rows with ``op_hlc`` — the LWW head — from
+    the op the write just emitted (RFC 004 write-flip).
+
+    This makes a local drawer a first-class last-writer-wins participant: a
+    later cross-replica ``drawer.revise``/``tombstone`` resolves by HLC in the
+    fold instead of being held as unversioned. Metadata-only update, so no
+    re-embed. ``replica_origin`` is deliberately left ABSENT — the "no
+    replica_origin stamp = locally authored" convention is load-bearing in
+    vector_cache, oppromote, and replica_sync; only ``op_hlc`` is added.
+    Best-effort: a failed stamp just leaves the drawer unversioned, which the
+    fold's safety net holds rather than clobbers.
+    """
+    if not op or not row_ids:
+        return
+    hlc = op.get("hlc") if hasattr(op, "get") else None
+    if not hlc:
+        return
+    try:
+        ids = list(row_ids)
+        collection.update(ids=ids, metadatas=[{OP_HLC_KEY: hlc}] * len(ids))
+    except Exception:
+        logger.warning("op_hlc stamp failed for %d row(s)", len(row_ids), exc_info=True)
 
 
 def emit_miner_writes(
@@ -44,23 +72,28 @@ def emit_miner_writes(
     prior: dict,
     new_drawers: list,
     author_agent: str = "mempalace",
-) -> None:
+) -> list:
     """Emit ops for a miner's (re-)ingest of one source file.
 
     ``prior`` maps ``drawer_id -> (content, meta)`` for the file's drawers as
     they were BEFORE the re-mine purge (empty for a first mine). ``new_drawers``
     is the list of ``(drawer_id, content, meta)`` just upserted. Revise every
     written chunk; tombstone any prior chunk id no longer present.
+
+    Returns the ``[(drawer_id, op), ...]`` of the revise ops that appended, so
+    the caller can stamp each drawer's ``op_hlc`` (:func:`stamp_op_hlc`) — the
+    write-flip's LWW head for locally-authored drawers.
     """
     if oplog is None:
-        return
+        return []
     new_ids = set()
+    stamped: list = []
     for drawer_id, content, meta in new_drawers:
         if not drawer_id or not isinstance(content, str) or not content:
             continue
         new_ids.add(drawer_id)
         meta = meta or {}
-        shadow_append(
+        op = shadow_append(
             oplog,
             "drawer.revise",
             {
@@ -76,6 +109,8 @@ def emit_miner_writes(
             },
             author_agent=author_agent,
         )
+        if op is not None:
+            stamped.append((drawer_id, op))
     for drawer_id in set(prior) - new_ids:
         content, meta = prior[drawer_id]
         content = content or ""
@@ -93,6 +128,7 @@ def emit_miner_writes(
             },
             author_agent=author_agent,
         )
+    return stamped
 
 
 def emit_bulk_tombstones(

@@ -148,14 +148,19 @@ def _apply_drawer_op(op: dict, collection, chunk_size: int, stats: dict) -> None
         return
 
     if kind in ("drawer.revise", "drawer.tombstone") and state is not None:
-        if state["replica_origin"] is None:
-            # Shadow guard: never mutate a locally-authored drawer from a
-            # remote op while Chroma is authoritative.
+        if state["replica_origin"] is None and state["op_hlc"] is None:
+            # Safety net (post write-flip): a remote op never mutates a drawer
+            # that carries NO version at all — no replica_origin and no op_hlc.
+            # That is a truly unstamped drawer (a pre-flip legacy row, or a local
+            # write whose op emission failed), for which we have no basis to run
+            # last-writer-wins, so we hold it rather than clobber blindly. A
+            # normal local write is stamped with op_hlc at author time, so it
+            # falls through to the LWW check below and remote revises resolve.
             stats["conflicts"] += 1
             if len(stats["conflict_sample"]) < SAMPLE_CAP:
                 stats["conflict_sample"].append({"op": op["op_id"], "drawer_id": drawer_id})
             logger.warning(
-                "op fold shadow-guard: remote %s for locally-authored drawer %s held",
+                "op fold: remote %s for unversioned drawer %s held (no op_hlc to LWW against)",
                 kind,
                 drawer_id,
             )

@@ -1516,11 +1516,15 @@ def process_file(
         # (add-if-absent / LWW-update on peers) and tombstone any prior chunk id
         # a shrinking re-mine dropped. After the store write, best-effort.
         if oplog is not None:
-            from .op_emit import emit_miner_writes
+            from .op_emit import emit_miner_writes, stamp_op_hlc
 
-            emit_miner_writes(
+            # Stamp op_hlc on each locally-mined drawer (one content-addressed
+            # row each) so a later cross-replica revise resolves by LWW instead
+            # of being held as unversioned (RFC 004 write-flip).
+            for _drawer_id, _op in emit_miner_writes(
                 oplog, source_file, prior_drawers, emitted_drawers, author_agent=agent
-            )
+            ):
+                stamp_op_hlc(collection, [_drawer_id], _op)
 
         # Build closet — the searchable index pointing to these drawers.
         # Purge first: a re-mine (mtime change or normalize_version bump) must

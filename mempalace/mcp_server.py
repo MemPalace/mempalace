@@ -939,8 +939,8 @@ def _emit_memory_op(kind: str, payload: dict, author_agent: str = "mcp") -> None
 
     palace_path = getattr(_config, "palace_path", None)
     if not palace_path:
-        return
-    emit_op(palace_path, kind, payload, author_agent=author_agent)
+        return None
+    return emit_op(palace_path, kind, payload, author_agent=author_agent)
 
 
 def _get_shadow_oplog():
@@ -2657,7 +2657,7 @@ def tool_add_drawer(
                     "The palace index may be stale; run reconnect or repair."
                 )
             _metadata_cache = None
-            _emit_memory_op(
+            _add_op = _emit_memory_op(
                 "drawer.add",
                 {
                     "drawer_id": drawer_id,
@@ -2672,6 +2672,9 @@ def tool_add_drawer(
                 },
                 author_agent=added_by,
             )
+            from .op_emit import stamp_op_hlc
+
+            stamp_op_hlc(col, [drawer_id], _add_op)
             logger.info(f"Filed drawer: {drawer_id} → {wing}/{room}")
             return {
                 "success": True,
@@ -2707,7 +2710,7 @@ def tool_add_drawer(
                 "The palace index may be stale; run reconnect or repair."
             )
         _metadata_cache = None
-        _emit_memory_op(
+        _add_op = _emit_memory_op(
             "drawer.add",
             {
                 "drawer_id": drawer_id,
@@ -2722,6 +2725,9 @@ def tool_add_drawer(
             },
             author_agent=added_by,
         )
+        from .op_emit import stamp_op_hlc
+
+        stamp_op_hlc(col, chunk_ids, _add_op)
         logger.info(f"Filed drawer: {drawer_id} → {wing}/{room} ({len(chunk_ids)} chunks)")
         return {
             "success": True,

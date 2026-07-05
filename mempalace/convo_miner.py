@@ -861,11 +861,12 @@ def _file_chunks_locked(
         # Dual-write shadow op emission (RFC 004 2a): revise each mined chunk,
         # tombstone any prior chunk id a shrinking re-mine dropped.
         if oplog is not None:
-            from .op_emit import emit_miner_writes
+            from .op_emit import emit_miner_writes, stamp_op_hlc
 
-            emit_miner_writes(
+            for _drawer_id, _op in emit_miner_writes(
                 oplog, source_file, prior_drawers, emitted_drawers, author_agent=agent
-            )
+            ):
+                stamp_op_hlc(collection, [_drawer_id], _op)
     return drawers_added, room_counts_delta, False
 
 

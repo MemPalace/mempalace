@@ -194,9 +194,11 @@ class TestDrawerFold:
         assert stats["applied_tombstones"] == 1
         assert rig["col"].logical_content("d1") is None
 
-    def test_shadow_guard_holds_local_drawers(self, rig):
-        # A locally-authored (unstamped) drawer must never be mutated by a
-        # remote op during the shadow.
+    def test_unversioned_local_drawer_held_as_safety_net(self, rig):
+        # Post write-flip the guard is a SAFETY NET: a drawer carrying NO version
+        # at all (no replica_origin AND no op_hlc — a pre-flip legacy row or a
+        # local write whose op emission failed) has no basis for LWW, so a remote
+        # revise/tombstone is held rather than clobbering it blindly.
         rig["col"].rows["d_local"] = ("precious", {"wing": "w", "room": "r"})
         _ship(rig, "drawer.revise", {"drawer_id": "d_local", "content": "overwrite"})
         _ship(rig, "drawer.tombstone", {"drawer_id": "d_local"})
@@ -205,6 +207,28 @@ class TestDrawerFold:
         assert rig["col"].rows["d_local"][0] == "precious"
         # Held conflicts do not wedge the fold: cursor is past them.
         assert rig["b"].fold_cursor(FOLD_CONSUMER) == rig["b"].count()
+
+    def test_flip_stamped_local_drawer_accepts_newer_remote_revise(self, rig):
+        # The write-flip's point: a locally-authored drawer is stamped with
+        # op_hlc at author time, so a NEWER cross-replica revise now APPLIES via
+        # LWW — exactly what the shadow guard used to block.
+        rig["col"].rows["d_local"] = (
+            "v1",
+            {"wing": "w", "room": "r", "op_hlc": "0000000000001-000000-rep_local"},
+        )
+        _ship(rig, "drawer.revise", {"drawer_id": "d_local", "content": "v2"})  # real, newer hlc
+        stats = _fold(rig)
+        assert stats["applied_revises"] == 1 and stats["conflicts"] == 0
+        assert rig["col"].rows["d_local"][0] == "v2"
+
+    def test_flip_stamped_local_drawer_rejects_stale_remote_revise(self, rig):
+        # A stamped local drawer whose op_hlc is NEWER than the remote revise:
+        # the stale remote loses (LWW), content unchanged, not a conflict.
+        rig["col"].rows["d_local"] = ("current", {"op_hlc": "9999999999999-000000-rep_local"})
+        _ship(rig, "drawer.revise", {"drawer_id": "d_local", "content": "ancient"})
+        stats = _fold(rig)
+        assert stats["skipped_stale"] == 1 and stats["conflicts"] == 0
+        assert rig["col"].rows["d_local"][0] == "current"
 
     def test_sha_mismatch_stops_fold_for_retry(self, rig):
         _ship(
