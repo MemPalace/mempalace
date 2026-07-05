@@ -117,7 +117,13 @@ def test_mine_convos_allows_general_after_exchange(capsys):
         rows = col.get(where={"source_file": resolved}, include=["metadatas"])
         modes = {meta.get("extract_mode") for meta in rows["metadatas"]}
         assert {"exchange", "general"} <= modes
-        assert any(drawer_id.startswith("drawer_test_decision_") for drawer_id in rows["ids"])
+        # v4 content-pure ids: wing/room live in metadata now, not the id.
+        assert rows["ids"] and all(
+            len(did.removeprefix("drawer_")) == 32
+            and did.startswith("drawer_")
+            and all(c in "0123456789abcdef" for c in did.removeprefix("drawer_"))
+            for did in rows["ids"]
+        )
         del col, client
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

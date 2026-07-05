@@ -83,7 +83,7 @@ from .palace import (
 # expose these as attributes of this module, breaking the test seams.
 from .config import MempalaceConfig, normalize_wing_name
 from .collision_scan import assert_no_collisions
-from .ids import ID_RECIPE, make_drawer_id_from_chunk
+from .ids import ID_RECIPE, make_drawer_id_for_write
 from .miner import (
     _compute_topic_tunnels_for_wing,
     chunk_text,
@@ -642,8 +642,14 @@ def _file_chunks_locked(
             batch_ids: list = []
             batch_metas: list = []
             for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
-                drawer_id = make_drawer_id_from_chunk(wing, room, source_file, chunk["chunk_index"])
                 content = chunk["content"]
+                drawer_id = make_drawer_id_for_write(
+                    content,
+                    wing=wing,
+                    room=room,
+                    source_file=source_file,
+                    chunk_index=chunk["chunk_index"],
+                )
                 meta: dict = {
                     "wing": wing,
                     "room": room,

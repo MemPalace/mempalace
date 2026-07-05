@@ -101,7 +101,7 @@ from .hallways import (  # noqa: E402
 from .knowledge_graph import KnowledgeGraph  # noqa: E402
 from .logstream import LOGSTREAM_DB_FILENAME, Logstream  # noqa: E402
 from .collision_scan import assert_no_collisions  # noqa: E402
-from .ids import ID_RECIPE, make_drawer_id_from_content  # noqa: E402
+from .ids import ID_RECIPE, make_drawer_id_for_write  # noqa: E402
 
 
 class _MempalaceLogFilter(logging.Filter):
@@ -2597,7 +2597,7 @@ def tool_add_drawer(
     if not col:
         return _collection_error_or_no_palace()
 
-    drawer_id = make_drawer_id_from_content(wing, room, content)
+    drawer_id = make_drawer_id_for_write(content, wing=wing, room=room)
 
     _wal_log(
         "add_drawer",

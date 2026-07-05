@@ -44,7 +44,7 @@ from .palace import (
 # ``_compute_topic_tunnels_for_wing`` post-mine block.
 from .collision_scan import assert_no_collisions
 from .hallways import compute_hallways_for_wing
-from .ids import ID_RECIPE, make_drawer_id_from_chunk
+from .ids import ID_RECIPE, make_drawer_id_for_write
 
 logger = logging.getLogger("mempalace_mcp")
 
@@ -1325,7 +1325,9 @@ def add_drawer(
     miner uses ``_build_drawer_metadata`` + a batched ``collection.upsert``
     to amortize the embedding model's forward-pass cost across chunks.
     """
-    drawer_id = make_drawer_id_from_chunk(wing, room, source_file, chunk_index)
+    drawer_id = make_drawer_id_for_write(
+        content, wing=wing, room=room, source_file=source_file, chunk_index=chunk_index
+    )
     try:
         source_mtime = os.path.getmtime(source_file)
     except OSError:
@@ -1476,7 +1478,13 @@ def process_file(
             batch_ids: list = []
             batch_metas: list = []
             for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
-                drawer_id = make_drawer_id_from_chunk(wing, room, source_file, chunk["chunk_index"])
+                drawer_id = make_drawer_id_for_write(
+                    chunk["content"],
+                    wing=wing,
+                    room=room,
+                    source_file=source_file,
+                    chunk_index=chunk["chunk_index"],
+                )
                 batch_docs.append(chunk["content"])
                 batch_ids.append(drawer_id)
                 batch_metas.append(
@@ -1519,7 +1527,14 @@ def process_file(
         # fully replace the prior closets, not append to them.
         if closets_col and drawers_added > 0:
             drawer_ids = [
-                make_drawer_id_from_chunk(wing, room, source_file, c["chunk_index"]) for c in chunks
+                make_drawer_id_for_write(
+                    c["content"],
+                    wing=wing,
+                    room=room,
+                    source_file=source_file,
+                    chunk_index=c["chunk_index"],
+                )
+                for c in chunks
             ]
             # Pass drawer_metas so build_closet_lines can emit the Tier 6a
             # 4-segment pointer (``topic|entities|YYYY-MM-DD:Lstart-Lend|→ids``)

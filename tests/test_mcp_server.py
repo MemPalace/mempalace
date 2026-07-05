@@ -1672,7 +1672,9 @@ class TestWriteTools:
         assert result["success"] is True
         assert result["wing"] == "test_wing"
         assert result["room"] == "test_room"
-        assert result["drawer_id"].startswith("drawer_test_wing_test_room_")
+        # v4 content-pure id: identity is the content alone (no wing/room in the id).
+        _v4 = result["drawer_id"].removeprefix("drawer_")
+        assert len(_v4) == 32 and all(c in "0123456789abcdef" for c in _v4)
 
     def test_add_drawer_duplicate_detection(self, monkeypatch, config, palace_path, kg):
         _patch_mcp_server(monkeypatch, config, kg)

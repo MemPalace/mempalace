@@ -20,7 +20,7 @@ from collections import defaultdict
 from typing import Optional
 
 from .collision_scan import assert_no_collisions
-from .ids import ID_RECIPE, make_convo_drawer_id, make_convo_sentinel_id
+from .ids import ID_RECIPE, make_convo_sentinel_id, make_drawer_id_for_write
 from .normalize import normalize
 from .entities import entities_metadata
 from .palace import (
@@ -817,8 +817,13 @@ def _file_chunks_locked(
                 chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
                 if extract_mode == "general":
                     room_counts_delta[chunk_room] += 1
-                drawer_id = make_convo_drawer_id(
-                    wing, chunk_room, source_file, extract_mode, chunk["chunk_index"]
+                drawer_id = make_drawer_id_for_write(
+                    chunk["content"],
+                    wing=wing,
+                    room=chunk_room,
+                    source_file=source_file,
+                    extract_mode=extract_mode,
+                    chunk_index=chunk["chunk_index"],
                 )
                 batch_docs.append(chunk["content"])
                 batch_ids.append(drawer_id)
