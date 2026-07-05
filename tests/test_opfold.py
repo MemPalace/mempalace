@@ -230,6 +230,45 @@ class TestDrawerFold:
         assert stats["skipped_stale"] == 1 and stats["conflicts"] == 0
         assert rig["col"].rows["d_local"][0] == "current"
 
+    def test_write_flip_remaps_legacy_v3_keyed_op_to_content_hash(self, rig):
+        # A legacy v3-keyed drawer.revise (drawer_id is wing/room-shaped, does
+        # not match hash(content)) is re-keyed to the content-pure v4 id and
+        # applied THERE — not folded as a v3 "ghost" under the stale id.
+        from mempalace.ids import make_drawer_id_content_pure
+
+        content = "revised!"  # <= chunk_size (10) so it stays a single row
+        v4_id = make_drawer_id_content_pure(content)
+        _ship(
+            rig,
+            "drawer.revise",
+            {
+                "drawer_id": "drawer_sessions_technical_abc123def456",
+                "content": content,
+                "content_sha256": _sha(content),
+            },
+        )
+        stats = _fold(rig)
+        assert stats["remapped_v3_ids"] == 1
+        assert v4_id in rig["col"].rows  # applied under the content-hash id
+        assert "drawer_sessions_technical_abc123def456" not in rig["col"].rows  # no ghost
+        assert rig["col"].rows[v4_id][0] == content
+
+    def test_write_flip_v4_keyed_op_is_not_remapped(self, rig):
+        # The normal path: a v4-keyed op already equals its content hash, so the
+        # remap is a no-op — zero behavior change, no counter bump.
+        from mempalace.ids import make_drawer_id_content_pure
+
+        content = "v4 keyed"  # <= chunk_size, single row under its own v4 id
+        v4_id = make_drawer_id_content_pure(content)
+        _ship(
+            rig,
+            "drawer.add",
+            {"drawer_id": v4_id, "content": content, "content_sha256": _sha(content)},
+        )
+        stats = _fold(rig)
+        assert stats["remapped_v3_ids"] == 0
+        assert v4_id in rig["col"].rows and rig["col"].rows[v4_id][0] == content
+
     def test_sha_mismatch_stops_fold_for_retry(self, rig):
         _ship(
             rig,

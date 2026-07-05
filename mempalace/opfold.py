@@ -35,6 +35,7 @@ rule as ``replica pull``.
 import hashlib
 import logging
 
+from .ids import make_drawer_id_content_pure
 from .oplog import OpLog
 
 logger = logging.getLogger("mempalace.opfold")
@@ -140,8 +141,30 @@ def _apply_drawer_op(op: dict, collection, chunk_size: int, stats: dict) -> None
     drawer_id = payload.get("drawer_id")
     if not drawer_id:
         raise ValueError(f"{op['op_id']}: drawer op has no drawer_id")
-    state = _logical_state(collection, drawer_id)
     kind = op["kind"]
+
+    # Write-flip remap (RFC 004): a legacy v3-keyed drawer.add/revise carries a
+    # wing/room/source-keyed drawer_id that no longer exists in a content-pure v4
+    # store. Re-key it to drawer_<hash(content)> so it applies as an add / LWW on
+    # the correct v4 drawer — identically on every backend — instead of folding
+    # as a v3 "ghost" (sqlite_exact upserts the stale id) or being dropped
+    # (chroma). A v4-keyed op already equals its content hash, so this is a no-op
+    # on the normal path. Tombstones carry no content to re-key from and keep the
+    # existing store-presence semantics below (apply if the target is present,
+    # skip if absent).
+    if kind in ("drawer.add", "drawer.revise") and drawer_id.startswith("drawer_"):
+        # Gate on the "drawer_" prefix: every production drawer id (v3 or v4)
+        # carries it (make_drawer_id_*), so this never changes real behavior —
+        # it only avoids re-keying arbitrary non-drawer ids that never occur in a
+        # live palace.
+        content = payload.get("content")
+        if isinstance(content, str) and content:
+            target = make_drawer_id_content_pure(content)
+            if target != drawer_id:
+                stats["remapped_v3_ids"] += 1
+                drawer_id = target
+
+    state = _logical_state(collection, drawer_id)
 
     if kind == "drawer.add" and state is not None:
         stats["skipped_existing"] += 1
@@ -249,6 +272,7 @@ def fold_ops(
         "skipped_existing": 0,
         "skipped_stale": 0,
         "skipped_other_kind": 0,
+        "remapped_v3_ids": 0,
         "conflicts": 0,
         "conflict_sample": [],
         "errors": 0,
