@@ -31,6 +31,22 @@ def strip_lone_surrogates(text: str) -> str:
     return _LONE_SURROGATE_RE.sub("�", text)
 
 
+# Tool output mined from real transcripts routinely embeds a NUL character
+# (U+0000) — e.g. captured Bash output where a reader raced a background
+# writer, or genuine binary/NUL-delimited command output. A document
+# containing one is otherwise valid, well-formed text (unlike a lone
+# surrogate, which is invalid UTF-8), but handing it to ChromaDB's
+# SQLite/FTS5 layer can corrupt the FTS5 inverted index for the *whole*
+# collection (``PRAGMA quick_check`` reports "malformed inverted index for
+# FTS5 table"), not just fail to store that one document. Stripping it
+# before it reaches the chromadb client is the same defense-in-depth this
+# module already applies to lone surrogates (#1235) — sanitize input we
+# don't control before it reaches a datastore we don't control.
+def strip_nul_bytes(text: str) -> str:
+    """Replace embedded NUL characters with U+FFFD before ChromaDB storage."""
+    return text.replace("\x00", "�")
+
+
 def normalize_wing_name(name: str) -> str:
     """Lower-case + collapse separators (`-`, ` `) to `_` for wing slugs.
 
