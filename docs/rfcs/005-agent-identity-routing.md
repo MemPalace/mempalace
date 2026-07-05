@@ -3,7 +3,7 @@
 Status: Draft — for Igor's review
 Owner: mac-claude (backend/hub owner; identity is palace/fleet infrastructure, not a meshguard concern)
 Created: 2026-07-04
-Branch: `feat/shared-brain-dogfood`
+Branch: `feat/replicated-palace`
 Prior art: RFC 003 (logstream — the routing surface this refines), RFC 004 (the replicated palace — provides the stable replica identity a host label derives from), the `rfc005_agent_identity_routing` correlation thread
 
 ## Summary

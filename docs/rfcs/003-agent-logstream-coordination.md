@@ -3,7 +3,7 @@
 Status: Implemented (phases 1-5). Phase 5 SSE shipped as GET /logstream/stream on the hub HTTP transport (bearer-authenticated, event_list filter set, since_event_id/Last-Event-ID resume, 15s heartbeats, bounded clients); logstream tools additionally dispatch outside the global HTTP request lock so long-polls cannot starve the hub. Server-side cursor storage and drawer compaction remain future work.
 Owner: Claude Fable 5
 Created: 2026-07-01
-Branch: `feat/shared-brain-dogfood`
+Branch: `feat/replicated-palace`
 
 ## Summary
 
@@ -114,7 +114,7 @@ Example event:
   "from_agent": "windows-codex",
   "to_agent": "mac-codex",
   "correlation_id": "task_01J...",
-  "branch": "feat/shared-brain-dogfood",
+  "branch": "feat/replicated-palace",
   "base_commit": "2668053",
   "status": "ready",
   "artifact_ids": ["art_01J..."],
@@ -210,7 +210,7 @@ Input:
   "from_agent": "mac-codex",
   "to_agent": "windows-codex",
   "correlation_id": "task_...",
-  "branch": "feat/shared-brain-dogfood",
+  "branch": "feat/replicated-palace",
   "base_commit": "2668053",
   "status": "open",
   "body": "Please fix search echo ranking.",
@@ -298,7 +298,7 @@ Input:
   "created_by": "windows-codex",
   "content": "diff --git ...",
   "metadata": {
-    "branch": "feat/shared-brain-dogfood",
+    "branch": "feat/replicated-palace",
     "base_commit": "2668053"
   }
 }
@@ -495,7 +495,7 @@ Before finishing:
 
 Windows dogfood verification by `windows-codex` on 2026-07-02:
 
-- Branch/base: `feat/shared-brain-dogfood` at `1ff3125`.
+- Branch/base: `feat/replicated-palace` at `1ff3125`.
 - OS: Microsoft Windows 11 Pro Insider Preview 10.0.29576 build 29576 64-bit.
 - Python: 3.12.11 via `uv run python`.
 - Command: `uv run pytest tests/test_logstream.py tests/test_mcp_logstream.py tests/test_cli_logstream.py -q`.

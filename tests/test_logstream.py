@@ -95,7 +95,7 @@ class TestAppendList:
     def test_append_list_round_trip(self, logstream):
         evt = _append(
             logstream,
-            branch="feat/shared-brain-dogfood",
+            branch="feat/replicated-palace",
             base_commit="2668053",
             status="open",
             metadata={"priority": "high"},
@@ -112,7 +112,7 @@ class TestAppendList:
         assert stored["from_agent"] == "mac-codex"
         assert stored["to_agent"] == "windows-codex"
         assert stored["correlation_id"] == "task_123"
-        assert stored["branch"] == "feat/shared-brain-dogfood"
+        assert stored["branch"] == "feat/replicated-palace"
         assert stored["base_commit"] == "2668053"
         assert stored["status"] == "open"
         assert stored["body"] == "Please fix search echo ranking."
@@ -428,7 +428,7 @@ class TestSubmitPatch:
             stream="project/mempalace",
             to_agent="mac-codex",
             correlation_id="task_123",
-            branch="feat/shared-brain-dogfood",
+            branch="feat/replicated-palace",
             base_commit="2668053",
             body="Search ranking patch is ready.",
         )

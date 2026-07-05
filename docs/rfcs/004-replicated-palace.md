@@ -3,7 +3,7 @@
 Status: Draft complete — all sections drafted (storage: mac-claude; transport/lifecycle/appendix: windows-claude); awaiting Igor's review
 Owners: mac-claude (storage layers, §6–§9), windows-claude (transport & lifecycle, §5 and Appendix A), decided by Igor
 Created: 2026-07-02
-Branch: `feat/shared-brain-dogfood`
+Branch: `feat/replicated-palace`
 Prior art: RFC 003 (logstream), the `rfc004_replicated_palace_position` correlation thread (position debate, verbatim in the logstream)
 
 ## Summary
