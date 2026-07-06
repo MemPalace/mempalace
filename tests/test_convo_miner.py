@@ -1,4 +1,6 @@
 import os
+import json
+import sqlite3
 import tempfile
 import shutil
 from pathlib import Path
@@ -7,9 +9,16 @@ import chromadb
 import pytest
 
 from mempalace.convo_miner import (
+    _ai_tool_default_wing,
+    chunk_exchanges,
     _is_ai_tool_path,
+    _project_wing_from_jsonl_cwd,
+    _opencode_source_file,
+    _resolve_opencode_db_path,
+    _resolve_wing_for_file,
     _resolve_wing,
     mine_convos,
+    scan_convos,
 )
 from mempalace.palace import MineAlreadyRunning, file_already_mined
 
@@ -108,7 +117,13 @@ def test_mine_convos_allows_general_after_exchange(capsys):
         rows = col.get(where={"source_file": resolved}, include=["metadatas"])
         modes = {meta.get("extract_mode") for meta in rows["metadatas"]}
         assert {"exchange", "general"} <= modes
-        assert any(drawer_id.startswith("drawer_test_decision_") for drawer_id in rows["ids"])
+        # v4 content-pure ids: wing/room live in metadata now, not the id.
+        assert rows["ids"] and all(
+            len(did.removeprefix("drawer_")) == 32
+            and did.startswith("drawer_")
+            and all(c in "0123456789abcdef" for c in did.removeprefix("drawer_"))
+            for did in rows["ids"]
+        )
         del col, client
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -195,6 +210,54 @@ def test_mine_convos_rebuilds_stale_drawers_after_schema_bump(capsys):
         del col, client
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_chunk_exchanges_prefers_word_boundaries_for_long_responses():
+    content = "> What happened?\n" + ("alpha beta gamma delta epsilon\n" * 20)
+    chunks = chunk_exchanges(content, chunk_size=80, min_chunk_size=0)
+
+    assert len(chunks) > 1
+    assert "".join(chunk["content"] for chunk in chunks) == content.rstrip("\n")
+    assert all(
+        not (chunk["content"][0].isalnum() and chunks[index - 1]["content"][-1].isalnum())
+        for index, chunk in enumerate(chunks)
+        if index > 0
+    )
+
+
+def test_chunk_exchanges_preserves_unbroken_long_tokens():
+    long_token = "x" * 120
+    content = f"> Token?\n{long_token}"
+    chunks = chunk_exchanges(content, chunk_size=50, min_chunk_size=0)
+
+    assert "".join(chunk["content"] for chunk in chunks) == content
+
+
+def test_chunk_exchanges_prefers_punctuation_boundaries_for_long_paths():
+    path_like = "/Users/me/.local/share/zsh/site-functions:/usr/share/zsh/functions:" * 4
+    content = f"> Path?\n{path_like}"
+    chunks = chunk_exchanges(content, chunk_size=80, min_chunk_size=0)
+
+    assert len(chunks) > 1
+    assert "".join(chunk["content"] for chunk in chunks) == content
+    assert all(
+        not (chunk["content"][0].isalnum() and chunks[index - 1]["content"][-1].isalnum())
+        for index, chunk in enumerate(chunks)
+        if index > 0
+    )
+
+
+def test_chunk_exchanges_paragraph_fallback_preserves_separators():
+    content = (
+        "First paragraph has enough content to spill over.\n\n"
+        "Second paragraph must keep the blank line before it.\n"
+        "- and lists\n"
+        "- should retain their line breaks too\n"
+    )
+    chunks = chunk_exchanges(content, chunk_size=70, min_chunk_size=0)
+
+    assert len(chunks) > 1
+    assert "".join(chunk["content"] for chunk in chunks) == content.rstrip("\n")
 
 
 def _hold_palace_lock_in_child(palace_path, ready_flag, release_flag):
@@ -298,14 +361,23 @@ def test_mine_convos_dry_run_bypasses_palace_lock(tmp_path, monkeypatch):
             holder.join(timeout=5)
 
 
-# ── _is_ai_tool_path / _resolve_wing — wing_api auto-routing ───────────
+def test_scan_convos_generic_export_keeps_text_markdown_and_json(tmp_path):
+    for name in ("chat.txt", "chat.md", "chat.json", "chat.jsonl"):
+        (tmp_path / name).write_text("> hello\nthere\n> again\nthere\n")
+
+    found = {path.name for path in scan_convos(str(tmp_path))}
+
+    assert found == {"chat.txt", "chat.md", "chat.json", "chat.jsonl"}
+
+
+# ── _is_ai_tool_path / _resolve_wing — AI transcript auto-routing ──────
 #
 # When a user runs `mempalace mine --mode convos` against a directory
 # inside a known AI-tool storage path (Claude Code's
 # ~/.claude/projects/, OpenAI Codex's ~/.codex/, Google Gemini CLI's
-# ~/.gemini/), the wing auto-defaults to "wing_api" rather than the
-# directory basename. This keeps API-sourced conversations grouped
-# under a single dedicated wing for visibility and privacy isolation.
+# ~/.gemini/), the wing auto-defaults to a harness-specific conversations
+# wing rather than the directory basename. This keeps backfilled agent
+# histories easy to scan and avoids collapsing every tool into wing_api.
 #
 # Explicit user-passed --wing always wins. Unrelated directories use
 # the existing basename fallback unchanged.
@@ -376,6 +448,48 @@ def test_is_ai_tool_path_substring_no_false_positive(tmp_path):
     assert _is_ai_tool_path(b) is False
 
 
+def test_scan_convos_claude_projects_excludes_sidecars(tmp_path):
+    target = tmp_path / ".claude" / "projects" / "-Users-test-myapp"
+    (target / "memory").mkdir(parents=True)
+    (target / "tool-results").mkdir()
+    (target / "workflows").mkdir()
+    (target / "subagents" / "workflows" / "wf_123").mkdir(parents=True)
+    (target / "session.jsonl").write_text("{}\n")
+    (target / "memory" / "MEMORY.md").write_text("not a transcript")
+    (target / "tool-results" / "tool.txt").write_text("tool output")
+    (target / "workflows" / "wf.json").write_text("{}")
+    (target / "subagents" / "workflows" / "wf_123" / "journal.jsonl").write_text("{}\n")
+
+    found = [path.relative_to(target).as_posix() for path in scan_convos(str(target))]
+
+    assert found == ["session.jsonl"]
+
+
+def test_scan_convos_codex_sessions_only_accepts_jsonl(tmp_path):
+    target = tmp_path / ".codex" / "sessions" / "2026" / "06" / "30"
+    target.mkdir(parents=True)
+    (target / "rollout.jsonl").write_text("{}\n")
+    (target / "notes.md").write_text("sidecar")
+    (target / "tool.txt").write_text("sidecar")
+    (target / "config.json").write_text("{}")
+
+    found = [path.name for path in scan_convos(str(target))]
+
+    assert found == ["rollout.jsonl"]
+
+
+def test_scan_convos_gemini_keeps_json_session_formats(tmp_path):
+    target = tmp_path / ".gemini" / "sessions"
+    target.mkdir(parents=True)
+    (target / "session.jsonl").write_text("{}\n")
+    (target / "session.json").write_text("{}")
+    (target / "notes.md").write_text("sidecar")
+
+    found = {path.name for path in scan_convos(str(target))}
+
+    assert found == {"session.jsonl", "session.json"}
+
+
 def test_resolve_wing_explicit_wins_over_auto_detection(tmp_path):
     """User-passed --wing always wins, even on an AI tool path."""
     target = tmp_path / ".claude" / "projects" / "-Users-x"
@@ -383,22 +497,36 @@ def test_resolve_wing_explicit_wins_over_auto_detection(tmp_path):
     assert _resolve_wing(target, wing="my_custom_wing") == "my_custom_wing"
 
 
-def test_resolve_wing_claude_projects_auto_routes_to_wing_api(tmp_path):
+def test_ai_tool_default_wing_routes_by_harness(tmp_path):
+    claude = tmp_path / ".claude" / "projects" / "-Users-test-myapp"
+    codex = tmp_path / ".codex" / "sessions" / "2026"
+    gemini = tmp_path / ".gemini" / "tmp" / "abc" / "chats"
+    unrelated = tmp_path / "Documents" / "myproject"
+    for path in (claude, codex, gemini, unrelated):
+        path.mkdir(parents=True)
+
+    assert _ai_tool_default_wing(claude) == "claude_conversations"
+    assert _ai_tool_default_wing(codex) == "codex_conversations"
+    assert _ai_tool_default_wing(gemini) == "gemini_conversations"
+    assert _ai_tool_default_wing(unrelated) is None
+
+
+def test_resolve_wing_claude_projects_auto_routes_to_claude_conversations(tmp_path):
     target = tmp_path / ".claude" / "projects" / "-Users-test-myapp"
     target.mkdir(parents=True)
-    assert _resolve_wing(target, wing=None) == "wing_api"
+    assert _resolve_wing(target, wing=None) == "claude_conversations"
 
 
-def test_resolve_wing_codex_auto_routes_to_wing_api(tmp_path):
+def test_resolve_wing_codex_auto_routes_to_codex_conversations(tmp_path):
     target = tmp_path / ".codex" / "sessions" / "2026"
     target.mkdir(parents=True)
-    assert _resolve_wing(target, wing=None) == "wing_api"
+    assert _resolve_wing(target, wing=None) == "codex_conversations"
 
 
-def test_resolve_wing_gemini_auto_routes_to_wing_api(tmp_path):
+def test_resolve_wing_gemini_auto_routes_to_gemini_conversations(tmp_path):
     target = tmp_path / ".gemini" / "tmp" / "abc" / "chats"
     target.mkdir(parents=True)
-    assert _resolve_wing(target, wing=None) == "wing_api"
+    assert _resolve_wing(target, wing=None) == "gemini_conversations"
 
 
 def test_resolve_wing_unrelated_dir_uses_basename_fallback(tmp_path):
@@ -415,7 +543,219 @@ def test_resolve_wing_empty_string_treated_as_no_wing(tmp_path):
     auto-detection / basename. Mirrors the original `if not wing:` guard."""
     target = tmp_path / ".gemini" / "tmp"
     target.mkdir(parents=True)
-    assert _resolve_wing(target, wing="") == "wing_api"
+    assert _resolve_wing(target, wing="") == "gemini_conversations"
+
+
+def test_project_wing_from_jsonl_cwd_uses_project_name(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        '{"type":"user","cwd":"/Users/me/dev/wormdb","content":"hello"}\n',
+        encoding="utf-8",
+    )
+
+    assert _project_wing_from_jsonl_cwd(transcript) == "wormdb"
+
+
+def _create_opencode_db(db_path: Path):
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.executescript(
+            """
+            create table session (
+                id text primary key,
+                directory text not null,
+                title text not null,
+                version text not null,
+                agent text,
+                model text,
+                time_created integer not null,
+                time_updated integer not null
+            );
+            create table message (
+                id text primary key,
+                session_id text not null,
+                time_created integer not null,
+                time_updated integer not null,
+                data text not null
+            );
+            create table part (
+                id text primary key,
+                message_id text not null,
+                session_id text not null,
+                time_created integer not null,
+                time_updated integer not null,
+                data text not null
+            );
+            """
+        )
+        conn.execute(
+            """
+            insert into session
+                (id, directory, title, version, agent, model, time_created, time_updated)
+            values (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "ses_test",
+                "/Users/me/dev/WormDB",
+                "OpenCode memory test",
+                "1.17.12",
+                "build",
+                '{"id":"local"}',
+                1782864000000,
+                1782864004000,
+            ),
+        )
+        rows = [
+            (
+                "msg_user",
+                "ses_test",
+                1782864001000,
+                1782864001000,
+                json.dumps({"role": "user"}),
+            ),
+            (
+                "msg_assistant",
+                "ses_test",
+                1782864002000,
+                1782864004000,
+                json.dumps({"role": "assistant"}),
+            ),
+        ]
+        conn.executemany(
+            """
+            insert into message (id, session_id, time_created, time_updated, data)
+            values (?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        parts = [
+            (
+                "prt_user",
+                "msg_user",
+                "ses_test",
+                1782864001001,
+                1782864001001,
+                json.dumps(
+                    {
+                        "type": "text",
+                        "text": "Remember the opencode comet canary for this project.",
+                    }
+                ),
+            ),
+            (
+                "prt_reasoning",
+                "msg_assistant",
+                "ses_test",
+                1782864002001,
+                1782864002001,
+                json.dumps(
+                    {
+                        "type": "reasoning",
+                        "text": "SHOULD_NOT_APPEAR_REASONING",
+                    }
+                ),
+            ),
+            (
+                "prt_tool",
+                "msg_assistant",
+                "ses_test",
+                1782864003000,
+                1782864003000,
+                json.dumps(
+                    {
+                        "type": "tool",
+                        "tool": "mempalace_mempalace_search",
+                        "state": {"output": "SHOULD_NOT_APPEAR_TOOL_OUTPUT"},
+                    }
+                ),
+            ),
+            (
+                "prt_assistant",
+                "msg_assistant",
+                "ses_test",
+                1782864004000,
+                1782864004000,
+                json.dumps(
+                    {
+                        "type": "text",
+                        "text": "The opencode comet canary is stored for WormDB.",
+                    }
+                ),
+            ),
+        ]
+        conn.executemany(
+            """
+            insert into part (id, message_id, session_id, time_created, time_updated, data)
+            values (?, ?, ?, ?, ?, ?)
+            """,
+            parts,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_resolve_opencode_db_path_accepts_file_and_data_dir(tmp_path):
+    data_dir = tmp_path / "opencode"
+    data_dir.mkdir()
+    db_path = data_dir / "opencode.db"
+    _create_opencode_db(db_path)
+
+    assert _resolve_opencode_db_path(db_path) == db_path
+    assert _resolve_opencode_db_path(data_dir) == db_path
+
+
+def test_mine_convos_opencode_db_uses_project_wing_and_skips_operational_parts(tmp_path, capsys):
+    data_dir = tmp_path / "opencode"
+    data_dir.mkdir()
+    db_path = data_dir / "opencode.db"
+    _create_opencode_db(db_path)
+    palace_path = str(tmp_path / "palace")
+
+    mine_convos(str(db_path), palace_path)
+    out = capsys.readouterr().out
+    assert "MemPalace Mine — OpenCode Conversations" in out
+
+    client = chromadb.PersistentClient(path=palace_path)
+    col = client.get_collection("mempalace_drawers")
+    rows = col.get(where={"source_file": _opencode_source_file("ses_test")})
+    assert rows["ids"], "OpenCode session should be filed under a synthetic session source"
+    doc = "\n".join(rows["documents"])
+    assert "Remember the opencode comet canary for this project." in doc
+    assert "The opencode comet canary is stored for WormDB." in doc
+    assert "SHOULD_NOT_APPEAR_REASONING" not in doc
+    assert "SHOULD_NOT_APPEAR_TOOL_OUTPUT" not in doc
+    assert all(meta["wing"] == "wormdb" for meta in rows["metadatas"])
+    assert all(
+        meta["source_file"] == _opencode_source_file("ses_test") for meta in rows["metadatas"]
+    )
+    assert all(meta["authored_at"] == "2026-07-01T00:00:04.000Z" for meta in rows["metadatas"])
+
+    mine_convos(str(data_dir), palace_path)
+    out2 = capsys.readouterr().out
+    assert "Sessions skipped (already filed): 1" in out2
+    del col, client
+
+
+def test_resolve_wing_for_file_prefers_project_cwd_over_harness_wing(tmp_path):
+    transcript = tmp_path / ".codex" / "sessions" / "2026" / "session.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(
+        '{"type":"user","cwd":"/Users/me/dev/MemPalace/mempalace","content":"hello"}\n',
+        encoding="utf-8",
+    )
+
+    assert _resolve_wing_for_file(transcript, "codex_conversations", None) == "mempalace"
+
+
+def test_resolve_wing_for_file_explicit_wing_still_wins(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        '{"type":"user","cwd":"/Users/me/dev/wormdb","content":"hello"}\n',
+        encoding="utf-8",
+    )
+
+    assert _resolve_wing_for_file(transcript, "codex_conversations", "custom") == "custom"
 
 
 def test_mine_convos_limit_skips_already_mined(capsys):

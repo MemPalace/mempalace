@@ -75,6 +75,16 @@ class EmbeddingCollection(BaseCollection):
     def run_maintenance(self, kind: str):
         return self._inner.run_maintenance(kind)
 
+    def rekey_row(self, old_id, new_id, *, content, metadata, embedding=None) -> None:
+        # Same shadowing reason as the identity forwards above: ``rekey_row`` is a
+        # concrete method on ``BaseCollection``, so ``__getattr__`` never delegates
+        # it. Forward explicitly so the wrapped backend's own override runs (e.g.
+        # sqlite_exact's single-transaction, docs_fts-aware rekey) instead of the
+        # base upsert+delete default.
+        return self._inner.rekey_row(
+            old_id, new_id, content=content, metadata=metadata, embedding=embedding
+        )
+
     def add(self, *, documents, ids, metadatas=None, embeddings=None):
         documents = _as_list(documents)
         ids = _as_list(ids)

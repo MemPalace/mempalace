@@ -377,6 +377,11 @@ def _mine_already_running(cmd: list[str]) -> bool:
       longer than the timeout.
     """
     pid_file = _pid_file_for_cmd(cmd)
+    return _mine_pid_slot_is_active(pid_file)
+
+
+def _mine_pid_slot_is_active(pid_file: Path) -> bool:
+    """Return True when ``pid_file`` points at a live, non-expired mine."""
     try:
         recorded = pid_file.read_text().strip()
     except OSError:
@@ -404,6 +409,33 @@ def _mine_already_running(cmd: list[str]) -> bool:
         if time.time() - start_ts > timeout_secs:
             return False
     return True
+
+
+def _cleanup_stale_mine_slots() -> int:
+    """Remove dead or expired hook mine PID slots left by crashes.
+
+    Matching-slot reclaim already happens in ``_claim_mine_slot``. This sweep
+    is broader: a force reboot can leave slots for targets that may never fire
+    again, so the next hook-triggered spawn does a best-effort cleanup across
+    the directory. Live slots are preserved.
+    """
+    try:
+        candidates = list(_MINE_PID_DIR.glob("mine_*.pid"))
+    except OSError:
+        return 0
+
+    removed = 0
+    for pid_file in candidates:
+        if _mine_pid_slot_is_active(pid_file):
+            continue
+        try:
+            pid_file.unlink()
+            removed += 1
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+    return removed
 
 
 def _create_mine_slot_with_placeholder(pid_file: Path) -> Path:
@@ -480,6 +512,9 @@ def _spawn_mine(cmd: list) -> None:
     """
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     log_path = STATE_DIR / "hook.log"
+    stale_removed = _cleanup_stale_mine_slots()
+    if stale_removed:
+        _log(f"Cleaned {stale_removed} stale mine PID slot(s)")
     pid_file = _claim_mine_slot(cmd)
     if pid_file is None:
         _log(f"Skipping mine: target already running ({' '.join(cmd[-3:])})")
@@ -1014,7 +1049,7 @@ def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
                     continue
                 project = cwd_norm.rsplit("/", 1)[-1]
                 if project:
-                    return f"wing_{_safe_wing_slug(project)}"
+                    return _safe_wing_slug(project)
     except OSError:
         pass
     return None
@@ -1043,7 +1078,7 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
     3. LEGACY — Match an explicit ``-Projects-<name>`` segment for
        transcripts not under the standard Claude Code projects dir.
 
-    4. DEFAULT — ``wing_sessions``.
+    4. DEFAULT — ``sessions``.
 
     Closes #1410.
     """
@@ -1071,15 +1106,15 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
             if encoded.startswith(prefix):
                 encoded = encoded[len(prefix) :]
                 break
-        return f"wing_{_safe_wing_slug(encoded)}"
+        return _safe_wing_slug(encoded)
 
     # 3. Legacy — explicit -Projects-<name> segment
     match = re.search(r"-Projects-([^/]+?)(?:/|$)", normalized)
     if match:
-        return f"wing_{_safe_wing_slug(match.group(1))}"
+        return _safe_wing_slug(match.group(1))
 
     # 4. Default
-    return "wing_sessions"
+    return "sessions"
 
 
 def hook_stop(data: dict, harness: str):

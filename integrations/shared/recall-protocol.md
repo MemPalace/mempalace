@@ -44,6 +44,18 @@ question-driven, not reflexive.
 6. **When a fact changes**, call `mempalace_kg_invalidate` on the old
    fact, then `mempalace_kg_add` for the new one.
 
+## Answer shape
+
+For memory-backed answers, make the provenance obvious:
+
+- Cite the source location first: wing, room, source file, or drawer id
+  when available.
+- Quote the drawer's exact stored words before any synthesis.
+- Keep your inference separate from the quote, and label it when it is
+  not directly stored in the drawer.
+- Include source dates or authored-at metadata when available, especially
+  when the memory may be stale.
+
 ## Tool selection
 
 | You need | Tool |
@@ -67,6 +79,13 @@ question — not a system prompt or pasted conversation) plus optional
 - **MCP unavailable / tool error.** Surface the error plainly and suggest
   the user verify the server (`mempalace status`, or re-run install).
   Do not silently fall back to guessing from model memory.
+- **Weak or unrelated results.** Refine inside MemPalace: try an exact
+  phrase, entity-plus-topic keywords, or a wing/room filter discovered
+  with `mempalace_list_wings` / `mempalace_list_rooms`. Do not use broad
+  `rg`, `grep`, or `find` scans over home directories, editor caches,
+  project folders, or conversation archives unless the user explicitly
+  asks for filesystem search; that bypasses palace provenance and can
+  drown exact memories in unrelated files.
 - **Palace index corrupt / compactor error.** When the server returns an
   error mentioning the HNSW segment writer, a ChromaDB compaction
   failure, or a stuck "Not connected" state after a write, the on-disk
@@ -116,5 +135,10 @@ added through the MCP server and diary entries, which have no source file
 
 - [`integrations/openclaw/SKILL.md`](../openclaw/SKILL.md) — the original
   full-protocol skill this is distilled from.
+- [`coordination-protocol.md`](coordination-protocol.md) — the shared-brain
+  companion protocol: when agents delegate work to each other over the
+  hub, they use the logstream (`mempalace_event_append` /
+  `mempalace_event_wait`), not drawers. Recall answers questions;
+  the logstream moves work.
 - MemPalace design principles (verbatim, local-first, never summarize):
   <https://github.com/MemPalace/mempalace>

@@ -169,3 +169,149 @@ mempalace instructions mine
 mempalace instructions help
 mempalace instructions status
 ```
+
+## `mempalace logstream`
+
+Agent coordination events — delegate work, wait for replies, acknowledge
+outcomes (RFC 003). Operates on `logstream.sqlite3` in the palace directory;
+safe to run alongside a live hub. See [Agent Logstream](/concepts/agent-logstream).
+
+```bash
+mempalace logstream append --type task.request --stream project/myapp \
+  --room delegation --from-agent mac --to-agent windows \
+  --correlation-id task_123 --body "Please fix the flaky test."
+
+mempalace logstream list --stream project/myapp --room delegation --json
+mempalace logstream wait --correlation-id task_123 --type patch.ready \
+  --timeout-ms 300000 --json
+mempalace logstream ack evt_... --from-agent mac --status applied
+```
+
+| Subcommand | Description |
+|------------|-------------|
+| `append` | Append an immutable event (`--type`, `--stream`, `--room`, `--from-agent` required; `--body`/`--body-file`, `--artifact-id` repeatable) |
+| `list` | List events, oldest first (all routing fields as filters, `--since-event-id`, `--limit`) |
+| `wait` | Long-poll until a match or timeout (`--timeout-ms`, max 300000; exits `2` on timeout) |
+| `ack` | Append an `event.ack` for an event (`--from-agent` required, `--status`, `--body`) |
+| `sync` | Pull missing events/artifacts from peer replicas (`--peer URL --token T`, or all peers in `peers.json`) |
+
+All subcommands accept `--json` for scriptable output.
+
+## `mempalace artifact`
+
+Exact artifact exchange for agent handoffs — unified diffs, files, logs.
+Content is stored verbatim with a SHA-256.
+
+```bash
+git diff | mempalace artifact put --kind patch --created-by windows --json
+mempalace artifact get art_... | git apply --3way
+mempalace artifact get art_... --out /tmp/handoff.patch
+```
+
+| Subcommand | Description |
+|------------|-------------|
+| `put` | Store content (`--kind patch\|file\|log\|json\|note`, `--created-by` required; `--content`, `--file`, or stdin) |
+| `get` | Print exact content to stdout, or `--out FILE`; `--json` for metadata |
+
+## `mempalace replica`
+
+Memory replication across your machines (RFC 004; see
+[The Replicated Palace](/concepts/replicated-palace)). Bootstraps a new
+replica from its peers and moves precomputed vectors between machines.
+
+```bash
+# Bootstrap: fold every peer's authored content into this palace.
+# STOP the local hub first — this writes the palace directly.
+mempalace replica pull --with-vectors
+
+# One specific origin instead of peers.json:
+mempalace replica pull --peer https://desktop.example.com --token "$TOKEN"
+
+# Precompute vectors into the portable cache (safe alongside a live hub):
+mempalace replica embed-cache --batch 512 --json
+```
+
+| Subcommand | Description |
+|------------|-------------|
+| `pull` | Fold drawers + knowledge graph from origins (`--peer`/`--token` or `peers.json`; `--with-vectors` uses origin-precomputed vectors, `--no-kg`, `--no-reconcile`) |
+| `embed-cache` | Bulk-embed local content into `vector_cache.sqlite3` so peers can pull `--with-vectors` (`--model`, `--batch`, `--all`) |
+
+`pull` requires the local hub to be stopped (single-writer rule) and the
+origins to be quiescent (no active mines). Pulls are insert-only and
+resumable — re-running heals any gap. Raise
+`MEMPALACE_SYNC_HTTP_TIMEOUT` (seconds, default 30) for large bootstraps.
+
+## `mempalace oplog`
+
+The canonical memory op-log (RFC 004 step 2a — currently in dual-write
+shadow). Every drawer and knowledge-graph write also lands as a
+provenance-stamped op in `oplog.sqlite3`; ops travel between replicas and
+fold into their stores.
+
+```bash
+mempalace oplog status --json    # counts, kind histogram, version vector
+mempalace oplog sync             # pull missing ops from peers
+mempalace oplog fold             # apply pulled ops to the local store (hub stopped)
+mempalace oplog promote          # one-time: pre-oplog drawers become drawer.add ops
+mempalace oplog verify           # replay ops vs the live store — the cutover gate
+```
+
+| Subcommand | Description |
+|------------|-------------|
+| `status` | Op counts, per-kind histogram, and this replica's version vector |
+| `sync` | Anti-entropy pull of missing memory ops (`--peer URL --token T`, or all peers) |
+| `fold` | Apply pulled remote ops to the local store — stop the hub first; a running hub folds on its own sync cadence |
+| `promote` | Emit `drawer.add` ops for locally-authored drawers that predate the op-log (mined sets, pre-shadow captures). Idempotent and resumable (`--dry-run`, `--limit N`); safe alongside a live hub — reads the store, writes only the op-log |
+| `verify` | Replay the op-log against the live store; exits `1` on divergence |
+
+Promotion is how an **existing palace's history** becomes op-carried: after
+one clean `promote`, the op-log covers everything the replica ever authored,
+and future replicas receive that history as ops instead of snapshot pulls.
+Remote-stamped copies are never promoted — each origin promotes its own.
+
+A running hub does all of this automatically every `MEMPALACE_SYNC_INTERVAL`
+seconds (default 15): logstream sync, memory-op sync, then the fold. The CLI
+verbs exist for bootstraps, offline machines, and inspection.
+
+## `mempalace migrate-ids`
+
+The v4 content-pure id migration (RFC 004 id purity). Rewrites drawer ids from
+the location-addressed forms (`drawer_<wing>_<room>_<hash>`) to content-pure
+`drawer_<hash(content)>`, so organization (wing/room) becomes plain metadata and
+the same content anywhere in the mesh is the same drawer — content-addressed
+cross-machine dedup.
+
+```bash
+mempalace migrate-ids                              # dry-run plan (writes nothing)
+mempalace migrate-ids --json                       # machine-readable plan
+mempalace migrate-ids --apply --target ~/palace-v4 # materialize a v4 palace (copy-first)
+```
+
+| Option | Description |
+|--------|-------------|
+| *(none)* | Dry-run plan: drawers that change, content-collision groups that will MERGE, and KG/tunnel refs to remap. Writes nothing. |
+| `--apply` | Materialize the migration. Requires `--target`. |
+| `--target <path>` | Fresh palace path to write the migrated v4 palace into (must differ from the source — the source is never mutated). |
+| `--json` | Machine-readable plan output |
+
+The migration is **copy-first**: `--apply` reads the source and writes a new v4
+palace into `--target`, copying vectors (never re-deriving them) and merging
+content-identical drawers into one. The source palace is left untouched.
+
+Content collisions **merge**: when several drawers hold identical content they
+collapse to one v4 drawer (placement chosen by latest `filed_at`), and every
+merged-away id is repointed so the knowledge graph's `source_drawer_id`
+provenance and any tunnels still resolve.
+
+Because a v4 id is a pure function of content, every replica migrates
+independently and converges on identical ids — no migration is ever synced.
+
+Full runbook (run against the target, validate, then swap it in):
+
+```bash
+mempalace migrate-ids --apply --target ~/palace-v4
+mempalace --palace ~/palace-v4 compress        # rebuild the closet index at v4 ids
+mempalace --palace ~/palace-v4 oplog promote   # build the v4 op-log
+mempalace --palace ~/palace-v4 oplog verify    # must report CLEAN
+mempalace --palace ~/palace-v4 search "..."    # confirm recall
+```

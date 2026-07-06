@@ -23,7 +23,7 @@ claude plugin add /path/to/mempalace
 
 ## Post-Install Setup
 
-After installing the plugin, run the init command to complete setup (installs the `mempalace` package via `uv tool` or `pip`, configures MCP, etc.):
+After installing the plugin, run the init command to complete setup. It checks that the `mempalace` package is installed, helps configure your palace path, and verifies the local tools:
 
 ```
 /mempalace:init
@@ -51,7 +51,7 @@ Set the `MEMPAL_DIR` environment variable to a directory path to automatically r
 
 ## MCP Server
 
-The plugin automatically configures a local MCP server with 34 tools for storing, searching, and managing memories. No manual MCP setup is required -- `/mempalace:init` handles everything.
+The plugin declares a local MCP server with 35 tools for storing, searching, and managing memories. No manual MCP setup is required when installing the plugin; `claude mcp list` should show `plugin:mempalace:mempalace` connected after install.
 
 ## Full Documentation
 

@@ -30,6 +30,18 @@ def test_config_from_file():
     assert cfg.palace_path == "/custom/palace"
 
 
+def test_set_palace_path_persists_normalized_absolute_path(tmp_path):
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    raw = str(tmp_path / "palaces" / ".." / "shared-agent-brain")
+
+    written = cfg.set_palace_path(raw)
+
+    expected = os.path.abspath(os.path.expanduser(raw))
+    assert written == expected
+    reloaded = MempalaceConfig(config_dir=str(tmp_path))
+    assert reloaded.palace_path == expected
+
+
 def test_backend_from_config_wins_over_env(tmp_path, monkeypatch):
     with open(tmp_path / "config.json", "w") as f:
         json.dump({"backend": "sqlite_exact"}, f)
@@ -793,6 +805,15 @@ def test_hook_use_daemon_env_override(monkeypatch, tmp_path):
     monkeypatch.setenv("MEMPALACE_HOOKS_DAEMON", "yes")
     cfg = MempalaceConfig(config_dir=str(tmp_path))
     assert cfg.hook_use_daemon is True
+
+
+def test_set_hook_setting_creates_config_file(tmp_path):
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+
+    cfg.set_hook_setting("silent_save", False)
+
+    reloaded = MempalaceConfig(config_dir=str(tmp_path))
+    assert reloaded.hook_silent_save is False
 
 
 # --- max_backups (backup retention) ---

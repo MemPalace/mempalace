@@ -55,9 +55,11 @@ import time  # noqa: E402
 from datetime import date, datetime  # noqa: E402
 from pathlib import Path  # noqa: E402
 from typing import Optional  # noqa: E402
+from urllib.parse import urlparse  # noqa: E402
 
 from .config import (  # noqa: E402
     MempalaceConfig,
+    normalize_wing_name,
     sanitize_kg_value,
     sanitize_name,
     sanitize_content,
@@ -96,9 +98,10 @@ from .hallways import (  # noqa: E402
     delete_hallway,
 )
 
-from .knowledge_graph import KnowledgeGraph, DEFAULT_KG_PATH  # noqa: E402
+from .knowledge_graph import KnowledgeGraph  # noqa: E402
+from .logstream import LOGSTREAM_DB_FILENAME, Logstream  # noqa: E402
 from .collision_scan import assert_no_collisions  # noqa: E402
-from .ids import ID_RECIPE, make_drawer_id_from_content  # noqa: E402
+from .ids import ID_RECIPE, make_drawer_id_for_write  # noqa: E402
 
 
 class _MempalaceLogFilter(logging.Filter):
@@ -322,6 +325,9 @@ _READ_ONLY = bool(getattr(_args, "read_only", False)) or os.environ.get(
 
 _kg_by_path: dict[str, KnowledgeGraph] = {}
 _kg_cache_lock = threading.Lock()
+
+_logstream_by_path: dict[str, Logstream] = {}
+_logstream_cache_lock = threading.Lock()
 _palace_flag_given: bool = bool(_args.palace)
 
 # MCP server idle auto-exit (#1552).  Stale MCP servers from ended Claude
@@ -347,6 +353,21 @@ _SQLITE_INTEGRITY_ALLOWED_TOOLS = frozenset(
     {
         "mempalace_status",
         "mempalace_reconnect",
+        # RFC 003: logstream lives in its own logstream.sqlite3 with no
+        # Chroma/FTS5 dependency, so agent coordination stays available
+        # even while the main palace index is corrupt and under repair.
+        "mempalace_event_append",
+        "mempalace_event_list",
+        "mempalace_event_wait",
+        "mempalace_event_ack",
+        "mempalace_artifact_put",
+        "mempalace_artifact_get",
+        "mempalace_patch_submit",
+        # RFC 004: the estate is observability — logstream + sync state +
+        # peers.json, no FTS5 dependency (the profile's drawer count
+        # degrades gracefully). A damaged palace is exactly when mesh
+        # visibility matters most; caught live on the third replica.
+        "mempalace_mesh_peers",
     }
 )
 
@@ -377,6 +398,26 @@ _MUTATING_TOOLS = frozenset(
         "mempalace_sync",
         "mempalace_update_drawer",
         "mempalace_diary_write",
+        "mempalace_event_append",
+        "mempalace_event_ack",
+        "mempalace_artifact_put",
+        "mempalace_patch_submit",
+    }
+)
+
+# Logstream mutating tools (RFC 003) write only to logstream.sqlite3 — an
+# independent WAL database with no Chroma/HNSW in-memory state — so the
+# peer-writer lease that protects Chroma does not apply to them. Exempting
+# them keeps agent coordination alive while a CLI mine or a peer stdio
+# writer holds the palace lock. They remain in _MUTATING_TOOLS so operator
+# read-only mode (--read-only / MEMPALACE_MCP_READ_ONLY) still hides and
+# refuses them.
+_PEER_WRITER_EXEMPT_TOOLS = frozenset(
+    {
+        "mempalace_event_append",
+        "mempalace_event_ack",
+        "mempalace_artifact_put",
+        "mempalace_patch_submit",
     }
 )
 
@@ -442,7 +483,7 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
 
 
 def _mcp_peer_writer_refusal(req_id, tool_name: str):
-    if tool_name not in _MUTATING_TOOLS:
+    if tool_name not in _MUTATING_TOOLS or tool_name in _PEER_WRITER_EXEMPT_TOOLS:
         return None
 
     ok, reason = _acquire_mcp_writer_lock()
@@ -459,6 +500,15 @@ def _mcp_peer_writer_refusal(req_id, tool_name: str):
                 "tool": tool_name,
                 "palace": _config.palace_path,
                 "reason": reason,
+                "hint": (
+                    "For multiple agents sharing one palace, connect them to one shared "
+                    "MemPalace MCP HTTP server instead of launching separate stdio "
+                    "mempalace-mcp writers (for example: mempalace serve --host "
+                    "127.0.0.1 --port 8765). For a local stdio setup, close stale "
+                    "agent sessions so only one mempalace-mcp owns the writer lease. "
+                    "Do not set the override unless you explicitly accept the Chroma "
+                    "stale-state/corruption risk."
+                ),
                 "override_env": _MCP_ALLOW_PEER_WRITER_ENV,
             },
         },
@@ -494,7 +544,25 @@ def _refresh_sqlite_integrity_status() -> None:
         )
         _sqlite_integrity_errors = [_sqlite_integrity_check_error]
     else:
-        _sqlite_integrity_errors = [str(error) for error in errors if str(error)]
+        errors = [str(error) for error in errors if str(error)]
+        # Self-heal isolated FTS5 inverted-index corruption on startup instead of
+        # gating every write: a six-figure v4 migration + compress on the chroma
+        # backend reliably leaves the FTS5 index malformed (seen on mac AND blade
+        # post-migration), and it rebuilds losslessly from the intact content
+        # shadow table. maybe_autoheal_fts5_index self-guards — it only touches
+        # the isolated-FTS5 case; broader corruption still gates below.
+        if errors:
+            try:
+                from .repair import maybe_autoheal_fts5_index
+
+                errors = maybe_autoheal_fts5_index(
+                    _config.palace_path,
+                    errors,
+                    progress=lambda m: logger.info("integrity auto-heal: %s", m),
+                )
+            except Exception:
+                logger.warning("FTS5 auto-heal attempt raised; leaving gate up", exc_info=True)
+        _sqlite_integrity_errors = errors
         _sqlite_integrity_check_error = ""
 
     _sqlite_integrity_checked = True
@@ -586,9 +654,8 @@ def _mcp_idle_timeout_secs() -> float:
 
 
 def _resolve_kg_path() -> str:
-    if _palace_flag_given:
-        return os.path.join(_config.palace_path, "knowledge_graph.sqlite3")
-    return DEFAULT_KG_PATH
+    palace_path = getattr(_config, "palace_path", None) or MempalaceConfig().palace_path
+    return os.path.join(os.path.expanduser(palace_path), "knowledge_graph.sqlite3")
 
 
 def _canonicalize_kg_path(path: str) -> str:
@@ -626,7 +693,7 @@ def _get_kg(canonical_path=None) -> KnowledgeGraph:
     with _kg_cache_lock:
         kg = _kg_by_path.get(path)
         if kg is None:
-            kg = KnowledgeGraph(db_path=path)
+            kg = KnowledgeGraph(db_path=path, oplog=_get_shadow_oplog())
             _kg_by_path[path] = kg
     return kg
 
@@ -669,6 +736,62 @@ def _call_kg(op):
                 with _kg_cache_lock:
                     if _kg_by_path.get(path) is kg:
                         _kg_by_path.pop(path, None)
+                continue
+            raise
+
+
+def _resolve_logstream_path() -> str:
+    """Resolve the RFC 003 logstream database path in the active palace.
+
+    Fails clearly (ValueError) when no palace path is configured — the
+    logstream must never silently write outside the palace directory.
+    """
+    palace_path = getattr(_config, "palace_path", None) or MempalaceConfig().palace_path
+    if not palace_path:
+        raise ValueError("no palace path configured; run mempalace init first")
+    return os.path.join(os.path.expanduser(palace_path), LOGSTREAM_DB_FILENAME)
+
+
+def _get_logstream(canonical_path=None) -> Logstream:
+    """Return the cached ``Logstream`` for the resolved palace.
+
+    Same canonical-key contract as :func:`_get_kg`: callers inside a retry
+    loop pass the captured key through so insert and evict keys cannot
+    drift apart under palace-path rotation.
+    """
+    path = (
+        canonical_path
+        if canonical_path is not None
+        else _canonicalize_kg_path(_resolve_logstream_path())
+    )
+    ls = _logstream_by_path.get(path)
+    if ls is not None:
+        return ls
+    with _logstream_cache_lock:
+        ls = _logstream_by_path.get(path)
+        if ls is None:
+            ls = Logstream(db_path=path)
+            _logstream_by_path[path] = ls
+    return ls
+
+
+def _call_logstream(op):
+    """Run ``op(logstream)`` with one-shot retry on a closed connection.
+
+    Mirrors :func:`_call_kg`: ``tool_reconnect`` on another thread can
+    close the cached handle between lookup and use; evict the stale entry
+    and retry once with a fresh instance.
+    """
+    path = _canonicalize_kg_path(_resolve_logstream_path())
+    for attempt in range(2):
+        ls = _get_logstream(path)
+        try:
+            return op(ls)
+        except sqlite3.ProgrammingError:
+            if attempt == 0:
+                with _logstream_cache_lock:
+                    if _logstream_by_path.get(path) is ls:
+                        _logstream_by_path.pop(path, None)
                 continue
             raise
 
@@ -818,6 +941,38 @@ def _refresh_vector_disabled_flag() -> None:
 # this module, whose import installs MCP stdio protection (os.dup2(2, 1) and
 # sys.stdout = sys.stderr) that would misroute their output.
 from .wal import _wal_log  # noqa: E402
+
+
+def _emit_memory_op(kind: str, payload: dict, author_agent: str = "mcp") -> None:
+    """RFC 004 step-2a dual-write shadow: record a palace mutation as an op.
+
+    During the shadow period the vector store remains the system of record
+    and this is bookkeeping beside it — ``emit_op`` in shadow posture never
+    raises (failures are logged loudly and surface in
+    ``mempalace oplog verify``), so a broken op-log can never break a
+    memory write. Sits beside ``_wal_log`` at each semantic write site:
+    the WAL is the forensic trail, the op is the replicable fact.
+    """
+    from .oplog import emit_op
+
+    palace_path = getattr(_config, "palace_path", None)
+    if not palace_path:
+        return None
+    return emit_op(palace_path, kind, payload, author_agent=author_agent)
+
+
+def _get_shadow_oplog():
+    """OpLog for the active palace (KG constructor injection), or None."""
+    palace_path = getattr(_config, "palace_path", None)
+    if not palace_path:
+        return None
+    try:
+        from .oplog import get_oplog
+
+        return get_oplog(palace_path)
+    except Exception:
+        logger.debug("op-log unavailable; KG shadow emission disabled", exc_info=True)
+        return None
 
 
 def _get_client():
@@ -1267,6 +1422,18 @@ def _sanitize_optional_name(value: str = None, field_name: str = "name") -> str:
     if value is None or not value.strip():
         return None
     return sanitize_name(value, field_name)
+
+
+def _sanitize_wing_name(value: str, field_name: str = "wing") -> str:
+    """Normalize and validate project wing names at the MCP boundary."""
+    return sanitize_name(normalize_wing_name(value), field_name)
+
+
+def _sanitize_optional_wing_name(value: str = None, field_name: str = "wing") -> str:
+    """Validate optional wing filters after project-name normalization."""
+    if value is None or not value.strip():
+        return None
+    return _sanitize_wing_name(value, field_name)
 
 
 # Bounds the whole stored source_file string (often an absolute path), so it is
@@ -1801,7 +1968,7 @@ def tool_list_wings():
 
 def tool_list_rooms(wing: str = None):
     try:
-        wing = _sanitize_optional_name(wing, "wing")
+        wing = _sanitize_optional_wing_name(wing, "wing")
     except ValueError as e:
         return {"error": str(e)}
     fast = _sqlite_taxonomy()
@@ -1914,13 +2081,13 @@ def tool_search(
     wing: str = None,
     room: str = None,
     source_file: str = None,
-    max_distance: float = 1.5,
+    max_distance: float = 0.0,
     min_similarity: float = None,
     context: str = None,
 ):
     limit = max(1, min(limit, _MAX_RESULTS))
     try:
-        wing = _sanitize_optional_name(wing, "wing")
+        wing = _sanitize_optional_wing_name(wing, "wing")
         room = _sanitize_optional_name(room, "room")
         source_file = _sanitize_optional_source_file(source_file)
     except ValueError as e:
@@ -2056,8 +2223,8 @@ def tool_traverse_graph(start_room: str, max_hops: int = 2):
 def tool_find_tunnels(wing_a: str = None, wing_b: str = None):
     """Find rooms that bridge two wings — the hallways connecting domains."""
     try:
-        wing_a = _sanitize_optional_name(wing_a, "wing_a")
-        wing_b = _sanitize_optional_name(wing_b, "wing_b")
+        wing_a = _sanitize_optional_wing_name(wing_a, "wing_a")
+        wing_b = _sanitize_optional_wing_name(wing_b, "wing_b")
     except ValueError as e:
         return {"error": str(e)}
     col = _get_collection()
@@ -2078,6 +2245,14 @@ def tool_graph_stats():
     if not col:
         return _collection_error_or_no_palace()
     return graph_stats(col=col)
+
+
+def tool_mesh_peers():
+    """Mesh estate snapshot — the committed compat surface for PalaceMind's
+    mesh view: exactly the GET /sync/peers payload, produced by the same
+    function so the tool and the endpoint can never drift. Read-only;
+    peers.json tokens are never included."""
+    return _mesh_peers_payload()
 
 
 def tool_create_tunnel(
@@ -2121,7 +2296,7 @@ def tool_create_tunnel(
 def tool_list_tunnels(wing: str = None):
     """List all explicit cross-wing tunnels, optionally filtered by wing."""
     try:
-        wing = _sanitize_optional_name(wing, "wing")
+        wing = _sanitize_optional_wing_name(wing, "wing")
     except ValueError as e:
         return {"error": str(e)}
     return list_tunnels(wing)
@@ -2137,7 +2312,7 @@ def tool_delete_tunnel(tunnel_id: str):
 def tool_list_hallways(wing: str = None):
     """List within-wing hallway records, optionally filtered by wing."""
     try:
-        wing = _sanitize_optional_name(wing, "wing")
+        wing = _sanitize_optional_wing_name(wing, "wing")
     except ValueError as e:
         return {"error": str(e)}
     return list_hallways(wing)
@@ -2153,7 +2328,7 @@ def tool_delete_hallway(hallway_id: str):
 def tool_follow_tunnels(wing: str, room: str):
     """Follow explicit tunnels from a room to see connected drawers in other wings."""
     try:
-        wing = sanitize_name(wing, "wing")
+        wing = _sanitize_wing_name(wing, "wing")
         room = sanitize_name(room, "room")
     except ValueError as e:
         return {"error": str(e)}
@@ -2427,7 +2602,7 @@ def tool_add_drawer(
     """
     global _metadata_cache
     try:
-        wing = sanitize_name(wing, "wing")
+        wing = _sanitize_wing_name(wing, "wing")
         room = sanitize_name(room, "room")
         content = sanitize_content(content)
         if source_file:
@@ -2440,7 +2615,7 @@ def tool_add_drawer(
     if not col:
         return _collection_error_or_no_palace()
 
-    drawer_id = make_drawer_id_from_content(wing, room, content)
+    drawer_id = make_drawer_id_for_write(content, wing=wing, room=room)
 
     _wal_log(
         "add_drawer",
@@ -2500,6 +2675,24 @@ def tool_add_drawer(
                     "The palace index may be stale; run reconnect or repair."
                 )
             _metadata_cache = None
+            _add_op = _emit_memory_op(
+                "drawer.add",
+                {
+                    "drawer_id": drawer_id,
+                    "wing": wing,
+                    "room": room,
+                    "content": content,
+                    "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                    "source_file": source_file or "",
+                    "filed_at": base_meta["filed_at"],
+                    "id_recipe": ID_RECIPE,
+                    "chunks": 1,
+                },
+                author_agent=added_by,
+            )
+            from .op_emit import stamp_op_hlc
+
+            stamp_op_hlc(col, [drawer_id], _add_op)
             logger.info(f"Filed drawer: {drawer_id} → {wing}/{room}")
             return {
                 "success": True,
@@ -2535,6 +2728,24 @@ def tool_add_drawer(
                 "The palace index may be stale; run reconnect or repair."
             )
         _metadata_cache = None
+        _add_op = _emit_memory_op(
+            "drawer.add",
+            {
+                "drawer_id": drawer_id,
+                "wing": wing,
+                "room": room,
+                "content": content,
+                "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                "source_file": source_file or "",
+                "filed_at": base_meta["filed_at"],
+                "id_recipe": ID_RECIPE,
+                "chunks": len(chunk_ids),
+            },
+            author_agent=added_by,
+        )
+        from .op_emit import stamp_op_hlc
+
+        stamp_op_hlc(col, chunk_ids, _add_op)
         logger.info(f"Filed drawer: {drawer_id} → {wing}/{room} ({len(chunk_ids)} chunks)")
         return {
             "success": True,
@@ -2573,6 +2784,23 @@ def tool_delete_drawer(drawer_id: str):
 
         col.delete(ids=record["ids"])
         _metadata_cache = None
+
+        # Tombstone hides, never deletes (RFC 004 merge table): during the shadow
+        # period Chroma still physically deletes, so the op carries the full
+        # verbatim content — nothing the store destroys is lost to history.
+        deleted_meta = _safe_meta(record["metadata"])
+        _emit_memory_op(
+            "drawer.tombstone",
+            {
+                "drawer_id": drawer_id,
+                "reason": "user_delete",
+                "content": record["content"],
+                "content_sha256": hashlib.sha256(record["content"].encode("utf-8")).hexdigest(),
+                "wing": deleted_meta.get("wing", ""),
+                "room": deleted_meta.get("room", ""),
+                "deleted_ids": record["ids"],
+            },
+        )
 
         logger.info("Deleted drawer: %s (%s rows)", drawer_id, len(record["ids"]))
 
@@ -2919,6 +3147,18 @@ def tool_delete_by_source(source_file: str, dry_run: bool = True):
         "delete_by_source",
         {"source_file": source_file, "match_count": match_count, "sample": sample},
     )
+    # Tombstone each logical drawer before the purge so the deletion replicates
+    # (RFC 004 2a). Read + group the matched rows into logical drawers first —
+    # the tombstone carries the verbatim content, so nothing is lost to history.
+    try:
+        from .op_emit import emit_bulk_tombstones, read_logical_drawers_where
+
+        oplog = _get_shadow_oplog()
+        if oplog is not None:
+            drawers = read_logical_drawers_where(col, where)
+            emit_bulk_tombstones(oplog, drawers, author_agent="mcp", reason="delete_by_source")
+    except Exception:
+        logger.error("op emission for delete_by_source failed", exc_info=True)
     try:
         col.delete(where=where)
         _metadata_cache = None
@@ -3020,7 +3260,7 @@ def tool_list_drawers(
     offset = max(0, offset)
 
     try:
-        wing = _sanitize_optional_name(wing, "wing")
+        wing = _sanitize_optional_wing_name(wing, "wing")
         room = _sanitize_optional_name(room, "room")
         since_dt = _parse_date_filter(since, "since")
         before_dt = _parse_date_filter(before, "before")
@@ -3101,7 +3341,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
 
         if wing is not None:
             try:
-                wing = sanitize_name(wing, "wing")
+                wing = _sanitize_wing_name(wing, "wing")
             except ValueError as e:
                 return {"success": False, "error": str(e)}
             if wing.lower() != str(old_meta.get("wing") or "").lower():
@@ -3128,6 +3368,19 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
             },
         )
 
+        # drawer.revise per the RFC 004 mutable-state mapping — content-addressed
+        # revision carrying the full new state; the prior sha ties the
+        # revision chain together for the v4 migration.
+        revise_payload = {
+            "drawer_id": drawer_id,
+            "content": new_doc,
+            "content_sha256": hashlib.sha256(new_doc.encode("utf-8")).hexdigest(),
+            "prior_content_sha256": hashlib.sha256(old_doc.encode("utf-8")).hexdigest(),
+            "wing": new_meta.get("wing", ""),
+            "room": new_meta.get("room", ""),
+            "content_changed": content is not None,
+        }
+
         chunk_size = max(1, int(getattr(_config, "chunk_size", 800) or 800))
         should_chunk = bool(record.get("chunked")) or len(new_doc) > chunk_size
 
@@ -3147,6 +3400,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
                 col.delete(ids=stale_ids)
 
             _metadata_cache = None
+            _emit_memory_op("drawer.revise", revise_payload)
 
             logger.info("Updated drawer: %s (%s rows)", drawer_id, len(chunk_ids))
 
@@ -3166,6 +3420,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
 
         col.update(**update_kwargs)
         _metadata_cache = None
+        _emit_memory_op("drawer.revise", revise_payload)
 
         logger.info("Updated drawer: %s", drawer_id)
 
@@ -3331,7 +3586,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
         return {"success": False, "error": str(e)}
 
     if wing:
-        wing = sanitize_name(wing)
+        wing = _sanitize_wing_name(wing)
     else:
         wing = f"wing_{agent_name.replace(' ', '_')}"
     room = "diary"
@@ -3382,6 +3637,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
                 "success": True,
                 "entry_id": entry_id,
                 "agent": agent_name,
+                "wing": wing,
                 "topic": topic,
                 "timestamp": now.isoformat(),
                 "chunks": 1,
@@ -3426,6 +3682,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
             "success": True,
             "entry_id": entry_id,
             "agent": agent_name,
+            "wing": wing,
             "topic": topic,
             "timestamp": now.isoformat(),
             "chunks": len(chunk_ids),
@@ -3454,7 +3711,7 @@ def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
     try:
         agent_name = sanitize_name(agent_name, "agent_name").lower()
         if wing:
-            wing = sanitize_name(wing)
+            wing = _sanitize_wing_name(wing)
     except ValueError as e:
         return {"error": str(e)}
     last_n = max(1, min(last_n, 100))
@@ -3675,6 +3932,13 @@ def tool_reconnect():
             except Exception:
                 pass
         _kg_by_path.clear()
+    with _logstream_cache_lock:
+        for ls in _logstream_by_path.values():
+            try:
+                ls.close()
+            except Exception:
+                pass
+        _logstream_by_path.clear()
     _refresh_sqlite_integrity_status()
     if _sqlite_integrity_errors:
         result = {
@@ -3801,6 +4065,223 @@ def tool_checkpoint(items, diary=None, dedup_threshold=0.9):
                     wing=diary.get("wing", ""),
                 )
     return out
+
+
+# ==================== LOGSTREAM TOOLS (RFC 003) ====================
+#
+# Agent coordination over the shared hub: durable append-only events plus
+# exact artifacts, stored in logstream.sqlite3 in the active palace dir.
+# No Chroma dependency and no vector index open — these handlers must never
+# call _get_collection().
+
+
+def tool_event_append(
+    type: str,
+    stream: str,
+    room: str,
+    from_agent: str,
+    to_agent: str = None,
+    correlation_id: str = None,
+    branch: str = None,
+    base_commit: str = None,
+    status: str = None,
+    body: str = "",
+    metadata: dict = None,
+    artifact_ids: list = None,
+):
+    """Append one immutable coordination event."""
+    try:
+        event = _call_logstream(
+            lambda ls: ls.append_event(
+                type=type,
+                stream=stream,
+                room=room,
+                from_agent=from_agent,
+                to_agent=to_agent,
+                correlation_id=correlation_id,
+                branch=branch,
+                base_commit=base_commit,
+                status=status,
+                body=body,
+                metadata=metadata,
+                artifact_ids=artifact_ids,
+            )
+        )
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+    return {"success": True, "event": event}
+
+
+_PREVIEW_BODY_CHARS = 200
+
+
+def _preview_event(event: dict) -> dict:
+    """Truncate a verbatim body to a scannable excerpt (preview mode).
+
+    Event bodies are stored verbatim and fleet status updates run to several
+    KB, so listing many events full-body is a large payload. Preview keeps all
+    routing/metadata fields and trims only ``body`` — enough to scan the stream
+    and decide which events to re-fetch in full (a targeted ``since_event_id``
+    call returns the untouched body)."""
+    body = event.get("body") or ""
+    if len(body) <= _PREVIEW_BODY_CHARS:
+        return event
+    out = dict(event)
+    out["body"] = body[:_PREVIEW_BODY_CHARS]
+    out["body_truncated"] = True
+    out["body_length"] = len(body)
+    return out
+
+
+def tool_event_list(
+    stream: str = None,
+    room: str = None,
+    type: str = None,
+    to_agent: str = None,
+    from_agent: str = None,
+    correlation_id: str = None,
+    status: str = None,
+    since_event_id: str = None,
+    since_created_at: str = None,
+    limit: int = 50,
+    preview: bool = False,
+):
+    """List coordination events with structured filters, oldest first.
+
+    ``preview=True`` truncates each event's verbatim body to a short excerpt
+    (marking ``body_truncated`` + ``body_length``) so scanning many events
+    stays cheap; re-fetch a specific event's full body with a targeted
+    ``since_event_id``.
+    """
+    try:
+        events = _call_logstream(
+            lambda ls: ls.list_events(
+                stream=stream,
+                room=room,
+                type=type,
+                to_agent=to_agent,
+                from_agent=from_agent,
+                correlation_id=correlation_id,
+                status=status,
+                since_event_id=since_event_id,
+                since_created_at=since_created_at,
+                limit=limit,
+            )
+        )
+    except ValueError as e:
+        return {"error": str(e)}
+    if preview:
+        events = [_preview_event(e) for e in events]
+    return {"events": events, "count": len(events)}
+
+
+def tool_event_wait(
+    stream: str = None,
+    room: str = None,
+    type: str = None,
+    to_agent: str = None,
+    from_agent: str = None,
+    correlation_id: str = None,
+    status: str = None,
+    since_event_id: str = None,
+    since_created_at: str = None,
+    timeout_ms: int = 60000,
+    limit: int = 50,
+):
+    """Block until a matching event exists or the timeout expires.
+
+    ``limit`` mirrors ``event_list`` so the two tools accept the same
+    filter set — agents kept tripping over wait rejecting a parameter
+    that list accepts (reported by windows-codex during dogfood).
+    """
+    try:
+        result = _call_logstream(
+            lambda ls: ls.wait_events(
+                timeout_ms=timeout_ms,
+                stream=stream,
+                room=room,
+                type=type,
+                to_agent=to_agent,
+                from_agent=from_agent,
+                correlation_id=correlation_id,
+                status=status,
+                since_event_id=since_event_id,
+                since_created_at=since_created_at,
+                limit=limit,
+            )
+        )
+    except ValueError as e:
+        return {"error": str(e)}
+    result["count"] = len(result["events"])
+    return result
+
+
+def tool_event_ack(event_id: str, from_agent: str, status: str = None, body: str = ""):
+    """Append an event.ack referencing a prior event (never mutates it)."""
+    try:
+        event = _call_logstream(
+            lambda ls: ls.ack_event(event_id, from_agent=from_agent, status=status, body=body)
+        )
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+    return {"success": True, "event": event}
+
+
+def tool_artifact_put(kind: str, content: str, created_by: str, metadata: dict = None):
+    """Store exact artifact content (patch, file, log, json, note)."""
+    try:
+        artifact = _call_logstream(
+            lambda ls: ls.put_artifact(
+                kind=kind, content=content, created_by=created_by, metadata=metadata
+            )
+        )
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+    return {"success": True, "artifact": artifact}
+
+
+def tool_artifact_get(artifact_id: str):
+    """Fetch an artifact by id — exact content and metadata."""
+    try:
+        artifact = _call_logstream(lambda ls: ls.get_artifact(artifact_id))
+    except ValueError as e:
+        return {"error": str(e)}
+    if artifact is None:
+        return {"error": f"artifact {artifact_id!r} not found"}
+    return {"artifact": artifact}
+
+
+def tool_patch_submit(
+    content: str,
+    from_agent: str,
+    stream: str,
+    room: str = "patches",
+    to_agent: str = None,
+    correlation_id: str = None,
+    branch: str = None,
+    base_commit: str = None,
+    body: str = "",
+    metadata: dict = None,
+):
+    """Store a patch artifact and append its patch.ready event in one call."""
+    try:
+        result = _call_logstream(
+            lambda ls: ls.submit_patch(
+                content=content,
+                from_agent=from_agent,
+                stream=stream,
+                room=room,
+                to_agent=to_agent,
+                correlation_id=correlation_id,
+                branch=branch,
+                base_commit=base_commit,
+                body=body,
+                metadata=metadata,
+            )
+        )
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+    return {"success": True, "artifact": result["artifact"], "event": result["event"]}
 
 
 # ==================== MCP PROTOCOL ====================
@@ -3963,6 +4444,11 @@ TOOLS = {
         "input_schema": {"type": "object", "properties": {}},
         "handler": tool_graph_stats,
     },
+    "mempalace_mesh_peers": {
+        "description": "Mesh estate snapshot (RFC 004): this replica's identity, version vector and node profile; each configured peer's reachability, last sync outcome, remote version vector and advertised profile; origins known only transitively; and origin_profiles keyed by replica_id. Exactly the GET /sync/peers payload — tokens are never included.",
+        "input_schema": {"type": "object", "properties": {}},
+        "handler": tool_mesh_peers,
+    },
     "mempalace_create_tunnel": {
         "description": "Create a cross-wing tunnel linking two palace locations. Use when content in one project relates to another — e.g., an API design in project_api connects to a database schema in project_database.",
         "input_schema": {
@@ -4075,7 +4561,7 @@ TOOLS = {
                 },
                 "max_distance": {
                     "type": "number",
-                    "description": "Max cosine distance threshold (0=identical, 2=opposite). Results further than this are dropped. Lower = stricter. Default 1.5. Set to 0 to disable.",
+                    "description": "Max cosine distance threshold (0=identical, 2=opposite). Results further than this are dropped. Lower = stricter. Default 0 disables filtering so lexical/exact matches can be recalled.",
                 },
                 "context": {
                     "type": "string",
@@ -4424,6 +4910,246 @@ TOOLS = {
             "properties": {},
         },
         "handler": tool_reconnect,
+    },
+    "mempalace_event_append": {
+        "description": (
+            "Append an immutable agent-coordination event to the logstream (RFC 003). Use for"
+            " delegating work (task.request), replying (task.reply), and announcing artifacts"
+            " (patch.ready). Events are append-only; corrections are new events."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "description": "Event type, e.g. 'task.request', 'task.reply', 'patch.ready'",
+                },
+                "stream": {
+                    "type": "string",
+                    "description": "Logical stream, e.g. 'project/mempalace' or 'shared_agent_brain'",
+                },
+                "room": {
+                    "type": "string",
+                    "description": "Sub-channel, e.g. 'delegation', 'patches', 'reviews', 'status'",
+                },
+                "from_agent": {"type": "string", "description": "Writer agent identity"},
+                "to_agent": {
+                    "type": "string",
+                    "description": "Target agent, or '*' for broadcast (optional)",
+                },
+                "correlation_id": {
+                    "type": "string",
+                    "description": "Task/conversation id tying request and reply events (optional)",
+                },
+                "branch": {"type": "string", "description": "Git branch, when relevant (optional)"},
+                "base_commit": {
+                    "type": "string",
+                    "description": "Git commit the work started from (optional)",
+                },
+                "status": {
+                    "type": "string",
+                    "description": (
+                        "One of: open, claimed, ready, applied, blocked, failed, superseded"
+                        " (optional)"
+                    ),
+                },
+                "body": {
+                    "type": "string",
+                    "description": "Verbatim human-readable content (optional, max 256 KiB)",
+                },
+                "metadata": {
+                    "type": "object",
+                    "description": "Extra structured fields, stored verbatim (optional)",
+                },
+                "artifact_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Ids of already-stored artifacts to reference (optional)",
+                },
+            },
+            "required": ["type", "stream", "room", "from_agent"],
+        },
+        "handler": tool_event_append,
+    },
+    "mempalace_event_list": {
+        "description": (
+            "List agent-coordination events with structured filters, oldest first. Use"
+            " since_event_id as the precise resume cursor (strictly after that event)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "stream": {"type": "string", "description": "Filter by stream (optional)"},
+                "room": {"type": "string", "description": "Filter by room (optional)"},
+                "type": {"type": "string", "description": "Filter by event type (optional)"},
+                "to_agent": {
+                    "type": "string",
+                    "description": "Filter by target agent; also matches '*' broadcasts (optional)",
+                },
+                "from_agent": {"type": "string", "description": "Filter by writer (optional)"},
+                "correlation_id": {
+                    "type": "string",
+                    "description": "Filter by correlation id (optional)",
+                },
+                "status": {"type": "string", "description": "Filter by status (optional)"},
+                "since_event_id": {
+                    "type": "string",
+                    "description": "Return only events strictly after this event id (optional)",
+                },
+                "since_created_at": {
+                    "type": "string",
+                    "description": (
+                        "Return events created at or after this time"
+                        " (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ, optional)"
+                    ),
+                },
+                "limit": {"type": "integer", "description": "Max events to return (default 50)"},
+                "preview": {
+                    "type": "boolean",
+                    "description": (
+                        "Truncate each event body to a short excerpt (marks body_truncated +"
+                        " body_length) so scanning many events stays cheap; re-fetch a specific"
+                        " event's full body with a targeted since_event_id (default false)"
+                    ),
+                },
+            },
+        },
+        "handler": tool_event_list,
+    },
+    "mempalace_event_wait": {
+        "description": (
+            "Block until a matching coordination event exists or the timeout expires (max 5"
+            " minutes). Returns {timed_out: true, events: []} on timeout instead of an error."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "stream": {"type": "string", "description": "Filter by stream (optional)"},
+                "room": {"type": "string", "description": "Filter by room (optional)"},
+                "type": {"type": "string", "description": "Filter by event type (optional)"},
+                "to_agent": {
+                    "type": "string",
+                    "description": "Filter by target agent; also matches '*' broadcasts (optional)",
+                },
+                "from_agent": {"type": "string", "description": "Filter by writer (optional)"},
+                "correlation_id": {
+                    "type": "string",
+                    "description": "Filter by correlation id (optional)",
+                },
+                "status": {"type": "string", "description": "Filter by status (optional)"},
+                "since_event_id": {
+                    "type": "string",
+                    "description": "Only match events strictly after this event id (optional)",
+                },
+                "since_created_at": {
+                    "type": "string",
+                    "description": (
+                        "Only match events created at or after this time"
+                        " (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ, optional)"
+                    ),
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "description": "How long to wait in milliseconds (default 60000, max 300000)",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max events to return when matches exist (default 50)",
+                },
+            },
+        },
+        "handler": tool_event_wait,
+    },
+    "mempalace_event_ack": {
+        "description": (
+            "Acknowledge a coordination event: appends a new event.ack routed back to the"
+            " original writer with the correlation id copied. Never mutates the target event."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "event_id": {"type": "string", "description": "Id of the event to acknowledge"},
+                "from_agent": {"type": "string", "description": "Acknowledging agent identity"},
+                "status": {
+                    "type": "string",
+                    "description": (
+                        "One of: open, claimed, ready, applied, blocked, failed, superseded"
+                        " (optional)"
+                    ),
+                },
+                "body": {"type": "string", "description": "Verbatim ack notes (optional)"},
+            },
+            "required": ["event_id", "from_agent"],
+        },
+        "handler": tool_event_ack,
+    },
+    "mempalace_artifact_put": {
+        "description": (
+            "Store exact artifact content (unified diff patch, file, log, json, note) for agent"
+            " handoffs. Returns id, sha256, and size_bytes. UTF-8 text only, max 4 MiB."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "description": "One of: patch, file, log, json, note",
+                },
+                "content": {"type": "string", "description": "Exact artifact content"},
+                "created_by": {"type": "string", "description": "Writer agent identity"},
+                "metadata": {
+                    "type": "object",
+                    "description": "Extra structured fields, e.g. branch/base_commit (optional)",
+                },
+            },
+            "required": ["kind", "content", "created_by"],
+        },
+        "handler": tool_artifact_put,
+    },
+    "mempalace_artifact_get": {
+        "description": (
+            "Fetch a coordination artifact by id — exact content plus sha256 for verification."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "artifact_id": {"type": "string", "description": "Artifact id to fetch"},
+            },
+            "required": ["artifact_id"],
+        },
+        "handler": tool_artifact_get,
+    },
+    "mempalace_patch_submit": {
+        "description": (
+            "Convenience: store a patch artifact and append its patch.ready event in one call."
+            " Use when handing completed work to another agent."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "string", "description": "Unified diff content"},
+                "from_agent": {"type": "string", "description": "Submitting agent identity"},
+                "stream": {
+                    "type": "string",
+                    "description": "Logical stream, e.g. 'project/mempalace'",
+                },
+                "room": {"type": "string", "description": "Sub-channel (default 'patches')"},
+                "to_agent": {"type": "string", "description": "Target agent or '*' (optional)"},
+                "correlation_id": {
+                    "type": "string",
+                    "description": "Task id tying this patch to its request (optional)",
+                },
+                "branch": {"type": "string", "description": "Git branch (optional)"},
+                "base_commit": {
+                    "type": "string",
+                    "description": "Git commit the patch applies to (optional)",
+                },
+                "body": {"type": "string", "description": "Verbatim notes (optional)"},
+                "metadata": {"type": "object", "description": "Extra structured fields (optional)"},
+            },
+            "required": ["content", "from_agent", "stream"],
+        },
+        "handler": tool_patch_submit,
     },
 }
 
@@ -4904,6 +5630,34 @@ def _json_rpc_parse_error(req_id=None):
 # can reference them as free names without a NameError.
 _HTTP_REQUEST_LOCK = threading.Lock()
 _HTTP_MAX_REQUEST_BYTES = 16 * 1024 * 1024
+_HTTP_ACTIVE_CLIENT_WINDOW_S = 120.0
+
+# RFC 003 phase 5: logstream tools touch only logstream.sqlite3 (its own WAL
+# database with internal locking) — never Chroma or the KG. Dispatching them
+# outside _HTTP_REQUEST_LOCK keeps a five-minute mempalace_event_wait
+# long-poll from stalling every other agent on a shared hub, and lets the
+# SSE stream coexist with normal tool traffic.
+_HTTP_LOCK_FREE_TOOLS = frozenset(
+    {
+        "mempalace_event_append",
+        "mempalace_event_list",
+        "mempalace_event_wait",
+        "mempalace_event_ack",
+        "mempalace_artifact_put",
+        "mempalace_artifact_get",
+        "mempalace_patch_submit",
+    }
+)
+
+# SSE stream limits (GET /logstream/stream). Each connected client holds one
+# handler thread, so the cap is a thread-exhaustion guard, not a rate limit.
+_SSE_MAX_CLIENTS_ENV = "MEMPALACE_SSE_MAX_CLIENTS"
+_SSE_MAX_CLIENTS_DEFAULT = 8
+_SSE_HEARTBEAT_S = 15.0
+_SSE_POLL_BASE_S = 0.3
+_SSE_POLL_JITTER_S = 0.4
+_SSE_BATCH_LIMIT = 500
+_HTTP_RECENT_CLIENT_LIMIT = 50
 # Host literals that always denote this machine. Used both to decide whether a
 # bind is loopback (skip the network-exposure warning) and to pin the Host
 # header against DNS rebinding when serving on loopback.
@@ -4947,6 +5701,9 @@ def _http_is_loopback(host: str) -> bool:
     return (host or "").strip().lower() in _HTTP_LOOPBACK_HOSTS
 
 
+_HTTP_EXTRA_ALLOWED_HOSTS_ENV = "MEMPALACE_MCP_EXTRA_ALLOWED_HOSTS"
+
+
 def _http_allowed_host_values(bind_host: str, port: int) -> set:
     """Host-header values accepted when Host pinning is enforced.
 
@@ -4955,6 +5712,13 @@ def _http_allowed_host_values(bind_host: str, port: int) -> set:
     so we pin ``Host`` to the loopback literals (and the bound host) with and
     without the port. Computed from the *actual* bound port so an ephemeral
     ``port=0`` bind (tests) still matches.
+
+    ``MEMPALACE_MCP_EXTRA_ALLOWED_HOSTS`` (comma-separated ``host`` or
+    ``host:port`` values) extends the pin for the documented fronting-proxy
+    pattern ("terminate TLS at a proxy"): a loopback-bound server behind
+    ``tailscale serve``/nginx receives the *public* name in ``Host``, which
+    the loopback pin would otherwise reject. Entries are matched exactly
+    (lowercased); a bare hostname also matches ``host:<bound port>``.
     """
     names = set(_HTTP_LOOPBACK_HOSTS)
     if bind_host:
@@ -4963,6 +5727,13 @@ def _http_allowed_host_values(bind_host: str, port: int) -> set:
     for name in names:
         values.add(name)
         values.add(f"{name}:{port}")
+    for raw in os.environ.get(_HTTP_EXTRA_ALLOWED_HOSTS_ENV, "").split(","):
+        entry = raw.strip().lower()
+        if not entry:
+            continue
+        values.add(entry)
+        if ":" not in entry:
+            values.add(f"{entry}:{port}")
     return values
 
 
@@ -4983,6 +5754,904 @@ def _http_origin_allowed(origin: str) -> bool:
     return host in ("127.0.0.1", "localhost", "::1")
 
 
+def _http_client_identity(handler) -> tuple[str, dict]:
+    headers = handler.headers
+    peer = handler.client_address[0] if handler.client_address else ""
+    forwarded_for = (headers.get("X-Forwarded-For") or "").split(",", 1)[0].strip()
+    real_ip = (headers.get("X-Real-IP") or "").strip()
+    tailnet_user = (headers.get("Tailscale-User-Login") or "").strip()
+    user_agent = (headers.get("User-Agent") or "").strip()
+    host_hdr = (headers.get("Host") or "").strip()
+    peer_hint = forwarded_for or real_ip or peer
+    basis = "|".join([peer_hint, tailnet_user, user_agent, host_hdr])
+    client_id = hashlib.sha256(basis.encode("utf-8", "replace")).hexdigest()[:16]
+    return client_id, {
+        "client_id": client_id,
+        "peer": peer,
+        "peer_hint": peer_hint,
+        "host": host_hdr,
+        "user_agent": user_agent[:160],
+        "tailscale_user": tailnet_user[:160],
+    }
+
+
+def _http_record_request(httpd, handler, status: int) -> None:
+    now = time.time()
+    now_iso = datetime.now().isoformat()
+    client_id, identity = _http_client_identity(handler)
+    with httpd.stats_lock:
+        httpd.request_count += 1
+        httpd.status_counts[str(status)] = httpd.status_counts.get(str(status), 0) + 1
+        entry = dict(httpd.recent_clients.get(client_id, identity))
+        entry.update(identity)
+        entry["last_seen"] = now_iso
+        entry["last_seen_monotonic"] = now
+        entry["request_count"] = int(entry.get("request_count", 0)) + 1
+        entry["last_method"] = handler.command
+        entry["last_path"] = urlparse(handler.path).path
+        entry["last_status"] = status
+        entry["authenticated"] = bool(
+            httpd.auth_token
+            and hmac.compare_digest(
+                handler.headers.get("Authorization", ""), f"Bearer {httpd.auth_token}"
+            )
+        )
+        httpd.recent_clients[client_id] = entry
+        overflow = len(httpd.recent_clients) - _HTTP_RECENT_CLIENT_LIMIT
+        if overflow > 0:
+            oldest = sorted(
+                httpd.recent_clients.items(),
+                key=lambda item: item[1].get("last_seen_monotonic", 0.0),
+            )
+            for stale_id, _entry in oldest[:overflow]:
+                httpd.recent_clients.pop(stale_id, None)
+
+
+def _http_status_payload(httpd) -> dict:
+    now = time.time()
+    with httpd.stats_lock:
+        recent = sorted(
+            (dict(entry) for entry in httpd.recent_clients.values()),
+            key=lambda entry: entry.get("last_seen_monotonic", 0.0),
+            reverse=True,
+        )
+        request_count = httpd.request_count
+        status_counts = dict(httpd.status_counts)
+
+    active = []
+    for entry in recent:
+        last_seen_monotonic = entry.pop("last_seen_monotonic", 0.0)
+        if now - last_seen_monotonic <= _HTTP_ACTIVE_CLIENT_WINDOW_S:
+            active.append(dict(entry))
+
+    writer = {
+        "read_only": _READ_ONLY,
+        "peer_writer_read_only": _MCP_WRITER_READ_ONLY,
+        "peer_writer_lock_failed": _MCP_WRITER_LOCK_FAILED,
+    }
+    if _MCP_WRITER_LOCK_ERROR:
+        writer["peer_writer_lock_error"] = _MCP_WRITER_LOCK_ERROR
+
+    integrity = _sqlite_integrity_payload()
+    palace_path = (
+        os.path.abspath(os.path.expanduser(_config.palace_path)) if _config.palace_path else ""
+    )
+    return {
+        "ok": bool(integrity.get("ok")),
+        "server": {
+            "name": "mempalace",
+            "version": __version__,
+            "transport": "http",
+            "scheme": getattr(httpd, "scheme", "http"),
+            "bind_host": httpd.bind_host,
+            "port": httpd.server_address[1],
+            "started_at": httpd.started_at,
+            "uptime_seconds": round(time.monotonic() - httpd.started_monotonic, 3),
+        },
+        "palace": {
+            "path_hash": hashlib.sha256(palace_path.encode("utf-8")).hexdigest()[:16]
+            if _config.palace_path
+            else "",
+            "backend": _config.backend,
+            "sqlite_integrity": integrity,
+        },
+        "writer": writer,
+        "requests": {
+            "total": request_count,
+            "by_status": status_counts,
+        },
+        "clients": {
+            "active_window_seconds": _HTTP_ACTIVE_CLIENT_WINDOW_S,
+            "active": active,
+            "recent": recent,
+        },
+    }
+
+
+def _http_request_rejected(handler, require_auth: bool) -> bool:
+    """Enforce HTTP Host/Origin/auth policy before dispatching a request."""
+    srv = handler.server
+    if srv.enforce_host_pin:
+        host_hdr = (handler.headers.get("Host") or "").strip().lower()
+        if host_hdr not in srv.allowed_hosts:
+            logger.warning("HTTP request rejected: Host %r not allowed", host_hdr)
+            handler.send_error(403, "Forbidden")
+            return True
+    origin = handler.headers.get("Origin")
+    if origin and not _http_origin_allowed(origin):
+        logger.warning("HTTP request rejected: cross-origin %r", origin)
+        handler.send_error(403, "Forbidden")
+        return True
+    if require_auth and srv.auth_token:
+        provided = handler.headers.get("Authorization", "")
+        if not hmac.compare_digest(provided, f"Bearer {srv.auth_token}"):
+            logger.warning("HTTP request rejected: missing/invalid bearer token")
+            handler.send_error(401, "Unauthorized")
+            return True
+    return False
+
+
+def _sse_max_clients() -> int:
+    try:
+        return max(0, int(os.environ.get(_SSE_MAX_CLIENTS_ENV, "") or _SSE_MAX_CLIENTS_DEFAULT))
+    except ValueError:
+        return _SSE_MAX_CLIENTS_DEFAULT
+
+
+def _http_dispatch(request):
+    """Dispatch one JSON-RPC request with the transport's locking policy.
+
+    The global request lock preserves the single-process / single-palace-
+    handle behavior stdio deployments rely on. Logstream tools are the one
+    exception: they never touch Chroma/KG state and carry their own database
+    lock, and serializing them would let one agent's event_wait long-poll
+    (up to 5 minutes) starve the whole hub.
+    """
+    if (
+        isinstance(request, dict)
+        and request.get("method") == "tools/call"
+        and isinstance(request.get("params"), dict)
+        and request["params"].get("name") in _HTTP_LOCK_FREE_TOOLS
+    ):
+        return handle_request(request)
+    with _HTTP_REQUEST_LOCK:
+        return handle_request(request)
+
+
+def _http_handle_get(handler) -> None:
+    """Route GET requests. Module-level (like the other _http_* helpers) to
+    keep _build_http_server under the C901 complexity ceiling.
+
+    /healthz is the only credential-free route (liveness probes); everything
+    else follows the bearer policy because it exposes palace/ops metadata.
+    """
+    path = urlparse(handler.path).path
+    if path == "/healthz":
+        if not handler._request_rejected(require_auth=False):
+            handler._send_bytes(200, b"ok\n", "text/plain; charset=utf-8")
+        return
+    if path == "/statusz":
+        if not handler._request_rejected(require_auth=True):
+            handler._send_json(200, handler._status_payload())
+        return
+    if path == "/logstream/stream":
+        # Events and artifacts expose work metadata and patch contents;
+        # the stream always follows the bearer policy.
+        if not handler._request_rejected(require_auth=True):
+            _http_serve_logstream_stream(handler)
+        return
+    if path.startswith("/sync/"):
+        if handler._request_rejected(require_auth=True):
+            return
+        if not _http_serve_sync(handler, path):
+            handler.send_error(404, "Not Found")
+        return
+    if path.startswith("/snapshot/"):
+        if handler._request_rejected(require_auth=True):
+            return
+        if not _http_serve_snapshot(handler, path):
+            handler.send_error(404, "Not Found")
+        return
+    if handler._request_rejected(require_auth=False):
+        return
+    handler.send_error(404, "Not Found")
+
+
+def _http_serve_snapshot(handler, path: str) -> bool:
+    """RFC 004 step 1: content-snapshot endpoints for memory read replicas.
+
+    GET /snapshot/manifest                → {replica_id, drawers, kg, collection}
+    GET /snapshot/drawers?offset=&limit=  → {items: [{id, document, metadata}]}
+    GET /snapshot/ids?offset=&limit=      → {ids: [...]} (delete reconciliation)
+    GET /snapshot/kg?table=&after=&limit= → {rows: [...]} (rowid-paged)
+
+    Facts only — verbatim documents, metadata, and KG rows. Vector indexes
+    are never served: the replica derives its own (RFC 004 layer 3). Chroma
+    access happens under the global request lock like every other
+    Chroma-touching request; pages are small enough to keep holds short.
+    """
+    from urllib.parse import parse_qsl
+
+    query = dict(parse_qsl(urlparse(handler.path).query))
+    try:
+        limit = max(1, min(int(query.get("limit", "500") or 500), 1000))
+        offset = max(0, int(query.get("offset", "0") or 0))
+        after = max(0, int(query.get("after", "0") or 0))
+    except (TypeError, ValueError):
+        handler._send_json(400, {"error": "limit/offset/after must be integers"})
+        return True
+
+    if path == "/snapshot/manifest":
+        from .vector_cache import VECTOR_CACHE_FILENAME, VectorCache
+
+        with _HTTP_REQUEST_LOCK:
+            col = _get_collection()
+            drawer_count = col.count() if col else 0
+        kg_stats = _call_kg(lambda kg: kg.stats())
+        vector_models = {}
+        if _config.palace_path and os.path.exists(
+            os.path.join(os.path.expanduser(_config.palace_path), VECTOR_CACHE_FILENAME)
+        ):
+            cache = VectorCache(_config.palace_path)
+            try:
+                with cache._lock:
+                    rows = (
+                        cache._conn()
+                        .execute("SELECT embedder, count(*) AS n FROM vectors GROUP BY embedder")
+                        .fetchall()
+                    )
+                vector_models = {row["embedder"]: row["n"] for row in rows}
+            finally:
+                cache.close()
+        handler._send_json(
+            200,
+            {
+                "replica_id": _call_logstream(lambda ls: ls.replica_id),
+                "drawers": drawer_count,
+                "kg": {
+                    "entities": kg_stats.get("entities", 0),
+                    "triples": kg_stats.get("triples", 0),
+                },
+                "collection": _config.collection_name,
+                "vector_cache": vector_models,
+            },
+        )
+        return True
+    if path == "/snapshot/drawers":
+        from .replica_sync import REPLICA_ORIGIN_KEY
+
+        with _HTTP_REQUEST_LOCK:
+            col = _get_collection()
+            if col is None:
+                handler._send_json(503, {"error": "no palace collection available"})
+                return True
+            batch = col.get(limit=limit, offset=offset, include=["documents", "metadatas"])
+        ids = batch.get("ids") or []
+        docs = batch.get("documents") or []
+        metas = batch.get("metadatas") or []
+        # Authored-only: a snapshot serves the facts THIS replica authors.
+        # Drawers folded from another origin (replica_origin-stamped) are
+        # excluded, or bidirectional pull-pairs would echo each other's
+        # content back re-stamped, corrupting provenance and reconciliation.
+        items = [
+            {"id": i, "document": d, "metadata": m or {}}
+            for i, d, m in zip(ids, docs, metas)
+            if not (m or {}).get(REPLICA_ORIGIN_KEY)
+        ]
+        # Distributed derivation (RFC 004): ship cached vectors alongside
+        # content when the caller names an embedder identity, so the fold
+        # side can insert without re-deriving. Missing vectors are simply
+        # omitted; the fold falls back to local embedding per item.
+        vectors_model = query.get("vectors") or ""
+        if vectors_model and items:
+            from .vector_cache import VectorCache, vector_to_b64
+
+            cache = VectorCache(_config.palace_path)
+            try:
+                found = cache.get_many(vectors_model, [item["id"] for item in items])
+            finally:
+                cache.close()
+            for item in items:
+                vector = found.get(item["id"])
+                if vector is not None:
+                    item["vector_b64"] = vector_to_b64(vector)
+            items_with = sum(1 for item in items if "vector_b64" in item)
+        else:
+            items_with = 0
+        handler._send_json(
+            200,
+            {
+                "items": items,
+                "count": len(items),
+                "vectors_included": items_with,
+                "vectors_model": vectors_model or None,
+                "offset": offset,
+                # Raw advance: pages may return fewer items than scanned.
+                "next_offset": offset + len(ids) if ids else None,
+            },
+        )
+        return True
+    if path == "/snapshot/ids":
+        from .replica_sync import REPLICA_ORIGIN_KEY
+
+        with _HTTP_REQUEST_LOCK:
+            col = _get_collection()
+            if col is None:
+                handler._send_json(503, {"error": "no palace collection available"})
+                return True
+            batch = col.get(limit=limit, offset=offset, include=["metadatas"])
+        raw_ids = batch.get("ids") or []
+        metas = batch.get("metadatas") or []
+        ids = [i for i, m in zip(raw_ids, metas) if not (m or {}).get(REPLICA_ORIGIN_KEY)]
+        handler._send_json(
+            200,
+            {
+                "ids": ids,
+                "count": len(ids),
+                "offset": offset,
+                "next_offset": offset + len(raw_ids) if raw_ids else None,
+            },
+        )
+        return True
+    if path == "/snapshot/kg":
+        table = query.get("table") or ""
+        try:
+            rows = _call_kg(lambda kg: kg.dump_rows(table, after_rowid=after, limit=limit))
+        except ValueError as exc:
+            handler._send_json(400, {"error": str(exc)})
+            return True
+        handler._send_json(200, {"table": table, "rows": rows, "count": len(rows)})
+        return True
+    return False
+
+
+def _http_serve_sync(handler, path: str) -> bool:
+    """RFC 004 step 0: pull-based anti-entropy endpoints for peer replicas.
+
+    GET /sync/version_vector           → {replica_id, version_vector}
+    GET /sync/ops?origin=&after=&limit → {origin, events, count} (author order)
+    GET /sync/artifact?id=             → {artifact} (exact content + sha256)
+
+    Bearer policy enforced by the caller; served lock-free like all
+    logstream traffic. Returns False when the path is not a sync route.
+    """
+    from urllib.parse import parse_qsl
+
+    query = dict(parse_qsl(urlparse(handler.path).query))
+    try:
+        if path == "/sync/version_vector":
+            handler._send_json(
+                200,
+                {
+                    "replica_id": _call_logstream(lambda ls: ls.replica_id),
+                    "version_vector": _call_logstream(lambda ls: ls.version_vector()),
+                    # Node-profile advertisement (additive): our own
+                    # self-description plus every profile we can relay, so
+                    # carriers propagate profiles for transitively-known
+                    # origins. Old peers ignore these fields.
+                    "profile": _node_profile(),
+                    "profiles": _known_profiles_snapshot(),
+                },
+            )
+            return True
+        if path == "/sync/ops":
+            origin = query.get("origin") or ""
+            after = int(query.get("after", "0") or 0)
+            limit = int(query.get("limit", "500") or 500)
+            events = _call_logstream(lambda ls: ls.list_ops(origin, after_seq=after, limit=limit))
+            handler._send_json(200, {"origin": origin, "events": events, "count": len(events)})
+            return True
+        if path == "/sync/artifact":
+            artifact_id = query.get("id") or ""
+            artifact = _call_logstream(lambda ls: ls.get_artifact(artifact_id))
+            if artifact is None:
+                handler._send_json(404, {"error": f"artifact {artifact_id!r} not found"})
+            else:
+                handler._send_json(200, {"artifact": artifact})
+            return True
+        if path == "/sync/peers":
+            handler._send_json(200, _mesh_peers_payload())
+            return True
+        if path == "/sync/memops/version_vector":
+            oplog = _get_shadow_oplog()
+            if oplog is None:
+                handler._send_json(503, {"error": "no active palace; op-log unavailable"})
+                return True
+            handler._send_json(
+                200,
+                {"replica_id": oplog.replica_id, "version_vector": oplog.version_vector()},
+            )
+            return True
+        if path == "/sync/memops":
+            oplog = _get_shadow_oplog()
+            if oplog is None:
+                handler._send_json(503, {"error": "no active palace; op-log unavailable"})
+                return True
+            origin = query.get("origin") or ""
+            after = int(query.get("after", "0") or 0)
+            limit = int(query.get("limit", "500") or 500)
+            ops = oplog.list_ops(origin, after_seq=after, limit=limit)
+            handler._send_json(200, {"origin": origin, "ops": ops, "count": len(ops)})
+            return True
+    except (ValueError, TypeError) as exc:
+        handler._send_json(400, {"error": str(exc)})
+        return True
+    return False
+
+
+# Estate data (RFC 004 A.1): what the mesh looks like from THIS replica.
+# Written by the sync loop after every round, read by /sync/peers. Values
+# are whole-entry replacements under the GIL, so readers never see a
+# half-updated peer record.
+_PEER_SYNC_STATE: dict = {}
+
+# Node profiles learned from peers (their self-descriptions, relayed
+# transitively), keyed by replica_id. LWW by advertised_at. The estate
+# renders roles/accelerator/counts from these instead of UI guesses.
+_KNOWN_PROFILES: dict = {}
+
+# Self profile is recomputed at most every TTL seconds — peers request it
+# every sync round and the drawer count / provider probe should not run
+# per request.
+_NODE_PROFILE_TTL_S = 60.0
+_node_profile_cache: dict = {}
+
+_ACCELERATOR_NAMES = {"cuda": "CUDA", "dml": "DirectML", "coreml": "CoreML", "cpu": "CPU"}
+
+
+def _node_profile() -> dict:
+    """This node's self-described profile — every field is pure derivation
+    (palace presence, logstream authorship, resolved onnxruntime provider),
+    never configuration, so the estate can render truth without guesses."""
+    import platform
+
+    cached = _node_profile_cache.get("profile")
+    if cached and time.monotonic() - _node_profile_cache.get("at", 0) < _NODE_PROFILE_TTL_S:
+        return cached
+
+    roles = []
+    drawers = None
+    try:
+        col = _get_collection(create=False)
+        if col is not None:
+            drawers = col.count()
+            roles.append("replica")
+    except Exception:
+        logger.debug("node profile: drawer count unavailable", exc_info=True)
+    try:
+        authored = _call_logstream(lambda ls: ls.version_vector().get(ls.replica_id, 0))
+        if authored:
+            roles.append("agents")
+    except Exception:
+        logger.debug("node profile: logstream authorship unavailable", exc_info=True)
+    accelerator = None
+    try:
+        from .embedding import _resolve_providers, current_model_name
+
+        device = getattr(_config, "embedding_device", None) or "auto"
+        _providers, effective = _resolve_providers(device)
+        accelerator = {
+            "provider": _ACCELERATOR_NAMES.get(effective, effective),
+            "embedder": current_model_name(),
+        }
+        roles.append("compute")
+    except Exception:
+        logger.debug("node profile: embedder resolution unavailable", exc_info=True)
+
+    profile = {
+        "roles": roles,
+        "accelerator": accelerator,
+        "drawers": drawers,
+        "hardware": platform.platform(),
+        "advertised_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    _node_profile_cache["profile"] = profile
+    _node_profile_cache["at"] = time.monotonic()
+    return profile
+
+
+def _merge_known_profiles(profiles: dict) -> None:
+    """Fold relayed profiles in, last-writer-wins by advertised_at."""
+    if not isinstance(profiles, dict):
+        return
+    for origin, profile in profiles.items():
+        if not isinstance(origin, str) or not isinstance(profile, dict):
+            continue
+        prior = _KNOWN_PROFILES.get(origin)
+        if prior and (prior.get("advertised_at") or "") >= (profile.get("advertised_at") or ""):
+            continue
+        _KNOWN_PROFILES[origin] = profile
+
+
+def _known_profiles_snapshot() -> dict:
+    """Every origin profile this node can vouch for having seen — learned
+    ones first, own fresh self-profile last so it always wins for self."""
+    snapshot = dict(_KNOWN_PROFILES)
+    try:
+        snapshot[_call_logstream(lambda ls: ls.replica_id)] = _node_profile()
+    except Exception:
+        logger.debug("node profile: self profile unavailable", exc_info=True)
+    return snapshot
+
+
+def _record_peer_sync(stats: dict) -> None:
+    """Fold one peer's round outcome into the estate state."""
+    name = stats.get("peer_name") or stats.get("peer_url") or "?"
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    prior = _PEER_SYNC_STATE.get(name) or {}
+    if stats.get("error"):
+        entry = {
+            "url": stats.get("peer_url") or prior.get("url"),
+            "replica_id": prior.get("replica_id"),
+            "reachable": False,
+            "last_error": stats["error"],
+            "last_error_at": now,
+            "last_success_at": prior.get("last_success_at"),
+            "remote_version_vector": prior.get("remote_version_vector"),
+            # Unreachable peers keep their last advertised profile — the
+            # estate renders "last seen as", never a blank node.
+            "profile": prior.get("profile"),
+        }
+    else:
+        entry = {
+            "url": stats.get("peer_url"),
+            "replica_id": stats.get("peer_replica"),
+            "reachable": True,
+            "last_error": None,
+            "last_error_at": prior.get("last_error_at"),
+            "last_success_at": now,
+            "last_pulled_events": stats.get("pulled_events", 0),
+            "last_pulled_artifacts": stats.get("pulled_artifacts", 0),
+            "remote_version_vector": stats.get("remote_version_vector") or {},
+            "profile": stats.get("remote_profile") or prior.get("profile"),
+        }
+        _merge_known_profiles(stats.get("remote_profiles") or {})
+        if stats.get("remote_profile") and stats.get("peer_replica"):
+            _merge_known_profiles({stats["peer_replica"]: stats["remote_profile"]})
+    _PEER_SYNC_STATE[name] = entry
+
+
+def _mesh_peers_payload() -> dict:
+    """The estate answer for one replica: who its peers are, whether they
+    were reachable last round, their vectors (drift is peer vector vs
+    self vector — computed by the consumer), and origins known only
+    transitively. peers.json tokens are NEVER included.
+    """
+    import socket
+
+    from .logsync import load_peers
+
+    replica_id = _call_logstream(lambda ls: ls.replica_id)
+    local_vector = _call_logstream(lambda ls: ls.version_vector())
+    try:
+        configured = load_peers(getattr(_config, "palace_path", None) or "")
+    except (ValueError, TypeError):
+        configured = []
+    named_origins = {replica_id}
+    peers = []
+    for peer in configured:
+        name = peer.get("name") or peer["url"]
+        state = dict(_PEER_SYNC_STATE.get(name) or {})
+        state.pop("url", None)  # peers.json is authoritative for the url
+        if state.get("replica_id"):
+            named_origins.add(state["replica_id"])
+        peers.append({"name": name, "url": peer["url"], **state})
+    return {
+        "self": {
+            "replica_id": replica_id,
+            "name": socket.gethostname(),
+            "version_vector": local_vector,
+            "profile": _node_profile(),
+        },
+        "peers": peers,
+        # Origins present in the local log but not configured as peers —
+        # replicas this node only knows transitively (gossip carriers).
+        "unnamed_origins": sorted(set(local_vector) - named_origins),
+        # Every self-described profile known here, keyed by replica_id —
+        # including profiles of unnamed origins relayed through carriers.
+        "origin_profiles": _known_profiles_snapshot(),
+        "sync_interval_s": _peer_sync_interval_s(),
+    }
+
+
+def _peer_sync_interval_s() -> float:
+    try:
+        return float(os.environ.get("MEMPALACE_SYNC_INTERVAL", "") or 15)
+    except ValueError:
+        return 15.0
+
+
+# The fold drains the op backlog into the store in BOUNDED batches, releasing
+# _HTTP_REQUEST_LOCK between each so POST /mcp and the rest of the sync loop
+# interleave. A single unbounded fold of a large backlog (a promotion-pass
+# backfill of tens of thousands of ops) held the lock for HOURS on a
+# CPU-bound host — every /mcp request starved and the sync loop never returned
+# to logstream/memop, freezing coordination convergence. Per-lock batch keeps
+# each hold short; per-round cap lets the loop cycle mid-drain. Both are
+# env-tunable for slow hosts; the fold is crash-safe and resumes from its
+# durable cursor.
+_FOLD_OPS_PER_LOCK_DEFAULT = 50
+_FOLD_MAX_OPS_PER_ROUND_DEFAULT = 1000
+
+
+def _fold_ops_per_lock() -> int:
+    try:
+        return max(
+            1, int(os.environ.get("MEMPALACE_FOLD_OPS_PER_LOCK", "") or _FOLD_OPS_PER_LOCK_DEFAULT)
+        )
+    except ValueError:
+        return _FOLD_OPS_PER_LOCK_DEFAULT
+
+
+def _fold_max_ops_per_round() -> int:
+    try:
+        return max(
+            1,
+            int(
+                os.environ.get("MEMPALACE_FOLD_MAX_OPS_PER_ROUND", "")
+                or _FOLD_MAX_OPS_PER_ROUND_DEFAULT
+            ),
+        )
+    except ValueError:
+        return _FOLD_MAX_OPS_PER_ROUND_DEFAULT
+
+
+def _start_peer_sync_thread() -> None:
+    """Background anti-entropy loop when peers.json exists (RFC 004 step 0).
+
+    Runs in the serving process so a hub with configured peers converges
+    with zero extra processes. Interval via MEMPALACE_SYNC_INTERVAL
+    (seconds, default 15; 0 disables). Errors are logged, never fatal —
+    a dead peer must not take the loop down (R1).
+    """
+    from .logsync import load_peers, sync_all
+
+    palace_path = getattr(_config, "palace_path", None)
+    if not palace_path:
+        return
+    interval = _peer_sync_interval_s()
+    if interval <= 0:
+        return
+    try:
+        if not load_peers(palace_path):
+            return
+    except ValueError as exc:
+        logger.error("peers.json is malformed; peer sync disabled: %s", exc)
+        return
+
+    def _loop():
+        while True:
+            time.sleep(interval)
+            try:
+                ls = _get_logstream()
+                for stats in sync_all(ls, palace_path):
+                    _record_peer_sync(stats)
+                    if stats.get("error"):
+                        logger.warning("peer sync %s: %s", stats.get("peer_name"), stats["error"])
+                    elif stats.get("pulled_events"):
+                        logger.info(
+                            "peer sync %s: pulled %d event(s), %d artifact(s)",
+                            stats.get("peer_name"),
+                            stats["pulled_events"],
+                            stats["pulled_artifacts"],
+                        )
+            except Exception:
+                logger.warning("peer sync round failed", exc_info=True)
+            try:
+                # Memory ops ride the same cadence and peers (RFC 004 2a).
+                # Op transport only — the fold consumer applies them to the
+                # store in its own stage.
+                from .opsync import sync_all_memops
+
+                for stats in sync_all_memops(palace_path):
+                    if stats.get("error"):
+                        logger.warning("memop sync %s: %s", stats.get("peer_name"), stats["error"])
+                    elif stats.get("pulled_ops"):
+                        logger.info(
+                            "memop sync %s: pulled %d op(s)",
+                            stats.get("peer_name"),
+                            stats["pulled_ops"],
+                        )
+            except Exception:
+                logger.warning("memop sync round failed", exc_info=True)
+            try:
+                # Fold pulled ops into the local store (RFC 004 2a). The hub
+                # owns the writer lease; the request lock serializes these
+                # Chroma writes against HTTP handlers exactly like any tool.
+                # BOUNDED so a large backlog can't monopolize the lock: fold at
+                # most _fold_ops_per_lock() ops per acquisition, release, and
+                # stop after _fold_max_ops_per_round() so the loop returns to
+                # logstream/memop. The fold resumes from its durable cursor.
+                oplog = _get_shadow_oplog()
+                if oplog is not None and oplog.count() > oplog.fold_cursor():
+                    from .opfold import fold_ops
+
+                    chunk_size = max(1, int(getattr(_config, "chunk_size", 800) or 800))
+                    lock_batch = _fold_ops_per_lock()
+                    round_cap = _fold_max_ops_per_round()
+                    backlog_start = oplog.count() - oplog.fold_cursor()
+                    folded = 0
+                    errored = False
+                    while folded < round_cap:
+                        before = oplog.fold_cursor()
+                        with _HTTP_REQUEST_LOCK:
+                            col = _get_collection(create=True)
+                            if not col:
+                                break
+                            fold_stats = fold_ops(
+                                oplog,
+                                col,
+                                _get_kg(),
+                                chunk_size=chunk_size,
+                                max_ops=lock_batch,
+                            )
+                        if fold_stats:
+                            applied = (
+                                fold_stats["applied_adds"]
+                                + fold_stats["applied_revises"]
+                                + fold_stats["applied_tombstones"]
+                                + fold_stats["applied_kg"]
+                            )
+                            if applied or fold_stats["conflicts"] or fold_stats["errors"]:
+                                logger.info("op fold: %s", fold_stats)
+                            if fold_stats["errors"]:
+                                errored = True
+                                break  # poison op — stop, next round retries it
+                        after = oplog.fold_cursor()
+                        if after <= before:
+                            break  # no progress: caught up or nothing appliable
+                        folded += after - before
+                    # Progress accounting: a silent no-progress fold round under a
+                    # real backlog is invisible — windows hit exactly this (fold
+                    # starved to zero progress by concurrent readers holding the
+                    # write lock, under OPS_PER_LOCK=1, logging nothing). Make the
+                    # drain visible and warn loudly when the backlog can't advance.
+                    remaining = oplog.count() - oplog.fold_cursor()
+                    if folded:
+                        logger.info(
+                            "op fold round: drained %d/%d op(s) (cursor now %d, %d remaining)",
+                            folded,
+                            backlog_start,
+                            oplog.fold_cursor(),
+                            remaining,
+                        )
+                    elif remaining > 0 and not errored:
+                        logger.warning(
+                            "op fold round made NO PROGRESS with %d op(s) still un-folded "
+                            "(cursor %d, count %d, ops_per_lock=%d) — likely write-lock "
+                            "contention from concurrent readers or a too-small "
+                            "MEMPALACE_FOLD_OPS_PER_LOCK; the backlog is NOT self-healing "
+                            "this round",
+                            remaining,
+                            oplog.fold_cursor(),
+                            oplog.count(),
+                            lock_batch,
+                        )
+            except Exception:
+                logger.warning("op fold round failed", exc_info=True)
+
+    thread = threading.Thread(target=_loop, name="mempalace-logsync", daemon=True)
+    thread.start()
+    logger.info("peer sync thread started (interval %.0fs)", interval)
+
+
+def _sse_acquire_slot(httpd) -> bool:
+    with httpd.sse_lock:
+        if httpd.sse_clients >= httpd.sse_max_clients:
+            return False
+        httpd.sse_clients += 1
+        return True
+
+
+def _sse_release_slot(httpd) -> None:
+    with httpd.sse_lock:
+        httpd.sse_clients -= 1
+
+
+def _http_serve_logstream_stream(handler) -> None:
+    """RFC 003 phase 5: live logstream tail over Server-Sent Events.
+
+    Query params are exactly the ``event_list`` filters plus
+    ``since_event_id`` (or the standard ``Last-Event-ID`` header): with a
+    cursor the server replays everything after it, then tails live; without
+    one it tails only post-connect events. Each event is one SSE frame
+    (``id:`` = event id, ``event: logstream``, ``data:`` = the same JSON
+    envelope event_list returns), with a ``: ping`` comment every ~15s so
+    proxies keep the pipe open. Never touches _HTTP_REQUEST_LOCK — the
+    stream must coexist with normal tool traffic, not starve it. Defined at
+    module level (like the other _http_* helpers) to keep
+    _build_http_server under the C901 complexity ceiling.
+    """
+    import random
+    from urllib.parse import parse_qsl
+
+    global _last_request_time
+
+    query = dict(parse_qsl(urlparse(handler.path).query))
+    filters = {
+        key: (query.get(key) or None)
+        for key in (
+            "stream",
+            "room",
+            "type",
+            "to_agent",
+            "from_agent",
+            "correlation_id",
+            "status",
+        )
+    }
+    cursor = query.get("since_event_id") or handler.headers.get("Last-Event-ID") or None
+
+    def _list_after(after_id):
+        return _call_logstream(
+            lambda ls: ls.list_events(since_event_id=after_id, limit=_SSE_BATCH_LIMIT, **filters)
+        )
+
+    try:
+        if cursor is None:
+            # Live tail: only post-connect events. On an empty log the
+            # cursor stays None and the whole log is post-connect.
+            cursor = _call_logstream(lambda ls: ls.latest_event_id())
+        # Validate filters (and an explicit cursor) before committing to a
+        # streaming response — errors must be a clean 400, not a half-open
+        # stream.
+        if cursor:
+            _list_after(cursor)
+        else:
+            _call_logstream(lambda ls: ls.list_events(limit=1, **filters))
+    except ValueError as exc:
+        handler._send_json(400, {"error": str(exc)})
+        return
+
+    if not _sse_acquire_slot(handler.server):
+        handler._record_request(503)
+        handler.send_response(503)
+        handler.send_header("Retry-After", "5")
+        handler.send_header("Content-Length", "0")
+        handler.send_header("Connection", "close")
+        handler.end_headers()
+        handler.close_connection = True
+        return
+
+    try:
+        handler._record_request(200)
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        handler.send_header("Cache-Control", "no-cache")
+        handler.send_header("X-Accel-Buffering", "no")
+        handler.end_headers()
+
+        last_write = time.monotonic()
+        while True:
+            _last_request_time = time.monotonic()
+            events = (
+                _list_after(cursor)
+                if cursor
+                else _call_logstream(lambda ls: ls.list_events(limit=_SSE_BATCH_LIMIT, **filters))
+            )
+            for event in events:
+                frame = (
+                    f"id: {event['id']}\n"
+                    f"event: logstream\n"
+                    f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                )
+                handler.wfile.write(frame.encode("utf-8"))
+                cursor = event["id"]
+                last_write = time.monotonic()
+            if events:
+                handler.wfile.flush()
+            elif time.monotonic() - last_write >= _SSE_HEARTBEAT_S:
+                handler.wfile.write(b": ping\n\n")
+                handler.wfile.flush()
+                last_write = time.monotonic()
+            time.sleep(_SSE_POLL_BASE_S + random.random() * _SSE_POLL_JITTER_S)
+    except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+        pass  # client went away — the normal way an SSE stream ends
+    finally:
+        _sse_release_slot(handler.server)
+        handler.close_connection = True
+
+
 def _build_http_server(host: str, port: int):
     """Construct (but do not start) the MCP HTTP server.
 
@@ -4993,7 +6662,6 @@ def _build_http_server(host: str, port: int):
     allowlist, Origin check, optional bearer token) is attached as attributes.
     """
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-    from urllib.parse import urlparse
 
     auth_token = os.environ.get("MEMPALACE_MCP_HTTP_TOKEN", "").strip()
     if (
@@ -5023,7 +6691,18 @@ def _build_http_server(host: str, port: int):
         def log_message(self, fmt, *args):
             logger.info("HTTP %s - " + fmt, self.client_address[0], *args)
 
+        def send_error(self, code, message=None, explain=None):
+            self._record_request(code)
+            return super().send_error(code, message, explain)
+
+        def _record_request(self, status: int) -> None:
+            _http_record_request(self.server, self, status)
+
+        def _status_payload(self) -> dict:
+            return _http_status_payload(self.server)
+
         def _send_bytes(self, status: int, body: bytes, content_type: str) -> None:
+            self._record_request(status)
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
@@ -5037,44 +6716,10 @@ def _build_http_server(host: str, port: int):
             self._send_bytes(status, body, "application/json; charset=utf-8")
 
         def _request_rejected(self, require_auth: bool) -> bool:
-            """Enforce the transport's access policy before any dispatch.
-
-            The palace is the most sensitive data MemPalace holds and ``/mcp``
-            is unauthenticated by default, so this guards the two ways a local
-            HTTP server leaks to the network: DNS rebinding (Host/Origin) and,
-            when the operator opts in, a missing/incorrect bearer token.
-            """
-            srv = self.server
-            if srv.enforce_host_pin:
-                host_hdr = (self.headers.get("Host") or "").strip().lower()
-                if host_hdr not in srv.allowed_hosts:
-                    logger.warning("HTTP request rejected: Host %r not allowed", host_hdr)
-                    self.send_error(403, "Forbidden")
-                    return True
-            origin = self.headers.get("Origin")
-            if origin and not _http_origin_allowed(origin):
-                logger.warning("HTTP request rejected: cross-origin %r", origin)
-                self.send_error(403, "Forbidden")
-                return True
-            if require_auth and srv.auth_token:
-                provided = self.headers.get("Authorization", "")
-                if not hmac.compare_digest(provided, f"Bearer {srv.auth_token}"):
-                    logger.warning("HTTP request rejected: missing/invalid bearer token")
-                    self.send_error(401, "Unauthorized")
-                    return True
-            return False
+            return _http_request_rejected(self, require_auth)
 
         def do_GET(self):
-            # Liveness probe is policy-gated for Host/Origin but never requires
-            # the token, so an orchestrator's health check works without creds.
-            if self._request_rejected(require_auth=False):
-                return
-            path = urlparse(self.path).path
-            if path == "/healthz":
-                self._send_bytes(200, b"ok\n", "text/plain; charset=utf-8")
-                return
-
-            self.send_error(404, "Not Found")
+            _http_handle_get(self)
 
         def do_POST(self):
             if self._request_rejected(require_auth=True):
@@ -5108,14 +6753,13 @@ def _build_http_server(host: str, port: int):
                 self._send_json(400, _json_rpc_parse_error())
                 return
 
-            # Preserve the single-process / single-palace-handle behavior that
-            # stdio deployments rely on. HTTP gives us a safer transport, not
-            # concurrent Chroma/HNSW mutation.
-            with _HTTP_REQUEST_LOCK:
-                response = handle_request(request)
+            # Locking policy lives in _http_dispatch: global lock for
+            # Chroma-touching tools, lock-free for logstream tools.
+            response = _http_dispatch(request)
 
             if response is None:
                 # JSON-RPC notifications intentionally have no response body.
+                self._record_request(202)
                 self.send_response(202)
                 self.send_header("Content-Length", "0")
                 self.send_header("Connection", "close")
@@ -5135,6 +6779,16 @@ def _build_http_server(host: str, port: int):
     httpd.allowed_hosts = _http_allowed_host_values(host, bound_port)
     httpd.auth_token = auth_token
     httpd.scheme = "http"
+    httpd.bind_host = host
+    httpd.started_at = datetime.now().isoformat()
+    httpd.started_monotonic = time.monotonic()
+    httpd.stats_lock = threading.Lock()
+    httpd.request_count = 0
+    httpd.status_counts = {}
+    httpd.recent_clients = {}
+    httpd.sse_lock = threading.Lock()
+    httpd.sse_clients = 0
+    httpd.sse_max_clients = _sse_max_clients()
     if tls_cert:
         httpd.socket = _wrap_tls(httpd.socket, tls_cert, tls_key)
         httpd.scheme = "https"
@@ -5156,6 +6810,31 @@ def _serve_http(host: str, port: int) -> None:
         sys.exit(1)
 
     bound_port = httpd.server_address[1]
+
+    # Register this process as the palace's hub so local short-lived writers
+    # (save hooks, plain `mempalace mine`) forward their writes here instead
+    # of colliding with the MCP writer lease. Best-effort: discovery is an
+    # optimization, serving must not fail because the record could not be
+    # written.
+    _registered_palace = _config.palace_path
+    if _registered_palace:
+        try:
+            from . import server_registry
+
+            server_registry.write_serverinfo(
+                _registered_palace,
+                host=host,
+                port=bound_port,
+                scheme=getattr(httpd, "scheme", "http"),
+                read_only=_READ_ONLY,
+            )
+            import atexit
+
+            atexit.register(server_registry.clear_serverinfo, _registered_palace)
+        except Exception:
+            logger.debug("Failed to write hub serverinfo", exc_info=True)
+            _registered_palace = None
+
     if not _http_is_loopback(host):
         if httpd.auth_token:
             logger.warning(
@@ -5170,6 +6849,10 @@ def _serve_http(host: str, port: int) -> None:
                 host,
                 _HTTP_ALLOW_INSECURE_NO_TOKEN_ENV,
             )
+
+    # RFC 004 step 0: converge with peer replicas when peers.json exists.
+    _start_peer_sync_thread()
+
     with httpd:
         logger.info(
             "MemPalace MCP HTTP server listening on %s://%s:%s/mcp%s%s",
@@ -5183,6 +6866,119 @@ def _serve_http(host: str, port: int) -> None:
             httpd.serve_forever(poll_interval=0.5)
         except KeyboardInterrupt:
             logger.info("MemPalace MCP HTTP server shutting down")
+        finally:
+            if _registered_palace:
+                try:
+                    from . import server_registry
+
+                    server_registry.clear_serverinfo(_registered_palace)
+                except Exception:
+                    logger.debug("Failed to clear hub serverinfo", exc_info=True)
+
+
+# Stdio→hub proxying. When a long-lived HTTP hub (`mempalace serve`) owns
+# this palace, a stdio server spawned by an agent harness must not open its
+# own Chroma handles: it could only ever be a read-only peer (writer lease,
+# #1818), and racing writers are exactly what corrupted FTS5 indexes in the
+# wild. Instead the stdio process forwards every JSON-RPC request to the hub
+# verbatim, adding the local bearer token. This makes stdio-only harnesses
+# (plugins, desktop apps) share the hub with zero client-side reconfiguration.
+# Shares the CLI forwarder's kill switch (MEMPALACE_HUB_FORWARD=0).
+_HUB_FORWARD_ENV = "MEMPALACE_HUB_FORWARD"
+_HUB_PROXY_TIMEOUT_S = 600.0
+_hub_proxy_announced = False
+
+
+def _hub_proxy_target():
+    """Return (base_url, headers) for a live hub serving our palace, or None."""
+    global _hub_proxy_announced
+    if _truthy_env_off(_HUB_FORWARD_ENV):
+        return None
+    try:
+        from . import server_registry
+
+        info = server_registry.read_live_serverinfo(_config.palace_path)
+        if not info or info.get("pid") == os.getpid():
+            return None
+        base_url = server_registry.client_base_url(info)
+        headers = {"Content-Type": "application/json"}
+        token = server_registry.load_server_token(_config.palace_path)
+    except Exception:
+        logger.debug("hub discovery failed; serving locally", exc_info=True)
+        return None
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if not _hub_proxy_announced:
+        _hub_proxy_announced = True
+        logger.info("Live palace hub detected at %s; proxying stdio requests to it", base_url)
+    return base_url, headers
+
+
+def _truthy_env_off(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"0", "false", "no", "off"}
+
+
+def _forward_request_to_hub(base_url: str, headers: dict, request: dict):
+    """POST one JSON-RPC request to the hub; None for notifications (202)."""
+    import urllib.request
+
+    body = json.dumps(request, ensure_ascii=False).encode("utf-8")
+    http_request = urllib.request.Request(f"{base_url}/mcp", data=body, headers=headers)
+    with urllib.request.urlopen(http_request, timeout=_HUB_PROXY_TIMEOUT_S) as resp:
+        raw = resp.read()
+    if not raw:
+        return None
+    return json.loads(raw.decode("utf-8"))
+
+
+def _request_is_mutating(request: dict) -> bool:
+    if request.get("method") != "tools/call":
+        return False
+    name = ((request.get("params") or {}).get("name")) or ""
+    return name in _MUTATING_TOOLS
+
+
+def _dispatch_stdio_request(request: dict):
+    """Route one stdio request: live hub first, local handling otherwise.
+
+    The hub check runs per request (a tiny local JSON read), so a hub that
+    starts, restarts on a new port, or dies mid-session is picked up without
+    restarting this process. Fallback to local handling is allowed only when
+    the failure provably happened before the hub accepted the request — a
+    mutating call that failed mid-flight must NOT be replayed locally (the
+    hub may still be executing it), so it surfaces as a JSON-RPC error.
+    """
+    import urllib.error
+
+    target = _hub_proxy_target()
+    if target is None:
+        return handle_request(request)
+    base_url, headers = target
+    try:
+        return _forward_request_to_hub(base_url, headers, request)
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
+        reached_hub = isinstance(exc, urllib.error.HTTPError)
+        if not reached_hub and not _request_is_mutating(request):
+            logger.warning("Hub at %s unreachable (%s); handling request locally", base_url, exc)
+            return handle_request(request)
+        if request.get("id") is None:
+            return None
+        return {
+            "jsonrpc": "2.0",
+            "id": request.get("id"),
+            "error": {
+                "code": -32000,
+                "message": f"palace hub proxy failed: {exc}",
+                "data": {
+                    "hub": base_url,
+                    "hint": (
+                        "The palace hub did not complete this request. Mutating tools "
+                        "are not replayed locally — the hub may still be executing the "
+                        "call. Check the hub process, then retry."
+                    ),
+                },
+            },
+        }
 
 
 def _run_stdio_loop() -> None:
@@ -5227,7 +7023,7 @@ def _run_stdio_loop() -> None:
                 continue
 
             request = json.loads(line)
-            response = handle_request(request)
+            response = _dispatch_stdio_request(request)
 
             if response is not None:
                 sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")

@@ -496,6 +496,43 @@ class SQLiteExactCollection(BaseCollection):
                 )
                 self._replace_fts(cur, collection_id, doc_id, doc)
 
+    # SQLite caps host parameters per statement (SQLITE_MAX_VARIABLE_NUMBER,
+    # historically 999). Chunk an id fetch well under that, leaving room for the
+    # collection_id parameter.
+    _ID_IN_CHUNK = 900
+
+    def _rows_by_ids(self, cur, ids, *, where=None, where_document=None) -> list[dict]:
+        """Fetch specific ids through the (collection_id, id) primary key — an
+        indexed lookup, NOT a full-collection scan. get-by-id previously read
+        the entire documents table (every doc + embedding blob) and filtered in
+        Python, so one get of a handful of ids near-scanned a multi-GB store."""
+        _validate_where(where)
+        _validate_where(where_document)
+        collection_id = self._collection_id(cur)
+        out = []
+        id_list = list(ids)
+        for start in range(0, len(id_list), self._ID_IN_CHUNK):
+            chunk = id_list[start : start + self._ID_IN_CHUNK]
+            placeholders = ",".join("?" for _ in chunk)
+            sql = (
+                "SELECT id, document, metadata_json, embedding\n"
+                "FROM documents\n"
+                f"WHERE collection_id = ? AND id IN ({placeholders})"
+            )
+            rows = cur.execute(sql, [collection_id, *chunk]).fetchall()
+            for doc_id, doc, meta_json, emb_blob in rows:
+                meta = _json_loads(meta_json)
+                if where is not None and not _matches_where(meta, where):
+                    continue
+                if where_document is not None and not _matches_where_document(
+                    doc or "", where_document
+                ):
+                    continue
+                out.append(
+                    {"id": doc_id, "document": doc or "", "metadata": meta, "embedding": emb_blob}
+                )
+        return out
+
     def _rows(self, cur, *, where=None, where_document=None, limit=None, offset=None) -> list[dict]:
         _validate_where(where)
         _validate_where(where_document)
@@ -633,12 +670,24 @@ class SQLiteExactCollection(BaseCollection):
         with self._cursor() as cur:
             if push_page:
                 rows = self._rows(cur, limit=limit, offset=offset)
+            elif ids is not None:
+                # Indexed fetch by primary key — never a full scan.
+                by_id = {
+                    row["id"]: row
+                    for row in self._rows_by_ids(
+                        cur, ids, where=where, where_document=where_document
+                    )
+                }
+                rows = [by_id[doc_id] for doc_id in ids if doc_id in by_id]
             else:
                 rows = self._rows(cur, where=where, where_document=where_document)
-        if not push_page:
-            if ids is not None:
-                by_id = {row["id"]: row for row in rows}
-                rows = [by_id[doc_id] for doc_id in ids if doc_id in by_id]
+        if not push_page and ids is None:
+            if offset:
+                rows = rows[offset:]
+            if limit is not None:
+                rows = rows[:limit]
+        elif ids is not None:
+            # Requested-id order is preserved above; honor offset/limit on it.
             if offset:
                 rows = rows[offset:]
             if limit is not None:
@@ -668,6 +717,67 @@ class SQLiteExactCollection(BaseCollection):
                         "DELETE FROM docs_fts WHERE collection_id = ? AND doc_id = ?",
                         (collection_id, doc_id),
                     )
+
+    def rekey_row(self, old_id, new_id, *, content, metadata, embedding=None) -> None:
+        """Single-transaction v3->v4 id rewrite for sqlite_exact (RFC 004 PART B).
+
+        Overrides the base upsert+delete default so the separate ``docs_fts`` table
+        stays consistent in ONE transaction: insert the row under ``new_id`` (with
+        the passed content/metadata/embedding + its FTS row), then delete the old
+        ``old_id`` row and its FTS row. Idempotent: if ``new_id`` already exists we
+        skip the insert and only drop the old ghost. ``metadata`` is written
+        verbatim — the reconcile orchestration already stamped ``id_recipe=v4``.
+        """
+        if new_id == old_id:
+            return
+        now = _utcnow()
+        with self._cursor() as cur:
+            collection_id = self._collection_id(cur)
+            exists = cur.execute(
+                "SELECT 1 FROM documents WHERE collection_id = ? AND id = ?",
+                (collection_id, new_id),
+            ).fetchone()
+            if not exists:
+                if embedding is not None:
+                    arr = _as_vector_array(embedding)
+                    emb_blob, dim = arr.tobytes(), int(arr.size)
+                else:
+                    # Fall back to the old row's stored embedding (same content),
+                    # so a caller that omits it never loses the vector.
+                    orow = cur.execute(
+                        "SELECT embedding, dim FROM documents WHERE collection_id = ? AND id = ?",
+                        (collection_id, old_id),
+                    ).fetchone()
+                    if orow is None:
+                        return  # nothing under old_id to rekey
+                    emb_blob, dim = orow[0], int(orow[1] or 0)
+                cur.execute(
+                    """
+                    INSERT INTO documents
+                        (collection_id, id, document, metadata_json, embedding, dim, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        collection_id,
+                        new_id,
+                        content,
+                        _json_dumps(metadata),
+                        emb_blob,
+                        dim,
+                        now,
+                        now,
+                    ),
+                )
+                self._replace_fts(cur, collection_id, new_id, content)
+            # Drop the old ghost row + its FTS row (both the insert and skip paths).
+            cur.execute(
+                "DELETE FROM documents WHERE collection_id = ? AND id = ?",
+                (collection_id, old_id),
+            )
+            cur.execute(
+                "DELETE FROM docs_fts WHERE collection_id = ? AND doc_id = ?",
+                (collection_id, old_id),
+            )
 
     def count(self) -> int:
         with self._cursor() as cur:

@@ -11,7 +11,13 @@ import pytest
 
 from _chroma_palace_helper import make_minimal_chroma_sqlite
 
-from mempalace.searcher import SearchError, build_where_filter, search, search_memories
+from mempalace.searcher import (
+    SearchError,
+    _hybrid_rank,
+    build_where_filter,
+    search,
+    search_memories,
+)
 
 
 # ── build_where_filter (unit) ──────────────────────────────────────────
@@ -28,6 +34,9 @@ class TestBuildWhereFilter:
 
     def test_wing_only(self):
         assert build_where_filter(wing="backend") == {"wing": "backend"}
+
+    def test_wing_normalizes_project_slug(self):
+        assert build_where_filter(wing="liquid-llm") == {"wing": "liquid_llm"}
 
     def test_room_only(self):
         assert build_where_filter(room="auth") == {"room": "auth"}
@@ -69,6 +78,25 @@ class TestSearchMemories:
     def test_wing_filter(self, palace_path, seeded_collection):
         result = search_memories("planning", palace_path, wing="notes")
         assert all(r["wing"] == "notes" for r in result["results"])
+
+    def test_wing_filter_normalizes_project_slug(self, palace_path, collection):
+        collection.add(
+            ids=["drawer_my_project_debugging"],
+            documents=["The Swift debugger uses fputs to stderr for reliable logs."],
+            metadatas=[
+                {
+                    "wing": "my_project",
+                    "room": "debugging",
+                    "source_file": "debug.md",
+                    "chunk_index": 0,
+                }
+            ],
+        )
+
+        result = search_memories("Swift debugger stderr", palace_path, wing="my-project")
+        assert result["filters"]["wing"] == "my_project"
+        assert result["results"]
+        assert all(r["wing"] == "my_project" for r in result["results"])
 
     def test_room_filter(self, palace_path, seeded_collection):
         result = search_memories("database", palace_path, room="backend")
@@ -126,6 +154,28 @@ class TestSearchMemories:
         miss = search_memories("deploy gunicorn workers", palace_path, source_file="deploy.sh")
         assert miss["results"] == []
 
+    def test_uri_like_source_file_display_preserves_provenance(self, palace_path):
+        from mempalace.palace import get_collection
+
+        col = get_collection(palace_path, create=True)
+        source = "manual://canary/hermes-desktop/2026-07-01"
+        col.upsert(
+            ids=["uri1"],
+            documents=["The Hermes Desktop canary passphrase is silver compass."],
+            metadatas=[
+                {
+                    "wing": "shared_agent_brain",
+                    "room": "canaries",
+                    "source_file": source,
+                    "chunk_index": 0,
+                }
+            ],
+        )
+
+        result = search_memories("silver compass", palace_path, wing="shared-agent-brain")
+        assert result["results"][0]["source_file"] == source
+        assert result["results"][0]["source_path"] == source
+
     def test_source_file_filter_honored_in_bm25_fallback(self, palace_path, seeded_collection):
         # vector_disabled routes through _bm25_only_via_sqlite (#1222); the
         # source_file filter must hold there too, not silently no-op.
@@ -139,6 +189,66 @@ class TestSearchMemories:
         assert "error" not in result
         assert result["results"], "BM25 fallback should still find the auth drawer"
         assert all(r["source_file"] == "auth.py" for r in result["results"])
+
+    def test_search_memories_omits_registry_sentinels(self, palace_path, collection):
+        collection.add(
+            ids=["registry_hit", "real_hit"],
+            documents=[
+                "[registry] opencode://session/registryneedle",
+                "The registryneedle recall target belongs in a real memory drawer.",
+            ],
+            metadatas=[
+                {
+                    "wing": "mempalace",
+                    "room": "_registry",
+                    "source_file": "opencode://session/registryneedle-empty",
+                    "ingest_mode": "registry",
+                },
+                {
+                    "wing": "mempalace",
+                    "room": "technical",
+                    "source_file": "opencode://session/registryneedle-real",
+                    "ingest_mode": "convos",
+                },
+            ],
+        )
+
+        result = search_memories("registryneedle", palace_path, n_results=5)
+
+        assert [hit["room"] for hit in result["results"]] == ["technical"]
+
+    def test_bm25_fallback_omits_registry_sentinels(self, palace_path, collection):
+        collection.add(
+            ids=["registry_hit", "real_hit"],
+            documents=[
+                "[registry] opencode://session/bm25registryneedle",
+                "The bm25registryneedle recall target belongs in a real memory drawer.",
+            ],
+            metadatas=[
+                {
+                    "wing": "mempalace",
+                    "room": "_registry",
+                    "source_file": "opencode://session/bm25registryneedle-empty",
+                    "ingest_mode": "registry",
+                },
+                {
+                    "wing": "mempalace",
+                    "room": "technical",
+                    "source_file": "opencode://session/bm25registryneedle-real",
+                    "ingest_mode": "convos",
+                },
+            ],
+        )
+
+        result = search_memories(
+            "bm25registryneedle",
+            palace_path,
+            n_results=5,
+            vector_disabled=True,
+            collection_name="mempalace_drawers",
+        )
+
+        assert [hit["room"] for hit in result["results"]] == ["technical"]
 
     def test_n_results_limit(self, palace_path, seeded_collection):
         result = search_memories("code", palace_path, n_results=2)
@@ -302,6 +412,88 @@ class TestSearchMemories:
         assert hits[0]["source_file"] == "a.md"
         assert hits[0]["matched_via"] == "drawer+closet"
 
+    def test_project_source_drawer_outranks_generic_recall_echo(self):
+        """A successful agent recall transcript can contain the query verbatim
+        and embed closer than the original source. In mixed candidate sets,
+        project/source drawers should outrank generic ``sessions`` echoes so
+        search returns the remembered thing, not a later agent talking about
+        remembering it.
+        """
+        results = [
+            {
+                "text": "Use MemPalace to search for small Swift local LLM client OpenCode.",
+                "wing": "sessions",
+                "room": "technical",
+                "distance": 0.1,
+            },
+            {
+                "text": "Architecture: Swift local LLM client for OpenCode with OllamaService.",
+                "wing": "liquid_llm",
+                "room": "technical",
+                "distance": 0.5,
+            },
+        ]
+
+        ranked = _hybrid_rank(results, "small Swift local LLM client OpenCode")
+
+        assert ranked[0]["wing"] == "liquid_llm"
+
+    def test_search_memories_reranks_before_slicing_to_n_results(self):
+        """Regression for early distance-only slicing: the API used to sort by
+        vector/closet distance, keep only ``n_results`` rows, and only then run
+        the final BM25 hybrid rerank. That let generic recall echoes crowd out
+        the original source before ranking had a chance to rescue it.
+        """
+        drawers_col = MagicMock()
+        drawers_col.query.return_value = {
+            "documents": [
+                [
+                    "Use MemPalace to search for small Swift local LLM client OpenCode.",
+                    "Invoke the mempalace skill: Swift local LLM client OpenCode.",
+                    "Architecture: Swift local LLM client for OpenCode with OllamaService.",
+                ]
+            ],
+            "metadatas": [
+                [
+                    {
+                        "source_file": "/sessions/a.jsonl",
+                        "wing": "sessions",
+                        "room": "technical",
+                        "ingest_mode": "convos",
+                    },
+                    {
+                        "source_file": "/sessions/b.jsonl",
+                        "wing": "sessions",
+                        "room": "technical",
+                        "ingest_mode": "convos",
+                    },
+                    {
+                        "source_file": "opencode://session/liquid-llm",
+                        "wing": "liquid_llm",
+                        "room": "technical",
+                        "ingest_mode": "convos",
+                    },
+                ]
+            ],
+            "distances": [[0.1, 0.2, 0.5]],
+            "ids": [["echo-a", "echo-b", "source"]],
+        }
+
+        with (
+            patch("mempalace.searcher.get_collection", return_value=drawers_col),
+            patch(
+                "mempalace.searcher.get_closets_collection",
+                side_effect=RuntimeError("no closets"),
+            ),
+        ):
+            result = search_memories(
+                "small Swift local LLM client OpenCode",
+                "/fake/path",
+                n_results=2,
+            )
+
+        assert [h["wing"] for h in result["results"]][0] == "liquid_llm"
+
 
 # ── BM25 internals: None / empty document safety ─────────────────────
 
@@ -403,6 +595,27 @@ class TestSearchCLI:
         captured = capsys.readouterr()
         # Should have output with at least one result block
         assert "[1]" in captured.out
+
+    def test_search_displays_drawer_id_when_source_missing(self, fake_palace_path, capsys):
+        """MCP-authored drawers often have no source_file.
+
+        The CLI still needs a citeable location for those memories instead
+        of showing only ``Source: ?``.
+        """
+        mock_col = MagicMock()
+        mock_col.metadata = {"hnsw:space": "cosine"}
+        mock_col.query.return_value = {
+            "ids": [["drawer_shared_canary"]],
+            "documents": [["Claude wrote the copper lighthouse canary."]],
+            "metadatas": [[{"wing": "shared_agent_brain", "room": "canaries"}]],
+            "distances": [[0.1]],
+        }
+        with patch("mempalace.searcher.get_collection", return_value=mock_col):
+            search("copper lighthouse", fake_palace_path, n_results=1)
+
+        captured = capsys.readouterr()
+        assert "Drawer: drawer_shared_canary" in captured.out
+        assert "Source: ?" not in captured.out
 
     def test_search_applies_bm25_hybrid_rerank(self, fake_palace_path, capsys):
         """CLI search must call the same hybrid rerank that the MCP path uses.

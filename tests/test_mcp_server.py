@@ -1672,7 +1672,9 @@ class TestWriteTools:
         assert result["success"] is True
         assert result["wing"] == "test_wing"
         assert result["room"] == "test_room"
-        assert result["drawer_id"].startswith("drawer_test_wing_test_room_")
+        # v4 content-pure id: identity is the content alone (no wing/room in the id).
+        _v4 = result["drawer_id"].removeprefix("drawer_")
+        assert len(_v4) == 32 and all(c in "0123456789abcdef" for c in _v4)
 
     def test_add_drawer_duplicate_detection(self, monkeypatch, config, palace_path, kg):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -1894,6 +1896,38 @@ class TestWriteTools:
         assert result["errors"] == []
         assert all(a["success"] for a in result["added"])
         assert result["diary"]["success"] is True
+
+    def test_checkpoint_normalizes_project_wing_names(self, monkeypatch, config, palace_path, kg):
+        """MCP writes must use the same project wing slug as transcript miners."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        client, col = _get_collection(palace_path, create=True)
+        del client
+        from mempalace.mcp_server import tool_checkpoint
+
+        result = tool_checkpoint(
+            items=[
+                {
+                    "wing": "liquid-llm",
+                    "room": "debugging",
+                    "content": "Snake case decoding broke the Ollama model picker.",
+                }
+            ],
+            diary={
+                "agent_name": "opencode",
+                "wing": "liquid-llm",
+                "entry": "SESSION|liquid.llm.debugged|★",
+            },
+        )
+
+        assert len(result["added"]) == 1
+        assert result["added"][0]["wing"] == "liquid_llm"
+        assert result["diary"]["wing"] == "liquid_llm"
+
+        rows = col.get(where={"wing": "liquid_llm"})
+        docs = "\n".join(rows["documents"])
+        assert "Snake case decoding broke the Ollama model picker." in docs
+        assert "SESSION|liquid.llm.debugged|★" in docs
+        assert not col.get(where={"wing": "liquid-llm"})["ids"]
 
     def test_checkpoint_skips_semantic_duplicates(self, monkeypatch, config, kg):
         from mempalace import mcp_server
@@ -3885,6 +3919,21 @@ class TestKGLazyCache:
         assert kg1 is kg2
         assert len(mcp_server._kg_by_path) == 1
 
+    def test_resolve_kg_path_uses_configured_palace_without_flag(self, tmp_path, monkeypatch):
+        """MCP clients launched from config must use the active palace sidecar.
+
+        The old fallback used ``~/.mempalace/knowledge_graph.sqlite3`` unless
+        the server was launched with --palace, which split KG facts away from
+        the drawer palace for configured clients like Hermes Desktop.
+        """
+        from mempalace import mcp_server
+
+        palace = tmp_path / "palace"
+        monkeypatch.setattr(mcp_server, "_palace_flag_given", False)
+        monkeypatch.setattr(mcp_server, "_config", type("C", (), {"palace_path": str(palace)})())
+
+        assert mcp_server._resolve_kg_path() == str(palace / "knowledge_graph.sqlite3")
+
     def test_get_kg_different_paths_different_instances(self, tmp_path, monkeypatch):
         """Different palace paths map to different KG instances."""
         from mempalace import mcp_server
@@ -4387,7 +4436,7 @@ class TestStructuredErrors:
         constructed: list = []
 
         class _StubKG:
-            def __init__(self, db_path=None):
+            def __init__(self, db_path=None, oplog=None):
                 constructed.append(db_path)
 
         monkeypatch.setattr(mcp_server, "_kg_by_path", {})
@@ -4780,6 +4829,8 @@ def test_peer_writer_guard_refuses_mutating_tool_before_handler(monkeypatch):
     assert response["error"]["code"] == -32001
     assert "read-only" in response["error"]["message"]
     assert response["error"]["data"]["tool"] == "mempalace_add_drawer"
+    assert "shared MemPalace MCP HTTP server" in response["error"]["data"]["hint"]
+    assert "stale-state/corruption risk" in response["error"]["data"]["hint"]
 
 
 def test_peer_writer_guard_does_not_gate_read_tool(monkeypatch):
@@ -4958,8 +5009,56 @@ def test_refresh_sqlite_integrity_status_records_quick_check_errors(monkeypatch)
     mcp_server._refresh_sqlite_integrity_status()
 
     assert mcp_server._sqlite_integrity_checked is True
+    # The startup gate attempts the in-place FTS5 auto-heal; against a fake
+    # palace (no chroma.sqlite3) the heal returns the errors unchanged, so the
+    # gate still records them.
     assert len(mcp_server._sqlite_integrity_errors) == 1
     assert "malformed inverted index" in mcp_server._sqlite_integrity_errors[0]
+
+
+def test_refresh_sqlite_integrity_self_heals_isolated_fts5(monkeypatch):
+    """Isolated FTS5 corruption on startup is auto-healed in place, not gated —
+    a six-figure chroma v4 migration+compress reliably malforms the index (seen
+    on mac AND blade), and it rebuilds losslessly from the intact content table."""
+    from mempalace import mcp_server, repair
+
+    monkeypatch.setattr(mcp_server, "_is_chroma_backend", lambda: True)
+    monkeypatch.setattr(
+        repair,
+        "sqlite_integrity_errors",
+        lambda p: ["malformed inverted index for FTS5 table main.embedding_fulltext_search"],
+    )
+    healed = {}
+
+    def _heal(palace_path, errors, *, progress=print):
+        healed["called"] = True
+        return []  # rebuild cleared quick_check
+
+    monkeypatch.setattr(repair, "maybe_autoheal_fts5_index", _heal)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", False)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", ["stale"])
+
+    mcp_server._refresh_sqlite_integrity_status()
+
+    assert healed.get("called") is True
+    assert mcp_server._sqlite_integrity_errors == []  # gate cleared — writes not refused
+
+
+def test_refresh_sqlite_integrity_still_gates_when_heal_cannot_clear(monkeypatch):
+    """Broader corruption (or a heal that can't clear) still gates writes."""
+    from mempalace import mcp_server, repair
+
+    errs = ["database disk image is malformed"]
+    monkeypatch.setattr(mcp_server, "_is_chroma_backend", lambda: True)
+    monkeypatch.setattr(repair, "sqlite_integrity_errors", lambda p: errs)
+    # Non-isolated corruption: the real auto-heal returns errors unchanged.
+    monkeypatch.setattr(repair, "maybe_autoheal_fts5_index", lambda p, e, *, progress=print: e)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", False)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", [])
+
+    mcp_server._refresh_sqlite_integrity_status()
+
+    assert mcp_server._sqlite_integrity_errors == errs  # still gated
 
 
 def test_sqlite_integrity_refusal_handles_none_palace_path(monkeypatch):

@@ -23,7 +23,7 @@ from .backends import (
     PalaceNotFoundError,
     UnsupportedCapabilityError,
 )
-from .config import sqlite_read_uri
+from .config import normalize_wing_name, sqlite_read_uri
 from .palace import (
     _open_collection_or_explain,
     get_closets_collection,
@@ -43,6 +43,12 @@ class SearchError(Exception):
 
 
 _TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
+_GENERIC_AGENT_TRANSCRIPT_WINGS = {
+    "sessions",
+    "claude_conversations",
+    "codex_conversations",
+}
+_GENERIC_AGENT_ECHO_PENALTY = 0.55
 
 
 def _first_or_empty(results, key: str) -> list:
@@ -163,6 +169,25 @@ def _distance_to_similarity(distance, metric: str = "cosine") -> float:
     return max(0.0, 1.0 - distance)
 
 
+def _candidate_meta(result: dict) -> dict:
+    """Return the metadata shape for either API or CLI ranking candidates."""
+    meta = result.get("metadata")
+    return meta if isinstance(meta, dict) else result
+
+
+def _is_generic_agent_transcript(result: dict) -> bool:
+    """True for mined agent-session echoes, not project/source memories.
+
+    Generic transcript wings are valuable recall evidence, but when a query
+    also finds a project-specific wing they often represent a prior agent
+    repeating the answer it found. Rank those echoes below the original source
+    drawers so "successful recall" transcripts do not become the top answer.
+    """
+    meta = _candidate_meta(result)
+    wing = str(meta.get("wing") or "").lower()
+    return wing in _GENERIC_AGENT_TRANSCRIPT_WINGS
+
+
 def _metric_for_collection(col) -> str:
     """Resolve a collection's declared distance metric, defaulting to cosine.
 
@@ -179,6 +204,88 @@ def _metric_for_collection(col) -> str:
         return "cosine"
     metric = str(metric or "cosine").lower()
     return metric if metric in ("cosine", "l2", "ip") else "cosine"
+
+
+def _result_metadata_value(result: dict, key: str, default=None):
+    if key in result:
+        return result.get(key, default)
+    meta = result.get("metadata")
+    if isinstance(meta, dict):
+        return meta.get(key, default)
+    return default
+
+
+def _is_registry_metadata(meta: dict) -> bool:
+    if not isinstance(meta, dict):
+        return False
+    ingest_mode = str(meta.get("ingest_mode", "") or "").lower()
+    room = str(meta.get("room", "") or "")
+    return ingest_mode == "registry" or room == "_registry"
+
+
+def _iter_searchable_query_rows(results):
+    ids = _first_or_empty(results, "ids")
+    rows = zip(
+        _first_or_empty(results, "documents"),
+        _first_or_empty(results, "metadatas"),
+        _first_or_empty(results, "distances"),
+    )
+    for idx, (doc, meta, dist) in enumerate(rows):
+        meta = meta or {}
+        if _is_registry_metadata(meta):
+            continue
+        hit_id = ids[idx] if idx < len(ids) else None
+        yield hit_id, doc, meta, dist
+
+
+def _looks_like_mempalace_search_echo(text: str) -> bool:
+    """Return True for chunks that are mostly MemPalace search/tool output.
+
+    We store transcripts verbatim, including tool calls and prior failed search
+    answers. Those chunks are useful history, but they should not outrank the
+    primary drawer they mention simply because they repeat the user's query and
+    JSON result payload several times.
+    """
+    lower = (text or "").lower()
+    if not lower:
+        return False
+
+    has_tool_call = (
+        "mempalace_search" in lower
+        or "mcp__plugin_mempalace" in lower
+        or "mcp__mempalace" in lower
+        or "[toolsearch]" in lower
+        or "called plugin:mempalace" in lower
+    )
+    has_search_payload = (
+        '"total_before_filter"' in lower
+        or '"results":' in lower
+        or '"filters":' in lower
+        or "max_distance" in lower
+    )
+    has_failed_search_narration = "searched mempalace" in lower and (
+        "nothing matching" in lower
+        or "no drawer" in lower
+        or "unrelated noise" in lower
+        or "not in there" in lower
+    )
+    return (has_tool_call and has_search_payload) or has_failed_search_narration
+
+
+def _rank_provenance_boost(result: dict) -> float:
+    """Small boost for curated drawers over mined transcript echoes."""
+    added_by = str(_result_metadata_value(result, "added_by", "") or "").lower()
+    ingest_mode = str(_result_metadata_value(result, "ingest_mode", "") or "").lower()
+    if added_by and added_by != "mempalace" and ingest_mode != "convos":
+        return 0.12
+    return 0.0
+
+
+def _rank_echo_penalty(result: dict) -> float:
+    ingest_mode = str(_result_metadata_value(result, "ingest_mode", "") or "").lower()
+    if ingest_mode == "convos" and _looks_like_mempalace_search_echo(result.get("text", "")):
+        return 0.35
+    return 1.0
 
 
 def _hybrid_rank(
@@ -214,12 +321,25 @@ def _hybrid_rank(
     bm25_raw = _bm25_scores(query, docs)
     max_bm25 = max(bm25_raw) if bm25_raw else 0.0
     bm25_norm = [s / max_bm25 for s in bm25_raw] if max_bm25 > 0 else [0.0] * len(bm25_raw)
+    has_generic_agent_transcripts = any(_is_generic_agent_transcript(r) for r in results)
+    has_source_or_project_drawers = any(not _is_generic_agent_transcript(r) for r in results)
+    apply_echo_penalty = has_generic_agent_transcripts and has_source_or_project_drawers
 
     scored = []
     for r, raw, norm in zip(results, bm25_raw, bm25_norm):
         vec_sim = _distance_to_similarity(r.get("distance"), metric)
         r["bm25_score"] = round(raw, 3)
-        scored.append((vector_weight * vec_sim + bm25_weight * norm, r))
+        base_score = vector_weight * vec_sim + bm25_weight * norm
+        echo_penalty = _rank_echo_penalty(r)
+        provenance_boost = _rank_provenance_boost(r)
+        generic_agent_penalty = (
+            _GENERIC_AGENT_ECHO_PENALTY
+            if apply_echo_penalty and _is_generic_agent_transcript(r)
+            else 0.0
+        )
+        r["_rank_echo_penalty"] = echo_penalty
+        r["_rank_provenance_boost"] = provenance_boost
+        scored.append((base_score * echo_penalty + provenance_boost - generic_agent_penalty, r))
 
     # Break exact score ties toward the more recently authored drawer so equal-score
     # candidates rank chronologically instead of in arbitrary backend order. ISO-8601
@@ -237,6 +357,26 @@ def _hybrid_rank(
     return results
 
 
+def _normalize_wing_filter(wing: str = None) -> str:
+    if not wing:
+        return wing
+    return normalize_wing_name(wing)
+
+
+def _display_source_file(source: str) -> str:
+    """Return a human-meaningful source label for search results.
+
+    Filesystem paths are shortened to basenames for scanability, but URI-like
+    synthetic sources (``opencode://...``, ``manual://...``) are already compact
+    provenance and must not be collapsed to their last path segment.
+    """
+    if not source:
+        return "?"
+    if "://" in source:
+        return source
+    return Path(source).name
+
+
 def build_where_filter(wing: str = None, room: str = None, source_file: str = None) -> dict:
     """Build a ChromaDB where filter from optional wing/room/source_file.
 
@@ -244,6 +384,7 @@ def build_where_filter(wing: str = None, room: str = None, source_file: str = No
     clause is returned bare and zero clauses yield an empty filter (#1815).
     """
     clauses = []
+    wing = _normalize_wing_filter(wing)
     if wing:
         clauses.append({"wing": wing})
     if room:
@@ -417,6 +558,7 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
         if not os.path.isdir(palace_path):
             raise SearchError(f"No palace found at {palace_path}")
         raise SearchError(f"No palace database at {palace_path}")
+    wing = _normalize_wing_filter(wing)
 
     # Alert the user if this palace predates hnsw:space=cosine being set on
     # creation — their similarity scores will be junk until they run repair.
@@ -442,6 +584,7 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
     docs = _first_or_empty(results, "documents")
     metas = _first_or_empty(results, "metadatas")
     dists = _first_or_empty(results, "distances")
+    ids = _first_or_empty(results, "ids") or [None] * len(docs)
 
     if not docs:
         print(f'\n  No results found for: "{query}"')
@@ -456,11 +599,43 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
     # `_hybrid_rank`; do the same here so CLI results match what agents
     # see via `mempalace_search`.
     metric = _metric_for_collection(col)
-    hits = [
-        {"text": doc or "", "distance": float(dist), "metadata": meta or {}}
-        for doc, meta, dist in zip(docs, metas, dists)
-    ]
-    hits = _hybrid_rank(hits, query, metric=metric)
+    hits = []
+    for drawer_id, doc, meta, dist in zip(ids, docs, metas, dists):
+        meta = meta or {}
+        if _is_registry_metadata(meta):
+            continue
+        source = meta.get("source_file", "") or ""
+        hits.append(
+            {
+                "id": drawer_id,
+                "text": doc or "",
+                "distance": float(dist),
+                "wing": meta.get("wing", "?"),
+                "room": meta.get("room", "?"),
+                "source_file": _display_source_file(source),
+                "source_path": source,
+                "created_at": meta.get("filed_at", "unknown"),
+                "authored_at": meta.get("authored_at", meta.get("filed_at", "unknown")),
+                "added_by": meta.get("added_by", ""),
+                "ingest_mode": meta.get("ingest_mode", ""),
+                "matched_via": "drawer",
+                "_drawer_id": drawer_id,
+                "_source_file_full": source,
+                "_chunk_index": meta.get("chunk_index"),
+            }
+        )
+    hits, strategy_error = _finalize_candidate_hits(
+        candidate_strategy="auto",
+        hits=hits,
+        drawers_col=col,
+        query=query,
+        wing=wing,
+        room=room,
+        n_results=n_results,
+        max_distance=0.0,
+    )
+    if strategy_error:
+        raise SearchError(strategy_error["error"])
 
     print(f"\n{'=' * 60}")
     print(f'  Results for: "{query}"')
@@ -471,15 +646,24 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
     print(f"{'=' * 60}\n")
 
     for i, hit in enumerate(hits, 1):
-        vec_sim = round(_distance_to_similarity(hit["distance"], metric), 3)
+        vec_sim = (
+            "n/a"
+            if hit.get("distance") is None
+            else round(_distance_to_similarity(hit["distance"], metric), 3)
+        )
         bm25 = hit.get("bm25_score", 0.0)
-        meta = hit["metadata"]
-        source = Path(meta.get("source_file", "?")).name
-        wing_name = meta.get("wing", "?")
-        room_name = meta.get("room", "?")
+        source = hit.get("source_file", "?")
+        drawer_id = hit.get("_drawer_id") or hit.get("id")
+        wing_name = hit.get("wing", "?")
+        room_name = hit.get("room", "?")
 
         print(f"  [{i}] {wing_name} / {room_name}")
-        print(f"      Source: {source}")
+        if source and source != "?":
+            print(f"      Source: {source}")
+        elif drawer_id:
+            print(f"      Drawer: {drawer_id}")
+        else:
+            print("      Source: ?")
         print(f"      Match:  {metric}_sim={vec_sim}  bm25={bm25}")
         print()
         # Print the verbatim text, indented
@@ -579,6 +763,7 @@ def _bm25_only_via_sqlite(
                     WHERE embedding_fulltext_search MATCH ?
                       AND c.name = ?
                     {filter_sql}
+                    ORDER BY rank
                     LIMIT ?
                     """,
                     (fts_query, collection_name, *filter_params, max_candidates),
@@ -677,6 +862,8 @@ def _bm25_only_via_sqlite(
     candidates = []
     for d in drawers.values():
         meta = d["metadata"]
+        if _is_registry_metadata(meta):
+            continue
         if wing and meta.get("wing") != wing:
             continue
         if room and meta.get("room") != room:
@@ -689,10 +876,12 @@ def _bm25_only_via_sqlite(
                 "text": d["text"],
                 "wing": meta.get("wing", "unknown"),
                 "room": meta.get("room", "unknown"),
-                "source_file": Path(full_source).name if full_source else "?",
+                "source_file": _display_source_file(full_source),
                 "source_path": full_source,
                 "created_at": meta.get("filed_at", "unknown"),
                 "authored_at": meta.get("authored_at", meta.get("filed_at", "unknown")),
+                "added_by": meta.get("added_by", ""),
+                "ingest_mode": meta.get("ingest_mode", ""),
                 # No vector distance available in BM25-only mode.
                 "similarity": None,
                 "distance": None,
@@ -713,7 +902,8 @@ def _bm25_only_via_sqlite(
     max_bm25 = max(bm25_raw) if bm25_raw else 0.0
     for c, raw in zip(candidates, bm25_raw):
         c["bm25_score"] = round(raw, 3)
-        c["_score"] = (raw / max_bm25) if max_bm25 > 0 else 0.0
+        norm = (raw / max_bm25) if max_bm25 > 0 else 0.0
+        c["_score"] = norm * _rank_echo_penalty(c) + _rank_provenance_boost(c)
     candidates.sort(key=lambda c: c["_score"], reverse=True)
     hits = candidates[:n_results]
     for h in hits:
@@ -786,22 +976,28 @@ def _merge_bm25_union_candidates(
     bm25_extra = []
     for hit in lexical.hits:
         meta = hit.metadata or {}
+        if _is_registry_metadata(meta):
+            continue
         full_source = meta.get("source_file", "") or ""
         bm25_extra.append(
             {
+                "id": hit.id,
                 "text": hit.document or "",
                 "wing": meta.get("wing", "unknown"),
                 "room": meta.get("room", "unknown"),
-                "source_file": Path(full_source).name if full_source else "?",
+                "source_file": _display_source_file(full_source),
                 "source_path": full_source,
                 "created_at": meta.get("filed_at", "unknown"),
                 "authored_at": meta.get("authored_at", meta.get("filed_at", "unknown")),
+                "added_by": meta.get("added_by", ""),
+                "ingest_mode": meta.get("ingest_mode", ""),
                 "similarity": None,
                 "distance": None,
                 "effective_distance": None,
                 "closet_boost": 0.0,
                 "matched_via": "bm25_backend",
                 "bm25_score": round(float(hit.score), 3),
+                "_drawer_id": hit.id,
                 "_source_file_full": full_source,
                 "_chunk_index": meta.get("chunk_index"),
             }
@@ -815,12 +1011,18 @@ def _merge_bm25_union_candidates(
         # Fall back to basename only when richer metadata is missing —
         # avoids silently dropping candidates on legacy data while still
         # giving chunk-precise dedup whenever the metadata is present.
-        return entry.get("source_file")
+        source = entry.get("source_file")
+        if source and source != "?":
+            return ("source", source)
+        drawer_id = entry.get("_drawer_id") or entry.get("id")
+        if drawer_id:
+            return ("id", drawer_id)
+        return None
 
     seen = {_dedup_key(h) for h in hits}
     for bh in bm25_extra:
         key = _dedup_key(bh)
-        if not key or key == "?" or key in seen:
+        if not key or key in seen:
             continue
         bh["distance"] = None
         bh["effective_distance"] = None
@@ -833,6 +1035,7 @@ def _merge_bm25_union_candidates(
 # project's complexity ceiling (C901 max-complexity=25). New strategies
 # register here.
 _CANDIDATE_MERGERS = {
+    "auto": _merge_bm25_union_candidates,
     "vector": None,  # default no-op
     "union": _merge_bm25_union_candidates,
 }
@@ -906,18 +1109,24 @@ def _finalize_candidate_hits(
             source_file=source_file,
         )
     except UnsupportedCapabilityError:
-        return [], {
-            "error": "candidate_strategy='union' requires a backend with lexical_search support",
-            "unsupported_capability": "supports_lexical_search",
-            "hint": "Use candidate_strategy='vector' or select a backend that supports lexical search.",
-        }
+        if candidate_strategy == "auto":
+            logger.debug("auto candidate strategy: backend has no lexical search", exc_info=True)
+        else:
+            return [], {
+                "error": "candidate_strategy='union' requires a backend with lexical_search support",
+                "unsupported_capability": "supports_lexical_search",
+                "hint": "Use candidate_strategy='vector' or select a backend that supports lexical search.",
+            }
 
     hits = _hybrid_rank(hits, query, metric=_metric_for_collection(drawers_col))[:n_results]
     for h in hits:
         h.pop("_sort_key", None)
+        h.pop("_drawer_id", None)
         h.pop("_source_file_full", None)
         h.pop("_chunk_index", None)
         h.pop("_parent_drawer_id", None)
+        h.pop("_rank_echo_penalty", None)
+        h.pop("_rank_provenance_boost", None)
     return hits, None
 
 
@@ -1034,6 +1243,8 @@ def _query_drawers_with_filter_fallback(
             _first_or_empty(raw, "distances"),
         ):
             meta = meta or {}
+            if _is_registry_metadata(meta):
+                continue
             if wing and meta.get("wing") != wing:
                 continue
             if room and meta.get("room") != room:
@@ -1055,7 +1266,7 @@ def search_memories(
     n_results: int = 5,
     max_distance: float = 0.0,
     vector_disabled: bool = False,
-    candidate_strategy: str = "vector",
+    candidate_strategy: str = "auto",
     collection_name: str = None,
 ) -> dict:
     """Programmatic search — returns a dict instead of printing.
@@ -1080,7 +1291,10 @@ def search_memories(
             load.
         candidate_strategy: How candidates for the hybrid re-rank are gathered.
 
-            * ``"vector"`` (default) — preserves historical behavior: top
+            * ``"auto"`` (default) — use vector candidates plus lexical
+              candidates when the backend supports ``lexical_search``;
+              silently degrade to vector-only on legacy/custom backends.
+            * ``"vector"`` — preserves historical behavior: top
               ``n_results * 3`` rows from the vector index are the rerank pool.
               Cheap; works well when query and target docs agree in the
               embedding space.
@@ -1099,6 +1313,7 @@ def search_memories(
     # regardless of whether the call routes through the vector path or
     # the BM25-only fallback below.
     _validate_candidate_strategy(candidate_strategy)
+    wing = _normalize_wing_filter(wing)
 
     if vector_disabled:
         return _vector_disabled_search(
@@ -1173,12 +1388,7 @@ def search_memories(
     CLOSET_DISTANCE_CAP = 1.5  # cosine dist > 1.5 = too weak to use as signal
 
     scored: list = []
-    for doc, meta, dist in zip(
-        _first_or_empty(drawer_results, "documents"),
-        _first_or_empty(drawer_results, "metadatas"),
-        _first_or_empty(drawer_results, "distances"),
-    ):
-        meta = meta or {}
+    for hit_id, doc, meta, dist in _iter_searchable_query_rows(drawer_results):
         doc = doc or ""
         # Filter on raw distance before rounding to avoid precision loss.
         if max_distance > 0.0 and dist > max_distance:
@@ -1203,15 +1413,18 @@ def search_memories(
         # inverting the ranking so the best hybrid matches sort last.
         effective_dist = max(0.0, min(2.0, dist - boost))
         entry = {
+            "id": hit_id,
             "text": doc,
             "wing": meta.get("wing", "unknown"),
             "room": meta.get("room", "unknown"),
             # source_file is the basename (display); source_path is the full
             # stored value, the round-trippable key for the source_file filter.
-            "source_file": Path(source).name if source else "?",
+            "source_file": _display_source_file(source),
             "source_path": source,
             "created_at": meta.get("filed_at", "unknown"),
             "authored_at": meta.get("authored_at", meta.get("filed_at", "unknown")),
+            "added_by": meta.get("added_by", ""),
+            "ingest_mode": meta.get("ingest_mode", ""),
             "similarity": round(_distance_to_similarity(effective_dist, metric), 3),
             "distance": round(dist, 4),
             "effective_distance": round(effective_dist, 4),
@@ -1222,6 +1435,7 @@ def search_memories(
             # basename-suffix matching (which silently collides when two
             # files share a basename across different directories).
             "_sort_key": effective_dist,
+            "_drawer_id": hit_id,
             "_source_file_full": source,
             "_chunk_index": meta.get("chunk_index"),
             "_parent_drawer_id": meta.get("parent_drawer_id"),
@@ -1231,7 +1445,7 @@ def search_memories(
         scored.append(entry)
 
     scored.sort(key=lambda h: h["_sort_key"])
-    hits = scored[:n_results]
+    hits = scored
 
     # Drawer-grep enrichment: for closet-boosted hits whose source has
     # multiple drawers, return the keyword-best chunk + its immediate

@@ -6,6 +6,7 @@ import shlex
 import sqlite3
 import subprocess
 import sys
+from types import SimpleNamespace
 from contextlib import closing
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
@@ -14,17 +15,20 @@ import pytest
 
 from mempalace.cli import (
     cmd_compress,
+    cmd_config,
     cmd_hook,
     cmd_init,
     cmd_instructions,
     cmd_daemon,
     cmd_mine,
+    cmd_palace_set_embedder,
     cmd_repair,
     cmd_search,
     cmd_split,
     cmd_status,
     cmd_wakeup,
     main,
+    _parse_kg_model_args,
 )
 
 
@@ -91,6 +95,20 @@ def test_cli_main_strips_leaked_pythonpath_from_env():
 
 
 # ── cmd_status ─────────────────────────────────────────────────────────
+
+
+def test_parse_kg_model_args_accepts_repeated_commas_and_env(monkeypatch):
+    assert _parse_kg_model_args(["qwen3:1.7b, qwen3:4b", "llama3.2:3b"]) == [
+        "qwen3:1.7b",
+        "qwen3:4b",
+        "llama3.2:3b",
+    ]
+
+    monkeypatch.setenv("LLM_MODEL", "phi4-mini")
+    assert _parse_kg_model_args([]) == ["phi4-mini"]
+
+    monkeypatch.delenv("LLM_MODEL")
+    assert _parse_kg_model_args([]) == []
 
 
 @patch("mempalace.cli.MempalaceConfig")
@@ -172,6 +190,45 @@ def test_cmd_hook_session_end_calls_run_hook():
     with patch("mempalace.hooks_cli.run_hook") as mock_run:
         cmd_hook(args)
         mock_run.assert_called_once_with(hook_name="session-end", harness="claude-code")
+
+
+# ── cmd_config ─────────────────────────────────────────────────────────
+
+
+def test_cmd_config_set_palace_path(capsys):
+    fake_cfg = MagicMock()
+    fake_cfg.set_palace_path.return_value = "/tmp/shared-agent-brain"
+    args = argparse.Namespace(config_action="set", key="palace-path", value="~/shared")
+
+    with patch("mempalace.cli.MempalaceConfig", return_value=fake_cfg):
+        cmd_config(args)
+
+    fake_cfg.set_palace_path.assert_called_once_with("~/shared")
+    assert "palace_path = /tmp/shared-agent-brain" in capsys.readouterr().out
+
+
+def test_cmd_config_set_hook_bool(capsys):
+    fake_cfg = MagicMock()
+    args = argparse.Namespace(config_action="set", key="hooks.auto-save", value="off")
+
+    with patch("mempalace.cli.MempalaceConfig", return_value=fake_cfg):
+        cmd_config(args)
+
+    fake_cfg.set_hook_setting.assert_called_once_with("auto_save", False)
+    assert "hooks.auto-save = false" in capsys.readouterr().out
+
+
+def test_cmd_config_rejects_bad_bool(capsys):
+    fake_cfg = MagicMock()
+    args = argparse.Namespace(config_action="set", key="hooks.auto-save", value="maybe")
+
+    with patch("mempalace.cli.MempalaceConfig", return_value=fake_cfg):
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_config(args)
+
+    assert exc_info.value.code == 2
+    fake_cfg.set_hook_setting.assert_not_called()
+    assert "expected true/false" in capsys.readouterr().err
 
 
 # ── cmd_init ───────────────────────────────────────────────────────────
@@ -1544,6 +1601,55 @@ def test_cmd_compress_dry_run(mock_config_cls, capsys):
 
 
 @patch("mempalace.cli.MempalaceConfig")
+def test_cmd_compress_batches_closet_upserts(mock_config_cls, capsys):
+    """The closet store must upsert in batches, not one call per drawer — a
+    per-drawer upsert embeds one doc at a time and made a six-figure compress
+    take hours on a GPU embedder."""
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    args = argparse.Namespace(palace=None, wing=None, dry_run=False, config=None)
+    n = 1200  # -> read in 500-batches, stored in 500-batches
+
+    def _read(**kwargs):
+        off, lim = kwargs.get("offset", 0), kwargs.get("limit", 500)
+        if off >= n:
+            return {"documents": [], "metadatas": [], "ids": []}
+        rng = range(off, min(off + lim, n))
+        return {
+            "documents": [f"doc {i}" for i in rng],
+            "metadatas": [{"wing": "w", "room": "r", "source_file": "f"} for _ in rng],
+            "ids": [f"id{i}" for i in rng],
+        }
+
+    read_col = MagicMock()
+    read_col.get.side_effect = lambda **k: _read(**k)
+    closets = MagicMock()
+
+    mock_dialect = MagicMock()
+    mock_dialect.compress.return_value = "c"
+    mock_dialect.compression_stats.return_value = {
+        "original_chars": 10,
+        "summary_chars": 3,
+        "original_tokens_est": 2,
+        "summary_tokens_est": 1,
+        "size_ratio": 3.0,
+        "note": "",
+    }
+    mock_dialect_mod = _make_mock_dialect_module(mock_dialect)
+
+    with (
+        patch("mempalace.palace._open_collection_or_explain", return_value=read_col),
+        patch("mempalace.palace.get_closets_collection", return_value=closets),
+        patch.dict("sys.modules", {"mempalace.dialect": mock_dialect_mod}),
+    ):
+        cmd_compress(args)
+
+    # 1200 drawers / 500 batch -> 3 upserts of 500/500/200, NOT 1200 calls.
+    sizes = [len(call.kwargs["ids"]) for call in closets.upsert.call_args_list]
+    assert sizes == [500, 500, 200]
+    assert sum(sizes) == n  # every drawer stored exactly once
+
+
+@patch("mempalace.cli.MempalaceConfig")
 def test_cmd_compress_with_config(mock_config_cls, tmp_path, capsys):
     mock_config_cls.return_value.palace_path = "/fake/palace"
     config_file = tmp_path / "entities.json"
@@ -1803,3 +1909,39 @@ def test_cmd_repair_rebuild_index_alias_uses_sqlite_archive(mock_config_cls, tmp
         dest_palace=str(palace_dir),
         archive_existing_dest=True,
     )
+
+
+@patch("mempalace.cli.MempalaceConfig")
+@patch("mempalace.palace.set_palace_embedder_identity")
+def test_cmd_palace_set_embedder_accepts_closets_collection_alias(
+    mock_set_identity, mock_config_cls, tmp_path, capsys
+):
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    mock_config = mock_config_cls.return_value
+    mock_config.palace_path = str(palace_dir)
+    mock_config.embedding_model = "minilm"
+    mock_set_identity.return_value = (
+        None,
+        SimpleNamespace(model_name="minilm", dimension=384),
+    )
+
+    args = argparse.Namespace(
+        palace=str(palace_dir),
+        model=None,
+        force=False,
+        backend=None,
+        global_backend=None,
+        collection="closets",
+    )
+
+    cmd_palace_set_embedder(args)
+
+    mock_set_identity.assert_called_once_with(
+        str(palace_dir),
+        model=None,
+        force=False,
+        backend=None,
+        collection_name="mempalace_closets",
+    )
+    assert "recorded embedder identity: minilm" in capsys.readouterr().out

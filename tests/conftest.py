@@ -108,6 +108,24 @@ def _reset_mcp_cache():
         except (ImportError, AttributeError):
             pass
 
+        # Close cached memory op-logs (RFC 004 step-2a shadow) so their
+        # SQLite handles don't outlive the test palace — on Windows an open
+        # handle blocks temp-dir cleanup, same class of leak as #1128.
+        try:
+            import sys as _sys
+
+            oplog_mod = _sys.modules.get("mempalace.oplog")
+            if oplog_mod is not None:
+                with oplog_mod._oplog_cache_lock:
+                    for log in list(oplog_mod._oplog_by_path.values()):
+                        try:
+                            log.close()
+                        except Exception:
+                            pass
+                    oplog_mod._oplog_by_path.clear()
+        except AttributeError:
+            pass
+
         # Release chromadb clients opened through the backend layer. Many tests
         # reach the store via palace.get_collection() (sweep, repair, CLI, ...),
         # which caches one PersistentClient per palace_path on the long-lived

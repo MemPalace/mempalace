@@ -152,7 +152,8 @@ def _enforce_embedder_identity(collection, palace_path, collection_name, *, crea
             warnings.warn(
                 f"palace collection {collection_name!r} has no recorded embedder "
                 f"identity; assuming the current model {model_name!r}. Run "
-                "`mempalace palace set-embedder --model <name>` to record it.",
+                "`mempalace palace set-embedder --model <name> "
+                f"--collection {collection_name}` to record it.",
                 EmbedderIdentityUnknownWarning,
                 stacklevel=2,
             )

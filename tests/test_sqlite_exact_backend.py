@@ -279,19 +279,30 @@ def test_sqlite_exact_get_offset_zero_is_a_full_scan(tmp_path):
     assert "OFFSET" not in selects[0]
 
 
-def test_sqlite_exact_get_ids_with_page_slices_in_python(tmp_path):
+def test_sqlite_exact_get_ids_uses_indexed_lookup_not_scan(tmp_path):
     _backend, col = _collection(tmp_path)
     _seed(col, 5)
 
-    # ids force the Python path even with a page: the requested order is kept,
-    # then offset/limit slice the reordered list with no SQL LIMIT/OFFSET.
-    result, selects = _doc_select_sql(
-        col, lambda: col.get(ids=["d4", "d3", "d2", "d1"], offset=1, limit=2)
-    )
+    # get-by-ids fetches through the (collection_id, id) primary key — an
+    # indexed IN query, NEVER the ORDER BY rowid full-collection scan that
+    # near-scanned a multi-GB store on every call. Requested order and
+    # offset/limit are still honored in Python (no SQL LIMIT/OFFSET).
+    statements = []
+    conn = col._handle.conn
+    conn.set_trace_callback(statements.append)
+    try:
+        result = col.get(ids=["d4", "d3", "d2", "d1"], offset=1, limit=2)
+    finally:
+        conn.set_trace_callback(None)
+
     assert result.ids == ["d3", "d2"]
-    assert len(selects) == 1
-    assert "LIMIT" not in selects[0]
-    assert "OFFSET" not in selects[0]
+    doc_selects = [
+        s for s in statements if "FROM documents" in s and s.lstrip().upper().startswith("SELECT")
+    ]
+    assert doc_selects, "expected a documents SELECT"
+    assert not any("ORDER BY rowid" in s for s in doc_selects), "must not full-scan on a get-by-ids"
+    assert any("id IN" in s for s in doc_selects), "must fetch through the id index"
+    assert all("LIMIT" not in s and "OFFSET" not in s for s in doc_selects)
 
 
 def test_sqlite_exact_upsert_delete_and_multi_collection_isolation(tmp_path):
@@ -524,6 +535,95 @@ def test_search_union_uses_sqlite_exact_lexical_search(tmp_path, monkeypatch):
     assert result["results"][0]["matched_via"] == "bm25_backend"
 
 
+def test_search_auto_uses_lexical_union_by_default(tmp_path, monkeypatch):
+    import mempalace.backends.embedding_wrapper as embedding_wrapper
+    from mempalace.palace import get_collection
+    from mempalace.searcher import search_memories
+
+    def fake_embed(texts):
+        vectors = []
+        for text in texts:
+            if text == "rareterm":
+                vectors.append([1.0, 0.0])
+            elif "rareterm" in text:
+                vectors.append([0.0, 1.0])
+            else:
+                vectors.append([0.5, math.sqrt(0.75)])
+        return vectors
+
+    monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "sqlite_exact")
+    monkeypatch.setattr(embedding_wrapper, "_embed_texts", fake_embed)
+
+    col = get_collection(str(tmp_path), create=True)
+    col.add(
+        ids=["d1", "d2", "d3", "rare"],
+        documents=[
+            "ordinary support note",
+            "ordinary billing note",
+            "ordinary project note",
+            "rareterm rareterm rareterm policy note",
+        ],
+        metadatas=[
+            {"wing": "w", "room": "r", "source_file": "/tmp/d1.md", "chunk_index": 0},
+            {"wing": "w", "room": "r", "source_file": "/tmp/d2.md", "chunk_index": 0},
+            {"wing": "w", "room": "r", "source_file": "/tmp/d3.md", "chunk_index": 0},
+            {"wing": "w", "room": "r", "source_file": "/tmp/rare.md", "chunk_index": 0},
+        ],
+    )
+
+    result = search_memories("rareterm", str(tmp_path), n_results=1)
+
+    assert result["results"][0]["source_file"] == "rare.md"
+    assert result["results"][0]["matched_via"] == "bm25_backend"
+
+
+def test_search_auto_keeps_lexical_hits_without_source_file(tmp_path, monkeypatch):
+    import mempalace.backends.embedding_wrapper as embedding_wrapper
+    from mempalace.palace import get_collection
+    from mempalace.searcher import search_memories
+
+    def fake_embed(texts):
+        vectors = []
+        for text in texts:
+            if text == "source less canary":
+                vectors.append([1.0, 0.0])
+            elif "source less canary" in text:
+                vectors.append([0.0, 1.0])
+            else:
+                vectors.append([0.5, math.sqrt(0.75)])
+        return vectors
+
+    monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "sqlite_exact")
+    monkeypatch.setattr(embedding_wrapper, "_embed_texts", fake_embed)
+
+    col = get_collection(str(tmp_path), create=True)
+    col.add(
+        ids=["ordinary", "source-less"],
+        documents=[
+            "ordinary support note",
+            "source less canary drawer from an MCP write",
+        ],
+        metadatas=[
+            {"wing": "w", "room": "r", "source_file": "/tmp/ordinary.md", "chunk_index": 0},
+            {"wing": "shared", "room": "canaries"},
+        ],
+    )
+
+    result = search_memories("source less canary", str(tmp_path), n_results=1)
+
+    top = result["results"][0]
+    assert top["wing"] == "shared"
+    assert top["source_file"] == "?"
+    # The contract is that the sourceless drawer surfaces at all. Which
+    # union candidate survives id-based dedup depends on how many vector
+    # hits reach the merge: since the echo-ranking change keeps the full
+    # scored list (hits are no longer truncated to n_results before the
+    # union merge), the vector hit for this drawer is present and the
+    # BM25 duplicate is dropped, so provenance reads "drawer". A pool
+    # where vector misses it still injects the "bm25_backend" candidate.
+    assert top["matched_via"] in ("drawer", "bm25_backend")
+
+
 def test_search_union_reports_unsupported_lexical_capability(monkeypatch, tmp_path):
     import mempalace.searcher as searcher
 
@@ -620,3 +720,63 @@ def test_concurrent_first_open_single_connection_no_leak(tmp_path, monkeypatch):
     backend.close()
     with pytest.raises(sqlite3.ProgrammingError):
         created[0].execute("SELECT 1")
+
+
+def test_rekey_row_through_wrapper_moves_row_and_fts(tmp_path):
+    """RFC 004 write-flip PART B: reconcile calls ``rekey_row`` on the
+    EmbeddingCollection wrapper. It must forward to sqlite_exact's single-txn,
+    docs_fts-aware override (NOT the shadowed BaseCollection upsert+delete
+    default), moving both the documents row and its FTS row from the v3 id to
+    the content-hash v4 id, idempotently, with content preserved."""
+    from mempalace.backends.embedding_wrapper import EmbeddingCollection
+
+    _, raw = _collection(tmp_path)
+    old_id = "drawer_sessions_technical_deadbeef01"
+    new_id = "drawer_00112233445566778899aabbccddeeff"
+    body = "zzquniquetoken revised content body"
+    raw.add(
+        ids=[old_id],
+        documents=[body],
+        metadatas=[{"wing": "sessions", "room": "technical", "chunk_index": 0, "id_recipe": "v3"}],
+        embeddings=[[0.11, 0.22, 0.33]],
+    )
+    wrapped = EmbeddingCollection(raw)
+    wrapped.rekey_row(
+        old_id,
+        new_id,
+        content=body,
+        metadata={"wing": "sessions", "room": "technical", "chunk_index": 0, "id_recipe": "v4"},
+        embedding=[0.11, 0.22, 0.33],
+    )
+
+    assert raw.get(ids=[old_id]).ids == []
+    got = raw.get(ids=[new_id])
+    assert got.ids == [new_id]
+    assert got.metadatas[0]["id_recipe"] == "v4"
+    assert got.documents == [body]
+
+    con = sqlite3.connect(str(tmp_path / "sqlite_exact.sqlite3"))
+    try:
+        cid = con.execute(
+            "SELECT id FROM collections WHERE name = ?", ("mempalace_drawers",)
+        ).fetchone()[0]
+        old_fts = con.execute(
+            "SELECT count(*) FROM docs_fts WHERE collection_id = ? AND doc_id = ?", (cid, old_id)
+        ).fetchone()[0]
+        new_fts = con.execute(
+            "SELECT count(*) FROM docs_fts WHERE collection_id = ? AND doc_id = ?", (cid, new_id)
+        ).fetchone()[0]
+    finally:
+        con.close()
+    assert old_fts == 0
+    assert new_fts == 1
+
+    # Idempotent: re-running with the old row already gone is a safe no-op.
+    wrapped.rekey_row(
+        old_id,
+        new_id,
+        content=body,
+        metadata={"wing": "sessions", "room": "technical", "chunk_index": 0, "id_recipe": "v4"},
+        embedding=[0.11, 0.22, 0.33],
+    )
+    assert raw.get(ids=[new_id]).ids == [new_id]

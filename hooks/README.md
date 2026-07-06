@@ -113,12 +113,23 @@ same entry point as a follow-up wherever their own session-end event is availabl
 
 ## Configuration
 
-Edit `mempal_save_hook.sh` to change:
+Use the CLI for persistent settings:
 
-- **`SAVE_INTERVAL=15`** — How many human messages between saves. Lower = more frequent saves, higher = less interruption.
-- **`STATE_DIR`** — Where hook state is stored (defaults to `~/.mempalace/hook_state/`)
+```bash
+mempalace config set palace-path ~/.mempalace/palaces/shared-agent-brain
+mempalace config set hooks.auto-save true
+mempalace config set hooks.silent-save true
+mempalace config show
+```
+
+Environment variables remain useful for per-shell overrides:
+
 - **`MEMPAL_DIR`** — Optional **project directory** (code, notes, docs) to also mine on each save trigger, with `--mode projects`. The hook ALWAYS mines the active conversation transcript automatically with `--mode convos` — `MEMPAL_DIR` is purely additive, never an override. Leave blank if you don't want to ingest project files.
-- **`MEMPALACE_PYTHON`** — Optional env var. Python interpreter with mempalace + chromadb installed. Auto-detects: `MEMPALACE_PYTHON` env var → repo `venv/bin/python3` → system `python3`. Set this if your venv is in a non-standard location.
+- **`MEMPAL_PYTHON`** — Optional override for the standalone shell hook scripts when they need a specific Python interpreter.
+- **`MEMPALACE_PYTHON`** — Optional override used by `mempalace hook run` when it spawns background mining work and must use a Python interpreter with mempalace installed.
+- **`MEMPALACE_HOOKS_AUTO_SAVE=false`** — Per-shell kill switch for hook blocking and auto-save behavior.
+
+Claude/Codex hook saves currently fire every 15 human messages. Cursor and Antigravity expose `MEMPAL_SAVE_INTERVAL`; the Claude/Codex interval is intentionally fixed in the current hook runner.
 
 ### Disabling Auto-Save (Silent Mode)
 
@@ -244,7 +255,15 @@ For Codex CLI sessions:
 mempalace mine ~/.codex/sessions/ --mode convos
 ```
 
-This only needs to be done once — after that, the hooks auto-mine each session as you go.
+For OpenCode sessions:
+```bash
+mempalace mine ~/.local/share/opencode --mode convos
+```
+
+Claude Code and Codex only need the one-time backfill once — after that,
+their hooks auto-mine each session as you go. OpenCode backfill is currently
+manual; MCP recall/write works once the OpenCode MCP server config points at
+`mempalace-mcp`.
 
 ## Cost
 

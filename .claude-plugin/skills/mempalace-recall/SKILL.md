@@ -1,6 +1,6 @@
 ---
 name: mempalace-recall
-description: Recall protocol for MemPalace — search the palace before answering about past work, prior decisions, people, or projects. Use when the user asks what was decided, what happened before, who someone is, what was discussed last time, or anything that may already be filed in their memory palace.
+description: Recall protocol for MemPalace - search the palace before answering about past work, prior decisions, people, or projects. Use when the user asks "do you remember", "what did we decide", "where did we leave off", "what happened before", who someone is, what was discussed last time, or anything that may already be filed in their memory palace.
 allowed-tools: Bash
 ---
 
@@ -21,14 +21,21 @@ If the `mempalace_*` MCP tools are not available, tell the user the
 server is not connected and point them at the `mempalace` skill or
 `/init`. Do not silently fall back to answering from model memory.
 
+Do not use `rg`, `grep`, `find`, or broad filesystem scans over home
+directories, editor caches, project folders, or conversation archives as a
+recall fallback unless the user explicitly asks for filesystem search.
+Refine inside MemPalace instead.
+
 ## When to recall
 
 Search the palace **before answering** whenever the user asks about
 something that may be filed:
 
 - Past work or prior decisions — "what did we decide / try / do?"
+- Project continuity — "where did we leave off?", "what are our goals?"
 - A person, project, or entity — "who is …", "what is …"
-- An earlier session — "remember when …", "last time …"
+- An earlier session — "do you remember …", "remember when …",
+  "last time …"
 - A preference, fact, or relationship that could have changed over time
 
 Skip recall for pure greenfield work with no memory relevance (renaming
@@ -47,6 +54,16 @@ a variable, fixing a typo). Recall is question-driven, not reflexive.
 5. When a fact changes: `mempalace_kg_invalidate` the old fact, then
    `mempalace_kg_add` the new one.
 
+## Answer shape
+
+- Cite the source location first: wing, room, source file, or drawer id
+  when available.
+- Quote the drawer's exact stored words before any synthesis.
+- Keep your inference separate from the quote, and label it when it is
+  not directly stored in the drawer.
+- Include source dates or authored-at metadata when available, especially
+  when the memory may be stale.
+
 ## Unhappy paths
 
 - **Empty results** — say the palace has nothing on this; do not invent
@@ -62,6 +79,10 @@ a variable, fixing a typo). Recall is question-driven, not reflexive.
   and diary entries (#1843). Do not repair in-process.
 - **Conflicting facts** — trust the knowledge graph's time-valid answer;
   invalidate-then-add rather than overwriting silently.
+- **Weak or unrelated results** — try exact phrases, entity-plus-topic
+  keywords, or a wing/room filter discovered through MemPalace tools. Do
+  not switch to broad filesystem search.
 
 The canonical protocol, shared across all MemPalace integrations, lives
-in `integrations/shared/recall-protocol.md`.
+in `integrations/shared/recall-protocol.md`:
+<https://github.com/MemPalace/mempalace/blob/main/integrations/shared/recall-protocol.md>

@@ -29,6 +29,8 @@ Examples:
     mempalace search "pricing discussion" --wing my_app --room costs
 """
 
+from __future__ import annotations
+
 import os
 import sys
 import shlex
@@ -543,6 +545,139 @@ def _maybe_run_mine_after_init(args, cfg) -> None:
         sys.exit(1)
 
 
+_HUB_FORWARD_ENV = "MEMPALACE_HUB_FORWARD"
+_HUB_HEALTH_TIMEOUT_S = 0.75
+# A backfill mine over a large transcript tree can legitimately run for many
+# minutes inside the hub; the forwarder is a background/CLI process, not a
+# hook-budgeted one, so it waits.
+_HUB_MINE_TIMEOUT_S = 3600.0
+
+
+def _hub_forward_disabled() -> bool:
+    return os.environ.get(_HUB_FORWARD_ENV, "").strip().lower() in {"0", "false", "no", "off"}
+
+
+def _mine_args_forwardable(args, include_ignored) -> bool:
+    """Only forward mines the ``mempalace_mine`` MCP tool can express.
+
+    Flags the tool has no parameters for (kg-extract, gitignore handling,
+    chunking overrides, origin redetection, explicit backend) keep the
+    direct path — where a held writer lease still surfaces as the existing
+    MineAlreadyRunning error rather than being silently dropped.
+    """
+    if getattr(args, "kg_extract", False) or getattr(args, "redetect_origin", False):
+        return False
+    if args.no_gitignore or include_ignored:
+        return False
+    if getattr(args, "max_chunks_per_file", None) is not None:
+        return False
+    if _backend_arg(args):
+        return False
+    return True
+
+
+def _forward_mine_to_hub(args, palace_path: str) -> bool:
+    """Run this mine inside the palace's HTTP hub, if one is alive.
+
+    A long-lived hub (``mempalace serve``) holds the MCP writer lease for
+    its whole lifetime, so a direct mine from this process — including the
+    background save hooks, which spawn exactly this CLI — would be refused
+    and transcript capture would silently stop on the hub machine. The hub
+    itself may mine (the palace lock is process-re-entrant there, #1859),
+    so the fix is to hand it the job over HTTP.
+
+    Returns True when the hub handled the mine (this function has already
+    printed the outcome and exited non-zero on failure). Returns False when
+    there is no usable hub — the caller proceeds with the direct path.
+    Once the hub has accepted the request there is no fallback: the job may
+    already be running, and re-mining directly would race it.
+    """
+    import json
+    import urllib.error
+    import urllib.request
+
+    from . import server_registry
+
+    if _hub_forward_disabled():
+        return False
+    info = server_registry.read_live_serverinfo(palace_path)
+    if not info or info.get("read_only"):
+        return False
+
+    base_url = server_registry.client_base_url(info)
+    headers = {"Content-Type": "application/json"}
+    token = server_registry.load_server_token(palace_path)
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    try:
+        health = urllib.request.Request(f"{base_url}/healthz", headers=headers)
+        with urllib.request.urlopen(health, timeout=_HUB_HEALTH_TIMEOUT_S) as resp:
+            if resp.status != 200:
+                return False
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+    arguments = {
+        "source": os.path.abspath(os.path.expanduser(args.dir)),
+        "mode": args.mode,
+        "agent": args.agent,
+        "limit": args.limit or 0,
+        "dry_run": bool(args.dry_run),
+        "extract": args.extract,
+    }
+    if args.wing:
+        arguments["wing"] = args.wing
+    body = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "mempalace_mine", "arguments": arguments},
+        }
+    ).encode("utf-8")
+
+    print(f"mempalace: forwarding mine to palace hub {base_url} (pid {info.get('pid')})")
+    try:
+        request = urllib.request.Request(f"{base_url}/mcp", data=body, headers=headers)
+        with urllib.request.urlopen(request, timeout=_HUB_MINE_TIMEOUT_S) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        # The hub answered — the request reached it, so no direct fallback.
+        print(f"mempalace: hub rejected mine ({exc.code} {exc.reason})", file=sys.stderr)
+        sys.exit(1)
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        print(
+            f"mempalace: hub at {base_url} did not complete the mine ({exc}); "
+            "not retrying directly — the hub may still be running the job. "
+            f"Set {_HUB_FORWARD_ENV}=0 to force direct mines.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if payload.get("error"):
+        err = payload["error"]
+        print(
+            f"mempalace: hub refused mine: {err.get('message', 'unknown error')}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        result = json.loads(payload["result"]["content"][0]["text"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        print("mempalace: hub returned an unrecognized mine response", file=sys.stderr)
+        sys.exit(1)
+
+    output = result.get("output")
+    if output:
+        print(output)
+    if not result.get("success", False):
+        print(f"mempalace: hub mine failed: {result.get('error', 'unknown')}", file=sys.stderr)
+        sys.exit(1)
+    return True
+
+
 def cmd_mine(args):
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     include_ignored = []
@@ -554,6 +689,13 @@ def cmd_mine(args):
         sys.exit(2)
 
     if getattr(args, "daemon", False):
+        if getattr(args, "kg_extract", False):
+            print(
+                "mempalace: --kg-extract is not yet supported with --daemon; "
+                "run `mempalace kg-extract` after the daemon mine completes",
+                file=sys.stderr,
+            )
+            sys.exit(2)
         payload = {
             "source": args.dir,
             "mode": args.mode,
@@ -568,6 +710,13 @@ def cmd_mine(args):
             "redetect_origin": getattr(args, "redetect_origin", False),
         }
         _submit_daemon_cli_job("mine", payload, args, background=getattr(args, "background", False))
+        return
+
+    # A live HTTP hub for this palace holds the MCP writer lease, so a
+    # direct mine here would be refused. Hand the job to the hub instead —
+    # this is how the save hooks keep capturing transcripts on a machine
+    # that runs `mempalace serve`.
+    if _mine_args_forwardable(args, include_ignored) and _forward_mine_to_hub(args, palace_path):
         return
 
     # --redetect-origin re-runs corpus_origin on the current corpus state
@@ -620,6 +769,9 @@ def cmd_mine(args):
                 include_ignored=include_ignored,
                 max_chunks_per_file=getattr(args, "max_chunks_per_file", None),
             )
+
+        if getattr(args, "kg_extract", False) and not args.dry_run:
+            _run_kg_extract_from_args(args, palace_path)
     except MineAlreadyRunning as exc:
         # A live MCP server or another mine is already writing to this
         # palace. Surface the holder identity so the operator knows what
@@ -645,6 +797,101 @@ def cmd_mine(args):
             file=sys.stderr,
         )
         sys.exit(1)
+
+
+def _run_kg_extract_from_args(args, palace_path: str):
+    from .kg_extractor import LLMConfig, extract_kg_triples
+
+    timeout_s = float(getattr(args, "kg_timeout", 60.0))
+    if timeout_s <= 0:
+        print("mempalace: KG extraction timeout must be greater than 0", file=sys.stderr)
+        sys.exit(2)
+    max_tokens = getattr(args, "kg_max_tokens", None)
+    if max_tokens is not None and max_tokens <= 0:
+        print("mempalace: KG extraction max tokens must be greater than 0", file=sys.stderr)
+        sys.exit(2)
+
+    cfg = LLMConfig(
+        endpoint=getattr(args, "kg_endpoint", None),
+        key=getattr(args, "kg_key", None),
+        model=getattr(args, "kg_model", None),
+        provider=getattr(args, "kg_provider", None),
+        no_think=getattr(args, "kg_no_think", None),
+        max_output_tokens=getattr(args, "kg_max_tokens", None),
+    )
+    result = extract_kg_triples(
+        palace_path,
+        wing=getattr(args, "kg_wing", None) or getattr(args, "wing", None),
+        room=getattr(args, "kg_room", None),
+        limit=getattr(args, "kg_limit", 0) or 0,
+        dry_run=getattr(args, "dry_run", False),
+        min_confidence=getattr(args, "kg_min_confidence", 0.0),
+        cfg=cfg,
+        show_facts=getattr(args, "kg_show_facts", False),
+        show_rejected=getattr(args, "kg_show_rejected", False),
+        include_diary=getattr(args, "kg_include_diary", False),
+        timeout_s=timeout_s,
+    )
+    if not result.get("success"):
+        sys.exit(130 if result.get("interrupted") else 1)
+
+
+def cmd_kg_extract(args):
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    _run_kg_extract_from_args(args, palace_path)
+
+
+def _parse_kg_model_args(values: list[str] | None) -> list[str]:
+    models: list[str] = []
+    for value in values or []:
+        for item in str(value).split(","):
+            model = item.strip()
+            if model:
+                models.append(model)
+    if not models:
+        env_model = os.environ.get("LLM_MODEL", "").strip()
+        if env_model:
+            models.append(env_model)
+    return models
+
+
+def cmd_kg_benchmark(args):
+    from .kg_extractor import benchmark_kg_models
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    timeout_s = float(getattr(args, "kg_timeout", 30.0))
+    if timeout_s <= 0:
+        print("mempalace: KG benchmark timeout must be greater than 0", file=sys.stderr)
+        sys.exit(2)
+    samples = int(getattr(args, "kg_samples", 3))
+    if samples <= 0:
+        print("mempalace: KG benchmark samples must be greater than 0", file=sys.stderr)
+        sys.exit(2)
+    max_tokens = getattr(args, "kg_max_tokens", None)
+    if max_tokens is not None and max_tokens <= 0:
+        print("mempalace: KG benchmark max tokens must be greater than 0", file=sys.stderr)
+        sys.exit(2)
+
+    result = benchmark_kg_models(
+        palace_path,
+        models=_parse_kg_model_args(getattr(args, "kg_models", None)),
+        endpoint=getattr(args, "kg_endpoint", None),
+        key=getattr(args, "kg_key", None),
+        provider=getattr(args, "kg_provider", None),
+        wing=getattr(args, "kg_wing", None),
+        room=getattr(args, "kg_room", None),
+        samples=samples,
+        min_confidence=getattr(args, "kg_min_confidence", 0.0),
+        no_think=getattr(args, "kg_no_think", None),
+        max_output_tokens=max_tokens,
+        include_diary=getattr(args, "kg_include_diary", False),
+        timeout_s=timeout_s,
+        show_details=getattr(args, "kg_show_details", False),
+        show_facts=getattr(args, "kg_show_facts", False),
+        show_rejected=getattr(args, "kg_show_rejected", False),
+    )
+    if not result.get("success"):
+        sys.exit(130 if result.get("interrupted") else 1)
 
 
 def cmd_sweep(args):
@@ -1016,11 +1263,693 @@ def cmd_hallways(args):
         print(f"    {label}")
 
 
+def cmd_migrate_ids(args):
+    """v4 content-pure id migration (RFC 004 id purity). Dry-run plan by default;
+    --apply materializes a v4 palace into a fresh --target (copy-first)."""
+    import json as _json
+
+    from .knowledge_graph import KnowledgeGraph
+    from .migrate_v4 import (
+        apply_v4_migration,
+        copy_replica_sidecars,
+        plan_v4_migration,
+        read_kg_source_ids,
+        remap_kg_source_ids,
+    )
+    from .palace import get_collection
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    as_json = getattr(args, "json", False)
+    src = get_collection(palace_path, create=False)
+    if not src:
+        print(f"  No palace collection at {palace_path}")
+        sys.exit(1)
+
+    kg_path = os.path.join(palace_path, "knowledge_graph.sqlite3")
+    kg_ids = set()
+    if os.path.exists(kg_path):
+        with KnowledgeGraph(db_path=kg_path) as kg:
+            kg_ids = read_kg_source_ids(kg)
+
+    plan = plan_v4_migration(src, kg_source_ids=kg_ids)
+    summary = {k: v for k, v in plan.items() if not k.startswith("_") and "sample" not in k}
+    if as_json:
+        print(_json.dumps(summary, indent=2))
+    else:
+        print(f"\n  v4 id migration plan for {palace_path}")
+        print(f"    logical drawers:     {plan['logical_drawers']:,}")
+        print(
+            f"    would change to v4:  {plan['changing']:,}  (already v4: {plan['already_v4']:,})"
+        )
+        print(
+            f"    content collisions:  {plan['collision_groups']:,} group(s) covering "
+            f"{plan['collision_drawers']:,} drawer(s) — these MERGE (content dedup)"
+        )
+        print(f"    KG refs to remap:    {plan['kg_refs_remapped']:,}")
+        print(f"    tunnel refs to remap:{plan['tunnel_refs_remapped']:,}")
+        if plan["empty_drawers"]:
+            print(f"    empty drawers:       {plan['empty_drawers']:,} (skipped)")
+
+    if not getattr(args, "apply", False):
+        print(
+            "\n  DRY RUN — nothing written. Re-run with --apply --target <new-palace> to migrate."
+        )
+        return
+
+    target = os.path.expanduser(args.target) if args.target else None
+    if not target:
+        _logstream_fail("--apply requires --target <new-palace-path> (copy-first)", as_json)
+    if os.path.abspath(target) == os.path.abspath(palace_path):
+        _logstream_fail("--target must differ from the source palace (copy-first)", as_json)
+    os.makedirs(target, exist_ok=True)
+    tgt = get_collection(target, create=True)
+    stats = apply_v4_migration(src, tgt)
+    # Provenance: copy the source KG into the target, then repoint its refs.
+    kg_updated = 0
+    if os.path.exists(kg_path):
+        import shutil
+
+        tgt_kg_path = os.path.join(target, "knowledge_graph.sqlite3")
+        shutil.copy2(kg_path, tgt_kg_path)
+        with KnowledgeGraph(db_path=tgt_kg_path) as tkg:
+            kg_updated = remap_kg_source_ids(tkg, stats["alias"])
+    # Carry the replica's sidecar identity/state so the target is swap-ready:
+    # same replica id, same logstream, same peers, same embedder. The op-log is
+    # deliberately NOT carried — it is rebuilt by re-promotion in the
+    # coordinated fleet window (see migrate_v4.SIDECAR_EXCLUDE rationale).
+    sidecars = copy_replica_sidecars(palace_path, target)
+    print(
+        f"\n  MIGRATED into {target}: {stats['written']:,} v4 drawer(s) "
+        f"({stats['merged_away']:,} merged away, {stats['rows_written']:,} rows), "
+        f"KG refs repointed: {kg_updated}"
+    )
+    unreadable = stats.get("vectors_unreadable", 0)
+    if unreadable:
+        print(
+            f"  ⚠ {unreadable:,} row(s) had an unreadable source vector (localized index "
+            f"damage in the source) — migrated without a vector; the target re-embeds them. "
+            f"Consider `mempalace --palace <source> repair` on the source palace."
+        )
+    if sidecars["replica_id"]:
+        print(
+            f"  Replica identity preserved: {sidecars['replica_id']} "
+            f"(sidecars carried: {', '.join(sidecars['carried'])})"
+        )
+    else:
+        print(
+            "  ⚠ No replica.json in the source — the target will mint a NEW replica "
+            "identity on first promote. Fine for a validation copy; do NOT live-swap "
+            "a target without the source's identity."
+        )
+    print("\n  NEXT (run against the target, validate, then swap it in):")
+    print(f"    mempalace --palace {target} compress        # rebuild the closet index at v4 ids")
+    print(f"    mempalace --palace {target} oplog promote    # build the v4 op-log")
+    print(f"    mempalace --palace {target} oplog verify     # must report CLEAN")
+    print(f'    mempalace --palace {target} search "..."      # confirm recall')
+
+
+def cmd_reconcile_ids(args):
+    """RFC 004 write-flip PART B: drain legacy v3-keyed ghost drawers in place —
+    rewrite each to its content-hash v4 id (never delete un-twinned content)."""
+    import json as _json
+
+    from .palace import get_collection
+    from .reconcile_v3 import apply_v3_reconcile, plan_v3_reconcile
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    as_json = getattr(args, "json", False)
+    col = get_collection(palace_path, create=False)
+    if not col:
+        print(f"  No palace collection at {palace_path}")
+        sys.exit(1)
+
+    if not getattr(args, "apply", False):
+        plan = plan_v3_reconcile(col)
+        if as_json:
+            print(_json.dumps({k: v for k, v in plan.items() if k != "sample"}, indent=2))
+        else:
+            print(f"\n  v3 ghost reconcile plan for {palace_path}")
+            print(f"    legacy v3-keyed ghost drawers:            {plan['ghost_drawers']:,}")
+            print(f"    would REWRITE to content-hash v4 id:      {plan['rewrite']:,}")
+            print(f"    would DROP (content already v4-present):  {plan['drop']:,}")
+            for s in plan["sample"][:10]:
+                print(f"      {s['old']} -> {s['new']}")
+            print("\n  DRY RUN — nothing written. Re-run with --apply to reconcile.")
+        return
+
+    stats = apply_v3_reconcile(col)
+    if as_json:
+        print(_json.dumps(stats, indent=2))
+    else:
+        print(
+            f"\n  RECONCILED {palace_path}: rewrote {stats['rewritten']:,} ghost(s) "
+            f"({stats['rows_rewritten']:,} rows) to content-hash v4 ids; "
+            f"dropped {stats['dropped']:,} content-dup(s). Legacy v3 drawers remaining: 0."
+        )
+        print(f"  Confirm: mempalace --palace {palace_path} oplog verify   # should be CLEAN")
+
+
 def cmd_status(args):
     from .miner import status
 
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     status(palace_path=palace_path)
+
+
+# ── Logstream (RFC 003 agent coordination) ────────────────────────────────
+
+
+def _open_logstream(args):
+    """Open the palace logstream database for a CLI command.
+
+    Direct SQLite access is safe alongside a running hub: logstream.sqlite3
+    is WAL-mode and independent of Chroma, so CLI writes are immediately
+    visible to hub readers without the mine-style forwarding Chroma needs.
+    """
+    from .logstream import LOGSTREAM_DB_FILENAME, Logstream
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    return Logstream(db_path=os.path.join(palace_path, LOGSTREAM_DB_FILENAME))
+
+
+def _logstream_fail(message: str, as_json: bool):
+    import json
+
+    if as_json:
+        print(json.dumps({"error": message}))
+    else:
+        print(f"Error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def _read_text_arg(inline, file_arg, default=""):
+    """Resolve inline text vs --*-file (with '-' meaning stdin)."""
+    if inline is not None and file_arg is not None:
+        raise ValueError("pass inline text or a file, not both")
+    if file_arg is not None:
+        if file_arg == "-":
+            return sys.stdin.read()
+        return Path(os.path.expanduser(file_arg)).read_text(encoding="utf-8")
+    if inline is not None:
+        return inline
+    return default
+
+
+def _parse_metadata_arg(raw):
+    import json
+
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw)
+    except ValueError as exc:
+        raise ValueError(f"--metadata is not valid JSON: {exc}") from None
+    if not isinstance(value, dict):
+        raise ValueError("--metadata must be a JSON object")
+    return value
+
+
+def _print_event_line(event):
+    target = event["to_agent"] or "*"
+    corr = f" corr={event['correlation_id']}" if event["correlation_id"] else ""
+    status = f" [{event['status']}]" if event["status"] else ""
+    arts = f" artifacts={len(event['artifact_ids'])}" if event["artifact_ids"] else ""
+    body = event["body"].replace("\n", " ")
+    if len(body) > 80:
+        body = body[:77] + "..."
+    body = f" :: {body}" if body else ""
+    print(
+        f"  {event['id']}  {event['created_at']}  {event['type']}  "
+        f"{event['stream']}/{event['room']}  {event['from_agent']}->{target}"
+        f"{status}{corr}{arts}{body}"
+    )
+
+
+def cmd_logstream(args):
+    import json
+
+    as_json = getattr(args, "json", False)
+    try:
+        ls = _open_logstream(args)
+    except Exception as exc:
+        _logstream_fail(str(exc), as_json)
+    try:
+        if args.logstream_action == "append":
+            try:
+                body = _read_text_arg(args.body, args.body_file)
+                event = ls.append_event(
+                    type=args.type,
+                    stream=args.stream,
+                    room=args.room,
+                    from_agent=args.from_agent,
+                    to_agent=args.to_agent,
+                    correlation_id=args.correlation_id,
+                    branch=args.branch,
+                    base_commit=args.base_commit,
+                    status=args.status,
+                    body=body,
+                    metadata=_parse_metadata_arg(args.metadata),
+                    artifact_ids=args.artifact_id or None,
+                )
+            except (ValueError, OSError) as exc:
+                _logstream_fail(str(exc), as_json)
+            if as_json:
+                print(json.dumps(event, indent=2, ensure_ascii=False))
+            else:
+                print("Appended:")
+                _print_event_line(event)
+        elif args.logstream_action in ("list", "wait"):
+            filters = {
+                "stream": args.stream,
+                "room": args.room,
+                "type": args.type,
+                "to_agent": args.to_agent,
+                "from_agent": args.from_agent,
+                "correlation_id": args.correlation_id,
+                "status": args.status,
+                "since_event_id": args.since_event_id,
+                "since_created_at": args.since_created_at,
+            }
+            try:
+                if args.logstream_action == "list":
+                    events = ls.list_events(limit=args.limit, **filters)
+                    result = {"events": events, "count": len(events)}
+                else:
+                    result = ls.wait_events(timeout_ms=args.timeout_ms, limit=args.limit, **filters)
+                    result["count"] = len(result["events"])
+            except ValueError as exc:
+                _logstream_fail(str(exc), as_json)
+            if as_json:
+                print(json.dumps(result, indent=2, ensure_ascii=False))
+            else:
+                if result.get("timed_out"):
+                    print("Timed out; no matching events.")
+                elif not result["events"]:
+                    print("No matching events.")
+                else:
+                    print(f"{result['count']} event(s):")
+                    for event in result["events"]:
+                        _print_event_line(event)
+            if result.get("timed_out"):
+                sys.exit(2)
+        elif args.logstream_action == "sync":
+            from .logsync import load_peers, sync_all, sync_with_peer
+
+            palace_path = (
+                os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+            )
+            try:
+                if args.peer:
+                    results = [sync_with_peer(ls, args.peer, args.token or "")]
+                else:
+                    if not load_peers(palace_path):
+                        _logstream_fail(
+                            f"no peers configured ({palace_path}/peers.json) and no --peer given",
+                            as_json,
+                        )
+                    results = sync_all(ls, palace_path)
+            except Exception as exc:
+                _logstream_fail(str(exc), as_json)
+            if as_json:
+                print(json.dumps(results, indent=2, ensure_ascii=False))
+            else:
+                for stats in results:
+                    if stats.get("error"):
+                        print(
+                            f"  {stats.get('peer_name', stats['peer_url'])}: ERROR {stats['error']}"
+                        )
+                    else:
+                        print(
+                            f"  {stats.get('peer_name', stats['peer_url'])} "
+                            f"({stats['peer_replica']}): +{stats['pulled_events']} events, "
+                            f"+{stats['pulled_artifacts']} artifacts"
+                        )
+            if any(s.get("error") for s in results):
+                sys.exit(1)
+        elif args.logstream_action == "ack":
+            try:
+                event = ls.ack_event(
+                    args.event_id,
+                    from_agent=args.from_agent,
+                    status=args.status,
+                    body=args.body or "",
+                )
+            except ValueError as exc:
+                _logstream_fail(str(exc), as_json)
+            if as_json:
+                print(json.dumps(event, indent=2, ensure_ascii=False))
+            else:
+                print("Acknowledged:")
+                _print_event_line(event)
+    finally:
+        ls.close()
+
+
+def cmd_artifact(args):
+    import json
+
+    as_json = getattr(args, "json", False)
+    try:
+        ls = _open_logstream(args)
+    except Exception as exc:
+        _logstream_fail(str(exc), as_json)
+    try:
+        if args.artifact_action == "put":
+            try:
+                content = _read_text_arg(args.content, args.file, default=None)
+                if content is None:
+                    content = sys.stdin.read()
+                artifact = ls.put_artifact(
+                    kind=args.kind,
+                    content=content,
+                    created_by=args.created_by,
+                    metadata=_parse_metadata_arg(args.metadata),
+                )
+            except (ValueError, OSError) as exc:
+                _logstream_fail(str(exc), as_json)
+            if as_json:
+                print(json.dumps(artifact, indent=2, ensure_ascii=False))
+            else:
+                print(f"Stored {artifact['id']}  kind={artifact['kind']}")
+                print(f"  sha256={artifact['sha256']}")
+                print(f"  size={artifact['size_bytes']} bytes")
+            # Warnings go to stderr in both modes so `--json | jq` stays
+            # clean while interactive callers still can't miss them.
+            for warning in artifact.get("warnings", []):
+                print(f"Warning: {warning}", file=sys.stderr)
+        elif args.artifact_action == "get":
+            try:
+                artifact = ls.get_artifact(args.artifact_id)
+            except ValueError as exc:
+                _logstream_fail(str(exc), as_json)
+            if artifact is None:
+                _logstream_fail(f"artifact {args.artifact_id!r} not found", as_json)
+            if args.out:
+                Path(os.path.expanduser(args.out)).write_text(artifact["content"], encoding="utf-8")
+            if as_json:
+                if args.out:
+                    artifact = {**artifact, "content_written_to": args.out}
+                    artifact.pop("content")
+                print(json.dumps(artifact, indent=2, ensure_ascii=False))
+            elif args.out:
+                print(f"Wrote {artifact['size_bytes']} bytes to {args.out}")
+                print(f"  sha256={artifact['sha256']}")
+            else:
+                # Exact content on stdout so `mempalace artifact get ID | git apply`
+                # works; metadata would corrupt the stream.
+                sys.stdout.write(artifact["content"])
+    finally:
+        ls.close()
+
+
+def cmd_replica(args):
+    """RFC 004 step 1: read-replica operations for memory (drawers + KG)."""
+    import json
+
+    as_json = getattr(args, "json", False)
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    if args.replica_action == "embed-cache":
+        from .embedding import get_embedder_identity
+        from .vector_cache import build_cache
+
+        model = args.model or get_embedder_identity().model_name
+
+        def progress(done, scanned):
+            if not as_json and done % 5120 < args.batch:
+                print(f"  embedded {done} (scanned {scanned})", flush=True)
+
+        try:
+            stats = build_cache(
+                palace_path,
+                model,
+                batch_size=args.batch,
+                authored_only=not args.all,
+                progress=progress,
+            )
+        except Exception as exc:
+            _logstream_fail(str(exc), as_json)
+        if as_json:
+            print(json.dumps(stats, indent=2, ensure_ascii=False))
+        else:
+            print(
+                f"  model={stats['model']}: embedded {stats['embedded']} "
+                f"(cached {stats['skipped_cached']}, total in cache {stats['cache_total']})"
+            )
+        return
+
+    if args.replica_action == "pull":
+        from .replica_sync import pull_from_peers, pull_memory
+
+        try:
+            if args.peer:
+                results = [
+                    pull_memory(
+                        palace_path,
+                        args.peer,
+                        args.token or "",
+                        reconcile_deletes=not args.no_reconcile,
+                        pull_kg=not getattr(args, "no_kg", False),
+                        with_vectors=getattr(args, "with_vectors", False),
+                    )
+                ]
+            else:
+                results = pull_from_peers(
+                    palace_path,
+                    pull_kg=not getattr(args, "no_kg", False),
+                    with_vectors=getattr(args, "with_vectors", False),
+                )
+                if not results:
+                    _logstream_fail(
+                        f"no peers configured ({palace_path}/peers.json) and no --peer given",
+                        as_json,
+                    )
+        except Exception as exc:
+            _logstream_fail(str(exc), as_json)
+        if as_json:
+            print(json.dumps(results, indent=2, ensure_ascii=False))
+        else:
+            for stats in results:
+                if stats.get("error"):
+                    print(
+                        f"  {stats.get('peer_name', stats['origin_url'])}: ERROR {stats['error']}"
+                    )
+                else:
+                    print(
+                        f"  {stats.get('peer_name', stats['origin_url'])} "
+                        f"({stats['origin_replica']}): {stats['drawers_upserted']} drawers folded, "
+                        f"{stats['drawers_deleted']} reconciled away, "
+                        f"KG +{stats['kg_entities']} entities / +{stats['kg_triples']} triples"
+                    )
+        if any(s.get("error") for s in results):
+            sys.exit(1)
+
+
+def _cmd_oplog_status(palace_path, as_json):
+    import json
+
+    from .oplog import OPLOG_DB_FILENAME, OpLog
+
+    db_path = os.path.join(palace_path, OPLOG_DB_FILENAME)
+    if not os.path.exists(db_path):
+        _logstream_fail(f"no op-log at {db_path} (no ops have been emitted yet)", as_json)
+    with OpLog(db_path) as log:
+        report = {
+            "palace": palace_path,
+            "replica_id": log.replica_id,
+            "ops": log.count(),
+            "by_kind": log.kind_histogram(),
+            "version_vector": log.version_vector(),
+        }
+    if as_json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        print(f"  op-log for {palace_path} ({report['replica_id']}): {report['ops']} ops")
+        for kind, count in sorted(report["by_kind"].items()):
+            print(f"    {kind}: {count}")
+        for origin, top in sorted(report["version_vector"].items()):
+            print(f"  origin {origin}: highest seq {top}")
+
+
+def _cmd_oplog_sync(args, palace_path, as_json):
+    import json
+
+    from .oplog import OPLOG_DB_FILENAME, OpLog
+    from .opsync import sync_all_memops, sync_memops_with_peer
+
+    try:
+        if args.peer:
+            from .transport import HttpsBearerTransport
+
+            with OpLog(os.path.join(palace_path, OPLOG_DB_FILENAME)) as log:
+                stats = sync_memops_with_peer(
+                    log,
+                    HttpsBearerTransport(palace_path),
+                    {"name": args.peer, "url": args.peer, "token": args.token or ""},
+                )
+                stats["peer_name"] = args.peer
+                results = [stats]
+        else:
+            results = sync_all_memops(palace_path)
+            if not results:
+                _logstream_fail(
+                    f"no peers configured ({palace_path}/peers.json) and no --peer given",
+                    as_json,
+                )
+    except Exception as exc:
+        _logstream_fail(str(exc), as_json)
+    if as_json:
+        print(json.dumps(results, indent=2, ensure_ascii=False))
+    else:
+        for stats in results:
+            if stats.get("error"):
+                print(f"  {stats['peer_name']}: ERROR {stats['error']}")
+            else:
+                print(
+                    f"  {stats['peer_name']} ({stats['peer_replica']}): "
+                    f"+{stats['pulled_ops']} ops {stats['per_origin']}"
+                )
+    if any(s.get("error") for s in results):
+        sys.exit(1)
+
+
+def _cmd_oplog_fold(palace_path, as_json):
+    import json
+
+    from .knowledge_graph import KnowledgeGraph
+    from .oplog import OPLOG_DB_FILENAME, OpLog
+    from .opfold import fold_ops
+    from .palace import get_collection
+
+    try:
+        with OpLog(os.path.join(palace_path, OPLOG_DB_FILENAME)) as log:
+            collection = get_collection(palace_path, create=True)
+            with KnowledgeGraph(db_path=os.path.join(palace_path, "knowledge_graph.sqlite3")) as kg:
+                chunk_size = max(1, int(MempalaceConfig().chunk_size or 800))
+                stats = fold_ops(log, collection, kg, chunk_size=chunk_size)
+    except Exception as exc:
+        _logstream_fail(str(exc), as_json)
+    if as_json:
+        print(json.dumps(stats, indent=2, ensure_ascii=False))
+    else:
+        applied = (
+            stats["applied_adds"]
+            + stats["applied_revises"]
+            + stats["applied_tombstones"]
+            + stats["applied_kg"]
+        )
+        print(
+            f"  folded {applied} op(s) (adds {stats['applied_adds']}, "
+            f"revises {stats['applied_revises']}, tombstones {stats['applied_tombstones']}, "
+            f"kg {stats['applied_kg']}); skipped own {stats['skipped_own']}, "
+            f"existing {stats['skipped_existing']}, stale {stats['skipped_stale']}"
+        )
+        if stats["conflicts"]:
+            print(f"  shadow-guard conflicts held: {stats['conflicts']}")
+            print(f"    sample: {stats['conflict_sample']}")
+        if stats["errors"]:
+            print(f"  ERRORS: {stats['errors']} — fold stopped for retry")
+            print(f"    sample: {stats['error_sample']}")
+    if stats.get("errors"):
+        sys.exit(1)
+
+
+def _cmd_oplog_promote(args, palace_path, as_json):
+    import json
+
+    from .oplog import OPLOG_DB_FILENAME, OpLog
+    from .oppromote import promote_local_rows
+    from .palace import get_collection
+
+    try:
+        collection = get_collection(palace_path, create=False)
+        with OpLog(os.path.join(palace_path, OPLOG_DB_FILENAME)) as log:
+            stats = promote_local_rows(
+                log,
+                collection,
+                dry_run=args.dry_run,
+                limit=args.limit,
+                batch=max(1, args.batch),
+            )
+    except Exception as exc:
+        _logstream_fail(str(exc), as_json)
+    if as_json:
+        print(json.dumps(stats, indent=2, ensure_ascii=False))
+    else:
+        verb = "would promote" if stats["dry_run"] else "promoted"
+        print(
+            f"  {verb} {stats['promoted']} drawer(s) as {stats['replica_id']} "
+            f"({stats['logical_drawers']} logical from {stats['rows_scanned']} rows; "
+            f"already op-carried {stats['already_op_carried']}, "
+            f"remote-owned {stats['remote_skipped']}, "
+            f"registry {stats['registry_skipped']})"
+        )
+        if stats["dry_run"]:
+            print(
+                "  (estimate — a dry run counts candidates without reading content; "
+                "a real run additionally skips any empty drawers)"
+            )
+        if stats["skipped_empty"]:
+            print(f"  empty drawers skipped: {stats['skipped_empty']}")
+            print(f"    sample: {stats['empty_sample']}")
+        if stats["remaining"]:
+            print(
+                f"  --limit reached; {stats['remaining']} candidate(s) remain — rerun to continue"
+            )
+        if stats["errors"]:
+            print(f"  ERRORS: {stats['errors']}")
+            print(f"    sample: {stats['error_sample']}")
+    if stats.get("errors"):
+        sys.exit(1)
+
+
+def _cmd_oplog_verify(palace_path, as_json):
+    import json
+
+    from .oplog_verify import verify_shadow
+
+    try:
+        report = verify_shadow(palace_path)
+    except Exception as exc:
+        _logstream_fail(str(exc), as_json)
+    if as_json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        drawers = report["drawers"]
+        kg = report["kg"]
+        print(f"  {report['ops']} ops replayed against {report['palace']}")
+        print(f"  drawers: {drawers.get('ok', 0)}/{drawers.get('checked', 0)} ok")
+        for bucket in ("missing", "diverged", "not_tombstoned"):
+            count = drawers.get(f"{bucket}_count", 0)
+            if count:
+                print(f"    {bucket}: {count} — sample {drawers.get(bucket)}")
+        print(f"  kg: {kg.get('ok', 0)}/{kg.get('checked', 0)} ok")
+        for bucket in ("missing", "diverged", "entity_missing"):
+            count = kg.get(f"{bucket}_count", 0)
+            if count:
+                print(f"    {bucket}: {count} — sample {kg.get(bucket)}")
+        if report["clean"]:
+            print("  CLEAN — every op is reflected in the store")
+        else:
+            print("  DIVERGED — the shadow found store/op-log disagreement")
+    if not report["clean"]:
+        sys.exit(1)
+
+
+def cmd_oplog(args):
+    """RFC 004 step 2a: canonical memory op-log — status, sync, fold, verify."""
+    as_json = getattr(args, "json", False)
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+
+    if args.oplog_action == "status":
+        _cmd_oplog_status(palace_path, as_json)
+    elif args.oplog_action == "sync":
+        _cmd_oplog_sync(args, palace_path, as_json)
+    elif args.oplog_action == "fold":
+        _cmd_oplog_fold(palace_path, as_json)
+    elif args.oplog_action == "promote":
+        _cmd_oplog_promote(args, palace_path, as_json)
+    elif args.oplog_action == "verify":
+        _cmd_oplog_verify(palace_path, as_json)
 
 
 def cmd_palace_set_embedder(args):
@@ -1040,12 +1969,14 @@ def cmd_palace_set_embedder(args):
         os.path.expanduser(args.palace) if args.palace else config.palace_path
     )
     model = getattr(args, "model", None)
+    collection_name = _normalize_embedder_collection_arg(getattr(args, "collection", None))
     try:
         old, new = set_palace_embedder_identity(
             palace_path,
             model=model,
             force=getattr(args, "force", False),
             backend=_backend_arg(args),
+            collection_name=collection_name,
         )
     except EmbedderIdentityMismatchError as exc:
         print(f"  ✗ {exc}")
@@ -1068,6 +1999,27 @@ def cmd_palace_set_embedder(args):
             f"  ⚠ configured model is {configured!r}; set MEMPALACE_EMBEDDING_MODEL="
             f"{new.model_name} (or run onboarding) so normal opens of this palace match."
         )
+
+
+def _normalize_embedder_collection_arg(value: str | None) -> str | None:
+    """Normalize user-friendly collection aliases for `palace set-embedder`."""
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    aliases = {
+        "drawers": "mempalace_drawers",
+        "drawer": "mempalace_drawers",
+        "mempalace_drawers": "mempalace_drawers",
+        "closets": "mempalace_closets",
+        "closet": "mempalace_closets",
+        "mempalace_closets": "mempalace_closets",
+    }
+    if normalized not in aliases:
+        raise SystemExit(
+            "  ✗ --collection must be one of: drawers, closets, "
+            "mempalace_drawers, mempalace_closets"
+        )
+    return aliases[normalized]
 
 
 def cmd_repair_status(args):
@@ -1328,6 +2280,75 @@ def cmd_instructions(args):
     run_instructions(name=args.name)
 
 
+_CONFIG_HOOK_KEYS = {
+    "hooks.auto-save": "auto_save",
+    "hooks.silent-save": "silent_save",
+    "hooks.desktop-toast": "desktop_toast",
+    "hooks.daemon": "daemon",
+}
+
+
+def _parse_config_bool(value: str) -> bool:
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError("expected true/false, yes/no, on/off, or 1/0")
+
+
+def cmd_config(args):
+    """Show or update the user's MemPalace config."""
+    cfg = MempalaceConfig()
+    action = getattr(args, "config_action", None)
+
+    if action == "show":
+        config_file = getattr(cfg, "_config_file", Path.home() / ".mempalace" / "config.json")
+        print("MemPalace config:")
+        print(f"  file: {config_file}")
+        print(f"  palace_path: {cfg.palace_path}")
+        print(f"  backend: {cfg.backend}")
+        print(f"  embedding_model: {cfg.embedding_model}")
+        print(f"  hooks.auto_save: {str(cfg.hooks_auto_save).lower()}")
+        print(f"  hooks.silent_save: {str(cfg.hook_silent_save).lower()}")
+        print(f"  hooks.desktop_toast: {str(cfg.hook_desktop_toast).lower()}")
+        print(f"  hooks.daemon: {str(cfg.hook_use_daemon).lower()}")
+        return
+
+    if action == "set":
+        key = args.key
+        value = args.value
+        try:
+            if key == "palace-path":
+                written = cfg.set_palace_path(value)
+                print(f"palace_path = {written}")
+                if os.environ.get("MEMPALACE_PALACE_PATH") or os.environ.get("MEMPAL_PALACE_PATH"):
+                    print(
+                        "Note: MEMPALACE_PALACE_PATH/MEMPAL_PALACE_PATH is set and "
+                        "overrides config in this process.",
+                        file=sys.stderr,
+                    )
+            elif key == "backend":
+                cfg.set_backend(value)
+                print(f"backend = {str(value).strip().lower()}")
+            elif key == "embedding-model":
+                cfg.set_embedding_model(value)
+                print(f"embedding_model = {str(value).strip().lower()}")
+            elif key in _CONFIG_HOOK_KEYS:
+                parsed = _parse_config_bool(value)
+                cfg.set_hook_setting(_CONFIG_HOOK_KEYS[key], parsed)
+                print(f"{key} = {str(parsed).lower()}")
+            else:
+                raise ValueError(f"unsupported config key: {key}")
+        except ValueError as exc:
+            print(f"mempalace: {exc}", file=sys.stderr)
+            sys.exit(2)
+        return
+
+    print("mempalace: unknown config action", file=sys.stderr)
+    sys.exit(2)
+
+
 def cmd_mcp(args):
     """Show how to wire MemPalace into MCP-capable hosts."""
     base_server_cmd = "mempalace-mcp"
@@ -1366,13 +2387,13 @@ def _server_token_path(palace_path: str) -> Path:
     """Per-palace location for the auto-generated server bearer token.
 
     Distinct from the daemon's token dir; keyed by the canonical palace path so
-    one server per palace reuses a stable token across restarts.
+    one server per palace reuses a stable token across restarts. Delegates to
+    ``server_registry`` so the token and the hub serverinfo record share one
+    directory convention.
     """
-    import hashlib
+    from .server_registry import server_token_path
 
-    canonical = os.path.abspath(os.path.realpath(os.path.expanduser(palace_path)))
-    key = hashlib.sha256(os.path.normcase(canonical).encode("utf-8")).hexdigest()[:24]
-    return Path.home() / ".mempalace" / "server" / key / "token"
+    return server_token_path(palace_path)
 
 
 def _load_or_create_server_token(palace_path: str) -> tuple[str, bool]:
@@ -1502,6 +2523,23 @@ def cmd_serve(args):
         sys.exit(completed.returncode)
 
 
+def _compress_store_batch() -> int:
+    """Closet-store upsert batch size (env-tunable).
+
+    Batches the compressed-drawer upserts so the embedder sees N documents per
+    call instead of one — the win is largest on GPU embedders (DirectML/CUDA)
+    that batch-accelerate. Default 500; override with
+    ``MEMPALACE_COMPRESS_STORE_BATCH``. Clamped to at least 1.
+    """
+    raw = os.environ.get("MEMPALACE_COMPRESS_STORE_BATCH", "").strip()
+    if not raw:
+        return 500
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 500
+
+
 def cmd_compress(args):
     """Compress drawers in a wing using AAAK Dialect."""
     from .dialect import Dialect
@@ -1605,17 +2643,42 @@ def cmd_compress(args):
             # _DEFAULT_BACKEND is reused (avoids a redundant ChromaBackend
             # instance and its potential WAL-lock contention on Windows).
             comp_col = get_closets_collection(palace_path, create=True)
+            # Batch the upserts. A per-drawer upsert embeds one document at a
+            # time; on a GPU embedder (e.g. Windows DirectML) that leaves the
+            # device almost idle and made a six-figure compress run for hours.
+            # One upsert of N docs embeds N at once (EmbeddingCollection passes
+            # the whole batch to _embed_texts) and cuts per-call insert overhead.
+            store_batch = _compress_store_batch()
+            total = len(compressed_entries)
+            b_ids: list = []
+            b_docs: list = []
+            b_metas: list = []
+            stored = 0
+
+            def _flush_closets():
+                nonlocal stored
+                if not b_ids:
+                    return
+                comp_col.upsert(ids=list(b_ids), documents=list(b_docs), metadatas=list(b_metas))
+                stored += len(b_ids)
+                b_ids.clear()
+                b_docs.clear()
+                b_metas.clear()
+                print(f"    stored {stored:,}/{total:,}...", flush=True)
+
             for doc_id, compressed, meta, stats in compressed_entries:
                 comp_meta = dict(meta)
                 comp_meta["compression_ratio"] = round(stats["size_ratio"], 1)
                 comp_meta["original_tokens"] = stats["original_tokens_est"]
-                comp_col.upsert(
-                    ids=[doc_id],
-                    documents=[compressed],
-                    metadatas=[comp_meta],
-                )
+                b_ids.append(doc_id)
+                b_docs.append(compressed)
+                b_metas.append(comp_meta)
+                if len(b_ids) >= store_batch:
+                    _flush_closets()
+            _flush_closets()
             print(
-                f"  Stored {len(compressed_entries)} compressed drawers in 'mempalace_closets' collection."
+                f"  Stored {total:,} compressed drawers in 'mempalace_closets' collection "
+                f"(batched {store_batch}/upsert)."
             )
         except Exception as e:
             print(f"  Error storing compressed drawers: {e}")
@@ -1857,6 +2920,274 @@ def main():
             f"Windows if you hit ONNX bad_alloc (#1455)."
         ),
     )
+    p_mine.add_argument(
+        "--kg-extract",
+        action="store_true",
+        help=(
+            "After a successful mine, derive knowledge-graph triples from the "
+            "newly available drawers using the configured LLM. Opt-in only."
+        ),
+    )
+    p_mine.add_argument(
+        "--kg-endpoint",
+        default=None,
+        help="LLM base URL for --kg-extract (overrides $LLM_ENDPOINT)",
+    )
+    p_mine.add_argument(
+        "--kg-model",
+        default=None,
+        help="LLM model for --kg-extract (overrides $LLM_MODEL)",
+    )
+    p_mine.add_argument(
+        "--kg-key",
+        default=None,
+        help="LLM bearer token for --kg-extract (overrides $LLM_KEY; optional for local LLMs)",
+    )
+    p_mine.add_argument(
+        "--kg-provider",
+        choices=["openai", "ollama"],
+        default=None,
+        help="LLM API provider for --kg-extract: openai-compatible or native Ollama",
+    )
+    p_mine.add_argument(
+        "--kg-no-think",
+        action="store_true",
+        default=None,
+        help="Prepend /no_think for local thinking models during --kg-extract",
+    )
+    p_mine.add_argument(
+        "--kg-max-tokens",
+        type=int,
+        default=None,
+        help="Maximum completion tokens for each --kg-extract LLM call (default 512)",
+    )
+    p_mine.add_argument(
+        "--kg-limit",
+        type=int,
+        default=0,
+        help="Maximum drawers to process during --kg-extract (0 = all matching drawers)",
+    )
+    p_mine.add_argument(
+        "--kg-room",
+        default=None,
+        help="Limit --kg-extract to one room",
+    )
+    p_mine.add_argument(
+        "--kg-min-confidence",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum LLM confidence for extracted facts. Default 0.0 because "
+            "local-model self-confidence is not calibrated; structural gates do the filtering."
+        ),
+    )
+    p_mine.add_argument(
+        "--kg-timeout",
+        type=float,
+        default=60.0,
+        help="Seconds to wait for each --kg-extract LLM call before failing that drawer",
+    )
+    p_mine.add_argument(
+        "--kg-show-facts",
+        action="store_true",
+        help="Print accepted facts during --kg-extract",
+    )
+    p_mine.add_argument(
+        "--kg-show-rejected",
+        action="store_true",
+        help="Print rejected fact candidates and reasons during --kg-extract",
+    )
+    p_mine.add_argument(
+        "--kg-include-diary",
+        action="store_true",
+        help="Include diary/checkpoint rooms in --kg-extract (skipped by default)",
+    )
+
+    # kg-extract
+    p_kg_extract = sub.add_parser(
+        "kg-extract",
+        help="Derive knowledge-graph triples from existing drawers via an explicit LLM",
+    )
+    p_kg_extract.add_argument("--wing", dest="kg_wing", default=None, help="Limit to one wing")
+    p_kg_extract.add_argument("--room", dest="kg_room", default=None, help="Limit to one room")
+    p_kg_extract.add_argument(
+        "--limit", dest="kg_limit", type=int, default=0, help="Maximum drawers to process"
+    )
+    p_kg_extract.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Call the LLM and show counts without writing triples",
+    )
+    p_kg_extract.add_argument(
+        "--endpoint",
+        dest="kg_endpoint",
+        default=None,
+        help="LLM base URL (overrides $LLM_ENDPOINT), e.g. http://localhost:11434/v1",
+    )
+    p_kg_extract.add_argument(
+        "--model",
+        dest="kg_model",
+        default=None,
+        help="LLM model name (overrides $LLM_MODEL)",
+    )
+    p_kg_extract.add_argument(
+        "--key",
+        dest="kg_key",
+        default=None,
+        help="LLM bearer token (overrides $LLM_KEY; optional for local LLMs)",
+    )
+    p_kg_extract.add_argument(
+        "--provider",
+        dest="kg_provider",
+        choices=["openai", "ollama"],
+        default=None,
+        help="LLM API provider: openai-compatible or native Ollama",
+    )
+    p_kg_extract.add_argument(
+        "--no-think",
+        dest="kg_no_think",
+        action="store_true",
+        default=None,
+        help="Prepend /no_think for local thinking models",
+    )
+    p_kg_extract.add_argument(
+        "--max-tokens",
+        dest="kg_max_tokens",
+        type=int,
+        default=None,
+        help="Maximum completion tokens for each LLM call (default 512)",
+    )
+    p_kg_extract.add_argument(
+        "--min-confidence",
+        dest="kg_min_confidence",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum LLM confidence for extracted facts. Default 0.0 because "
+            "local-model self-confidence is not calibrated; structural gates do the filtering."
+        ),
+    )
+    p_kg_extract.add_argument(
+        "--timeout",
+        dest="kg_timeout",
+        type=float,
+        default=60.0,
+        help="Seconds to wait for each LLM call before failing that drawer",
+    )
+    p_kg_extract.add_argument(
+        "--show-facts",
+        dest="kg_show_facts",
+        action="store_true",
+        help="Print accepted facts with their verbatim evidence",
+    )
+    p_kg_extract.add_argument(
+        "--show-rejected",
+        dest="kg_show_rejected",
+        action="store_true",
+        help="Print rejected candidates and rejection reasons",
+    )
+    p_kg_extract.add_argument(
+        "--include-diary",
+        dest="kg_include_diary",
+        action="store_true",
+        help="Include diary/checkpoint rooms (skipped by default)",
+    )
+
+    # kg-benchmark
+    p_kg_benchmark = sub.add_parser(
+        "kg-benchmark",
+        help="Benchmark KG extraction quality and latency across local LLMs",
+    )
+    p_kg_benchmark.add_argument("--wing", dest="kg_wing", default=None, help="Limit to one wing")
+    p_kg_benchmark.add_argument("--room", dest="kg_room", default=None, help="Limit to one room")
+    p_kg_benchmark.add_argument(
+        "--samples",
+        dest="kg_samples",
+        type=int,
+        default=3,
+        help="Number of matching drawers to benchmark (default 3)",
+    )
+    p_kg_benchmark.add_argument(
+        "--endpoint",
+        dest="kg_endpoint",
+        default=None,
+        help="LLM base URL (overrides $LLM_ENDPOINT), e.g. http://localhost:11434/v1",
+    )
+    p_kg_benchmark.add_argument(
+        "--model",
+        dest="kg_models",
+        action="append",
+        default=[],
+        help="Model to benchmark; repeat or comma-separate (falls back to $LLM_MODEL)",
+    )
+    p_kg_benchmark.add_argument(
+        "--key",
+        dest="kg_key",
+        default=None,
+        help="LLM bearer token (overrides $LLM_KEY; optional for local LLMs)",
+    )
+    p_kg_benchmark.add_argument(
+        "--provider",
+        dest="kg_provider",
+        choices=["openai", "ollama"],
+        default=None,
+        help="LLM API provider: openai-compatible or native Ollama",
+    )
+    p_kg_benchmark.add_argument(
+        "--no-think",
+        dest="kg_no_think",
+        action="store_true",
+        default=None,
+        help="Prepend /no_think for local thinking models",
+    )
+    p_kg_benchmark.add_argument(
+        "--max-tokens",
+        dest="kg_max_tokens",
+        type=int,
+        default=None,
+        help="Maximum completion tokens for each LLM call (default 512)",
+    )
+    p_kg_benchmark.add_argument(
+        "--min-confidence",
+        dest="kg_min_confidence",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum LLM confidence for extracted facts. Default 0.0 because "
+            "local-model self-confidence is not calibrated; structural gates do the filtering."
+        ),
+    )
+    p_kg_benchmark.add_argument(
+        "--timeout",
+        dest="kg_timeout",
+        type=float,
+        default=30.0,
+        help="Seconds to wait for each LLM call before failing that drawer",
+    )
+    p_kg_benchmark.add_argument(
+        "--show-details",
+        dest="kg_show_details",
+        action="store_true",
+        help="Print per-drawer benchmark results",
+    )
+    p_kg_benchmark.add_argument(
+        "--show-facts",
+        dest="kg_show_facts",
+        action="store_true",
+        help="With --show-details, print accepted facts and verbatim evidence",
+    )
+    p_kg_benchmark.add_argument(
+        "--show-rejected",
+        dest="kg_show_rejected",
+        action="store_true",
+        help="With --show-details, print rejected candidates and reasons",
+    )
+    p_kg_benchmark.add_argument(
+        "--include-diary",
+        dest="kg_include_diary",
+        action="store_true",
+        help="Include diary/checkpoint rooms (skipped by default)",
+    )
 
     # sweep
     p_sweep = sub.add_parser(
@@ -1990,6 +3321,26 @@ def main():
     instructions_sub = p_instructions.add_subparsers(dest="instructions_name")
     for instr_name in ["init", "search", "mine", "help", "status"]:
         instructions_sub.add_parser(instr_name, help=f"Output {instr_name} instructions")
+
+    # config
+    p_config = sub.add_parser("config", help="Show or update MemPalace config")
+    config_sub = p_config.add_subparsers(dest="config_action")
+    config_sub.add_parser("show", help="Show effective config values")
+    p_config_set = config_sub.add_parser("set", help="Persist a config value")
+    p_config_set.add_argument(
+        "key",
+        choices=[
+            "palace-path",
+            "backend",
+            "embedding-model",
+            "hooks.auto-save",
+            "hooks.silent-save",
+            "hooks.desktop-toast",
+            "hooks.daemon",
+        ],
+        help="Config key to update",
+    )
+    p_config_set.add_argument("value", help="Value to persist")
 
     # repair
     p_repair = sub.add_parser(
@@ -2182,6 +3533,244 @@ def main():
         help="Storage backend to use for status (default: config/env/detected/chroma)",
     )
 
+    # migrate-ids (RFC 004 id purity — v4 content-pure drawer ids)
+    p_migrate_ids = sub.add_parser(
+        "migrate-ids",
+        help="Plan/apply the v4 content-pure id migration (dry-run by default; "
+        "--apply materializes a v4 palace into a fresh --target, copy-first)",
+    )
+    p_migrate_ids.add_argument(
+        "--apply", action="store_true", help="Materialize the migration (needs --target)"
+    )
+    p_migrate_ids.add_argument(
+        "--target", default=None, help="Fresh palace path to write the migrated v4 palace into"
+    )
+    p_migrate_ids.add_argument("--json", action="store_true", help="Machine-readable plan output")
+
+    # reconcile-ids (RFC 004 write-flip PART B — drain legacy v3-keyed ghosts)
+    p_reconcile_ids = sub.add_parser(
+        "reconcile-ids",
+        help="Drain legacy v3-keyed 'ghost' drawers to their content-hash v4 id, "
+        "in place (dry-run by default; --apply rewrites them, never deletes "
+        "un-twinned content)",
+    )
+    p_reconcile_ids.add_argument(
+        "--apply", action="store_true", help="Rewrite the ghosts (default is a dry-run report)"
+    )
+    p_reconcile_ids.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    # logstream (RFC 003 agent coordination)
+    p_logstream = sub.add_parser(
+        "logstream",
+        help="Agent coordination events — delegate work, wait for replies (RFC 003)",
+    )
+    logstream_sub = p_logstream.add_subparsers(dest="logstream_action")
+
+    def _add_logstream_filters(p):
+        p.add_argument("--stream", default=None, help="Stream, e.g. project/mempalace")
+        p.add_argument("--room", default=None, help="Room, e.g. delegation, patches")
+        p.add_argument("--type", default=None, help="Event type, e.g. task.request")
+        p.add_argument("--to-agent", default=None, help="Target agent (also matches '*')")
+        p.add_argument("--from-agent", default=None, help="Writer agent")
+        p.add_argument("--correlation-id", default=None, help="Task/conversation id")
+        p.add_argument(
+            "--status",
+            default=None,
+            help="open|claimed|ready|applied|blocked|failed|superseded",
+        )
+        p.add_argument("--since-event-id", default=None, help="Only events strictly after this id")
+        p.add_argument(
+            "--since-created-at",
+            default=None,
+            help="Only events at/after this time (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ)",
+        )
+
+    p_ls_append = logstream_sub.add_parser("append", help="Append a coordination event")
+    p_ls_append.add_argument("--type", required=True, help="Event type, e.g. task.request")
+    p_ls_append.add_argument("--stream", required=True, help="Stream, e.g. project/mempalace")
+    p_ls_append.add_argument("--room", required=True, help="Room, e.g. delegation")
+    p_ls_append.add_argument("--from-agent", required=True, help="Writer agent identity")
+    p_ls_append.add_argument("--to-agent", default=None, help="Target agent or '*'")
+    p_ls_append.add_argument("--correlation-id", default=None, help="Task/conversation id")
+    p_ls_append.add_argument("--branch", default=None, help="Git branch")
+    p_ls_append.add_argument("--base-commit", default=None, help="Git commit work started from")
+    p_ls_append.add_argument(
+        "--status",
+        default=None,
+        help="open|claimed|ready|applied|blocked|failed|superseded",
+    )
+    p_ls_append.add_argument("--body", default=None, help="Verbatim body text")
+    p_ls_append.add_argument(
+        "--body-file", default=None, help="Read body from file ('-' for stdin)"
+    )
+    p_ls_append.add_argument("--metadata", default=None, help="Extra fields as a JSON object")
+    p_ls_append.add_argument(
+        "--artifact-id",
+        action="append",
+        default=None,
+        help="Reference an already-stored artifact (repeatable)",
+    )
+    p_ls_append.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    p_ls_list = logstream_sub.add_parser("list", help="List events, oldest first")
+    _add_logstream_filters(p_ls_list)
+    p_ls_list.add_argument("--limit", type=int, default=50, help="Max events (default 50)")
+    p_ls_list.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    p_ls_wait = logstream_sub.add_parser(
+        "wait", help="Block until a matching event exists (exit 2 on timeout)"
+    )
+    _add_logstream_filters(p_ls_wait)
+    p_ls_wait.add_argument(
+        "--timeout-ms",
+        type=int,
+        default=60000,
+        help="How long to wait in ms (default 60000, max 300000)",
+    )
+    p_ls_wait.add_argument(
+        "--limit", type=int, default=50, help="Max events to return on match (default 50)"
+    )
+    p_ls_wait.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    p_ls_ack = logstream_sub.add_parser(
+        "ack", help="Acknowledge an event (appends event.ack, never mutates)"
+    )
+    p_ls_ack.add_argument("event_id", help="Event id to acknowledge")
+    p_ls_ack.add_argument("--from-agent", required=True, help="Acknowledging agent identity")
+    p_ls_ack.add_argument(
+        "--status",
+        default=None,
+        help="open|claimed|ready|applied|blocked|failed|superseded",
+    )
+    p_ls_ack.add_argument("--body", default=None, help="Verbatim ack notes")
+    p_ls_ack.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    p_ls_sync = logstream_sub.add_parser(
+        "sync", help="Pull missing events/artifacts from peer replicas (RFC 004)"
+    )
+    p_ls_sync.add_argument(
+        "--peer", default=None, help="Peer base URL (default: all peers in peers.json)"
+    )
+    p_ls_sync.add_argument("--token", default=None, help="Bearer token for --peer")
+    p_ls_sync.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    # artifact (RFC 003 exact content exchange)
+    p_artifact = sub.add_parser(
+        "artifact", help="Exact artifact exchange for agent handoffs (RFC 003)"
+    )
+    artifact_sub = p_artifact.add_subparsers(dest="artifact_action")
+
+    p_art_put = artifact_sub.add_parser("put", help="Store exact artifact content")
+    p_art_put.add_argument("--kind", required=True, help="patch|file|log|json|note")
+    p_art_put.add_argument("--created-by", required=True, help="Writer agent identity")
+    p_art_put.add_argument("--content", default=None, help="Inline content")
+    p_art_put.add_argument(
+        "--file", default=None, help="Read content from file ('-' for stdin; default stdin)"
+    )
+    p_art_put.add_argument("--metadata", default=None, help="Extra fields as a JSON object")
+    p_art_put.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    p_art_get = artifact_sub.add_parser(
+        "get", help="Fetch exact artifact content (stdout pipes into git apply)"
+    )
+    p_art_get.add_argument("artifact_id", help="Artifact id")
+    p_art_get.add_argument("--out", default=None, help="Write content to this file instead")
+    p_art_get.add_argument(
+        "--json", action="store_true", help="Metadata as JSON (content omitted with --out)"
+    )
+
+    # replica (RFC 004 read replicas)
+    p_replica = sub.add_parser(
+        "replica", help="Memory read-replica operations — pull facts from an origin palace"
+    )
+    replica_sub = p_replica.add_subparsers(dest="replica_action")
+    p_rep_pull = replica_sub.add_parser(
+        "pull", help="Pull drawers + KG from the origin; derive the vector index locally"
+    )
+    p_rep_pull.add_argument(
+        "--peer", default=None, help="Origin base URL (default: all peers in peers.json)"
+    )
+    p_rep_pull.add_argument("--token", default=None, help="Bearer token for --peer")
+    p_rep_pull.add_argument(
+        "--no-reconcile",
+        action="store_true",
+        help="Skip deleting local copies whose upstream original is gone",
+    )
+    p_rep_pull.add_argument(
+        "--no-kg",
+        action="store_true",
+        help="Skip knowledge-graph rows (use when the peer replicates your own KG back)",
+    )
+    p_rep_pull.add_argument(
+        "--with-vectors",
+        action="store_true",
+        help="Use vectors precomputed by the origin under this palace's embedder "
+        "identity (insert-only fold; origin must have run embed-cache)",
+    )
+    p_rep_pull.add_argument("--json", action="store_true", help="Machine-readable output")
+    p_rep_embed = replica_sub.add_parser(
+        "embed-cache",
+        help="Bulk-embed local documents into the portable vector cache "
+        "(distributed derivation: compute here, fold anywhere)",
+    )
+    p_rep_embed.add_argument(
+        "--model", default=None, help="Embedder identity (default: this palace's identity)"
+    )
+    p_rep_embed.add_argument("--batch", type=int, default=256, help="Embedding batch size")
+    p_rep_embed.add_argument(
+        "--all",
+        action="store_true",
+        help="Embed everything (default: authored-only — the set peers pull from us)",
+    )
+    p_rep_embed.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    # oplog (RFC 004 step 2a — canonical memory op-log)
+    p_oplog = sub.add_parser(
+        "oplog", help="Canonical memory op-log — dual-write shadow status and verification"
+    )
+    oplog_sub = p_oplog.add_subparsers(dest="oplog_action")
+    p_oplog_status = oplog_sub.add_parser(
+        "status", help="Op counts, kind histogram, and version vector"
+    )
+    p_oplog_status.add_argument("--json", action="store_true", help="Machine-readable output")
+    p_oplog_verify = oplog_sub.add_parser(
+        "verify",
+        help="Replay the op-log against the live store and report divergence "
+        "(the step-2a cutover gate; exits 1 on divergence)",
+    )
+    p_oplog_verify.add_argument("--json", action="store_true", help="Machine-readable output")
+    p_oplog_sync = oplog_sub.add_parser(
+        "sync", help="Pull missing memory ops from peer replicas (RFC 004 anti-entropy)"
+    )
+    p_oplog_sync.add_argument(
+        "--peer", default=None, help="Peer base URL (default: all peers in peers.json)"
+    )
+    p_oplog_sync.add_argument("--token", default=None, help="Bearer token for --peer")
+    p_oplog_sync.add_argument("--json", action="store_true", help="Machine-readable output")
+    p_oplog_fold = oplog_sub.add_parser(
+        "fold",
+        help="Apply pulled remote ops to the local store (STOP the hub first — "
+        "this writes the palace directly, same single-writer rule as replica pull; "
+        "a running hub folds on its own sync cadence)",
+    )
+    p_oplog_fold.add_argument("--json", action="store_true", help="Machine-readable output")
+    p_oplog_promote = oplog_sub.add_parser(
+        "promote",
+        help="One-time local-capture promotion: emit drawer.add ops for every "
+        "locally-authored drawer that predates the op-log (safe alongside a "
+        "live hub — reads the store, writes only the op-log; idempotent)",
+    )
+    p_oplog_promote.add_argument(
+        "--dry-run", action="store_true", help="Count what would be promoted without emitting"
+    )
+    p_oplog_promote.add_argument(
+        "--limit", type=int, default=None, help="Promote at most N drawers (rerun to continue)"
+    )
+    p_oplog_promote.add_argument(
+        "--batch", type=int, default=2000, help="Store scan page size (default 2000)"
+    )
+    p_oplog_promote.add_argument("--json", action="store_true", help="Machine-readable output")
+
     p_palace = sub.add_parser("palace", help="Palace maintenance commands")
     palace_sub = p_palace.add_subparsers(dest="palace_action")
     p_set_embedder = palace_sub.add_parser(
@@ -2200,6 +3789,11 @@ def main():
         action="store_true",
         help="Overwrite an existing identity that names a different model "
         "(only if you know the stored vectors are compatible)",
+    )
+    p_set_embedder.add_argument(
+        "--collection",
+        default=None,
+        help="Collection to record: drawers or closets (default: drawers)",
     )
     p_set_embedder.add_argument(
         "--backend",
@@ -2231,11 +3825,46 @@ def main():
         cmd_instructions(args)
         return
 
+    if args.command == "config":
+        if not getattr(args, "config_action", None):
+            p_config.print_help()
+            return
+        cmd_config(args)
+        return
+
     if args.command == "palace":
         if getattr(args, "palace_action", None) == "set-embedder":
             cmd_palace_set_embedder(args)
         else:
             p_palace.print_help()
+        return
+
+    if args.command == "logstream":
+        if not getattr(args, "logstream_action", None):
+            p_logstream.print_help()
+            return
+        cmd_logstream(args)
+        return
+
+    if args.command == "artifact":
+        if not getattr(args, "artifact_action", None):
+            p_artifact.print_help()
+            return
+        cmd_artifact(args)
+        return
+
+    if args.command == "replica":
+        if not getattr(args, "replica_action", None):
+            p_replica.print_help()
+            return
+        cmd_replica(args)
+        return
+
+    if args.command == "oplog":
+        if not getattr(args, "oplog_action", None):
+            p_oplog.print_help()
+            return
+        cmd_oplog(args)
         return
 
     if args.command == "daemon":
@@ -2248,6 +3877,8 @@ def main():
     dispatch = {
         "init": cmd_init,
         "mine": cmd_mine,
+        "kg-extract": cmd_kg_extract,
+        "kg-benchmark": cmd_kg_benchmark,
         "split": cmd_split,
         "search": cmd_search,
         "sweep": cmd_sweep,
@@ -2260,6 +3891,8 @@ def main():
         "repair-status": cmd_repair_status,
         "migrate": cmd_migrate,
         "migrate-wings": cmd_migrate_wings,
+        "migrate-ids": cmd_migrate_ids,
+        "reconcile-ids": cmd_reconcile_ids,
         "hallways": cmd_hallways,
         "status": cmd_status,
     }

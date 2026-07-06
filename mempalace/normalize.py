@@ -156,7 +156,7 @@ def normalize(filepath: str) -> str:
     ext = Path(filepath).suffix.lower()
     if ext in (".json", ".jsonl") or content.strip()[:1] in ("{", "["):
         normalized = _try_normalize_json(content)
-        if normalized:
+        if normalized is not None:
             return normalized
 
     return content
@@ -170,7 +170,7 @@ def _try_normalize_json(content: str) -> Optional[str]:
         return normalized
 
     normalized = _try_codex_jsonl(content)
-    if normalized:
+    if normalized is not None:
         return normalized
 
     normalized = _try_gemini_jsonl(content)
@@ -305,9 +305,11 @@ def _try_codex_jsonl(content: str) -> Optional[str]:
         elif payload_type == "agent_message":
             messages.append(("assistant", text))
 
-    if len(messages) >= 2 and has_session_meta:
+    if not has_session_meta:
+        return None
+    if len(messages) >= 2:
         return _messages_to_transcript(messages)
-    return None
+    return ""
 
 
 def _try_gemini_jsonl(content: str) -> Optional[str]:

@@ -427,6 +427,37 @@ class BaseCollection(ABC):
     def health(self) -> HealthStatus:
         return HealthStatus.healthy()
 
+    def rekey_row(
+        self,
+        old_id: str,
+        new_id: str,
+        *,
+        content: str,
+        metadata: dict,
+        embedding: Optional[list[float]] = None,
+    ) -> None:
+        """Rewrite one physical row from ``old_id`` to ``new_id``, preserving its
+        document + embedding and taking ``metadata`` (RFC 004 write-flip PART B:
+        draining legacy v3-keyed drawers to their content-hash v4 id in place).
+
+        Default: reinsert under ``new_id`` — carrying ``embedding`` so it is NOT
+        re-derived — then delete ``old_id``; each backend's own upsert/delete keep
+        secondary indexes (FTS, HNSW) consistent. Not atomic across the two steps
+        but idempotent: a crash mid-rekey leaves both rows, and a re-run drops the
+        old one once its content-hash twin is present. A backend that needs
+        single-transaction atomicity (e.g. sqlite_exact's separate ``docs_fts``
+        table keyed by doc id) overrides this. No-op when ``new_id == old_id``.
+        """
+        if new_id == old_id:
+            return
+        if embedding is not None:
+            self.upsert(
+                ids=[new_id], documents=[content], metadatas=[metadata], embeddings=[embedding]
+            )
+        else:
+            self.upsert(ids=[new_id], documents=[content], metadatas=[metadata])
+        self.delete(ids=[old_id])
+
     @property
     def distance_metric(self) -> str:
         """The space this collection's ``distances`` are reported in.

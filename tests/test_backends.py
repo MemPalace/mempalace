@@ -2,6 +2,7 @@ import os
 import pickle
 import shutil
 import sqlite3
+import logging
 from contextlib import closing
 from pathlib import Path
 
@@ -1077,7 +1078,7 @@ def test_quarantine_stale_hnsw_renames_corrupt_segment(tmp_path):
     assert (drift_dirs[0] / "data_level0.bin").exists()
 
 
-def test_quarantine_stale_hnsw_leaves_healthy_segment_with_drift_alone(tmp_path):
+def test_quarantine_stale_hnsw_leaves_healthy_segment_with_drift_alone(tmp_path, caplog):
     """Segment with stale mtime but a complete metadata file is NOT
     renamed — this is the chromadb-1.5.x async-flush steady state, not
     corruption. Production case at 06:24 PDT 2026-04-26: cold-start
@@ -1090,9 +1091,11 @@ def test_quarantine_stale_hnsw_leaves_healthy_segment_with_drift_alone(tmp_path)
         sqlite_mtime=now,
         meta_bytes=_HEALTHY_META,
     )
-    moved = quarantine_stale_hnsw(str(palace), stale_seconds=3600.0)
+    with caplog.at_level(logging.INFO, logger="mempalace.backends.chroma"):
+        moved = quarantine_stale_hnsw(str(palace), stale_seconds=3600.0)
     assert moved == []
     assert seg.exists()
+    assert "flush-lag, not corruption" not in caplog.text
 
 
 def test_quarantine_stale_hnsw_leaves_empty_segment_without_metadata_alone(tmp_path):

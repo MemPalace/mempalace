@@ -410,6 +410,21 @@ def test_codex_jsonl_no_session_meta():
     assert result is None
 
 
+def test_codex_jsonl_session_with_no_agent_message_is_empty(tmp_path):
+    """Recognized Codex sessions with no assistant turn must not fall back to raw JSON."""
+    lines = [
+        json.dumps({"type": "session_meta", "payload": {}}),
+        json.dumps({"type": "event_msg", "payload": {"type": "user_message", "message": "Q"}}),
+        json.dumps({"type": "event_msg", "payload": {"type": "task_complete"}}),
+    ]
+
+    assert _try_codex_jsonl("\n".join(lines)) == ""
+
+    transcript = tmp_path / "rollout.jsonl"
+    transcript.write_text("\n".join(lines))
+    assert normalize(str(transcript)) == ""
+
+
 def test_codex_jsonl_skips_non_event_msg():
     lines = [
         json.dumps({"type": "session_meta"}),
