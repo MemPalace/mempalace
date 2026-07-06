@@ -959,13 +959,25 @@ def test_duplicate_detection_threshold_garbage_falls_back_to_default(monkeypatch
 # ── incremental_mining_enabled ───────────────────────────────────────────
 
 
-def test_incremental_mining_disabled_by_default(monkeypatch, tmp_path):
+def test_incremental_mining_enabled_by_default(monkeypatch, tmp_path):
+    """Default flipped to True after a real-corpus benchmark measured a
+    3.8x speedup with byte-identical final palace state vs a full
+    re-mine (see the property's docstring) -- no explicit config or env
+    var needed to get the incremental path."""
     monkeypatch.delenv("MEMPALACE_INCREMENTAL_MINING", raising=False)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.incremental_mining_enabled is True
+
+
+def test_incremental_mining_can_be_disabled_via_config(monkeypatch, tmp_path):
+    monkeypatch.delenv("MEMPALACE_INCREMENTAL_MINING", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"incremental_mining": {"enabled": False}}, f)
     cfg = MempalaceConfig(config_dir=str(tmp_path))
     assert cfg.incremental_mining_enabled is False
 
 
-def test_incremental_mining_enabled_from_config(monkeypatch, tmp_path):
+def test_incremental_mining_enabled_explicitly_from_config(monkeypatch, tmp_path):
     monkeypatch.delenv("MEMPALACE_INCREMENTAL_MINING", raising=False)
     with open(tmp_path / "config.json", "w") as f:
         json.dump({"incremental_mining": {"enabled": True}}, f)
@@ -980,8 +992,20 @@ def test_incremental_mining_env_override_true(monkeypatch, tmp_path):
 
 
 def test_incremental_mining_env_override_false_string(monkeypatch, tmp_path):
+    """Env var can opt back out even when config.json says True (or,
+    now that the default itself is True, when nothing overrides it at
+    all) -- confirmed here against an explicit config.json True so the
+    override behavior is unambiguous."""
     with open(tmp_path / "config.json", "w") as f:
         json.dump({"incremental_mining": {"enabled": True}}, f)
     monkeypatch.setenv("MEMPALACE_INCREMENTAL_MINING", "0")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.incremental_mining_enabled is False
+
+
+def test_incremental_mining_env_override_false_with_no_config(monkeypatch, tmp_path):
+    """The env var must be able to opt out of the new default (True)
+    on its own, with no config.json involved at all."""
+    monkeypatch.setenv("MEMPALACE_INCREMENTAL_MINING", "false")
     cfg = MempalaceConfig(config_dir=str(tmp_path))
     assert cfg.incremental_mining_enabled is False

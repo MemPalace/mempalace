@@ -1408,19 +1408,20 @@ class TestFetchStoredCursor:
         assert _fetch_stored_cursor(col, "a.jsonl", "exchange") is None
 
 
-# ── incremental mining wired in (opt-in, off by default) ─────────────────
+# ── incremental mining wired in (on by default, opt-out) ─────────────────
 
 
 class TestIncrementalMiningWiredIn:
     """End-to-end through the real mine_convos()/palace path: when
-    incremental_mining_enabled is set, growing a previously-mined
-    transcript re-chunks only the trailing exchange onward instead of
-    purging and rebuilding the whole file -- proven by the STABLE
+    incremental_mining_enabled applies (the default, after a real-corpus
+    benchmark -- see MempalaceConfig's docstring), growing a previously-
+    mined transcript re-chunks only the trailing exchange onward instead
+    of purging and rebuilding the whole file -- proven by the STABLE
     prefix's drawers surviving the second mine completely untouched
     (same filed_at, not just same content -- filed_at is stamped fresh
     on every upsert, so an unchanged filed_at proves no re-upsert
-    happened). Off by default, existing full-remine behavior is
-    unchanged from before this feature existed."""
+    happened). Explicitly disabling it (MEMPALACE_INCREMENTAL_MINING=0)
+    still produces the old full-remine behavior exactly."""
 
     @staticmethod
     def _write_jsonl(path: Path, num_exchanges: int) -> None:
@@ -1445,8 +1446,12 @@ class TestIncrementalMiningWiredIn:
             )
         path.write_text("\n".join(lines) + "\n")
 
-    def test_disabled_by_default_full_remine_on_growth(self, monkeypatch, capsys):
-        monkeypatch.delenv("MEMPALACE_INCREMENTAL_MINING", raising=False)
+    def test_explicitly_disabled_full_remine_on_growth(self, monkeypatch, capsys):
+        """Opting back out (MEMPALACE_INCREMENTAL_MINING=false) must still
+        produce the old full-remine behavior, with no "(incremental)"
+        marker -- the flag has to work in both directions, not just
+        toward the new default."""
+        monkeypatch.setenv("MEMPALACE_INCREMENTAL_MINING", "false")
         tmpdir = tempfile.mkdtemp()
         try:
             convo_path = Path(tmpdir) / "session.jsonl"
@@ -1461,6 +1466,29 @@ class TestIncrementalMiningWiredIn:
             mine_convos(tmpdir, palace_path, wing="test")
             out = capsys.readouterr().out
             assert "(incremental)" not in out
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_default_takes_incremental_path_with_no_override(self, monkeypatch, capsys):
+        """incremental_mining_enabled defaults to True (see
+        MempalaceConfig's docstring for the benchmark backing this) --
+        growing a previously-mined file with NO env var or config.json
+        override at all must take the incremental path out of the box."""
+        monkeypatch.delenv("MEMPALACE_INCREMENTAL_MINING", raising=False)
+        tmpdir = tempfile.mkdtemp()
+        try:
+            convo_path = Path(tmpdir) / "session.jsonl"
+            self._write_jsonl(convo_path, 3)
+            palace_path = os.path.join(tmpdir, "palace")
+
+            mine_convos(tmpdir, palace_path, wing="test")
+            capsys.readouterr()
+
+            time.sleep(0.05)
+            self._write_jsonl(convo_path, 4)
+            mine_convos(tmpdir, palace_path, wing="test")
+            out = capsys.readouterr().out
+            assert "(incremental)" in out
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
