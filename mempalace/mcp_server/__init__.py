@@ -118,6 +118,12 @@ from ..config import (  # noqa: E402
     wing_aliases,
 )
 from ..date_window import filed_at_in_window, parse_date_bound  # noqa: E402
+from ..dynamics import (  # noqa: E402
+    apply_decay,
+    drawer_salience,
+    initialize_drawer_dynamics_fields,
+    potentiate,
+)
 from ..embedding import (  # noqa: E402
     MODEL_ERROR_CLASS_NAMES,
     EmbeddingFunctionUnavailableError,

@@ -60,7 +60,7 @@ Full wing → room → drawer count tree.
 
 ### `mempalace_search`
 
-Semantic search. Returns verbatim drawer content with similarity scores.
+Semantic search. Returns verbatim drawer content with similarity scores and a lazy-decayed `salience` block. By default this is read-only. If `MEMPALACE_SALIENCE_POTENTIATE=true`, surfaced logical drawers are potentiated best-effort unless the MCP server is read-only or lacks the palace writer lock.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -72,7 +72,7 @@ Semantic search. Returns verbatim drawer content with similarity scores.
 | `before` | string | No | Include drawers filed strictly before this ISO date/datetime |
 | `max_distance` | number | No | Distance cutoff on the cosine scale (0 = identical, 2 = opposite), applied the same way whatever metric the palace uses. Default: no cutoff |
 
-**Returns:** `{ query, filters, results: [{ text, wing, room, source_file, similarity }] }`
+**Returns:** `{ query, filters, results: [{ text, wing, room, source_file, similarity, salience }] }`
 
 When `max_distance` drops results, the response says how many in
 `filtered_by_max_distance`. With `candidate_strategy: "union"`, a lexical-only
@@ -241,14 +241,14 @@ Mining records which directory that was by storing its inode on each drawer. A p
 
 ### `mempalace_get_drawer`
 
-Fetch a single drawer by ID — returns full content and metadata.
+Fetch a single drawer by ID — returns full content, metadata, and lazy-decayed salience.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `drawer_id` | string | **Yes** | ID of the drawer to fetch |
 | `include_source_bytes` | boolean | No | Also return `source_bytes_base64` for a drawer whose metadata names a `source_encoding` |
 
-**Returns:** `{ drawer_id, content, wing, room, metadata }` where `metadata.source_file`, when present, is the basename only — the absolute path written by the miners is reduced before the dict is returned to MCP clients.
+**Returns:** `{ drawer_id, content, wing, room, salience, metadata }` where `metadata.source_file`, when present, is the basename only — the absolute path written by the miners is reduced before the dict is returned to MCP clients.
 
 A drawer mined from a file with bytes that are not valid UTF-8 carries `metadata.source_encoding`. Responses show such a byte as U+FFFD, because some clients' JSON parsers reject the escape that would carry it; the palace keeps the byte. With `include_source_bytes: true` the response adds `source_bytes_base64`, the drawer text's exact source bytes.
 
@@ -278,6 +278,21 @@ List drawers with pagination. Optional wing/room filter. Returns IDs, wings, roo
 | `offset` | integer | No | Offset for pagination (default 0) |
 
 **Returns:** `{ drawers: [...], total, limit, offset }`
+
+---
+
+### `mempalace_drawer_salience`
+
+List lazy-decayed salience for logical drawers. Chunked drawers are deduped by `parent_drawer_id`; when opt-in search potentiation updates a chunked drawer, every physical chunk receives the same salience metadata so the parent remains consistent.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `wing` | string | No | Filter by wing |
+| `room` | string | No | Filter by room |
+| `limit` | integer | No | Max results (default 100, max 100) |
+| `order_by` | string | No | Sort by `strength`, `access_count`, or `last_activated` (default `strength`) |
+
+**Returns:** `{ drawers: [{ id, wing, room, strength, stability, last_activated, access_count }] }`
 
 ---
 
