@@ -757,7 +757,16 @@ class SQLiteExactCollection(BaseCollection):
                         (collection_id, id, document, metadata_json, embedding, dim, created_at, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (collection_id, new_id, content, _json_dumps(metadata), emb_blob, dim, now, now),
+                    (
+                        collection_id,
+                        new_id,
+                        content,
+                        _json_dumps(metadata),
+                        emb_blob,
+                        dim,
+                        now,
+                        now,
+                    ),
                 )
                 self._replace_fts(cur, collection_id, new_id, content)
             # Drop the old ghost row + its FTS row (both the insert and skip paths).

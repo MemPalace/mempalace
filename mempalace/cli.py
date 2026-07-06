@@ -29,6 +29,8 @@ Examples:
     mempalace search "pricing discussion" --wing my_app --room costs
 """
 
+from __future__ import annotations
+
 import os
 import sys
 import shlex
