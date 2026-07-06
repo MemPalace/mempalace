@@ -182,6 +182,18 @@ def _parse_entities(value) -> list[str]:
     return result
 
 
+def _hallway_label(entity_a: str, entity_b: str, count: int, rooms: list) -> str:
+    """Human-readable hallway label. Single source of truth so freshly-computed
+    and re-keyed/merged records format identically."""
+    room_summary = ", ".join(rooms[:3]) if rooms else "(no room tags)"
+    if len(rooms) > 3:
+        room_summary += f", +{len(rooms) - 3} more"
+    return (
+        f"{entity_a} \u2194 {entity_b} (co-occur in {count} drawers across "
+        f"{len(rooms) or 'no'} room{'s' if len(rooms) != 1 else ''}: {room_summary})"
+    )
+
+
 def _hallway_id(wing: str, entity_a: str, entity_b: str) -> str:
     """Deterministic id derived from wing + sorted entity pair.
 
@@ -341,9 +353,6 @@ def compute_hallways_for_wing(
             continue
         entity_a, entity_b = key
         rooms = sorted(pair_rooms.get(key, set()))
-        room_summary = ", ".join(rooms[:3]) if rooms else "(no room tags)"
-        if len(rooms) > 3:
-            room_summary += f", +{len(rooms) - 3} more"
         record = {
             "id": _hallway_id(wing, entity_a, entity_b),
             "wing": wing,
@@ -351,7 +360,7 @@ def compute_hallways_for_wing(
             "entity_b": entity_b,
             "co_occurrence_count": count,
             "rooms": rooms,
-            "label": f"{entity_a} ↔ {entity_b} (co-occur in {count} drawers across {len(rooms) or 'no'} room{'s' if len(rooms) != 1 else ''}: {room_summary})",
+            "label": _hallway_label(entity_a, entity_b, count, rooms),
             "created_at": created_at,
             "created_by": "auto",
         }
@@ -391,3 +400,65 @@ def delete_hallway(hallway_id: str, config=None) -> bool:
         return False
     _save_hallways(filtered, config)
     return True
+
+
+def _merge_hallways(dst: dict, src: dict) -> None:
+    """Fold ``src`` into ``dst`` in place when two hallways collapse onto the
+    same (wing, entity-pair). Counts/rooms combine; dynamics keep the stronger
+    and more-recent signal so the #1578 living-connection layer is not reset."""
+    count = int(dst.get("co_occurrence_count", 0)) + int(src.get("co_occurrence_count", 0))
+    rooms = sorted(set(dst.get("rooms") or []) | set(src.get("rooms") or []))
+    dst["co_occurrence_count"] = count
+    dst["rooms"] = rooms
+    dst["label"] = _hallway_label(dst.get("entity_a"), dst.get("entity_b"), count, rooms)
+    dst["strength"] = max(float(dst.get("strength", 1.0)), float(src.get("strength", 1.0)))
+    dst["stability"] = max(float(dst.get("stability", 1.0)), float(src.get("stability", 1.0)))
+    if str(src.get("last_activated", "")) > str(dst.get("last_activated", "")):
+        dst["last_activated"] = src.get("last_activated")
+    dst["access_count"] = int(dst.get("access_count", 0)) + int(src.get("access_count", 0))
+
+
+def rekey_hallway_wings(rename_map: dict, config=None) -> int:
+    """Re-key the ``wing`` field on hallway records after a wing rename.
+
+    ``rename_map`` maps ``{old_wing: new_wing}``. Every hallway whose wing is a
+    key is rewritten to the target wing and its id regenerated (ids embed the
+    wing via ``_hallway_id``). When re-keyed records collide with an existing
+    record on the same ``(wing, sorted entity pair)`` — two source wings
+    normalizing to one target, or the target already holding that pair — they
+    are merged via ``_merge_hallways`` rather than duplicated.
+
+    A rename does not change drawer membership or entity co-occurrence, so
+    re-keying (rather than recomputing from drawers) is both sufficient and
+    preserves the accumulated dynamics fields. Returns the number of records
+    whose wing changed.
+    """
+    if not rename_map:
+        return 0
+    hallways = _load_hallways(config)
+    index: dict = {}
+    order: list = []
+    changed = 0
+
+    def _add(rec: dict) -> None:
+        a, b = sorted([rec.get("entity_a"), rec.get("entity_b")])
+        k = (rec.get("wing"), a, b)
+        if k in index:
+            _merge_hallways(index[k], rec)
+        else:
+            index[k] = rec
+            order.append(k)
+
+    for h in hallways:
+        old = h.get("wing")
+        if old in rename_map:
+            new = rename_map[old]
+            a, b = sorted([h.get("entity_a"), h.get("entity_b")])
+            h["wing"] = new
+            h["id"] = _hallway_id(new, a, b)
+            changed += 1
+        _add(h)
+
+    if changed:
+        _save_hallways([index[k] for k in order], config)
+    return changed
