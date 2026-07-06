@@ -72,6 +72,7 @@ READ_TOOLS = frozenset(
         "mempalace_follow_tunnels",
         "mempalace_search",
         "mempalace_check_duplicate",
+        "mempalace_find_duplicates",
         "mempalace_get_drawer",
         "mempalace_get_drawers",
         "mempalace_list_drawers",
