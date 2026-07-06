@@ -1343,3 +1343,121 @@ def test_text_fallback_consumes_the_drawer_fingerprint_too(initialized_provider)
     initialized_provider.on_session_end(window)
     initialized_provider._worker_queue.join()
     assert initialized_provider._collection.count() == pre + 1
+
+
+def test_interrupted_then_retried_identical_prompt_keeps_both(initialized_provider):
+    # Turn A: "continue" → partial answer (interrupted; Hermes never syncs
+    # interrupted turns). Turn B: "continue" → "done" (synced). The exact
+    # match for B must win before A's fp arm can steal the drawer — A's
+    # content gets filed, B is skipped.
+    synced = [
+        {"role": "user", "content": "continue"},
+        {"role": "assistant", "content": "done"},
+    ]
+    initialized_provider.sync_turn("continue", "done", messages=synced)
+    initialized_provider._worker_queue.join()
+    pre = initialized_provider._collection.count()
+
+    window = [
+        {"role": "user", "content": "continue"},
+        {"role": "assistant", "content": "partial answer before interrupt"},
+    ] + synced
+    initialized_provider.on_session_end(window)
+    initialized_provider._worker_queue.join()
+    assert initialized_provider._collection.count() == pre + 1
+    docs = initialized_provider._collection.get(include=["documents"]).get("documents") or []
+    assert any("partial answer before interrupt" in d for d in docs)
+
+
+def test_contended_fingerprint_files_all_occurrences(initialized_provider):
+    # Two same-prompt tool turns with different outcomes; only one synced,
+    # and neither raw segment exact-matches the clean drawer. We cannot
+    # tell which occurrence the drawer covers — file BOTH (bounded
+    # duplication), never guess (possible loss).
+    t1 = [
+        {"role": "user", "content": "run it"},
+        {"role": "assistant", "content": [{"type": "tool_use", "name": "bash"}]},
+        {"role": "assistant", "content": "exit 0"},
+    ]
+    t2 = [
+        {"role": "user", "content": "run it"},
+        {"role": "assistant", "content": [{"type": "tool_use", "name": "bash"}]},
+        {"role": "assistant", "content": "exit 1"},
+    ]
+    initialized_provider.sync_turn("run it", "exit 0", messages=t1)
+    initialized_provider._worker_queue.join()
+    pre = initialized_provider._collection.count()
+
+    initialized_provider.on_session_end(t1 + t2)
+    initialized_provider._worker_queue.join()
+    assert initialized_provider._collection.count() == pre + 2
+
+
+def test_preamble_segment_dedups_across_repeated_pre_compress(initialized_provider):
+    # A post-compression window can START with assistant/tool messages (no
+    # user anchor). The anchorless segment files once, and a second
+    # overlapping window must not re-file it (exact-text pass, fp == "").
+    window = [
+        {"role": "assistant", "content": "orphaned assistant tail"},
+        {"role": "user", "content": "next question"},
+        {"role": "assistant", "content": "next answer"},
+    ]
+    initialized_provider.on_pre_compress(window)
+    initialized_provider._worker_queue.join()
+    once = initialized_provider._collection.count()
+    assert once >= 2  # preamble segment + anchored turn
+
+    initialized_provider.on_pre_compress(window)
+    initialized_provider._worker_queue.join()
+    assert initialized_provider._collection.count() == once
+
+
+def test_pre_compress_scans_branch_lineage(initialized_provider):
+    msgs = [
+        {"role": "user", "content": "lineage question"},
+        {"role": "assistant", "content": "lineage answer"},
+    ]
+    initialized_provider.sync_turn("lineage question", "lineage answer", messages=msgs)
+    initialized_provider._worker_queue.join()
+    pre = initialized_provider._collection.count()
+
+    initialized_provider.on_session_switch(
+        "branch-pc", parent_session_id="test-session-1", reset=False, reason="branch"
+    )
+    hint = initialized_provider.on_pre_compress(msgs)
+    initialized_provider._worker_queue.join()
+    assert "mempalace_search" in hint
+    assert initialized_provider._collection.count() == pre
+
+
+def test_scan_failure_blind_files_with_warning(initialized_provider, monkeypatch, caplog):
+    import logging
+
+    def _boom(col, source_files):
+        raise RuntimeError("chroma exploded")
+
+    monkeypatch.setattr(initialized_provider, "_scan_filed", _boom)
+    msgs = [
+        {"role": "user", "content": "scan failure question"},
+        {"role": "assistant", "content": "scan failure answer"},
+    ]
+    pre = initialized_provider._collection.count()
+    with caplog.at_level(logging.WARNING, logger="mempalace.hermes"):
+        initialized_provider.on_session_end(msgs)
+        initialized_provider._worker_queue.join()
+    assert initialized_provider._collection.count() == pre + 1
+    assert any("filing without dedup" in r.message for r in caplog.records)
+
+
+def test_session_end_blocking_put_times_out_with_warning(provider, caplog):
+    import logging
+    import queue as queue_module
+
+    provider._cron_skipped = False
+    provider._initialized = True
+    provider.SESSION_END_ENQUEUE_TIMEOUT = 0.05
+    provider._worker_queue = queue_module.Queue(maxsize=1)
+    provider._worker_queue.put_nowait(("file_turn", {}))  # saturate; no worker running
+    with caplog.at_level(logging.WARNING, logger="mempalace.hermes"):
+        provider.on_session_end([{"role": "user", "content": "hi"}])
+    assert any("queue full at session_end" in r.message for r in caplog.records)

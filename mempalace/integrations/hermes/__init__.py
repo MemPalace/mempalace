@@ -718,6 +718,11 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
     DEFAULT_PALACE_PATH = "~/.mempalace/palace"
     DEFAULT_IDENTITY_PATH = "~/.mempalace/identity.txt"
     WORKER_QUEUE_MAX = 500
+    # on_session_end blocks up to this long to enqueue its safety-net scan:
+    # the session is ending, so there is no later retry — briefly blocking
+    # the agent thread beats permanently dropping unchecked turns. Mid-
+    # conversation hooks (sync_turn, on_pre_compress) stay non-blocking.
+    SESSION_END_ENQUEUE_TIMEOUT = 5.0
     # Cap for status-style metadata scans. On large palaces (200k+ drawers)
     # an unbounded ``col.get(include=["metadatas"])`` would materialize every
     # row into Python memory just to compute counts — multi-second hangs and
@@ -993,7 +998,7 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         # Safety net, not a second filing path: the worker scans what
         # sync_turn already filed and captures only what is missing.
         try:
-            self._worker_queue.put_nowait(
+            self._worker_queue.put(
                 (
                     "session_end",
                     {
@@ -1001,7 +1006,8 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
                         "session_id": self._session_id,
                         "lineage": list(self._session_lineage),
                     },
-                )
+                ),
+                timeout=self.SESSION_END_ENQUEUE_TIMEOUT,
             )
         except queue.Full:
             logger.warning(
@@ -1462,7 +1468,9 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
                     extra_metadata=extra,
                 )
         except Exception as exc:
-            logger.debug("MemPalace _file_turn error: %s", exc)
+            # warning, not debug — a failed palace write is a broken verbatim
+            # promise, never log noise.
+            logger.warning("MemPalace _file_turn error — turn not persisted: %s", exc)
 
     def _scan_filed(self, col: Any, source_files: List[str]) -> Counter:
         """Multiset of (turn_fp, document text) pairs already filed.
@@ -1500,13 +1508,28 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
 
         sync_turn is the primary filing path. This scans what's already in
         the palace for this session (plus branch ancestors) and files only
-        segments not covered — by turn fingerprint (correlates sync_turn's
-        clean pair with the raw turn despite representation differences)
-        or by exact text (catches a re-fired session_end and
-        pre_compress/session_end overlap, which compose identically).
-        Every skip consumes exactly one physical drawer atomically across
-        both indexes (the pair multiset), so one drawer can never protect
-        two segments.
+        segments not covered. Matching runs in three passes, each consuming
+        one physical drawer atomically across all indexes (the pair
+        multiset), so one drawer can never protect two segments:
+
+        1. Exact ``(turn_fp, text)`` matches for EVERY segment — before any
+           donor arm runs, so a donor can never steal a drawer an exact
+           match needs.
+        2. Fingerprint coverage, grouped per fingerprint (correlates
+           sync_turn's clean pair with the raw turn despite representation
+           differences). When same-fingerprint occurrences outnumber their
+           drawers we cannot tell WHICH are covered — file them ALL:
+           bounded duplication of a covered turn is acceptable; guessing
+           risks losing the missed one, which is not.
+        3. Exact-text coverage for anchorless segments and fp-missed
+           segments (catches a re-fired session_end and
+           pre_compress/session_end overlap, which compose byte-identically;
+           identical texts are interchangeable, so donor choice is
+           immaterial).
+
+        Donor lookups scan the pair multiset — O(segments × pairs) worst
+        case, on the background worker with session-bounded input; deep
+        /branch lineage chains are the pathological case.
 
         Loss-safe by construction: empty session_id or a failed scan means
         NO dedup (blind-file). The failure direction is always a duplicate
@@ -1539,38 +1562,97 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
                 fp_totals[pair_fp] += count
             text_totals[pair_text] += count
 
-        def consume(pair: tuple) -> None:
+        def consume(pair: tuple[str, str]) -> None:
             # One physical drawer leaves ALL indexes at once — the invariant
             # that makes over-skipping (data loss) impossible: skips map 1:1
-            # onto distinct filed drawers.
+            # onto distinct filed drawers. It also guarantees the donor
+            # next(...) lookups below: a positive total implies a positive
+            # pair count exists (totals are sums of non-negatives kept in
+            # lockstep here).
             pair_counts[pair] -= 1
             if pair[0]:
                 fp_totals[pair[0]] -= 1
             text_totals[pair[1]] -= 1
 
+        # ---- Pass 1: exact (fp, text) matches, for EVERY segment, before
+        # any donor arm runs. A greedy single pass let an earlier segment's
+        # fingerprint-donor arm steal the drawer a later segment would have
+        # exact-matched — re-filing the covered turn and silently losing the
+        # missed one (see
+        # test_interrupted_then_retried_identical_prompt_keeps_both).
+        remaining: List[Dict[str, str]] = []
         for seg in segments:
-            fp = seg["turn_fp"]
-            text = _compose_exchange_text(seg["user"], seg["assistant"])
-            # Exact drawer first, then any drawer covering this turn (same
-            # fingerprint), then any drawer with identical text (re-fired
-            # session_end / pre_compress overlap compose byte-identically).
-            if pair_counts.get((fp, text), 0) > 0:
-                consume((fp, text))
-                continue
-            if fp and fp_totals.get(fp, 0) > 0:
-                donor_text = next(t for (f, t), c in pair_counts.items() if f == fp and c > 0)
-                consume((fp, donor_text))
-                continue
-            if text_totals.get(text, 0) > 0:
-                donor_fp = next(f for (f, t), c in pair_counts.items() if t == text and c > 0)
+            pair = (seg["turn_fp"], _compose_exchange_text(seg["user"], seg["assistant"]))
+            if pair_counts.get(pair, 0) > 0:
+                consume(pair)
+            else:
+                remaining.append(seg)
+
+        # ---- Pass 2: fingerprint coverage, grouped per fingerprint.
+        # Same-fp segments are occurrences of the same user turn; D drawers
+        # with that fp attest D covered occurrences. When occurrences
+        # outnumber drawers we cannot tell WHICH are covered — file them
+        # ALL: bounded duplication of a covered turn is acceptable; guessing
+        # risks losing the missed one, which is not.
+        to_file: List[Dict[str, str]] = []
+        text_pass: List[Dict[str, str]] = []
+        by_fp: Dict[str, List[Dict[str, str]]] = {}
+        for seg in remaining:
+            if seg["turn_fp"]:
+                by_fp.setdefault(seg["turn_fp"], []).append(seg)
+            else:
+                text_pass.append(seg)
+        for fp, group in by_fp.items():
+            available = fp_totals.get(fp, 0)
+            if available == 0:
+                # No fp coverage — these may still text-match a drawer whose
+                # fingerprint differs (sync_turn saw an injected snapshot).
+                text_pass.extend(group)
+            elif len(group) <= available:
+                for index in range(len(group)):
+                    donor_text = next(
+                        (t for (f, t), c in pair_counts.items() if f == fp and c > 0),
+                        None,
+                    )
+                    if donor_text is None:
+                        # Unreachable while consume() keeps totals and pairs
+                        # in lockstep — if a future edit breaks that, filing
+                        # is the loss-safe answer.
+                        to_file.extend(group[index:])
+                        break
+                    consume((fp, donor_text))
+            else:
+                to_file.extend(group)
+
+        # ---- Pass 3: exact-text coverage for anchorless segments and
+        # fp-missed segments. Identical texts are byte-identical content,
+        # so which occurrence a donor drawer covers is immaterial.
+        by_text: Dict[str, List[Dict[str, str]]] = {}
+        for seg in text_pass:
+            by_text.setdefault(_compose_exchange_text(seg["user"], seg["assistant"]), []).append(
+                seg
+            )
+        for text, group in by_text.items():
+            available = min(len(group), text_totals.get(text, 0))
+            covered = 0
+            while covered < available:
+                donor_fp = next(
+                    (f for (f, t), c in pair_counts.items() if t == text and c > 0),
+                    None,
+                )
+                if donor_fp is None:
+                    break  # invariant breach — fall through to filing (loss-safe)
                 consume((donor_fp, text))
-                continue
+                covered += 1
+            to_file.extend(group[covered:])
+
+        for seg in to_file:
             self._file_turn(
                 {
                     "user": seg["user"],
                     "assistant": seg["assistant"],
                     "session_id": session_id,
-                    "turn_fp": fp,
+                    "turn_fp": seg["turn_fp"],
                 }
             )
 
@@ -1621,7 +1703,9 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
                 elif task == "mem_write":
                     self._mirror_mem_write(payload)
             except Exception as exc:
-                logger.debug("MemPalace worker task %s error: %s", task, exc)
+                # warning, not debug — an aborted worker task can mean lost
+                # turns, the one failure class this provider must not bury.
+                logger.warning("MemPalace worker task %s error: %s", task, exc)
             finally:
                 try:
                     self._worker_queue.task_done()
