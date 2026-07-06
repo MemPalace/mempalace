@@ -11,6 +11,7 @@ Tools (read):
   mempalace_get_taxonomy    — full wing → room → count tree
   mempalace_search          — semantic search, optional wing/room/source_file filter
   mempalace_check_duplicate — check if content already exists before filing
+  mempalace_find_duplicates — find read-only near-duplicate drawer clusters
 
 Tools (write):
   mempalace_add_drawer      — file verbatim content into a wing/room
@@ -86,6 +87,7 @@ from .searcher import (  # noqa: E402
     _metric_for_collection,
     search_memories,
 )
+from .dedup import DEFAULT_THRESHOLD as DEDUP_DEFAULT_THRESHOLD, find_duplicate_clusters  # noqa: E402
 from .palace_graph import (  # noqa: E402
     traverse,
     find_tunnels,
@@ -2591,6 +2593,60 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
     except Exception:
         logger.exception("check_duplicate failed")
         return {"error": "Duplicate check failed"}
+
+
+def tool_find_duplicates(
+    wing: str = None,
+    room: str = None,
+    threshold: float = DEDUP_DEFAULT_THRESHOLD,
+    max_clusters: int = None,
+):
+    try:
+        wing = _sanitize_optional_name(wing, "wing")
+        room = _sanitize_optional_name(room, "room")
+        threshold = float(threshold)
+        if threshold < 0 or threshold > 2:
+            return {"error": "threshold must be between 0 and 2"}
+        if max_clusters is not None:
+            max_clusters = int(max_clusters)
+            if max_clusters < 1:
+                return {"error": "max_clusters must be at least 1"}
+    except (TypeError, ValueError) as e:
+        return {"error": str(e)}
+
+    _refresh_vector_disabled_flag()
+    if _vector_disabled:
+        return {
+            "clusters": [],
+            "params": {
+                "wing": wing,
+                "room": room,
+                "threshold": threshold,
+                "max_clusters": max_clusters,
+            },
+            "vector_disabled": True,
+            "vector_disabled_reason": _vector_disabled_reason,
+            "hint": (
+                "duplicate cluster detection requires vector search; "
+                "run `mempalace repair` to restore"
+            ),
+        }
+
+    col = _get_collection()
+    if not col:
+        return _collection_error_or_no_palace()
+
+    try:
+        return find_duplicate_clusters(
+            col,
+            wing=wing,
+            room=room,
+            threshold=threshold,
+            max_clusters=max_clusters,
+        )
+    except Exception:
+        logger.exception("find_duplicates failed")
+        return {"error": "Duplicate cluster detection failed"}
 
 
 def tool_get_aaak_spec():
@@ -5279,6 +5335,26 @@ TOOLS = {
             "required": ["content"],
         },
         "handler": tool_check_duplicate,
+    },
+    "mempalace_find_duplicates": {
+        "description": "Read-only duplicate audit. Returns connected clusters of near-duplicate logical drawers with pairwise cosine distances; never returns raw vectors or content.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "wing": {"type": "string", "description": "Filter by wing (optional)"},
+                "room": {"type": "string", "description": "Filter by room (optional)"},
+                "threshold": {
+                    "type": "number",
+                    "description": "Cosine distance threshold (default 0.15). Lower is stricter.",
+                },
+                "max_clusters": {
+                    "type": "integer",
+                    "description": "Maximum number of duplicate clusters to return (optional)",
+                    "minimum": 1,
+                },
+            },
+        },
+        "handler": tool_find_duplicates,
     },
     "mempalace_add_drawer": {
         "description": "File verbatim content into the palace. Checks for duplicates first.",
