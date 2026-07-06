@@ -72,6 +72,7 @@ import os
 import queue
 import re
 import threading
+import time
 from collections import Counter, deque
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -723,6 +724,11 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
     # the agent thread beats permanently dropping unchecked turns. Mid-
     # conversation hooks (sync_turn, on_pre_compress) stay non-blocking.
     SESSION_END_ENQUEUE_TIMEOUT = 5.0
+    # Transient "database is locked" retries for palace writes. Chroma's
+    # sqlite locks briefly under concurrent readers (notably on Windows);
+    # a dropped turn over a momentary lock breaks the verbatim promise.
+    FILE_TURN_LOCK_RETRIES = 3
+    FILE_TURN_LOCK_BACKOFF = 0.25  # seconds; doubled per attempt
     # Cap for status-style metadata scans. On large palaces (200k+ drawers)
     # an unbounded ``col.get(include=["metadatas"])`` would materialize every
     # row into Python memory just to compute counts — multi-second hangs and
@@ -1014,13 +1020,24 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
                 "MemPalace queue full at session_end — %d messages not checked for gaps",
                 len(messages or []),
             )
-        # Regenerate the AAAK wake-up cache for the next session.
+        # Regenerate the AAAK wake-up cache for the next session — routed
+        # through the worker AFTER the safety-net task so this ChromaDB
+        # reader never races the safety net's writes. Chroma's sqlite locks
+        # under concurrent access (notably on Windows), and a locked write
+        # drops a turn. Clear the done-flag before enqueueing so readers that
+        # wait on it observe "refresh pending" for the whole queued interval,
+        # not just while the refresh itself runs.
         self._wake_up_done.clear()
-        threading.Thread(
-            target=self._refresh_wake_up_cache,
-            daemon=True,
-            name="mempalace-wakeup",
-        ).start()
+        try:
+            self._worker_queue.put_nowait(("wakeup", {}))
+        except queue.Full:
+            # Best-effort fallback: refresh concurrently rather than not at
+            # all; the _file_turn lock retries absorb the reader race.
+            threading.Thread(
+                target=self._refresh_wake_up_cache,
+                daemon=True,
+                name="mempalace-wakeup",
+            ).start()
 
     def on_session_switch(
         self,
@@ -1439,6 +1456,11 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         # Classify outside the lock — pure CPU / config, no Chroma access.
         text = _compose_exchange_text(user_msg, assistant_msg)
         wing = self._classify_wing(text)
+        # Always file under a stable room name ("conversations"). Using
+        # session_id here would mint one room per session — pollutes
+        # ``mempalace_list_rooms`` and splits live writes from backfill
+        # drawers (which also write to "conversations"). The session id
+        # stays available on the dedicated metadata field below.
         session_id = payload.get("session_id") or ""
         extra: Dict[str, Any] = {"source": "hermes"}
         if session_id:
@@ -1446,31 +1468,40 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         turn_fp = payload.get("turn_fp") or ""
         if turn_fp:
             extra["turn_fp"] = turn_fp
-        # Hold the collection lock across the whole upsert so wake-up L1
-        # scans (same client) never interleave with writes mid-compactor.
-        try:
-            with self._collection_lock:
-                col = self._collection
-                if col is None:
-                    return
-                # Always file under a stable room name ("conversations"). Using
-                # session_id here would mint one room per session — pollutes
-                # ``mempalace_list_rooms`` and splits live writes from backfill
-                # drawers (which also write to "conversations"). The session id
-                # stays available on the dedicated metadata field below.
-                file_conversation_exchange(
-                    col,
-                    wing=wing,
-                    room="conversations",
-                    text=text,
-                    source_file=f"hermes-session:{session_id or 'unknown'}",
-                    agent="hermes",
-                    extra_metadata=extra,
-                )
-        except Exception as exc:
-            # warning, not debug — a failed palace write is a broken verbatim
-            # promise, never log noise.
-            logger.warning("MemPalace _file_turn error — turn not persisted: %s", exc)
+        # Each attempt holds the collection lock across the whole upsert so
+        # wake-up L1 scans (same client) never interleave with a write
+        # mid-compactor. The backoff sleep stays OUTSIDE the lock — the lock
+        # only serializes in-process access, and holding it while waiting out
+        # a cross-process sqlite lock would stall readers for no benefit.
+        for attempt in range(self.FILE_TURN_LOCK_RETRIES + 1):
+            try:
+                with self._collection_lock:
+                    col = self._collection
+                    if col is None:
+                        return
+                    file_conversation_exchange(
+                        col,
+                        wing=wing,
+                        room="conversations",
+                        text=text,
+                        source_file=f"hermes-session:{session_id or 'unknown'}",
+                        agent="hermes",
+                        extra_metadata=extra,
+                    )
+                return
+            except Exception as exc:
+                # Chroma's sqlite briefly locks under concurrent readers
+                # (notably on Windows). Losing a turn over a transient lock
+                # breaks the verbatim promise — retry with backoff before
+                # giving up.
+                transient = "database is locked" in str(exc).lower()
+                if transient and attempt < self.FILE_TURN_LOCK_RETRIES:
+                    time.sleep(self.FILE_TURN_LOCK_BACKOFF * (2**attempt))
+                    continue
+                # warning, not debug — a failed palace write is a broken
+                # verbatim promise, never log noise.
+                logger.warning("MemPalace _file_turn error — turn not persisted: %s", exc)
+                return
 
     def _scan_filed(self, col: Any, source_files: List[str]) -> Counter:
         """Multiset of (turn_fp, document text) pairs already filed.
@@ -1553,18 +1584,23 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             return
         pair_counts: Counter = Counter()
         if session_id:
-            with self._collection_lock:
-                col = self._collection
-            if col is not None:
-                sources = [f"hermes-session:{sid}" for sid in [session_id, *lineage]]
-                try:
-                    pair_counts = self._scan_filed(col, sources)
-                except Exception as exc:
-                    logger.warning(
-                        "MemPalace dedup scan failed — filing without dedup "
-                        "(duplicates possible, nothing lost): %s",
-                        exc,
-                    )
+            # Hold the collection lock across the whole scan — it reads the
+            # same long-lived Chroma client that _file_turn writes through and
+            # the wake-up L1 refresh scans, and every access to that client is
+            # serialized on this lock. Released before the filing loop below;
+            # _file_turn re-takes it per attempt (the lock is not reentrant).
+            sources = [f"hermes-session:{sid}" for sid in [session_id, *lineage]]
+            try:
+                with self._collection_lock:
+                    col = self._collection
+                    if col is not None:
+                        pair_counts = self._scan_filed(col, sources)
+            except Exception as exc:
+                logger.warning(
+                    "MemPalace dedup scan failed — filing without dedup "
+                    "(duplicates possible, nothing lost): %s",
+                    exc,
+                )
         fp_totals: Counter = Counter()
         text_totals: Counter = Counter()
         for (pair_fp, pair_text), count in pair_counts.items():
@@ -1710,6 +1746,10 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
                     # Safety nets share one path: scan what sync_turn already
                     # filed, capture only what's missing.
                     self._file_missing_exchanges(payload)
+                elif task == "wakeup":
+                    # Sequenced behind session_end so this reader never
+                    # races the safety net's writes.
+                    self._refresh_wake_up_cache()
                 elif task == "mem_write":
                     self._mirror_mem_write(payload)
             except Exception as exc:
