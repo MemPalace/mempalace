@@ -1099,6 +1099,13 @@ def test_session_switch_reset_clears_lineage(provider):
     assert provider._session_lineage == []
 
 
+def test_session_switch_branch_without_parent_clears_lineage(provider):
+    provider._session_id = "parent-1"
+    provider._session_lineage = ["grandparent-0"]
+    provider.on_session_switch("branch-x", parent_session_id="", reset=False, reason="branch")
+    assert provider._session_lineage == []
+
+
 def test_session_switch_rewind_keeps_lineage(provider):
     # Rewind stays within the same conversation — ancestry still applies.
     provider._session_id = "branch-1"
@@ -1121,7 +1128,8 @@ def test_fingerprint_call_sites_are_consistent(integration_module):
         {"role": "user", "content": [{"type": "tool_result", "content": "out"}]},
     ]
     direct = fn_fp(msgs)
-    from_seg = next(s["turn_fp"] for s in reversed(fn_seg(msgs)) if s["turn_fp"])
+    from_seg = next((s["turn_fp"] for s in reversed(fn_seg(msgs)) if s["turn_fp"]), None)
+    assert from_seg is not None
     assert direct != ""
     assert direct == from_seg
 
@@ -1281,4 +1289,57 @@ def test_pre_compress_skips_covered_turns_files_missing(initialized_provider):
     hint = initialized_provider.on_pre_compress(window)
     initialized_provider._worker_queue.join()
     assert "mempalace_search" in hint
+    assert initialized_provider._collection.count() == pre + 1
+
+
+def test_one_drawer_protects_exactly_one_of_two_same_fp_occurrences(initialized_provider):
+    # Turn synced once (drawer: fp F, CLEAN text). The window holds two
+    # occurrences of that turn: tool-shaped (fp F, raw text) and a plain
+    # repeat whose raw composition equals the drawer's clean text (fp F).
+    # One physical drawer must protect exactly one of them.
+    tool_turn = [
+        {"role": "user", "content": "same question"},
+        {"role": "assistant", "content": [{"type": "tool_use", "name": "grep"}]},
+        {"role": "assistant", "content": "same answer"},
+    ]
+    initialized_provider.sync_turn("same question", "same answer", messages=tool_turn)
+    initialized_provider._worker_queue.join()
+    pre = initialized_provider._collection.count()
+
+    window = tool_turn + [
+        {"role": "user", "content": "same question"},
+        {"role": "assistant", "content": "same answer"},
+    ]
+    initialized_provider.on_session_end(window)
+    initialized_provider._worker_queue.join()
+    assert initialized_provider._collection.count() == pre + 1
+
+
+def test_text_fallback_consumes_the_drawer_fingerprint_too(initialized_provider):
+    # Drawer filed with fp F_injected (sync_turn saw an injected snapshot)
+    # and clean text T. Window: a plain segment composing exactly T (fp
+    # F_plain) followed by the tool-shaped segment carrying F_injected.
+    # The text-fallback consumes the drawer for the first segment; the
+    # second must then be FILED, not skipped on the drawer's orphaned fp.
+    injected_turn = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "q2"},
+                {"type": "text", "text": "[injected skill]"},
+            ],
+        },
+        {"role": "assistant", "content": [{"type": "tool_use", "name": "grep"}]},
+        {"role": "assistant", "content": "a2"},
+    ]
+    initialized_provider.sync_turn("q2", "a2", messages=injected_turn)
+    initialized_provider._worker_queue.join()
+    pre = initialized_provider._collection.count()
+
+    window = [
+        {"role": "user", "content": "q2"},
+        {"role": "assistant", "content": "a2"},
+    ] + injected_turn
+    initialized_provider.on_session_end(window)
+    initialized_provider._worker_queue.join()
     assert initialized_provider._collection.count() == pre + 1

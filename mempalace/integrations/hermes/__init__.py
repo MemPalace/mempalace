@@ -744,7 +744,11 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         self._hermes_home: str = ""
         self._turn_count = 0
         # Ancestor session ids whose drawers cover this conversation's
-        # inherited transcript (grows only on /branch; see on_session_switch).
+        # inherited transcript (grows only on /branch; unbounded — one entry
+        # per ancestor). Worker code must NEVER read this directly: it is
+        # mutated by on_session_switch while the queue drains, and a stale
+        # populated read would false-dedup (data loss). Snapshot it into the
+        # task payload at enqueue time (see on_session_end / on_pre_compress).
         self._session_lineage: List[str] = []
 
         # ChromaDB access through mempalace's own backend (matches embedding
@@ -1023,6 +1027,11 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
     ) -> None:
         # Repoint subsequent writes at the new session. /reset and /new flush
         # per-session counters; /resume and /branch keep them.
+        # "branch" / "resume" are Hermes-protocol reason strings (see the
+        # on_session_switch call sites in hermes-agent's cli.py). If Hermes
+        # renames them, the branch arm silently falls to the else (clears →
+        # re-files, duplication-safe but noisy) — a rename upstream must
+        # update this match.
         reason = str(kwargs.get("reason", "") or "")
         if reset:
             # Fresh conversation — no inherited transcript.
@@ -1039,6 +1048,8 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             # being LEFT, not transcript ancestry. Stale lineage in the scan
             # would false-dedup against unrelated drawers — clear it. Failure
             # direction on a lost real ancestry is duplication, never loss.
+            # A "branch" with an empty parent_session_id also lands here —
+            # with no ancestor to record, clearing is the loss-safe default.
             self._session_lineage = []
         self._session_id = new_session_id or ""
         if reset:
@@ -1453,15 +1464,17 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         except Exception as exc:
             logger.debug("MemPalace _file_turn error: %s", exc)
 
-    def _scan_filed(self, col: Any, source_files: List[str]) -> tuple[Counter, Counter]:
-        """Multisets of (turn fingerprints, exact document texts) already filed.
+    def _scan_filed(self, col: Any, source_files: List[str]) -> Counter:
+        """Multiset of (turn_fp, document text) pairs already filed.
 
-        Paginated per source_file — sessions are bounded (hundreds of
-        turns), and the FIFO worker guarantees every earlier file_turn
-        upsert has landed before this runs, so the scan is authoritative.
+        One counter entry per PHYSICAL drawer — dedup consumes a whole
+        drawer atomically, never its fingerprint and text separately
+        (independent counters let one drawer protect two segments, which
+        under-files and loses a turn). Paginated per source_file; the FIFO
+        worker guarantees every earlier file_turn upsert has landed before
+        this runs, so the scan is authoritative.
         """
-        fp_counts: Counter = Counter()
-        text_counts: Counter = Counter()
+        pair_counts: Counter = Counter()
         for source_file in source_files:
             offset = 0
             while True:
@@ -1475,15 +1488,12 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
                 documents = batch.get("documents") or []
                 metadatas = batch.get("metadatas") or []
                 for doc, meta in zip(documents, metadatas):
-                    fp = (meta or {}).get("turn_fp") or ""
-                    if fp:
-                        fp_counts[fp] += 1
                     if doc:
-                        text_counts[doc] += 1
+                        pair_counts[((meta or {}).get("turn_fp") or "", doc)] += 1
                 if not batch_ids:
                     break
                 offset += len(batch_ids)
-        return fp_counts, text_counts
+        return pair_counts
 
     def _file_missing_exchanges(self, payload: Dict[str, Any]) -> None:
         """Safety net for session_end / pre_compress: file only uncovered turns.
@@ -1494,6 +1504,9 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         clean pair with the raw turn despite representation differences)
         or by exact text (catches a re-fired session_end and
         pre_compress/session_end overlap, which compose identically).
+        Every skip consumes exactly one physical drawer atomically across
+        both indexes (the pair multiset), so one drawer can never protect
+        two segments.
 
         Loss-safe by construction: empty session_id or a failed scan means
         NO dedup (blind-file). The failure direction is always a duplicate
@@ -1505,33 +1518,52 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         segments = _segment_turns(messages)
         if not segments:
             return
-        fp_counts: Counter = Counter()
-        text_counts: Counter = Counter()
+        pair_counts: Counter = Counter()
         if session_id:
             with self._collection_lock:
                 col = self._collection
             if col is not None:
                 sources = [f"hermes-session:{sid}" for sid in [session_id, *lineage]]
                 try:
-                    fp_counts, text_counts = self._scan_filed(col, sources)
+                    pair_counts = self._scan_filed(col, sources)
                 except Exception as exc:
                     logger.warning(
                         "MemPalace dedup scan failed — filing without dedup "
                         "(duplicates possible, nothing lost): %s",
                         exc,
                     )
+        fp_totals: Counter = Counter()
+        text_totals: Counter = Counter()
+        for (pair_fp, pair_text), count in pair_counts.items():
+            if pair_fp:
+                fp_totals[pair_fp] += count
+            text_totals[pair_text] += count
+
+        def consume(pair: tuple) -> None:
+            # One physical drawer leaves ALL indexes at once — the invariant
+            # that makes over-skipping (data loss) impossible: skips map 1:1
+            # onto distinct filed drawers.
+            pair_counts[pair] -= 1
+            if pair[0]:
+                fp_totals[pair[0]] -= 1
+            text_totals[pair[1]] -= 1
+
         for seg in segments:
             fp = seg["turn_fp"]
             text = _compose_exchange_text(seg["user"], seg["assistant"])
-            if fp and fp_counts.get(fp, 0) > 0:
-                fp_counts[fp] -= 1
-                # Exhaust the matching text slot so the same physical drawer
-                # cannot also protect a second segment via the text fallback.
-                if text_counts.get(text, 0) > 0:
-                    text_counts[text] -= 1
+            # Exact drawer first, then any drawer covering this turn (same
+            # fingerprint), then any drawer with identical text (re-fired
+            # session_end / pre_compress overlap compose byte-identically).
+            if pair_counts.get((fp, text), 0) > 0:
+                consume((fp, text))
                 continue
-            if text_counts.get(text, 0) > 0:
-                text_counts[text] -= 1
+            if fp and fp_totals.get(fp, 0) > 0:
+                donor_text = next(t for (f, t), c in pair_counts.items() if f == fp and c > 0)
+                consume((fp, donor_text))
+                continue
+            if text_totals.get(text, 0) > 0:
+                donor_fp = next(f for (f, t), c in pair_counts.items() if t == text and c > 0)
+                consume((donor_fp, text))
                 continue
             self._file_turn(
                 {
