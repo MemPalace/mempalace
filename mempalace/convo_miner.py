@@ -486,6 +486,38 @@ def _extract_authored_at(filepath):
     return latest
 
 
+def _flag_possible_duplicates(collection, batch_docs: list, batch_metas: list) -> None:
+    """Flag chunks whose closest existing match is a probable duplicate.
+
+    Opt-in (MempalaceConfig.duplicate_detection_enabled, off by default):
+    adds a batched cosine-similarity query per upsert batch on top of the
+    embedding mining already computes -- a real per-batch cost. Off by
+    default so this changes nothing unless explicitly enabled.
+
+    Never skips or alters an insert -- only attaches
+    possible_duplicate_of / duplicate_similarity metadata to batch_metas
+    in place when a match's similarity is >= the configured threshold.
+    Nothing is ever silently dropped based on a similarity match; the
+    flag is there for later search-time downranking or manual review.
+    """
+    from .config import MempalaceConfig
+
+    cfg = MempalaceConfig()
+    if not cfg.duplicate_detection_enabled:
+        return
+
+    from .searcher import find_near_duplicates
+
+    matches = find_near_duplicates(
+        collection, batch_docs, threshold=cfg.duplicate_detection_threshold
+    )
+    for meta, match in zip(batch_metas, matches):
+        if match is not None:
+            drawer_id, similarity = match
+            meta["possible_duplicate_of"] = drawer_id
+            meta["duplicate_similarity"] = similarity
+
+
 def _file_chunks_locked(
     collection, source_file, chunks, wing, room, agent, extract_mode, authored_at=None
 ):
@@ -562,6 +594,7 @@ def _file_chunks_locked(
                     meta["source_mtime"] = source_mtime
                 batch_metas.append(meta)
             assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
+            _flag_possible_duplicates(collection, batch_docs, batch_metas)
             try:
                 collection.upsert(
                     documents=batch_docs,

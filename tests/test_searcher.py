@@ -15,6 +15,7 @@ from mempalace.backends import BackendMismatchError
 from mempalace.searcher import (
     SearchError,
     build_where_filter,
+    find_near_duplicates,
     get_collection,
     search,
     search_memories,
@@ -642,3 +643,68 @@ class TestSearchCLI:
 
         mock_probe.assert_not_called()
         mock_open.assert_called_once_with(fake_palace_path, opener=get_collection)
+
+# ── find_near_duplicates ─────────────────────────────────────────────
+
+
+class TestFindNearDuplicates:
+    """Bulk-mining duplicate-detection hook: one batched query for the
+    whole chunk list, never raises, flags rather than gates (callers
+    decide what to do with a match -- this function only reports it)."""
+
+    def test_empty_contents_returns_empty_no_query(self):
+        mock_col = MagicMock()
+        assert find_near_duplicates(mock_col, []) == []
+        mock_col.query.assert_not_called()
+
+    def test_one_batched_query_not_one_per_item(self):
+        mock_col = MagicMock()
+        mock_col.metadata = {"hnsw:space": "cosine"}
+        mock_col.query.return_value = {
+            "ids": [["d1"], ["d2"], ["d3"]],
+            "distances": [[0.5], [0.5], [0.5]],
+        }
+        find_near_duplicates(mock_col, ["a", "b", "c"], threshold=0.9)
+        assert mock_col.query.call_count == 1
+        assert mock_col.query.call_args.kwargs["query_texts"] == ["a", "b", "c"]
+
+    def test_match_at_or_above_threshold_returned(self):
+        mock_col = MagicMock()
+        mock_col.metadata = {"hnsw:space": "cosine"}
+        # cosine distance 0.05 -> similarity 0.95
+        mock_col.query.return_value = {"ids": [["drawer_existing_1"]], "distances": [[0.05]]}
+        result = find_near_duplicates(mock_col, ["near-duplicate text"], threshold=0.9)
+        assert result == [("drawer_existing_1", 0.95)]
+
+    def test_match_below_threshold_returns_none(self):
+        mock_col = MagicMock()
+        mock_col.metadata = {"hnsw:space": "cosine"}
+        # cosine distance 0.5 -> similarity 0.5, below threshold
+        mock_col.query.return_value = {"ids": [["drawer_x"]], "distances": [[0.5]]}
+        result = find_near_duplicates(mock_col, ["unrelated text"], threshold=0.9)
+        assert result == [None]
+
+    def test_no_existing_drawers_returns_none(self):
+        mock_col = MagicMock()
+        mock_col.metadata = {"hnsw:space": "cosine"}
+        mock_col.query.return_value = {"ids": [[]], "distances": [[]]}
+        result = find_near_duplicates(mock_col, ["first ever content"], threshold=0.9)
+        assert result == [None]
+
+    def test_mixed_batch_positional_correspondence(self):
+        mock_col = MagicMock()
+        mock_col.metadata = {"hnsw:space": "cosine"}
+        mock_col.query.return_value = {
+            "ids": [["dup_of_a"], [], ["dup_of_c"]],
+            "distances": [[0.02], [0.5], [0.01]],
+        }
+        result = find_near_duplicates(mock_col, ["a", "b", "c"], threshold=0.9)
+        assert result[0] == ("dup_of_a", 0.98)
+        assert result[1] is None
+        assert result[2] == ("dup_of_c", 0.99)
+
+    def test_query_failure_fails_open_returns_all_none(self):
+        mock_col = MagicMock()
+        mock_col.query.side_effect = RuntimeError("vector search unavailable")
+        result = find_near_duplicates(mock_col, ["a", "b"], threshold=0.9)
+        assert result == [None, None]

@@ -571,6 +571,41 @@ class MempalaceConfig:
         """Mapping of hall names to keyword lists."""
         return self._file_config.get("hall_keywords", DEFAULT_HALL_KEYWORDS)
 
+    @property
+    def duplicate_detection_enabled(self) -> bool:
+        """Whether bulk mining runs a cosine-similarity check against
+        existing drawers before inserting each chunk, flagging near-matches
+        with ``possible_duplicate_of``/``duplicate_similarity`` metadata
+        rather than skipping them (nothing is ever silently dropped).
+
+        Off by default: adds a similarity-search query per chunk on top of
+        the embedding mining already computes, a real per-chunk cost for
+        large corpora. Env var ``MEMPALACE_DUPLICATE_DETECTION`` takes
+        precedence over config.json's ``duplicate_detection.enabled``.
+        """
+        env_val = os.environ.get("MEMPALACE_DUPLICATE_DETECTION", "").strip()
+        if env_val:
+            return env_val.lower() in ("true", "1", "yes", "on")
+        value = self._file_config.get("duplicate_detection", {}).get("enabled", False)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.lower() in ("true", "1", "yes", "on")
+        return bool(value)
+
+    @property
+    def duplicate_detection_threshold(self) -> float:
+        """Cosine similarity (0-1) at or above which a chunk is flagged as
+        a possible duplicate of an existing drawer. Same default as the
+        MCP ``mempalace_check_duplicate`` tool for consistency.
+        """
+        try:
+            value = self._file_config.get("duplicate_detection", {}).get("threshold", 0.9)
+            value = float(value)
+        except (TypeError, ValueError):
+            return 0.9
+        return value if 0.0 <= value <= 1.0 else 0.9
+
     @staticmethod
     def _try_coerce_int(value, minimum=None):
         """Coerce a raw config value to int, or ``None`` if it cannot be a

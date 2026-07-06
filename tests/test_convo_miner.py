@@ -3,11 +3,13 @@ import tempfile
 import shutil
 import time
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import chromadb
 import pytest
 
 from mempalace.convo_miner import (
+    _flag_possible_duplicates,
     _is_ai_tool_path,
     _register_file,
     _resolve_wing,
@@ -696,3 +698,66 @@ def test_register_file_sentinel_includes_source_mtime():
         assert abs(mined[str(tiny_file)] - os.path.getmtime(tiny_file)) < 0.001
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ── bulk-mining duplicate detection (opt-in, off by default) ───────────
+#
+# On a match, the new chunk is flagged (possible_duplicate_of /
+# duplicate_similarity metadata) and still stored -- never skipped, per
+# the "verbatim is sacred" policy this codebase already applies elsewhere.
+# find_near_duplicates itself is unit-tested in test_searcher.py; these
+# tests cover the config gate and the metadata-attachment contract.
+
+
+class TestFlagPossibleDuplicates:
+    def test_noop_when_disabled_by_default(self, monkeypatch):
+        monkeypatch.delenv("MEMPALACE_DUPLICATE_DETECTION", raising=False)
+        mock_col = MagicMock()
+        batch_docs = ["some content"]
+        batch_metas = [{"source_file": "a.txt"}]
+        with patch("mempalace.searcher.find_near_duplicates") as mock_find:
+            _flag_possible_duplicates(mock_col, batch_docs, batch_metas)
+        mock_find.assert_not_called()
+        assert "possible_duplicate_of" not in batch_metas[0]
+
+    def test_attaches_metadata_when_enabled_and_match_found(self, monkeypatch):
+        monkeypatch.setenv("MEMPALACE_DUPLICATE_DETECTION", "true")
+        mock_col = MagicMock()
+        batch_docs = ["near-duplicate content"]
+        batch_metas = [{"source_file": "a.txt"}]
+        with patch(
+            "mempalace.searcher.find_near_duplicates",
+            return_value=[("drawer_existing_1", 0.94)],
+        ) as mock_find:
+            _flag_possible_duplicates(mock_col, batch_docs, batch_metas)
+        mock_find.assert_called_once()
+        assert batch_metas[0]["possible_duplicate_of"] == "drawer_existing_1"
+        assert batch_metas[0]["duplicate_similarity"] == 0.94
+
+    def test_no_metadata_added_when_enabled_but_no_match(self, monkeypatch):
+        monkeypatch.setenv("MEMPALACE_DUPLICATE_DETECTION", "true")
+        mock_col = MagicMock()
+        batch_docs = ["genuinely new content"]
+        batch_metas = [{"source_file": "a.txt"}]
+        with patch("mempalace.searcher.find_near_duplicates", return_value=[None]):
+            _flag_possible_duplicates(mock_col, batch_docs, batch_metas)
+        assert "possible_duplicate_of" not in batch_metas[0]
+
+    def test_never_skips_the_insert_even_when_flagged(self, monkeypatch):
+        """The flag is metadata-only -- batch_docs/batch_ids (what actually
+        gets upserted) must be untouched; content is never dropped based
+        on a similarity match."""
+        monkeypatch.setenv("MEMPALACE_DUPLICATE_DETECTION", "true")
+        mock_col = MagicMock()
+        batch_docs = ["a", "b", "c"]
+        batch_metas = [{"i": 0}, {"i": 1}, {"i": 2}]
+        with patch(
+            "mempalace.searcher.find_near_duplicates",
+            return_value=[("d1", 0.99), ("d2", 0.95), None],
+        ):
+            _flag_possible_duplicates(mock_col, batch_docs, batch_metas)
+        assert batch_docs == ["a", "b", "c"]  # untouched
+        assert len(batch_metas) == 3  # nothing removed
+        assert batch_metas[0]["possible_duplicate_of"] == "d1"
+        assert batch_metas[1]["possible_duplicate_of"] == "d2"
+        assert "possible_duplicate_of" not in batch_metas[2]

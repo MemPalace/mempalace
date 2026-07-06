@@ -181,6 +181,49 @@ def _metric_for_collection(col) -> str:
     return metric if metric in ("cosine", "l2", "ip") else "cosine"
 
 
+def find_near_duplicates(collection, contents: list, threshold: float = 0.9) -> list:
+    """For each string in ``contents``, find the single closest existing
+    match in ``collection`` and return ``(drawer_id, similarity)`` when
+    that match's similarity is ``>= threshold``, else ``None`` at that
+    position. Returns a list the same length as ``contents``, in order.
+
+    One batched query for the whole list rather than one query per item:
+    ChromaDB's ``query_texts`` accepts a list and returns per-query nearest
+    neighbors in a single round trip, so the added cost is one embed+HNSW
+    search per BATCH, not per chunk.
+
+    Never raises: any backend/vector-search failure (including "vector
+    search disabled/unavailable") yields ``None`` for every item. A
+    duplicate-check failure must never block mining -- callers that flag
+    matches with metadata rather than skipping inserts (the recommended
+    usage) lose nothing but the flag on a check failure.
+    """
+    if not contents:
+        return []
+    try:
+        results = collection.query(
+            query_texts=contents,
+            n_results=1,
+            include=["distances"],
+        )
+    except Exception:
+        return [None] * len(contents)
+
+    metric = _metric_for_collection(collection)
+    ids_lists = results.get("ids") or []
+    distances_lists = results.get("distances") or []
+    out = []
+    for i in range(len(contents)):
+        item_ids = ids_lists[i] if i < len(ids_lists) else []
+        item_distances = distances_lists[i] if i < len(distances_lists) else []
+        if not item_ids or not item_distances:
+            out.append(None)
+            continue
+        similarity = round(_distance_to_similarity(item_distances[0], metric), 3)
+        out.append((item_ids[0], similarity) if similarity >= threshold else None)
+    return out
+
+
 def _hybrid_rank(
     results: list,
     query: str,
