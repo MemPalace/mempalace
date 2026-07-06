@@ -284,27 +284,27 @@ def test_on_turn_start_tracks_turn_number(provider):
 
 
 # ---------------------------------------------------------------------------
-# on_session_end / on_pre_compress: sync_turn is the sole filing path — these
-# hooks must neither enqueue filing work nor promise persistence. Re-filing
-# the raw message list mints duplicate drawers (filed_at is hashed into the
-# drawer id, so upserts cannot collapse the copies).
+# on_session_end / on_pre_compress: sync_turn is the PRIMARY filing path —
+# these hooks enqueue a scan-based safety net that files only turns
+# sync_turn missed. Dedup correctness lives in _file_missing_exchanges.
 # ---------------------------------------------------------------------------
 
 
-def test_on_pre_compress_returns_no_hint_and_files_nothing(provider):
+def test_on_pre_compress_returns_hint_and_enqueues_safety_net(provider):
     provider._cron_skipped = False
     provider._initialized = True
     pre = provider._worker_queue.qsize()
-    assert provider.on_pre_compress([{"role": "user", "content": "hi"}]) == ""
-    assert provider._worker_queue.qsize() == pre
+    hint = provider.on_pre_compress([{"role": "user", "content": "hi"}])
+    assert "mempalace_search" in hint
+    assert provider._worker_queue.qsize() == pre + 1
 
 
-def test_on_session_end_files_nothing_when_initialized(provider):
+def test_on_session_end_enqueues_safety_net(provider):
     provider._cron_skipped = False
     provider._initialized = True
     pre = provider._worker_queue.qsize()
     provider.on_session_end([{"role": "user", "content": "hi"}])
-    assert provider._worker_queue.qsize() == pre
+    assert provider._worker_queue.qsize() == pre + 1
 
 
 def test_on_pre_compress_under_cron_returns_empty_string(provider, tmp_path):
@@ -1047,7 +1047,7 @@ def test_sync_turn_with_messages_stores_turn_fingerprint(initialized_provider):
 
     metas = initialized_provider._collection.get(include=["metadatas"]).get("metadatas") or []
     hermes = [m for m in metas if m.get("source") == "hermes"]
-    assert hermes
+    assert len(hermes) == 1, f"expected exactly 1 hermes drawer, got {len(hermes)}"
     assert hermes[0].get("turn_fp") == make_turn_fingerprint("what's the plan?")
 
 
@@ -1059,7 +1059,7 @@ def test_sync_turn_without_messages_stores_no_fingerprint(initialized_provider):
 
     metas = initialized_provider._collection.get(include=["metadatas"]).get("metadatas") or []
     hermes = [m for m in metas if m.get("source") == "hermes"]
-    assert hermes
+    assert len(hermes) == 1, f"expected exactly 1 hermes drawer, got {len(hermes)}"
     assert "turn_fp" not in hermes[0]
 
 
@@ -1124,3 +1124,161 @@ def test_fingerprint_call_sites_are_consistent(integration_module):
     from_seg = next(s["turn_fp"] for s in reversed(fn_seg(msgs)) if s["turn_fp"])
     assert direct != ""
     assert direct == from_seg
+
+
+# ---------------------------------------------------------------------------
+# Dedup safety net end-to-end: session_end / pre_compress file only what
+# sync_turn missed.
+# ---------------------------------------------------------------------------
+
+
+def test_session_end_does_not_refile_synced_turns(initialized_provider):
+    msgs = [
+        {"role": "user", "content": "what's the plan?"},
+        {"role": "assistant", "content": "ship the PR"},
+    ]
+    initialized_provider.sync_turn("what's the plan?", "ship the PR", messages=msgs)
+    initialized_provider._worker_queue.join()
+    pre = initialized_provider._collection.count()
+    assert pre >= 1
+
+    initialized_provider.on_session_end(msgs)
+    initialized_provider._worker_queue.join()
+    assert initialized_provider._collection.count() == pre
+
+
+def test_session_end_skips_tool_turns_covered_by_sync(initialized_provider):
+    # The representation-mismatch case: sync_turn files the CLEAN pair while
+    # the raw list carries injected user content + tool traffic. Exact-text
+    # matching can never catch this — the fingerprint must.
+    msgs = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "search for JWT handling"},
+                {"type": "text", "text": "[injected skill context]"},
+            ],
+        },
+        {"role": "assistant", "content": [{"type": "tool_use", "name": "grep"}]},
+        {"role": "user", "content": [{"type": "tool_result", "content": "auth.py:42"}]},
+        {"role": "assistant", "content": "JWT handling lives in auth.py."},
+    ]
+    initialized_provider.sync_turn(
+        "search for JWT handling", "JWT handling lives in auth.py.", messages=msgs
+    )
+    initialized_provider._worker_queue.join()
+    pre = initialized_provider._collection.count()
+    assert pre >= 1
+
+    initialized_provider.on_session_end(msgs)
+    initialized_provider._worker_queue.join()
+    assert initialized_provider._collection.count() == pre
+
+
+def test_session_end_files_turns_sync_never_saw(initialized_provider):
+    synced = [
+        {"role": "user", "content": "first question"},
+        {"role": "assistant", "content": "first answer"},
+    ]
+    initialized_provider.sync_turn("first question", "first answer", messages=synced)
+    initialized_provider._worker_queue.join()
+    pre = initialized_provider._collection.count()
+
+    full = synced + [
+        {"role": "user", "content": "second question"},
+        {"role": "assistant", "content": "second answer"},
+    ]
+    initialized_provider.on_session_end(full)
+    initialized_provider._worker_queue.join()
+    assert initialized_provider._collection.count() == pre + 1
+    docs = initialized_provider._collection.get(include=["documents"]).get("documents") or []
+    assert any("second question" in d for d in docs)
+
+
+def test_double_session_end_is_idempotent(initialized_provider):
+    # session_end fires more than once in Hermes (best-effort interrupt hook
+    # plus real shutdown). Drawers the first pass files carry turn_fp, so
+    # the second pass's scan sees them as covered.
+    msgs = [
+        {"role": "user", "content": "never synced question"},
+        {"role": "assistant", "content": "never synced answer"},
+    ]
+    initialized_provider.on_session_end(msgs)
+    initialized_provider._worker_queue.join()
+    once = initialized_provider._collection.count()
+    assert once >= 1
+
+    initialized_provider.on_session_end(msgs)
+    initialized_provider._worker_queue.join()
+    assert initialized_provider._collection.count() == once
+
+
+def test_repeated_identical_exchanges_use_multiset_counts(initialized_provider):
+    # Two identical turns, only one synced → session_end owes exactly one.
+    one_turn = [
+        {"role": "user", "content": "are we done?"},
+        {"role": "assistant", "content": "yes"},
+    ]
+    initialized_provider.sync_turn("are we done?", "yes", messages=one_turn)
+    initialized_provider._worker_queue.join()
+    pre = initialized_provider._collection.count()
+
+    initialized_provider.on_session_end(one_turn + one_turn)
+    initialized_provider._worker_queue.join()
+    assert initialized_provider._collection.count() == pre + 1
+
+
+def test_empty_session_id_blind_files(initialized_provider):
+    # Without a session id every anonymous session shares the
+    # hermes-session:unknown bucket — dedup there would false-match across
+    # sessions (data loss). Blind-filing (duplication) is the safe direction.
+    msgs = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "hi"},
+    ]
+    initialized_provider.sync_turn("hello", "hi", messages=msgs)
+    initialized_provider._worker_queue.join()
+    pre = initialized_provider._collection.count()
+
+    initialized_provider._session_id = ""
+    initialized_provider.on_session_end(msgs)
+    initialized_provider._worker_queue.join()
+    assert initialized_provider._collection.count() == pre + 1
+
+
+def test_branch_session_end_skips_parent_filed_turns(initialized_provider):
+    msgs = [
+        {"role": "user", "content": "parent question"},
+        {"role": "assistant", "content": "parent answer"},
+    ]
+    # Filed under the original session id ("test-session-1").
+    initialized_provider.sync_turn("parent question", "parent answer", messages=msgs)
+    initialized_provider._worker_queue.join()
+    pre = initialized_provider._collection.count()
+
+    # /branch mints a new id; the transcript carries forward.
+    initialized_provider.on_session_switch(
+        "branch-1", parent_session_id="test-session-1", reset=False, reason="branch"
+    )
+    initialized_provider.on_session_end(msgs)
+    initialized_provider._worker_queue.join()
+    assert initialized_provider._collection.count() == pre
+
+
+def test_pre_compress_skips_covered_turns_files_missing(initialized_provider):
+    synced = [
+        {"role": "user", "content": "covered question"},
+        {"role": "assistant", "content": "covered answer"},
+    ]
+    initialized_provider.sync_turn("covered question", "covered answer", messages=synced)
+    initialized_provider._worker_queue.join()
+    pre = initialized_provider._collection.count()
+
+    window = synced + [
+        {"role": "user", "content": "uncovered question"},
+        {"role": "assistant", "content": "uncovered answer"},
+    ]
+    hint = initialized_provider.on_pre_compress(window)
+    initialized_provider._worker_queue.join()
+    assert "mempalace_search" in hint
+    assert initialized_provider._collection.count() == pre + 1
