@@ -937,3 +937,93 @@ def test_on_memory_write_skips_unknown_target_and_non_add(initialized_provider):
     initialized_provider.on_memory_write("replace", "memory", "x")
     initialized_provider.on_memory_write("remove", "user", "x")
     assert initialized_provider._worker_queue.qsize() == pre
+
+
+# ---------------------------------------------------------------------------
+# Dedup safety net: real-user detection, turn segmentation, fingerprints.
+# ---------------------------------------------------------------------------
+
+
+def test_is_real_user_message_distinguishes_tool_results(integration_module):
+    fn = integration_module._is_real_user_message
+    assert fn({"role": "user", "content": "plain text"}) is True
+    assert fn({"role": "user", "content": [{"type": "text", "text": "hi"}]}) is True
+    # Anthropic-format tool results are user-role with only tool_result blocks.
+    assert fn({"role": "user", "content": [{"type": "tool_result", "content": "out"}]}) is False
+    assert fn({"role": "assistant", "content": "hi"}) is False
+    assert fn({"role": "user", "content": ""}) is False
+    # Mixed content (tool_result + text) counts as real.
+    assert (
+        fn(
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "content": "out"},
+                    {"type": "text", "text": "and another thing"},
+                ],
+            }
+        )
+        is True
+    )
+
+
+def test_turn_fingerprint_from_messages_uses_last_real_user(integration_module):
+    from mempalace.ids import make_turn_fingerprint
+
+    fn = integration_module._turn_fingerprint_from_messages
+    norm = integration_module._normalize_content
+    msgs = [
+        {"role": "user", "content": "first question"},
+        {"role": "assistant", "content": "answer"},
+        {"role": "user", "content": [{"type": "text", "text": "second question"}]},
+        {"role": "assistant", "content": [{"type": "tool_use", "name": "grep"}]},
+        # Trailing tool result must NOT be picked as the turn anchor.
+        {"role": "user", "content": [{"type": "tool_result", "content": "grep out"}]},
+    ]
+    expected = make_turn_fingerprint(norm([{"type": "text", "text": "second question"}]))
+    assert fn(msgs) == expected
+    assert fn([]) == ""
+    assert fn([{"role": "assistant", "content": "orphan"}]) == ""
+
+
+def test_segment_turns_folds_tool_traffic_into_turn(integration_module):
+    fn = integration_module._segment_turns
+    msgs = [
+        {"role": "user", "content": "search for JWT handling"},
+        {"role": "assistant", "content": [{"type": "tool_use", "name": "grep"}]},
+        {"role": "user", "content": [{"type": "tool_result", "content": "auth.py:42"}]},
+        {"role": "assistant", "content": "JWT handling lives in auth.py."},
+        {"role": "user", "content": "thanks"},
+        {"role": "assistant", "content": "any time"},
+    ]
+    segs = fn(msgs)
+    assert len(segs) == 2
+    assert segs[0]["user"] == "search for JWT handling"
+    # Tool traffic and the final response all belong to the first turn.
+    assert "[tool_use: grep]" in segs[0]["assistant"]
+    assert "auth.py:42" in segs[0]["assistant"]
+    assert "JWT handling lives in auth.py." in segs[0]["assistant"]
+    assert segs[0]["turn_fp"] != ""
+    assert segs[1]["user"] == "thanks"
+    assert segs[1]["assistant"] == "any time"
+
+
+def test_segment_turns_preamble_without_user_anchor(integration_module):
+    fn = integration_module._segment_turns
+    msgs = [
+        {"role": "assistant", "content": "orphaned assistant text"},
+        {"role": "user", "content": "now a real question"},
+        {"role": "assistant", "content": "an answer"},
+    ]
+    segs = fn(msgs)
+    assert len(segs) == 2
+    assert segs[0]["user"] == ""
+    assert segs[0]["assistant"] == "orphaned assistant text"
+    assert segs[0]["turn_fp"] == ""  # no user anchor — text-only dedup applies
+    assert segs[1]["user"] == "now a real question"
+
+
+def test_segment_turns_drops_empty_segments(integration_module):
+    fn = integration_module._segment_turns
+    assert fn([]) == []
+    assert fn([{"role": "assistant", "content": ""}]) == []
