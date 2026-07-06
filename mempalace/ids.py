@@ -35,7 +35,7 @@ _DELIM: str = "|"
 # fixture comparisons that hard-code truncation length still parse.
 _HASH_TRUNC_DRAWER: int = 24
 _HASH_TRUNC_TRIPLE: int = 12
-_HASH_TRUNC_FP: int = 16
+_HASH_TRUNC_FINGERPRINT: int = 16
 
 
 def _delimited_sha256(parts: tuple[object, ...], truncate: int) -> str:
@@ -136,16 +136,19 @@ def make_turn_fingerprint(content: str) -> str:
     Used by the Hermes provider to correlate a drawer filed by
     ``sync_turn`` (clean user text + final response) with the same turn
     as it appears in the raw message list at ``on_session_end`` /
-    ``on_pre_compress``. Both sides hash the *normalized raw* user
-    message content, so the fingerprint matches even though the filed
-    text never can (Hermes hands ``sync_turn`` cleaned/stripped content
-    while the raw list carries injected skill text and tool traffic).
+    ``on_pre_compress``. Both call sites fingerprint the normalized
+    content of the SAME raw user-message dict from the messages
+    snapshot — never ``sync_turn``'s cleaned positional arguments, which
+    differ from the raw list (injected skill text, tool traffic,
+    think-block stripping) and would never match. This function applies
+    no normalization itself; callers pass content already run through
+    the Hermes provider's ``_normalize_content``.
 
     Hash input is the single content string under the standard
     length-prefixed delimiter recipe; truncated to 16 hex chars — this
     is a per-session correlation key, not a global primary key.
     """
-    return _delimited_sha256((content,), _HASH_TRUNC_FP)
+    return _delimited_sha256((content,), _HASH_TRUNC_FINGERPRINT)
 
 
 def make_triple_id(
