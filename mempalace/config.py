@@ -486,6 +486,36 @@ class MempalaceConfig:
         return hooks.get("auto_save", True)
 
     @property
+    def hooks_transcript_mining(self):
+        """Whether hooks may spawn detached transcript-mining subprocesses.
+
+        Transcript mining (via ``_ingest_transcript`` / ``_maybe_auto_ingest``
+        / ``_mine_sync``) is heavyweight. Under multi-writer deployments
+        (multiple concurrent Claude Code / Codex sessions filing through
+        the same palace), an in-hook mine can starve interactive MCP writes
+        queued behind it in the daemon (#1497), or contend with concurrent
+        processes for the palace storage lock.
+
+        When ``False``, hooks emit reminders (governed by ``hooks.silent_save``)
+        but never spawn mining. Bulk mining can then be scheduled out-of-band
+        via a systemd timer / cron job that runs when no session is active —
+        the pattern @anastasiiaanfimova ships as an out-of-tree ``mine off``
+        patch and @jphein's palace-daemon replicates at gateway layer.
+
+        Master ``hooks.auto_save`` still gates this: if auto-save is off,
+        this is always effectively off.
+
+        Env override: ``MEMPALACE_HOOKS_TRANSCRIPT_MINING``.
+        """
+        env_val = os.environ.get("MEMPALACE_HOOKS_TRANSCRIPT_MINING")
+        if env_val is not None:
+            return env_val.lower() not in ("false", "0", "no")
+        if not self.hooks_auto_save:
+            return False
+        hooks = self._file_config.get("hooks", {})
+        return hooks.get("transcript_mining", True)
+
+    @property
     def topic_wings(self):
         """List of topic wing names."""
         return self._file_config.get("topic_wings", DEFAULT_TOPIC_WINGS)

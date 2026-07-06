@@ -973,6 +973,89 @@ def test_mine_sync_with_env_uses_projects_mode(tmp_path):
                 assert cmd[cmd.index("--mode") + 1] == "projects"
 
 
+# --- hooks.transcript_mining belt-and-suspenders guards ---
+
+
+def test_maybe_auto_ingest_skipped_when_transcript_mining_off(tmp_path):
+    """With transcript_mining=false, _maybe_auto_ingest is a no-op.
+
+    Even with MEMPAL_DIR set to a valid directory (which would normally
+    trigger a mine subprocess), no Popen call happens when the config
+    flag is off.
+    """
+    mempal_dir = tmp_path / "project"
+    mempal_dir.mkdir()
+    with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli._MINE_PID_DIR", tmp_path / "mine_pids"):
+                with patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls:
+                    mock_cfg_cls.return_value.hooks_transcript_mining = False
+                    with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                        _maybe_auto_ingest()
+                        mock_popen.assert_not_called()
+
+
+def test_mine_sync_skipped_when_transcript_mining_off(tmp_path):
+    """With transcript_mining=false, _mine_sync is a no-op.
+
+    Precompact sync mine would otherwise spawn a subprocess.run — this
+    guard prevents that during a hook fire when the operator has
+    scheduled mining out-of-band via a timer instead.
+    """
+    mempal_dir = tmp_path / "project"
+    mempal_dir.mkdir()
+    with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls:
+                mock_cfg_cls.return_value.hooks_transcript_mining = False
+                with patch("mempalace.hooks_cli.subprocess.run") as mock_run:
+                    _mine_sync()
+                    mock_run.assert_not_called()
+
+
+def test_ingest_transcript_skipped_when_transcript_mining_off(tmp_path):
+    """With transcript_mining=false, _ingest_transcript is a no-op.
+
+    Even with a valid transcript path large enough to normally trigger
+    the mine, no daemon submission and no subprocess Popen happens when
+    the config flag is off.
+    """
+    from mempalace.hooks_cli import _ingest_transcript
+
+    transcript = tmp_path / "session.jsonl"
+    # Write enough bytes to pass the 100-byte size gate
+    transcript.write_text('{"message": {"role": "user", "content": "x" * 200}}\n' * 5)
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        with patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls:
+            mock_cfg_cls.return_value.hooks_transcript_mining = False
+            with patch("mempalace.hooks_cli._daemon_available") as mock_daemon_avail:
+                with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                    _ingest_transcript(str(transcript))
+                    mock_popen.assert_not_called()
+                    # daemon shouldn't even be checked — we bail before that
+                    mock_daemon_avail.assert_not_called()
+
+
+def test_maybe_auto_ingest_default_true_still_mines(tmp_path):
+    """Regression: default config (transcript_mining not set) still mines.
+
+    Guards against a bug where the belt-and-suspenders guard misreads
+    the default and turns mining off for existing users.
+    """
+    mempal_dir = tmp_path / "project"
+    mempal_dir.mkdir()
+    with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli._MINE_PID_DIR", tmp_path / "mine_pids"):
+                # Real MempalaceConfig from a temp dir with no config.json →
+                # hooks_transcript_mining defaults to True
+                with patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls:
+                    mock_cfg_cls.return_value.hooks_transcript_mining = True
+                    with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                        _maybe_auto_ingest()
+                        mock_popen.assert_called_once()
+
+
 def test_mine_sync_uses_mempalace_python(tmp_path):
     """Sync mine command uses _mempalace_python(), not bare sys.executable."""
     mempal_dir = tmp_path / "project"
