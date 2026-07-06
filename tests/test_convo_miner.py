@@ -10,6 +10,7 @@ import pytest
 
 from mempalace.convo_miner import (
     _compute_convo_cursor,
+    _fetch_stored_cursor,
     _flag_possible_duplicates,
     _incremental_reparse,
     _is_ai_tool_path,
@@ -1296,5 +1297,254 @@ class TestConvoCursorStorage:
             result = col.get(include=["metadatas"])
             with_cursor = [m for m in result["metadatas"] if m and m.get("cursor_format")]
             assert with_cursor == []
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class TestFetchStoredCursor:
+    """_fetch_stored_cursor scans one source file's own drawers for the
+    cursor a prior mine stored, applying the same schema-version and
+    extract_mode scoping other lookups in this module use -- verified
+    directly here rather than relying only on end-to-end coverage, since
+    an incorrect cursor returned here would silently drive an
+    incremental mine off stale or wrong data."""
+
+    @staticmethod
+    def _make_collection(metadatas: list) -> MagicMock:
+        ids = [f"d{i}" for i in range(len(metadatas))]
+        mock_col = MagicMock()
+        # _fetch_stored_cursor loops until a batch comes back with no ids
+        # (matching the paginated-scan pattern used elsewhere in this
+        # module) -- the first call returns the real data, the second
+        # terminates the loop.
+        mock_col.get.side_effect = [
+            {"ids": ids, "metadatas": metadatas},
+            {"ids": [], "metadatas": []},
+        ]
+        return mock_col
+
+    def test_returns_none_when_no_cursor_bearing_drawer(self):
+        col = self._make_collection([{"source_file": "a.jsonl", "chunk_index": 0}])
+        assert _fetch_stored_cursor(col, "a.jsonl", "exchange") is None
+
+    def test_returns_cursor_and_room_when_found(self):
+        from mempalace.palace import NORMALIZE_VERSION
+
+        meta = {
+            "source_file": "a.jsonl",
+            "chunk_index": 2,
+            "cursor_line": 10,
+            "cursor_chunk_index": 2,
+            "cursor_anchor_hash": "abc123",
+            "cursor_format": "claude_code_jsonl",
+            "room": "technical",
+            "normalize_version": NORMALIZE_VERSION,
+        }
+        col = self._make_collection([meta])
+        result = _fetch_stored_cursor(col, "a.jsonl", "exchange")
+        assert result == {
+            "cursor_line": 10,
+            "cursor_chunk_index": 2,
+            "cursor_anchor_hash": "abc123",
+            "cursor_format": "claude_code_jsonl",
+            "room": "technical",
+        }
+
+    def test_returns_none_when_cursor_drawer_has_stale_normalize_version(self):
+        """A cursor-bearing drawer stamped with an older schema version
+        must not drive an incremental mine -- the stored chunk/cursor
+        shape may not match what the current pipeline would produce.
+        Enforced directly here, not just relied on via a caller's own
+        mined_mtimes gate."""
+        from mempalace.palace import NORMALIZE_VERSION
+
+        meta = {
+            "source_file": "a.jsonl",
+            "chunk_index": 2,
+            "cursor_line": 10,
+            "cursor_chunk_index": 2,
+            "cursor_anchor_hash": "abc123",
+            "cursor_format": "claude_code_jsonl",
+            "room": "technical",
+            "normalize_version": NORMALIZE_VERSION - 1,
+        }
+        col = self._make_collection([meta])
+        assert _fetch_stored_cursor(col, "a.jsonl", "exchange") is None
+
+    def test_returns_none_when_more_than_one_cursor_bearing_drawer(self):
+        """A data inconsistency (shouldn't happen under normal operation,
+        since only one chunk per file is ever stamped) -- safer to fall
+        back to a full re-mine than guess which one is current."""
+        from mempalace.palace import NORMALIZE_VERSION
+
+        base = {
+            "source_file": "a.jsonl",
+            "cursor_format": "claude_code_jsonl",
+            "cursor_line": 4,
+            "cursor_anchor_hash": "x",
+            "room": "technical",
+            "normalize_version": NORMALIZE_VERSION,
+        }
+        meta1 = {**base, "chunk_index": 1, "cursor_chunk_index": 1}
+        meta2 = {**base, "chunk_index": 3, "cursor_chunk_index": 3}
+        col = self._make_collection([meta1, meta2])
+        assert _fetch_stored_cursor(col, "a.jsonl", "exchange") is None
+
+    def test_ignores_drawers_from_a_different_extract_mode(self):
+        from mempalace.palace import NORMALIZE_VERSION
+
+        meta = {
+            "source_file": "a.jsonl",
+            "chunk_index": 0,
+            "extract_mode": "general",
+            "cursor_format": "claude_code_jsonl",
+            "cursor_line": 0,
+            "cursor_chunk_index": 0,
+            "cursor_anchor_hash": "x",
+            "room": "technical",
+            "normalize_version": NORMALIZE_VERSION,
+        }
+        col = self._make_collection([meta])
+        assert _fetch_stored_cursor(col, "a.jsonl", "exchange") is None
+
+
+# ── incremental mining wired in (opt-in, off by default) ─────────────────
+
+
+class TestIncrementalMiningWiredIn:
+    """End-to-end through the real mine_convos()/palace path: when
+    incremental_mining_enabled is set, growing a previously-mined
+    transcript re-chunks only the trailing exchange onward instead of
+    purging and rebuilding the whole file -- proven by the STABLE
+    prefix's drawers surviving the second mine completely untouched
+    (same filed_at, not just same content -- filed_at is stamped fresh
+    on every upsert, so an unchanged filed_at proves no re-upsert
+    happened). Off by default, existing full-remine behavior is
+    unchanged from before this feature existed."""
+
+    @staticmethod
+    def _write_jsonl(path: Path, num_exchanges: int) -> None:
+        import json as jsonlib
+
+        lines = []
+        for i in range(1, num_exchanges + 1):
+            lines.append(
+                jsonlib.dumps(
+                    {"type": "human", "message": {"content": f"Question number {i} about the plan"}}
+                )
+            )
+            lines.append(
+                jsonlib.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "content": f"Answer number {i} explaining the approach in detail"
+                        },
+                    }
+                )
+            )
+        path.write_text("\n".join(lines) + "\n")
+
+    def test_disabled_by_default_full_remine_on_growth(self, monkeypatch, capsys):
+        monkeypatch.delenv("MEMPALACE_INCREMENTAL_MINING", raising=False)
+        tmpdir = tempfile.mkdtemp()
+        try:
+            convo_path = Path(tmpdir) / "session.jsonl"
+            self._write_jsonl(convo_path, 3)
+            palace_path = os.path.join(tmpdir, "palace")
+
+            mine_convos(tmpdir, palace_path, wing="test")
+            capsys.readouterr()
+
+            time.sleep(0.05)  # ensure a distinct mtime
+            self._write_jsonl(convo_path, 4)
+            mine_convos(tmpdir, palace_path, wing="test")
+            out = capsys.readouterr().out
+            assert "(incremental)" not in out
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_enabled_reuses_stable_prefix_without_reupserting(self, monkeypatch, capsys):
+        monkeypatch.setenv("MEMPALACE_INCREMENTAL_MINING", "true")
+        tmpdir = tempfile.mkdtemp()
+        try:
+            convo_path = Path(tmpdir) / "session.jsonl"
+            self._write_jsonl(convo_path, 3)
+            palace_path = os.path.join(tmpdir, "palace")
+
+            mine_convos(tmpdir, palace_path, wing="test")
+            capsys.readouterr()
+
+            client = chromadb.PersistentClient(path=palace_path)
+            col = client.get_collection("mempalace_drawers")
+            first = col.get(include=["metadatas", "documents"])
+            first_by_id = dict(zip(first["ids"], zip(first["documents"], first["metadatas"])))
+            del col, client
+
+            time.sleep(0.05)
+            self._write_jsonl(convo_path, 5)  # grow by 2 more exchanges
+
+            mine_convos(tmpdir, palace_path, wing="test")
+            out = capsys.readouterr().out
+            assert "(incremental)" in out
+
+            client = chromadb.PersistentClient(path=palace_path)
+            col = client.get_collection("mempalace_drawers")
+            second = col.get(include=["metadatas", "documents"])
+            second_by_id = dict(zip(second["ids"], zip(second["documents"], second["metadatas"])))
+
+            # Every drawer except the one that carried the cursor (the
+            # old trailing exchange, superseded by this pass) must
+            # survive completely untouched.
+            first_cursor_id = next(
+                did for did, (_, meta) in first_by_id.items() if meta.get("cursor_format")
+            )
+            stable_ids = set(first_by_id) - {first_cursor_id}
+            assert stable_ids, "test setup should produce more than one drawer on the first mine"
+            for did in stable_ids:
+                assert did in second_by_id, f"{did} missing after incremental mine"
+                assert second_by_id[did][0] == first_by_id[did][0], f"{did} content changed"
+                assert second_by_id[did][1].get("filed_at") == first_by_id[did][1].get(
+                    "filed_at"
+                ), f"{did}'s filed_at changed -- it was re-upserted, not left untouched"
+
+            # The end result must still equal a full re-mine of the same
+            # final content -- the equivalence claim, now exercised
+            # end-to-end through the real palace.
+            del col, client
+            palace_path_full = os.path.join(tmpdir, "palace_full_control")
+            mine_convos(tmpdir, palace_path_full, wing="test")
+            client2 = chromadb.PersistentClient(path=palace_path_full)
+            col2 = client2.get_collection("mempalace_drawers")
+            full = col2.get(include=["documents"])
+            assert sorted(second["documents"]) == sorted(full["documents"])
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_falls_back_to_full_remine_when_no_stored_cursor(self, monkeypatch, capsys):
+        """A file with nothing to resume from (mined before any cursor
+        was ever computed for it -- e.g. it was below the exchange-
+        chunking threshold at the time) still mines correctly via the
+        existing full path, even with incremental mining enabled."""
+        monkeypatch.setenv("MEMPALACE_INCREMENTAL_MINING", "true")
+        tmpdir = tempfile.mkdtemp()
+        try:
+            convo_path = Path(tmpdir) / "session.jsonl"
+            entries = [
+                '{"type":"human","message":{"content":"A short question long enough to clear the min chunk size floor"}}',
+                '{"type":"assistant","message":{"content":"A short answer long enough to clear the min chunk size floor too"}}',
+            ]
+            convo_path.write_text("\n".join(entries) + "\n")
+            palace_path = os.path.join(tmpdir, "palace")
+            mine_convos(tmpdir, palace_path, wing="test")
+            capsys.readouterr()
+
+            time.sleep(0.05)
+            self._write_jsonl(convo_path, 3)  # now clears the threshold
+
+            mine_convos(tmpdir, palace_path, wing="test")
+            out = capsys.readouterr().out
+            assert "(incremental)" not in out
+            assert "Files skipped (already filed): 0" in out
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)

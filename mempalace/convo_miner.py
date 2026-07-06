@@ -155,12 +155,28 @@ def _register_file(collection, source_file: str, wing: str, agent: str, extract_
     )
 
 
-def _source_file_delete_ids(collection, source_file: str, extract_mode: str) -> list[str]:
+def _source_file_delete_ids(
+    collection, source_file: str, extract_mode: str, min_chunk_index: Optional[int] = None
+) -> list[str]:
     """Collect drawer IDs for one source file and extraction mode.
 
     Legacy conversation drawers did not carry extract_mode; treat those as
     exchange-mode rows so schema rebuilds can still clean them up without
     deleting newer general-mode drawers for the same transcript.
+
+    ``min_chunk_index``, when given, additionally restricts this to
+    drawers whose ``chunk_index`` is at or above it -- the incremental-
+    mining path's partial purge (replace only the trailing exchange
+    onward, keep the rest). A drawer with no usable ``chunk_index``
+    (legacy rows, or the 0-chunk registry sentinel) is excluded rather
+    than assumed to qualify, since "no chunk_index" isn't ">= N" for any
+    N -- it's simply not a candidate for this comparison, and this
+    filter is never used for the registry sentinel's own source_file
+    scan anyway (that always goes through the ``None`` / delete-all
+    path). Matched in Python rather than pushed into the ``where``
+    query because ``extract_mode`` legacy-matching already requires
+    per-row Python logic here (see above) that ChromaDB's ``where``
+    can't express.
     """
     ids: list[str] = []
     offset = 0
@@ -174,8 +190,16 @@ def _source_file_delete_ids(collection, source_file: str, extract_mode: str) -> 
         batch_ids = batch.get("ids") or []
         metadatas = batch.get("metadatas") or []
         for drawer_id, meta in zip(batch_ids, metadatas):
-            if _metadata_matches_extract_mode(meta or {}, extract_mode):
-                ids.append(drawer_id)
+            meta = meta or {}
+            if not _metadata_matches_extract_mode(meta, extract_mode):
+                continue
+            if min_chunk_index is not None:
+                chunk_index = meta.get("chunk_index")
+                if not isinstance(chunk_index, (int, float)) or isinstance(chunk_index, bool):
+                    continue
+                if chunk_index < min_chunk_index:
+                    continue
+            ids.append(drawer_id)
         if not batch_ids:
             break
         offset += len(batch_ids)
@@ -454,6 +478,21 @@ def scan_convos(convo_dir: str) -> list:
 # =============================================================================
 
 
+def _normalize_or_register(filepath: Path, raw_content: str) -> Optional[str]:
+    """normalize() ``raw_content``, swallowing the same ``(OSError,
+    ValueError)`` the caller's own read step already tolerates, and
+    returning None on failure -- the caller's existing "empty/too-short
+    content" check already registers a sentinel and continues for a
+    falsy ``content``, so that single check handles this failure case
+    too rather than duplicating the registration here (which would add
+    its own try/except to ``_mine_convos_impl``'s own body).
+    """
+    try:
+        return normalize(str(filepath), content=raw_content)
+    except (OSError, ValueError):
+        return None
+
+
 def _extract_authored_at(filepath):
     """Most-recent message timestamp in a transcript, used as the drawer's authored date.
 
@@ -714,6 +753,74 @@ def _incremental_reparse(
     return tail_chunks
 
 
+def _fetch_stored_cursor(collection, source_file: str, extract_mode: str) -> Optional[dict]:
+    """Look up the cursor stored by the last full mine of ``source_file``
+    (see ``_compute_convo_cursor``), if any -- the anchor an incremental
+    re-mine can attempt to resume from.
+
+    Only scans this one source file's own drawers (bounded by however
+    many chunks that file produced, not the whole palace), and is only
+    called for files already confirmed changed-and-previously-mined --
+    the same small subset of files that are about to pay the (larger)
+    cost of re-chunking anyway, not every file in the sweep.
+
+    Returns None when no drawer for this source_file/extract_mode
+    carries cursor metadata (never computed -- wrong format, general
+    mode, below the exchange-chunking threshold, etc.), when the only
+    cursor-bearing drawer found is stamped with an older
+    ``normalize_version`` (a schema bump means the stored chunk/cursor
+    shape may not match what the current normalize/chunk pipeline would
+    produce -- a full rebuild is required, same as it already is for
+    any other stale-schema drawer), or when more than one candidate
+    somehow does (a data inconsistency; safer to fall back to a full
+    re-mine than guess which one is current). This function does not
+    rely on its caller having already excluded stale-schema files (even
+    though today's only caller does, via ``mined_mtimes``) -- the
+    version check is repeated here so this function's own correctness
+    doesn't depend on staying in sync with a gate several frames away.
+
+    The returned dict also carries a ``"room"`` key -- the topic
+    classification stored on that same drawer -- so a caller doing an
+    incremental update can reuse the file's existing room rather than
+    reclassify from a partial/tail-only sample. This is NOT one of the
+    four cursor fields (``cursor_line``/``cursor_chunk_index``/
+    ``cursor_anchor_hash``/``cursor_format``) that ``_incremental_reparse``
+    validates -- it's along for the ride for this function's own callers.
+    """
+    found: Optional[dict] = None
+    offset = 0
+    while True:
+        batch = collection.get(
+            where={"source_file": source_file},
+            limit=1000,
+            offset=offset,
+            include=["metadatas"],
+        )
+        batch_ids = batch.get("ids") or []
+        metadatas = batch.get("metadatas") or []
+        for meta in metadatas:
+            meta = meta or {}
+            if not _metadata_matches_extract_mode(meta, extract_mode):
+                continue
+            if not meta.get("cursor_format"):
+                continue
+            if meta.get("normalize_version", 1) < NORMALIZE_VERSION:
+                continue
+            if found is not None:
+                return None
+            found = {
+                "cursor_line": meta.get("cursor_line"),
+                "cursor_chunk_index": meta.get("cursor_chunk_index"),
+                "cursor_anchor_hash": meta.get("cursor_anchor_hash"),
+                "cursor_format": meta.get("cursor_format"),
+                "room": meta.get("room"),
+            }
+        if not batch_ids:
+            break
+        offset += len(batch_ids)
+    return found
+
+
 def _flag_possible_duplicates(collection, batch_docs: list, batch_metas: list) -> None:
     """Flag chunks whose closest existing match is a probable duplicate.
 
@@ -746,6 +853,88 @@ def _flag_possible_duplicates(collection, batch_docs: list, batch_metas: list) -
             meta["duplicate_similarity"] = similarity
 
 
+def _upsert_chunk_batch(
+    collection,
+    source_file,
+    chunks,
+    wing,
+    room,
+    agent,
+    extract_mode,
+    filed_at,
+    source_mtime,
+    authored_at,
+    cursor,
+) -> tuple:
+    """Batch-upsert ``chunks`` for one source file: build each chunk's
+    metadata (room/hall/entities, cursor stamping) and flag possible
+    duplicates before insert. Shared by the full-rebuild path
+    (``_file_chunks_locked``) and the incremental-update path
+    (``_file_chunks_locked_incremental``) so the metadata construction
+    can't drift between the two.
+
+    ``cursor``, when given (see ``_compute_convo_cursor``), is stamped
+    onto the metadata of whichever chunk's ``chunk_index`` matches
+    ``cursor["cursor_chunk_index"]`` -- the caller decides what that
+    cursor describes (a full mine's trailing exchange, or an
+    incremental mine's new trailing exchange); this function only
+    matches indices.
+
+    Returns (drawers_added, room_counts_delta).
+    """
+    room_counts_delta: dict = defaultdict(int)
+    drawers_added = 0
+    for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
+        batch_docs: list = []
+        batch_ids: list = []
+        batch_metas: list = []
+        for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
+            chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
+            if extract_mode == "general":
+                room_counts_delta[chunk_room] += 1
+            drawer_id = make_convo_drawer_id(
+                wing, chunk_room, source_file, extract_mode, chunk["chunk_index"]
+            )
+            batch_docs.append(chunk["content"])
+            batch_ids.append(drawer_id)
+            meta = {
+                "wing": wing,
+                "room": chunk_room,
+                "hall": _detect_hall_cached(chunk["content"]),
+                "source_file": source_file,
+                "chunk_index": chunk["chunk_index"],
+                "added_by": agent,
+                "filed_at": filed_at,
+                "entities": entities_metadata(chunk["content"]),
+                "authored_at": authored_at if authored_at is not None else filed_at,
+                "ingest_mode": "convos",
+                "extract_mode": extract_mode,
+                "normalize_version": NORMALIZE_VERSION,
+                "id_recipe": ID_RECIPE,
+            }
+            if source_mtime is not None:
+                meta["source_mtime"] = source_mtime
+            if cursor is not None and chunk["chunk_index"] == cursor["cursor_chunk_index"]:
+                meta["cursor_line"] = cursor["cursor_line"]
+                meta["cursor_chunk_index"] = cursor["cursor_chunk_index"]
+                meta["cursor_anchor_hash"] = cursor["cursor_anchor_hash"]
+                meta["cursor_format"] = cursor["cursor_format"]
+            batch_metas.append(meta)
+        assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
+        _flag_possible_duplicates(collection, batch_docs, batch_metas)
+        try:
+            collection.upsert(
+                documents=batch_docs,
+                ids=batch_ids,
+                metadatas=batch_metas,
+            )
+            drawers_added += len(batch_docs)
+        except Exception as e:
+            if "already exists" not in str(e).lower():
+                raise
+    return drawers_added, room_counts_delta
+
+
 def _file_chunks_locked(
     collection, source_file, chunks, wing, room, agent, extract_mode, authored_at=None, cursor=None
 ):
@@ -761,19 +950,16 @@ def _file_chunks_locked(
 
     ``cursor``, when given (see ``_compute_convo_cursor``), is stamped onto
     the LAST chunk's metadata only -- the trailing exchange is the anchor
-    a future incremental re-mine would resume from. Nothing reads this
-    yet, so storing it changes no existing behavior.
+    a future incremental re-mine would resume from.
 
     Returns (drawers_added, room_counts_delta, skipped).
     """
-    room_counts_delta: dict = defaultdict(int)
-    drawers_added = 0
     with mine_lock(source_file):
         # Re-check after lock — another agent may have just finished this file
         # at the current schema/mtime. A stale hit here returns False, so we
         # still fall through to the purge+rebuild path below.
         if file_already_mined(collection, source_file, check_mtime=True, extract_mode=extract_mode):
-            return 0, room_counts_delta, True
+            return 0, defaultdict(int), True
 
         # Purge stale drawers first. Fires both on a normalize-schema bump
         # (file_already_mined() returned False for pre-v2 drawers) and on a
@@ -795,54 +981,77 @@ def _file_chunks_locked(
             source_mtime = os.path.getmtime(source_file)
         except OSError:
             source_mtime = None
-        for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
-            batch_docs: list = []
-            batch_ids: list = []
-            batch_metas: list = []
-            for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
-                chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
-                if extract_mode == "general":
-                    room_counts_delta[chunk_room] += 1
-                drawer_id = make_convo_drawer_id(
-                    wing, chunk_room, source_file, extract_mode, chunk["chunk_index"]
-                )
-                batch_docs.append(chunk["content"])
-                batch_ids.append(drawer_id)
-                meta = {
-                    "wing": wing,
-                    "room": chunk_room,
-                    "hall": _detect_hall_cached(chunk["content"]),
-                    "source_file": source_file,
-                    "chunk_index": chunk["chunk_index"],
-                    "added_by": agent,
-                    "filed_at": filed_at,
-                    "entities": entities_metadata(chunk["content"]),
-                    "authored_at": authored_at if authored_at is not None else filed_at,
-                    "ingest_mode": "convos",
-                    "extract_mode": extract_mode,
-                    "normalize_version": NORMALIZE_VERSION,
-                    "id_recipe": ID_RECIPE,
-                }
-                if source_mtime is not None:
-                    meta["source_mtime"] = source_mtime
-                if cursor is not None and chunk["chunk_index"] == cursor["cursor_chunk_index"]:
-                    meta["cursor_line"] = cursor["cursor_line"]
-                    meta["cursor_chunk_index"] = cursor["cursor_chunk_index"]
-                    meta["cursor_anchor_hash"] = cursor["cursor_anchor_hash"]
-                    meta["cursor_format"] = cursor["cursor_format"]
-                batch_metas.append(meta)
-            assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
-            _flag_possible_duplicates(collection, batch_docs, batch_metas)
-            try:
-                collection.upsert(
-                    documents=batch_docs,
-                    ids=batch_ids,
-                    metadatas=batch_metas,
-                )
-                drawers_added += len(batch_docs)
-            except Exception as e:
-                if "already exists" not in str(e).lower():
-                    raise
+        drawers_added, room_counts_delta = _upsert_chunk_batch(
+            collection,
+            source_file,
+            chunks,
+            wing,
+            room,
+            agent,
+            extract_mode,
+            filed_at,
+            source_mtime,
+            authored_at,
+            cursor,
+        )
+    return drawers_added, room_counts_delta, False
+
+
+def _file_chunks_locked_incremental(
+    collection,
+    source_file,
+    tail_chunks,
+    replace_from_index,
+    wing,
+    room,
+    agent,
+    extract_mode,
+    authored_at=None,
+    cursor=None,
+):
+    """Incremental-mining counterpart to ``_file_chunks_locked``: replaces
+    only the drawers at or after ``replace_from_index`` instead of
+    purging the whole file, when ``_incremental_reparse`` produced a
+    usable ``tail_chunks`` list for a grown transcript.
+
+    Same locking/recheck contract as ``_file_chunks_locked`` -- another
+    agent may have already handled this exact on-disk state under the
+    lock, in which case this returns ``skipped=True`` and makes no
+    changes, same as the full-rebuild path.
+
+    Returns (drawers_added, room_counts_delta, skipped).
+    """
+    with mine_lock(source_file):
+        if file_already_mined(collection, source_file, check_mtime=True, extract_mode=extract_mode):
+            return 0, defaultdict(int), True
+
+        try:
+            delete_ids = _source_file_delete_ids(
+                collection, source_file, extract_mode, min_chunk_index=replace_from_index
+            )
+            if delete_ids:
+                collection.delete(ids=delete_ids)
+        except Exception:
+            logger.debug("Incremental purge failed for %s", source_file, exc_info=True)
+
+        filed_at = datetime.now().isoformat()
+        try:
+            source_mtime = os.path.getmtime(source_file)
+        except OSError:
+            source_mtime = None
+        drawers_added, room_counts_delta = _upsert_chunk_batch(
+            collection,
+            source_file,
+            tail_chunks,
+            wing,
+            room,
+            agent,
+            extract_mode,
+            filed_at,
+            source_mtime,
+            authored_at,
+            cursor,
+        )
     return drawers_added, room_counts_delta, False
 
 
@@ -992,6 +1201,142 @@ def _compute_hallways_for_wing_safe(wing, collection, drawers_filed, config=None
         print(f"  (hallways skipped: {exc})")
 
 
+def _attempt_incremental_mine(
+    collection,
+    source_file: str,
+    raw_content: str,
+    wing: str,
+    agent: str,
+    extract_mode: str,
+    filepath: Path,
+    palace_config,
+    cfg_chunk_size: int,
+    cfg_min_chunk_size: int,
+    mined_mtimes: dict,
+    dry_run: bool,
+) -> Optional[tuple]:
+    """Try the incremental-mining path for one changed file: re-chunk only
+    the trailing exchange onward instead of purging and rebuilding the
+    whole file. Extracted out of ``_mine_convos_impl``'s loop body to keep
+    it readable (and under this repo's function-complexity gate).
+
+    Returns None whenever the attempt doesn't apply or can't proceed --
+    extract_mode is "general" (no cursor to resume from, see
+    ``_compute_convo_cursor``), the feature isn't opted in
+    (``incremental_mining_enabled``, off by default), this file has no
+    prior mine to be incremental relative to (``mined_mtimes`` holds no
+    stored mtime for it), no stored cursor is found on its existing
+    drawers, or ``_incremental_reparse`` itself declines (any of its own
+    preconditions failing). The caller falls back to the existing full
+    path in every ``None`` case -- always safe.
+
+    Otherwise returns ``(drawers_added, room_counts_delta, skipped,
+    room)`` -- the same three values ``_file_chunks_locked`` /
+    ``_file_chunks_locked_incremental`` return, plus the file's room
+    (reused from its existing classification, not recomputed) so the
+    caller can bump ``room_counts`` the same way the full path does.
+    """
+    if (
+        dry_run
+        or extract_mode == "general"
+        or not palace_config.incremental_mining_enabled
+        or mined_mtimes.get(source_file) is None
+    ):
+        return None
+
+    stored_cursor = _fetch_stored_cursor(collection, source_file, extract_mode)
+    if stored_cursor is None:
+        return None
+
+    tail_chunks = _incremental_reparse(
+        stored_cursor, raw_content, chunk_size=cfg_chunk_size, min_chunk_size=cfg_min_chunk_size
+    )
+    if not tail_chunks:
+        return None
+
+    # Reuse the file's existing room classification rather than
+    # reclassify from a partial/tail-only sample -- incremental mining
+    # deliberately leaves everything about the stable prefix untouched,
+    # including its topic classification. This matches what a full
+    # re-mine would produce whenever the file was already past
+    # detect_convo_room's ~3000-character sample size at its first mine
+    # (the common case for a real transcript) -- it can only diverge
+    # for a file still under that size when first mined, which then
+    # keeps its original room indefinitely rather than picking up
+    # whatever a later full re-mine's fresh sample would classify (see
+    # MempalaceConfig.incremental_mining_enabled's docstring).
+    room = stored_cursor.get("room")
+
+    # The grown file's new total chunk count, without re-chunking it:
+    # chunks before the OLD cursor are untouched (this is the whole
+    # point), and tail_chunks' own chunk_index values already continue
+    # that same global numbering (see _incremental_reparse), so the last
+    # one IS the new total minus one.
+    num_chunks_new_total = stored_cursor["cursor_chunk_index"] + len(tail_chunks)
+
+    # Recomputing the cursor still parses the whole (grown) file once --
+    # a real but bounded cost (JSONL parse + per-message noise-strip),
+    # well short of the chunking, entity/hall detection, duplicate-
+    # checking, and embedding work this path skips for the untouched
+    # stable prefix, which is what actually dominates for large
+    # transcripts. Making the cursor recomputation itself incremental
+    # too is a natural follow-up, not required for this rollout.
+    new_cursor = _compute_convo_cursor(
+        raw_content,
+        num_chunks_new_total,
+        chunk_size=cfg_chunk_size,
+        min_chunk_size=cfg_min_chunk_size,
+    )
+
+    drawers_added, room_delta, skipped = _file_chunks_locked_incremental(
+        collection,
+        source_file,
+        tail_chunks,
+        stored_cursor["cursor_chunk_index"],
+        wing,
+        room,
+        agent,
+        extract_mode,
+        authored_at=_extract_authored_at(filepath),
+        cursor=new_cursor,
+    )
+    return drawers_added, room_delta, skipped, room
+
+
+def _record_mine_outcome(
+    room_counts: dict,
+    room_delta: dict,
+    drawers_added: int,
+    skipped: bool,
+    i: int,
+    total_files: int,
+    filepath: Path,
+    limit: int,
+    files_mined_so_far: int,
+    label: str = "",
+) -> tuple:
+    """Apply one file's mining outcome -- full or incremental -- to
+    ``room_counts``, print the standard progress line, and report the
+    counter deltas the caller should apply. Shared by both mining paths
+    in ``_mine_convos_impl`` (each just calls this once) so this
+    bookkeeping isn't duplicated inline for each, which would otherwise
+    count twice against that function's own complexity budget.
+
+    Returns ``(drawers_delta, files_mined_delta, files_skipped_delta,
+    should_break)`` -- plain ints/bool rather than mutating the caller's
+    counters directly, since those are simple local variables in
+    ``_mine_convos_impl``, not a shared mutable object.
+    """
+    if skipped:
+        return 0, 0, 1, False
+    for r, n in room_delta.items():
+        room_counts[r] += n
+    new_files_mined = files_mined_so_far + 1
+    print(f"  + [{i:4}/{total_files}] {filepath.name[:50]:50} +{drawers_added}{label}")
+    should_break = limit > 0 and new_files_mined >= limit
+    return drawers_added, 1, 0, should_break
+
+
 def _mine_convos_impl(
     convo_dir: str,
     palace_path: str,
@@ -1071,17 +1416,66 @@ def _mine_convos_impl(
             files_skipped += 1
             continue
 
-        # Read once, normalize from that same content -- a second,
-        # independent read (e.g. for cursor computation further below)
-        # could otherwise observe a different state of a file that's
-        # actively being appended to than the one actually mined here.
+        # Read once -- a second, independent read (e.g. for cursor
+        # computation further below, or the incremental-mining attempt
+        # right after) could otherwise observe a different state of a
+        # file that's actively being appended to than the one actually
+        # mined here.
         try:
             raw_content = _read_source_file(str(filepath))
-            content = normalize(str(filepath), content=raw_content)
         except (OSError, ValueError):
             if not dry_run:
                 _register_file(collection, source_file, wing, agent, extract_mode)
             continue
+
+        # Try the incremental path FIRST, before paying for a full
+        # normalize()+chunk_exchanges() pass over content that (for the
+        # stable prefix) hasn't changed. Returns None whenever it doesn't
+        # apply or can't proceed (dry run, general mode, not opted in, no
+        # prior mine, no usable stored cursor, or _incremental_reparse
+        # itself declining) -- always safe, exactly the designed
+        # fallback to the existing full path below.
+        incremental_result = _attempt_incremental_mine(
+            collection,
+            source_file,
+            raw_content,
+            wing,
+            agent,
+            extract_mode,
+            filepath,
+            palace_config,
+            cfg_chunk_size,
+            cfg_min_chunk_size,
+            mined_mtimes,
+            dry_run,
+        )
+        if incremental_result is not None:
+            drawers_added, room_delta, skipped, room = incremental_result
+            # Bumped regardless of skipped, matching the full path's own
+            # ordering below (another agent may have already handled
+            # this file under the lock -- it still counts toward this
+            # room for reporting purposes).
+            room_counts[room] += 1
+            drawers_delta, mined_delta, skipped_delta, should_break = _record_mine_outcome(
+                room_counts,
+                room_delta,
+                drawers_added,
+                skipped,
+                i,
+                len(files),
+                filepath,
+                limit,
+                files_mined,
+                label=" (incremental)",
+            )
+            total_drawers += drawers_delta
+            files_mined += mined_delta
+            files_skipped += skipped_delta
+            if should_break:
+                break
+            continue
+
+        content = _normalize_or_register(filepath, raw_content)
 
         if not content or len(content.strip()) < cfg_min_chunk_size:
             if not dry_run:
@@ -1166,16 +1560,21 @@ def _mine_convos_impl(
             authored_at=_extract_authored_at(filepath),
             cursor=cursor,
         )
-        if skipped:
-            files_skipped += 1
-            continue
-        for r, n in room_delta.items():
-            room_counts[r] += n
-
-        total_drawers += drawers_added
-        files_mined += 1
-        print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")
-        if limit > 0 and files_mined >= limit:
+        drawers_delta, mined_delta, skipped_delta, should_break = _record_mine_outcome(
+            room_counts,
+            room_delta,
+            drawers_added,
+            skipped,
+            i,
+            len(files),
+            filepath,
+            limit,
+            files_mined,
+        )
+        total_drawers += drawers_delta
+        files_mined += mined_delta
+        files_skipped += skipped_delta
+        if should_break:
             break
 
     if not dry_run:

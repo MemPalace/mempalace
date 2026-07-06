@@ -954,3 +954,34 @@ def test_duplicate_detection_threshold_garbage_falls_back_to_default(monkeypatch
         json.dump({"duplicate_detection": {"threshold": bad}}, f)
     cfg = MempalaceConfig(config_dir=str(tmp_path))
     assert cfg.duplicate_detection_threshold == 0.9
+
+
+# ── incremental_mining_enabled ───────────────────────────────────────────
+
+
+def test_incremental_mining_disabled_by_default(monkeypatch, tmp_path):
+    monkeypatch.delenv("MEMPALACE_INCREMENTAL_MINING", raising=False)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.incremental_mining_enabled is False
+
+
+def test_incremental_mining_enabled_from_config(monkeypatch, tmp_path):
+    monkeypatch.delenv("MEMPALACE_INCREMENTAL_MINING", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"incremental_mining": {"enabled": True}}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.incremental_mining_enabled is True
+
+
+def test_incremental_mining_env_override_true(monkeypatch, tmp_path):
+    monkeypatch.setenv("MEMPALACE_INCREMENTAL_MINING", "yes")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.incremental_mining_enabled is True
+
+
+def test_incremental_mining_env_override_false_string(monkeypatch, tmp_path):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"incremental_mining": {"enabled": True}}, f)
+    monkeypatch.setenv("MEMPALACE_INCREMENTAL_MINING", "0")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.incremental_mining_enabled is False

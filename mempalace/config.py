@@ -594,6 +594,51 @@ class MempalaceConfig:
         return bool(value)
 
     @property
+    def incremental_mining_enabled(self) -> bool:
+        """Whether convo mining, on finding a changed (grown) transcript
+        with a stored cursor from its last mine, tries re-chunking only
+        the trailing exchange onward instead of purging and re-chunking
+        the whole file.
+
+        Off by default: this changes real mining behavior for the first
+        time (the cursor itself, computed unconditionally, has been
+        inert storage-only data up to this point) -- rolling it out
+        opt-in first, matching the pattern used for
+        ``duplicate_detection_enabled``. When enabled but no usable
+        cursor exists for a given file (wrong format, hash mismatch,
+        general mode, etc.), mining falls back to the existing full
+        rebuild automatically -- this flag only controls whether that
+        *attempt* is made, never removes the fallback. Env var
+        ``MEMPALACE_INCREMENTAL_MINING`` takes precedence over
+        config.json's ``incremental_mining.enabled``.
+
+        Known trade-off: an incremental update reuses the file's
+        existing room (topic) classification instead of recomputing it
+        against the grown content, since ``detect_convo_room`` only
+        samples the first ~3000 characters of the normalized
+        transcript -- for any file already past that size at its first
+        mine, a full re-mine would sample the same leading text and
+        classify identically anyway, so this matches full-remine
+        behavior in the common case. It only diverges for a file that
+        was still under ~3000 characters when first mined and later
+        grows past it -- there, the incremental path keeps the
+        original (now possibly stale) room indefinitely, rather than
+        picking up whatever a full re-mine's fresh sample would
+        classify. Content, chunk_index, and every other per-chunk field
+        stay exactly equivalent to a full re-mine regardless; only this
+        one coarse, already-soft classification can lag.
+        """
+        env_val = os.environ.get("MEMPALACE_INCREMENTAL_MINING", "").strip()
+        if env_val:
+            return env_val.lower() in ("true", "1", "yes", "on")
+        value = self._file_config.get("incremental_mining", {}).get("enabled", False)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.lower() in ("true", "1", "yes", "on")
+        return bool(value)
+
+    @property
     def duplicate_detection_threshold(self) -> float:
         """Cosine similarity (0-1) at or above which a chunk is flagged as
         a possible duplicate of an existing drawer. Same default as the
