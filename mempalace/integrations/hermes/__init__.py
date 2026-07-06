@@ -1533,7 +1533,17 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
 
         Loss-safe by construction: empty session_id or a failed scan means
         NO dedup (blind-file). The failure direction is always a duplicate
-        drawer, never a lost turn.
+        drawer, never a lost turn — with ONE known, accepted residual:
+        fingerprint coverage cannot see occurrences compression removed
+        from the window. If a byte-identical user prompt ("continue",
+        "go") recurs after its synced occurrence was compressed away, and
+        the recurrence was never synced (interrupted), the stale drawer
+        fp-skips it and the recurrence's partial ASSISTANT output is not
+        captured (the user's words are already in the palace from the
+        synced occurrence). Undecidable with occurrence counting alone —
+        Hermes message dicts carry no per-message identity — and closing
+        it by dropping fp-skip would re-file every tool-shaped turn.
+        Pinned by test_truncated_window_fp_coverage_is_accepted_limit.
         """
         messages = payload.get("messages", []) or []
         session_id = payload.get("session_id", "") or ""
