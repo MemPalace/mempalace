@@ -2164,3 +2164,353 @@ def test_schema_description_documents_message_count_definition(adapter):
         "message_count schema description must clarify it counts exchange pairs, "
         f"not drawers (got: {desc!r})"
     )
+
+
+# ===========================================================================
+# R1: Broader token redaction — sk-proj-*, sk-svcacct-*, github_pat_, gho_, etc.
+# ===========================================================================
+
+# Fake tokens in the new formats — never real credentials.
+_FAKE_SK_PROJ = "sk-proj-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+_FAKE_SK_SVCACCT = "sk-svcacct-BBBBBBBBBBBBBBBBBBBBBB"
+_FAKE_GITHUB_PAT = "github_pat_CCCCCCCCCCCCCCCCCCCCCC"
+_FAKE_GHO = "gho_DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
+_FAKE_GHU = "ghu_EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE"
+_FAKE_GHR = "ghr_FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"
+
+
+def test_r1_sk_proj_token_is_redacted():
+    """R1: sk-proj-... tokens must be redacted (dashes in tail broke old pattern)."""
+    role_tab = f"user\t{json.dumps(f'Token: {_FAKE_SK_PROJ}')}"
+    result = src_transforms.openclaw_redact_secrets(role_tab)
+    body = json.loads(result.partition("\t")[2])
+    assert _FAKE_SK_PROJ not in body, "sk-proj-... token survived redaction"
+    assert "[REDACTED:api_token]" in body
+
+
+def test_r1_sk_svcacct_token_is_redacted():
+    """R1: sk-svcacct-... tokens must be redacted."""
+    role_tab = f"user\t{json.dumps(f'Key: {_FAKE_SK_SVCACCT}')}"
+    result = src_transforms.openclaw_redact_secrets(role_tab)
+    body = json.loads(result.partition("\t")[2])
+    assert _FAKE_SK_SVCACCT not in body, "sk-svcacct-... token survived redaction"
+    assert "[REDACTED:api_token]" in body
+
+
+def test_r1_github_pat_is_redacted():
+    """R1: github_pat_... fine-grained PATs must be redacted."""
+    role_tab = f"user\t{json.dumps(f'PAT: {_FAKE_GITHUB_PAT}')}"
+    result = src_transforms.openclaw_redact_secrets(role_tab)
+    body = json.loads(result.partition("\t")[2])
+    assert _FAKE_GITHUB_PAT not in body, "github_pat_... token survived redaction"
+    assert "[REDACTED:api_token]" in body
+
+
+def test_r1_gho_token_is_redacted():
+    """R1: gho_... GitHub OAuth tokens must be redacted."""
+    role_tab = f"user\t{json.dumps(f'OAuth token: {_FAKE_GHO}')}"
+    result = src_transforms.openclaw_redact_secrets(role_tab)
+    body = json.loads(result.partition("\t")[2])
+    assert _FAKE_GHO not in body, "gho_... token survived redaction"
+    assert "[REDACTED:api_token]" in body
+
+
+def test_r1_ghu_ghr_tokens_are_redacted():
+    """R1: ghu_... and ghr_... GitHub tokens must be redacted."""
+    for tok in (_FAKE_GHU, _FAKE_GHR):
+        role_tab = f"user\t{json.dumps(f'Token {tok}')}"
+        result = src_transforms.openclaw_redact_secrets(role_tab)
+        body = json.loads(result.partition("\t")[2])
+        assert tok not in body, f"{tok[:10]}... token survived redaction"
+        assert "[REDACTED:api_token]" in body
+
+
+def test_r1_new_tokens_redacted_end_to_end(adapter, palace_ctx, tmp_path):
+    """R1: sk-proj- and github_pat_ tokens must not appear in drawer content."""
+    sdir = tmp_path / "sessions"
+    sdir.mkdir()
+
+    user_text = (
+        f"Here is my OpenAI key: {_FAKE_SK_PROJ}. "
+        f"And my GitHub PAT: {_FAKE_GITHUB_PAT}. "
+        f"Please help me configure the CI. This message is long enough to chunk."
+    )
+    assistant_text = (
+        "Please rotate those credentials immediately — they are now compromised. "
+        "This answer is also long enough to form a complete chunk for testing."
+    )
+    build_trajectory_fixture(
+        sdir / "sess-r1-tokens.trajectory.jsonl",
+        "sess-r1-tokens",
+        [(user_text, [assistant_text])],
+        workspace_dir="/home/user/projects/r1-test",
+    )
+
+    results = list(adapter.ingest(source=SourceRef(local_path=str(sdir)), palace=palace_ctx))
+    drawers = [r for r in results if isinstance(r, DrawerRecord)]
+    assert drawers, "expected at least one drawer"
+
+    joined = "\n".join(d.content for d in drawers)
+    assert _FAKE_SK_PROJ not in joined, "sk-proj- token survived end-to-end redaction"
+    assert _FAKE_GITHUB_PAT not in joined, "github_pat_ token survived end-to-end redaction"
+    assert "configure the CI" in joined or "rotate" in joined, (
+        "legitimate content was stripped by over-aggressive redaction"
+    )
+
+
+def test_r1_existing_prefixes_still_redacted():
+    """R1: existing ghp_/ghs_/lin_api_ patterns must still be redacted (no regression)."""
+    for fake in (_FAKE_GH_TOKEN, _FAKE_LIN_API, _FAKE_CLH, _FAKE_ATATT):
+        role_tab = f"user\t{json.dumps(f'Token: {fake}')}"
+        result = src_transforms.openclaw_redact_secrets(role_tab)
+        body = json.loads(result.partition("\t")[2])
+        assert fake not in body, f"existing token {fake[:12]}... regressed after R1 changes"
+
+
+# ===========================================================================
+# R3: Envelope-only user turns — assistant content must not be lost
+# ===========================================================================
+
+
+def _build_envelope_only_trajectory(path: Path, session_id: str) -> None:
+    """Write a trajectory where the first user turn is pure Slack envelope (no real text).
+
+    After strip transforms, the user body is empty.  The assistant reply must
+    still survive into a drawer via the > [non-text user turn] placeholder.
+    """
+    # User text that reduces to empty after metadata strip.
+    envelope_only = (
+        "Conversation info (untrusted metadata):\n"
+        "```json\n"
+        '{"chat_id": "user:UTEST", "sender_id": "UTEST", "inbound_event_kind": "ping"}\n'
+        "```\n"
+        "\n"
+        "Sender (untrusted metadata):\n"
+        "```json\n"
+        '{"label": "Bot", "id": "UTEST"}\n'
+        "```\n"
+    )
+    assistant_reply = (
+        "I received your ping. The bot is online and ready for commands. "
+        "This response is long enough to be stored as a drawer."
+    )
+    build_trajectory_fixture(
+        path,
+        session_id,
+        [(envelope_only, [assistant_reply])],
+        workspace_dir="/home/user/projects/r3-test",
+    )
+
+
+def test_r3_envelope_only_user_turn_produces_placeholder(adapter, palace_ctx, tmp_path):
+    """R3: assistant reply must survive when the leading user turn is envelope-only.
+
+    Before the fix, an empty user body caused openclaw_format_exchange to
+    ``continue`` (skip the turn), leaving the assistant reply as a leading
+    orphan that _chunk_by_exchange silently discarded.  After the fix, the
+    placeholder ``> [non-text user turn]`` keeps the pair intact.
+    """
+    sdir = tmp_path / "sessions"
+    sdir.mkdir()
+    session_id = "sess-r3-envelope-0001"
+    _build_envelope_only_trajectory(sdir / f"{session_id}.trajectory.jsonl", session_id)
+
+    results = list(adapter.ingest(source=SourceRef(local_path=str(sdir)), palace=palace_ctx))
+    drawers = [r for r in results if isinstance(r, DrawerRecord)]
+
+    assert drawers, (
+        "R3 regression: envelope-only user + assistant reply produced no drawers; "
+        "the assistant content was silently dropped"
+    )
+    joined = "\n".join(d.content for d in drawers)
+    assert "online and ready" in joined, (
+        "R3 regression: assistant reply text missing from drawer content"
+    )
+
+
+def test_r3_placeholder_appears_in_format_exchange_output():
+    """R3 unit test: openclaw_format_exchange emits placeholder for empty user body."""
+    empty_user = f"user\t{json.dumps('')}"
+    assistant_reply = f"assistant\t{json.dumps('Bot is online.')}"
+    role_tab = f"{empty_user}\n{assistant_reply}"
+
+    result = src_transforms.openclaw_format_exchange(role_tab)
+
+    assert "> [non-text user turn]" in result, (
+        "empty user body must produce placeholder, not be silently dropped"
+    )
+    assert "Bot is online." in result, "assistant content must survive when user body is empty"
+
+
+def test_r3_empty_assistant_still_skipped():
+    """R3: empty assistant bodies must still be silently dropped (unchanged behaviour)."""
+    user_text = f"user\t{json.dumps('What is 2 + 2?')}"
+    empty_assistant = f"assistant\t{json.dumps('')}"
+    role_tab = f"{user_text}\n{empty_assistant}"
+
+    result = src_transforms.openclaw_format_exchange(role_tab)
+
+    assert "> What is 2 + 2?" in result
+    # Empty assistant — only the user block appears
+    assert result.strip() == "> What is 2 + 2?"
+
+
+# ===========================================================================
+# R4: ReDoS hardening — _OPENCLAW_META_FENCE adversarial input test
+# ===========================================================================
+
+
+def test_r4_meta_fence_regex_matches_existing_patterns():
+    """R4: existing metadata-fence behaviour must be preserved after regex rewrite."""
+    preamble = (
+        '```json\n{"chat_id": "user:U123", "sender_id": "U123", "inbound_event_kind": "msg"}\n```'
+    )
+    result = src_transforms._OPENCLAW_META_FENCE.sub("", preamble)
+    assert "chat_id" not in result, "R4 regression: metadata fence not removed"
+    assert result.strip() == "", "R4 regression: fence body leaked after rewrite"
+
+
+def test_r4_meta_fence_regex_completes_fast_on_adversarial_input():
+    """R4: regex must complete quickly on a long body that contains backtick lines.
+
+    The original pattern used two DOTALL .*? spans.  With many backtick-prefixed
+    lines followed by many key occurrences and no closing fence, the original
+    could exhibit O(n\u00b2) backtracking.  The [^`]*? fix stops at the first
+    backtick, aborting the match in O(1) for each starting position.
+    """
+    import time
+
+    # Adversarial: many backtick-prefixed lines (early termination trigger for
+    # [^`]*?) followed by many occurrences of a matching key, no closing ```.
+    # The [^`]*? rewrite stops immediately at the backtick in each `inert line;
+    # the original .*? would scan past them and attempt all key positions.
+    adversarial = (
+        "```json\n"
+        + "`inert_line\n" * 3000  # 3000 lines each starting with a backtick
+        + "chat_id: val\n" * 500  # 500 key occurrences after the backtick lines
+        # deliberately no closing ``` to force the full scan
+    )
+    start = time.perf_counter()
+    result = src_transforms._OPENCLAW_META_FENCE.sub("", adversarial)
+    elapsed = time.perf_counter() - start
+
+    assert result == adversarial, "adversarial input should not match (no closing ```)"
+    assert elapsed < 1.0, (
+        f"R4 ReDoS guard: regex took {elapsed:.3f}s on adversarial input "
+        f"(expected < 1.0s after [^`]*? rewrite)"
+    )
+
+
+# ===========================================================================
+# PERF: runtime _apply_post_extract_pipeline parity with declared pipeline
+# ===========================================================================
+
+
+def test_perf_runtime_pipeline_matches_declared_pipeline(sessions_dir):
+    """PERF: _apply_post_extract_pipeline must produce identical output to
+    _apply_transform_pipeline (full declared pipeline from raw bytes).
+
+    This is the drift-prevention lock: if the optimised runtime path ever
+    diverges from the conformance path, this test catches it immediately.
+    Covers the R3 orphan case and R1 new token patterns via sub-fixtures.
+    """
+    from mempalace.sources.openclaw import (
+        JsonlTrajectoryEventSource,
+        _apply_post_extract_pipeline,
+        _apply_transform_pipeline,
+        _build_canonical_source_bytes,
+        _extract_turns_from_events,
+    )
+
+    for session_id in (_SESSION_SIMPLE, _SESSION_METADATA, _SESSION_UNICODE):
+        tfile = sessions_dir / f"{session_id}.trajectory.jsonl"
+        # Conformance path: full declared pipeline from raw bytes.
+        raw = _build_canonical_source_bytes(tfile)
+        declared_output = _apply_transform_pipeline(raw)
+
+        # Runtime path: extract turns from events, then post-extract pipeline.
+        events = list(JsonlTrajectoryEventSource(tfile).iter_events())
+        turns_text = _extract_turns_from_events(events)
+        runtime_output = _apply_post_extract_pipeline(turns_text)
+
+        assert declared_output == runtime_output, (
+            f"PERF parity failure for {session_id}: "
+            "runtime _apply_post_extract_pipeline diverged from declared pipeline"
+        )
+
+
+def test_perf_parity_with_r3_orphan_fixture(tmp_path):
+    """PERF parity: orphan-user fixture (R3) must be identical on both paths."""
+    from mempalace.sources.openclaw import (
+        JsonlTrajectoryEventSource,
+        _apply_post_extract_pipeline,
+        _apply_transform_pipeline,
+        _build_canonical_source_bytes,
+        _extract_turns_from_events,
+    )
+
+    session_id = "sess-parity-r3-0001"
+    tfile = tmp_path / f"{session_id}.trajectory.jsonl"
+    _build_envelope_only_trajectory(tfile, session_id)
+
+    raw = _build_canonical_source_bytes(tfile)
+    declared_output = _apply_transform_pipeline(raw)
+
+    events = list(JsonlTrajectoryEventSource(tfile).iter_events())
+    turns_text = _extract_turns_from_events(events)
+    runtime_output = _apply_post_extract_pipeline(turns_text)
+
+    assert declared_output == runtime_output, (
+        "PERF parity failure on R3 orphan fixture: runtime path diverged from declared pipeline"
+    )
+    # Also assert that the placeholder is present (R3 correctness on both paths).
+    assert "> [non-text user turn]" in declared_output, (
+        "R3 placeholder missing from declared pipeline output"
+    )
+    assert "> [non-text user turn]" in runtime_output, (
+        "R3 placeholder missing from runtime pipeline output"
+    )
+
+
+def test_perf_parity_with_r1_secrets_fixture(tmp_path):
+    """PERF parity: new token formats (R1) must be redacted identically on both paths."""
+    from mempalace.sources.openclaw import (
+        JsonlTrajectoryEventSource,
+        _apply_post_extract_pipeline,
+        _apply_transform_pipeline,
+        _build_canonical_source_bytes,
+        _extract_turns_from_events,
+    )
+
+    session_id = "sess-parity-r1-0001"
+    tfile = tmp_path / f"{session_id}.trajectory.jsonl"
+
+    user_text = (
+        f"My keys: {_FAKE_SK_PROJ} and {_FAKE_GITHUB_PAT}. "
+        f"Please help configure this service. Long enough to form a complete chunk."
+    )
+    assistant_text = (
+        "Please rotate those credentials. This response is also long enough for a chunk."
+    )
+    build_trajectory_fixture(
+        tfile,
+        session_id,
+        [(user_text, [assistant_text])],
+        workspace_dir="/home/user/projects/parity-r1",
+    )
+
+    raw = _build_canonical_source_bytes(tfile)
+    declared_output = _apply_transform_pipeline(raw)
+
+    events = list(JsonlTrajectoryEventSource(tfile).iter_events())
+    turns_text = _extract_turns_from_events(events)
+    runtime_output = _apply_post_extract_pipeline(turns_text)
+
+    assert declared_output == runtime_output, (
+        "PERF parity failure on R1 secrets fixture: runtime path diverged from declared pipeline"
+    )
+    # Both paths must redact the secrets.
+    assert _FAKE_SK_PROJ not in declared_output, "sk-proj token not redacted in declared path"
+    assert _FAKE_GITHUB_PAT not in declared_output, "github_pat token not redacted in declared path"
+    assert _FAKE_SK_PROJ not in runtime_output, "sk-proj token not redacted in runtime path"
+    assert _FAKE_GITHUB_PAT not in runtime_output, "github_pat token not redacted in runtime path"

@@ -179,9 +179,13 @@ _OPENCLAW_RUNTIME_BLOCK = re.compile(
     re.DOTALL,
 )
 # Strip fenced code blocks whose body contains OpenClaw routing metadata keys.
+# R4 / ReDoS hardening: replaced the two DOTALL .*? spans with [^`]*? so the
+# pattern is bounded by backtick characters and cannot span ``` delimiters.
+# [^`] matches any character except a backtick — including newlines — so
+# re.DOTALL is not needed.  Behavior on well-formed OpenClaw metadata fences
+# (JSON bodies without inline backticks) is identical to the original.
 _OPENCLAW_META_FENCE = re.compile(
-    r"```[a-zA-Z]*\s*\n.*?(?:chat_id|inbound_event_kind|sender_id|\"label\").*?```",
-    re.DOTALL,
+    r'```[a-zA-Z]*[^\n]*\n[^`]*?(?:chat_id|inbound_event_kind|sender_id|"label")[^`]*?```',
 )
 # Strip bare label header lines injected above the metadata fences.
 _OPENCLAW_LABEL_LINES = re.compile(
@@ -355,12 +359,17 @@ def openclaw_format_exchange(text: str) -> str:  # noqa: D401
         if not isinstance(body, str):
             body = str(body)
         body = body.strip()
-        if not body:
-            continue
+        # R3: empty user bodies are emitted as a stable placeholder so the
+        # following assistant turn stays paired and is not lost as a leading
+        # orphan by _chunk_by_exchange.  Empty assistant turns are still
+        # silently skipped (they carry no useful content).
         if role == "user":
-            quoted = "\n".join(f"> {ln}" for ln in body.split("\n"))
-            blocks.append(quoted)
-        else:
+            if not body:
+                blocks.append("> [non-text user turn]")
+            else:
+                quoted = "\n".join(f"> {ln}" for ln in body.split("\n"))
+                blocks.append(quoted)
+        elif body:  # assistant — skip if empty
             blocks.append(body)
     return "\n\n".join(blocks)
 
@@ -386,14 +395,20 @@ def openclaw_format_exchange(text: str) -> str:  # noqa: D401
 _OC_RE_AWS_KEY = re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")
 
 # Well-known token prefixes with variable-length alphanumeric tails.
+# R1: broadened to cover dashed/newer OpenAI formats (sk-proj-*, sk-svcacct-*)
+# and additional GitHub token prefixes (gho_, ghu_, ghr_, github_pat_).
 _OC_RE_PREFIXED_TOKENS = re.compile(
     r"\b(?:"
-    r"ghp_[A-Za-z0-9_]{36,}"  # GitHub personal access token
+    r"ghp_[A-Za-z0-9_]{36,}"  # GitHub personal access token (classic)
     r"|ghs_[A-Za-z0-9_]{36,}"  # GitHub server-to-server token
+    r"|gho_[A-Za-z0-9_]{36,}"  # GitHub OAuth app token
+    r"|ghu_[A-Za-z0-9_]{36,}"  # GitHub user-to-server token
+    r"|ghr_[A-Za-z0-9_]{36,}"  # GitHub refresh token
+    r"|github_pat_[A-Za-z0-9_]{22,}"  # GitHub fine-grained PAT
     r"|lin_api_[A-Za-z0-9_]{30,}"  # Linear API key
     r"|xoxb-[A-Za-z0-9\-]{20,}"  # Slack bot token
     r"|xoxp-[A-Za-z0-9\-]{20,}"  # Slack user token
-    r"|sk-[A-Za-z0-9]{20,}"  # OpenAI / generic sk- token
+    r"|sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}"  # OpenAI / generic sk- token
     r"|clh_[A-Za-z0-9_\-]{20,}"  # ClawHub token
     r"|ATATT[A-Za-z0-9+=/\-_]{30,}"  # Atlassian (Jira) personal access token
     r")"
@@ -413,6 +428,11 @@ _OC_RE_PEM_KEY = re.compile(
 
 # Common key=value / key: value assignment patterns.
 # Group 1 = the key prefix (preserved); group 2 = the value (redacted).
+# R2 — known limitation (accepted, best-effort): the value pattern
+# [^\s,'"`\n>{]{8,} matches any non-whitespace run of ≥8 chars, so a
+# single prose word after a secret-like key (e.g. "password: yesterday")
+# can be over-redacted.  Eliminating these false positives would require
+# entropy-based heuristics and risks introducing false negatives.
 _OC_RE_KV_SECRET = re.compile(
     r"(?i)"
     r"((?:api[_-]?key|api[_-]?token|auth[_-]?token|access[_-]?token"

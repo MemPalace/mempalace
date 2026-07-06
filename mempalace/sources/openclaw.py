@@ -789,24 +789,72 @@ def _apply_transform_pipeline(raw_text: str) -> str:
     return text
 
 
-def _apply_post_extract_pipeline(turns_text: str) -> str:
+def _apply_post_extract_pipeline(turns_text: str) -> str:  # noqa: C901
     """Apply post-extract transforms to role-tab-JSON turn text (runtime path).
 
-    Receives the output of :func:`_extract_turns_from_events` (which is
-    identical to ``openclaw_extract_turns`` applied to raw bytes) and applies
-    the remaining declared transforms in :data:`DECLARED_TRANSFORMATION_ORDER`.
+    PERF optimisation: decodes each role-tab-JSON line's body **once** and
+    applies all per-body transforms in-memory before formatting, instead of
+    running three separate JSON round-trips (strip_runtime_context,
+    strip_metadata_preamble, redact_secrets each calling json.loads/dumps on
+    every line).
+
+    Correctness guarantee: every regex applied here is the **same module-level
+    constant** used by the corresponding declared transform, so there is zero
+    behavioural drift from the RFC §7.3 conformance path.  The declared
+    text→text transforms (``openclaw_strip_runtime_context``,
+    ``openclaw_strip_metadata_preamble``, ``openclaw_redact_secrets``,
+    ``openclaw_format_exchange``) remain unchanged and are still exercised by
+    :func:`_apply_transform_pipeline`.
     """
-    pipeline = [
-        _transforms.openclaw_strip_runtime_context,
-        _transforms.openclaw_strip_metadata_preamble,
-        _transforms.openclaw_redact_secrets,
-        _transforms.openclaw_format_exchange,
-        _transforms.newline_normalize,
-        _transforms.whitespace_trim,
-    ]
-    text = turns_text
-    for step in pipeline:
-        text = step(text)
+    blocks: List[str] = []
+    for line in turns_text.split("\n"):
+        role, sep, body_json = line.partition("\t")
+        if not sep:
+            continue
+        try:
+            body: str = json.loads(body_json)
+        except (ValueError, TypeError):
+            body = body_json
+        if not isinstance(body, str):
+            body = str(body)
+
+        if role == "user":
+            # --- openclaw_strip_runtime_context ---
+            body = _transforms._OPENCLAW_RUNTIME_BLOCK.sub("", body)
+            # --- openclaw_strip_metadata_preamble ---
+            body = _transforms._OPENCLAW_META_FENCE.sub("", body)
+            body = _transforms._OPENCLAW_LABEL_LINES.sub("", body)
+            body = _transforms._OPENCLAW_SLACK_HEADER.sub("", body)
+            body = _transforms._OPENCLAW_MEDIA_ATTACHED.sub("", body)
+            body = _transforms._OPENCLAW_SLACK_FILE_LINE.sub("", body)
+            body = _transforms._OPENCLAW_SLACK_MSG_ID.sub("", body)
+            body = _transforms._OPENCLAW_FILE_WRAPPER.sub("", body)
+
+        # --- openclaw_redact_secrets (both roles) ---
+        body = _transforms._OC_RE_AWS_KEY.sub("[REDACTED:aws_key]", body)
+        body = _transforms._OC_RE_PREFIXED_TOKENS.sub("[REDACTED:api_token]", body)
+        body = _transforms._OC_RE_BEARER.sub("Bearer [REDACTED:bearer_token]", body)
+        body = _transforms._OC_RE_BASIC_AUTH.sub("Basic [REDACTED:basic_auth]", body)
+        body = _transforms._OC_RE_PEM_KEY.sub("[REDACTED:pem_private_key]", body)
+        body = _transforms._OC_RE_KV_SECRET.sub(r"\1[REDACTED:secret_value]", body)
+
+        # --- openclaw_format_exchange ---
+        body = body.strip()
+        if role == "user":
+            if not body:
+                # R3: preserve empty user turns as a placeholder so the
+                # following assistant reply is not lost as a leading orphan.
+                blocks.append("> [non-text user turn]")
+            else:
+                quoted = "\n".join(f"> {ln}" for ln in body.split("\n"))
+                blocks.append(quoted)
+        elif body:  # assistant — skip if empty
+            blocks.append(body)
+
+    text = "\n\n".join(blocks)
+    # --- newline_normalize + whitespace_trim ---
+    text = _transforms.newline_normalize(text)
+    text = _transforms.whitespace_trim(text)
     return text
 
 
