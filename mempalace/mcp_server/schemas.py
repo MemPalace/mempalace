@@ -640,6 +640,28 @@ TOOLS = {
         },
         "handler": tool_list_drawers,
     },
+    "mempalace_drawer_salience": {
+        "description": "List lazy-decayed per-drawer salience at logical drawer granularity. Chunked drawers are deduped by parent_drawer_id.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "wing": {"type": "string", "description": "Filter by wing (optional)"},
+                "room": {"type": "string", "description": "Filter by room (optional)"},
+                "limit": {
+                    "type": "integer",
+                    "description": "Max drawers to return (default 100, max 100)",
+                    "minimum": 1,
+                    "maximum": 100,
+                },
+                "order_by": {
+                    "type": "string",
+                    "enum": ["strength", "access_count", "last_activated"],
+                    "description": "Sort field (default strength)",
+                },
+            },
+        },
+        "handler": tool_drawer_salience,
+    },
     "mempalace_update_drawer": {
         "description": "Update an existing drawer's content and/or metadata (wing, room). Fetches existing drawer first; returns error if not found.",
         "input_schema": {

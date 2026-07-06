@@ -75,6 +75,7 @@ READ_TOOLS = frozenset(
         "mempalace_get_drawer",
         "mempalace_get_drawers",
         "mempalace_list_drawers",
+        "mempalace_drawer_salience",
         "mempalace_diary_read",
         "mempalace_kg_query",
         "mempalace_kg_stats",

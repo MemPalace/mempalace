@@ -232,6 +232,7 @@ def _drawer_payload(record):
         "content": record["content"],
         "wing": safe_meta.get("wing", ""),
         "room": safe_meta.get("room", ""),
+        "salience": drawer_salience(record["metadata"], now=datetime.now(timezone.utc)),
         "metadata": safe_meta,
     }
 
@@ -242,6 +243,19 @@ def _drawer_payload(record):
         payload["metadata"]["chunk_ids"] = record["ids"]
 
     return payload
+
+
+def _metadata_where_filter(wing: str = None, room: str = None):
+    conditions = []
+    if wing:
+        conditions.append({"wing": wing})
+    if room:
+        conditions.append({"room": room})
+    if len(conditions) == 1:
+        return conditions[0]
+    if len(conditions) > 1:
+        return {"$and": conditions}
+    return None
 
 
 def _fetch_drawer_rows(col, where=None, page_size: int = 1000, include=None):
@@ -1258,18 +1272,7 @@ def tool_list_drawers(
         return {"error": str(e)}
 
     try:
-        where = None
-        conditions = []
-
-        if wing:
-            conditions.append({"wing": wing})
-        if room:
-            conditions.append({"room": room})
-
-        if len(conditions) == 1:
-            where = conditions[0]
-        elif len(conditions) > 1:
-            where = {"$and": conditions}
+        where = _metadata_where_filter(wing=wing, room=room)
 
         listed = None
         if _is_chroma_backend() and _config.palace_path:
@@ -1313,6 +1316,64 @@ def tool_list_drawers(
         }
     except Exception as e:
         logger.exception("tool_list_drawers failed")
+        return {"error": str(e)}
+
+
+def tool_drawer_salience(
+    wing: str = None,
+    room: str = None,
+    limit: int = 100,
+    order_by: str = "strength",
+):
+    """List lazy-decayed drawer salience at logical drawer granularity."""
+    limit = max(1, min(limit, _MAX_RESULTS))
+    if order_by not in {"strength", "access_count", "last_activated"}:
+        return {"error": "order_by must be one of: strength, access_count, last_activated"}
+
+    try:
+        wing = _sanitize_optional_name(wing, "wing")
+        room = _sanitize_optional_name(room, "room")
+    except ValueError as e:
+        return {"error": str(e)}
+
+    col = _get_collection()
+    if not col:
+        return _collection_error_or_no_palace()
+
+    try:
+        ids, documents, metadatas = _fetch_drawer_rows(
+            col, where=_metadata_where_filter(wing=wing, room=room)
+        )
+        drawers = _collapse_drawer_rows(ids, documents, metadatas)
+        rows = []
+        now = datetime.now(timezone.utc)
+        for drawer in drawers:
+            rows.append(
+                {
+                    "id": drawer["drawer_id"],
+                    "wing": drawer.get("wing", ""),
+                    "room": drawer.get("room", ""),
+                    **drawer_salience(drawer.get("metadata", {}), now=now),
+                }
+            )
+
+        def sort_key(item):
+            value = item.get(order_by)
+            if order_by == "last_activated":
+                parsed = datetime.min.replace(tzinfo=timezone.utc)
+                try:
+                    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                except (TypeError, ValueError):
+                    pass
+                return (parsed, item["id"])
+            return (value, item["id"])
+
+        rows.sort(key=sort_key, reverse=True)
+        return {"drawers": rows[:limit]}
+    except Exception as e:
+        logger.exception("tool_drawer_salience failed")
         return {"error": str(e)}
 
 
