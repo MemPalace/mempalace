@@ -8,10 +8,11 @@ from unittest.mock import MagicMock, patch
 import chromadb
 import pytest
 
+from mempalace.config import MempalaceConfig
 from mempalace.convo_miner import (
     _compute_convo_cursor,
     _fetch_stored_cursor,
-    _flag_possible_duplicates,
+    _flag_or_drop_duplicates,
     _incremental_reparse,
     _is_ai_tool_path,
     _register_file,
@@ -713,58 +714,217 @@ def test_register_file_sentinel_includes_source_mtime():
 # tests cover the config gate and the metadata-attachment contract.
 
 
-class TestFlagPossibleDuplicates:
+class TestFlagOrDropDuplicates:
+    @staticmethod
+    def _call(batch_docs, batch_metas, mock_col=None, batch_ids=None, batch_rooms=None):
+        mock_col = mock_col if mock_col is not None else MagicMock()
+        batch_ids = (
+            batch_ids if batch_ids is not None else [f"id{i}" for i in range(len(batch_docs))]
+        )
+        batch_rooms = batch_rooms if batch_rooms is not None else ["technical"] * len(batch_docs)
+        dropped = _flag_or_drop_duplicates(
+            mock_col, "a.txt", batch_docs, batch_ids, batch_metas, batch_rooms
+        )
+        return dropped, batch_ids, batch_rooms
+
     def test_noop_when_disabled_by_default(self, monkeypatch):
         monkeypatch.delenv("MEMPALACE_DUPLICATE_DETECTION", raising=False)
-        mock_col = MagicMock()
         batch_docs = ["some content"]
         batch_metas = [{"source_file": "a.txt"}]
         with patch("mempalace.searcher.find_near_duplicates") as mock_find:
-            _flag_possible_duplicates(mock_col, batch_docs, batch_metas)
+            dropped, *_ = self._call(batch_docs, batch_metas)
         mock_find.assert_not_called()
         assert "possible_duplicate_of" not in batch_metas[0]
+        assert dropped == 0
 
     def test_attaches_metadata_when_enabled_and_match_found(self, monkeypatch):
         monkeypatch.setenv("MEMPALACE_DUPLICATE_DETECTION", "true")
-        mock_col = MagicMock()
         batch_docs = ["near-duplicate content"]
         batch_metas = [{"source_file": "a.txt"}]
         with patch(
             "mempalace.searcher.find_near_duplicates",
             return_value=[("drawer_existing_1", 0.94)],
         ) as mock_find:
-            _flag_possible_duplicates(mock_col, batch_docs, batch_metas)
+            dropped, *_ = self._call(batch_docs, batch_metas)
         mock_find.assert_called_once()
         assert batch_metas[0]["possible_duplicate_of"] == "drawer_existing_1"
         assert batch_metas[0]["duplicate_similarity"] == 0.94
+        assert dropped == 0  # drop threshold (0.97) not cleared, and drop_enabled is off anyway
 
     def test_no_metadata_added_when_enabled_but_no_match(self, monkeypatch):
         monkeypatch.setenv("MEMPALACE_DUPLICATE_DETECTION", "true")
-        mock_col = MagicMock()
         batch_docs = ["genuinely new content"]
         batch_metas = [{"source_file": "a.txt"}]
         with patch("mempalace.searcher.find_near_duplicates", return_value=[None]):
-            _flag_possible_duplicates(mock_col, batch_docs, batch_metas)
+            self._call(batch_docs, batch_metas)
         assert "possible_duplicate_of" not in batch_metas[0]
 
-    def test_never_skips_the_insert_even_when_flagged(self, monkeypatch):
-        """The flag is metadata-only -- batch_docs/batch_ids (what actually
-        gets upserted) must be untouched; content is never dropped based
-        on a similarity match."""
+    def test_never_drops_when_drop_disabled(self, monkeypatch):
+        """Flagging is metadata-only by default -- batch_docs/batch_ids
+        (what actually gets upserted) must be untouched even for a
+        near-perfect match, unless duplicate_drop_enabled is separately
+        turned on."""
         monkeypatch.setenv("MEMPALACE_DUPLICATE_DETECTION", "true")
-        mock_col = MagicMock()
+        monkeypatch.delenv("MEMPALACE_DUPLICATE_DROP", raising=False)
         batch_docs = ["a", "b", "c"]
         batch_metas = [{"i": 0}, {"i": 1}, {"i": 2}]
         with patch(
             "mempalace.searcher.find_near_duplicates",
             return_value=[("d1", 0.99), ("d2", 0.95), None],
         ):
-            _flag_possible_duplicates(mock_col, batch_docs, batch_metas)
+            dropped, batch_ids, _ = self._call(batch_docs, batch_metas)
+        assert dropped == 0
         assert batch_docs == ["a", "b", "c"]  # untouched
         assert len(batch_metas) == 3  # nothing removed
+        assert len(batch_ids) == 3
         assert batch_metas[0]["possible_duplicate_of"] == "d1"
         assert batch_metas[1]["possible_duplicate_of"] == "d2"
         assert "possible_duplicate_of" not in batch_metas[2]
+
+    def test_drops_when_drop_enabled_and_above_drop_threshold(self, monkeypatch):
+        monkeypatch.setenv("MEMPALACE_DUPLICATE_DETECTION", "true")
+        monkeypatch.setenv("MEMPALACE_DUPLICATE_DROP", "true")
+        batch_docs = ["exact-ish duplicate"]
+        batch_metas = [{"i": 0}]
+        with patch(
+            "mempalace.searcher.find_near_duplicates",
+            return_value=[("d1", 0.99)],  # clears the default 0.97 drop threshold
+        ):
+            dropped, batch_ids, batch_rooms = self._call(batch_docs, batch_metas)
+        assert dropped == 1
+        assert batch_docs == []
+        assert batch_ids == []
+        assert batch_metas == []
+        assert batch_rooms == []
+
+    def test_flags_but_does_not_drop_between_flag_and_drop_threshold(self, monkeypatch):
+        monkeypatch.setenv("MEMPALACE_DUPLICATE_DETECTION", "true")
+        monkeypatch.setenv("MEMPALACE_DUPLICATE_DROP", "true")
+        batch_docs = ["similar but not certain"]
+        batch_metas = [{"i": 0}]
+        with patch(
+            "mempalace.searcher.find_near_duplicates",
+            # Clears the 0.9 flag threshold but not the stricter 0.97
+            # default drop threshold.
+            return_value=[("d1", 0.93)],
+        ):
+            dropped, batch_ids, _ = self._call(batch_docs, batch_metas)
+        assert dropped == 0
+        assert batch_docs == ["similar but not certain"]
+        assert batch_ids == ["id0"]
+        assert batch_metas[0]["possible_duplicate_of"] == "d1"
+        assert batch_metas[0]["duplicate_similarity"] == 0.93
+
+    def test_mixed_batch_drops_only_matching_indices_consistently(self, monkeypatch):
+        """batch_docs/batch_ids/batch_metas/batch_rooms must all shrink
+        to the SAME surviving indices, in the same order -- a dropped
+        chunk in the middle of a batch must not misalign the others."""
+        monkeypatch.setenv("MEMPALACE_DUPLICATE_DETECTION", "true")
+        monkeypatch.setenv("MEMPALACE_DUPLICATE_DROP", "true")
+        batch_docs = ["dropped", "flagged", "clean"]
+        batch_metas = [{"i": 0}, {"i": 1}, {"i": 2}]
+        batch_ids = ["id0", "id1", "id2"]
+        batch_rooms = ["technical", "problems", "planning"]
+        with patch(
+            "mempalace.searcher.find_near_duplicates",
+            return_value=[("d0", 0.99), ("d1", 0.93), None],
+        ):
+            dropped = _flag_or_drop_duplicates(
+                MagicMock(), "a.txt", batch_docs, batch_ids, batch_metas, batch_rooms
+            )
+        assert dropped == 1
+        assert batch_docs == ["flagged", "clean"]
+        assert batch_ids == ["id1", "id2"]
+        assert batch_rooms == ["problems", "planning"]
+        assert batch_metas[0]["possible_duplicate_of"] == "d1"
+        assert "possible_duplicate_of" not in batch_metas[1]
+
+    def test_drop_threshold_clamped_to_at_least_flag_threshold(self, monkeypatch):
+        """A misconfigured drop_threshold BELOW the flag threshold must
+        not make dropping easier to trigger than flagging --
+        find_near_duplicates only ever returns matches at or above the
+        flag threshold, so an unclamped lower drop_threshold would drop
+        everything that gets flagged. The clamp guarantees dropping
+        stays at least as strict as flagging even then."""
+        monkeypatch.setenv("MEMPALACE_DUPLICATE_DETECTION", "true")
+        monkeypatch.setenv("MEMPALACE_DUPLICATE_DROP", "true")
+        monkeypatch.setattr(MempalaceConfig, "duplicate_drop_threshold", 0.5)
+        batch_docs = ["borderline match"]
+        batch_metas = [{"i": 0}]
+        with patch(
+            "mempalace.searcher.find_near_duplicates",
+            # Exactly at the (default 0.9) flag threshold -- the lowest
+            # similarity find_near_duplicates would ever return a match
+            # for.
+            return_value=[("d1", 0.9)],
+        ):
+            dropped, *_ = self._call(batch_docs, batch_metas)
+        assert dropped == 1
+
+
+class TestDuplicateDropWiredIn:
+    """End-to-end through the real mine_convos()/palace path, using real
+    embeddings (not mocked) -- two files with identical exchange text
+    should embed to the same vector and clear the default 0.97 drop
+    threshold, proving the wiring works with the actual similarity
+    backend, not just the mocked unit tests above."""
+
+    _SHARED_TEXT = (
+        "> What is the deployment process?\n"
+        "We deploy via a blue-green rollout with automated health checks "
+        "before traffic cuts over to the new version.\n"
+    )
+
+    def test_drop_enabled_removes_near_certain_duplicate(self, monkeypatch, capsys):
+        monkeypatch.setenv("MEMPALACE_DUPLICATE_DETECTION", "true")
+        monkeypatch.setenv("MEMPALACE_DUPLICATE_DROP", "true")
+        tmpdir = tempfile.mkdtemp()
+        try:
+            (Path(tmpdir) / "a.txt").write_text(self._SHARED_TEXT)
+            (Path(tmpdir) / "b.txt").write_text(self._SHARED_TEXT)
+            palace_path = os.path.join(tmpdir, "palace")
+
+            mine_convos(tmpdir, palace_path, wing="test")
+            out = capsys.readouterr().out
+
+            client = chromadb.PersistentClient(path=palace_path)
+            col = client.get_collection("mempalace_drawers")
+            result = col.get(include=["metadatas"])
+            source_files = {m.get("source_file") for m in result["metadatas"] if m}
+            # Only ONE of the two identical files' drawers actually got
+            # filed -- whichever was mined second had its near-certain
+            # duplicate dropped against the first.
+            assert len(source_files) == 1
+            assert "Possible duplicates skipped: 1" in out
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_flag_only_keeps_both_when_drop_disabled(self, monkeypatch, capsys):
+        """Same identical-content setup, but with drop NOT enabled --
+        both files' drawers must survive (flagging never removes
+        content), confirming the drop behavior is gated by its own
+        opt-in and not an accidental side effect of flagging alone."""
+        monkeypatch.setenv("MEMPALACE_DUPLICATE_DETECTION", "true")
+        monkeypatch.delenv("MEMPALACE_DUPLICATE_DROP", raising=False)
+        tmpdir = tempfile.mkdtemp()
+        try:
+            (Path(tmpdir) / "a.txt").write_text(self._SHARED_TEXT)
+            (Path(tmpdir) / "b.txt").write_text(self._SHARED_TEXT)
+            palace_path = os.path.join(tmpdir, "palace")
+
+            mine_convos(tmpdir, palace_path, wing="test")
+            out = capsys.readouterr().out
+
+            client = chromadb.PersistentClient(path=palace_path)
+            col = client.get_collection("mempalace_drawers")
+            result = col.get(include=["metadatas"])
+            source_files = {m.get("source_file") for m in result["metadatas"] if m}
+            assert len(source_files) == 2
+            assert "Possible duplicates skipped: 0" in out
+            flagged = [m for m in result["metadatas"] if m and m.get("possible_duplicate_of")]
+            assert len(flagged) == 1
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ── incremental-mining cursor (compute + store only, nothing reads it yet) ──

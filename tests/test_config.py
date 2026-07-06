@@ -956,6 +956,57 @@ def test_duplicate_detection_threshold_garbage_falls_back_to_default(monkeypatch
     assert cfg.duplicate_detection_threshold == 0.9
 
 
+# ── duplicate_drop_enabled / duplicate_drop_threshold ────────────────────
+
+
+def test_duplicate_drop_disabled_by_default(monkeypatch, tmp_path):
+    monkeypatch.delenv("MEMPALACE_DUPLICATE_DROP", raising=False)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.duplicate_drop_enabled is False
+
+
+def test_duplicate_drop_enabled_from_config(monkeypatch, tmp_path):
+    monkeypatch.delenv("MEMPALACE_DUPLICATE_DROP", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"duplicate_detection": {"drop_enabled": True}}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.duplicate_drop_enabled is True
+
+
+def test_duplicate_drop_env_override_true(monkeypatch, tmp_path):
+    monkeypatch.setenv("MEMPALACE_DUPLICATE_DROP", "yes")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.duplicate_drop_enabled is True
+
+
+def test_duplicate_drop_env_override_false_string(monkeypatch, tmp_path):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"duplicate_detection": {"drop_enabled": True}}, f)
+    monkeypatch.setenv("MEMPALACE_DUPLICATE_DROP", "0")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.duplicate_drop_enabled is False
+
+
+def test_duplicate_drop_threshold_default(monkeypatch, tmp_path):
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.duplicate_drop_threshold == 0.97
+
+
+def test_duplicate_drop_threshold_from_config(monkeypatch, tmp_path):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"duplicate_detection": {"drop_threshold": 0.98}}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.duplicate_drop_threshold == 0.98
+
+
+@pytest.mark.parametrize("bad", ["abc", 1.5, -0.1, None])
+def test_duplicate_drop_threshold_garbage_falls_back_to_default(monkeypatch, tmp_path, bad):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"duplicate_detection": {"drop_threshold": bad}}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.duplicate_drop_threshold == 0.97
+
+
 # ── incremental_mining_enabled ───────────────────────────────────────────
 
 

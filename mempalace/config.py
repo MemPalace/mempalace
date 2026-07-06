@@ -659,6 +659,53 @@ class MempalaceConfig:
             return 0.9
         return value if 0.0 <= value <= 1.0 else 0.9
 
+    @property
+    def duplicate_drop_enabled(self) -> bool:
+        """Whether a chunk whose closest match clears
+        ``duplicate_drop_threshold`` (a stricter bar than the flagging
+        threshold above) is skipped entirely rather than inserted and
+        flagged.
+
+        Off by default, and only takes effect when
+        ``duplicate_detection_enabled`` is also on -- dropping needs the
+        same similarity query flagging already runs, it just acts on the
+        result more aggressively. Unlike flagging (which never removes
+        anything), a false positive here means real content is
+        permanently lost, not just mistagged -- this is why it has its
+        own, separate opt-in and its own, stricter threshold rather than
+        reusing the flag threshold directly. Env var
+        ``MEMPALACE_DUPLICATE_DROP`` takes precedence over config.json's
+        ``duplicate_detection.drop_enabled``.
+        """
+        env_val = os.environ.get("MEMPALACE_DUPLICATE_DROP", "").strip()
+        if env_val:
+            return env_val.lower() in ("true", "1", "yes", "on")
+        value = self._file_config.get("duplicate_detection", {}).get("drop_enabled", False)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.lower() in ("true", "1", "yes", "on")
+        return bool(value)
+
+    @property
+    def duplicate_drop_threshold(self) -> float:
+        """Cosine similarity (0-1) at or above which a chunk is dropped
+        entirely instead of inserted, when ``duplicate_drop_enabled`` is
+        on. Deliberately defaults higher than
+        ``duplicate_detection_threshold`` (0.9) -- dropping is meant for
+        near-certain duplicates only, not merely "worth a human's
+        attention." The consumer of this value additionally clamps it to
+        never go below ``duplicate_detection_threshold`` at runtime, so
+        a misconfigured lower value here can't make dropping *easier*
+        to trigger than flagging.
+        """
+        try:
+            value = self._file_config.get("duplicate_detection", {}).get("drop_threshold", 0.97)
+            value = float(value)
+        except (TypeError, ValueError):
+            return 0.97
+        return value if 0.0 <= value <= 1.0 else 0.97
+
     @staticmethod
     def _try_coerce_int(value, minimum=None):
         """Coerce a raw config value to int, or ``None`` if it cannot be a

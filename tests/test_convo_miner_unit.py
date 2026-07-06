@@ -538,13 +538,14 @@ class TestFileChunksLocked:
         monkeypatch.setattr(convo_miner, "mine_lock", lambda source_file: contextlib.nullcontext())
         monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda content: "conversations")
 
-        drawers, room_counts, skipped = _file_chunks_locked(
+        drawers, room_counts, skipped, dropped = _file_chunks_locked(
             col, "chat.txt", chunks, "wing", "general", "agent", "exchange"
         )
 
         assert drawers == 5
         assert dict(room_counts) == {}
         assert skipped is False
+        assert dropped == 0
         assert col.batch_sizes == [2, 2, 1]
 
     def test_populates_entities_metadata(self, monkeypatch):
@@ -582,6 +583,66 @@ class TestFileChunksLocked:
         assert "MemoryStack" in entities
         assert "rag/foo.py" in entities
         assert "do_thing_now" in entities
+
+    def test_dropping_the_cursor_chunk_removes_its_metadata_entirely(self, monkeypatch):
+        """If the specific chunk carrying the incremental-mining cursor
+        (see _compute_convo_cursor) is itself dropped as a near-certain
+        duplicate, its cursor metadata is lost with it -- no other
+        surviving chunk inherits it. This is a known, accepted
+        trade-off, not a bug: _fetch_stored_cursor finds no cursor on
+        the next mine of this file and falls back to the (already-safe)
+        full re-mine path, which recomputes and reattaches a fresh
+        cursor to whatever ends up as the new last chunk -- a one-time
+        loss of the incremental-mining optimization for this file, not a
+        permanent one. Losing an optimization is a categorically
+        different, lower-severity outcome than losing real content.
+        """
+        import mempalace.convo_miner as convo_miner
+
+        class FakeCol:
+            def __init__(self):
+                self.metas = []
+
+            def delete(self, *args, **kwargs):
+                pass
+
+            def get(self, ids=None, include=None, **kwargs):
+                return {"ids": [], "metadatas": []}
+
+            def upsert(self, documents, ids, metadatas):
+                self.metas.extend(metadatas)
+
+        chunks = [
+            {"content": "first exchange content here", "chunk_index": 0},
+            {"content": "second exchange, the trailing one", "chunk_index": 1},
+        ]
+        cursor = {
+            "cursor_line": 4,
+            "cursor_chunk_index": 1,  # the LAST chunk, matching _compute_convo_cursor's convention
+            "cursor_anchor_hash": "deadbeef",
+            "cursor_format": "claude_code_jsonl",
+        }
+        col = FakeCol()
+        monkeypatch.setenv("MEMPALACE_DUPLICATE_DETECTION", "true")
+        monkeypatch.setenv("MEMPALACE_DUPLICATE_DROP", "true")
+        monkeypatch.setattr(
+            convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
+        )
+        monkeypatch.setattr(convo_miner, "mine_lock", lambda source_file: contextlib.nullcontext())
+        monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda content: "conversations")
+        monkeypatch.setattr(
+            "mempalace.searcher.find_near_duplicates",
+            lambda collection, contents, threshold: [None, ("existing_drawer", 0.99)],
+        )
+
+        drawers, room_counts, skipped, dropped = _file_chunks_locked(
+            col, "chat.txt", chunks, "wing", "general", "agent", "exchange", cursor=cursor
+        )
+
+        assert drawers == 1  # only the first (non-cursor) chunk survived
+        assert dropped == 1
+        assert len(col.metas) == 1
+        assert not any(m.get("cursor_format") for m in col.metas)
 
 
 class TestExtractAuthoredAt:

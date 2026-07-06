@@ -821,36 +821,87 @@ def _fetch_stored_cursor(collection, source_file: str, extract_mode: str) -> Opt
     return found
 
 
-def _flag_possible_duplicates(collection, batch_docs: list, batch_metas: list) -> None:
-    """Flag chunks whose closest existing match is a probable duplicate.
+def _flag_or_drop_duplicates(
+    collection,
+    source_file: str,
+    batch_docs: list,
+    batch_ids: list,
+    batch_metas: list,
+    batch_rooms: list,
+) -> int:
+    """Flag chunks whose closest existing match is a probable duplicate,
+    and -- only when separately opted in -- drop the near-certain ones
+    entirely instead of inserting them.
 
     Opt-in (MempalaceConfig.duplicate_detection_enabled, off by default):
     adds a batched cosine-similarity query per upsert batch on top of the
     embedding mining already computes -- a real per-batch cost. Off by
     default so this changes nothing unless explicitly enabled.
 
-    Never skips or alters an insert -- only attaches
-    possible_duplicate_of / duplicate_similarity metadata to batch_metas
-    in place when a match's similarity is >= the configured threshold.
-    Nothing is ever silently dropped based on a similarity match; the
-    flag is there for later search-time downranking or manual review.
+    Flagging never alters an insert -- it only attaches
+    possible_duplicate_of / duplicate_similarity metadata to a chunk
+    whose closest match is >= duplicate_detection_threshold (0.9 by
+    default). Dropping is a second, separate opt-in
+    (MempalaceConfig.duplicate_drop_enabled, also off by default): a
+    chunk whose closest match clears the stricter duplicate_drop_threshold
+    (0.97 by default) is removed from batch_docs/batch_ids/batch_metas/
+    batch_rooms IN PLACE before this returns, so it's never upserted at
+    all -- unlike flagging, this really does lose the content
+    permanently on a false positive, which is why it needs its own
+    higher bar and its own opt-in rather than reusing the flag
+    threshold. drop_threshold is clamped to never go below
+    duplicate_detection_threshold here, so a misconfigured lower value
+    can't make dropping easier to trigger than flagging (find_near_duplicates
+    already only returns matches at or above duplicate_detection_threshold,
+    so an unclamped lower drop_threshold would drop everything that gets
+    flagged).
+
+    Returns the number of chunks dropped (0 when dropping is off, or
+    when nothing clears the drop threshold) -- the caller's own
+    mine-summary reporting.
     """
     from .config import MempalaceConfig
 
     cfg = MempalaceConfig()
     if not cfg.duplicate_detection_enabled:
-        return
+        return 0
 
     from .searcher import find_near_duplicates
 
     matches = find_near_duplicates(
         collection, batch_docs, threshold=cfg.duplicate_detection_threshold
     )
-    for meta, match in zip(batch_metas, matches):
-        if match is not None:
-            drawer_id, similarity = match
-            meta["possible_duplicate_of"] = drawer_id
-            meta["duplicate_similarity"] = similarity
+
+    drop_enabled = cfg.duplicate_drop_enabled
+    drop_threshold = max(cfg.duplicate_detection_threshold, cfg.duplicate_drop_threshold)
+
+    drop_indices = []
+    for i, match in enumerate(matches):
+        if match is None:
+            continue
+        drawer_id, similarity = match
+        if drop_enabled and similarity >= drop_threshold:
+            drop_indices.append(i)
+            logger.debug(
+                "Dropped near-duplicate chunk (similarity=%.3f, matches %s) for %s",
+                similarity,
+                drawer_id,
+                source_file,
+            )
+            continue
+        batch_metas[i]["possible_duplicate_of"] = drawer_id
+        batch_metas[i]["duplicate_similarity"] = similarity
+
+    if not drop_indices:
+        return 0
+
+    drop_set = set(drop_indices)
+    kept = [i for i in range(len(batch_docs)) if i not in drop_set]
+    batch_docs[:] = [batch_docs[i] for i in kept]
+    batch_ids[:] = [batch_ids[i] for i in kept]
+    batch_metas[:] = [batch_metas[i] for i in kept]
+    batch_rooms[:] = [batch_rooms[i] for i in kept]
+    return len(drop_indices)
 
 
 def _upsert_chunk_batch(
@@ -880,23 +931,31 @@ def _upsert_chunk_batch(
     incremental mine's new trailing exchange); this function only
     matches indices.
 
-    Returns (drawers_added, room_counts_delta).
+    Returns (drawers_added, room_counts_delta, dropped_count).
+    ``dropped_count`` is always 0 unless both
+    ``duplicate_detection_enabled`` and ``duplicate_drop_enabled`` are
+    on (see ``_flag_or_drop_duplicates``).
     """
     room_counts_delta: dict = defaultdict(int)
     drawers_added = 0
+    dropped_count = 0
     for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
         batch_docs: list = []
         batch_ids: list = []
         batch_metas: list = []
+        # Parallel to the three lists above, tracked separately from
+        # room_counts_delta so a chunk dropped as a near-certain
+        # duplicate (see below) doesn't get counted toward a room it
+        # never actually ends up filed under.
+        batch_rooms: list = []
         for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
             chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
-            if extract_mode == "general":
-                room_counts_delta[chunk_room] += 1
             drawer_id = make_convo_drawer_id(
                 wing, chunk_room, source_file, extract_mode, chunk["chunk_index"]
             )
             batch_docs.append(chunk["content"])
             batch_ids.append(drawer_id)
+            batch_rooms.append(chunk_room)
             meta = {
                 "wing": wing,
                 "room": chunk_room,
@@ -920,8 +979,29 @@ def _upsert_chunk_batch(
                 meta["cursor_anchor_hash"] = cursor["cursor_anchor_hash"]
                 meta["cursor_format"] = cursor["cursor_format"]
             batch_metas.append(meta)
+        # May shrink batch_docs/batch_ids/batch_metas/batch_rooms in
+        # place (dropping near-certain duplicates) -- must run before
+        # assert_no_collisions and the room_counts_delta tally below, so
+        # neither one considers a chunk that's about to be dropped.
+        #
+        # If the chunk carrying the cursor above is itself dropped here,
+        # its cursor metadata is lost with it -- nothing rescues it onto
+        # a different surviving chunk. Accepted, not fixed:
+        # _fetch_stored_cursor finds no cursor on this file's next mine
+        # and falls back to the full re-mine path (already the safe
+        # default for "no cursor available"), which recomputes and
+        # reattaches a fresh cursor to whatever ends up as the new last
+        # chunk -- a one-time loss of the incremental-mining shortcut for
+        # this file, not a permanent one.
+        dropped_count += _flag_or_drop_duplicates(
+            collection, source_file, batch_docs, batch_ids, batch_metas, batch_rooms
+        )
+        if extract_mode == "general":
+            for r in batch_rooms:
+                room_counts_delta[r] += 1
+        if not batch_docs:
+            continue
         assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
-        _flag_possible_duplicates(collection, batch_docs, batch_metas)
         try:
             collection.upsert(
                 documents=batch_docs,
@@ -932,7 +1012,7 @@ def _upsert_chunk_batch(
         except Exception as e:
             if "already exists" not in str(e).lower():
                 raise
-    return drawers_added, room_counts_delta
+    return drawers_added, room_counts_delta, dropped_count
 
 
 def _file_chunks_locked(
@@ -952,14 +1032,14 @@ def _file_chunks_locked(
     the LAST chunk's metadata only -- the trailing exchange is the anchor
     a future incremental re-mine would resume from.
 
-    Returns (drawers_added, room_counts_delta, skipped).
+    Returns (drawers_added, room_counts_delta, skipped, dropped_count).
     """
     with mine_lock(source_file):
         # Re-check after lock — another agent may have just finished this file
         # at the current schema/mtime. A stale hit here returns False, so we
         # still fall through to the purge+rebuild path below.
         if file_already_mined(collection, source_file, check_mtime=True, extract_mode=extract_mode):
-            return 0, defaultdict(int), True
+            return 0, defaultdict(int), True, 0
 
         # Purge stale drawers first. Fires both on a normalize-schema bump
         # (file_already_mined() returned False for pre-v2 drawers) and on a
@@ -981,7 +1061,7 @@ def _file_chunks_locked(
             source_mtime = os.path.getmtime(source_file)
         except OSError:
             source_mtime = None
-        drawers_added, room_counts_delta = _upsert_chunk_batch(
+        drawers_added, room_counts_delta, dropped_count = _upsert_chunk_batch(
             collection,
             source_file,
             chunks,
@@ -994,7 +1074,7 @@ def _file_chunks_locked(
             authored_at,
             cursor,
         )
-    return drawers_added, room_counts_delta, False
+    return drawers_added, room_counts_delta, False, dropped_count
 
 
 def _file_chunks_locked_incremental(
@@ -1019,11 +1099,11 @@ def _file_chunks_locked_incremental(
     lock, in which case this returns ``skipped=True`` and makes no
     changes, same as the full-rebuild path.
 
-    Returns (drawers_added, room_counts_delta, skipped).
+    Returns (drawers_added, room_counts_delta, skipped, dropped_count).
     """
     with mine_lock(source_file):
         if file_already_mined(collection, source_file, check_mtime=True, extract_mode=extract_mode):
-            return 0, defaultdict(int), True
+            return 0, defaultdict(int), True, 0
 
         try:
             delete_ids = _source_file_delete_ids(
@@ -1039,7 +1119,7 @@ def _file_chunks_locked_incremental(
             source_mtime = os.path.getmtime(source_file)
         except OSError:
             source_mtime = None
-        drawers_added, room_counts_delta = _upsert_chunk_batch(
+        drawers_added, room_counts_delta, dropped_count = _upsert_chunk_batch(
             collection,
             source_file,
             tail_chunks,
@@ -1052,7 +1132,7 @@ def _file_chunks_locked_incremental(
             authored_at,
             cursor,
         )
-    return drawers_added, room_counts_delta, False
+    return drawers_added, room_counts_delta, False, dropped_count
 
 
 def _is_ai_tool_path(path: Path) -> bool:
@@ -1231,10 +1311,11 @@ def _attempt_incremental_mine(
     path in every ``None`` case -- always safe.
 
     Otherwise returns ``(drawers_added, room_counts_delta, skipped,
-    room)`` -- the same three values ``_file_chunks_locked`` /
-    ``_file_chunks_locked_incremental`` return, plus the file's room
-    (reused from its existing classification, not recomputed) so the
-    caller can bump ``room_counts`` the same way the full path does.
+    room, dropped_count)`` -- the same four values
+    ``_file_chunks_locked`` / ``_file_chunks_locked_incremental``
+    return, plus the file's room (reused from its existing
+    classification, not recomputed) so the caller can bump
+    ``room_counts`` the same way the full path does.
     """
     if (
         dry_run
@@ -1288,7 +1369,7 @@ def _attempt_incremental_mine(
         min_chunk_size=cfg_min_chunk_size,
     )
 
-    drawers_added, room_delta, skipped = _file_chunks_locked_incremental(
+    drawers_added, room_delta, skipped, dropped_count = _file_chunks_locked_incremental(
         collection,
         source_file,
         tail_chunks,
@@ -1300,7 +1381,7 @@ def _attempt_incremental_mine(
         authored_at=_extract_authored_at(filepath),
         cursor=new_cursor,
     )
-    return drawers_added, room_delta, skipped, room
+    return drawers_added, room_delta, skipped, room, dropped_count
 
 
 def _record_mine_outcome(
@@ -1313,6 +1394,7 @@ def _record_mine_outcome(
     filepath: Path,
     limit: int,
     files_mined_so_far: int,
+    dropped_count: int = 0,
     label: str = "",
 ) -> tuple:
     """Apply one file's mining outcome -- full or incremental -- to
@@ -1323,18 +1405,21 @@ def _record_mine_outcome(
     count twice against that function's own complexity budget.
 
     Returns ``(drawers_delta, files_mined_delta, files_skipped_delta,
-    should_break)`` -- plain ints/bool rather than mutating the caller's
-    counters directly, since those are simple local variables in
-    ``_mine_convos_impl``, not a shared mutable object.
+    dropped_delta, should_break)`` -- plain ints/bool rather than
+    mutating the caller's counters directly, since those are simple
+    local variables in ``_mine_convos_impl``, not a shared mutable
+    object. ``dropped_delta`` is always 0 when ``skipped`` -- a skipped
+    file made no changes at all, so it can't have dropped anything
+    either.
     """
     if skipped:
-        return 0, 0, 1, False
+        return 0, 0, 1, 0, False
     for r, n in room_delta.items():
         room_counts[r] += n
     new_files_mined = files_mined_so_far + 1
     print(f"  + [{i:4}/{total_files}] {filepath.name[:50]:50} +{drawers_added}{label}")
     should_break = limit > 0 and new_files_mined >= limit
-    return drawers_added, 1, 0, should_break
+    return drawers_added, 1, 0, dropped_count, should_break
 
 
 def _mine_convos_impl(
@@ -1394,6 +1479,7 @@ def _mine_convos_impl(
     files_mined = 0
     files_skipped = 0
     files_processed = 0
+    total_dropped = 0
     room_counts = defaultdict(int)
 
     for i, filepath in enumerate(files, 1):
@@ -1450,27 +1536,31 @@ def _mine_convos_impl(
             dry_run,
         )
         if incremental_result is not None:
-            drawers_added, room_delta, skipped, room = incremental_result
+            drawers_added, room_delta, skipped, room, dropped_count = incremental_result
             # Bumped regardless of skipped, matching the full path's own
             # ordering below (another agent may have already handled
             # this file under the lock -- it still counts toward this
             # room for reporting purposes).
             room_counts[room] += 1
-            drawers_delta, mined_delta, skipped_delta, should_break = _record_mine_outcome(
-                room_counts,
-                room_delta,
-                drawers_added,
-                skipped,
-                i,
-                len(files),
-                filepath,
-                limit,
-                files_mined,
-                label=" (incremental)",
+            drawers_delta, mined_delta, skipped_delta, dropped_delta, should_break = (
+                _record_mine_outcome(
+                    room_counts,
+                    room_delta,
+                    drawers_added,
+                    skipped,
+                    i,
+                    len(files),
+                    filepath,
+                    limit,
+                    files_mined,
+                    dropped_count=dropped_count,
+                    label=" (incremental)",
+                )
             )
             total_drawers += drawers_delta
             files_mined += mined_delta
             files_skipped += skipped_delta
+            total_dropped += dropped_delta
             if should_break:
                 break
             continue
@@ -1549,7 +1639,7 @@ def _mine_convos_impl(
 
         # Lock + purge stale + file fresh chunks. Lock serializes concurrent
         # agents; purge removes pre-v2 drawers so the schema bump applies.
-        drawers_added, room_delta, skipped = _file_chunks_locked(
+        drawers_added, room_delta, skipped, dropped_count = _file_chunks_locked(
             collection,
             source_file,
             chunks,
@@ -1560,20 +1650,24 @@ def _mine_convos_impl(
             authored_at=_extract_authored_at(filepath),
             cursor=cursor,
         )
-        drawers_delta, mined_delta, skipped_delta, should_break = _record_mine_outcome(
-            room_counts,
-            room_delta,
-            drawers_added,
-            skipped,
-            i,
-            len(files),
-            filepath,
-            limit,
-            files_mined,
+        drawers_delta, mined_delta, skipped_delta, dropped_delta, should_break = (
+            _record_mine_outcome(
+                room_counts,
+                room_delta,
+                drawers_added,
+                skipped,
+                i,
+                len(files),
+                filepath,
+                limit,
+                files_mined,
+                dropped_count=dropped_count,
+            )
         )
         total_drawers += drawers_delta
         files_mined += mined_delta
         files_skipped += skipped_delta
+        total_dropped += dropped_delta
         if should_break:
             break
 
@@ -1589,6 +1683,7 @@ def _mine_convos_impl(
     print(f"  Files processed: {files_processed - files_skipped}")
     print(f"  Files skipped (already filed): {files_skipped}")
     print(f"  Drawers filed: {total_drawers}")
+    print(f"  Possible duplicates skipped: {total_dropped}")
     if room_counts:
         print("\n  By room:")
         for room, count in sorted(room_counts.items(), key=lambda x: x[1], reverse=True):
