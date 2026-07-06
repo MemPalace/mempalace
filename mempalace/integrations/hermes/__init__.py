@@ -324,6 +324,9 @@ def _turn_fingerprint_from_messages(messages: List[Dict[str, Any]]) -> str:
             normalized = _normalize_content(msg.get("content"))
             if normalized:
                 return make_turn_fingerprint(normalized)
+            # an empty-text anchor fingerprints nothing; don't scan further —
+            # _segment_turns gives that segment turn_fp == "" too, so the call
+            # sites stay consistent
             return ""
     return ""
 
@@ -359,6 +362,7 @@ def _segment_turns(messages: List[Dict[str, Any]]) -> List[Dict[str, str]]:
         current["parts"].append(part)
     result: List[Dict[str, str]] = []
     for seg in segments:
+        # double-blank separates whole messages; _normalize_content uses single \n within one message
         assistant = "\n\n".join(seg["parts"])
         if not seg["user"] and not assistant:
             continue
@@ -727,6 +731,9 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         self._session_id: str = ""
         self._hermes_home: str = ""
         self._turn_count = 0
+        # Ancestor session ids whose drawers cover this conversation's
+        # inherited transcript (grows only on /branch; see on_session_switch).
+        self._session_lineage: List[str] = []
 
         # ChromaDB access through mempalace's own backend (matches embedding
         # function, fixes the dim-mismatch bug from prior PRs).
@@ -988,6 +995,23 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
     ) -> None:
         # Repoint subsequent writes at the new session. /reset and /new flush
         # per-session counters; /resume and /branch keep them.
+        reason = str(kwargs.get("reason", "") or "")
+        if reset:
+            # Fresh conversation — no inherited transcript.
+            self._session_lineage = []
+        elif reason == "branch" and parent_session_id:
+            # The branch carries the parent transcript forward; the parent's
+            # drawers cover those turns, so the dedup scan must include them.
+            self._session_lineage.append(parent_session_id)
+        elif rewound or new_session_id == self._session_id:
+            # Same conversation (rewind / no-op switch) — ancestry unchanged.
+            pass
+        else:
+            # /resume or unknown transition: parent_session_id is the session
+            # being LEFT, not transcript ancestry. Stale lineage in the scan
+            # would false-dedup against unrelated drawers — clear it. Failure
+            # direction on a lost real ancestry is duplication, never loss.
+            self._session_lineage = []
         self._session_id = new_session_id or ""
         if reset:
             self._turn_count = 0
