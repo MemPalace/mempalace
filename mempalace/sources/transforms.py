@@ -23,6 +23,7 @@ conformance suite can locate and apply them.
 
 from __future__ import annotations
 
+import json as _json
 import re
 from typing import Protocol, Union
 
@@ -151,6 +152,170 @@ def synthesized_marker(text: str) -> str:
 def speaker_role_assignment(text: str) -> str:
     """Adapter-supplied: multi-party speakers alternately assigned user/assistant."""
     return text
+
+
+# ---------------------------------------------------------------------------
+# Adapter-namespaced reference implementations — OpenClaw
+# ---------------------------------------------------------------------------
+#
+# Per RFC 002 §7.3, custom (non-reserved) transformations declared by an
+# adapter MUST expose a reference implementation under
+# ``mempalace.sources.transforms.<adapter_name>_<transform_name>`` so the
+# conformance suite can locate and apply them by attribute lookup. The
+# implementations below are the OpenClaw adapter's; future adapters add their
+# own under their own ``<name>_`` prefix.
+#
+# The OpenClaw adapter's canonical source bytes for one session are the raw
+# ``*.trajectory.jsonl`` file contents: one JSON event object per line. The
+# transformation chain below converts that into chunked exchange-pair markdown
+# compatible with ``mempalace.convo_miner.chunk_exchanges``.
+
+
+# Regex patterns for user-text cleanup — compiled once at module load.
+_OPENCLAW_RUNTIME_BLOCK = re.compile(
+    r"OpenClaw runtime context.*?END_OPENCLAW_INTERNAL_CONTEXT>>>",
+    re.DOTALL,
+)
+_OPENCLAW_META_FENCE = re.compile(
+    r"```[a-zA-Z]*\s*\n.*?(?:chat_id|inbound_event_kind|sender_id|\"label\").*?```",
+    re.DOTALL,
+)
+_OPENCLAW_LABEL_LINES = re.compile(
+    r"^\s*(?:Conversation info \(untrusted metadata\):"
+    r"|Sender \(untrusted metadata\):"
+    r"|Conversation info.*:"
+    r"|.*untrusted metadata.*:)\s*$",
+    re.MULTILINE,
+)
+
+
+def openclaw_extract_turns(text: str) -> str:  # noqa: D401
+    """Parse JSONL trajectory events and emit one role-tab-JSON line per turn.
+
+    Input: newline-separated JSON event objects (raw ``*.trajectory.jsonl``
+    file contents).
+
+    Output: lines of the form ``<role>\\t<json_body>`` where ``<json_body>``
+    is the JSON-encoded turn text. ``user`` turns come from
+    ``prompt.submitted`` (``data.prompt``); ``assistant`` turns come from
+    ``model.completed`` (``data.assistantTexts`` joined with ``\\n``).
+    All other event types — ``context.compiled``, ``session.started``,
+    ``session.ended``, ``trace.*`` etc. — are skipped.
+
+    The JSON encoding of the body means embedded newlines are escaped and
+    downstream transforms can split on ``\\n`` without ambiguity.
+    """
+    out: list[str] = []
+    pending_user: str | None = None
+    for raw_line in text.split("\n"):
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        try:
+            event = _json.loads(raw_line)
+        except (ValueError, TypeError):
+            continue
+        etype = event.get("type")
+        data = event.get("data") or {}
+        if etype == "prompt.submitted":
+            pending_user = data.get("prompt") or ""
+        elif etype == "model.completed":
+            texts = data.get("assistantTexts") or []
+            assistant = "\n".join(x for x in texts if isinstance(x, str)).strip()
+            if pending_user is not None:
+                out.append(f"user\t{_json.dumps(pending_user)}")
+            if assistant:
+                out.append(f"assistant\t{_json.dumps(assistant)}")
+            pending_user = None
+    return "\n".join(out)
+
+
+def openclaw_strip_runtime_context(text: str) -> str:  # noqa: D401
+    """Strip OpenClaw runtime-context injection blocks from user turns.
+
+    Operates on the role-tab-JSON line format produced by
+    :func:`openclaw_extract_turns`. For each ``user`` line, JSON-decodes the
+    body, removes the ``OpenClaw runtime context … END_OPENCLAW_INTERNAL_CONTEXT>>>``
+    block (inserted by the agent runtime before every prompt), then re-encodes.
+    Assistant lines are passed through unchanged.
+    """
+    out: list[str] = []
+    for line in text.split("\n"):
+        role, sep, body_json = line.partition("\t")
+        if not sep:
+            out.append(line)
+            continue
+        if role == "user":
+            try:
+                body = _json.loads(body_json)
+                body = _OPENCLAW_RUNTIME_BLOCK.sub("", body)
+                body_json = _json.dumps(body)
+            except (ValueError, TypeError):
+                pass
+        out.append(f"{role}\t{body_json}")
+    return "\n".join(out)
+
+
+def openclaw_strip_metadata_preamble(text: str) -> str:  # noqa: D401
+    """Strip OpenClaw metadata fences and header label lines from user turns.
+
+    Operates on the role-tab-JSON line format produced by
+    :func:`openclaw_extract_turns`. For each ``user`` line, JSON-decodes the
+    body, removes:
+
+    * Fenced code blocks containing OpenClaw metadata JSON (``chat_id``,
+      ``sender_id``, ``inbound_event_kind``, ``label`` keys).
+    * Bare label lines such as ``Conversation info (untrusted metadata):``.
+
+    Assistant lines are passed through unchanged.
+    """
+    out: list[str] = []
+    for line in text.split("\n"):
+        role, sep, body_json = line.partition("\t")
+        if not sep:
+            out.append(line)
+            continue
+        if role == "user":
+            try:
+                body = _json.loads(body_json)
+                body = _OPENCLAW_META_FENCE.sub("", body)
+                body = _OPENCLAW_LABEL_LINES.sub("", body)
+                body_json = _json.dumps(body)
+            except (ValueError, TypeError):
+                pass
+        out.append(f"{role}\t{body_json}")
+    return "\n".join(out)
+
+
+def openclaw_format_exchange(text: str) -> str:  # noqa: D401
+    """Reformat role-tab-JSON lines as ``convo_miner`` exchange-pair markdown.
+
+    Mirrors :func:`opencode_format_exchange` but JSON-decodes the body first.
+    ``user`` lines become ``> <body>``; ``assistant`` lines become the body on
+    its own paragraph. Pairs are separated by blank lines. The output is what
+    ``mempalace.convo_miner.chunk_exchanges`` recognises as an exchange
+    transcript.
+    """
+    blocks: list[str] = []
+    for line in text.split("\n"):
+        role, sep, body_json = line.partition("\t")
+        if not sep:
+            continue
+        try:
+            body = _json.loads(body_json)
+        except (ValueError, TypeError):
+            body = body_json
+        if not isinstance(body, str):
+            body = str(body)
+        body = body.strip()
+        if not body:
+            continue
+        if role == "user":
+            quoted = "\n".join(f"> {ln}" for ln in body.split("\n"))
+            blocks.append(quoted)
+        else:
+            blocks.append(body)
+    return "\n\n".join(blocks)
 
 
 # ---------------------------------------------------------------------------
