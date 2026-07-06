@@ -1461,3 +1461,33 @@ def test_session_end_blocking_put_times_out_with_warning(provider, caplog):
     with caplog.at_level(logging.WARNING, logger="mempalace.hermes"):
         provider.on_session_end([{"role": "user", "content": "hi"}])
     assert any("queue full at session_end" in r.message for r in caplog.records)
+
+
+def test_truncated_window_fp_coverage_is_accepted_limit(initialized_provider):
+    # KNOWN, ACCEPTED residual (documented in _file_missing_exchanges):
+    # a synced occurrence of a byte-identical prompt was compressed out of
+    # the window; a NEW, never-synced occurrence of the same prompt is then
+    # fp-skipped against the stale drawer, and its partial assistant output
+    # is not captured. Undecidable with occurrence counting alone — Hermes
+    # message dicts carry no per-message identity — and dropping fp-skip
+    # would re-file every tool-shaped turn. This test PINS the accepted
+    # behavior; if it ever starts failing because the content IS captured,
+    # a better correlation key exists and the docstring should be updated.
+    old_tool_turn = [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": [{"type": "tool_use", "name": "bash"}]},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    initialized_provider.sync_turn("go", "old answer", messages=old_tool_turn)
+    initialized_provider._worker_queue.join()
+    pre = initialized_provider._collection.count()
+
+    window = [  # post-compression window: only the NEW, never-synced "go" turn
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "brand new partial output qqq"},
+    ]
+    initialized_provider.on_session_end(window)
+    initialized_provider._worker_queue.join()
+    docs = initialized_provider._collection.get(include=["documents"]).get("documents") or []
+    assert not any("brand new partial output qqq" in d for d in docs)
+    assert initialized_provider._collection.count() == pre
