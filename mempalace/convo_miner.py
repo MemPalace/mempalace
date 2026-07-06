@@ -487,10 +487,36 @@ def _extract_authored_at(filepath):
     return latest
 
 
-def _compute_convo_cursor(raw_content: str, num_chunks: int) -> Optional[dict]:
+def _resolve_chunk_params(chunk_size: Optional[int], min_chunk_size: Optional[int]) -> tuple:
+    """Resolve chunk_size/min_chunk_size against this module's defaults and
+    validate them with the same rules ``chunk_exchanges`` enforces.
+
+    ``_compute_convo_cursor`` and ``_incremental_reparse`` both call
+    ``_chunk_by_exchange`` directly, bypassing ``chunk_exchanges``' own
+    dispatcher (see their docstrings for why) -- which means they also
+    bypass its upfront validation. Without this, a non-positive
+    chunk_size reaches ``_emit_bounded``'s ``range(0, len(content),
+    chunk_size)`` and fails with a confusing ``ValueError`` deep inside
+    unrelated code instead of a clear one at the actual bad input.
+    """
+    resolved_chunk_size = chunk_size if chunk_size is not None else CHUNK_SIZE
+    resolved_min_chunk_size = min_chunk_size if min_chunk_size is not None else MIN_CHUNK_SIZE
+    if resolved_chunk_size <= 0:
+        raise ValueError(f"chunk_size must be > 0, got {resolved_chunk_size}")
+    if resolved_min_chunk_size < 0:
+        raise ValueError(f"min_chunk_size must be >= 0, got {resolved_min_chunk_size}")
+    return resolved_chunk_size, resolved_min_chunk_size
+
+
+def _compute_convo_cursor(
+    raw_content: str,
+    num_chunks: int,
+    chunk_size: int = None,
+    min_chunk_size: int = None,
+) -> Optional[dict]:
     """Compute the incremental-mining cursor for a Claude Code JSONL
-    transcript: the raw line where the trailing exchange (the last chunk
-    ``chunk_exchanges`` would produce) began, so a future re-mine of a
+    transcript: the raw line where the trailing exchange began, and which
+    physical chunk it first occupies, so a future re-mine of a
     grown/extended session can resume from there instead of reprocessing
     the whole file. This only COMPUTES and STORES the cursor -- nothing
     yet reads or acts on it, so this changes no existing mining behavior.
@@ -502,6 +528,14 @@ def _compute_convo_cursor(raw_content: str, num_chunks: int) -> Optional[dict]:
     appended to (the exact scenario this feature exists for), producing
     a cursor that describes content different from what was actually
     mined in this pass.
+
+    ``chunk_size``/``min_chunk_size`` must match whatever the caller
+    passed to the real ``chunk_exchanges(content, ...)`` call that
+    produced ``num_chunks`` -- they're needed here to correctly count how
+    many physical chunks the trailing exchange itself occupies (see
+    below); a mismatch would silently point the cursor at the wrong
+    chunk. Defaults to this module's own ``CHUNK_SIZE``/``MIN_CHUNK_SIZE``
+    when omitted, matching ``chunk_exchanges``' own defaults.
 
     Returns None (no cursor recorded, meaning "no incremental path
     available, full reprocess next time" -- always a safe default) when:
@@ -519,6 +553,17 @@ def _compute_convo_cursor(raw_content: str, num_chunks: int) -> Optional[dict]:
       3`` condition exactly, checked against the same parsed transcript
       text, so the two can't silently drift out of sync with each other.
 
+    A long trailing exchange can itself span more than one physical
+    chunk (its AI response alone exceeds ``chunk_size``) -- the cursor
+    must point at the FIRST of those chunks, not the last, or a future
+    incremental re-mine would treat the earlier ones as part of the
+    stable, unaffected prefix when they actually belong to the same
+    (about-to-be-regenerated) trailing exchange. Found by re-chunking
+    just the trailing exchange's own text in isolation (via
+    ``_chunk_by_exchange`` directly, not the public dispatcher --  same
+    reasoning as above: its own quote-line count is not the right gate
+    here) and counting how many chunks that alone produces.
+
     Scoped to extract_mode="exchange" only for now (the caller does not
     invoke this for "general" mode): chunk_exchanges' one-chunk-per-user-
     turn shape maps directly onto "the last user-role message", but
@@ -528,7 +573,9 @@ def _compute_convo_cursor(raw_content: str, num_chunks: int) -> Optional[dict]:
     if num_chunks <= 0:
         return None
 
-    from .normalize import _try_claude_code_jsonl
+    resolved_chunk_size, resolved_min_chunk_size = _resolve_chunk_params(chunk_size, min_chunk_size)
+
+    from .normalize import _messages_to_transcript, _try_claude_code_jsonl
 
     parsed = _try_claude_code_jsonl(raw_content, track_positions=True)
     if parsed is None:
@@ -553,12 +600,118 @@ def _compute_convo_cursor(raw_content: str, num_chunks: int) -> Optional[dict]:
         return None
     anchor_line = raw_lines[anchor_line_index]
 
+    trailing_text = _messages_to_transcript(parsed.messages[last_user_idx:])
+    trailing_chunk_count = len(
+        _chunk_by_exchange(trailing_text.split("\n"), resolved_chunk_size, resolved_min_chunk_size)
+    )
+    if trailing_chunk_count <= 0 or trailing_chunk_count > num_chunks:
+        return None
+
     return {
         "cursor_line": anchor_line_index,
-        "cursor_chunk_index": num_chunks - 1,
+        "cursor_chunk_index": num_chunks - trailing_chunk_count,
         "cursor_anchor_hash": hashlib.sha256(anchor_line.encode("utf-8")).hexdigest(),
         "cursor_format": "claude_code_jsonl",
     }
+
+
+def _incremental_reparse(
+    cursor: dict,
+    raw_content: str,
+    chunk_size: int = None,
+    min_chunk_size: int = None,
+) -> Optional[list]:
+    """Re-chunk only the trailing exchange onward, using a cursor stored
+    by a prior mine, instead of re-chunking a whole (possibly huge)
+    transcript for content that hasn't changed since.
+
+    Nothing calls this yet -- it's a standalone unit, verified by
+    equivalence tests to produce output identical to what a full re-mine
+    of the same grown transcript would, without doing the full-transcript
+    work.
+
+    Returns None -- meaning "the append-only assumption this rests on
+    doesn't hold (or can't be confirmed) for this file right now; the
+    caller must fall back to a full re-mine" -- when:
+    - the cursor's format isn't "claude_code_jsonl" (the only format this
+      supports, matching ``_compute_convo_cursor``);
+    - ``raw_content`` is now SHORTER than the anchor line (the file was
+      truncated or rewritten, not grown);
+    - the anchor line's content no longer matches the stored hash (the
+      prefix up to and including the cursor was edited, not purely
+      appended to -- the core precondition this whole feature depends on
+      was violated for this file);
+    - the trailing content, parsed on its own starting exactly at the
+      anchor line, doesn't parse as a real Claude Code JSONL exchange
+      (e.g. the file's tail is mid-write and momentarily has only a lone
+      trailing user turn with no response yet -- rare, and always safe
+      to fall back on rather than guess at incomplete data).
+
+    When it returns a chunk list, ``chunks[i]["chunk_index"]`` continues
+    the SAME global numbering the cursor's originating mine used --
+    values start at ``cursor["cursor_chunk_index"]``, not 0 -- so a
+    caller can replace exactly the drawers at or after that index
+    (delete where chunk_index >= cursor_chunk_index, upsert this list)
+    instead of the whole file's drawers.
+
+    Re-chunks via ``_chunk_by_exchange`` directly rather than the public
+    ``chunk_exchanges`` dispatcher: the tail slice's OWN quote-line count
+    can fall under the exchange-vs-paragraph threshold even when the
+    full transcript is well above it (the common case -- growing a
+    session by one more exchange adds one '>' line to a slice that has
+    at most a couple), which would wrongly switch just the tail to
+    paragraph chunking. The append-only-verified precondition already
+    establishes that the exchange-pair path applies to this transcript;
+    the tail is a suffix of it, not a fresh decision point.
+
+    A malformed ``cursor`` (missing/wrong-typed keys, or not a dict at
+    all -- e.g. stored drawer metadata that predates this field or was
+    hand-edited) is just another way the preconditions above can fail,
+    so it also gets a safe ``None`` rather than raising ``KeyError`` /
+    ``AttributeError`` / ``TypeError`` on the caller.
+    """
+    resolved_chunk_size, resolved_min_chunk_size = _resolve_chunk_params(chunk_size, min_chunk_size)
+
+    if not isinstance(cursor, dict) or cursor.get("cursor_format") != "claude_code_jsonl":
+        return None
+
+    cursor_line = cursor.get("cursor_line")
+    cursor_chunk_index = cursor.get("cursor_chunk_index")
+    cursor_anchor_hash = cursor.get("cursor_anchor_hash")
+    if (
+        not isinstance(cursor_line, int)
+        or isinstance(cursor_line, bool)
+        or not isinstance(cursor_chunk_index, int)
+        or isinstance(cursor_chunk_index, bool)
+        or not isinstance(cursor_anchor_hash, str)
+        or not isinstance(raw_content, str)
+    ):
+        return None
+
+    raw_lines = raw_content.strip().split("\n")
+    if cursor_line < 0 or cursor_line >= len(raw_lines):
+        return None
+
+    anchor_line = raw_lines[cursor_line]
+    if hashlib.sha256(anchor_line.encode("utf-8")).hexdigest() != cursor_anchor_hash:
+        return None
+
+    from .normalize import _try_claude_code_jsonl
+
+    tail_raw = "\n".join(raw_lines[cursor_line:])
+    tail_text = _try_claude_code_jsonl(tail_raw)
+    if tail_text is None:
+        return None
+
+    tail_chunks = _chunk_by_exchange(
+        tail_text.split("\n"), resolved_chunk_size, resolved_min_chunk_size
+    )
+    if not tail_chunks:
+        return None
+
+    for chunk in tail_chunks:
+        chunk["chunk_index"] += cursor_chunk_index
+    return tail_chunks
 
 
 def _flag_possible_duplicates(collection, batch_docs: list, batch_metas: list) -> None:
@@ -990,7 +1143,14 @@ def _mine_convos_impl(
         # format, which is exactly the desired "no incremental path for
         # this format" default.
         cursor = (
-            _compute_convo_cursor(raw_content, len(chunks)) if extract_mode != "general" else None
+            _compute_convo_cursor(
+                raw_content,
+                len(chunks),
+                chunk_size=cfg_chunk_size,
+                min_chunk_size=cfg_min_chunk_size,
+            )
+            if extract_mode != "general"
+            else None
         )
 
         # Lock + purge stale + file fresh chunks. Lock serializes concurrent

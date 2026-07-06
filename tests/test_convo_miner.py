@@ -11,9 +11,11 @@ import pytest
 from mempalace.convo_miner import (
     _compute_convo_cursor,
     _flag_possible_duplicates,
+    _incremental_reparse,
     _is_ai_tool_path,
     _register_file,
     _resolve_wing,
+    chunk_exchanges,
     mine_convos,
 )
 from mempalace.palace import MineAlreadyRunning, file_already_mined, prefetch_mined_set
@@ -822,13 +824,419 @@ class TestComputeConvoCursor:
         ]
         content = "\n".join(lines) + "\n"
 
-        cursor = _compute_convo_cursor(content, num_chunks=3)
+        # min_chunk_size=0: these synthetic exchanges are a handful of
+        # characters each, well under the module's real 30-char floor --
+        # irrelevant to what this test is checking (cursor arithmetic),
+        # but the floor is applied for real when this function re-derives
+        # the trailing exchange's own chunk count, so it must be
+        # explicitly disabled here or the trailing exchange would be
+        # dropped as noise before it's ever counted.
+        cursor = _compute_convo_cursor(content, num_chunks=3, min_chunk_size=0)
         assert cursor is not None
         assert cursor["cursor_line"] == 4  # the third (last) user turn
         assert cursor["cursor_chunk_index"] == 2  # 0-indexed, last of 3 chunks
         assert cursor["cursor_format"] == "claude_code_jsonl"
         expected_hash = __import__("hashlib").sha256(lines[4].encode("utf-8")).hexdigest()
         assert cursor["cursor_anchor_hash"] == expected_hash
+
+    def test_multi_chunk_trailing_exchange_points_to_first_chunk(self):
+        """The bug this guards against: a trailing exchange whose own AI
+        response is long enough to split across multiple physical chunks
+        (via chunk_exchanges' chunk_size splitting) must get a cursor
+        pointing at the FIRST of those chunks, not the last -- otherwise
+        a future incremental re-mine would treat the earlier ones as part
+        of the stable, unaffected prefix, when they actually belong to
+        the same (about-to-be-regenerated) trailing exchange."""
+        import json as jsonlib
+
+        from mempalace.normalize import normalize
+
+        long_response = "A" * 100
+        lines = [
+            jsonlib.dumps({"type": "human", "message": {"content": "Q1"}}),
+            jsonlib.dumps({"type": "assistant", "message": {"content": "A1"}}),
+            jsonlib.dumps({"type": "human", "message": {"content": "Q2"}}),
+            jsonlib.dumps({"type": "assistant", "message": {"content": "A2"}}),
+            jsonlib.dumps({"type": "human", "message": {"content": "Q3"}}),
+            jsonlib.dumps({"type": "assistant", "message": {"content": long_response}}),
+        ]
+        content = "\n".join(lines) + "\n"
+
+        normalized = normalize("session.jsonl", content=content)
+        chunks = chunk_exchanges(normalized, chunk_size=20, min_chunk_size=0)
+        # Confirms this test actually exercises a split trailing exchange
+        # rather than accidentally testing the single-chunk case.
+        assert len(chunks) > 3
+
+        cursor = _compute_convo_cursor(
+            content, num_chunks=len(chunks), chunk_size=20, min_chunk_size=0
+        )
+        assert cursor is not None
+
+        trailing_from_full = chunks[cursor["cursor_chunk_index"] :]
+        assert len(trailing_from_full) > 1  # really did land on a multi-chunk span
+        # Every chunk here is either the exchange's opening slice (has
+        # "Q3") or a pure slice of the long "A"-only response -- nothing
+        # from an earlier, unrelated exchange leaked in.
+        assert all("Q3" in c["content"] or set(c["content"]) <= {"A"} for c in trailing_from_full)
+        # The chunk immediately before the cursor must belong to the
+        # PRIOR exchange -- confirms the cursor doesn't point too early.
+        if cursor["cursor_chunk_index"] > 0:
+            assert "Q3" not in chunks[cursor["cursor_chunk_index"] - 1]["content"]
+
+
+class TestIncrementalReparse:
+    """_incremental_reparse takes a stored cursor and the CURRENT
+    (possibly grown) raw content and must produce output that, combined
+    with the stable prefix of a prior mine's chunks, is identical to a
+    full re-chunk of the grown file -- without re-chunking the whole
+    thing. Nothing calls this yet; these are equivalence tests against
+    the real chunk_exchanges/normalize pipeline, not a hand-derived
+    oracle, since that pipeline's exact chunking behavior is what an
+    incremental re-mine must match byte-for-byte.
+    """
+
+    @staticmethod
+    def _build_jsonl(num_exchanges: int, trailing_response: str = None) -> str:
+        import json as jsonlib
+
+        lines = []
+        for i in range(1, num_exchanges + 1):
+            lines.append(jsonlib.dumps({"type": "human", "message": {"content": f"Q{i}"}}))
+            response = (
+                f"A{i}" if not (i == num_exchanges and trailing_response) else trailing_response
+            )
+            lines.append(jsonlib.dumps({"type": "assistant", "message": {"content": response}}))
+        return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _append_exchanges(raw: str, start: int, count: int) -> str:
+        new_lines = []
+        for i in range(start, start + count):
+            new_lines.append(f'{{"type":"human","message":{{"content":"Q{i}"}}}}')
+            new_lines.append(f'{{"type":"assistant","message":{{"content":"A{i}"}}}}')
+        return raw.rstrip("\n") + "\n" + "\n".join(new_lines) + "\n"
+
+    def _assert_equivalent_to_full_remine(
+        self, raw_v1: str, raw_v2: str, chunk_size: int = 800, min_chunk_size: int = 0
+    ) -> None:
+        from mempalace.normalize import normalize
+
+        chunks_v1 = chunk_exchanges(
+            normalize("session.jsonl", content=raw_v1),
+            chunk_size=chunk_size,
+            min_chunk_size=min_chunk_size,
+        )
+        cursor = _compute_convo_cursor(
+            raw_v1, len(chunks_v1), chunk_size=chunk_size, min_chunk_size=min_chunk_size
+        )
+        assert cursor is not None, "test setup must produce a real cursor"
+
+        tail_chunks = _incremental_reparse(
+            cursor, raw_v2, chunk_size=chunk_size, min_chunk_size=min_chunk_size
+        )
+        assert tail_chunks is not None
+
+        stable_prefix = chunks_v1[: cursor["cursor_chunk_index"]]
+        combined = stable_prefix + tail_chunks
+
+        chunks_v2_full = chunk_exchanges(
+            normalize("session.jsonl", content=raw_v2),
+            chunk_size=chunk_size,
+            min_chunk_size=min_chunk_size,
+        )
+
+        assert [c["content"] for c in combined] == [c["content"] for c in chunks_v2_full]
+        assert [c["chunk_index"] for c in combined] == [c["chunk_index"] for c in chunks_v2_full]
+
+    def test_equivalence_small_increment_below_exchange_threshold(self):
+        """The common case: growing a session by one more exchange. The
+        TAIL slice alone has only 2 quoted lines (the trailing exchange
+        from v1 plus the one new exchange) -- below chunk_exchanges' own
+        3-line exchange-vs-paragraph gate, proving _incremental_reparse
+        must call _chunk_by_exchange directly rather than through that
+        public dispatcher, or this would wrongly fall back to paragraph
+        chunking for just the tail while the full document still uses
+        exchange-pair chunking."""
+        raw_v1 = self._build_jsonl(3)
+        raw_v2 = self._append_exchanges(raw_v1, start=4, count=1)
+        self._assert_equivalent_to_full_remine(raw_v1, raw_v2)
+
+    def test_equivalence_many_new_exchanges(self):
+        """Growing by several exchanges at once (e.g. a long working
+        session since the last mine)."""
+        raw_v1 = self._build_jsonl(3)
+        raw_v2 = self._append_exchanges(raw_v1, start=4, count=5)
+        self._assert_equivalent_to_full_remine(raw_v1, raw_v2)
+
+    def test_equivalence_multi_chunk_trailing_exchange(self):
+        """The trailing exchange at v1 time is itself long enough to span
+        multiple physical chunks under a small chunk_size -- confirms
+        the fix to _compute_convo_cursor's cursor_chunk_index (first
+        chunk of the trailing exchange, not the last) combines correctly
+        with _incremental_reparse's output rather than duplicating or
+        dropping part of that exchange."""
+        raw_v1 = self._build_jsonl(3, trailing_response="A" * 100)
+        raw_v2 = self._append_exchanges(raw_v1, start=4, count=1)
+        self._assert_equivalent_to_full_remine(raw_v1, raw_v2, chunk_size=20)
+
+    def test_anchor_hash_mismatch_returns_none(self):
+        """The anchor line itself was edited (not purely appended after)
+        -- the append-only assumption this whole feature depends on was
+        violated for this file. Must fall back to a full re-mine rather
+        than trust a cursor that no longer describes reality."""
+        from mempalace.normalize import normalize
+
+        raw_v1 = self._build_jsonl(3)
+        chunks_v1 = chunk_exchanges(
+            normalize("session.jsonl", content=raw_v1),
+            min_chunk_size=0,
+        )
+        cursor = _compute_convo_cursor(raw_v1, len(chunks_v1), min_chunk_size=0)
+        assert cursor is not None
+
+        raw_lines = raw_v1.strip().split("\n")
+        raw_lines[cursor["cursor_line"]] = raw_lines[cursor["cursor_line"]].replace(
+            "Q3", "Q3-edited"
+        )
+        tampered = "\n".join(raw_lines) + "\n"
+
+        assert _incremental_reparse(cursor, tampered) is None
+
+    def test_file_shrank_below_anchor_returns_none(self):
+        """The file is now SHORTER than the stored anchor line -- it was
+        truncated or rewritten, not grown. Never safe to trust."""
+        cursor = {
+            "cursor_line": 100,
+            "cursor_chunk_index": 2,
+            "cursor_anchor_hash": "deadbeef",
+            "cursor_format": "claude_code_jsonl",
+        }
+        assert _incremental_reparse(cursor, "short content\nonly a few lines\n") is None
+
+    def test_non_claude_code_cursor_format_returns_none(self):
+        """A cursor for a format other than claude_code_jsonl (none exist
+        yet, but the gate must hold for whatever comes next) is never
+        acted on here."""
+        cursor = {
+            "cursor_line": 0,
+            "cursor_chunk_index": 0,
+            "cursor_anchor_hash": "deadbeef",
+            "cursor_format": "some_future_format",
+        }
+        assert _incremental_reparse(cursor, "anything\n") is None
+
+    def test_lone_trailing_user_message_returns_none(self):
+        """The tail, parsed on its own, is just a single trailing user
+        turn with no response yet (e.g. re-mining while the assistant is
+        still mid-response). _try_claude_code_jsonl requires at least 2
+        messages to recognize content as this format at all -- correctly
+        falls back to a full re-mine rather than guess at incomplete
+        data."""
+        raw_v1 = self._build_jsonl(3)
+        from mempalace.normalize import normalize
+
+        chunks_v1 = chunk_exchanges(normalize("session.jsonl", content=raw_v1), min_chunk_size=0)
+        cursor = _compute_convo_cursor(raw_v1, len(chunks_v1), min_chunk_size=0)
+        assert cursor is not None
+
+        # No new content appended -- the tail is exactly the same lone
+        # trailing exchange as before, unchanged. Sanity check that this
+        # normally resolves fine (min_chunk_size=0: these synthetic
+        # exchanges are a handful of characters, under the module's real
+        # 30-char floor, which is irrelevant to what this test checks).
+        assert _incremental_reparse(cursor, raw_v1, min_chunk_size=0) is not None
+
+        # Truncate raw_v2 to end right after the anchor line's OWN user
+        # turn, before its assistant response -- simulates re-mining
+        # mid-write.
+        raw_lines = raw_v1.strip().split("\n")
+        raw_v2 = "\n".join(raw_lines[: cursor["cursor_line"] + 1]) + "\n"
+        assert _incremental_reparse(cursor, raw_v2, min_chunk_size=0) is None
+
+    def test_equivalence_tool_round_in_original_trailing_exchange(self):
+        """A tool_use/tool_result round entirely within the ORIGINAL
+        trailing exchange (resolved before v1 was mined), with a brand
+        new exchange appended after it in v2. Confirms re-parsing the
+        tail in isolation correctly rebuilds tool_use_map from scratch
+        for that exchange rather than needing anything from before the
+        cursor."""
+        import json as jsonlib
+
+        lines_v1 = [
+            jsonlib.dumps({"type": "human", "message": {"content": "Q1"}}),
+            jsonlib.dumps({"type": "assistant", "message": {"content": "A1"}}),
+            jsonlib.dumps({"type": "human", "message": {"content": "Q2"}}),
+            jsonlib.dumps({"type": "assistant", "message": {"content": "A2"}}),
+            jsonlib.dumps({"type": "human", "message": {"content": "Q3"}}),
+            jsonlib.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {"type": "text", "text": "Let me check."},
+                            {
+                                "type": "tool_use",
+                                "id": "tool1",
+                                "name": "Bash",
+                                "input": {"command": "ls"},
+                            },
+                        ]
+                    },
+                }
+            ),
+            jsonlib.dumps(
+                {
+                    "type": "human",
+                    "message": {
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "tool1", "content": "file1.txt"}
+                        ]
+                    },
+                }
+            ),
+            jsonlib.dumps({"type": "assistant", "message": {"content": "Found it."}}),
+        ]
+        raw_v1 = "\n".join(lines_v1) + "\n"
+        raw_v2 = self._append_exchanges(raw_v1, start=4, count=1)
+        self._assert_equivalent_to_full_remine(raw_v1, raw_v2)
+
+    def test_equivalence_multi_round_tool_loop_in_new_trailing_exchange(self):
+        """The NEW exchange added since v1 (not the original trailing
+        one) itself contains a multi-round tool loop -- two separate
+        tool_use/tool_result rounds folding into one assistant message
+        -- before a final plain-text assistant reply. Confirms the
+        assistant-message-merge logic in _try_claude_code_jsonl behaves
+        identically whether it's parsing the tail in isolation or as
+        part of a full-document parse."""
+        import json as jsonlib
+
+        raw_v1 = self._build_jsonl(3)
+        new_lines = [
+            jsonlib.dumps({"type": "human", "message": {"content": "Q4"}}),
+            jsonlib.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {"type": "text", "text": "Checking..."},
+                            {
+                                "type": "tool_use",
+                                "id": "tool1",
+                                "name": "Bash",
+                                "input": {"command": "ls"},
+                            },
+                        ]
+                    },
+                }
+            ),
+            jsonlib.dumps(
+                {
+                    "type": "human",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "tool1",
+                                "content": "a.txt b.txt",
+                            }
+                        ]
+                    },
+                }
+            ),
+            jsonlib.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "tool2",
+                                "name": "Read",
+                                "input": {"file_path": "a.txt", "offset": 1, "limit": 10},
+                            }
+                        ]
+                    },
+                }
+            ),
+            jsonlib.dumps(
+                {
+                    "type": "human",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "tool2",
+                                "content": "contents of a.txt",
+                            }
+                        ]
+                    },
+                }
+            ),
+            jsonlib.dumps(
+                {"type": "assistant", "message": {"content": "Done, here's what I found."}}
+            ),
+        ]
+        raw_v2 = raw_v1.rstrip("\n") + "\n" + "\n".join(new_lines) + "\n"
+        self._assert_equivalent_to_full_remine(raw_v1, raw_v2)
+
+    def test_malformed_cursor_returns_none_instead_of_raising(self):
+        """A cursor dict missing required keys, or not a dict at all --
+        e.g. stored drawer metadata that predates this field, or was
+        hand-edited -- is just another way the append-only precondition
+        can't be confirmed. Must return None like every other
+        precondition failure, not raise."""
+        assert (
+            _incremental_reparse(
+                {"cursor_format": "claude_code_jsonl", "cursor_anchor_hash": "x"}, "a\nb\n"
+            )
+            is None
+        )
+        assert _incremental_reparse(None, "a\nb\n") is None
+        assert _incremental_reparse("not a dict", "a\nb\n") is None
+        assert (
+            _incremental_reparse(
+                {
+                    "cursor_format": "claude_code_jsonl",
+                    "cursor_line": 0,
+                    "cursor_chunk_index": 0,
+                    "cursor_anchor_hash": "x",
+                },
+                None,
+            )
+            is None
+        )
+        assert (
+            _incremental_reparse(
+                {
+                    "cursor_format": "claude_code_jsonl",
+                    "cursor_line": "not an int",
+                    "cursor_chunk_index": 0,
+                    "cursor_anchor_hash": "x",
+                },
+                "a\nb\n",
+            )
+            is None
+        )
+
+    def test_non_positive_chunk_size_raises_value_error(self):
+        """_compute_convo_cursor and _incremental_reparse both call
+        _chunk_by_exchange directly, bypassing chunk_exchanges' own
+        upfront chunk_size validation -- they must reproduce that
+        validation themselves rather than let a bad value fail deep
+        inside _emit_bounded with a confusing error."""
+        cursor = {
+            "cursor_format": "claude_code_jsonl",
+            "cursor_line": 0,
+            "cursor_chunk_index": 0,
+            "cursor_anchor_hash": "x",
+        }
+        with pytest.raises(ValueError):
+            _incremental_reparse(cursor, "a\nb\n", chunk_size=0)
+        with pytest.raises(ValueError):
+            _incremental_reparse(cursor, "a\nb\n", min_chunk_size=-1)
+        with pytest.raises(ValueError):
+            _compute_convo_cursor("a\nb\n", 3, chunk_size=0)
 
 
 class TestConvoCursorStorage:
