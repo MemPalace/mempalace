@@ -718,6 +718,58 @@ class SQLiteExactCollection(BaseCollection):
                         (collection_id, doc_id),
                     )
 
+    def rekey_row(self, old_id, new_id, *, content, metadata, embedding=None) -> None:
+        """Single-transaction v3->v4 id rewrite for sqlite_exact (RFC 004 PART B).
+
+        Overrides the base upsert+delete default so the separate ``docs_fts`` table
+        stays consistent in ONE transaction: insert the row under ``new_id`` (with
+        the passed content/metadata/embedding + its FTS row), then delete the old
+        ``old_id`` row and its FTS row. Idempotent: if ``new_id`` already exists we
+        skip the insert and only drop the old ghost. ``metadata`` is written
+        verbatim — the reconcile orchestration already stamped ``id_recipe=v4``.
+        """
+        if new_id == old_id:
+            return
+        now = _utcnow()
+        with self._cursor() as cur:
+            collection_id = self._collection_id(cur)
+            exists = cur.execute(
+                "SELECT 1 FROM documents WHERE collection_id = ? AND id = ?",
+                (collection_id, new_id),
+            ).fetchone()
+            if not exists:
+                if embedding is not None:
+                    arr = _as_vector_array(embedding)
+                    emb_blob, dim = arr.tobytes(), int(arr.size)
+                else:
+                    # Fall back to the old row's stored embedding (same content),
+                    # so a caller that omits it never loses the vector.
+                    orow = cur.execute(
+                        "SELECT embedding, dim FROM documents WHERE collection_id = ? AND id = ?",
+                        (collection_id, old_id),
+                    ).fetchone()
+                    if orow is None:
+                        return  # nothing under old_id to rekey
+                    emb_blob, dim = orow[0], int(orow[1] or 0)
+                cur.execute(
+                    """
+                    INSERT INTO documents
+                        (collection_id, id, document, metadata_json, embedding, dim, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (collection_id, new_id, content, _json_dumps(metadata), emb_blob, dim, now, now),
+                )
+                self._replace_fts(cur, collection_id, new_id, content)
+            # Drop the old ghost row + its FTS row (both the insert and skip paths).
+            cur.execute(
+                "DELETE FROM documents WHERE collection_id = ? AND id = ?",
+                (collection_id, old_id),
+            )
+            cur.execute(
+                "DELETE FROM docs_fts WHERE collection_id = ? AND doc_id = ?",
+                (collection_id, old_id),
+            )
+
     def count(self) -> int:
         with self._cursor() as cur:
             collection_id = self._collection_id(cur)

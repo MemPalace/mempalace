@@ -720,3 +720,63 @@ def test_concurrent_first_open_single_connection_no_leak(tmp_path, monkeypatch):
     backend.close()
     with pytest.raises(sqlite3.ProgrammingError):
         created[0].execute("SELECT 1")
+
+
+def test_rekey_row_through_wrapper_moves_row_and_fts(tmp_path):
+    """RFC 004 write-flip PART B: reconcile calls ``rekey_row`` on the
+    EmbeddingCollection wrapper. It must forward to sqlite_exact's single-txn,
+    docs_fts-aware override (NOT the shadowed BaseCollection upsert+delete
+    default), moving both the documents row and its FTS row from the v3 id to
+    the content-hash v4 id, idempotently, with content preserved."""
+    from mempalace.backends.embedding_wrapper import EmbeddingCollection
+
+    _, raw = _collection(tmp_path)
+    old_id = "drawer_sessions_technical_deadbeef01"
+    new_id = "drawer_00112233445566778899aabbccddeeff"
+    body = "zzquniquetoken revised content body"
+    raw.add(
+        ids=[old_id],
+        documents=[body],
+        metadatas=[{"wing": "sessions", "room": "technical", "chunk_index": 0, "id_recipe": "v3"}],
+        embeddings=[[0.11, 0.22, 0.33]],
+    )
+    wrapped = EmbeddingCollection(raw)
+    wrapped.rekey_row(
+        old_id,
+        new_id,
+        content=body,
+        metadata={"wing": "sessions", "room": "technical", "chunk_index": 0, "id_recipe": "v4"},
+        embedding=[0.11, 0.22, 0.33],
+    )
+
+    assert raw.get(ids=[old_id]).ids == []
+    got = raw.get(ids=[new_id])
+    assert got.ids == [new_id]
+    assert got.metadatas[0]["id_recipe"] == "v4"
+    assert got.documents == [body]
+
+    con = sqlite3.connect(str(tmp_path / "sqlite_exact.sqlite3"))
+    try:
+        cid = con.execute(
+            "SELECT id FROM collections WHERE name = ?", ("mempalace_drawers",)
+        ).fetchone()[0]
+        old_fts = con.execute(
+            "SELECT count(*) FROM docs_fts WHERE collection_id = ? AND doc_id = ?", (cid, old_id)
+        ).fetchone()[0]
+        new_fts = con.execute(
+            "SELECT count(*) FROM docs_fts WHERE collection_id = ? AND doc_id = ?", (cid, new_id)
+        ).fetchone()[0]
+    finally:
+        con.close()
+    assert old_fts == 0
+    assert new_fts == 1
+
+    # Idempotent: re-running with the old row already gone is a safe no-op.
+    wrapped.rekey_row(
+        old_id,
+        new_id,
+        content=body,
+        metadata={"wing": "sessions", "room": "technical", "chunk_index": 0, "id_recipe": "v4"},
+        embedding=[0.11, 0.22, 0.33],
+    )
+    assert raw.get(ids=[new_id]).ids == [new_id]

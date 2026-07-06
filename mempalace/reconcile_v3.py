@@ -81,10 +81,20 @@ def _twin_present(collection, v4_id: str) -> bool:
 
 
 def plan_v3_reconcile(collection, batch: int = 2000) -> dict:
-    """Read-only: count ghost drawers and how many would rewrite vs drop."""
+    """Read-only: count ghost drawers and how many would rewrite vs drop.
+
+    Projection mirrors ``apply_v3_reconcile``'s SEQUENTIAL drain over the same
+    ``groups.items()`` order: a ghost drops when its content-hash twin is ALREADY
+    in the store, OR when an earlier ghost in this same set already mints that v4
+    id (duplicate-content ghosts collapse — first rewrites, the rest drop). Only
+    the pre-write store is queried, so intra-set duplicates are tracked here rather
+    than re-queried, keeping the preview honest (e.g. 109 ghosts, 32 of them dups,
+    previews 77 rewrite / 32 drop — exactly what --apply does).
+    """
     groups = _scan_ghost_drawers(collection, batch, with_embeddings=False)
     rewrite = drop = 0
     sample: list = []
+    projected: set = set()  # v4 ids an earlier ghost in this drain already mints
     for logical_id, g in groups.items():
         content = "".join(doc for _i, _r, doc, _m, _e in sorted(g["rows"]))
         if not content:
@@ -92,10 +102,11 @@ def plan_v3_reconcile(collection, batch: int = 2000) -> dict:
         v4_id = make_drawer_id_content_pure(content)
         if v4_id == logical_id:
             continue  # already content-pure — not actually a ghost to move
-        if _twin_present(collection, v4_id):
+        if v4_id in projected or _twin_present(collection, v4_id):
             drop += 1
         else:
             rewrite += 1
+            projected.add(v4_id)
         if len(sample) < SAMPLE_CAP:
             sample.append({"old": logical_id, "new": v4_id})
     return {

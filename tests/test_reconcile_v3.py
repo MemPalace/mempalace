@@ -70,6 +70,21 @@ def test_plan_counts_rewrite_and_drop():
     assert plan["rewrite"] == 1 and plan["drop"] == 1
 
 
+def test_plan_dedups_duplicate_content_ghosts_matching_apply():
+    # Two ghosts with IDENTICAL content, no pre-existing v4 twin. The sequential
+    # drain rewrites the first and drops the second (twin now present). The plan
+    # must project the same 1 rewrite / 1 drop, not 2 rewrites.
+    col = _FakeCollection()
+    dup = "same revised content under two v3 ids"
+    _ghost(col, "drawer_sessions_technical_g1", dup)
+    _ghost(col, "drawer_sessions_technical_g2", dup)
+    plan = plan_v3_reconcile(col)
+    assert plan["ghost_drawers"] == 2
+    assert plan["rewrite"] == 1 and plan["drop"] == 1
+    stats = apply_v3_reconcile(col)  # apply agrees with the projection
+    assert stats["rewritten"] == 1 and stats["dropped"] == 1
+
+
 def test_apply_rewrites_single_row_ghost_to_content_hash():
     col = _FakeCollection()
     content = "revised note that only exists under a v3 id"
