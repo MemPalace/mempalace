@@ -379,7 +379,7 @@ def test_adapter_identity():
 
 
 def test_declared_transformations_have_reference_impls():
-    """Every declared transformation MUST resolve to a callable on transforms (RFC 002 §7.3)."""
+    """Every declared transformation MUST resolve to a callable on transforms (RFC 002 section 7.3)."""
     for name in OpenClawSourceAdapter.declared_transformations:
         impl = getattr(src_transforms, name, None)
         assert callable(impl), (
@@ -964,7 +964,7 @@ def test_openclaw_format_exchange_handles_multiline_user():
 
 
 # ===========================================================================
-# Declared-transformation round-trip (RFC 002 §7.3)
+# Declared-transformation round-trip (RFC 002 section 7.3)
 # ===========================================================================
 
 
@@ -972,7 +972,7 @@ def test_declared_transformation_round_trip_reproduces_drawer_content(
     adapter, palace_ctx, sessions_dir
 ):
     """Applying declared transforms in order to canonical source bytes then
-    chunking MUST reproduce the drawer content (RFC 002 §7.3 conformance).
+    chunking MUST reproduce the drawer content (RFC 002 section 7.3 conformance).
 
     This test verifies both:
     (a) The conformance path: raw bytes → full DECLARED_TRANSFORMATION_ORDER → chunks.
