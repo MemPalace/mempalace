@@ -760,6 +760,60 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
         return {"error": "Duplicate check failed"}
 
 
+def tool_find_duplicates(
+    wing: str = None,
+    room: str = None,
+    threshold: float = DEDUP_DEFAULT_THRESHOLD,
+    max_clusters: int = None,
+):
+    try:
+        wing = _sanitize_optional_name(wing, "wing")
+        room = _sanitize_optional_name(room, "room")
+        threshold = float(threshold)
+        if threshold < 0 or threshold > 2:
+            return {"error": "threshold must be between 0 and 2"}
+        if max_clusters is not None:
+            max_clusters = int(max_clusters)
+            if max_clusters < 1:
+                return {"error": "max_clusters must be at least 1"}
+    except (TypeError, ValueError) as e:
+        return {"error": str(e)}
+
+    _refresh_vector_disabled_flag()
+    if _vector_disabled:
+        return {
+            "clusters": [],
+            "params": {
+                "wing": wing,
+                "room": room,
+                "threshold": threshold,
+                "max_clusters": max_clusters,
+            },
+            "vector_disabled": True,
+            "vector_disabled_reason": _vector_disabled_reason,
+            "hint": (
+                "duplicate cluster detection requires vector search; "
+                "run `mempalace repair` to restore"
+            ),
+        }
+
+    col = _get_collection()
+    if not col:
+        return _collection_error_or_no_palace()
+
+    try:
+        return find_duplicate_clusters(
+            col,
+            wing=wing,
+            room=room,
+            threshold=threshold,
+            max_clusters=max_clusters,
+        )
+    except Exception:
+        logger.exception("find_duplicates failed")
+        return {"error": "Duplicate cluster detection failed"}
+
+
 def tool_get_aaak_spec():
     """Return the AAAK dialect specification."""
     return {"aaak_spec": AAAK_SPEC}
