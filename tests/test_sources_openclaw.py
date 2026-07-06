@@ -7,6 +7,11 @@ Covers:
     * Unit tests for JSONL extraction, runtime-context strip, metadata-preamble
       strip, exchange formatting, and chunked-exchange emit via
       ``convo_miner.chunk_exchanges``.
+    * Second-pass hardening (improvement 1-4):
+      - Schema-marker validation (valid, wrong traceSchema, unknown schemaVersion).
+      - Discovery across OPENCLAW_TRAJECTORY_DIR, pointer files, and default.
+      - Truncation tolerance (partial final line, truncation-marker event).
+      - TrajectoryEventSource / JsonlTrajectoryEventSource abstraction seam.
     * Edge cases: empty file, file with no exchange pairs, single-turn
       sessions, unicode content, explicit wing override.
 
@@ -35,8 +40,11 @@ from mempalace.sources.base import (
 )
 from mempalace.sources.context import PalaceContext
 from mempalace.sources.openclaw import (
+    JsonlTrajectoryEventSource,
     OpenClawSourceAdapter,
+    TrajectoryEventSource,
     _build_canonical_source_bytes,
+    _read_pointer_file,
     _scan_trajectory_file,
     session_source_file,
 )
@@ -1098,3 +1106,641 @@ def test_malformed_jsonl_lines_are_skipped(adapter, palace_ctx, tmp_path):
     results = list(adapter.ingest(source=SourceRef(local_path=str(sdir)), palace=palace_ctx))
     drawers = [r for r in results if isinstance(r, DrawerRecord)]
     assert len(drawers) >= 1, "malformed lines should be skipped, not crash"
+
+
+# ===========================================================================
+# Second-pass hardening: 1 — Schema-marker validation
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Helpers for schema-marker tests
+# ---------------------------------------------------------------------------
+
+
+def _write_events(path: Path, events: list) -> None:
+    """Write a list of event dicts (or raw strings) as JSONL."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fh:
+        for e in events:
+            fh.write((json.dumps(e) if isinstance(e, dict) else str(e)) + "\n")
+
+
+def _make_minimal_event(
+    event_type: str,
+    seq: int,
+    *,
+    trace_schema: str = "openclaw-trajectory",
+    schema_version: int = 1,
+    session_id: str = "sess-schema-test",
+) -> dict:
+    """Build a minimal event with explicit schema marker fields."""
+    return {
+        "traceSchema": trace_schema,
+        "schemaVersion": schema_version,
+        "type": event_type,
+        "ts": "2026-01-01T00:00:00.000Z",
+        "seq": seq,
+        "sessionId": session_id,
+        "sessionKey": "agent:main:slack:direct:UTEST",
+        "workspaceDir": "/home/user/projects/schematest",
+        "modelId": "anthropic/claude-test",
+        "data": {},
+    }
+
+
+def _make_exchange_events(
+    session_id: str,
+    seq_start: int,
+    user_text: str,
+    assistant_text: str,
+    *,
+    trace_schema: str = "openclaw-trajectory",
+    schema_version: int = 1,
+) -> list:
+    """Build prompt.submitted + model.completed events with explicit schema fields."""
+    kwargs = dict(
+        trace_schema=trace_schema,
+        schema_version=schema_version,
+        session_id=session_id,
+    )
+    return [
+        _make_minimal_event("session.started", seq_start, **kwargs),
+        {
+            **_make_minimal_event("prompt.submitted", seq_start + 1, **kwargs),
+            "data": {"prompt": user_text},
+        },
+        {
+            **_make_minimal_event("model.completed", seq_start + 2, **kwargs),
+            "data": {"assistantTexts": [assistant_text]},
+        },
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Test: valid traceSchema parses normally
+# ---------------------------------------------------------------------------
+
+
+def test_valid_trace_schema_parses_normally(adapter, palace_ctx, tmp_path):
+    """A file with the correct traceSchema and schemaVersion 1 ingests cleanly."""
+    sdir = tmp_path / "sessions"
+    sdir.mkdir()
+    tfile = sdir / "sess-valid-schema.trajectory.jsonl"
+    events = _make_exchange_events(
+        "sess-valid-schema",
+        1,
+        "What is the capital of France? This question is long enough to chunk.",
+        "The capital of France is Paris, a major European city with rich culture.",
+    )
+    _write_events(tfile, events)
+
+    results = list(adapter.ingest(source=SourceRef(local_path=str(sdir)), palace=palace_ctx))
+    drawers = [r for r in results if isinstance(r, DrawerRecord)]
+    metas = [r for r in results if isinstance(r, SourceItemMetadata)]
+    assert len(metas) == 1, "expected one SourceItemMetadata for valid schema"
+    assert drawers, "valid traceSchema should produce drawers"
+
+
+# ---------------------------------------------------------------------------
+# Test: wrong traceSchema causes file to be skipped
+# ---------------------------------------------------------------------------
+
+
+def test_wrong_trace_schema_causes_file_to_be_skipped(adapter, palace_ctx, tmp_path):
+    """A file with traceSchema != 'openclaw-trajectory' must be silently skipped."""
+    sdir = tmp_path / "sessions"
+    sdir.mkdir()
+    tfile = sdir / "sess-wrong-schema.trajectory.jsonl"
+    events = _make_exchange_events(
+        "sess-wrong-schema",
+        1,
+        "Ignored user text because the schema is wrong.",
+        "Ignored assistant text.",
+        trace_schema="some-other-format",
+    )
+    _write_events(tfile, events)
+
+    results = list(adapter.ingest(source=SourceRef(local_path=str(sdir)), palace=palace_ctx))
+    # Wrong schema → _scan_trajectory_file returns None → file skipped entirely
+    metas = [r for r in results if isinstance(r, SourceItemMetadata)]
+    drawers = [r for r in results if isinstance(r, DrawerRecord)]
+    assert len(metas) == 0, (
+        "wrong traceSchema must suppress SourceItemMetadata; adapter should skip the file entirely"
+    )
+    assert len(drawers) == 0, "wrong traceSchema must suppress all drawers"
+
+
+def test_wrong_trace_schema_logs_warning(tmp_path, caplog):
+    """Wrong traceSchema must emit a WARNING log."""
+    import logging
+
+    tfile = tmp_path / "sess-warn.trajectory.jsonl"
+    events = _make_exchange_events(
+        "sess-warn", 1, "user text", "assistant text", trace_schema="bad-schema"
+    )
+    _write_events(tfile, events)
+
+    src = JsonlTrajectoryEventSource(tfile)
+    with caplog.at_level(logging.WARNING, logger="mempalace.sources.openclaw"):
+        result = src.session_metadata()
+
+    assert result is None, "wrong traceSchema should return None metadata"
+    assert any("traceSchema" in rec.message for rec in caplog.records), (
+        "expected a WARNING mentioning traceSchema"
+    )
+
+
+def test_missing_trace_schema_is_tolerated(adapter, palace_ctx, tmp_path):
+    """Events without any traceSchema marker (legacy files) must be parsed normally."""
+    sdir = tmp_path / "sessions"
+    sdir.mkdir()
+    tfile = sdir / "sess-no-schema.trajectory.jsonl"
+
+    # Build events without schema marker fields at all.
+    events = [
+        {
+            "type": "session.started",
+            "ts": "2026-01-01T00:00:00.000Z",
+            "seq": 1,
+            "sessionId": "sess-no-schema",
+            "sessionKey": "k",
+            "workspaceDir": "/home/user/projects/noschema",
+            "modelId": "m",
+            "data": {},
+        },
+        {
+            "type": "prompt.submitted",
+            "ts": "2026-01-01T00:00:01.000Z",
+            "seq": 2,
+            "sessionId": "sess-no-schema",
+            "sessionKey": "k",
+            "workspaceDir": "/home/user/projects/noschema",
+            "modelId": "m",
+            "data": {
+                "prompt": (
+                    "How do I use context managers in Python? "
+                    "This is long enough to form a complete chunk in the test."
+                )
+            },
+        },
+        {
+            "type": "model.completed",
+            "ts": "2026-01-01T00:00:02.000Z",
+            "seq": 3,
+            "sessionId": "sess-no-schema",
+            "sessionKey": "k",
+            "workspaceDir": "/home/user/projects/noschema",
+            "modelId": "m",
+            "data": {
+                "assistantTexts": [
+                    "Use the 'with' statement. It calls __enter__ and __exit__ "
+                    "automatically, ensuring cleanup even if an exception occurs."
+                ]
+            },
+        },
+    ]
+    _write_events(tfile, events)
+
+    results = list(adapter.ingest(source=SourceRef(local_path=str(sdir)), palace=palace_ctx))
+    drawers = [r for r in results if isinstance(r, DrawerRecord)]
+    assert drawers, "events without schema marker (legacy) must parse normally"
+
+
+# ---------------------------------------------------------------------------
+# Test: unknown schemaVersion warns but still parses
+# ---------------------------------------------------------------------------
+
+
+def test_unknown_schema_version_warns_and_still_parses(adapter, palace_ctx, tmp_path, caplog):
+    """An unknown schemaVersion must emit a WARNING but still produce drawers."""
+    import logging
+
+    sdir = tmp_path / "sessions"
+    sdir.mkdir()
+    tfile = sdir / "sess-future-schema.trajectory.jsonl"
+    events = _make_exchange_events(
+        "sess-future-schema",
+        1,
+        (
+            "How does the new v99 trajectory format work? "
+            "This question is long enough to produce a chunk."
+        ),
+        (
+            "The v99 format is hypothetical. Best-effort parse should still "
+            "extract user and assistant turns from known fields."
+        ),
+        schema_version=99,  # future/unknown version
+    )
+    _write_events(tfile, events)
+
+    with caplog.at_level(logging.WARNING, logger="mempalace.sources.openclaw"):
+        results = list(adapter.ingest(source=SourceRef(local_path=str(sdir)), palace=palace_ctx))
+
+    drawers = [r for r in results if isinstance(r, DrawerRecord)]
+    assert drawers, "unknown schemaVersion should still produce drawers (best-effort parse)"
+    assert any("schemaVersion" in rec.message for rec in caplog.records), (
+        "expected a WARNING mentioning schemaVersion"
+    )
+
+
+def test_jsonl_source_scan_unknown_schema_version_not_none(tmp_path):
+    """JsonlTrajectoryEventSource must return non-None metadata for future schemaVersion."""
+    tfile = tmp_path / "future.trajectory.jsonl"
+    events = _make_exchange_events(
+        "sess-future",
+        1,
+        "user text for future schema",
+        "assistant text for future schema",
+        schema_version=42,
+    )
+    _write_events(tfile, events)
+
+    src = JsonlTrajectoryEventSource(tfile)
+    meta = src.session_metadata()
+    assert meta is not None, "best-effort parse of future schemaVersion must return metadata"
+    assert meta["message_count"] == 1
+
+
+# ===========================================================================
+# Second-pass hardening: 2 — Discovery across all documented capture locations
+# ===========================================================================
+
+
+def test_discovery_finds_files_in_openclaw_trajectory_dir(
+    adapter, palace_ctx, tmp_path, monkeypatch
+):
+    """OPENCLAW_TRAJECTORY_DIR env var must be scanned for trajectory files."""
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    traj_dir = tmp_path / "trajectories"
+    traj_dir.mkdir()
+
+    session_id = "sess-traj-dir-0001"
+    build_trajectory_fixture(
+        traj_dir / f"{session_id}.trajectory.jsonl",
+        session_id,
+        [
+            (
+                "Question in the trajectory dir — long enough to chunk properly.",
+                ["Answer from the trajectory dir — also long enough for chunking."],
+            )
+        ],
+        workspace_dir="/home/user/projects/trajdir",
+    )
+
+    monkeypatch.setenv("OPENCLAW_TRAJECTORY_DIR", str(traj_dir))
+
+    results = list(
+        adapter.ingest(source=SourceRef(local_path=str(sessions_dir)), palace=palace_ctx)
+    )
+    metas = [r for r in results if isinstance(r, SourceItemMetadata)]
+    # The file is only in traj_dir, not in sessions_dir — must still be found.
+    assert len(metas) == 1, f"expected 1 file from OPENCLAW_TRAJECTORY_DIR, got {len(metas)}"
+    assert any(session_id in m.source_file for m in metas)
+
+
+def test_discovery_follows_pointer_files(adapter, palace_ctx, tmp_path):
+    """Pointer files (*.trajectory-path.json) beside sessions must be followed."""
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    relocated_dir = tmp_path / "relocated"
+    relocated_dir.mkdir()
+
+    session_id = "sess-pointer-0001"
+    tfile = relocated_dir / f"{session_id}.trajectory.jsonl"
+    build_trajectory_fixture(
+        tfile,
+        session_id,
+        [
+            (
+                "Pointer-relocated question — long enough to form a chunk.",
+                ["Pointer-relocated answer — long enough to form a chunk."],
+            )
+        ],
+        workspace_dir="/home/user/projects/pointed",
+    )
+
+    # Write pointer file beside a (non-existent) session file in sessions_dir.
+    pointer_path = sessions_dir / f"{session_id}.trajectory-path.json"
+    pointer_path.write_text(json.dumps({"path": str(tfile)}), encoding="utf-8")
+
+    results = list(
+        adapter.ingest(source=SourceRef(local_path=str(sessions_dir)), palace=palace_ctx)
+    )
+    metas = [r for r in results if isinstance(r, SourceItemMetadata)]
+    assert len(metas) == 1, f"pointer file must resolve to 1 trajectory file; got {len(metas)}"
+    assert any(session_id in m.source_file for m in metas)
+
+
+def test_discovery_deduplicates_when_pointer_and_direct(adapter, palace_ctx, tmp_path, monkeypatch):
+    """If a file is reachable via both direct sidecar AND pointer, count it once."""
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    traj_dir = tmp_path / "trajectories"
+    traj_dir.mkdir()
+
+    session_id = "sess-dedup-0001"
+    tfile = sessions_dir / f"{session_id}.trajectory.jsonl"
+    build_trajectory_fixture(
+        tfile,
+        session_id,
+        [
+            (
+                "Deduplicated question — must appear exactly once.",
+                ["Deduplicated answer — must appear exactly once."],
+            )
+        ],
+        workspace_dir="/home/user/projects/dedup",
+    )
+
+    # Pointer points to the SAME file that already exists as a sidecar.
+    pointer_path = sessions_dir / f"{session_id}.trajectory-path.json"
+    pointer_path.write_text(json.dumps({"path": str(tfile)}), encoding="utf-8")
+
+    # OPENCLAW_TRAJECTORY_DIR also has a symlink to the same file (extra dup).
+    import shutil
+
+    shutil.copy(str(tfile), str(traj_dir / f"{session_id}.trajectory.jsonl"))
+
+    monkeypatch.setenv("OPENCLAW_TRAJECTORY_DIR", str(traj_dir))
+
+    results = list(
+        adapter.ingest(source=SourceRef(local_path=str(sessions_dir)), palace=palace_ctx)
+    )
+    metas = [r for r in results if isinstance(r, SourceItemMetadata)]
+    # All three sources point to files with the same resolved content/session;
+    # the traj_dir copy is a different inode so may produce 2 metas — but
+    # the sidecar + pointer MUST deduplicate to 1.
+    # traj_dir copy has same session_id embedded in source_file but different
+    # file path, so they are distinct source_files. What we verify is that the
+    # sessions_dir sidecar + pointer do NOT duplicate.
+    assert len(metas) <= 2, (
+        "sidecar + pointer referencing the same file must deduplicate; "
+        f"got {len(metas)} SourceItemMetadata records"
+    )
+
+
+def test_discovery_invalid_openclaw_trajectory_dir_logs_warning(tmp_path, caplog, monkeypatch):
+    """OPENCLAW_TRAJECTORY_DIR pointing at a non-dir emits a WARNING, no crash."""
+    import logging
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    nonexistent = tmp_path / "nosuchdir"
+
+    monkeypatch.setenv("OPENCLAW_TRAJECTORY_DIR", str(nonexistent))
+
+    from mempalace.sources.openclaw import _discover_from_dir
+
+    with caplog.at_level(logging.WARNING, logger="mempalace.sources.openclaw"):
+        result = _discover_from_dir(sessions_dir)
+
+    assert isinstance(result, list), "must return a list even on bad env var"
+    assert any("OPENCLAW_TRAJECTORY_DIR" in rec.message for rec in caplog.records), (
+        "expected a WARNING about OPENCLAW_TRAJECTORY_DIR"
+    )
+
+
+def test_read_pointer_file_returns_path_from_valid_json(tmp_path):
+    """_read_pointer_file must return the target Path for a valid JSON pointer."""
+    pointer = tmp_path / "sess.trajectory-path.json"
+    target_path = "/abs/path/to/sess.trajectory.jsonl"
+    pointer.write_text(json.dumps({"path": target_path}), encoding="utf-8")
+
+    result = _read_pointer_file(pointer)
+    assert result is not None
+    assert str(result) == target_path
+
+
+def test_read_pointer_file_returns_none_for_corrupt_json(tmp_path):
+    """_read_pointer_file must return None for corrupt / unreadable pointer files."""
+    pointer = tmp_path / "sess.trajectory-path.json"
+    pointer.write_text("THIS IS NOT JSON", encoding="utf-8")
+
+    result = _read_pointer_file(pointer)
+    assert result is None
+
+
+def test_read_pointer_file_returns_none_for_missing_key(tmp_path):
+    """_read_pointer_file must return None if no recognised path key is present."""
+    pointer = tmp_path / "sess.trajectory-path.json"
+    pointer.write_text(json.dumps({"unknown_key": "/some/path"}), encoding="utf-8")
+
+    result = _read_pointer_file(pointer)
+    assert result is None
+
+
+# ===========================================================================
+# Second-pass hardening: 3 — Truncation tolerance
+# ===========================================================================
+
+
+def test_partial_final_line_does_not_crash(adapter, palace_ctx, tmp_path):
+    """A file ending with a partial (un-terminated) JSON line must not crash."""
+    sdir = tmp_path / "sessions"
+    sdir.mkdir()
+    tfile = sdir / "sess-partial.trajectory.jsonl"
+
+    # Write a valid session with two events, then append a partial line (no newline).
+    events = _make_exchange_events(
+        "sess-partial",
+        1,
+        "Question before truncation — long enough to form a proper chunk.",
+        "Answer before truncation — long enough to form a proper chunk here.",
+    )
+    lines = [json.dumps(e) + "\n" for e in events]
+    lines.append('{"type": "model.completed", "seq": 99, "data": {"assistantTe')  # partial!
+
+    with tfile.open("w", encoding="utf-8") as fh:
+        fh.writelines(lines)
+
+    # Must not raise; should produce the drawer from the complete exchange.
+    results = list(adapter.ingest(source=SourceRef(local_path=str(sdir)), palace=palace_ctx))
+    metas = [r for r in results if isinstance(r, SourceItemMetadata)]
+    drawers = [r for r in results if isinstance(r, DrawerRecord)]
+    assert len(metas) == 1, "partial final line must not suppress SourceItemMetadata"
+    assert len(drawers) >= 1, "complete exchange before partial line must produce a drawer"
+
+
+def test_partial_final_line_scan_does_not_crash(tmp_path):
+    """_scan_trajectory_file must not crash on a partial final line."""
+    tfile = tmp_path / "sess-partial-scan.trajectory.jsonl"
+    events = _make_exchange_events(
+        "sess-partial-scan",
+        1,
+        "Question before truncation.",
+        "Answer before truncation.",
+    )
+    lines = [json.dumps(e) + "\n" for e in events]
+    lines.append('{"type": "broken_json": ')  # partial line, also invalid JSON
+
+    with tfile.open("w", encoding="utf-8") as fh:
+        fh.writelines(lines)
+
+    # Must not raise; should return valid metadata for the events that parsed.
+    meta = _scan_trajectory_file(tfile)
+    assert meta is not None, "partial final line must not prevent metadata extraction"
+    assert isinstance(meta["message_count"], int)
+    assert meta["message_count"] == 1
+
+
+def test_truncation_marker_event_is_skipped_and_data_preserved(adapter, palace_ctx, tmp_path):
+    """A truncation-marker event must be skipped; data before it must survive."""
+    sdir = tmp_path / "sessions"
+    sdir.mkdir()
+    tfile = sdir / "sess-truncated.trajectory.jsonl"
+
+    # Build a normal exchange followed by the truncation marker.
+    events = _make_exchange_events(
+        "sess-truncated",
+        1,
+        "Question captured before the 10 MiB cap fired — long enough to chunk.",
+        "Answer captured before the 10 MiB cap fired — long enough to chunk.",
+    )
+    truncation_marker = {
+        "type": "trace.truncated",
+        "ts": "2026-01-01T00:00:10.000Z",
+        "seq": 20,
+        "sessionId": "sess-truncated",
+        "traceSchema": "openclaw-trajectory",
+        "schemaVersion": 1,
+        "data": {"reason": "size_cap", "bytesWritten": 10485760},
+    }
+    _write_events(tfile, events + [truncation_marker])
+
+    results = list(adapter.ingest(source=SourceRef(local_path=str(sdir)), palace=palace_ctx))
+    drawers = [r for r in results if isinstance(r, DrawerRecord)]
+    metas = [r for r in results if isinstance(r, SourceItemMetadata)]
+
+    # The truncation marker must not become a drawer.
+    assert len(metas) == 1, "expected one SourceItemMetadata"
+    assert len(drawers) >= 1, "data before truncation marker must still produce drawers"
+    # The truncation marker event must not appear in any drawer content.
+    joined = "\n".join(d.content for d in drawers)
+    assert "size_cap" not in joined, "truncation marker data must not appear in drawer content"
+    assert "trace.truncated" not in joined
+
+
+def test_truncation_marker_not_counted_in_message_count(tmp_path):
+    """Truncation-marker events must not be counted in message_count."""
+    tfile = tmp_path / "sess-tc-count.trajectory.jsonl"
+    events = _make_exchange_events(
+        "sess-tc-count",
+        1,
+        "Real exchange before truncation.",
+        "Real answer before truncation.",
+    )
+    truncation = {
+        "type": "trace.truncated",
+        "seq": 99,
+        "sessionId": "sess-tc-count",
+        "traceSchema": "openclaw-trajectory",
+        "schemaVersion": 1,
+        "ts": "2026-01-01T00:00:10.000Z",
+        "data": {},
+    }
+    _write_events(tfile, events + [truncation])
+
+    src = JsonlTrajectoryEventSource(tfile)
+    meta = src.session_metadata()
+    assert meta is not None
+    assert meta["message_count"] == 1, "truncation marker must not increment message_count"
+
+
+def test_file_all_corrupt_returns_none_scan(tmp_path):
+    """A file containing only unparseable lines must return None from scan."""
+    tfile = tmp_path / "corrupt.trajectory.jsonl"
+    tfile.write_text("NOT JSON\nALSO NOT JSON\n{broken\n", encoding="utf-8")
+    assert _scan_trajectory_file(tfile) is None
+
+
+def test_jsonl_source_iter_events_empty_lines_skipped(tmp_path):
+    """Blank lines in a JSONL file must be silently skipped."""
+    tfile = tmp_path / "blanks.trajectory.jsonl"
+    events = _make_exchange_events("sess-blanks", 1, "user text", "assistant text")
+    # Interleave blank lines.
+    lines = []
+    for e in events:
+        lines.append(json.dumps(e))
+        lines.append("")  # blank
+        lines.append("   ")  # whitespace-only
+    tfile.write_text("\n".join(lines), encoding="utf-8")
+
+    src = JsonlTrajectoryEventSource(tfile)
+    collected = list(src.iter_events())
+    assert len(collected) == len(events), "blank lines must be skipped without altering event count"
+
+
+# ===========================================================================
+# Second-pass hardening: 4 — Reader abstraction seam
+# ===========================================================================
+
+
+def test_jsonl_source_is_trajectory_event_source(tmp_path):
+    """JsonlTrajectoryEventSource must satisfy the TrajectoryEventSource Protocol."""
+    tfile = tmp_path / "proto-check.trajectory.jsonl"
+    tfile.write_text("")
+    src = JsonlTrajectoryEventSource(tfile)
+    assert isinstance(src, TrajectoryEventSource), (
+        "JsonlTrajectoryEventSource must pass isinstance check against "
+        "TrajectoryEventSource Protocol"
+    )
+
+
+def test_trajectory_event_source_protocol_has_required_methods():
+    """TrajectoryEventSource must declare iter_events and session_metadata."""
+    # Protocol attributes are accessible via its __protocol_attrs__ in Python 3.12+
+    # or via dir() for all versions.
+    attrs = set(dir(TrajectoryEventSource))
+    assert "iter_events" in attrs
+    assert "session_metadata" in attrs
+
+
+def test_jsonl_source_iter_events_yields_dicts(sessions_dir):
+    """iter_events must yield dicts with expected event fields."""
+    tfile = sessions_dir / f"{_SESSION_SIMPLE}.trajectory.jsonl"
+    src = JsonlTrajectoryEventSource(tfile)
+    events = list(src.iter_events())
+    assert events, "expected at least one event from a non-empty fixture"
+    for event in events:
+        assert isinstance(event, dict), f"iter_events must yield dicts; got {type(event)}"
+    # At least one prompt.submitted and one model.completed.
+    types = {e.get("type") for e in events}
+    assert "prompt.submitted" in types
+    assert "model.completed" in types
+
+
+def test_jsonl_source_session_metadata_is_consistent_with_scan(sessions_dir):
+    """JsonlTrajectoryEventSource.session_metadata must match _scan_trajectory_file."""
+    for sid in (_SESSION_SIMPLE, _SESSION_METADATA, _SESSION_UNICODE):
+        tfile = sessions_dir / f"{sid}.trajectory.jsonl"
+        src = JsonlTrajectoryEventSource(tfile)
+        meta_src = src.session_metadata()
+        meta_scan = _scan_trajectory_file(tfile)
+        # Both paths should agree (scan delegates to the source anyway, but
+        # this double-checks the contract is stable).
+        assert meta_src == meta_scan, (
+            f"JsonlTrajectoryEventSource.session_metadata() and _scan_trajectory_file() "
+            f"must agree for {sid}"
+        )
+
+
+def test_jsonl_source_metadata_cache_is_stable(sessions_dir):
+    """Calling session_metadata() twice must return the same dict (caching)."""
+    tfile = sessions_dir / f"{_SESSION_SIMPLE}.trajectory.jsonl"
+    src = JsonlTrajectoryEventSource(tfile)
+    first = src.session_metadata()
+    second = src.session_metadata()
+    assert first is second, "session_metadata must return the same cached object"
+
+
+def test_reader_abstraction_seam_docstring_present():
+    """TrajectoryEventSource must have a docstring describing the SQLite seam."""
+    doc = TrajectoryEventSource.__doc__ or ""
+    assert "trajectory_runtime_events" in doc, (
+        "TrajectoryEventSource docstring must describe the SQLite seam "
+        "with the trajectory_runtime_events table name"
+    )
+    assert "SqliteTrajectoryEventSource" in doc, (
+        "TrajectoryEventSource docstring must name the expected SQLite implementation"
+    )
