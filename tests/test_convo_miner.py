@@ -11,12 +11,16 @@ import pytest
 from mempalace.config import MempalaceConfig
 from mempalace.convo_miner import (
     _compute_convo_cursor,
+    _extract_cwd_from_codex_session,
     _fetch_stored_cursor,
     _flag_or_drop_duplicates,
     _incremental_reparse,
     _is_ai_tool_path,
+    _is_claude_code_projects_path,
+    _is_codex_path,
     _register_file,
     _resolve_wing,
+    _resolve_wing_for_file,
     chunk_exchanges,
     mine_convos,
 )
@@ -427,6 +431,191 @@ def test_resolve_wing_empty_string_treated_as_no_wing(tmp_path):
     assert _resolve_wing(target, wing="") == "wing_api"
 
 
+# ── _is_claude_code_projects_path / _is_codex_path — narrow format gates ─
+#
+# Narrower than _is_ai_tool_path: used by _resolve_wing_for_file to decide
+# which per-file cwd-extraction strategy (if any) applies to one specific
+# conversation file.
+
+
+def test_is_claude_code_projects_path_true(tmp_path):
+    target = tmp_path / ".claude" / "projects" / "-Users-x" / "session.jsonl"
+    target.parent.mkdir(parents=True)
+    assert _is_claude_code_projects_path(target) is True
+
+
+def test_is_claude_code_projects_path_false_for_codex(tmp_path):
+    target = tmp_path / ".codex" / "sessions" / "session.jsonl"
+    target.parent.mkdir(parents=True)
+    assert _is_claude_code_projects_path(target) is False
+
+
+def test_is_codex_path_true(tmp_path):
+    target = tmp_path / ".codex" / "sessions" / "2026" / "session.jsonl"
+    target.parent.mkdir(parents=True)
+    assert _is_codex_path(target) is True
+
+
+def test_is_codex_path_false_for_claude_code(tmp_path):
+    target = tmp_path / ".claude" / "projects" / "-Users-x" / "session.jsonl"
+    target.parent.mkdir(parents=True)
+    assert _is_codex_path(target) is False
+
+
+# ── _extract_cwd_from_codex_session ──────────────────────────────────────
+#
+# Codex CLI nests cwd under payload, on session_meta/turn_context records
+# -- confirmed against real ~/.codex/sessions/**/*.jsonl files, a
+# structurally different location than Claude Code's top-level cwd field.
+
+
+def test_extract_cwd_from_codex_session_meta_record(tmp_path):
+    import json as jsonlib
+
+    f = tmp_path / "session.jsonl"
+    f.write_text(
+        jsonlib.dumps(
+            {
+                "timestamp": "2026-07-05T15:59:41Z",
+                "type": "session_meta",
+                "payload": {"cwd": "/Users/jrmurray/Code/forktail/forktail-app"},
+            }
+        )
+        + "\n"
+    )
+    assert _extract_cwd_from_codex_session(f) == "/Users/jrmurray/Code/forktail/forktail-app"
+
+
+def test_extract_cwd_from_codex_turn_context_record(tmp_path):
+    import json as jsonlib
+
+    f = tmp_path / "session.jsonl"
+    f.write_text(
+        jsonlib.dumps(
+            {
+                "timestamp": "2026-07-05T15:59:42Z",
+                "type": "turn_context",
+                "payload": {"cwd": "/Users/x/Code/y", "workspace_roots": ["/Users/x/Code/y"]},
+            }
+        )
+        + "\n"
+    )
+    assert _extract_cwd_from_codex_session(f) == "/Users/x/Code/y"
+
+
+def test_extract_cwd_from_codex_session_ignores_other_record_types(tmp_path):
+    import json as jsonlib
+
+    f = tmp_path / "session.jsonl"
+    lines = [
+        jsonlib.dumps({"type": "response_item", "payload": {"cwd": "/should/not/match"}}),
+        jsonlib.dumps({"type": "session_meta", "payload": {"cwd": "/real/project"}}),
+    ]
+    f.write_text("\n".join(lines) + "\n")
+    assert _extract_cwd_from_codex_session(f) == "/real/project"
+
+
+def test_extract_cwd_from_codex_session_none_if_top_level_cwd(tmp_path):
+    """Claude-Code-shaped top-level cwd (not nested under payload) must
+    NOT match -- confirms the two formats' extractors stay independent."""
+    import json as jsonlib
+
+    f = tmp_path / "session.jsonl"
+    f.write_text(jsonlib.dumps({"type": "session_meta", "cwd": "/should/not/match"}) + "\n")
+    assert _extract_cwd_from_codex_session(f) is None
+
+
+def test_extract_cwd_from_codex_session_none_if_malformed(tmp_path):
+    f = tmp_path / "session.jsonl"
+    f.write_text("not valid json at all\n")
+    assert _extract_cwd_from_codex_session(f) is None
+
+
+def test_extract_cwd_from_codex_session_none_if_file_missing(tmp_path):
+    assert _extract_cwd_from_codex_session(tmp_path / "missing.jsonl") is None
+
+
+# ── _resolve_wing_for_file — per-file wing resolution ────────────────────
+
+
+def test_resolve_wing_for_file_explicit_wing_always_wins(tmp_path):
+    """The exact bug this must never repeat: an explicit --wing wing_api
+    must be indistinguishable from any other explicit choice, not
+    silently overridden by per-file detection just because it happens to
+    match the AI-tool-path sentinel default (MemPalace/mempalace#1757)."""
+    import json as jsonlib
+
+    session = tmp_path / ".claude" / "projects" / "-Users-x" / "session.jsonl"
+    session.parent.mkdir(parents=True)
+    session.write_text(jsonlib.dumps({"type": "user", "cwd": "/Users/x/some-real-project"}) + "\n")
+
+    assert _resolve_wing_for_file(session, "wing_api", "wing_api") == "wing_api"
+    assert _resolve_wing_for_file(session, "my_custom_wing", "wing_api") == "my_custom_wing"
+
+
+def test_resolve_wing_for_file_claude_code_resolves_from_cwd(tmp_path):
+    import json as jsonlib
+
+    session = tmp_path / ".claude" / "projects" / "-Users-x-forktail" / "session.jsonl"
+    session.parent.mkdir(parents=True)
+    session.write_text(
+        jsonlib.dumps({"type": "user", "cwd": "/Users/x/Code/forktail/forktail-app"}) + "\n"
+    )
+    assert _resolve_wing_for_file(session, None, "wing_api") == "forktail_app"
+
+
+def test_resolve_wing_for_file_claude_code_collapses_worktree(tmp_path):
+    import json as jsonlib
+
+    session = tmp_path / ".claude" / "projects" / "-x" / "session.jsonl"
+    session.parent.mkdir(parents=True)
+    cwd = "/Users/x/Code/forktail/forktail-app/.claude/worktrees/silly-mcnulty-d987f4"
+    session.write_text(jsonlib.dumps({"type": "user", "cwd": cwd}) + "\n")
+    assert _resolve_wing_for_file(session, None, "wing_api") == "forktail_app"
+
+
+def test_resolve_wing_for_file_codex_resolves_from_nested_cwd(tmp_path):
+    import json as jsonlib
+
+    session = tmp_path / ".codex" / "sessions" / "2026" / "session.jsonl"
+    session.parent.mkdir(parents=True)
+    session.write_text(
+        jsonlib.dumps(
+            {"type": "session_meta", "payload": {"cwd": "/Users/x/Code/forktail/forktail-app"}}
+        )
+        + "\n"
+    )
+    assert _resolve_wing_for_file(session, None, "wing_api") == "forktail_app"
+
+
+def test_resolve_wing_for_file_falls_back_when_cwd_unreadable(tmp_path):
+    """Malformed/empty session with no readable cwd -> falls back to
+    default_wing, not a crash."""
+    session = tmp_path / ".claude" / "projects" / "-x" / "empty.jsonl"
+    session.parent.mkdir(parents=True)
+    session.write_text("not valid json\n")
+    assert _resolve_wing_for_file(session, None, "wing_api") == "wing_api"
+
+
+def test_resolve_wing_for_file_gemini_not_attempted_falls_back(tmp_path):
+    """No confirmed cwd-equivalent field for Gemini (no real session data,
+    no upstream reference) -- stays on the existing coarse fallback rather
+    than risk a silent misresolution against an unverified schema."""
+    import json as jsonlib
+
+    session = tmp_path / ".gemini" / "tmp" / "abc" / "chats" / "session.jsonl"
+    session.parent.mkdir(parents=True)
+    session.write_text(jsonlib.dumps({"type": "user", "cwd": "/Users/x/some-project"}) + "\n")
+    assert _resolve_wing_for_file(session, None, "wing_api") == "wing_api"
+
+
+def test_resolve_wing_for_file_non_ai_tool_path_falls_back(tmp_path):
+    session = tmp_path / "Documents" / "myproject" / "chat.txt"
+    session.parent.mkdir(parents=True)
+    session.write_text("> hi\nhello\n")
+    assert _resolve_wing_for_file(session, None, "myproject") == "myproject"
+
+
 def test_mine_convos_limit_skips_already_mined(capsys):
     """--limit N counts only new work, not already-mined skips (#1535)."""
     tmpdir = tempfile.mkdtemp()
@@ -632,6 +821,112 @@ def test_prefetch_mined_set_none_for_drawer_without_stored_mtime():
         mined = prefetch_mined_set(col, extract_mode="exchange")
         assert "/fake/legacy/file.txt" in mined
         assert mined["/fake/legacy/file.txt"] is None
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ── min_wing_resolution_version — one-time per-project-wing backfill ────
+#
+# file_already_mined/prefetch_mined_set's min_wing_resolution_version
+# parameter is None by default (used by no caller except the convo
+# miner's per-project wing-resolution backfill) -- passing it excludes a
+# file whose stored wing_resolution_version is missing or older than it,
+# forcing a full re-mine that resolves the file's correct per-project
+# wing exactly once. Mirrors normalize_version's existing stale-schema
+# handling, scoped separately so it never affects the project/format
+# miners (which never pass this parameter).
+
+
+def test_prefetch_mined_set_excludes_stale_wing_resolution_version():
+    tmpdir = tempfile.mkdtemp()
+    try:
+        palace_path = os.path.join(tmpdir, "palace")
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection("mempalace_drawers")
+        col.upsert(
+            ids=["drawer_1"],
+            documents=["content mined before wing_resolution_version existed"],
+            metadatas=[
+                {
+                    "wing": "wing_api",
+                    "room": "general",
+                    "source_file": "/fake/pre-wing-feature/file.txt",
+                    "chunk_index": 0,
+                    "extract_mode": "exchange",
+                    "normalize_version": 999,
+                    "source_mtime": 123.456,
+                    # no wing_resolution_version field at all
+                }
+            ],
+        )
+        without_check = prefetch_mined_set(col, extract_mode="exchange")
+        assert "/fake/pre-wing-feature/file.txt" in without_check
+
+        with_check = prefetch_mined_set(col, extract_mode="exchange", min_wing_resolution_version=1)
+        assert "/fake/pre-wing-feature/file.txt" not in with_check
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_prefetch_mined_set_includes_current_wing_resolution_version():
+    tmpdir = tempfile.mkdtemp()
+    try:
+        palace_path = os.path.join(tmpdir, "palace")
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection("mempalace_drawers")
+        col.upsert(
+            ids=["drawer_1"],
+            documents=["content mined under the current wing-resolution version"],
+            metadatas=[
+                {
+                    "wing": "forktail_app",
+                    "room": "general",
+                    "source_file": "/fake/current/file.txt",
+                    "chunk_index": 0,
+                    "extract_mode": "exchange",
+                    "normalize_version": 999,
+                    "source_mtime": 123.456,
+                    "wing_resolution_version": 1,
+                }
+            ],
+        )
+        mined = prefetch_mined_set(col, extract_mode="exchange", min_wing_resolution_version=1)
+        assert "/fake/current/file.txt" in mined
+        assert mined["/fake/current/file.txt"] == 123.456
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_file_already_mined_false_for_stale_wing_resolution_version():
+    tmpdir = tempfile.mkdtemp()
+    try:
+        palace_path = os.path.join(tmpdir, "palace")
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection("mempalace_drawers")
+        source_file = str(Path(tmpdir) / "session.txt")
+        Path(source_file).write_text("hi")
+        col.upsert(
+            ids=["drawer_1"],
+            documents=["content"],
+            metadatas=[
+                {
+                    "wing": "wing_api",
+                    "room": "general",
+                    "source_file": source_file,
+                    "chunk_index": 0,
+                    "extract_mode": "exchange",
+                    "normalize_version": 999,
+                    "source_mtime": os.path.getmtime(source_file),
+                }
+            ],
+        )
+        assert file_already_mined(col, source_file, extract_mode="exchange") is True
+        assert (
+            file_already_mined(
+                col, source_file, extract_mode="exchange", min_wing_resolution_version=1
+            )
+            is False
+        )
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -1734,5 +2029,213 @@ class TestIncrementalMiningWiredIn:
             out = capsys.readouterr().out
             assert "(incremental)" not in out
             assert "Files skipped (already filed): 0" in out
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ── per-project wing segregation for multi-project sweeps ───────────────
+#
+# Mining a directory containing sessions from more than one underlying
+# project (most commonly the whole ~/.claude/projects) used to put every
+# session into the same wing_api bucket regardless of which project it
+# actually came from. _resolve_wing_for_file resolves each Claude Code /
+# Codex session's real project identity from its own cwd, splitting a
+# multi-project sweep into one wing per project instead.
+
+
+def _write_claude_code_session(path: Path, cwd: str, topic: str = "the deployment plan") -> None:
+    import json as jsonlib
+
+    lines = [
+        jsonlib.dumps({"type": "human", "cwd": cwd, "message": {"content": f"What is {topic}?"}}),
+        jsonlib.dumps(
+            {
+                "type": "assistant",
+                "cwd": cwd,
+                "message": {
+                    "content": f"Here is a detailed explanation of {topic} with enough words to clear the minimum chunk size floor comfortably."
+                },
+            }
+        ),
+    ]
+    path.write_text("\n".join(lines) + "\n")
+
+
+class TestMultiProjectWingSegregation:
+    def test_segregates_by_project_with_no_explicit_wing(self, capsys):
+        tmpdir = tempfile.mkdtemp()
+        try:
+            projects_root = Path(tmpdir) / ".claude" / "projects"
+            proj_a = projects_root / "-Users-x-Code-alpha-repo"
+            proj_b = projects_root / "-Users-x-Code-beta-repo"
+            proj_a.mkdir(parents=True)
+            proj_b.mkdir(parents=True)
+            _write_claude_code_session(
+                proj_a / "session.jsonl",
+                "/Users/x/Code/alpha-repo",
+                topic="alpha's release process",
+            )
+            _write_claude_code_session(
+                proj_b / "session.jsonl", "/Users/x/Code/beta-repo", topic="beta's test suite"
+            )
+            palace_path = os.path.join(tmpdir, "palace")
+
+            mine_convos(str(projects_root), palace_path)
+            out = capsys.readouterr().out
+            assert "alpha_repo" in out
+            assert "beta_repo" in out
+
+            client = chromadb.PersistentClient(path=palace_path)
+            col = client.get_collection("mempalace_drawers")
+            result = col.get(include=["metadatas"])
+            wings_by_source = {
+                m["source_file"]: m["wing"]
+                for m in result["metadatas"]
+                if m and m.get("room") != "_registry"
+            }
+            assert wings_by_source[str((proj_a / "session.jsonl").resolve())] == "alpha_repo"
+            assert wings_by_source[str((proj_b / "session.jsonl").resolve())] == "beta_repo"
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_worktree_sessions_of_same_project_share_one_wing(self, capsys):
+        """Two sessions from different worktrees of the SAME repo must
+        land in the SAME wing, not be split by the ephemeral worktree
+        name -- the whole point of _project_name_from_cwd's
+        worktree-collapsing."""
+        tmpdir = tempfile.mkdtemp()
+        try:
+            projects_root = Path(tmpdir) / ".claude" / "projects"
+            proj_main = projects_root / "-Users-x-Code-gamma-repo"
+            proj_wt = projects_root / "-Users-x-Code-gamma-repo--claude-worktrees-some-wt"
+            proj_main.mkdir(parents=True)
+            proj_wt.mkdir(parents=True)
+            _write_claude_code_session(
+                proj_main / "session.jsonl",
+                "/Users/x/Code/gamma-repo",
+                topic="the main branch work",
+            )
+            _write_claude_code_session(
+                proj_wt / "session.jsonl",
+                "/Users/x/Code/gamma-repo/.claude/worktrees/some-wt",
+                topic="the worktree branch work",
+            )
+            palace_path = os.path.join(tmpdir, "palace")
+
+            mine_convos(str(projects_root), palace_path)
+
+            client = chromadb.PersistentClient(path=palace_path)
+            col = client.get_collection("mempalace_drawers")
+            result = col.get(include=["metadatas"])
+            wings = {m["wing"] for m in result["metadatas"] if m and m.get("room") != "_registry"}
+            assert wings == {"gamma_repo"}
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_malformed_session_falls_back_to_wing_api(self):
+        """A session with no readable cwd (malformed/empty JSONL) must
+        fall back to wing_api, not crash the whole sweep."""
+        tmpdir = tempfile.mkdtemp()
+        try:
+            projects_root = Path(tmpdir) / ".claude" / "projects"
+            proj = projects_root / "-Users-x-Code-bad-session"
+            proj.mkdir(parents=True)
+            (proj / "broken.jsonl").write_text("not valid json at all\nmore garbage\n")
+            palace_path = os.path.join(tmpdir, "palace")
+
+            # Must not raise.
+            mine_convos(str(projects_root), palace_path)
+
+            client = chromadb.PersistentClient(path=palace_path)
+            col = client.get_collection("mempalace_drawers")
+            result = col.get(include=["metadatas"])
+            assert all(m.get("wing") == "wing_api" for m in result["metadatas"] if m)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_explicit_wing_overrides_per_file_detection_for_every_file(self, capsys):
+        """Explicit --wing (even literally "wing_api") must win for every
+        file, unconditionally -- must never be silently replaced by
+        per-file detection just because it matches the AI-tool-path
+        sentinel default (the exact bug in the abandoned upstream attempt
+        at this feature, MemPalace/mempalace#1757)."""
+        tmpdir = tempfile.mkdtemp()
+        try:
+            projects_root = Path(tmpdir) / ".claude" / "projects"
+            proj_a = projects_root / "-Users-x-Code-alpha-repo"
+            proj_b = projects_root / "-Users-x-Code-beta-repo"
+            proj_a.mkdir(parents=True)
+            proj_b.mkdir(parents=True)
+            _write_claude_code_session(proj_a / "session.jsonl", "/Users/x/Code/alpha-repo")
+            _write_claude_code_session(proj_b / "session.jsonl", "/Users/x/Code/beta-repo")
+            palace_path = os.path.join(tmpdir, "palace")
+
+            mine_convos(str(projects_root), palace_path, wing="wing_api")
+
+            client = chromadb.PersistentClient(path=palace_path)
+            col = client.get_collection("mempalace_drawers")
+            result = col.get(include=["metadatas"])
+            wings = {m["wing"] for m in result["metadatas"] if m and m.get("room") != "_registry"}
+            assert wings == {"wing_api"}
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_one_time_backfill_reclassifies_already_mined_content(self):
+        """Content mined before this feature existed (stamped without
+        wing_resolution_version, everything collapsed under wing_api)
+        must get reclassified into its correct per-project wing on the
+        VERY NEXT mine -- even though the underlying file's content and
+        mtime are completely unchanged. This is the one-time backfill:
+        prefetch_mined_set's min_wing_resolution_version check excludes
+        such a file from the "already mined" set, forcing a full re-mine
+        that resolves and stamps its correct wing."""
+        tmpdir = tempfile.mkdtemp()
+        try:
+            projects_root = Path(tmpdir) / ".claude" / "projects"
+            proj = projects_root / "-Users-x-Code-delta-repo"
+            proj.mkdir(parents=True)
+            session = proj / "session.jsonl"
+            _write_claude_code_session(session, "/Users/x/Code/delta-repo")
+            palace_path = os.path.join(tmpdir, "palace")
+
+            # Simulate a PRE-EXISTING mine from before this feature: mine
+            # normally, then strip wing_resolution_version from every
+            # drawer and force the wing back to wing_api, as if it had
+            # been filed under the old single-wing-per-sweep behavior.
+            mine_convos(str(projects_root), palace_path)
+
+            client = chromadb.PersistentClient(path=palace_path)
+            col = client.get_collection("mempalace_drawers")
+            existing = col.get(include=["metadatas", "documents"])
+            downgraded_metas = []
+            for meta in existing["metadatas"]:
+                meta = dict(meta or {})
+                meta.pop("wing_resolution_version", None)
+                meta["wing"] = "wing_api"
+                downgraded_metas.append(meta)
+            # col.update() merges metadata rather than replacing it --
+            # a field simply absent from the new dict silently keeps its
+            # OLD stored value, which would defeat this exact simulation
+            # (removing wing_resolution_version). delete + fresh upsert
+            # is the only way to actually drop a field.
+            col.delete(ids=existing["ids"])
+            col.upsert(
+                ids=existing["ids"],
+                documents=existing["documents"],
+                metadatas=downgraded_metas,
+            )
+            del col, client
+
+            # Re-mine the SAME, unchanged directory -- content and mtime
+            # are identical to the first pass.
+            mine_convos(str(projects_root), palace_path)
+
+            client2 = chromadb.PersistentClient(path=palace_path)
+            col2 = client2.get_collection("mempalace_drawers")
+            result = col2.get(include=["metadatas"])
+            wings = {m["wing"] for m in result["metadatas"] if m and m.get("room") != "_registry"}
+            assert wings == {"delta_repo"}, (
+                f"expected the backfill to reclassify into delta_repo, got {wings}"
+            )
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)

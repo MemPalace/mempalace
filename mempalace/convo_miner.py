@@ -78,6 +78,20 @@ CONVO_SKIP_DIRS = SKIP_DIRS | {"tool-results"}
 
 MIN_CHUNK_SIZE = 30
 CHUNK_SIZE = 800  # chars per drawer — align with miner.py
+WING_RESOLUTION_VERSION = 1
+# Bumping this forces a ONE-TIME full re-mine of every already-filed convo
+# drawer (via file_already_mined/prefetch_mined_set's
+# min_wing_resolution_version parameter, which they take specifically for
+# this), the same way NORMALIZE_VERSION forces a rebuild after a
+# normalization-schema change -- except scoped to convo mining only,
+# never touching the shared project/format miners (they never pass this
+# parameter and see no behavior change). Introduced alongside per-file
+# wing resolution (_resolve_wing_for_file) so every file already mined
+# under the old single-wing-per-sweep behavior gets reclassified into
+# its correct per-project wing exactly once, rather than staying
+# collapsed under wing_api until its content happens to change again.
+# Bump again only if the wing-resolution ALGORITHM itself changes in a
+# way that should force another reclassification pass.
 _LINE_GROUP_SIZE = 25  # lines per fallback group when no paragraph breaks
 _LINE_FALLBACK_MIN_NEWLINES = 20  # trigger line-group fallback above this newline count
 DRAWER_UPSERT_BATCH_SIZE = 1000
@@ -145,6 +159,7 @@ def _register_file(collection, source_file: str, wing: str, agent: str, extract_
         "extract_mode": extract_mode,
         "normalize_version": NORMALIZE_VERSION,
         "id_recipe": ID_RECIPE,
+        "wing_resolution_version": WING_RESOLUTION_VERSION,
     }
     if source_mtime is not None:
         meta["source_mtime"] = source_mtime
@@ -970,6 +985,7 @@ def _upsert_chunk_batch(
                 "extract_mode": extract_mode,
                 "normalize_version": NORMALIZE_VERSION,
                 "id_recipe": ID_RECIPE,
+                "wing_resolution_version": WING_RESOLUTION_VERSION,
             }
             if source_mtime is not None:
                 meta["source_mtime"] = source_mtime
@@ -1038,7 +1054,13 @@ def _file_chunks_locked(
         # Re-check after lock — another agent may have just finished this file
         # at the current schema/mtime. A stale hit here returns False, so we
         # still fall through to the purge+rebuild path below.
-        if file_already_mined(collection, source_file, check_mtime=True, extract_mode=extract_mode):
+        if file_already_mined(
+            collection,
+            source_file,
+            check_mtime=True,
+            extract_mode=extract_mode,
+            min_wing_resolution_version=WING_RESOLUTION_VERSION,
+        ):
             return 0, defaultdict(int), True, 0
 
         # Purge stale drawers first. Fires both on a normalize-schema bump
@@ -1102,7 +1124,13 @@ def _file_chunks_locked_incremental(
     Returns (drawers_added, room_counts_delta, skipped, dropped_count).
     """
     with mine_lock(source_file):
-        if file_already_mined(collection, source_file, check_mtime=True, extract_mode=extract_mode):
+        if file_already_mined(
+            collection,
+            source_file,
+            check_mtime=True,
+            extract_mode=extract_mode,
+            min_wing_resolution_version=WING_RESOLUTION_VERSION,
+        ):
             return 0, defaultdict(int), True, 0
 
         try:
@@ -1135,6 +1163,47 @@ def _file_chunks_locked_incremental(
     return drawers_added, room_counts_delta, False, dropped_count
 
 
+def _path_parts_or_empty(path: Path) -> tuple:
+    """Resolve ``path.parts``, treating any resolution failure (broken
+    symlink, permission error) as "no parts" rather than raising -- shared
+    by the AI-tool-path detection helpers below, which must never crash
+    mid-scan on an unusual path.
+    """
+    try:
+        return path.resolve().parts
+    except (OSError, RuntimeError):
+        return ()
+
+
+def _is_claude_code_projects_path(path: Path) -> bool:
+    """True when `path` lives under a ``.claude/projects`` tree
+    specifically (Claude Code sessions) -- narrower than
+    ``_is_ai_tool_path``, which also matches ``.codex``/``.gemini``.
+
+    Per-file cwd-based wing resolution (``_resolve_wing_for_file``) is
+    scoped per format: Claude Code JSONL is confirmed to carry a
+    top-level ``cwd`` field on message records (see
+    ``convo_scanner._extract_cwd_from_session``).
+    """
+    parts = _path_parts_or_empty(path)
+    for i in range(len(parts) - 1):
+        if parts[i] == ".claude" and parts[i + 1] == "projects":
+            return True
+    return False
+
+
+def _is_codex_path(path: Path) -> bool:
+    """True when `path` lives under a ``.codex`` tree (Codex CLI sessions).
+
+    Codex nests its own ``cwd`` differently than Claude Code -- under
+    ``payload`` on ``session_meta``/``turn_context`` records rather than
+    top-level on every message -- so it gets its own extractor
+    (``_extract_cwd_from_codex_session``) rather than reusing
+    ``convo_scanner``'s Claude-Code-specific one.
+    """
+    return ".codex" in _path_parts_or_empty(path)
+
+
 def _is_ai_tool_path(path: Path) -> bool:
     """Return True when `path` lives inside a known AI-tool storage dir.
 
@@ -1147,21 +1216,17 @@ def _is_ai_tool_path(path: Path) -> bool:
         not a conversation source.
 
     Used by ``_resolve_wing`` to default the destination wing to
-    ``wing_api`` when the user hasn't passed an explicit ``--wing``.
+    ``wing_api`` when the user hasn't passed an explicit ``--wing``, and
+    (in its narrower ``_is_claude_code_projects_path``/``_is_codex_path``
+    forms) by ``_resolve_wing_for_file`` to decide which per-file
+    cwd-extraction strategy applies, if any.
     """
-    try:
-        parts = path.resolve().parts
-    except (OSError, RuntimeError):
-        return False
-
+    parts = _path_parts_or_empty(path)
     if ".codex" in parts:
         return True
     if ".gemini" in parts:
         return True
-    for i in range(len(parts) - 1):
-        if parts[i] == ".claude" and parts[i + 1] == "projects":
-            return True
-    return False
+    return _is_claude_code_projects_path(path)
 
 
 def _is_unchanged_since_last_mine(source_file: str, mined_mtimes: dict) -> bool:
@@ -1209,6 +1274,101 @@ def _resolve_wing(convo_path: Path, wing: Optional[str]) -> str:
     if _is_ai_tool_path(convo_path):
         return "wing_api"
     return normalize_wing_name(convo_path.name)
+
+
+_CODEX_CWD_RECORD_TYPES = ("session_meta", "turn_context")
+_CODEX_CWD_MAX_LINES = 20  # matches convo_scanner.MAX_HEADER_LINES
+
+
+def _extract_cwd_from_codex_session(session_file: Path) -> Optional[str]:
+    """Return the ``cwd`` from the first Codex CLI record that carries one.
+
+    Codex CLI sessions (``~/.codex/sessions/**/*.jsonl``) nest ``cwd``
+    under ``payload``, on ``session_meta`` or ``turn_context`` records --
+    confirmed against real session files, e.g.
+    ``{"type": "session_meta", "payload": {"cwd": "/Users/x/Code/y", ...}}``.
+    This is a structurally different location than Claude Code's, where
+    ``cwd`` is a top-level field on every message record (see
+    ``convo_scanner._extract_cwd_from_session``), so it gets its own
+    extractor rather than reusing that one.
+
+    Returns None if the file can't be read, has no JSON, or no record in
+    the first ``_CODEX_CWD_MAX_LINES`` lines carries a ``payload.cwd``.
+    """
+    try:
+        with open(session_file, encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i >= _CODEX_CWD_MAX_LINES:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(obj, dict) or obj.get("type") not in _CODEX_CWD_RECORD_TYPES:
+                    continue
+                payload = obj.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+                cwd = payload.get("cwd")
+                if isinstance(cwd, str) and cwd:
+                    return cwd
+    except OSError:
+        return None
+    return None
+
+
+def _resolve_wing_for_file(filepath: Path, explicit_wing: Optional[str], default_wing: str) -> str:
+    """Per-file wing resolution for one conversation file within a
+    ``mine_convos()`` sweep -- segregates a multi-project directory (most
+    commonly the whole ``~/.claude/projects``) into one wing per project
+    instead of collapsing every session into a single ``wing_api`` bucket.
+
+    Precedence:
+
+      1. ``explicit_wing`` (the caller's ``--wing`` argument) always wins
+         -- checked against the ORIGINAL argument value, never the
+         resolved sentinel. ``mine --wing wing_api`` must be
+         indistinguishable from any other explicit choice, not silently
+         overridden by per-file detection just because it happens to
+         match the AI-tool-path default -- a real bug in an earlier,
+         since-abandoned upstream attempt at this exact feature
+         (MemPalace/mempalace#1757: ``if wing == "wing_api"`` couldn't
+         tell an explicit choice from the auto-routed sentinel).
+      2. A file under ``.claude/projects`` gets its own project identity
+         from that session's own ``cwd``
+         (``convo_scanner._extract_cwd_from_session``).
+      3. A file under ``.codex`` gets the same treatment via its own
+         nested-field extractor (``_extract_cwd_from_codex_session``).
+      4. Anything else (``.gemini`` -- no confirmed cwd-equivalent field,
+         no real session data or upstream reference to verify one against
+         -- or a plain non-AI-tool directory) falls back to
+         ``default_wing``, unchanged from today's behavior.
+
+    Falls back to ``default_wing`` whenever the relevant extractor
+    returns None (unreadable/malformed session, or no cwd found in the
+    first ~20 lines) -- always safe.
+    """
+    if explicit_wing:
+        return explicit_wing
+
+    from .config import normalize_wing_name
+    from .convo_scanner import _extract_cwd_from_session, _project_name_from_cwd
+
+    cwd = None
+    if _is_claude_code_projects_path(filepath):
+        cwd = _extract_cwd_from_session(filepath)
+    elif _is_codex_path(filepath):
+        cwd = _extract_cwd_from_codex_session(filepath)
+
+    if not cwd:
+        return default_wing
+    project_name = _project_name_from_cwd(cwd)
+    if not project_name:
+        return default_wing
+    return normalize_wing_name(project_name)
 
 
 def mine_convos(
@@ -1279,6 +1439,40 @@ def _compute_hallways_for_wing_safe(wing, collection, drawers_filed, config=None
         compute_hallways_for_wing(wing, col=collection, config=config)
     except Exception as exc:
         print(f"  (hallways skipped: {exc})")
+
+
+def _compute_hallways_for_all_wings(wing_drawer_counts: dict, collection) -> None:
+    """One `_compute_hallways_for_wing_safe` call per distinct wing
+    touched this mine -- a multi-project sweep no longer files everything
+    under a single wing, so a single hallway computation (the pre-
+    per-file-wing-resolution behavior) would miss every wing but one.
+    """
+    for w, w_drawers in wing_drawer_counts.items():
+        _compute_hallways_for_wing_safe(w, collection, w_drawers)
+
+
+def _wing_header_label(wing_arg: Optional[str], default_wing: str) -> str:
+    """Text for the mine summary's "Wing:" header line -- notes that
+    per-file resolution may override `default_wing` for individual
+    Claude Code/Codex sessions, unless the caller passed an explicit
+    ``--wing`` (which always wins outright and needs no such caveat).
+    """
+    if wing_arg:
+        return default_wing
+    return f"{default_wing} (per-file for Claude Code/Codex sessions)"
+
+
+def _print_wing_breakdown(wing_counts: dict) -> None:
+    """ "By wing:" section of the mine summary -- only when a sweep
+    actually touched more than one wing (the common single-wing case,
+    e.g. an explicit --wing or a non-AI-tool directory, prints nothing
+    extra here, unchanged from before per-file wing resolution existed).
+    """
+    if len(wing_counts) <= 1:
+        return
+    print("\n  By wing:")
+    for w, count in sorted(wing_counts.items(), key=lambda x: x[1], reverse=True):
+        print(f"    {w:20} {count} files")
 
 
 def _attempt_incremental_mine(
@@ -1447,14 +1641,20 @@ def _mine_convos_impl(
     cfg_min_chunk_size = explicit_min if explicit_min is not None else MIN_CHUNK_SIZE
 
     convo_path = Path(convo_dir).expanduser().resolve()
-    wing = _resolve_wing(convo_path, wing)
+    # Preserved separately from the resolved default so per-file wing
+    # resolution below can tell "the caller explicitly passed --wing"
+    # apart from "the sentinel default happened to resolve to wing_api" --
+    # conflating the two was a real bug in an abandoned upstream attempt
+    # at this exact feature (MemPalace/mempalace#1757).
+    wing_arg = wing
+    default_wing = _resolve_wing(convo_path, wing_arg)
 
     files = scan_convos(convo_dir)
 
     print(f"\n{'=' * 55}")
     print("  MemPalace Mine — Conversations")
     print(f"{'=' * 55}")
-    print(f"  Wing:    {wing}")
+    print(f"  Wing:    {_wing_header_label(wing_arg, default_wing)}")
     print(f"  Source:  {convo_path}")
     limit_suffix = f" (limit: {limit} new)" if limit > 0 else ""
     print(f"  Files:   {len(files)}{limit_suffix}")
@@ -1471,8 +1671,20 @@ def _mine_convos_impl(
     # 2000-file sweep used to spend >1h just deciding to skip.
     # prefetch_mined_set() does the same decisions in a single scan; loop
     # body becomes an O(1) dict lookup + a cheap local mtime comparison.
+    # min_wing_resolution_version forces the one-time per-project-wing
+    # backfill: a file whose stored drawers predate WING_RESOLUTION_VERSION
+    # is excluded here, so it reads as "changed" below and falls through
+    # to a full re-mine that resolves its correct per-file wing, exactly
+    # once -- after that its drawers carry the current version and go
+    # back to being skipped normally.
     mined_mtimes: dict = (
-        prefetch_mined_set(collection, extract_mode=extract_mode) if not dry_run else {}
+        prefetch_mined_set(
+            collection,
+            extract_mode=extract_mode,
+            min_wing_resolution_version=WING_RESOLUTION_VERSION,
+        )
+        if not dry_run
+        else {}
     )
 
     total_drawers = 0
@@ -1481,6 +1693,8 @@ def _mine_convos_impl(
     files_processed = 0
     total_dropped = 0
     room_counts = defaultdict(int)
+    wing_counts = defaultdict(int)
+    wing_drawer_counts = defaultdict(int)
 
     for i, filepath in enumerate(files, 1):
         files_processed = i
@@ -1502,6 +1716,16 @@ def _mine_convos_impl(
             files_skipped += 1
             continue
 
+        # Per-file wing resolution -- computed once past the cheap skip
+        # checks above (so a file that's going to be skipped never pays
+        # for it), reused for every downstream call in this iteration.
+        # Counted toward wing_counts regardless of what happens next
+        # (dry-run preview, in-lock skip, or a real mine), matching
+        # room_counts' own "counts toward reporting even if skipped"
+        # convention below.
+        file_wing = _resolve_wing_for_file(filepath, wing_arg, default_wing)
+        wing_counts[file_wing] += 1
+
         # Read once -- a second, independent read (e.g. for cursor
         # computation further below, or the incremental-mining attempt
         # right after) could otherwise observe a different state of a
@@ -1511,7 +1735,7 @@ def _mine_convos_impl(
             raw_content = _read_source_file(str(filepath))
         except (OSError, ValueError):
             if not dry_run:
-                _register_file(collection, source_file, wing, agent, extract_mode)
+                _register_file(collection, source_file, file_wing, agent, extract_mode)
             continue
 
         # Try the incremental path FIRST, before paying for a full
@@ -1525,7 +1749,7 @@ def _mine_convos_impl(
             collection,
             source_file,
             raw_content,
-            wing,
+            file_wing,
             agent,
             extract_mode,
             filepath,
@@ -1558,6 +1782,7 @@ def _mine_convos_impl(
                 )
             )
             total_drawers += drawers_delta
+            wing_drawer_counts[file_wing] += drawers_delta
             files_mined += mined_delta
             files_skipped += skipped_delta
             total_dropped += dropped_delta
@@ -1569,7 +1794,7 @@ def _mine_convos_impl(
 
         if not content or len(content.strip()) < cfg_min_chunk_size:
             if not dry_run:
-                _register_file(collection, source_file, wing, agent, extract_mode)
+                _register_file(collection, source_file, file_wing, agent, extract_mode)
             continue
 
         # Chunk — either exchange pairs or general extraction
@@ -1587,7 +1812,7 @@ def _mine_convos_impl(
 
         if not chunks:
             if not dry_run:
-                _register_file(collection, source_file, wing, agent, extract_mode)
+                _register_file(collection, source_file, file_wing, agent, extract_mode)
             continue
 
         # Detect room from content (general mode uses memory_type instead)
@@ -1602,10 +1827,15 @@ def _mine_convos_impl(
 
                 type_counts = Counter(c.get("memory_type", "general") for c in chunks)
                 types_str = ", ".join(f"{t}:{n}" for t, n in type_counts.most_common())
-                print(f"    [DRY RUN] {filepath.name} → {len(chunks)} memories ({types_str})")
+                print(
+                    f"    [DRY RUN] {filepath.name} → wing:{file_wing} → {len(chunks)} memories ({types_str})"
+                )
             else:
-                print(f"    [DRY RUN] {filepath.name} → room:{room} ({len(chunks)} drawers)")
+                print(
+                    f"    [DRY RUN] {filepath.name} → wing:{file_wing} room:{room} ({len(chunks)} drawers)"
+                )
             total_drawers += len(chunks)
+            wing_drawer_counts[file_wing] += len(chunks)
             # Track room counts
             if extract_mode == "general":
                 for c in chunks:
@@ -1643,7 +1873,7 @@ def _mine_convos_impl(
             collection,
             source_file,
             chunks,
-            wing,
+            file_wing,
             room,
             agent,
             extract_mode,
@@ -1665,6 +1895,7 @@ def _mine_convos_impl(
             )
         )
         total_drawers += drawers_delta
+        wing_drawer_counts[file_wing] += drawers_delta
         files_mined += mined_delta
         files_skipped += skipped_delta
         total_dropped += dropped_delta
@@ -1675,7 +1906,7 @@ def _mine_convos_impl(
         # Compute hallways before the FTS5 validation: the latter opens a direct sqlite
         # connection to the Chroma DB, which can invalidate the live collection handle on
         # some Chroma builds and make the hallway fetch fail.
-        _compute_hallways_for_wing_safe(wing, collection, total_drawers, config=palace_config)
+        _compute_hallways_for_all_wings(wing_drawer_counts, collection)
         _validate_palace_fts5_after_mine(palace_path)
 
     print(f"\n{'=' * 55}")
@@ -1688,6 +1919,7 @@ def _mine_convos_impl(
         print("\n  By room:")
         for room, count in sorted(room_counts.items(), key=lambda x: x[1], reverse=True):
             print(f"    {room:20} {count} files")
+    _print_wing_breakdown(wing_counts)
     print('\n  Next: mempalace search "what you\'re looking for"')
     print(f"{'=' * 55}\n")
 

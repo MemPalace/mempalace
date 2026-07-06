@@ -1225,6 +1225,7 @@ def file_already_mined(
     source_file: str,
     check_mtime: bool = False,
     extract_mode: Optional[str] = None,
+    min_wing_resolution_version: Optional[int] = None,
 ) -> bool:
     """Check if a file has already been filed in the palace.
 
@@ -1233,6 +1234,8 @@ def file_already_mined(
       - the stored `normalize_version` is missing or older than the current
         schema (triggers silent rebuild after a normalization upgrade)
       - `check_mtime=True` and the file's mtime differs from the stored one
+      - `min_wing_resolution_version` is given and the stored
+        `wing_resolution_version` is missing or older than it
 
     When check_mtime=True (used by the project miner, and by the convo
     miner's in-lock recheck), also re-mines on content change. Conversation
@@ -1248,6 +1251,14 @@ def file_already_mined(
     that extraction mode so exchange-mode and general-mode drawers can coexist
     for the same source transcript. Legacy drawers without extract_mode are
     treated as exchange-mode drawers.
+
+    `min_wing_resolution_version` is None by default and used by no caller
+    except the convo miner's per-project wing-resolution backfill --
+    passing it is what forces a one-time full re-mine of every file whose
+    drawers predate that feature (see WING_RESOLUTION_VERSION in
+    convo_miner.py), without affecting file_already_mined's other two
+    callers (the project miner, the format miner), which never pass it and
+    see no change in behavior.
     """
     try:
         # Under the additive-mining model, a single ``source_file`` can have
@@ -1284,6 +1295,10 @@ def file_already_mined(
                 stored_version = meta.get("normalize_version", 1)
                 if stored_version < NORMALIZE_VERSION:
                     continue
+                if min_wing_resolution_version is not None:
+                    stored_wing_version = meta.get("wing_resolution_version", 0)
+                    if stored_wing_version < min_wing_resolution_version:
+                        continue
                 if not check_mtime:
                     return True
                 stored_mtime = meta.get("source_mtime")
@@ -1300,7 +1315,9 @@ def file_already_mined(
 
 
 def prefetch_mined_set(
-    collection, extract_mode: Optional[str] = None
+    collection,
+    extract_mode: Optional[str] = None,
+    min_wing_resolution_version: Optional[int] = None,
 ) -> dict[str, Optional[float]]:
     """Pre-fetch source_file -> stored source_mtime for files already mined
     at the current NORMALIZE_VERSION, in one bulk pass instead of one
@@ -1322,6 +1339,13 @@ def prefetch_mined_set(
     When extract_mode is set, mirrors file_already_mined(..., extract_mode=...)
     so conversation mines skip per extraction mode rather than per source file.
 
+    `min_wing_resolution_version`, when given, additionally excludes a file
+    from the returned dict if its stored `wing_resolution_version` is
+    missing or older than it -- the same one-time-backfill mechanism
+    file_already_mined's own `min_wing_resolution_version` parameter
+    implements, applied here to the bulk skip-check path instead of the
+    per-file recheck. None by default; only the convo miner passes it.
+
     The convo miner walks thousands of transcript files; per-file
     `collection.get(where={"source_file": X})` costs ~2s on a 150k-drawer
     palace, making a 2000-file sweep take >1h of pure skip-checking. This
@@ -1342,9 +1366,14 @@ def prefetch_mined_set(
                     continue
                 # Same default as file_already_mined: missing version == 1
                 version = meta.get("normalize_version", 1)
-                if version >= NORMALIZE_VERSION:
-                    stored_mtime = meta.get("source_mtime")
-                    mined[src] = float(stored_mtime) if stored_mtime is not None else None
+                if version < NORMALIZE_VERSION:
+                    continue
+                if min_wing_resolution_version is not None:
+                    stored_wing_version = meta.get("wing_resolution_version", 0)
+                    if stored_wing_version < min_wing_resolution_version:
+                        continue
+                stored_mtime = meta.get("source_mtime")
+                mined[src] = float(stored_mtime) if stored_mtime is not None else None
             if not batch["ids"]:
                 break
             offset += len(batch["ids"])
