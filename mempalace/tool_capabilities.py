@@ -51,6 +51,7 @@ TOOL_CAPABILITIES = {
     "mempalace_follow_tunnels": ("read", ""),
     "mempalace_search": ("read", "embedding_release"),
     "mempalace_check_duplicate": ("read", "embedding_release"),
+    "mempalace_find_duplicates": ("read", "embedding_release"),
     "mempalace_add_drawer": ("write", "mutating vector_write"),
     "mempalace_checkpoint": ("write", "mutating vector_write"),
     "mempalace_delete_drawer": ("write", "mutating vector_write"),
