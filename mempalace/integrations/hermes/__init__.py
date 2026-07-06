@@ -17,12 +17,18 @@ Design notes
 * Per-turn writes go through a bounded background queue. The agent loop
   never blocks on ChromaDB or SQLite.
 
-* ``sync_turn`` is the **sole** filing path. ``on_session_end`` and
-  ``on_pre_compress`` intentionally file nothing: re-filing the raw
-  message list duplicates every turn ``sync_turn`` already stored —
-  ``filed_at`` is hashed into the drawer id, so upserts cannot collapse
-  the copies. Any future safety net here must first scan what is
-  already filed and add only what is missing.
+* ``sync_turn`` is the **primary** filing path. ``on_session_end`` and
+  ``on_pre_compress`` are scan-based safety nets: they segment the raw
+  message list into turns, scan the session's existing drawers (plus
+  /branch ancestors), and file only uncovered turns. Coverage is tracked
+  by a ``turn_fp`` fingerprint of the raw user message (survives
+  representation differences, restarts, and compression) with exact-text
+  matching as a fallback. Empty session_id or a failed scan disables
+  dedup — the failure direction is a duplicate drawer, never a lost
+  turn. Interrupted turns, which Hermes never syncs (hermes-agent
+  #15218), are captured here. ``on_delegation`` synthetic turns overlap
+  raw tool results by design; convo-miner ingest of Hermes transcripts
+  from disk files under a different source_file and is not deduped.
 
 * The provider is **inactive** under ``agent_context in {"cron", "flush"}``
   or ``platform == "cron"``. Cron-context turns are system-generated and
@@ -66,7 +72,7 @@ import os
 import queue
 import re
 import threading
-from collections import deque
+from collections import Counter, deque
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -368,6 +374,12 @@ def _segment_turns(messages: List[Dict[str, Any]]) -> List[Dict[str, str]]:
             continue
         result.append({"user": seg["user"], "assistant": assistant, "turn_fp": seg["turn_fp"]})
     return result
+
+
+def _compose_exchange_text(user: str, assistant: str) -> str:
+    """The exact drawer text ``_file_turn`` writes. Dedup compares against
+    this composition, so there must be precisely one implementation."""
+    return f"User: {user}\n\nAssistant: {assistant}".strip()
 
 
 # ---------------------------------------------------------------------------
@@ -970,12 +982,28 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         self._turn_count = turn_number
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+        # Skip when the provider never came up — enqueueing to a queue whose
+        # worker never started would silently fill the bounded buffer.
         if self._cron_skipped or not self._initialized:
             return
-        # Intentionally no filing here. ``sync_turn`` has already filed every
-        # completed turn, and re-filing the message list mints duplicate
-        # drawers: ``filed_at`` is part of the drawer-id hash, so the upsert
-        # cannot collapse the re-file into the original.
+        # Safety net, not a second filing path: the worker scans what
+        # sync_turn already filed and captures only what is missing.
+        try:
+            self._worker_queue.put_nowait(
+                (
+                    "session_end",
+                    {
+                        "messages": list(messages or []),
+                        "session_id": self._session_id,
+                        "lineage": list(self._session_lineage),
+                    },
+                )
+            )
+        except queue.Full:
+            logger.warning(
+                "MemPalace queue full at session_end — %d messages not checked for gaps",
+                len(messages or []),
+            )
         # Regenerate the AAAK wake-up cache for the next session.
         self._wake_up_done.clear()
         threading.Thread(
@@ -1017,14 +1045,38 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             self._turn_count = 0
 
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
-        """Intentionally a no-op that returns no hint.
+        """Capture turns the primary path missed, then hint the summarizer.
 
-        Blind-filing the compression window duplicates every turn
-        ``sync_turn`` already filed. Returning ``""`` keeps the
-        summarizer on its default conservative discarding — a hint must
-        never promise persistence this provider hasn't performed.
+        The hint is **only** returned when the worker can actually process
+        the payload — if the backend never came up or the queue is
+        saturated, say nothing so the summarizer falls back to its default
+        conservative discarding rather than acting on a false promise.
         """
-        return ""
+        if self._cron_skipped or not self._initialized:
+            return ""
+        try:
+            self._worker_queue.put_nowait(
+                (
+                    "pre_compress",
+                    {
+                        "messages": list(messages or []),
+                        "session_id": self._session_id,
+                        "lineage": list(self._session_lineage),
+                    },
+                )
+            )
+        except queue.Full:
+            logger.warning(
+                "MemPalace queue full at pre_compress — %d messages not checked for gaps",
+                len(messages or []),
+            )
+            return ""
+        return (
+            "MemPalace has every conversation turn in this window filed "
+            "verbatim. Compressed content remains searchable via the "
+            "`mempalace_search` tool — the summarizer can be aggressive "
+            "about discarding raw turns."
+        )
 
     def on_memory_write(
         self,
@@ -1368,7 +1420,7 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         if not user_msg and not assistant_msg:
             return
         # Classify outside the lock — pure CPU / config, no Chroma access.
-        text = f"User: {user_msg}\n\nAssistant: {assistant_msg}".strip()
+        text = _compose_exchange_text(user_msg, assistant_msg)
         wing = self._classify_wing(text)
         session_id = payload.get("session_id") or ""
         extra: Dict[str, Any] = {"source": "hermes"}
@@ -1400,6 +1452,95 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
                 )
         except Exception as exc:
             logger.debug("MemPalace _file_turn error: %s", exc)
+
+    def _scan_filed(self, col: Any, source_files: List[str]) -> tuple[Counter, Counter]:
+        """Multisets of (turn fingerprints, exact document texts) already filed.
+
+        Paginated per source_file — sessions are bounded (hundreds of
+        turns), and the FIFO worker guarantees every earlier file_turn
+        upsert has landed before this runs, so the scan is authoritative.
+        """
+        fp_counts: Counter = Counter()
+        text_counts: Counter = Counter()
+        for source_file in source_files:
+            offset = 0
+            while True:
+                batch = col.get(
+                    where={"source_file": source_file},
+                    limit=1000,
+                    offset=offset,
+                    include=["documents", "metadatas"],
+                )
+                batch_ids = batch.get("ids") or []
+                documents = batch.get("documents") or []
+                metadatas = batch.get("metadatas") or []
+                for doc, meta in zip(documents, metadatas):
+                    fp = (meta or {}).get("turn_fp") or ""
+                    if fp:
+                        fp_counts[fp] += 1
+                    if doc:
+                        text_counts[doc] += 1
+                if not batch_ids:
+                    break
+                offset += len(batch_ids)
+        return fp_counts, text_counts
+
+    def _file_missing_exchanges(self, payload: Dict[str, Any]) -> None:
+        """Safety net for session_end / pre_compress: file only uncovered turns.
+
+        sync_turn is the primary filing path. This scans what's already in
+        the palace for this session (plus branch ancestors) and files only
+        segments not covered — by turn fingerprint (correlates sync_turn's
+        clean pair with the raw turn despite representation differences)
+        or by exact text (catches a re-fired session_end and
+        pre_compress/session_end overlap, which compose identically).
+
+        Loss-safe by construction: empty session_id or a failed scan means
+        NO dedup (blind-file). The failure direction is always a duplicate
+        drawer, never a lost turn.
+        """
+        messages = payload.get("messages", []) or []
+        session_id = payload.get("session_id", "") or ""
+        lineage = payload.get("lineage", []) or []
+        segments = _segment_turns(messages)
+        if not segments:
+            return
+        fp_counts: Counter = Counter()
+        text_counts: Counter = Counter()
+        if session_id:
+            with self._collection_lock:
+                col = self._collection
+            if col is not None:
+                sources = [f"hermes-session:{sid}" for sid in [session_id, *lineage]]
+                try:
+                    fp_counts, text_counts = self._scan_filed(col, sources)
+                except Exception as exc:
+                    logger.warning(
+                        "MemPalace dedup scan failed — filing without dedup "
+                        "(duplicates possible, nothing lost): %s",
+                        exc,
+                    )
+        for seg in segments:
+            fp = seg["turn_fp"]
+            text = _compose_exchange_text(seg["user"], seg["assistant"])
+            if fp and fp_counts.get(fp, 0) > 0:
+                fp_counts[fp] -= 1
+                # Exhaust the matching text slot so the same physical drawer
+                # cannot also protect a second segment via the text fallback.
+                if text_counts.get(text, 0) > 0:
+                    text_counts[text] -= 1
+                continue
+            if text_counts.get(text, 0) > 0:
+                text_counts[text] -= 1
+                continue
+            self._file_turn(
+                {
+                    "user": seg["user"],
+                    "assistant": seg["assistant"],
+                    "session_id": session_id,
+                    "turn_fp": fp,
+                }
+            )
 
     def _mirror_mem_write(self, payload: Dict[str, Any]) -> None:
         # target "user" carries facts about the user; target "memory" carries
@@ -1441,6 +1582,10 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             try:
                 if task == "file_turn":
                     self._file_turn(payload)
+                elif task in ("session_end", "pre_compress"):
+                    # Safety nets share one path: scan what sync_turn already
+                    # filed, capture only what's missing.
+                    self._file_missing_exchanges(payload)
                 elif task == "mem_write":
                     self._mirror_mem_write(payload)
             except Exception as exc:
