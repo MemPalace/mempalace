@@ -100,6 +100,12 @@ from ..backends.chroma import (  # noqa: E402
 )
 from ..backends import BackendMismatchError, PalaceRef, detect_backend_for_path  # noqa: E402
 from ..date_window import filed_at_in_window, parse_date_bound  # noqa: E402
+from ..dynamics import (  # noqa: E402
+    apply_decay,
+    drawer_salience,
+    initialize_drawer_dynamics_fields,
+    potentiate,
+)
 from ..query_sanitizer import sanitize_query  # noqa: E402
 from ..source_identity import identity_metadata  # noqa: E402
 from ..searcher import (  # noqa: E402

@@ -5,6 +5,8 @@ if __name__ != "mempalace.mcp_server":
 
 # ==================== READ TOOLS ====================
 
+_SALIENCE_POTENTIATE_ENV = "MEMPALACE_SALIENCE_POTENTIATE"
+
 
 def _tool_status_via_sqlite() -> dict:
     """Pure-sqlite status reader for the #1222 fallback path.
@@ -702,7 +704,67 @@ def tool_search(
         }
     if context:
         result["context_received"] = True
+    if "results" in result:
+        _maybe_potentiate_search_results(result["results"])
+        for hit in result["results"]:
+            hit.pop("_parent_drawer_id", None)
     return result
+
+
+def _can_potentiate_on_search() -> bool:
+    if not _truthy_env(_SALIENCE_POTENTIATE_ENV):
+        return False
+    if _READ_ONLY:
+        return False
+    if _MCP_WRITER_LOCK_CM is not None:
+        return True
+    ok, _reason = _acquire_mcp_writer_lock()
+    return ok and _MCP_WRITER_LOCK_CM is not None
+
+
+def _logical_ids_from_search_hits(hits: list[dict]) -> list[str]:
+    ids = []
+    seen = set()
+    for hit in hits:
+        drawer_id = hit.get("_parent_drawer_id") or hit.get("id") or hit.get("drawer_id")
+        if not drawer_id or drawer_id in seen:
+            continue
+        seen.add(drawer_id)
+        ids.append(drawer_id)
+    return ids
+
+
+def _maybe_potentiate_search_results(hits: list[dict]) -> None:
+    """Best-effort opt-in salience write for logical drawers surfaced by search."""
+    global _metadata_cache
+
+    if not hits or not _can_potentiate_on_search():
+        return
+
+    col = _get_collection()
+    if not col:
+        return
+
+    now = datetime.now(timezone.utc)
+    for drawer_id in _logical_ids_from_search_hits(hits):
+        try:
+            record = _logical_drawer_record(col, drawer_id)
+            if record is None:
+                continue
+            base_meta = dict(_safe_meta(record["metadata"]))
+            initialize_drawer_dynamics_fields(base_meta, now=now)
+            apply_decay(base_meta, now=now)
+            potentiate(base_meta, now=now)
+            update_metas = []
+            for old_meta in record["metadatas"]:
+                merged = dict(_safe_meta(old_meta))
+                for key in ("strength", "stability", "last_activated", "access_count"):
+                    merged[key] = base_meta[key]
+                update_metas.append(merged)
+            col.update(ids=record["ids"], metadatas=update_metas)
+            _metadata_cache = None
+        except Exception:
+            logger.debug("drawer salience potentiation failed for %s", drawer_id, exc_info=True)
 
 
 def tool_check_duplicate(content: str, threshold: float = 0.9):

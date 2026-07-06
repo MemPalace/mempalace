@@ -340,6 +340,7 @@ def search_memories(
             "effective_distance": round(effective_dist, 4),
             "closet_boost": round(boost, 3),
             "matched_via": matched_via,
+            "salience": drawer_salience(meta),
             # Internal: retain the full source_file path + chunk_index so the
             # enrichment step below doesn't have to reverse-lookup via
             # basename-suffix matching (which silently collides when two
