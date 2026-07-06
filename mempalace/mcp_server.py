@@ -350,6 +350,19 @@ _SQLITE_INTEGRITY_ALLOWED_TOOLS = frozenset(
     }
 )
 
+# The startup probe above runs PRAGMA quick_check, which reads every page of
+# chroma.sqlite3 and is therefore O(database size). On multi-GB palaces it can
+# exceed the MCP client's connection/handshake timeout, so the server never
+# finishes starting and the client drops the connection (the peer-writer guard
+# and lazy consumers all funnel through _refresh_sqlite_integrity_status). Skip
+# the *startup* probe when the database exceeds this size (MB). `mempalace
+# repair` still runs the full quick_check via repair.sqlite_integrity_errors
+# before any destructive rebuild, so corruption is still caught where it
+# matters. Set MEMPALACE_STARTUP_INTEGRITY_MAX_MB=0 to disable the gate and
+# always run the startup probe.
+_STARTUP_INTEGRITY_MAX_MB_ENV = "MEMPALACE_STARTUP_INTEGRITY_MAX_MB"
+_STARTUP_INTEGRITY_MAX_MB_DEFAULT = 512.0
+
 
 # MCP peer-writer guard (#1818).
 #
@@ -368,11 +381,14 @@ _MUTATING_TOOLS = frozenset(
     {
         "mempalace_kg_add",
         "mempalace_kg_invalidate",
+        "mempalace_kg_supersede",
         "mempalace_create_tunnel",
         "mempalace_delete_tunnel",
         "mempalace_delete_hallway",
         "mempalace_add_drawer",
         "mempalace_delete_drawer",
+        "mempalace_checkpoint",
+        "mempalace_delete_by_source",
         "mempalace_mine",
         "mempalace_sync",
         "mempalace_update_drawer",
@@ -465,6 +481,33 @@ def _mcp_peer_writer_refusal(req_id, tool_name: str):
     }
 
 
+def _startup_integrity_size_limit_bytes() -> int:
+    """Byte size above which the startup SQLite quick_check is skipped.
+
+    Returns 0 when the gate is disabled (``MEMPALACE_STARTUP_INTEGRITY_MAX_MB``
+    set to 0, a non-positive number, or an unparseable value), meaning the
+    startup probe always runs.
+    """
+
+    raw = os.environ.get(_STARTUP_INTEGRITY_MAX_MB_ENV, "").strip()
+    if not raw:
+        mb = _STARTUP_INTEGRITY_MAX_MB_DEFAULT
+    else:
+        try:
+            mb = float(raw)
+        except ValueError:
+            logger.warning(
+                "Invalid %s=%r; using default %.0f MB",
+                _STARTUP_INTEGRITY_MAX_MB_ENV,
+                raw,
+                _STARTUP_INTEGRITY_MAX_MB_DEFAULT,
+            )
+            mb = _STARTUP_INTEGRITY_MAX_MB_DEFAULT
+    if mb <= 0:
+        return 0
+    return int(mb * 1024 * 1024)
+
+
 def _refresh_sqlite_integrity_status() -> None:
     """Refresh the MCP startup SQLite/FTS5 integrity gate.
 
@@ -483,6 +526,29 @@ def _refresh_sqlite_integrity_status() -> None:
         _sqlite_integrity_errors = []
         _sqlite_integrity_check_error = ""
         return
+
+    max_bytes = _startup_integrity_size_limit_bytes()
+    if max_bytes > 0:
+        sqlite_path = os.path.join(_config.palace_path, "chroma.sqlite3")
+        try:
+            db_bytes = os.path.getsize(sqlite_path)
+        except OSError:
+            db_bytes = 0
+        if db_bytes > max_bytes:
+            _sqlite_integrity_checked = True
+            _sqlite_integrity_errors = []
+            _sqlite_integrity_check_error = ""
+            logger.warning(
+                "SQLite startup integrity check skipped: %s is %.0f MB "
+                "(> %.0f MB limit); PRAGMA quick_check would block MCP "
+                "startup. Run `mempalace repair` for a full check, or set "
+                "%s (MB; 0 disables the limit).",
+                sqlite_path,
+                db_bytes / (1024 * 1024),
+                max_bytes / (1024 * 1024),
+                _STARTUP_INTEGRITY_MAX_MB_ENV,
+            )
+            return
 
     try:
         from .repair import sqlite_integrity_errors
@@ -1732,7 +1798,7 @@ PALACE_PROTOCOL = """IMPORTANT — MemPalace Memory Protocol:
 2. BEFORE RESPONDING about any person, project, or past event: call mempalace_kg_query or mempalace_search FIRST. Never guess — verify.
 3. IF UNSURE about a fact (name, gender, age, relationship): say "let me check" and query the palace. Wrong is worse than slow.
 4. AFTER EACH SESSION: call mempalace_diary_write to record what happened, what you learned, what matters.
-5. WHEN FACTS CHANGE: call mempalace_kg_invalidate on the old fact, mempalace_kg_add for the new one.
+5. WHEN A SINGLE-VALUED FACT CHANGES (model, employer, address): call mempalace_kg_supersede(subject, predicate, old, new) to replace it atomically at one boundary — do NOT hand-roll invalidate + add, which leaves the old and new values overlapping at the boundary. Use mempalace_kg_invalidate for a fact that simply ended, and mempalace_kg_add to add an independent (possibly concurrent) fact.
 
 This protocol ensures the AI KNOWS before it speaks. Storage is not memory — but storage + this protocol = memory."""
 
@@ -3292,6 +3358,57 @@ def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = N
     }
 
 
+def tool_kg_supersede(
+    subject: str,
+    predicate: str,
+    old_object: str,
+    new_object: str,
+    at: str = None,
+):
+    """Atomically replace one fact with another at a single shared boundary.
+
+    Closes ``(subject, predicate, old_object)`` and opens
+    ``(subject, predicate, new_object)`` at one shared instant, so a
+    point-in-time query at the boundary returns only the new value. Use this
+    instead of a separate ``kg_invalidate`` + ``kg_add`` when a single-valued
+    fact changes (e.g. a model, employer, or address changes).
+
+    ``at`` accepts ``YYYY-MM-DD`` or a canonical UTC datetime
+    (``YYYY-MM-DDTHH:MM:SSZ``) and defaults to the current UTC instant.
+    """
+    try:
+        subject = sanitize_kg_value(subject, "subject")
+        predicate = sanitize_name(predicate, "predicate")
+        old_object = sanitize_kg_value(old_object, "old_object")
+        new_object = sanitize_kg_value(new_object, "new_object")
+        at = sanitize_iso_temporal(at, "at")
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+
+    _wal_log(
+        "kg_supersede",
+        {
+            "subject": subject,
+            "predicate": predicate,
+            "old_object": old_object,
+            "new_object": new_object,
+            "at": at,
+        },
+    )
+
+    # Domain ValueErrors from kg.supersede (e.g. inverted boundary) are left to
+    # bubble to the dispatcher, matching tool_kg_add / tool_kg_invalidate: the
+    # -32000 response carries error_class + message in error.data. Only input
+    # sanitization above returns the {success: False} envelope.
+    triple_id = _call_kg(lambda kg: kg.supersede(subject, predicate, old_object, new_object, at=at))
+    return {
+        "success": True,
+        "triple_id": triple_id,
+        "fact": f"{subject} → {predicate} → {new_object}",
+        "superseded": old_object,
+    }
+
+
 def tool_kg_timeline(entity: str = None):
     """Get chronological timeline of facts, optionally for one entity."""
     if entity is not None:
@@ -3910,6 +4027,27 @@ TOOLS = {
             "required": ["subject", "predicate", "object"],
         },
         "handler": tool_kg_invalidate,
+    },
+    "mempalace_kg_supersede": {
+        "description": "Atomically replace a fact with its successor at a shared boundary. Use when a single-valued fact changes (model, employer, address) instead of separate kg_invalidate + kg_add — a point-in-time query at the boundary then returns only the new value.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "subject": {"type": "string", "description": "The entity whose fact is changing"},
+                "predicate": {
+                    "type": "string",
+                    "description": "The relationship type (e.g. 'uses_model', 'works_at')",
+                },
+                "old_object": {"type": "string", "description": "The value being replaced"},
+                "new_object": {"type": "string", "description": "The new value"},
+                "at": {
+                    "type": "string",
+                    "description": "Boundary instant (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ, optional; defaults to now UTC)",
+                },
+            },
+            "required": ["subject", "predicate", "old_object", "new_object"],
+        },
+        "handler": tool_kg_supersede,
     },
     "mempalace_kg_timeline": {
         "description": "Chronological timeline of facts. Shows the story of an entity (or everything) in order.",

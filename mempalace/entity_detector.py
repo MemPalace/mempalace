@@ -215,6 +215,8 @@ PROSE_EXTENSIONS = {
     ".md",
     ".rst",
     ".csv",
+    ".tex",
+    ".bib",
 }
 
 READABLE_EXTENSIONS = {

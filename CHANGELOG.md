@@ -8,6 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Features
+
+- **`supersede()` / `mempalace_kg_supersede` — atomic fact replacement.** Closes an open fact and opens its successor at a single shared instant, so a point-in-time query at the boundary returns only the new value. This is the primitive for a single-valued fact change (model, employer, address) instead of hand-rolling `kg_invalidate` + `kg_add`, which left the two facts sharing the transition day. `at` defaults to the current UTC instant. (#1913)
+
+### Bug Fixes
+
+- **`kg query --as-of` no longer returns a superseded fact and its successor at the shared boundary.** `_temporal_filter_sql` now treats validity as half-open `[valid_from, valid_to)` (strict upper bound), so a fact whose `valid_to` equals the query instant has ended and only the successor matches. Standalone date-only facts still stay valid through the end of their final day (whole-day expansion retained). (#1913)
+
 ---
 
 ## [3.5.0] — 2026-06-22

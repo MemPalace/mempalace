@@ -263,6 +263,22 @@ Mark a fact as no longer true.
 
 ---
 
+### `mempalace_kg_supersede`
+
+Atomically replace a fact with its successor at a single shared boundary. Use when a single-valued fact changes (model, employer, address) instead of a separate `mempalace_kg_invalidate` + `mempalace_kg_add` — a point-in-time query at the boundary then returns only the new value.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `subject` | string | **Yes** | Entity whose fact is changing |
+| `predicate` | string | **Yes** | Relationship (e.g. `uses_model`, `works_at`) |
+| `old_object` | string | **Yes** | Value being replaced |
+| `new_object` | string | **Yes** | New value |
+| `at` | string | No | Boundary instant (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ; default: now UTC) |
+
+**Returns:** `{ success, triple_id, fact, superseded }`
+
+---
+
 ### `mempalace_kg_timeline`
 
 Chronological timeline of facts.

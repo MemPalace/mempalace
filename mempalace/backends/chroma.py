@@ -1375,8 +1375,8 @@ class ChromaCollection(BaseCollection):
 
     @staticmethod
     def _sanitize_documents_for_chromadb(documents):
-        """Strip lone UTF-16 surrogates from every document before it reaches
-        the chromadb client.
+        """Strip lone UTF-16 surrogates and embedded NUL characters from every
+        document before it reaches the chromadb client.
 
         A single lone surrogate (U+D800–U+DFFF) raises ``UnicodeEncodeError``
         inside chromadb's encode path and aborts the *entire* add/upsert batch
@@ -1389,18 +1389,29 @@ class ChromaCollection(BaseCollection):
         directly. Sanitising here makes the chokepoint catch-all complete: the
         sibling :meth:`_sanitize_metadatas_for_chromadb` already guarantees this
         for metadata one method over; documents get the same guarantee.
+
+        A document containing an embedded NUL (U+0000) — routine in mined
+        Bash tool output — is well-formed UTF-8, unlike a lone surrogate, but
+        can corrupt the FTS5 inverted index for the whole collection rather
+        than just failing to store that one row (a ChromaDB-side bug; tracked
+        upstream). Stripping it here is the same defense-in-depth already
+        applied to surrogates: sanitize input we don't control before it
+        reaches a datastore we don't control.
         """
         if documents is None:
             return None
-        from ..config import strip_lone_surrogates
+        from ..config import strip_lone_surrogates, strip_nul_bytes
+
+        def _sanitize(d):
+            return strip_nul_bytes(strip_lone_surrogates(d))
 
         # chromadb accepts OneOrMany[Document]: a bare str is a single document,
         # not an iterable of characters. Handle it explicitly so we don't split
         # it into per-character documents — that would be exactly the kind of
         # silent corruption this method exists to prevent.
         if isinstance(documents, str):
-            return strip_lone_surrogates(documents)
-        return [strip_lone_surrogates(d) if isinstance(d, str) else d for d in documents]
+            return _sanitize(documents)
+        return [_sanitize(d) if isinstance(d, str) else d for d in documents]
 
     def add(self, *, documents, ids, metadatas=None, embeddings=None):
         kwargs: dict[str, Any] = {
