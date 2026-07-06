@@ -928,12 +928,25 @@ def _validate_palace_fts5_after_mine(palace_path: str) -> None:
     Reuses the same primitive that `cmd_repair` already runs as preflight so the
     operator sees the same recovery banner regardless of which command surfaces
     the bug.
+
+    An isolated ``malformed inverted index for FTS5 table`` — the common result
+    of a mine killed mid-write (#1596) — is self-healed in place before raising:
+    the index rebuilds from the intact content shadow table without touching any
+    drawer rows. Without this, every subsequent mine re-detects the same corrupt
+    index and aborts, so a single interrupted write strands background mining in
+    a permanent repair-abort loop that only a manual ``mempalace repair`` breaks.
+    ``cmd_repair`` already runs this autoheal in its preflight; do the same here
+    so the mine path self-heals rather than looping.
     """
     if resolve_backend_name(palace_path) != "chroma":
         return
 
     # Defer-import: keeps the repair module graph out of mine's hot import path.
-    from .repair import _close_chroma_handles, sqlite_integrity_errors
+    from .repair import (
+        _close_chroma_handles,
+        maybe_autoheal_fts5_index,
+        sqlite_integrity_errors,
+    )
 
     # Pass the live singleton so the writer's cached PersistentClient actually
     # gets closed and WAL flushes before the read-only sqlite3 re-open.
@@ -943,6 +956,13 @@ def _validate_palace_fts5_after_mine(palace_path: str) -> None:
     _close_chroma_handles(palace_path, backend=_DEFAULT_BACKEND)
 
     errors = sqlite_integrity_errors(palace_path)
+    if errors:
+        # Heal an isolated FTS5 inverted-index failure in place; broader
+        # corruption (or a rebuild that doesn't clear quick_check) leaves the
+        # errors intact so we still raise. maybe_autoheal_fts5_index re-acquires
+        # mine_palace_lock, which is re-entrant for the holding process, so this
+        # composes with the outer mine lock without self-deadlock.
+        errors = maybe_autoheal_fts5_index(palace_path, errors)
     if errors:
         raise MineValidationError(palace_path, errors)
 

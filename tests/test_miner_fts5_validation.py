@@ -150,17 +150,75 @@ def test_helper_raises_on_page_mangled_sqlite(tmp_path):
     assert "malformed" in combined or "quick_check failed" in combined
 
 
-def test_helper_raises_on_fts5_segment_corruption(tmp_path):
-    """The reporter-shaped failure: FTS5 inverted index malformed, main pages OK."""
+def test_helper_autoheals_fts5_segment_corruption(tmp_path):
+    """The reporter-shaped failure (FTS5 inverted index malformed, main pages
+    OK) is self-healed in place, not raised (#1596).
+
+    An isolated FTS5 failure is the common result of a mine killed mid-write.
+    The validator rebuilds the index from the intact content shadow table so
+    the mine completes instead of stranding every future mine in a repair-abort
+    loop. Only broader (unhealable) corruption still raises — see
+    ``test_helper_raises_on_page_mangled_sqlite``.
+    """
+    from mempalace.repair import sqlite_integrity_errors
+
     palace = tmp_path / "palace"
     _build_palace_with_drawer(palace)
     _corrupt_fts5_segment(palace / "chroma.sqlite3")
 
+    # Fixture precondition: the corruption is real before the heal runs.
+    assert sqlite_integrity_errors(str(palace)), "fixture must corrupt FTS5"
+
+    # Heals in place and returns silently instead of raising.
+    assert _validate_palace_fts5_after_mine(str(palace)) is None
+
+    # quick_check is clean afterward: the index was rebuilt, not just ignored.
+    assert sqlite_integrity_errors(str(palace)) == []
+
+
+def test_validator_suppresses_raise_when_autoheal_clears(tmp_path, monkeypatch):
+    """The validator routes quick_check errors through the FTS5 autoheal and
+    does not raise when the heal clears them.
+
+    Build-independent counterpart to the fixture-based heal tests, which skip on
+    SQLite builds that refuse direct FTS5 shadow-table writes: here the integrity
+    primitives are stubbed so the loop-breaking wiring is exercised everywhere.
+    """
+    palace = tmp_path / "palace"
+    _build_palace_with_drawer(palace)
+
+    fts_err = ["malformed inverted index for FTS5 table main.embedding_fulltext_search"]
+    monkeypatch.setattr("mempalace.repair.sqlite_integrity_errors", lambda _p: fts_err)
+
+    heal_calls = []
+
+    def _fake_heal(palace_path, errors, **_):
+        heal_calls.append((palace_path, tuple(errors)))
+        return []  # healed: quick_check now clean
+
+    monkeypatch.setattr("mempalace.repair.maybe_autoheal_fts5_index", _fake_heal)
+
+    assert _validate_palace_fts5_after_mine(str(palace)) is None
+    assert heal_calls == [(str(palace), tuple(fts_err))], "autoheal must receive the errors"
+
+
+def test_validator_still_raises_when_autoheal_cannot_clear(tmp_path, monkeypatch):
+    """Broader corruption (or a heal that doesn't clear quick_check) still raises
+    MineValidationError — the autoheal only suppresses the raise when it works.
+    """
+    palace = tmp_path / "palace"
+    _build_palace_with_drawer(palace)
+
+    errs = ["database disk image is malformed"]
+    monkeypatch.setattr("mempalace.repair.sqlite_integrity_errors", lambda _p: errs)
+    monkeypatch.setattr(
+        "mempalace.repair.maybe_autoheal_fts5_index",
+        lambda palace_path, errors, **_: errors,  # unchanged: could not heal
+    )
+
     with pytest.raises(MineValidationError) as exc_info:
         _validate_palace_fts5_after_mine(str(palace))
-
-    err = exc_info.value
-    assert "fts5" in " ".join(err.errors).lower()
+    assert exc_info.value.errors
 
 
 # ── 3. cmd_mine surfaces MineValidationError as exit-1 + banner ─────
@@ -271,6 +329,16 @@ def test_full_chain_raises_through_mine_impl(tmp_path, monkeypatch):
 
     _corrupt_fts5_segment(palace / "chroma.sqlite3")
 
+    # Force the unhealable branch: isolated FTS5 corruption now self-heals, so
+    # to exercise _mine_impl's re-raise path we make the autoheal a no-op that
+    # leaves the errors intact (as a genuine broader corruption would). The heal
+    # itself is covered by test_helper_autoheals_fts5_segment_corruption and the
+    # end-to-end re-mine test.
+    monkeypatch.setattr(
+        "mempalace.repair.maybe_autoheal_fts5_index",
+        lambda palace_path, errors, **_: errors,
+    )
+
     # Spy on the validator so we can prove IT was the raise-source, not
     # some other exception masquerading as MineValidationError.
     called = []
@@ -297,7 +365,9 @@ def test_full_chain_raises_through_mine_impl(tmp_path, monkeypatch):
     assert exc_info.value.palace_path == str(palace)
 
 
-def test_mine_impl_does_not_print_partial_summary_on_validation_error(tmp_path, capsys):
+def test_mine_impl_does_not_print_partial_summary_on_validation_error(
+    tmp_path, capsys, monkeypatch
+):
     """When _validate_palace_fts5_after_mine raises, miner._mine_impl must
     NOT print the "Mine aborted by exception" partial-progress banner that
     `except Exception` adds. That banner is reserved for true mid-loop
@@ -320,6 +390,14 @@ def test_mine_impl_does_not_print_partial_summary_on_validation_error(tmp_path, 
     )
     _corrupt_fts5_segment(palace / "chroma.sqlite3")
 
+    # Force the unhealable branch so the validator still raises (isolated FTS5
+    # otherwise self-heals). This test covers the no-partial-banner behavior,
+    # not the heal.
+    monkeypatch.setattr(
+        "mempalace.repair.maybe_autoheal_fts5_index",
+        lambda palace_path, errors, **_: errors,
+    )
+
     with pytest.raises(MineValidationError):
         miner_mod.mine(
             project_dir=str(src),
@@ -332,6 +410,48 @@ def test_mine_impl_does_not_print_partial_summary_on_validation_error(tmp_path, 
 
     captured = capsys.readouterr()
     assert "Mine aborted by exception" not in captured.out + captured.err
+
+
+def test_remine_self_heals_isolated_fts5_instead_of_looping(tmp_path):
+    """End-to-end regression for the repair-abort loop (#1596).
+
+    Mine, corrupt the FTS5 index (as a killed-mid-write mine would), then
+    re-mine. Before the autoheal, the validator raised on every subsequent
+    mine and background mining was stuck until a manual `mempalace repair`.
+    Now the re-mine heals the index in place and completes normally, and
+    quick_check is clean afterward.
+    """
+    from mempalace import miner as miner_mod
+    from mempalace.repair import sqlite_integrity_errors
+
+    palace = tmp_path / "palace"
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "big.md").write_text("lorem ipsum " * 200)
+
+    miner_mod.mine(
+        project_dir=str(src),
+        palace_path=str(palace),
+        wing_override=None,
+        agent="mempalace",
+        limit=0,
+        dry_run=False,
+    )
+
+    _corrupt_fts5_segment(palace / "chroma.sqlite3")
+    assert sqlite_integrity_errors(str(palace)), "fixture must corrupt FTS5"
+
+    # The re-mine must NOT raise MineValidationError — it self-heals.
+    miner_mod.mine(
+        project_dir=str(src),
+        palace_path=str(palace),
+        wing_override=None,
+        agent="mempalace",
+        limit=0,
+        dry_run=False,
+    )
+
+    assert sqlite_integrity_errors(str(palace)) == [], "re-mine must leave quick_check clean"
 
 
 def test_mine_validation_error_rejects_empty_errors():
