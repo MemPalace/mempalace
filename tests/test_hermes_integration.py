@@ -952,6 +952,7 @@ def test_is_real_user_message_distinguishes_tool_results(integration_module):
     assert fn({"role": "user", "content": [{"type": "tool_result", "content": "out"}]}) is False
     assert fn({"role": "assistant", "content": "hi"}) is False
     assert fn({"role": "user", "content": ""}) is False
+    assert fn({"role": "user", "content": []}) is False
     # Mixed content (tool_result + text) counts as real.
     assert (
         fn(
@@ -1060,3 +1061,66 @@ def test_sync_turn_without_messages_stores_no_fingerprint(initialized_provider):
     hermes = [m for m in metas if m.get("source") == "hermes"]
     assert hermes
     assert "turn_fp" not in hermes[0]
+
+
+# ---------------------------------------------------------------------------
+# Branch lineage: /branch mints a new session id but carries the transcript
+# forward — the dedup scan must include ancestor sessions. /resume's
+# parent_session_id is the session being LEFT (not ancestry) and must clear
+# lineage; keeping it could false-dedup against unrelated drawers.
+# ---------------------------------------------------------------------------
+
+
+def test_session_switch_branch_appends_parent_to_lineage(provider):
+    provider._session_id = "parent-1"
+    provider.on_session_switch(
+        "branch-1", parent_session_id="parent-1", reset=False, reason="branch"
+    )
+    assert provider._session_lineage == ["parent-1"]
+    # Branch-of-branch chains.
+    provider.on_session_switch(
+        "branch-2", parent_session_id="branch-1", reset=False, reason="branch"
+    )
+    assert provider._session_lineage == ["parent-1", "branch-1"]
+
+
+def test_session_switch_resume_clears_lineage(provider):
+    provider._session_id = "branch-1"
+    provider._session_lineage = ["parent-1"]
+    provider.on_session_switch(
+        "other-session", parent_session_id="branch-1", reset=False, reason="resume"
+    )
+    assert provider._session_lineage == []
+
+
+def test_session_switch_reset_clears_lineage(provider):
+    provider._session_lineage = ["parent-1"]
+    provider.on_session_switch("fresh", reset=True, reason="new_session")
+    assert provider._session_lineage == []
+
+
+def test_session_switch_rewind_keeps_lineage(provider):
+    # Rewind stays within the same conversation — ancestry still applies.
+    provider._session_id = "branch-1"
+    provider._session_lineage = ["parent-1"]
+    provider.on_session_switch("branch-1", parent_session_id="", reset=False, rewound=True)
+    assert provider._session_lineage == ["parent-1"]
+
+
+def test_fingerprint_call_sites_are_consistent(integration_module):
+    # The invariant the dedup system rests on: _turn_fingerprint_from_messages
+    # (used by sync_turn) and _segment_turns (used by the safety net) must
+    # fingerprint the SAME message dict identically.
+    fn_fp = integration_module._turn_fingerprint_from_messages
+    fn_seg = integration_module._segment_turns
+    msgs = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": [{"type": "text", "text": "second"}]},
+        {"role": "assistant", "content": [{"type": "tool_use", "name": "grep"}]},
+        {"role": "user", "content": [{"type": "tool_result", "content": "out"}]},
+    ]
+    direct = fn_fp(msgs)
+    from_seg = next(s["turn_fp"] for s in reversed(fn_seg(msgs)) if s["turn_fp"])
+    assert direct != ""
+    assert direct == from_seg
