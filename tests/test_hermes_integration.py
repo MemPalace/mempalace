@@ -299,12 +299,17 @@ def test_on_pre_compress_returns_hint_and_enqueues_safety_net(provider):
     assert provider._worker_queue.qsize() == pre + 1
 
 
-def test_on_session_end_enqueues_safety_net(provider):
+def test_on_session_end_enqueues_safety_net_then_wakeup(provider):
     provider._cron_skipped = False
     provider._initialized = True
-    pre = provider._worker_queue.qsize()
     provider.on_session_end([{"role": "user", "content": "hi"}])
-    assert provider._worker_queue.qsize() == pre + 1
+    # The wake-up refresh is sequenced BEHIND the safety-net task so its
+    # ChromaDB reads never race the safety net's writes (Windows sqlite
+    # locks under concurrent access; a locked write drops a turn).
+    tasks = []
+    while not provider._worker_queue.empty():
+        tasks.append(provider._worker_queue.get_nowait()[0])
+    assert tasks == ["session_end", "wakeup"]
 
 
 def test_on_pre_compress_under_cron_returns_empty_string(provider, tmp_path):
@@ -1491,3 +1496,45 @@ def test_truncated_window_fp_coverage_is_accepted_limit(initialized_provider):
     docs = initialized_provider._collection.get(include=["documents"]).get("documents") or []
     assert not any("brand new partial output qqq" in d for d in docs)
     assert initialized_provider._collection.count() == pre
+
+
+def test_file_turn_retries_transient_database_lock(
+    integration_module, initialized_provider, monkeypatch
+):
+    # Chroma's sqlite briefly locks under concurrent readers (notably on
+    # Windows — this reproduced in CI as a lost turn). A transient lock
+    # must be retried, not swallowed as a permanent write failure.
+    calls = {"n": 0}
+    real = integration_module.file_conversation_exchange
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("Error updating collection: database is locked")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(integration_module, "file_conversation_exchange", flaky)
+    monkeypatch.setattr(initialized_provider, "FILE_TURN_LOCK_BACKOFF", 0.01)
+    pre = initialized_provider._collection.count()
+    initialized_provider.sync_turn("locked once", "but persisted")
+    initialized_provider._worker_queue.join()
+    assert calls["n"] == 2
+    assert initialized_provider._collection.count() == pre + 1
+
+
+def test_file_turn_gives_up_on_persistent_lock_with_warning(
+    integration_module, initialized_provider, monkeypatch, caplog
+):
+    import logging
+
+    def always_locked(*args, **kwargs):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(integration_module, "file_conversation_exchange", always_locked)
+    monkeypatch.setattr(initialized_provider, "FILE_TURN_LOCK_BACKOFF", 0.01)
+    pre = initialized_provider._collection.count()
+    with caplog.at_level(logging.WARNING, logger="mempalace.hermes"):
+        initialized_provider.sync_turn("never lands", "sadly")
+        initialized_provider._worker_queue.join()
+    assert initialized_provider._collection.count() == pre
+    assert any("turn not persisted" in r.message for r in caplog.records)
