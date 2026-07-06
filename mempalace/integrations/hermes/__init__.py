@@ -79,6 +79,7 @@ from mempalace.config import (
     sanitize_name,
 )
 from mempalace.convo_miner import file_conversation_exchange
+from mempalace.ids import make_turn_fingerprint
 from mempalace.knowledge_graph import KnowledgeGraph
 from mempalace.layers import Layer0
 from mempalace.searcher import search_memories
@@ -288,6 +289,81 @@ def _normalize_content(content: Any) -> str:
                     parts.append(text)
         return "\n".join(parts)
     return str(content)
+
+
+def _is_real_user_message(msg: Dict[str, Any]) -> bool:
+    """True for user messages a human actually authored this turn.
+
+    Anthropic-format tool results arrive as ``role == "user"`` messages
+    whose content is exclusively ``tool_result`` blocks — those anchor
+    no turn. A message mixing tool_result blocks with any other part
+    still counts as real (the user typed alongside the result).
+    """
+    if msg.get("role") != "user":
+        return False
+    content = msg.get("content")
+    if isinstance(content, list):
+        return any(
+            not (isinstance(block, dict) and block.get("type") == "tool_result")
+            for block in content
+        )
+    return bool(content)
+
+
+def _turn_fingerprint_from_messages(messages: List[Dict[str, Any]]) -> str:
+    """Fingerprint of the LAST real user message in a snapshot.
+
+    ``sync_turn`` receives the full messages snapshot at end of turn, so
+    the last real user message is this turn's anchor. The fingerprint is
+    computed over ``_normalize_content`` of the raw dict — the identical
+    dict ``_segment_turns`` sees later — so coverage checks correlate
+    byte-exactly despite ``sync_turn``'s cleaned/stripped text arguments.
+    """
+    for msg in reversed(messages or []):
+        if _is_real_user_message(msg):
+            normalized = _normalize_content(msg.get("content"))
+            if normalized:
+                return make_turn_fingerprint(normalized)
+            return ""
+    return ""
+
+
+def _segment_turns(messages: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """Segment a raw message list into turns anchored at real user messages.
+
+    A turn spans one real user message plus everything (assistant
+    replies, tool_use, tool results) up to the next real user message —
+    folded into the segment's ``assistant`` side in order. Messages
+    before the first real user message form an anchorless preamble
+    segment (``turn_fp == ""``), which downstream dedup can only match
+    by exact text. Segments empty on both sides are dropped.
+    """
+    segments: List[Dict[str, Any]] = []
+    current: Optional[Dict[str, Any]] = None
+    for msg in messages or []:
+        if _is_real_user_message(msg):
+            user_text = _normalize_content(msg.get("content"))
+            current = {
+                "user": user_text,
+                "parts": [],
+                "turn_fp": make_turn_fingerprint(user_text) if user_text else "",
+            }
+            segments.append(current)
+            continue
+        part = _normalize_content(msg.get("content"))
+        if not part:
+            continue
+        if current is None:
+            current = {"user": "", "parts": [], "turn_fp": ""}
+            segments.append(current)
+        current["parts"].append(part)
+    result: List[Dict[str, str]] = []
+    for seg in segments:
+        assistant = "\n\n".join(seg["parts"])
+        if not seg["user"] and not assistant:
+            continue
+        result.append({"user": seg["user"], "assistant": assistant, "turn_fp": seg["turn_fp"]})
+    return result
 
 
 # ---------------------------------------------------------------------------
