@@ -1027,3 +1027,36 @@ def test_segment_turns_drops_empty_segments(integration_module):
     fn = integration_module._segment_turns
     assert fn([]) == []
     assert fn([{"role": "assistant", "content": ""}]) == []
+
+
+# ---------------------------------------------------------------------------
+# sync_turn coverage fingerprints: the correlation key the safety net uses.
+# ---------------------------------------------------------------------------
+
+
+def test_sync_turn_with_messages_stores_turn_fingerprint(initialized_provider):
+    from mempalace.ids import make_turn_fingerprint
+
+    msgs = [
+        {"role": "user", "content": "what's the plan?"},
+        {"role": "assistant", "content": "ship the PR"},
+    ]
+    initialized_provider.sync_turn("what's the plan?", "ship the PR", messages=msgs)
+    initialized_provider._worker_queue.join()
+
+    metas = initialized_provider._collection.get(include=["metadatas"]).get("metadatas") or []
+    hermes = [m for m in metas if m.get("source") == "hermes"]
+    assert hermes
+    assert hermes[0].get("turn_fp") == make_turn_fingerprint("what's the plan?")
+
+
+def test_sync_turn_without_messages_stores_no_fingerprint(initialized_provider):
+    # Legacy callers / on_delegation synthetic turns carry no snapshot —
+    # a fabricated fingerprint would wrongly mark raw turns as covered.
+    initialized_provider.sync_turn("solo question", "solo answer")
+    initialized_provider._worker_queue.join()
+
+    metas = initialized_provider._collection.get(include=["metadatas"]).get("metadatas") or []
+    hermes = [m for m in metas if m.get("source") == "hermes"]
+    assert hermes
+    assert "turn_fp" not in hermes[0]
