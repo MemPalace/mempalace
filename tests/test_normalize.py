@@ -386,6 +386,127 @@ def test_claude_code_jsonl_non_dict_entries():
     assert result is not None
 
 
+# ── _try_claude_code_jsonl(track_positions=True) ────────────────────────
+#
+# Powers convo_miner's incremental-mining cursor: needs to know which raw
+# JSONL line each (merged) message started at, not just the flattened
+# transcript text.
+
+
+class TestClaudeCodeJsonlPositions:
+    def test_default_unaffected_returns_plain_string(self):
+        """track_positions defaults to False -- every existing caller of
+        _try_claude_code_jsonl must see zero behavior change."""
+        lines = [
+            json.dumps({"type": "human", "message": {"content": "Q"}}),
+            json.dumps({"type": "assistant", "message": {"content": "A"}}),
+        ]
+        result = _try_claude_code_jsonl("\n".join(lines))
+        assert isinstance(result, str)
+
+    def test_too_few_messages_returns_none_either_way(self):
+        lines = [json.dumps({"type": "human", "message": {"content": "only one"}})]
+        assert _try_claude_code_jsonl("\n".join(lines), track_positions=True) is None
+
+    def test_start_lines_point_at_correct_raw_line(self):
+        lines = [
+            json.dumps({"type": "human", "message": {"content": "Q1"}}),  # line 0
+            json.dumps({"type": "assistant", "message": {"content": "A1"}}),  # line 1
+            json.dumps({"type": "human", "message": {"content": "Q2"}}),  # line 2
+            json.dumps({"type": "assistant", "message": {"content": "A2"}}),  # line 3
+        ]
+        result = _try_claude_code_jsonl("\n".join(lines), track_positions=True)
+        assert result is not None
+        assert [m[0] for m in result.messages] == ["user", "assistant", "user", "assistant"]
+        assert result.start_lines == [0, 1, 2, 3]
+
+    def test_blank_lines_shift_raw_indices_correctly(self):
+        """start_lines must index into content.strip().split("\\n") exactly
+        -- the same line list _try_claude_code_jsonl itself iterates -- so a
+        caller re-splitting the same content the same way lands on the
+        right line. Note the pre-existing (unchanged by this feature)
+        content.strip() at the top of the function trims LEADING blank
+        lines before the split, so indices are relative to the stripped
+        content, not the raw file bytes -- fine in practice, since a real
+        Claude Code JSONL transcript is never written with a leading blank
+        line, but worth being explicit about here. Interior/trailing blank
+        lines (this test's real case) are unaffected by that trim and just
+        count normally.
+        """
+        lines = [
+            json.dumps({"type": "human", "message": {"content": "Q1"}}),  # line 0
+            "",  # line 1: blank
+            json.dumps({"type": "assistant", "message": {"content": "A1"}}),  # line 2
+        ]
+        result = _try_claude_code_jsonl("\n".join(lines), track_positions=True)
+        assert result is not None
+        assert result.start_lines == [0, 2]
+
+    def test_tool_result_merge_does_not_add_a_position_entry(self):
+        """A tool_result folded into the previous assistant message extends
+        an EXISTING entry -- it must not get its own start_lines slot, and
+        the assistant's recorded start line must stay at its ORIGINAL line
+        (where it first appeared), not shift to the merged-in line."""
+        lines = [
+            json.dumps({"type": "human", "message": {"content": "Q1"}}),  # line 0
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}]
+                    },
+                }
+            ),  # line 1 -- this is the assistant message's start
+            json.dumps(
+                {
+                    "type": "user",
+                    "message": {
+                        "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]
+                    },
+                }
+            ),  # line 2 -- tool result, merges into the line-1 assistant message
+            json.dumps({"type": "human", "message": {"content": "Q2"}}),  # line 3
+            json.dumps({"type": "assistant", "message": {"content": "A2"}}),  # line 4
+        ]
+        result = _try_claude_code_jsonl("\n".join(lines), track_positions=True)
+        assert result is not None
+        assert [m[0] for m in result.messages] == ["user", "assistant", "user", "assistant"]
+        # Line 2 (the tool_result) contributed no new message -- start_lines
+        # has exactly 4 entries, one per message, not 5.
+        assert result.start_lines == [0, 1, 3, 4]
+
+    def test_multiturn_assistant_merge_keeps_first_start_line(self):
+        """Consecutive assistant messages (a multi-turn tool loop) merge
+        into one; the recorded start line is where the FIRST one began."""
+        lines = [
+            json.dumps({"type": "human", "message": {"content": "Q1"}}),  # line 0
+            json.dumps({"type": "assistant", "message": {"content": "A1a"}}),  # line 1
+            json.dumps(
+                {"type": "assistant", "message": {"content": "A1b"}}
+            ),  # line 2 (merges into line 1)
+            json.dumps({"type": "human", "message": {"content": "Q2"}}),  # line 3
+            json.dumps({"type": "assistant", "message": {"content": "A2"}}),  # line 4
+        ]
+        result = _try_claude_code_jsonl("\n".join(lines), track_positions=True)
+        assert result is not None
+        assert [m[0] for m in result.messages] == ["user", "assistant", "user", "assistant"]
+        assert result.start_lines == [0, 1, 3, 4]
+
+    def test_last_user_message_start_line_identifies_trailing_exchange(self):
+        """The actual use case: find the start line of the LAST user-role
+        message, to anchor a re-mine's rewind point at the trailing
+        exchange's beginning."""
+        lines = [
+            json.dumps({"type": "human", "message": {"content": "Q1"}}),
+            json.dumps({"type": "assistant", "message": {"content": "A1"}}),
+            json.dumps({"type": "human", "message": {"content": "Q2"}}),
+            json.dumps({"type": "assistant", "message": {"content": "A2"}}),
+        ]
+        result = _try_claude_code_jsonl("\n".join(lines), track_positions=True)
+        last_user_idx = max(i for i, m in enumerate(result.messages) if m[0] == "user")
+        assert result.start_lines[last_user_idx] == 2
+
+
 # ── _try_codex_jsonl ───────────────────────────────────────────────────
 
 

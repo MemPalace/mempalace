@@ -23,7 +23,7 @@ import os
 import re
 import stat
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 
 # Provenance footer appended to Slack transcript output so downstream consumers
 # know the speaker roles are positionally assigned, not verified.
@@ -114,10 +114,21 @@ def strip_noise(text: str) -> str:
     return text.strip()
 
 
-def normalize(filepath: str) -> str:
-    """
-    Load a file and normalize to transcript format if it's a chat export.
-    Plain text files pass through unchanged.
+def _read_source_file(filepath: str) -> str:
+    """Hardened raw-content read shared by normalize() and any caller that
+    needs the exact same raw content it would read (e.g. convo_miner's
+    incremental-mining cursor computation, which needs raw JSONL lines
+    alongside the parsed transcript). Rejects symlinks, requires a
+    regular file, and caps size at 500 MB.
+
+    Centralizing this is what lets a caller read a file ONCE and hand
+    the same string to both normalize() and a second consumer, instead
+    of two independent reads that could observe different content if the
+    file is actively being appended to between them (a real scenario for
+    an in-progress Claude Code session) -- and without this, a second,
+    separately-written reader could easily end up LESS careful than this
+    one (e.g. skipping the symlink/size checks), a real gap even before
+    considering the race.
     """
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     if os.path.islink(filepath):
@@ -132,7 +143,7 @@ def normalize(filepath: str) -> str:
             raise IOError(f"File too large ({file_stat.st_size // (1024 * 1024)} MB): {filepath}")
         with os.fdopen(fd, "r", encoding="utf-8-sig", errors="replace") as f:
             fd = -1
-            content = f.read()
+            return f.read()
     except OSError as e:
         raise IOError(f"Could not read {filepath}: {e}") from e
     finally:
@@ -141,6 +152,24 @@ def normalize(filepath: str) -> str:
                 os.close(fd)
             except OSError:
                 pass
+
+
+def normalize(filepath: str, content: Optional[str] = None) -> str:
+    """
+    Load a file and normalize to transcript format if it's a chat export.
+    Plain text files pass through unchanged.
+
+    ``content``, when given, is used directly instead of re-reading
+    ``filepath`` -- lets a caller that already read the file (see
+    ``_read_source_file``) avoid a second read and the TOCTOU risk of two
+    independent reads observing different states of a file that's
+    actively being appended to (e.g. convo_miner computing an
+    incremental-mining cursor from the same content it just chunked).
+    Every existing caller omits this parameter and sees no behavior
+    change: the read happens exactly as before.
+    """
+    if content is None:
+        content = _read_source_file(filepath)
 
     if not content.strip():
         return content
@@ -200,13 +229,56 @@ def _try_normalize_json(content: str) -> Optional[str]:
     return None
 
 
-def _try_claude_code_jsonl(content: str) -> Optional[str]:
-    """Claude Code JSONL sessions."""
-    lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
+class PositionedClaudeCodeParse(NamedTuple):
+    """Result of _try_claude_code_jsonl(..., track_positions=True).
+
+    ``messages`` and ``start_lines`` are parallel lists: ``start_lines[i]``
+    is the 0-based index into ``content.strip().split("\\n")`` (interior
+    blank lines are counted; matches exactly what this function itself
+    iterates) where ``messages[i]`` first began. A merge (tool-result
+    folded into the previous assistant turn, multi-turn tool loop folded
+    into one assistant message) extends an EXISTING message rather than
+    appending a new one, so it does not get its own entry here -- the
+    start line stays the line where that message *first* appeared.
+
+    Caveat for callers that persist a start_line and reload it later: the
+    leading ``.strip()`` (pre-existing behavior, unrelated to this
+    feature) trims leading blank lines/whitespace before the split, so an
+    index is relative to the *stripped* content, not raw file bytes. A
+    real Claude Code JSONL transcript is never written with leading blank
+    lines in practice, so this doesn't matter for that format -- but a
+    caller resuming from a stored start_line MUST reproduce the exact same
+    ``content.strip().split("\\n")`` transform on re-read, not a raw
+    ``readlines()``, or the indices won't line up.
+    """
+
+    text: str
+    messages: list
+    start_lines: list
+
+
+def _try_claude_code_jsonl(content: str, track_positions: bool = False):
+    """Claude Code JSONL sessions.
+
+    ``track_positions=False`` (default, every existing caller): returns
+    ``Optional[str]``, unchanged from before this parameter existed.
+
+    ``track_positions=True``: returns ``Optional[PositionedClaudeCodeParse]``
+    instead, additionally carrying the raw-line position of each message --
+    used by convo_miner's cursor computation (incremental re-mining) to
+    identify where the trailing exchange in a transcript actually started
+    in the source file. Callers that don't need this keep paying zero cost
+    for it: the extra bookkeeping is a few list appends, not a second pass.
+    """
+    raw_lines = content.strip().split("\n")
     messages = []
+    start_lines = []  # parallel to `messages`; only touched on append, never on merge
     tool_use_map = {}  # tool_use_id → tool_name
 
-    for line in lines:
+    for line_index, raw_line in enumerate(raw_lines):
+        line = raw_line.strip()
+        if not line:
+            continue
         try:
             entry = json.loads(line)
         except json.JSONDecodeError:
@@ -244,6 +316,7 @@ def _try_claude_code_jsonl(content: str) -> Optional[str]:
                     messages[-1] = (prev_role, prev_text + "\n" + text)
                 elif not is_tool_only:
                     messages.append(("user", text))
+                    start_lines.append(line_index)
         elif msg_type == "assistant":
             text = _extract_content(msg_content, tool_use_map=tool_use_map)
             if text:
@@ -256,10 +329,16 @@ def _try_claude_code_jsonl(content: str) -> Optional[str]:
                     messages[-1] = (prev_role, prev_text + "\n" + text)
                 else:
                     messages.append(("assistant", text))
+                    start_lines.append(line_index)
 
-    if len(messages) >= 2:
-        return _messages_to_transcript(messages)
-    return None
+    if len(messages) < 2:
+        return None
+    transcript = _messages_to_transcript(messages)
+    if track_positions:
+        return PositionedClaudeCodeParse(
+            text=transcript, messages=messages, start_lines=start_lines
+        )
+    return transcript
 
 
 def _try_codex_jsonl(content: str) -> Optional[str]:

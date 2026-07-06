@@ -9,6 +9,7 @@ import chromadb
 import pytest
 
 from mempalace.convo_miner import (
+    _compute_convo_cursor,
     _flag_possible_duplicates,
     _is_ai_tool_path,
     _register_file,
@@ -761,3 +762,131 @@ class TestFlagPossibleDuplicates:
         assert batch_metas[0]["possible_duplicate_of"] == "d1"
         assert batch_metas[1]["possible_duplicate_of"] == "d2"
         assert "possible_duplicate_of" not in batch_metas[2]
+
+
+# ── incremental-mining cursor (compute + store only, nothing reads it yet) ──
+#
+# Nothing reads this cursor yet -- these tests cover that it gets computed
+# correctly and stored on exactly the right drawer, not that mining
+# behavior changes (it doesn't, yet).
+
+
+class TestComputeConvoCursor:
+    """_compute_convo_cursor takes the RAW content the caller already read
+    for normalize()/chunk_exchanges -- not a file path -- specifically so
+    it can never re-read a different state of a file that's actively
+    being appended to (see the docstring for the full rationale)."""
+
+    def test_zero_chunks_returns_none(self):
+        content = '{"type":"user","message":{"content":"hi"}}\n'
+        assert _compute_convo_cursor(content, num_chunks=0) is None
+
+    def test_non_claude_code_content_returns_none(self):
+        """Content that doesn't parse as Claude Code JSONL at all (e.g.
+        plain text) gets no cursor -- the safe "no incremental path for
+        this format" default."""
+        content = "just some plain text, not JSON at all\nsecond line\n"
+        assert _compute_convo_cursor(content, num_chunks=2) is None
+
+    def test_below_exchange_chunking_threshold_returns_none(self):
+        """The bug this test guards against: chunk_exchanges falls back to
+        paragraph/character-offset chunking when the transcript has fewer
+        than 3 quoted lines (chunk_exchanges' own quote_lines >= 3 gate).
+        In that mode "chunk N" has no correspondence to "the Nth user
+        turn" at all -- a cursor computed here would silently attach
+        wrong position data to an unrelated chunk. Must mirror that gate
+        exactly and return None rather than compute a misleading cursor.
+        A single exchange produces only 2 quoted lines' worth of
+        structure (one user turn) -- below the threshold.
+        """
+        import json as jsonlib
+
+        content = "\n".join(
+            [
+                jsonlib.dumps({"type": "human", "message": {"content": "Q1"}}),
+                jsonlib.dumps({"type": "assistant", "message": {"content": "A1"}}),
+            ]
+        )
+        assert _compute_convo_cursor(content, num_chunks=2) is None
+
+    def test_real_claude_code_jsonl_computes_correct_cursor(self):
+        import json as jsonlib
+
+        lines = [
+            jsonlib.dumps({"type": "human", "message": {"content": "Q1"}}),  # line 0
+            jsonlib.dumps({"type": "assistant", "message": {"content": "A1"}}),  # line 1
+            jsonlib.dumps({"type": "human", "message": {"content": "Q2"}}),  # line 2
+            jsonlib.dumps({"type": "assistant", "message": {"content": "A2"}}),  # line 3
+            jsonlib.dumps({"type": "human", "message": {"content": "Q3"}}),  # line 4
+            jsonlib.dumps({"type": "assistant", "message": {"content": "A3"}}),  # line 5
+        ]
+        content = "\n".join(lines) + "\n"
+
+        cursor = _compute_convo_cursor(content, num_chunks=3)
+        assert cursor is not None
+        assert cursor["cursor_line"] == 4  # the third (last) user turn
+        assert cursor["cursor_chunk_index"] == 2  # 0-indexed, last of 3 chunks
+        assert cursor["cursor_format"] == "claude_code_jsonl"
+        expected_hash = __import__("hashlib").sha256(lines[4].encode("utf-8")).hexdigest()
+        assert cursor["cursor_anchor_hash"] == expected_hash
+
+
+class TestConvoCursorStorage:
+    """End-to-end: a real mine stores the cursor on exactly the last
+    drawer, nowhere else, and general mode gets no cursor at all."""
+
+    def test_cursor_stored_only_on_last_drawer(self):
+        tmpdir = tempfile.mkdtemp()
+        try:
+            convo_path = Path(tmpdir) / "session.jsonl"
+            # At least 3 exchanges: chunk_exchanges only takes the real
+            # exchange-pair path (which a cursor can meaningfully anchor
+            # on) once the transcript has >= 3 quoted lines; fewer than
+            # that falls back to paragraph chunking, where no cursor is
+            # computed at all (see TestComputeConvoCursor).
+            entries = [
+                '{"type":"human","message":{"content":"What is the plan?"}}',
+                '{"type":"assistant","message":{"content":"Start with the schema."}}',
+                '{"type":"human","message":{"content":"Any risks?"}}',
+                '{"type":"assistant","message":{"content":"Migration ordering is the main one."}}',
+                '{"type":"human","message":{"content":"What about rollback?"}}',
+                '{"type":"assistant","message":{"content":"We snapshot before every migration."}}',
+            ]
+            convo_path.write_text("\n".join(entries) + "\n")
+            palace_path = os.path.join(tmpdir, "palace")
+
+            mine_convos(tmpdir, palace_path, wing="test")
+
+            client = chromadb.PersistentClient(path=palace_path)
+            col = client.get_collection("mempalace_drawers")
+            result = col.get(include=["metadatas"])
+            with_cursor = [m for m in result["metadatas"] if m and m.get("cursor_format")]
+            assert len(with_cursor) == 1, (
+                f"expected exactly one drawer with a cursor, got {len(with_cursor)}"
+            )
+            assert with_cursor[0]["cursor_chunk_index"] == max(
+                m["chunk_index"] for m in result["metadatas"] if m
+            )
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_general_mode_gets_no_cursor(self):
+        tmpdir = tempfile.mkdtemp()
+        try:
+            convo_path = Path(tmpdir) / "session.jsonl"
+            entries = [
+                '{"type":"human","message":{"content":"What did we decide about the API design?"}}',
+                '{"type":"assistant","message":{"content":"We decided to use REST because it keeps things simple and well understood by the team."}}',
+            ]
+            convo_path.write_text("\n".join(entries) + "\n")
+            palace_path = os.path.join(tmpdir, "palace")
+
+            mine_convos(tmpdir, palace_path, wing="test", extract_mode="general")
+
+            client = chromadb.PersistentClient(path=palace_path)
+            col = client.get_collection("mempalace_drawers")
+            result = col.get(include=["metadatas"])
+            with_cursor = [m for m in result["metadatas"] if m and m.get("cursor_format")]
+            assert with_cursor == []
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)

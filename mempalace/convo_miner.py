@@ -8,6 +8,7 @@ Normalizes format, chunks by exchange pair (Q+A = one unit), files to palace.
 Same palace as project mining. Different ingest strategy.
 """
 
+import hashlib
 import os
 import sys
 import json
@@ -20,7 +21,7 @@ from typing import Optional
 
 from .collision_scan import assert_no_collisions
 from .ids import ID_RECIPE, make_convo_drawer_id, make_convo_sentinel_id
-from .normalize import normalize
+from .normalize import _read_source_file, normalize
 from .entities import entities_metadata
 from .palace import (
     NORMALIZE_VERSION,
@@ -486,6 +487,80 @@ def _extract_authored_at(filepath):
     return latest
 
 
+def _compute_convo_cursor(raw_content: str, num_chunks: int) -> Optional[dict]:
+    """Compute the incremental-mining cursor for a Claude Code JSONL
+    transcript: the raw line where the trailing exchange (the last chunk
+    ``chunk_exchanges`` would produce) began, so a future re-mine of a
+    grown/extended session can resume from there instead of reprocessing
+    the whole file. This only COMPUTES and STORES the cursor -- nothing
+    yet reads or acts on it, so this changes no existing mining behavior.
+
+    ``raw_content`` must be the SAME content the caller already read and
+    passed to ``normalize()`` to produce the chunks being filed this
+    pass -- not a fresh re-read of the file. A second, independent read
+    here could observe a different state of a file that's actively being
+    appended to (the exact scenario this feature exists for), producing
+    a cursor that describes content different from what was actually
+    mined in this pass.
+
+    Returns None (no cursor recorded, meaning "no incremental path
+    available, full reprocess next time" -- always a safe default) when:
+    - there are no chunks to anchor on;
+    - the file doesn't parse as Claude Code JSONL specifically (the only
+      format currently verified append-only across /compact and /clear;
+      every other format falls back to full reprocess, unconditionally,
+      by simply never getting a cursor);
+    - ``chunk_exchanges`` would fall back to paragraph/character-offset
+      chunking for this content (fewer than 3 quoted lines) rather than
+      real exchange-pair chunking -- "the last user-role message" has no
+      correspondence to "the last chunk" in that mode, so a cursor
+      computed here would silently attach wrong position data to an
+      unrelated chunk. Mirrors ``chunk_exchanges``' own ``quote_lines >=
+      3`` condition exactly, checked against the same parsed transcript
+      text, so the two can't silently drift out of sync with each other.
+
+    Scoped to extract_mode="exchange" only for now (the caller does not
+    invoke this for "general" mode): chunk_exchanges' one-chunk-per-user-
+    turn shape maps directly onto "the last user-role message", but
+    general mode's chunking doesn't share that direct correspondence and
+    needs its own analysis before it can get the same treatment.
+    """
+    if num_chunks <= 0:
+        return None
+
+    from .normalize import _try_claude_code_jsonl
+
+    parsed = _try_claude_code_jsonl(raw_content, track_positions=True)
+    if parsed is None:
+        return None
+
+    transcript_lines = parsed.text.split("\n")
+    quote_lines = sum(1 for line in transcript_lines if line.strip().startswith(">"))
+    if quote_lines < 3:
+        return None
+
+    last_user_idx = None
+    for i in range(len(parsed.messages) - 1, -1, -1):
+        if parsed.messages[i][0] == "user":
+            last_user_idx = i
+            break
+    if last_user_idx is None:
+        return None
+
+    anchor_line_index = parsed.start_lines[last_user_idx]
+    raw_lines = raw_content.strip().split("\n")
+    if anchor_line_index >= len(raw_lines):
+        return None
+    anchor_line = raw_lines[anchor_line_index]
+
+    return {
+        "cursor_line": anchor_line_index,
+        "cursor_chunk_index": num_chunks - 1,
+        "cursor_anchor_hash": hashlib.sha256(anchor_line.encode("utf-8")).hexdigest(),
+        "cursor_format": "claude_code_jsonl",
+    }
+
+
 def _flag_possible_duplicates(collection, batch_docs: list, batch_metas: list) -> None:
     """Flag chunks whose closest existing match is a probable duplicate.
 
@@ -519,7 +594,7 @@ def _flag_possible_duplicates(collection, batch_docs: list, batch_metas: list) -
 
 
 def _file_chunks_locked(
-    collection, source_file, chunks, wing, room, agent, extract_mode, authored_at=None
+    collection, source_file, chunks, wing, room, agent, extract_mode, authored_at=None, cursor=None
 ):
     """Lock the source file, purge stale drawers, and upsert fresh chunks.
 
@@ -530,6 +605,11 @@ def _file_chunks_locked(
     differs from what's stored) -- transcripts are not assumed immutable,
     since a Claude Code session keeps appending to its own file while
     active and /compact or /clear can rewrite one in place.
+
+    ``cursor``, when given (see ``_compute_convo_cursor``), is stamped onto
+    the LAST chunk's metadata only -- the trailing exchange is the anchor
+    a future incremental re-mine would resume from. Nothing reads this
+    yet, so storing it changes no existing behavior.
 
     Returns (drawers_added, room_counts_delta, skipped).
     """
@@ -592,6 +672,11 @@ def _file_chunks_locked(
                 }
                 if source_mtime is not None:
                     meta["source_mtime"] = source_mtime
+                if cursor is not None and chunk["chunk_index"] == cursor["cursor_chunk_index"]:
+                    meta["cursor_line"] = cursor["cursor_line"]
+                    meta["cursor_chunk_index"] = cursor["cursor_chunk_index"]
+                    meta["cursor_anchor_hash"] = cursor["cursor_anchor_hash"]
+                    meta["cursor_format"] = cursor["cursor_format"]
                 batch_metas.append(meta)
             assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
             _flag_possible_duplicates(collection, batch_docs, batch_metas)
@@ -833,9 +918,13 @@ def _mine_convos_impl(
             files_skipped += 1
             continue
 
-        # Normalize format
+        # Read once, normalize from that same content -- a second,
+        # independent read (e.g. for cursor computation further below)
+        # could otherwise observe a different state of a file that's
+        # actively being appended to than the one actually mined here.
         try:
-            content = normalize(str(filepath))
+            raw_content = _read_source_file(str(filepath))
+            content = normalize(str(filepath), content=raw_content)
         except (OSError, ValueError):
             if not dry_run:
                 _register_file(collection, source_file, wing, agent, extract_mode)
@@ -894,6 +983,16 @@ def _mine_convos_impl(
         if extract_mode != "general":
             room_counts[room] += 1
 
+        # Compute (but do not yet act on) the incremental-mining cursor.
+        # Scoped to exchange mode, where chunk_exchanges' one-chunk-per-
+        # user-turn shape maps directly onto "the last user-role message".
+        # Returns None (no cursor stored) for any non-Claude-Code-JSONL
+        # format, which is exactly the desired "no incremental path for
+        # this format" default.
+        cursor = (
+            _compute_convo_cursor(raw_content, len(chunks)) if extract_mode != "general" else None
+        )
+
         # Lock + purge stale + file fresh chunks. Lock serializes concurrent
         # agents; purge removes pre-v2 drawers so the schema bump applies.
         drawers_added, room_delta, skipped = _file_chunks_locked(
@@ -905,6 +1004,7 @@ def _mine_convos_impl(
             agent,
             extract_mode,
             authored_at=_extract_authored_at(filepath),
+            cursor=cursor,
         )
         if skipped:
             files_skipped += 1
