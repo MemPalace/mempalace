@@ -1359,6 +1359,7 @@ def process_file(
     chunk_overlap: int = None,
     min_chunk_size: int = None,
     max_chunks_per_file: Optional[int] = None,
+    mined_mtime_cache: Optional[dict[str, set[float]]] = None,
 ) -> tuple:
     """Read, chunk, route, and file one file.
 
@@ -1373,8 +1374,21 @@ def process_file(
 
     # Skip if already filed
     source_file = str(filepath)
-    if not dry_run and file_already_mined(collection, source_file, check_mtime=True):
-        return 0, "general", None
+    if not dry_run:
+        try:
+            source_mtime = os.path.getmtime(source_file)
+        except OSError:
+            source_mtime = None
+        if (
+            mined_mtime_cache is not None
+            and source_mtime is not None
+            and source_mtime in mined_mtime_cache.get(source_file, set())
+        ):
+            return 0, "general", None
+        if mined_mtime_cache is None and file_already_mined(
+            collection, source_file, check_mtime=True
+        ):
+            return 0, "general", None
 
     content = _read_text_no_follow(filepath, project_path)
     if content is None:
@@ -1520,6 +1534,26 @@ def process_file(
             upsert_closet_lines(closets_col, closet_id_base, closet_lines, closet_meta)
 
     return drawers_added, room, None
+
+
+def _build_mined_mtime_cache(collection, wing: str) -> Optional[dict[str, set[float]]]:
+    """Build a per-wing source-file mtime cache for incremental mine skips."""
+    cache: dict[str, set[float]] = defaultdict(set)
+    try:
+        metadatas = collection.get_all_metadata(where={"wing": wing})
+    except Exception:
+        logger.debug("Bulk mined-file metadata cache failed; falling back per file", exc_info=True)
+        return None
+    for meta in metadatas:
+        if not isinstance(meta, dict):
+            continue
+        if meta.get("normalize_version") != NORMALIZE_VERSION:
+            continue
+        source_file = meta.get("source_file")
+        source_mtime = meta.get("source_mtime")
+        if isinstance(source_file, str) and isinstance(source_mtime, (int, float)):
+            cache[source_file].add(float(source_mtime))
+    return cache
 
 
 # =============================================================================
@@ -1747,6 +1781,10 @@ def _mine_impl(
     last_file = None
     room_counts = defaultdict(int)
     effective_chunk_cap = _resolve_max_chunks_per_file(max_chunks_per_file)
+    mined_mtime_cache: Optional[dict[str, set[float]]] = None
+
+    if not dry_run:
+        mined_mtime_cache = _build_mined_mtime_cache(collection, wing)
 
     try:
         for i, filepath in enumerate(files, 1):
@@ -1768,6 +1806,7 @@ def _mine_impl(
                     # otherwise a malformed env var would emit its warning
                     # per file.
                     max_chunks_per_file=effective_chunk_cap,
+                    mined_mtime_cache=mined_mtime_cache,
                 )
             except KeyboardInterrupt:
                 # Re-raise so the outer handler prints the summary; we
@@ -1794,7 +1833,7 @@ def _mine_impl(
                 if limit > 0 and files_mined >= limit:
                     break
 
-        if not dry_run:
+        if not dry_run and total_drawers > 0:
             # Cross-wing topic tunnels: after every file in this wing has been
             # processed, link this wing to any other wing that shares a
             # confirmed TOPIC label. Out of scope for v1: manifest-dependency

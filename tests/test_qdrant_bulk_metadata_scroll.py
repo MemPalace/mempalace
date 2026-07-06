@@ -187,9 +187,23 @@ def _make_qdrant_collection(monkeypatch, scroll_pages):
     call_log = []
 
     def fake_scroll_points(
-        collection, *, qdrant_filter=None, limit=4096, offset=None, with_vector=False
+        collection,
+        *,
+        qdrant_filter=None,
+        limit=4096,
+        offset=None,
+        with_vector=False,
+        with_payload=True,
     ):
-        call_log.append({"limit": limit, "offset": offset, "filter": qdrant_filter})
+        call_log.append(
+            {
+                "limit": limit,
+                "offset": offset,
+                "filter": qdrant_filter,
+                "with_vector": with_vector,
+                "with_payload": with_payload,
+            }
+        )
         idx = len([c for c in call_log]) - 1
         return scroll_pages[idx]
 
@@ -252,6 +266,8 @@ class TestQdrantGetAllMetadataSingleScroll:
         assert len(call_log) == 2, (
             f"Expected exactly 2 scroll_points() calls (one full pass), got {len(call_log)}"
         )
+        assert all(call["with_payload"] == [qdrant_mod._PAYLOAD_METADATA] for call in call_log)
+        assert all(call["with_vector"] is False for call in call_log)
 
     def test_does_not_call_get_internally(self, monkeypatch):
         """

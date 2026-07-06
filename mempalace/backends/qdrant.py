@@ -498,10 +498,11 @@ class _QdrantRESTClient:
         limit: int = _SCROLL_PAGE_SIZE,
         offset: Any = None,
         with_vector: bool = False,
+        with_payload: Any = True,
     ) -> tuple[list[dict], Any]:
         body: dict[str, Any] = {
             "limit": int(limit),
-            "with_payload": True,
+            "with_payload": with_payload,
             "with_vector": bool(with_vector),
         }
         if qdrant_filter:
@@ -751,6 +752,15 @@ class QdrantCollection(BaseCollection):
                 self._client.create_collection(self._remote_collection, dimension)
                 self._client.create_payload_index(
                     self._remote_collection, _PAYLOAD_DOCUMENT, "text"
+                )
+                self._client.create_payload_index(
+                    self._remote_collection, f"{_PAYLOAD_METADATA}.source_file", "keyword"
+                )
+                self._client.create_payload_index(
+                    self._remote_collection, f"{_PAYLOAD_METADATA}.wing", "keyword"
+                )
+                self._client.create_payload_index(
+                    self._remote_collection, f"{_PAYLOAD_METADATA}.room", "keyword"
                 )
                 self._known_dimension = dimension
                 return
@@ -1056,17 +1066,36 @@ class QdrantCollection(BaseCollection):
         loop would re-walk the entire collection from the start just to
         discard everything outside its slice (O(n^2) over collection size).
 
-        Delegates to self._rows(), the same single-scroll-plus-local-filter
-        helper that backs get()/delete(). With ids=None and
-        where_document=None, _rows() reduces to exactly one _scroll_all()
-        pass followed by an unconditional _matches_where() re-check on every
-        row -- the same filter logic get(), delete(), and lexical_search()
-        already use, so this can't independently drift from those call
-        sites. (Maintainer review on #1832: avoid duplicating the filter
-        dance inline.)
+        Uses Qdrant's payload selector to fetch only the metadata payload.
+        The full document text is not needed by callers that are building an
+        incremental source-file cache, and transferring it dominates runtime
+        for large local codebases.
         """
-        rows = self._rows(where=where)
-        return [row["metadata"] for row in rows]
+        _validate_where(where)
+        self._ensure_open()
+        if not self._remote_exists():
+            if self._marker_exists():
+                raise CollectionNotInitializedError(self._collection_name)
+            return []
+        q_filter = None if _requires_local_filter(where) else _qdrant_filter(where)
+        metadatas: list[dict] = []
+        offset = None
+        while True:
+            points, offset = self._client.scroll_points(
+                self._remote_collection,
+                qdrant_filter=q_filter,
+                limit=_SCROLL_PAGE_SIZE,
+                offset=offset,
+                with_vector=False,
+                with_payload=[_PAYLOAD_METADATA],
+            )
+            for point in points:
+                payload = point.get("payload") or {}
+                metadata = payload.get(_PAYLOAD_METADATA) or {}
+                if isinstance(metadata, dict) and _matches_where(metadata, where):
+                    metadatas.append(metadata)
+            if offset is None:
+                return metadatas
 
     def facet_counts(
         self,
