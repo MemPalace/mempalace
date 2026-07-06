@@ -234,7 +234,7 @@ def test_chunk_exchanges_preserves_unbroken_long_tokens():
 
 
 def test_chunk_exchanges_prefers_punctuation_boundaries_for_long_paths():
-    path_like = "/Users/igorls/.local/share/zsh/site-functions:/usr/share/zsh/functions:" * 4
+    path_like = "/Users/me/.local/share/zsh/site-functions:/usr/share/zsh/functions:" * 4
     content = f"> Path?\n{path_like}"
     chunks = chunk_exchanges(content, chunk_size=80, min_chunk_size=0)
 
