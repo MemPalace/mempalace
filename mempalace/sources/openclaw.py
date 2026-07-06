@@ -24,6 +24,14 @@ The extraction pipeline mirrors ``convo-spike/convert_trajectories.py``:
   ``trace.*`` etc. are skipped.
 * OpenClaw runtime-context injection blocks and metadata-preamble fences
   are stripped from user text before chunking.
+
+.. note:: Secret redaction
+    ``openclaw_redact_secrets`` is applied as a declared transform before
+    content is chunked.  This is best-effort protection against credentials
+    present in raw agent trajectories (API keys, tokens, private keys, etc.)
+    landing verbatim in ChromaDB.  ``default_privacy_class = "pii_potential"``
+    is retained; treat redaction as a defence-in-depth measure, not a
+    security guarantee.
 """
 
 from __future__ import annotations
@@ -140,17 +148,35 @@ class TrajectoryEventSource(Protocol):
        is used today — no changes to extraction, transform, or chunking
        required.
 
+    For versioning, use ``SELECT COUNT(*) FROM trajectory_runtime_events WHERE
+    session_id = ?`` or the row count as the version rather than file size.
+
     JSONL sidecars remain valid as legacy/doctor-import inputs via
     :class:`JsonlTrajectoryEventSource`; runtime ingest switches to the
     SQLite source once the migration is complete.
 
-    .. note::
-        Transcript content transformation (the JSONL text → ruff pipeline)
-        is separate from event iteration.  For a SQLite source, synthesise
-        JSONL text from ``iter_events()`` output before passing it to
-        :func:`_build_canonical_source_bytes_from_events` (a helper to be
-        added when the SQLite backend lands).  The transform/chunk steps are
-        unchanged.
+    .. rubric:: RFC §7.3 conformance — single-parse reconciliation
+
+    The declared transforms (``openclaw_extract_turns``, strip transforms,
+    ``openclaw_redact_secrets``, format, normalize, trim) are text→text
+    reference implementations that the conformance suite applies to the raw
+    canonical source bytes (``*.trajectory.jsonl`` text) in declaration order.
+
+    The runtime path avoids re-parsing the same JSON by:
+
+    1. Collecting events via ``iter_events()`` **once**.
+    2. Building the role-tab-JSON turn lines from those events using
+       :func:`_extract_turns_from_events` — identical output to
+       ``openclaw_extract_turns`` applied to the serialized events, but no
+       second ``json.loads`` over the same bytes.
+    3. Applying only the post-extract declared transforms (strip, redact,
+       format, normalize, trim) via :func:`_apply_post_extract_pipeline`.
+
+    The conformance round-trip test still applies the FULL
+    ``DECLARED_TRANSFORMATION_ORDER`` starting from raw bytes (including
+    ``openclaw_extract_turns``) and arrives at the same drawer content.
+    ``openclaw_extract_turns`` is thus kept as the conformance reference impl
+    without being exercised in the hot path.
     """
 
     def iter_events(self) -> Iterator[Dict[str, Any]]:
@@ -175,7 +201,7 @@ class TrajectoryEventSource(Protocol):
 
         Returned keys when not ``None``:
         ``session_id``, ``session_key``, ``workspace_dir``, ``model_id``,
-        ``session_created_at``, ``version``, ``message_count``.
+        ``session_created_at``, ``message_count``.
         """
         ...
 
@@ -257,17 +283,22 @@ def _aggregate_session_metadata(
     Returns:
         Metadata dict with keys ``session_id``, ``session_key``,
         ``workspace_dir``, ``model_id``, ``session_created_at``,
-        ``version``, ``message_count``; or ``None`` if no events were found.
+        ``message_count``; or ``None`` if no events were found.
+
+    Note:
+        ``version`` is intentionally **not** included in the returned dict.
+        Version is source-dependent: for JSONL sidecars it is computed from
+        the file's byte-size (cheap, robust, monotonic on append); for a
+        SQLite source it would be a row count.  Callers are responsible for
+        computing and attaching a version appropriate for their backend.
     """
     first_event: Optional[Dict[str, Any]] = None
-    last_event: Optional[Dict[str, Any]] = None
     message_count = 0
     pending_user = False
 
     for event in events:
         if first_event is None:
             first_event = event
-        last_event = event
         etype = event.get("type")
         if etype == "prompt.submitted":
             pending_user = True
@@ -284,7 +315,6 @@ def _aggregate_session_metadata(
         "workspace_dir": first_event.get("workspaceDir") or "",
         "model_id": first_event.get("modelId") or "",
         "session_created_at": first_event.get("ts") or "",
-        "version": str(last_event.get("seq", 0)) if last_event else "0",
         "message_count": message_count,
     }
 
@@ -394,7 +424,10 @@ def _scan_trajectory_file(path: Path) -> Optional[dict]:
     * ``workspace_dir`` — from ``workspaceDir`` field.
     * ``model_id`` — from ``modelId`` field.
     * ``session_created_at`` — ISO-8601 ``ts`` of the first event.
-    * ``version`` — ``str(seq)`` of the last event.
+    * ``version`` — **file size in bytes** (``str(path.stat().st_size)``).
+      Trajectory files are append-only, so the byte count is monotonically
+      non-decreasing and robust across re-runs.  (The previous per-run
+      ``seq`` was not monotonic across appends — M2 fix.)
     * ``message_count`` — number of complete exchange pairs found.
 
     Returns ``None`` if no parseable events are found or if the file has a
@@ -405,7 +438,13 @@ def _scan_trajectory_file(path: Path) -> Optional[dict]:
         :meth:`JsonlTrajectoryEventSource.session_metadata`; it exists for
         backward compatibility and is exported in :data:`__all__`.
     """
-    return JsonlTrajectoryEventSource(path).session_metadata()
+    meta = JsonlTrajectoryEventSource(path).session_metadata()
+    if meta is None:
+        return None
+    # M2: version = file size, not last_event.seq (which is per-run, not
+    # whole-file monotonic).  A file with 124 events may have last seq = 7.
+    meta["version"] = str(path.stat().st_size)
+    return meta
 
 
 # ---------------------------------------------------------------------------
@@ -508,34 +547,8 @@ def _discover_from_dir(sessions_dir: Path) -> List[Path]:
     return sorted(found)
 
 
-def _resolve_sessions_dir(local_path: Optional[str] = None) -> Optional[Path]:
-    """Resolve a sessions directory from an optional caller-supplied path.
-
-    Returns ``None`` when ``local_path`` points at a single trajectory file
-    (caller will handle enumeration themselves). Returns a :class:`Path` to
-    the directory to enumerate otherwise.
-
-    Raises :class:`SourceNotFoundError` when a non-``None`` ``local_path``
-    resolves to neither a file nor a directory.
-    """
-    if local_path:
-        p = Path(local_path).expanduser()
-        if p.is_file():
-            return None  # single-file mode; caller enumerates
-        if p.is_dir():
-            return p.resolve()
-        raise SourceNotFoundError(
-            f"SourceRef.local_path {local_path!r} is neither a file nor a directory."
-        )
-    # No explicit path: try defaults.
-    for raw in _DEFAULT_SESSIONS_DIRS:
-        p = Path(raw).expanduser()
-        if p.is_dir():
-            return p.resolve()
-    raise SourceNotFoundError(
-        f"No OpenClaw sessions directory found (searched {list(_DEFAULT_SESSIONS_DIRS)}). "
-        f"Pass SourceRef(local_path=<sessions-dir>) or create one of the default paths."
-    )
+# NOTE: _resolve_sessions_dir was removed (S1 fix — it was unused dead code;
+# all callers use _enumerate_trajectory_files which duplicated the logic).
 
 
 def _enumerate_trajectory_files(source: SourceRef) -> List[Path]:
@@ -574,7 +587,7 @@ def _enumerate_trajectory_files(source: SourceRef) -> List[Path]:
 
 
 # ---------------------------------------------------------------------------
-# Source file URI and transform helpers
+# Source file URI helpers
 # ---------------------------------------------------------------------------
 
 
@@ -588,43 +601,210 @@ def session_source_file(file_path: str, session_id: str) -> str:
     return f"openclaw://{file_path}#session={session_id}"
 
 
+def _peek_trajectory_header(path: Path) -> Optional[Tuple[str, str]]:
+    """Read only the first parseable event: validate schema + extract session_id.
+
+    This is the cheap O(1) pre-check used by :meth:`ingest` before committing
+    to a full parse.  Returns ``(session_id, first_ts)`` or ``None`` if the
+    file has no parseable events or a wrong ``traceSchema``.
+
+    The ``traceSchema`` check here mirrors the one inside ``iter_events()`` so
+    files with wrong schema are excluded *before* a :class:`SourceItemMetadata`
+    is yielded, preserving the existing "skip file entirely" behaviour.
+    """
+    try:
+        with path.open(encoding="utf-8", errors="replace") as fh:
+            for raw_line in fh:
+                raw = raw_line.strip()
+                if not raw:
+                    continue
+                try:
+                    event = json.loads(raw)
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                if not _validate_schema_marker(event, path.name):
+                    return None  # wrong traceSchema — skip file
+                session_id = event.get("sessionId") or path.name.removesuffix(_TRAJECTORY_SUFFIX)
+                return (session_id, event.get("ts") or "")
+    except OSError as exc:
+        logger.warning("openclaw adapter: cannot open %s: %s", path, exc)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Canonical-bytes helpers (M1 / RFC §7.3 conformance seam)
+# ---------------------------------------------------------------------------
+
+
 def _build_canonical_source_bytes(path: Path) -> str:
-    """Return the canonical source bytes for a trajectory file.
+    """Return the raw UTF-8 text of a trajectory file (conformance / test surface).
 
-    The canonical form is the raw UTF-8 text of the ``.trajectory.jsonl``
-    file (UTF-8 decode with replacement for invalid bytes). This is the
-    input the declared transformation chain consumes; the conformance
-    suite uses the same shape to verify the declared-transformation
-    round-trip is exact.
+    This is the input that the declared transformation chain consumes for the
+    conformance round-trip defined by RFC §7.3: apply every transform in
+    ``DECLARED_TRANSFORMATION_ORDER`` to this text in order and arrive at the
+    same chunks the runtime emits.
 
-    .. note:: SQLite seam — future work
-        For a SQLite-backed :class:`TrajectoryEventSource`, synthesise JSONL
-        text from the event rows before passing to this pipeline::
-
-            raw = "\\n".join(json.dumps(e) for e in source.iter_events())
-
-        This keeps the transform/chunk pipeline source-agnostic.  The helper
-        ``_build_canonical_source_bytes_from_events`` will be added when the
-        SQLite backend lands.
+    .. note:: Runtime path (M1)
+        The runtime does **not** call this function in the hot path.  It
+        collects parsed events via ``iter_events()`` **once**, builds the
+        role-tab-JSON turn text with :func:`_extract_turns_from_events` (no
+        second ``json.loads``), then applies only the post-extract transforms
+        via :func:`_apply_post_extract_pipeline`.  The outputs are identical.
     """
     return path.read_text(encoding="utf-8", errors="replace")
 
 
-def _apply_transform_pipeline(raw_text: str) -> str:
-    """Apply the declared OpenClaw transform pipeline in declaration order.
+def _build_canonical_source_bytes_from_events(events: List[Dict[str, Any]]) -> str:
+    """Serialise already-parsed events back to JSONL (SQLite seam / test helper).
 
-    Returns the pre-chunking exchange-pair transcript; pass the result to
-    ``convo_miner.chunk_exchanges`` to produce drawer chunks.
+    Produces the same canonical bytes that :func:`_build_canonical_source_bytes`
+    would return for the equivalent on-disk file.  This is the helper promised
+    in the original docstring and used by:
+
+    * The planned ``SqliteTrajectoryEventSource``: synthesise JSONL from
+      ``iter_events()`` output, then pass to ``openclaw_extract_turns`` for
+      conformance testing even though the runtime uses
+      :func:`_extract_turns_from_events`.
+    * Tests that need to verify the round-trip without a file on disk.
+
+    Each event is serialised as compact JSON on one line, separated by ``\\n``.
+    """
+    return "\n".join(json.dumps(e) for e in events)
+
+
+def _extract_turns_from_events(events: List[Dict[str, Any]]) -> str:
+    """Build role-tab-JSON turn lines directly from parsed events (runtime path).
+
+    Produces output **identical** to ``transforms.openclaw_extract_turns``
+    applied to the serialised events, but without a second ``json.loads`` over
+    the same bytes.  This is the single-parse runtime equivalent (M1 fix).
+
+    ``user`` turns come from ``prompt.submitted`` (``data.prompt``);
+    ``assistant`` turns come from ``model.completed`` (``data.assistantTexts``
+    joined with ``\\n``).  All other event types are skipped.
+    """
+    out: List[str] = []
+    pending_user: Optional[str] = None
+    for event in events:
+        etype = event.get("type")
+        data = event.get("data") or {}
+        if etype == "prompt.submitted":
+            pending_user = data.get("prompt") or ""
+        elif etype == "model.completed":
+            texts = data.get("assistantTexts") or []
+            assistant = "\n".join(x for x in texts if isinstance(x, str)).strip()
+            if pending_user is not None:
+                out.append(f"user\t{json.dumps(pending_user)}")
+            if assistant:
+                out.append(f"assistant\t{json.dumps(assistant)}")
+            pending_user = None
+    return "\n".join(out)
+
+
+def _extract_turns_and_metadata(
+    events: Iterator[Dict[str, Any]],
+    *,
+    fallback_stem: str = "",
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """Single streaming pass: build turn text AND aggregate metadata at once.
+
+    Fuses :func:`_extract_turns_from_events` and
+    :func:`_aggregate_session_metadata` into one iteration over ``events`` so
+    the caller never materializes the full event list (S5).  Only the
+    extracted turn strings and a reference to the first event are retained;
+    large plumbing events (``context.compiled`` carrying compiled system
+    prompts / tool schemas, ``trace.*`` etc.) are processed and discarded as
+    the generator yields them, keeping peak memory bounded by the
+    conversational text rather than the whole raw event stream.
+
+    Returns ``(turns_text, meta)``; both are ``None`` when no events were
+    found.  ``turns_text`` is byte-identical to
+    ``_extract_turns_from_events(list(events))`` and ``meta`` matches
+    :func:`_aggregate_session_metadata`, so the RFC §7.3 conformance
+    round-trip is unaffected.
+    """
+    first_event: Optional[Dict[str, Any]] = None
+    out: List[str] = []
+    pending_user: Optional[str] = None
+    message_count = 0
+
+    for event in events:
+        if first_event is None:
+            first_event = event
+        etype = event.get("type")
+        data = event.get("data") or {}
+        if etype == "prompt.submitted":
+            pending_user = data.get("prompt") or ""
+        elif etype == "model.completed":
+            texts = data.get("assistantTexts") or []
+            assistant = "\n".join(x for x in texts if isinstance(x, str)).strip()
+            if pending_user is not None:
+                out.append(f"user\t{json.dumps(pending_user)}")
+                # message_count counts completed exchange pairs (a
+                # model.completed answering a pending prompt) — identical to
+                # _aggregate_session_metadata's definition.
+                message_count += 1
+            if assistant:
+                out.append(f"assistant\t{json.dumps(assistant)}")
+            pending_user = None
+
+    if first_event is None:
+        return None, None
+
+    meta = {
+        "session_id": first_event.get("sessionId") or fallback_stem,
+        "session_key": first_event.get("sessionKey") or "",
+        "workspace_dir": first_event.get("workspaceDir") or "",
+        "model_id": first_event.get("modelId") or "",
+        "session_created_at": first_event.get("ts") or "",
+        "message_count": message_count,
+    }
+    return "\n".join(out), meta
+
+
+def _apply_transform_pipeline(raw_text: str) -> str:
+    """Apply the full declared OpenClaw transform pipeline from raw JSONL text.
+
+    Conformance / legacy path: starts from the raw ``*.trajectory.jsonl``
+    file text and applies all transforms in :data:`DECLARED_TRANSFORMATION_ORDER`
+    (including ``openclaw_extract_turns`` which re-parses the JSON).  The
+    runtime uses :func:`_extract_turns_from_events` +
+    :func:`_apply_post_extract_pipeline` to avoid the double-parse.
+    Both paths produce identical output.
     """
     pipeline = [
         _transforms.openclaw_extract_turns,
         _transforms.openclaw_strip_runtime_context,
         _transforms.openclaw_strip_metadata_preamble,
+        _transforms.openclaw_redact_secrets,
         _transforms.openclaw_format_exchange,
         _transforms.newline_normalize,
         _transforms.whitespace_trim,
     ]
     text = raw_text
+    for step in pipeline:
+        text = step(text)
+    return text
+
+
+def _apply_post_extract_pipeline(turns_text: str) -> str:
+    """Apply post-extract transforms to role-tab-JSON turn text (runtime path).
+
+    Receives the output of :func:`_extract_turns_from_events` (which is
+    identical to ``openclaw_extract_turns`` applied to raw bytes) and applies
+    the remaining declared transforms in :data:`DECLARED_TRANSFORMATION_ORDER`.
+    """
+    pipeline = [
+        _transforms.openclaw_strip_runtime_context,
+        _transforms.openclaw_strip_metadata_preamble,
+        _transforms.openclaw_redact_secrets,
+        _transforms.openclaw_format_exchange,
+        _transforms.newline_normalize,
+        _transforms.whitespace_trim,
+    ]
+    text = turns_text
     for step in pipeline:
         text = step(text)
     return text
@@ -636,10 +816,22 @@ def _now_utc_iso() -> str:
 
 
 def _detect_hall(content: str) -> str:
-    """Hall-detection helper — defers to convo_miner's cached lookup."""
-    from ..convo_miner import _detect_hall_cached
+    """Hall-detection helper — defers to convo_miner's cached lookup.
 
-    return _detect_hall_cached(content)
+    Uses the private ``_detect_hall_cached`` symbol from ``convo_miner``.
+    Guarded with ``getattr`` so a future rename or removal degrades gracefully
+    to an empty string rather than raising ``AttributeError`` at ingest time.
+    The coupling is intentional (same module family) but acknowledged as a
+    private dependency (S4 fix).
+    """
+    from .. import convo_miner as _cm
+
+    fn = getattr(_cm, "_detect_hall_cached", None)
+    if fn is not None:
+        return fn(content)
+    # Fallback: no hall routing if the private symbol was renamed.
+    logger.debug("openclaw adapter: _detect_hall_cached not found in convo_miner; returning ''")
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -648,7 +840,15 @@ def _detect_hall(content: str) -> str:
 
 
 class OpenClawSourceAdapter(BaseSourceAdapter):
-    """Mine OpenClaw AI-agent session transcripts into the palace (RFC 002 §1)."""
+    """Mine OpenClaw AI-agent session transcripts into the palace (RFC 002 §1).
+
+    .. note:: Secret redaction
+        The declared transform ``openclaw_redact_secrets`` is applied to every
+        turn before chunking.  This is best-effort protection against live
+        credentials in raw agent trajectories (``default_privacy_class =
+        "pii_potential"`` is retained).  See the ``openclaw_redact_secrets``
+        docstring for covered patterns and limitations.
+    """
 
     name = "openclaw"
     adapter_version = "0.1.0"
@@ -665,6 +865,7 @@ class OpenClawSourceAdapter(BaseSourceAdapter):
             "openclaw_extract_turns",
             "openclaw_strip_runtime_context",
             "openclaw_strip_metadata_preamble",
+            "openclaw_redact_secrets",
             "openclaw_format_exchange",
             "newline_normalize",
             "whitespace_trim",
@@ -672,13 +873,20 @@ class OpenClawSourceAdapter(BaseSourceAdapter):
     )
     default_privacy_class = "pii_potential"
 
-    # Order of declared transformations as applied by the adapter. The
-    # conformance suite walks this list in order, so it MUST mirror the
-    # actual pipeline in :func:`_apply_transform_pipeline`.
+    # Order of declared transformations as applied by the adapter pipeline.
+    # The conformance suite walks this list in order starting from the raw
+    # canonical source bytes (the *.trajectory.jsonl file text), so it MUST
+    # mirror the actual pipeline defined in :func:`_apply_transform_pipeline`.
+    #
+    # Runtime reconciliation (M1): the runtime uses
+    # :func:`_extract_turns_from_events` (no second json.loads) followed by
+    # :func:`_apply_post_extract_pipeline` (all steps after extract_turns).
+    # Both paths produce identical drawer content.
     DECLARED_TRANSFORMATION_ORDER: Tuple[str, ...] = (
         "openclaw_extract_turns",
         "openclaw_strip_runtime_context",
         "openclaw_strip_metadata_preamble",
+        "openclaw_redact_secrets",
         "openclaw_format_exchange",
         "newline_normalize",
         "whitespace_trim",
@@ -736,7 +944,9 @@ class OpenClawSourceAdapter(BaseSourceAdapter):
                     type="int",
                     required=True,
                     description=(
-                        "Number of exchange pairs (user+assistant turns) extracted from the session"
+                        "Count of complete exchange pairs (prompt.submitted → model.completed) "
+                        "found in raw trajectory events. Note: the number of emitted drawers "
+                        "may differ because chunking may split or merge exchanges."
                     ),
                 ),
                 "extract_mode": FieldSpec(
@@ -761,26 +971,51 @@ class OpenClawSourceAdapter(BaseSourceAdapter):
             raise AdapterClosedError("OpenClawSourceAdapter is closed")
         trajectory_files = _enumerate_trajectory_files(source)
         for tfile in trajectory_files:
-            meta = _scan_trajectory_file(tfile)
-            if meta is None:
-                logger.debug("openclaw adapter: skipping %s (no parseable events)", tfile)
+            # ----------------------------------------------------------
+            # CHEAP STAGE: stat + first-event peek; no full JSON parse.
+            # ----------------------------------------------------------
+
+            # M2/S2: version = file byte size.  Trajectory files are
+            # append-only, so size grows monotonically on any real change.
+            # The previous last_event["seq"] was per-run (not whole-file
+            # monotonic), so two distinct file states could share the same
+            # trailing seq — fixed here.  Using stat avoids opening the file
+            # at all for "current" files.
+            try:
+                file_size = tfile.stat().st_size
+            except OSError as exc:
+                logger.warning("openclaw adapter: cannot stat %s: %s", tfile, exc)
                 continue
+            version = str(file_size)
+
+            # Peek first event: validate traceSchema + extract session_id.
+            # Returns None for empty files or wrong traceSchema → skip file
+            # entirely so no SourceItemMetadata is yielded (preserves the
+            # existing "skip file silently" contract for bad-schema files).
+            header = _peek_trajectory_header(tfile)
+            if header is None:
+                logger.debug(
+                    "openclaw adapter: skipping %s (no parseable events or wrong schema)",
+                    tfile,
+                )
+                continue
+            session_id, _first_ts = header
 
             file_path = str(tfile)
-            session_id = meta["session_id"]
             src_file = session_source_file(file_path, session_id)
-            version = meta["version"]
 
-            # Yield lazy-fetch metadata so core can short-circuit when
-            # the trajectory file hasn't grown since the last ingest.
+            # Yield lazy-fetch metadata; core short-circuits via is_current.
+            # route_hint is None at this stage (workspace_dir unknown until
+            # full parse); the DrawerRecord emit fills it in per chunk.
             yield SourceItemMetadata(
                 source_file=src_file,
                 version=version,
-                size_hint=tfile.stat().st_size,
-                route_hint=self._route_hint_for(source, meta["workspace_dir"]),
+                size_hint=file_size,
+                route_hint=None,
             )
-            # is_skip_requested() is the public getter added in PR #1484 (not yet
-            # on develop); fall back to the underlying flag until it merges.
+
+            # is_skip_requested() is the public getter added in PR #1484 (not
+            # yet on develop); fall back to the underlying flag until it merges.
             skip = (
                 palace.is_skip_requested()
                 if hasattr(palace, "is_skip_requested")
@@ -789,8 +1024,40 @@ class OpenClawSourceAdapter(BaseSourceAdapter):
             if skip:
                 continue
 
-            raw_text = _build_canonical_source_bytes(tfile)
-            transcript = _apply_transform_pipeline(raw_text)
+            # ----------------------------------------------------------
+            # FULL PARSE STAGE (only for non-current files).
+            # M1: iter_events() is the SINGLE JSON parse.
+            # S5: a single streaming pass builds turn text AND metadata
+            # together, so we never materialize the full event list — large
+            # plumbing events (context.compiled, trace.*) are discarded as the
+            # generator yields them, keeping peak memory bounded by the
+            # conversational text rather than the whole raw event stream.
+            # ----------------------------------------------------------
+            event_source = JsonlTrajectoryEventSource(tfile)
+            turns_text, meta = _extract_turns_and_metadata(
+                event_source.iter_events(),
+                fallback_stem=session_id,
+            )
+            if meta is None:
+                logger.debug(
+                    "openclaw adapter: skipping %s — no parseable events after full scan",
+                    tfile.name,
+                )
+                continue
+
+            # session_id from events may differ from filename in edge cases
+            # (e.g. doctor-imported files); prefer the event-sourced value so
+            # stored source_file URIs are consistent with what iter_events saw.
+            session_id = meta["session_id"]
+            src_file = session_source_file(file_path, session_id)
+
+            # M1: turns_text was built directly from parsed events (no second
+            # json.loads).  It is identical to openclaw_extract_turns applied
+            # to the serialised events; the conformance round-trip still
+            # applies openclaw_extract_turns via DECLARED_TRANSFORMATION_ORDER
+            # (text→text reference impl) — only the runtime shortcut differs.
+            transcript = _apply_post_extract_pipeline(turns_text)
+
             if not transcript:
                 logger.debug(
                     "openclaw adapter: skipping %s — empty transcript after transforms",
@@ -806,8 +1073,9 @@ class OpenClawSourceAdapter(BaseSourceAdapter):
                 )
                 continue
 
-            # message_count is computed during scan: number of matched
-            # prompt.submitted → model.completed pairs in the raw events.
+            # S3: message_count = exchange pair count from raw events (NOT
+            # the chunk/drawer count, which depends on chunking).  The schema
+            # description now documents this distinction explicitly.
             message_count = meta["message_count"]
 
             wing = self._wing_for(source, meta["workspace_dir"])
@@ -817,6 +1085,7 @@ class OpenClawSourceAdapter(BaseSourceAdapter):
             for chunk in chunks:
                 content = chunk["content"]
                 chunk_index = int(chunk["chunk_index"])
+                hall = _detect_hall(content)
                 metadata = {
                     # Universal §5.1 fields
                     "source_file": src_file,
@@ -825,7 +1094,7 @@ class OpenClawSourceAdapter(BaseSourceAdapter):
                     "added_by": "openclaw-adapter",
                     "wing": wing,
                     "room": room,
-                    "hall": _detect_hall(content),
+                    "hall": hall,
                     "ingest_mode": "chunked_content",
                     "extract_mode": "exchange",
                     "privacy_class": self.default_privacy_class,
@@ -845,7 +1114,7 @@ class OpenClawSourceAdapter(BaseSourceAdapter):
                     source_file=src_file,
                     chunk_index=chunk_index,
                     metadata=metadata,
-                    route_hint=RouteHint(wing=wing, room=room, hall=metadata["hall"]),
+                    route_hint=RouteHint(wing=wing, room=room, hall=hall),
                 )
 
     # ------------------------------------------------------------------
@@ -861,6 +1130,7 @@ class OpenClawSourceAdapter(BaseSourceAdapter):
         if not existing_metadata:
             return False
         # Prefer the stored ``openclaw_session_version`` field (set in v0.1+).
+        # Both the stored value and item.version are now file-size strings.
         stored_version = existing_metadata.get("openclaw_session_version")
         if stored_version is not None:
             return str(stored_version) == item.version
@@ -931,5 +1201,6 @@ __all__ = [
     "TrajectoryEventSource",
     "session_source_file",
     "_build_canonical_source_bytes",
+    "_build_canonical_source_bytes_from_events",
     "_scan_trajectory_file",
 ]

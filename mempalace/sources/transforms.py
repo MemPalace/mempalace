@@ -366,6 +366,110 @@ def openclaw_format_exchange(text: str) -> str:  # noqa: D401
 
 
 # ---------------------------------------------------------------------------
+# Adapter-namespaced reference implementations — OpenClaw (continued)
+# ---------------------------------------------------------------------------
+#
+# M3: Secret redaction (RFC 002 §7.3 declared transform).
+#
+# ``openclaw_redact_secrets`` applies best-effort regex redaction to role-tab-
+# JSON turn lines (the format produced by ``openclaw_extract_turns``).  It
+# operates on the decoded body of every turn (both user and assistant) before
+# content is chunked into drawers.  This reduces the risk of vacuuming live
+# credentials from raw agent trajectories into ChromaDB.
+#
+# .. warning::
+#     This is BEST-EFFORT redaction only — it covers known prefixes and common
+#     key=value patterns, not every possible secret format.  Do not rely on it
+#     as the sole credential-protection mechanism.
+
+# AWS access key IDs: AKIA... (long-term) or ASIA... (assumed-role)
+_OC_RE_AWS_KEY = re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")
+
+# Well-known token prefixes with variable-length alphanumeric tails.
+_OC_RE_PREFIXED_TOKENS = re.compile(
+    r"\b(?:"
+    r"ghp_[A-Za-z0-9_]{36,}"  # GitHub personal access token
+    r"|ghs_[A-Za-z0-9_]{36,}"  # GitHub server-to-server token
+    r"|lin_api_[A-Za-z0-9_]{30,}"  # Linear API key
+    r"|xoxb-[A-Za-z0-9\-]{20,}"  # Slack bot token
+    r"|xoxp-[A-Za-z0-9\-]{20,}"  # Slack user token
+    r"|sk-[A-Za-z0-9]{20,}"  # OpenAI / generic sk- token
+    r"|clh_[A-Za-z0-9_\-]{20,}"  # ClawHub token
+    r"|ATATT[A-Za-z0-9+=/\-_]{30,}"  # Atlassian (Jira) personal access token
+    r")"
+)
+
+# Bearer token in an Authorization header.
+_OC_RE_BEARER = re.compile(r"(?i)\bBearer\s+([A-Za-z0-9\-._~+/]{16,}=*)")
+
+# HTTP Basic Auth base64 blob.
+_OC_RE_BASIC_AUTH = re.compile(r"(?i)\bBasic\s+([A-Za-z0-9+/]{8,}={0,2})\b")
+
+# PEM private key blocks.
+_OC_RE_PEM_KEY = re.compile(
+    r"-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----.*?-----END (?:[A-Z ]+ )?PRIVATE KEY-----",
+    re.DOTALL,
+)
+
+# Common key=value / key: value assignment patterns.
+# Group 1 = the key prefix (preserved); group 2 = the value (redacted).
+_OC_RE_KV_SECRET = re.compile(
+    r"(?i)"
+    r"((?:api[_-]?key|api[_-]?token|auth[_-]?token|access[_-]?token"
+    r"|secret[_-]?key|secret[_-]?token|secret|password|passwd|private[_-]?key)"
+    r"\s*[:=]\s*)"
+    r"([^\s,'\"\n>{]{8,})"
+)
+
+
+def openclaw_redact_secrets(text: str) -> str:  # noqa: D401
+    """Redact common secret patterns from role-tab-JSON turn lines (best-effort).
+
+    Operates on the role-tab-JSON line format produced by
+    :func:`openclaw_extract_turns`.  JSON-decodes the body of every turn (both
+    ``user`` and ``assistant``), applies the regex suite below, then re-encodes.
+
+    Patterns covered:
+
+    * AWS access key IDs — ``AKIA\u2026`` / ``ASIA\u2026`` + 16 alphanumeric chars.
+    * Well-known token prefixes — ``ghp_``, ``ghs_``, ``lin_api_``, ``xoxb-``,
+      ``xoxp-``, ``sk-``, ``clh_``, ``ATATT``.
+    * ``Bearer <token>`` Authorization header values.
+    * ``Basic <base64>`` Authorization header values.
+    * PEM ``-----BEGIN \u2026 PRIVATE KEY-----`` blocks.
+    * ``key = value`` / ``token: value`` / ``secret = value`` assignment pairs.
+
+    Redacted values are replaced by stable placeholders of the form
+    ``[REDACTED:<kind>]`` so the sanitised content is still human-readable.
+
+    .. warning::
+        BEST-EFFORT only.  This transform reduces the risk of credentials
+        landing in ChromaDB but is **not a security guarantee**.  It cannot
+        detect every possible secret format.
+    """
+    out: list[str] = []
+    for line in text.split("\n"):
+        role, sep, body_json = line.partition("\t")
+        if not sep:
+            out.append(line)
+            continue
+        try:
+            body = _json.loads(body_json)
+            if isinstance(body, str):
+                body = _OC_RE_AWS_KEY.sub("[REDACTED:aws_key]", body)
+                body = _OC_RE_PREFIXED_TOKENS.sub("[REDACTED:api_token]", body)
+                body = _OC_RE_BEARER.sub("Bearer [REDACTED:bearer_token]", body)
+                body = _OC_RE_BASIC_AUTH.sub("Basic [REDACTED:basic_auth]", body)
+                body = _OC_RE_PEM_KEY.sub("[REDACTED:pem_private_key]", body)
+                body = _OC_RE_KV_SECRET.sub(r"\1[REDACTED:secret_value]", body)
+            body_json = _json.dumps(body)
+        except (ValueError, TypeError):
+            pass
+        out.append(f"{role}\t{body_json}")
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 

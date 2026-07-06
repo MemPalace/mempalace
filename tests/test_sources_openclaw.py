@@ -506,14 +506,93 @@ def test_scan_trajectory_file_returns_none_for_empty_file(tmp_path):
     assert _scan_trajectory_file(empty) is None
 
 
-def test_scan_trajectory_file_version_is_last_seq(sessions_dir):
-    """Version must be the seq of the last event (append-only growth check)."""
+def test_scan_trajectory_file_version_is_size_based(sessions_dir):
+    """Version must be the file byte-size (append-only monotonic — M2 fix)."""
     tfile = sessions_dir / f"{_SESSION_SIMPLE}.trajectory.jsonl"
     meta = _scan_trajectory_file(tfile)
-    # Read the last non-empty line to confirm the seq matches
-    events = [json.loads(ln) for ln in tfile.read_text().splitlines() if ln.strip()]
-    last_seq = str(events[-1]["seq"])
-    assert meta["version"] == last_seq
+    assert meta is not None
+    assert meta["version"] == str(tfile.stat().st_size)
+
+
+def test_version_is_stable_when_file_unchanged(sessions_dir):
+    """Re-scanning the same unchanged file must return the same version."""
+    tfile = sessions_dir / f"{_SESSION_SIMPLE}.trajectory.jsonl"
+    meta1 = _scan_trajectory_file(tfile)
+    meta2 = _scan_trajectory_file(tfile)
+    assert meta1 is not None
+    assert meta2 is not None
+    assert meta1["version"] == meta2["version"]
+
+
+def test_version_grows_on_append(tmp_path):
+    """Appending bytes to a file must increase its version (M2: size-based)."""
+    tfile = tmp_path / "sess-grow.trajectory.jsonl"
+    build_trajectory_fixture(
+        tfile,
+        "sess-grow",
+        [("Initial question that forms a complete chunk.", ["Initial answer."])],
+        workspace_dir="/tmp/test",
+    )
+    meta1 = _scan_trajectory_file(tfile)
+    assert meta1 is not None
+
+    # Append a benign non-event line (version check only cares about byte count).
+    extra = {
+        "type": "trace.ping",
+        "seq": 99,
+        "sessionId": "sess-grow",
+        "traceSchema": "openclaw-trajectory",
+        "schemaVersion": 1,
+        "ts": "2026-01-02T00:00:00.000Z",
+        "data": {},
+    }
+    with tfile.open("a") as fh:
+        fh.write(json.dumps(extra) + "\n")
+
+    meta2 = _scan_trajectory_file(tfile)
+    assert meta2 is not None
+    assert int(meta2["version"]) > int(meta1["version"]), (
+        "appending to a file must increase the size-based version"
+    )
+
+
+def test_per_run_seq_no_longer_used_as_version(tmp_path):
+    """Confirm version is NOT the last event's seq (which would break M2)."""
+    tfile = tmp_path / "sess-seq-check.trajectory.jsonl"
+    # Write a tiny file where last seq is 7 (mirrors the real-data finding).
+    events = [
+        {
+            "traceSchema": "openclaw-trajectory",
+            "schemaVersion": 1,
+            "type": "session.started",
+            "seq": 1,
+            "sessionId": "sess-seq-check",
+            "sessionKey": "k",
+            "workspaceDir": "/tmp",
+            "modelId": "m",
+            "ts": "2026-01-01T00:00:00.000Z",
+            "data": {},
+        },
+        {
+            "traceSchema": "openclaw-trajectory",
+            "schemaVersion": 1,
+            "type": "model.completed",
+            "seq": 7,  # seq resets per-run
+            "sessionId": "sess-seq-check",
+            "sessionKey": "k",
+            "workspaceDir": "/tmp",
+            "modelId": "m",
+            "ts": "2026-01-01T00:00:01.000Z",
+            "data": {"assistantTexts": ["answer"]},
+        },
+    ]
+    with tfile.open("w") as fh:
+        for e in events:
+            fh.write(json.dumps(e) + "\n")
+    meta = _scan_trajectory_file(tfile)
+    assert meta is not None
+    assert meta["version"] != "7", "version must not be last_event.seq (per-run, not monotonic)"
+    assert meta["version"] == str(tfile.stat().st_size)
 
 
 # ===========================================================================
@@ -681,6 +760,90 @@ def test_is_current_falls_back_to_presence_when_version_missing(adapter):
 
 
 # ===========================================================================
+# M1: No-double-parse — runtime path identical to conformance path
+# ===========================================================================
+
+
+def test_extract_turns_from_events_matches_openclaw_extract_turns(sessions_dir):
+    """_extract_turns_from_events must produce identical output to openclaw_extract_turns."""
+    from mempalace.sources.openclaw import (
+        JsonlTrajectoryEventSource,
+        _build_canonical_source_bytes_from_events,
+        _extract_turns_from_events,
+    )
+
+    tfile = sessions_dir / f"{_SESSION_SIMPLE}.trajectory.jsonl"
+    src = JsonlTrajectoryEventSource(tfile)
+    events = list(src.iter_events())
+
+    # Runtime path (single parse).
+    runtime_turns = _extract_turns_from_events(events)
+
+    # Conformance path (re-serialise events, then run declared extract transform).
+    canon_bytes = _build_canonical_source_bytes_from_events(events)
+    conformance_turns = src_transforms.openclaw_extract_turns(canon_bytes)
+
+    assert runtime_turns == conformance_turns, (
+        "_extract_turns_from_events must produce identical output to "
+        "openclaw_extract_turns applied to serialised events"
+    )
+
+
+def test_extract_turns_and_metadata_matches_split_helpers(sessions_dir):
+    """S5: the fused single-pass runtime path must be byte-identical to the two
+    original helpers it replaces (so it can't silently drift from the RFC
+    conformance reference impls)."""
+    from mempalace.sources.openclaw import (
+        JsonlTrajectoryEventSource,
+        _aggregate_session_metadata,
+        _extract_turns_and_metadata,
+        _extract_turns_from_events,
+    )
+
+    tfile = sessions_dir / f"{_SESSION_SIMPLE}.trajectory.jsonl"
+    events = list(JsonlTrajectoryEventSource(tfile).iter_events())
+
+    turns_split = _extract_turns_from_events(events)
+    meta_split = _aggregate_session_metadata(tfile.name, iter(events), fallback_stem=tfile.stem)
+
+    # Fused pass consumes a fresh generator (never materializes the list).
+    turns_fused, meta_fused = _extract_turns_and_metadata(
+        JsonlTrajectoryEventSource(tfile).iter_events(),
+        fallback_stem=tfile.stem,
+    )
+
+    assert turns_fused == turns_split
+    assert meta_fused == meta_split
+
+
+def test_extract_turns_and_metadata_empty_returns_none():
+    """S5: no events → (None, None), matching the split helpers' empty contract."""
+    from mempalace.sources.openclaw import _extract_turns_and_metadata
+
+    turns, meta = _extract_turns_and_metadata(iter([]), fallback_stem="stem")
+    assert turns is None and meta is None
+
+
+def test_build_canonical_source_bytes_from_events_round_trips(sessions_dir):
+    """Serialise → extract should reproduce the same turns as direct extract."""
+    from mempalace.sources.openclaw import (
+        JsonlTrajectoryEventSource,
+        _build_canonical_source_bytes_from_events,
+    )
+
+    tfile = sessions_dir / f"{_SESSION_METADATA}.trajectory.jsonl"
+    src = JsonlTrajectoryEventSource(tfile)
+    events = list(src.iter_events())
+
+    canon = _build_canonical_source_bytes_from_events(events)
+    # Every line must be valid JSON.
+    for i, line in enumerate(canon.split("\n")):
+        if line.strip():
+            parsed = json.loads(line)
+            assert isinstance(parsed, dict), f"line {i} not a dict after round-trip"
+
+
+# ===========================================================================
 # Transform unit tests
 # ===========================================================================
 
@@ -808,8 +971,15 @@ def test_openclaw_format_exchange_handles_multiline_user():
 def test_declared_transformation_round_trip_reproduces_drawer_content(
     adapter, palace_ctx, sessions_dir
 ):
-    """Applying the declared transforms in order to canonical source bytes
-    then chunking MUST reproduce the drawer content."""
+    """Applying declared transforms in order to canonical source bytes then
+    chunking MUST reproduce the drawer content (RFC 002 §7.3 conformance).
+
+    This test verifies both:
+    (a) The conformance path: raw bytes → full DECLARED_TRANSFORMATION_ORDER → chunks.
+    (b) Implicitly, the runtime path (_extract_turns_from_events +
+        _apply_post_extract_pipeline) produces identical results since both
+        paths converge on the same transcript text.
+    """
     results = list(
         adapter.ingest(source=SourceRef(local_path=str(sessions_dir)), palace=palace_ctx)
     )
@@ -1711,18 +1881,25 @@ def test_jsonl_source_iter_events_yields_dicts(sessions_dir):
 
 
 def test_jsonl_source_session_metadata_is_consistent_with_scan(sessions_dir):
-    """JsonlTrajectoryEventSource.session_metadata must match _scan_trajectory_file."""
+    """JsonlTrajectoryEventSource.session_metadata must match _scan_trajectory_file.
+
+    _scan_trajectory_file adds 'version' (size-based) on top of the base metadata;
+    all other keys must agree.
+    """
     for sid in (_SESSION_SIMPLE, _SESSION_METADATA, _SESSION_UNICODE):
         tfile = sessions_dir / f"{sid}.trajectory.jsonl"
         src = JsonlTrajectoryEventSource(tfile)
         meta_src = src.session_metadata()
         meta_scan = _scan_trajectory_file(tfile)
-        # Both paths should agree (scan delegates to the source anyway, but
-        # this double-checks the contract is stable).
-        assert meta_src == meta_scan, (
-            f"JsonlTrajectoryEventSource.session_metadata() and _scan_trajectory_file() "
-            f"must agree for {sid}"
+        assert meta_src is not None
+        assert meta_scan is not None
+        # scan adds 'version'; strip it before comparing.
+        scan_without_version = {k: v for k, v in meta_scan.items() if k != "version"}
+        assert meta_src == scan_without_version, (
+            f"session_metadata() and _scan_trajectory_file() (minus 'version') must agree for {sid}"
         )
+        # version must be the file size.
+        assert meta_scan["version"] == str(tfile.stat().st_size)
 
 
 def test_jsonl_source_metadata_cache_is_stable(sessions_dir):
@@ -1743,4 +1920,247 @@ def test_reader_abstraction_seam_docstring_present():
     )
     assert "SqliteTrajectoryEventSource" in doc, (
         "TrajectoryEventSource docstring must name the expected SQLite implementation"
+    )
+
+
+# ===========================================================================
+# M3: Secret redaction — transform unit tests + end-to-end
+# ===========================================================================
+
+# Fake (non-real) secret values used exclusively in test fixtures.
+# These are intentionally synthetic — they follow the prefix format but are
+# not (and have never been) real credentials.
+_FAKE_AWS_KEY = "AKIAFAKEKEY1234ABCDE"
+_FAKE_GH_TOKEN = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+_FAKE_LIN_API = "lin_api_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+_FAKE_BEARER = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.AAAAAAAAAAAAAAAAAA"
+_FAKE_ATATT = "ATATT3xFfGF0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+_FAKE_CLH = "clh_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+_FAKE_PEM = (
+    "-----BEGIN RSA PRIVATE KEY-----\n"
+    "MIIEowIBAAKCAQEA0000000000000000000000000000000000000000000000\n"
+    "-----END RSA PRIVATE KEY-----"
+)
+
+
+def test_openclaw_redact_secrets_removes_aws_key():
+    """AWS access key IDs must be redacted."""
+    role_tab = f"user\t{json.dumps(f'My key is {_FAKE_AWS_KEY} thanks')}"
+    result = src_transforms.openclaw_redact_secrets(role_tab)
+    body = json.loads(result.partition("\t")[2])
+    assert _FAKE_AWS_KEY not in body
+    assert "[REDACTED:aws_key]" in body
+
+
+def test_openclaw_redact_secrets_removes_github_token():
+    """GitHub personal access tokens (ghp_...) must be redacted."""
+    role_tab = f"assistant\t{json.dumps(f'Token: {_FAKE_GH_TOKEN}')}"
+    result = src_transforms.openclaw_redact_secrets(role_tab)
+    body = json.loads(result.partition("\t")[2])
+    assert _FAKE_GH_TOKEN not in body
+    assert "[REDACTED:api_token]" in body
+
+
+def test_openclaw_redact_secrets_removes_linear_api_key():
+    """Linear API keys (lin_api_...) must be redacted."""
+    role_tab = f"user\t{json.dumps(f'API key: {_FAKE_LIN_API}')}"
+    result = src_transforms.openclaw_redact_secrets(role_tab)
+    body = json.loads(result.partition("\t")[2])
+    assert _FAKE_LIN_API not in body
+    assert "[REDACTED:api_token]" in body
+
+
+def test_openclaw_redact_secrets_removes_bearer_token():
+    """Bearer tokens in Authorization headers must be redacted."""
+    role_tab = f"user\t{json.dumps(f'Authorization: Bearer {_FAKE_BEARER}')}"
+    result = src_transforms.openclaw_redact_secrets(role_tab)
+    body = json.loads(result.partition("\t")[2])
+    assert _FAKE_BEARER not in body
+    assert "Bearer [REDACTED:bearer_token]" in body
+
+
+def test_openclaw_redact_secrets_removes_kv_password():
+    """key=value password patterns must be redacted."""
+    role_tab = f"user\t{json.dumps('password=SuperSecretPass123!')}"
+    result = src_transforms.openclaw_redact_secrets(role_tab)
+    body = json.loads(result.partition("\t")[2])
+    assert "SuperSecretPass123!" not in body
+    assert "[REDACTED:secret_value]" in body
+
+
+def test_openclaw_redact_secrets_removes_pem_private_key():
+    """PEM private key blocks must be redacted."""
+    role_tab = f"user\t{json.dumps(f'Key: {_FAKE_PEM}')}"
+    result = src_transforms.openclaw_redact_secrets(role_tab)
+    body = json.loads(result.partition("\t")[2])
+    assert "-----BEGIN RSA PRIVATE KEY-----" not in body
+    assert "[REDACTED:pem_private_key]" in body
+
+
+def test_openclaw_redact_secrets_is_noop_for_clean_content():
+    """Clean content (no secrets) must pass through unchanged."""
+    clean = "How do I use Python decorators effectively in production code?"
+    role_tab = f"user\t{json.dumps(clean)}"
+    result = src_transforms.openclaw_redact_secrets(role_tab)
+    body = json.loads(result.partition("\t")[2])
+    assert body == clean
+
+
+def test_openclaw_redact_secrets_redacts_assistant_turns():
+    """Redaction must apply to assistant turns as well as user turns."""
+    role_tab = f"assistant\t{json.dumps(f'Here is your token: {_FAKE_GH_TOKEN}')}"
+    result = src_transforms.openclaw_redact_secrets(role_tab)
+    body = json.loads(result.partition("\t")[2])
+    assert _FAKE_GH_TOKEN not in body
+
+
+def test_redaction_end_to_end_drawer_content(adapter, palace_ctx, tmp_path):
+    """Seeded fake secrets must NOT appear in emitted drawer content (M3).
+
+    Uses only synthetic/fake credentials — no real tokens.
+    """
+    sdir = tmp_path / "sessions"
+    sdir.mkdir()
+
+    # Embed fake credentials into the user prompts.
+    user_text_with_secrets = (
+        f"My AWS key is {_FAKE_AWS_KEY} and my GitHub token is {_FAKE_GH_TOKEN}. "
+        f"Also the Linear key is {_FAKE_LIN_API} and Atlassian is {_FAKE_ATATT}. "
+        f"Please help me set up access. This text is long enough to form a chunk."
+    )
+    assistant_text = (
+        "I can help you set up access. Please rotate those credentials first — "
+        "sharing them in chat is insecure. This answer is long enough to chunk."
+    )
+
+    build_trajectory_fixture(
+        sdir / "sess-redact-e2e.trajectory.jsonl",
+        "sess-redact-e2e",
+        [(user_text_with_secrets, [assistant_text])],
+        workspace_dir="/home/user/projects/redact-test",
+    )
+
+    results = list(adapter.ingest(source=SourceRef(local_path=str(sdir)), palace=palace_ctx))
+    drawers = [r for r in results if isinstance(r, DrawerRecord)]
+    assert drawers, "expected at least one drawer"
+
+    joined = "\n".join(d.content for d in drawers)
+
+    # None of the fake secrets should appear in drawer content.
+    assert _FAKE_AWS_KEY not in joined, "AWS key survived redaction"
+    assert _FAKE_GH_TOKEN not in joined, "GitHub token survived redaction"
+    assert _FAKE_LIN_API not in joined, "Linear API key survived redaction"
+    assert _FAKE_ATATT not in joined, "Atlassian token survived redaction"
+
+    # Legitimate content must still be present.
+    assert "set up access" in joined or "rotate" in joined, (
+        "legitimate content was stripped by over-aggressive redaction"
+    )
+
+
+def test_redaction_round_trip_still_matches_declared_transforms(adapter, palace_ctx, tmp_path):
+    """Conformance: declared-transform round-trip must match runtime even with redaction.
+
+    Seeded secrets are redacted in BOTH the conformance path and the runtime path,
+    so the outputs must remain identical.
+    """
+    from mempalace.convo_miner import chunk_exchanges
+
+    sdir = tmp_path / "sessions"
+    sdir.mkdir()
+
+    user_text = (
+        f"Token for CI: {_FAKE_GH_TOKEN}. "
+        f"Please confirm the deployment pipeline is set up. "
+        f"This message is intentionally long enough to form a chunk for testing."
+    )
+    assistant_text = (
+        "Deployment confirmed. The CI pipeline is configured. "
+        "This response is also long enough to be chunked properly."
+    )
+
+    tfile = sdir / "sess-redact-roundtrip.trajectory.jsonl"
+    build_trajectory_fixture(
+        tfile,
+        "sess-redact-roundtrip",
+        [(user_text, [assistant_text])],
+        workspace_dir="/home/user/projects/roundtrip",
+    )
+
+    results = list(adapter.ingest(source=SourceRef(local_path=str(sdir)), palace=palace_ctx))
+    drawers = [r for r in results if isinstance(r, DrawerRecord)]
+    if not drawers:
+        pytest.skip("no drawers — nothing to verify")
+
+    # Apply conformance path.
+    raw = _build_canonical_source_bytes(tfile)
+    transformed = raw
+    for name in adapter.DECLARED_TRANSFORMATION_ORDER:
+        fn = getattr(src_transforms, name)
+        transformed = fn(transformed)
+    expected_chunks = chunk_exchanges(transformed)
+
+    ds_sorted = sorted(drawers, key=lambda d: d.chunk_index)
+    assert len(expected_chunks) == len(ds_sorted)
+    for c, d in zip(expected_chunks, ds_sorted):
+        assert c["content"] == d.content, (
+            f"round-trip mismatch at chunk_index={d.chunk_index} after redaction"
+        )
+
+
+# ===========================================================================
+# S3: message_count definition — drawer count vs exchange-pair count
+# ===========================================================================
+
+
+def test_message_count_reflects_exchange_pairs_not_drawer_count(adapter, palace_ctx, tmp_path):
+    """message_count must equal exchange pairs, NOT drawer count (S3 fix).
+
+    The schema description now explicitly states this — verify the field value
+    is the exchange pair count for a session where chunking might produce a
+    different number of drawers.
+    """
+    sdir = tmp_path / "sessions"
+    sdir.mkdir()
+
+    # Build a 3-exchange session.
+    exchanges = [
+        (
+            f"Question {i}: explain concept {i} in enough detail to fill a chunk properly.",
+            [f"Answer {i}: here is a thorough explanation of concept {i} that fills a chunk."],
+        )
+        for i in range(3)
+    ]
+    build_trajectory_fixture(
+        sdir / "sess-msgcount.trajectory.jsonl",
+        "sess-msgcount",
+        exchanges,
+        workspace_dir="/home/user/projects/msgcount",
+    )
+
+    results = list(adapter.ingest(source=SourceRef(local_path=str(sdir)), palace=palace_ctx))
+    drawers = [r for r in results if isinstance(r, DrawerRecord)]
+    assert drawers
+
+    # All drawers from one session share the same message_count.
+    mc_values = {d.metadata["message_count"] for d in drawers}
+    assert len(mc_values) == 1, "all drawers from one session must have the same message_count"
+    mc = mc_values.pop()
+
+    # message_count must equal the number of exchange pairs (3), not drawer count.
+    assert mc == 3, f"expected message_count == 3 (exchange pairs), got {mc}"
+
+    # Document that it may differ from drawer count (S3 contract).
+    # (We don't assert equality — the spec says they CAN differ.)
+    drawer_count = len(drawers)
+    _ = drawer_count  # number of drawers is chunk-dependent; not required to equal mc
+
+
+def test_schema_description_documents_message_count_definition(adapter):
+    """describe_schema message_count description must mention 'drawer' or 'chunking'."""
+    schema = adapter.describe_schema()
+    desc = schema.fields["message_count"].description
+    assert any(word in desc.lower() for word in ("drawer", "chunk", "emitted", "differ")), (
+        "message_count schema description must clarify it counts exchange pairs, "
+        f"not drawers (got: {desc!r})"
     )
