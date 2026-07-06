@@ -172,20 +172,54 @@ def speaker_role_assignment(text: str) -> str:
 
 
 # Regex patterns for user-text cleanup — compiled once at module load.
+
+# Strip the OpenClaw internal context injection block inserted before every prompt.
 _OPENCLAW_RUNTIME_BLOCK = re.compile(
     r"OpenClaw runtime context.*?END_OPENCLAW_INTERNAL_CONTEXT>>>",
     re.DOTALL,
 )
+# Strip fenced code blocks whose body contains OpenClaw routing metadata keys.
 _OPENCLAW_META_FENCE = re.compile(
     r"```[a-zA-Z]*\s*\n.*?(?:chat_id|inbound_event_kind|sender_id|\"label\").*?```",
     re.DOTALL,
 )
+# Strip bare label header lines injected above the metadata fences.
 _OPENCLAW_LABEL_LINES = re.compile(
     r"^\s*(?:Conversation info \(untrusted metadata\):"
     r"|Sender \(untrusted metadata\):"
     r"|Conversation info.*:"
     r"|.*untrusted metadata.*:)\s*$",
     re.MULTILINE,
+)
+# Strip Slack routing header prepended to each Slack-delivered message:
+# "[Slack <name> +Nm Mon YYYY-MM-DD HH:MM:SS UTC] <name>: "
+# Uses [ \t]+ (not \s+) between ] and the display name so the pattern cannot
+# cross line boundaries and accidentally consume the next line's content.
+_OPENCLAW_SLACK_HEADER = re.compile(
+    r"^\[Slack [^\]]+\][ \t]+[^:\n]+:\s*",
+    re.MULTILINE,
+)
+# Strip [media attached: media://... (mime/type)] annotation lines.
+_OPENCLAW_MEDIA_ATTACHED = re.compile(
+    r"^\[media attached:[^\]]*\][ \t]*$",
+    re.MULTILINE,
+)
+# Strip [Slack file: <name> (fileId: <id>)] provenance lines.
+_OPENCLAW_SLACK_FILE_LINE = re.compile(
+    r"^\[Slack file:[^\]]*\][ \t]*$",
+    re.MULTILINE,
+)
+# Strip [slack message id: <ts> channel: <id>] provenance lines.
+_OPENCLAW_SLACK_MSG_ID = re.compile(
+    r"^\[slack message id:[^\]]*\][ \t]*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+# Strip <file name="..." mime="...">...</file> wrapper blocks including any
+# <<<EXTERNAL_UNTRUSTED_CONTENT>>> / SECURITY NOTICE scaffolding inside.
+# Inner content is tool-injected file data, not human conversation text.
+_OPENCLAW_FILE_WRAPPER = re.compile(
+    r"<file\b[^>]*>.*?</file>",
+    re.DOTALL | re.IGNORECASE,
 )
 
 
@@ -257,15 +291,23 @@ def openclaw_strip_runtime_context(text: str) -> str:  # noqa: D401
 
 
 def openclaw_strip_metadata_preamble(text: str) -> str:  # noqa: D401
-    """Strip OpenClaw metadata fences and header label lines from user turns.
+    """Strip OpenClaw metadata fences and all Slack/media envelope annotations.
 
     Operates on the role-tab-JSON line format produced by
     :func:`openclaw_extract_turns`. For each ``user`` line, JSON-decodes the
-    body, removes:
+    body and removes:
 
-    * Fenced code blocks containing OpenClaw metadata JSON (``chat_id``,
-      ``sender_id``, ``inbound_event_kind``, ``label`` keys).
-    * Bare label lines such as ``Conversation info (untrusted metadata):``.
+    * Fenced code blocks whose body contains OpenClaw routing metadata keys
+      (``chat_id``, ``sender_id``, ``inbound_event_kind``, ``label``).
+    * Bare label lines such as ``Conversation info (untrusted metadata):``
+      and ``Sender (untrusted metadata):``.
+    * Slack routing header prefix: ``[Slack <name> +Nm ...] <name>:``.
+    * ``[media attached: media://... (mime)]`` file-attachment annotation lines.
+    * ``[Slack file: <name> (fileId: <id>)]`` file provenance lines.
+    * ``[slack message id: <ts> channel: <id>]`` message provenance lines.
+    * ``<file name="..." mime="...">...</file>`` wrapper blocks; inner content
+      is tool-injected file data (with ``<<<EXTERNAL_UNTRUSTED_CONTENT>>>``
+      scaffolding) and is dropped entirely — it is not human conversation text.
 
     Assistant lines are passed through unchanged.
     """
@@ -280,6 +322,11 @@ def openclaw_strip_metadata_preamble(text: str) -> str:  # noqa: D401
                 body = _json.loads(body_json)
                 body = _OPENCLAW_META_FENCE.sub("", body)
                 body = _OPENCLAW_LABEL_LINES.sub("", body)
+                body = _OPENCLAW_SLACK_HEADER.sub("", body)
+                body = _OPENCLAW_MEDIA_ATTACHED.sub("", body)
+                body = _OPENCLAW_SLACK_FILE_LINE.sub("", body)
+                body = _OPENCLAW_SLACK_MSG_ID.sub("", body)
+                body = _OPENCLAW_FILE_WRAPPER.sub("", body)
                 body_json = _json.dumps(body)
             except (ValueError, TypeError):
                 pass

@@ -55,9 +55,7 @@ logger = logging.getLogger(__name__)
 
 
 # Default sessions-directory search order.
-_DEFAULT_SESSIONS_DIRS: Tuple[str, ...] = (
-    "~/.openclaw/agents/main/sessions",
-)
+_DEFAULT_SESSIONS_DIRS: Tuple[str, ...] = ("~/.openclaw/agents/main/sessions",)
 
 # Filename suffix that identifies trajectory files.
 _TRAJECTORY_SUFFIX = ".trajectory.jsonl"
@@ -154,11 +152,18 @@ def _scan_trajectory_file(path: Path) -> Optional[dict]:
     * ``version`` — ``str(seq)`` of the last event (used by
       :meth:`is_current`; trajectory files are append-only so the last
       ``seq`` advances whenever new events are appended).
+    * ``message_count`` — number of complete exchange pairs found: each
+      ``prompt.submitted`` event matched to the ``model.completed`` event
+      that immediately follows it. This is the definitive count advertised
+      by :meth:`describe_schema`; computing it at scan time avoids a
+      second pass over the transform pipeline.
 
     Returns ``None`` if no parseable events are found.
     """
     first_event: Optional[dict] = None
     last_event: Optional[dict] = None
+    message_count = 0
+    pending_user = False
     for raw in path.open(encoding="utf-8", errors="replace"):
         raw = raw.strip()
         if not raw:
@@ -170,6 +175,12 @@ def _scan_trajectory_file(path: Path) -> Optional[dict]:
         if first_event is None:
             first_event = event
         last_event = event
+        etype = event.get("type")
+        if etype == "prompt.submitted":
+            pending_user = True
+        elif etype == "model.completed" and pending_user:
+            message_count += 1
+            pending_user = False
 
     if first_event is None:
         return None
@@ -181,6 +192,7 @@ def _scan_trajectory_file(path: Path) -> Optional[dict]:
         "model_id": first_event.get("modelId") or "",
         "session_created_at": first_event.get("ts") or "",
         "version": str(last_event.get("seq", 0)) if last_event else "0",
+        "message_count": message_count,
     }
 
 
@@ -218,12 +230,7 @@ def _apply_transform_pipeline(raw_text: str) -> str:
 
 def _now_utc_iso() -> str:
     """Return current UTC time as ISO-8601 with trailing ``Z``."""
-    return (
-        datetime.now(timezone.utc)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 class OpenClawSourceAdapter(BaseSourceAdapter):
@@ -286,8 +293,7 @@ class OpenClawSourceAdapter(BaseSourceAdapter):
                     type="string",
                     required=False,
                     description=(
-                        "OpenClaw session routing key "
-                        "(e.g. agent:main:slack:direct:<user-id>)"
+                        "OpenClaw session routing key (e.g. agent:main:slack:direct:<user-id>)"
                     ),
                     indexed=True,
                 ),
@@ -304,8 +310,7 @@ class OpenClawSourceAdapter(BaseSourceAdapter):
                     type="string",
                     required=False,
                     description=(
-                        "Model identifier used for the session "
-                        "(e.g. anthropic/claude-sonnet-4-6)"
+                        "Model identifier used for the session (e.g. anthropic/claude-sonnet-4-6)"
                     ),
                 ),
                 "session_created_at": FieldSpec(
@@ -317,8 +322,7 @@ class OpenClawSourceAdapter(BaseSourceAdapter):
                     type="int",
                     required=True,
                     description=(
-                        "Number of exchange pairs (user+assistant turns) extracted "
-                        "from the session"
+                        "Number of exchange pairs (user+assistant turns) extracted from the session"
                     ),
                 ),
                 "extract_mode": FieldSpec(
@@ -388,8 +392,9 @@ class OpenClawSourceAdapter(BaseSourceAdapter):
                 )
                 continue
 
-            # Count exchange pairs for metadata (rough: count "> " lines).
-            message_count = sum(1 for ln in transcript.split("\n") if ln.strip().startswith(">"))
+            # message_count is computed during scan: number of matched
+            # prompt.submitted → model.completed pairs in the raw events.
+            message_count = meta["message_count"]
 
             wing = self._wing_for(source, meta["workspace_dir"])
             room = detect_convo_room(transcript)

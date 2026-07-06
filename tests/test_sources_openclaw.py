@@ -213,16 +213,16 @@ _SESSION_SINGLE_TURN = "sess-aa11bb22-0000-0000-0000-000000000004"
 def _make_metadata_prompt(user_request: str) -> str:
     """Wrap a user request with the OpenClaw metadata preamble."""
     return (
-        'Conversation info (untrusted metadata):\n'
-        '```json\n'
-        '{\n'
+        "Conversation info (untrusted metadata):\n"
+        "```json\n"
+        "{\n"
         '  "chat_id": "user:UTEST123",\n'
         '  "message_id": "1234567890.123456",\n'
         '  "sender_id": "UTEST123",\n'
         '  "sender": "Test User"\n'
-        '}\n'
-        '```\n'
-        '\n' + user_request
+        "}\n"
+        "```\n"
+        "\n" + user_request
     )
 
 
@@ -259,11 +259,15 @@ def sessions_dir(tmp_path) -> Path:
         [
             (
                 "How do I use TanStack Query for data fetching?",
-                ["Use the useQuery hook with a queryFn. For example: useQuery({ queryKey: ['todos'], queryFn: fetchTodos })"],
+                [
+                    "Use the useQuery hook with a queryFn. For example: useQuery({ queryKey: ['todos'], queryFn: fetchTodos })"
+                ],
             ),
             (
                 "How do I invalidate the cache after a mutation?",
-                ["Call queryClient.invalidateQueries({ queryKey: ['todos'] }) inside the onSuccess callback of useMutation."],
+                [
+                    "Call queryClient.invalidateQueries({ queryKey: ['todos'] }) inside the onSuccess callback of useMutation."
+                ],
             ),
         ],
         workspace_dir="/home/user/projects/myproject",
@@ -280,7 +284,9 @@ def sessions_dir(tmp_path) -> Path:
             ),
             (
                 "Here is the traceback: AttributeError: NoneType has no attribute 'split'",
-                ["That error means you're calling .split() on a None value. Check where the variable is assigned."],
+                [
+                    "That error means you're calling .split() on a None value. Check where the variable is assigned."
+                ],
             ),
         ],
         workspace_dir="/home/user/projects/backend",
@@ -293,7 +299,9 @@ def sessions_dir(tmp_path) -> Path:
         [
             (
                 "日本語で説明してください: how does async/await work in Python?",
-                ["async/await は非同期処理のための構文です。asyncキーワードをコルーチン関数の前に付けます。"],
+                [
+                    "async/await は非同期処理のための構文です。asyncキーワードをコルーチン関数の前に付けます。"
+                ],
             ),
         ],
         workspace_dir="/home/user/projects/docs",
@@ -404,7 +412,9 @@ def test_session_source_file_is_stable():
 
 
 def test_session_source_file_has_expected_shape():
-    sf = session_source_file("/home/user/.openclaw/agents/main/sessions/abc.trajectory.jsonl", "abc")
+    sf = session_source_file(
+        "/home/user/.openclaw/agents/main/sessions/abc.trajectory.jsonl", "abc"
+    )
     assert sf.startswith("openclaw://")
     assert "#session=" in sf
 
@@ -468,6 +478,18 @@ def test_scan_trajectory_file_extracts_metadata(sessions_dir):
     assert meta["model_id"] == "anthropic/claude-test-model"
     assert meta["session_created_at"]  # non-empty ISO timestamp
     assert meta["version"]  # non-empty version string
+    # Defect 1 fix: message_count must be an integer, not absent or None.
+    assert isinstance(meta["message_count"], int)
+    assert meta["message_count"] == 2  # _SESSION_SIMPLE has exactly 2 exchanges
+
+
+def test_scan_trajectory_file_message_count_empty_session(sessions_dir):
+    """A session with zero exchange pairs must report message_count == 0."""
+    tfile = sessions_dir / f"{_SESSION_SINGLE_TURN}.trajectory.jsonl"
+    meta = _scan_trajectory_file(tfile)
+    assert meta is not None
+    assert isinstance(meta["message_count"], int)
+    assert meta["message_count"] == 0
 
 
 def test_scan_trajectory_file_returns_none_for_empty_file(tmp_path):
@@ -492,7 +514,9 @@ def test_scan_trajectory_file_version_is_last_seq(sessions_dir):
 
 
 def test_ingest_yields_metadata_then_drawers(adapter, palace_ctx, sessions_dir):
-    results = list(adapter.ingest(source=SourceRef(local_path=str(sessions_dir)), palace=palace_ctx))
+    results = list(
+        adapter.ingest(source=SourceRef(local_path=str(sessions_dir)), palace=palace_ctx)
+    )
     metas = [r for r in results if isinstance(r, SourceItemMetadata)]
     drawers = [r for r in results if isinstance(r, DrawerRecord)]
     # 4 files → 4 SourceItemMetadata
@@ -507,7 +531,9 @@ def test_ingest_yields_metadata_then_drawers(adapter, palace_ctx, sessions_dir):
 
 def test_ingest_empty_session_produces_no_drawers(adapter, palace_ctx, sessions_dir):
     """The single-turn (0-exchange) session should yield metadata but no drawers."""
-    results = list(adapter.ingest(source=SourceRef(local_path=str(sessions_dir)), palace=palace_ctx))
+    results = list(
+        adapter.ingest(source=SourceRef(local_path=str(sessions_dir)), palace=palace_ctx)
+    )
     drawers = [r for r in results if isinstance(r, DrawerRecord)]
     src_files_with_drawers = {d.source_file for d in drawers}
     assert all(_SESSION_SINGLE_TURN not in sf for sf in src_files_with_drawers), (
@@ -516,7 +542,9 @@ def test_ingest_empty_session_produces_no_drawers(adapter, palace_ctx, sessions_
 
 
 def test_drawer_metadata_has_all_universal_and_schema_fields(adapter, palace_ctx, sessions_dir):
-    results = list(adapter.ingest(source=SourceRef(local_path=str(sessions_dir)), palace=palace_ctx))
+    results = list(
+        adapter.ingest(source=SourceRef(local_path=str(sessions_dir)), palace=palace_ctx)
+    )
     drawers = [r for r in results if isinstance(r, DrawerRecord)]
     assert drawers, "expected at least one drawer"
     schema_keys = set(adapter.describe_schema().fields.keys())
@@ -548,14 +576,18 @@ def test_drawer_metadata_has_all_universal_and_schema_fields(adapter, palace_ctx
 
 
 def test_drawer_extract_mode_is_exchange(adapter, palace_ctx, sessions_dir):
-    results = list(adapter.ingest(source=SourceRef(local_path=str(sessions_dir)), palace=palace_ctx))
+    results = list(
+        adapter.ingest(source=SourceRef(local_path=str(sessions_dir)), palace=palace_ctx)
+    )
     for r in results:
         if isinstance(r, DrawerRecord):
             assert r.metadata["extract_mode"] == "exchange"
 
 
 def test_drawer_route_hint_carries_wing_and_room(adapter, palace_ctx, sessions_dir):
-    results = list(adapter.ingest(source=SourceRef(local_path=str(sessions_dir)), palace=palace_ctx))
+    results = list(
+        adapter.ingest(source=SourceRef(local_path=str(sessions_dir)), palace=palace_ctx)
+    )
     drawers = [r for r in results if isinstance(r, DrawerRecord)]
     for d in drawers:
         assert d.route_hint is not None
@@ -569,12 +601,12 @@ def test_drawer_route_hint_carries_wing_and_room(adapter, palace_ctx, sessions_d
 
 
 def test_wing_derived_from_workspace_dir_basename(adapter, palace_ctx, sessions_dir):
-    results = list(adapter.ingest(source=SourceRef(local_path=str(sessions_dir)), palace=palace_ctx))
+    results = list(
+        adapter.ingest(source=SourceRef(local_path=str(sessions_dir)), palace=palace_ctx)
+    )
     drawers = [r for r in results if isinstance(r, DrawerRecord)]
     # _SESSION_SIMPLE has workspace_dir="/home/user/projects/myproject" → wing="myproject"
-    myproject_drawers = [
-        d for d in drawers if _SESSION_SIMPLE in d.source_file
-    ]
+    myproject_drawers = [d for d in drawers if _SESSION_SIMPLE in d.source_file]
     assert myproject_drawers, "expected drawers for simple session"
     assert all(d.metadata["wing"] == "myproject" for d in myproject_drawers)
 
@@ -620,8 +652,12 @@ def test_is_current_uses_stored_version_when_present(adapter):
         source_file="openclaw:///tmp/x.trajectory.jsonl#session=sess-abc",
         version="42",
     )
-    assert adapter.is_current(item=item, existing_metadata={"openclaw_session_version": "42"}) is True
-    assert adapter.is_current(item=item, existing_metadata={"openclaw_session_version": "99"}) is False
+    assert (
+        adapter.is_current(item=item, existing_metadata={"openclaw_session_version": "42"}) is True
+    )
+    assert (
+        adapter.is_current(item=item, existing_metadata={"openclaw_session_version": "99"}) is False
+    )
 
 
 def test_is_current_falls_back_to_presence_when_version_missing(adapter):
@@ -683,7 +719,10 @@ def test_openclaw_extract_turns_multiple_assistant_texts():
     """Multiple assistantTexts entries are joined with newline."""
     events = [
         {"type": "prompt.submitted", "data": {"prompt": "Give me two answers."}},
-        {"type": "model.completed", "data": {"assistantTexts": ["First answer.", "Second answer."]}},
+        {
+            "type": "model.completed",
+            "data": {"assistantTexts": ["First answer.", "Second answer."]},
+        },
     ]
     raw = "\n".join(json.dumps(e) for e in events)
     result = src_transforms.openclaw_extract_turns(raw)
@@ -695,9 +734,7 @@ def test_openclaw_extract_turns_multiple_assistant_texts():
 
 def test_openclaw_strip_runtime_context_removes_block():
     """Runtime context block must be removed from user turns."""
-    raw_prompt = (
-        "<<<OpenClaw runtime context\nSome internal info.\nEND_OPENCLAW_INTERNAL_CONTEXT>>>\n\nActual question"
-    )
+    raw_prompt = "<<<OpenClaw runtime context\nSome internal info.\nEND_OPENCLAW_INTERNAL_CONTEXT>>>\n\nActual question"
     role_tab = f"user\t{json.dumps(raw_prompt)}"
     result = src_transforms.openclaw_strip_runtime_context(role_tab)
     body = json.loads(result.partition("\t")[2])
@@ -716,11 +753,11 @@ def test_openclaw_strip_runtime_context_preserves_assistant_turns():
 def test_openclaw_strip_metadata_preamble_removes_fence():
     """Metadata JSON fences must be stripped from user prompts."""
     preamble_prompt = (
-        'Conversation info (untrusted metadata):\n'
-        '```json\n'
+        "Conversation info (untrusted metadata):\n"
+        "```json\n"
         '{"chat_id": "user:U123", "sender_id": "U123"}\n'
-        '```\n'
-        '\nReal user request here'
+        "```\n"
+        "\nReal user request here"
     )
     role_tab = f"user\t{json.dumps(preamble_prompt)}"
     result = src_transforms.openclaw_strip_metadata_preamble(role_tab)
@@ -730,10 +767,7 @@ def test_openclaw_strip_metadata_preamble_removes_fence():
 
 
 def test_openclaw_strip_metadata_preamble_removes_label_lines():
-    prompt_with_label = (
-        "Conversation info (untrusted metadata):\n"
-        "Real content below"
-    )
+    prompt_with_label = "Conversation info (untrusted metadata):\nReal content below"
     role_tab = f"user\t{json.dumps(prompt_with_label)}"
     result = src_transforms.openclaw_strip_metadata_preamble(role_tab)
     body = json.loads(result.partition("\t")[2])
@@ -807,6 +841,144 @@ def test_declared_transformation_round_trip_reproduces_drawer_content(
 
 
 # ===========================================================================
+# Realistic Slack + media input — strips all envelope cruft
+# ===========================================================================
+
+_SESSION_SLACK_REALISTIC = "sess-aa11bb22-0000-0000-0000-000000000099"
+
+
+def _make_slack_user_prompt(core_message: str) -> str:
+    """Build a realistic Slack-delivered prompt as the runtime injects it.
+
+    Includes every pattern the Defect 2 fix must strip:
+    * Two OpenClaw metadata fences (Conversation info + Sender).
+    * A ``[media attached: ...]`` annotation line.
+    * A Slack routing header prefix ``[Slack <name> ...] <name>:``.
+    * A ``[Slack file: ...]`` file provenance line.
+    * A ``[slack message id: ...]`` message provenance line.
+    * A ``<file ...>...</file>`` wrapper block containing
+      ``<<<EXTERNAL_UNTRUSTED_CONTENT>>>`` scaffolding.
+    """
+    return (
+        "Conversation info (untrusted metadata):\n"
+        "```json\n"
+        "{\n"
+        '  "chat_id": "user:UREALISTIC",\n'
+        '  "message_id": "1783366572.599909",\n'
+        '  "sender_id": "UREALISTIC",\n'
+        '  "sender": "Grace",\n'
+        '  "inbound_event_kind": "user_request"\n'
+        "}\n"
+        "```\n"
+        "\n"
+        "Sender (untrusted metadata):\n"
+        "```json\n"
+        "{\n"
+        '  "label": "Grace (UREALISTIC)",\n'
+        '  "id": "UREALISTIC",\n'
+        '  "name": "Grace"\n'
+        "}\n"
+        "```\n"
+        "\n"
+        "[media attached: media://inbound/abc-def-123 (application/force-download)]\n"
+        "[Slack Grace +1m Mon 2026-07-06 19:36:12 UTC] Grace: " + core_message + "\n"
+        "[Slack file: notes.txt (fileId: F0BGBN9QG9E)]\n"
+        "[slack message id: 1783366572.599909 channel: D0AM196D2P6]\n"
+        "\n"
+        '<file name="abc-def-123" mime="text/plain">\n'
+        "\n"
+        '<<<EXTERNAL_UNTRUSTED_CONTENT id="deadbeef0001">\n'
+        "Source: External\n"
+        "---\n"
+        "This is injected file content that must be stripped entirely.\n"
+        '<<<END_EXTERNAL_UNTRUSTED_CONTENT id="deadbeef0001">\n'
+        "</file>\n"
+    )
+
+
+def test_realistic_slack_media_cruft_stripped(adapter, palace_ctx, tmp_path):
+    """Realistic Slack-delivered input: all envelope annotations must be stripped.
+
+    Asserts (per task spec):
+    (a) All envelope cruft is absent from drawer content.
+    (b) message_count is an int and equals the number of exchange pairs.
+    (c) All describe_schema fields appear in every emitted DrawerRecord.metadata.
+    """
+    sdir = tmp_path / "sessions"
+    sdir.mkdir()
+
+    core_msg_1 = (
+        "Can you summarize the attached Slack transcript? "
+        "It is long enough to form a complete chunk."
+    )
+    core_msg_2 = "Thanks! Now list the three main decisions."
+
+    build_trajectory_fixture(
+        sdir / f"{_SESSION_SLACK_REALISTIC}.trajectory.jsonl",
+        _SESSION_SLACK_REALISTIC,
+        [
+            (
+                _make_slack_user_prompt(core_msg_1),
+                [
+                    "Sure — the Slack transcript covers three topics: "
+                    "memory routing, the RFC 002 adapter spike, and palace cleanup. "
+                    "I'll summarize each in turn."
+                ],
+            ),
+            (
+                _make_slack_user_prompt(core_msg_2),
+                [
+                    "The three main decisions were: "
+                    "(1) use declared-transformation round-trip tests, "
+                    "(2) adopt the wing/room/hall routing hierarchy, "
+                    "(3) keep ChromaDB as the vector backend for v4."
+                ],
+            ),
+        ],
+        workspace_dir="/home/user/projects/slack-test",
+    )
+
+    results = list(adapter.ingest(source=SourceRef(local_path=str(sdir)), palace=palace_ctx))
+    drawers = [r for r in results if isinstance(r, DrawerRecord)]
+    assert drawers, "expected at least one drawer from the realistic session"
+
+    joined = "\n".join(d.content for d in drawers)
+
+    # (a) All Slack/media envelope patterns must be gone from drawer content.
+    assert "media attached:" not in joined, "[media attached:] survived transform"
+    assert "[Slack Grace" not in joined, "Slack header prefix survived transform"
+    assert "[Slack file:" not in joined, "[Slack file:] survived transform"
+    assert "slack message id:" not in joined.lower(), "[slack message id:] survived"
+    assert "<file name=" not in joined, "<file> wrapper survived transform"
+    assert "EXTERNAL_UNTRUSTED_CONTENT" not in joined, "file content survived transform"
+    assert "chat_id" not in joined, "metadata fence content survived transform"
+    assert "sender_id" not in joined, "sender fence content survived transform"
+
+    # Actual user content must survive.
+    assert "summarize" in joined or "decisions" in joined, (
+        "core user message was stripped alongside the cruft"
+    )
+
+    # (b) message_count must be a populated int equal to the pair count.
+    meta_values = [d.metadata.get("message_count") for d in drawers]
+    assert all(isinstance(v, int) for v in meta_values), (
+        f"message_count is not int in some drawers: {meta_values!r}"
+    )
+    # All chunks of the same session share the same message_count.
+    assert all(v == 2 for v in meta_values), (
+        f"expected message_count == 2 (2 exchanges), got: {set(meta_values)}"
+    )
+
+    # (c) All describe_schema fields must appear in each DrawerRecord.metadata.
+    schema_keys = set(adapter.describe_schema().fields.keys())
+    for drawer in drawers:
+        missing = schema_keys - set(drawer.metadata.keys())
+        assert not missing, (
+            f"drawer metadata missing schema fields: {missing}; source_file={drawer.source_file!r}"
+        )
+
+
+# ===========================================================================
 # Edge cases
 # ===========================================================================
 
@@ -823,10 +995,11 @@ def test_ingest_single_file_via_local_path(adapter, palace_ctx, sessions_dir):
 
 def test_unicode_content_preserved_end_to_end(adapter, palace_ctx, sessions_dir):
     """BMP + emoji Unicode must survive the full transform pipeline to drawer.content."""
-    results = list(adapter.ingest(source=SourceRef(local_path=str(sessions_dir)), palace=palace_ctx))
+    results = list(
+        adapter.ingest(source=SourceRef(local_path=str(sessions_dir)), palace=palace_ctx)
+    )
     drawers = [
-        d for d in results
-        if isinstance(d, DrawerRecord) and _SESSION_UNICODE in d.source_file
+        d for d in results if isinstance(d, DrawerRecord) and _SESSION_UNICODE in d.source_file
     ]
     assert drawers, "expected at least one drawer for the unicode session"
     joined = "\n".join(d.content for d in drawers)
@@ -863,10 +1036,11 @@ def test_runtime_context_stripped_from_drawers(adapter, palace_ctx, tmp_path):
 
 def test_metadata_preamble_stripped_from_drawers(adapter, palace_ctx, sessions_dir):
     """Metadata JSON fences must not appear in drawer content."""
-    results = list(adapter.ingest(source=SourceRef(local_path=str(sessions_dir)), palace=palace_ctx))
+    results = list(
+        adapter.ingest(source=SourceRef(local_path=str(sessions_dir)), palace=palace_ctx)
+    )
     drawers = [
-        d for d in results
-        if isinstance(d, DrawerRecord) and _SESSION_METADATA in d.source_file
+        d for d in results if isinstance(d, DrawerRecord) and _SESSION_METADATA in d.source_file
     ]
     assert drawers, "expected drawers for metadata-preamble session"
     joined = "\n".join(d.content for d in drawers)
@@ -882,17 +1056,40 @@ def test_malformed_jsonl_lines_are_skipped(adapter, palace_ctx, tmp_path):
     sdir.mkdir()
     tfile = sdir / "malformed.trajectory.jsonl"
     events = [
-        {"type": "session.started", "data": {}, "sessionId": "sess-mal",
-         "sessionKey": "k", "workspaceDir": "/tmp", "modelId": "m",
-         "ts": "2026-01-01T00:00:00.000Z", "seq": 1},
+        {
+            "type": "session.started",
+            "data": {},
+            "sessionId": "sess-mal",
+            "sessionKey": "k",
+            "workspaceDir": "/tmp",
+            "modelId": "m",
+            "ts": "2026-01-01T00:00:00.000Z",
+            "seq": 1,
+        },
         "THIS IS NOT JSON",
-        {"type": "prompt.submitted", "data": {"prompt": "Valid question that is long enough to pass chunking threshold"},
-         "sessionId": "sess-mal", "sessionKey": "k", "workspaceDir": "/tmp",
-         "modelId": "m", "ts": "2026-01-01T00:00:01.000Z", "seq": 2},
+        {
+            "type": "prompt.submitted",
+            "data": {"prompt": "Valid question that is long enough to pass chunking threshold"},
+            "sessionId": "sess-mal",
+            "sessionKey": "k",
+            "workspaceDir": "/tmp",
+            "modelId": "m",
+            "ts": "2026-01-01T00:00:01.000Z",
+            "seq": 2,
+        },
         "ANOTHER GARBAGE LINE",
-        {"type": "model.completed", "data": {"assistantTexts": ["Valid answer that is also long enough to make a proper chunk"]},
-         "sessionId": "sess-mal", "sessionKey": "k", "workspaceDir": "/tmp",
-         "modelId": "m", "ts": "2026-01-01T00:00:02.000Z", "seq": 3},
+        {
+            "type": "model.completed",
+            "data": {
+                "assistantTexts": ["Valid answer that is also long enough to make a proper chunk"]
+            },
+            "sessionId": "sess-mal",
+            "sessionKey": "k",
+            "workspaceDir": "/tmp",
+            "modelId": "m",
+            "ts": "2026-01-01T00:00:02.000Z",
+            "seq": 3,
+        },
     ]
     with tfile.open("w") as fh:
         for e in events:
