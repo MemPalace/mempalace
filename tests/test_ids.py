@@ -203,3 +203,11 @@ def test_make_turn_fingerprint_is_short_hex():
     fp = ids.make_turn_fingerprint("some user message")
     assert len(fp) == 16
     assert all(c in "0123456789abcdef" for c in fp)
+
+
+def test_make_turn_fingerprint_pins_recipe():
+    # The fingerprint must match across independently computed call
+    # sites (sync_turn vs session_end). Pin the exact recipe output so
+    # an accidental recipe change fails loudly here.
+    expected = hashlib.sha256(b"11:hello world").hexdigest()[:16]
+    assert ids.make_turn_fingerprint("hello world") == expected
