@@ -1693,9 +1693,6 @@ def tool_status():
     # is detected so status stays reachable.
     db_exists = _backend_db_exists()
     _refresh_vector_disabled_flag()
-    writer_ok, writer_reason = _acquire_mcp_writer_lock()
-    if not writer_ok:
-        logger.warning("%s; mutating MCP tools will run read-only", writer_reason)
 
     if _vector_disabled:
         return _tool_status_via_sqlite()

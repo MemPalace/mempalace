@@ -4832,6 +4832,27 @@ def test_peer_writer_guard_does_not_gate_read_tool(monkeypatch):
     assert '"ok": true' in response["result"]["content"][0]["text"]
 
 
+def test_status_tool_does_not_acquire_peer_writer_lock(monkeypatch):
+    from mempalace import mcp_server
+
+    def forbidden_lock():
+        raise AssertionError("status should not acquire the peer-writer lock")
+
+    monkeypatch.setattr(mcp_server, "_ensure_sqlite_integrity_status", lambda: None)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", None)
+    monkeypatch.setattr(mcp_server, "_backend_db_exists", lambda: True)
+    monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", lambda: None)
+    monkeypatch.setattr(mcp_server, "_vector_disabled", True)
+    monkeypatch.setattr(
+        mcp_server,
+        "_tool_status_via_sqlite",
+        lambda: {"total_drawers": 0, "wings": {}, "rooms": {}},
+    )
+    monkeypatch.setattr(mcp_server, "_acquire_mcp_writer_lock", forbidden_lock)
+
+    assert mcp_server.tool_status()["total_drawers"] == 0
+
+
 def test_peer_writer_lock_setup_failure_is_cached(monkeypatch):
     from mempalace import mcp_server, palace
 

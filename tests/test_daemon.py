@@ -174,6 +174,7 @@ def test_service_tool_classification():
     assert service.classify_tool("mempalace_search") == "read"
     assert service.classify_tool("mempalace_add_drawer") == "write"
     assert service.classify_tool("mempalace_checkpoint") == "write"
+    assert service.classify_tool("mempalace_delete_by_source") == "write"
     assert service.classify_tool("mempalace_mine") == "maintenance"
     assert service.classify_tool("unknown") == "unknown"
 
