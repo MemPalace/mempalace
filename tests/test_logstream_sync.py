@@ -17,7 +17,7 @@ import threading
 import pytest
 
 from mempalace import logsync
-from mempalace.hlc import HybridLogicalClock, parse, render
+from mempalace.hlc import MAX_FUTURE_DRIFT_MS, HybridLogicalClock, parse, render
 from mempalace.logstream import Logstream
 from mempalace.replica import get_replica_id
 
@@ -104,15 +104,27 @@ class TestHLC:
         third = clock.tick()
         assert first < second < third
 
-    def test_observe_absorbs_remote_instant(self):
+    def test_observe_absorbs_remote_instant_within_drift(self):
         clock = HybridLogicalClock("rep_aaaaaaaaaaaa", now_ms=lambda: 1000)
-        clock.observe(render(9999, 5, "rep_bbbbbbbbbbbb"))
-        assert clock.tick() > render(9999, 5, "rep_bbbbbbbbbbbb")
+        remote = render(1000 + MAX_FUTURE_DRIFT_MS, 5, "rep_bbbbbbbbbbbb")
+        clock.observe(remote)
+        assert clock.tick() > remote
+
+    def test_observe_ignores_absurd_future_instant(self):
+        clock = HybridLogicalClock("rep_aaaaaaaaaaaa", now_ms=lambda: 1000)
+        remote = render(1000 + MAX_FUTURE_DRIFT_MS + 1, 0, "rep_bbbbbbbbbbbb")
+        clock.observe(remote)
+        assert clock.tick() < remote
 
     def test_restart_seeding_preserves_monotonicity(self):
         stamp = render(5000, 3, "rep_aaaaaaaaaaaa")
         clock = HybridLogicalClock("rep_aaaaaaaaaaaa", last=stamp, now_ms=lambda: 1000)
         assert clock.tick() > stamp
+
+    def test_restart_seeding_ignores_absurd_future_instant(self):
+        stamp = render(1000 + MAX_FUTURE_DRIFT_MS + 1, 3, "rep_aaaaaaaaaaaa")
+        clock = HybridLogicalClock("rep_aaaaaaaaaaaa", last=stamp, now_ms=lambda: 1000)
+        assert clock.tick() < stamp
 
     def test_parse_render_round_trip(self):
         stamp = render(1783038849123, 7, "rep_ab12cd34ef56")

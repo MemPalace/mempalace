@@ -11,6 +11,7 @@ in mempalace/oplog_verify.py.
 import hashlib
 import os
 import threading
+import time
 
 import pytest
 
@@ -228,12 +229,19 @@ class TestApplyRemoteOp:
         local = oplog.append("drawer.add", {"drawer_id": "d1"})
         assert oplog.apply_remote_op(local) is False
 
-    def test_remote_hlc_observed(self, oplog):
+    def test_remote_hlc_within_drift_is_observed(self, oplog):
+        remote = _remote_op(seq=1)
+        remote["hlc"] = f"{int(time.time() * 1000) + 5_000:013d}-000000-rep_aaaaaaaaaaaa"
+        oplog.apply_remote_op(remote)
+        nxt = oplog.append("drawer.add", {"drawer_id": "d2"})
+        assert nxt["hlc"] > remote["hlc"]
+
+    def test_absurd_future_remote_hlc_is_not_observed(self, oplog):
         remote = _remote_op(seq=1)
         remote["hlc"] = "9999999999999-000000-rep_aaaaaaaaaaaa"
         oplog.apply_remote_op(remote)
         nxt = oplog.append("drawer.add", {"drawer_id": "d2"})
-        assert nxt["hlc"] > remote["hlc"]
+        assert nxt["hlc"] < remote["hlc"]
 
     def test_missing_field_rejected(self, oplog):
         op = _remote_op(seq=1)

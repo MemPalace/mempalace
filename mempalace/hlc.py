@@ -28,6 +28,7 @@ import time
 _HLC_RE = re.compile(r"^(\d{13})-([0-9a-f]{6})-(.+)$")
 
 MAX_COUNTER = 0xFFFFFF
+MAX_FUTURE_DRIFT_MS = 60_000
 
 
 def parse(hlc: str):
@@ -55,9 +56,15 @@ class HybridLogicalClock:
         self._lock = threading.Lock()
         if last:
             ms, counter, _ = parse(last)
-            self._ms, self._counter = ms, counter
+            if self._is_within_future_drift(ms):
+                self._ms, self._counter = ms, counter
+            else:
+                self._ms, self._counter = 0, 0
         else:
             self._ms, self._counter = 0, 0
+
+    def _is_within_future_drift(self, ms: int) -> bool:
+        return ms <= self._now_ms() + MAX_FUTURE_DRIFT_MS
 
     def tick(self) -> str:
         """Stamp a new local op; strictly greater than everything seen."""
@@ -80,6 +87,8 @@ class HybridLogicalClock:
             remote_ms, remote_counter, _ = parse(remote_hlc)
         except ValueError:
             return  # never let a malformed remote stamp wedge the clock
+        if not self._is_within_future_drift(remote_ms):
+            return
         with self._lock:
             if remote_ms > self._ms or (remote_ms == self._ms and remote_counter > self._counter):
                 self._ms, self._counter = remote_ms, remote_counter
