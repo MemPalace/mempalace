@@ -1679,7 +1679,10 @@ def test_read_pointer_file_returns_path_from_valid_json(tmp_path):
 
     result = _read_pointer_file(pointer)
     assert result is not None
-    assert str(result) == target_path
+    # Compare as Path objects, not strings: str(Path("/abs/path")) renders with
+    # backslashes on Windows, so a hard-coded POSIX string comparison is not
+    # portable. Path equality normalizes per-platform.
+    assert result == Path(target_path)
 
 
 def test_read_pointer_file_returns_none_for_corrupt_json(tmp_path):
