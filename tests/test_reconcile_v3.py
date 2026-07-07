@@ -155,9 +155,11 @@ def test_apply_is_idempotent_and_dry_run_writes_nothing():
     assert again["ghost_drawers"] == 0
 
 
-def test_base_default_rekey_row_reinserts_then_deletes():
-    # The abstract default (used by chroma) rewrites via upsert(new)+delete(old),
-    # carrying the embedding so it is not re-derived.
+def test_base_default_rekey_row_reinserts_then_deletes_without_clobbering_twin():
+    # The abstract default (used by chroma) probes the v4 twin first, then
+    # rewrites via upsert(new)+delete(old), carrying the embedding so it is not
+    # re-derived. If the twin already exists, it is preserved and only the old
+    # ghost is dropped.
     from mempalace.backends.base import BaseCollection
 
     class _Min(BaseCollection):
@@ -176,8 +178,14 @@ def test_base_default_rekey_row_reinserts_then_deletes():
         def query(self, **k):
             raise NotImplementedError
 
-        def get(self, **k):
-            raise NotImplementedError
+        def get(self, *, ids=None, **k):
+            hits = [(i, *self.rows[i]) for i in ids or [] if i in self.rows]
+            return GetResult(
+                ids=[h[0] for h in hits],
+                documents=[h[1] for h in hits],
+                metadatas=[h[2] for h in hits],
+                embeddings=None,
+            )
 
         def delete(self, *, ids=None, where=None):
             for i in ids or []:
@@ -191,3 +199,9 @@ def test_base_default_rekey_row_reinserts_then_deletes():
     c.rekey_row("old", "new", content="body", metadata={"id_recipe": "v4"}, embedding=[0.7])
     assert "old" not in c.rows
     assert c.rows["new"] == ("body", {"id_recipe": "v4"}, [0.7])
+
+    c.upsert(ids=["old2"], documents=["body"], metadatas=[{"id_recipe": "v3"}])
+    c.upsert(ids=["new"], documents=["body"], metadatas=[{"id_recipe": "v4", "fresh": True}])
+    c.rekey_row("old2", "new", content="body", metadata={"id_recipe": "v4", "stale": True})
+    assert "old2" not in c.rows
+    assert c.rows["new"] == ("body", {"id_recipe": "v4", "fresh": True}, None)
