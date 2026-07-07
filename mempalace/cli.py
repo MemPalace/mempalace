@@ -1394,8 +1394,41 @@ def cmd_reconcile_ids(args):
             print(f"    would DROP (content already v4-present):  {plan['drop']:,}")
             for s in plan["sample"][:10]:
                 print(f"      {s['old']} -> {s['new']}")
-            print("\n  DRY RUN — nothing written. Re-run with --apply to reconcile.")
+            print(
+                "\n  DRY RUN — nothing written. STOP the hub first, then re-run "
+                "with --apply to reconcile."
+            )
         return
+
+    from . import server_registry
+
+    live_hub = server_registry.read_live_serverinfo(palace_path)
+    if live_hub and not live_hub.get("read_only") and not getattr(args, "force_live_hub", False):
+        base_url = server_registry.client_base_url(live_hub)
+        message = (
+            "reconcile-ids --apply writes the palace directly; STOP the hub first "
+            f"(live hub at {base_url}, pid {live_hub.get('pid')}). "
+            "Pass --force-live-hub only for manual recovery when you accept the "
+            "single-writer race."
+        )
+        if as_json:
+            print(
+                _json.dumps(
+                    {
+                        "success": False,
+                        "error": message,
+                        "hub": {
+                            "pid": live_hub.get("pid"),
+                            "url": base_url,
+                            "read_only": bool(live_hub.get("read_only")),
+                        },
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            print(f"  ERROR: {message}", file=sys.stderr)
+        sys.exit(1)
 
     stats = apply_v3_reconcile(col)
     if as_json:
@@ -3555,7 +3588,14 @@ def main():
         "un-twinned content)",
     )
     p_reconcile_ids.add_argument(
-        "--apply", action="store_true", help="Rewrite the ghosts (default is a dry-run report)"
+        "--apply",
+        action="store_true",
+        help="Rewrite the ghosts (STOP the hub first; default is a dry-run report)",
+    )
+    p_reconcile_ids.add_argument(
+        "--force-live-hub",
+        action="store_true",
+        help="Allow --apply even when a live write-capable hub is registered (manual recovery only)",
     )
     p_reconcile_ids.add_argument("--json", action="store_true", help="Machine-readable output")
 

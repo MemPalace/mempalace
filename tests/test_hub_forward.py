@@ -16,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from mempalace import cli, server_registry
+from mempalace import cli, palace as palace_mod, reconcile_v3, server_registry
 
 
 @pytest.fixture
@@ -188,6 +188,49 @@ def _register_hub(palace, hub, read_only=False):
     server_registry.write_serverinfo(
         palace, host="127.0.0.1", port=hub.port, scheme="http", read_only=read_only
     )
+
+
+def _reconcile_args(palace, **overrides):
+    defaults = dict(palace=palace, apply=True, json=False, force_live_hub=False)
+    defaults.update(overrides)
+    return argparse.Namespace(**defaults)
+
+
+class TestReconcileIdsHubGuard:
+    def test_refuses_apply_when_write_hub_is_live(
+        self, isolated_home, tmp_path, fake_hub, monkeypatch, capsys
+    ):
+        palace = str(tmp_path / "palace")
+        _register_hub(palace, fake_hub)
+        monkeypatch.setattr(palace_mod, "get_collection", lambda *a, **k: object())
+
+        with pytest.raises(SystemExit) as exc:
+            cli.cmd_reconcile_ids(_reconcile_args(palace))
+
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "reconcile-ids --apply writes the palace directly" in err
+        assert "STOP the hub first" in err
+
+    def test_force_live_hub_allows_apply(
+        self, isolated_home, tmp_path, fake_hub, monkeypatch, capsys
+    ):
+        palace = str(tmp_path / "palace")
+        _register_hub(palace, fake_hub)
+        collection = object()
+        called = {}
+        monkeypatch.setattr(palace_mod, "get_collection", lambda *a, **k: collection)
+
+        def fake_apply(col):
+            called["collection"] = col
+            return {"rewritten": 0, "rows_rewritten": 0, "dropped": 0}
+
+        monkeypatch.setattr(reconcile_v3, "apply_v3_reconcile", fake_apply)
+
+        cli.cmd_reconcile_ids(_reconcile_args(palace, force_live_hub=True))
+
+        assert called == {"collection": collection}
+        assert "RECONCILED" in capsys.readouterr().out
 
 
 class TestForwardMineToHub:
