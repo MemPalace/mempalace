@@ -98,6 +98,12 @@ dev = [
     # Run ad-hoc with ``mypy mempalace/``; CI doesn't gate on it yet but
     # contributors should fix mypy errors they see before pushing.
     "mypy>=1.0",
+    # dev installs include the [mps] extra so the embedding test suite can
+    # exercise the sentence-transformers branch without a separate install
+    # step. CI runners on Linux pull torch CPU wheels (no ROCm / CUDA
+    # needed for tests).
+    "sentence-transformers>=2.2.0",
+    "torch>=2.0.0",
 ]
 spellcheck = ["autocorrect>=2.0"]
 # Opt-in Milvus backend. Defaults to per-palace Milvus Lite
@@ -112,14 +118,23 @@ milvus = [
 # MEMPALACE_BACKEND=pgvector / --backend pgvector; never required for the
 # default (Chroma) install.
 pgvector = ["psycopg[binary]>=3.1"]
-# Hardware acceleration for the ONNX embedding model. Install exactly one:
-#   pip install mempalace[gpu]       — NVIDIA CUDA
-#   pip install mempalace[dml]       — DirectML (Windows AMD/Intel/NVIDIA)
-#   pip install mempalace[coreml]    — macOS Neural Engine
-# After install, set MEMPALACE_EMBEDDING_DEVICE=cuda|dml|coreml (or "auto").
+# Hardware acceleration for the embedding model. Install exactly one:
+#   pip install mempalace[gpu]       — NVIDIA CUDA   (ONNX Runtime CUDAExecutionProvider)
+#   pip install mempalace[dml]       — DirectML      (Windows AMD/Intel/NVIDIA via ONNX Runtime)
+#   pip install mempalace[coreml]    — Apple ANE     (ONNX Runtime CoreMLExecutionProvider)
+#   pip install mempalace[mps]       — Apple Metal   (PyTorch + sentence-transformers, bypasses ONNX)
+# After install, set MEMPALACE_EMBEDDING_DEVICE=cuda|dml|coreml|mps (or "auto").
+#
+# Why both [coreml] and [mps] for macOS: the CoreML execution provider falls
+# back op-by-op to CPU for all-MiniLM-L6-v2 because some MLProgram lowerings
+# are unimplemented; the resulting ANE↔CPU copies thrash the bus and pin
+# throughput at ~2 chunks/s on the measured M5. Routing through PyTorch MPS
+# instead (sentence-transformers, same weights) measured ~523 chunks/s on that
+# system. Both remain explicit options because performance can vary by host.
 gpu = ["onnxruntime-gpu>=1.16"]
 dml = ["onnxruntime-directml>=1.16"]
 coreml = ["onnxruntime>=1.16"]
+mps = ["sentence-transformers>=2.2.0", "torch>=2.0.0"]
 # Multilingual extra kept as a no-op alias for back-compat with
 # `pip install mempalace[multilingual]` — these deps now ship in core.
 multilingual = []
@@ -140,6 +155,9 @@ extract = [
 ]
 
 [dependency-groups]
+# dev installs include the [mps] extra so the embedding test suite can
+# exercise the sentence-transformers branch without a separate install step.
+# CI runners on Linux pull torch CPU wheels (no ROCm / CUDA needed for tests).
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
@@ -152,6 +170,8 @@ dev = [
     "hypothesis>=6.0",
     "pre-commit>=3.0",
     "mypy>=1.0",
+    "sentence-transformers>=2.2.0",
+    "torch>=2.0.0",
 ]
 
 [build-system]

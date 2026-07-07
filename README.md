@@ -286,6 +286,41 @@ For per-message recall on top of the file-level chunks the hooks produce,
 run `mempalace sweep <transcript-dir>` periodically — it stores one
 verbatim drawer per user/assistant message, idempotent and resume-safe.
 
+## Embedding device
+
+For the default `minilm` model (`all-MiniLM-L6-v2`), switching device does
+not invalidate an existing palace. Set the device with `config.json` or the
+`MEMPALACE_EMBEDDING_DEVICE` env var:
+
+| Device | Extra to install | Notes |
+|---|---|---|
+| `auto` (default) | — | resolve at runtime: mps ▸ cuda ▸ coreml ▸ dml ▸ cpu |
+| `cpu` | — | bundled ONNX Runtime, works everywhere |
+| `cuda` | `mempalace[gpu]` | NVIDIA via ONNX Runtime CUDAExecutionProvider |
+| `coreml` | `mempalace[coreml]` | Apple ANE via ONNX Runtime CoreML provider |
+| `dml` | `mempalace[dml]` | Windows AMD/Intel/NVIDIA via DirectML |
+| `mps` | `mempalace[mps]` | Apple Metal via PyTorch + sentence-transformers (`minilm` only) |
+
+The MPS path currently supports `minilm` only. With `embeddinggemma`, an
+`mps` selection falls back to the model's CPU ONNX path; `openai-compat`
+uses its configured endpoint and ignores the local device setting.
+
+On Apple Silicon, the `mps` device is materially faster than `coreml`
+because ChromaDB's bundled ONNX path enables `CoreMLExecutionProvider`,
+which silently falls back op-by-op to CPU for `all-MiniLM-L6-v2` — the
+ANE↔CPU copies cost more than they save. Measured on M5, 200 real
+chunks: `coreml` ≈ 2 chunks/s, `cpu` ≈ 45, `mps` ≈ 523. See
+[`benchmarks/apple_silicon_bench.py`](benchmarks/apple_silicon_bench.py)
+to reproduce.
+
+A note on reproducibility: same-model embeddings agree to ~1e-6 across
+runtimes (ONNX vs PyTorch FP arithmetic ordering), well below cosine
+retrieval's noise floor. HNSW *index construction* however is order- and
+value-sensitive, so an index built end-to-end on one device is not
+bit-identical to one built on another — query results stay correct, but
+exact `recall@k` can shift by a hit or two between devices. Pin
+`MEMPALACE_EMBEDDING_DEVICE` if you need strict reproducibility.
+
 ---
 
 ## Requirements
