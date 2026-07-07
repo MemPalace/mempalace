@@ -150,7 +150,7 @@ class Layer1:
                         pass
                     break
             age_days = None
-            for key in ("authored_at", "created_at"):
+            for key in ("authored_at", "created_at", "filed_at"):
                 raw = meta.get(key)
                 if raw:
                     try:
