@@ -50,7 +50,7 @@ an edge case.
 ## Ops, clocks, and version vectors
 
 Each replica has a stable identity (`replica.json`, e.g.
-`rep_1a2b3c4d5e6f`) and stamps everything it authors with:
+`rep_0123456789abcdef0123456789abcdef`) and stamps everything it authors with:
 
 - `origin_replica` — which machine authored it (provenance, forever)
 - `origin_seq` — the author's own counter

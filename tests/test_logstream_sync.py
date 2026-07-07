@@ -11,6 +11,7 @@ claims), and the CLI sync command.
 import http.client
 import json
 import os
+import re
 import sqlite3
 import threading
 
@@ -142,9 +143,22 @@ class TestHLC:
 class TestReplicaIdentity:
     def test_mint_persist_stable(self, palace_a):
         first = get_replica_id(palace_a)
-        assert first.startswith("rep_")
+        assert re.match(r"^rep_[0-9a-f]{32}$", first)
         assert get_replica_id(palace_a) == first
         assert json.load(open(os.path.join(palace_a, "replica.json")))["replica_id"] == first
+
+    def test_legacy_short_replica_id_stays_valid(self, palace_a):
+        with open(os.path.join(palace_a, "replica.json"), "w", encoding="utf-8") as f:
+            json.dump({"replica_id": "rep_aaaabbbbcccc"}, f)
+
+        assert get_replica_id(palace_a) == "rep_aaaabbbbcccc"
+
+    def test_invalid_replica_id_fails_loudly(self, palace_a):
+        with open(os.path.join(palace_a, "replica.json"), "w", encoding="utf-8") as f:
+            json.dump({"replica_id": "rep_aaaabbbbccccdddd"}, f)
+
+        with pytest.raises(ValueError, match="invalid replica_id"):
+            get_replica_id(palace_a)
 
     def test_corrupt_file_fails_loudly(self, palace_a):
         with open(os.path.join(palace_a, "replica.json"), "w") as f:

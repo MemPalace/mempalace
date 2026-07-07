@@ -4,7 +4,8 @@ replica.py — Per-palace replica identity (RFC 004 transport seam / provenance)
 Every palace replica has one stable ``ReplicaId``, stamped as
 ``origin_replica`` into every op it authors. For the step-0 pilot the id is
 minted locally on first use and persisted in ``replica.json`` inside the
-palace directory. When the transport layer lands (MeshGuard), the mesh
+palace directory. Existing 12-hex pilot ids remain valid, but new ids use
+128 bits of entropy. When the transport layer lands (MeshGuard), the mesh
 Ed25519 identity supersedes it via an alias op — RFC 004 Appendix A.4:
 "a rename is just another provenance fact."
 
@@ -20,11 +21,11 @@ from pathlib import Path
 
 REPLICA_FILENAME = "replica.json"
 
-_REPLICA_ID_RE = re.compile(r"^rep_[0-9a-f]{12}$")
+_REPLICA_ID_RE = re.compile(r"^rep_(?:[0-9a-f]{12}|[0-9a-f]{32})$")
 
 
 def _mint() -> str:
-    return f"rep_{secrets.token_hex(6)}"
+    return f"rep_{secrets.token_hex(16)}"
 
 
 def get_replica_id(palace_path: str) -> str:
