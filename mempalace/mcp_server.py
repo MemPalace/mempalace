@@ -377,6 +377,35 @@ _MCP_WRITER_LOCK_FAILED = False
 _MCP_WRITER_LOCK_ERROR = ""
 _MCP_ALLOW_PEER_WRITER_ENV = "MEMPALACE_MCP_ALLOW_PEER_WRITER"
 
+# A peer writer is very often a short-lived `mempalace mine` kicked off by a
+# SessionStart/ingest hook, not a competing interactive session. Without a
+# grace period, an MCP server whose *very first* mutating tool call happens
+# to land inside that mine's lock window goes permanently read-only for its
+# entire process lifetime (see the "once read-only, stays read-only"
+# contract on _acquire_mcp_writer_lock) even though the peer releases the
+# lock moments later — the only way back is a full client reconnect. Retry
+# the initial acquisition for a short, bounded window before committing to
+# that permanent decision. This does not change behavior once a server has
+# already decided read-write or read-only — only the first attempt gets the
+# grace period, and only against MineAlreadyRunning (a transient peer-writer
+# collision), not against setup failures (those still fail open immediately,
+# unchanged).
+_MCP_WRITER_LOCK_RETRY_SECONDS_ENV = "MEMPALACE_MCP_WRITER_LOCK_RETRY_SECONDS"
+_MCP_WRITER_LOCK_RETRY_SECONDS_DEFAULT = 5.0
+_MCP_WRITER_LOCK_RETRY_INTERVAL_SECONDS = 0.5
+
+
+def _mcp_writer_lock_retry_seconds() -> float:
+    raw = os.environ.get(_MCP_WRITER_LOCK_RETRY_SECONDS_ENV, "")
+    if not raw.strip():
+        return _MCP_WRITER_LOCK_RETRY_SECONDS_DEFAULT
+    try:
+        seconds = float(raw)
+    except ValueError:
+        return _MCP_WRITER_LOCK_RETRY_SECONDS_DEFAULT
+    return max(0.0, seconds)
+
+
 _MUTATING_TOOLS = frozenset(
     {
         "mempalace_kg_add",
@@ -405,9 +434,11 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     """Acquire this process's per-palace MCP writer lease.
 
     Returns (True, "") when this process may write. Returns (False, reason)
-    when another live writer already owns the per-palace lease. Once a server
-    starts read-only it stays read-only for its lifetime; restarting is the
-    safe way to become the writer after the original holder exits.
+    when another live writer still owns the per-palace lease after the
+    MEMPALACE_MCP_WRITER_LOCK_RETRY_SECONDS grace period (default 5s,
+    polled every 0.5s) has elapsed. Once a server starts read-only it stays
+    read-only for its lifetime; restarting is the safe way to become the
+    writer after the original holder exits.
     """
 
     global _MCP_WRITER_LOCK_CM, _MCP_WRITER_READ_ONLY, _MCP_WRITER_LOCK_FAILED
@@ -428,8 +459,22 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     try:
         from .palace import MineAlreadyRunning, mine_palace_lock
 
-        lock_cm = mine_palace_lock(_config.palace_path)
-        lock_cm.__enter__()
+        deadline = time.monotonic() + _mcp_writer_lock_retry_seconds()
+        lock_cm = None
+        last_exc = None
+        while True:
+            try:
+                lock_cm = mine_palace_lock(_config.palace_path)
+                lock_cm.__enter__()
+                last_exc = None
+                break
+            except MineAlreadyRunning as exc:
+                last_exc = exc
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(_MCP_WRITER_LOCK_RETRY_INTERVAL_SECONDS)
+        if last_exc is not None:
+            raise last_exc
     except MineAlreadyRunning as exc:
         _MCP_WRITER_READ_ONLY = True
         _MCP_WRITER_LOCK_ERROR = (

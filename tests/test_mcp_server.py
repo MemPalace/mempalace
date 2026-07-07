@@ -4881,6 +4881,146 @@ def test_peer_writer_lock_setup_failure_is_cached(monkeypatch):
     assert reason_second == reason_first
 
 
+class _FakeWriterLockCM:
+    """Stand-in for the context manager mine_palace_lock() normally returns."""
+
+    def __enter__(self):
+        return None
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+def _reset_peer_writer_state(monkeypatch, mcp_server):
+    monkeypatch.delenv(mcp_server._MCP_ALLOW_PEER_WRITER_ENV, raising=False)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_CM", None)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_READ_ONLY", False)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_FAILED", False)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_ERROR", "")
+
+
+def _fake_clock(monkeypatch, mcp_server):
+    """Replace time.monotonic/time.sleep with an instant, controllable clock
+    so retry-window tests don't burn wall-clock time."""
+    state = {"t": 0.0}
+    monkeypatch.setattr(mcp_server.time, "monotonic", lambda: state["t"])
+    monkeypatch.setattr(mcp_server.time, "sleep", lambda s: state.__setitem__("t", state["t"] + s))
+    return state
+
+
+def test_peer_writer_lock_retries_before_going_read_only(monkeypatch):
+    """A peer writer that releases within the grace period must not
+    permanently flip this process read-only (#1908 follow-up)."""
+    from mempalace import mcp_server, palace
+
+    monkeypatch.setenv(mcp_server._MCP_WRITER_LOCK_RETRY_SECONDS_ENV, "5")
+    _reset_peer_writer_state(monkeypatch, mcp_server)
+    _fake_clock(monkeypatch, mcp_server)
+
+    calls = {"count": 0}
+
+    def flaky_mine_palace_lock(palace_path):
+        calls["count"] += 1
+        if calls["count"] < 3:
+            raise palace.MineAlreadyRunning("pid=999")
+        return _FakeWriterLockCM()
+
+    monkeypatch.setattr(palace, "mine_palace_lock", flaky_mine_palace_lock)
+
+    ok, reason = mcp_server._acquire_mcp_writer_lock()
+
+    assert ok is True
+    assert reason == ""
+    assert calls["count"] == 3
+    assert mcp_server._MCP_WRITER_READ_ONLY is False
+
+    # Cached from here — a second call must not re-probe the lock at all.
+    ok2, reason2 = mcp_server._acquire_mcp_writer_lock()
+    assert ok2 is True
+    assert calls["count"] == 3
+
+
+def test_peer_writer_lock_becomes_permanently_read_only_after_retry_window(monkeypatch):
+    """If the peer writer never releases within the grace period, the
+    existing 'permanently read-only for this process' contract still
+    holds — the retry only widens the window, it doesn't remove it."""
+    from mempalace import mcp_server, palace
+
+    monkeypatch.setenv(mcp_server._MCP_WRITER_LOCK_RETRY_SECONDS_ENV, "2")
+    _reset_peer_writer_state(monkeypatch, mcp_server)
+    _fake_clock(monkeypatch, mcp_server)
+
+    calls = {"count": 0}
+
+    def always_busy(palace_path):
+        calls["count"] += 1
+        raise palace.MineAlreadyRunning("pid=999")
+
+    monkeypatch.setattr(palace, "mine_palace_lock", always_busy)
+
+    ok, reason = mcp_server._acquire_mcp_writer_lock()
+
+    assert ok is False
+    assert "another mempalace writer already holds" in reason
+    assert mcp_server._MCP_WRITER_READ_ONLY is True
+    assert calls["count"] >= 2  # more than a single bare probe
+
+    calls_after_first_decision = calls["count"]
+    ok2, reason2 = mcp_server._acquire_mcp_writer_lock()
+    assert ok2 is False
+    assert reason2 == reason
+    assert calls["count"] == calls_after_first_decision  # no new attempt
+
+
+def test_peer_writer_lock_retry_disabled_by_zero_fails_immediately(monkeypatch):
+    """MEMPALACE_MCP_WRITER_LOCK_RETRY_SECONDS=0 preserves the pre-retry
+    behavior exactly: one probe, no sleep, immediate read-only."""
+    from mempalace import mcp_server, palace
+
+    monkeypatch.setenv(mcp_server._MCP_WRITER_LOCK_RETRY_SECONDS_ENV, "0")
+    _reset_peer_writer_state(monkeypatch, mcp_server)
+
+    calls = {"count": 0}
+
+    def always_busy(palace_path):
+        calls["count"] += 1
+        raise palace.MineAlreadyRunning("pid=999")
+
+    monkeypatch.setattr(palace, "mine_palace_lock", always_busy)
+    monkeypatch.setattr(
+        mcp_server.time,
+        "sleep",
+        lambda s: (_ for _ in ()).throw(AssertionError("retry disabled must not sleep")),
+    )
+
+    ok, reason = mcp_server._acquire_mcp_writer_lock()
+
+    assert ok is False
+    assert calls["count"] == 1
+
+
+def test_mcp_writer_lock_retry_seconds_env_parsing(monkeypatch):
+    from mempalace import mcp_server
+
+    monkeypatch.delenv(mcp_server._MCP_WRITER_LOCK_RETRY_SECONDS_ENV, raising=False)
+    assert (
+        mcp_server._mcp_writer_lock_retry_seconds()
+        == mcp_server._MCP_WRITER_LOCK_RETRY_SECONDS_DEFAULT
+    )
+
+    monkeypatch.setenv(mcp_server._MCP_WRITER_LOCK_RETRY_SECONDS_ENV, "12.5")
+    assert mcp_server._mcp_writer_lock_retry_seconds() == 12.5
+
+    monkeypatch.setenv(mcp_server._MCP_WRITER_LOCK_RETRY_SECONDS_ENV, "-3")
+    assert mcp_server._mcp_writer_lock_retry_seconds() == 0.0
+
+    monkeypatch.setenv(mcp_server._MCP_WRITER_LOCK_RETRY_SECONDS_ENV, "not-a-number")
+    assert (
+        mcp_server._mcp_writer_lock_retry_seconds()
+        == mcp_server._MCP_WRITER_LOCK_RETRY_SECONDS_DEFAULT
+    )
+
+
 def test_sqlite_integrity_gate_refuses_non_status_tool(monkeypatch):
     from mempalace import mcp_server
 
