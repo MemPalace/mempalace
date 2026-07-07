@@ -18,6 +18,7 @@ and ~/.mempalace/identity.txt.
 
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from collections import defaultdict
 
@@ -87,7 +88,9 @@ class Layer1:
 
     MAX_DRAWERS = 15  # at most 15 moments in wake-up
     MAX_CHARS = 3200  # hard cap on total L1 text (~800 tokens)
-    MAX_SCAN = 2000  # don't scan more than this for L1 generation
+    MAX_SCAN = 200_000  # safety valve on metadata scan (full corpus expected)
+    RECENCY_WEIGHT = 2.0  # max score boost for a just-filed drawer
+    RECENCY_HALF_LIFE_DAYS = 14.0  # boost halves every N days
 
     def __init__(self, palace_path: str = None, wing: str = None):
         cfg = MempalaceConfig()
@@ -101,37 +104,42 @@ class Layer1:
         except Exception:
             return "## L1 — No palace found. Run: mempalace mine <dir>"
 
-        # Fetch all drawers in batches to avoid SQLite variable limit (~999)
+        # Scan metadata for the FULL corpus (no documents — cheap), batched
+        # to avoid SQLite variable limit (~999). Documents are fetched later
+        # for only the top MAX_DRAWERS winners.
         _BATCH = 500
-        docs, metas = [], []
+        ids, metas = [], []
         offset = 0
         while True:
-            kwargs = {"include": ["documents", "metadatas"], "limit": _BATCH, "offset": offset}
+            kwargs = {"include": ["metadatas"], "limit": _BATCH, "offset": offset}
             if self.wing:
                 kwargs["where"] = {"wing": self.wing}
             try:
                 batch = col.get(**kwargs)
             except Exception:
                 break
-            batch_docs = batch.get("documents", [])
+            batch_ids = batch.get("ids", [])
             batch_metas = batch.get("metadatas", [])
-            if not batch_docs:
+            if not batch_ids:
                 break
-            docs.extend(batch_docs)
+            ids.extend(batch_ids)
             metas.extend(batch_metas)
-            offset += len(batch_docs)
-            if len(batch_docs) < _BATCH or len(docs) >= self.MAX_SCAN:
+            offset += len(batch_ids)
+            if len(batch_ids) < _BATCH or len(ids) >= self.MAX_SCAN:
                 break
 
-        if not docs:
+        if not ids:
             return "## L1 — No memories yet."
 
-        # Score each drawer: prefer high importance, recent filing
+        # Score each drawer: importance + recency decay (half-life
+        # RECENCY_HALF_LIFE_DAYS). A fresh default-importance drawer can
+        # outrank a stale high-importance one, so the essential story tracks
+        # the present, not the archive.
+        now = datetime.now(timezone.utc)
         scored = []
-        for doc, meta in zip(docs, metas):
+        for did, meta in zip(ids, metas):
             meta = meta or {}
-            doc = doc or ""
-            importance = 3
+            importance = 3.0
             # Try multiple metadata keys that might carry weight info
             for key in ("importance", "emotional_weight", "weight"):
                 val = meta.get(key)
@@ -141,11 +149,36 @@ class Layer1:
                     except (ValueError, TypeError):
                         pass
                     break
-            scored.append((importance, meta, doc))
+            age_days = None
+            for key in ("authored_at", "created_at"):
+                raw = meta.get(key)
+                if raw:
+                    try:
+                        ts = datetime.fromisoformat(str(raw))
+                        if ts.tzinfo is None:
+                            ts = ts.replace(tzinfo=timezone.utc)
+                        age_days = max((now - ts).total_seconds() / 86400.0, 0.0)
+                    except (ValueError, TypeError):
+                        pass
+                    break
+            recency = (
+                0.0
+                if age_days is None
+                else self.RECENCY_WEIGHT * 0.5 ** (age_days / self.RECENCY_HALF_LIFE_DAYS)
+            )
+            scored.append((importance + recency, did, meta))
 
-        # Sort by importance descending, take top N
+        # Sort by combined score descending, take top N, then fetch
+        # documents for just the winners
         scored.sort(key=lambda x: x[0], reverse=True)
-        top = scored[: self.MAX_DRAWERS]
+        winners = scored[: self.MAX_DRAWERS]
+        try:
+            fetched = col.get(ids=[d for _s, d, _m in winners], include=["documents"])
+        except Exception:
+            return "## L1 — No memories yet."
+        doc_by_id = dict(zip(fetched.get("ids", []), fetched.get("documents", [])))
+
+        top = [(score, meta, doc_by_id.get(did) or "") for score, did, meta in winners]
 
         # Group by room for readability
         by_room = defaultdict(list)
