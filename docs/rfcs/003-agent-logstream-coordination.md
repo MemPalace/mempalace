@@ -269,6 +269,9 @@ Implementation for v1:
 - max timeout 5 minutes;
 - return `{ "timed_out": true, "events": [] }` rather than error on timeout.
 
+`mempalace_event_wait` remains the polling MCP tool. Clients that can hold an
+HTTP stream should use `GET /logstream/stream` SSE for live tailing.
+
 ### `mempalace_event_ack`
 
 Append an acknowledgement event.

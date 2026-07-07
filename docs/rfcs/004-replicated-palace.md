@@ -357,6 +357,12 @@ Every mutation of the palace becomes an immutable op:
 | Logstream | event.append | Append-only union; cross-replica order by HLC; per-origin `seq` preserved; consumer contract additive (`origin_replica`, `hlc` are new fields) |
 | Diary | drawer.add in diary rooms | Same as drawer content (already append-only) |
 
+`org.tunnel.remove` is the remove half of the tunnel OR-set: it hides the edge
+from the current organization view, not from history. If MemPalace adopts a
+first-class dormant-tunnel product state, ship it as an explicit state op
+(`org.tunnel.set_state(active|dormant)` or equivalent) rather than overloading
+remove with dormancy semantics.
+
 Anti-entropy: peers exchange version vectors and pull missing per-origin
 ranges (`GET /sync/ops?origin=X&after=N`), push-notified over the existing
 SSE channel. No broker, no framework: automerge/yjs are document-CRDTs

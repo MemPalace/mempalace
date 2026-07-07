@@ -518,6 +518,9 @@ List events with structured filters, oldest first.
 
 Block until a matching event exists or the timeout expires (long-poll; max 5 minutes). Accepts the same filters as `event_list` plus:
 
+For live-tail clients that can keep an HTTP connection open, use
+`GET /logstream/stream` SSE instead; `event_wait` is the polling MCP surface.
+
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `timeout_ms` | integer | No | Wait duration in ms (default 60000, clamped to 300000) |
