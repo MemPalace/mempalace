@@ -306,6 +306,31 @@ provenance and any tunnels still resolve.
 Because a v4 id is a pure function of content, every replica migrates
 independently and converges on identical ids — no migration is ever synced.
 
+## `mempalace reconcile-ids`
+
+Drain legacy v3-keyed "ghost" drawers that remain after the write-flip. New
+writes already mint content-pure v4 ids; this command rewrites older store rows
+to their content-hash ids, or drops a ghost when the same content already exists
+under its v4 id.
+
+```bash
+mempalace reconcile-ids          # dry-run plan (writes nothing)
+mempalace reconcile-ids --json   # machine-readable plan/output
+mempalace reconcile-ids --apply  # write the drain; stop the hub first
+```
+
+| Option | Description |
+|--------|-------------|
+| *(none)* | Dry-run plan: legacy ghosts, rows to rewrite, and duplicates to drop. Writes nothing. |
+| `--apply` | Rewrite/drop the ghosts in place. Stop the hub first; this command writes the palace directly. |
+| `--force-live-hub` | Allow `--apply` even when a live write-capable hub is registered. Manual recovery only. |
+| `--json` | Machine-readable output |
+
+The write-flip and reconcile drain are separate. During the gap, ordinary
+search may show duplicate logical content under a legacy id and its v4
+content-hash id. Treat the migration as stable only after `reconcile-ids
+--apply` reports zero remaining legacy ghosts.
+
 Full runbook (run against the target, validate, then swap it in):
 
 ```bash
@@ -313,5 +338,6 @@ mempalace migrate-ids --apply --target ~/palace-v4
 mempalace --palace ~/palace-v4 compress        # rebuild the closet index at v4 ids
 mempalace --palace ~/palace-v4 oplog promote   # build the v4 op-log
 mempalace --palace ~/palace-v4 oplog verify    # must report CLEAN
+mempalace --palace ~/palace-v4 reconcile-ids   # confirm no legacy ghosts
 mempalace --palace ~/palace-v4 search "..."    # confirm recall
 ```

@@ -342,7 +342,7 @@ Every mutation of the palace becomes an immutable op:
 
 | State | Op kinds | Merge rule |
 |---|---|---|
-| Drawer content | add / revise / tombstone | Grow-only set of content-addressed revisions; head = latest by HLC; tombstone hides, never deletes (verbatim survives) |
+| Drawer content | add / revise / tombstone | Grow-only op history of content-addressed revisions; head = latest by HLC. A tombstone removes the drawer from the materialized/queryable store, while the tombstone op keeps the verbatim content for replay/audit. |
 | Artifacts | artifact.put | True G-set, union by sha256 — conflicts impossible |
 | Organization | org.file / org.move / org.tunnel.* | LWW-by-HLC register per drawer (placement) / OR-set (tunnels); merges surfaced to user (R4) |
 | Knowledge graph | kg.assert / kg.close / kg.entity.upsert | Assert = G-set; close = interval-close (idempotent, min valid_to wins); entity upsert = LWW-by-HLC |
@@ -379,7 +379,7 @@ alias table for inbound references (tunnels, KG `source_drawer_id`).
 |---|---|---|
 | `tool_update_drawer` in-place update/upsert | mcp_server.py | `drawer.revise` (new content-addressed revision) |
 | Miner re-mine upsert over same id | miner.py:1336,1478 | `drawer.revise` at origin replica only (§8) |
-| `delete_drawer` / `delete_by_source` / dedup batch delete | dedup.py:127 | `drawer.tombstone` (hide, never destroy) |
+| `delete_drawer` / `delete_by_source` / dedup batch delete | dedup.py:127 | `drawer.tombstone` (delete from the materialized store; preserve verbatim content in the op-log) |
 | Entity registry whole-file `json.dumps` | entity_registry.py:328 | `registry.entity.upsert` op stream |
 | `hallways.json` whole-file rewrite | hallways.py:140 | `org.tunnel.add/remove` OR-set ops |
 | KG `invalidate` UPDATE of valid_to; entities INSERT OR REPLACE | knowledge_graph.py | `kg.close` interval op; `kg.entity.upsert` |
@@ -435,14 +435,20 @@ machine.
    derived consumers. Decided 2026-07-02 (Igor): ships as **2a**
    (drawers + KG ops — the waiting customers: mining promotion and the
    multi-writer foundation) followed by **2b** (registry + hallways/tunnels
-   op conversion); superseded revisions are kept **forever** (verbatim
-   maximalism — search surfaces head revisions only; no GC path exists);
+   op conversion); superseded revisions are kept **forever in the op-log**
+   (verbatim maximalism; search surfaces the materialized current store);
    the v4 migration runs **staged on a palace copy first**, validated, then
    live with a timestamped backup and a brief read-only window; the mac
    origin runs a **dual-write shadow period** (Chroma writes + op emission,
    divergence detectable) before cutover. Step 3's write-flip on remote
    replicas begins only **after the local-capture promotion validates**
-   end-to-end. Two commitments this step MUST honor:
+   end-to-end. The write-flip and ghost drain are two separate operations:
+   flipping `ID_RECIPE=v4` makes new writes content-pure immediately, while
+   `mempalace reconcile-ids --apply` drains legacy v3-keyed ghosts afterward.
+   Until that drain reports zero ghosts, the same logical content can appear
+   twice in ordinary search results (legacy id plus content-hash id). A palace
+   is not migration-stable until reconcile finishes. Two commitments this step
+   MUST honor:
    - **Local-capture promotion.** A step-1 replica may mine machine-local
      data (projects, conversations) into its own palace before step 2
      exists — such drawers carry no `replica_origin` stamp, so read-replica
