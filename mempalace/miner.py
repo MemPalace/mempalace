@@ -2058,12 +2058,16 @@ def status(palace_path: str):
     un-bootstrapped collection, or an unexpected schema); the fallback also
     emits the state-specific guidance for absent/empty palaces.
     """
-    from .backends.chroma import _sqlite_wing_room_counts
+    from .backends.chroma import _sqlite_v3_ghost_drawer_count, _sqlite_wing_room_counts
+    from .ids import ID_RECIPE
 
     counts = _sqlite_wing_room_counts(palace_path, "mempalace_drawers")
     if counts is not None:
         total, wing_rooms = counts
-        _print_status(total, wing_rooms)
+        ghost_count = None
+        if ID_RECIPE == "v4":
+            ghost_count = _sqlite_v3_ghost_drawer_count(palace_path, "mempalace_drawers")
+        _print_status(total, wing_rooms, v3_ghost_count=ghost_count)
         return
 
     col = _open_collection_or_explain(palace_path)
@@ -2086,10 +2090,21 @@ def status(palace_path: str):
             wing_rooms[m.get("wing", "?")][m.get("room", "?")] += 1
         offset += len(batch)
 
-    _print_status(total, wing_rooms)
+    ghost_count = None
+    if ID_RECIPE == "v4":
+        try:
+            from .reconcile_v3 import plan_v3_reconcile
+
+            ghost_count = plan_v3_reconcile(col)["ghost_drawers"]
+        except Exception:
+            logger.debug("status v3 ghost diagnostic unavailable", exc_info=True)
+
+    _print_status(total, wing_rooms, v3_ghost_count=ghost_count)
 
 
-def _print_status(total: int, wing_rooms: dict[str, dict[str, int]]) -> None:
+def _print_status(
+    total: int, wing_rooms: dict[str, dict[str, int]], v3_ghost_count: Optional[int] = None
+) -> None:
     """Render the wing/room histogram shared by both status code paths."""
     print(f"\n{'=' * 55}")
     print(f"  MemPalace Status — {total} drawers")
@@ -2099,4 +2114,10 @@ def _print_status(total: int, wing_rooms: dict[str, dict[str, int]]) -> None:
         for room, count in sorted(rooms.items(), key=lambda x: x[1], reverse=True):
             print(f"    ROOM: {room:20} {count:5} drawers")
         print()
+    if v3_ghost_count:
+        print(
+            f"  WARNING: {v3_ghost_count:,} legacy v3 ghost drawer(s) remain after "
+            "the v4 write-flip."
+        )
+        print("           Run `mempalace reconcile-ids` and apply after stopping the hub.\n")
     print(f"{'=' * 55}\n")

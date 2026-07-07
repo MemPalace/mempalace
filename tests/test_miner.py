@@ -906,6 +906,29 @@ def test_status_does_not_cold_load_vector_index(palace_path, seeded_collection, 
     assert "WING: notes" in out
 
 
+def test_status_warns_about_legacy_v3_ghosts(collection, palace_path, capsys):
+    """After the v4 write-flip, status should surface an unfinished ghost drain."""
+    collection.add(
+        ids=["drawer_sessions_technical_legacy"],
+        documents=["legacy ghost content"],
+        metadatas=[{"wing": "sessions", "room": "technical", "id_recipe": "v3"}],
+        embeddings=[[1.0, 0.0, 0.0]],
+    )
+    collection.add(
+        ids=["drawer_0123456789abcdef0123456789abcdef"],
+        documents=["current content"],
+        metadatas=[{"wing": "sessions", "room": "technical", "id_recipe": "v4"}],
+        embeddings=[[0.0, 1.0, 0.0]],
+    )
+
+    status(palace_path)
+
+    out = capsys.readouterr().out
+    assert "MemPalace Status — 2 drawers" in out
+    assert "1 legacy v3 ghost drawer(s) remain" in out
+    assert "mempalace reconcile-ids" in out
+
+
 def test_sqlite_wing_room_counts_exact_tally(palace_path, seeded_collection):
     """The sqlite tally must equal the seeded drawers exactly — 2 project/
     backend, 1 project/frontend, 1 notes/planning — with no double counting.

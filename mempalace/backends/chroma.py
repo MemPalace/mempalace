@@ -966,6 +966,66 @@ def _sqlite_wing_room_counts(
     return total, wing_rooms
 
 
+def _sqlite_v3_ghost_drawer_count(palace_path: str, collection_name: str) -> Optional[int]:
+    """Count legacy v3 logical drawers directly from ``chroma.sqlite3``.
+
+    Returns ``None`` when the sqlite read cannot be trusted. Mirrors the
+    ``reconcile_v3`` ghost predicate closely enough for status diagnostics:
+    rows with ``id_recipe != v4`` are ghosts, registry sentinels are excluded,
+    and chunk rows collapse by ``parent_drawer_id``.
+    """
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return None
+    try:
+        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+        try:
+            conn.execute("PRAGMA busy_timeout = 3000")
+            if (
+                conn.execute(
+                    "SELECT 1 FROM collections WHERE name = ?", (collection_name,)
+                ).fetchone()
+                is None
+            ):
+                return None
+            rows = conn.execute(
+                """
+                SELECT e.embedding_id,
+                       COALESCE(recipe.string_value, CAST(recipe.int_value AS TEXT),
+                                CAST(recipe.float_value AS TEXT)) AS id_recipe,
+                       COALESCE(mode.string_value, CAST(mode.int_value AS TEXT),
+                                CAST(mode.float_value AS TEXT)) AS ingest_mode,
+                       COALESCE(parent.string_value, CAST(parent.int_value AS TEXT),
+                                CAST(parent.float_value AS TEXT)) AS parent_drawer_id
+                FROM embeddings e
+                JOIN segments s ON e.segment_id = s.id AND s.scope = 'METADATA'
+                JOIN collections c ON s.collection = c.id
+                LEFT JOIN embedding_metadata recipe
+                  ON recipe.id = e.id AND recipe.key = 'id_recipe'
+                LEFT JOIN embedding_metadata mode
+                  ON mode.id = e.id AND mode.key = 'ingest_mode'
+                LEFT JOIN embedding_metadata parent
+                  ON parent.id = e.id AND parent.key = 'parent_drawer_id'
+                WHERE c.name = ?
+                """,
+                (collection_name,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+    ghosts: set[str] = set()
+    for row_id, recipe, ingest_mode, parent in rows:
+        row_id = str(row_id)
+        if row_id.startswith("_reg_") or ingest_mode == "registry":
+            continue
+        if recipe == "v4":
+            continue
+        ghosts.add(str(parent) if parent else row_id)
+    return len(ghosts)
+
+
 def _pin_hnsw_threads(collection) -> None:
     """Best-effort retrofit: pin ``hnsw:num_threads=1`` on an existing collection.
 

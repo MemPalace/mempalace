@@ -118,7 +118,9 @@ mempalace compress --config entities.json
 
 ## `mempalace status`
 
-Show what's been filed — drawer count, wing/room breakdown.
+Show what's been filed — drawer count, wing/room breakdown. After the v4
+write-flip, it also warns when legacy v3 ghost drawers still need
+`mempalace reconcile-ids`.
 
 ```bash
 mempalace status
