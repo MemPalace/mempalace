@@ -7,6 +7,11 @@ import mempalace.embedding as embedding
 def isolate_embedding_state(monkeypatch):
     monkeypatch.setattr(embedding, "_EF_CACHE", {})
     monkeypatch.setattr(embedding, "_WARNED", set())
+    # Default-off MPS for the onnx-focused tests below so they keep their
+    # original meaning even on an Apple Silicon dev machine where the [mps]
+    # extra is installed. MPS-specific tests re-enable these explicitly.
+    monkeypatch.setattr(embedding, "_torch_mps_available", lambda: False)
+    monkeypatch.setattr(embedding, "_sentence_transformers_available", lambda: False)
 
 
 def test_auto_picks_cuda(monkeypatch):
@@ -192,3 +197,148 @@ def test_describe_device_uses_resolved_effective_device(monkeypatch):
     )
 
     assert embedding.describe_device("auto") == "cuda"
+
+
+# ---------------------------------------------------------------------------
+# MPS device — sentence-transformers / torch.mps branch
+# ---------------------------------------------------------------------------
+#
+# Why MPS is its own path: ChromaDB's bundled ONNXMiniLM_L6_V2 enables
+# CoreMLExecutionProvider by default, which silently falls back op-by-op
+# to CPU for all-MiniLM-L6-v2 on Apple Silicon. The ANE↔CPU copies cost
+# more than they save (measured 60-256x slowdown). Routing through
+# sentence-transformers + torch.mps bypasses CoreML entirely and runs
+# the model directly on the Metal GPU.
+
+
+def test_mps_explicit_resolves_to_sentinel_when_available(monkeypatch):
+    """Explicit device='mps' returns the MPS sentinel when torch+ST+MPS line up."""
+    monkeypatch.setattr(embedding, "_torch_mps_available", lambda: True)
+    monkeypatch.setattr(embedding, "_sentence_transformers_available", lambda: True)
+
+    providers, effective = embedding._resolve_providers("mps")
+    assert providers[0] == embedding._MPS_SENTINEL
+    assert effective == "mps"
+
+
+def test_mps_missing_extra_warns_and_falls_to_cpu(monkeypatch, caplog):
+    """device='mps' without the [mps] extra installed -> CPU + actionable warning."""
+    monkeypatch.setattr(embedding, "_torch_mps_available", lambda: False)
+    monkeypatch.setattr(embedding, "_sentence_transformers_available", lambda: False)
+
+    providers, effective = embedding._resolve_providers("mps")
+    assert providers == ["CPUExecutionProvider"]
+    assert effective == "cpu"
+    assert "mempalace[mps]" in caplog.text
+
+
+def test_mps_st_installed_but_no_metal_warns(monkeypatch, caplog):
+    """ST installed but torch.backends.mps unavailable (e.g. Linux/Intel Mac)."""
+    monkeypatch.setattr(embedding, "_sentence_transformers_available", lambda: True)
+    monkeypatch.setattr(embedding, "_torch_mps_available", lambda: False)
+
+    providers, effective = embedding._resolve_providers("mps")
+    assert providers == ["CPUExecutionProvider"]
+    assert effective == "cpu"
+    assert "torch.backends.mps" in caplog.text
+
+
+def test_auto_prefers_mps_over_coreml_when_torch_mps_available(monkeypatch):
+    """The whole point of this PR: MPS wins on Apple Silicon, even if CoreML works."""
+    monkeypatch.setattr(embedding, "_torch_mps_available", lambda: True)
+    monkeypatch.setattr(embedding, "_sentence_transformers_available", lambda: True)
+    monkeypatch.setattr(
+        "onnxruntime.get_available_providers",
+        lambda: ["CoreMLExecutionProvider", "CPUExecutionProvider"],
+    )
+
+    providers, effective = embedding._resolve_providers("auto")
+    assert effective == "mps"
+    assert providers[0] == embedding._MPS_SENTINEL
+
+
+def test_auto_falls_to_coreml_when_torch_unavailable(monkeypatch):
+    """Without the [mps] extra, auto on Apple Silicon should still use CoreML."""
+    monkeypatch.setattr(embedding, "_torch_mps_available", lambda: False)
+    monkeypatch.setattr(embedding, "_sentence_transformers_available", lambda: False)
+    monkeypatch.setattr(
+        "onnxruntime.get_available_providers",
+        lambda: ["CoreMLExecutionProvider", "CPUExecutionProvider"],
+    )
+
+    providers, effective = embedding._resolve_providers("auto")
+    assert effective == "coreml"
+    assert providers == ["CoreMLExecutionProvider", "CPUExecutionProvider"]
+
+
+def test_get_embedding_function_routes_mps_to_st_branch(monkeypatch):
+    """When the resolver returns the MPS sentinel, get_embedding_function must
+    take the sentence-transformers path (``_build_mps_ef``), not the ONNX path."""
+
+    class DummySTEF:
+        pass
+
+    onnx_called = False
+
+    def fake_build_ef_class():
+        nonlocal onnx_called
+        onnx_called = True
+
+        class _Dummy:
+            def __init__(self, **_):
+                pass
+
+        return _Dummy
+
+    monkeypatch.setattr(embedding, "_build_ef_class", fake_build_ef_class)
+    monkeypatch.setattr(embedding, "_build_mps_ef", lambda: DummySTEF())
+    monkeypatch.setattr(
+        embedding,
+        "_resolve_providers",
+        lambda device: ([embedding._MPS_SENTINEL, "CPUExecutionProvider"], "mps"),
+    )
+
+    ef = embedding.get_embedding_function("mps")
+    assert isinstance(ef, DummySTEF)
+    assert onnx_called is False  # ONNX class was never built — proves routing
+
+
+def test_get_embedding_function_caches_mps_branch(monkeypatch):
+    """The MPS branch must hit the same ``_EF_CACHE`` as the ONNX branch."""
+
+    class DummySTEF:
+        pass
+
+    monkeypatch.setattr(embedding, "_build_mps_ef", lambda: DummySTEF())
+    monkeypatch.setattr(
+        embedding,
+        "_resolve_providers",
+        lambda device: ([embedding._MPS_SENTINEL, "CPUExecutionProvider"], "mps"),
+    )
+
+    a = embedding.get_embedding_function("mps")
+    b = embedding.get_embedding_function("mps")
+    assert a is b
+
+
+def test_unknown_device_does_not_match_mps_sentinel(monkeypatch, caplog):
+    """Regression guard: arbitrary unknown strings must not accidentally route to MPS."""
+    monkeypatch.setattr("onnxruntime.get_available_providers", lambda: ["CPUExecutionProvider"])
+    providers, effective = embedding._resolve_providers("__mempalace_torch_mps__")
+    assert effective == "cpu"
+    assert providers == ["CPUExecutionProvider"]
+
+
+def test_torch_mps_available_returns_bool_without_torch(monkeypatch):
+    """Helper must not raise when torch is missing — important for non-Apple CI."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "torch":
+            raise ImportError("no torch in this venv")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    assert embedding._torch_mps_available() is False

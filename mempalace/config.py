@@ -640,11 +640,16 @@ class MempalaceConfig:
 
     @property
     def embedding_device(self):
-        """Hardware device for the ONNX embedding model.
+        """Hardware device for the embedding model.
 
         Values: ``"auto"`` (default), ``"cpu"``, ``"cuda"``, ``"coreml"``,
-        ``"dml"``. Read from env ``MEMPALACE_EMBEDDING_DEVICE`` first, then
-        ``embedding_device`` in ``config.json``, then ``"auto"``.
+        ``"dml"``, ``"mps"``. Read from env ``MEMPALACE_EMBEDDING_DEVICE``
+        first, then ``embedding_device`` in ``config.json``, then ``"auto"``.
+
+        ``cpu`` / ``cuda`` / ``coreml`` / ``dml`` are ONNX Runtime execution
+        providers; ``mps`` routes through PyTorch + sentence-transformers
+        instead, bypassing CoreML's op-fallback thrash on Apple Silicon
+        (see :mod:`mempalace.embedding` docstring for the full diagnosis).
 
         ``auto`` resolves to the first available accelerator at runtime via
         :mod:`mempalace.embedding`; requesting an unavailable accelerator
