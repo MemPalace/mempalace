@@ -15,6 +15,8 @@ import math
 import os
 import re
 import sqlite3
+import subprocess
+import sys
 from datetime import timedelta
 from pathlib import Path
 from typing import Optional
@@ -601,6 +603,75 @@ def _print_search_results_bm25_only(
     print()
 
 
+def _chromadb_open_crashes(palace_path: str, collection_name: str) -> bool:
+    """Return True if opening the chromadb collection crashes the process.
+
+    A corrupt HNSW segment makes chromadb segfault on segment load. SIGSEGV
+    kills the interpreter and cannot be caught with try/except, so the check
+    runs in a throwaway subprocess: if the child dies by signal (a negative
+    return code) or times out, in-process open is unsafe and the caller must
+    avoid touching chromadb. A clean non-zero exit is an ordinary Python
+    exception, which the in-process open re-raises as a catchable,
+    diagnosable error — that is treated as safe so the caller keeps its
+    normal error path.
+    """
+    probe = (
+        "import sys\n"
+        "from mempalace.palace import get_collection\n"
+        "col = get_collection(sys.argv[1], collection_name=sys.argv[2], create=False)\n"
+        "col.count()\n"
+    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", probe, palace_path, collection_name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=120,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return True
+    # Negative return code = killed by a signal (e.g. -SIGSEGV): uncatchable
+    # in-process, so the vector path is unsafe. Exit code 1+ is an ordinary
+    # exception the in-process open surfaces as a proper diagnostic.
+    return proc.returncode < 0
+    # ponytail: re-probes chromadb every search. Cache on the HNSW segment's
+    # mtime/size if search latency on a healthy palace ever matters.
+
+
+def _print_lexical_results(res: dict, query: str, wing: str, room: str, n_results: int) -> None:
+    """Print :func:`_bm25_only_via_sqlite` output in the CLI ``search`` format."""
+    if res.get("error"):
+        print(f"\n  Search error: {res['error']}")
+        raise SearchError(res["error"])
+    results = res.get("results", [])[:n_results]
+    if not results:
+        print(f'\n  No results found for: "{query}"')
+        return
+
+    print(f"\n{'=' * 60}")
+    print(f'  Results for: "{query}"  (lexical mode — vector index unavailable)')
+    if wing:
+        print(f"  Wing: {wing}")
+    if room:
+        print(f"  Room: {room}")
+    print(f"{'=' * 60}\n")
+
+    for i, hit in enumerate(results, 1):
+        bm25 = hit.get("bm25_score", 0.0)
+        source = Path(hit.get("source_file") or "?").name
+        wing_name = hit.get("wing") or "?"
+        room_name = hit.get("room") or "?"
+        print(f"  [{i}] {wing_name} / {room_name}")
+        print(f"      Source: {source}")
+        print(f"      Match:  bm25={bm25}")
+        print()
+        for line in (hit.get("text") or "").strip().split("\n"):
+            print(f"      {line}")
+        print()
+        print(f"  {'─' * 56}")
+    print()
+
+
 def search(
     query: str,
     palace_path: str,
@@ -655,6 +726,33 @@ def search(
             since_dt=since_dt,
             before_dt=before_dt,
         )
+
+    if backend_name == "chroma":
+        # A corrupt HNSW segment segfaults chromadb on open, which would take
+        # the whole CLI down and return nothing. Probe the open in a
+        # subprocess; when unsafe, serve the query from the FTS5/sqlite
+        # lexical index, which is independent of the vector segment.
+        from .config import get_configured_collection_name
+
+        collection_name = get_configured_collection_name()
+        if _chromadb_open_crashes(palace_path, collection_name):
+            logger.warning(
+                "chromadb open unsafe for palace %s; serving lexical (FTS5) results",
+                palace_path,
+            )
+            res = _bm25_only_via_sqlite(
+                query,
+                palace_path,
+                wing=wing,
+                room=room,
+                n_results=n_results,
+                collection_name=collection_name,
+                stop_words=stop_words,
+                since_dt=since_dt,
+                before_dt=before_dt,
+            )
+            _print_lexical_results(res, query, wing, room, n_results)
+            return
 
     col = _open_collection_or_explain(palace_path, opener=get_collection)
     if col is None:
