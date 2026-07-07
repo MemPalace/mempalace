@@ -76,8 +76,9 @@ fleet (logstream correlation `rfc004_replicated_palace_position`):
   encrypted offsite snapshots. Zero knowledge; never queryable server-side.
 - **Thin/partial replicas (phone-class devices) in v1.** They remain remote
   clients of a nearby full replica; partial replication is future work.
-- **Multi-user merge semantics.** One human, N devices. Trust boundary =
-  palace boundary.
+- **Multi-user merge and authorization semantics.** One human, N devices.
+  Trust boundary = palace boundary. Mesh membership is full-replica trust,
+  not family/team scoped read or write permission.
 
 ## Architecture Overview
 
@@ -158,6 +159,12 @@ mutually authenticated — a `request` whose caller identity isn't a current,
 non-revoked member is refused at Layer 1, before Layer 2 sees a byte. That
 refusal is the replication ACL (R7) and it is the *only* authorization Layer
 2 relies on: an op that arrived is an op from a trusted replica.
+
+This is deliberately a v1 device-trust boundary, not a user/role permission
+model. Admitting a replica means admitting it to the entire personal palace,
+verbatim content included. Delegated, family, team, or other partial-access
+workflows need a separate palace-level capability layer; they must not be
+modeled as "just add this device to the replication mesh."
 
 `ReplicaId` is the transport's node identity — no separate replica registry
 to drift. Under MeshGuard it is the Ed25519 public key; that same value is
@@ -356,6 +363,13 @@ SSE channel. No broker, no framework: automerge/yjs are document-CRDTs
 (wrong shape, heavy deps); cr-sqlite is a native extension whose generic
 table-CRDTs know nothing of id purity or verbatim; file-level sync of live
 SQLite corrupts. The merge logic above is ~hundreds of lines we fully own.
+
+Future domain-specific state needs the same explicit treatment before it
+enters Layer 2. Closet/card semantics, succession edges, contradiction
+intervals, or other semantic structures are not automatically drawer
+placement registers. Each adopted state must name its own op kinds, conflict
+surface, and any merge-exempt or intentionally non-LWW transitions; otherwise
+replicas can silently erase meaning while still "converging."
 
 ### 6.3 Id purity (prerequisite, not footnote)
 
