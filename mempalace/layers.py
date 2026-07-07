@@ -89,7 +89,7 @@ class Layer1:
     MAX_DRAWERS = 15  # at most 15 moments in wake-up
     MAX_CHARS = 3200  # hard cap on total L1 text (~800 tokens)
     MAX_SCAN = 200_000  # safety valve on metadata scan (full corpus expected)
-    RECENCY_WEIGHT = 2.0  # max score boost for a just-filed drawer
+    RECENCY_WEIGHT = 3.0  # max score boost for a just-filed drawer
     RECENCY_HALF_LIFE_DAYS = 14.0  # boost halves every N days
 
     def __init__(self, palace_path: str = None, wing: str = None):
@@ -168,10 +168,19 @@ class Layer1:
             )
             scored.append((importance + recency, did, meta))
 
-        # Sort by combined score descending, take top N, then fetch
-        # documents for just the winners
+        # Sort by combined score descending, take top N — at most one drawer
+        # per source_file so multi-chunk files don't monopolize L1 — then
+        # fetch documents for just the winners
         scored.sort(key=lambda x: x[0], reverse=True)
-        winners = scored[: self.MAX_DRAWERS]
+        winners, seen_sources = [], set()
+        for score, did, meta in scored:
+            source = meta.get("source_file") or did
+            if source in seen_sources:
+                continue
+            seen_sources.add(source)
+            winners.append((score, did, meta))
+            if len(winners) >= self.MAX_DRAWERS:
+                break
         try:
             fetched = col.get(ids=[d for _s, d, _m in winners], include=["documents"])
         except Exception:
