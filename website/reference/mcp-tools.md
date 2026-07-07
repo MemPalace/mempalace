@@ -15,15 +15,16 @@ Agents that build memory-first workflows should start with these stable outputs:
 ```json
 {
   "total_drawers": 1832,
-  "wings": 12,
-  "rooms": 38,
-  "protocol": {
-    "steps": [
-      "call mempalace_search before asserting facts about people/projects",
-      "prefer mempalace_kg_query for time-bound claims"
-    ]
+  "wings": {
+    "api-service": 214,
+    "frontend": 117
   },
-  "aaak_dialect": "..."
+  "rooms": {
+    "decisions": 84,
+    "incidents": 31
+  },
+  "protocol": "call mempalace_search before asserting facts about people/projects...",
+  "aaak_dialect": "AAAK dialect specification..."
 }
 ```
 

@@ -3,6 +3,7 @@
 Ensure MCP tool-count claims in documentation stay aligned with the implementation.
 """
 
+import ast
 import re
 from pathlib import Path
 
@@ -15,6 +16,9 @@ DOC_PATHS = [
     Path("website/guide/openclaw.md"),
     Path("website/reference/modules.md"),
     Path("website/reference/mcp-tools.md"),
+    Path(".claude-plugin/README.md"),
+    Path(".cursor-plugin/README.md"),
+    Path(".codex-plugin/plugin.json"),
     Path("skills/mempalace/SKILL.md"),
     Path("integrations/openclaw/SKILL.md"),
 ]
@@ -22,7 +26,21 @@ DOC_PATHS = [
 
 def _tool_count_from_server() -> int:
     server_src = Path("mempalace/mcp_server.py").read_text(encoding="utf-8")
-    return len(re.findall(r'"(mempalace_\w+)":\s*\{', server_src))
+    module = ast.parse(server_src)
+    for node in module.body:
+        if (
+            isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "TOOLS" for target in node.targets)
+            and isinstance(node.value, ast.Dict)
+        ):
+            return sum(
+                1
+                for key in node.value.keys
+                if isinstance(key, ast.Constant)
+                and isinstance(key.value, str)
+                and key.value.startswith("mempalace_")
+            )
+    raise AssertionError("mempalace/mcp_server.py does not define a TOOLS dict")
 
 
 def _doc_tool_counts(path: Path) -> list[int]:
