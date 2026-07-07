@@ -46,7 +46,7 @@ You have access to a local memory palace via MCP tools. The palace stores verbat
 
 ## Available Tools
 
-Full MCP surface: 35 tools. Destructive or host-level tools are documented so
+Full MCP surface: 36 tools. Destructive or host-level tools are documented so
 you know they exist, but use them only when the user explicitly asks or when a
 tool-specific workflow below says to.
 

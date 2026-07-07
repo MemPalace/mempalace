@@ -36,6 +36,29 @@ non-default backend is opt-in.
 | `pgvector` | Server (Postgres) | `mempalace[pgvector]` | ✓ | ✓ |
 <!-- New backends add one row here and one `### <Backend>` subsection (with its connection variables) below; keep README's compatibility table in sync. -->
 
+## Local-first backend contract
+
+MemPalace keeps the memory stack local-first by default. For the two local backends
+(`chroma`, `sqlite_exact`), embeddings, indexes, and verbatim drawer text all stay
+on disk under `palace_path`.
+
+| Backend | Data location | Network required | Notes |
+| ------- | ------------- | ---------------- | ----- |
+| `chroma` | `~/.mempalace/palace` or `--palace` directory | No | Default |
+| `sqlite_exact` | `~/.mempalace/palace` or `--palace` directory | No | Exact-cosine local baseline |
+| `qdrant` | Self-hosted Qdrant server | Yes (configured endpoint) | Opt-in server mode |
+| `pgvector` | Self-hosted Postgres | Yes (configured DSN) | Opt-in server mode |
+
+Only server-mode backends (`qdrant`, `pgvector`) send verbatim payloads beyond the
+local machine, and only to the exact endpoint you configured.
+
+When server-mode backends are used:
+
+- `MEMPALACE_<BACKEND>_NAMESPACE` values should be set per workflow to avoid tenant overlap.
+- Each palace writes `<backend>_backend.json` so reopen checks can reject mismatched backends.
+- Treat namespace and endpoint as part of your deployment trust boundary; MemPalace does
+  not abstract that security policy for you.
+
 Select a backend with `--backend <name>` on any `mempalace` / `mempalace-mcp`
 command, `MEMPALACE_BACKEND=<name>` in the environment, or `"backend": "<name>"`
 in `config.json`.

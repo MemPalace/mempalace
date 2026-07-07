@@ -43,6 +43,17 @@ MCP tool: mempalace_diary_read
 | `mempalace_diary_write` | Write an AAAK diary entry |
 | `mempalace_diary_read` | Read recent diary entries |
 
+## Persistent Agent Pattern
+
+Use one stable `agent_name` and the same workflow each session:
+
+```text
+1) start: mempalace_status
+2) recall: mempalace_search("topic"), and mempalace_kg_query(entity, as_of=...) when facts may have changed
+3) verify: mempalace_get_drawer(id) for critical claims
+4) persist: mempalace_diary_write(agent_name="<agent_name>", entry="what changed + open risks")
+```
+
 ## How It Works
 
 Each named agent maps to its own wing in the palace:

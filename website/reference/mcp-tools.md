@@ -1,7 +1,73 @@
 # MCP Tools Reference
 
-Detailed parameter schemas for all 35 MCP tools.
+Detailed parameter schemas for all 36 MCP tools.
+## Persistent Recall Schemas
 
+Agents that build memory-first workflows should start with these stable outputs:
+
+- `mempalace_status` for protocol framing and AAAK loading.
+- `mempalace_search` for scoped recall.
+- `mempalace_get_drawer` for full-text verification.
+- `mempalace_kg_query` for temporal relationship recall when a fact may have changed.
+
+`mempalace_status` reply shape (high-value fields):
+
+```json
+{
+  "total_drawers": 1832,
+  "wings": 12,
+  "rooms": 38,
+  "protocol": {
+    "steps": [
+      "call mempalace_search before asserting facts about people/projects",
+      "prefer mempalace_kg_query for time-bound claims"
+    ]
+  },
+  "aaak_dialect": "..."
+}
+```
+
+`mempalace_search` reply shape:
+
+```json
+{
+  "query": "auth decision",
+  "filters": {
+    "wing": "api-service",
+    "room": "decisions"
+  },
+  "results": [
+    {
+      "text": "We switched from Clerk to Auth0 because ...",
+      "wing": "api-service",
+      "room": "decisions",
+      "source_file": "session_2026-01-17.md",
+      "similarity": 0.921
+    }
+  ]
+}
+```
+
+`mempalace_kg_query` reply shape:
+
+```json
+{
+  "entity": "Alex",
+  "as_of": "2026-01-17",
+  "facts": [
+    {
+      "direction": "outgoing",
+      "subject": "Alex",
+      "predicate": "works_on",
+      "object": "mempalace",
+      "valid_from": "2024-03-01",
+      "valid_to": null,
+      "current": true
+    }
+  ],
+  "count": 1
+}
+```
 ## Palace — Read Tools
 
 ### `mempalace_status`
