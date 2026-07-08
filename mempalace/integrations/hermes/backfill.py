@@ -56,7 +56,11 @@ def parse_session_file(path: Path) -> list[dict]:
     exchanges: list[dict] = []
     text = path.read_text(encoding="utf-8", errors="replace")
 
-    # --- JSONL: one message object per line ---
+    # --- JSONL: one SESSION object per line (`hermes sessions export`
+    # writes ``{**session, "messages": [...]}``) or one message per line
+    # (raw transcripts). Session objects get the same unwrap the .json
+    # dict branch applies — without it a real export file silently
+    # parses to zero exchanges.
     if path.suffix == ".jsonl":
         messages = []
         for line in text.splitlines():
@@ -64,9 +68,17 @@ def parse_session_file(path: Path) -> list[dict]:
             if not line:
                 continue
             try:
-                messages.append(json.loads(line))
+                obj = json.loads(line)
             except json.JSONDecodeError:
-                pass
+                continue
+            if not isinstance(obj, dict):
+                continue
+            if "messages" in obj or "turns" in obj:
+                inner = obj.get("messages", obj.get("turns", []))
+                if isinstance(inner, list):
+                    messages.extend(inner)
+            else:
+                messages.append(obj)
         exchanges = _messages_to_exchanges(messages)
 
     # --- JSON: array of messages or {"messages": [...]} ---
@@ -89,31 +101,24 @@ def parse_session_file(path: Path) -> list[dict]:
 
 
 def _messages_to_exchanges(messages: list[dict]) -> list[dict]:
-    """Pair consecutive user/assistant messages into exchange dicts."""
-    exchanges: list[dict] = []
-    i = 0
-    while i < len(messages):
-        msg = messages[i]
-        role = msg.get("role", "")
-        content = msg.get("content", "") or ""
-        if isinstance(content, list):
-            # Handle structured content blocks
-            content = " ".join(
-                block.get("text", "") for block in content if isinstance(block, dict)
-            )
-        if role == "user" and content.strip():
-            assistant_content = ""
-            if i + 1 < len(messages) and messages[i + 1].get("role") == "assistant":
-                next_content = messages[i + 1].get("content", "") or ""
-                if isinstance(next_content, list):
-                    next_content = " ".join(
-                        block.get("text", "") for block in next_content if isinstance(block, dict)
-                    )
-                assistant_content = next_content
-                i += 1
-            exchanges.append({"user": content.strip(), "assistant": assistant_content.strip()})
-        i += 1
-    return exchanges
+    """Segment raw messages into exchange dicts.
+
+    Delegates to the live provider's ``_segment_turns`` — the same
+    anchoring the runtime safety net uses: a turn spans one real user
+    message plus everything (tool_use, tool results, the FINAL answer)
+    up to the next real user message, all normalized by
+    ``_normalize_content``. A hand-rolled pairing that grabs only the
+    immediately-following assistant message takes the tool_use stub as
+    "the" answer and drops the real one — and tool-using turns are the
+    COMMON case for a coding agent, so that quietly violated verbatim
+    for most of a palace's history. One segmentation implementation,
+    not two kept in sync by hand (same rule as ``classify_wing``).
+    """
+    from mempalace.integrations.hermes import _segment_turns
+
+    return [
+        {"user": seg["user"], "assistant": seg["assistant"]} for seg in _segment_turns(messages)
+    ]
 
 
 def _parse_markdown_session(text: str) -> list[dict]:
@@ -218,12 +223,17 @@ def file_exchange(
     """
     user_msg = exchange.get("user", "").strip()
     assistant_msg = exchange.get("assistant", "").strip()
-    if not user_msg:
+    # Only both-empty is unfillable. Assistant-only exchanges (anchorless
+    # preamble segments from a transcript starting mid-turn) are verbatim
+    # history too.
+    if not user_msg and not assistant_msg:
         return False
 
-    text = f"User: {user_msg}"
-    if assistant_msg:
-        text += f"\n\nAssistant: {assistant_msg}"
+    from mempalace.integrations.hermes import _compose_exchange_text
+
+    # The live provider's composition, verbatim — the dedup safety net's
+    # exact-text matching compares against precisely this string.
+    text = _compose_exchange_text(user_msg, assistant_msg)
 
     if dry_run:
         preview = text[:120].replace("\n", " ")
@@ -340,6 +350,7 @@ def backfill(
             continue
 
         filed_in_file = 0
+        wing = "skipped"  # last-filed wing, shown in the verbose summary line
         for exchange in exchanges:
             combined = (exchange.get("user", "") + " " + exchange.get("assistant", "")).strip()
             wing = classify_wing(combined, wing_config)
