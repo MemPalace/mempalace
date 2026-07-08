@@ -71,7 +71,11 @@ def _ancestor_matchers(source_file: Path, root: Path, matcher_cache: dict) -> li
         return matchers
     # Prune with the same ignore convention the miner used on the way in:
     # .mempalaceignore if the project declares one, else .gitignore.
-    ignore_filename = detect_ignore_filename(root)
+    # Cache the detection to avoid redundant is_file() calls per source file.
+    cache_key = ("ignore_filename", root)
+    if cache_key not in matcher_cache:
+        matcher_cache[cache_key] = detect_ignore_filename(root)
+    ignore_filename = matcher_cache[cache_key]
     cursor = root
     matcher = load_gitignore_matcher(cursor, matcher_cache, filename=ignore_filename)
     if matcher is not None:

@@ -2453,3 +2453,74 @@ def test_mine_limit_summary_counts(tmp_path, capsys):
     assert "Files processed: 2" in out
     assert "Drawers filed: 6" in out
     assert "(limit: 2 new)" in out
+
+
+# ── .mempalaceignore ───────────────────────────────────────────────────
+
+
+def test_detect_ignore_filename_prefers_mempalaceignore(tmp_path):
+    project_root = tmp_path.resolve()
+    write_file(project_root / ".gitignore", "*.log\n")
+    assert detect_ignore_filename(project_root) == ".gitignore"
+
+    write_file(project_root / ".mempalaceignore", "*.tmp\n")
+    assert detect_ignore_filename(project_root) == ".mempalaceignore"
+
+
+def test_scan_project_respects_mempalaceignore():
+    tmpdir = tempfile.mkdtemp()
+    try:
+        project_root = Path(tmpdir).resolve()
+
+        write_file(project_root / ".mempalaceignore", "ignored.py\ngenerated/\n")
+        write_file(project_root / "src" / "app.py", "print('hello')\n" * 20)
+        write_file(project_root / "ignored.py", "print('ignore me')\n" * 20)
+        write_file(project_root / "generated" / "artifact.py", "print('artifact')\n" * 20)
+
+        assert scanned_files(project_root) == ["src/app.py"]
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_mempalaceignore_supersedes_gitignore_project_wide():
+    tmpdir = tempfile.mkdtemp()
+    try:
+        project_root = Path(tmpdir).resolve()
+
+        write_file(project_root / ".mempalaceignore", "*.tmp\n")
+        write_file(project_root / ".gitignore", "src/\n")
+        write_file(project_root / "sub" / ".gitignore", "keep.py\n")
+        write_file(project_root / "src" / "app.py", "print('app')\n" * 20)
+        write_file(project_root / "sub" / "keep.py", "print('keep')\n" * 20)
+        write_file(project_root / "scratch.tmp", "temp\n" * 20)
+
+        assert scanned_files(project_root) == ["src/app.py", "sub/keep.py"]
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_scan_project_falls_back_to_gitignore_without_mempalaceignore():
+    tmpdir = tempfile.mkdtemp()
+    try:
+        project_root = Path(tmpdir).resolve()
+
+        write_file(project_root / ".gitignore", "data/\n")
+        write_file(project_root / "data" / "stuff.csv", "a,b,c\n" * 20)
+        write_file(project_root / "src" / "app.py", "print('app')\n" * 20)
+
+        assert scanned_files(project_root) == ["src/app.py"]
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_scan_project_can_disable_mempalaceignore():
+    tmpdir = tempfile.mkdtemp()
+    try:
+        project_root = Path(tmpdir).resolve()
+
+        write_file(project_root / ".mempalaceignore", "data/\n")
+        write_file(project_root / "data" / "stuff.csv", "a,b,c\n" * 20)
+
+        assert scanned_files(project_root, respect_gitignore=False) == ["data/stuff.csv"]
+    finally:
+        shutil.rmtree(tmpdir)
