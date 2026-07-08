@@ -324,11 +324,16 @@ _kg_by_path: dict[str, KnowledgeGraph] = {}
 _kg_cache_lock = threading.Lock()
 _palace_flag_given: bool = bool(_args.palace)
 
-# MCP server idle auto-exit (#1552).  Stale MCP servers from ended Claude
+# MCP server stale auto-exit (#1552).  Stale MCP servers from ended Claude
 # Code sessions do not self-terminate, accumulating ChromaDB/HNSW file
-# handles on Windows.  When MEMPALACE_MCP_IDLE_HOURS is set (or defaults
-# to 8 h), a background daemon thread exits the process once no request
-# has been handled for that long.  Set to 0 to disable.
+# handles on Windows.  A background daemon thread exits the process when it
+# goes stale.  For stdio servers "stale" means orphaned (the parent MCP
+# client process is gone) — pure idle time is the wrong signal there,
+# because Claude Desktop keeps servers connected but silent for many hours
+# and never respawns a stdio server it saw die.  The HTTP transport has no
+# parent to watch and runs under supervisors that respawn it, so it keeps
+# the original idle-timeout exit.  MEMPALACE_MCP_IDLE_HOURS overrides the
+# idle threshold / polling cadence; set to 0 to disable the watchdog.
 _MCP_IDLE_HOURS_ENV = "MEMPALACE_MCP_IDLE_HOURS"
 _MCP_IDLE_HOURS_DEFAULT = 8.0
 _last_request_time: float = time.monotonic()
@@ -5032,34 +5037,88 @@ def _maybe_eager_warmup_embedder() -> None:
         )
 
 
-def _start_idle_exit_watchdog() -> None:
-    """Start a daemon thread that exits the process after an idle period.
+def _parent_process_exited(initial_ppid: int) -> bool:
+    """Return True when the process that spawned this server is gone.
 
-    When no request has been handled for ``MEMPALACE_MCP_IDLE_HOURS``
-    (default 8 h), the thread terminates the process so that stale MCP
-    servers from ended Claude Code sessions do not accumulate ChromaDB /
-    HNSW file handles on Windows (#1552).
+    On POSIX an orphaned process is reparented, so a parent PID that is 1
+    (init/launchd) or no longer the original one means the MCP client died.
+    On Windows ``os.getppid()`` keeps returning the creator's PID after it
+    exits, so poll a handle to the parent process instead.
+    """
+    if os.name != "nt":
+        ppid = os.getppid()
+        return ppid == 1 or ppid != initial_ppid
 
-    Set ``MEMPALACE_MCP_IDLE_HOURS=0`` to disable the watchdog.
+    import ctypes
+
+    SYNCHRONIZE = 0x00100000
+    WAIT_TIMEOUT = 0x00000102
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(SYNCHRONIZE, False, initial_ppid)
+    if not handle:
+        return True
+    try:
+        return kernel32.WaitForSingleObject(handle, 0) != WAIT_TIMEOUT
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _idle_watchdog_loop(
+    initial_ppid: int, timeout: float, check_interval: float, require_orphan: bool
+) -> None:
+    while True:
+        time.sleep(check_interval)
+        idle = time.monotonic() - _last_request_time
+        if require_orphan:
+            if not _parent_process_exited(initial_ppid):
+                continue
+            logger.info(
+                "MCP server orphaned (parent %d gone; idle %.1f h); exiting to release file handles.",
+                initial_ppid,
+                idle / 3600,
+            )
+            os._exit(0)
+        if idle >= timeout:
+            logger.info(
+                "MCP server idle for %.1f h (limit %.1f h); exiting to release file handles.",
+                idle / 3600,
+                timeout / 3600,
+            )
+            os._exit(0)
+
+
+def _start_idle_exit_watchdog(require_orphan: bool = True) -> None:
+    """Start a daemon thread that exits the process when the server is stale.
+
+    Introduced by #1552 so stale MCP servers from ended Claude Code sessions
+    do not accumulate ChromaDB / HNSW file handles on Windows.
+
+    ``require_orphan=True`` (stdio transport): exit only when the parent MCP
+    client process is gone. Idle time alone must not kill a stdio server —
+    Claude Desktop keeps servers connected but silent for many hours, never
+    respawns a stdio server it saw die, and shows a persistent "Server
+    disconnected" banner when one exits underneath it. Clean client
+    disconnects are already handled by the stdin-EOF check in the read loop;
+    this covers parents that die without closing our stdin.
+
+    ``require_orphan=False`` (HTTP transport): exit after
+    ``MEMPALACE_MCP_IDLE_HOURS`` (default 8 h) without a request, as before.
+    HTTP servers have no parent to watch and run under supervisors that
+    respawn them.
+
+    Set ``MEMPALACE_MCP_IDLE_HOURS=0`` to disable the watchdog; other values
+    override the idle threshold and polling cadence.
     """
     timeout = _mcp_idle_timeout_secs()
     if timeout <= 0:
         return
     check_interval = min(60.0, timeout / 4)
-
-    def _watchdog() -> None:
-        while True:
-            time.sleep(check_interval)
-            idle = time.monotonic() - _last_request_time
-            if idle >= timeout:
-                logger.info(
-                    "MCP server idle for %.1f h (limit %.1f h); exiting to release file handles.",
-                    idle / 3600,
-                    timeout / 3600,
-                )
-                os._exit(0)
-
-    t = threading.Thread(target=_watchdog, name="mcp-idle-watchdog", daemon=True)
+    t = threading.Thread(
+        target=_idle_watchdog_loop,
+        args=(os.getppid(), timeout, check_interval, require_orphan),
+        name="mcp-idle-watchdog",
+        daemon=True,
+    )
     t.start()
 
 
@@ -5384,8 +5443,9 @@ def _run_stdio_loop() -> None:
     # timeout (#1495). Default off — preserves current startup latency.
     _maybe_eager_warmup_embedder()
 
-    # Idle auto-exit: release ChromaDB file handles from stale servers
-    # that outlived their Claude Code session (#1552).
+    # Stale auto-exit: release ChromaDB file handles from servers whose MCP
+    # client died without closing stdin (#1552). Orphan-gated so a live but
+    # idle Claude Desktop connection is never killed.
     _start_idle_exit_watchdog()
 
     while True:
@@ -5421,7 +5481,9 @@ def _run_http_loop() -> None:
     # optional embedder/HNSW warmup. Operators and tests should see /healthz as
     # soon as the process is alive.
     _refresh_vector_disabled_flag()
-    _start_idle_exit_watchdog()
+    # No parent process to watch over HTTP; keep the plain idle-timeout exit
+    # and rely on the supervisor (systemd/docker) to respawn.
+    _start_idle_exit_watchdog(require_orphan=False)
 
     raw_warmup = os.environ.get("MEMPALACE_EAGER_WARMUP", "").strip().lower()
     if raw_warmup in _WARMUP_TRUTHY:

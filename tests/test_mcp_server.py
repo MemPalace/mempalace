@@ -4425,6 +4425,115 @@ class TestStructuredErrors:
         assert len(mcp_server._kg_by_path) == 1
 
 
+# ── Stale-server auto-exit watchdog (#1552) ──────────────────────────────
+
+
+class TestIdleExitWatchdog:
+    """Stale-server auto-exit (#1552): orphan-gated for stdio, idle for HTTP."""
+
+    class _Exited(Exception):
+        pass
+
+    class _LoopDone(Exception):
+        pass
+
+    def _run_loop(
+        self,
+        monkeypatch,
+        *,
+        require_orphan,
+        parent_exited,
+        idle_secs,
+        timeout=100.0,
+        iterations=3,
+    ):
+        """Drive _idle_watchdog_loop with fakes; return the os._exit code or None."""
+        from mempalace import mcp_server
+
+        exited = {}
+        sleeps = {"n": 0}
+
+        def fake_sleep(_secs):
+            sleeps["n"] += 1
+            if sleeps["n"] > iterations:
+                raise self._LoopDone
+
+        def fake_exit(code):
+            exited["code"] = code
+            raise self._Exited
+
+        monkeypatch.setattr(mcp_server.time, "sleep", fake_sleep)
+        monkeypatch.setattr(mcp_server.os, "_exit", fake_exit)
+        monkeypatch.setattr(mcp_server, "_parent_process_exited", lambda ppid: parent_exited)
+        monkeypatch.setattr(
+            mcp_server, "_last_request_time", mcp_server.time.monotonic() - idle_secs
+        )
+
+        try:
+            mcp_server._idle_watchdog_loop(4321, timeout, 1.0, require_orphan)
+        except (self._Exited, self._LoopDone):
+            pass
+        return exited.get("code")
+
+    def test_stdio_live_parent_survives_idle_timeout(self, monkeypatch):
+        """An idle-past-timeout stdio server with a live parent must NOT exit.
+
+        Claude Desktop keeps stdio servers connected but silent overnight and
+        never respawns one it saw die; exiting here leaves a permanent
+        "Server disconnected" banner.
+        """
+        code = self._run_loop(
+            monkeypatch, require_orphan=True, parent_exited=False, idle_secs=10_000.0
+        )
+        assert code is None
+
+    def test_stdio_orphaned_server_exits(self, monkeypatch):
+        """An orphaned stdio server exits even with recent traffic."""
+        code = self._run_loop(monkeypatch, require_orphan=True, parent_exited=True, idle_secs=0.0)
+        assert code == 0
+
+    def test_http_idle_timeout_exits_regardless_of_parent(self, monkeypatch):
+        """HTTP transport keeps the original pure idle-timeout exit."""
+        code = self._run_loop(
+            monkeypatch, require_orphan=False, parent_exited=False, idle_secs=10_000.0
+        )
+        assert code == 0
+
+    def test_http_below_idle_timeout_survives(self, monkeypatch):
+        code = self._run_loop(monkeypatch, require_orphan=False, parent_exited=False, idle_secs=1.0)
+        assert code is None
+
+    def test_zero_idle_hours_disables_watchdog(self, monkeypatch):
+        """MEMPALACE_MCP_IDLE_HOURS=0 still disables the watchdog entirely."""
+        from mempalace import mcp_server
+
+        monkeypatch.setenv("MEMPALACE_MCP_IDLE_HOURS", "0")
+        started = []
+        monkeypatch.setattr(
+            mcp_server.threading,
+            "Thread",
+            lambda *a, **kw: started.append(kw) or MagicMock(),
+        )
+        mcp_server._start_idle_exit_watchdog()
+        assert started == []
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX reparenting semantics")
+    def test_parent_process_exited_posix(self, monkeypatch):
+        from mempalace import mcp_server
+
+        initial = 5555
+        monkeypatch.setattr(mcp_server.os, "getppid", lambda: initial)
+        assert mcp_server._parent_process_exited(initial) is False
+
+        # Reparented to init/launchd → orphaned.
+        monkeypatch.setattr(mcp_server.os, "getppid", lambda: 1)
+        assert mcp_server._parent_process_exited(initial) is True
+
+        # Reparented to a subreaper that is not PID 1 → still orphaned.
+        monkeypatch.setattr(mcp_server.os, "getppid", lambda: 7777)
+        assert mcp_server._parent_process_exited(initial) is True
+
+
 # ── Param-shape diagnostics on tools/call dispatch (#1351) ──────────────
 
 
@@ -4899,9 +5008,7 @@ def test_peer_writer_readonly_self_heals_after_peer_exits(monkeypatch):
         calls["count"] += 1
         if calls["count"] == 1:
             # First attempt: a live peer still holds the lease.
-            raise palace.MineAlreadyRunning(
-                f"palace {palace_path} is held by pid=999"
-            )
+            raise palace.MineAlreadyRunning(f"palace {palace_path} is held by pid=999")
         # Second attempt: peer has exited, flock is free.
         return _DummyLock()
 
