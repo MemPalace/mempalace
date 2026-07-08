@@ -10,6 +10,7 @@ import re
 from datetime import date, datetime
 from functools import lru_cache
 from pathlib import Path
+from typing import Optional
 
 # ── Input validation ──────────────────────────────────────────────────────────
 # Shared sanitizers for wing/room/entity names. Prevents path traversal,
@@ -60,6 +61,94 @@ def normalize_wing_name(name: str) -> str:
     would reject.
     """
     return name.lower().replace(" ", "_").replace("-", "_").strip("_")
+
+
+def _find_primary_repo_root(start_path: Path) -> Optional[Path]:
+    """Walk up from ``start_path`` looking for a ``.git`` entry, resolving
+    a linked worktree back to the primary checkout root. Filesystem-only
+    -- no ``git`` subprocess.
+
+    Git's own on-disk convention is what this reads: in a primary
+    checkout, ``.git`` is a directory. In a linked worktree, ``.git`` is a
+    plain file containing a single ``gitdir: <path>`` line, where
+    ``<path>`` always has the shape ``.../.git/worktrees/<name>``.
+    Stripping ``worktrees/<name>`` off that path lands on the primary
+    repo's real ``.git`` directory; its parent is the true project root,
+    structurally correct for any worktree (Claude Code's own convention
+    or a plain ``git worktree add`` anywhere else), not a naming
+    heuristic.
+
+    Returns None when no ``.git`` is found before the filesystem root
+    (not a git repo at all), or when a found ``.git`` file doesn't parse
+    as the expected linked-worktree pointer (unexpected git-internals
+    shape) -- both cases fall through to the caller's own fallback rather
+    than guessing.
+    """
+    current = start_path
+    while True:
+        git_entry = current / ".git"
+        if git_entry.is_dir():
+            return current
+        if git_entry.is_file():
+            try:
+                content = git_entry.read_text().strip()
+            except OSError:
+                return None
+            if content.startswith("gitdir:"):
+                gitdir_path = Path(content[len("gitdir:") :].strip())
+                if (
+                    gitdir_path.parent.name == "worktrees"
+                    and gitdir_path.parent.parent.name == ".git"
+                ):
+                    return gitdir_path.parent.parent.parent
+            return None
+        parent = current.parent
+        if parent == current:
+            return None  # reached filesystem root
+        current = parent
+
+
+def project_name_from_path(path: str) -> str:
+    """Recover the real project name from a path.
+
+    Prefers walking the filesystem to the primary git checkout root (see
+    ``_find_primary_repo_root``) -- structurally correct for any
+    worktree, not tied to a specific naming convention. Falls back to
+    collapsing a ``.claude/worktrees/<name>`` path suffix by string match
+    when no ``.git`` is found (the path doesn't currently exist on disk,
+    e.g. a historical ``cwd`` recorded in an old session transcript for a
+    since-deleted or since-moved project, or genuinely isn't a git repo).
+
+    The worktree name itself is an ephemeral, randomly-generated label
+    (e.g. ``ecstatic-meitner-b60440``), never the project identity --
+    plain ``Path(path).name`` would otherwise split one project's
+    history/config across as many identities as it has ever had
+    worktrees.
+
+    Shared by convo_scanner._extract_cwd_from_session's per-file wing
+    resolution (a session's recorded ``cwd``) and miner.load_config's
+    no-yaml fallback (the mined directory's own path) -- same collapsing
+    rule, two different kinds of path.
+    """
+    p = Path(path)
+    if p.exists():
+        primary_root = _find_primary_repo_root(p if p.is_dir() else p.parent)
+        if primary_root is not None:
+            return primary_root.name
+
+    parts = p.parts
+    anchor = p.anchor
+    for i in range(len(parts) - 1):
+        if parts[i] == ".claude" and parts[i + 1] == "worktrees":
+            # parts[i - 1] is only a real project-name segment when it
+            # isn't the path's own anchor ("/" on POSIX) -- a path like
+            # "/.claude/worktrees/x" has nothing meaningful before
+            # .claude, so fall through to the plain-basename default
+            # rather than returning the bare anchor as a "project name".
+            if i > 0 and parts[i - 1] != anchor:
+                return parts[i - 1]
+            return p.name or path
+    return p.name or path
 
 
 def sanitize_name(value: str, field_name: str = "name") -> str:

@@ -100,28 +100,14 @@ def _safe_mtime(path: Path) -> float:
 
 
 def _project_name_from_cwd(cwd: str) -> str:
-    """Recover the real repo/project name from a session's cwd, collapsing
-    away a `.claude/worktrees/<name>` suffix so sessions launched from
-    different worktrees of the same repo resolve to the same project
-    name -- the worktree name itself is an ephemeral, randomly-generated
-    label (e.g. `ecstatic-meitner-b60440`), never the project identity.
-    Plain `Path(cwd).name` would otherwise split one project's history
-    across as many "projects" as it has ever had worktrees.
+    """Recover the real repo/project name from a session's cwd.
+
+    Thin wrapper over ``config.project_name_from_path`` -- see that
+    function's docstring for the worktree-collapsing rule this applies.
     """
-    path = Path(cwd)
-    parts = path.parts
-    anchor = path.anchor
-    for i in range(len(parts) - 1):
-        if parts[i] == ".claude" and parts[i + 1] == "worktrees":
-            # parts[i - 1] is only a real project-name segment when it
-            # isn't the path's own anchor ("/" on POSIX) -- a cwd like
-            # "/.claude/worktrees/x" has nothing meaningful before
-            # .claude, so fall through to the plain-basename default
-            # rather than returning the bare anchor as a "project name".
-            if i > 0 and parts[i - 1] != anchor:
-                return parts[i - 1]
-            return path.name or cwd
-    return path.name or cwd
+    from mempalace.config import project_name_from_path
+
+    return project_name_from_path(cwd)
 
 
 def _resolve_project_name(project_dir: Path) -> str:

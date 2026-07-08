@@ -492,15 +492,19 @@ def load_config(project_dir: str) -> dict:
         if legacy_path.exists():
             config_path = legacy_path
         else:
-            from .config import normalize_wing_name
+            from .config import normalize_wing_name, project_name_from_path
 
             # Normalize the dirname-derived fallback wing the same way
             # ``cmd_init`` and ``room_detector_local`` do — otherwise a
             # hyphenated project mined without a yaml file lands under a
             # raw-name wing while ``topics_by_wing`` was keyed under the
             # normalized slug, silently dropping every topic tunnel
-            # (the no-yaml branch of issue #1194).
-            wing_name = normalize_wing_name(resolved_project_dir.name)
+            # (the no-yaml branch of issue #1194). ``project_name_from_path``
+            # additionally collapses a ``.claude/worktrees/<name>`` suffix
+            # first, so mining from inside a git worktree resolves to the
+            # real project name instead of the worktree's own randomly-
+            # generated directory name.
+            wing_name = normalize_wing_name(project_name_from_path(str(resolved_project_dir)))
             print(
                 f"  No mempalace.yaml found in {resolved_project_dir} "
                 f"— using auto-detected defaults (wing='{wing_name}'). "

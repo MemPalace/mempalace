@@ -314,6 +314,25 @@ def test_load_config_no_yaml_normalizes_hyphenated_wing():
         shutil.rmtree(parent)
 
 
+def test_load_config_no_yaml_resolves_wing_from_worktree(tmp_path):
+    """Mining from inside a git worktree checkout must resolve the fallback
+    wing to the primary project's own name, not the worktree's own
+    randomly-generated directory name -- see config.project_name_from_path."""
+    primary = tmp_path / "coolproj"
+    primary.mkdir()
+    (primary / ".git").mkdir()
+    (primary / ".git" / "worktrees" / "ecstatic-meitner-b60440").mkdir(parents=True)
+
+    worktree = tmp_path / "ecstatic-meitner-b60440"
+    worktree.mkdir()
+    (worktree / ".git").write_text(
+        f"gitdir: {primary / '.git' / 'worktrees' / 'ecstatic-meitner-b60440'}\n"
+    )
+
+    config = load_config(str(worktree))
+    assert config["wing"] == "coolproj"
+
+
 def test_scan_project_skips_mempalace_generated_files():
     with tempfile.TemporaryDirectory() as tmpdir:
         project_root = Path(tmpdir).resolve()

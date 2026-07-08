@@ -7,6 +7,7 @@ import pytest
 from mempalace.config import (
     MempalaceConfig,
     normalize_wing_name,
+    project_name_from_path,
     sanitize_iso_date,
     sanitize_iso_temporal,
     sanitize_kg_value,
@@ -314,6 +315,73 @@ def test_normalize_wing_name_strips_leading_separator():
 
 def test_normalize_wing_name_strips_trailing_separator():
     assert normalize_wing_name("project-") == "project"
+
+
+# --- project_name_from_path ---
+
+
+def _init_git_repo(path):
+    """Minimal on-disk .git dir -- enough for project_name_from_path's
+    directory-vs-file check without shelling out to git."""
+    (path / ".git").mkdir()
+
+
+def test_project_name_from_path_primary_checkout(tmp_path):
+    repo = tmp_path / "coolproj"
+    repo.mkdir()
+    _init_git_repo(repo)
+    assert project_name_from_path(str(repo)) == "coolproj"
+
+
+def test_project_name_from_path_resolves_linked_worktree(tmp_path):
+    """A linked worktree's .git is a file pointing back at
+    <primary>/.git/worktrees/<name> -- must resolve to the primary
+    checkout's own directory name, not the worktree's random one."""
+    primary = tmp_path / "coolproj"
+    primary.mkdir()
+    (primary / ".git").mkdir()
+    (primary / ".git" / "worktrees" / "ecstatic-meitner-b60440").mkdir(parents=True)
+
+    worktree = tmp_path / "some-random-worktree-dir"
+    worktree.mkdir()
+    (worktree / ".git").write_text(
+        f"gitdir: {primary / '.git' / 'worktrees' / 'ecstatic-meitner-b60440'}\n"
+    )
+
+    assert project_name_from_path(str(worktree)) == "coolproj"
+
+
+def test_project_name_from_path_resolves_from_nested_subdir(tmp_path):
+    """The caller may pass a file or a subdirectory inside the checkout,
+    not just the checkout root -- must still walk up to find .git."""
+    primary = tmp_path / "coolproj"
+    (primary / "src" / "nested").mkdir(parents=True)
+    _init_git_repo(primary)
+    assert project_name_from_path(str(primary / "src" / "nested")) == "coolproj"
+
+
+def test_project_name_from_path_falls_back_when_not_a_git_repo(tmp_path):
+    plain_dir = tmp_path / "not-a-repo"
+    plain_dir.mkdir()
+    assert project_name_from_path(str(plain_dir)) == "not-a-repo"
+
+
+def test_project_name_from_path_falls_back_for_nonexistent_path():
+    """A historical cwd from an old session transcript for a
+    since-deleted/moved project: no filesystem access is possible, so
+    this must fall back to the string-based .claude/worktrees collapse
+    rather than raising."""
+    cwd = "/Users/jrmurray/Code/forktail/forktail-app/.claude/worktrees/ecstatic-meitner-b60440"
+    assert project_name_from_path(cwd) == "forktail-app"
+
+
+def test_project_name_from_path_malformed_gitdir_file_falls_back(tmp_path):
+    """A .git file that doesn't parse as a linked-worktree pointer
+    (unexpected git-internals shape) must fall back rather than guess."""
+    weird = tmp_path / "weird-repo"
+    weird.mkdir()
+    (weird / ".git").write_text("not a real gitdir pointer\n")
+    assert project_name_from_path(str(weird)) == "weird-repo"
 
 
 # --- sanitize_name ---
