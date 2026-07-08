@@ -306,3 +306,122 @@ def test_backfill_rerun_does_not_duplicate(tmp_path):
 
     assert backfill.backfill(sessions, str(palace)) == 0
     assert col.count() == count_after_first
+
+
+def test_messages_to_exchanges_keeps_final_answer_on_tool_turns():
+    """A tool-calling turn is user → assistant(tool_use) → user(tool_result)
+    → assistant(final text). Pairing user with the immediately-next
+    assistant message grabbed the tool_use stub and DROPPED the real
+    answer — the common case for a coding agent, and a verbatim
+    violation. Segmentation must fold everything up to the next real
+    user message into the assistant side (via the live provider's
+    _segment_turns — one implementation, not two).
+    """
+    backfill = _load_backfill_module()
+
+    exchanges = backfill._messages_to_exchanges(
+        [
+            {"role": "user", "content": "check the weather and tell me if I need an umbrella"},
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "1", "name": "get_weather", "input": {}}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "1", "content": "rainy"}],
+            },
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Yes, bring an umbrella - it's rainy."}],
+            },
+        ]
+    )
+    assert len(exchanges) == 1
+    assert exchanges[0]["user"] == "check the weather and tell me if I need an umbrella"
+    assert "Yes, bring an umbrella - it's rainy." in exchanges[0]["assistant"]
+    # Tool traffic is verbatim history too — the markers must survive.
+    assert "[tool_use: get_weather]" in exchanges[0]["assistant"]
+    assert "rainy" in exchanges[0]["assistant"]
+
+
+def test_parse_session_file_unwraps_hermes_export_jsonl(tmp_path):
+    """`hermes sessions export` writes one SESSION object per line
+    ({**session, "messages": [...]}); treating each line as a message
+    silently produced zero exchanges. The .json dict branch already
+    unwraps this shape — .jsonl must too.
+    """
+    import json
+
+    backfill = _load_backfill_module()
+
+    f = tmp_path / "export.jsonl"
+    f.write_text(
+        json.dumps(
+            {
+                "id": "sess-123",
+                "messages": [
+                    {"role": "user", "content": "let's plan the Q3 roadmap"},
+                    {"role": "assistant", "content": "here is the plan"},
+                ],
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "id": "sess-124",
+                "messages": [
+                    {"role": "user", "content": "and the Q4 one"},
+                    {"role": "assistant", "content": "here too"},
+                ],
+            }
+        )
+        + "\n"
+    )
+    exchanges = backfill.parse_session_file(f)
+    assert len(exchanges) == 2
+    assert exchanges[0]["user"] == "let's plan the Q3 roadmap"
+    assert exchanges[1]["assistant"] == "here too"
+
+
+def test_parse_session_file_still_reads_message_per_line_jsonl(tmp_path):
+    import json
+
+    backfill = _load_backfill_module()
+
+    f = tmp_path / "raw.jsonl"
+    f.write_text(
+        json.dumps({"role": "user", "content": "plain question"})
+        + "\n"
+        + json.dumps({"role": "assistant", "content": "plain answer"})
+        + "\n"
+    )
+    exchanges = backfill.parse_session_file(f)
+    assert exchanges == [{"user": "plain question", "assistant": "plain answer"}]
+
+
+def test_file_exchange_files_assistant_only_preamble_with_live_composition(tmp_path):
+    """Anchorless preamble segments (a transcript starting mid-turn) carry
+    assistant-side content only; dropping them violates verbatim. The
+    guard rejects only both-empty exchanges, and the drawer text must be
+    composed by the live provider's _compose_exchange_text — the exact
+    composition the dedup safety net compares against.
+    """
+    backfill = _load_backfill_module()
+
+    from mempalace.backends.chroma import ChromaBackend
+    from mempalace.integrations.hermes import _compose_exchange_text
+
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    col = ChromaBackend().get_or_create_collection(str(palace), "mempalace_drawers")
+    src = tmp_path / "sess.json"
+    src.write_text("[]")
+    ok = backfill.file_exchange(
+        {"user": "", "assistant": "orphaned assistant text"},
+        "wing_general",
+        str(src),
+        collection=col,
+    )
+    assert ok is True
+    docs = col.get(include=["documents"]).get("documents") or []
+    assert docs == [_compose_exchange_text("", "orphaned assistant text")]
