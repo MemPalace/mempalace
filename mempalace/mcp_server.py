@@ -44,6 +44,7 @@ except (OSError, AttributeError):
 sys.stdout = sys.stderr
 
 import argparse  # noqa: E402  (deferred until after stdio protection above)
+import contextlib  # noqa: E402
 import json  # noqa: E402
 import logging  # noqa: E402
 import re  # noqa: E402
@@ -368,14 +369,39 @@ _STARTUP_INTEGRITY_MAX_MB_DEFAULT = 512.0
 #
 # The existing per-operation palace lock serializes individual writes, but it
 # cannot make another long-lived Chroma PersistentClient forget stale in-memory
-# HNSW/FTS state. Hold the same per-palace mine lock for this MCP process
-# lifetime. A peer MCP process can still serve read tools, but mutating tools
-# refuse before touching Chroma or the knowledge graph.
+# HNSW/FTS state. Hold the same per-palace mine lock across mutating tools —
+# not per write — and release it only after an idle window plus a full Chroma
+# cache reset (see the cooperative-lease block below). A peer MCP process can
+# still serve read tools, but mutating tools refuse before touching Chroma or
+# the knowledge graph while this server holds the lease.
 _MCP_WRITER_LOCK_CM = None
 _MCP_WRITER_READ_ONLY = False
 _MCP_WRITER_LOCK_FAILED = False
 _MCP_WRITER_LOCK_ERROR = ""
 _MCP_ALLOW_PEER_WRITER_ENV = "MEMPALACE_MCP_ALLOW_PEER_WRITER"
+
+# Cooperative lease (#1888, #1963): a lifetime-held writer lease starves every
+# other writer on the palace — hook/manual mines exit with MineAlreadyRunning
+# and daemon jobs fail — for as long as this server lives, which for an
+# interactive session can be hours. Instead, release the lease once no
+# mutating tool has run for MEMPALACE_MCP_WRITER_LEASE_IDLE_S seconds
+# (default 300; 0 restores the legacy hold-until-exit behavior). Release must
+# also drop every cached Chroma handle (_force_chroma_cache_reset): the whole
+# reason the lease is lifetime-scoped is that a PersistentClient's in-memory
+# HNSW graph goes stale the moment a peer writes, so a re-acquire is only
+# safe if the next write reopens the palace from disk.
+_MCP_WRITER_LEASE_IDLE_S_ENV = "MEMPALACE_MCP_WRITER_LEASE_IDLE_S"
+_MCP_WRITER_LEASE_IDLE_S_DEFAULT = 300.0
+# Guards every transition of _MCP_WRITER_LOCK_CM (acquire, idle release,
+# atexit release) plus the in-flight counter: the idle release runs on the
+# watchdog thread while mutating tools run on the stdio loop or HTTP worker
+# threads. Leaf lock — nothing is called while holding it that takes another
+# mempalace lock (mine_palace_lock's internal guard is taken by __enter__ /
+# __exit__, which we call while holding this, but palace.py never takes ours).
+_MCP_WRITER_LEASE_GUARD = threading.Lock()
+_MCP_WRITER_LAST_MUTATION_TS = 0.0  # monotonic; 0 = no mutation yet
+_MCP_WRITER_INFLIGHT = 0  # mutating tools currently executing
+_MCP_WRITER_ATEXIT_REGISTERED = False
 
 _MUTATING_TOOLS = frozenset(
     {
@@ -419,51 +445,158 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     """
 
     global _MCP_WRITER_LOCK_CM, _MCP_WRITER_READ_ONLY, _MCP_WRITER_LOCK_FAILED
-    global _MCP_WRITER_LOCK_ERROR
+    global _MCP_WRITER_LOCK_ERROR, _MCP_WRITER_LAST_MUTATION_TS
+    global _MCP_WRITER_ATEXIT_REGISTERED
 
     if _truthy_env(_MCP_ALLOW_PEER_WRITER_ENV):
         return True, ""
 
-    if _MCP_WRITER_LOCK_CM is not None:
+    with _MCP_WRITER_LEASE_GUARD:
+        if _MCP_WRITER_LOCK_CM is not None:
+            _MCP_WRITER_LAST_MUTATION_TS = time.monotonic()
+            return True, ""
+
+        # NB: deliberately NO sticky read-only short-circuit here. If a peer held
+        # the lease at startup we fall through and retry mine_palace_lock below, so
+        # the server self-heals into the writer the moment the peer exits. A broken
+        # lock *mechanism* (below) is still cached, since retrying it can't help.
+        if _MCP_WRITER_LOCK_FAILED:
+            return True, _MCP_WRITER_LOCK_ERROR
+
+        try:
+            from .palace import MineAlreadyRunning, mine_palace_lock
+
+            lock_cm = mine_palace_lock(_config.palace_path)
+            lock_cm.__enter__()
+        except MineAlreadyRunning as exc:
+            _MCP_WRITER_READ_ONLY = True
+            _MCP_WRITER_LOCK_ERROR = (
+                "another mempalace writer already holds the palace lock for "
+                f"{_config.palace_path!r}: {exc}"
+            )
+            return False, _MCP_WRITER_LOCK_ERROR
+        except Exception as exc:
+            _MCP_WRITER_LOCK_FAILED = True
+            _MCP_WRITER_LOCK_ERROR = (
+                "could not acquire MCP peer-writer lock for "
+                f"{_config.palace_path!r}: {exc!r}; continuing without "
+                "peer-writer protection"
+            )
+            logger.warning(_MCP_WRITER_LOCK_ERROR)
+            return True, _MCP_WRITER_LOCK_ERROR
+
+        _MCP_WRITER_LOCK_CM = lock_cm
+        _MCP_WRITER_LAST_MUTATION_TS = time.monotonic()
+        if not _MCP_WRITER_ATEXIT_REGISTERED:
+            # Register once and read the CURRENT lease at exit time. A
+            # per-acquire lambda would go stale under the idle-release cycle:
+            # each release/re-acquire would pile up another callback pointing
+            # at an already-exited context manager.
+            import atexit
+
+            atexit.register(_release_mcp_writer_lock_at_exit)
+            _MCP_WRITER_ATEXIT_REGISTERED = True
+        _MCP_WRITER_READ_ONLY = False
+        _MCP_WRITER_LOCK_FAILED = False
+        _MCP_WRITER_LOCK_ERROR = ""
         return True, ""
 
-    # NB: deliberately NO sticky read-only short-circuit here. If a peer held
-    # the lease at startup we fall through and retry mine_palace_lock below, so
-    # the server self-heals into the writer the moment the peer exits. A broken
-    # lock *mechanism* (below) is still cached, since retrying it can't help.
-    if _MCP_WRITER_LOCK_FAILED:
-        return True, _MCP_WRITER_LOCK_ERROR
 
+def _writer_lease_idle_seconds() -> float:
+    """Idle seconds after which the writer lease is released (0 = never).
+
+    Invalid values fall back to the default rather than raising: a bad env
+    var must not take down the server or silently disable the release.
+    """
+    raw = os.environ.get(_MCP_WRITER_LEASE_IDLE_S_ENV, "").strip()
+    if not raw:
+        return _MCP_WRITER_LEASE_IDLE_S_DEFAULT
     try:
-        from .palace import MineAlreadyRunning, mine_palace_lock
-
-        lock_cm = mine_palace_lock(_config.palace_path)
-        lock_cm.__enter__()
-    except MineAlreadyRunning as exc:
-        _MCP_WRITER_READ_ONLY = True
-        _MCP_WRITER_LOCK_ERROR = (
-            "another mempalace writer already holds the palace lock for "
-            f"{_config.palace_path!r}: {exc}"
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; using default %.0f s",
+            _MCP_WRITER_LEASE_IDLE_S_ENV,
+            raw,
+            _MCP_WRITER_LEASE_IDLE_S_DEFAULT,
         )
-        return False, _MCP_WRITER_LOCK_ERROR
-    except Exception as exc:
-        _MCP_WRITER_LOCK_FAILED = True
-        _MCP_WRITER_LOCK_ERROR = (
-            "could not acquire MCP peer-writer lock for "
-            f"{_config.palace_path!r}: {exc!r}; continuing without "
-            "peer-writer protection"
-        )
-        logger.warning(_MCP_WRITER_LOCK_ERROR)
-        return True, _MCP_WRITER_LOCK_ERROR
+        return _MCP_WRITER_LEASE_IDLE_S_DEFAULT
+    return max(0.0, value)
 
-    _MCP_WRITER_LOCK_CM = lock_cm
-    import atexit
 
-    atexit.register(lambda: lock_cm.__exit__(None, None, None))
-    _MCP_WRITER_READ_ONLY = False
-    _MCP_WRITER_LOCK_FAILED = False
-    _MCP_WRITER_LOCK_ERROR = ""
-    return True, ""
+@contextlib.contextmanager
+def _writer_lease_activity(tool_name: str):
+    """Track a mutating tool's execution window for the idle-release clock.
+
+    While at least one mutating tool is in flight the lease is never
+    released, and the idle clock restarts when the last one finishes.
+    Non-mutating tools pass through untouched.
+    """
+    global _MCP_WRITER_INFLIGHT, _MCP_WRITER_LAST_MUTATION_TS
+    if tool_name not in _MUTATING_TOOLS:
+        yield
+        return
+    with _MCP_WRITER_LEASE_GUARD:
+        _MCP_WRITER_INFLIGHT += 1
+    try:
+        yield
+    finally:
+        with _MCP_WRITER_LEASE_GUARD:
+            _MCP_WRITER_INFLIGHT -= 1
+            _MCP_WRITER_LAST_MUTATION_TS = time.monotonic()
+
+
+def _release_mcp_writer_lock_if_idle() -> bool:
+    """Release the writer lease once mutating tools have been idle long enough.
+
+    Called periodically from the idle watchdog thread. Returns True when the
+    lease was actually released. Releasing lets starved peers (hook/manual
+    mines, daemon jobs, another session's MCP server — see #1888) write to the
+    palace; the next mutating tool on this server transparently re-acquires
+    via the existing self-heal retry in ``_acquire_mcp_writer_lock``.
+    """
+    global _MCP_WRITER_LOCK_CM, _MCP_WRITER_READ_ONLY
+    idle_limit = _writer_lease_idle_seconds()
+    if idle_limit <= 0:
+        return False
+    with _MCP_WRITER_LEASE_GUARD:
+        if _MCP_WRITER_LOCK_CM is None or _MCP_WRITER_INFLIGHT > 0:
+            return False
+        idle = time.monotonic() - _MCP_WRITER_LAST_MUTATION_TS
+        if idle < idle_limit:
+            return False
+        lock_cm = _MCP_WRITER_LOCK_CM
+        _MCP_WRITER_LOCK_CM = None
+        _MCP_WRITER_READ_ONLY = False
+        try:
+            lock_cm.__exit__(None, None, None)
+        except Exception:
+            logger.warning("Failed to release idle MCP writer lease", exc_info=True)
+    # Outside the guard: this tears down Chroma handles and can take a
+    # moment. A mutating call that lands in this window re-acquires the
+    # lease and may open a fresh collection that the reset then drops —
+    # that only costs that call a re-open, never correctness (the reset
+    # only clears caches; it writes nothing).
+    _force_chroma_cache_reset()
+    logger.info(
+        "Released MCP writer lease after %.0f s without mutating tools; "
+        "peer writers (mines, daemon jobs, other sessions) may now write.",
+        idle,
+    )
+    return True
+
+
+def _release_mcp_writer_lock_at_exit() -> None:
+    """atexit hook: release the current lease, if any (registered once)."""
+    global _MCP_WRITER_LOCK_CM
+    with _MCP_WRITER_LEASE_GUARD:
+        lock_cm = _MCP_WRITER_LOCK_CM
+        _MCP_WRITER_LOCK_CM = None
+    if lock_cm is not None:
+        try:
+            lock_cm.__exit__(None, None, None)
+        except Exception:
+            pass
 
 
 def _mcp_peer_writer_refusal(req_id, tool_name: str):
@@ -4806,7 +4939,10 @@ def handle_request(request):
             if "entry" not in tool_args or tool_args["entry"] is None:
                 tool_args["entry"] = content_val
         try:
-            result = _decorate_mcp_tool_result(tool_name, TOOLS[tool_name]["handler"](**tool_args))
+            with _writer_lease_activity(tool_name):
+                result = _decorate_mcp_tool_result(
+                    tool_name, TOOLS[tool_name]["handler"](**tool_args)
+                )
 
             return {
                 "jsonrpc": "2.0",
@@ -5040,16 +5176,32 @@ def _start_idle_exit_watchdog() -> None:
     servers from ended Claude Code sessions do not accumulate ChromaDB /
     HNSW file handles on Windows (#1552).
 
-    Set ``MEMPALACE_MCP_IDLE_HOURS=0`` to disable the watchdog.
+    Set ``MEMPALACE_MCP_IDLE_HOURS=0`` to disable the idle exit.
+
+    The same thread also drives the cooperative writer-lease release
+    (#1888): every tick it releases the per-palace write lock if no
+    mutating tool has run for ``MEMPALACE_MCP_WRITER_LEASE_IDLE_S``
+    seconds, so hook/manual mines and daemon jobs are not starved for
+    this server's whole lifetime. The thread therefore starts when
+    EITHER feature is enabled.
     """
     timeout = _mcp_idle_timeout_secs()
-    if timeout <= 0:
+    lease_idle = _writer_lease_idle_seconds()
+    if timeout <= 0 and lease_idle <= 0:
         return
-    check_interval = min(60.0, timeout / 4)
+    candidates = [t / 4 for t in (timeout,) if t > 0]
+    candidates += [t / 2 for t in (lease_idle,) if t > 0]
+    check_interval = min(60.0, *candidates)
 
     def _watchdog() -> None:
         while True:
             time.sleep(check_interval)
+            try:
+                _release_mcp_writer_lock_if_idle()
+            except Exception:  # noqa: BLE001 - release failure must not kill the thread
+                logger.warning("Idle writer-lease release failed", exc_info=True)
+            if timeout <= 0:
+                continue
             idle = time.monotonic() - _last_request_time
             if idle >= timeout:
                 logger.info(
