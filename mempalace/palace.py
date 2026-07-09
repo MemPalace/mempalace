@@ -11,6 +11,7 @@ import os
 import re
 import sys
 import threading
+import time
 from typing import Optional
 
 from .backends import (
@@ -1073,119 +1074,213 @@ def _write_lock_holder(lock_file) -> None:
         pass
 
 
-@contextlib.contextmanager
-def mine_palace_lock(palace_path: str):
-    """Per-palace non-blocking lock around the full `mine` pipeline.
+_DEFAULT_MINE_PALACE_LOCK_WAIT_SECONDS = 30.0
+_DEFAULT_MINE_PALACE_LOCK_POLL_SECONDS = 0.25
+_MINE_PALACE_LOCK_WAIT_ENV = "MEMPALACE_MINE_PALACE_LOCK_WAIT_SECONDS"
+_MINE_PALACE_LOCK_POLL_ENV = "MEMPALACE_MINE_PALACE_LOCK_POLL_SECONDS"
 
-    The per-file `mine_lock` only protects delete+insert interleave for a
-    single source; it does not prevent N copies of `mempalace mine <dir>`
-    from being spawned concurrently by hooks. When that happens, each copy
-    drives ChromaDB HNSW inserts in parallel against the same palace,
-    which (combined with chromadb's multi-threaded ParallelFor) can
-    corrupt the HNSW graph and produce sparse link_lists.bin blowups.
 
-    The lock file is keyed by sha256(palace_path) so mines against
-    *different* palaces can still run in parallel — we only serialize
-    writes into the same palace, which is the correctness boundary.
+def _float_env(name: str, default: float, *, minimum: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
 
-    The key is derived from a fully normalized form of the path:
-    `realpath` resolves symlinks and `..` segments, and `normcase` folds
-    case on Windows (which has a case-insensitive filesystem). Without
-    normcase, `C:\\Palace` and `c:\\palace` would hash to different keys
-    on Windows and let two concurrent mines touch the same on-disk palace.
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
 
-    Non-blocking: if another `mine` is already writing to this palace,
-    raise MineAlreadyRunning so the caller can exit cleanly instead of
-    piling up as a waiting worker.
+    return max(minimum, value)
 
-    Re-entrant: if the current process already holds the lock for the same
-    palace, the context manager passes through without re-acquiring. This
-    lets ChromaCollection write methods (which acquire the lock themselves
-    to protect MCP/direct callers) compose with miner.mine() (which holds
-    the outer lock for the entire mine pipeline) without self-deadlock, and
-    lets the threaded MCP HTTP transport write from a worker thread while the
-    long-lived writer-lease is held on another thread of the same process.
-    """
+
+def _mine_palace_lock_wait_seconds() -> float:
+    """How long palace writers should wait for a transient holder."""
+    return _float_env(
+        _MINE_PALACE_LOCK_WAIT_ENV,
+        _DEFAULT_MINE_PALACE_LOCK_WAIT_SECONDS,
+        minimum=0.0,
+    )
+
+
+def _mine_palace_lock_poll_seconds() -> float:
+    """How often palace writers should retry while waiting."""
+    return _float_env(
+        _MINE_PALACE_LOCK_POLL_ENV,
+        _DEFAULT_MINE_PALACE_LOCK_POLL_SECONDS,
+        minimum=0.01,
+    )
+
+
+def _palace_lock_parts(palace_path: str) -> tuple[str, str, str]:
+    """Return resolved palace path, lock key, and lock path."""
     lock_dir = os.path.join(os.path.expanduser("~"), ".mempalace", "locks")
     os.makedirs(lock_dir, exist_ok=True)
+
     resolved = os.path.realpath(os.path.expanduser(palace_path))
     lock_key_source = os.path.normcase(resolved)
     palace_key = hashlib.sha256(lock_key_source.encode()).hexdigest()[:16]
     lock_path = os.path.join(lock_dir, f"mine_palace_{palace_key}.lock")
+    return resolved, palace_key, lock_path
+
+
+def _holder_pid_from_message(holder: str) -> int | None:
+    match = re.search(r"\bPID\s+(\d+)\b", holder or "")
+    if not match:
+        return None
+
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _process_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+
+    if pid == os.getpid():
+        return True
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        # Some platforms do not support signal 0 reliably. Prefer safety:
+        # treat the holder as alive rather than stealing an active writer.
+        return True
+
+    return True
+
+
+def _holder_pid_is_dead(holder: str) -> bool:
+    pid = _holder_pid_from_message(holder)
+    if pid is None or pid == os.getpid():
+        return False
+
+    return not _process_is_alive(pid)
+
+
+def _try_lock_palace_lock_file(lock_file) -> bool:
+    """Try to acquire the palace lock file without blocking."""
+    lock_file.seek(0)
+
+    if os.name == "nt":
+        import msvcrt
+
+        try:
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return False
+        return True
+
+    import fcntl
+
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+
+    return True
+
+
+def _unlock_palace_lock_file(lock_file) -> None:
+    lock_file.seek(0)
+
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def mine_palace_lock(palace_path: str):
+    """Per-palace bounded-wait lock around Chroma-backed palace writes.
+
+    A fail-fast nonblocking flock turns transient hook/mine overlap into lost
+    writes. Waiting forever is also unsafe because an idle long-lived process
+    can starve every writer. The compromise is a bounded wait with safe
+    liveness cleanup: retry transient holders, remove stale files only when the
+    recorded holder PID is dead, and otherwise fail with a clear timeout.
+    """
+
+    resolved, palace_key, lock_path = _palace_lock_parts(palace_path)
 
     if _held_by_this_process(palace_key):
-        # This process already holds the lock for this palace — pass through.
         yield
         return
 
-    # Ensure the file exists, then open r+ so we can both read the prior
-    # holder's identity (for failure diagnostics) and write our own. "w"
-    # truncates and erases the prior holder. "a+" puts the position at EOF,
-    # which on Windows breaks ``msvcrt.locking`` (it locks 1 byte at the
-    # *current* position, so two contenders end up locking different bytes
-    # and silently both acquire — observed as Windows-CI lock test
-    # failures during #1264 development).
-    if not os.path.exists(lock_path):
-        # Touch atomically: O_CREAT|O_EXCL would fail if a concurrent
-        # contender just created it, which is fine — we proceed to open.
-        try:
-            fd = os.open(lock_path, os.O_CREAT | os.O_WRONLY, 0o600)
-            os.close(fd)
-        except FileExistsError:
-            pass
-    lf = open(lock_path, "r+b")
-    acquired = False
-    try:
-        # Lock byte 0 explicitly. msvcrt.locking is byte-position dependent;
-        # fcntl.flock is whole-file but the seek is harmless there.
-        lf.seek(0)
-        if os.name == "nt":
-            import msvcrt
+    timeout = _mine_palace_lock_wait_seconds()
+    poll = _mine_palace_lock_poll_seconds()
+    deadline = time.monotonic() + timeout
+    last_holder = "another writer (identity not recorded)"
 
+    while True:
+        if not os.path.exists(lock_path):
             try:
-                msvcrt.locking(lf.fileno(), msvcrt.LK_NBLCK, 1)
-                acquired = True
-            except OSError as exc:
-                holder = _read_lock_holder(lf)
-                raise MineAlreadyRunning(
-                    f"palace {resolved} is held by {holder}; "
-                    "wait for it to finish or stop the holder before retrying"
-                ) from exc
-        else:
-            import fcntl
-
-            try:
-                fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                acquired = True
-            except BlockingIOError as exc:
-                holder = _read_lock_holder(lf)
-                raise MineAlreadyRunning(
-                    f"palace {resolved} is held by {holder}; "
-                    "wait for it to finish or stop the holder before retrying"
-                ) from exc
-        # Record our own identity for any later contender's diagnostic message.
-        _write_lock_holder(lf)
-        _mark_held(palace_key)
-        try:
-            yield
-        finally:
-            _mark_released(palace_key)
-    finally:
-        if acquired:
-            try:
-                if os.name == "nt":
-                    import msvcrt
-
-                    # Match the lock region: byte 0.
-                    lf.seek(0)
-                    msvcrt.locking(lf.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(lf, fcntl.LOCK_UN)
-            except Exception:
+                fd = os.open(lock_path, os.O_CREAT | os.O_WRONLY, 0o600)
+                os.close(fd)
+            except FileExistsError:
                 pass
-        lf.close()
+
+        lf = open(lock_path, "r+b")
+        acquired = False
+
+        try:
+            acquired = _try_lock_palace_lock_file(lf)
+
+            if acquired:
+                _write_lock_holder(lf)
+                _mark_held(palace_key)
+                try:
+                    yield
+                finally:
+                    _mark_released(palace_key)
+                return
+
+            last_holder = _read_lock_holder(lf)
+
+            if _holder_pid_is_dead(last_holder):
+                # The recorded process is gone. The OS lock should already be
+                # released, but the rendezvous file can still carry stale
+                # holder identity; remove it and retry on a fresh inode/path.
+                try:
+                    lf.close()
+                finally:
+                    try:
+                        os.remove(lock_path)
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        logger.debug(
+                            "Failed to remove stale palace lock %s",
+                            lock_path,
+                            exc_info=True,
+                        )
+                continue
+
+        finally:
+            if not acquired and not lf.closed:
+                lf.close()
+
+        now = time.monotonic()
+        if now >= deadline:
+            waited = max(0.0, timeout)
+            raise MineAlreadyRunning(
+                f"palace {resolved} is held by {last_holder}; "
+                f"timed out after {waited:.1f}s waiting for it to finish"
+            )
+
+        time.sleep(min(poll, max(0.0, deadline - now)))
+
+    # The loop returns from inside the acquired branch.
 
 
 # Backward-compatible alias (previous patch iteration used a single global
