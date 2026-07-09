@@ -673,6 +673,7 @@ def test_init_default_attempts_llm_provider(ai_dialogue_corpus: Path, tmp_path: 
 
     fake_provider = MagicMock()
     fake_provider.check_available.return_value = (True, "ok")
+    fake_provider.is_external_service = False  # real Ollama (localhost) is not external
     # refine_entities will run; mock the provider's classify so it returns
     # an empty classification list (no candidate reclassification happens).
     fake_provider.classify.return_value = MagicMock(text='{"classifications": []}')
@@ -787,6 +788,7 @@ def test_init_legacy_llm_flag_compatible(ai_dialogue_corpus: Path, tmp_path: Pat
 
     fake_provider = MagicMock()
     fake_provider.check_available.return_value = (True, "ok")
+    fake_provider.is_external_service = False  # real Ollama (localhost) is not external
     fake_provider.classify.return_value = MagicMock(text='{"classifications": []}')
 
     with (
@@ -828,6 +830,7 @@ def test_end_to_end_init_with_llm_separates_personas(ai_dialogue_corpus: Path, t
 
     fake_provider = MagicMock()
     fake_provider.check_available.return_value = (True, "ok")
+    fake_provider.is_external_service = False  # real Ollama (localhost) is not external
     # refine_entities classify call — return empty so the LLM doesn't
     # reclassify candidates; we just need it not to crash.
     fake_provider.classify.return_value = MagicMock(text='{"classifications": []}')
@@ -1170,6 +1173,7 @@ def test_integration_entities_json_includes_topics_excludes_personas(
 
     fake_provider = MagicMock()
     fake_provider.check_available.return_value = (True, "ok")
+    fake_provider.is_external_service = False  # real Ollama (localhost) is not external
     # llm_refine returns nothing (no reclassifications) — keeps test deterministic
     fake_provider.classify.return_value = MagicMock(text='{"classifications": []}')
 
@@ -1226,6 +1230,7 @@ def test_integration_add_to_known_entities_called_with_wing(
 
     fake_provider = MagicMock()
     fake_provider.check_available.return_value = (True, "ok")
+    fake_provider.is_external_service = False  # real Ollama (localhost) is not external
     fake_provider.classify.return_value = MagicMock(text='{"classifications": []}')
 
     fake_origin = CorpusOriginResult(
@@ -1752,6 +1757,7 @@ def test_init_prints_privacy_warning_when_provider_is_external(
         patch("mempalace.cli.get_provider", return_value=fake_provider),
         patch("mempalace.cli._maybe_run_mine_after_init"),
         patch("mempalace.room_detector_local.detect_rooms_local"),
+        patch("builtins.input", return_value="y"),
     ):
         cmd_init(args)
 
@@ -2019,4 +2025,43 @@ def test_init_no_consent_prompt_when_endpoint_is_local(
     assert not mock_input.called, (
         "Local endpoint (is_external_service=False) must NOT trigger the "
         "consent prompt regardless of api_key_source. Nothing leaves the box."
+    )
+
+
+def test_init_keyboardinterrupt_at_consent_closes_candidate(
+    ai_dialogue_corpus: Path, tmp_path: Path, capsys
+):
+    """Ctrl-C at the consent prompt must NOT leak the started provider runtime.
+
+    ``check_available()`` already started the Copilot subprocess + loop thread
+    before the prompt. If the user hits Ctrl-C at ``input()``, cmd_init must still
+    close the candidate on the way out — ``llm_provider`` stays None until consent
+    is granted, so the ``finally`` reclaims it. Regression for the deferred-retention
+    fix (a keyless external provider like Copilot, api_key_source=None)."""
+    from mempalace.cli import cmd_init
+
+    palace = tmp_path / "palace"
+    args = _init_args(ai_dialogue_corpus)
+    fake_provider = MagicMock()
+    fake_provider.check_available.return_value = (True, "ok")
+    fake_provider.is_external_service = True
+    fake_provider.api_key_source = None  # keyless external provider (Copilot)
+    fake_provider.classify.return_value = MagicMock(text='{"classifications": []}')
+
+    with (
+        patch("mempalace.cli.MempalaceConfig", return_value=_stub_cfg(palace)),
+        patch("mempalace.cli.get_provider", return_value=fake_provider),
+        patch("mempalace.cli._maybe_run_mine_after_init"),
+        patch("mempalace.room_detector_local.detect_rooms_local"),
+        patch("builtins.input", side_effect=KeyboardInterrupt),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        cmd_init(args)
+
+    assert not fake_provider.classify.called, (
+        "Ctrl-C at consent must abort before any external LLM call."
+    )
+    assert fake_provider.close.called, (
+        "Ctrl-C at the consent prompt leaked the started provider — the candidate "
+        "must be closed even when input() raises KeyboardInterrupt."
     )

@@ -52,6 +52,28 @@ cases to a minimal counterexample. Useful any time a function returns
 `Optional[X]` or has a wide input domain — it catches the failure-space
 gaps that hand-written positive tests miss.
 
+### Live provider tests (opt-in)
+
+The GitHub Copilot provider ships with a live end-to-end test that runs the
+real, authenticated Copilot CLI. It is **skipped by default** (marked `slow` and
+gated on an environment variable) so the normal suite stays offline and
+key-free. To run it you need Python 3.11+, the `copilot` extra
+(`pip install "mempalace[copilot]"`), and a signed-in Copilot CLI:
+
+```bash
+# Enable the live test and run it (bypasses the default `not slow` filter).
+MEMPALACE_LIVE_COPILOT=1 uv run pytest tests/test_copilot_live_e2e.py -m slow -v
+
+# Optionally pin the model the live test uses (defaults to `auto`).
+MEMPALACE_LIVE_COPILOT=1 MEMPALACE_LIVE_COPILOT_MODEL=gpt-5.5 \
+  uv run pytest tests/test_copilot_live_e2e.py -m slow -v
+```
+
+Everything else about the provider is covered by fast unit/integration tests
+that stub the SDK, so CI (which installs `.[dev]`, without the `copilot` extra)
+exercises the provider without ever contacting GitHub. See
+[docs/COPILOT_PROVIDER.md](docs/COPILOT_PROVIDER.md) for user-facing details.
+
 ## Running Benchmarks
 
 ```bash

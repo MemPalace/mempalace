@@ -175,6 +175,16 @@ class LLMProvider:
         """
         return not _endpoint_is_local(self.endpoint)
 
+    def close(self) -> None:
+        """Release any resources held by the provider (idempotent).
+
+        Stateless HTTP providers (Ollama / OpenAI-compat / Anthropic) hold
+        nothing and use this no-op. Providers that own a subprocess, socket, or
+        background thread (e.g. the Copilot CLI runtime) override this to reclaim
+        them promptly instead of waiting for interpreter exit.
+        """
+        return None
+
 
 def _http_post_json(url: str, body: dict, headers: dict, timeout: int) -> dict:
     """POST JSON and return the parsed response. Raises LLMError on any failure."""
@@ -445,6 +455,42 @@ PROVIDERS: dict[str, type[LLMProvider]] = {
     "anthropic": AnthropicProvider,
 }
 
+# Providers backed by an optional dependency are resolved lazily so importing
+# ``llm_client`` never pulls a heavy/optional SDK and this module stays
+# stdlib-only. ``name -> (module_path, class_name)``. The module is imported on
+# first use in ``get_provider``; a genuinely missing/broken optional package
+# surfaces as an actionable ``LLMError`` there (a merely uninstalled runtime is
+# reported later by the provider's ``check_available``, preserving graceful
+# heuristics-only degradation).
+_LAZY_PROVIDERS: dict[str, tuple[str, str]] = {
+    "copilot": ("mempalace.copilot_provider", "CopilotProvider"),
+}
+
+
+def _resolve_provider_class(name: str) -> Optional[type[LLMProvider]]:
+    """Resolve a provider class by name, importing optional backends on demand.
+
+    Returns ``None`` for an unknown name. Raises ``LLMError`` when a registered
+    optional provider's module cannot be imported (e.g. a broken install).
+    """
+    cls = PROVIDERS.get(name)
+    if cls is not None:
+        return cls
+    lazy = _LAZY_PROVIDERS.get(name)
+    if lazy is None:
+        return None
+    module_path, class_name = lazy
+    import importlib
+
+    try:
+        module = importlib.import_module(module_path)
+    except ImportError as e:  # pragma: no cover — defensive; module imports stdlib-only
+        raise LLMError(
+            f"Provider '{name}' is unavailable: {e}. Install its extra with "
+            f"`pip install 'mempalace[{name}]'`."
+        ) from e
+    return getattr(module, class_name)
+
 
 def get_provider(
     name: str,
@@ -459,7 +505,8 @@ def get_provider(
     Extra kwargs (e.g. num_ctx for Ollama) are forwarded to the provider's
     constructor; providers that don't recognize them ignore via **_.
     """
-    cls = PROVIDERS.get(name)
+    cls = _resolve_provider_class(name)
     if cls is None:
-        raise LLMError(f"Unknown provider '{name}'. Choices: {sorted(PROVIDERS.keys())}")
+        known = sorted(set(PROVIDERS) | set(_LAZY_PROVIDERS))
+        raise LLMError(f"Unknown provider '{name}'. Choices: {known}")
     return cls(model=model, endpoint=endpoint, api_key=api_key, timeout=timeout, **provider_kwargs)
