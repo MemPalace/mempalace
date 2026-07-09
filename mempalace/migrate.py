@@ -295,7 +295,7 @@ def migrate(palace_path: str, dry_run: bool = False, confirm: bool = False):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_path = f"{palace_path}.pre-migrate.{timestamp}"
     print(f"\n  Backing up to {backup_path}...")
-    shutil.copytree(palace_path, backup_path)
+    shutil.copytree(palace_path, backup_path, symlinks=True)
 
     # Enforce backup retention so repeated migrations cannot fill the disk
     # with full-palace copies. The backup we just created is the newest, so

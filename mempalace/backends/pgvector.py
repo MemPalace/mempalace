@@ -37,6 +37,7 @@ from urllib import parse as urlparse
 
 import numpy as np
 
+from ..config import strip_lone_surrogates
 from ._sidecar import EMBEDDER_SIDECAR_FILENAME, read_embedder_sidecar, write_embedder_sidecar
 from .base import (
     BackendClosedError,
@@ -78,6 +79,42 @@ def _utcnow() -> str:
 
 def _json_dumps(obj: Any) -> str:
     return json.dumps(obj or {}, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _strip_nul(value: Any) -> Any:
+    """Recursively strip NUL (0x00) from strings, list/tuple items, and dict keys
+    and values so pgvector can store the result.
+
+    PostgreSQL cannot store NUL in ``text`` or ``jsonb``: psycopg rejects a raw
+    NUL in a text column ("PostgreSQL text fields cannot contain NUL (0x00)
+    bytes"), and a NUL in metadata serializes to a JSON unicode escape that the
+    ``jsonb`` cast rejects ("unsupported Unicode escape sequence"). A single
+    transcript that captured NUL in tool output would otherwise abort the whole
+    mine run (#1829). ChromaDB and the SQLite backend store the byte verbatim,
+    so stripping only here keeps the same inputs ingestible.
+
+    Applied to id, document, and metadata in :meth:`_PgVectorClient.upsert_rows`
+    so the write path never carries a NUL into Postgres. Only ``str`` values are
+    rewritten; the ``int``/``float``/``bool``/``None`` scalars JSON metadata
+    normalizes to pass through unchanged. Stripping is not injective, so two keys
+    (or ids)
+    differing only by a NUL collapse to one (last wins); this does not occur in
+    practice because drawer ids are SHA-256 hashes and metadata keys are fixed
+    field names, so only transcript-derived values are ever actually changed.
+    Unlike ``config.sanitize_content`` (which rejects NUL in user-supplied
+    content), the bulk-mine path strips so one stray byte cannot abort a whole
+    backfill. ``str.replace`` returns the original string when it holds no NUL,
+    so a clean document is not reallocated.
+    """
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if isinstance(value, dict):
+        return {_strip_nul(key): _strip_nul(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_strip_nul(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_strip_nul(item) for item in value)
+    return value
 
 
 def _tokenize(text: str) -> list[str]:
@@ -465,11 +502,10 @@ class _PgVectorClient:
     def __init__(self, config: _PgVectorConfig):
         self._config = config
         self._conn = None
+        self._closed = False
         self._lock = threading.RLock()
 
     def _connect(self):
-        if self._conn is not None and not getattr(self._conn, "closed", False):
-            return self._conn
         try:
             import psycopg
         except ImportError as exc:  # pragma: no cover - exercised only without the extra
@@ -477,15 +513,27 @@ class _PgVectorClient:
                 "pgvector backend requires the optional 'psycopg' dependency; "
                 "install mempalace[pgvector]"
             ) from exc
-        try:
-            self._conn = psycopg.connect(self._config.dsn)
-        except Exception as exc:  # noqa: BLE001 - surface any driver failure uniformly
-            raise BackendError(f"pgvector connection failed: {exc}") from exc
-        return self._conn
+        # One client is shared across threads (PgVectorBackend caches a
+        # single instance per config), so the read-create-store on self._conn
+        # must hold the same lock _execute serializes on; unlocked, two
+        # first-connect threads each opened a connection and the loser leaked
+        # unclosed. The RLock makes the _execute -> _connect nesting safe. A
+        # stalled connect blocks peers under the lock the same way any
+        # in-flight query on this single shared connection already does.
+        with self._lock:
+            if self._closed:
+                raise BackendError("pgvector client has been closed")
+            if self._conn is not None and not getattr(self._conn, "closed", False):
+                return self._conn
+            try:
+                self._conn = psycopg.connect(self._config.dsn)
+            except Exception as exc:  # noqa: BLE001 - surface any driver failure uniformly
+                raise BackendError(f"pgvector connection failed: {exc}") from exc
+            return self._conn
 
     def _execute(self, sql: str, params=None, *, fetch: bool = False, many: bool = False):
-        conn = self._connect()
         with self._lock:
+            conn = self._connect()
             try:
                 with conn.cursor() as cur:
                     if many:
@@ -570,9 +618,21 @@ class _PgVectorClient:
         )
         params = [
             (
-                row["id"],
-                row["document"],
-                _json_dumps(row.get("metadata")),
+                # Strip both unstorable byte classes Postgres rejects before
+                # binding, so one stray byte in a transcript cannot abort the
+                # whole mine (#1829 NUL, #1833 lone surrogate).
+                #
+                # Order matters for metadata: NUL must be stripped *before*
+                # serialization (json escapes it to \\u0000, which the jsonb cast
+                # rejects), while a lone surrogate must be stripped *after*
+                # serialization (json.dumps(ensure_ascii=False) leaves it raw, so
+                # one pass over the serialized string cleans it without walking
+                # the dict). id/document are plain strings, so the two passes
+                # commute there. ids are NUL- and surrogate-free in practice, so
+                # those passes are defensive no-ops on the ON CONFLICT key.
+                strip_lone_surrogates(_strip_nul(row["id"])),
+                strip_lone_surrogates(_strip_nul(row["document"])),
+                strip_lone_surrogates(_json_dumps(_strip_nul(row.get("metadata")))),
                 _vector_literal(row["embedding"]),
                 row.get("updated_at") or _utcnow(),
             )
@@ -614,14 +674,34 @@ class _PgVectorClient:
         *,
         where: Optional[dict] = None,
         with_embedding: bool = False,
+        with_document: bool = True,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
     ) -> list[dict]:
         qi = _quote_identifier(table)
         params: list = []
         where_sql = _where_to_sql(where, params) if where else "TRUE"
-        cols = "id, document, metadata"
+        # Project NULL into the document slot when the caller only needs
+        # metadata (e.g. mempalace_status's wing/room tally). Keeps the
+        # positional _row parser unchanged — document remains record[1] —
+        # while avoiding O(n × document_size) bytes over the wire on remote
+        # pgvector deployments. Follow-up to #1840.
+        cols = "id, document, metadata" if with_document else "id, NULL::text, metadata"
         if with_embedding:
             cols += ", embedding"
         sql = f"SELECT {cols} FROM {qi} WHERE {where_sql}"
+        # Push pagination into SQL when a page is requested. ORDER BY the
+        # primary key gives OFFSET a stable order (an unordered scan may skip
+        # or repeat rows across pages); callers that scroll the whole table
+        # pass neither bound, leaving their SQL unchanged.
+        if limit is not None or offset:
+            sql += " ORDER BY id"
+            if limit is not None:
+                params.append(int(limit))
+                sql += " LIMIT %s"
+            if offset:
+                params.append(int(offset))
+                sql += " OFFSET %s"
         rows = self._execute(sql, params, fetch=True)
         return [
             self._row(record, with_embedding=with_embedding, with_distance=False)
@@ -684,7 +764,12 @@ class _PgVectorClient:
         self._execute(f"ANALYZE {_quote_identifier(table)}")
 
     def close(self) -> None:
+        # Terminal: the only caller is PgVectorBackend.close(), after which
+        # the backend refuses to hand the client out again. Without the flag a
+        # stale reference would silently reconnect and leak a session nobody
+        # can ever close.
         with self._lock:
+            self._closed = True
             if self._conn is not None:
                 try:
                     self._conn.close()
@@ -776,13 +861,56 @@ class PgVectorCollection(BaseCollection):
                 )
             self._known_dimension = existing_dim or dimension
 
-    def _scroll(self, *, where=None, with_embedding=False) -> list[dict]:
+    def _scroll(
+        self,
+        *,
+        where=None,
+        with_embedding=False,
+        with_document=True,
+        limit=None,
+        offset=None,
+    ) -> list[dict]:
         self._ensure_open()
         if not self._table_exists():
             if self._marker_exists():
                 raise CollectionNotInitializedError(self._collection_name)
             return []
-        return self._client.scroll_rows(self._table, where=where, with_embedding=with_embedding)
+        return self._client.scroll_rows(
+            self._table,
+            where=where,
+            with_embedding=with_embedding,
+            with_document=with_document,
+            limit=limit,
+            offset=offset,
+        )
+
+    def get_all_metadata(self, where=None) -> list[dict]:
+        """Single-pass metadata-only fetch — projects out the document column.
+
+        The base implementation pages through ``get(include=["metadatas"])``,
+        which routes here via ``_scroll`` and (pre-this-override) always sent
+        the ``document`` text over the wire even when nothing consumed it.
+        For pgvector deployments where the client is remote (TLS over WAN),
+        that meant ``mempalace_status`` transferred O(n × document_size)
+        bytes per call, dominating wall time. With ``with_document=False``
+        the SELECT replaces document with NULL, dropping the per-row payload
+        to id + metadata for every caller of this method.
+
+        Filtered fetches still need the ``_matches_where`` post-filter for
+        non-pushdown semantics (array/object values where ``metadata @> ...``
+        is broader than the exact match the caller asked for — same
+        correctness contract as #1840's filtered ``get`` path). Since that
+        post-filter only reads ``metadata``, we keep the single-scroll +
+        ``with_document=False`` fast path and just apply the filter locally
+        on the metadata dicts before returning. This extends the wire-byte
+        win to filtered callers as well.
+        """
+        _validate_where(where)
+        pushdown = None if _requires_local_filter(where) else where
+        rows = self._scroll(where=pushdown, with_document=False)
+        if where is None:
+            return [row["metadata"] for row in rows]
+        return [row["metadata"] for row in rows if _matches_where(row["metadata"], where)]
 
     def _rows(
         self,
@@ -1001,16 +1129,40 @@ class PgVectorCollection(BaseCollection):
         include=None,
     ) -> GetResult:
         spec = _IncludeSpec.resolve(include, default_distances=False)
-        rows = self._rows(
-            ids=ids, where=where, where_document=where_document, with_embedding=spec.embeddings
+        # Fast path for the common unfiltered page fetch (e.g.
+        # prefetch_mined_set's sweep): push LIMIT/OFFSET into the scan instead
+        # of fetching the whole table and slicing in Python, which is the
+        # O(rows x pages) cost this avoids. Only the no-filter case is pushed:
+        # the "metadata @> ..." pushdown is broader than the exact
+        # _matches_where re-filter for array/object values, so any filtered get
+        # keeps the full-scan path where that re-filter still runs. ids, where,
+        # where_document and negative bounds all fall through to the unchanged
+        # path below. (The document column is still selected for metadata-only
+        # pages; projecting it out needs the positional _row parser to change,
+        # so it stays a separate follow-up.)
+        push_page = (
+            ids is None
+            and not where
+            and not where_document
+            and (limit is None or limit >= 0)
+            and (offset is None or offset >= 0)
+            and (limit is not None or offset)
         )
-        if ids is not None:
-            by_id = {row["id"]: row for row in rows}
-            rows = [by_id[doc_id] for doc_id in ids if doc_id in by_id]
-        if offset:
-            rows = rows[offset:]
-        if limit is not None:
-            rows = rows[:limit]
+        if push_page:
+            rows = self._scroll(
+                where=None, with_embedding=spec.embeddings, limit=limit, offset=offset
+            )
+        else:
+            rows = self._rows(
+                ids=ids, where=where, where_document=where_document, with_embedding=spec.embeddings
+            )
+            if ids is not None:
+                by_id = {row["id"]: row for row in rows}
+                rows = [by_id[doc_id] for doc_id in ids if doc_id in by_id]
+            if offset:
+                rows = rows[offset:]
+            if limit is not None:
+                rows = rows[:limit]
         return GetResult(
             ids=[row["id"] for row in rows],
             documents=[row["document"] for row in rows] if spec.documents else [],
@@ -1285,9 +1437,12 @@ class PgVectorBackend(BaseBackend):
 
     # ------------------------------------------------------------------
     def _client(self, config: _PgVectorConfig) -> _PgVectorClient:
-        if self._closed:
-            raise BackendClosedError("PgVectorBackend has been closed")
         with self._lock:
+            # Checked under the lock so a client cannot be created and stored
+            # concurrently with close() clearing the registry (mirrors
+            # SQLiteExactBackend._connect).
+            if self._closed:
+                raise BackendClosedError("PgVectorBackend has been closed")
             client = self._clients.get(config)
             if client is None:
                 client = _PgVectorClient(config)

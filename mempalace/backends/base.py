@@ -468,6 +468,48 @@ class BaseCollection(ABC):
         """
         return None
 
+    def get_all_metadata(self, where: Optional[dict] = None) -> list[dict]:
+        """Return every matching record's metadata in one logical pass (#1796).
+
+        Default implementation pages through :meth:`get` using
+        ``limit``/``offset`` -- correct for backends with a real server-side
+        cursor (e.g. Chroma's SQL OFFSET), and the same shape callers already
+        relied on before this method existed.
+
+        Backends whose ``get(limit=, offset=)`` is implemented by fully
+        materializing a result set and then Python-slicing it (no true
+        server-side cursor) MUST override this method to walk their native
+        cursor exactly once instead. Calling the default implementation on
+        such a backend is O(n^2) in collection size: each page re-walks the
+        entire collection just to discard everything outside the requested
+        slice. See issue #1796.
+        """
+        all_meta: list[dict] = []
+        offset = 0
+        page_size = 1000
+        while True:
+            kwargs: dict = {"include": ["metadatas"], "limit": page_size, "offset": offset}
+            if where:
+                kwargs["where"] = where
+            batch = self.get(**kwargs)
+            batch_meta = batch.metadatas if hasattr(batch, "metadatas") else batch.get("metadatas")
+            if not batch_meta:
+                break
+            all_meta.extend(batch_meta)
+            if len(batch_meta) < page_size:
+                break
+            offset += len(batch_meta)
+        return all_meta
+
+    def facet_counts(
+        self,
+        field: str,
+        where: Optional[dict] = None,
+        limit: int = 1000,
+    ) -> dict[str, int]:
+        """Return counts for each distinct value of a metadata field."""
+        raise UnsupportedCapabilityError("backend does not support facet_counts")
+
     def maintenance_state(self) -> dict:
         """Return a structured snapshot of this collection's maintenance state.
 

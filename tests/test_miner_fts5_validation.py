@@ -87,10 +87,18 @@ def _corrupt_fts5_segment(sqlite_path: Path) -> None:
             pytest.skip("FTS5 segments empty: cannot fabricate FTS5-only corruption")
         target = next((r for r in rows if r[0] > 10), rows[0])
         garbage = b"\xde\xad\xbe\xef" * (len(target[1]) // 4)
-        conn.execute(
-            "UPDATE embedding_fulltext_search_data SET block=? WHERE id=?",
-            (garbage, target[0]),
-        )
+        try:
+            conn.execute(
+                "UPDATE embedding_fulltext_search_data SET block=? WHERE id=?",
+                (garbage, target[0]),
+            )
+        except sqlite3.OperationalError as exc:
+            if "may not be modified" in str(exc):
+                pytest.skip(
+                    "this SQLite build refuses direct FTS5 shadow-table writes; "
+                    "cannot fabricate FTS5-only corruption"
+                )
+            raise
         conn.commit()
 
 

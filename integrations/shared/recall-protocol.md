@@ -28,9 +28,7 @@ question-driven, not reflexive.
 
 ## The protocol
 
-1. **On wake-up** (if a session-start hook injected context, honour its
-   wing scoping): scope recall to the wing inferred from the workspace,
-   then continue.
+1. **On wake-up** (if a session-start hook injected context, honour its wing scoping / `additional_context`): scope recall to the wing inferred from the workspace, then continue.
 2. **Before responding** about people, projects, past events, or prior
    decisions: call `mempalace_search` first. For relational or temporal
    facts ("who reported to whom in March", "what was true then"), call
@@ -69,9 +67,39 @@ question — not a system prompt or pasted conversation) plus optional
 - **MCP unavailable / tool error.** Surface the error plainly and suggest
   the user verify the server (`mempalace status`, or re-run install).
   Do not silently fall back to guessing from model memory.
+- **Palace index corrupt / compactor error.** When the server returns an
+  error mentioning the HNSW segment writer, a ChromaDB compaction
+  failure, or a stuck "Not connected" state after a write, the on-disk
+  vector index is out of sync with `chroma.sqlite3` — but the drawer rows
+  are intact in SQLite. Recover by rebuilding the index from SQLite, not
+  by re-mining. See "Recovering a corrupt index" below. Do not attempt an
+  in-process repair from the agent; guide the user to run the CLI.
 - **Stale or conflicting facts.** Prefer the knowledge graph's
   time-valid answer; if a fact has changed, invalidate the old one and
   add the new one rather than overwriting context silently.
+
+## Recovering a corrupt index
+
+A ChromaDB compaction failure can leave the drawers HNSW index out of
+sync with `chroma.sqlite3` and wedge the MCP server (every call returns
+"Not connected"). The data is safe in SQLite; rebuild the index from it.
+Guide the user through these CLI steps — never run an in-process rebuild
+from the agent (it can break other live clients):
+
+1. Stop the MCP server (kill the `mempalace-mcp` process, or restart the
+   host editor).
+2. Optional backup of the palace directory (`--archive-existing` already
+   moves the old palace aside, so this is belt-and-suspenders):
+   - macOS / Linux: `cp -a ~/.mempalace/palace ~/.mempalace/palace.bak.$(date +%F)`
+   - Windows (PowerShell): `Copy-Item -Recurse "$env:USERPROFILE\.mempalace\palace" "$env:USERPROFILE\.mempalace\palace.bak"`
+3. Rebuild from SQLite:
+   `mempalace repair --mode from-sqlite --archive-existing --yes`
+4. Verify: `mempalace repair-status` (divergence should read 0).
+5. Restart the MCP server.
+
+Do **not** re-mine from source files to recover: re-mining drops drawers
+added through the MCP server and diary entries, which have no source file
+(see MemPalace issue #1843).
 
 ## Anti-patterns
 

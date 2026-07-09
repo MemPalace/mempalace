@@ -23,6 +23,7 @@ from .backends import (
     PalaceNotFoundError,
     UnsupportedCapabilityError,
 )
+from .config import sqlite_read_uri
 from .palace import (
     _open_collection_or_explain,
     get_closets_collection,
@@ -220,20 +221,40 @@ def _hybrid_rank(
         r["bm25_score"] = round(raw, 3)
         scored.append((vector_weight * vec_sim + bm25_weight * norm, r))
 
-    scored.sort(key=lambda pair: pair[0], reverse=True)
+    # Break exact score ties toward the more recently authored drawer so equal-score
+    # candidates rank chronologically instead of in arbitrary backend order. ISO-8601
+    # ``authored_at`` strings sort chronologically; missing dates sort oldest.
+    # authored_at lives at the top level on the search_memories path and nested under
+    # "metadata" on the candidate-union path; check both so the tie-break works for each.
+    scored.sort(
+        key=lambda pair: (
+            pair[0],
+            pair[1].get("authored_at") or pair[1].get("metadata", {}).get("authored_at") or "",
+        ),
+        reverse=True,
+    )
     results[:] = [r for _, r in scored]
     return results
 
 
-def build_where_filter(wing: str = None, room: str = None) -> dict:
-    """Build ChromaDB where filter for wing/room filtering."""
-    if wing and room:
-        return {"$and": [{"wing": wing}, {"room": room}]}
-    elif wing:
-        return {"wing": wing}
-    elif room:
-        return {"room": room}
-    return {}
+def build_where_filter(wing: str = None, room: str = None, source_file: str = None) -> dict:
+    """Build a ChromaDB where filter from optional wing/room/source_file.
+
+    ChromaDB needs a ``$and`` only when ≥2 clauses are present; a single
+    clause is returned bare and zero clauses yield an empty filter (#1815).
+    """
+    clauses = []
+    if wing:
+        clauses.append({"wing": wing})
+    if room:
+        clauses.append({"room": room})
+    if source_file:
+        clauses.append({"source_file": source_file})
+    if not clauses:
+        return {}
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"$and": clauses}
 
 
 def _extract_drawer_ids_from_closet(closet_doc: str) -> list:
@@ -248,6 +269,31 @@ def _extract_drawer_ids_from_closet(closet_doc: str) -> list:
             if did and did not in seen:
                 seen[did] = None
     return list(seen.keys())
+
+
+def _scoped_source_filter(source_file: str, parent_drawer_id=None) -> dict:
+    """Build a Chroma ``where`` clause that scopes a query to ``source_file``,
+    additionally constrained by ``parent_drawer_id`` when one is supplied.
+
+    Two unrelated oversized ``tool_add_drawer`` writes (chunked path from
+    #1539) can pass the same ``source_file`` (e.g. two pastes tagged
+    ``"chat.log"``); each call stores its own ``parent_drawer_id`` group
+    of chunks but the bare ``source_file`` filter pulls chunks from both
+    groups as if they were siblings (#1580). When the matched chunk
+    carries a ``parent_drawer_id`` the filter narrows to that logical
+    group. Otherwise (pre-#1539 drawers, single-chunk writes, and
+    ``diary_ingest`` drawers grouped by real file path) the original
+    file-global shape is preserved. Mirrors the conditional-``$and``
+    precedent in ``build_where_filter``.
+    """
+    if parent_drawer_id:
+        return {
+            "$and": [
+                {"source_file": source_file},
+                {"parent_drawer_id": parent_drawer_id},
+            ]
+        }
+    return {"source_file": source_file}
 
 
 def _expand_with_neighbors(drawers_col, matched_doc: str, matched_meta: dict, radius: int = 1):
@@ -273,15 +319,20 @@ def _expand_with_neighbors(drawers_col, matched_doc: str, matched_meta: dict, ra
     if not src or not isinstance(chunk_idx, int):
         return {"text": matched_doc, "drawer_index": chunk_idx, "total_drawers": None}
 
+    # Narrow by ``parent_drawer_id`` when present so chunks from unrelated
+    # logical drawers sharing ``source_file`` do not stitch (#1580). See
+    # ``_scoped_source_filter`` for the contract.
+    parent_id = matched_meta.get("parent_drawer_id")
     target_indexes = [chunk_idx + offset for offset in range(-radius, radius + 1)]
+    neighbor_clauses = [
+        {"source_file": src},
+        {"chunk_index": {"$in": target_indexes}},
+    ]
+    if parent_id:
+        neighbor_clauses.append({"parent_drawer_id": parent_id})
     try:
         neighbors = drawers_col.get(
-            where={
-                "$and": [
-                    {"source_file": src},
-                    {"chunk_index": {"$in": target_indexes}},
-                ]
-            },
+            where={"$and": neighbor_clauses},
             include=["documents", "metadatas"],
         )
     except Exception:
@@ -299,10 +350,16 @@ def _expand_with_neighbors(drawers_col, matched_doc: str, matched_meta: dict, ra
     else:
         combined_text = "\n\n".join(doc for _, doc in indexed_docs)
 
-    # Cheap total_drawers lookup: metadata-only scan of the source file.
+    # Cheap total_drawers lookup. When ``parent_drawer_id`` is present the
+    # count is scoped to that group so the returned number matches the
+    # text the caller gets back. Without a parent id, the legacy
+    # file-global count is preserved.
     total_drawers = None
     try:
-        all_meta = drawers_col.get(where={"source_file": src}, include=["metadatas"])
+        all_meta = drawers_col.get(
+            where=_scoped_source_filter(src, parent_id),
+            include=["metadatas"],
+        )
         total_drawers = len(all_meta.ids) if all_meta.ids else None
     except Exception:
         logger.debug("total_drawers lookup failed for %s", src, exc_info=True)
@@ -439,6 +496,7 @@ def _bm25_only_via_sqlite(
     palace_path: str,
     wing: str = None,
     room: str = None,
+    source_file: str = None,
     n_results: int = 5,
     max_candidates: int = 500,
     _include_internal: bool = False,
@@ -474,7 +532,7 @@ def _bm25_only_via_sqlite(
     def _metadata_filter_sql(row_id_expr: str) -> tuple[str, list[str]]:
         clauses = []
         params = []
-        for key, value in (("wing", wing), ("room", room)):
+        for key, value in (("wing", wing), ("room", room), ("source_file", source_file)):
             if not value:
                 continue
             clauses.append(
@@ -497,7 +555,7 @@ def _bm25_only_via_sqlite(
         return "".join(clauses), params
 
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
     except sqlite3.Error as e:
         return {"error": f"sqlite open failed: {e}"}
 
@@ -587,7 +645,7 @@ def _bm25_only_via_sqlite(
         if not candidate_ids:
             return {
                 "query": query,
-                "filters": {"wing": wing, "room": room},
+                "filters": {"wing": wing, "room": room, "source_file": source_file},
                 "total_before_filter": 0,
                 "results": [],
                 "fallback": "bm25_only_via_sqlite",
@@ -623,6 +681,8 @@ def _bm25_only_via_sqlite(
             continue
         if room and meta.get("room") != room:
             continue
+        if source_file and meta.get("source_file") != source_file:
+            continue
         full_source = meta.get("source_file", "") or ""
         candidates.append(
             {
@@ -630,7 +690,9 @@ def _bm25_only_via_sqlite(
                 "wing": meta.get("wing", "unknown"),
                 "room": meta.get("room", "unknown"),
                 "source_file": Path(full_source).name if full_source else "?",
+                "source_path": full_source,
                 "created_at": meta.get("filed_at", "unknown"),
+                "authored_at": meta.get("authored_at", meta.get("filed_at", "unknown")),
                 # No vector distance available in BM25-only mode.
                 "similarity": None,
                 "distance": None,
@@ -665,7 +727,7 @@ def _bm25_only_via_sqlite(
 
     return {
         "query": query,
-        "filters": {"wing": wing, "room": room},
+        "filters": {"wing": wing, "room": room, "source_file": source_file},
         "total_before_filter": len(candidates),
         "results": hits,
         "fallback": "bm25_only_via_sqlite",
@@ -681,6 +743,7 @@ def _merge_bm25_union_candidates(
     room: str,
     n_results: int,
     max_distance: float = 0.0,
+    source_file: str = None,
 ) -> None:
     """Append top-K backend lexical candidates into ``hits`` in place.
 
@@ -707,7 +770,7 @@ def _merge_bm25_union_candidates(
     if max_distance > 0.0:
         return
 
-    where = build_where_filter(wing, room)
+    where = build_where_filter(wing, room, source_file)
     try:
         lexical = drawers_col.lexical_search(
             query=query,
@@ -730,7 +793,9 @@ def _merge_bm25_union_candidates(
                 "wing": meta.get("wing", "unknown"),
                 "room": meta.get("room", "unknown"),
                 "source_file": Path(full_source).name if full_source else "?",
+                "source_path": full_source,
                 "created_at": meta.get("filed_at", "unknown"),
+                "authored_at": meta.get("authored_at", meta.get("filed_at", "unknown")),
                 "similarity": None,
                 "distance": None,
                 "effective_distance": None,
@@ -795,6 +860,7 @@ def _apply_candidate_strategy(
     room: str,
     n_results: int,
     max_distance: float = 0.0,
+    source_file: str = None,
 ) -> None:
     """Dispatch to the registered merger for ``strategy``.
 
@@ -803,7 +869,16 @@ def _apply_candidate_strategy(
     """
     merger = _CANDIDATE_MERGERS[strategy]
     if merger is not None:
-        merger(hits, drawers_col, query, wing, room, n_results, max_distance=max_distance)
+        merger(
+            hits,
+            drawers_col,
+            query,
+            wing,
+            room,
+            n_results,
+            max_distance=max_distance,
+            source_file=source_file,
+        )
 
 
 def _finalize_candidate_hits(
@@ -816,6 +891,7 @@ def _finalize_candidate_hits(
     room: str,
     n_results: int,
     max_distance: float,
+    source_file: str = None,
 ) -> tuple:
     try:
         _apply_candidate_strategy(
@@ -827,6 +903,7 @@ def _finalize_candidate_hits(
             room,
             n_results,
             max_distance=max_distance,
+            source_file=source_file,
         )
     except UnsupportedCapabilityError:
         return [], {
@@ -840,6 +917,7 @@ def _finalize_candidate_hits(
         h.pop("_sort_key", None)
         h.pop("_source_file_full", None)
         h.pop("_chunk_index", None)
+        h.pop("_parent_drawer_id", None)
     return hits, None
 
 
@@ -867,6 +945,7 @@ def _vector_disabled_search(
     room: str,
     n_results: int,
     collection_name: str,
+    source_file: str = None,
 ) -> dict:
     try:
         backend_name = resolve_backend_name(palace_path)
@@ -886,6 +965,7 @@ def _vector_disabled_search(
         palace_path,
         wing=wing,
         room=room,
+        source_file=source_file,
         n_results=n_results,
         collection_name=collection_name,
     )
@@ -919,7 +999,9 @@ def _open_search_collection(palace_path: str, collection_name: str):
         }
 
 
-def _query_drawers_with_filter_fallback(drawers_col, dkwargs, query, n_results, wing, room):
+def _query_drawers_with_filter_fallback(
+    drawers_col, dkwargs, query, n_results, wing, room, source_file=None
+):
     """Run the filtered drawer query, falling back to an unfiltered query plus a
     Python-side post-filter when ChromaDB raises on the filtered query.
 
@@ -927,7 +1009,7 @@ def _query_drawers_with_filter_fallback(drawers_col, dkwargs, query, n_results, 
     "Error finding id" even when unfiltered search works fine — it happens when
     drawers are ingested via two different paths (e.g. bulk import vs MCP tool
     calls), leaving the vector index inconsistent with the metadata store. We
-    retry unfiltered (over-fetching) and re-apply the wing/room filter in Python.
+    retry unfiltered (over-fetching) and re-apply the wing/room/source_file filter in Python.
     See #1245 / #1035.
     """
     where = dkwargs.get("where")
@@ -956,6 +1038,8 @@ def _query_drawers_with_filter_fallback(drawers_col, dkwargs, query, n_results, 
                 continue
             if room and meta.get("room") != room:
                 continue
+            if source_file and meta.get("source_file") != source_file:
+                continue
             fdocs.append(doc)
             fmetas.append(meta)
             fdists.append(dist)
@@ -967,6 +1051,7 @@ def search_memories(
     palace_path: str,
     wing: str = None,
     room: str = None,
+    source_file: str = None,
     n_results: int = 5,
     max_distance: float = 0.0,
     vector_disabled: bool = False,
@@ -982,6 +1067,8 @@ def search_memories(
         palace_path: Path to the ChromaDB palace directory.
         wing: Optional wing filter.
         room: Optional room filter.
+        source_file: Optional exact source_file filter. Matches the full
+            stored source_file value verbatim (#1815).
         n_results: Max results to return.
         max_distance: Max cosine distance threshold. The palace collection uses
             cosine distance (hnsw:space=cosine) — 0 = identical, 2 = opposite.
@@ -1021,6 +1108,7 @@ def search_memories(
             room=room,
             n_results=n_results,
             collection_name=collection_name,
+            source_file=source_file,
         )
 
     drawers_col, open_error = _open_search_collection(palace_path, collection_name)
@@ -1028,7 +1116,7 @@ def search_memories(
         return open_error
 
     metric = _metric_for_collection(drawers_col)
-    where = build_where_filter(wing, room)
+    where = build_where_filter(wing, room, source_file)
 
     # Hybrid retrieval: always query drawers directly (the floor), then use
     # closet hits to boost rankings. Closets are a ranking SIGNAL, never a
@@ -1046,7 +1134,7 @@ def search_memories(
         if where:
             dkwargs["where"] = where
         drawer_results = _query_drawers_with_filter_fallback(
-            drawers_col, dkwargs, query, n_results, wing, room
+            drawers_col, dkwargs, query, n_results, wing, room, source_file
         )
     except Exception as e:
         return {"error": f"Search error: {e}"}
@@ -1118,8 +1206,12 @@ def search_memories(
             "text": doc,
             "wing": meta.get("wing", "unknown"),
             "room": meta.get("room", "unknown"),
+            # source_file is the basename (display); source_path is the full
+            # stored value, the round-trippable key for the source_file filter.
             "source_file": Path(source).name if source else "?",
+            "source_path": source,
             "created_at": meta.get("filed_at", "unknown"),
+            "authored_at": meta.get("authored_at", meta.get("filed_at", "unknown")),
             "similarity": round(_distance_to_similarity(effective_dist, metric), 3),
             "distance": round(dist, 4),
             "effective_distance": round(effective_dist, 4),
@@ -1132,6 +1224,7 @@ def search_memories(
             "_sort_key": effective_dist,
             "_source_file_full": source,
             "_chunk_index": meta.get("chunk_index"),
+            "_parent_drawer_id": meta.get("parent_drawer_id"),
         }
         if closet_preview:
             entry["closet_preview"] = closet_preview
@@ -1152,9 +1245,11 @@ def search_memories(
         full_source = h.get("_source_file_full") or ""
         if not full_source:
             continue
+        # Narrow by ``parent_drawer_id`` when present so unrelated
+        # chunked drawers sharing ``source_file`` do not stitch (#1580).
         try:
             source_drawers = drawers_col.get(
-                where={"source_file": full_source},
+                where=_scoped_source_filter(full_source, h.get("_parent_drawer_id")),
                 include=["documents", "metadatas"],
             )
         except Exception:
@@ -1213,13 +1308,14 @@ def search_memories(
         room=room,
         n_results=n_results,
         max_distance=max_distance,
+        source_file=source_file,
     )
     if strategy_error:
         return strategy_error
 
     return {
         "query": query,
-        "filters": {"wing": wing, "room": room},
+        "filters": {"wing": wing, "room": room, "source_file": source_file},
         "total_before_filter": len(_first_or_empty(drawer_results, "documents")),
         "results": hits,
     }

@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "$HOME/.mempalace/hooks/cursor/mempal_wake_hook_cursor.sh"
+      }
+    ],
+    "stop": [
+      {
+        "command": "$HOME/.mempalace/hooks/cursor/mempal_save_hook_cursor.sh",
+        "loop_limit": 1
+      }
+    ],
+    "preCompact": [
+      {
+        "command": "$HOME/.mempalace/hooks/cursor/mempal_precompact_hook_cursor.sh"
+      }
+    ]
+  }
+}

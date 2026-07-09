@@ -1,6 +1,7 @@
 import os
 import tempfile
 import shutil
+import time
 from pathlib import Path
 
 import chromadb
@@ -8,10 +9,11 @@ import pytest
 
 from mempalace.convo_miner import (
     _is_ai_tool_path,
+    _register_file,
     _resolve_wing,
     mine_convos,
 )
-from mempalace.palace import MineAlreadyRunning, file_already_mined
+from mempalace.palace import MineAlreadyRunning, file_already_mined, prefetch_mined_set
 
 
 def test_convo_mining():
@@ -452,5 +454,245 @@ def test_mine_convos_limit_skips_already_mined(capsys):
                 filed = int(line.split(":")[1].strip())
                 assert filed > 0, f"limit=2 should mine new files, got {filed}"
                 break
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ── mtime-aware re-mining ────────────────────────────────────────────
+#
+# Conversation transcripts are NOT immutable: a Claude Code session keeps
+# appending to its own file while active, and /compact or /clear can
+# rewrite one in place. These tests cover the fix -- convo mining used to
+# treat "we've seen this source_file before" as sufficient to skip it
+# forever (transcripts were assumed immutable), silently missing content
+# appended after the first mine.
+
+
+def test_mine_convos_reprocesses_when_file_grows(capsys):
+    """A session file that grows after being mined must be picked up on
+    the next mine, not skipped forever."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        convo_path = Path(tmpdir) / "session.txt"
+        convo_path.write_text(
+            "> What is the plan?\nStart with the schema, then the API.\n\n"
+            "> Any risks?\nMigration ordering is the main one.\n"
+        )
+        palace_path = os.path.join(tmpdir, "palace")
+
+        mine_convos(tmpdir, palace_path, wing="test")
+        capsys.readouterr()
+
+        # Simulate the session being extended: real content added, mtime
+        # bumped forward (avoids same-second mtime resolution flakiness).
+        convo_path.write_text(
+            "> What is the plan?\nStart with the schema, then the API.\n\n"
+            "> Any risks?\nMigration ordering is the main one.\n\n"
+            "> UNIQUE_GROWN_SESSION_MARKER, did we resolve it?\n"
+            "Yes, resolved by locking the migration order explicitly.\n"
+        )
+        future = time.time() + 60
+        os.utime(convo_path, (future, future))
+
+        mine_convos(tmpdir, palace_path, wing="test")
+        out = capsys.readouterr().out
+        assert "Files skipped (already filed): 1" not in out
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_collection("mempalace_drawers")
+        docs = col.get(include=["documents"])["documents"]
+        assert any("UNIQUE_GROWN_SESSION_MARKER" in d for d in docs), (
+            "grown session content was not picked up on re-mine"
+        )
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_mine_convos_unchanged_file_still_skipped(capsys):
+    """A file whose content and mtime are unchanged must still be skipped
+    -- the mtime check must not defeat the existing skip-on-unchanged
+    optimization."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        convo_path = Path(tmpdir) / "session.txt"
+        convo_path.write_text(
+            "> What is the plan?\nStart with the schema, then the API.\n\n"
+            "> Any risks?\nMigration ordering is the main one.\n"
+        )
+        palace_path = os.path.join(tmpdir, "palace")
+
+        mine_convos(tmpdir, palace_path, wing="test")
+        capsys.readouterr()
+
+        mine_convos(tmpdir, palace_path, wing="test")
+        out = capsys.readouterr().out
+        assert "Files skipped (already filed): 1" in out
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_mine_convos_grown_file_purges_stale_drawers_not_additive(capsys):
+    """Re-mining a grown file must not leave duplicate/stale drawers behind
+    -- purge-then-insert, not additive accumulation. Checks content
+    directly (a drawer count comparison is fragile: ChromaDB collections
+    can carry non-drawer bookkeeping rows unrelated to this behavior)."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        convo_path = Path(tmpdir) / "session.txt"
+        convo_path.write_text(
+            "> What is the plan?\nUNIQUE_ORIGINAL_EXCHANGE_MARKER here.\n\n"
+            "> Any risks?\nMigration ordering is the main one.\n"
+        )
+        palace_path = os.path.join(tmpdir, "palace")
+
+        mine_convos(tmpdir, palace_path, wing="test")
+        capsys.readouterr()
+
+        convo_path.write_text(
+            "> What is the plan?\nUNIQUE_ORIGINAL_EXCHANGE_MARKER here.\n\n"
+            "> Any risks?\nMigration ordering is the main one.\n\n"
+            "> One more exchange?\nUNIQUE_NEW_EXCHANGE_MARKER here.\n"
+        )
+        future = time.time() + 60
+        os.utime(convo_path, (future, future))
+        mine_convos(tmpdir, palace_path, wing="test")
+        capsys.readouterr()
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_collection("mempalace_drawers")
+        docs = col.get(include=["documents"])["documents"]
+
+        original_hits = sum(1 for d in docs if "UNIQUE_ORIGINAL_EXCHANGE_MARKER" in d)
+        new_hits = sum(1 for d in docs if "UNIQUE_NEW_EXCHANGE_MARKER" in d)
+        assert original_hits == 1, (
+            f"original exchange duplicated across re-mine: {original_hits} copies"
+        )
+        assert new_hits == 1, f"new exchange should appear exactly once, got {new_hits}"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_prefetch_mined_set_returns_stored_mtime():
+    """prefetch_mined_set's dict carries each source_file's stored mtime,
+    not just membership."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        convo_path = Path(tmpdir) / "session.txt"
+        convo_path.write_text(
+            "> What is the plan?\nStart with the schema, then the API.\n\n"
+            "> Any risks?\nMigration ordering is the main one.\n"
+        )
+        palace_path = os.path.join(tmpdir, "palace")
+        mine_convos(tmpdir, palace_path, wing="test")
+
+        resolved_file = str(convo_path.resolve())
+        actual_mtime = os.path.getmtime(resolved_file)
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_collection("mempalace_drawers")
+        mined = prefetch_mined_set(col, extract_mode="exchange")
+
+        assert resolved_file in mined
+        assert mined[resolved_file] is not None
+        assert abs(mined[resolved_file] - actual_mtime) < 0.001
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_prefetch_mined_set_none_for_drawer_without_stored_mtime():
+    """A drawer written before source_mtime existed (or with getmtime
+    failure at write time) must surface as None, not be silently absent --
+    None must be treated as stale by callers, not as 'unknown, assume ok'."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        palace_path = os.path.join(tmpdir, "palace")
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection("mempalace_drawers")
+        col.upsert(
+            ids=["drawer_legacy_1"],
+            documents=["legacy content with no source_mtime field"],
+            metadatas=[
+                {
+                    "wing": "test",
+                    "room": "general",
+                    "source_file": "/fake/legacy/file.txt",
+                    "chunk_index": 0,
+                    "extract_mode": "exchange",
+                    "normalize_version": 999,  # force >= current version
+                }
+            ],
+        )
+        mined = prefetch_mined_set(col, extract_mode="exchange")
+        assert "/fake/legacy/file.txt" in mined
+        assert mined["/fake/legacy/file.txt"] is None
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_mine_convos_reprocesses_legacy_drawer_without_stored_mtime(capsys):
+    """A file mined before source_mtime was tracked (simulated: drawer
+    written directly, no source_mtime field) must be re-mined on the next
+    run, not skipped forever -- this is the one-time backfill behavior."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        convo_path = Path(tmpdir) / "session.txt"
+        convo_path.write_text(
+            "> What is the plan?\nUNIQUE_LEGACY_BACKFILL_MARKER here.\n\n"
+            "> Any risks?\nMigration ordering is the main one.\n"
+        )
+        resolved_file = str(convo_path.resolve())
+        palace_path = os.path.join(tmpdir, "palace")
+
+        # Simulate a pre-existing drawer from before source_mtime existed.
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection("mempalace_drawers")
+        from mempalace.palace import NORMALIZE_VERSION
+
+        col.upsert(
+            ids=["drawer_legacy_session_1"],
+            documents=["stale legacy content, no mtime field"],
+            metadatas=[
+                {
+                    "wing": "test",
+                    "room": "general",
+                    "source_file": resolved_file,
+                    "chunk_index": 0,
+                    "extract_mode": "exchange",
+                    "normalize_version": NORMALIZE_VERSION,
+                }
+            ],
+        )
+        del col, client
+
+        mine_convos(tmpdir, palace_path, wing="test")
+        out = capsys.readouterr().out
+        assert "Files skipped (already filed): 1" not in out
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_collection("mempalace_drawers")
+        docs = col.get(include=["documents"])["documents"]
+        assert any("UNIQUE_LEGACY_BACKFILL_MARKER" in d for d in docs)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_register_file_sentinel_includes_source_mtime():
+    """The 0-chunk sentinel must stamp source_mtime too, so a file that
+    later grows past the min-chunk-size floor is detected as changed
+    instead of being skipped forever by the sentinel."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        tiny_file = Path(tmpdir) / "tiny.txt"
+        tiny_file.write_text("hi")
+        palace_path = os.path.join(tmpdir, "palace")
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection("mempalace_drawers")
+
+        _register_file(col, str(tiny_file), "test", "mempalace", "exchange")
+
+        mined = prefetch_mined_set(col, extract_mode="exchange")
+        assert str(tiny_file) in mined
+        assert mined[str(tiny_file)] is not None
+        assert abs(mined[str(tiny_file)] - os.path.getmtime(tiny_file)) < 0.001
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

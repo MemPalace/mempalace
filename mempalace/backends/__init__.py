@@ -36,6 +36,7 @@ from .base import (
     UnsupportedMaintenanceKindError,
 )
 from .chroma import ChromaBackend, ChromaCollection
+from .milvus import MilvusBackend, MilvusCollection
 from .pgvector import PgVectorBackend, PgVectorCollection
 from .qdrant import QdrantBackend, QdrantCollection
 from .sqlite_exact import SQLiteExactBackend, SQLiteExactCollection
@@ -67,6 +68,8 @@ __all__ = [
     "LexicalHit",
     "LexicalResult",
     "MaintenanceResult",
+    "MilvusBackend",
+    "MilvusCollection",
     "PalaceNotFoundError",
     "PalaceRef",
     "PgVectorBackend",

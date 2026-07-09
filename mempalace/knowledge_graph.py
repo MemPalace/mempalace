@@ -39,7 +39,7 @@ import json
 import os
 import sqlite3
 import threading
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
 from .config import sanitize_iso_temporal
@@ -113,6 +113,14 @@ def _temporal_filter_sql(as_of: str) -> tuple[str, list[str]]:
 
     This keeps legacy date-only facts working when callers query with
     canonical UTC datetimes such as '2026-05-06T15:00:00Z'.
+
+    The upper bound is *strict* (``valid_to > as_of``): a fact whose
+    ``valid_to`` equals the query instant has already ended at that instant,
+    so the interval is treated as half-open ``[valid_from, valid_to)``. This
+    is what lets a fact and its successor share a boundary instant without an
+    as-of query returning both. Date-only ``valid_to`` still expands to the
+    end of that day (``T23:59:59Z``), so a standalone date-only fact stays
+    valid through its whole final day exactly as before.
     """
 
     as_of_key = _temporal_start_key(as_of)
@@ -121,7 +129,7 @@ def _temporal_filter_sql(as_of: str) -> tuple[str, list[str]]:
 
     return (
         f" AND (t.valid_from IS NULL OR {valid_from_expr} <= ?) "
-        f"AND (t.valid_to IS NULL OR {valid_to_expr} >= ?)",
+        f"AND (t.valid_to IS NULL OR {valid_to_expr} > ?)",
         [as_of_key, as_of_key],
     )
 
@@ -358,6 +366,125 @@ class KnowledgeGraph:
                     "WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
                     (ended, sub_id, pred, obj_id),
                 )
+
+    def supersede(
+        self,
+        subject: str,
+        predicate: str,
+        old_obj: str,
+        new_obj: str,
+        at: str = None,
+        confidence: float = 1.0,
+        source_closet: str = None,
+        source_file: str = None,
+        source_drawer_id: str = None,
+        adapter_name: str = None,
+    ):
+        """Atomically replace one fact with another at a single shared boundary.
+
+        Closes the currently-open ``(subject, predicate, old_obj)`` triple with
+        ``valid_to = at`` and opens ``(subject, predicate, new_obj)`` with
+        ``valid_from = at`` in one transaction, at a single shared instant.
+        Paired with the half-open upper bound in ``_temporal_filter_sql``, an
+        as-of query at that instant returns only the successor.
+
+        This is the primitive for a value change. Hand-rolling a handover as
+        ``invalidate(ended=D)`` + ``add_triple(valid_from=D)`` with date-only
+        ``D`` leaves two facts sharing the whole day ``D`` (``valid_to`` expands
+        to ``T23:59:59Z`` while ``valid_from`` expands to ``T00:00:00Z``), so an
+        as-of query on ``D`` returns both. ``supersede`` avoids this by writing
+        one identical precise instant to both sides.
+
+        ``at`` defaults to the current UTC instant. A date-only ``at`` is
+        normalized to ``<date>T00:00:00Z`` so both sides carry the same precise
+        value rather than the asymmetric whole-day expansion.
+
+        Returns the new triple's id. If no open ``old_obj`` triple exists the
+        successor is still opened, so ``supersede`` degrades to ``add_triple``.
+        """
+        if at is None:
+            boundary = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        elif _is_date_only_temporal(at):
+            boundary = f"{at}T00:00:00Z"
+        else:
+            boundary = at
+        boundary = sanitize_iso_temporal(boundary, "at")
+
+        sub_id = self._entity_id(subject)
+        old_id = self._entity_id(old_obj)
+        new_id = self._entity_id(new_obj)
+        pred = predicate.lower().replace(" ", "_")
+
+        with self._lock:
+            conn = self._conn()
+            with conn:
+                # Only create entities we actually open a fact for. old_obj is
+                # matched by id in the UPDATE below whether or not its row
+                # exists, so inserting it would just orphan an entity when no
+                # open old fact is present (the degrade-to-add path).
+                for name, eid in ((subject, sub_id), (new_obj, new_id)):
+                    conn.execute(
+                        "INSERT OR IGNORE INTO entities (id, name) VALUES (?, ?)",
+                        (eid, name),
+                    )
+
+                # Reject a boundary that precedes the old fact's start — an
+                # inverted interval would be invisible to every KG query.
+                rows = conn.execute(
+                    "SELECT valid_from FROM triples "
+                    "WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
+                    (sub_id, pred, old_id),
+                ).fetchall()
+                for row in rows:
+                    valid_from = row["valid_from"]
+                    if valid_from is not None and _temporal_end_key(boundary) < _temporal_start_key(
+                        valid_from
+                    ):
+                        raise ValueError(
+                            f"at={boundary!r} is before valid_from={valid_from!r}; "
+                            "an inverted interval would be invisible to every KG query"
+                        )
+
+                # Close the open old fact at the shared boundary.
+                conn.execute(
+                    "UPDATE triples SET valid_to=? "
+                    "WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
+                    (boundary, sub_id, pred, old_id),
+                )
+
+                # Open the successor at the same instant (idempotent if already open).
+                existing = conn.execute(
+                    "SELECT id FROM triples "
+                    "WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
+                    (sub_id, pred, new_id),
+                ).fetchone()
+                if existing:
+                    return existing["id"]
+
+                triple_id = make_triple_id(
+                    sub_id, pred, new_id, boundary, datetime.now().isoformat()
+                )
+                conn.execute(
+                    """INSERT INTO triples (
+                        id, subject, predicate, object, valid_from, valid_to,
+                        confidence, source_closet, source_file,
+                        source_drawer_id, adapter_name
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        triple_id,
+                        sub_id,
+                        pred,
+                        new_id,
+                        boundary,
+                        None,
+                        confidence,
+                        source_closet,
+                        source_file,
+                        source_drawer_id,
+                        adapter_name,
+                    ),
+                )
+                return triple_id
 
     # ── Query operations ──────────────────────────────────────────────────
 

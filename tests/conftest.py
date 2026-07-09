@@ -77,6 +77,17 @@ def _reset_mcp_cache():
                 if hasattr(mcp_server, "_kg_by_path"):
                     mcp_server._kg_by_path.clear()
 
+                # Close (not just dereference) the cached chromadb client so its
+                # rust-side file handles are released; on Windows a bare deref
+                # leaves them locked and leaks across the session (#1128).
+                cached_client = getattr(mcp_server, "_client_cache", None)
+                if cached_client is not None:
+                    close = getattr(cached_client, "close", None)
+                    if callable(close):
+                        try:
+                            close()
+                        except Exception:
+                            pass
                 mcp_server._client_cache = None
                 mcp_server._collection_cache = None
                 if hasattr(mcp_server, "_collection_cache_backend"):
@@ -94,6 +105,29 @@ def _reset_mcp_cache():
             from mempalace.backends.chroma import ChromaBackend
 
             ChromaBackend._quarantined_paths.clear()
+        except (ImportError, AttributeError):
+            pass
+
+        # Release chromadb clients opened through the backend layer. Many tests
+        # reach the store via palace.get_collection() (sweep, repair, CLI, ...),
+        # which caches one PersistentClient per palace_path on the long-lived
+        # backend singleton and never closes it. chromadb frees the rust-side
+        # SQLite/HNSW file handles only on client.close(); on POSIX the open
+        # handles are harmless, but on Windows they stay locked and accumulate
+        # across the session until a later test's HNSW segment write fails
+        # (#1128 Windows CI). close_palace() closes the client and drops the
+        # handle without marking the backend closed, so it stays reusable.
+        try:
+            from mempalace import palace as _palace
+
+            backend = getattr(_palace, "_DEFAULT_BACKEND", None)
+            clients = getattr(backend, "_clients", None)
+            if clients:
+                for path in list(clients):
+                    try:
+                        backend.close_palace(path)
+                    except Exception:
+                        pass
         except (ImportError, AttributeError):
             pass
 
@@ -154,7 +188,11 @@ def collection(palace_path):
     col = client.get_or_create_collection("mempalace_drawers", metadata={"hnsw:space": "cosine"})
     yield col
     client.delete_collection("mempalace_drawers")
-    del client
+    # close() (not a bare dereference) releases chromadb's rust-side SQLite/HNSW
+    # file handles. On Windows a mere `del` leaves them locked, so the temp
+    # palace cannot be removed and handles leak across the whole test session
+    # until a later test's HNSW write fails (#1128 Windows CI).
+    client.close()
 
 
 @pytest.fixture
