@@ -56,7 +56,10 @@ Repository = "https://github.com/MemPalace/mempalace"
 
 [project.scripts]
 mempalace = "mempalace.cli:main"
-mempalace-mcp = "mempalace.mcp_server:main"
+mempalace-mcp = "mempalace.mcp_bridge:main"
+mempalace-mcp-bridge = "mempalace.mcp_bridge:main"
+mempalace-mcp-daemon = "mempalace.mcp_daemon:main"
+mempalace-mcp-stdio = "mempalace.mcp_server:main"
 
 [project.entry-points."mempalace.backends"]
 chroma = "mempalace.backends.chroma:ChromaBackend"
