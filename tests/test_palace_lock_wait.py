@@ -12,7 +12,31 @@ def _redirect_home(monkeypatch, tmp_path):
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
 
 
-def test_mine_palace_lock_retries_transient_holder(monkeypatch, tmp_path):
+def test_mine_palace_lock_retries_transient_holder_when_wait_is_enabled(
+    monkeypatch,
+    tmp_path,
+):
+    _redirect_home(monkeypatch, tmp_path)
+    attempts: list[str] = []
+
+    def fake_try_lock(lock_file):
+        attempts.append(lock_file.name)
+        return len(attempts) >= 2
+
+    monkeypatch.setattr(palace, "_try_lock_palace_lock_file", fake_try_lock)
+    monkeypatch.setattr(palace.time, "sleep", lambda _seconds: None)
+
+    with palace.mine_palace_lock(
+        str(tmp_path / "palace"),
+        wait_seconds=1,
+        poll_seconds=0.01,
+    ):
+        pass
+
+    assert len(attempts) == 2
+
+
+def test_mine_palace_lock_env_can_enable_bounded_wait(monkeypatch, tmp_path):
     _redirect_home(monkeypatch, tmp_path)
     attempts: list[str] = []
 
@@ -31,35 +55,55 @@ def test_mine_palace_lock_retries_transient_holder(monkeypatch, tmp_path):
     assert len(attempts) == 2
 
 
+def test_mine_palace_lock_default_remains_fail_fast(monkeypatch, tmp_path):
+    _redirect_home(monkeypatch, tmp_path)
+    attempts: list[str] = []
+
+    def fake_try_lock(lock_file):
+        attempts.append(lock_file.name)
+        return False
+
+    monkeypatch.setattr(palace, "_try_lock_palace_lock_file", fake_try_lock)
+    monkeypatch.setattr(
+        palace,
+        "_read_lock_holder",
+        lambda _lock_file: "PID 12345 synthetic-holder",
+    )
+
+    with pytest.raises(palace.MineAlreadyRunning, match="wait for it to finish"):
+        with palace.mine_palace_lock(str(tmp_path / "palace")):
+            pass
+
+    assert len(attempts) == 1
+
+
 def test_mine_palace_lock_times_out_for_alive_holder(monkeypatch, tmp_path):
     _redirect_home(monkeypatch, tmp_path)
-    palace_dir = tmp_path / "palace"
-    palace_dir.mkdir()
+    attempts: list[str] = []
+    monotonic_values = iter([0.0, 0.02])
 
-    _resolved, _key, lock_path = palace._palace_lock_parts(str(palace_dir))
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-    os.close(fd)
+    def fake_try_lock(lock_file):
+        attempts.append(lock_file.name)
+        return False
 
-    leaked = open(lock_path, "r+b")
-    try:
-        assert palace._try_lock_palace_lock_file(leaked)
-        ident = f"{os.getpid()} synthetic-holder".encode("utf-8")
-        leaked.seek(palace._LOCK_SENTINEL_BYTES)
-        leaked.truncate(palace._LOCK_SENTINEL_BYTES + len(ident))
-        leaked.write(ident)
-        leaked.flush()
+    monkeypatch.setattr(palace, "_try_lock_palace_lock_file", fake_try_lock)
+    monkeypatch.setattr(
+        palace,
+        "_read_lock_holder",
+        lambda _lock_file: f"PID {os.getpid()} synthetic-holder",
+    )
+    monkeypatch.setattr(palace.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(palace.time, "sleep", lambda _seconds: None)
 
-        monkeypatch.setenv("MEMPALACE_MINE_PALACE_LOCK_WAIT_SECONDS", "0")
-
-        with pytest.raises(palace.MineAlreadyRunning, match="timed out"):
-            with palace.mine_palace_lock(str(palace_dir)):
-                pass
-    finally:
-        try:
-            palace._unlock_palace_lock_file(leaked)
-        except Exception:
+    with pytest.raises(palace.MineAlreadyRunning, match="timed out"):
+        with palace.mine_palace_lock(
+            str(tmp_path / "palace"),
+            wait_seconds=0.01,
+            poll_seconds=0.01,
+        ):
             pass
-        leaked.close()
+
+    assert len(attempts) == 1
 
 
 def test_dead_holder_detection_is_conservative(monkeypatch):

@@ -1074,7 +1074,7 @@ def _write_lock_holder(lock_file) -> None:
         pass
 
 
-_DEFAULT_MINE_PALACE_LOCK_WAIT_SECONDS = 30.0
+_DEFAULT_MINE_PALACE_LOCK_WAIT_SECONDS = 0.0
 _DEFAULT_MINE_PALACE_LOCK_POLL_SECONDS = 0.25
 _MINE_PALACE_LOCK_WAIT_ENV = "MEMPALACE_MINE_PALACE_LOCK_WAIT_SECONDS"
 _MINE_PALACE_LOCK_POLL_ENV = "MEMPALACE_MINE_PALACE_LOCK_POLL_SECONDS"
@@ -1093,8 +1093,29 @@ def _float_env(name: str, default: float, *, minimum: float) -> float:
     return max(minimum, value)
 
 
-def _mine_palace_lock_wait_seconds() -> float:
-    """How long palace writers should wait for a transient holder."""
+def _bounded_float(value, default: float, *, minimum: float) -> float:
+    if value is None:
+        return default
+
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+
+    return max(minimum, parsed)
+
+
+def _mine_palace_lock_wait_seconds(wait_seconds: Optional[float] = None) -> float:
+    """Return how long a palace writer may wait for a transient holder.
+
+    The default remains fail-fast. That is the existing anti-corruption
+    contract: direct Chroma/MCP writers must not queue behind another local
+    writer unless a caller explicitly opts into queueing.
+    """
+
+    if wait_seconds is not None:
+        return _bounded_float(wait_seconds, 0.0, minimum=0.0)
+
     return _float_env(
         _MINE_PALACE_LOCK_WAIT_ENV,
         _DEFAULT_MINE_PALACE_LOCK_WAIT_SECONDS,
@@ -1102,8 +1123,16 @@ def _mine_palace_lock_wait_seconds() -> float:
     )
 
 
-def _mine_palace_lock_poll_seconds() -> float:
-    """How often palace writers should retry while waiting."""
+def _mine_palace_lock_poll_seconds(poll_seconds: Optional[float] = None) -> float:
+    """Return how often an opt-in waiter should retry the palace lock."""
+
+    if poll_seconds is not None:
+        return _bounded_float(
+            poll_seconds,
+            _DEFAULT_MINE_PALACE_LOCK_POLL_SECONDS,
+            minimum=0.01,
+        )
+
     return _float_env(
         _MINE_PALACE_LOCK_POLL_ENV,
         _DEFAULT_MINE_PALACE_LOCK_POLL_SECONDS,
@@ -1111,8 +1140,9 @@ def _mine_palace_lock_poll_seconds() -> float:
     )
 
 
-def _palace_lock_parts(palace_path: str) -> tuple[str, str, str]:
-    """Return resolved palace path, lock key, and lock path."""
+def _palace_lock_parts(palace_path: str) -> tuple:
+    """Return resolved palace path, palace lock key, and lock file path."""
+
     lock_dir = os.path.join(os.path.expanduser("~"), ".mempalace", "locks")
     os.makedirs(lock_dir, exist_ok=True)
 
@@ -1123,7 +1153,7 @@ def _palace_lock_parts(palace_path: str) -> tuple[str, str, str]:
     return resolved, palace_key, lock_path
 
 
-def _holder_pid_from_message(holder: str) -> int | None:
+def _holder_pid_from_message(holder: str) -> Optional[int]:
     match = re.search(r"\bPID\s+(\d+)\b", holder or "")
     if not match:
         return None
@@ -1148,8 +1178,8 @@ def _process_is_alive(pid: int) -> bool:
     except PermissionError:
         return True
     except OSError:
-        # Some platforms do not support signal 0 reliably. Prefer safety:
-        # treat the holder as alive rather than stealing an active writer.
+        # Prefer safety: treat ambiguous platform errors as alive rather than
+        # stealing a potentially active writer.
         return True
 
     return True
@@ -1165,50 +1195,29 @@ def _holder_pid_is_dead(holder: str) -> bool:
 
 def _try_lock_palace_lock_file(lock_file) -> bool:
     """Try to acquire the palace lock file without blocking."""
-    lock_file.seek(0)
 
-    if os.name == "nt":
-        import msvcrt
-
-        try:
-            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
-        except OSError:
-            return False
-        return True
-
-    import fcntl
-
-    try:
-        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        return False
-
-    return True
+    return _lock_mine_lock_file(lock_file, blocking=False)
 
 
 def _unlock_palace_lock_file(lock_file) -> None:
-    lock_file.seek(0)
-
-    if os.name == "nt":
-        import msvcrt
-
-        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
-        return
-
-    import fcntl
-
-    fcntl.flock(lock_file, fcntl.LOCK_UN)
+    _unlock_mine_lock_file(lock_file)
 
 
 @contextlib.contextmanager
-def mine_palace_lock(palace_path: str):
-    """Per-palace bounded-wait lock around Chroma-backed palace writes.
+def mine_palace_lock(
+    palace_path: str,
+    *,
+    wait_seconds: Optional[float] = None,
+    poll_seconds: Optional[float] = None,
+):
+    """Per-palace lock around Chroma-backed palace writes.
 
-    A fail-fast nonblocking flock turns transient hook/mine overlap into lost
-    writes. Waiting forever is also unsafe because an idle long-lived process
-    can starve every writer. The compromise is a bounded wait with safe
-    liveness cleanup: retry transient holders, remove stale files only when the
-    recorded holder PID is dead, and otherwise fail with a clear timeout.
+    Existing direct writers remain fail-fast by default: if another process
+    holds the palace lock, they raise MineAlreadyRunning before entering the
+    ChromaDB write path.
+
+    Bounded wait is opt-in for callers that are safe to queue. Use
+    wait_seconds=... directly or set MEMPALACE_MINE_PALACE_LOCK_WAIT_SECONDS.
     """
 
     resolved, palace_key, lock_path = _palace_lock_parts(palace_path)
@@ -1217,8 +1226,8 @@ def mine_palace_lock(palace_path: str):
         yield
         return
 
-    timeout = _mine_palace_lock_wait_seconds()
-    poll = _mine_palace_lock_poll_seconds()
+    timeout = _mine_palace_lock_wait_seconds(wait_seconds)
+    poll = _mine_palace_lock_poll_seconds(poll_seconds)
     deadline = time.monotonic() + timeout
     last_holder = "another writer (identity not recorded)"
 
@@ -1243,44 +1252,41 @@ def mine_palace_lock(palace_path: str):
                     yield
                 finally:
                     _mark_released(palace_key)
+                    try:
+                        _unlock_palace_lock_file(lf)
+                    except Exception:
+                        logger.debug("Palace-lock release failed", exc_info=True)
+                    try:
+                        lf.close()
+                    except Exception:
+                        logger.debug("Palace-lock close failed", exc_info=True)
                 return
 
             last_holder = _read_lock_holder(lf)
-
             if _holder_pid_is_dead(last_holder):
-                # The recorded process is gone. The OS lock should already be
-                # released, but the rendezvous file can still carry stale
-                # holder identity; remove it and retry on a fresh inode/path.
-                try:
-                    lf.close()
-                finally:
-                    try:
-                        os.remove(lock_path)
-                    except FileNotFoundError:
-                        pass
-                    except OSError:
-                        logger.debug(
-                            "Failed to remove stale palace lock %s",
-                            lock_path,
-                            exc_info=True,
-                        )
-                continue
+                last_holder = (
+                    f"{last_holder} (recorded PID is no longer alive; "
+                    "the OS lock is still held or another contender replaced it)"
+                )
 
         finally:
             if not acquired and not lf.closed:
                 lf.close()
 
         now = time.monotonic()
-        if now >= deadline:
-            waited = max(0.0, timeout)
+        if timeout <= 0 or now >= deadline:
+            if timeout > 0:
+                raise MineAlreadyRunning(
+                    f"palace {resolved} is held by {last_holder}; "
+                    f"timed out after {timeout:.1f}s waiting for it to finish"
+                )
+
             raise MineAlreadyRunning(
                 f"palace {resolved} is held by {last_holder}; "
-                f"timed out after {waited:.1f}s waiting for it to finish"
+                "wait for it to finish or stop the holder before retrying"
             )
 
         time.sleep(min(poll, max(0.0, deadline - now)))
-
-    # The loop returns from inside the acquired branch.
 
 
 # Backward-compatible alias (previous patch iteration used a single global

@@ -4899,9 +4899,7 @@ def test_peer_writer_readonly_self_heals_after_peer_exits(monkeypatch):
         calls["count"] += 1
         if calls["count"] == 1:
             # First attempt: a live peer still holds the lease.
-            raise palace.MineAlreadyRunning(
-                f"palace {palace_path} is held by pid=999"
-            )
+            raise palace.MineAlreadyRunning(f"palace {palace_path} is held by pid=999")
         # Second attempt: peer has exited, flock is free.
         return _DummyLock()
 
