@@ -1073,7 +1073,7 @@ def _write_lock_holder(lock_file) -> None:
         pass
 
 
-def _holder_pid_from_message(holder: str) -> int | None:
+def _holder_pid_from_message(holder: str) -> Optional[int]:
     match = re.search(r"\bPID\s+(\d+)\b", holder or "")
     if not match:
         return None
