@@ -1704,11 +1704,21 @@ class TestDrawerGrepExpansion:
             ],
         )
         # Closet pointing at group A's first chunk for this source.
+        #
+        # Keep this fixture high-signal across Chroma platform builds. This
+        # test is about source_file/parent_drawer_id isolation during neighbor
+        # enrichment, not about whether one terse closet line embeds close
+        # enough to the query on every OS/backend build.
         closets = get_closets_collection(palace_path)
-        closets.upsert(
-            ids=["closet_proj_log_aaa_01"],
-            documents=["JWT auth|;|→drawer_proj_log_aaa_chunk_000000"],
-            metadatas=[{"wing": "proj", "room": "log", "source_file": source}],
+        upsert_closet_lines(
+            closets,
+            closet_id_base="closet_proj_log_aaa",
+            lines=[
+                "JWT authentication flow|;|→drawer_proj_log_aaa_chunk_000000",
+                "JWT auth narrative|;|→drawer_proj_log_aaa_chunk_000000",
+                "alpha JWT authentication context|;|→drawer_proj_log_aaa_chunk_000000",
+            ],
+            metadata={"wing": "proj", "room": "log", "source_file": source},
         )
 
         result = search_memories("JWT authentication", palace_path)
