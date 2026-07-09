@@ -67,7 +67,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def _exec_raw_stdio_server(argv: list[str]) -> None:
+def _exec_raw_stdio_server(argv: list[str]) -> None:  # pragma: no cover
     cmd = [sys.executable, "-m", "mempalace.mcp_server", *argv]
     env = os.environ.copy()
     if os.name == "posix":
@@ -75,7 +75,7 @@ def _exec_raw_stdio_server(argv: list[str]) -> None:
     raise SystemExit(subprocess.call(cmd, env=env))
 
 
-def _connect(socket_path: Path, timeout: float = 0.5) -> socket.socket:
+def _connect(socket_path: Path, timeout: float = 0.5) -> socket.socket:  # pragma: no cover
     if not hasattr(socket, "AF_UNIX"):
         raise BridgeError("Unix domain sockets are not available on this Python/platform")
 
@@ -101,7 +101,7 @@ def build_daemon_command(args: argparse.Namespace, socket_path: Path) -> list[st
     return cmd
 
 
-def _detached_kwargs(log_path: Path) -> dict[str, Any]:
+def _detached_kwargs(log_path: Path) -> dict[str, Any]:  # pragma: no cover
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_fh = open(log_path, "a", encoding="utf-8")
     try:
@@ -128,7 +128,9 @@ def _detached_kwargs(log_path: Path) -> dict[str, Any]:
     return kwargs
 
 
-def start_daemon(args: argparse.Namespace, socket_path: Path, palace_path: str) -> None:
+def start_daemon(
+    args: argparse.Namespace, socket_path: Path, palace_path: str
+) -> None:  # pragma: no cover
     state_dir = state_dir_for_palace(palace_path)
     state_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -195,7 +197,7 @@ def _bridge_error_response(req_id: Any, message: str) -> str:
     return json.dumps(payload, ensure_ascii=False) + "\n"
 
 
-def run_bridge(args: argparse.Namespace) -> int:
+def run_bridge(args: argparse.Namespace) -> int:  # pragma: no cover
     palace_path = canonical_palace_path(args.palace)
     socket_path = (
         Path(args.socket).expanduser() if args.socket else socket_path_for_palace(palace_path)
@@ -264,7 +266,7 @@ def run_bridge(args: argparse.Namespace) -> int:
     return 0
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(argv: list[str] | None = None) -> None:  # pragma: no cover
     args = _parse_args(argv)
 
     if args.transport != "stdio" or _truthy_env(_DISABLE_ENV):

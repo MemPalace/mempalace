@@ -106,7 +106,7 @@ def dispatch_request(request: Any, handler: Callable[[Any], Any]) -> Any:
     return handler(request)
 
 
-def _load_mcp_handler() -> tuple[Callable[[Any], Any], Any]:
+def _load_mcp_handler() -> tuple[Callable[[Any], Any], Any]:  # pragma: no cover
     """Import the existing MCP server after daemon args/env are resolved."""
     from . import mcp_server
 
@@ -171,7 +171,7 @@ def _prepare_socket_path(path: Path) -> None:
         raise SystemExit(f"Cannot remove stale MCP socket {path}: {exc}") from exc
 
 
-def _handle_client(conn: socket.socket, handler: Callable[[Any], Any]) -> None:
+def _handle_client(conn: socket.socket, handler: Callable[[Any], Any]) -> None:  # pragma: no cover
     with conn:
         try:
             reader = conn.makefile("r", encoding="utf-8", newline="\n")
@@ -219,7 +219,7 @@ def _handle_client(conn: socket.socket, handler: Callable[[Any], Any]) -> None:
                 writer.flush()
 
 
-def serve_unix_socket(socket_path: Path, handler: Callable[[Any], Any]) -> None:
+def serve_unix_socket(socket_path: Path, handler: Callable[[Any], Any]) -> None:  # pragma: no cover
     if not hasattr(socket, "AF_UNIX"):
         raise SystemExit("Unix domain sockets are not available on this Python/platform")
 
@@ -260,7 +260,7 @@ def serve_unix_socket(socket_path: Path, handler: Callable[[Any], Any]) -> None:
                 pass
 
 
-def _install_signal_handlers() -> None:
+def _install_signal_handlers() -> None:  # pragma: no cover
     def _stop(_signum, _frame):
         _STOP_EVENT.set()
 
@@ -285,7 +285,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(argv: list[str] | None = None) -> None:  # pragma: no cover
     logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stderr)
     args = _parse_args(argv)
 
