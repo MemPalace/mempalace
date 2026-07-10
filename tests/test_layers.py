@@ -180,6 +180,29 @@ def test_layer1_respects_max_chars():
     assert "more in L3 search" in result
 
 
+def test_layer1_recent_filing_tiebreaker():
+    """When importance is equal, most recently filed drawers come first."""
+    docs = ["old memory", "new memory"]
+    metas = [
+        {"room": "r", "source_file": "old.txt", "filed_at": "2025-01-01T00:00:00"},
+        {"room": "r", "source_file": "new.txt", "filed_at": "2026-03-15T12:00:00"},
+    ]
+    mock_client = _mock_chromadb_for_layer(docs, metas)
+
+    with (
+        patch("mempalace.layers.MempalaceConfig") as mock_cfg,
+        patch("mempalace.layers.chromadb.PersistentClient", return_value=mock_client),
+    ):
+        mock_cfg.return_value.palace_path = "/fake"
+        layer = Layer1(palace_path="/fake")
+        result = layer.generate()
+
+    # "new memory" should appear before "old memory" in the output
+    new_pos = result.index("new memory")
+    old_pos = result.index("old memory")
+    assert new_pos < old_pos, "Most recent drawer should appear first in L1"
+
+
 def test_layer1_importance_from_various_keys():
     """Layer1 tries importance, emotional_weight, weight keys."""
     docs = ["mem1", "mem2", "mem3"]
