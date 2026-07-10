@@ -2318,3 +2318,41 @@ def test_regular_file_at_palace_root_treated_as_absent(tmp_path, monkeypatch):
     # The stray file is left untouched; we never try to convert it.
     assert fake_root.is_file()
     assert fake_root.read_text() == "oops, this is a file not a directory"
+
+
+class TestIgnoredCwd:
+    """hooks.ignore_paths exempts ephemeral worker project dirs from capture."""
+
+    def _cfg(self, tmp_path, monkeypatch, paths):
+        import json as _json
+        from mempalace import hooks_cli
+
+        root = tmp_path / ".mempalace"
+        root.mkdir(exist_ok=True)
+        (root / "config.json").write_text(_json.dumps({"hooks": {"ignore_paths": paths}}))
+        monkeypatch.setattr(hooks_cli, "PALACE_ROOT", root)
+        return hooks_cli
+
+    def test_cwd_prefix_match(self, tmp_path, monkeypatch):
+        h = self._cfg(tmp_path, monkeypatch, ["/home/dev/Projects/daggerheart-agents"])
+        assert h._ignored_cwd({"cwd": "/home/dev/Projects/daggerheart-agents"})
+        assert h._ignored_cwd({"cwd": "/home/dev/Projects/daggerheart-agents/app"})
+        assert not h._ignored_cwd({"cwd": "/home/dev/Projects/daggerheart"})
+        assert not h._ignored_cwd({"cwd": "/home/dev/Projects/daggerheart-agents-two"})
+
+    def test_transcript_path_fallback(self, tmp_path, monkeypatch):
+        h = self._cfg(tmp_path, monkeypatch, ["/home/dev/Projects/daggerheart-agents"])
+        assert h._ignored_cwd(
+            {"transcript_path": "/home/dev/.claude/projects/-home-dev-Projects-daggerheart-agents/x.jsonl"}
+        )
+        assert not h._ignored_cwd(
+            {"transcript_path": "/home/dev/.claude/projects/-home-dev-Projects/x.jsonl"}
+        )
+
+    def test_no_config_or_empty(self, tmp_path, monkeypatch):
+        from mempalace import hooks_cli
+
+        monkeypatch.setattr(hooks_cli, "PALACE_ROOT", tmp_path / "missing")
+        assert not hooks_cli._ignored_cwd({"cwd": "/anywhere"})
+        h = self._cfg(tmp_path, monkeypatch, [])
+        assert not h._ignored_cwd({"cwd": "/anywhere"})
