@@ -37,6 +37,7 @@ from .palace import (
 )
 
 HOST = "127.0.0.1"
+MCP_ALLOW_PEER_WRITER_ENV = "MEMPALACE_MCP_ALLOW_PEER_WRITER"
 STATE_ROOT_ENV = "MEMPALACE_DAEMON_STATE_ROOT"
 DEFAULT_WAIT_TIMEOUT = 60.0 * 60.0
 # Liveness-probe timeout for the hook "is a daemon already running?" precheck.
@@ -685,6 +686,14 @@ class DaemonRuntime:
     def __init__(self, palace_path: str, backend: str | None = None):
         self.palace_path = canonical_palace_path(palace_path)
         self.backend = backend
+        # One in-process writer gate for daemon-routed writes. Queue jobs and
+        # MCP tools share this lock, while direct external writers keep the
+        # existing fail-fast mine_palace_lock contract.
+        self._writer_lock = threading.RLock()
+        self._mcp_import_lock = threading.RLock()
+        self._mcp_module = None
+        self._mcp_handler = None
+        self._mcp_identity: dict[str, Any] | None = None
         self.store = QueueStore(queue_path(self.palace_path))
         self.shutdown_event = threading.Event()
         self.worker_wake = threading.Event()
@@ -709,6 +718,118 @@ class DaemonRuntime:
         self.worker_thread = thread
         thread.start()
         return thread
+
+    def _ensure_mcp_handler(self, identity: dict[str, Any]):
+        """Load mempalace.mcp_server lazily inside the daemon process."""
+
+        with self._mcp_import_lock:
+            if self._mcp_handler is not None:
+                return self._mcp_handler
+
+            # The daemon is the routed writer owner. Holding the legacy MCP
+            # server-lifetime peer-writer lease inside this long-lived process
+            # would starve hook/CLI writers merely because the daemon exists.
+            os.environ.setdefault(MCP_ALLOW_PEER_WRITER_ENV, "1")
+
+            if identity.get("read_only"):
+                os.environ["MEMPALACE_MCP_READ_ONLY"] = "1"
+            else:
+                os.environ.pop("MEMPALACE_MCP_READ_ONLY", None)
+
+            from . import mcp_server
+
+            actual_read_only = bool(getattr(mcp_server, "_READ_ONLY", False))
+            expected_read_only = bool(identity.get("read_only"))
+            if actual_read_only != expected_read_only:
+                raise DaemonError(
+                    "MCP server read-only mode does not match daemon bridge identity: "
+                    f"expected={expected_read_only!r} actual={actual_read_only!r}"
+                )
+
+            for name in (
+                "_refresh_sqlite_integrity_status",
+                "_refresh_vector_disabled_flag",
+                "_maybe_eager_warmup_embedder",
+            ):
+                fn = getattr(mcp_server, name, None)
+                if callable(fn):
+                    try:
+                        fn()
+                    except Exception:
+                        # Startup checks are best-effort here; mcp_server also
+                        # gates request handling with structured JSON-RPC errors.
+                        pass
+
+            self._mcp_module = mcp_server
+            self._mcp_handler = mcp_server.handle_request
+            return self._mcp_handler
+
+    def _check_mcp_identity(self, identity: dict[str, Any]) -> None:
+        expected = {
+            "palace_path": self.palace_path,
+            "backend": str(self.backend or "").strip().lower(),
+            "read_only": bool(identity.get("read_only")),
+            "collection_name": str(identity.get("collection_name") or "").strip(),
+        }
+        received = {
+            "palace_path": canonical_palace_path(str(identity.get("palace_path") or "")),
+            "backend": str(identity.get("backend") or "").strip().lower(),
+            "read_only": bool(identity.get("read_only")),
+            "collection_name": str(identity.get("collection_name") or "").strip(),
+        }
+
+        if not expected["backend"] and not received["backend"]:
+            pass
+        elif expected["backend"] != received["backend"]:
+            raise DaemonError(
+                "MCP bridge backend mismatch: "
+                f"daemon={expected['backend']!r} bridge={received['backend']!r}"
+            )
+
+        expected_no_backend = dict(expected)
+        received_no_backend = dict(received)
+        expected_no_backend.pop("backend")
+        received_no_backend.pop("backend")
+
+        if expected_no_backend != received_no_backend:
+            raise DaemonError(
+                "MCP bridge identity mismatch: "
+                f"daemon={expected_no_backend!r} bridge={received_no_backend!r}"
+            )
+
+        if self._mcp_identity is None:
+            self._mcp_identity = received
+            return
+
+        if self._mcp_identity != received:
+            raise DaemonError(
+                "MCP daemon already initialized with different identity: "
+                f"daemon={self._mcp_identity!r} bridge={received!r}"
+            )
+
+    def handle_mcp_request(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Handle one JSON-RPC request forwarded by mempalace.mcp_bridge."""
+
+        if not isinstance(payload, dict):
+            raise DaemonError("MCP daemon payload must be an object")
+
+        request = payload.get("request")
+        identity = payload.get("identity") or {}
+        if not isinstance(identity, dict):
+            raise DaemonError("MCP daemon identity must be an object")
+
+        self._check_mcp_identity(identity)
+        handler = self._ensure_mcp_handler(identity)
+
+        needs_writer = isinstance(request, dict) and request.get("method") == "tools/call"
+
+        if needs_writer:
+            with self._writer_lock:
+                response = handler(request)
+        else:
+            response = handler(request)
+
+        return {"response": response}
 
     def worker_alive(self) -> bool:
         return self.worker_thread is not None and self.worker_thread.is_alive()
@@ -767,7 +888,8 @@ class DaemonRuntime:
                 payload["palace_path"] = self.palace_path
                 if self.backend:
                     payload["backend"] = self.backend
-                result = execute_job(job.kind, payload)
+                with self._writer_lock:
+                    result = execute_job(job.kind, payload)
                 ok = bool(result.get("success", True))
                 if not ok and result.get("error_class") == LOCK_REFUSAL_ERROR_CLASS:
                     # Refused the palace write lock: no drawer was filed, so this
@@ -875,11 +997,18 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
         "MEMPALACE_PALACE_PATH": os.environ.get("MEMPALACE_PALACE_PATH"),
         "MEMPALACE_BACKEND_EXPLICIT": os.environ.get("MEMPALACE_BACKEND_EXPLICIT"),
         "MEMPALACE_BACKEND": os.environ.get("MEMPALACE_BACKEND"),
+        "MEMPALACE_MCP_ALLOW_PEER_WRITER": os.environ.get("MEMPALACE_MCP_ALLOW_PEER_WRITER"),
+        "MEMPALACE_MCP_READ_ONLY": os.environ.get("MEMPALACE_MCP_READ_ONLY"),
     }
     os.environ["MEMPALACE_PALACE_PATH"] = palace_path
     if backend:
         os.environ["MEMPALACE_BACKEND_EXPLICIT"] = backend
         os.environ["MEMPALACE_BACKEND"] = backend
+    # The daemon is the single routed writer owner. Holding the legacy
+    # MCP server-lifetime peer-writer lease inside this process would
+    # starve hook/CLI writers that route through the same daemon.
+    os.environ.setdefault(MCP_ALLOW_PEER_WRITER_ENV, "1")
+
     # Privacy by architecture: tighten the umask to owner-only BEFORE the queue
     # DB is created. SQLite's WAL/SHM sidecars hold un-checkpointed verbatim
     # payloads and are (re)created with the process umask on every open/close
@@ -961,9 +1090,21 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
                         "backend": runtime.backend,
                         "active_job_id": runtime.active_job_id,
                         "counts": runtime.store.counts(),
+                        "mcp_identity": runtime._mcp_identity,
                     },
                 )
                 return
+            if parsed.path == "/mcp":
+                try:
+                    body = self._read_json()
+                    result = runtime.handle_mcp_request(body)
+                except Exception as exc:  # noqa: BLE001 - client gets structured failure
+                    _json_response(self, 400, {"error": str(exc)})
+                    return
+
+                _json_response(self, 200, result)
+                return
+
             if parsed.path == "/jobs":
                 qs = parse_qs(parsed.query)
                 limit = int((qs.get("limit") or ["20"])[0])
@@ -1219,6 +1360,21 @@ class DaemonClient:
 
     def shutdown(self) -> dict[str, Any]:
         return self.request("POST", "/shutdown", {})
+
+    def mcp_request(
+        self,
+        request_payload: Any,
+        identity: dict[str, Any],
+        *,
+        timeout: float = DEFAULT_WAIT_TIMEOUT,
+    ) -> Any:
+        payload = self.request(
+            "POST",
+            "/mcp",
+            {"request": request_payload, "identity": identity},
+            timeout=timeout,
+        )
+        return payload.get("response")
 
 
 def get_client_if_running(palace_path: str, *, health_timeout: float = 5.0) -> DaemonClient | None:

@@ -58,7 +58,6 @@ Repository = "https://github.com/MemPalace/mempalace"
 mempalace = "mempalace.cli:main"
 mempalace-mcp = "mempalace.mcp_bridge:main"
 mempalace-mcp-bridge = "mempalace.mcp_bridge:main"
-mempalace-mcp-daemon = "mempalace.mcp_daemon:main"
 mempalace-mcp-stdio = "mempalace.mcp_server:main"
 
 [project.entry-points."mempalace.backends"]
