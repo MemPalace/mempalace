@@ -101,6 +101,47 @@ _EF_CACHE: dict = {}
 _EF_CACHE_LOCK = threading.Lock()
 _WARNED: set = set()
 
+# One-shot guard for _preload_gpu_dlls: the DLL search path only needs to be
+# fixed up once per process, before the first GPU InferenceSession. The lock
+# keeps concurrent resolvers (e.g. a warmup thread racing the first tool
+# call) from both paying the preload.
+_PRELOAD_DONE = False
+_PRELOAD_LOCK = threading.Lock()
+
+
+def _preload_gpu_dlls(ort) -> None:
+    """One-shot ``onnxruntime.preload_dlls()`` before the first GPU session.
+
+    pip-installed CUDA/cuDNN runtimes (the ``nvidia-*-cu12`` wheels) live
+    inside site-packages, which is not on the Windows DLL search path.
+    Without the preload, ``CUDAExecutionProvider`` reports *available* but
+    session creation fails to load ``cublasLt64_12.dll``/``cudnn64_9.dll``
+    (LoadLibrary error 126) and onnxruntime silently falls back to CPU —
+    ``describe_device()`` says GPU while every embedding runs ~10x slower.
+    ``preload_dlls()`` (onnxruntime >= 1.21) resolves the wheel DLLs
+    explicitly and is a no-op where nothing needs fixing; builds without it
+    are skipped. Never raises: a failed preload just reproduces today's
+    fallback behavior, which the session-creation path already handles.
+    """
+    global _PRELOAD_DONE
+    if _PRELOAD_DONE:
+        return
+    with _PRELOAD_LOCK:
+        if _PRELOAD_DONE:
+            return
+        _PRELOAD_DONE = True
+        preload = getattr(ort, "preload_dlls", None)
+        if preload is None:  # onnxruntime < 1.21
+            return
+        try:
+            preload()
+        except Exception:
+            logger.warning(
+                "onnxruntime.preload_dlls() failed — GPU sessions may silently "
+                "fall back to CPU if the CUDA/cuDNN DLLs are not on the search path",
+                exc_info=True,
+            )
+
 
 def _resolve_providers(device: str, model: Optional[str] = None) -> tuple[list, str]:
     """Return ``(provider_list, effective_device)`` for ``device``.
@@ -125,6 +166,7 @@ def _resolve_providers(device: str, model: Optional[str] = None) -> tuple[list, 
     if device == "auto":
         for provider, name in _AUTO_ORDER:
             if provider in available and provider not in denied:
+                _preload_gpu_dlls(ort)
                 return ([provider, "CPUExecutionProvider"], name)
         return (["CPUExecutionProvider"], "cpu")
 
@@ -152,6 +194,7 @@ def _resolve_providers(device: str, model: Optional[str] = None) -> tuple[list, 
             _WARNED.add(device)
         return (["CPUExecutionProvider"], "cpu")
 
+    _preload_gpu_dlls(ort)
     return (requested, device)
 
 
