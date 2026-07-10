@@ -578,6 +578,83 @@ def test_start_daemon_kills_orphan_on_readiness_timeout(tmp_path, monkeypatch):
     assert fake.killed is True
 
 
+def test_concurrent_start_daemon_calls_spawn_one_process(tmp_path, monkeypatch):
+    """Concurrent agent writes must converge on one per-palace daemon."""
+    monkeypatch.setenv(daemon.STATE_ROOT_ENV, str(tmp_path / "state"))
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    initial_checks = threading.Barrier(2)
+    class SharedClient:
+        def health(self):
+            return {"ok": True}
+
+    shared_client = SharedClient()
+    spawned = []
+    spawned_lock = threading.Lock()
+    client_checks = 0
+
+    def get_client_if_running(*args, **kwargs):
+        nonlocal client_checks
+        with spawned_lock:
+            client_checks += 1
+            check_number = client_checks
+        if check_number <= 2:
+            initial_checks.wait(timeout=5)
+            return None
+        return shared_client if spawned else None
+
+    class FakeProc:
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            self.returncode = -9
+
+        def wait(self):
+            return self.returncode
+
+    def fake_popen(*args, **kwargs):
+        with spawned_lock:
+            spawned.append(FakeProc())
+        # Keep the winning caller inside the start critical section long enough
+        # for the contender to attempt entry.
+        time.sleep(0.1)
+        return spawned[-1]
+
+    class ReadyClient:
+        def __new__(cls, *args, **kwargs):
+            return shared_client
+
+    monkeypatch.setattr(daemon, "get_client_if_running", get_client_if_running)
+    monkeypatch.setattr(daemon.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(daemon, "DaemonClient", ReadyClient)
+    monkeypatch.setattr(daemon, "ensure_token", lambda *args, **kwargs: "token")
+    monkeypatch.setattr(daemon, "_detached_kwargs", lambda *args, **kwargs: {})
+
+    results = []
+    errors = []
+
+    def start():
+        try:
+            results.append(daemon.start_daemon(str(palace)))
+        except BaseException as exc:  # noqa: BLE001 - surfaced in the test thread
+            errors.append(exc)
+
+    threads = [threading.Thread(target=start) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert errors == []
+    assert all(not thread.is_alive() for thread in threads)
+    assert results == [shared_client, shared_client]
+    assert len(spawned) == 1
+
+
 # --- service.run_* happy-path coverage ---
 # These close the draft PR's follow-up ("Add focused happy-path tests for
 # service.run_mine / run_diary_write / run_mcp_tool") and, now that the daemon

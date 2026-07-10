@@ -4350,7 +4350,7 @@ class TestUnknownParamName:
         assert "result" in resp
 
 
-def test_peer_writer_guard_refuses_mutating_tool_before_handler(monkeypatch):
+def test_peer_writer_guard_reports_busy_writer_when_called(monkeypatch):
     from mempalace import mcp_server
 
     called = {"value": False}
@@ -4381,21 +4381,7 @@ def test_peer_writer_guard_refuses_mutating_tool_before_handler(monkeypatch):
         lambda: (False, "busy writer"),
     )
 
-    response = mcp_server.handle_request(
-        {
-            "jsonrpc": "2.0",
-            "id": 7,
-            "method": "tools/call",
-            "params": {
-                "name": "mempalace_add_drawer",
-                "arguments": {
-                    "wing": "wing_test",
-                    "room": "room_test",
-                    "content": "hello",
-                },
-            },
-        }
-    )
+    response = mcp_server._mcp_peer_writer_refusal(7, "mempalace_add_drawer")
 
     assert called["value"] is False
     assert response["error"]["code"] == -32001
@@ -4432,7 +4418,7 @@ def test_peer_writer_guard_does_not_gate_read_tool(monkeypatch):
     assert '"ok": true' in response["result"]["content"][0]["text"]
 
 
-def test_peer_writer_guard_refuses_checkpoint_before_handler(monkeypatch):
+def test_queued_checkpoint_bypasses_process_lifetime_peer_lease(monkeypatch):
     from mempalace import mcp_server
 
     called = {"value": False}
@@ -4456,23 +4442,112 @@ def test_peer_writer_guard_refuses_checkpoint_before_handler(monkeypatch):
     monkeypatch.setattr(
         mcp_server,
         "_acquire_mcp_writer_lock",
-        lambda: (False, "busy writer"),
+        lambda: (_ for _ in ()).throw(AssertionError("queued writes do not use the peer lease")),
     )
     monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", lambda: None)
     monkeypatch.setattr(mcp_server, "_vector_disabled", False)
+    monkeypatch.setenv(mcp_server._MCP_DAEMON_WRITES_ENV, "1")
+
+    response = mcp_server._mcp_tool_preflight_refusal(1818, "mempalace_checkpoint")
+
+    assert called["value"] is False
+    assert response is None
+
+
+def test_mcp_memory_write_uses_daemon_when_peer_writer_exists(monkeypatch):
+    """Agent MCP processes share the daemon writer instead of becoming read-only."""
+    import json
+
+    from mempalace import daemon, mcp_server
+
+    submitted = {}
+
+    def local_handler_must_not_run(**kwargs):
+        raise AssertionError("memory writes must execute in the daemon")
+
+    def submit_job(kind, payload, **kwargs):
+        submitted.update(kind=kind, payload=payload, kwargs=kwargs)
+        return {
+            "id": "job-1",
+            "state": "succeeded",
+            "result": {
+                "success": True,
+                "drawer_id": "queued-drawer",
+                "exit_code": 0,
+            },
+        }
+
+    monkeypatch.setitem(
+        mcp_server.TOOLS,
+        "mempalace_diary_write",
+        {
+            "description": "test diary write",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "agent_name": {"type": "string"},
+                    "entry": {"type": "string"},
+                },
+            },
+            "handler": local_handler_must_not_run,
+        },
+    )
+    monkeypatch.setattr(daemon, "submit_job", submit_job)
+    monkeypatch.setenv(mcp_server._MCP_DAEMON_WRITES_ENV, "1")
+    monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", lambda: None)
+    monkeypatch.setattr(mcp_server, "_vector_disabled", False)
+    monkeypatch.setattr(
+        mcp_server,
+        "_acquire_mcp_writer_lock",
+        lambda: (_ for _ in ()).throw(AssertionError("peer lease must not gate queued writes")),
+    )
 
     response = mcp_server.handle_request(
         {
             "jsonrpc": "2.0",
-            "id": 1818,
+            "id": 1819,
             "method": "tools/call",
-            "params": {"name": "mempalace_checkpoint", "arguments": {"items": []}},
+            "params": {
+                "name": "mempalace_diary_write",
+                "arguments": {"agent_name": "Codex", "entry": "milestone"},
+            },
         }
     )
 
-    assert called["value"] is False
-    assert response["error"]["code"] == -32001
-    assert response["error"]["data"]["tool"] == "mempalace_checkpoint"
+    assert "error" not in response
+    result = json.loads(response["result"]["content"][0]["text"])
+    assert result == {"success": True, "drawer_id": "queued-drawer"}
+    assert submitted["kind"] == "mcp_tool"
+    assert submitted["payload"] == {
+        "name": "mempalace_diary_write",
+        "arguments": {"agent_name": "Codex", "entry": "milestone"},
+    }
+    assert submitted["kwargs"]["palace_path"] == mcp_server._config.palace_path
+    assert submitted["kwargs"]["wait"] is True
+    assert submitted["kwargs"]["auto_start"] is True
+
+
+def test_status_does_not_claim_peer_lease_for_daemon_writes(monkeypatch):
+    from mempalace import mcp_server
+
+    monkeypatch.setenv(mcp_server._MCP_DAEMON_WRITES_ENV, "1")
+    monkeypatch.setattr(mcp_server, "_ensure_sqlite_integrity_status", lambda: None)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", [])
+    monkeypatch.setattr(mcp_server, "_backend_db_exists", lambda: True)
+    monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", lambda: None)
+    monkeypatch.setattr(mcp_server, "_vector_disabled", True)
+    monkeypatch.setattr(
+        mcp_server,
+        "_tool_status_via_sqlite",
+        lambda: {"total_drawers": 1},
+    )
+    monkeypatch.setattr(
+        mcp_server,
+        "_acquire_mcp_writer_lock",
+        lambda: (_ for _ in ()).throw(AssertionError("status must not claim the peer lease")),
+    )
+
+    assert mcp_server.tool_status() == {"total_drawers": 1}
 
 
 def test_vector_divergence_refuses_diary_write_before_handler(monkeypatch):

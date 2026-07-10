@@ -96,6 +96,45 @@ def state_dir(palace_path: str) -> Path:
     return state_root() / palace_key(palace_path)
 
 
+@contextlib.contextmanager
+def _daemon_start_lock(lock_path: Path):
+    """Serialize the per-palace check-and-spawn sequence on every platform."""
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fh = open(lock_path, "a+b")
+    _chmod_private(lock_path)
+    acquired = False
+    try:
+        lock_fh.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            while True:
+                try:
+                    msvcrt.locking(lock_fh.fileno(), msvcrt.LK_NBLCK, 1)
+                    acquired = True
+                    break
+                except OSError:
+                    time.sleep(0.05)
+        else:
+            _fcntl.flock(lock_fh.fileno(), _fcntl.LOCK_EX)
+            acquired = True
+        yield
+    finally:
+        if acquired:
+            try:
+                lock_fh.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(lock_fh.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    _fcntl.flock(lock_fh.fileno(), _fcntl.LOCK_UN)
+            except OSError:
+                pass
+        lock_fh.close()
+
+
 def _write_private(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -992,7 +1031,6 @@ def start_daemon(
     timeout: float = 15.0,
 ) -> DaemonClient:
     palace_path = canonical_palace_path(palace_path)
-    ensure_token(palace_path)
     existing = get_client_if_running(palace_path)
     if existing is not None:
         return existing
@@ -1008,78 +1046,64 @@ def start_daemon(
 
     # Spawn mutual exclusion: two concurrent `daemon start` callers would both
     # observe no running daemon and both spawn a child, double-claiming jobs.
-    # A non-blocking flock serializes the check-then-spawn; the loser waits for
-    # the winner to finish coming up, then re-checks and reuses that daemon.
-    lock_fh = open(sd / "start.lock", "w") if _fcntl is not None else None
-    if _fcntl is not None and lock_fh is not None:
-        _chmod_private(sd / "start.lock")
-        try:
-            _fcntl.flock(lock_fh.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
-        except OSError:
-            # Another start is in flight — wait for it, then reuse its daemon.
-            _fcntl.flock(lock_fh.fileno(), _fcntl.LOCK_EX)
-            existing = get_client_if_running(palace_path)
-            if existing is not None:
-                return existing
-            # The other starter failed without bringing the daemon up; fall
-            # through and spawn ourselves (we now hold the lock).
+    # The lock covers token creation too: without it, concurrent first starts
+    # can generate different bearer tokens before either endpoint is ready.
+    with _daemon_start_lock(sd / "start.lock"):
+        existing = get_client_if_running(palace_path)
+        if existing is not None:
+            return existing
+        ensure_token(palace_path)
 
-    for stale in (endpoint_path(palace_path), pid_path(palace_path)):
+        for stale in (endpoint_path(palace_path), pid_path(palace_path)):
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+        cmd = [
+            sys.executable,
+            "-m",
+            "mempalace.daemon",
+            "serve",
+            "--palace",
+            palace_path,
+        ]
+        if backend:
+            cmd.extend(["--backend", backend])
+        env = os.environ.copy()
+        if STATE_ROOT_ENV in os.environ:
+            env[STATE_ROOT_ENV] = os.environ[STATE_ROOT_ENV]
+        kwargs = _detached_kwargs(sd / "daemon.log")
+        proc = None
         try:
-            stale.unlink()
-        except OSError:
-            pass
-    cmd = [
-        sys.executable,
-        "-m",
-        "mempalace.daemon",
-        "serve",
-        "--palace",
-        palace_path,
-    ]
-    if backend:
-        cmd.extend(["--backend", backend])
-    env = os.environ.copy()
-    if STATE_ROOT_ENV in os.environ:
-        env[STATE_ROOT_ENV] = os.environ[STATE_ROOT_ENV]
-    kwargs = _detached_kwargs(sd / "daemon.log")
-    proc = None
-    try:
-        proc = subprocess.Popen(cmd, env=env, **kwargs)
-    finally:
-        log_fh = kwargs.get("stdout")
-        if hasattr(log_fh, "close"):
-            log_fh.close()
-    try:
-        deadline = time.monotonic() + timeout
-        last_error = None
-        while time.monotonic() < deadline:
-            if proc.poll() is not None:
-                raise DaemonError(f"daemon exited during startup with code {proc.returncode}")
-            try:
-                client = DaemonClient(palace_path)
-                client.health()
-                return client
-            except DaemonError as exc:
-                last_error = exc
-                time.sleep(0.1)
-        raise DaemonError(f"daemon did not become ready: {last_error}")
-    except BaseException:
-        # Readiness failed — don't leak an orphaned detached child holding the
-        # port, token, queue, and log handle. Kill and reap it before raising.
-        if proc is not None and proc.poll() is None:
-            try:
-                proc.kill()
-                proc.wait()
-            except Exception:  # noqa: BLE001 - cleanup best-effort
-                pass
-        raise
-    finally:
-        if lock_fh is not None:
-            try:
-                lock_fh.close()
-            except Exception:  # noqa: BLE001 - cleanup best-effort
-                pass
+            proc = subprocess.Popen(cmd, env=env, **kwargs)
+        finally:
+            log_fh = kwargs.get("stdout")
+            if hasattr(log_fh, "close"):
+                log_fh.close()
+        try:
+            deadline = time.monotonic() + timeout
+            last_error = None
+            while time.monotonic() < deadline:
+                if proc.poll() is not None:
+                    raise DaemonError(f"daemon exited during startup with code {proc.returncode}")
+                try:
+                    client = DaemonClient(palace_path)
+                    client.health()
+                    return client
+                except DaemonError as exc:
+                    last_error = exc
+                    time.sleep(0.1)
+            raise DaemonError(f"daemon did not become ready: {last_error}")
+        except BaseException:
+            # Readiness failed — don't leak an orphaned detached child holding the
+            # port, token, queue, and log handle. Kill and reap it before raising.
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.kill()
+                    proc.wait()
+                except Exception:  # noqa: BLE001 - cleanup best-effort
+                    pass
+            raise
 
 
 def ensure_client(

@@ -25,6 +25,9 @@ os.environ["HOME"] = _session_tmp
 os.environ["USERPROFILE"] = _session_tmp
 os.environ["HOMEDRIVE"] = os.path.splitdrive(_session_tmp)[0] or "C:"
 os.environ["HOMEPATH"] = os.path.splitdrive(_session_tmp)[1] or _session_tmp
+# Handler unit tests execute writes in-process. Tests that exercise production
+# daemon routing opt in explicitly with monkeypatch.
+os.environ["MEMPALACE_MCP_DAEMON_WRITES"] = "0"
 
 # Now it is safe to import mempalace modules that trigger initialisation.
 import chromadb  # noqa: E402

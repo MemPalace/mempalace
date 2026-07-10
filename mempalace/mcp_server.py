@@ -275,6 +275,7 @@ _MCP_WRITER_READ_ONLY = False
 _MCP_WRITER_LOCK_FAILED = False
 _MCP_WRITER_LOCK_ERROR = ""
 _MCP_ALLOW_PEER_WRITER_ENV = "MEMPALACE_MCP_ALLOW_PEER_WRITER"
+_MCP_DAEMON_WRITES_ENV = "MEMPALACE_MCP_DAEMON_WRITES"
 
 _MUTATING_TOOLS = frozenset(
     {
@@ -309,6 +310,11 @@ _VECTOR_MUTATING_TOOLS = frozenset(
 
 def _truthy_env(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _mcp_daemon_writes_enabled() -> bool:
+    value = os.environ.get(_MCP_DAEMON_WRITES_ENV)
+    return value is None or value.strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _acquire_mcp_writer_lock() -> tuple[bool, str]:
@@ -1503,9 +1509,10 @@ def tool_status():
     # is detected so status stays reachable.
     db_exists = _backend_db_exists()
     _refresh_vector_disabled_flag()
-    writer_ok, writer_reason = _acquire_mcp_writer_lock()
-    if not writer_ok:
-        logger.warning("%s; mutating MCP tools will run read-only", writer_reason)
+    if not _mcp_daemon_writes_enabled():
+        writer_ok, writer_reason = _acquire_mcp_writer_lock()
+        if not writer_ok:
+            logger.warning("%s; mutating MCP tools will run read-only", writer_reason)
 
     if _vector_disabled:
         return _tool_status_via_sqlite()
@@ -4215,6 +4222,13 @@ def _mcp_tool_preflight_refusal(req_id, tool_name: str):
     if vector_write_error is not None:
         return vector_write_error
 
+    from .service import classify_tool
+
+    if _mcp_daemon_writes_enabled() and classify_tool(tool_name) == "write":
+        # MCP writes are serialized by the per-palace daemon. Individual MCP
+        # processes must not compete for the old process-lifetime writer lease.
+        return None
+
     return _mcp_peer_writer_refusal(req_id, tool_name)
 
 
@@ -4224,6 +4238,39 @@ def _decorate_mcp_tool_result(tool_name: str, result):
     if tool_name == "mempalace_status" and isinstance(result, dict):
         result.setdefault("sqlite_integrity", _sqlite_integrity_payload())
 
+    return result
+
+
+def _execute_mcp_tool(tool_name: str, tool_args: dict):
+    """Execute reads locally and serialize writes through the palace daemon."""
+
+    from .service import classify_tool
+
+    if not _mcp_daemon_writes_enabled() or classify_tool(tool_name) != "write":
+        return TOOLS[tool_name]["handler"](**tool_args)
+
+    from .daemon import submit_job
+
+    job = submit_job(
+        "mcp_tool",
+        {"name": tool_name, "arguments": tool_args},
+        palace_path=_config.palace_path,
+        backend=_selected_backend_name(),
+        wait=True,
+        auto_start=True,
+    )
+    result = job.get("result")
+    if not isinstance(result, dict):
+        error = job.get("error") or {}
+        message = error.get("message") if isinstance(error, dict) else str(error)
+        raise RuntimeError(message or f"daemon job {job.get('id', '<unknown>')} failed")
+
+    # The daemon adds process-transport bookkeeping that direct MCP handlers
+    # never returned. Keep the public tool result backward-compatible.
+    result = dict(result)
+    result.pop("exit_code", None)
+    result.pop("stdout", None)
+    result.pop("stderr", None)
     return result
 
 
@@ -4361,7 +4408,7 @@ def handle_request(request):
             if "entry" not in tool_args or tool_args["entry"] is None:
                 tool_args["entry"] = content_val
         try:
-            result = _decorate_mcp_tool_result(tool_name, TOOLS[tool_name]["handler"](**tool_args))
+            result = _decorate_mcp_tool_result(tool_name, _execute_mcp_tool(tool_name, tool_args))
 
             return {
                 "jsonrpc": "2.0",
