@@ -2803,6 +2803,26 @@ class TestKGTools:
 
 
 class TestDiaryTools:
+    def test_diary_write_refuses_vector_divergence_before_collection_open(self, monkeypatch):
+        from mempalace import mcp_server
+
+        def detect_divergence():
+            mcp_server._vector_disabled = True
+            mcp_server._vector_disabled_reason = "772 drawers missing from HNSW"
+            mcp_server._vector_capacity_status = {"divergence": 772}
+
+        def forbidden_collection(*args, **kwargs):
+            raise AssertionError("diverged diary write must not open Chroma")
+
+        monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", detect_divergence)
+        monkeypatch.setattr(mcp_server, "_get_collection", forbidden_collection)
+
+        result = mcp_server.tool_diary_write(agent_name="Codex", entry="milestone")
+
+        assert result["success"] is False
+        assert "repair required" in result["error"].lower()
+        assert result["divergence"] == 772
+
     def test_diary_write_and_read(self, monkeypatch, config, palace_path, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         _client, _col = _get_collection(palace_path, create=True)
@@ -4410,6 +4430,149 @@ def test_peer_writer_guard_does_not_gate_read_tool(monkeypatch):
     )
 
     assert '"ok": true' in response["result"]["content"][0]["text"]
+
+
+def test_peer_writer_guard_refuses_checkpoint_before_handler(monkeypatch):
+    from mempalace import mcp_server
+
+    called = {"value": False}
+
+    def handler(**kwargs):
+        called["value"] = True
+        return {"added": []}
+
+    monkeypatch.setitem(
+        mcp_server.TOOLS,
+        "mempalace_checkpoint",
+        {
+            "description": "test checkpoint",
+            "input_schema": {
+                "type": "object",
+                "properties": {"items": {"type": "array"}},
+            },
+            "handler": handler,
+        },
+    )
+    monkeypatch.setattr(
+        mcp_server,
+        "_acquire_mcp_writer_lock",
+        lambda: (False, "busy writer"),
+    )
+    monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", lambda: None)
+    monkeypatch.setattr(mcp_server, "_vector_disabled", False)
+
+    response = mcp_server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1818,
+            "method": "tools/call",
+            "params": {"name": "mempalace_checkpoint", "arguments": {"items": []}},
+        }
+    )
+
+    assert called["value"] is False
+    assert response["error"]["code"] == -32001
+    assert response["error"]["data"]["tool"] == "mempalace_checkpoint"
+
+
+def test_vector_divergence_refuses_diary_write_before_handler(monkeypatch):
+    from mempalace import mcp_server
+
+    called = {"handler": False, "probe": False}
+
+    def handler(**kwargs):
+        called["handler"] = True
+        return {"success": True}
+
+    def detect_divergence():
+        called["probe"] = True
+        mcp_server._vector_disabled = True
+        mcp_server._vector_disabled_reason = "772 drawers missing from HNSW"
+        mcp_server._vector_capacity_status = {
+            "sqlite_count": 111_164,
+            "hnsw_count": 110_392,
+            "divergence": 772,
+        }
+
+    monkeypatch.setitem(
+        mcp_server.TOOLS,
+        "mempalace_diary_write",
+        {
+            "description": "test diary write",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "agent_name": {"type": "string"},
+                    "entry": {"type": "string"},
+                },
+            },
+            "handler": handler,
+        },
+    )
+    monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", detect_divergence)
+    monkeypatch.setattr(mcp_server, "_acquire_mcp_writer_lock", lambda: (True, ""))
+
+    response = mcp_server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1222,
+            "method": "tools/call",
+            "params": {
+                "name": "mempalace_diary_write",
+                "arguments": {"agent_name": "Codex", "entry": "milestone"},
+            },
+        }
+    )
+
+    assert called["probe"] is True
+    assert called["handler"] is False
+    assert response["error"]["code"] == -32003
+    assert "repair required" in response["error"]["message"].lower()
+    assert response["error"]["data"]["tool"] == "mempalace_diary_write"
+    assert response["error"]["data"]["divergence"] == 772
+
+
+def test_vector_divergence_refuses_checkpoint_before_handler(monkeypatch):
+    from mempalace import mcp_server
+
+    called = {"handler": False}
+
+    def handler(**kwargs):
+        called["handler"] = True
+        return {"added": []}
+
+    def detect_divergence():
+        mcp_server._vector_disabled = True
+        mcp_server._vector_disabled_reason = "772 drawers missing from HNSW"
+        mcp_server._vector_capacity_status = {"divergence": 772}
+
+    monkeypatch.setitem(
+        mcp_server.TOOLS,
+        "mempalace_checkpoint",
+        {
+            "description": "test checkpoint",
+            "input_schema": {
+                "type": "object",
+                "properties": {"items": {"type": "array"}},
+            },
+            "handler": handler,
+        },
+    )
+    monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", detect_divergence)
+    monkeypatch.setattr(mcp_server, "_acquire_mcp_writer_lock", lambda: (True, ""))
+
+    response = mcp_server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1223,
+            "method": "tools/call",
+            "params": {"name": "mempalace_checkpoint", "arguments": {"items": []}},
+        }
+    )
+
+    assert called["handler"] is False
+    assert response["error"]["code"] == -32003
+    assert response["error"]["data"]["tool"] == "mempalace_checkpoint"
 
 
 def test_peer_writer_lock_setup_failure_is_cached(monkeypatch):

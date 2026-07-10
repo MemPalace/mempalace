@@ -254,6 +254,7 @@ _sqlite_integrity_checked = False
 _sqlite_integrity_errors: list[str] = []
 _sqlite_integrity_check_error = ""
 _SQLITE_INTEGRITY_ERROR_CODE = -32002
+_VECTOR_DIVERGENCE_ERROR_CODE = -32003
 _SQLITE_INTEGRITY_ALLOWED_TOOLS = frozenset(
     {
         "mempalace_status",
@@ -288,6 +289,20 @@ _MUTATING_TOOLS = frozenset(
         "mempalace_sync",
         "mempalace_update_drawer",
         "mempalace_diary_write",
+        "mempalace_checkpoint",
+    }
+)
+
+_VECTOR_MUTATING_TOOLS = frozenset(
+    {
+        "mempalace_delete_hallway",
+        "mempalace_add_drawer",
+        "mempalace_delete_drawer",
+        "mempalace_mine",
+        "mempalace_sync",
+        "mempalace_update_drawer",
+        "mempalace_diary_write",
+        "mempalace_checkpoint",
     }
 )
 
@@ -717,6 +732,36 @@ def _refresh_vector_disabled_flag() -> None:
             )
         _vector_disabled = False
         _vector_disabled_reason = ""
+
+
+def _mcp_vector_write_refusal(req_id, tool_name: str):
+    """Refuse HNSW writes when the safe capacity probe detects divergence."""
+
+    if tool_name not in _VECTOR_MUTATING_TOOLS:
+        return None
+
+    _refresh_vector_disabled_flag()
+    if not _vector_disabled:
+        return None
+
+    capacity = _vector_capacity_status or {}
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {
+            "code": _VECTOR_DIVERGENCE_ERROR_CODE,
+            "message": "Vector index repair required; mutating tool refused safely",
+            "data": {
+                "tool": tool_name,
+                "palace": _config.palace_path,
+                "reason": _vector_disabled_reason,
+                "sqlite_count": capacity.get("sqlite_count"),
+                "hnsw_count": capacity.get("hnsw_count"),
+                "divergence": capacity.get("divergence"),
+                "repair_command": "mempalace repair --mode from-sqlite --archive-existing",
+            },
+        },
+    }
 
 
 # ==================== WRITE-AHEAD LOG ====================
@@ -3037,6 +3082,20 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
     else:
         wing = f"wing_{agent_name.replace(' ', '_')}"
     room = "diary"
+
+    _refresh_vector_disabled_flag()
+    if _vector_disabled:
+        capacity = _vector_capacity_status or {}
+        return {
+            "success": False,
+            "error": "Vector index repair required; diary write refused safely",
+            "reason": _vector_disabled_reason,
+            "sqlite_count": capacity.get("sqlite_count"),
+            "hnsw_count": capacity.get("hnsw_count"),
+            "divergence": capacity.get("divergence"),
+            "repair_command": "mempalace repair --mode from-sqlite --archive-existing",
+        }
+
     col = _get_collection(create=True)
     if not col:
         return _collection_error_or_no_palace()
@@ -4151,6 +4210,10 @@ def _mcp_tool_preflight_refusal(req_id, tool_name: str):
     sqlite_integrity_error = _mcp_sqlite_integrity_refusal(req_id, tool_name)
     if sqlite_integrity_error is not None:
         return sqlite_integrity_error
+
+    vector_write_error = _mcp_vector_write_refusal(req_id, tool_name)
+    if vector_write_error is not None:
+        return vector_write_error
 
     return _mcp_peer_writer_refusal(req_id, tool_name)
 
