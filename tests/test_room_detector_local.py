@@ -238,6 +238,16 @@ def test_save_config_valid_yaml(tmp_path):
     assert data["rooms"][0]["name"] == "general"
 
 
+def test_save_config_writes_utf8(tmp_path):
+    import yaml
+
+    rooms = [{"name": "général", "description": "All files", "keywords": []}]
+    save_config(str(tmp_path), "test_proj", rooms)
+    config_file = tmp_path / "mempalace.yaml"
+    data = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+    assert data["rooms"][0]["name"] == "général"
+
+
 # ── print_proposed_structure ──────────────────────────────────────────
 
 

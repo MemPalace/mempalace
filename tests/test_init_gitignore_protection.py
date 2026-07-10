@@ -60,3 +60,13 @@ def test_handles_gitignore_without_trailing_newline(tmp_path):
     assert "dist\n" in contents
     assert "mempalace.yaml" in contents
     assert "entities.json" in contents
+
+
+def test_custom_config_dir_adds_relative_paths(tmp_path):
+    _git_init(tmp_path)
+    cfg_dir = tmp_path / ".mempalace" / "config"
+    cfg_dir.mkdir(parents=True)
+    assert _ensure_mempalace_files_gitignored(tmp_path, config_dir=cfg_dir) is True
+    contents = (tmp_path / ".gitignore").read_text()
+    assert ".mempalace/config/mempalace.yaml" in contents
+    assert ".mempalace/config/entities.json" in contents
