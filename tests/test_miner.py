@@ -1216,6 +1216,40 @@ def test_process_file_uses_bounded_upsert_batches(tmp_path, monkeypatch):
     assert col.batch_sizes == [2, 2, 1]
 
 
+def test_process_file_uses_bulk_mtime_cache_before_reading(tmp_path, monkeypatch):
+    from mempalace import miner
+
+    source = tmp_path / "cached.py"
+    source.write_text("print('already indexed')\n", encoding="utf-8")
+    source_mtime = source.stat().st_mtime
+
+    monkeypatch.setattr(
+        miner,
+        "file_already_mined",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("per-file query used")),
+    )
+    monkeypatch.setattr(
+        miner,
+        "_read_text_no_follow",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("file was read")),
+    )
+
+    drawers, room, skip_reason = miner.process_file(
+        source,
+        tmp_path,
+        object(),
+        "wing",
+        [{"name": "general", "description": "General"}],
+        "agent",
+        False,
+        mined_mtime_cache={str(source): {source_mtime}},
+    )
+
+    assert drawers == 0
+    assert room == "general"
+    assert skip_reason is None
+
+
 # ── normalize_version schema gate ───────────────────────────────────────
 #
 # When the normalization pipeline changes shape (e.g., strip_noise lands),

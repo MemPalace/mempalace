@@ -148,8 +148,11 @@ class _FakeQdrantClient:
         limit=256,
         offset=None,
         with_vector=False,
+        with_payload=True,
     ):
-        self.scroll_calls.append(qdrant_filter)
+        self.scroll_calls.append(
+            {"filter": qdrant_filter, "with_vector": with_vector, "with_payload": with_payload}
+        )
         points = list(self.collections.get(collection, {"points": {}})["points"].values())
         points = [point for point in points if _fake_match_filter(point, qdrant_filter)]
         start = int(offset or 0)
@@ -157,7 +160,13 @@ class _FakeQdrantClient:
         next_offset = start + limit if start + limit < len(points) else None
         out = []
         for point in selected:
-            item = {"id": point["id"], "payload": point["payload"]}
+            if with_payload is True:
+                payload = point["payload"]
+            elif with_payload is False:
+                payload = {}
+            else:
+                payload = {key: point["payload"][key] for key in with_payload if key in point["payload"]}
+            item = {"id": point["id"], "payload": payload}
             if with_vector:
                 item["vector"] = point["vector"]
             out.append(item)
@@ -265,7 +274,12 @@ def test_qdrant_add_query_filters_lexical_and_marker(tmp_path, fake_qdrant):
 
     hits = col.lexical_search(query="rareterm backend", n_results=2, where={"wing": "project"}).hits
     assert [hit.id for hit in hits] == ["b", "a"]
-    assert fake_qdrant.instances[0].created_indexes[0][1:] == ("document", "text")
+    assert [index[1:] for index in fake_qdrant.instances[0].created_indexes] == [
+        ("document", "text"),
+        ("metadata.source_file", "keyword"),
+        ("metadata.wing", "keyword"),
+        ("metadata.room", "keyword"),
+    ]
 
     backend.close_palace(str(tmp_path))
     with pytest.raises(Exception):
