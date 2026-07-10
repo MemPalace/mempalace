@@ -100,6 +100,14 @@ Wire it into an MCP client (e.g. Claude Code) as a stdio server:
 }
 ```
 
+For Autohand Code, register the same Docker-backed stdio server with:
+
+```bash
+autohand mcp add mempalace docker run -i --rm -v mempalace-data:/data mempalace
+```
+
+Add `--scope project` after `add` to keep the server configuration in the current project. See [Autohand Code](https://github.com/autohandai/code-cli/) for current installation and CLI details.
+
 `docker compose run --rm mcp` works too (see `docker-compose.yml`). For
 CUDA-accelerated embeddings, build the GPU variant with
 `docker build -f Dockerfile.gpu -t mempalace:gpu .` and run it with
