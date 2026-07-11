@@ -344,15 +344,21 @@ def cmd_sweep(args):
             auto_start=routing.decision.auto_start_daemon,
         )
         return
+
+    # --room only takes effect alongside --wing (a room needs a wing to nest
+    # in); flag the no-op rather than dropping the value silently.
+    if args.room and not args.wing:
+        print("  WARNING: --room is ignored without --wing.", file=sys.stderr)
+
     if os.path.isfile(target):
-        result = sweep(target, palace_path)
+        result = sweep(target, palace_path, wing=args.wing, room=args.room)
         print(
             f"  Swept {target}: +{result['drawers_added']} new, "
             f"{result['drawers_already_present']} already present, "
             f"{result['drawers_skipped']} skipped (< cursor)."
         )
     elif os.path.isdir(target):
-        result = sweep_directory(target, palace_path)
+        result = sweep_directory(target, palace_path, wing=args.wing, room=args.room)
         print(
             f"  Swept {result['files_succeeded']}/{result['files_attempted']} "
             f"files from {target}: +{result['drawers_added']} new, "
