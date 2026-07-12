@@ -209,16 +209,16 @@ Usage and tool reference:
 
 ## MCP server
 
-35 MCP tools cover palace reads/writes, knowledge-graph operations,
+36 MCP tools cover palace reads/writes, knowledge-graph operations,
 cross-wing navigation, drawer management, and agent diaries. Installation
 and the full tool list:
 [mempalaceofficial.com/reference/mcp-tools](https://mempalaceofficial.com/reference/mcp-tools.html).
 
 ## Agents
 
-Each specialist agent gets its own wing and diary in the palace.
-Discoverable at runtime via `mempalace_list_agents` — no bloat in your
-system prompt:
+Each specialist agent can get its own wing and diary in the palace.
+Use `mempalace_diary_write` to record entries and `mempalace_diary_read`
+to retrieve them — no bloat in your system prompt:
 [mempalaceofficial.com/concepts/agents](https://mempalaceofficial.com/concepts/agents.html).
 
 ## Auto-save hooks

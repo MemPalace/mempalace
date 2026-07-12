@@ -1,7 +1,10 @@
 """
 MemPalace configuration system.
 
-Priority: env vars > config file (~/.mempalace/config.json) > defaults
+Most settings resolve as env vars > config file (~/.mempalace/config.json) > defaults.
+The storage backend is the intentional exception: a persisted config backend wins
+over MEMPALACE_BACKEND so an existing palace does not silently switch backends.
+Explicit CLI --backend still wins by setting MEMPALACE_BACKEND_EXPLICIT.
 """
 
 import json
@@ -339,7 +342,8 @@ DEFAULT_HALL_KEYWORDS = {
 class MempalaceConfig:
     """Configuration manager for MemPalace.
 
-    Load order: env vars > config file > defaults.
+    Load order: env vars > config file > defaults for most settings.
+    The backend property intentionally reads config before MEMPALACE_BACKEND.
     """
 
     def __init__(self, config_dir=None):
