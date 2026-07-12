@@ -2471,3 +2471,39 @@ def test_pi_jsonl_invalid_lines_skipped():
     ]
     result = _try_pi_jsonl("\n".join(lines))
     assert result is not None
+
+
+# ── promoted tool-chrome patterns ──────────────────────────────────────
+
+
+def test_bash_no_output_placeholder_stripped():
+    out = strip_noise("ran the migration\n(Bash completed with no output)\nall done")
+    assert "(Bash completed with no output)" not in out
+    assert "ran the migration" in out and "all done" in out
+
+
+def test_bash_no_output_stripped_inline_in_flattened_tool_result():
+    """Flattened tool_result forms embed the placeholder mid-line — the
+    pattern is deliberately unanchored so those are cleaned too."""
+    out = strip_noise('[tool_result: "(Bash completed with no output)"]')
+    assert "Bash completed" not in out
+
+
+def test_gh_run_log_prefix_stripped_keeps_log_text():
+    line = "Smoke API (crypto)\tUNKNOWN STEP\t2026-07-08T01:35:10.3582300Z real log text here"
+    out = strip_noise(line)
+    assert "UNKNOWN STEP" not in out
+    assert "Smoke API" not in out
+    assert "real log text here" in out
+
+
+def test_gh_run_log_prefix_keeps_arrow_marker():
+    line = "→ Gates\tUNKNOWN STEP\t2026-07-08T01:35:10.9457855Z ##[error]checklist missing"
+    out = strip_noise(line)
+    assert out.startswith("→ ")
+    assert "##[error]checklist missing" in out
+
+
+def test_tabbed_prose_without_gh_shape_untouched():
+    text = "col a\tcol b\tcol c\nplain prose line"
+    assert strip_noise(text) == text
