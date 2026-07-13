@@ -144,6 +144,64 @@ def test_daemon_http_lifecycle_executes_job(tmp_path, monkeypatch):
     _stop_server(client, thread, holders)
 
 
+def test_daemon_http_post_mcp_routes_to_runtime(tmp_path, monkeypatch):
+    seen = []
+
+    def fake_handle_mcp(self, payload):
+        seen.append(payload)
+        request = payload["request"]
+        return {
+            "response": {
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": {"ok": True},
+            }
+        }
+
+    monkeypatch.setattr(
+        daemon.DaemonRuntime,
+        "handle_mcp_request",
+        fake_handle_mcp,
+    )
+    client, thread, palace, holders = _start_server(
+        tmp_path,
+        monkeypatch,
+        lambda *_: {"success": True, "exit_code": 0},
+    )
+    request = {
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "ping",
+    }
+    identity = {
+        "palace_path": daemon.canonical_palace_path(str(palace)),
+        "backend": "",
+        "read_only": False,
+        "collection_name": "",
+    }
+
+    try:
+        response = client.mcp_request(
+            request,
+            identity,
+            timeout=3.0,
+        )
+    finally:
+        _stop_server(client, thread, holders)
+
+    assert response == {
+        "jsonrpc": "2.0",
+        "id": 7,
+        "result": {"ok": True},
+    }
+    assert seen == [
+        {
+            "request": request,
+            "identity": identity,
+        }
+    ]
+
+
 def test_daemon_holds_local_backend_writer_lease_for_lifetime(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     client, thread, palace, holders = _start_server(

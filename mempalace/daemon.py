@@ -771,9 +771,14 @@ class DaemonRuntime:
             "read_only": bool(identity.get("read_only")),
             "collection_name": str(identity.get("collection_name") or "").strip(),
         }
+        received_backend = str(identity.get("backend") or "").strip().lower()
+        # A bridge without an explicit --backend inherits the daemon's selected
+        # backend; omission must not become a distinct, mismatching identity.
+        if not received_backend:
+            received_backend = expected["backend"]
         received = {
             "palace_path": canonical_palace_path(str(identity.get("palace_path") or "")),
-            "backend": str(identity.get("backend") or "").strip().lower(),
+            "backend": received_backend,
             "read_only": bool(identity.get("read_only")),
             "collection_name": str(identity.get("collection_name") or "").strip(),
         }
@@ -1094,17 +1099,6 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
                     },
                 )
                 return
-            if parsed.path == "/mcp":
-                try:
-                    body = self._read_json()
-                    result = runtime.handle_mcp_request(body)
-                except Exception as exc:  # noqa: BLE001 - client gets structured failure
-                    _json_response(self, 400, {"error": str(exc)})
-                    return
-
-                _json_response(self, 200, result)
-                return
-
             if parsed.path == "/jobs":
                 qs = parse_qs(parsed.query)
                 limit = int((qs.get("limit") or ["20"])[0])
@@ -1139,6 +1133,16 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
             if not self._authorized():
                 return
             parsed = urlparse(self.path)
+            if parsed.path == "/mcp":
+                try:
+                    body = self._read_json()
+                    result = runtime.handle_mcp_request(body)
+                except Exception as exc:  # noqa: BLE001 - client gets structured failure
+                    _json_response(self, 400, {"error": str(exc)})
+                    return
+
+                _json_response(self, 200, result)
+                return
             if parsed.path == "/jobs":
                 try:
                     body = self._read_json()

@@ -229,6 +229,46 @@ def test_daemon_mcp_identity_mismatch_is_refused(tmp_path):
         )
 
 
+def test_daemon_blank_bridge_backend_inherits_runtime_backend(tmp_path):
+    runtime = daemon.DaemonRuntime(str(tmp_path / "palace"), backend="chroma")
+    runtime._mcp_handler = lambda request: {
+        "jsonrpc": "2.0",
+        "id": request["id"],
+        "result": {},
+    }
+    blank_identity = {
+        "palace_path": runtime.palace_path,
+        "backend": "",
+        "read_only": False,
+        "collection_name": "",
+    }
+
+    first = runtime.handle_mcp_request(
+        {
+            "identity": blank_identity,
+            "request": {"jsonrpc": "2.0", "id": 1, "method": "ping"},
+        }
+    )
+    second = runtime.handle_mcp_request(
+        {
+            "identity": {**blank_identity, "backend": "chroma"},
+            "request": {"jsonrpc": "2.0", "id": 2, "method": "ping"},
+        }
+    )
+
+    assert first["response"]["id"] == 1
+    assert second["response"]["id"] == 2
+    assert runtime._mcp_identity["backend"] == "chroma"
+
+    with pytest.raises(daemon.DaemonError, match="backend mismatch"):
+        runtime.handle_mcp_request(
+            {
+                "identity": {**blank_identity, "backend": "qdrant"},
+                "request": {"jsonrpc": "2.0", "id": 3, "method": "ping"},
+            }
+        )
+
+
 def test_daemon_mcp_jobs_and_mcp_tools_share_one_writer_lock(tmp_path, monkeypatch):
     runtime = daemon.DaemonRuntime(str(tmp_path / "palace"))
     identity = {
