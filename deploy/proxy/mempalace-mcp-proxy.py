@@ -196,6 +196,12 @@ async def _forward_to_upstream(
             circuit_record_success()
             _metrics["requests_success"] += 1
 
+            # 202 Accepted / 204 No Content — valid for JSON-RPC notifications
+            # (notifications have no response body). Return None to signal the
+            # handler to return an empty success response.
+            if resp.status_code in (202, 204) or not resp.content:
+                return None, resp.status_code, None
+
             try:
                 payload = resp.json()
                 return payload, resp.status_code, None
@@ -298,6 +304,26 @@ async def handle_mcp_post(request: web.Request) -> web.StreamResponse:
     payload, status, error = await _forward_to_upstream(body, headers, req_id)
 
     if payload is None:
+        # 202/204 with no payload = successful notification (no response body)
+        if status in (202, 204):
+            elapsed = time.time() - req_start
+            log.info(
+                f"[{request_id}] OK method={method} status={status} "
+                f"elapsed={elapsed:.3f}s (notification accepted)"
+            )
+            notif_headers = {}
+            if session_id and session_id in sessions:
+                notif_headers["Mcp-Session-Id"] = session_id
+            accept = request.headers.get("Accept", "")
+            if "text/event-stream" in accept:
+                return web.Response(
+                    status=202,
+                    content_type="text/event-stream",
+                    headers=notif_headers,
+                )
+            return web.Response(status=202, headers=notif_headers)
+
+        # Actual failure
         _metrics["requests_failed"] += 1
         elapsed = time.time() - req_start
         log.error(
