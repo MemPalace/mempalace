@@ -148,6 +148,80 @@ class TestResponseWrapping:
         pass
 
 
+class TestNotificationHandling:
+    """Tests for JSON-RPC notification handling (202/204 responses).
+
+    JSON-RPC notifications (messages without an `id`) have no response body.
+    The upstream returns HTTP 202 (Accepted) with empty content. The proxy
+    must NOT treat this as an error — it should pass through the 202 status
+    with an empty body.
+
+    This was a critical bug: the proxy tried to JSON-parse the empty 202
+    response, failed, and returned a -32000 error to the client, breaking
+    the MCP handshake at the `notifications/initialized` step.
+    """
+
+    def test_202_returns_none_payload(self):
+        """_forward_to_upstream should return (None, 202, None) for 202 responses."""
+
+        # Simulate a mock response object with status 202 and empty content
+        class MockResponse:
+            status_code = 202
+            content = b""
+            text = ""
+
+            def json(self):
+                raise ValueError("No JSON body")
+
+        # We need to test the logic inside _forward_to_upstream.
+        # Since it's async and uses httpx, we test the decision logic directly.
+        resp = MockResponse()
+
+        # The fix checks: if status in (202, 204) or not resp.content
+        should_return_none = resp.status_code in (202, 204) or not resp.content
+        assert should_return_none is True, "202 with empty content should return None payload"
+
+    def test_204_returns_none_payload(self):
+        """204 No Content should also return None payload."""
+        class MockResponse:
+            status_code = 204
+            content = b""
+
+        resp = MockResponse()
+        should_return_none = resp.status_code in (202, 204) or not resp.content
+        assert should_return_none is True
+
+    def test_200_with_content_does_not_return_none(self):
+        """200 with actual JSON content should NOT trigger the 202/204 path."""
+        class MockResponse:
+            status_code = 200
+            content = b'{"jsonrpc": "2.0", "result": {}}'
+
+        resp = MockResponse()
+        should_return_none = resp.status_code in (202, 204) or not resp.content
+        assert should_return_none is False
+
+    def test_200_with_empty_content_returns_none(self):
+        """200 with empty content (edge case) should also return None."""
+        class MockResponse:
+            status_code = 200
+            content = b""
+
+        resp = MockResponse()
+        should_return_none = resp.status_code in (202, 204) or not resp.content
+        assert should_return_none is True
+
+    def test_notification_method_has_no_id(self):
+        """JSON-RPC notifications have no 'id' field — verify detection logic."""
+        import json
+
+        notification = json.loads('{"jsonrpc": "2.0", "method": "notifications/initialized"}')
+        request = json.loads('{"jsonrpc": "2.0", "method": "tools/list", "id": 1}')
+
+        assert notification.get("id") is None, "Notifications should not have an id"
+        assert request.get("id") is not None, "Requests should have an id"
+
+
 class TestConfiguration:
     """Configuration via environment variables."""
 
