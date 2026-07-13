@@ -1,0 +1,41 @@
+# mempalace-watchdog.service — systemd unit for the auto-restart watchdog.
+#
+# Install:
+#   sudo cp deploy/proxy/mempalace-watchdog.service /etc/systemd/system/
+#   sudo cp deploy/proxy/mempalace-watchdog.sh /usr/local/bin/
+#   sudo chmod +x /usr/local/bin/mempalace-watchdog.sh
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now mempalace-watchdog
+#
+# The watchdog checks the MemPalace server every 30s and restarts it
+# if it becomes unresponsive. It complements the server's own
+# Restart=on-failure by also catching hangs (process alive but not
+# responding to JSON-RPC).
+
+[Unit]
+Description=MemPalace MCP Server Watchdog
+After=network-online.target mempalace-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mempalace
+Group=mempalace
+Environment=MEMPALACE_HOST=127.0.0.1
+Environment=MEMPALACE_PORT=8765
+# Environment=MEMPALACE_TOKEN=your-secret-token
+Environment=WATCHDOG_INTERVAL=30
+Environment=MAX_RESTARTS_PER_HOUR=5
+Environment=RESTART_COOLDOWN=60
+Environment=MEMPALACE_START_CMD=mempalace serve --host 0.0.0.0 --port 8765
+ExecStart=/usr/local/bin/mempalace-watchdog.sh
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
