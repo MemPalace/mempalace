@@ -2373,6 +2373,7 @@ def tool_search(
     max_distance: float = 1.5,
     min_similarity: float = None,
     context: str = None,
+    verify_authority: bool = False,
 ):
     limit = max(1, min(limit, _MAX_RESULTS))
     try:
@@ -2406,6 +2407,7 @@ def tool_search(
         max_distance=dist,
         vector_disabled=_vector_disabled,
         collection_name=_config.collection_name,
+        verify_authority=bool(verify_authority),
     )
     if _is_transient_index_error(result):
         # Post-bulk-write HNSW flush window (#1315): drop caches, give
@@ -2426,6 +2428,7 @@ def tool_search(
             max_distance=dist,
             vector_disabled=_vector_disabled,
             collection_name=_config.collection_name,
+            verify_authority=bool(verify_authority),
         )
         if not _is_transient_index_error(result):
             result["index_recovered"] = True
@@ -2915,7 +2918,14 @@ def _build_chunk_rows(drawer_id: str, content: str, meta: dict, chunk_size: int)
 
 
 def tool_add_drawer(
-    wing: str, room: str, content: str, source_file: str = None, added_by: str = "mcp"
+    wing: str,
+    room: str,
+    content: str,
+    source_file: str = None,
+    added_by: str = "mcp",
+    authority_uri: str = None,
+    authority_version: str = None,
+    memory_kind: str = None,
 ):
     """File verbatim content into a wing/room. Checks for duplicates first.
 
@@ -2937,6 +2947,9 @@ def tool_add_drawer(
         if source_file:
             source_file = strip_lone_surrogates(source_file)
         added_by = strip_lone_surrogates(added_by)
+        authority_uri = strip_lone_surrogates(authority_uri or "")
+        authority_version = strip_lone_surrogates(authority_version or "")
+        memory_kind = sanitize_name(memory_kind, "memory_kind") if memory_kind else ""
     except ValueError as e:
         return {"success": False, "error": str(e)}
 
@@ -2967,6 +2980,12 @@ def tool_add_drawer(
         "filed_at": datetime.now().isoformat(),
         "id_recipe": ID_RECIPE,
     }
+    if authority_uri:
+        base_meta["authority_uri"] = authority_uri
+    if authority_version:
+        base_meta["authority_version"] = authority_version
+    if memory_kind:
+        base_meta["memory_kind"] = memory_kind
 
     # Idempotency. Three cases to detect a prior committed write:
     # (a) Single-doc path: drawer_id row exists (the only id used).
@@ -4427,7 +4446,15 @@ def tool_checkpoint(items, diary=None, dedup_threshold=0.9, added_by=None):
         # string by the guard above) we still file rather than drop the
         # memory: verbatim recall is the priority and add_drawer's own
         # idempotency blocks exact duplicates.
-        res = tool_add_drawer(wing=wing, room=room, content=content, added_by=resolved_added_by)
+        res = tool_add_drawer(
+            wing=wing,
+            room=room,
+            content=content,
+            added_by=resolved_added_by,
+            authority_uri=item.get("authority_uri"),
+            authority_version=item.get("authority_version"),
+            memory_kind=item.get("memory_kind"),
+        )
         if res.get("success"):
             out["added"].append(res)
         else:
@@ -4988,6 +5015,10 @@ TOOLS = {
                     "type": "string",
                     "description": "Background context for the search (optional). NOT used for embedding — only for future re-ranking.",
                 },
+                "verify_authority": {
+                    "type": "boolean",
+                    "description": "Verify file:// or absolute-path authority version tokens. Adds current/stale/unverified status to each result.",
+                },
             },
             "required": ["query"],
         },
@@ -5024,6 +5055,18 @@ TOOLS = {
                 },
                 "source_file": {"type": "string", "description": "Where this came from (optional)"},
                 "added_by": {"type": "string", "description": "Who is filing this (default: mcp)"},
+                "authority_uri": {
+                    "type": "string",
+                    "description": "Canonical local file path or file:// URI (optional)",
+                },
+                "authority_version": {
+                    "type": "string",
+                    "description": "sha256:<hex> or mtime_ns:<integer> token (optional)",
+                },
+                "memory_kind": {
+                    "type": "string",
+                    "description": "Memory class such as decision, finding, or preference (optional)",
+                },
             },
             "required": ["wing", "room", "content"],
         },
@@ -5049,6 +5092,9 @@ TOOLS = {
                                 "type": "string",
                                 "description": "Verbatim content to store",
                             },
+                            "authority_uri": {"type": "string"},
+                            "authority_version": {"type": "string"},
+                            "memory_kind": {"type": "string"},
                         },
                         "required": ["wing", "room", "content"],
                     },

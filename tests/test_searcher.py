@@ -7,6 +7,8 @@ plus mock-based tests for error paths.
 
 import sqlite3
 from datetime import datetime
+import hashlib
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1533,3 +1535,67 @@ class TestCliSearchDateFilter:
 
         with pytest.raises(SearchError, match="must be earlier than"):
             search("anything", palace_path, since="2026-01-04", before="2026-01-01")
+
+
+def test_resolve_authority_status_detects_current_and_stale_file(tmp_path):
+    from mempalace.searcher import resolve_authority_status
+
+    authority = tmp_path / "plan.md"
+    authority.write_text("v1", encoding="utf-8")
+    version = f"sha256:{hashlib.sha256(authority.read_bytes()).hexdigest()}"
+    metadata = {"authority_uri": str(authority), "authority_version": version}
+
+    assert resolve_authority_status(metadata, verify=True)["status"] == "current"
+    authority.write_text("v2", encoding="utf-8")
+    stale = resolve_authority_status(metadata, verify=True)
+    assert stale["status"] == "stale"
+    assert stale["reason"] == "authority_changed"
+
+
+def test_resolve_authority_status_is_unverified_by_default(tmp_path):
+    from mempalace.searcher import resolve_authority_status
+
+    result = resolve_authority_status(
+        {"authority_uri": str(tmp_path / "plan.md"), "authority_version": "sha256:abc"}
+    )
+    assert result["status"] == "unverified"
+    assert result["reason"] == "verification_not_requested"
+
+
+def test_resolve_authority_status_decodes_local_file_uri(tmp_path):
+    from mempalace.searcher import resolve_authority_status
+
+    authority = tmp_path / "plan with spaces.md"
+    authority.write_text("v1", encoding="utf-8")
+    version = f"sha256:{hashlib.sha256(authority.read_bytes()).hexdigest()}"
+
+    result = resolve_authority_status(
+        {"authority_uri": authority.as_uri(), "authority_version": version}, verify=True
+    )
+
+    assert result["status"] == "current"
+    assert result["reason"] == "authority_matches"
+
+
+def test_resolve_authority_status_reuses_per_search_cache(tmp_path, monkeypatch):
+    from mempalace.searcher import resolve_authority_status
+
+    authority = tmp_path / "plan.md"
+    authority.write_text("v1", encoding="utf-8")
+    version = f"sha256:{hashlib.sha256(authority.read_bytes()).hexdigest()}"
+    metadata = {"authority_uri": authority.as_uri(), "authority_version": version}
+    original = Path.read_bytes
+    calls = 0
+
+    def counted(path):
+        nonlocal calls
+        calls += 1
+        return original(path)
+
+    monkeypatch.setattr(Path, "read_bytes", counted)
+    cache = {}
+    first = resolve_authority_status(metadata, verify=True, cache=cache)
+    second = resolve_authority_status(metadata, verify=True, cache=cache)
+
+    assert first == second
+    assert calls == 1

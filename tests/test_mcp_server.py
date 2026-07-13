@@ -2172,6 +2172,39 @@ class TestWriteTools:
         assert all(a["success"] for a in result["added"])
         assert result["diary"]["success"] is True
 
+    def test_checkpoint_forwards_authority_metadata(self, monkeypatch, config, kg):
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(
+            mcp_server, "tool_check_duplicate", lambda *_a, **_k: {"is_duplicate": False}
+        )
+        filed = {}
+
+        def _add(**kwargs):
+            filed.update(kwargs)
+            return {"success": True, "drawer_id": "d1"}
+
+        monkeypatch.setattr(mcp_server, "tool_add_drawer", _add)
+        result = mcp_server.tool_checkpoint(
+            items=[
+                {
+                    "wing": "w",
+                    "room": "decisions",
+                    "content": "Use the planner as authority.",
+                    "authority_uri": "file:///repo/planner/task.md",
+                    "authority_version": "sha256:abc",
+                    "memory_kind": "decision",
+                }
+            ],
+            added_by="planner-agent",
+        )
+
+        assert result["errors"] == []
+        assert filed["added_by"] == "planner-agent"
+        assert filed["authority_uri"] == "file:///repo/planner/task.md"
+        assert filed["authority_version"] == "sha256:abc"
+        assert filed["memory_kind"] == "decision"
+
     def test_checkpoint_skips_semantic_duplicates(self, monkeypatch, config, kg):
         from mempalace import mcp_server
 
