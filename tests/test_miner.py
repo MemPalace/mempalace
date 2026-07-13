@@ -1,3 +1,4 @@
+import hashlib
 import os
 import shlex
 import shutil
@@ -1208,6 +1209,7 @@ def test_process_file_uses_bounded_upsert_batches(tmp_path, monkeypatch):
     class FakeCol:
         def __init__(self):
             self.batch_sizes = []
+            self.metadatas = []
 
         def get(self, *args, **kwargs):
             return {"ids": []}
@@ -1217,6 +1219,7 @@ def test_process_file_uses_bounded_upsert_batches(tmp_path, monkeypatch):
 
         def upsert(self, documents, ids, metadatas):
             self.batch_sizes.append(len(documents))
+            self.metadatas.extend(metadatas)
 
     source = tmp_path / "src.py"
     source.write_text("print('hello')\n" * 20, encoding="utf-8")
@@ -1241,6 +1244,83 @@ def test_process_file_uses_bounded_upsert_batches(tmp_path, monkeypatch):
     assert room == "general"
     assert skip_reason is None
     assert col.batch_sizes == [2, 2, 1]
+    expected_version = f"sha256:{hashlib.sha256(source.read_bytes()).hexdigest()}"
+    assert {meta["authority_uri"] for meta in col.metadatas} == {source.resolve().as_uri()}
+    assert {meta["authority_version"] for meta in col.metadatas} == {expected_version}
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlink semantics require POSIX O_NOFOLLOW")
+def test_process_file_force_reindex_does_not_follow_symlink(tmp_path):
+    """A changed-set reindex must retain the normal no-follow source boundary."""
+    from mempalace import miner
+
+    project = tmp_path / "project"
+    project.mkdir()
+    outside = tmp_path / "outside.md"
+    outside.write_text("secret content " * 20, encoding="utf-8")
+    linked_source = project / "linked.md"
+    linked_source.symlink_to(outside)
+
+    added, room, reason = miner.process_file(
+        linked_source,
+        project,
+        object(),
+        "wing",
+        [{"name": "general", "description": "General"}],
+        "agent",
+        False,
+        force_reindex=True,
+    )
+
+    assert (added, room, reason) == (0, "general", None)
+
+
+def test_process_file_reindex_is_scoped_to_target_wing(tmp_path, collection, monkeypatch):
+    from mempalace import miner
+
+    source = tmp_path / "shared.md"
+    source.write_text("new canonical content " * 20, encoding="utf-8")
+    collection.upsert(
+        ids=["wing-a-old", "wing-b-preserved"],
+        documents=["old A", "stable B"],
+        metadatas=[
+            {
+                "wing": "wing-a",
+                "room": "general",
+                "source_file": str(source),
+                "chunk_index": 0,
+                "normalize_version": NORMALIZE_VERSION,
+                "source_mtime": 0.0,
+            },
+            {
+                "wing": "wing-b",
+                "room": "general",
+                "source_file": str(source),
+                "chunk_index": 0,
+                "normalize_version": NORMALIZE_VERSION,
+                "source_mtime": source.stat().st_mtime,
+            },
+        ],
+    )
+    monkeypatch.setattr(miner, "detect_hall", lambda _content: "documentation")
+    monkeypatch.setattr(miner, "_extract_entities_for_metadata", lambda _content: "")
+
+    added, _room, reason = miner.process_file(
+        source,
+        tmp_path,
+        collection,
+        "wing-a",
+        [{"name": "general", "description": "General"}],
+        "agent",
+        False,
+        force_reindex=True,
+    )
+
+    assert reason is None
+    assert added > 0
+    preserved = collection.get(ids=["wing-b-preserved"], include=["documents", "metadatas"])
+    assert preserved["documents"] == ["stable B"]
+    assert preserved["metadatas"][0]["wing"] == "wing-b"
 
 
 def test_process_file_stamps_chunk_total_for_completion_check(tmp_path, monkeypatch):
@@ -1540,7 +1620,14 @@ def test_process_file_cleans_partial_drawers_after_a_batch_upsert_failure(tmp_pa
             }
 
         def delete(self, where=None):
-            source_file = where.get("source_file") if where else None
+            source_file = None
+            if where:
+                if "source_file" in where:
+                    source_file = where["source_file"]
+                elif "$and" in where:
+                    for clause in where["$and"]:
+                        if "source_file" in clause:
+                            source_file = clause["source_file"]
             self.deleted_sources.append(source_file)
             self.records = [
                 record

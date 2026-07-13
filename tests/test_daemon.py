@@ -1379,6 +1379,38 @@ def test_safe_defer_swallows_store_errors_and_leaves_the_job_running(tmp_path, m
     assert runtime.store.get(job.id).state == "running"
 
 
+def test_run_sync_dispatches_changed_set_without_full_scan(tmp_path, monkeypatch):
+    import mempalace.changed_set as changed_set_module
+    from mempalace import service
+
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    (palace / "chroma.sqlite3").touch()
+    project = tmp_path / "project"
+    project.mkdir()
+    captured = {}
+
+    def fake_sync(**kwargs):
+        captured.update(kwargs)
+        return {"changed": 1, "deleted": 1, "reindexed": 1, "drawers_added": 2, "dry_run": False}
+
+    monkeypatch.setattr(changed_set_module, "sync_changed_sources", fake_sync)
+    result = service.run_sync(
+        {
+            "palace_path": str(palace),
+            "dir": str(project),
+            "wing": "demo",
+            "dry_run": False,
+            "changed_set": {"changed": ["a.py"], "deleted": ["old.py"]},
+        }
+    )
+
+    assert result["success"] is True
+    assert captured["project_root"] == str(project)
+    assert captured["changed"] == ["a.py"]
+    assert captured["deleted"] == ["old.py"]
+
+
 # --- post-merge review follow-ups (Copilot review on #1826) ---
 
 

@@ -337,9 +337,24 @@ def run_sync(payload: dict[str, Any]) -> dict[str, Any]:
     print(f"{'-' * 55}\n")
 
     try:
+        from .changed_set import sync_changed_sources
         from .sync import sync_palace
         from .wal import _wal_log
 
+        changed_set = payload.get("changed_set")
+        if changed_set is not None:
+            if not project_dirs:
+                raise ValueError("changed-set sync requires a project root")
+            report = sync_changed_sources(
+                palace_path=palace_path,
+                project_root=project_dirs[0],
+                changed=changed_set.get("changed") or [],
+                deleted=changed_set.get("deleted") or [],
+                wing=payload.get("wing"),
+                agent=payload.get("agent") or "mempalace",
+                dry_run=dry_run,
+            )
+            return {"success": True, "report": report, "exit_code": 0}
         report = sync_palace(
             palace_path=palace_path,
             project_dirs=project_dirs,

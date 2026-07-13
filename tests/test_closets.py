@@ -1519,6 +1519,7 @@ class TestDrawerGrepExpansion:
         # The hybrid path promotes the closet-agreeing source to drawer+closet.
         boosted = [h for h in result["results"] if h["matched_via"] == "drawer+closet"]
         assert boosted, "hybrid search should mark the closet-agreeing source"
+        assert len(boosted) == 1, "identical hydrated windows must collapse to one result"
         top = boosted[0]
         assert top["total_drawers"] == 5
         assert isinstance(top["drawer_index"], int)
