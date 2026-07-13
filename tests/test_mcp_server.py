@@ -2205,6 +2205,116 @@ class TestWriteTools:
         assert filed["authority_version"] == "sha256:abc"
         assert filed["memory_kind"] == "decision"
 
+    def test_supersede_drawer_marks_predecessor_without_deleting_it(self, monkeypatch):
+        from mempalace import mcp_server
+
+        writes = []
+
+        class FakeCollection:
+            def upsert(self, **kwargs):
+                writes.append(kwargs)
+
+        old = {
+            "ids": ["old"],
+            "documents": ["Use SQLite."],
+            "metadatas": [{"decision_key": "db/backend", "authority_status": "current"}],
+            "metadata": {"decision_key": "db/backend", "authority_status": "current"},
+        }
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda: FakeCollection())
+        monkeypatch.setattr(mcp_server, "_logical_drawer_record", lambda _col, _id: old)
+        monkeypatch.setattr(
+            mcp_server,
+            "tool_add_drawer",
+            lambda **_kwargs: {"success": True, "drawer_id": "new", "chunks": 1},
+        )
+        monkeypatch.setattr(mcp_server, "_wal_log", lambda *_a, **_k: None)
+
+        result = mcp_server.tool_supersede_drawer(
+            supersedes_id="old",
+            decision_key="db/backend",
+            wing="project",
+            room="decisions",
+            content="Use PostgreSQL.",
+        )
+
+        assert result["success"] is True
+        assert result["supersedes_id"] == "old"
+        assert writes[0]["ids"] == ["old"]
+        assert writes[0]["documents"] == ["Use SQLite."]
+        assert writes[0]["metadatas"][0]["authority_status"] == "superseded"
+        assert writes[0]["metadatas"][0]["superseded_by"] == "new"
+
+    def test_supersede_drawer_rejects_decision_key_mismatch(self, monkeypatch):
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda: object())
+        monkeypatch.setattr(
+            mcp_server,
+            "_logical_drawer_record",
+            lambda *_a: {"metadata": {"decision_key": "other"}},
+        )
+        result = mcp_server.tool_supersede_drawer(
+            supersedes_id="old",
+            decision_key="db/backend",
+            wing="project",
+            room="decisions",
+            content="Use PostgreSQL.",
+        )
+        assert result["success"] is False
+        assert "same non-empty decision_key" in result["error"]
+
+    def test_search_hides_superseded_by_default(self, monkeypatch):
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", lambda: None)
+        monkeypatch.setattr(
+            mcp_server,
+            "search_memories",
+            lambda *_a, **_k: {
+                "results": [
+                    {"text": "old", "authority": {"status": "superseded"}},
+                    {"text": "new", "authority": {"status": "current"}},
+                ],
+                "count": 2,
+            },
+        )
+        result = mcp_server.tool_search("database")
+        history = mcp_server.tool_search("database", include_superseded=True)
+        assert [hit["text"] for hit in result["results"]] == ["new"]
+        assert result["count"] == 1
+        assert history["count"] == 2
+
+    def test_checkpoint_supersession_bypasses_semantic_dedup(self, monkeypatch):
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(
+            mcp_server,
+            "tool_check_duplicate",
+            lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("dedup must be bypassed")),
+        )
+        captured = {}
+
+        def fake_supersede(**kwargs):
+            captured.update(kwargs)
+            return {"success": True, "drawer_id": "new"}
+
+        monkeypatch.setattr(mcp_server, "tool_supersede_drawer", fake_supersede)
+        result = mcp_server.tool_checkpoint(
+            items=[
+                {
+                    "wing": "w",
+                    "room": "decisions",
+                    "content": "Use PostgreSQL instead of SQLite.",
+                    "decision_key": "db/backend",
+                    "supersedes_id": "old",
+                }
+            ],
+            added_by="planner-agent",
+        )
+        assert result["errors"] == []
+        assert captured["supersedes_id"] == "old"
+        assert captured["added_by"] == "planner-agent"
+
     def test_checkpoint_skips_semantic_duplicates(self, monkeypatch, config, kg):
         from mempalace import mcp_server
 

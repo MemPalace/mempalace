@@ -420,6 +420,7 @@ _MUTATING_TOOLS = frozenset(
         "mempalace_delete_drawer",
         "mempalace_checkpoint",
         "mempalace_delete_by_source",
+        "mempalace_supersede_drawer",
         "mempalace_mine",
         "mempalace_sync",
         "mempalace_update_drawer",
@@ -2374,6 +2375,7 @@ def tool_search(
     min_similarity: float = None,
     context: str = None,
     verify_authority: bool = False,
+    include_superseded: bool = False,
 ):
     limit = max(1, min(limit, _MAX_RESULTS))
     try:
@@ -2446,6 +2448,13 @@ def tool_search(
         }
     if context:
         result["context_received"] = True
+    if not include_superseded and isinstance(result.get("results"), list):
+        result["results"] = [
+            hit
+            for hit in result["results"]
+            if (hit.get("authority") or {}).get("status") != "superseded"
+        ]
+        result["count"] = len(result["results"])
     return result
 
 
@@ -2926,6 +2935,7 @@ def tool_add_drawer(
     authority_uri: str = None,
     authority_version: str = None,
     memory_kind: str = None,
+    decision_key: str = None,
 ):
     """File verbatim content into a wing/room. Checks for duplicates first.
 
@@ -2950,6 +2960,7 @@ def tool_add_drawer(
         authority_uri = strip_lone_surrogates(authority_uri or "")
         authority_version = strip_lone_surrogates(authority_version or "")
         memory_kind = sanitize_name(memory_kind, "memory_kind") if memory_kind else ""
+        decision_key = strip_lone_surrogates(decision_key or "").strip()
     except ValueError as e:
         return {"success": False, "error": str(e)}
 
@@ -2986,6 +2997,9 @@ def tool_add_drawer(
         base_meta["authority_version"] = authority_version
     if memory_kind:
         base_meta["memory_kind"] = memory_kind
+    if decision_key:
+        base_meta["decision_key"] = decision_key
+        base_meta["authority_status"] = "current"
 
     # Idempotency. Three cases to detect a prior committed write:
     # (a) Single-doc path: drawer_id row exists (the only id used).
@@ -3069,6 +3083,76 @@ def tool_add_drawer(
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+def tool_supersede_drawer(
+    supersedes_id: str,
+    decision_key: str,
+    wing: str,
+    room: str,
+    content: str,
+    source_file: str = None,
+    added_by: str = "mcp",
+    authority_uri: str = None,
+    authority_version: str = None,
+    memory_kind: str = "decision",
+):
+    """Add a new decision drawer and explicitly mark its predecessor superseded."""
+    global _metadata_cache
+    col = _get_collection()
+    if not col:
+        return _collection_error_or_no_palace()
+    old = _logical_drawer_record(col, supersedes_id)
+    if old is None:
+        return {"success": False, "error": f"Drawer not found: {supersedes_id}"}
+    old_key = str((old.get("metadata") or {}).get("decision_key") or "")
+    if not decision_key or old_key != decision_key:
+        return {
+            "success": False,
+            "error": "supersession requires the same non-empty decision_key as the predecessor",
+        }
+
+    added = tool_add_drawer(
+        wing=wing,
+        room=room,
+        content=content,
+        source_file=source_file,
+        added_by=added_by,
+        authority_uri=authority_uri,
+        authority_version=authority_version,
+        memory_kind=memory_kind,
+        decision_key=decision_key,
+    )
+    if not added.get("success"):
+        return added
+    replacement_id = added["drawer_id"]
+    if replacement_id == supersedes_id:
+        return {"success": False, "error": "replacement content resolves to predecessor drawer id"}
+
+    updated_metas = []
+    for metadata in old["metadatas"]:
+        updated_metas.append(
+            {
+                **_safe_meta(metadata),
+                "authority_status": "superseded",
+                "superseded_by": replacement_id,
+            }
+        )
+    col.upsert(ids=old["ids"], documents=old["documents"], metadatas=updated_metas)
+    _wal_log(
+        "supersede_drawer",
+        {
+            "drawer_id": supersedes_id,
+            "superseded_by": replacement_id,
+            "decision_key": decision_key,
+        },
+    )
+    _metadata_cache = None
+    return {
+        **added,
+        "supersedes_id": supersedes_id,
+        "decision_key": decision_key,
+    }
 
 
 def tool_delete_drawer(drawer_id: str):
@@ -4438,23 +4522,34 @@ def tool_checkpoint(items, diary=None, dedup_threshold=0.9, added_by=None):
                 {"item": item, "error": "wing, room, content must be non-empty strings"}
             )
             continue
-        dup = tool_check_duplicate(content, threshold=dedup_threshold)
-        if dup.get("is_duplicate"):
-            out["duplicates"].append({"room": room, "matches": dup.get("matches", [])})
-            continue
+        # Explicit version transitions must not be blocked by semantic dedup:
+        # replacement decisions are often intentionally similar to predecessors.
+        if not item.get("supersedes_id"):
+            dup = tool_check_duplicate(content, threshold=dedup_threshold)
+            if dup.get("is_duplicate"):
+                out["duplicates"].append({"room": room, "matches": dup.get("matches", [])})
+                continue
         # On a dedup error (genuine index failure — content is guaranteed a
         # string by the guard above) we still file rather than drop the
         # memory: verbatim recall is the priority and add_drawer's own
         # idempotency blocks exact duplicates.
-        res = tool_add_drawer(
-            wing=wing,
-            room=room,
-            content=content,
-            added_by=resolved_added_by,
-            authority_uri=item.get("authority_uri"),
-            authority_version=item.get("authority_version"),
-            memory_kind=item.get("memory_kind"),
-        )
+        common = {
+            "wing": wing,
+            "room": room,
+            "content": content,
+            "added_by": resolved_added_by,
+            "authority_uri": item.get("authority_uri"),
+            "authority_version": item.get("authority_version"),
+            "memory_kind": item.get("memory_kind"),
+            "decision_key": item.get("decision_key"),
+        }
+        if item.get("supersedes_id"):
+            res = tool_supersede_drawer(
+                supersedes_id=item["supersedes_id"],
+                **common,
+            )
+        else:
+            res = tool_add_drawer(**common)
         if res.get("success"):
             out["added"].append(res)
         else:
@@ -5019,6 +5114,10 @@ TOOLS = {
                     "type": "boolean",
                     "description": "Verify file:// or absolute-path authority version tokens. Adds current/stale/unverified status to each result.",
                 },
+                "include_superseded": {
+                    "type": "boolean",
+                    "description": "Include explicitly superseded decision drawers (default false)",
+                },
             },
             "required": ["query"],
         },
@@ -5067,6 +5166,10 @@ TOOLS = {
                     "type": "string",
                     "description": "Memory class such as decision, finding, or preference (optional)",
                 },
+                "decision_key": {
+                    "type": "string",
+                    "description": "Stable logical key for a versioned decision (optional)",
+                },
             },
             "required": ["wing", "room", "content"],
         },
@@ -5095,6 +5198,8 @@ TOOLS = {
                             "authority_uri": {"type": "string"},
                             "authority_version": {"type": "string"},
                             "memory_kind": {"type": "string"},
+                            "decision_key": {"type": "string"},
+                            "supersedes_id": {"type": "string"},
                         },
                         "required": ["wing", "room", "content"],
                     },
@@ -5124,6 +5229,26 @@ TOOLS = {
             "required": ["items"],
         },
         "handler": tool_checkpoint,
+    },
+    "mempalace_supersede_drawer": {
+        "description": "Create a replacement decision and explicitly preserve its predecessor as superseded history.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "supersedes_id": {"type": "string"},
+                "decision_key": {"type": "string"},
+                "wing": {"type": "string"},
+                "room": {"type": "string"},
+                "content": {"type": "string"},
+                "source_file": {"type": "string"},
+                "added_by": {"type": "string"},
+                "authority_uri": {"type": "string"},
+                "authority_version": {"type": "string"},
+                "memory_kind": {"type": "string"},
+            },
+            "required": ["supersedes_id", "decision_key", "wing", "room", "content"],
+        },
+        "handler": tool_supersede_drawer,
     },
     "mempalace_delete_drawer": {
         "description": "Delete a drawer by ID. Irreversible.",

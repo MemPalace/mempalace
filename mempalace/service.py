@@ -88,6 +88,7 @@ WRITE_TOOLS = frozenset(
         "mempalace_checkpoint",
         "mempalace_delete_by_source",
         "mempalace_delete_drawer",
+        "mempalace_supersede_drawer",
         "mempalace_update_drawer",
         "mempalace_diary_write",
         "mempalace_kg_add",

@@ -58,8 +58,11 @@ Semantic search. Returns verbatim drawer content with similarity scores.
 | `limit` | integer | No | Max results (default: 5) |
 | `wing` | string | No | Filter by wing |
 | `room` | string | No | Filter by room |
+| `source_file` | string | No | Exact full source path filter |
+| `verify_authority` | boolean | No | Resolve supported local authority version and return current/stale/unverified status |
+| `include_superseded` | boolean | No | Include explicitly superseded decision history (default false) |
 
-**Returns:** `{ query, filters, results: [{ text, wing, room, source_file, similarity }] }`
+**Returns:** `{ query, filters, results: [{ text, wing, room, source_file, similarity, authority }] }`
 
 ---
 
@@ -101,6 +104,10 @@ File verbatim content into the palace. Identical content (same deterministic dra
 | `content` | string | **Yes** | Verbatim content to store |
 | `source_file` | string | No | Where this came from |
 | `added_by` | string | No | Who is filing (default: "mcp") |
+| `authority_uri` | string | No | Canonical absolute local path or `file://` URI |
+| `authority_version` | string | No | `sha256:<hex>` or `mtime_ns:<integer>` token |
+| `memory_kind` | string | No | Memory class such as `decision` or `finding` |
+| `decision_key` | string | No | Stable logical key for a versioned decision |
 
 **Returns:** `{ success, drawer_id, wing, room }`
 
@@ -112,12 +119,36 @@ Save a whole session in one call. Semantic-dedups each item, files the non-dupli
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `items` | array | **Yes** | Verbatim items to file. Each is `{ wing, room, content }` |
+| `items` | array | **Yes** | Verbatim items to file. Supports authority fields plus `decision_key` and explicit `supersedes_id` |
 | `diary` | object | No | Diary entry written after filing: `{ agent_name, entry, topic?, wing? }` (`entry` is AAAK-format) |
 | `dedup_threshold` | number | No | Similarity threshold 0–1 for the per-item dedup check (default 0.9) |
 | `added_by` | string | No | Who is filing these drawers. An explicit value takes precedence; otherwise the diary `agent_name`, else `checkpoint` |
 
 **Returns:** `{ added: [...], duplicates: [...], errors: [...], diary? }`
+
+---
+
+### `mempalace_supersede_drawer`
+
+Create a replacement decision while preserving its predecessor as explicit
+history. The predecessor must carry the same non-empty `decision_key`; semantic
+similarity alone never triggers supersession.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `supersedes_id` | string | **Yes** | Logical drawer ID of the predecessor |
+| `decision_key` | string | **Yes** | Stable decision identity; must match predecessor |
+| `wing` | string | **Yes** | Wing for the replacement |
+| `room` | string | **Yes** | Room for the replacement |
+| `content` | string | **Yes** | New verbatim decision content |
+| `authority_uri` | string | No | Canonical local authority |
+| `authority_version` | string | No | Authority version token |
+
+The predecessor receives `authority_status=superseded` and
+`superseded_by=<new drawer id>`. Default MCP search hides it;
+`include_superseded=true` returns the historical record.
+
+**Returns:** `{ success, drawer_id, supersedes_id, decision_key, ... }`
 
 ---
 
