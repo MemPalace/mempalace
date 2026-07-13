@@ -1,4 +1,8 @@
+import json
 import os
+import sys
+import threading
+import types
 
 import pytest
 
@@ -14,9 +18,13 @@ from mempalace.backends import (
 )
 from mempalace.backends.pgvector import (
     PgVectorBackend,
+    _PgVectorClient,
+    _PgVectorConfig,
     _matches_where,
     _vector_distance,
     _as_vector_array,
+    _strip_nul,
+    _json_dumps,
 )
 
 
@@ -34,6 +42,7 @@ class _FakePgVectorClient:
     def __init__(self, _config):
         self.tables: dict = {}
         self.query_calls: list = []
+        self.scroll_calls: list = []
         _FakePgVectorClient.instances.append(self)
 
     def ping(self):
@@ -84,13 +93,35 @@ class _FakePgVectorClient:
             out.append(item)
         return out
 
-    def scroll_rows(self, table, *, where=None, with_embedding=False):
+    def scroll_rows(
+        self,
+        table,
+        *,
+        where=None,
+        with_embedding=False,
+        with_document=True,
+        limit=None,
+        offset=None,
+    ):
+        self.scroll_calls.append(
+            {"where": where, "limit": limit, "offset": offset, "with_document": with_document}
+        )
+        rows = self._filtered(table, where)
+        if limit is not None or offset:
+            # Mirror the real backend: ORDER BY id, then LIMIT/OFFSET.
+            rows = sorted(rows, key=lambda row: row["id"])
+            if offset:
+                rows = rows[offset:]
+            if limit is not None:
+                rows = rows[:limit]
         out = []
-        for row in self._filtered(table, where):
+        for row in rows:
             out.append(
                 {
                     "id": row["id"],
-                    "document": row["document"],
+                    # Match the real backend: NULL document becomes empty string
+                    # via the SELECT NULL::text projection when with_document=False.
+                    "document": row["document"] if with_document else "",
                     "metadata": row.get("metadata") or {},
                     "embedding": row.get("embedding") if with_embedding else None,
                     "distance": None,
@@ -357,6 +388,179 @@ def test_pgvector_get_limit_offset_and_embeddings(tmp_path, fake_pgvector):
     assert page.embeddings is not None and len(page.embeddings[0]) == 2
 
 
+def test_pgvector_get_unfiltered_page_pushes_limit_offset(tmp_path, fake_pgvector):
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a", "b", "c", "d"],
+        documents=["da", "db", "dc", "dd"],
+        metadatas=[{"wing": "x"}, {"wing": "x"}, {"wing": "x"}, {"wing": "x"}],
+        embeddings=[[1, 0], [0, 1], [0.5, 0.5], [0.2, 0.8]],
+    )
+    client = fake_pgvector.instances[0]
+    client.scroll_calls.clear()
+
+    page = col.get(limit=2, offset=1, include=["metadatas"])
+
+    # An unfiltered page is pushed to SQL as LIMIT/OFFSET instead of fetching
+    # the whole table and slicing in Python (the O(rows x pages) path).
+    assert client.scroll_calls == [{"where": None, "limit": 2, "offset": 1, "with_document": True}]
+    # ORDER BY id, then OFFSET 1 LIMIT 2 -> b, c.
+    assert page.ids == ["b", "c"]
+
+
+def test_pgvector_get_filtered_page_stays_on_full_scan(tmp_path, fake_pgvector):
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a", "b", "c"],
+        documents=["da", "db", "dc"],
+        metadatas=[{"wing": "x"}, {"wing": "y"}, {"wing": "x"}],
+        embeddings=[[1, 0], [0, 1], [0.5, 0.5]],
+    )
+    client = fake_pgvector.instances[0]
+    client.scroll_calls.clear()
+
+    page = col.get(where={"wing": "x"}, limit=1, offset=1, include=["metadatas"])
+
+    # A filtered get keeps the full-scan path (no LIMIT/OFFSET pushed) so the
+    # exact _matches_where re-filter runs before pagination.
+    assert client.scroll_calls == [
+        {"where": {"wing": "x"}, "limit": None, "offset": None, "with_document": True}
+    ]
+    assert page.ids == ["c"]
+
+
+def test_pgvector_get_offset_only_and_limit_only_push(tmp_path, fake_pgvector):
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a", "b", "c", "d"],
+        documents=["da", "db", "dc", "dd"],
+        metadatas=[{"wing": "x"}] * 4,
+        embeddings=[[1, 0], [0, 1], [0.5, 0.5], [0.2, 0.8]],
+    )
+    client = fake_pgvector.instances[0]
+
+    # offset-only (limit=None) is pushed.
+    client.scroll_calls.clear()
+    page = col.get(offset=2, include=["metadatas"])
+    assert client.scroll_calls == [
+        {"where": None, "limit": None, "offset": 2, "with_document": True}
+    ]
+    assert page.ids == ["c", "d"]
+
+    # limit-only (offset=None) is pushed.
+    client.scroll_calls.clear()
+    page = col.get(limit=2, include=["metadatas"])
+    assert client.scroll_calls == [
+        {"where": None, "limit": 2, "offset": None, "with_document": True}
+    ]
+    assert page.ids == ["a", "b"]
+
+
+def test_pgvector_get_negative_bounds_use_python_slice(tmp_path, fake_pgvector):
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a", "b", "c"],
+        documents=["da", "db", "dc"],
+        metadatas=[{"wing": "x"}] * 3,
+        embeddings=[[1, 0], [0, 1], [0.5, 0.5]],
+    )
+    client = fake_pgvector.instances[0]
+    client.scroll_calls.clear()
+
+    # A negative offset must not reach SQL (OFFSET -1 would error); it falls
+    # through to the unchanged full-scan + Python-slice path.
+    page = col.get(offset=-1, include=["metadatas"])
+    assert client.scroll_calls == [
+        {"where": None, "limit": None, "offset": None, "with_document": True}
+    ]
+    assert page.ids == ["c"]
+
+
+def test_pgvector_get_pages_tile_without_overlap(tmp_path, fake_pgvector):
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a", "b", "c", "d", "e"],
+        documents=["da", "db", "dc", "dd", "de"],
+        metadatas=[{"wing": "x"}] * 5,
+        embeddings=[[1, 0], [0, 1], [0.5, 0.5], [0.2, 0.8], [0.3, 0.7]],
+    )
+    # Consecutive pages tile the whole table exactly once, in stable id order.
+    p1 = col.get(limit=2, offset=0, include=["metadatas"]).ids
+    p2 = col.get(limit=2, offset=2, include=["metadatas"]).ids
+    p3 = col.get(limit=2, offset=4, include=["metadatas"]).ids
+    assert p1 == ["a", "b"]
+    assert p2 == ["c", "d"]
+    assert p3 == ["e"]
+    assert p1 + p2 + p3 == ["a", "b", "c", "d", "e"]
+
+
+def test_pgvector_get_all_metadata_skips_document_column(tmp_path, fake_pgvector):
+    """The metadata-only fast path must NOT pull document text over the wire.
+
+    Default base ``get_all_metadata`` pages through ``get(include=["metadatas"])``,
+    which used to route here via scroll_rows with documents always selected — the
+    "separate follow-up" #1840 flagged. This override calls scroll_rows with
+    with_document=False so the SELECT projects NULL into the document slot,
+    dropping per-row payload for remote (TLS over WAN) clients where status
+    otherwise dominates wall time.
+    """
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a", "b", "c"],
+        documents=["doc_a", "doc_b", "doc_c"],
+        metadatas=[
+            {"wing": "p", "room": "backend"},
+            {"wing": "p", "room": "frontend"},
+            {"wing": "q", "room": "backend"},
+        ],
+        embeddings=[[1, 0], [0, 1], [0.5, 0.5]],
+    )
+    client = fake_pgvector.instances[0]
+    client.scroll_calls.clear()
+
+    metas = col.get_all_metadata()
+
+    # Exactly one scroll, with_document=False (no document text on the wire).
+    assert client.scroll_calls == [
+        {"where": None, "limit": None, "offset": None, "with_document": False}
+    ]
+    # Returns just the metadata dicts (full set, any order — sort by wing+room for stability).
+    metas_sorted = sorted(metas, key=lambda m: (m["wing"], m["room"]))
+    assert metas_sorted == [
+        {"wing": "p", "room": "backend"},
+        {"wing": "p", "room": "frontend"},
+        {"wing": "q", "room": "backend"},
+    ]
+
+
+def test_pgvector_get_all_metadata_filtered_uses_fast_path(tmp_path, fake_pgvector):
+    """Filtered get_all_metadata uses the single-pass metadata-only fast path.
+
+    ``_matches_where`` only reads ``metadata``, so we keep ``with_document=False``
+    and apply the post-filter locally on the metadata dicts. SQL pushdown still
+    happens when the filter is pushdownable; the local ``_matches_where`` re-runs
+    for array/object semantics #1840's filtered path required.
+    """
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a", "b", "c"],
+        documents=["doc_a", "doc_b", "doc_c"],
+        metadatas=[{"wing": "x"}, {"wing": "y"}, {"wing": "x"}],
+        embeddings=[[1, 0], [0, 1], [0.5, 0.5]],
+    )
+    client = fake_pgvector.instances[0]
+    client.scroll_calls.clear()
+
+    metas = col.get_all_metadata(where={"wing": "x"})
+
+    # Exactly one scroll with with_document=False — pushdown forwards the
+    # equality filter to SQL; no document text on the wire.
+    assert client.scroll_calls == [
+        {"where": {"wing": "x"}, "limit": None, "offset": None, "with_document": False}
+    ]
+    assert sorted(metas, key=lambda m: m["wing"]) == [{"wing": "x"}, {"wing": "x"}]
+
+
 def test_pgvector_delete_by_where_pushdown_and_local(tmp_path, fake_pgvector):
     _backend, col = _collection(tmp_path)
     col.add(
@@ -509,3 +713,350 @@ def test_pgvector_live_roundtrip_when_enabled(tmp_path):
         except Exception:
             pass
         backend.close()
+
+
+def test_client_concurrent_first_connect_single_connection(monkeypatch):
+    """Two threads racing ``_execute`` through the first ``_connect`` must end
+    up on one shared connection.
+
+    The barrier inside the fake ``psycopg.connect`` releases immediately only
+    when both threads pass the ``self._conn is None`` check together: the
+    broken interleaving, which created two connections, leaked the loser, and
+    ran the threads on different connections. With ``_connect`` under
+    ``self._lock`` the second thread blocks on the lock, the winner's barrier
+    times out, and the loser reuses the winner's connection.
+    """
+    created = []
+    barrier = threading.Barrier(2)
+
+    class _FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def execute(self, sql, params=None):
+            return None
+
+        def executemany(self, sql, params=None):
+            return None
+
+        def fetchall(self):
+            return [(1,)]
+
+    class _FakeConn:
+        def __init__(self):
+            self.closed = False
+
+        def cursor(self):
+            return _FakeCursor()
+
+        def commit(self):
+            return None
+
+        def rollback(self):
+            return None
+
+        def close(self):
+            self.closed = True
+
+    fake_psycopg = types.ModuleType("psycopg")
+
+    def racing_connect(dsn):
+        try:
+            barrier.wait(timeout=1.0)
+        except threading.BrokenBarrierError:
+            pass
+        conn = _FakeConn()
+        created.append(conn)
+        return conn
+
+    fake_psycopg.connect = racing_connect
+    monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
+
+    client = _PgVectorClient(_PgVectorConfig(dsn="postgresql://localhost/unused", namespace=None))
+    errors = []
+
+    def run_query():
+        try:
+            client.ping()
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run_query, daemon=True) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert not any(t.is_alive() for t in threads)
+    assert errors == []
+    assert len(created) == 1
+    assert client._conn is created[0]
+
+    client.close()
+    assert created[0].closed
+
+
+def test_client_execute_after_close_raises(monkeypatch):
+    """``close()`` is terminal: a stale client reference must get an error
+    instead of silently reconnecting and leaking a session nobody closes."""
+    created = []
+
+    class _FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def execute(self, sql, params=None):
+            return None
+
+        def fetchall(self):
+            return [(1,)]
+
+    class _FakeConn:
+        def __init__(self):
+            self.closed = False
+
+        def cursor(self):
+            return _FakeCursor()
+
+        def commit(self):
+            return None
+
+        def close(self):
+            self.closed = True
+
+    fake_psycopg = types.ModuleType("psycopg")
+
+    def fake_connect(dsn):
+        conn = _FakeConn()
+        created.append(conn)
+        return conn
+
+    fake_psycopg.connect = fake_connect
+    monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
+
+    client = _PgVectorClient(_PgVectorConfig(dsn="postgresql://localhost/unused", namespace=None))
+    client.ping()
+    assert len(created) == 1
+
+    client.close()
+    assert created[0].closed
+
+    with pytest.raises(BackendError, match="closed"):
+        client.ping()
+    assert len(created) == 1
+
+
+class _FakeUpsertCursor:
+    """Captures the params bound by ``upsert_rows`` -> ``_execute(many=True)``."""
+
+    def __init__(self, captured):
+        self._captured = captured
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params=None):
+        return None
+
+    def executemany(self, sql, params=None):
+        self._captured.extend(params or [])
+
+    def fetchall(self):
+        return []
+
+
+class _FakeUpsertConn:
+    def __init__(self, captured):
+        self._captured = captured
+
+    def cursor(self):
+        return _FakeUpsertCursor(self._captured)
+
+    def commit(self):
+        return None
+
+    def rollback(self):
+        return None
+
+    def close(self):
+        return None
+
+
+def _fake_upsert_client(monkeypatch):
+    """Install a fake psycopg whose connection captures bound params, and return
+    ``(client, captured)`` for driving the real ``upsert_rows`` write path."""
+    captured = []
+    fake_psycopg = types.ModuleType("psycopg")
+    fake_psycopg.connect = lambda *args, **kwargs: _FakeUpsertConn(captured)
+    monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
+    client = _PgVectorClient(_PgVectorConfig(dsn="postgresql://localhost/unused", namespace=None))
+    return client, captured
+
+
+def test_pgvector_upsert_strips_nul_bytes(monkeypatch):
+    """A NUL (0x00) byte in id/document/metadata must never reach Postgres.
+
+    psycopg's text/jsonb dumpers reject NUL outright ("PostgreSQL text fields
+    cannot contain NUL (0x00) bytes"), which aborts the entire mine run (#1829)
+    when a single transcript captured a NUL in tool output. ChromaDB and the
+    SQLite backend store the byte verbatim, so pgvector strips it to keep the
+    same inputs ingestible. Strip, not reject: rejecting would re-abort the
+    mine or drop the drawer entirely (recall loss).
+    """
+    client, captured = _fake_upsert_client(monkeypatch)
+    client.upsert_rows(
+        "drawers",
+        [
+            {
+                "id": "draw\x00er",
+                "document": "before\x00after",
+                "metadata": {"go\x00od": "v\x00w", "nested": ["a\x00b", 7]},
+                "embedding": [1.0, 0.0],
+                "updated_at": "2026-06-20T00:00:00Z",
+            }
+        ],
+    )
+
+    assert len(captured) == 1, "upsert_rows should bind exactly one row"
+    row_id, document, metadata_json = captured[0][0], captured[0][1], captured[0][2]
+
+    # No NUL survives into any text-bound parameter (id, document, metadata).
+    assert "\x00" not in row_id
+    assert "\x00" not in document
+    assert "\x00" not in metadata_json
+
+    # Stripping removes only the NUL; surrounding content is otherwise preserved.
+    assert row_id == "drawer"
+    assert document == "beforeafter"
+    assert json.loads(metadata_json) == {"good": "vw", "nested": ["ab", 7]}
+
+
+def test_strip_nul_helper():
+    """``_strip_nul`` removes NUL from strings, list/tuple items, and dict keys
+    and values; NUL-free input and non-string scalars are returned unchanged."""
+    assert _strip_nul("a\x00b") == "ab"
+    assert _strip_nul("clean") == "clean"
+    assert _strip_nul("") == ""
+    assert _strip_nul("\x00") == ""
+    # Keys, values, list items, and nested structures are all stripped.
+    assert _strip_nul({"k\x00": "v\x00", "n": [1, "x\x00y"]}) == {"k": "v", "n": [1, "xy"]}
+    assert _strip_nul([{"a\x00": "b\x00"}, "c\x00"]) == [{"a": "b"}, "c"]
+    # Tuples recurse too and stay tuples (defends direct callers that pass
+    # un-normalized metadata before the JSON round-trip).
+    assert _strip_nul(("a\x00b", 1, ["c\x00"])) == ("ab", 1, ["c"])
+    # Keys differing only by a NUL collapse, last wins (documented, harmless:
+    # real metadata keys are fixed field names, never NUL-only-distinguished).
+    assert _strip_nul({"a\x00": 1, "a": 2}) == {"a": 2}
+    # Non-string scalars pass through unchanged (bool stays bool, not int).
+    assert _strip_nul(7) == 7
+    assert _strip_nul(3.5) == 3.5
+    assert _strip_nul(True) is True
+    assert _strip_nul(None) is None
+
+
+def test_pgvector_upsert_replaces_lone_surrogates(monkeypatch):
+    """A lone UTF-16 surrogate in id/document/metadata must never reach Postgres.
+
+    psycopg encodes text/jsonb parameters as UTF-8, and a lone surrogate has no
+    UTF-8 encoding, so it raises UnicodeEncodeError ("surrogates not allowed") and
+    aborts the entire mine run (the surrogate sibling of the NUL abort in #1829).
+    ChromaDB sanitizes document text via config.strip_lone_surrogates;
+    pgvector matches it (for document and metadata) by replacing the surrogate with
+    U+FFFD rather than dropping the drawer (recall loss) or re-aborting the mine.
+    """
+    # Build the surrogates with chr() so this source file stays valid UTF-8 (a raw
+    # lone surrogate has no UTF-8 encoding and would not parse).
+    hi, lo, s3, s4, s5 = (chr(c) for c in (0xD800, 0xDFFF, 0xD834, 0xDCA1, 0xDC00))
+    repl = chr(0xFFFD)
+    client, captured = _fake_upsert_client(monkeypatch)
+    client.upsert_rows(
+        "drawers",
+        [
+            {
+                "id": f"draw{hi}er",
+                "document": f"before{lo}after",
+                "metadata": {f"go{s3}od": f"v{s4}w", "nested": [f"a{s5}b", 7]},
+                "embedding": [1.0, 0.0],
+                "updated_at": "2026-06-20T00:00:00Z",
+            }
+        ],
+    )
+
+    assert len(captured) == 1, "upsert_rows should bind exactly one row"
+    row_id, document, metadata_json = captured[0][0], captured[0][1], captured[0][2]
+
+    # Every text-bound parameter must now be UTF-8 encodable (what psycopg does to
+    # bind it); a surviving lone surrogate would raise here.
+    for field in (row_id, document, metadata_json):
+        field.encode("utf-8")
+
+    # Surrogates are replaced with U+FFFD, not dropped: surrounding content stays
+    # and each lone surrogate maps to exactly one replacement character.
+    assert row_id == f"draw{repl}er"
+    assert document == f"before{repl}after"
+    assert json.loads(metadata_json) == {f"go{repl}od": f"v{repl}w", "nested": [f"a{repl}b", 7]}
+
+
+def test_pgvector_upsert_strips_nul_and_surrogate_together(monkeypatch):
+    """A single row carrying *both* a NUL and a lone surrogate must come out
+    clean on every text-bound field.
+
+    This pins the composition of the two sibling fixes (#1829 NUL, #1833
+    surrogate), which edit the same ``upsert_rows`` binding: NUL is stripped
+    pre-serialization and the surrogate replaced post-serialization. A rebase
+    that kept only one strip would regress the other byte class silently, since
+    neither sibling test exercises both at once.
+    """
+    sur = chr(0xD800)
+    repl = chr(0xFFFD)
+    client, captured = _fake_upsert_client(monkeypatch)
+    client.upsert_rows(
+        "drawers",
+        [
+            {
+                "id": f"id\x00{sur}x",
+                "document": f"doc\x00{sur}y",
+                "metadata": {f"k\x00{sur}": f"v\x00{sur}", "nested": [f"a\x00{sur}b", 7]},
+                "embedding": [1.0, 0.0],
+                "updated_at": "2026-06-20T00:00:00Z",
+            }
+        ],
+    )
+
+    assert len(captured) == 1, "upsert_rows should bind exactly one row"
+    row_id, document, metadata_json = captured[0][0], captured[0][1], captured[0][2]
+
+    # Neither unstorable byte survives, and each bound field is UTF-8 encodable.
+    for field in (row_id, document, metadata_json):
+        assert "\x00" not in field
+        assert sur not in field
+        field.encode("utf-8")
+
+    # NUL dropped, surrogate -> U+FFFD, surrounding content preserved.
+    assert row_id == f"id{repl}x"
+    assert document == f"doc{repl}y"
+    assert json.loads(metadata_json) == {f"k{repl}": f"v{repl}", "nested": [f"a{repl}b", 7]}
+
+
+def test_strip_lone_surrogates_reuses_config_util():
+    """The pgvector write path strips surrogates via ``config.strip_lone_surrogates``
+    applied to id/document and the serialized metadata JSON (no pgvector-local
+    helper). End-to-end coverage is ``test_pgvector_upsert_replaces_lone_surrogates``;
+    the utility's own edge cases live in ``tests/test_clean_lone_surrogates.py``."""
+    from mempalace.config import strip_lone_surrogates
+
+    # ensure_ascii=False leaves a metadata surrogate raw in the JSON, so a single
+    # pass over the serialized string cleans it (the property the write path relies on).
+    raw = _json_dumps({"k": f"v{chr(0xD800)}w"})
+    cleaned = strip_lone_surrogates(raw)
+    assert chr(0xD800) not in cleaned
+    assert json.loads(cleaned) == {"k": f"v{chr(0xFFFD)}w"}

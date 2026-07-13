@@ -19,14 +19,21 @@ HOOK_CONFIG = REPO_ROOT / ".claude-plugin" / "hooks" / "hooks.json"
 # timeout of 60s in mempalace/hooks_cli.py. The hook-level floor of 60
 # keeps the inner bound from being truncated, and the ceiling of 90
 # bounds the worst case at ~30s above that.
+# SessionEnd backgrounds all of its work in the shell wrapper — the foreground
+# only forks the detached child and returns in milliseconds — so its timeout is
+# a generous backstop on a near-instant operation, not a synchronous-work bound
+# like Stop/PreCompact. A bound is still required (#1465) so a wedged fork can
+# never fall back to the 600s command default.
 EVENT_TIMEOUT_BOUNDS: dict[str, tuple[int, int]] = {
     "Stop": (10, 30),
+    "SessionEnd": (5, 30),
     "PreCompact": (60, 90),
 }
 
-EXPECTED_DIRECT_COMMANDS: dict[str, str] = {
-    "Stop": "mempalace hook run --hook stop --harness claude-code",
-    "PreCompact": "mempalace hook run --hook pre-compact --harness claude-code",
+WRAPPER_SCRIPTS = {
+    "Stop": "mempal-stop-hook.sh",
+    "SessionEnd": "mempal-session-end-hook.sh",
+    "PreCompact": "mempal-precompact-hook.sh",
 }
 
 
@@ -93,19 +100,33 @@ def test_no_unbounded_events_in_plugin_config(hook_config: dict) -> None:
     )
 
 
-@pytest.mark.parametrize("event, expected_command", sorted(EXPECTED_DIRECT_COMMANDS.items()))
-def test_plugin_hooks_use_direct_cross_platform_commands(
-    hook_config: dict, event: str, expected_command: str
-) -> None:
-    """Plugin hook commands should not shell through bash wrappers (#1660).
+def test_session_end_hook_uses_background_wrapper(hook_config: dict) -> None:
+    """Claude SessionEnd should use the backgrounding wrapper, not PreCompact."""
+    events = hook_config.get("hooks", {})
 
-    Windows expands ``CLAUDE_PLUGIN_ROOT`` to a backslash path. Passing that
-    path through ``bash "${CLAUDE_PLUGIN_ROOT}/hooks/..."`` mangles the hook
-    script path before execution. Calling ``mempalace hook run`` directly keeps
-    the same hook behavior without depending on shell path translation.
-    """
-    entries = hook_config["hooks"][event]
-    assert len(entries) == 1, f"{event} expected exactly one entry"
-    sub_hooks = entries[0]["hooks"]
-    assert len(sub_hooks) == 1, f"{event} expected exactly one command hook"
-    assert sub_hooks[0]["command"] == expected_command
+    assert "SessionEnd" in events
+    assert "PreCompact" in events
+    assert events["SessionEnd"] != events["PreCompact"]
+
+    commands = [
+        hook["command"]
+        for entry in events["SessionEnd"]
+        for hook in entry.get("hooks", [])
+        if hook.get("type") == "command"
+    ]
+
+    assert any("mempal-session-end-hook.sh" in command for command in commands)
+    assert not any("mempal-precompact-hook.sh" in command for command in commands)
+
+
+@pytest.mark.parametrize("event, wrapper", sorted(WRAPPER_SCRIPTS.items()))
+def test_plugin_hooks_normalize_wrapper_paths_for_bash(
+    hook_config: dict, event: str, wrapper: str
+) -> None:
+    """Plugin hooks must preserve wrappers without passing Windows paths as bash source."""
+    command = hook_config["hooks"][event][0]["hooks"][0]["command"]
+
+    assert command == (
+        "bash -c 'script=${1//\\\\//}; exec bash \"$script\"' -- "
+        f'"${{CLAUDE_PLUGIN_ROOT}}/hooks/{wrapper}"'
+    )

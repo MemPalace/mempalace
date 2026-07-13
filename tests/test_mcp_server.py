@@ -9,11 +9,14 @@ via monkeypatch to avoid touching real data.
 from datetime import datetime
 import json
 import os
+from types import SimpleNamespace
 import subprocess
 import sys
 from unittest.mock import MagicMock
 
 import pytest
+
+from _chroma_palace_helper import make_minimal_chroma_sqlite
 
 
 # ── MCP entry point: PYTHONPATH stripping ────────────────────────────────
@@ -107,8 +110,9 @@ class TestColdStartDiagnostics:
 
     Each test runs ``main()`` in a fresh ``subprocess`` because
 
-    * ``_init_logging`` uses ``logging.basicConfig(force=True)`` which
-      would otherwise reset pytest's ``caplog`` handlers across cases,
+    * ``_init_logging`` configures logging only at module import, so each
+      case needs a fresh interpreter to observe a pristine root logger and
+      configure host logging *before* importing the server,
     * ``ChromaBackend._resolve_embedding_function`` is a class-level
       attribute that test monkeypatching mutates globally,
     * The whole point of the new env vars is process-startup behaviour
@@ -208,7 +212,7 @@ class TestColdStartDiagnostics:
         """
         palace = tmp_path / "palace"
         palace.mkdir()
-        (palace / "chroma.sqlite3").touch()
+        make_minimal_chroma_sqlite(palace)
         return str(palace)
 
     @staticmethod
@@ -457,6 +461,143 @@ class TestColdStartDiagnostics:
             f"stderr={result.stderr!r}"
         )
 
+    def test_host_root_logger_config_survives_import(self, tmp_path):
+        """#1860: importing the server must NOT clobber a host app's root
+        logger. ``_init_logging`` previously called
+        ``logging.basicConfig(force=True)`` at import, resetting root's
+        level, format, and handlers — silently overriding any app that
+        configured logging before importing ``mempalace.mcp_server``."""
+        marker = tmp_path / "rootstate.txt"
+        extra = (
+            "import logging, pathlib\n"
+            # Host app configures logging BEFORE importing mempalace.
+            "logging.basicConfig(level=logging.DEBUG, "
+            "format='HOST %(levelname)s %(message)s')\n"
+            "_sentinel = logging.NullHandler()\n"
+            "logging.getLogger().addHandler(_sentinel)\n"
+            "from mempalace import mcp_server  # noqa: F401 — triggers _init_logging()\n"
+            "_root = logging.getLogger()\n"
+            "_fmt = next((h.formatter._fmt for h in _root.handlers "
+            "if h.formatter is not None), None)\n"
+            f"pathlib.Path({str(marker)!r}).write_text(\n"
+            "    f'level={logging.getLevelName(_root.level)}|'\n"
+            "    f'sentinel={_sentinel in _root.handlers}|'\n"
+            "    f'nhandlers={len(_root.handlers)}|'\n"
+            "    f'fmt={_fmt!r}'\n"
+            ")\n"
+            "raise SystemExit(0)\n"
+        )
+        result = self._run_main({"MEMPALACE_LOG_FILE": None}, extra_code=extra)
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
+        state = marker.read_text()
+        # Root logger must remain exactly as the host configured it.
+        assert "level=DEBUG" in state, state
+        assert "sentinel=True" in state, state
+        # MEMPALACE_LOG_FILE unset + host owns root → mempalace adds no handler.
+        assert "nhandlers=2" in state, state
+        assert "fmt='HOST %(levelname)s %(message)s'" in state, state
+
+    def test_log_file_with_host_root_captures_mempalace_only(self, tmp_path):
+        """#1860 + #1495: when a host app owns the root logger and
+        MEMPALACE_LOG_FILE is set, the file still captures mempalace's own
+        records — including the dotted ``mempalace.*`` family (the cold-load
+        path) — but NOT the host's. Proves the additive, mempalace-filtered
+        file handler: a naive 'reset root' or 'single dedicated logger' fix
+        would either leak host logs into the file or drop the dotted family."""
+        log_path = tmp_path / "mcp.log"
+        extra = (
+            "import logging\n"
+            # Host owns root logging before the import.
+            "logging.basicConfig(level=logging.DEBUG, format='%(message)s')\n"
+            "from mempalace import mcp_server  # noqa: F401 — triggers _init_logging()\n"
+            "logging.getLogger('host.app').warning('HOST-ONLY-LINE-xyz')\n"
+            "logging.getLogger('mempalace.embedding').info('MEMPALACE-DOTTED-LINE-xyz')\n"
+            "logging.getLogger('mempalace_mcp').info('MEMPALACE-FLAT-LINE-xyz')\n"
+            "logging.shutdown()\n"
+            "raise SystemExit(0)\n"
+        )
+        result = self._run_main({"MEMPALACE_LOG_FILE": str(log_path)}, extra_code=extra)
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
+        assert log_path.exists(), f"log file missing; stderr={result.stderr!r}"
+        body = log_path.read_text(encoding="utf-8")
+        assert "MEMPALACE-DOTTED-LINE-xyz" in body, body
+        assert "MEMPALACE-FLAT-LINE-xyz" in body, body
+        assert "HOST-ONLY-LINE-xyz" not in body, body
+        # Format is "%(message)s" in the embedded path too: the line is the bare
+        # message with no "LEVEL:name:" prefix (the file handler sets its own
+        # formatter, independent of basicConfig which never runs here).
+        assert any(line == "MEMPALACE-FLAT-LINE-xyz" for line in body.splitlines()), body
+
+    def test_embedded_host_warning_root_gates_mempalace_info(self, tmp_path):
+        """Documents the intentional embedded-mode level-gating tradeoff: when
+        a host owns root at WARNING, mempalace INFO heartbeats do NOT reach
+        MEMPALACE_LOG_FILE (the file handler rides on the host-gated root), but
+        WARNING/ERROR cold-load failure diagnostics still do. #1860 never
+        raises the host's level; #1495's motivating case is a standalone launch
+        (root empty -> INFO pinned) and is unaffected."""
+        log_path = tmp_path / "mcp.log"
+        extra = (
+            "import logging\n"
+            "logging.basicConfig(level=logging.WARNING, format='%(message)s')\n"
+            "from mempalace import mcp_server  # noqa: F401 — triggers _init_logging()\n"
+            "logging.getLogger('mempalace_mcp').info('INFO-HEARTBEAT-xyz')\n"
+            "logging.getLogger('mempalace_mcp').warning('WARN-DIAG-xyz')\n"
+            "logging.shutdown()\n"
+            "raise SystemExit(0)\n"
+        )
+        result = self._run_main({"MEMPALACE_LOG_FILE": str(log_path)}, extra_code=extra)
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
+        body = log_path.read_text(encoding="utf-8")
+        assert "WARN-DIAG-xyz" in body, body
+        assert "INFO-HEARTBEAT-xyz" not in body, body
+
+    def test_standalone_log_file_excludes_third_party_records(self, tmp_path):
+        """The MEMPALACE_LOG_FILE stream is mempalace-only in standalone mode
+        too: third-party library records reaching the root logger are kept out
+        of the file by ``_MempalaceLogFilter`` (the file stays a clean
+        mempalace diagnostic stream)."""
+        log_path = tmp_path / "mcp.log"
+        extra = (
+            "import logging\n"
+            "from mempalace import mcp_server  # noqa: F401 — standalone: root starts empty\n"
+            "logging.getLogger('chromadb.fake').warning('THIRDPARTY-LINE-xyz')\n"
+            "logging.getLogger('mempalace.embedding').info('MEMPALACE-STD-LINE-xyz')\n"
+            "logging.shutdown()\n"
+            "raise SystemExit(0)\n"
+        )
+        result = self._run_main({"MEMPALACE_LOG_FILE": str(log_path)}, extra_code=extra)
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
+        body = log_path.read_text(encoding="utf-8")
+        assert "MEMPALACE-STD-LINE-xyz" in body, body
+        assert "THIRDPARTY-LINE-xyz" not in body, body
+
+    def test_reload_does_not_duplicate_file_handler(self, tmp_path):
+        """#1885 review: the idempotency guard must survive ``importlib.reload``,
+        not only a direct second call. A reload re-executes the module body; the
+        guard flag is restored from ``globals()`` so ``_init_logging`` early-exits
+        and does not stack a second ``FileHandler`` on root."""
+        log_path = tmp_path / "mcp.log"
+        marker = tmp_path / "counts.txt"
+        extra = (
+            "import logging, importlib, pathlib\n"
+            "from mempalace import mcp_server\n"
+            "def _nfile():\n"
+            "    return sum(\n"
+            "        isinstance(h, logging.FileHandler)\n"
+            "        for h in logging.getLogger().handlers\n"
+            "    )\n"
+            "_before = _nfile()\n"
+            "importlib.reload(mcp_server)\n"
+            "_after = _nfile()\n"
+            f"pathlib.Path({str(marker)!r}).write_text(f'{{_before}},{{_after}}')\n"
+            "raise SystemExit(0)\n"
+        )
+        result = self._run_main({"MEMPALACE_LOG_FILE": str(log_path)}, extra_code=extra)
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
+        before, after = marker.read_text().split(",")
+        assert before == "1", f"expected one file handler after import, got {before}"
+        assert after == "1", f"reload duplicated the file handler: {before}->{after}"
+
 
 # ── Protocol Layer ──────────────────────────────────────────────────────
 
@@ -536,6 +677,20 @@ class TestHandleRequest:
         assert "mempalace_search" in names
         assert "mempalace_add_drawer" in names
         assert "mempalace_kg_add" in names
+
+    def test_no_tool_schema_uses_top_level_combinator(self):
+        """Anthropic's Messages API rejects a tool whose input schema has a
+        top-level anyOf/oneOf/allOf and drops the entire tools array with a
+        400, killing the session (#1711). Cross-tool constraints must be
+        enforced at dispatch instead.
+        """
+        from mempalace.mcp_server import handle_request
+
+        resp = handle_request({"method": "tools/list", "id": 2, "params": {}})
+        for tool in resp["result"]["tools"]:
+            schema = tool["inputSchema"]
+            for keyword in ("anyOf", "oneOf", "allOf"):
+                assert keyword not in schema, f"{tool['name']} schema has top-level {keyword}"
 
     def test_null_arguments_does_not_hang(self, monkeypatch, config, palace_path, seeded_kg):
         """Sending arguments: null should return a result, not hang (#394)."""
@@ -830,6 +985,106 @@ class TestReadTools:
         assert result["taxonomy"]["project"]["frontend"] == 1
         assert result["taxonomy"]["notes"]["planning"] == 1
 
+    def test_overview_tools_use_sqlite_fast_path(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        """Overview tools must answer from the sqlite cross-tab without paging
+        all metadata through the chroma client (#1748 / #1379). A tripwire on
+        the pagination helper fails loudly if the fast path regresses to the
+        slow client path that times out on large palaces."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        def _boom(*_a, **_k):
+            raise AssertionError("pagination path used instead of sqlite fast path")
+
+        monkeypatch.setattr(mcp_server, "_metadata_cache", None)
+        monkeypatch.setattr(mcp_server, "_fetch_all_metadata", _boom)
+
+        status = mcp_server.tool_status()
+        assert status["total_drawers"] == 4
+        assert status["wings"] == {"project": 3, "notes": 1}
+
+        assert mcp_server.tool_list_wings()["wings"] == {"project": 3, "notes": 1}
+
+        rooms = mcp_server.tool_list_rooms(wing="project")["rooms"]
+        assert rooms == {"backend": 2, "frontend": 1}
+
+        tax = mcp_server.tool_get_taxonomy()["taxonomy"]
+        assert tax["project"] == {"backend": 2, "frontend": 1}
+        assert tax["notes"] == {"planning": 1}
+
+    def test_overview_tools_normalize_missing_wing_room_to_unknown(
+        self, monkeypatch, config, palace_path, collection, kg
+    ):
+        """Fast path must keep the client path's contract: drawers missing
+        wing/room metadata read as 'unknown', not the sqlite COALESCE
+        placeholder '?' (#1748 review)."""
+        collection.add(
+            ids=["no_meta_drawer"],
+            documents=["a drawer with no wing or room metadata"],
+            metadatas=[{"source_file": "loose.txt"}],
+        )
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "_metadata_cache", None)
+
+        tax = mcp_server.tool_get_taxonomy()["taxonomy"]
+        assert tax == {"unknown": {"unknown": 1}}
+
+        status = mcp_server.tool_status()
+        assert status["wings"] == {"unknown": 1}
+        assert status["rooms"] == {"unknown": 1}
+
+    def test_graph_stats_uses_sqlite_fast_path(
+        self, monkeypatch, config, palace_path, collection, kg
+    ):
+        """graph_stats must aggregate from sqlite without paging metadata
+        through build_graph()/HNSW (#1379). Mirrors the build_graph parity
+        case in test_palace_graph. Tripwires fail loudly if the fast path
+        regresses: graph_stats() (the slow client build) and _get_collection()
+        (any client/HNSW open) must never be reached."""
+        collection.add(
+            ids=["d_db_code", "d_db_proj", "d_auth", "d_general", "d_orphan"],
+            documents=[
+                "chromadb setup in the code wing",
+                "chromadb usage in the project wing",
+                "auth and security notes",
+                "a general catch-all drawer",
+                "a drawer with no wing",
+            ],
+            metadatas=[
+                {"room": "chromadb", "wing": "wing_code", "hall": "db"},
+                {"room": "chromadb", "wing": "wing_project", "hall": "db"},
+                {"room": "auth", "wing": "wing_code", "hall": "security"},
+                {"room": "general", "wing": "wing_code", "hall": "misc"},
+                {"room": "orphan", "source_file": "loose.txt"},
+            ],
+        )
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        def _boom(*_a, **_k):
+            raise AssertionError("build_graph client path used instead of sqlite fast path")
+
+        def _no_client_open(*_a, **_k):
+            raise AssertionError("chroma collection opened — fast path must avoid HNSW")
+
+        monkeypatch.setattr(mcp_server, "graph_stats", _boom)
+        monkeypatch.setattr(mcp_server, "_get_collection", _no_client_open)
+
+        stats = mcp_server.tool_graph_stats()
+        # "general" room and the wing-less drawer are excluded, matching
+        # build_graph's per-drawer filter.
+        assert stats["total_rooms"] == 2
+        assert stats["tunnel_rooms"] == 1
+        assert stats["total_edges"] == 1
+        assert stats["rooms_per_wing"] == {"wing_code": 2, "wing_project": 1}
+        assert stats["top_tunnels"] == [
+            {"room": "chromadb", "wings": ["wing_code", "wing_project"], "count": 2}
+        ]
+
     def test_no_palace_returns_error(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace.mcp_server import tool_status
@@ -839,6 +1094,130 @@ class TestReadTools:
 
 
 # ── Regression: None-metadata safety (issue #1426) ──────────────────────
+
+
+class TestMetadataFacets:
+    def test_tool_status_uses_metadata_facets(self, monkeypatch):
+        from unittest.mock import MagicMock
+        import mempalace.mcp_server as mcp
+
+        monkeypatch.setattr(mcp, "_sqlite_taxonomy", lambda: None)
+        monkeypatch.setattr(mcp, "_supports_metadata_facets", lambda _: True)
+
+        col = MagicMock()
+        col.count.return_value = 5
+        col.facet_counts.side_effect = [
+            {"wing_a": 2, "wing_b": 3},
+            {"room_x": 4, "room_y": 1},
+        ]
+        monkeypatch.setattr(mcp, "_get_collection", lambda create=False: col)
+        result = mcp.tool_status()
+
+        assert result["wings"] == {
+            "wing_a": 2,
+            "wing_b": 3,
+        }
+
+        assert result["rooms"] == {
+            "room_x": 4,
+            "room_y": 1,
+        }
+        assert col.facet_counts.call_count == 2
+
+    def test_tool_list_wings_uses_metadata_facets(self, monkeypatch):
+        from unittest.mock import MagicMock
+        import mempalace.mcp_server as mcp
+
+        monkeypatch.setattr(mcp, "_sqlite_taxonomy", lambda: None)
+        monkeypatch.setattr(mcp, "_supports_metadata_facets", lambda _: True)
+
+        col = MagicMock()
+        col.facet_counts.return_value = {
+            "wing_a": 5,
+            "wing_b": 2,
+        }
+        monkeypatch.setattr(mcp, "_get_collection", lambda: col)
+        result = mcp.tool_list_wings()
+
+        assert result == {
+            "wings": {
+                "wing_a": 5,
+                "wing_b": 2,
+            }
+        }
+        col.facet_counts.assert_called_once_with("wing")
+
+    def test_tool_list_rooms_uses_metadata_facets(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        import mempalace.mcp_server as mcp
+
+        monkeypatch.setattr(mcp, "_sqlite_taxonomy", lambda: None)
+        monkeypatch.setattr(mcp, "_supports_metadata_facets", lambda _: True)
+
+        col = MagicMock()
+
+        col.facet_counts.return_value = {
+            "room1": 7,
+            "room2": 3,
+        }
+
+        monkeypatch.setattr(mcp, "_get_collection", lambda: col)
+
+        result = mcp.tool_list_rooms("engineering")
+
+        assert result["rooms"] == {
+            "room1": 7,
+            "room2": 3,
+        }
+
+        from unittest.mock import call
+
+        assert col.facet_counts.call_args_list == [
+            call("room", where={"wing": "engineering"}),
+            call("wing", where={"wing": "engineering"}),
+        ]
+
+    def test_tool_get_taxonomy_uses_metadata_facets(self, monkeypatch):
+        from unittest.mock import MagicMock, call
+        import mempalace.mcp_server as mcp
+
+        monkeypatch.setattr(mcp, "_sqlite_taxonomy", lambda: None)
+        monkeypatch.setattr(mcp, "_supports_metadata_facets", lambda _: True)
+
+        col = MagicMock()
+
+        def facet_counts_mock(field, where=None):
+            if field == "wing":
+                return {"wing_a": 2, "wing_b": 1}
+            if field == "room" and where == {"wing": "wing_a"}:
+                return {"room1": 2}
+            if field == "room" and where == {"wing": "wing_b"}:
+                return {"room2": 1}
+            return {}
+
+        col.facet_counts.side_effect = facet_counts_mock
+
+        monkeypatch.setattr(mcp, "_get_collection", lambda: col)
+
+        result = mcp.tool_get_taxonomy()
+        assert col.facet_counts.call_args_list[0] == call("wing")
+        # Per-wing room facets run concurrently (ThreadPoolExecutor), so order is
+        # non-deterministic. Compare order-independently without a set() — a
+        # ``call`` carrying a dict kwarg is unhashable, so membership (==) is used.
+        room_calls = col.facet_counts.call_args_list[1:]
+        assert len(room_calls) == 2
+        assert call("room", where={"wing": "wing_a"}) in room_calls
+        assert call("room", where={"wing": "wing_b"}) in room_calls
+
+        assert result["taxonomy"] == {
+            "wing_a": {
+                "room1": 2,
+            },
+            "wing_b": {
+                "room2": 1,
+            },
+        }
 
 
 class TestNoneMetadataSafety:
@@ -990,6 +1369,91 @@ class TestSearchTool:
         result = tool_search(query="database", room="backend")
         assert all(r["room"] == "backend" for r in result["results"])
 
+    def test_search_with_source_file_filter(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_search
+
+        result = tool_search(query="authentication module", source_file="auth.py")
+        assert result["results"]
+        assert all(r["source_file"] == "auth.py" for r in result["results"])
+        assert result["filters"]["source_file"] == "auth.py"
+
+    def test_search_source_file_allows_path_separators(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        # Unlike wing/room, a source_file is a path — '/' must NOT be rejected
+        # as a path-traversal attempt the way sanitize_name() would.
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_search
+
+        result = tool_search(query="authentication", source_file="/abs/path/to/auth.py")
+        assert "error" not in result
+
+    def test_search_blank_source_file_ignored(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_search
+
+        result = tool_search(query="JWT authentication", source_file="   ")
+        assert "results" in result
+        assert result["filters"]["source_file"] is None
+
+    def test_search_rejects_null_byte_source_file(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        # A null byte in a metadata where-value can crash chromadb add/upsert
+        # (#1235 lineage); reject it cleanly the way sanitize_name does.
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_search
+
+        result = tool_search(query="JWT", source_file="bad\x00null")
+        assert "error" in result
+
+    def test_search_rejects_overlong_source_file(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_search
+
+        result = tool_search(query="JWT", source_file="x" * 5000)
+        assert "error" in result
+
+    def test_search_rejects_non_string_source_file(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        # A non-string source_file (e.g. a JSON number, which the schema's
+        # string type does not coerce) must yield a clean validation error,
+        # not an unhandled AttributeError from .strip().
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_search
+
+        result = tool_search(query="JWT", source_file=42)
+        assert "error" in result
+
+    def test_search_rejects_lone_surrogate_source_file(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        # A lone UTF-16 surrogate can crash chromadb (#1235); reject it for
+        # parity with sanitize_name rather than letting it reach the backend.
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_search
+
+        result = tool_search(query="JWT", source_file="bad\udc80surrogate")
+        assert "error" in result
+
+    def test_search_accepts_source_file_at_length_boundary(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        # Exactly _MAX_SOURCE_FILE_LENGTH is allowed (the cap is a strict '>').
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import _MAX_SOURCE_FILE_LENGTH, tool_search
+
+        result = tool_search(query="JWT", source_file="x" * _MAX_SOURCE_FILE_LENGTH)
+        assert "error" not in result
+
     def test_search_min_similarity_backwards_compat(
         self, monkeypatch, config, palace_path, seeded_collection, kg
     ):
@@ -1053,6 +1517,38 @@ class TestSearchTool:
         assert reset_calls["n"] == 1
         assert "results" in result
         assert result.get("index_recovered") is True
+
+    def test_search_retry_preserves_collection_name(self, monkeypatch, config, kg):
+        """Retry path must query the same configured collection both times."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(
+            mcp_server,
+            "_config",
+            SimpleNamespace(
+                palace_path=config.palace_path,
+                collection_name="custom_drawers",
+            ),
+        )
+        seen_collection_names = []
+
+        def fake_search(*args, **kwargs):
+            seen_collection_names.append(kwargs.get("collection_name"))
+            if len(seen_collection_names) == 1:
+                return {
+                    "error": "Search error: Error executing plan: Internal error: Error finding id"
+                }
+            return {"results": [{"text": "ok", "wing": "w", "room": "r"}]}
+
+        monkeypatch.setattr(mcp_server, "search_memories", fake_search)
+        monkeypatch.setattr(mcp_server, "_force_chroma_cache_reset", lambda: None)
+        monkeypatch.setattr(mcp_server.time, "sleep", lambda _: None)
+
+        result = mcp_server.tool_search(query="anything", wing="wing_api")
+
+        assert "results" in result
+        assert seen_collection_names == ["custom_drawers", "custom_drawers"]
 
     def test_search_does_not_retry_on_non_transient_error(self, monkeypatch, config, kg):
         """Validation / unrelated errors must not trigger the retry path."""
@@ -1142,12 +1638,12 @@ class TestSearchTool:
 
     def test_wal_redacts_sensitive_fields(self, monkeypatch, config, kg, tmp_path):
         _patch_mcp_server(monkeypatch, config, kg)
-        from mempalace import mcp_server
+        from mempalace import wal
 
         wal_file = tmp_path / "write_log.jsonl"
-        monkeypatch.setattr(mcp_server, "_WAL_FILE", wal_file)
+        monkeypatch.setattr(wal, "_WAL_FILE", wal_file)
 
-        mcp_server._wal_log(
+        wal._wal_log(
             "test",
             {"content": "secret note", "query": "private search", "safe": "ok"},
         )
@@ -1191,6 +1687,63 @@ class TestWriteTools:
         result2 = tool_add_drawer(wing="w", room="r", content=content)
         assert result2["success"] is True
         assert result2["reason"] == "already_exists"
+
+    def test_add_drawer_returns_failure_when_idempotency_precheck_raises(
+        self, monkeypatch, config, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        mock_col = MagicMock()
+        mock_col.get.side_effect = RuntimeError("precheck boom")
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: mock_col)
+
+        result = mcp_server.tool_add_drawer("w", "r", "content")
+
+        assert result["success"] is False
+        assert "Idempotency check failed before write" in result["error"]
+        assert "precheck boom" in result["error"]
+
+    def test_add_drawer_does_not_upsert_when_idempotency_precheck_raises(
+        self, monkeypatch, config, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        mock_col = MagicMock()
+        mock_col.get.side_effect = RuntimeError("precheck boom")
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: mock_col)
+
+        result = mcp_server.tool_add_drawer("w", "r", "content")
+
+        assert result["success"] is False
+        mock_col.upsert.assert_not_called()
+
+    def test_add_drawer_treats_dict_like_precheck_hit_as_already_exists(
+        self, monkeypatch, config, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        mock_col = MagicMock()
+        mock_col.get.return_value = {"ids": ["existing-drawer"]}
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: mock_col)
+
+        result = mcp_server.tool_add_drawer("w", "r", "content")
+
+        assert result["success"] is True
+        assert result["reason"] == "already_exists"
+        mock_col.upsert.assert_not_called()
+
+    def test_get_result_ids_normalizes_none_to_empty_list(self):
+        from mempalace import mcp_server
+
+        class DictLikeResult:
+            def get(self, key, default=None):
+                return None
+
+        assert mcp_server._get_result_ids({"ids": None}) == []
+        assert mcp_server._get_result_ids(DictLikeResult()) == []
 
     def test_add_drawer_fails_when_readback_misses(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -1323,6 +1876,127 @@ class TestWriteTools:
         assert result["vector_disabled"] is True
         assert result["vector_disabled_reason"] == "capacity mismatch"
 
+    def test_checkpoint_files_items_and_writes_diary(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_checkpoint
+
+        result = tool_checkpoint(
+            items=[
+                {"wing": "w", "room": "decisions", "content": "Use PostgreSQL for storage."},
+                {"wing": "w", "room": "backend", "content": "Cache sessions in Redis."},
+            ],
+            diary={"agent_name": "cursor-ide", "wing": "w", "entry": "SESSION|did.stuff|★"},
+        )
+        assert len(result["added"]) == 2
+        assert result["duplicates"] == []
+        assert result["errors"] == []
+        assert all(a["success"] for a in result["added"])
+        assert result["diary"]["success"] is True
+
+    def test_checkpoint_skips_semantic_duplicates(self, monkeypatch, config, kg):
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(
+            mcp_server,
+            "tool_check_duplicate",
+            lambda content, threshold=0.9: {
+                "is_duplicate": True,
+                "matches": [{"id": "x", "similarity": 0.95}],
+            },
+        )
+        called = {"add": False}
+
+        def _fail_add(**_kwargs):
+            called["add"] = True
+            return {"success": True}
+
+        monkeypatch.setattr(mcp_server, "tool_add_drawer", _fail_add)
+
+        result = mcp_server.tool_checkpoint(
+            items=[{"wing": "w", "room": "r", "content": "already known"}]
+        )
+        assert result["added"] == []
+        assert len(result["duplicates"]) == 1
+        assert called["add"] is False
+
+    def test_checkpoint_reports_malformed_items(self, monkeypatch, config, kg):
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(
+            mcp_server, "tool_check_duplicate", lambda *a, **k: {"is_duplicate": False}
+        )
+        result = mcp_server.tool_checkpoint(items=[{"wing": "w", "room": "r"}, "not-a-dict"])
+        assert result["added"] == []
+        assert len(result["errors"]) == 2
+
+    def test_checkpoint_rejects_non_string_fields_without_calling_handlers(
+        self, monkeypatch, config, kg
+    ):
+        """A non-string content must be reported, never passed to the
+        single-item handlers where it would raise deep in sanitization."""
+        from mempalace import mcp_server
+
+        def _explode(*_a, **_k):
+            raise AssertionError("handlers must not run for malformed items")
+
+        monkeypatch.setattr(mcp_server, "tool_check_duplicate", _explode)
+        monkeypatch.setattr(mcp_server, "tool_add_drawer", _explode)
+
+        result = mcp_server.tool_checkpoint(
+            items=[{"wing": "w", "room": "r", "content": {"not": "a string"}}]
+        )
+        assert result["added"] == []
+        assert len(result["errors"]) == 1
+        assert "non-empty strings" in result["errors"][0]["error"]
+
+    def test_checkpoint_files_when_dedup_check_errors(self, monkeypatch, config, kg):
+        """A dedup error is a genuine index failure (content is already
+        validated as a string); we still file rather than drop the memory."""
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(
+            mcp_server,
+            "tool_check_duplicate",
+            lambda *a, **k: {"error": "Duplicate check failed"},
+        )
+        filed = {}
+
+        def _add(**kwargs):
+            filed.update(kwargs)
+            return {"success": True, "drawer_id": "d1"}
+
+        monkeypatch.setattr(mcp_server, "tool_add_drawer", _add)
+
+        result = mcp_server.tool_checkpoint(
+            items=[{"wing": "w", "room": "r", "content": "keep me"}]
+        )
+        assert len(result["added"]) == 1
+        assert filed["content"] == "keep me"
+
+    def test_checkpoint_reports_malformed_diary(self, monkeypatch, config, kg):
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(
+            mcp_server, "tool_check_duplicate", lambda *a, **k: {"is_duplicate": False}
+        )
+
+        def _fail_diary(*_a, **_k):
+            raise AssertionError("diary_write must not run for malformed diary")
+
+        monkeypatch.setattr(mcp_server, "tool_diary_write", _fail_diary)
+
+        result = mcp_server.tool_checkpoint(items=[], diary={"agent_name": "x"})
+        assert "diary" not in result
+        assert any("diary entry" in e.get("error", "") for e in result["errors"])
+
+    def test_checkpoint_registered_in_tools(self):
+        from mempalace import mcp_server
+
+        assert "mempalace_checkpoint" in mcp_server.TOOLS
+        assert mcp_server.TOOLS["mempalace_checkpoint"]["handler"] is mcp_server.tool_checkpoint
+
     def test_get_drawer(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace.mcp_server import tool_get_drawer
@@ -1425,6 +2099,141 @@ class TestWriteTools:
         result = tool_list_drawers(offset=-5)
         assert result["offset"] == 0
 
+    def test_list_drawers_since_filter_inclusive(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_list_drawers
+
+        # seeded filed_at values: 2026-01-01..2026-01-04; since is inclusive.
+        result = tool_list_drawers(since="2026-01-03")
+        assert result["total"] == 2
+        assert result["count"] == 2
+        filed = sorted(d["metadata"]["filed_at"] for d in result["drawers"])
+        assert filed == ["2026-01-03T00:00:00", "2026-01-04T00:00:00"]
+
+    def test_list_drawers_before_filter_exclusive(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_list_drawers
+
+        # before is exclusive: 2026-01-03 keeps only 01 and 02.
+        result = tool_list_drawers(before="2026-01-03")
+        assert result["total"] == 2
+        filed = sorted(d["metadata"]["filed_at"] for d in result["drawers"])
+        assert filed == ["2026-01-01T00:00:00", "2026-01-02T00:00:00"]
+
+    def test_list_drawers_since_and_before_window(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_list_drawers
+
+        # [since, before): 02 and 03 kept, 01 below, 04 at/above the bound.
+        result = tool_list_drawers(since="2026-01-02", before="2026-01-04")
+        assert result["total"] == 2
+        filed = sorted(d["metadata"]["filed_at"] for d in result["drawers"])
+        assert filed == ["2026-01-02T00:00:00", "2026-01-03T00:00:00"]
+
+    def test_list_drawers_date_window_single_day(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_list_drawers
+
+        # since inclusive + before exclusive isolates exactly 2026-01-02.
+        result = tool_list_drawers(since="2026-01-02", before="2026-01-03")
+        assert result["total"] == 1
+        assert result["drawers"][0]["metadata"]["filed_at"] == "2026-01-02T00:00:00"
+
+    def test_list_drawers_date_filter_combines_with_wing(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_list_drawers
+
+        # project wing = 01,02,03; since 2026-01-02 narrows to 02,03.
+        result = tool_list_drawers(wing="project", since="2026-01-02")
+        assert result["total"] == 2
+        assert all(d["wing"] == "project" for d in result["drawers"])
+
+    def test_list_drawers_no_date_filter_unchanged(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_list_drawers
+
+        # Omitting since/before leaves the full set (regression guard).
+        assert tool_list_drawers()["total"] == 4
+
+    def test_list_drawers_rejects_invalid_since(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_list_drawers
+
+        result = tool_list_drawers(since="not-a-date")
+        assert "error" in result
+        assert "since" in result["error"]
+
+    def test_list_drawers_rejects_invalid_before(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_list_drawers
+
+        result = tool_list_drawers(before="2026-99-99")
+        assert "error" in result
+        assert "before" in result["error"]
+
+    def test_list_drawers_rejects_inverted_window(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_list_drawers
+
+        # since must be earlier than before; inverted bounds are a clear error,
+        # not a silently empty result.
+        result = tool_list_drawers(since="2026-06-01", before="2026-01-01")
+        assert "error" in result
+        assert "since" in result["error"]
+        assert "before" in result["error"]
+
+    def test_list_drawers_excludes_undated_drawer_when_filtered(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_list_drawers
+
+        # A drawer with no filed_at is present unfiltered but excluded once a
+        # date bound is active (its age cannot be confirmed in-window).
+        seeded_collection.add(
+            ids=["drawer_no_filed_at"],
+            documents=["A drawer without a filed_at timestamp."],
+            metadatas=[{"wing": "project", "room": "backend"}],
+        )
+        assert tool_list_drawers()["total"] == 5
+        filtered = tool_list_drawers(since="2026-01-01")
+        ids = [d["drawer_id"] for d in filtered["drawers"]]
+        assert "drawer_no_filed_at" not in ids
+        assert filtered["total"] == 4
+
+    def test_list_drawers_date_filter_paginates_on_filtered_total(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_list_drawers
+
+        # window [01-01, 01-04) keeps 01, 02, 03; pagination runs on that
+        # filtered total, not the grand total of 4.
+        page1 = tool_list_drawers(since="2026-01-01", before="2026-01-04", limit=2, offset=0)
+        page2 = tool_list_drawers(since="2026-01-01", before="2026-01-04", limit=2, offset=2)
+        assert page1["total"] == 3
+        assert page1["count"] == 2
+        assert page2["total"] == 3
+        assert page2["count"] == 1
+
     def test_update_drawer_content(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace.mcp_server import tool_update_drawer, tool_get_drawer
@@ -1511,6 +2320,113 @@ class TestWriteTools:
         )
 
         assert result == {"error": msg}
+
+    # ── hallway MCP tools (mirror the tunnel pattern) ──
+
+    def _seed_hallways(self, monkeypatch, tmp_path):
+        """Point hallways resolvers at a tmp file and seed two records."""
+        from mempalace import hallways
+
+        hallway_file = tmp_path / "hallways.json"
+        monkeypatch.setattr(hallways, "_get_hallway_file", lambda *a, **kw: str(hallway_file))
+        monkeypatch.setattr(
+            hallways,
+            "_legacy_hallway_file",
+            lambda: str(tmp_path / "legacy-hallways.json"),
+        )
+        seeded = [
+            {
+                "id": "hallway_wing_a_X_Y_aaaa",
+                "wing": "wing_a",
+                "entity_a": "X",
+                "entity_b": "Y",
+                "co_occurrence_count": 3,
+                "rooms": ["room1"],
+            },
+            {
+                "id": "hallway_wing_b_X_Z_bbbb",
+                "wing": "wing_b",
+                "entity_a": "X",
+                "entity_b": "Z",
+                "co_occurrence_count": 1,
+                "rooms": ["room2"],
+            },
+        ]
+        hallways._save_hallways(seeded)
+        return seeded
+
+    def test_tool_list_hallways_returns_all_without_filter(self, monkeypatch, tmp_path):
+        """tool_list_hallways with no wing returns every record."""
+        from mempalace import mcp_server
+
+        seeded = self._seed_hallways(monkeypatch, tmp_path)
+        result = mcp_server.tool_list_hallways()
+        assert isinstance(result, list)
+        assert len(result) == len(seeded)
+        ids = {h["id"] for h in result}
+        assert ids == {h["id"] for h in seeded}
+
+    def test_tool_list_hallways_filters_by_wing(self, monkeypatch, tmp_path):
+        """tool_list_hallways with wing returns only that wing's records."""
+        from mempalace import mcp_server
+
+        self._seed_hallways(monkeypatch, tmp_path)
+        result = mcp_server.tool_list_hallways(wing="wing_a")
+        assert len(result) == 1
+        assert result[0]["wing"] == "wing_a"
+
+    def test_tool_list_hallways_rejects_invalid_wing_name(self, monkeypatch, tmp_path):
+        """Invalid wing names go through _sanitize_optional_name and return a
+        structured error rather than crashing — mirrors tool_list_tunnels."""
+        from mempalace import mcp_server
+
+        self._seed_hallways(monkeypatch, tmp_path)
+        # Forward-slash is not a valid name character per sanitize_name.
+        result = mcp_server.tool_list_hallways(wing="wing/with/slashes")
+        assert isinstance(result, dict)
+        assert "error" in result
+
+    def test_tool_delete_hallway_removes_existing_record(self, monkeypatch, tmp_path):
+        """tool_delete_hallway removes the record and returns {deleted: True}."""
+        from mempalace import mcp_server
+
+        seeded = self._seed_hallways(monkeypatch, tmp_path)
+        target_id = seeded[0]["id"]
+        result = mcp_server.tool_delete_hallway(hallway_id=target_id)
+        assert result == {"deleted": True}
+        remaining = mcp_server.tool_list_hallways()
+        assert target_id not in {h["id"] for h in remaining}
+
+    def test_tool_delete_hallway_unknown_id_returns_false(self, monkeypatch, tmp_path):
+        """Deleting an ID that doesn't exist returns {deleted: False} without error."""
+        from mempalace import mcp_server
+
+        self._seed_hallways(monkeypatch, tmp_path)
+        result = mcp_server.tool_delete_hallway(hallway_id="hallway_does_not_exist")
+        assert result == {"deleted": False}
+
+    def test_tool_delete_hallway_requires_string_id(self):
+        """Missing or non-string hallway_id surfaces a structured error."""
+        from mempalace import mcp_server
+
+        assert mcp_server.tool_delete_hallway(hallway_id="") == {"error": "hallway_id is required"}
+        assert mcp_server.tool_delete_hallway(hallway_id=None) == {
+            "error": "hallway_id is required"
+        }
+
+    def test_hallway_tools_registered_in_tools_registry(self):
+        """Both new tools must appear in the public TOOLS registry so MCP clients can dispatch them."""
+        from mempalace import mcp_server
+
+        assert "mempalace_list_hallways" in mcp_server.TOOLS
+        assert "mempalace_delete_hallway" in mcp_server.TOOLS
+        assert (
+            mcp_server.TOOLS["mempalace_list_hallways"]["handler"] is mcp_server.tool_list_hallways
+        )
+        assert (
+            mcp_server.TOOLS["mempalace_delete_hallway"]["handler"]
+            is mcp_server.tool_delete_hallway
+        )
 
     def test_add_drawer_normal_content_single_drawer(self, monkeypatch, config, palace_path, kg):
         """Regression catch: content below CHUNK_SIZE produces exactly
@@ -1634,35 +2550,276 @@ class TestWriteTools:
         assert result["chunks"] == 1
         assert "chunk_ids" not in result
 
-    def test_add_drawer_chunked_logical_id_not_fetchable_directly(
-        self, monkeypatch, config, palace_path, kg
-    ):
-        """Documented contract on the chunked path: ``tool_get_drawer``
-        and ``tool_delete_drawer`` against the returned logical
-        ``drawer_id`` report ``not found`` because no row is stored
-        under that id. Callers must iterate ``chunk_ids`` or query by
-        ``parent_drawer_id`` metadata."""
+
+def test_add_drawer_chunked_logical_id_fetches_deletes_and_lists_as_one(
+    monkeypatch, config, palace_path, kg
+):
+    """Chunk rows are internal storage; MCP tools operate on the logical id."""
+    _patch_mcp_server(monkeypatch, config, kg)
+    _client, _col = _get_collection(palace_path, create=True)
+    del _client
+
+    from mempalace.mcp_server import (
+        tool_add_drawer,
+        tool_delete_drawer,
+        tool_get_drawer,
+        tool_list_drawers,
+    )
+
+    result = tool_add_drawer(wing="w", room="r", content="P" * 4000)
+
+    assert result["success"] is True
+    assert result["chunks"] > 1
+
+    logical_id = result["drawer_id"]
+
+    fetched = tool_get_drawer(logical_id)
+    assert fetched["drawer_id"] == logical_id
+    assert fetched["content"] == "P" * 4000
+    assert fetched["chunks"] == result["chunks"]
+    assert fetched["chunk_ids"] == result["chunk_ids"]
+
+    listed = tool_list_drawers(wing="w", room="r")
+    assert listed["total"] == 1
+    assert listed["count"] == 1
+    assert listed["drawers"][0]["drawer_id"] == logical_id
+    assert listed["drawers"][0]["chunks"] == result["chunks"]
+
+    deleted = tool_delete_drawer(logical_id)
+    assert deleted["success"] is True
+    assert deleted["chunks_deleted"] == result["chunks"]
+
+    missing = tool_get_drawer(logical_id)
+    assert "error" in missing
+    assert "not found" in missing["error"].lower()
+
+
+def test_update_drawer_chunked_logical_id_rewrites_group(monkeypatch, config, palace_path, kg):
+    """Updating the returned logical id rewrites the underlying chunk group."""
+    _patch_mcp_server(monkeypatch, config, kg)
+    _client, _col = _get_collection(palace_path, create=True)
+    del _client
+
+    from mempalace.mcp_server import (
+        tool_add_drawer,
+        tool_get_drawer,
+        tool_list_drawers,
+        tool_update_drawer,
+    )
+
+    result = tool_add_drawer(wing="old", room="old_room", content="A" * 2600)
+    assert result["success"] is True
+    assert result["chunks"] > 1
+
+    logical_id = result["drawer_id"]
+
+    updated = tool_update_drawer(
+        logical_id,
+        content="B" * 1800,
+        wing="new",
+        room="new_room",
+    )
+
+    assert updated["success"] is True
+    assert updated["drawer_id"] == logical_id
+
+    fetched = tool_get_drawer(logical_id)
+    assert fetched["drawer_id"] == logical_id
+    assert fetched["content"] == "B" * 1800
+    assert fetched["wing"] == "new"
+    assert fetched["room"] == "new_room"
+
+    listed = tool_list_drawers(wing="new", room="new_room")
+    assert listed["total"] == 1
+    assert listed["drawers"][0]["drawer_id"] == logical_id
+
+
+# ── Delete by source (#1722) ────────────────────────────────────────────
+
+
+class TestDeleteBySource:
+    """``tool_delete_by_source`` — bulk cleanup of benchmark/test contamination (#1722)."""
+
+    def _seed(self, monkeypatch, config, palace_path, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         _client, _col = _get_collection(palace_path, create=True)
         del _client
-        from mempalace.mcp_server import tool_add_drawer, tool_delete_drawer, tool_get_drawer
+        from mempalace.mcp_server import tool_add_drawer
 
-        result = tool_add_drawer(wing="w", room="r", content="P" * 4000)
-        assert result["success"] is True and result["chunks"] > 1
+        # Two drawers from a "benchmark" source, one from real user data.
+        tool_add_drawer(
+            wing="bench",
+            room="general",
+            content="ShareGPT yoga retreat conversation noise number one.",
+            source_file="results_mempal_hybrid_v4_session_1.jsonl",
+        )
+        tool_add_drawer(
+            wing="bench",
+            room="general",
+            content="ShareGPT coding job description noise number two.",
+            source_file="results_mempal_hybrid_v4_session_1.jsonl",
+        )
+        tool_add_drawer(
+            wing="clients",
+            room="webdesign",
+            content="GG Sauna Dachdecker real client memory that must survive.",
+            source_file="notes/clients.md",
+        )
 
-        # tool_get_drawer against logical id: not found.
-        got_logical = tool_get_drawer(result["drawer_id"])
-        assert "error" in got_logical and "not found" in got_logical["error"].lower()
+    def _seed_closets(self, palace_path):
+        """Seed the AAAK index (closets) directly.
 
-        # tool_get_drawer against the first chunk id: found, full content slice.
-        got_chunk = tool_get_drawer(result["chunk_ids"][0])
-        assert got_chunk["content"] == "P" * config.chunk_size
-        assert got_chunk["metadata"]["parent_drawer_id"] == result["drawer_id"]
+        ``tool_add_drawer`` never builds closets — those are a miner-side
+        artifact — so to exercise the closet purge we add them straight to the
+        collection, keyed by the same ``source_file`` the drawers use: two for
+        the benchmark source, one for the real-client source.
+        """
+        from mempalace.palace import get_closets_collection
 
-        # tool_delete_drawer against logical id: also not found.
-        deleted_logical = tool_delete_drawer(result["drawer_id"])
-        assert deleted_logical["success"] is False
-        assert "not found" in deleted_logical["error"].lower()
+        closets_col = get_closets_collection(palace_path, create=True)
+        closets_col.add(
+            ids=["bench_closet_01", "bench_closet_02", "client_closet_01"],
+            documents=[
+                "topic: yoga retreat | coding job",
+                "topic: more bench noise",
+                "topic: GG Sauna client",
+            ],
+            metadatas=[
+                {"source_file": "results_mempal_hybrid_v4_session_1.jsonl"},
+                {"source_file": "results_mempal_hybrid_v4_session_1.jsonl"},
+                {"source_file": "notes/clients.md"},
+            ],
+        )
+        return closets_col
+
+    def test_dry_run_reports_count_without_deleting(self, monkeypatch, config, palace_path, kg):
+        self._seed(monkeypatch, config, palace_path, kg)
+        from mempalace.mcp_server import tool_delete_by_source, tool_status
+
+        result = tool_delete_by_source("results_mempal_hybrid_v4_session_1.jsonl")
+        assert result["success"] is True
+        assert result["dry_run"] is True
+        assert result["match_count"] == 2
+        assert {"wing": "bench", "room": "general"} in result["sample"]
+        # Nothing removed — all three drawers still present.
+        assert tool_status()["total_drawers"] == 3
+
+    def test_dry_run_reports_closet_match_count(self, monkeypatch, config, palace_path, kg):
+        """Dry run surfaces the closet blast radius (#1722) without deleting."""
+        self._seed(monkeypatch, config, palace_path, kg)
+        closets_col = self._seed_closets(palace_path)
+        from mempalace.mcp_server import tool_delete_by_source
+
+        result = tool_delete_by_source("results_mempal_hybrid_v4_session_1.jsonl")
+        assert result["dry_run"] is True
+        assert result["closet_match_count"] == 2
+        # Nothing removed — all three closets still present.
+        assert len(closets_col.get(include=[])["ids"]) == 3
+
+    def test_commit_deletes_only_matching_source(self, monkeypatch, config, palace_path, kg):
+        self._seed(monkeypatch, config, palace_path, kg)
+        from mempalace.mcp_server import tool_delete_by_source, tool_status
+
+        result = tool_delete_by_source("results_mempal_hybrid_v4_session_1.jsonl", dry_run=False)
+        assert result["success"] is True
+        assert result["dry_run"] is False
+        assert result["deleted"] == 2
+        # Only the real client drawer remains.
+        assert tool_status()["total_drawers"] == 1
+
+    def test_commit_purges_matching_closets(self, monkeypatch, config, palace_path, kg):
+        """Deleting by source purges the matching closets too, so the AAAK
+        index keeps no stale pointers at the now-deleted drawers (#1722)."""
+        self._seed(monkeypatch, config, palace_path, kg)
+        closets_col = self._seed_closets(palace_path)
+        from mempalace.mcp_server import tool_delete_by_source
+
+        result = tool_delete_by_source("results_mempal_hybrid_v4_session_1.jsonl", dry_run=False)
+        assert result["success"] is True
+        assert result["deleted"] == 2
+        assert result["closets_deleted"] == 2
+        # The two benchmark closets are gone; the real-client closet survives.
+        remaining = closets_col.get(include=["metadatas"])
+        sources = {m["source_file"] for m in remaining["metadatas"]}
+        assert sources == {"notes/clients.md"}
+
+    def test_no_match_is_idempotent_not_error(self, monkeypatch, config, palace_path, kg):
+        self._seed(monkeypatch, config, palace_path, kg)
+        from mempalace.mcp_server import tool_delete_by_source, tool_status
+
+        result = tool_delete_by_source("does/not/exist.jsonl", dry_run=False)
+        assert result["success"] is True
+        assert result["deleted"] == 0
+        assert tool_status()["total_drawers"] == 3
+
+    def test_empty_source_file_rejected(self, monkeypatch, config, palace_path, kg):
+        self._seed(monkeypatch, config, palace_path, kg)
+        from mempalace.mcp_server import tool_delete_by_source
+
+        result = tool_delete_by_source("   ", dry_run=False)
+        assert result["success"] is False
+        assert "non-empty" in result["error"]
+
+    def test_non_string_source_rejected(self, monkeypatch, config, palace_path, kg):
+        """A non-string source_file must return a clean error, not AttributeError."""
+        self._seed(monkeypatch, config, palace_path, kg)
+        from mempalace.mcp_server import tool_delete_by_source
+
+        result = tool_delete_by_source(123, dry_run=False)
+        assert result["success"] is False
+        assert "non-empty" in result["error"]
+
+    def test_matches_after_surrogate_normalization(self, monkeypatch, config, palace_path, kg):
+        """source_file is stripped of lone surrogates on both ingest and delete,
+        so a path that arrived via a cp1252 stdin (#1488) still matches."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import (
+            tool_add_drawer,
+            tool_delete_by_source,
+            tool_status,
+        )
+
+        # Lone low surrogate embedded in the path — add_drawer strips it.
+        raw_source = "noise\udce9_data.jsonl"
+        tool_add_drawer(
+            wing="bench",
+            room="general",
+            content="benchmark noise from a non-ASCII path",
+            source_file=raw_source,
+        )
+        assert tool_status()["total_drawers"] == 1
+
+        # Deleting with the same raw (un-stripped) string must still match.
+        result = tool_delete_by_source(raw_source, dry_run=False)
+        assert result["success"] is True
+        assert result["deleted"] == 1
+        assert tool_status()["total_drawers"] == 0
+
+    def test_registered_and_dispatchable(self, monkeypatch, config, palace_path, kg):
+        self._seed(monkeypatch, config, palace_path, kg)
+        from mempalace.mcp_server import handle_request
+
+        # Listed in tools/list
+        listed = handle_request({"method": "tools/list", "id": 1, "params": {}})
+        names = {t["name"] for t in listed["result"]["tools"]}
+        assert "mempalace_delete_by_source" in names
+
+        # Dispatches and defaults to dry-run (no destructive side effect)
+        resp = handle_request(
+            {
+                "method": "tools/call",
+                "id": 2,
+                "params": {
+                    "name": "mempalace_delete_by_source",
+                    "arguments": {"source_file": "results_mempal_hybrid_v4_session_1.jsonl"},
+                },
+            }
+        )
+        content = json.loads(resp["result"]["content"][0]["text"])
+        assert content["dry_run"] is True
+        assert content["match_count"] == 2
 
 
 # ── KG Tools ────────────────────────────────────────────────────────────
@@ -1702,6 +2859,27 @@ class TestKGTools:
         # Regression #1314: response must echo the actual ended date,
         # not silently drop it and return the literal string "today".
         assert result["ended"] == "2026-03-01"
+
+    def test_kg_supersede(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_kg_supersede
+
+        kg.add_triple("Bot", "uses_model", "old", valid_from="2026-05-01")
+        result = tool_kg_supersede(
+            subject="Bot",
+            predicate="uses_model",
+            old_object="old",
+            new_object="new",
+            at="2026-06-02",
+        )
+        assert result["success"] is True
+        assert result["superseded"] == "old"
+        models = [
+            f["object"]
+            for f in kg.query_entity("Bot", as_of="2026-06-02", direction="outgoing")
+            if f["predicate"] == "uses_model"
+        ]
+        assert models == ["new"]
 
     def test_kg_add_forwards_valid_to(self, monkeypatch, config, palace_path, kg):
         """Regression #1314 case 1: valid_to must round-trip through kg_add."""
@@ -2338,10 +3516,20 @@ class TestCacheInvalidation:
         if os.path.isfile(db_file):
             os.remove(db_file)
 
+        make_client_calls = []
+
+        def fail_if_make_client_called(path):
+            make_client_calls.append(path)
+            raise AssertionError("_get_collection(create=False) should not open missing Chroma DB")
+
+        monkeypatch.setattr(mcp_server.ChromaBackend, "make_client", fail_if_make_client_called)
+
         # Cache should be invalidated; _get_collection returns None
         # because the backend can't open a missing DB without create=True
-        mcp_server._get_collection()
+        assert mcp_server._get_collection() is None
         # The key assertion: the old cached collection was dropped
+        assert make_client_calls == []
+        assert mcp_server._collection_cache is None
         assert mcp_server._palace_db_inode == 0
         assert mcp_server._palace_db_mtime == 0.0
 
@@ -2658,13 +3846,13 @@ class TestImportKillSwitchSafety:
         Proves the deferred setup still works (defers WAL creation to write
         time, does not disable it) and preserves the WAL permission bits.
         """
-        from mempalace import mcp_server
+        from mempalace import wal
 
         wal_file = tmp_path / "fresh" / "wal" / "write_log.jsonl"
         assert not wal_file.parent.exists()
-        monkeypatch.setattr(mcp_server, "_WAL_FILE", wal_file)
+        monkeypatch.setattr(wal, "_WAL_FILE", wal_file)
 
-        mcp_server._wal_log("test_op", {"safe": "ok"})
+        wal._wal_log("test_op", {"safe": "ok"})
 
         assert wal_file.exists(), "lazy WAL init did not create the log on first write"
         entry = json.loads(wal_file.read_text().strip())
@@ -3560,3 +4748,596 @@ class TestUnknownParamName:
         )
         assert "error" not in resp
         assert "result" in resp
+
+
+def test_peer_writer_guard_refuses_mutating_tool_before_handler(monkeypatch):
+    from mempalace import mcp_server
+
+    called = {"value": False}
+
+    def handler(**kwargs):
+        called["value"] = True
+        return {"ok": True}
+
+    monkeypatch.setitem(
+        mcp_server.TOOLS,
+        "mempalace_add_drawer",
+        {
+            "description": "test write tool",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "wing": {"type": "string"},
+                    "room": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+            },
+            "handler": handler,
+        },
+    )
+    monkeypatch.setattr(
+        mcp_server,
+        "_acquire_mcp_writer_lock",
+        lambda: (False, "busy writer"),
+    )
+
+    response = mcp_server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "mempalace_add_drawer",
+                "arguments": {
+                    "wing": "wing_test",
+                    "room": "room_test",
+                    "content": "hello",
+                },
+            },
+        }
+    )
+
+    assert called["value"] is False
+    assert response["error"]["code"] == -32001
+    assert "read-only" in response["error"]["message"]
+    assert response["error"]["data"]["tool"] == "mempalace_add_drawer"
+
+
+def test_peer_writer_guard_does_not_gate_read_tool(monkeypatch):
+    from mempalace import mcp_server
+
+    def forbidden_lock():
+        raise AssertionError("read tools should not acquire the peer-writer lock")
+
+    monkeypatch.setitem(
+        mcp_server.TOOLS,
+        "mempalace_status",
+        {
+            "description": "test read tool",
+            "input_schema": {"type": "object", "properties": {}},
+            "handler": lambda: {"ok": True},
+        },
+    )
+    monkeypatch.setattr(mcp_server, "_acquire_mcp_writer_lock", forbidden_lock)
+
+    response = mcp_server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "tools/call",
+            "params": {"name": "mempalace_status", "arguments": {}},
+        }
+    )
+
+    assert '"ok": true' in response["result"]["content"][0]["text"]
+
+
+def test_status_tool_does_not_acquire_peer_writer_lock(monkeypatch):
+    from mempalace import mcp_server
+
+    def forbidden_lock():
+        raise AssertionError("status should not acquire the peer-writer lock")
+
+    monkeypatch.setattr(mcp_server, "_ensure_sqlite_integrity_status", lambda: None)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", None)
+    monkeypatch.setattr(mcp_server, "_backend_db_exists", lambda: True)
+    monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", lambda: None)
+    monkeypatch.setattr(mcp_server, "_vector_disabled", True)
+    monkeypatch.setattr(
+        mcp_server,
+        "_tool_status_via_sqlite",
+        lambda: {"total_drawers": 0, "wings": {}, "rooms": {}},
+    )
+    monkeypatch.setattr(mcp_server, "_acquire_mcp_writer_lock", forbidden_lock)
+
+    assert mcp_server.tool_status()["total_drawers"] == 0
+
+
+def test_peer_writer_lock_setup_failure_is_cached(monkeypatch):
+    from mempalace import mcp_server, palace
+
+    calls = {"count": 0}
+
+    def broken_mine_palace_lock(palace_path):
+        calls["count"] += 1
+        raise RuntimeError(f"permission denied for {palace_path}")
+
+    monkeypatch.delenv(mcp_server._MCP_ALLOW_PEER_WRITER_ENV, raising=False)
+    monkeypatch.setattr(palace, "mine_palace_lock", broken_mine_palace_lock)
+
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_CM", None)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_READ_ONLY", False)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_FAILED", False)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_ERROR", "")
+
+    ok_first, reason_first = mcp_server._acquire_mcp_writer_lock()
+    ok_second, reason_second = mcp_server._acquire_mcp_writer_lock()
+
+    assert ok_first is True
+    assert ok_second is True
+    assert calls["count"] == 1
+    assert mcp_server._MCP_WRITER_LOCK_FAILED is True
+    assert "continuing without peer-writer protection" in reason_first
+    assert reason_second == reason_first
+
+
+def test_peer_writer_readonly_self_heals_after_peer_exits(monkeypatch):
+    """A server that came up read-only must retry the flock and promote itself
+    to writer once the peer holding the lease exits — no restart required."""
+    from mempalace import mcp_server, palace
+
+    class _DummyLock:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    calls = {"count": 0}
+
+    def flaky_mine_palace_lock(palace_path):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            # First attempt: a live peer still holds the lease.
+            raise palace.MineAlreadyRunning(f"palace {palace_path} is held by pid=999")
+        # Second attempt: peer has exited, flock is free.
+        return _DummyLock()
+
+    monkeypatch.delenv(mcp_server._MCP_ALLOW_PEER_WRITER_ENV, raising=False)
+    monkeypatch.setattr(palace, "mine_palace_lock", flaky_mine_palace_lock)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_CM", None)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_READ_ONLY", False)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_FAILED", False)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_ERROR", "")
+
+    # First call: refused, latched read-only for reporting.
+    ok_first, reason_first = mcp_server._acquire_mcp_writer_lock()
+    assert ok_first is False
+    assert mcp_server._MCP_WRITER_READ_ONLY is True
+    assert "already holds" in reason_first
+
+    # Second call: the sticky latch must NOT short-circuit — retry succeeds.
+    ok_second, reason_second = mcp_server._acquire_mcp_writer_lock()
+    assert ok_second is True
+    assert reason_second == ""
+    assert calls["count"] == 2  # retried, not stranded read-only
+    assert mcp_server._MCP_WRITER_LOCK_CM is not None
+    assert mcp_server._MCP_WRITER_READ_ONLY is False
+
+
+def test_sqlite_integrity_gate_refuses_non_status_tool(monkeypatch):
+    from mempalace import mcp_server
+
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", True)
+    monkeypatch.setattr(
+        mcp_server,
+        "_sqlite_integrity_errors",
+        ["malformed inverted index for FTS5 table main.embedding_fulltext_search"],
+    )
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+
+    response = mcp_server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1818,
+            "method": "tools/call",
+            "params": {"name": "mempalace_list_wings", "arguments": {}},
+        }
+    )
+
+    assert response["error"]["code"] == mcp_server._SQLITE_INTEGRITY_ERROR_CODE
+    assert "integrity check failed" in response["error"]["message"]
+    assert response["error"]["data"]["tool"] == "mempalace_list_wings"
+    assert "malformed inverted index" in response["error"]["data"]["errors"][0]
+
+
+def test_sqlite_integrity_status_surfaces_payload_without_chroma(monkeypatch):
+    import json
+
+    from mempalace import mcp_server
+
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", True)
+    monkeypatch.setattr(
+        mcp_server,
+        "_sqlite_integrity_errors",
+        ["malformed inverted index for FTS5 table main.embedding_fulltext_search"],
+    )
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+    monkeypatch.setattr(
+        mcp_server,
+        "_tool_status_via_sqlite",
+        lambda: {"total_drawers": 123, "backend": "chroma"},
+    )
+
+    response = mcp_server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1819,
+            "method": "tools/call",
+            "params": {"name": "mempalace_status", "arguments": {}},
+        }
+    )
+
+    payload = json.loads(response["result"]["content"][0]["text"])
+
+    assert payload["total_drawers"] == 123
+    assert payload["sqlite_integrity_failed"] is True
+    assert payload["sqlite_integrity"]["ok"] is False
+    assert payload["sqlite_integrity"]["error_count"] == 1
+    assert "malformed inverted index" in payload["sqlite_integrity"]["errors"][0]
+
+
+def test_sqlite_integrity_payload_not_applicable_on_non_chroma_backend(monkeypatch):
+    """#1931: a non-chroma backend runs no sqlite quick_check, so status must
+    report the check as not-applicable rather than implying it passed.
+
+    Before the fix the payload reported ``checked=True``/``ok=True`` and a
+    ``chroma.sqlite3`` path that does not exist for the active backend.
+    """
+    from mempalace import mcp_server
+
+    monkeypatch.setattr(mcp_server, "_selected_backend_name", lambda: "qdrant")
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", True)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", [])
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+
+    payload = mcp_server._sqlite_integrity_payload()
+
+    assert payload["checked"] is False
+    assert payload["ok"] is None
+    assert "qdrant" in payload["reason"]
+    # No chroma.sqlite3 reference and a shape stable with the chroma payload.
+    assert payload["sqlite_path"] == ""
+    assert payload["error_count"] == 0
+    assert payload["errors"] == []
+
+
+def test_sqlite_integrity_payload_reports_unknown_when_backend_unresolvable(monkeypatch):
+    """#1931: if backend resolution raises, status still must not claim an
+    integrity pass; it reports not-applicable for an unknown backend.
+    """
+    from mempalace import mcp_server
+
+    def _boom():
+        raise RuntimeError("backend registry unavailable")
+
+    monkeypatch.setattr(mcp_server, "_selected_backend_name", _boom)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", True)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", [])
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+
+    payload = mcp_server._sqlite_integrity_payload()
+
+    assert payload["checked"] is False
+    assert payload["ok"] is None
+    assert "unknown" in payload["reason"]
+
+
+def test_sqlite_integrity_payload_full_shape_on_chroma_backend(monkeypatch):
+    """#1931 guard: a chroma backend with no recorded errors must still return
+    the full integrity payload; the not-applicable branch must not swallow the
+    chroma path.
+    """
+    from mempalace import mcp_server
+
+    monkeypatch.setattr(mcp_server, "_selected_backend_name", lambda: "chroma")
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", True)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", [])
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+
+    payload = mcp_server._sqlite_integrity_payload()
+
+    assert payload["checked"] is True
+    assert payload["ok"] is True
+    assert "sqlite_path" in payload
+    assert payload["error_count"] == 0
+    assert "reason" not in payload
+
+
+def test_sqlite_integrity_reconnect_allowed_when_corrupt(monkeypatch):
+    from mempalace import mcp_server
+
+    called = {"value": False}
+
+    def fake_reconnect():
+        called["value"] = True
+        return {"success": True}
+
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", True)
+    monkeypatch.setattr(
+        mcp_server,
+        "_sqlite_integrity_errors",
+        ["malformed inverted index for FTS5 table main.embedding_fulltext_search"],
+    )
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+    monkeypatch.setitem(
+        mcp_server.TOOLS,
+        "mempalace_reconnect",
+        {
+            "description": "test reconnect",
+            "input_schema": {"type": "object", "properties": {}},
+            "handler": fake_reconnect,
+        },
+    )
+
+    response = mcp_server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1820,
+            "method": "tools/call",
+            "params": {"name": "mempalace_reconnect", "arguments": {}},
+        }
+    )
+
+    assert called["value"] is True
+    assert '"success": true' in response["result"]["content"][0]["text"]
+
+
+def test_refresh_sqlite_integrity_status_records_quick_check_errors(monkeypatch):
+    from mempalace import mcp_server, repair
+
+    monkeypatch.setattr(mcp_server, "_is_chroma_backend", lambda: True)
+    monkeypatch.setattr(
+        repair,
+        "sqlite_integrity_errors",
+        lambda palace_path: [
+            "malformed inverted index for FTS5 table main.embedding_fulltext_search"
+        ],
+    )
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", False)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", [])
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+
+    mcp_server._refresh_sqlite_integrity_status()
+
+    assert mcp_server._sqlite_integrity_checked is True
+    assert len(mcp_server._sqlite_integrity_errors) == 1
+    assert "malformed inverted index" in mcp_server._sqlite_integrity_errors[0]
+
+
+def test_refresh_sqlite_integrity_status_skips_oversized_db(monkeypatch, tmp_path):
+    """Oversized chroma.sqlite3 must NOT run the O(size) startup quick_check."""
+    from mempalace import mcp_server, repair
+
+    (tmp_path / "chroma.sqlite3").write_bytes(b"\0" * (2 * 1024 * 1024))  # 2 MB
+    monkeypatch.setattr(mcp_server, "_is_chroma_backend", lambda: True)
+    monkeypatch.setattr(
+        type(mcp_server._config), "palace_path", property(lambda self: str(tmp_path))
+    )
+    monkeypatch.setenv("MEMPALACE_STARTUP_INTEGRITY_MAX_MB", "1")  # limit 1 MB < 2 MB
+
+    called = {"n": 0}
+
+    def _boom(palace_path):
+        called["n"] += 1
+        raise AssertionError("quick_check must not run for oversized DB")
+
+    monkeypatch.setattr(repair, "sqlite_integrity_errors", _boom)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", False)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", ["stale"])
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+
+    mcp_server._refresh_sqlite_integrity_status()
+
+    assert called["n"] == 0
+    assert mcp_server._sqlite_integrity_checked is True
+    assert mcp_server._sqlite_integrity_errors == []
+
+
+def test_refresh_sqlite_integrity_status_runs_when_under_limit(monkeypatch, tmp_path):
+    """A DB under the limit still runs the quick_check (behaviour preserved)."""
+    from mempalace import mcp_server, repair
+
+    (tmp_path / "chroma.sqlite3").write_bytes(b"\0" * (512 * 1024))  # 0.5 MB
+    monkeypatch.setattr(mcp_server, "_is_chroma_backend", lambda: True)
+    monkeypatch.setattr(
+        type(mcp_server._config), "palace_path", property(lambda self: str(tmp_path))
+    )
+    monkeypatch.setenv("MEMPALACE_STARTUP_INTEGRITY_MAX_MB", "1")  # limit 1 MB > 0.5 MB
+
+    called = {"n": 0}
+
+    def _spy(palace_path):
+        called["n"] += 1
+        return []
+
+    monkeypatch.setattr(repair, "sqlite_integrity_errors", _spy)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", False)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", [])
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+
+    mcp_server._refresh_sqlite_integrity_status()
+
+    assert called["n"] == 1
+    assert mcp_server._sqlite_integrity_checked is True
+
+
+def test_startup_integrity_size_gate_disabled_with_zero(monkeypatch, tmp_path):
+    """MEMPALACE_STARTUP_INTEGRITY_MAX_MB=0 disables the gate: check always runs."""
+    from mempalace import mcp_server, repair
+
+    (tmp_path / "chroma.sqlite3").write_bytes(b"\0" * (4 * 1024 * 1024))  # 4 MB
+    monkeypatch.setattr(mcp_server, "_is_chroma_backend", lambda: True)
+    monkeypatch.setattr(
+        type(mcp_server._config), "palace_path", property(lambda self: str(tmp_path))
+    )
+    monkeypatch.setenv("MEMPALACE_STARTUP_INTEGRITY_MAX_MB", "0")
+
+    called = {"n": 0}
+
+    def _spy(palace_path):
+        called["n"] += 1
+        return []
+
+    monkeypatch.setattr(repair, "sqlite_integrity_errors", _spy)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", False)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", [])
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+
+    mcp_server._refresh_sqlite_integrity_status()
+
+    assert called["n"] == 1
+
+
+def test_sqlite_integrity_refusal_handles_none_palace_path(monkeypatch):
+    """
+    Regression test for Gemini review feedback on PR #1823 (lines 433-455).
+
+    _mcp_sqlite_integrity_refusal() must not raise TypeError when
+    _config.palace_path is None — os.path.join(None, "chroma.sqlite3")
+    would otherwise crash the server on every mutating tool call while
+    the palace is unconfigured and integrity errors are present.
+    """
+    from mempalace import mcp_server
+
+    # palace_path is a read-only @property on MempalaceConfig (no setter),
+    # so monkeypatch.setattr on the instance fails. Patch the class-level
+    # property instead -- monkeypatch restores it automatically on teardown.
+    monkeypatch.setattr(type(mcp_server._config), "palace_path", property(lambda self: None))
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", True)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", ["malformed inverted index"])
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+
+    # Must not raise
+    result = mcp_server._mcp_sqlite_integrity_refusal(req_id=1, tool_name="mempalace_kg_add")
+
+    assert result is not None
+    assert result["error"]["data"]["palace"] == ""
+    assert result["error"]["data"]["sqlite_path"] == ""
+    assert result["error"]["data"]["tool"] == "mempalace_kg_add"
+
+
+class TestListDrawersDateFilters:
+    """Unit tests for the #1128 date-filter helpers in mcp_server."""
+
+    def test_parse_date_filter_none_and_blank(self):
+        from mempalace.mcp_server import _parse_date_filter
+
+        assert _parse_date_filter(None, "since") is None
+        assert _parse_date_filter("   ", "since") is None
+
+    def test_parse_date_filter_date_only(self):
+        from datetime import datetime
+
+        from mempalace.mcp_server import _parse_date_filter
+
+        assert _parse_date_filter("2026-04-01", "since") == datetime(2026, 4, 1)
+
+    def test_parse_date_filter_full_timestamp(self):
+        from datetime import datetime
+
+        from mempalace.mcp_server import _parse_date_filter
+
+        assert _parse_date_filter("2026-04-01T09:30:00", "since") == datetime(2026, 4, 1, 9, 30)
+
+    def test_parse_date_filter_drops_timezone(self):
+        from datetime import datetime
+
+        from mempalace.mcp_server import _parse_date_filter
+
+        # tz offset dropped -> naive wall-clock, never raises vs naive filed_at.
+        parsed = _parse_date_filter("2026-04-01T09:30:00+02:00", "since")
+        assert parsed == datetime(2026, 4, 1, 9, 30)
+        assert parsed.tzinfo is None
+
+    def test_parse_date_filter_rejects_garbage(self):
+        import pytest
+
+        from mempalace.mcp_server import _parse_date_filter
+
+        with pytest.raises(ValueError, match="since"):
+            _parse_date_filter("not-a-date", "since")
+
+    def test_parse_date_filter_rejects_impossible_date(self):
+        import pytest
+
+        from mempalace.mcp_server import _parse_date_filter
+
+        with pytest.raises(ValueError):
+            _parse_date_filter("2026-13-40", "before")
+
+    def test_filed_at_in_window_since_inclusive(self):
+        from datetime import datetime
+
+        from mempalace.mcp_server import _filed_at_in_window
+
+        since = datetime(2026, 1, 2)
+        assert _filed_at_in_window("2026-01-02T00:00:00", since, None) is True
+        assert _filed_at_in_window("2026-01-01T23:59:59", since, None) is False
+
+    def test_filed_at_in_window_before_exclusive(self):
+        from datetime import datetime
+
+        from mempalace.mcp_server import _filed_at_in_window
+
+        before = datetime(2026, 1, 3)
+        assert _filed_at_in_window("2026-01-02T23:59:59", None, before) is True
+        assert _filed_at_in_window("2026-01-03T00:00:00", None, before) is False
+
+    def test_filed_at_in_window_missing_or_malformed_excluded(self):
+        from datetime import datetime
+
+        from mempalace.mcp_server import _filed_at_in_window
+
+        since = datetime(2026, 1, 1)
+        assert _filed_at_in_window(None, since, None) is False
+        assert _filed_at_in_window("", since, None) is False
+        assert _filed_at_in_window("garbage", since, None) is False
+        assert _filed_at_in_window(12345, since, None) is False
+
+    def test_filed_at_in_window_tz_aware_wall_clock(self):
+        from datetime import datetime
+
+        from mempalace.mcp_server import _filed_at_in_window
+
+        # tz dropped on both sides -> wall-clock compare, no TypeError raised.
+        since = datetime(2026, 1, 2)
+        assert _filed_at_in_window("2026-01-02T08:00:00+05:00", since, None) is True
+
+    def test_parse_date_filter_accepts_zulu_suffix(self):
+        from datetime import datetime
+
+        from mempalace.mcp_server import _parse_date_filter
+
+        # "Z" is not accepted by datetime.fromisoformat before 3.11; the helper
+        # strips it so Zulu inputs parse on the 3.9 floor, tz then dropped.
+        parsed = _parse_date_filter("2026-04-01T09:30:00Z", "since")
+        assert parsed == datetime(2026, 4, 1, 9, 30)
+        assert parsed.tzinfo is None
+
+        # Date-only with a Zulu suffix must also parse on 3.9/3.10 (appending
+        # "+00:00" would have raised there; stripping Z does not).
+        parsed_date = _parse_date_filter("2026-04-01Z", "since")
+        assert parsed_date == datetime(2026, 4, 1)
+        assert parsed_date.tzinfo is None
+
+        # Lowercase z is tolerated too.
+        assert _parse_date_filter("2026-04-01t09:30:00z", "since") == datetime(2026, 4, 1, 9, 30)
+
+    def test_filed_at_in_window_accepts_zulu_filed_at(self):
+        from datetime import datetime
+
+        from mempalace.mcp_server import _filed_at_in_window
+
+        since = datetime(2026, 1, 2)
+        assert _filed_at_in_window("2026-01-02T08:00:00Z", since, None) is True

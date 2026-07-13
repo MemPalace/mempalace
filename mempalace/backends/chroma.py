@@ -8,7 +8,9 @@ import math
 import os
 import pickle
 import re
+import shlex
 import sqlite3
+import time
 from collections import defaultdict
 from numbers import Integral
 from pathlib import Path
@@ -17,6 +19,8 @@ from typing import Any, Optional
 import chromadb
 from chromadb.errors import NotFoundError as _ChromaNotFoundError
 
+from ..config import sqlite_read_uri
+from ._sidecar import EMBEDDER_SIDECAR_FILENAME, read_embedder_sidecar, write_embedder_sidecar
 from .base import (
     BaseBackend,
     BaseCollection,
@@ -78,13 +82,52 @@ def _hnsw_link_to_data_ratio(seg_dir: str) -> Optional[float]:
     return link_size / data_size
 
 
-def _hnsw_link_lists_is_usable_for_payload(seg_dir: str) -> bool:
-    """Return False when a non-trivial HNSW payload lacks usable link lists.
+def _hnsw_metadata_marker_intact(seg_dir: str) -> bool:
+    """Return True when ``index_metadata.pickle`` bears a complete envelope.
 
-    A missing or empty link_lists.bin is acceptable only for a fresh/empty
-    segment. Once data_level0.bin has real payload, a zero-byte link_lists.bin
-    is not a harmless async-flush shape: ChromaDB can later hand the broken
-    graph to hnswlib and crash in native code.
+    ChromaDB writes ``index_metadata.pickle`` last during a persist, so an
+    intact pickle envelope — protocol marker ``0x80`` at the head, ``STOP``
+    byte ``0x2e`` at the tail — proves the flush finished. Used as a
+    persist-completion marker: when present, the segment's on-disk shape
+    (including an all-layer-0 index with an empty ``link_lists.bin``) is the
+    one chromadb intentionally serialized, not a half-written one.
+
+    Deliberately byte-sniffs only; never deserializes. Deserialization can
+    execute arbitrary code, and the byte-sniff is enough to tell a complete
+    write from truncation or zero-fill. Assumes pickle protocol >= 2.
+    """
+    meta_path = os.path.join(seg_dir, "index_metadata.pickle")
+    try:
+        if not os.path.isfile(meta_path) or os.path.getsize(meta_path) < 16:
+            return False
+        with open(meta_path, "rb") as f:
+            head = f.read(2)
+            f.seek(-1, 2)  # last byte
+            tail = f.read(1)
+    except OSError:
+        return False
+    return len(head) == 2 and head[0] == 0x80 and tail == b"\x2e"
+
+
+def _hnsw_link_lists_is_usable_for_payload(seg_dir: str) -> bool:
+    """Return False when a non-trivial HNSW payload looks like a partial flush.
+
+    A zero-byte ``link_lists.bin`` is *not* corruption on its own. hnswlib
+    stores the entire layer-0 graph inside ``data_level0.bin`` and only writes
+    ``link_lists.bin`` for elements promoted to level > 0. A small or
+    low-fanout index where every element stays on layer 0 therefore
+    serializes an empty ``link_lists.bin`` and loads/searches fine (#1716).
+    Treating that shape as corruption produced a self-perpetuating quarantine
+    loop: repair rebuilt the byte-identical all-layer-0 segment, which the next
+    cold start quarantined again, accumulating drift dirs without bound.
+
+    An empty ``link_lists.bin`` only signals trouble when the persist was
+    interrupted before it could finish. ChromaDB writes
+    ``index_metadata.pickle`` last, so an intact metadata envelope proves the
+    flush completed and the empty ``link_lists.bin`` is the legitimate
+    all-layer-0 shape. Only when there is real payload, an empty
+    ``link_lists.bin``, *and* no completion marker do we treat the segment as a
+    partial flush.
     """
     data_path = os.path.join(seg_dir, "data_level0.bin")
     link_path = os.path.join(seg_dir, "link_lists.bin")
@@ -97,9 +140,15 @@ def _hnsw_link_lists_is_usable_for_payload(seg_dir: str) -> bool:
         if data_size <= _HNSW_MISSING_METADATA_DATA_FLOOR:
             return True
 
-        return os.path.isfile(link_path) and os.path.getsize(link_path) > 0
+        if os.path.isfile(link_path) and os.path.getsize(link_path) > 0:
+            return True
     except OSError:
         return False
+
+    # Real payload with an empty/absent link_lists.bin: legitimate only when
+    # the persist completed (all-layer-0 index), proven by an intact metadata
+    # marker. Otherwise it is a half-written segment chromadb could segfault on.
+    return _hnsw_metadata_marker_intact(seg_dir)
 
 
 def _hnsw_payload_appears_sane(seg_dir: str) -> bool:
@@ -333,17 +382,7 @@ def _segment_appears_healthy(seg_dir: str) -> bool:
     if not _hnsw_payload_appears_sane(seg_dir):
         return False
 
-    try:
-        size = os.path.getsize(meta_path)
-        if size < 16:
-            return False
-        with open(meta_path, "rb") as f:
-            head = f.read(2)
-            f.seek(-1, 2)  # last byte
-            tail = f.read(1)
-    except OSError:
-        return False
-    return len(head) == 2 and head[0] == 0x80 and tail == b"\x2e"
+    return _hnsw_metadata_marker_intact(seg_dir)
 
 
 def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> list[str]:
@@ -456,7 +495,7 @@ def _vector_segment_id(palace_path: str, collection_name: str) -> Optional[str]:
     if not os.path.isfile(db_path):
         return None
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
         try:
             row = conn.execute(
                 """
@@ -605,6 +644,7 @@ def _hnsw_element_count(palace_path: str, segment_id: str) -> Optional[int]:
 # sync_threshold) from expected steady-state lag.
 _HNSW_DIVERGENCE_FALLBACK_FLOOR = 2000
 _HNSW_DIVERGENCE_FRACTION = 0.10
+_HNSW_PERSISTENT_DIVERGENCE_GRACE_SECONDS = 300.0
 
 
 def _read_sync_threshold(palace_path: str, collection_name: str) -> int:
@@ -625,7 +665,7 @@ def _read_sync_threshold(palace_path: str, collection_name: str) -> int:
     if not os.path.isfile(db_path):
         return 1000
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
         try:
             cur = conn.cursor()
             cur.execute(
@@ -646,6 +686,45 @@ def _read_sync_threshold(palace_path: str, collection_name: str) -> int:
     except Exception:
         logger.debug("_read_sync_threshold failed", exc_info=True)
         return 1000
+
+
+def _collection_has_sync_threshold_metadata(palace_path: str, collection_name: str) -> bool:
+    """Return True when the collection explicitly stores hnsw:sync_threshold."""
+
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return False
+
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            row = conn.execute(
+                """
+                SELECT 1
+                  FROM collection_metadata cm
+                  JOIN collections c ON cm.collection_id = c.id
+                 WHERE c.name = ?
+                   AND cm.key = 'hnsw:sync_threshold'
+                 LIMIT 1
+                """,
+                (collection_name,),
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+    except Exception:
+        logger.debug("_collection_has_sync_threshold_metadata failed", exc_info=True)
+        return False
+
+
+def _hnsw_metadata_age_seconds(palace_path: str, segment_id: str) -> Optional[float]:
+    """Return index_metadata.pickle age in seconds, or None when unreadable."""
+
+    pickle_path = os.path.join(palace_path, segment_id, "index_metadata.pickle")
+    try:
+        return max(0.0, time.time() - os.path.getmtime(pickle_path))
+    except OSError:
+        return None
 
 
 def hnsw_capacity_status(palace_path: str, collection_name: str = "mempalace_drawers") -> dict:
@@ -692,11 +771,15 @@ def hnsw_capacity_status(palace_path: str, collection_name: str = "mempalace_dra
 
         hnsw_count = _hnsw_element_count(palace_path, seg_id)
         out["hnsw_count"] = hnsw_count
-
         sync_threshold = _read_sync_threshold(palace_path, collection_name)
-        # Two synchronization windows worth — see comment above
-        # _HNSW_DIVERGENCE_FALLBACK_FLOOR for the rationale.
-        divergence_floor = max(_HNSW_DIVERGENCE_FALLBACK_FLOOR, 2 * sync_threshold)
+        has_explicit_sync_threshold = _collection_has_sync_threshold_metadata(
+            palace_path,
+            collection_name,
+        )
+        metadata_age_seconds = (
+            _hnsw_metadata_age_seconds(palace_path, seg_id) if hnsw_count is not None else None
+        )
+        out["hnsw_metadata_age_seconds"] = metadata_age_seconds
 
         if hnsw_count is None:
             # No pickle yet, so this probe cannot measure HNSW capacity.
@@ -714,21 +797,53 @@ def hnsw_capacity_status(palace_path: str, collection_name: str = "mempalace_dra
 
         divergence = sqlite_count - hnsw_count
         out["divergence"] = divergence
-        threshold = max(divergence_floor, int(sqlite_count * _HNSW_DIVERGENCE_FRACTION))
-        if divergence > threshold:
+
+        # Newer palaces explicitly store mempalace's low sync threshold
+        # (currently 2), so a gap of dozens of rows is far beyond ordinary
+        # flush lag. Older palaces may lack the metadata row; keep the
+        # historical floor for fresh lag there, but do not let a stale pickle
+        # sit below the floor forever (#1816).
+        if has_explicit_sync_threshold:
+            threshold = max(0, 2 * sync_threshold)
+        else:
+            divergence_floor = max(_HNSW_DIVERGENCE_FALLBACK_FLOOR, 2 * sync_threshold)
+            threshold = max(
+                divergence_floor,
+                int(sqlite_count * _HNSW_DIVERGENCE_FRACTION),
+            )
+
+        out["threshold"] = threshold
+        stale_below_threshold = (
+            not has_explicit_sync_threshold
+            and divergence > 0
+            and metadata_age_seconds is not None
+            and metadata_age_seconds >= _HNSW_PERSISTENT_DIVERGENCE_GRACE_SECONDS
+        )
+
+        if divergence > threshold or stale_below_threshold:
             out["status"] = "diverged"
             out["diverged"] = True
             pct = 100.0 * divergence / max(sqlite_count, 1)
+            if divergence > threshold:
+                reason = f"exceeds threshold {threshold:,}"
+            else:
+                age = metadata_age_seconds or 0.0
+                reason = f"persisted below the old flush-lag floor for {age:.0f}s"
             out["message"] = (
                 f"HNSW index holds {hnsw_count:,} elements but sqlite has "
-                f"{sqlite_count:,} embeddings — {divergence:,} drawers ({pct:.0f}%) "
-                "are invisible to vector search. Run `mempalace repair` to rebuild."
+                f"{sqlite_count:,} embeddings - {divergence:,} drawers "
+                f"({pct:.0f}%) are missing from the flushed HNSW index "
+                f"({reason}). Vector reads are disabled until "
+                "`mempalace repair` rebuilds it."
             )
         else:
             out["status"] = "ok"
             out["message"] = (
                 f"HNSW {hnsw_count:,} / sqlite {sqlite_count:,} (within flush-lag tolerance)"
             )
+            if divergence < 0:
+                out["message"] += " (HNSW has extra flushed elements; treating as safe)"
+
     except Exception:
         logger.debug("hnsw_capacity_status failed", exc_info=True)
         out["message"] = "HNSW capacity probe raised; skipping"
@@ -745,7 +860,7 @@ def _sqlite_embedding_count(palace_path: str, collection_name: str) -> Optional[
     if not os.path.isfile(db_path):
         return None
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
         try:
             row = conn.execute(
                 """
@@ -806,7 +921,7 @@ def _sqlite_wing_room_counts(
     if not os.path.isfile(db_path):
         return None
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
         try:
             # Wait out a transient writer/checkpoint lock rather than falling
             # straight back to the expensive vector-index path (#1681).
@@ -925,7 +1040,12 @@ def _missing_dimensionality_appears_recoverable(
         return False
 
     label_count = len(id_to_label)
-    if int(total) != label_count or len(label_to_id) != label_count:
+    # total_elements_added is monotonic across every add, while id_to_label and
+    # label_to_id hold only live elements, so a segment that has had deletions
+    # carries total_elements_added > label_count. Require >= (not ==), otherwise
+    # every post-deletion dim-None segment is wrongly quarantined (#1710); the
+    # label-map size and bijection checks still reject inconsistent label maps.
+    if int(total) < label_count or len(label_to_id) != label_count:
         return False
     try:
         return all(label_to_id.get(label) == item_id for item_id, label in id_to_label.items())
@@ -1067,7 +1187,7 @@ def _fix_blob_seq_ids(palace_path: str) -> None:
     if os.path.isfile(marker):
         return
     try:
-        with sqlite3.connect(db_path) as conn:
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
             try:
                 rows = conn.execute(
                     "SELECT rowid, seq_id FROM embeddings WHERE typeof(seq_id) = 'blob'"
@@ -1255,8 +1375,8 @@ class ChromaCollection(BaseCollection):
 
     @staticmethod
     def _sanitize_documents_for_chromadb(documents):
-        """Strip lone UTF-16 surrogates from every document before it reaches
-        the chromadb client.
+        """Strip lone UTF-16 surrogates and embedded NUL characters from every
+        document before it reaches the chromadb client.
 
         A single lone surrogate (U+D800–U+DFFF) raises ``UnicodeEncodeError``
         inside chromadb's encode path and aborts the *entire* add/upsert batch
@@ -1269,18 +1389,29 @@ class ChromaCollection(BaseCollection):
         directly. Sanitising here makes the chokepoint catch-all complete: the
         sibling :meth:`_sanitize_metadatas_for_chromadb` already guarantees this
         for metadata one method over; documents get the same guarantee.
+
+        A document containing an embedded NUL (U+0000) — routine in mined
+        Bash tool output — is well-formed UTF-8, unlike a lone surrogate, but
+        can corrupt the FTS5 inverted index for the whole collection rather
+        than just failing to store that one row (a ChromaDB-side bug; tracked
+        upstream). Stripping it here is the same defense-in-depth already
+        applied to surrogates: sanitize input we don't control before it
+        reaches a datastore we don't control.
         """
         if documents is None:
             return None
-        from ..config import strip_lone_surrogates
+        from ..config import strip_lone_surrogates, strip_nul_bytes
+
+        def _sanitize(d):
+            return strip_nul_bytes(strip_lone_surrogates(d))
 
         # chromadb accepts OneOrMany[Document]: a bare str is a single document,
         # not an iterable of characters. Handle it explicitly so we don't split
         # it into per-character documents — that would be exactly the kind of
         # silent corruption this method exists to prevent.
         if isinstance(documents, str):
-            return strip_lone_surrogates(documents)
-        return [strip_lone_surrogates(d) if isinstance(d, str) else d for d in documents]
+            return _sanitize(documents)
+        return [_sanitize(d) if isinstance(d, str) else d for d in documents]
 
     def add(self, *, documents, ids, metadatas=None, embeddings=None):
         kwargs: dict[str, Any] = {
@@ -1564,7 +1695,7 @@ class ChromaCollection(BaseCollection):
         # rowid, embedding_id is the user-facing drawer id.
         public_ids: dict[int, str] = {}
         try:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
             conn.row_factory = sqlite3.Row
         except sqlite3.Error:
             logger.debug("Chroma lexical sqlite open failed", exc_info=True)
@@ -1724,6 +1855,46 @@ class ChromaCollection(BaseCollection):
         """
         return self._collection.metadata or {}
 
+    @property
+    def distance_metric(self) -> str:
+        """Report this collection's actual space from ``hnsw:space``.
+
+        MemPalace sets ``hnsw:space=cosine`` on every creation path, so a
+        healthy palace reports ``"cosine"``. When the key is absent, empty, or
+        an unrecognized value, the collection is genuinely using Chroma's HNSW
+        default — **L2** (Euclidean) — because cosine was never set on it. We
+        report ``"l2"`` in that case so core ranking maps the distances
+        correctly; reporting ``"cosine"`` here would reintroduce the
+        floor-every-result-to-zero misranking this property exists to fix.
+        """
+        space = str(self.metadata.get("hnsw:space", "") or "").lower()
+        if space in ("cosine", "l2", "ip"):
+            return space
+        return "l2"
+
+    # ------------------------------------------------------------------
+    # Embedder identity (RFC 001)
+    #
+    # Stored in a small sidecar JSON in the palace dir rather than the Chroma
+    # collection metadata: ``collection.modify(metadata=...)`` replaces the
+    # whole dict and some Chroma versions reject re-passing the immutable
+    # ``hnsw:*`` construction keys, so mutating it on every open is fragile.
+    # The sidecar is keyed by collection name (a palace may hold several).
+    # This is complementary to Chroma's own embedding-function-name check —
+    # the core check runs at open time and yields the clean cross-backend
+    # error before Chroma's read-time rejection fires.
+    # ------------------------------------------------------------------
+    def _embedder_sidecar_path(self) -> Optional[str]:
+        if not self._palace_path:
+            return None
+        return os.path.join(self._palace_path, EMBEDDER_SIDECAR_FILENAME)
+
+    def get_stored_embedder_identity(self):
+        return read_embedder_sidecar(self._embedder_sidecar_path(), self._collection_name())
+
+    def set_embedder_identity(self, identity) -> None:
+        write_embedder_sidecar(self._embedder_sidecar_path(), self._collection_name(), identity)
+
 
 # ---------------------------------------------------------------------------
 # Backend
@@ -1800,6 +1971,7 @@ class ChromaBackend(BaseBackend):
             current_model = MempalaceConfig().embedding_model
         except Exception:
             current_model = "unknown"
+        rebuild_cmd = f"mempalace --palace {shlex.quote(palace_path)} repair rebuild-index"
         return (
             f"Embedding model mismatch reading palace at {palace_path!r}.\n"
             f"  Underlying ChromaDB error: {msg}\n"
@@ -1807,8 +1979,8 @@ class ChromaBackend(BaseBackend):
             f"  The palace was built with a different embedding model. Either:\n"
             f"    (a) revert the model: unset MEMPALACE_EMBEDDING_MODEL (or set "
             f"the previous value), or\n"
-            f"    (b) re-embed in place: `mempalace repair rebuild-index "
-            f"--palace {palace_path}` (writes new vectors with the current model)."
+            f"    (b) re-embed in place: `{rebuild_cmd}` "
+            f"(writes new vectors with the current model)."
         )
 
     # ------------------------------------------------------------------
@@ -2067,7 +2239,26 @@ class ChromaBackend(BaseBackend):
 
     @classmethod
     def detect(cls, path: str) -> bool:
-        return os.path.isfile(os.path.join(path, "chroma.sqlite3"))
+        """Return True when ``path`` looks like a chroma palace.
+
+        Verifies the SQLite magic header rather than file presence alone.
+        Bare ``sqlite3.connect()`` against a missing path leaves a 0-byte
+        file behind (the SQLite header is written on the first statement,
+        not on connection), so file-presence alone treats those artifacts
+        as real chroma palaces and breaks multi-backend resolution. The
+        16-byte ``SQLite format 3\\x00`` magic prefix is written as soon
+        as chromadb's ``PersistentClient`` does any work, so this check
+        accepts every real chroma palace while rejecting empty / garbage
+        files. See #1893.
+        """
+        db_path = os.path.join(path, "chroma.sqlite3")
+        if not os.path.isfile(db_path):
+            return False
+        try:
+            with open(db_path, "rb") as f:
+                return f.read(16) == b"SQLite format 3\x00"
+        except OSError:
+            return False
 
     # ------------------------------------------------------------------
     # Legacy (pre-RFC 001) surface — retained while callers migrate.

@@ -46,10 +46,11 @@ from .dynamics import initialize_dynamics_fields
 
 logger = logging.getLogger("mempalace_hallways")
 
-# Persistence target. Mirrors ``palace_graph._TUNNEL_FILE`` so the storage
-# pattern is uniform across the two related primitives. Tests override
-# this via ``monkeypatch.setattr(hallways, "_HALLWAY_FILE", tmp_path/...)``.
-_HALLWAY_FILE = os.path.join(os.path.expanduser("~"), ".mempalace", "hallways.json")
+# Persistence target is resolved through ``_get_hallway_file`` below, which
+# mirrors ``palace_graph._get_tunnel_file`` (the 3.3.6 palace-scoped pattern)
+# so the storage layout is uniform across the two related primitives. Tests
+# should monkey-patch ``_get_hallway_file`` and ``_legacy_hallway_file`` rather
+# than poking a module-level constant.
 
 _SCHEMA_VERSION = 1
 
@@ -62,36 +63,72 @@ __all__ = [
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Persistence — JSON file at _HALLWAY_FILE, restricted perms (0600) on POSIX
+# Persistence — JSON file resolved from MempalaceConfig.hallway_file,
+# restricted perms (0600) on POSIX. Pre-3.3.6 behavior (hardcoded
+# ~/.mempalace/hallways.json) is kept only as a one-time orphan detection
+# fallback, matching the palace_graph tunnel-file migration pattern.
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _load_hallways() -> list[dict]:
-    """Read all hallway records. Returns ``[]`` if the file is missing or corrupt."""
-    if not os.path.exists(_HALLWAY_FILE):
+def _get_hallway_file(config=None) -> str:
+    """Return the path to the hallways.json file, derived from MempalaceConfig.palace_path."""
+    from .config import MempalaceConfig
+
+    config = config or MempalaceConfig()
+    return config.hallway_file
+
+
+def _legacy_hallway_file() -> str:
+    """The pre-palace-scoped hardcoded path. Kept only for one-time orphan detection."""
+    return os.path.join(os.path.expanduser("~"), ".mempalace", "hallways.json")
+
+
+def _load_hallways(config=None) -> list[dict]:
+    """Read all hallway records. Returns ``[]`` if the file is missing or corrupt.
+
+    Backwards-compatibility: prior to this migration the hallway file was
+    hardcoded at ``~/.mempalace/hallways.json`` regardless of the configured
+    palace_path. If the configured hallway file is missing but a legacy file
+    exists at a different path, log a one-line warning naming both paths so
+    users can move the file manually. We do NOT auto-migrate — auto-merging
+    hallway state across two locations is too magical for a bugfix and risks
+    clobbering newer data. Same posture as ``palace_graph._load_tunnels``.
+    """
+    current_hallway_file = _get_hallway_file(config)
+    if os.path.exists(current_hallway_file):
+        try:
+            with open(current_hallway_file, encoding="utf-8") as f:
+                raw = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            logger.debug("hallways: load failed, treating as empty", exc_info=True)
+            return []
+        if isinstance(raw, dict) and "hallways" in raw:
+            return raw.get("hallways") or []
+        if isinstance(raw, list):
+            return raw
         return []
-    try:
-        with open(_HALLWAY_FILE, encoding="utf-8") as f:
-            raw = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        logger.debug("hallways: load failed, treating as empty", exc_info=True)
-        return []
-    if isinstance(raw, dict) and "hallways" in raw:
-        return raw.get("hallways") or []
-    if isinstance(raw, list):
-        return raw
+
+    legacy = _legacy_hallway_file()
+    if legacy != current_hallway_file and os.path.exists(legacy):
+        logger.warning(
+            "Legacy hallways file at '%s' is being ignored; configured location is '%s'. "
+            "Move or copy the legacy file to the configured path to recover its hallways.",
+            legacy,
+            current_hallway_file,
+        )
     return []
 
 
-def _save_hallways(hallways: list[dict]) -> None:
-    """Atomically persist hallway records to _HALLWAY_FILE.
+def _save_hallways(hallways: list[dict], config=None) -> None:
+    """Atomically persist hallway records to the configured hallway file.
 
     Uses an os.replace temp-file dance so a crash mid-write doesn't
     corrupt the file. POSIX permission is restricted to 0600 because
     hallways reveal within-wing entity connections that the user may
     not want world-readable.
     """
-    directory = os.path.dirname(_HALLWAY_FILE)
+    hallway_file = _get_hallway_file(config)
+    directory = os.path.dirname(hallway_file)
     os.makedirs(directory, exist_ok=True)
     payload = {
         "schema_version": _SCHEMA_VERSION,
@@ -106,7 +143,7 @@ def _save_hallways(hallways: list[dict]) -> None:
         except OSError:
             # Non-POSIX systems may not support chmod; not fatal.
             pass
-        os.replace(tmp_path, _HALLWAY_FILE)
+        os.replace(tmp_path, hallway_file)
     except Exception:
         try:
             os.unlink(tmp_path)

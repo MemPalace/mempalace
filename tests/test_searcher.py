@@ -9,7 +9,51 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from mempalace.searcher import SearchError, search, search_memories
+from _chroma_palace_helper import make_minimal_chroma_sqlite
+
+from mempalace.searcher import SearchError, build_where_filter, search, search_memories
+
+
+# ── build_where_filter (unit) ──────────────────────────────────────────
+
+
+class TestBuildWhereFilter:
+    """build_where_filter composes a ChromaDB where clause from optional
+    wing / room / source_file constraints (#1815). ChromaDB needs a ``$and``
+    only when ≥2 clauses are present; a single clause is returned bare and
+    zero clauses yield an empty filter."""
+
+    def test_no_filters_returns_empty(self):
+        assert build_where_filter() == {}
+
+    def test_wing_only(self):
+        assert build_where_filter(wing="backend") == {"wing": "backend"}
+
+    def test_room_only(self):
+        assert build_where_filter(room="auth") == {"room": "auth"}
+
+    def test_wing_and_room(self):
+        assert build_where_filter(wing="backend", room="auth") == {
+            "$and": [{"wing": "backend"}, {"room": "auth"}]
+        }
+
+    def test_source_file_only(self):
+        assert build_where_filter(source_file="auth.py") == {"source_file": "auth.py"}
+
+    def test_wing_and_source_file(self):
+        assert build_where_filter(wing="backend", source_file="auth.py") == {
+            "$and": [{"wing": "backend"}, {"source_file": "auth.py"}]
+        }
+
+    def test_room_and_source_file(self):
+        assert build_where_filter(room="auth", source_file="auth.py") == {
+            "$and": [{"room": "auth"}, {"source_file": "auth.py"}]
+        }
+
+    def test_wing_room_and_source_file(self):
+        assert build_where_filter(wing="backend", room="auth", source_file="auth.py") == {
+            "$and": [{"wing": "backend"}, {"room": "auth"}, {"source_file": "auth.py"}]
+        }
 
 
 # ── search_memories (API) ──────────────────────────────────────────────
@@ -33,6 +77,68 @@ class TestSearchMemories:
     def test_wing_and_room_filter(self, palace_path, seeded_collection):
         result = search_memories("code", palace_path, wing="project", room="frontend")
         assert all(r["wing"] == "project" and r["room"] == "frontend" for r in result["results"])
+
+    def test_source_file_filter(self, palace_path, seeded_collection):
+        result = search_memories("authentication module", palace_path, source_file="auth.py")
+        assert result["results"], "exact source_file match should return its drawer"
+        assert all(r["source_file"] == "auth.py" for r in result["results"])
+
+    def test_source_file_with_wing_filter(self, palace_path, seeded_collection):
+        result = search_memories("database", palace_path, wing="project", source_file="db.py")
+        assert result["results"]
+        assert all(
+            r["source_file"] == "db.py" and r["wing"] == "project" for r in result["results"]
+        )
+
+    def test_nonmatching_source_file_returns_empty_not_error(self, palace_path, seeded_collection):
+        result = search_memories("authentication", palace_path, source_file="nope.md")
+        assert "error" not in result
+        assert result["results"] == []
+
+    def test_filters_envelope_includes_source_file(self, palace_path, seeded_collection):
+        result = search_memories("authentication", palace_path, source_file="auth.py")
+        assert result["filters"]["source_file"] == "auth.py"
+
+    def test_result_exposes_full_source_path(self, palace_path, seeded_collection):
+        # The displayed source_file is a basename; source_path carries the full
+        # stored value so a caller can round-trip it back into a source_file filter.
+        result = search_memories("authentication module", palace_path)
+        hit = result["results"][0]
+        assert hit["source_file"] == "auth.py"
+        assert hit["source_path"] == "auth.py"
+
+    def test_source_file_filter_matches_full_path_not_basename(self, palace_path):
+        from mempalace.palace import get_collection
+
+        col = get_collection(palace_path, create=True)
+        col.upsert(
+            ids=["fp1"],
+            documents=["The deploy script restarts the gunicorn workers nightly."],
+            metadatas=[{"wing": "ops", "room": "deploy", "source_file": "/srv/app/deploy.sh"}],
+        )
+        # The full stored path matches and round-trips via source_path.
+        hit = search_memories(
+            "deploy gunicorn workers", palace_path, source_file="/srv/app/deploy.sh"
+        )
+        assert [h["source_path"] for h in hit["results"]] == ["/srv/app/deploy.sh"]
+        assert [h["source_file"] for h in hit["results"]] == ["deploy.sh"]
+        # The basename does NOT match — exact full-path semantics only (issue v1).
+        miss = search_memories("deploy gunicorn workers", palace_path, source_file="deploy.sh")
+        assert miss["results"] == []
+
+    def test_source_file_filter_honored_in_bm25_fallback(self, palace_path, seeded_collection):
+        # vector_disabled routes through _bm25_only_via_sqlite (#1222); the
+        # source_file filter must hold there too, not silently no-op.
+        result = search_memories(
+            "authentication module",
+            palace_path,
+            source_file="auth.py",
+            vector_disabled=True,
+            collection_name="mempalace_drawers",
+        )
+        assert "error" not in result
+        assert result["results"], "BM25 fallback should still find the auth drawer"
+        assert all(r["source_file"] == "auth.py" for r in result["results"])
 
     def test_n_results_limit(self, palace_path, seeded_collection):
         result = search_memories("code", palace_path, n_results=2)
@@ -245,7 +351,7 @@ def fake_palace_path(tmp_path):
     backend instead of raising on State A / State B."""
     p = tmp_path / "palace"
     p.mkdir()
-    (p / "chroma.sqlite3").touch()
+    make_minimal_chroma_sqlite(p)
     return str(p)
 
 
@@ -343,8 +449,10 @@ class TestSearchCLI:
         # Non-zero bm25 reported
         assert "bm25=" in first_block
         assert "bm25=0.0" not in first_block
-        # Cosine still reported for transparency
-        assert "cosine=" in first_block
+        # Metric-labeled vector similarity still reported for transparency.
+        # Label is now "<metric>_sim=" (honest about the backend's metric)
+        # rather than a hard-coded "cosine=".
+        assert "cosine_sim=" in first_block
 
     def test_search_warns_when_palace_uses_wrong_distance_metric(self, fake_palace_path, capsys):
         """Legacy palaces created without `hnsw:space=cosine` silently

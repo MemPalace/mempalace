@@ -7,6 +7,8 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
+from _chroma_palace_helper import make_minimal_chroma_sqlite
+
 from mempalace import repair
 
 
@@ -312,9 +314,35 @@ def test_rebuild_index_empty_palace(mock_backend_cls, mock_shutil, tmp_path):
     mock_backend.delete_collection.assert_not_called()
 
 
-@patch("mempalace.repair.shutil")
 @patch("mempalace.repair.ChromaBackend")
-def test_rebuild_index_success(mock_backend_cls, mock_shutil, tmp_path):
+def test_rebuild_index_read_failure_points_to_from_sqlite(mock_backend_cls, tmp_path):
+    """A chromadb HNSW compactor failure makes the first ``count()`` read
+    raise; rebuild_index cannot recover it, so it must direct the user to
+    ``repair --mode from-sqlite`` (rows are intact in chroma.sqlite3) rather
+    than re-mining from source files, which drops MCP-added drawers (#1843)."""
+    sqlite3.connect(str(tmp_path / "chroma.sqlite3")).close()
+    mock_col = MagicMock()
+    mock_col.count.side_effect = Exception("Failed to apply logs to the hnsw segment writer")
+    mock_backend_cls.return_value.get_collection.return_value = mock_col
+    msgs: list[str] = []
+    repair.rebuild_index(palace_path=str(tmp_path), progress=msgs.append)
+    out = "\n".join(msgs)
+    assert "mempalace repair --mode from-sqlite --archive-existing" in out
+    assert "may need to be re-mined" not in out
+
+
+def test_index_read_recovery_guidance_recommends_from_sqlite():
+    """The shared guidance helper names the from-sqlite recovery command in
+    full and never tells the user the palace ``may need to be re-mined`` —
+    the harmful pre-#1843 advice that silently drops MCP-added drawers."""
+    msg = repair.index_read_recovery_guidance()
+    assert "mempalace repair --mode from-sqlite --archive-existing" in msg
+    assert "may need to be re-mined" not in msg
+
+
+@patch("mempalace.repair._copy_file_no_follow")
+@patch("mempalace.repair.ChromaBackend")
+def test_rebuild_index_success(mock_backend_cls, mock_copy, tmp_path):
     # Create a valid sqlite file so the repair preflight can run quick_check.
     sqlite_path = tmp_path / "chroma.sqlite3"
     with sqlite3.connect(sqlite_path) as conn:
@@ -339,8 +367,8 @@ def test_rebuild_index_success(mock_backend_cls, mock_shutil, tmp_path):
     repair.rebuild_index(palace_path=str(tmp_path))
 
     # Verify: backed up sqlite only, not copytree.
-    mock_shutil.copy2.assert_called_once()
-    assert "chroma.sqlite3" in str(mock_shutil.copy2.call_args)
+    mock_copy.assert_called_once()
+    assert "chroma.sqlite3" in str(mock_copy.call_args)
 
     # Verify: deleted and recreated (cosine is the backend default)
     assert mock_backend.create_collection.call_args_list == [
@@ -359,19 +387,19 @@ def test_rebuild_index_success(mock_backend_cls, mock_shutil, tmp_path):
     mock_new_col.add.assert_not_called()
 
 
-@patch("mempalace.repair.shutil")
+@patch("mempalace.repair._copy_file_no_follow")
 @patch("mempalace.repair.ChromaBackend")
 def test_rebuild_index_ignores_missing_temp_collection_at_start(
-    mock_backend_cls, mock_shutil, tmp_path
+    mock_backend_cls, mock_copy, tmp_path
 ):
     sqlite_path = tmp_path / "chroma.sqlite3"
     sqlite3.connect(str(sqlite_path)).close()
 
-    def _fake_copy2(src, dst):
+    def _fake_copy2(src, dst, **_):
         with open(dst, "w") as handle:
             handle.write("backup")
 
-    mock_shutil.copy2.side_effect = _fake_copy2
+    mock_copy.side_effect = _fake_copy2
 
     mock_col = MagicMock()
     mock_col.count.return_value = 2
@@ -395,7 +423,7 @@ def test_rebuild_index_ignores_missing_temp_collection_at_start(
 
     repair.rebuild_index(palace_path=str(tmp_path))
 
-    assert mock_shutil.copy2.call_count == 1
+    assert mock_copy.call_count == 1
     assert mock_backend.delete_collection.call_args_list == [
         call(str(tmp_path), "mempalace_drawers__repair_tmp"),
         call(str(tmp_path), "mempalace_drawers"),
@@ -557,7 +585,7 @@ def test_status_returns_empty_when_db_present_no_drawers(tmp_path, capsys):
     'uninitialized' (#1498). Mocks sqlite_drawer_count to assert the
     return-shape contract; see the real-disk sibling below for the
     no-chromadb-client invariant."""
-    (tmp_path / "chroma.sqlite3").touch()
+    make_minimal_chroma_sqlite(tmp_path)
     with patch("mempalace.repair.sqlite_drawer_count", return_value=0):
         result = repair.status(palace_path=str(tmp_path))
 
@@ -596,7 +624,7 @@ def test_status_falls_through_to_capacity_when_sqlite_count_unreadable(tmp_path)
     """When sqlite_drawer_count returns None (schema drift / locked file),
     repair.status must fall through to hnsw_capacity_status instead of
     short-circuiting on 'empty' (#1498)."""
-    (tmp_path / "chroma.sqlite3").touch()
+    make_minimal_chroma_sqlite(tmp_path)
     with (
         patch("mempalace.repair.sqlite_drawer_count", return_value=None),
         patch("mempalace.repair.hnsw_capacity_status") as capacity_status,
@@ -632,7 +660,7 @@ def test_status_default_uses_configured_drawer_collection(tmp_path):
     # Provide the on-disk preconditions the stratified state helper (#1498)
     # checks before reaching the capacity probe: chroma.sqlite3 file exists
     # and sqlite_drawer_count returns a positive number (palace not empty).
-    (tmp_path / "chroma.sqlite3").touch()
+    make_minimal_chroma_sqlite(tmp_path)
     with (
         patch("mempalace.repair._drawers_collection_name", return_value="custom_drawers"),
         patch("mempalace.repair.sqlite_drawer_count", return_value=1),
@@ -662,9 +690,9 @@ def test_status_default_uses_configured_drawer_collection(tmp_path):
     assert capacity_status.call_args_list[1].args == (str(tmp_path), "mempalace_closets")
 
 
-@patch("mempalace.repair.shutil")
+@patch("mempalace.repair._copy_file_no_follow")
 @patch("mempalace.repair.ChromaBackend")
-def test_rebuild_index_aborts_on_truncation_signal(mock_backend_cls, mock_shutil, tmp_path):
+def test_rebuild_index_aborts_on_truncation_signal(mock_backend_cls, mock_copy, tmp_path):
     """rebuild_index honors the safety guard: SQLite says 67k, get() returns
     10k → no delete_collection, no upsert, no backup."""
     mock_backend = MagicMock()
@@ -688,7 +716,7 @@ def test_rebuild_index_aborts_on_truncation_signal(mock_backend_cls, mock_shutil
     # Guard fired: nothing destructive happened
     mock_backend.delete_collection.assert_not_called()
     mock_backend.create_collection.assert_not_called()
-    mock_shutil.copy2.assert_not_called()
+    mock_copy.assert_not_called()
 
 
 @patch("mempalace.repair.shutil")
@@ -723,10 +751,10 @@ def test_rebuild_index_proceeds_with_override(mock_backend_cls, mock_shutil, tmp
     mock_new_col.upsert.assert_called()
 
 
-@patch("mempalace.repair.shutil")
+@patch("mempalace.repair._copy_file_no_follow")
 @patch("mempalace.repair.ChromaBackend")
 def test_rebuild_index_stage_failure_leaves_live_collection_untouched(
-    mock_backend_cls, mock_shutil, tmp_path
+    mock_backend_cls, mock_copy, tmp_path
 ):
     sqlite_path = tmp_path / "chroma.sqlite3"
     sqlite3.connect(str(sqlite_path)).close()
@@ -747,24 +775,24 @@ def test_rebuild_index_stage_failure_leaves_live_collection_untouched(
         repair.rebuild_index(palace_path=str(tmp_path))
 
     assert excinfo.value.live_replaced is False
-    assert mock_shutil.copy2.call_count == 1
+    assert mock_copy.call_count == 1
     assert mock_backend.delete_collection.call_args_list == [
         call(str(tmp_path), "mempalace_drawers__repair_tmp"),
         call(str(tmp_path), "mempalace_drawers__repair_tmp"),
     ]
 
 
-@patch("mempalace.repair.shutil")
+@patch("mempalace.repair._copy_file_no_follow")
 @patch("mempalace.repair.ChromaBackend")
-def test_rebuild_index_live_failure_restores_backup(mock_backend_cls, mock_shutil, tmp_path):
+def test_rebuild_index_live_failure_restores_backup(mock_backend_cls, mock_copy, tmp_path):
     sqlite_path = tmp_path / "chroma.sqlite3"
     sqlite3.connect(str(sqlite_path)).close()
 
-    def _fake_copy2(src, dst):
+    def _fake_copy2(src, dst, **_):
         with open(dst, "w") as handle:
             handle.write("backup")
 
-    mock_shutil.copy2.side_effect = _fake_copy2
+    mock_copy.side_effect = _fake_copy2
 
     mock_col = MagicMock()
     mock_col.count.return_value = 2
@@ -787,7 +815,7 @@ def test_rebuild_index_live_failure_restores_backup(mock_backend_cls, mock_shuti
         repair.rebuild_index(palace_path=str(tmp_path))
 
     assert excinfo.value.live_replaced is True
-    assert mock_shutil.copy2.call_count == 2
+    assert mock_copy.call_count == 2
     assert active_backend.delete_collection.call_args_list == [
         call(str(tmp_path), "mempalace_drawers__repair_tmp"),
         call(str(tmp_path), "mempalace_drawers"),
@@ -798,19 +826,19 @@ def test_rebuild_index_live_failure_restores_backup(mock_backend_cls, mock_shuti
     helper_backend.close_palace.assert_not_called()
 
 
-@patch("mempalace.repair.shutil")
+@patch("mempalace.repair._copy_file_no_follow")
 @patch("mempalace.repair.ChromaBackend")
 def test_rebuild_index_live_delete_missing_still_restores_backup(
-    mock_backend_cls, mock_shutil, tmp_path
+    mock_backend_cls, mock_copy, tmp_path
 ):
     sqlite_path = tmp_path / "chroma.sqlite3"
     sqlite3.connect(str(sqlite_path)).close()
 
-    def _fake_copy2(src, dst):
+    def _fake_copy2(src, dst, **_):
         with open(dst, "w") as handle:
             handle.write("backup")
 
-    mock_shutil.copy2.side_effect = _fake_copy2
+    mock_copy.side_effect = _fake_copy2
 
     mock_col = MagicMock()
     mock_col.count.return_value = 2
@@ -834,7 +862,7 @@ def test_rebuild_index_live_delete_missing_still_restores_backup(
         repair.rebuild_index(palace_path=str(tmp_path))
 
     assert excinfo.value.live_replaced is True
-    assert mock_shutil.copy2.call_count == 2
+    assert mock_copy.call_count == 2
     assert mock_backend.delete_collection.call_args_list == [
         call(str(tmp_path), "mempalace_drawers__repair_tmp"),
         call(str(tmp_path), "mempalace_drawers"),
@@ -843,21 +871,22 @@ def test_rebuild_index_live_delete_missing_still_restores_backup(
     ]
 
 
-@patch("mempalace.repair.shutil")
+@patch("mempalace.repair._copy_file_no_follow")
 @patch("mempalace.repair.ChromaBackend")
 def test_rebuild_index_restore_failure_preserves_original_error(
-    mock_backend_cls, mock_shutil, tmp_path, capsys
+    mock_backend_cls, mock_copy, tmp_path, capsys
 ):
     sqlite_path = tmp_path / "chroma.sqlite3"
     sqlite3.connect(str(sqlite_path)).close()
 
-    def _copy2_side_effect(src, dst):
-        if str(src).endswith(".backup"):
+    def _copy_side_effect(src, dst, **_):
+        # The restore copy reads from the timestamped backup file.
+        if ".backup." in str(src):
             raise PermissionError("locked sqlite")
         with open(dst, "w") as handle:
             handle.write("backup")
 
-    mock_shutil.copy2.side_effect = _copy2_side_effect
+    mock_copy.side_effect = _copy_side_effect
 
     mock_col = MagicMock()
     mock_col.count.return_value = 2
@@ -918,19 +947,19 @@ def test_rebuild_collection_via_temp_keeps_original_error_when_cleanup_fails(
     ]
 
 
-@patch("mempalace.repair.shutil")
+@patch("mempalace.repair._copy_file_no_follow")
 @patch("mempalace.repair.ChromaBackend")
 def test_rebuild_index_ignores_temp_cleanup_failure_after_success(
-    mock_backend_cls, mock_shutil, tmp_path
+    mock_backend_cls, mock_copy, tmp_path
 ):
     sqlite_path = tmp_path / "chroma.sqlite3"
     sqlite3.connect(str(sqlite_path)).close()
 
-    def _fake_copy2(src, dst):
+    def _fake_copy2(src, dst, **_):
         with open(dst, "w") as handle:
             handle.write("backup")
 
-    mock_shutil.copy2.side_effect = _fake_copy2
+    mock_copy.side_effect = _fake_copy2
 
     mock_col = MagicMock()
     mock_col.count.return_value = 2
@@ -953,7 +982,7 @@ def test_rebuild_index_ignores_temp_cleanup_failure_after_success(
 
     repair.rebuild_index(palace_path=str(tmp_path))
 
-    assert mock_shutil.copy2.call_count == 1
+    assert mock_copy.call_count == 1
     assert mock_backend.delete_collection.call_args_list == [
         call(str(tmp_path), "mempalace_drawers__repair_tmp"),
         call(str(tmp_path), "mempalace_drawers"),
@@ -1240,6 +1269,57 @@ def test_max_seq_id_backup_created(tmp_path):
     assert rows[seg["drawers_meta"]] == seg["poisoned_values"][seg["drawers_meta"]]
 
 
+def test_max_seq_id_backup_pruned_to_max_backups(tmp_path, monkeypatch):
+    """Old max-seq-id backups beyond MEMPALACE_MAX_BACKUPS are pruned after a repair.
+
+    Without retention, every repair left a full chroma.sqlite3 copy behind
+    that was never cleaned up — the unbounded disk-growth bug this guards.
+    """
+    palace = str(tmp_path / "palace")
+    _seed_poisoned_max_seq_id(palace)
+
+    # Pre-seed 4 stale backups with old mtimes so the just-created one is
+    # unambiguously the newest.
+    for i in range(4):
+        stale = os.path.join(palace, f"chroma.sqlite3.max-seq-id-backup-2026010{i}-000000")
+        with open(stale, "w") as f:
+            f.write("old")
+        os.utime(stale, (1_700_000_000 + i, 1_700_000_000 + i))
+
+    monkeypatch.setenv("MEMPALACE_MAX_BACKUPS", "2")
+
+    result = repair.repair_max_seq_id(palace, assume_yes=True)
+
+    backups = sorted(
+        fn for fn in os.listdir(palace) if fn.startswith("chroma.sqlite3.max-seq-id-backup-")
+    )
+    # 4 stale + 1 fresh = 5 written; retention keeps only the 2 newest.
+    assert len(backups) == 2
+    # The backup created by this repair must be one of the survivors.
+    assert os.path.basename(result["backup"]) in backups
+
+
+def test_max_seq_id_backup_retained_when_pruning_disabled(tmp_path, monkeypatch):
+    """max_backups=0 keeps every backup (opt-out for external retention)."""
+    palace = str(tmp_path / "palace")
+    _seed_poisoned_max_seq_id(palace)
+
+    for i in range(3):
+        stale = os.path.join(palace, f"chroma.sqlite3.max-seq-id-backup-2026010{i}-000000")
+        with open(stale, "w") as f:
+            f.write("old")
+        os.utime(stale, (1_700_000_000 + i, 1_700_000_000 + i))
+
+    monkeypatch.setenv("MEMPALACE_MAX_BACKUPS", "0")
+
+    repair.repair_max_seq_id(palace, assume_yes=True)
+
+    backups = [
+        fn for fn in os.listdir(palace) if fn.startswith("chroma.sqlite3.max-seq-id-backup-")
+    ]
+    assert len(backups) == 4
+
+
 def test_max_seq_id_rollback_on_verification_failure(tmp_path, monkeypatch):
     """If the post-update detector still sees poison, raise and leave a backup."""
     palace = str(tmp_path / "palace")
@@ -1290,11 +1370,11 @@ def test_sqlite_integrity_errors_reports_unreadable_sqlite_file(tmp_path):
     assert "quick_check failed" in errors[0]
 
 
-@patch("mempalace.repair.shutil")
+@patch("mempalace.repair._copy_file_no_follow")
 @patch("mempalace.repair.ChromaBackend")
 def test_rebuild_index_aborts_on_sqlite_integrity_errors_before_delete_collection(
     mock_backend_cls,
-    mock_shutil,
+    mock_copy,
     tmp_path,
     capsys,
 ):
@@ -1333,7 +1413,7 @@ def test_rebuild_index_aborts_on_sqlite_integrity_errors_before_delete_collectio
 
     mock_backend.delete_collection.assert_not_called()
     mock_backend.create_collection.assert_not_called()
-    mock_shutil.copy2.assert_not_called()
+    mock_copy.assert_not_called()
 
 
 def test_rebuild_index_runs_sqlite_preflight_before_chromadb_open(tmp_path, capsys):
@@ -1737,6 +1817,45 @@ def test_rebuild_from_sqlite_in_place_refuses_without_archive_flag(tmp_path):
     assert archives == []
 
 
+def test_rebuild_from_sqlite_in_place_archive_failure_leaves_palace_untouched(
+    tmp_path, monkeypatch
+):
+    """A file inside the palace held open by another process (MCP server,
+    a running mine, another harness) must abort the archive step cleanly,
+    leaving the live palace fully intact.
+
+    Regression test for a real-world incident (2026-07-05/06, Windows 11):
+    the archive step used ``shutil.move``, whose fallback for a failed
+    ``os.rename`` is copytree + rmtree. That rmtree deletes the live
+    palace file-by-file until it hits the first locked file, so an
+    in-progress mine or a live MCP server holding one file open left the
+    palace partially gutted next to a partial archive copy -- twice, on
+    two separate nights. os.rename fails atomically up front with nothing
+    touched; this test locks that behaviour in so a future change back to
+    shutil.move (or an equivalent copy+delete fallback) fails loudly.
+    """
+    palace = tmp_path / "palace"
+    rows = [("d1", "doc one", {"wing": "w"}), ("d2", "doc two", {"wing": "w"})]
+    _seed_palace(palace, "mempalace_drawers", rows)
+    sqlite_before = (palace / "chroma.sqlite3").stat().st_size
+    entries_before = sorted(p.name for p in palace.iterdir())
+
+    def _raise(*_args, **_kwargs):
+        raise PermissionError("[WinError 32] simulated: file held open by another process")
+
+    monkeypatch.setattr(repair.os, "rename", _raise)
+
+    counts = repair.rebuild_from_sqlite(str(palace), str(palace), archive_existing_dest=True)
+
+    assert counts == {}
+    # Palace directory contents and the sqlite file itself are byte-for-byte
+    # untouched -- no partial delete, no partial archive left behind.
+    assert sorted(p.name for p in palace.iterdir()) == entries_before
+    assert (palace / "chroma.sqlite3").stat().st_size == sqlite_before
+    archives = [p for p in tmp_path.iterdir() if "pre-rebuild" in p.name]
+    assert archives == []
+
+
 def test_rebuild_from_sqlite_source_missing_chroma_db(tmp_path):
     """Source dir exists but has no chroma.sqlite3 → returns empty,
     leaves dest untouched."""
@@ -1898,6 +2017,114 @@ def test_vacuum_and_rebuild_fts5_missing_sqlite(tmp_path):
     repair._vacuum_and_rebuild_fts5(str(tmp_path))  # no file — must not raise
 
 
+# ── FTS5 inverted-index auto-heal (#1596) ─────────────────────────────
+
+
+def _make_fts5_palace(tmp_path, *, corrupt: bool) -> str:
+    """Build a palace whose embedding_fulltext_search index is optionally
+    corrupted to the malformed-inverted-index quick_check state #1596 hits."""
+    sqlite_path = tmp_path / "chroma.sqlite3"
+    with closing(sqlite3.connect(str(sqlite_path))) as conn:
+        conn.execute(
+            "CREATE VIRTUAL TABLE embedding_fulltext_search"
+            " USING fts5(string_value, tokenize='unicode61')"
+        )
+        for i in range(200):
+            conn.execute(
+                "INSERT INTO embedding_fulltext_search(string_value) VALUES(?)",
+                (f"alpha beta gamma row{i} delta epsilon",),
+            )
+        conn.commit()
+        if corrupt:
+            # Zero the last index segment leaf: quick_check then reports
+            # "malformed inverted index" while the content table stays intact.
+            conn.execute(
+                "UPDATE embedding_fulltext_search_data SET block=zeroblob(length(block)) "
+                "WHERE id=(SELECT max(id) FROM embedding_fulltext_search_data)"
+            )
+            conn.commit()
+    return str(tmp_path)
+
+
+def test_errors_are_isolated_fts5_classification():
+    fts = "malformed inverted index for FTS5 table main.embedding_fulltext_search"
+    page = "Page 4 of B-tree 12345: database disk image is malformed"
+    assert repair._errors_are_isolated_fts5([fts])
+    assert repair._errors_are_isolated_fts5([fts, fts])
+    assert not repair._errors_are_isolated_fts5([])
+    assert not repair._errors_are_isolated_fts5([page])
+    # Any non-FTS5 error in the set means the data itself may be damaged.
+    assert not repair._errors_are_isolated_fts5([fts, page])
+
+
+def test_maybe_autoheal_fts5_index_heals_isolated_corruption(tmp_path):
+    palace = _make_fts5_palace(tmp_path, corrupt=True)
+    errors = repair.sqlite_integrity_errors(palace)
+    assert errors and repair._errors_are_isolated_fts5(errors)
+
+    remaining = repair.maybe_autoheal_fts5_index(palace, errors, progress=lambda *_: None)
+
+    assert remaining == []
+    # quick_check is clean and full-text search works again.
+    assert repair.sqlite_integrity_errors(palace) == []
+    with closing(sqlite3.connect(str(tmp_path / "chroma.sqlite3"))) as conn:
+        hits = conn.execute(
+            "SELECT count(*) FROM embedding_fulltext_search "
+            "WHERE embedding_fulltext_search MATCH 'gamma'"
+        ).fetchone()[0]
+    assert hits == 200
+
+
+def test_maybe_autoheal_fts5_index_leaves_non_fts5_errors_untouched(tmp_path):
+    palace = _make_fts5_palace(tmp_path, corrupt=False)
+    page_errors = ["Page 4 of B-tree 12345: database disk image is malformed"]
+
+    # Not isolated FTS5: returned unchanged and the rebuild is never attempted.
+    with patch("mempalace.palace.mine_palace_lock") as lock:
+        remaining = repair.maybe_autoheal_fts5_index(palace, page_errors, progress=lambda *_: None)
+    assert remaining == page_errors
+    lock.assert_not_called()
+
+
+def test_maybe_autoheal_fts5_index_skips_when_palace_is_being_mined(tmp_path):
+    from mempalace.palace import MineAlreadyRunning
+
+    palace = _make_fts5_palace(tmp_path, corrupt=True)
+    errors = repair.sqlite_integrity_errors(palace)
+
+    def _raise(_path):
+        raise MineAlreadyRunning("held by pid 999")
+
+    # A live mine holds the lock: do not race the rebuild — surface and abort.
+    with patch("mempalace.palace.mine_palace_lock", side_effect=_raise):
+        remaining = repair.maybe_autoheal_fts5_index(palace, errors, progress=lambda *_: None)
+
+    assert remaining == errors
+    # The FTS index is still corrupt because we refused to rebuild under contention.
+    assert repair.sqlite_integrity_errors(palace) == errors
+
+
+def test_rebuild_index_preflight_autoheals_isolated_fts5_then_proceeds(tmp_path, monkeypatch):
+    """The preflight no longer hard-aborts on isolated FTS5 corruption (#1596):
+    it rebuilds the index, then continues into the rebuild path."""
+    palace = _make_fts5_palace(tmp_path, corrupt=True)
+
+    called = {}
+
+    def _fake_max_seq(_palace_path, **_kwargs):
+        # Reached only if the preflight did NOT abort — record and stop early
+        # so the test doesn't need a real chromadb collection.
+        called["reached"] = True
+        return {"stopped": True}
+
+    monkeypatch.setattr(repair, "maybe_repair_poisoned_max_seq_id_before_rebuild", _fake_max_seq)
+
+    repair.rebuild_index(palace_path=palace, progress=lambda *_: None)
+
+    assert called.get("reached") is True
+    assert repair.sqlite_integrity_errors(palace) == []
+
+
 @patch("mempalace.repair.shutil")
 @patch("mempalace.repair.ChromaBackend")
 def test_rebuild_index_calls_vacuum(mock_backend_cls, mock_shutil, tmp_path):
@@ -1944,3 +2171,26 @@ def test_rebuild_index_calls_vacuum(mock_backend_cls, mock_shutil, tmp_path):
         args, kwargs = mock_vacuum.call_args
         assert args[0] == str(tmp_path)
         assert "progress" in kwargs
+
+
+def test_rebuild_from_sqlite_preserves_knowledge_graph_sidecar(tmp_path):
+    """The from-sqlite repair path must not drop the KG SQLite sidecar."""
+    src = tmp_path / "source"
+    dest = tmp_path / "dest"
+    src.mkdir()
+    dest.mkdir()
+
+    (src / "knowledge_graph.sqlite3").write_text("kg-db", encoding="utf-8")
+    (src / "knowledge_graph.sqlite3-wal").write_text("kg-wal", encoding="utf-8")
+    (src / "knowledge_graph.sqlite3-shm").write_text("kg-shm", encoding="utf-8")
+
+    copied = repair._preserve_knowledge_graph_sqlite(str(src), str(dest))
+
+    assert copied == [
+        "knowledge_graph.sqlite3",
+        "knowledge_graph.sqlite3-wal",
+        "knowledge_graph.sqlite3-shm",
+    ]
+    assert (dest / "knowledge_graph.sqlite3").read_text(encoding="utf-8") == "kg-db"
+    assert (dest / "knowledge_graph.sqlite3-wal").read_text(encoding="utf-8") == "kg-wal"
+    assert (dest / "knowledge_graph.sqlite3-shm").read_text(encoding="utf-8") == "kg-shm"

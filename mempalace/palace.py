@@ -70,13 +70,109 @@ _EXPLICIT_BACKEND_ENV = "MEMPALACE_BACKEND_EXPLICIT"
 NORMALIZE_VERSION = 2
 
 
+# (palace_id, collection_name, model_name) tuples already validated this
+# process, so the identity check (one metadata read) runs at most once per
+# collection per run — keeps the hot get_collection path cheap.
+_VALIDATED_IDENTITY: set = set()
+
+
+def _enforce_embedder_identity(collection, palace_path, collection_name, *, create) -> None:
+    """Check (and, for a brand-new collection, record) embedder identity (RFC 001).
+
+    Check at open so a model swap fails fast — before any query silently
+    returns degraded results. Record only when the collection is brand-new and
+    empty: recording the *current* model on a legacy palace that already holds
+    vectors from an unknown model would mislabel it, so populated-but-unrecorded
+    collections warn instead and are resolved with
+    ``mempalace palace set-embedder``.
+
+    Bookkeeping must never break memory operations: only the deliberate
+    identity/dimension mismatch propagates; every other error is swallowed.
+    """
+    import warnings
+
+    from .backends.base import (
+        DimensionMismatchError,
+        EmbedderIdentity,
+        EmbedderIdentityMismatchError,
+        EmbedderIdentityUnknownWarning,
+        check_embedder_identity,
+    )
+    from .embedding import current_model_name
+
+    # A server_embedder backend embeds with its own model and ignores the
+    # injected/core embedder, so its effective identity — not the configured
+    # model — is what must be checked and recorded. Fall back to the configured
+    # model name for the normal (core-embedder) case.
+    current: Optional[EmbedderIdentity] = None
+    try:
+        effective = collection.effective_embedder_identity()
+    except Exception:
+        effective = None
+    if effective is not None and getattr(effective, "model_name", ""):
+        current = effective
+    else:
+        try:
+            model_name = current_model_name()
+        except Exception:
+            return
+        if not model_name:
+            return  # nameless embedder — cannot enforce identity
+        current = EmbedderIdentity(model_name=model_name, dimension=0)
+
+    model_name = current.model_name
+    key = (str(palace_path), str(collection_name), model_name)
+    if key in _VALIDATED_IDENTITY:
+        return
+
+    try:
+        stored = collection.get_stored_embedder_identity()
+    except Exception:
+        logger.debug("embedder-identity read failed for %s", collection_name, exc_info=True)
+        return
+    try:
+        state = check_embedder_identity(stored, current)
+    except (EmbedderIdentityMismatchError, DimensionMismatchError):
+        raise  # deliberate, user-facing — the whole point of the contract
+    except Exception:
+        return
+
+    if state == "unknown" and stored is None:
+        try:
+            count = collection.count()
+        except Exception:
+            count = None
+        if count == 0:
+            if create:
+                try:
+                    collection.set_embedder_identity(current)
+                except Exception:
+                    logger.debug("embedder-identity record failed", exc_info=True)
+        elif count:
+            warnings.warn(
+                f"palace collection {collection_name!r} has no recorded embedder "
+                f"identity; assuming the current model {model_name!r}. Run "
+                "`mempalace palace set-embedder --model <name>` to record it.",
+                EmbedderIdentityUnknownWarning,
+                stacklevel=2,
+            )
+
+    _VALIDATED_IDENTITY.add(key)
+
+
 def get_collection(
     palace_path: str,
     collection_name: Optional[str] = None,
     create: bool = True,
     backend: Optional[str] = None,
+    _skip_identity_check: bool = False,
 ):
-    """Get the palace collection through the backend layer."""
+    """Get the palace collection through the backend layer.
+
+    ``_skip_identity_check`` bypasses the embedder-identity enforcement so the
+    ``set-embedder`` override path can open a palace whose recorded model
+    differs from the current one (the very state it exists to repair).
+    """
     if collection_name is None:
         from .config import get_configured_collection_name
 
@@ -98,8 +194,69 @@ def get_collection(
             create=create,
         )
     if "requires_explicit_embeddings" in getattr(backend_obj, "capabilities", frozenset()):
-        return EmbeddingCollection(collection)
+        collection = EmbeddingCollection(collection)
+    if not _skip_identity_check:
+        _enforce_embedder_identity(collection, palace_path, collection_name, create=create)
     return collection
+
+
+def set_palace_embedder_identity(
+    palace_path: str,
+    model: Optional[str] = None,
+    *,
+    force: bool = False,
+    backend: Optional[str] = None,
+    collection_name: Optional[str] = None,
+):
+    """Record (or force-override) a palace collection's embedder identity (RFC 001).
+
+    Backs ``mempalace palace set-embedder``. Returns ``(old, new)`` identities.
+    Without ``force``, refuses to overwrite an existing identity that names a
+    different model (the user must confirm they know the vectors are
+    compatible). Opens with the identity check skipped so a mismatched palace —
+    the exact state being repaired — can be opened at all.
+    """
+    from .backends.base import EmbedderIdentity, EmbedderIdentityMismatchError
+    from .config import MempalaceConfig
+    from .embedding import get_embedder_identity
+
+    configured = MempalaceConfig().embedding_model
+    target = (model or configured or "").strip().lower()
+    if not target:
+        # No model given and none configured — there is nothing to record, and
+        # recording a nameless identity is a silent no-op in every backend.
+        raise ValueError(
+            "no embedder model to record: pass --model NAME or configure MEMPALACE_EMBEDDING_MODEL"
+        )
+    if target == (configured or "").strip().lower():
+        # Recording the in-use model — probe its dimension (already loaded).
+        new = get_embedder_identity()
+    else:
+        # Explicit override of a non-configured model: record the name only,
+        # never load a foreign model (which can be a large download) just to
+        # probe a dimension. The model-name check is the actual protection.
+        new = EmbedderIdentity(model_name=target, dimension=0)
+    collection = get_collection(
+        palace_path,
+        collection_name=collection_name,
+        create=True,
+        backend=backend,
+        _skip_identity_check=True,
+    )
+    try:
+        old = collection.get_stored_embedder_identity()
+    except Exception:
+        old = None
+    if old is not None and old.model_name != new.model_name and not force:
+        raise EmbedderIdentityMismatchError(
+            f"palace already records embedder {old.model_name!r}; pass --force to "
+            f"overwrite it with {new.model_name!r} (only if the vectors are compatible)"
+        )
+    collection.set_embedder_identity(new)
+    # Reset the per-process validation cache so a re-open re-checks against the
+    # newly recorded identity rather than a stale verdict.
+    _VALIDATED_IDENTITY.clear()
+    return old, new
 
 
 def get_closets_collection(
@@ -568,36 +725,183 @@ def mine_lock(source_file: str):
     Prevents multiple agents from mining the same file simultaneously,
     which causes duplicate drawers when the delete+insert cycle interleaves.
     """
-    lock_dir = os.path.join(os.path.expanduser("~"), ".mempalace", "locks")
-    os.makedirs(lock_dir, exist_ok=True)
-    lock_path = os.path.join(
-        lock_dir, hashlib.sha256(source_file.encode()).hexdigest()[:16] + ".lock"
-    )
-
-    lf = open(lock_path, "w")
+    lock_path = _mine_lock_path(source_file)
+    lf = _acquire_mine_lock_file(lock_path)
     try:
-        if os.name == "nt":
-            import msvcrt
-
-            msvcrt.locking(lf.fileno(), msvcrt.LK_LOCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(lf, fcntl.LOCK_EX)
         yield
     finally:
         try:
-            if os.name == "nt":
-                import msvcrt
-
-                msvcrt.locking(lf.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(lf, fcntl.LOCK_UN)
+            _unlock_mine_lock_file(lf)
         except Exception:
             logger.debug("Mine-lock release failed", exc_info=True)
+        try:
+            lf.close()
+        except Exception:
+            logger.debug("Mine-lock close failed", exc_info=True)
+        _cleanup_mine_lock_file(lock_path)
+
+
+def _mine_lock_path(source_file: str) -> str:
+    lock_dir = os.path.join(os.path.expanduser("~"), ".mempalace", "locks")
+    os.makedirs(lock_dir, exist_ok=True)
+    return os.path.join(lock_dir, hashlib.sha256(source_file.encode()).hexdigest()[:16] + ".lock")
+
+
+def _open_mine_lock_file(lock_path: str, *, create: bool):
+    flags = os.O_RDWR
+    if create:
+        flags |= os.O_CREAT
+    fd = os.open(lock_path, flags, 0o600)
+    return os.fdopen(fd, "r+b")
+
+
+def _lock_mine_lock_file(lock_file, *, blocking: bool) -> bool:
+    lock_file.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        mode = msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK
+        try:
+            msvcrt.locking(lock_file.fileno(), mode, 1)
+        except OSError:
+            if not blocking:
+                return False
+            raise
+        return True
+
+    import fcntl
+
+    flags = fcntl.LOCK_EX
+    if not blocking:
+        flags |= fcntl.LOCK_NB
+    try:
+        fcntl.flock(lock_file, flags)
+    except BlockingIOError:
+        if not blocking:
+            return False
+        raise
+    return True
+
+
+def _unlock_mine_lock_file(lock_file) -> None:
+    lock_file.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+def _mine_lock_file_is_current(lock_file, lock_path: str) -> bool:
+    """Return whether ``lock_file`` is still the inode reached by ``lock_path``.
+
+    POSIX advisory locks attach to the opened inode, not the pathname. If a
+    lock file is unlinked while a contender is waiting, that contender can later
+    acquire a lock on an inode no new process will use. We reject that stale
+    handle and retry on the current pathname.
+    """
+    if os.name == "nt":
+        return True
+    try:
+        path_stat = os.stat(lock_path)
+        file_stat = os.fstat(lock_file.fileno())
+    except OSError:
+        return False
+    return (path_stat.st_dev, path_stat.st_ino) == (file_stat.st_dev, file_stat.st_ino)
+
+
+def _acquire_open_mine_lock_file(lock_file, lock_path: str) -> bool:
+    """Acquire ``lock_file`` and return False if cleanup made it stale."""
+    _lock_mine_lock_file(lock_file, blocking=True)
+    if _mine_lock_file_is_current(lock_file, lock_path):
+        return True
+    try:
+        _unlock_mine_lock_file(lock_file)
+    except Exception:
+        logger.debug("Mine-lock stale-handle release failed", exc_info=True)
+    return False
+
+
+def _acquire_mine_lock_file(lock_path: str):
+    while True:
+        lf = _open_mine_lock_file(lock_path, create=True)
+        try:
+            if _acquire_open_mine_lock_file(lf, lock_path):
+                return lf
+        except Exception:
+            lf.close()
+            raise
         lf.close()
+
+
+def _cleanup_mine_lock_file(lock_path: str) -> None:
+    """Best-effort removal that preserves flock rendezvous semantics.
+
+    A plain ``os.remove(lock_path)`` after closing the critical-section lock is
+    unsafe on POSIX: a waiter may already be blocked on the old inode while a
+    later process creates and locks a new inode at the same pathname. Instead,
+    cleanup briefly re-acquires the current file nonblocking. If it wins, it can
+    unlink that inode as cleanup-only work; waiters on the old inode will detect
+    the stale handle after waking and retry on the current path.
+    """
+    try:
+        lf = _open_mine_lock_file(lock_path, create=False)
+    except FileNotFoundError:
+        return
+    except OSError:
+        logger.debug("Mine-lock cleanup open failed for %s", lock_path, exc_info=True)
+        return
+
+    acquired = False
+    closed = False
+    try:
+        try:
+            acquired = _lock_mine_lock_file(lf, blocking=False)
+        except OSError:
+            logger.debug("Mine-lock cleanup acquire failed for %s", lock_path, exc_info=True)
+            return
+        if not acquired:
+            return
+        if not _mine_lock_file_is_current(lf, lock_path):
+            return
+
+        if os.name == "nt":
+            # Windows generally cannot unlink an open locked file. Release and
+            # close first; if another process opens the file in the gap,
+            # os.remove should fail and we leave the rendezvous file in place.
+            try:
+                _unlock_mine_lock_file(lf)
+            except Exception:
+                logger.debug("Mine-lock cleanup release failed", exc_info=True)
+                acquired = False
+                return
+            acquired = False
+            lf.close()
+            closed = True
+            try:
+                os.remove(lock_path)
+            except OSError:
+                pass
+            return
+
+        try:
+            os.remove(lock_path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.debug("Mine-lock cleanup remove failed for %s", lock_path, exc_info=True)
+    finally:
+        if not closed:
+            if acquired:
+                try:
+                    _unlock_mine_lock_file(lf)
+                except Exception:
+                    logger.debug("Mine-lock cleanup release failed", exc_info=True)
+            lf.close()
 
 
 class MineAlreadyRunning(RuntimeError):
@@ -643,45 +947,79 @@ def _validate_palace_fts5_after_mine(palace_path: str) -> None:
         raise MineValidationError(palace_path, errors)
 
 
-# Per-thread record of palaces this thread already holds the lock for. Used by
-# `mine_palace_lock` to short-circuit re-entrant acquisition from the same
-# thread (e.g. miner.mine() acquires the outer lock then calls
+# Process-wide record of palaces this PROCESS already holds the lock for. Used
+# by `mine_palace_lock` to short-circuit re-entrant acquisition from the same
+# process (e.g. miner.mine() acquires the outer lock then calls
 # ChromaCollection.upsert which now also tries to acquire). Without this guard
 # the inner call would block on its own outer flock (Linux fcntl locks are per
-# open file description, so a same-thread second open of the lock file is a
-# distinct lock and self-deadlocks).
+# open file description, so a second open of the lock file from the same process
+# is a distinct lock and self-conflicts / EWOULDBLOCKs).
 #
-# The holder set is tagged with ``pid`` so that a forked child does NOT
-# inherit re-entrant credit from its parent: the OS-level flock IS NOT
-# inherited as a "we hold it" semantically — the child must reacquire — but
-# Python's ``threading.local`` IS inherited across fork. The pid check
-# clears stale state so a forked child correctly hits the fcntl path.
-_palace_lock_holders = threading.local()
+# This MUST be process-wide, not thread-local: the MCP HTTP transport
+# (ThreadingHTTPServer) acquires the long-lived writer-lease on one thread
+# (`mcp_server._acquire_mcp_writer_lock`) but dispatches each write request on a
+# different worker thread. A thread-local guard makes those handlers fail to see
+# the process-held lease, re-acquire the flock, and self-conflict
+# ("palace ... is held by PID <self>"). flock is per-process and HTTP writes are
+# serialized by `_HTTP_REQUEST_LOCK`, so the process is the correct re-entrancy
+# boundary.
+#
+# The holder set is tagged with ``pid`` so that a forked child does NOT inherit
+# re-entrant credit from its parent: the OS-level flock IS NOT inherited as a
+# "we hold it" semantically — the child must reacquire. The pid check clears
+# stale state so a forked child correctly hits the fcntl path. Access is guarded
+# by ``_palace_lock_guard`` because the set is now shared across threads.
+#
+# Fork safety: ``_palace_lock_guard`` is a real ``threading.Lock``, so a child
+# forked while another thread held it would inherit it locked (the holder thread
+# does not exist in the child) and deadlock on the next acquire. An at-fork
+# handler (registered below) replaces the guard with a fresh unlocked lock and
+# clears state in the child, which must reacquire the flock anyway.
+_palace_lock_guard = threading.Lock()
+_palace_lock_pid = None
+_palace_lock_keys = set()
 
 
-def _holder_state():
-    """Return the per-thread (pid, keys) record, refreshing after fork."""
-    keys = getattr(_palace_lock_holders, "keys", None)
-    pid = getattr(_palace_lock_holders, "pid", None)
+def _reset_palace_lock_state_after_fork() -> None:
+    """Reset lock state in a forked child to avoid an inherited-locked deadlock."""
+    global _palace_lock_guard, _palace_lock_pid, _palace_lock_keys
+    _palace_lock_guard = threading.Lock()
+    _palace_lock_keys = set()
+    _palace_lock_pid = os.getpid()
+
+
+# Availability: Unix (no-op elsewhere — Windows has no fork()).
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_palace_lock_state_after_fork)
+
+
+def _holder_keys_locked():
+    """Return the process-wide held-key set, refreshing after fork.
+
+    Caller MUST hold ``_palace_lock_guard``.
+    """
+    global _palace_lock_pid, _palace_lock_keys
     current_pid = os.getpid()
-    if keys is None or pid != current_pid:
-        keys = set()
-        _palace_lock_holders.keys = keys
-        _palace_lock_holders.pid = current_pid
-    return keys
+    if _palace_lock_pid != current_pid:
+        _palace_lock_keys = set()
+        _palace_lock_pid = current_pid
+    return _palace_lock_keys
 
 
-def _held_by_this_thread(lock_key: str) -> bool:
-    """Return True if this thread already holds ``mine_palace_lock`` for ``lock_key``."""
-    return lock_key in _holder_state()
+def _held_by_this_process(lock_key: str) -> bool:
+    """Return True if this process already holds ``mine_palace_lock`` for ``lock_key``."""
+    with _palace_lock_guard:
+        return lock_key in _holder_keys_locked()
 
 
 def _mark_held(lock_key: str) -> None:
-    _holder_state().add(lock_key)
+    with _palace_lock_guard:
+        _holder_keys_locked().add(lock_key)
 
 
 def _mark_released(lock_key: str) -> None:
-    _holder_state().discard(lock_key)
+    with _palace_lock_guard:
+        _holder_keys_locked().discard(lock_key)
 
 
 def _format_lock_holder(content: str) -> str:
@@ -760,11 +1098,13 @@ def mine_palace_lock(palace_path: str):
     raise MineAlreadyRunning so the caller can exit cleanly instead of
     piling up as a waiting worker.
 
-    Re-entrant: if the current thread already holds the lock for the same
+    Re-entrant: if the current process already holds the lock for the same
     palace, the context manager passes through without re-acquiring. This
     lets ChromaCollection write methods (which acquire the lock themselves
     to protect MCP/direct callers) compose with miner.mine() (which holds
-    the outer lock for the entire mine pipeline) without self-deadlock.
+    the outer lock for the entire mine pipeline) without self-deadlock, and
+    lets the threaded MCP HTTP transport write from a worker thread while the
+    long-lived writer-lease is held on another thread of the same process.
     """
     lock_dir = os.path.join(os.path.expanduser("~"), ".mempalace", "locks")
     os.makedirs(lock_dir, exist_ok=True)
@@ -773,8 +1113,8 @@ def mine_palace_lock(palace_path: str):
     palace_key = hashlib.sha256(lock_key_source.encode()).hexdigest()[:16]
     lock_path = os.path.join(lock_dir, f"mine_palace_{palace_key}.lock")
 
-    if _held_by_this_thread(palace_key):
-        # Same thread already holds the lock for this palace — pass through.
+    if _held_by_this_process(palace_key):
+        # This process already holds the lock for this palace — pass through.
         yield
         return
 
@@ -875,9 +1215,15 @@ def file_already_mined(
         schema (triggers silent rebuild after a normalization upgrade)
       - `check_mtime=True` and the file's mtime differs from the stored one
 
-    When check_mtime=True (used by project miner), also re-mines on content
-    change. When check_mtime=False (used by convo miner), transcripts are
-    assumed immutable, so only the version gate triggers a rebuild.
+    When check_mtime=True (used by the project miner, and by the convo
+    miner's in-lock recheck), also re-mines on content change. Conversation
+    transcripts are NOT assumed immutable: a Claude Code session keeps
+    appending to its own file while active, and /compact or /clear can
+    rewrite one in place. The convo miner's bulk skip-check uses
+    prefetch_mined_set()'s stored mtimes instead of calling this function
+    per file (same mtime-aware decision, without the O(n) per-file query
+    cost); this function's check_mtime=True path remains its per-file,
+    lock-held race-condition recheck.
 
     When extract_mode is set (used by convo miner), idempotency is scoped to
     that extraction mode so exchange-mode and general-mode drawers can coexist
@@ -934,42 +1280,25 @@ def file_already_mined(
         return False
 
 
-def bulk_check_mined(collection) -> dict[str, float]:
-    """Pre-fetch source_file/source_mtime pairs for all documents in the collection.
+def prefetch_mined_set(
+    collection, extract_mode: Optional[str] = None
+) -> dict[str, Optional[float]]:
+    """Pre-fetch source_file -> stored source_mtime for files already mined
+    at the current NORMALIZE_VERSION, in one bulk pass instead of one
+    ChromaDB query per file.
 
-    Returns a dict mapping source_file -> source_mtime (as float) for every
-    document that has both fields.  Callers can check membership and compare
-    mtimes locally instead of issuing one ChromaDB query per file.
-
-    Fetches the full collection in paginated batches (like palace_graph.py)
-    since a WHERE-IN filter on thousands of paths is not supported by ChromaDB.
-    """
-    mined: dict[str, float] = {}
-    try:
-        total = collection.count()
-        offset = 0
-        while offset < total:
-            batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
-            for meta in batch["metadatas"]:
-                src = meta.get("source_file")
-                mtime = meta.get("source_mtime")
-                if src and mtime is not None:
-                    mined[src] = float(mtime)
-            if not batch["ids"]:
-                break
-            offset += len(batch["ids"])
-    except Exception:
-        logger.warning("bulk_check_mined: partial fetch, %d files loaded", len(mined))
-    return mined
-
-
-def prefetch_mined_set(collection, extract_mode: Optional[str] = None) -> set[str]:
-    """Pre-fetch the set of source_files already mined at the current NORMALIZE_VERSION.
-
-    Mirrors file_already_mined()'s version-gate semantics (check_mtime=False
-    branch) but in one bulk pass instead of one ChromaDB query per file.
-    Returns a set of source_file paths whose stored drawers are at or above
-    NORMALIZE_VERSION; callers do `if path in result_set: skip`.
+    Return type is a dict rather than a bare set so callers get mtime
+    awareness "for free": conversation transcripts are not immutable once
+    mined (a Claude Code session keeps appending to the same file while
+    active, and /compact or /clear can rewrite one in place), so "we've
+    seen this source_file before" is not suffient to skip it -- the caller
+    must also confirm its current on-disk mtime still matches what was
+    stored. `if src in mined_set` still means the same thing as the old
+    set-based return (dict `in` checks keys); a caller that wants staleness
+    detection reads `mined_set[src]` and compares against
+    os.path.getmtime(src) itself. `None` means either no mtime was ever
+    stored (drawers written before this field existed) or getmtime failed
+    when the drawer was written -- both should be treated as stale.
 
     When extract_mode is set, mirrors file_already_mined(..., extract_mode=...)
     so conversation mines skip per extraction mode rather than per source file.
@@ -979,7 +1308,7 @@ def prefetch_mined_set(collection, extract_mode: Optional[str] = None) -> set[st
     palace, making a 2000-file sweep take >1h of pure skip-checking. This
     helper drops that to a single paginated scan plus O(1) lookups.
     """
-    mined: set[str] = set()
+    mined: dict[str, Optional[float]] = {}
     try:
         total = collection.count()
         offset = 0
@@ -995,7 +1324,8 @@ def prefetch_mined_set(collection, extract_mode: Optional[str] = None) -> set[st
                 # Same default as file_already_mined: missing version == 1
                 version = meta.get("normalize_version", 1)
                 if version >= NORMALIZE_VERSION:
-                    mined.add(src)
+                    stored_mtime = meta.get("source_mtime")
+                    mined[src] = float(stored_mtime) if stored_mtime is not None else None
             if not batch["ids"]:
                 break
             offset += len(batch["ids"])

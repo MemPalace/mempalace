@@ -37,6 +37,8 @@ from urllib import parse as urlparse
 
 import numpy as np
 
+from ..config import strip_lone_surrogates
+from ._sidecar import EMBEDDER_SIDECAR_FILENAME, read_embedder_sidecar, write_embedder_sidecar
 from .base import (
     BackendClosedError,
     BackendError,
@@ -77,6 +79,42 @@ def _utcnow() -> str:
 
 def _json_dumps(obj: Any) -> str:
     return json.dumps(obj or {}, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _strip_nul(value: Any) -> Any:
+    """Recursively strip NUL (0x00) from strings, list/tuple items, and dict keys
+    and values so pgvector can store the result.
+
+    PostgreSQL cannot store NUL in ``text`` or ``jsonb``: psycopg rejects a raw
+    NUL in a text column ("PostgreSQL text fields cannot contain NUL (0x00)
+    bytes"), and a NUL in metadata serializes to a JSON unicode escape that the
+    ``jsonb`` cast rejects ("unsupported Unicode escape sequence"). A single
+    transcript that captured NUL in tool output would otherwise abort the whole
+    mine run (#1829). ChromaDB and the SQLite backend store the byte verbatim,
+    so stripping only here keeps the same inputs ingestible.
+
+    Applied to id, document, and metadata in :meth:`_PgVectorClient.upsert_rows`
+    so the write path never carries a NUL into Postgres. Only ``str`` values are
+    rewritten; the ``int``/``float``/``bool``/``None`` scalars JSON metadata
+    normalizes to pass through unchanged. Stripping is not injective, so two keys
+    (or ids)
+    differing only by a NUL collapse to one (last wins); this does not occur in
+    practice because drawer ids are SHA-256 hashes and metadata keys are fixed
+    field names, so only transcript-derived values are ever actually changed.
+    Unlike ``config.sanitize_content`` (which rejects NUL in user-supplied
+    content), the bulk-mine path strips so one stray byte cannot abort a whole
+    backfill. ``str.replace`` returns the original string when it holds no NUL,
+    so a clean document is not reallocated.
+    """
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if isinstance(value, dict):
+        return {_strip_nul(key): _strip_nul(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_strip_nul(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_strip_nul(item) for item in value)
+    return value
 
 
 def _tokenize(text: str) -> list[str]:
@@ -352,6 +390,30 @@ def _quote_identifier(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
+# Session-level advisory-lock namespace for serializing HNSW index builds
+# across daemon writers (RFC 001). classid is a fixed mempalace constant
+# ("MEMP" in ASCII); objid is a stable per-table key. Both must fit a signed
+# int4, which ``pg_advisory_lock(int4, int4)`` requires.
+_MAINTENANCE_LOCK_CLASSID = 0x4D454D50  # "MEMP" — a positive, valid int4
+
+
+def _advisory_objid(table: str) -> int:
+    """Stable signed-int4 advisory key derived from the table name."""
+    raw = int(sha256(table.encode("utf-8")).hexdigest()[:8], 16)  # 0 .. 2**32-1
+    return raw - 2**32 if raw >= 2**31 else raw
+
+
+def _hnsw_index_name(table: str) -> str:
+    """Deterministic, collision-safe index name for ``table``.
+
+    Routes through :func:`_pg_identifier`, which hashes the overflow when the
+    name exceeds Postgres' 63-byte limit. A naive ``[:63]`` truncation could
+    return the table name verbatim (tables and indexes share the ``pg_class``
+    namespace), which would fail with "relation already exists".
+    """
+    return _pg_identifier(f"{table}_hnsw_idx")
+
+
 def _field_sql(field: str, expression: Any, params: list) -> str:
     """Translate one field predicate to a JSONB containment expression."""
     if isinstance(expression, dict):
@@ -440,11 +502,10 @@ class _PgVectorClient:
     def __init__(self, config: _PgVectorConfig):
         self._config = config
         self._conn = None
+        self._closed = False
         self._lock = threading.RLock()
 
     def _connect(self):
-        if self._conn is not None and not getattr(self._conn, "closed", False):
-            return self._conn
         try:
             import psycopg
         except ImportError as exc:  # pragma: no cover - exercised only without the extra
@@ -452,15 +513,27 @@ class _PgVectorClient:
                 "pgvector backend requires the optional 'psycopg' dependency; "
                 "install mempalace[pgvector]"
             ) from exc
-        try:
-            self._conn = psycopg.connect(self._config.dsn)
-        except Exception as exc:  # noqa: BLE001 - surface any driver failure uniformly
-            raise BackendError(f"pgvector connection failed: {exc}") from exc
-        return self._conn
+        # One client is shared across threads (PgVectorBackend caches a
+        # single instance per config), so the read-create-store on self._conn
+        # must hold the same lock _execute serializes on; unlocked, two
+        # first-connect threads each opened a connection and the loser leaked
+        # unclosed. The RLock makes the _execute -> _connect nesting safe. A
+        # stalled connect blocks peers under the lock the same way any
+        # in-flight query on this single shared connection already does.
+        with self._lock:
+            if self._closed:
+                raise BackendError("pgvector client has been closed")
+            if self._conn is not None and not getattr(self._conn, "closed", False):
+                return self._conn
+            try:
+                self._conn = psycopg.connect(self._config.dsn)
+            except Exception as exc:  # noqa: BLE001 - surface any driver failure uniformly
+                raise BackendError(f"pgvector connection failed: {exc}") from exc
+            return self._conn
 
     def _execute(self, sql: str, params=None, *, fetch: bool = False, many: bool = False):
-        conn = self._connect()
         with self._lock:
+            conn = self._connect()
             try:
                 with conn.cursor() as cur:
                     if many:
@@ -545,9 +618,21 @@ class _PgVectorClient:
         )
         params = [
             (
-                row["id"],
-                row["document"],
-                _json_dumps(row.get("metadata")),
+                # Strip both unstorable byte classes Postgres rejects before
+                # binding, so one stray byte in a transcript cannot abort the
+                # whole mine (#1829 NUL, #1833 lone surrogate).
+                #
+                # Order matters for metadata: NUL must be stripped *before*
+                # serialization (json escapes it to \\u0000, which the jsonb cast
+                # rejects), while a lone surrogate must be stripped *after*
+                # serialization (json.dumps(ensure_ascii=False) leaves it raw, so
+                # one pass over the serialized string cleans it without walking
+                # the dict). id/document are plain strings, so the two passes
+                # commute there. ids are NUL- and surrogate-free in practice, so
+                # those passes are defensive no-ops on the ON CONFLICT key.
+                strip_lone_surrogates(_strip_nul(row["id"])),
+                strip_lone_surrogates(_strip_nul(row["document"])),
+                strip_lone_surrogates(_json_dumps(_strip_nul(row.get("metadata")))),
                 _vector_literal(row["embedding"]),
                 row.get("updated_at") or _utcnow(),
             )
@@ -589,14 +674,34 @@ class _PgVectorClient:
         *,
         where: Optional[dict] = None,
         with_embedding: bool = False,
+        with_document: bool = True,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
     ) -> list[dict]:
         qi = _quote_identifier(table)
         params: list = []
         where_sql = _where_to_sql(where, params) if where else "TRUE"
-        cols = "id, document, metadata"
+        # Project NULL into the document slot when the caller only needs
+        # metadata (e.g. mempalace_status's wing/room tally). Keeps the
+        # positional _row parser unchanged — document remains record[1] —
+        # while avoiding O(n × document_size) bytes over the wire on remote
+        # pgvector deployments. Follow-up to #1840.
+        cols = "id, document, metadata" if with_document else "id, NULL::text, metadata"
         if with_embedding:
             cols += ", embedding"
         sql = f"SELECT {cols} FROM {qi} WHERE {where_sql}"
+        # Push pagination into SQL when a page is requested. ORDER BY the
+        # primary key gives OFFSET a stable order (an unordered scan may skip
+        # or repeat rows across pages); callers that scroll the whole table
+        # pass neither bound, leaving their SQL unchanged.
+        if limit is not None or offset:
+            sql += " ORDER BY id"
+            if limit is not None:
+                params.append(int(limit))
+                sql += " LIMIT %s"
+            if offset:
+                params.append(int(offset))
+                sql += " OFFSET %s"
         rows = self._execute(sql, params, fetch=True)
         return [
             self._row(record, with_embedding=with_embedding, with_distance=False)
@@ -625,8 +730,46 @@ class _PgVectorClient:
     def drop_table(self, table: str) -> None:
         self._execute(f"DROP TABLE IF EXISTS {_quote_identifier(table)}")
 
+    # ------------------------------------------------------------------
+    # Maintenance (RFC 001)
+    # ------------------------------------------------------------------
+    def has_vector_index(self, table: str) -> bool:
+        rows = self._execute(
+            "SELECT 1 FROM pg_indexes WHERE schemaname = current_schema() "
+            "AND tablename = %s AND indexdef ILIKE %s",
+            [table, "%using hnsw%"],
+            fetch=True,
+        )
+        return bool(rows)
+
+    def try_advisory_lock(self, classid: int, objid: int) -> bool:
+        rows = self._execute("SELECT pg_try_advisory_lock(%s, %s)", [classid, objid], fetch=True)
+        return bool(rows and rows[0] and rows[0][0])
+
+    def advisory_unlock(self, classid: int, objid: int) -> None:
+        self._execute("SELECT pg_advisory_unlock(%s, %s)", [classid, objid], fetch=True)
+
+    def create_hnsw_index(self, table: str) -> None:
+        qi = _quote_identifier(table)
+        idx = _quote_identifier(_hnsw_index_name(table))
+        # Non-concurrent build takes ACCESS EXCLUSIVE for the build duration;
+        # the advisory lock in the caller ensures only one session builds, so
+        # writes are blocked once rather than by every writer that crossed the
+        # threshold (the production wedge this serialization fixes).
+        self._execute(
+            f"CREATE INDEX IF NOT EXISTS {idx} ON {qi} USING hnsw (embedding vector_cosine_ops)"
+        )
+
+    def analyze_table(self, table: str) -> None:
+        self._execute(f"ANALYZE {_quote_identifier(table)}")
+
     def close(self) -> None:
+        # Terminal: the only caller is PgVectorBackend.close(), after which
+        # the backend refuses to hand the client out again. Without the flag a
+        # stale reference would silently reconnect and leak a session nobody
+        # can ever close.
         with self._lock:
+            self._closed = True
             if self._conn is not None:
                 try:
                     self._conn.close()
@@ -686,6 +829,14 @@ class PgVectorCollection(BaseCollection):
     def _marker_exists(self) -> bool:
         return self._backend._marker_exists(self._palace)
 
+    def get_stored_embedder_identity(self):
+        return self._backend._get_embedder_identity(self._palace, self._collection_name)
+
+    def set_embedder_identity(self, identity) -> None:
+        # Sidecar-backed (see PgVectorBackend), so this records even on a
+        # brand-new palace whose mismatch marker doesn't exist yet.
+        self._backend._set_embedder_identity(self._palace, self._collection_name, identity)
+
     def _ensure_table(self, dimension: int) -> None:
         if dimension <= 0:
             raise ValueError("embedding dimension must be positive")
@@ -710,13 +861,56 @@ class PgVectorCollection(BaseCollection):
                 )
             self._known_dimension = existing_dim or dimension
 
-    def _scroll(self, *, where=None, with_embedding=False) -> list[dict]:
+    def _scroll(
+        self,
+        *,
+        where=None,
+        with_embedding=False,
+        with_document=True,
+        limit=None,
+        offset=None,
+    ) -> list[dict]:
         self._ensure_open()
         if not self._table_exists():
             if self._marker_exists():
                 raise CollectionNotInitializedError(self._collection_name)
             return []
-        return self._client.scroll_rows(self._table, where=where, with_embedding=with_embedding)
+        return self._client.scroll_rows(
+            self._table,
+            where=where,
+            with_embedding=with_embedding,
+            with_document=with_document,
+            limit=limit,
+            offset=offset,
+        )
+
+    def get_all_metadata(self, where=None) -> list[dict]:
+        """Single-pass metadata-only fetch — projects out the document column.
+
+        The base implementation pages through ``get(include=["metadatas"])``,
+        which routes here via ``_scroll`` and (pre-this-override) always sent
+        the ``document`` text over the wire even when nothing consumed it.
+        For pgvector deployments where the client is remote (TLS over WAN),
+        that meant ``mempalace_status`` transferred O(n × document_size)
+        bytes per call, dominating wall time. With ``with_document=False``
+        the SELECT replaces document with NULL, dropping the per-row payload
+        to id + metadata for every caller of this method.
+
+        Filtered fetches still need the ``_matches_where`` post-filter for
+        non-pushdown semantics (array/object values where ``metadata @> ...``
+        is broader than the exact match the caller asked for — same
+        correctness contract as #1840's filtered ``get`` path). Since that
+        post-filter only reads ``metadata``, we keep the single-scroll +
+        ``with_document=False`` fast path and just apply the filter locally
+        on the metadata dicts before returning. This extends the wire-byte
+        win to filtered callers as well.
+        """
+        _validate_where(where)
+        pushdown = None if _requires_local_filter(where) else where
+        rows = self._scroll(where=pushdown, with_document=False)
+        if where is None:
+            return [row["metadata"] for row in rows]
+        return [row["metadata"] for row in rows if _matches_where(row["metadata"], where)]
 
     def _rows(
         self,
@@ -935,16 +1129,40 @@ class PgVectorCollection(BaseCollection):
         include=None,
     ) -> GetResult:
         spec = _IncludeSpec.resolve(include, default_distances=False)
-        rows = self._rows(
-            ids=ids, where=where, where_document=where_document, with_embedding=spec.embeddings
+        # Fast path for the common unfiltered page fetch (e.g.
+        # prefetch_mined_set's sweep): push LIMIT/OFFSET into the scan instead
+        # of fetching the whole table and slicing in Python, which is the
+        # O(rows x pages) cost this avoids. Only the no-filter case is pushed:
+        # the "metadata @> ..." pushdown is broader than the exact
+        # _matches_where re-filter for array/object values, so any filtered get
+        # keeps the full-scan path where that re-filter still runs. ids, where,
+        # where_document and negative bounds all fall through to the unchanged
+        # path below. (The document column is still selected for metadata-only
+        # pages; projecting it out needs the positional _row parser to change,
+        # so it stays a separate follow-up.)
+        push_page = (
+            ids is None
+            and not where
+            and not where_document
+            and (limit is None or limit >= 0)
+            and (offset is None or offset >= 0)
+            and (limit is not None or offset)
         )
-        if ids is not None:
-            by_id = {row["id"]: row for row in rows}
-            rows = [by_id[doc_id] for doc_id in ids if doc_id in by_id]
-        if offset:
-            rows = rows[offset:]
-        if limit is not None:
-            rows = rows[:limit]
+        if push_page:
+            rows = self._scroll(
+                where=None, with_embedding=spec.embeddings, limit=limit, offset=offset
+            )
+        else:
+            rows = self._rows(
+                ids=ids, where=where, where_document=where_document, with_embedding=spec.embeddings
+            )
+            if ids is not None:
+                by_id = {row["id"]: row for row in rows}
+                rows = [by_id[doc_id] for doc_id in ids if doc_id in by_id]
+            if offset:
+                rows = rows[offset:]
+            if limit is not None:
+                rows = rows[:limit]
         return GetResult(
             ids=[row["id"] for row in rows],
             documents=[row["document"] for row in rows] if spec.documents else [],
@@ -1008,6 +1226,60 @@ class PgVectorCollection(BaseCollection):
             return HealthStatus.unhealthy(str(exc))
         return HealthStatus.healthy()
 
+    def maintenance_state(self) -> dict:
+        empty = {"row_count": 0, "vector_index": None, "index_build_complete": False}
+        self._ensure_open()
+        try:
+            if not self._table_exists():
+                return empty
+            rows = self._client.count_rows(self._table)
+            has_index = self._client.has_vector_index(self._table)
+        except Exception:  # noqa: BLE001 - state report must not raise
+            logger.debug("pgvector maintenance state probe failed", exc_info=True)
+            return empty
+        return {
+            "row_count": rows,
+            "vector_index": "hnsw" if has_index else None,
+            "index_build_complete": has_index,
+        }
+
+    def run_maintenance(self, kind: str):
+        from .base import MaintenanceResult, UnsupportedMaintenanceKindError
+
+        if kind not in PgVectorBackend.maintenance_kinds:
+            raise UnsupportedMaintenanceKindError(
+                f"pgvector does not support maintenance kind {kind!r}"
+            )
+        self._ensure_open()
+        # Nothing to maintain on a not-yet-materialized table (collection opened
+        # create=True but never written) — return noop rather than letting a
+        # raw "relation does not exist" error escape.
+        if not self._table_exists():
+            return MaintenanceResult(kind=kind, status="noop", stats={"reason": "no table"})
+        if kind == "analyze":
+            self._client.analyze_table(self._table)
+            return MaintenanceResult(kind="analyze", status="ran")
+
+        # reindex → build the optional HNSW index. Opt-in: it makes search
+        # approximate, trading the exact-scan 100%-recall default for scale.
+        # Serialized with a session advisory lock so concurrent daemon writers
+        # learn "already_running" instead of each stacking an ACCESS EXCLUSIVE
+        # index build.
+        if self._client.has_vector_index(self._table):
+            return MaintenanceResult(kind="reindex", status="noop", stats={"vector_index": "hnsw"})
+        classid, objid = _MAINTENANCE_LOCK_CLASSID, _advisory_objid(self._table)
+        if not self._client.try_advisory_lock(classid, objid):
+            return MaintenanceResult(kind="reindex", status="already_running")
+        try:
+            if self._client.has_vector_index(self._table):  # re-check under lock
+                return MaintenanceResult(
+                    kind="reindex", status="noop", stats={"vector_index": "hnsw"}
+                )
+            self._client.create_hnsw_index(self._table)
+            return MaintenanceResult(kind="reindex", status="ran", stats={"vector_index": "hnsw"})
+        finally:
+            self._client.advisory_unlock(classid, objid)
+
 
 class PgVectorBackend(BaseBackend):
     name = "pgvector"
@@ -1020,9 +1292,15 @@ class PgVectorBackend(BaseBackend):
             "supports_metadata_filters",
             "supports_lexical_search",
             "supports_namespace_isolation",
+            "supports_server_side_indexes",
             "server_mode",
         }
     )
+    # "compact" is omitted: Postgres autovacuum reclaims space automatically,
+    # so a manual VACUUM kind would be redundant. "reindex" builds the optional
+    # HNSW index — an opt-in scale lever, NOT on by default, because it makes
+    # vector search approximate (the exact ``<=>`` scan is the 100%-recall path).
+    maintenance_kinds = frozenset({"analyze", "reindex"})
 
     def __init__(self):
         self._clients: dict[_PgVectorConfig, _PgVectorClient] = {}
@@ -1140,11 +1418,31 @@ class PgVectorBackend(BaseBackend):
         except (OSError, NotImplementedError):
             pass
 
+    # Embedder identity lives in a sidecar, NOT the backend marker: the marker's
+    # presence signals "palace initialized" (reads raise CollectionNotInitialized
+    # when the marker exists but the remote table doesn't), so recording identity
+    # at first empty open must not create it. The sidecar is unguarded — like the
+    # chroma sidecar — so a brand-new palace can record identity immediately.
+    @staticmethod
+    def _embedder_sidecar_path(palace: PalaceRef) -> Optional[str]:
+        if not palace.local_path:
+            return None
+        return os.path.join(palace.local_path, EMBEDDER_SIDECAR_FILENAME)
+
+    def _get_embedder_identity(self, palace: PalaceRef, collection_name: str):
+        return read_embedder_sidecar(self._embedder_sidecar_path(palace), collection_name)
+
+    def _set_embedder_identity(self, palace: PalaceRef, collection_name: str, identity) -> None:
+        write_embedder_sidecar(self._embedder_sidecar_path(palace), collection_name, identity)
+
     # ------------------------------------------------------------------
     def _client(self, config: _PgVectorConfig) -> _PgVectorClient:
-        if self._closed:
-            raise BackendClosedError("PgVectorBackend has been closed")
         with self._lock:
+            # Checked under the lock so a client cannot be created and stored
+            # concurrently with close() clearing the registry (mirrors
+            # SQLiteExactBackend._connect).
+            if self._closed:
+                raise BackendClosedError("PgVectorBackend has been closed")
             client = self._clients.get(config)
             if client is None:
                 client = _PgVectorClient(config)

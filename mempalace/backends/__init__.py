@@ -27,13 +27,16 @@ from .base import (
     HealthStatus,
     LexicalHit,
     LexicalResult,
+    MaintenanceResult,
     PalaceNotFoundError,
     PalaceRef,
     QueryResult,
     UnsupportedCapabilityError,
     UnsupportedFilterError,
+    UnsupportedMaintenanceKindError,
 )
 from .chroma import ChromaBackend, ChromaCollection
+from .milvus import MilvusBackend, MilvusCollection
 from .pgvector import PgVectorBackend, PgVectorCollection
 from .qdrant import QdrantBackend, QdrantCollection
 from .sqlite_exact import SQLiteExactBackend, SQLiteExactCollection
@@ -64,6 +67,9 @@ __all__ = [
     "HealthStatus",
     "LexicalHit",
     "LexicalResult",
+    "MaintenanceResult",
+    "MilvusBackend",
+    "MilvusCollection",
     "PalaceNotFoundError",
     "PalaceRef",
     "PgVectorBackend",
@@ -75,6 +81,7 @@ __all__ = [
     "SQLiteExactCollection",
     "UnsupportedCapabilityError",
     "UnsupportedFilterError",
+    "UnsupportedMaintenanceKindError",
     "available_backends",
     "detect_backend_for_path",
     "detect_backends_for_path",

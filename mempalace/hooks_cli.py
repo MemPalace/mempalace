@@ -1,8 +1,8 @@
 """
-Hook logic for MemPalace — Python implementation of session-start, stop, and precompact hooks.
+Hook logic for MemPalace — Python implementation of session-start, stop, session-end, and precompact hooks.
 
 Reads JSON from stdin, outputs JSON to stdout.
-Supported hooks: session-start, stop, precompact
+Supported hooks: session-start, stop, session-end, precompact
 Supported harnesses: claude-code, codex (extensible to cursor, gemini, etc.)
 """
 
@@ -25,7 +25,7 @@ PALACE_ROOT = Path.home() / ".mempalace"
 
 
 def _detached_popen_kwargs() -> dict:
-    """Kwargs that fully detach a Popen child so the hook process can exit.
+    """Kwargs that give a Popen child a hidden console so the hook can exit.
 
     Without these, Windows holds the parent open until the child closes the
     inherited stdout/stderr handles — manifesting as "Stop hook hangs" at
@@ -36,7 +36,7 @@ def _detached_popen_kwargs() -> dict:
     kwargs: dict = {"stdin": subprocess.DEVNULL, "close_fds": True}
     if os.name == "nt":
         flags = 0
-        for name in ("DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP", "CREATE_BREAKAWAY_FROM_JOB"):
+        for name in ("CREATE_NO_WINDOW", "CREATE_NEW_PROCESS_GROUP", "CREATE_BREAKAWAY_FROM_JOB"):
             flags |= getattr(subprocess, name, 0)
         if flags:
             kwargs["creationflags"] = flags
@@ -509,6 +509,73 @@ def _spawn_mine(cmd: list) -> None:
         pass
 
 
+def _hooks_daemon_enabled() -> bool:
+    try:
+        return MempalaceConfig().hook_use_daemon is True
+    except Exception:
+        return False
+
+
+def _daemon_mine_dedupe_key(source: str, mode: str) -> str:
+    try:
+        source_key = str(Path(source).expanduser().resolve())
+    except OSError:
+        source_key = str(Path(source).expanduser())
+    return f"hook:mine:{mode}:{source_key}"
+
+
+def _daemon_available() -> bool:
+    """True iff a daemon is already running for the configured palace.
+
+    This is a fast localhost health check, not a spawn: the 500ms hook budget
+    forbids auto-starting a python subprocess from a hook (cold start is
+    ~15s). Daemon mode for hooks requires the user to have started the daemon
+    explicitly via `mempalace daemon start`; when it isn't up, hooks fall back
+    to the existing direct (in-process / spawn) path instead of blocking.
+    """
+    from .daemon import HOOK_PROBE_TIMEOUT, get_client_if_running
+
+    try:
+        return (
+            get_client_if_running(MempalaceConfig().palace_path, health_timeout=HOOK_PROBE_TIMEOUT)
+            is not None
+        )
+    except Exception:
+        return False
+
+
+def _submit_daemon_job(
+    kind: str,
+    payload: dict,
+    *,
+    dedupe_key: str = None,
+    priority: int = 0,
+    wait: bool = False,
+    timeout: float = 60.0,
+):
+    """Submit to an already-running daemon. Never auto-starts (see _daemon_available).
+
+    Raises DaemonError on a real failure (job rejected, timeout, daemon died
+    mid-submit). Callers must NOT fall back to the direct path on such errors —
+    the daemon may already have accepted the job, and re-running it would
+    duplicate verbatim content. Only an absent daemon (handled by the caller's
+    _daemon_available() precheck) should fall back.
+    """
+    from .daemon import submit_job
+
+    palace_path = MempalaceConfig().palace_path
+    return submit_job(
+        kind,
+        payload,
+        palace_path=palace_path,
+        dedupe_key=dedupe_key,
+        priority=priority,
+        wait=wait,
+        auto_start=False,
+        timeout=timeout,
+    )
+
+
 def _maybe_auto_ingest():
     """Background-mine MEMPAL_DIR (project files) if set.
 
@@ -527,9 +594,26 @@ def _maybe_auto_ingest():
         return
     for mine_dir, mode in targets:
         try:
+            if _hooks_daemon_enabled() and _daemon_available():
+                try:
+                    _submit_daemon_job(
+                        "mine",
+                        {"source": mine_dir, "mode": mode, "agent": "mempalace"},
+                        dedupe_key=_daemon_mine_dedupe_key(mine_dir, mode),
+                        wait=False,
+                    )
+                except Exception as exc:
+                    # Daemon accepted context — don't fall back (would double-mine).
+                    _log(f"Daemon mine submission failed: {exc}")
+                continue
             _spawn_mine([_mempalace_python(), "-m", "mempalace", "mine", mine_dir, "--mode", mode])
         except OSError:
             pass
+        except Exception as exc:
+            # Non-daemon spawn path failed. Hooks must never crash the user's
+            # shell — log and continue. Do not label this a daemon failure: the
+            # daemon block above handles its own errors with its own message.
+            _log(f"mine hook failed: {exc}")
 
 
 def _mine_sync():
@@ -546,6 +630,22 @@ def _mine_sync():
     log_path = STATE_DIR / "hook.log"
     for mine_dir, mode in targets:
         try:
+            if _hooks_daemon_enabled() and _daemon_available():
+                try:
+                    job = _submit_daemon_job(
+                        "mine",
+                        {"source": mine_dir, "mode": mode, "agent": "mempalace"},
+                        dedupe_key=_daemon_mine_dedupe_key(mine_dir, mode),
+                        wait=True,
+                        timeout=60,
+                    )
+                    result = job.get("result") or {}
+                    if job.get("state") != "succeeded" or not result.get("success", True):
+                        _log(f"Daemon sync mine failed: {result.get('error', job.get('error'))}")
+                except Exception as exc:
+                    # Daemon accepted context — don't fall back (would double-mine).
+                    _log(f"Daemon sync mine submission failed: {exc}")
+                continue
             with open(log_path, "a") as log_f:
                 subprocess.run(
                     [
@@ -560,9 +660,19 @@ def _mine_sync():
                     stdout=log_f,
                     stderr=log_f,
                     timeout=60,
+                    # Windows: hide the conhost window this sync mine would
+                    # otherwise flash on every fire. Mirrors the async paths
+                    # (_spawn_mine / _desktop_toast) via _detached_popen_kwargs().
+                    # 0 is a no-op off-Windows.
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
         except (OSError, subprocess.TimeoutExpired):
             pass
+        except Exception as exc:
+            # Non-daemon sync spawn path failed. Hooks must never crash the
+            # user's shell — log and continue (not a daemon failure; the daemon
+            # block above handles its own errors).
+            _log(f"mine hook failed: {exc}")
 
 
 def _desktop_toast(body: str, title: str = "MemPalace"):
@@ -680,6 +790,41 @@ def _save_diary_direct(
     )
 
     try:
+        if _hooks_daemon_enabled() and _daemon_available():
+            try:
+                job = _submit_daemon_job(
+                    "diary_write",
+                    {
+                        "agent_name": agent_name,
+                        "entry": entry,
+                        "topic": "checkpoint",
+                        "wing": wing,
+                    },
+                    priority=10,
+                    wait=True,
+                    timeout=30,
+                )
+            except Exception as exc:
+                # Daemon accepted context — don't fall back (would double-write).
+                _log(f"Daemon diary checkpoint failed: {exc}")
+                return {"count": 0}
+            result = job.get("result") or {}
+            if job.get("state") == "succeeded" and result.get("success"):
+                _log(f"Diary checkpoint saved: {result.get('entry_id', '?')}")
+                try:
+                    ack_file = STATE_DIR / "last_checkpoint"
+                    ack_file.write_text(
+                        json.dumps({"msgs": len(messages), "ts": now.isoformat()}),
+                        encoding="utf-8",
+                    )
+                except OSError:
+                    pass
+                if toast:
+                    _desktop_toast(f"Checkpoint saved - {len(messages)} messages archived")
+                return {"count": len(messages), "themes": themes}
+            _log(f"Daemon diary checkpoint failed: {result.get('error', job.get('error'))}")
+            return {"count": 0}
+
         from .mcp_server import tool_diary_write
 
         result = tool_diary_write(
@@ -711,8 +856,13 @@ def _save_diary_direct(
 
 def _ingest_transcript(transcript_path: str):
     """Mine a Claude Code session transcript into the palace as a conversation."""
-    path = Path(transcript_path).expanduser()
-    if not path.is_file() or path.stat().st_size < 100:
+    path = _validate_transcript_path(transcript_path)
+    if path is None:
+        return
+    try:
+        if not path.is_file() or path.stat().st_size < 100:
+            return
+    except OSError:
         return
 
     try:
@@ -721,6 +871,25 @@ def _ingest_transcript(transcript_path: str):
         return
 
     try:
+        if _hooks_daemon_enabled() and _daemon_available():
+            try:
+                _submit_daemon_job(
+                    "mine",
+                    {
+                        "source": str(path.parent),
+                        "mode": "convos",
+                        "wing": "sessions",
+                        "agent": "mempalace",
+                    },
+                    dedupe_key=_daemon_mine_dedupe_key(str(path.parent), "convos"),
+                    wait=False,
+                )
+                _log(f"Transcript ingest submitted to daemon: {path.name}")
+            except Exception as exc:
+                # Daemon accepted context — don't fall back (would double-mine).
+                _log(f"Daemon transcript ingest failed: {exc}")
+            return
+
         # Route through ``_spawn_mine`` so the per-target PID guard kicks
         # in here too — repeated Stop/PreCompact fires for the same
         # transcript should not stack up parallel ingest mines.
@@ -740,6 +909,11 @@ def _ingest_transcript(transcript_path: str):
         _log(f"Transcript ingest started: {path.name}")
     except OSError:
         pass
+    except Exception as exc:
+        # Non-daemon ingest spawn path failed. Hooks must never crash the
+        # user's shell — log and continue (not a daemon failure; the daemon
+        # block above handles its own errors).
+        _log(f"transcript ingest hook failed: {exc}")
 
 
 SUPPORTED_HARNESSES = {"claude-code", "codex"}
@@ -787,6 +961,26 @@ _ENCODED_PARENT_PREFIXES = (
 )
 
 
+def _safe_wing_slug(name: str) -> str:
+    """Normalize a project directory name into a wing slug ``sanitize_name`` accepts.
+
+    Builds on the historical space/hyphen handling: map characters outside
+    ``sanitize_name``'s set to ``_`` while keeping ``.`` and ``'`` so existing wings
+    for names like ``my.app`` are preserved (renaming a wing would orphan diary
+    entries already filed under it), collapse ``..`` which the validator rejects as
+    path traversal, trim edge separators it won't accept, and cap the length so
+    ``wing_<slug>`` stays within ``sanitize_name``'s 128-character limit. Without
+    this a folder containing e.g. a leading ``+`` produced ``wing_+project``, which
+    ``sanitize_name`` rejects — silently breaking diary auto-save. Falls back to
+    ``sessions`` when a name reduces to nothing (e.g. ``+``).
+    """
+    slug = name.lower().replace(" ", "_").replace("-", "_")
+    slug = re.sub(r"[^\w.']+", "_", slug)
+    slug = re.sub(r"\.{2,}", ".", slug)
+    slug = slug[:120].strip("_.'")
+    return slug or "sessions"
+
+
 def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
     """Read ``cwd`` from the first JSONL line that records it.
 
@@ -820,8 +1014,7 @@ def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
                     continue
                 project = cwd_norm.rsplit("/", 1)[-1]
                 if project:
-                    slug = project.lower().replace(" ", "_").replace("-", "_")
-                    return f"wing_{slug}"
+                    return f"wing_{_safe_wing_slug(project)}"
     except OSError:
         pass
     return None
@@ -878,15 +1071,12 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
             if encoded.startswith(prefix):
                 encoded = encoded[len(prefix) :]
                 break
-        project = encoded.lower().replace(" ", "_").replace("-", "_")
-        if project:
-            return f"wing_{project}"
+        return f"wing_{_safe_wing_slug(encoded)}"
 
     # 3. Legacy — explicit -Projects-<name> segment
     match = re.search(r"-Projects-([^/]+?)(?:/|$)", normalized)
     if match:
-        project = match.group(1).lower().replace(" ", "_").replace("-", "_")
-        return f"wing_{project}"
+        return f"wing_{_safe_wing_slug(match.group(1))}"
 
     # 4. Default
     return "wing_sessions"
@@ -1021,6 +1211,116 @@ def hook_session_start(data: dict, harness: str):
     _output({})
 
 
+def _clear_session_last_save(session_id: str) -> None:
+    """Drop the per-session save marker once a session has ended.
+
+    ``hook_stop`` writes ``{session_id}_last_save`` but never had a clean-exit
+    cleanup path, so the marker lingered. The session is over by the time
+    ``hook_session_end`` runs, so removing it here keeps ``hook_state/`` from
+    accumulating dead markers. OS errors (including a missing marker, since
+    ``FileNotFoundError`` is an ``OSError``) are swallowed — this is best-effort
+    cleanup, never a reason to fail the hook.
+    """
+    try:
+        (STATE_DIR / f"{session_id}_last_save").unlink()
+    except OSError:
+        pass
+
+
+def hook_session_end(data: dict, harness: str):
+    """Session end hook: one final flush when a session exits cleanly.
+
+    Closes the gap (#1341) where a session that never crosses ``SAVE_INTERVAL``
+    on ``Stop`` and never triggers ``PreCompact`` exits with nothing saved —
+    the common case for short, useful sessions.
+
+    Why background instead of mine inline: Claude Code's hooks reference
+    documents a default SessionEnd timeout of 1.5 seconds, and "timeouts set on
+    plugin-provided hooks do not raise the budget"
+    (https://code.claude.com/docs/en/hooks). A cold ``mempalace`` start alone
+    exceeds 1.5s, so this handler must never mine in the hook foreground. The
+    shell wrapper backgrounds it and returns immediately; the heavy capture is
+    spawned *detached* via ``_ingest_transcript`` / ``_maybe_auto_ingest`` (both
+    route through ``_spawn_mine`` / ``_detached_popen_kwargs``). On POSIX that
+    detached child reliably outlives the session (verified). On Windows only the
+    mine grandchild (spawned with detached-process flags) is designed to break
+    away from the session; the backgrounded hook process and the in-process
+    diary write are best-effort there (no Windows CI coverage yet). This
+    honors the "background everything / hooks under 500ms" budget. SessionEnd
+    has no decision control, so this only ever saves; it never emits a block
+    payload.
+    """
+    if not _palace_root_exists():
+        _output({})
+        return
+
+    # Parse inside the try so a malformed payload (e.g. non-dict stdin that
+    # makes _parse_harness_input raise) still runs the finally cleanup below.
+    session_id = "unknown"
+    try:
+        parsed = _parse_harness_input(data, harness)
+        session_id = parsed["session_id"]
+        transcript_path = parsed["transcript_path"]
+
+        # Read config defensively (mirror hook_stop): a corrupt or unreadable
+        # config must not lose the final save, so default to auto-save on and
+        # toasts off rather than crashing the hook.
+        try:
+            config = MempalaceConfig()
+            auto_save = config.hooks_auto_save
+            toast = config.hook_desktop_toast
+        except Exception:
+            auto_save = True
+            toast = False
+
+        # Respect auto_save config toggle (clean opt-out)
+        if not auto_save:
+            _output({})
+            return
+
+        _log(f"SESSION END for session {session_id}")
+
+        # Validate the harness-provided transcript path before touching it
+        # (extension + ".." traversal check), mirroring the read path that
+        # already runs through _validate_transcript_path. A rejected path skips
+        # the transcript captures but still lets the independent MEMPAL_DIR mine
+        # run.
+        valid_transcript = ""
+        if transcript_path:
+            try:
+                validated = _validate_transcript_path(transcript_path)
+            except OSError:
+                validated = None
+            if validated is None:
+                _log(f"WARNING: transcript_path rejected by validator: {transcript_path!r}")
+            else:
+                valid_transcript = str(validated)
+
+        # Flush. The diary checkpoint (in-process ChromaDB write) runs FIRST,
+        # before any detached mine is spawned, so it never contends for the
+        # palace lock; this handler is already backgrounded by the wrapper, so it
+        # is not under the SessionEnd budget and has time to finish. The detached
+        # transcript ingest follows; re-mining a transcript ``Stop`` already
+        # captured is a near no-op (deterministic convo IDs + ``file_already_mined``
+        # short-circuit + upsert). ``reason`` is intentionally not branched on:
+        # every clean-exit reason (incl. ``/clear`` / ``resume``) warrants the
+        # flush. Order matches ``hook_stop``.
+        if valid_transcript:
+            _save_diary_direct(
+                valid_transcript,
+                session_id,
+                wing=_wing_from_transcript_path(valid_transcript),
+                toast=toast,
+                agent_name=_diary_agent_for_harness(harness),
+            )
+            _ingest_transcript(valid_transcript)
+        _maybe_auto_ingest()
+
+        _output({})
+    finally:
+        _clear_session_last_save(session_id)
+
+
 def hook_precompact(data: dict, harness: str):
     """Precompact hook: mine transcript synchronously, then allow compaction.
 
@@ -1064,6 +1364,7 @@ def run_hook(hook_name: str, harness: str):
     hooks = {
         "session-start": hook_session_start,
         "stop": hook_stop,
+        "session-end": hook_session_end,
         "precompact": hook_precompact,
     }
 

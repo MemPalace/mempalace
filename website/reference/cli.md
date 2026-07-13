@@ -1,6 +1,8 @@
 # CLI Commands
 
 All commands accept `--palace <path>` to override the default palace location.
+The top-level command also accepts `--backend <name>` to select a storage
+backend such as `sqlite_exact`, `milvus`, `qdrant`, or `pgvector`.
 
 ## `mempalace init`
 

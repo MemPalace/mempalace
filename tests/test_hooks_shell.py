@@ -24,6 +24,7 @@ import os
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -31,6 +32,8 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SAVE_HOOK = REPO_ROOT / "hooks" / "mempal_save_hook.sh"
 PRECOMPACT_HOOK = REPO_ROOT / "hooks" / "mempal_precompact_hook.sh"
+SESSION_END_HOOK = REPO_ROOT / "hooks" / "mempal_session_end_hook.sh"
+PLUGIN_SESSION_END_HOOK = REPO_ROOT / ".claude-plugin" / "hooks" / "mempal-session-end-hook.sh"
 
 
 pytestmark = pytest.mark.skipif(os.name == "nt", reason="bash hook scripts are POSIX-only")
@@ -168,3 +171,131 @@ class TestMempalPythonOverride:
         assert "python3" in invocations, (
             f"fallback-to-PATH did not use the shimmed python3. Marker log: {invocations!r}"
         )
+
+
+# ── session-end wrapper: must background so the foreground beats the budget ──
+
+
+def _write_recording_mempalace(
+    path: Path, args_file: Path, *, sleep_secs: float = 0.0, done_file: Path | None = None
+) -> Path:
+    """A fake ``mempalace`` that consumes stdin, optionally sleeps, then records
+    its argv to ``args_file`` (and touches ``done_file``). Lets a test observe a
+    *backgrounded* dispatch after the wrapper's foreground has already returned.
+    """
+    done_line = f'printf done > "{done_file}"' if done_file is not None else ":"
+    src = f"""#!/bin/bash
+cat >/dev/null
+sleep {sleep_secs}
+printf '%s' "$*" > "{args_file}"
+{done_line}
+printf '{{}}'
+"""
+    path.write_text(src)
+    path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return path
+
+
+def _wait_for(path: Path, timeout: float = 15.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists() and path.read_text():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+class TestSessionEndWrapper:
+    def test_foreground_returns_before_worker_finishes(self, tmp_path):
+        """Budget contract: the foreground must return well before the (slow)
+        worker completes, otherwise SessionEnd's ~1.5s budget would kill the
+        mine. Proven with a worker that sleeps 2s before recording."""
+        args_file = tmp_path / "args.log"
+        done_file = tmp_path / "worker.done"
+        fake = _write_recording_mempalace(
+            tmp_path / "mempalace", args_file, sleep_secs=2.0, done_file=done_file
+        )
+        t0 = time.monotonic()
+        result = _run_hook(
+            SESSION_END_HOOK,
+            {"session_id": "abc", "transcript_path": ""},
+            env_overrides={"HOME": str(tmp_path)},
+            path_prefix=[fake.parent],
+        )
+        elapsed = time.monotonic() - t0
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
+        assert result.stdout == "{}"
+        assert elapsed < 1.5, f"foreground blocked {elapsed:.2f}s; the budget would kill it"
+        assert not done_file.exists(), (
+            "worker finished before the foreground returned — wrapper is not backgrounding"
+        )
+        assert _wait_for(done_file), "detached worker never completed"
+        assert args_file.read_text() == "hook run --hook session-end --harness claude-code"
+
+    def test_dispatches_via_mempal_python_override(self, tmp_path):
+        args_file = tmp_path / "args.log"
+        shim = tmp_path / "python3"
+        shim.write_text(
+            f"""#!/bin/bash
+if [ "$1" = "-c" ]; then exit 0; fi
+if [ "$1" = "-m" ] && [ "$2" = "mempalace" ]; then
+  shift 2
+  cat >/dev/null
+  printf '%s' "$*" > "{args_file}"
+  printf '{{}}'
+  exit 0
+fi
+exit 1
+""",
+            encoding="utf-8",
+        )
+        shim.chmod(shim.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        result = _run_hook(
+            SESSION_END_HOOK,
+            {"session_id": "abc", "transcript_path": ""},
+            env_overrides={
+                "HOME": str(tmp_path),
+                "PATH": "/usr/bin:/bin",
+                "MEMPAL_PYTHON": str(shim),
+            },
+        )
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
+        assert result.stdout == "{}"
+        assert _wait_for(args_file), "backgrounded worker never ran"
+        assert args_file.read_text() == "hook run --hook session-end --harness claude-code"
+
+    def test_harness_override_is_forwarded(self, tmp_path):
+        args_file = tmp_path / "args.log"
+        fake = _write_recording_mempalace(tmp_path / "mempalace", args_file)
+        result = _run_hook(
+            SESSION_END_HOOK,
+            {"session_id": "abc", "transcript_path": ""},
+            env_overrides={"HOME": str(tmp_path), "MEMPALACE_HOOK_HARNESS": "codex"},
+            path_prefix=[fake.parent],
+        )
+        assert result.returncode == 0
+        assert _wait_for(args_file)
+        assert args_file.read_text() == "hook run --hook session-end --harness codex"
+
+
+class TestPluginSessionEndWrapper:
+    def test_foreground_returns_before_worker_finishes(self, tmp_path):
+        args_file = tmp_path / "args.log"
+        done_file = tmp_path / "worker.done"
+        fake = _write_recording_mempalace(
+            tmp_path / "mempalace", args_file, sleep_secs=2.0, done_file=done_file
+        )
+        t0 = time.monotonic()
+        result = _run_hook(
+            PLUGIN_SESSION_END_HOOK,
+            {"session_id": "abc", "transcript_path": ""},
+            env_overrides={"HOME": str(tmp_path)},
+            path_prefix=[fake.parent],
+        )
+        elapsed = time.monotonic() - t0
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
+        assert result.stdout == "{}"
+        assert elapsed < 1.5, f"plugin foreground blocked {elapsed:.2f}s"
+        assert not done_file.exists()
+        assert _wait_for(done_file), "detached plugin worker never completed"
+        assert args_file.read_text() == "hook run --hook session-end --harness claude-code"

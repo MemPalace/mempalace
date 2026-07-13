@@ -10,7 +10,15 @@ import pytest
 import yaml
 
 from mempalace.config import normalize_wing_name
-from mempalace.miner import detect_room, load_config, mine, scan_project, status
+from mempalace.miner import (
+    PHP_EXTENSIONS,
+    READABLE_EXTENSIONS,
+    detect_room,
+    load_config,
+    mine,
+    scan_project,
+    status,
+)
 from mempalace.palace import NORMALIZE_VERSION, file_already_mined, prefetch_mined_set
 
 
@@ -22,6 +30,24 @@ def write_file(path: Path, content: str):
 def scanned_files(project_root: Path, **kwargs):
     files = scan_project(str(project_root), **kwargs)
     return sorted(path.relative_to(project_root).as_posix() for path in files)
+
+
+def test_php_ecosystem_extensions_are_readable():
+    assert PHP_EXTENSIONS <= READABLE_EXTENSIONS
+
+
+def test_scan_project_includes_php_ecosystem_files(tmp_path):
+    expected = []
+    for index, extension in enumerate(sorted(PHP_EXTENSIONS)):
+        filename = f"example_{index}{extension}"
+        write_file(tmp_path / filename, "<?php echo 'verbatim';\n")
+        expected.append(filename)
+
+    # Extension matching is deliberately case-insensitive.
+    write_file(tmp_path / "uppercase.PHP", "<?php echo 'uppercase';\n")
+    expected.append("uppercase.PHP")
+
+    assert scanned_files(tmp_path) == sorted(expected)
 
 
 def test_project_mining():
@@ -296,6 +322,47 @@ def test_scan_project_skips_mempalace_generated_files():
         assert scanned_files(project_root) == ["notes.md"]
 
 
+def test_scan_project_includes_swift_files():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        project_root = Path(tmpdir).resolve()
+        write_file(
+            project_root / "Sources" / "App.swift",
+            "struct App {}\n" * 20,
+        )
+        assert scanned_files(project_root) == ["Sources/App.swift"]
+
+
+def test_scan_project_includes_kotlin_files():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        project_root = Path(tmpdir).resolve()
+        write_file(
+            project_root / "src" / "Main.kt",
+            "fun main() {}\n" * 20,
+        )
+        write_file(
+            project_root / "settings.gradle.kts",
+            'rootProject.name = "demo"\n' * 20,
+        )
+        assert scanned_files(project_root) == [
+            "settings.gradle.kts",
+            "src/Main.kt",
+        ]
+
+
+def test_scan_project_includes_latex_files():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        project_root = Path(tmpdir).resolve()
+        write_file(
+            project_root / "main.tex",
+            "\\documentclass{article}\n\\begin{document}\nHello, world.\n\\end{document}\n" * 20,
+        )
+        write_file(
+            project_root / "refs.bib",
+            "@article{lamport1986, author={Leslie Lamport}, title={LaTeX}, year={1986}}\n" * 20,
+        )
+        assert scanned_files(project_root) == ["main.tex", "refs.bib"]
+
+
 def test_scan_project_respects_gitignore():
     tmpdir = tempfile.mkdtemp()
     try:
@@ -522,6 +589,115 @@ def test_scan_project_logs_nested_symlink_with_relative_path(tmp_path, capsys):
     assert "(symlink)" in err
 
 
+def test_scan_project_exclude_patterns_skips_matching_files():
+    tmpdir = tempfile.mkdtemp()
+    try:
+        project_root = Path(tmpdir).resolve()
+
+        write_file(project_root / "src" / "app.py", "print('app')\n" * 20)
+        write_file(project_root / "docs" / "guide.md", "# Guide\n" * 20)
+        write_file(project_root / "README.md", "# README\n" * 20)
+
+        # *.md excludes README.md and docs/guide.md; docs/* would also cover docs/
+        # subtree.  Patterns follow .gitignore syntax via GitignoreMatcher.
+        assert scanned_files(
+            project_root,
+            exclude_patterns=["*.md", "docs/*"],
+        ) == ["src/app.py"]
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_scan_project_exclude_patterns_prunes_entire_directory():
+    tmpdir = tempfile.mkdtemp()
+    try:
+        project_root = Path(tmpdir).resolve()
+
+        write_file(project_root / "src" / "app.py", "print('app')\n" * 20)
+        write_file(project_root / "docs" / "sub" / "deep.md", "# Deep\n" * 20)
+
+        # A trailing-slash pattern (dir-only) prunes the whole directory so
+        # os.walk never descends into it.
+        assert scanned_files(project_root, exclude_patterns=["docs/"]) == ["src/app.py"]
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_scan_project_exclude_patterns_include_ignored_bypasses_exclusion():
+    tmpdir = tempfile.mkdtemp()
+    try:
+        project_root = Path(tmpdir).resolve()
+
+        write_file(project_root / "src" / "app.py", "print('app')\n" * 20)
+        write_file(project_root / ".gitignore", "docs/\n")
+        write_file(project_root / "docs" / "guide.md", "# Guide\n" * 20)
+
+        # docs/ is both gitignored and matched by exclude_patterns, but
+        # include_ignored should override both filters and bring it back.
+        assert scanned_files(
+            project_root,
+            exclude_patterns=["docs/*"],
+            include_ignored=["docs"],
+        ) == ["docs/guide.md", "src/app.py"]
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_mine_exclude_patterns_applied_to_prescan_files(monkeypatch):
+    """exclude_patterns from config must be applied when mine() is given a pre-scanned list.
+
+    The init command calls scan_project() first to show a file-count estimate,
+    then passes the result to mine(..., files=...) to avoid walking the tree
+    twice.  The _mine_impl elif branch must apply exclude_patterns to that list
+    so per-project exclusions still take effect.
+    """
+    import mempalace.miner as miner_mod
+
+    tmpdir = tempfile.mkdtemp()
+    try:
+        project_root = Path(tmpdir).resolve()
+
+        write_file(project_root / "src" / "app.py", "print('app')\n" * 20)
+        write_file(project_root / "docs" / "guide.md", "# Guide\n" * 20)
+        write_file(project_root / "README.md", "# README\n" * 20)
+
+        with open(project_root / "mempalace.yaml", "w") as f:
+            yaml.dump(
+                {
+                    "wing": "test_project",
+                    "rooms": [{"name": "general", "description": "General"}],
+                    "exclude_patterns": ["*.md", "docs/"],
+                },
+                f,
+            )
+
+        # Simulate the init double-scan: scan without exclude_patterns first
+        # (representing the caller that doesn't know the config), then pass
+        # the full list to mine() so the elif branch applies the config exclusions.
+        prescan = scan_project(str(project_root), exclude_patterns=None)
+        assert len(prescan) >= 2, "prescan should include .md files before filtering"
+
+        # Capture which files process_file is called with during dry_run
+        processed = []
+        _real_process_file = miner_mod.process_file
+
+        def _capture_process_file(filepath, **kwargs):
+            processed.append(filepath)
+            return _real_process_file(filepath, **kwargs)
+
+        monkeypatch.setattr(miner_mod, "process_file", _capture_process_file)
+
+        palace_path = project_root / "palace"
+        mine(str(project_root), str(palace_path), dry_run=True, files=prescan)
+
+        processed_rel = [p.relative_to(project_root).as_posix() for p in processed]
+        assert "src/app.py" in processed_rel
+        assert "docs/guide.md" not in processed_rel
+        assert "README.md" not in processed_rel
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def test_entity_metadata_finds_cyrillic_names(monkeypatch):
     """Entity extraction must find non-Latin names when entity_languages includes the locale."""
     import mempalace.palace as palace_mod
@@ -571,6 +747,62 @@ def test_entity_metadata_matches_known_names_case_insensitively(monkeypatch):
     matched_mixed = set(result_mixed.split(";")) if result_mixed else set()
     assert "Aya" in matched_mixed
     assert "Lumi" in matched_mixed
+
+
+def test_scan_project_skips_oversized_files(tmp_path, capsys, monkeypatch):
+    import re
+
+    import mempalace.miner as miner_mod
+
+    monkeypatch.setattr(miner_mod, "MAX_FILE_SIZE", 100)
+
+    write_file(tmp_path / "small.py", "x = 1\n" * 10)
+    write_file(tmp_path / "big.py", "x = 1\n" * 100)
+
+    files = scan_project(str(tmp_path))
+    names = [f.name for f in files]
+    assert "small.py" in names
+    assert "big.py" not in names
+
+    err = capsys.readouterr().err
+    # SKIP message goes to stderr, matching the existing
+    # `SKIP: <rel> (symlink)` line in the same function.
+    assert "SKIP: big.py" in err
+    # Validate the full template shape so a regression to bare-substring
+    # output (or a drop of the MB suffix) trips the test instead of
+    # silently passing.
+    assert re.search(r"SKIP: big\.py \(\d+\.\d+ MB\) exceeds \d+ MB limit", err), err
+
+
+def test_scan_project_skips_unreadable_files(tmp_path, capsys, monkeypatch):
+    from pathlib import Path
+
+    # Two real files; the unreadable one will have stat() raise.
+    write_file(tmp_path / "readable.py", "x = 1\n")
+    unreadable = tmp_path / "unreadable.py"
+    write_file(unreadable, "x = 1\n")
+
+    real_stat = Path.stat
+
+    def selective_stat(self, *args, **kwargs):
+        # On Py 3.10+, Path.is_symlink() routes through lstat ->
+        # stat(follow_symlinks=False). Only raise for the follow-symlinks
+        # call that the actual size-check makes, otherwise the test
+        # never reaches the size-check arm we want to exercise.
+        if self.name == "unreadable.py" and kwargs.get("follow_symlinks", True):
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", selective_stat)
+
+    files = scan_project(str(tmp_path))
+    names = [f.name for f in files]
+    assert "readable.py" in names
+    assert "unreadable.py" not in names
+
+    err = capsys.readouterr().err
+    assert "SKIP: unreadable.py" in err
+    assert "stat error" in err
 
 
 def test_file_already_mined_check_mtime():
@@ -2185,3 +2417,129 @@ def test_file_already_mined_handles_multiple_groups_under_one_source_file(tmp_pa
         "must iterate all groups for the source_file (mirroring the existing "
         "paginated pattern in the extract_mode-is-set branch)."
     )
+
+
+# ── --limit skips already-mined files (#1535) ──────────────────────────
+
+
+def test_mine_limit_skips_already_mined_files(tmp_path, capsys):
+    """--limit N should count only NEW work, not already-mined skips (#1535)."""
+    from unittest.mock import patch
+
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=10)
+    palace_path = project_root / "palace"
+
+    call_count = 0
+
+    def fake_process_file(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count <= 8:
+            return (0, "general", None)
+        return (3, "general", None)
+
+    with patch("mempalace.miner.process_file", side_effect=fake_process_file):
+        mine(str(project_root), str(palace_path), limit=5)
+
+    out = capsys.readouterr().out
+    assert "Drawers filed: 6" in out
+    assert call_count == 10
+
+
+def test_mine_limit_stops_after_n_new_files(tmp_path, capsys):
+    """--limit 3 on 5 unmined files mines exactly 3 and stops."""
+    from unittest.mock import patch
+
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=5)
+    palace_path = project_root / "palace"
+
+    call_count = 0
+
+    def fake_process_file(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return (2, "general", None)
+
+    with patch("mempalace.miner.process_file", side_effect=fake_process_file):
+        mine(str(project_root), str(palace_path), limit=3)
+
+    assert call_count == 3
+    out = capsys.readouterr().out
+    assert "Drawers filed: 6" in out
+
+
+def test_mine_limit_zero_mines_all(tmp_path, capsys):
+    """--limit 0 (default) processes every file."""
+    from unittest.mock import patch
+
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=4)
+    palace_path = project_root / "palace"
+
+    call_count = 0
+
+    def fake_process_file(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return (1, "general", None)
+
+    with patch("mempalace.miner.process_file", side_effect=fake_process_file):
+        mine(str(project_root), str(palace_path), limit=0)
+
+    assert call_count == 4
+    out = capsys.readouterr().out
+    assert "Drawers filed: 4" in out
+
+
+def test_mine_limit_dry_run(tmp_path, capsys):
+    """--dry-run --limit N counts new files toward the limit."""
+    from unittest.mock import patch
+
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=5)
+    palace_path = project_root / "palace"
+
+    call_count = 0
+
+    def fake_process_file(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return (2, "general", None)
+
+    with patch("mempalace.miner.process_file", side_effect=fake_process_file):
+        mine(str(project_root), str(palace_path), limit=3, dry_run=True)
+
+    assert call_count == 3
+
+
+def test_mine_limit_summary_counts(tmp_path, capsys):
+    """Summary arithmetic is correct when limit causes early exit."""
+    from unittest.mock import patch
+
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=8)
+    palace_path = project_root / "palace"
+
+    call_idx = 0
+
+    def fake_process_file(*args, **kwargs):
+        nonlocal call_idx
+        call_idx += 1
+        if call_idx % 2 == 0:
+            return (0, "general", None)
+        return (3, "general", None)
+
+    with patch("mempalace.miner.process_file", side_effect=fake_process_file):
+        mine(str(project_root), str(palace_path), limit=2)
+
+    out = capsys.readouterr().out
+    assert "Files processed: 2" in out
+    assert "Drawers filed: 6" in out
+    assert "(limit: 2 new)" in out

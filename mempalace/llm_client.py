@@ -323,7 +323,7 @@ class OpenAICompatProvider(LLMProvider):
         base = base.removesuffix("/chat/completions").removesuffix("/v1")
         try:
             req = Request(f"{base}/v1/models")
-            if self.api_key:
+            if self.api_key and (self.api_key_source != "env" or not self.is_external_service):
                 req.add_header("Authorization", f"Bearer {self.api_key}")
             with urlopen(req, timeout=5):
                 pass

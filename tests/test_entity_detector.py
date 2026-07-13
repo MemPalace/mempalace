@@ -531,6 +531,24 @@ def test_scan_for_detection_skips_git_dir(tmp_path):
     assert not any(".git" in f for f in file_strs)
 
 
+def test_scan_for_detection_includes_latex_prose(tmp_path):
+    # .tex and .bib are prose-heavy (author names, abstracts, citations) and
+    # belong in the preferred PROSE_EXTENSIONS bucket alongside .md / .rst,
+    # not the code-file fallback. .bib in particular is almost entirely
+    # author names — high entity density per byte.
+    (tmp_path / "paper.tex").write_text(
+        "\\documentclass{article}\\author{Leslie Lamport}\\begin{document}Body.\\end{document}"
+    )
+    (tmp_path / "refs.bib").write_text(
+        "@article{l86, author={Leslie Lamport}, title={LaTeX}, year={1986}}"
+    )
+    (tmp_path / "code.py").write_text("import os")
+    files = scan_for_detection(str(tmp_path))
+    extensions = {os.path.splitext(str(f))[1] for f in files}
+    assert ".tex" in extensions
+    assert ".bib" in extensions
+
+
 # ── module-level constants ──────────────────────────────────────────────
 
 
@@ -543,6 +561,8 @@ def test_stopwords_contains_common_words():
 def test_prose_extensions():
     assert ".txt" in PROSE_EXTENSIONS
     assert ".md" in PROSE_EXTENSIONS
+    assert ".tex" in PROSE_EXTENSIONS
+    assert ".bib" in PROSE_EXTENSIONS
 
 
 # ── _print_entity_list ─────────────────────────────────────────────────

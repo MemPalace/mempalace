@@ -12,7 +12,7 @@ from mempalace.palace import (
     get_collection,
     upsert_closet_lines,
 )
-from mempalace.searcher import search_memories
+from mempalace.searcher import _hybrid_rank, search_memories
 
 
 def _seed_drawers(palace_path):
@@ -114,11 +114,13 @@ class TestClosetMetadata:
             palace,
             drawer_id="D1",
             source_file="fixture_D1.md",
-            topics=["JWT auth tokens", "24h expiry", "authentication"],
+            topics=["JWT auth tokens", "session expiry", "authentication service"],
         )
-        result = search_memories("JWT authentication", palace, n_results=2)
+        result = search_memories("JWT auth tokens expiry", palace, n_results=2)
         top = result["results"][0]
         assert top["source_file"] == "fixture_D1.md"
+        assert top["matched_via"] == "drawer+closet"
+        assert top["closet_boost"] > 0
         assert "closet_preview" in top
 
     def test_drawer_only_hits_have_no_closet_preview(self, tmp_path):
@@ -131,3 +133,74 @@ class TestClosetMetadata:
             assert h["matched_via"] == "drawer"
             assert "closet_preview" not in h
             assert h["closet_boost"] == 0.0
+
+
+# ── source_file filter scopes both drawer and closet queries (#1815) ──────
+
+
+class TestSourceFileFilter:
+    def test_source_file_filter_excludes_other_sources(self, tmp_path):
+        palace = str(tmp_path / "palace")
+        _seed_drawers(palace)
+        result = search_memories(
+            "Kafka consumer rebalance timeout",
+            palace,
+            n_results=5,
+            source_file="fixture_D4.md",
+        )
+        ids = [h["source_file"] for h in result["results"]]
+        assert ids, "the matching source_file drawer should be returned"
+        assert set(ids) == {"fixture_D4.md"}
+
+    def test_source_file_filter_overrides_closet_boost_for_other_source(self, tmp_path):
+        # A strong closet pointing at D1 must NOT leak D1 in when the search
+        # is scoped to a different source_file — the where clause is applied
+        # to the closet query too, not just the drawer query.
+        palace = str(tmp_path / "palace")
+        _seed_drawers(palace)
+        _seed_strong_closet_for(
+            palace,
+            drawer_id="D1",
+            source_file="fixture_D1.md",
+            topics=["Kafka queue tuning", "consumer rebalance config"],
+        )
+        result = search_memories(
+            "Kafka consumer rebalance",
+            palace,
+            n_results=5,
+            source_file="fixture_D4.md",
+        )
+        ids = [h["source_file"] for h in result["results"]]
+        assert "fixture_D1.md" not in ids
+        assert set(ids) <= {"fixture_D4.md"}
+
+
+def test_hybrid_rank_breaks_score_ties_by_authored_at():
+    """Identical-content hits get identical vector + BM25 scores; the tie must break
+    toward the more recently authored drawer, not arbitrary backend order."""
+    older = {
+        "text": "alpha beta gamma",
+        "distance": 0.2,
+        "metadata": {"authored_at": "2026-06-21T10:00:00.000Z"},
+    }
+    newer = {
+        "text": "alpha beta gamma",
+        "distance": 0.2,
+        "metadata": {"authored_at": "2026-06-27T10:00:00.000Z"},
+    }
+    # Input order puts the older drawer first; the tiebreak should reorder it.
+    results = [older, newer]
+    _hybrid_rank(results, "alpha beta gamma")
+    assert results[0]["metadata"]["authored_at"] == "2026-06-27T10:00:00.000Z"
+    assert results[1]["metadata"]["authored_at"] == "2026-06-21T10:00:00.000Z"
+
+
+def test_hybrid_rank_tiebreak_handles_top_level_authored_at():
+    """The search_memories path puts authored_at at the top level (no `metadata`
+    nesting); the tie-break must read it there too."""
+    older = {"text": "alpha beta gamma", "distance": 0.2, "authored_at": "2026-06-21T10:00:00.000Z"}
+    newer = {"text": "alpha beta gamma", "distance": 0.2, "authored_at": "2026-06-27T10:00:00.000Z"}
+    results = [older, newer]
+    _hybrid_rank(results, "alpha beta gamma")
+    assert results[0]["authored_at"] == "2026-06-27T10:00:00.000Z"
+    assert results[1]["authored_at"] == "2026-06-21T10:00:00.000Z"

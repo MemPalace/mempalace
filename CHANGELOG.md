@@ -6,6 +6,88 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [Unreleased]
+
+### Features
+
+- **`supersede()` / `mempalace_kg_supersede` — atomic fact replacement.** Closes an open fact and opens its successor at a single shared instant, so a point-in-time query at the boundary returns only the new value. This is the primitive for a single-valued fact change (model, employer, address) instead of hand-rolling `kg_invalidate` + `kg_add`, which left the two facts sharing the transition day. `at` defaults to the current UTC instant. (#1913)
+
+### Bug Fixes
+
+- **`kg query --as-of` no longer returns a superseded fact and its successor at the shared boundary.** `_temporal_filter_sql` now treats validity as half-open `[valid_from, valid_to)` (strict upper bound), so a fact whose `valid_to` equals the query instant has ended and only the successor matches. Standalone date-only facts still stay valid through the end of their final day (whole-day expansion retained). (#1913)
+
+---
+
+## [3.5.0] — 2026-06-22
+
+### Features
+
+- **Opt-in local daemon for queued writes.** A new `mempalace daemon` queues MemPalace writes through a single local process so background mines, diary saves, and hook-driven ingests serialize against one palace handle instead of racing for it. Opt-in and local-only — nothing binds to a public interface. (#1826)
+
+- **Opt-in HTTP transport for the MCP server.** `mempalace-mcp --transport http` serves JSON-RPC at `POST /mcp` (with a `GET /healthz` liveness probe) for operators running MemPalace behind a long-lived HTTP MCP client/proxy, avoiding the long-lived-stdio framing failures of #1801. stdio remains the default and is unchanged. The transport reuses the exact stdio request dispatcher (no separate write/search path), binds `127.0.0.1` by default, and is hardened against the two ways a local HTTP server leaks to the network: it pins the `Host` header to loopback on a loopback bind and rejects any non-loopback browser `Origin` (DNS-rebinding/SSRF guard), and supports an optional bearer token via `MEMPALACE_MCP_HTTP_TOKEN` (required on `/mcp`, never on `/healthz`). A 16 MiB request cap and a loud warning when bound to a non-loopback host round it out. (#1801, #1806)
+
+- **`mempalace_checkpoint` batch-save MCP tool.** Collapses multiple `add_drawer` calls plus an optional diary entry into a single MCP round-trip for agents that want to file a whole session at once. Stores content verbatim and reuses the existing idempotent add/dedup path. (#1851)
+
+- **`mempalace_delete_by_source` bulk-cleanup MCP tool.** Exact-match, dry-run-by-default deletion of every drawer (and its matching closet/AAAK index entries) for a given `source_file` — the recourse for benchmark/eval files mined into the same wing as real data and drowning out search. The dry run reports the drawer and closet blast radius before anything is removed, and the commit writes a WAL audit entry. (#1722, #1729)
+
+- **Optional `source_file` filter for `mempalace_search`.** Scope a search to an exact stored source path. The filter is threaded through every search path (vector, BM25/SQLite fallback, lexical union, and index-mismatch fallback) so it never silently drops a matching drawer, and results now expose the full `source_path` as a round-trippable key. (#1815, #1817)
+
+- **New transcript parsers / importers.** Continue.dev session parser (#731), Gemini CLI / AI Studio JSON session import (#204), and a Pi agent JSONL session normalizer (#169).
+
+- **Wider miner language coverage.** C# / .NET, PHP (#1819), Swift / Kotlin (#1368), and Java project detection including rootless subprojects (#1720).
+
+- **Final mine on Claude plugin `SessionEnd`.** The Claude Code plugin now runs a closing mine when a session ends so the last exchanges are captured without waiting for the next save nudge. (#1814, #1820)
+
+### Performance
+
+- **Overview/status MCP tools answer from the SQLite aggregate.** Large palaces no longer time out building wing/room/status overviews — the counts come from a single SQLite aggregate instead of a client-side fetch-and-tally. (#1748, #1379)
+
+- **`graph_stats` SQLite fast path.** Knowledge-graph stats are computed in SQLite rather than walking the collection, fixing large-palace timeouts. (#1379)
+
+- **Embedder caps ONNX-runtime intra-op threads** so a background mine no longer pins every core. (#1068)
+
+- **Backend pagination pushed into the query.** `sqlite_exact` (#1841, #1842) and `pgvector` (#1830, #1840) now apply `get(limit, offset)` in SQL, and Qdrant fetches bulk metadata in a single scroll with a larger page size (#1796, #1832).
+
+### Bug Fixes
+
+- **pgvector tolerates hostile transcript bytes.** A lone Unicode surrogate (#1833) or a NUL byte (#1829) in a transcript no longer aborts the whole mine — both are sanitized before the row is written.
+
+- **SQLite read-only URIs are percent-encoded** so palace paths with spaces or special characters open correctly, and `_sqlite_graph_stats` is routed through the same `sqlite_read_uri` helper.
+
+- **Stale ChromaDB HNSW divergence routes to the SQLite fallback** instead of failing the read outright. (#1816, #1822)
+
+- **Diverged-index recovery now points at `repair --mode from-sqlite`, not a re-mine.** A failed ChromaDB HNSW compaction leaves the index out of sync while the rows stay intact in `chroma.sqlite3`; the old "re-mine from source" advice silently dropped MCP-added drawers and diary entries (which have no source file). Both the legacy `repair`/`rebuild_index` error messages and the `repair-status` recommendation, plus the recall skill docs, now guide users to rebuild from SQLite. (#1843, #1847, #1849)
+
+- **The MCP server refuses a second writer for the same palace** rather than letting two processes race the same HNSW handle. (#1818, #1823)
+
+- **Windows hook miner spawns with `CREATE_NO_WINDOW`** so background mines no longer flash a console window. (#1783, #1848)
+
+- **`fact_checker` `__main__` no longer emits a runpy warning** under the test runner. (#1798)
+
+### Internal
+
+- Live-substrate conformance test module for pgvector (#1769); dependabot bumps for `docker/login-action` (3→4), `docker/build-push-action` (6→7), and `docker/metadata-action` (5→6) (#1788, #1787, #1786); ruff dev dependency bumped to 0.15.18.
+
+---
+
+## [3.4.1] — 2026-06-14
+
+### Features
+
+- **Cursor IDE plugin (`.cursor-plugin/`).** Drops into `~/.cursor/plugins/local/mempalace` (or installs from the Cursor marketplace once published) and auto-registers the `mempalace-mcp` server, five slash commands (`/mempalace-help`, `/mempalace-init`, `/mempalace-mine`, `/mempalace-search`, `/mempalace-status`), and the model-invocable [`mempalace` skill](skills/mempalace/SKILL.md) — no manual `~/.cursor/mcp.json` edit required. The plugin manifest deliberately omits a hardcoded `version` field — `mempalace/version.py` is the single source of truth, so there is nothing to drift on the next release (a contract test enforces the field stays absent). The canonical plugin components (`commands/`, `skills/`, `mcp.json`) are real files at the plugin root; no symlinks are committed (committed symlinks materialise as broken text files on Windows clones with `core.symlinks=false`). Mirrors the surface of [`.claude-plugin/`](.claude-plugin/) and [`.codex-plugin/`](.codex-plugin/) without duplicating their hook scripts: the Cursor hook scripts under [`hooks/cursor/`](hooks/cursor/) (shipped in the same release) remain the canonical install path for `stop` / `preCompact` / `sessionStart`, wired separately by [`hooks/cursor/install.sh`](hooks/cursor/install.sh). Contract tests in [`tests/test_cursor_plugin_manifest.py`](tests/test_cursor_plugin_manifest.py) cover manifest JSON validity, kebab-case naming, `..`-free relative paths, on-disk path resolution, marketplace alignment, MCP config shape (`mcpServers` wrapper required by Cursor, unlike Claude's flat `.mcp.json`), the version-field-absent guard, the no-symlink guard, and every skill/command frontmatter — all pure file inspection so they run on any CI platform without Cursor itself.
+
+- **Cursor IDE hook support (`stop` / `preCompact` / `sessionStart`).** Three new bash hooks live under [`hooks/cursor/`](hooks/cursor/) and share a `lib/common.sh` helpers module. The save hook counts `stop` invocations per Cursor `conversation_id` and emits a `followup_message` every `MEMPAL_SAVE_INTERVAL` (default 15) so the agent files the session into MemPalace and writes a diary entry. Unlike the silent-by-default Claude Code hook, the Cursor followup fires **on by default**: Cursor's transcript format is undocumented and `normalize.py` has no Cursor parser yet, so the background `mempalace mine --mode convos` is best-effort only and the `followup_message` is the load-bearing verbatim-capture path. Users who want the Claude-style "zero tokens in the chat window" behaviour can suppress it with `MEMPAL_CURSOR_SILENT=1` (or `MEMPAL_VERBOSE=false`); the default flips to silent once a Cursor transcript parser lands. The precompact hook synchronously mines the transcript before Cursor's compaction summarises it and drops a marker so the next `stop` forces a save nudge (Cursor's `preCompact` is observational-only — it cannot block or emit a `followup_message`, unlike Claude Code's `PreCompact`); the synchronous mine is bounded by Cursor's per-hook timeout, and because `mempalace mine` is incremental/append-only a killed mine resumes cleanly on the next run rather than corrupting the palace. The wake hook is Cursor-only: `sessionStart` returns `additional_context` telling the agent to recall scoped to the wing inferred from the workspace root. Honours the same `MEMPALACE_HOOKS_AUTO_SAVE=false` kill switch as the Claude Code hooks, plus a new `MEMPAL_DISABLE_HOOK=1` alias and a `MEMPAL_STATE_DIR` env override. Per-conversation state files are garbage-collected by a daily-throttled, Cursor-namespaced TTL sweep (`MEMPAL_STATE_TTL_DAYS`, default 30) so `cursor_*.count` / `cursor_*.pending` cannot grow unbounded — shared logs and other editors' state are never touched. Includes an opt-in installer at [`hooks/cursor/install.sh`](hooks/cursor/install.sh) with `--scope user|project`, `--variant full|minimal`, `--dry-run`, and `--uninstall` (idempotent, preserves unrelated hooks via `python3`-based JSON merge — no `jq` dependency). Example wirings live at [`examples/cursor/hooks.json`](examples/cursor/hooks.json) and [`examples/cursor/hooks.minimal.json`](examples/cursor/hooks.minimal.json); they are intentionally not placed at the repo root because Cursor auto-loads project hooks from any trusted workspace and we do not arm hooks on contributor checkout. Per-event stdin/stdout schema documented at [`hooks/cursor/STDIN_SHAPE.md`](hooks/cursor/STDIN_SHAPE.md). Walkthrough at [`website/guide/cursor-hooks.md`](website/guide/cursor-hooks.md). Coverage added in [`tests/test_cursor_hooks_shell.py`](tests/test_cursor_hooks_shell.py) and [`tests/test_cursor_hooks_install.py`](tests/test_cursor_hooks_install.py).
+
+- **First-class Antigravity IDE support.** New `.antigravity-plugin/` package + idempotent installer at `hooks/antigravity/install.sh` that registers MemPalace as a Google Antigravity plugin (MCP server, skill, two lifecycle hooks) at `~/.gemini/config/plugins/mempalace/`. The Stop hook background-mines the active conversation transcript every Nth fire (default 15, configurable via `MEMPAL_SAVE_INTERVAL`); the PreInvocation hook injects verbatim memory on the first model call only via Antigravity's `injectSteps[].ephemeralMessage` output, gated by `invocationNum == 1`. Both hooks are bash 3.2.57 compatible (macOS default), use the same `~/.mempalace/hook_state/` directory as the Claude Code / Codex / Cursor hooks (`antigravity_*`-namespaced state files), and respect every existing kill switch (`MEMPAL_DISABLE_HOOK`, `MEMPALACE_HOOKS_AUTO_SAVE`, `~/.mempalace/config.json` `hooks.auto_save`). Installer is `cmp`-gated (re-run produces a byte-identical install), uninstall is basename-guarded (refuses to wipe a directory whose basename isn't `mempalace`), and `--dry-run` is side-effect free. Full audit of which Antigravity surfaces we ship and which we deliberately don't is in [`hooks/antigravity/INVESTIGATION.md`](hooks/antigravity/INVESTIGATION.md). User-facing guide: [`website/guide/antigravity.md`](website/guide/antigravity.md). Standalone examples in [`examples/antigravity/`](examples/antigravity/).
+  - **Zero-config interpreter resolution.** `mempal_resolve_python` now derives the Python interpreter from the `mempalace-mcp` / `mempalace` console-script shebang on `$PATH` before falling back to `python3`. The common `uv tool install mempalace` / `pipx install` layout installs the console scripts into an isolated environment whose interpreter is **not** system `python3`, so the previous `command -v python3` resolution landed on a Python that couldn't import `mempalace`, the `-m mempalace` probe failed, and mining silently never fired. Resolution is pure shebang parsing + `stat` (no Python subprocess at source time, preserving the hook performance budget). `MEMPAL_PYTHON` remains the explicit override. Documented under *How the hooks find your `mempalace` install* in the guide.
+
+### Bug Fixes
+
+- **`embeddinggemma` no longer OOM-kills bulk re-embeds.** `EmbeddinggemmaONNX.__call__` ran a single `session.run` over its entire input, so a repair-scale batch (5000 docs) allocated attention buffers far beyond available RAM and the kernel killed the process silently: `mempalace repair --yes` on an `embedding_model: embeddinggemma` palace died right after `Building temporary collection:` with no traceback and no crash report (#1770). Embedding now runs in sub-batches of 32 docs (constructor-tunable `batch_size`), matching the internal batching of ChromaDB's bundled MiniLM embedder. Per-document vectors are unchanged: the model's pooled output is attention-masked, so sub-batch padding does not affect values. The embedder is also hardened for shared use: the process-wide EF cache and the lazy model load are thread-safe (concurrent first calls build exactly one ONNX session), and `__call__` handles a bare string, `None`, and empty input without triggering the model download.
+- **Backup retention to prevent unbounded disk usage.** `mempalace migrate` (full-palace `<palace>.pre-migrate.<timestamp>` copies) and `mempalace repair max-seq-id` (`chroma.sqlite3.max-seq-id-backup-<timestamp>` copies) each wrote a fresh, full-size, timestamped backup every run and never deleted the old ones. On a machine that mines or repairs on a schedule, those copies could silently accumulate until they filled the disk — one palace was found with hundreds of GB of stale backups beside a few hundred MB of live data, hidden from a normal `du` of the home directory. A new `max_backups` setting (default `10`, env `MEMPALACE_MAX_BACKUPS`, or `config.json`) now prunes the oldest backups after each new one is written. Set it to `0` to keep every backup. Pruning is keyed by filesystem mtime, scoped strictly to each backup's own naming pattern (live data is never touched), and best-effort so a deletion failure can never abort a migration or repair that already succeeded.
+
+---
+
 ## [3.3.6] — 2026-05-24
 
 ### Features
@@ -494,7 +576,16 @@ Initial public release.
 
 ---
 
-[Unreleased]: https://github.com/MemPalace/mempalace/compare/v3.2.0...HEAD
+[Unreleased]: https://github.com/MemPalace/mempalace/compare/v3.4.1...HEAD
+[3.4.1]: https://github.com/MemPalace/mempalace/compare/v3.4.0...v3.4.1
+[3.4.0]: https://github.com/MemPalace/mempalace/compare/v3.3.6...v3.4.0
+[3.3.6]: https://github.com/MemPalace/mempalace/compare/v3.3.5...v3.3.6
+[3.3.5]: https://github.com/MemPalace/mempalace/compare/v3.3.4...v3.3.5
+[3.3.4]: https://github.com/MemPalace/mempalace/compare/v3.3.3...v3.3.4
+[3.3.3]: https://github.com/MemPalace/mempalace/compare/v3.3.2...v3.3.3
+[3.3.2]: https://github.com/MemPalace/mempalace/compare/v3.3.1...v3.3.2
+[3.3.1]: https://github.com/MemPalace/mempalace/compare/v3.3.0...v3.3.1
+[3.3.0]: https://github.com/MemPalace/mempalace/compare/v3.2.0...v3.3.0
 [3.2.0]: https://github.com/MemPalace/mempalace/compare/v3.1.0...v3.2.0
 [3.1.0]: https://github.com/MemPalace/mempalace/compare/v3.0.0...v3.1.0
 [3.0.0]: https://github.com/MemPalace/mempalace/releases/tag/v3.0.0

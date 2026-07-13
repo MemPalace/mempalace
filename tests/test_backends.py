@@ -178,10 +178,42 @@ def test_resolve_backend_priority_order(tmp_path):
     assert resolve_backend_for_palace() == "chroma"
 
 
-def test_chroma_detect_matches_palace_with_chroma_sqlite(tmp_path):
-    (tmp_path / "chroma.sqlite3").write_bytes(b"")
+def test_chroma_detect_matches_palace_with_sqlite_header(tmp_path):
+    """A real SQLite database at ``<path>/chroma.sqlite3`` registers as chroma.
+
+    Uses ``sqlite3.connect`` + a write so the SQLite magic header is actually
+    on disk — the only thing detection looks at.
+    """
+    db_path = tmp_path / "chroma.sqlite3"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE detect_smoke(x)")
+    conn.commit()
+    conn.close()
     assert ChromaBackend.detect(str(tmp_path)) is True
     assert ChromaBackend.detect(str(tmp_path.parent)) is False
+
+
+def test_chroma_detect_rejects_empty_chroma_sqlite(tmp_path):
+    """A 0-byte ``chroma.sqlite3`` is not a chroma palace (closes #1893).
+
+    Bare ``sqlite3.connect()`` against a missing path leaves a 0-byte file
+    behind because the SQLite header is written on the first statement, not
+    on connect. Detection must reject that artifact so it cannot trip
+    ``BackendMismatchError`` against a real non-chroma backend marker in the
+    same directory.
+    """
+    (tmp_path / "chroma.sqlite3").write_bytes(b"")
+    assert ChromaBackend.detect(str(tmp_path)) is False
+
+
+def test_chroma_detect_rejects_non_sqlite_file(tmp_path):
+    """A non-SQLite file at the ``chroma.sqlite3`` path is not chroma.
+
+    Defends against partial writes / garbage content / anything that lands at
+    the canonical path but isn't actually a SQLite database.
+    """
+    (tmp_path / "chroma.sqlite3").write_bytes(b"not a sqlite file" * 4)
+    assert ChromaBackend.detect(str(tmp_path)) is False
 
 
 def test_chroma_lexical_search_uses_sqlite_fts_not_full_collection_scan(tmp_path):
@@ -766,6 +798,33 @@ def test_fix_blob_seq_ids_writes_marker_when_already_integer(tmp_path):
     _fix_blob_seq_ids(str(tmp_path))
 
     assert marker.is_file(), "marker must be written even when no BLOBs found"
+
+
+def test_fix_blob_seq_ids_closes_sqlite_connection(tmp_path, monkeypatch):
+    """The migration closes sqlite connections after the pre-open probe."""
+    db_path = tmp_path / "chroma.sqlite3"
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.execute("CREATE TABLE embeddings (rowid INTEGER PRIMARY KEY, seq_id INTEGER)")
+        conn.execute("INSERT INTO embeddings (seq_id) VALUES (42)")
+        conn.commit()
+
+    closed = []
+    real_connect = sqlite3.connect
+
+    class TrackingConnection(sqlite3.Connection):
+        def close(self):
+            closed.append(True)
+            super().close()
+
+    def tracking_connect(*args, **kwargs):
+        kwargs["factory"] = TrackingConnection
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr("mempalace.backends.chroma.sqlite3.connect", tracking_connect)
+
+    _fix_blob_seq_ids(str(tmp_path))
+
+    assert closed == [True]
 
 
 def test_fix_blob_seq_ids_skips_sqlite_when_marker_present(tmp_path):
@@ -1467,6 +1526,35 @@ def test_quarantine_invalid_hnsw_metadata_keeps_consistent_missing_dimensionalit
     assert seg.exists()
 
 
+def test_quarantine_invalid_hnsw_metadata_keeps_post_deletion_missing_dimensionality(tmp_path):
+    """A deleted-from segment has total_elements_added > live label count (the
+    counter is monotonic); that dim-None shape is recoverable, not corruption (#1710).
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    seg = palace / "abcd-1234-5678"
+    seg.mkdir()
+    (seg / "data_level0.bin").write_bytes(b"x" * 2048)
+    (seg / "link_lists.bin").write_bytes(b"x" * 128)
+    with open(seg / "index_metadata.pickle", "wb") as f:
+        pickle.dump(
+            {
+                "dimensionality": None,
+                "total_elements_added": 5,
+                "max_seq_id": None,
+                "id_to_label": {"a": 1, "b": 2},
+                "label_to_id": {1: "a", 2: "b"},
+                "id_to_seq_id": {},
+            },
+            f,
+        )
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert moved == []
+    assert seg.exists()
+
+
 def test_quarantine_invalid_hnsw_metadata_renames_mismatched_missing_dimensionality(tmp_path):
     palace = tmp_path / "palace"
     palace.mkdir()
@@ -1754,7 +1842,7 @@ def test_explain_ef_mismatch_recognizes_chromadb_conflict():
     assert msg is not None
     assert "/tmp/palace.db" in msg
     assert "MEMPALACE_EMBEDDING_MODEL" in msg
-    assert "rebuild-index" in msg
+    assert "mempalace --palace /tmp/palace.db repair rebuild-index" in msg
 
 
 def test_explain_ef_mismatch_returns_none_for_unrelated_errors():
