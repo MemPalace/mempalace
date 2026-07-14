@@ -295,7 +295,9 @@ class _ScopedFakeCol:
             "metadatas": [{"source_file": self.docs[i][1]} for i in ids],
         }
 
-    def query(self, query_texts=None, query_embeddings=None, n_results=5, where=None, include=None, **kw):
+    def query(
+        self, query_texts=None, query_embeddings=None, n_results=5, where=None, include=None, **kw
+    ):
         self.query_calls.append({"where": where, "n_results": n_results})
         pool = [i for i, (_, src) in self.docs.items()]
         if where and "source_file" in where:
