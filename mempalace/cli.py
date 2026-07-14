@@ -259,14 +259,16 @@ def _ensure_mempalace_files_gitignored(project_dir) -> bool:
     if not (project_path / ".git").exists():
         return False
     gitignore = project_path / ".gitignore"
-    existing = gitignore.read_text() if gitignore.exists() else ""
+    # Force UTF-8: Windows defaults to GBK and chokes on non-ASCII .gitignore
+    # comments, killing auto-init even though the file is valid UTF-8.
+    existing = gitignore.read_text(encoding="utf-8", errors="replace") if gitignore.exists() else ""
     existing_lines = {line.strip() for line in existing.splitlines()}
     missing = [p for p in _MEMPALACE_PROJECT_FILES if p not in existing_lines]
     if not missing:
         return False
     prefix = "" if not existing or existing.endswith("\n") else "\n"
     block = prefix + "\n# MemPalace per-project files (issue #185)\n" + "\n".join(missing) + "\n"
-    with open(gitignore, "a") as f:
+    with open(gitignore, "a", encoding="utf-8") as f:
         f.write(block)
     print(f"  Added {', '.join(missing)} to {gitignore.name}")
     return True
