@@ -1707,6 +1707,7 @@ def mine(
     include_ignored: list = None,
     files: list = None,
     max_chunks_per_file: Optional[int] = None,
+    progress_callback=None,
 ):
     """Mine a project directory into the palace.
 
@@ -1733,6 +1734,7 @@ def mine(
             include_ignored=include_ignored,
             files=files,
             max_chunks_per_file=max_chunks_per_file,
+            progress_callback=progress_callback,
         )
 
     # MineAlreadyRunning propagates so the CLI can render a clear holder-aware
@@ -1750,6 +1752,7 @@ def mine(
             include_ignored=include_ignored,
             files=files,
             max_chunks_per_file=max_chunks_per_file,
+            progress_callback=progress_callback,
         )
 
 
@@ -1764,10 +1767,23 @@ def _mine_impl(
     include_ignored: list = None,
     files: list = None,
     max_chunks_per_file: Optional[int] = None,
+    progress_callback=None,
 ):
     from .config import MempalaceConfig
+    from .progress import ProgressReporter
 
     project_path = Path(project_dir).expanduser().resolve()
+    reporter = ProgressReporter(progress_callback)
+    reporter.emit(
+        force=True,
+        phase="scanning",
+        files_total=0,
+        files_processed=0,
+        files_changed=0,
+        files_skipped=0,
+        files_failed=0,
+        current_source="",
+    )
     config = load_config(project_dir)
     palace_config = MempalaceConfig()
 
@@ -1790,6 +1806,8 @@ def _mine_impl(
         files = _apply_exclude_patterns_to_prescanned_files(
             files, project_path, exclude_patterns, include_ignored
         )
+
+    reporter.emit(force=True, phase="mining", files_total=len(files))
 
     from .embedding import describe_device
 
@@ -1870,8 +1888,29 @@ def _mine_impl(
                 if not dry_run:
                     print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers}")
                 if limit > 0 and files_mined >= limit:
+                    reporter.emit(
+                        force=True,
+                        files_processed=files_processed,
+                        files_changed=files_mined,
+                        files_skipped=files_skipped,
+                        current_source=str(filepath.relative_to(project_path)),
+                    )
                     break
+            reporter.emit(
+                files_processed=files_processed,
+                files_changed=files_mined,
+                files_skipped=files_skipped,
+                current_source=str(filepath.relative_to(project_path)),
+            )
 
+        reporter.emit(
+            force=True,
+            phase="post_processing",
+            files_processed=files_processed,
+            files_changed=files_mined,
+            files_skipped=files_skipped,
+        )
+        reporter.emit(force=True, phase="verifying")
         if not dry_run:
             # Cross-wing topic tunnels: after every file in this wing has been
             # processed, link this wing to any other wing that shares a
@@ -1950,6 +1989,14 @@ def _mine_impl(
             print(f"    {room:20} {count} files")
         print('\n  Next: mempalace search "what you\'re looking for"')
         print(f"{'=' * 55}\n")
+        reporter.emit(
+            force=True,
+            phase="verifying",
+            files_processed=files_processed,
+            files_changed=files_mined,
+            files_skipped=files_skipped,
+            current_source=last_file or "",
+        )
     except KeyboardInterrupt:
         # Idempotent re-mine: deterministic drawer IDs mean already-filed
         # drawers upsert to the same row on next run, so partial progress

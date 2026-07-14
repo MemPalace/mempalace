@@ -697,6 +697,7 @@ def mine_formats(
     agent: str = "mempalace",
     limit: int = 0,
     dry_run: bool = False,
+    progress_callback=None,
 ) -> None:
     """Mine a directory of binary office-format files into the palace.
 
@@ -745,6 +746,20 @@ def mine_formats(
     # tests can patch ``mempalace.format_miner.MempalaceConfig`` and
     # ``mempalace.format_miner.chunk_text`` directly. Hoisted as part of the
     # PR #1555 polish PR (Gemini #3).
+
+    from .progress import ProgressReporter
+
+    reporter = ProgressReporter(progress_callback)
+    reporter.emit(
+        force=True,
+        phase="scanning",
+        files_total=0,
+        files_processed=0,
+        files_changed=0,
+        files_skipped=0,
+        files_failed=0,
+        current_source="",
+    )
 
     # Load palace-wide config. Chunk parameters (chunk_size, chunk_overlap,
     # min_chunk_size) are now threaded through chunk_text below, so users
@@ -801,6 +816,7 @@ def mine_formats(
         # ``~/docs`` and relative inputs work consistently. Per PR #1555 review
         # (Copilot #10).
         files = scan_formats(format_path)
+        reporter.emit(force=True, phase="mining", files_total=len(files))
 
         print(f"\n{'=' * 55}")
         print("  MemPalace Mine — Format extraction")
@@ -819,6 +835,13 @@ def mine_formats(
         for i, filepath in enumerate(files, 1):
             files_processed = i
             source_file = str(filepath)
+            reporter.emit(
+                files_processed=files_processed,
+                files_changed=files_mined,
+                files_skipped=files_skipped,
+                files_failed=files_errored,
+                current_source=str(filepath.relative_to(format_path)),
+            )
 
             # Per-file try/except so one bad file can't crash the whole mine.
             # Mirrors miner.py's robustness pattern.
@@ -938,6 +961,14 @@ def mine_formats(
             file=sys.stderr,
         )
     else:
+        reporter.emit(
+            force=True,
+            phase="post_processing",
+            files_processed=files_processed,
+            files_changed=files_mined,
+            files_skipped=files_skipped,
+            files_failed=files_errored,
+        )
         # All files processed without interruption — compute cross-wing topic
         # tunnels linking this wing to others that share confirmed topics.
         # Mirrors the post-loop tunnel block in miner._mine_impl: tunnel-compute
@@ -965,7 +996,10 @@ def mine_formats(
             # exit Done on the --mode extract path that bypasses _mine_impl.
             # Sits outside the per-file try/except in the for-loop body, so
             # caught per-file errors do not mask the integrity result.
+            reporter.emit(force=True, phase="verifying")
             _validate_palace_fts5_after_mine(palace_path)
+        else:
+            reporter.emit(force=True, phase="verifying")
     finally:
         # Hook-spawned mines write a PID file that miner.py's
         # _cleanup_mine_pid_file() clears; we mirror that so format-mode
@@ -987,4 +1021,12 @@ def mine_formats(
         files_errored=files_errored,
         total_drawers=total_drawers,
         status_counts=status_counts,
+    )
+    reporter.emit(
+        force=True,
+        phase="verifying",
+        files_processed=files_processed,
+        files_changed=files_mined,
+        files_skipped=files_skipped,
+        files_failed=files_errored,
     )

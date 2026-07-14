@@ -649,6 +649,7 @@ def mine_convos(
     limit: int = 0,
     dry_run: bool = False,
     extract_mode: str = "exchange",
+    progress_callback=None,
 ):
     """Mine a directory of conversation files into the palace.
 
@@ -681,6 +682,7 @@ def mine_convos(
             limit=limit,
             dry_run=dry_run,
             extract_mode=extract_mode,
+            progress_callback=progress_callback,
         )
 
     with mine_palace_lock(palace_path):
@@ -692,6 +694,7 @@ def mine_convos(
             limit=limit,
             dry_run=dry_run,
             extract_mode=extract_mode,
+            progress_callback=progress_callback,
         )
 
 
@@ -719,8 +722,10 @@ def _mine_convos_impl(
     limit: int = 0,
     dry_run: bool = False,
     extract_mode: str = "exchange",
+    progress_callback=None,
 ):
     from .config import MempalaceConfig
+    from .progress import ProgressReporter
 
     palace_config = MempalaceConfig()
     cfg_chunk_size = palace_config.chunk_size
@@ -738,7 +743,19 @@ def _mine_convos_impl(
     convo_path = Path(convo_dir).expanduser().resolve()
     wing = _resolve_wing(convo_path, wing)
 
+    reporter = ProgressReporter(progress_callback)
+    reporter.emit(
+        force=True,
+        phase="scanning",
+        files_total=0,
+        files_processed=0,
+        files_changed=0,
+        files_skipped=0,
+        files_failed=0,
+        current_source="",
+    )
     files = scan_convos(convo_dir)
+    reporter.emit(force=True, phase="mining", files_total=len(files))
 
     print(f"\n{'=' * 55}")
     print("  MemPalace Mine — Conversations")
@@ -773,6 +790,12 @@ def _mine_convos_impl(
     for i, filepath in enumerate(files, 1):
         files_processed = i
         source_file = str(filepath)
+        reporter.emit(
+            files_processed=files_processed,
+            files_changed=files_mined,
+            files_skipped=files_skipped,
+            current_source=str(filepath.relative_to(convo_path)),
+        )
 
         # Skip only if already filed at the current NORMALIZE_VERSION AND
         # unchanged on disk since. Transcripts are NOT assumed immutable:
@@ -875,12 +898,22 @@ def _mine_convos_impl(
         if limit > 0 and files_mined >= limit:
             break
 
+    reporter.emit(
+        force=True,
+        phase="post_processing",
+        files_processed=files_processed,
+        files_changed=files_mined,
+        files_skipped=files_skipped,
+    )
     if not dry_run:
         # Compute hallways before the FTS5 validation: the latter opens a direct sqlite
         # connection to the Chroma DB, which can invalidate the live collection handle on
         # some Chroma builds and make the hallway fetch fail.
         _compute_hallways_for_wing_safe(wing, collection, total_drawers)
+        reporter.emit(force=True, phase="verifying")
         _validate_palace_fts5_after_mine(palace_path)
+    else:
+        reporter.emit(force=True, phase="verifying")
 
     print(f"\n{'=' * 55}")
     print("  Done.")
@@ -893,6 +926,13 @@ def _mine_convos_impl(
             print(f"    {room:20} {count} files")
     print('\n  Next: mempalace search "what you\'re looking for"')
     print(f"{'=' * 55}\n")
+    reporter.emit(
+        force=True,
+        phase="verifying",
+        files_processed=files_processed,
+        files_changed=files_mined,
+        files_skipped=files_skipped,
+    )
 
 
 if __name__ == "__main__":

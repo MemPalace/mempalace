@@ -973,6 +973,25 @@ def test_mine_dry_run_with_tiny_file_no_crash():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_mine_reports_progress_phases_and_file_counts(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    write_file(project / "app.py", "def useful():\n    return 'memory'\n" * 10)
+    events = []
+
+    mine(
+        str(project),
+        str(tmp_path / "palace"),
+        dry_run=True,
+        progress_callback=events.append,
+    )
+
+    assert events[0]["phase"] == "scanning"
+    assert any(event.get("files_total") == 1 for event in events)
+    assert events[-1]["phase"] == "verifying"
+    assert events[-1]["files_processed"] == 1
+
+
 def test_status_missing_palace_does_not_create_empty_collection(tmp_path, capsys):
     palace_path = tmp_path / "missing-palace"
 

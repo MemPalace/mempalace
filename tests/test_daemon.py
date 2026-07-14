@@ -173,6 +173,44 @@ def test_job_to_dict_redacts_verbatim_write_payload(tmp_path, monkeypatch):
     assert "secret" not in str(payload)
 
 
+def test_runtime_heartbeats_and_persists_job_progress(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(daemon, "DAEMON_HEARTBEAT_SECONDS", 0.02)
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    started = threading.Event()
+    release = threading.Event()
+
+    def fake_execute(kind, payload, progress_callback=None):
+        assert kind == "mine"
+        progress_callback({"phase": "mining", "files_processed": 1})
+        started.set()
+        release.wait(2)
+        return {"success": True, "exit_code": 0}
+
+    monkeypatch.setattr(service, "execute_job", fake_execute)
+    runtime = daemon.DaemonRuntime(str(palace))
+    job = runtime.store.enqueue("mine", {"source": str(tmp_path)})
+    worker = runtime.start_worker()
+
+    try:
+        assert started.wait(1)
+        first = runtime.store.get(job.id)
+        assert first.progress == {"phase": "mining", "files_processed": 1}
+        first_heartbeat = first.heartbeat_at
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            if runtime.store.get(job.id).heartbeat_at != first_heartbeat:
+                break
+            time.sleep(0.01)
+        assert runtime.store.get(job.id).heartbeat_at != first_heartbeat
+    finally:
+        release.set()
+        runtime.shutdown_event.set()
+        runtime.worker_wake.set()
+        worker.join(timeout=2)
+
+
 def test_daemon_http_lifecycle_executes_job(tmp_path, monkeypatch):
     calls = []
 

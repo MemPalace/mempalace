@@ -101,12 +101,18 @@ def _capture(fn):
     return result, stdout.getvalue(), stderr.getvalue()
 
 
-def execute_job(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+def execute_job(
+    kind: str,
+    payload: dict[str, Any],
+    progress_callback=None,
+) -> dict[str, Any]:
     """Execute one daemon job and return a JSON-serializable result."""
 
     def _run():
         if kind == "mine":
-            return run_mine(payload)
+            if progress_callback is None:
+                return run_mine(payload)
+            return run_mine(payload, progress_callback=progress_callback)
         if kind == "sync":
             return run_sync(payload)
         if kind == "diary_write":
@@ -140,7 +146,7 @@ def execute_job(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
+def run_mine(payload: dict[str, Any], progress_callback=None) -> dict[str, Any]:
     """Run the same mine operation as the CLI, without daemon transport concerns."""
     palace_path = os.path.abspath(
         os.path.expanduser(payload.get("palace_path") or MempalaceConfig().palace_path)
@@ -174,6 +180,7 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
                 limit=limit,
                 dry_run=dry_run,
                 extract_mode=payload.get("extract") or "exchange",
+                progress_callback=progress_callback,
             )
         elif mode == "extract":
             from .format_miner import mine_formats
@@ -185,6 +192,7 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
                 agent=agent,
                 limit=limit,
                 dry_run=dry_run,
+                progress_callback=progress_callback,
             )
         elif mode == "projects":
             include_ignored = payload.get("include_ignored") or []
@@ -200,6 +208,7 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
                 respect_gitignore=not bool(payload.get("no_gitignore")),
                 include_ignored=include_ignored,
                 max_chunks_per_file=payload.get("max_chunks_per_file"),
+                progress_callback=progress_callback,
             )
         else:
             return {"success": False, "error": f"invalid mine mode: {mode}", "exit_code": 2}

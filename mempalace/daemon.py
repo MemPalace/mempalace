@@ -41,6 +41,7 @@ TERMINAL_STATES = {"succeeded", "failed", "cancelled"}
 MAX_ATTEMPTS = 3
 MAX_BODY_BYTES = 1 << 20  # 1 MiB cap on request bodies (auth-gated DoS guard)
 SHUTDOWN_DRAIN_SECONDS = 10.0
+DAEMON_HEARTBEAT_SECONDS = 5.0
 # Terminal jobs are kept for diagnostics then pruned so the queue DB (which
 # holds verbatim payloads) doesn't grow without bound across a long-lived
 # daemon. Override via env for operators who want a longer/shorter window.
@@ -698,6 +699,25 @@ class DaemonRuntime:
         except Exception:  # noqa: BLE001 - a finish failure must not kill the worker
             pass
 
+    def _heartbeat_loop(self, job_id: str, stop: threading.Event) -> None:
+        while not stop.wait(DAEMON_HEARTBEAT_SECONDS):
+            try:
+                self.store.heartbeat(job_id)
+            except Exception:  # noqa: BLE001 - observability cannot kill useful work
+                pass
+
+    @staticmethod
+    def _execute_with_progress(execute_job, kind: str, payload: dict, progress_callback):
+        import inspect
+
+        try:
+            accepts_progress = "progress_callback" in inspect.signature(execute_job).parameters
+        except (TypeError, ValueError):
+            accepts_progress = True
+        if accepts_progress:
+            return execute_job(kind, payload, progress_callback=progress_callback)
+        return execute_job(kind, payload)
+
     def _worker_loop(self) -> None:
         from .service import execute_job
 
@@ -712,6 +732,14 @@ class DaemonRuntime:
                 self.worker_wake.clear()
                 continue
             self.active_job_id = job.id
+            heartbeat_stop = threading.Event()
+            heartbeat_thread = threading.Thread(
+                target=self._heartbeat_loop,
+                args=(job.id, heartbeat_stop),
+                name=f"mempalace-heartbeat-{job.id[:8]}",
+                daemon=True,
+            )
+            heartbeat_thread.start()
             try:
                 payload = dict(job.payload)
                 # Override, never trust the client: an authenticated request for
@@ -719,7 +747,19 @@ class DaemonRuntime:
                 payload["palace_path"] = self.palace_path
                 if self.backend:
                     payload["backend"] = self.backend
-                result = execute_job(job.kind, payload)
+
+                def progress_callback(progress: dict[str, Any]) -> None:
+                    self.store.update_progress(job.id, progress)
+
+                from .palace import mine_palace_lock
+
+                with mine_palace_lock(self.palace_path):
+                    result = self._execute_with_progress(
+                        execute_job,
+                        job.kind,
+                        payload,
+                        progress_callback,
+                    )
                 ok = bool(result.get("success", True))
                 state = "succeeded" if ok else "failed"
                 error = None if ok else {"message": result.get("error", "job failed")}
@@ -738,6 +778,8 @@ class DaemonRuntime:
                     error={"error_class": type(exc).__name__, "message": str(exc)},
                 )
             finally:
+                heartbeat_stop.set()
+                heartbeat_thread.join(timeout=1.0)
                 self.active_job_id = None
 
 
