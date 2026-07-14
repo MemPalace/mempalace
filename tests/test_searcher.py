@@ -519,3 +519,78 @@ class TestSearchCLI:
         captured = capsys.readouterr()
         assert "[1]" in captured.out
         assert "[2]" in captured.out
+
+    def test_search_routes_to_bm25_when_hnsw_diverged(self, fake_palace_path, capsys):
+        """Regression: `mempalace search` on a diverged HNSW segment must not
+        segfault ChromaDB's Rust bindings.
+
+        The MCP path gates this via ``_vector_disabled`` (#1222); the CLI
+        path was missing the gate, so any query into a diverged palace
+        exited 139 (SIGBUS) at ``chromadb/api/rust.py:_query`` with zero
+        diagnostic output. This test verifies the CLI now probes
+        ``hnsw_capacity_status`` and routes to the BM25-only sqlite
+        fallback instead of calling ``col.query()`` against a segment
+        that would crash it.
+        """
+        mock_col = MagicMock()
+        bm25_result = {
+            "query": "anything",
+            "filters": {},
+            "total_before_filter": 1,
+            "results": [
+                {
+                    "text": "diary entry that matches the query",
+                    "wing": "wing_test",
+                    "room": "diary",
+                    "source_file": "test.jsonl",
+                    "bm25_score": 1.5,
+                    "distance": None,
+                }
+            ],
+            "fallback": "bm25_only_via_sqlite",
+            "fallback_reason": "vector_search_disabled",
+        }
+        with (
+            patch(
+                "mempalace.backends.chroma.hnsw_capacity_status",
+                return_value={"diverged": True, "message": "test divergence"},
+            ),
+            patch("mempalace.searcher._bm25_only_via_sqlite", return_value=bm25_result),
+            patch("mempalace.searcher.get_collection", return_value=mock_col),
+        ):
+            search("anything", fake_palace_path)
+        captured = capsys.readouterr()
+        # Routed to BM25 — never touched the vector path that would segfault.
+        mock_col.query.assert_not_called()
+        # User got actionable output, not a silent crash.
+        assert "mempalace repair" in captured.out
+        assert "diary entry that matches" in captured.out
+
+    def test_search_proceeds_to_vector_when_hnsw_healthy(self, fake_palace_path, capsys):
+        """Paired guard: when HNSW is healthy, the divergence probe must NOT
+        short-circuit to BM25 — vector search proceeds normally.
+
+        Prevents a regression where the gate accidentally always fires.
+        """
+        mock_col = MagicMock()
+        mock_col.metadata = {"hnsw:space": "cosine"}
+        mock_col.query.return_value = {
+            "documents": [["a matching doc"]],
+            "metadatas": [[{"source_file": "a.md", "wing": "w", "room": "r"}]],
+            "distances": [[0.1]],
+        }
+        with (
+            patch(
+                "mempalace.backends.chroma.hnsw_capacity_status",
+                return_value={"diverged": False, "status": "ok"},
+            ),
+            patch("mempalace.searcher._bm25_only_via_sqlite") as mock_bm25,
+            patch("mempalace.searcher.get_collection", return_value=mock_col),
+        ):
+            search("anything", fake_palace_path)
+        captured = capsys.readouterr()
+        # Vector path ran.
+        mock_col.query.assert_called_once()
+        # BM25 fallback was NOT invoked.
+        mock_bm25.assert_not_called()
+        assert "a matching doc" in captured.out
