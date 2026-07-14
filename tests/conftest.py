@@ -227,6 +227,7 @@ def seeded_collection(collection):
                 "chunk_index": 0,
                 "added_by": "miner",
                 "filed_at": "2026-01-01T00:00:00",
+                "origin_handle": "session-alpha",
             },
             {
                 "wing": "project",

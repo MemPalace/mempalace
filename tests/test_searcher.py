@@ -73,6 +73,19 @@ class TestSearchMemories:
         assert len(result["results"]) > 0
         assert result["query"] == "JWT authentication"
 
+    def test_hits_carry_their_stored_metadata(self, palace_path, seeded_collection):
+        """Consumers that filter or re-rank hits need the fields they stamped at
+        ingest; a hit flattened to display fields blinds every downstream filter."""
+        result = search_memories("JWT authentication", palace_path)
+        hit = result["results"][0]
+        assert "metadata" in hit
+        assert hit["metadata"].get("origin_handle") == "session-alpha"
+        assert hit["metadata"].get("wing") == "project"
+        # a drawer without custom stamps still carries its stored metadata whole
+        other = search_memories("React frontend", palace_path)["results"][0]
+        assert "origin_handle" not in other["metadata"]
+        assert other["metadata"].get("room") == "frontend"
+
     def test_wing_filter(self, palace_path, seeded_collection):
         result = search_memories("planning", palace_path, wing="notes")
         assert all(r["wing"] == "notes" for r in result["results"])
