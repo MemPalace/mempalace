@@ -153,3 +153,26 @@ class TestTimeoutProxy:
         col = proxy.get_collection("fake")
         assert isinstance(col, TimeoutProxy)
         assert col.query() == "queried"
+
+
+class TestTransportFailureTranslation:
+    def test_connection_failure_becomes_unreachable(self):
+        import httpx
+
+        def dead_call():
+            raise httpx.ConnectError("[Errno 61] Connection refused")
+
+        with pytest.raises(PalaceBackendUnreachableError) as excinfo:
+            run_with_timeout("collection.query", dead_call)
+        assert "during 'collection.query'" in str(excinfo.value)
+
+    def test_builtin_connection_error_translates(self):
+        def dead_call():
+            raise ConnectionRefusedError("refused")
+
+        with pytest.raises(PalaceBackendUnreachableError):
+            run_with_timeout("op", dead_call)
+
+    def test_non_transport_errors_untouched(self):
+        with pytest.raises(KeyError):
+            run_with_timeout("op", lambda: (_ for _ in ()).throw(KeyError("k")))

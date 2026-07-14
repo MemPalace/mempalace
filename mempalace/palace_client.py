@@ -131,13 +131,31 @@ def _get_executor() -> ThreadPoolExecutor:
     return _executor
 
 
+def _is_transport_failure(exc: BaseException) -> bool:
+    """True when ``exc`` means the backend is gone, not that the call was bad.
+
+    chromadb's sync client rides on httpx; a killed/restarting server surfaces
+    as ``httpx.TransportError`` (connect refused, read cut mid-response, …).
+    The builtin ``ConnectionError`` covers non-httpx paths.
+    """
+    if isinstance(exc, ConnectionError):
+        return True
+    try:
+        import httpx
+    except ImportError:
+        return False
+    return isinstance(exc, httpx.TransportError)
+
+
 def run_with_timeout(op_name: str, fn, /, *args, timeout_s: float | None = None, **kwargs):
     """Run ``fn(*args, **kwargs)`` under the hard operation timeout.
 
     Raises :class:`PalaceOperationTimeoutError` naming ``op_name`` when the
-    ceiling is hit. Exceptions raised by ``fn`` propagate unchanged so
-    callers' existing except-clauses (e.g. Chroma NotFoundError handling)
-    keep working.
+    ceiling is hit, and translates transport-level failures (server killed
+    mid-call) into :class:`PalaceBackendUnreachableError` so every consumer
+    gets the same structured error whether the server died before or during
+    the call. All other exceptions propagate unchanged so callers' existing
+    except-clauses (e.g. Chroma NotFoundError handling) keep working.
     """
     limit = op_timeout_s() if timeout_s is None else timeout_s
     future = _get_executor().submit(fn, *args, **kwargs)
@@ -148,6 +166,13 @@ def run_with_timeout(op_name: str, fn, /, *args, timeout_s: float | None = None,
         raise PalaceOperationTimeoutError(
             f"palace operation '{op_name}' timed out after {limit:g}s against {backend_address()}"
         ) from None
+    except Exception as exc:
+        if _is_transport_failure(exc):
+            raise PalaceBackendUnreachableError(
+                f"palace backend unreachable at {backend_address()} during "
+                f"'{op_name}' ({type(exc).__name__}: {exc})"
+            ) from exc
+        raise
 
 
 # Duck-type check for chromadb Collection objects so the proxy can wrap
