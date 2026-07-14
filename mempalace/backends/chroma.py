@@ -20,6 +20,7 @@ import chromadb
 from chromadb.errors import NotFoundError as _ChromaNotFoundError
 
 from ..config import sqlite_read_uri
+from ..palace_client import backend_address, http_mode, make_http_client
 from ._sidecar import EMBEDDER_SIDECAR_FILENAME, read_embedder_sidecar, write_embedder_sidecar
 from .base import (
     BaseBackend,
@@ -1339,9 +1340,14 @@ class ChromaCollection(BaseCollection):
     def _write_lock(self):
         """Acquire ``mine_palace_lock`` for the configured palace, if any.
 
-        No-op (yields immediately) when ``self._palace_path`` is None.
+        No-op (yields immediately) when ``self._palace_path`` is None, and in
+        HTTP mode: the flock guarded embedded ChromaDB's
+        multi-threaded HNSW corruption (#974/#965), but over HTTP the server
+        serializes writes itself. Kept on, the non-blocking flock turns the
+        multi-process topology this transport exists for (MCP servers + hook
+        CLI writing concurrently) into hard ``MineAlreadyRunning`` errors.
         """
-        if self._palace_path is None:
+        if self._palace_path is None or http_mode():
             yield
             return
         # Late import — palace.py imports ChromaBackend from this module.
@@ -2019,6 +2025,19 @@ class ChromaBackend(BaseBackend):
 
             raise BackendClosedError("ChromaBackend has been closed")
 
+        if http_mode():
+            # HTTP mode: the standalone Chroma server owns the persist
+            # directory. Cache keyed on the server address — inode/mtime
+            # freshness is meaningless over HTTP (the server, not this
+            # process, sees on-disk rebuilds), and the embedded pre-open
+            # repair pass must never touch files a live server owns.
+            key = f"http://{backend_address()}"
+            cached = self._clients.get(key)
+            if cached is None:
+                cached = make_http_client()
+                self._clients[key] = cached
+            return cached
+
         cached = self._clients.get(palace_path)
         cached_inode, cached_mtime = self._freshness.get(palace_path, (0, 0.0))
         current_inode, current_mtime = self._db_stat(palace_path)
@@ -2130,6 +2149,12 @@ class ChromaBackend(BaseBackend):
         Quarantines HNSW segments on first open and after any detected
         disk change. See :attr:`_quarantined_paths` for the gate logic.
         """
+        if http_mode():
+            # HTTP mode: server-owned files — skip the embedded pre-open
+            # repair pass entirely (client-side repair against a live
+            # server's files is a corruption risk, and the server does
+            # its own segment management).
+            return make_http_client()
         ChromaBackend._prepare_palace_for_open(palace_path)
         return chromadb.PersistentClient(path=palace_path)
 
