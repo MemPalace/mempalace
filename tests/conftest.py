@@ -26,6 +26,13 @@ os.environ["USERPROFILE"] = _session_tmp
 os.environ["HOMEDRIVE"] = os.path.splitdrive(_session_tmp)[0] or "C:"
 os.environ["HOMEPATH"] = os.path.splitdrive(_session_tmp)[1] or _session_tmp
 
+# The suite exercises palaces in throwaway temp directories, which
+# only works through the embedded client. Force embedded mode so tests can
+# never reach a real Chroma server — in HTTP mode palace_path is ignored and
+# every write would land in the developer's live palace. HTTP-mode behavior
+# is covered by tests/test_palace_client.py, which sets the env explicitly.
+os.environ["MEMPALACE_CHROMA_MODE"] = "embedded"
+
 # Now it is safe to import mempalace modules that trigger initialisation.
 import chromadb  # noqa: E402
 import pytest  # noqa: E402
