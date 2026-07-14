@@ -212,6 +212,7 @@ def run_mine(payload: dict[str, Any], progress_callback=None) -> dict[str, Any]:
                 include_ignored=include_ignored,
                 max_chunks_per_file=payload.get("max_chunks_per_file"),
                 progress_callback=progress_callback,
+                source_canonicality=payload.get("source_canonicality") or "canonical",
             )
         else:
             return {"success": False, "error": f"invalid mine mode: {mode}", "exit_code": 2}

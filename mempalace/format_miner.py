@@ -83,6 +83,7 @@ from .palace import (
 # expose these as attributes of this module, breaking the test seams.
 from .config import MempalaceConfig, normalize_wing_name
 from .collision_scan import assert_no_collisions
+from .source_metadata import SourceContext, build_source_metadata, sha256_file
 from .ids import ID_RECIPE, make_drawer_id_from_chunk
 from .miner import (
     _compute_topic_tunnels_for_wing,
@@ -536,7 +537,12 @@ def _print_mine_summary(
 
 
 def _register_skip_sentinel_if_appropriate(
-    collection, source_file: str, wing: str, agent: str, status: ExtractionStatus
+    collection,
+    source_file: str,
+    wing: str,
+    agent: str,
+    status: ExtractionStatus,
+    source_root: str = None,
 ) -> None:
     """Write the ``file_already_mined`` sentinel ONLY when the skip is durable.
 
@@ -548,10 +554,12 @@ def _register_skip_sentinel_if_appropriate(
     """
     if status in _TRANSIENT_MISSING_DEP_STATUSES:
         return
-    _register_file(collection, source_file, wing, agent)
+    _register_file(collection, source_file, wing, agent, source_root=source_root)
 
 
-def _register_file(collection, source_file: str, wing: str, agent: str) -> None:
+def _register_file(
+    collection, source_file: str, wing: str, agent: str, source_root: str = None
+) -> None:
     """Write a sentinel so file_already_mined() returns True for 0-chunk files.
 
     Without this, files that extract to nothing (or hit a SKIP status) get
@@ -559,24 +567,31 @@ def _register_file(collection, source_file: str, wing: str, agent: str) -> None:
     Mirrors the helper of the same name in convo_miner.py.
     """
     sentinel_id = f"sentinel_{wing}_{hashlib.sha256(source_file.encode()).hexdigest()[:24]}"
+    content = "[empty]"
+    source_context = SourceContext(
+        root=source_root or os.path.dirname(source_file),
+        source_file=source_file,
+        source_kind="documentation",
+        source_sha256=sha256_file(source_file),
+    )
+    metadata = {
+        "wing": wing,
+        "room": "documents",
+        "source_file": source_file,
+        "chunk_index": -1,
+        "added_by": agent,
+        "filed_at": datetime.now().isoformat(),
+        "ingest_mode": "extract",
+        "extract_mode": "format",
+        "normalize_version": NORMALIZE_VERSION,
+        "is_sentinel": True,
+    }
+    metadata.update(build_source_metadata(source_context, content, -1))
     try:
         collection.upsert(
-            documents=["[empty]"],
+            documents=[content],
             ids=[sentinel_id],
-            metadatas=[
-                {
-                    "wing": wing,
-                    "room": "documents",
-                    "source_file": source_file,
-                    "chunk_index": -1,
-                    "added_by": agent,
-                    "filed_at": datetime.now().isoformat(),
-                    "ingest_mode": "extract",
-                    "extract_mode": "format",
-                    "normalize_version": NORMALIZE_VERSION,
-                    "is_sentinel": True,
-                }
-            ],
+            metadatas=[metadata],
         )
     except Exception:
         logger.debug("Sentinel write failed for %s", source_file, exc_info=True)
@@ -591,6 +606,7 @@ def _file_chunks_locked(
     agent,
     source_mtime: Optional[float] = None,
     content: Optional[str] = None,
+    source_root: Optional[str] = None,
 ):
     """Lock the source file, purge stale drawers, and upsert fresh chunks.
 
@@ -615,6 +631,12 @@ def _file_chunks_locked(
     # the binary source). Caller may pass ``content`` (full extracted text) for
     # the body-scan branch; if absent, the helper still uses filename + mtime.
     file_content_date = _extract_content_date(source_file, content or "")
+    source_context = SourceContext(
+        root=source_root or os.path.dirname(source_file),
+        source_file=source_file,
+        source_kind="documentation",
+        source_sha256=sha256_file(source_file),
+    )
 
     drawers_added = 0
     with mine_lock(source_file):
@@ -673,6 +695,7 @@ def _file_chunks_locked(
                 entities = _extract_entities_for_metadata(content)
                 if entities:
                     meta["entities"] = entities
+                meta.update(build_source_metadata(source_context, content, chunk["chunk_index"]))
                 batch_docs.append(content)
                 batch_ids.append(drawer_id)
                 batch_metas.append(meta)
@@ -871,7 +894,12 @@ def mine_formats(
                 if status != ExtractionStatus.OK or not text:
                     if not dry_run:
                         _register_skip_sentinel_if_appropriate(
-                            collection, source_file, wing, agent, status
+                            collection,
+                            source_file,
+                            wing,
+                            agent,
+                            status,
+                            source_root=str(format_path),
                         )
                     print(f"  - [{i:4}/{len(files)}] {filepath.name[:50]:50} {status.name}")
                     continue
@@ -888,7 +916,13 @@ def mine_formats(
                 )
                 if not chunks:
                     if not dry_run:
-                        _register_file(collection, source_file, wing, agent)
+                        _register_file(
+                            collection,
+                            source_file,
+                            wing,
+                            agent,
+                            source_root=str(format_path),
+                        )
                     print(f"  - [{i:4}/{len(files)}] {filepath.name[:50]:50} EMPTY_AFTER_CHUNK")
                     continue
 
@@ -915,6 +949,7 @@ def mine_formats(
                     agent,
                     source_mtime=source_mtime,
                     content=text,
+                    source_root=str(format_path),
                 )
                 if skipped:
                     files_skipped += 1

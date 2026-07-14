@@ -45,6 +45,12 @@ from .palace import (
 from .collision_scan import assert_no_collisions
 from .hallways import compute_hallways_for_wing
 from .ids import ID_RECIPE, make_drawer_id_from_chunk
+from .source_metadata import (
+    SourceContext,
+    build_source_metadata,
+    git_revision,
+    sha256_file,
+)
 
 logger = logging.getLogger("mempalace_mcp")
 
@@ -1328,6 +1334,7 @@ def _build_drawer_metadata(
     line_start: Optional[int] = None,
     line_end: Optional[int] = None,
     content_date: Optional[str] = None,
+    source_context: Optional[SourceContext] = None,
 ) -> dict:
     """Build the metadata dict for one drawer without upserting.
 
@@ -1362,6 +1369,8 @@ def _build_drawer_metadata(
         metadata["line_end"] = line_end
     if content_date:
         metadata["content_date"] = content_date
+    if source_context is not None:
+        metadata.update(build_source_metadata(source_context, content, chunk_index))
     metadata["hall"] = detect_hall(content)
     entities = _extract_entities_for_metadata(content)
     if entities:
@@ -1384,7 +1393,19 @@ def add_drawer(
     except OSError:
         source_mtime = None
     metadata = _build_drawer_metadata(
-        wing, room, source_file, chunk_index, agent, content, source_mtime
+        wing,
+        room,
+        source_file,
+        chunk_index,
+        agent,
+        content,
+        source_mtime,
+        source_context=SourceContext(
+            root=os.path.dirname(source_file),
+            source_file=source_file,
+            source_kind="code",
+            source_sha256=sha256_file(source_file),
+        ),
     )
     collection.upsert(
         documents=[content],
@@ -1412,6 +1433,8 @@ def process_file(
     chunk_overlap: int = None,
     min_chunk_size: int = None,
     max_chunks_per_file: Optional[int] = None,
+    source_revision: Optional[str] = None,
+    source_canonicality: str = "canonical",
 ) -> tuple:
     """Read, chunk, route, and file one file.
 
@@ -1438,6 +1461,14 @@ def process_file(
         return 0, "general", None
 
     room = detect_room(filepath, content, rooms, project_path)
+    source_context = SourceContext(
+        root=str(project_path),
+        source_file=source_file,
+        source_kind="code",
+        source_revision=source_revision,
+        source_canonicality=source_canonicality,
+        source_sha256=sha256_file(source_file),
+    )
     chunks = chunk_text(
         content,
         source_file,
@@ -1525,6 +1556,7 @@ def process_file(
                         line_start=chunk.get("line_start"),
                         line_end=chunk.get("line_end"),
                         content_date=file_content_date,
+                        source_context=source_context,
                     )
                 )
             assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
@@ -1708,6 +1740,7 @@ def mine(
     files: list = None,
     max_chunks_per_file: Optional[int] = None,
     progress_callback=None,
+    source_canonicality: str = "canonical",
 ):
     """Mine a project directory into the palace.
 
@@ -1735,6 +1768,7 @@ def mine(
             files=files,
             max_chunks_per_file=max_chunks_per_file,
             progress_callback=progress_callback,
+            source_canonicality=source_canonicality,
         )
 
     # MineAlreadyRunning propagates so the CLI can render a clear holder-aware
@@ -1753,6 +1787,7 @@ def mine(
             files=files,
             max_chunks_per_file=max_chunks_per_file,
             progress_callback=progress_callback,
+            source_canonicality=source_canonicality,
         )
 
 
@@ -1768,6 +1803,7 @@ def _mine_impl(
     files: list = None,
     max_chunks_per_file: Optional[int] = None,
     progress_callback=None,
+    source_canonicality: str = "canonical",
 ):
     from .config import MempalaceConfig
     from .progress import ProgressReporter
@@ -1843,6 +1879,7 @@ def _mine_impl(
     last_file = None
     room_counts = defaultdict(int)
     effective_chunk_cap = _resolve_max_chunks_per_file(max_chunks_per_file)
+    project_revision = git_revision(str(project_path))
 
     try:
         for i, filepath in enumerate(files, 1):
@@ -1864,6 +1901,8 @@ def _mine_impl(
                     # otherwise a malformed env var would emit its warning
                     # per file.
                     max_chunks_per_file=effective_chunk_cap,
+                    source_revision=project_revision,
+                    source_canonicality=source_canonicality,
                 )
             except KeyboardInterrupt:
                 # Re-raise so the outer handler prints the summary; we

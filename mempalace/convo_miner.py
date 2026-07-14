@@ -22,6 +22,7 @@ from .collision_scan import assert_no_collisions
 from .ids import ID_RECIPE, make_convo_drawer_id, make_convo_sentinel_id
 from .normalize import normalize
 from .entities import entities_metadata
+from .source_metadata import SourceContext, build_source_metadata, sha256_file
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
@@ -107,7 +108,14 @@ def _is_regular_source_file(filepath: Path, root: Path) -> bool:
                 pass
 
 
-def _register_file(collection, source_file: str, wing: str, agent: str, extract_mode: str):
+def _register_file(
+    collection,
+    source_file: str,
+    wing: str,
+    agent: str,
+    extract_mode: str,
+    source_root: str = None,
+):
     """Write a sentinel so file_already_mined() returns True for 0-chunk files.
 
     Without this, files that normalize to nothing or produce zero chunks are
@@ -124,6 +132,13 @@ def _register_file(collection, source_file: str, wing: str, agent: str, extract_
     except OSError:
         source_mtime = None
     sentinel_id = make_convo_sentinel_id(source_file, extract_mode)
+    content = f"[registry] {source_file}"
+    source_context = SourceContext(
+        root=source_root or os.path.dirname(source_file),
+        source_file=source_file,
+        source_kind="session",
+        source_sha256=sha256_file(source_file),
+    )
     meta = {
         "wing": wing,
         "room": "_registry",
@@ -135,10 +150,11 @@ def _register_file(collection, source_file: str, wing: str, agent: str, extract_
         "normalize_version": NORMALIZE_VERSION,
         "id_recipe": ID_RECIPE,
     }
+    meta.update(build_source_metadata(source_context, content, -1))
     if source_mtime is not None:
         meta["source_mtime"] = source_mtime
     collection.upsert(
-        documents=[f"[registry] {source_file}"],
+        documents=[content],
         ids=[sentinel_id],
         metadatas=[meta],
     )
@@ -477,7 +493,15 @@ def _extract_authored_at(filepath):
 
 
 def _file_chunks_locked(
-    collection, source_file, chunks, wing, room, agent, extract_mode, authored_at=None
+    collection,
+    source_file,
+    chunks,
+    wing,
+    room,
+    agent,
+    extract_mode,
+    authored_at=None,
+    source_root=None,
 ):
     """Lock the source file, purge stale drawers, and upsert fresh chunks.
 
@@ -520,6 +544,12 @@ def _file_chunks_locked(
             source_mtime = os.path.getmtime(source_file)
         except OSError:
             source_mtime = None
+        source_context = SourceContext(
+            root=source_root or os.path.dirname(source_file),
+            source_file=source_file,
+            source_kind="session",
+            source_sha256=sha256_file(source_file),
+        )
         for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
             batch_docs: list = []
             batch_ids: list = []
@@ -550,6 +580,9 @@ def _file_chunks_locked(
                 }
                 if source_mtime is not None:
                     meta["source_mtime"] = source_mtime
+                meta.update(
+                    build_source_metadata(source_context, chunk["content"], chunk["chunk_index"])
+                )
                 batch_metas.append(meta)
             assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
             try:
@@ -818,12 +851,16 @@ def _mine_convos_impl(
             content = normalize(str(filepath))
         except (OSError, ValueError):
             if not dry_run:
-                _register_file(collection, source_file, wing, agent, extract_mode)
+                _register_file(
+                    collection, source_file, wing, agent, extract_mode, source_root=str(convo_path)
+                )
             continue
 
         if not content or len(content.strip()) < cfg_min_chunk_size:
             if not dry_run:
-                _register_file(collection, source_file, wing, agent, extract_mode)
+                _register_file(
+                    collection, source_file, wing, agent, extract_mode, source_root=str(convo_path)
+                )
             continue
 
         # Chunk — either exchange pairs or general extraction
@@ -841,7 +878,9 @@ def _mine_convos_impl(
 
         if not chunks:
             if not dry_run:
-                _register_file(collection, source_file, wing, agent, extract_mode)
+                _register_file(
+                    collection, source_file, wing, agent, extract_mode, source_root=str(convo_path)
+                )
             continue
 
         # Detect room from content (general mode uses memory_type instead)
@@ -885,6 +924,7 @@ def _mine_convos_impl(
             agent,
             extract_mode,
             authored_at=_extract_authored_at(filepath),
+            source_root=str(convo_path),
         )
         if skipped:
             files_skipped += 1
