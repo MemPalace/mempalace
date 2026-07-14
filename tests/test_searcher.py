@@ -55,6 +55,18 @@ class TestBuildWhereFilter:
             "$and": [{"wing": "backend"}, {"room": "auth"}, {"source_file": "auth.py"}]
         }
 
+    def test_multiwing_source_kind_filter(self):
+        where = build_where_filter(
+            wings=["se", "se-code"],
+            source_kinds=["curated", "code"],
+        )
+        assert {"wing": {"$in": ["se", "se-code"]}} in where["$and"]
+        assert {"source_kind": {"$in": ["curated", "code"]}} in where["$and"]
+
+    def test_singular_and_plural_wings_are_mutually_exclusive(self):
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            build_where_filter(wing="se", wings=["se-code"])
+
 
 # ── search_memories (API) ──────────────────────────────────────────────
 
@@ -139,6 +151,93 @@ class TestSearchMemories:
         assert "error" not in result
         assert result["results"], "BM25 fallback should still find the auth drawer"
         assert all(r["source_file"] == "auth.py" for r in result["results"])
+
+    def test_multiwing_source_kind_and_hot_default_match_vector_and_bm25(self, palace_path):
+        from mempalace.palace import get_collection
+
+        col = get_collection(palace_path, create=True)
+        col.upsert(
+            ids=["curated-hot", "code-cold", "legacy-hot", "other-wing"],
+            documents=[
+                "shared scope needle curated hot",
+                "shared scope needle code cold",
+                "shared scope needle legacy tier",
+                "shared scope needle outside",
+            ],
+            metadatas=[
+                {
+                    "wing": "se",
+                    "room": "decisions",
+                    "source_file": "curated.md",
+                    "source_kind": "curated",
+                    "memory_tier": "hot",
+                },
+                {
+                    "wing": "se-code",
+                    "room": "workers",
+                    "source_file": "worker.py",
+                    "source_kind": "code",
+                    "memory_tier": "cold",
+                },
+                {
+                    "wing": "se-code",
+                    "room": "workers",
+                    "source_file": "legacy.py",
+                    "source_kind": "code",
+                },
+                {
+                    "wing": "other",
+                    "room": "workers",
+                    "source_file": "other.py",
+                    "source_kind": "code",
+                    "memory_tier": "hot",
+                },
+            ],
+        )
+
+        kwargs = {
+            "wings": ["se", "se-code"],
+            "source_kinds": ["curated", "code"],
+            "n_results": 10,
+            "collection_name": "mempalace_drawers",
+        }
+        vector = search_memories("shared scope needle", palace_path, **kwargs)
+        bm25 = search_memories("shared scope needle", palace_path, vector_disabled=True, **kwargs)
+
+        assert {hit["source_file"] for hit in vector["results"]} == {
+            "curated.md",
+            "legacy.py",
+        }
+        assert {hit["source_file"] for hit in bm25["results"]} == {
+            "curated.md",
+            "legacy.py",
+        }
+
+    def test_include_cold_opt_in_returns_cold_results(self, palace_path):
+        from mempalace.palace import get_collection
+
+        col = get_collection(palace_path, create=True)
+        col.upsert(
+            ids=["cold"],
+            documents=["archived session needle"],
+            metadatas=[
+                {
+                    "wing": "se-sessions",
+                    "room": "history",
+                    "source_file": "session.jsonl",
+                    "source_kind": "session",
+                    "memory_tier": "cold",
+                }
+            ],
+        )
+
+        hidden = search_memories("archived session needle", palace_path, n_results=5)
+        visible = search_memories(
+            "archived session needle", palace_path, n_results=5, include_cold=True
+        )
+
+        assert hidden["results"] == []
+        assert [hit["source_file"] for hit in visible["results"]] == ["session.jsonl"]
 
     def test_n_results_limit(self, palace_path, seeded_collection):
         result = search_memories("code", palace_path, n_results=2)

@@ -15,6 +15,7 @@ import os
 import re
 import sqlite3
 from pathlib import Path
+from typing import List, Optional
 
 from .backends import (
     BackendError,
@@ -24,6 +25,7 @@ from .backends import (
     UnsupportedCapabilityError,
 )
 from .config import sqlite_read_uri
+from .source_metadata import SOURCE_KINDS
 from .palace import (
     _open_collection_or_explain,
     get_closets_collection,
@@ -237,19 +239,97 @@ def _hybrid_rank(
     return results
 
 
-def build_where_filter(wing: str = None, room: str = None, source_file: str = None) -> dict:
-    """Build a ChromaDB where filter from optional wing/room/source_file.
+def _validate_scope(wing: Optional[str], wings: Optional[List[str]]) -> List[str]:
+    if wing and wings:
+        raise ValueError("wing and wings are mutually exclusive")
+    values = [wing] if wing else list(wings or [])
+    if any(not isinstance(value, str) or not value for value in values):
+        raise ValueError("wings must contain non-empty strings")
+    return list(dict.fromkeys(values))
+
+
+def _validate_source_kinds(source_kinds: Optional[List[str]]) -> List[str]:
+    values = list(source_kinds or [])
+    invalid = [value for value in values if value not in SOURCE_KINDS]
+    if invalid:
+        raise ValueError(f"invalid source_kind: {invalid[0]!r}")
+    return list(dict.fromkeys(values))
+
+
+def _metadata_visible(
+    meta: dict,
+    *,
+    scoped_wings: List[str],
+    room: Optional[str],
+    source_file: Optional[str],
+    source_kinds: List[str],
+    include_cold: bool,
+) -> bool:
+    if scoped_wings and meta.get("wing") not in scoped_wings:
+        return False
+    if room and meta.get("room") != room:
+        return False
+    if source_file and meta.get("source_file") != source_file:
+        return False
+    if source_kinds and meta.get("source_kind") not in source_kinds:
+        return False
+    return include_cold or meta.get("memory_tier", "hot") != "cold"
+
+
+def _filter_envelope(
+    *,
+    wing=None,
+    wings=None,
+    room=None,
+    source_file=None,
+    source_kinds=None,
+    include_cold=False,
+) -> dict:
+    return {
+        "wing": wing,
+        "wings": list(wings or []),
+        "room": room,
+        "source_file": source_file,
+        "source_kinds": list(source_kinds or []),
+        "include_cold": bool(include_cold),
+    }
+
+
+def _vector_candidate_limit(n_results: int, include_cold: bool) -> int:
+    multiplier = 3 if include_cold else 15
+    return min(n_results * multiplier, 500)
+
+
+def build_where_filter(
+    wing: str = None,
+    room: str = None,
+    source_file: str = None,
+    *,
+    wings: List[str] = None,
+    source_kinds: List[str] = None,
+    include_cold: bool = False,
+) -> dict:
+    """Build a ChromaDB where filter from optional source scopes.
 
     ChromaDB needs a ``$and`` only when ≥2 clauses are present; a single
     clause is returned bare and zero clauses yield an empty filter (#1815).
+    Tier visibility is post-filtered because Chroma cannot express
+    ``memory_tier is missing OR memory_tier != cold`` portably.
     """
+    scoped_wings = _validate_scope(wing, wings)
+    kinds = _validate_source_kinds(source_kinds)
     clauses = []
     if wing:
         clauses.append({"wing": wing})
+    elif scoped_wings:
+        clauses.append({"wing": {"$in": scoped_wings}})
     if room:
         clauses.append({"room": room})
     if source_file:
         clauses.append({"source_file": source_file})
+    if kinds:
+        clauses.append({"source_kind": {"$in": kinds}})
+    _ = include_cold
     if not clauses:
         return {}
     if len(clauses) == 1:
@@ -501,6 +581,9 @@ def _bm25_only_via_sqlite(
     max_candidates: int = 500,
     _include_internal: bool = False,
     collection_name: str = None,
+    wings: List[str] = None,
+    source_kinds: List[str] = None,
+    include_cold: bool = False,
 ) -> dict:
     """BM25-only search reading drawers directly from chroma.sqlite3.
 
@@ -528,11 +611,21 @@ def _bm25_only_via_sqlite(
         from .config import get_configured_collection_name
 
         collection_name = get_configured_collection_name()
+    scoped_wings = _validate_scope(wing, wings)
+    kinds = _validate_source_kinds(source_kinds)
+    filters = _filter_envelope(
+        wing=wing,
+        wings=wings,
+        room=room,
+        source_file=source_file,
+        source_kinds=kinds,
+        include_cold=include_cold,
+    )
 
     def _metadata_filter_sql(row_id_expr: str) -> tuple[str, list[str]]:
         clauses = []
         params = []
-        for key, value in (("wing", wing), ("room", room), ("source_file", source_file)):
+        for key, value in (("room", room), ("source_file", source_file)):
             if not value:
                 continue
             clauses.append(
@@ -552,6 +645,34 @@ def _bm25_only_via_sqlite(
                 """
             )
             params.extend([key, value])
+        for key, values in (("wing", scoped_wings), ("source_kind", kinds)):
+            if not values:
+                continue
+            placeholders = ",".join("?" for _ in values)
+            clauses.append(
+                f"""
+                AND EXISTS (
+                    SELECT 1
+                    FROM embedding_metadata mf
+                    WHERE mf.id = {row_id_expr}
+                      AND mf.key = ?
+                      AND mf.string_value IN ({placeholders})
+                )
+                """
+            )
+            params.extend([key, *values])
+        if not include_cold:
+            clauses.append(
+                f"""
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM embedding_metadata mt
+                    WHERE mt.id = {row_id_expr}
+                      AND mt.key = 'memory_tier'
+                      AND mt.string_value = 'cold'
+                )
+                """
+            )
         return "".join(clauses), params
 
     try:
@@ -645,7 +766,7 @@ def _bm25_only_via_sqlite(
         if not candidate_ids:
             return {
                 "query": query,
-                "filters": {"wing": wing, "room": room, "source_file": source_file},
+                "filters": filters,
                 "total_before_filter": 0,
                 "results": [],
                 "fallback": "bm25_only_via_sqlite",
@@ -677,11 +798,14 @@ def _bm25_only_via_sqlite(
     candidates = []
     for d in drawers.values():
         meta = d["metadata"]
-        if wing and meta.get("wing") != wing:
-            continue
-        if room and meta.get("room") != room:
-            continue
-        if source_file and meta.get("source_file") != source_file:
+        if not _metadata_visible(
+            meta,
+            scoped_wings=scoped_wings,
+            room=room,
+            source_file=source_file,
+            source_kinds=kinds,
+            include_cold=include_cold,
+        ):
             continue
         full_source = meta.get("source_file", "") or ""
         candidates.append(
@@ -727,7 +851,7 @@ def _bm25_only_via_sqlite(
 
     return {
         "query": query,
-        "filters": {"wing": wing, "room": room, "source_file": source_file},
+        "filters": filters,
         "total_before_filter": len(candidates),
         "results": hits,
         "fallback": "bm25_only_via_sqlite",
@@ -744,6 +868,9 @@ def _merge_bm25_union_candidates(
     n_results: int,
     max_distance: float = 0.0,
     source_file: str = None,
+    wings=None,
+    source_kinds=None,
+    include_cold=False,
 ) -> None:
     """Append top-K backend lexical candidates into ``hits`` in place.
 
@@ -770,7 +897,16 @@ def _merge_bm25_union_candidates(
     if max_distance > 0.0:
         return
 
-    where = build_where_filter(wing, room, source_file)
+    scoped_wings = _validate_scope(wing, wings)
+    kinds = _validate_source_kinds(source_kinds)
+    where = build_where_filter(
+        wing,
+        room,
+        source_file,
+        wings=wings,
+        source_kinds=kinds,
+        include_cold=include_cold,
+    )
     try:
         lexical = drawers_col.lexical_search(
             query=query,
@@ -786,6 +922,15 @@ def _merge_bm25_union_candidates(
     bm25_extra = []
     for hit in lexical.hits:
         meta = hit.metadata or {}
+        if not _metadata_visible(
+            meta,
+            scoped_wings=scoped_wings,
+            room=room,
+            source_file=source_file,
+            source_kinds=kinds,
+            include_cold=include_cold,
+        ):
+            continue
         full_source = meta.get("source_file", "") or ""
         bm25_extra.append(
             {
@@ -861,6 +1006,9 @@ def _apply_candidate_strategy(
     n_results: int,
     max_distance: float = 0.0,
     source_file: str = None,
+    wings=None,
+    source_kinds=None,
+    include_cold=False,
 ) -> None:
     """Dispatch to the registered merger for ``strategy``.
 
@@ -878,6 +1026,9 @@ def _apply_candidate_strategy(
             n_results,
             max_distance=max_distance,
             source_file=source_file,
+            wings=wings,
+            source_kinds=source_kinds,
+            include_cold=include_cold,
         )
 
 
@@ -892,6 +1043,9 @@ def _finalize_candidate_hits(
     n_results: int,
     max_distance: float,
     source_file: str = None,
+    wings=None,
+    source_kinds=None,
+    include_cold=False,
 ) -> tuple:
     try:
         _apply_candidate_strategy(
@@ -904,6 +1058,9 @@ def _finalize_candidate_hits(
             n_results,
             max_distance=max_distance,
             source_file=source_file,
+            wings=wings,
+            source_kinds=source_kinds,
+            include_cold=include_cold,
         )
     except UnsupportedCapabilityError:
         return [], {
@@ -946,6 +1103,9 @@ def _vector_disabled_search(
     n_results: int,
     collection_name: str,
     source_file: str = None,
+    wings: List[str] = None,
+    source_kinds: List[str] = None,
+    include_cold: bool = False,
 ) -> dict:
     try:
         backend_name = resolve_backend_name(palace_path)
@@ -968,6 +1128,9 @@ def _vector_disabled_search(
         source_file=source_file,
         n_results=n_results,
         collection_name=collection_name,
+        wings=wings,
+        source_kinds=source_kinds,
+        include_cold=include_cold,
     )
 
 
@@ -1000,7 +1163,16 @@ def _open_search_collection(palace_path: str, collection_name: str):
 
 
 def _query_drawers_with_filter_fallback(
-    drawers_col, dkwargs, query, n_results, wing, room, source_file=None
+    drawers_col,
+    dkwargs,
+    query,
+    n_results,
+    wing,
+    room,
+    source_file=None,
+    wings=None,
+    source_kinds=None,
+    include_cold=False,
 ):
     """Run the filtered drawer query, falling back to an unfiltered query plus a
     Python-side post-filter when ChromaDB raises on the filtered query.
@@ -1027,6 +1199,8 @@ def _query_drawers_with_filter_fallback(
             n_results=min(n_results * 15, 500),
             include=["documents", "metadatas", "distances"],
         )
+        scoped_wings = _validate_scope(wing, wings)
+        kinds = _validate_source_kinds(source_kinds)
         fdocs, fmetas, fdists = [], [], []
         for doc, meta, dist in zip(
             _first_or_empty(raw, "documents"),
@@ -1034,16 +1208,45 @@ def _query_drawers_with_filter_fallback(
             _first_or_empty(raw, "distances"),
         ):
             meta = meta or {}
-            if wing and meta.get("wing") != wing:
-                continue
-            if room and meta.get("room") != room:
-                continue
-            if source_file and meta.get("source_file") != source_file:
+            if not _metadata_visible(
+                meta,
+                scoped_wings=scoped_wings,
+                room=room,
+                source_file=source_file,
+                source_kinds=kinds,
+                include_cold=include_cold,
+            ):
                 continue
             fdocs.append(doc)
             fmetas.append(meta)
             fdists.append(dist)
         return {"documents": [fdocs], "metadatas": [fmetas], "distances": [fdists]}
+
+
+def _visible_query_rows(
+    drawer_results,
+    *,
+    scoped_wings,
+    room,
+    source_file,
+    source_kinds,
+    include_cold,
+):
+    for doc, meta, dist in zip(
+        _first_or_empty(drawer_results, "documents"),
+        _first_or_empty(drawer_results, "metadatas"),
+        _first_or_empty(drawer_results, "distances"),
+    ):
+        meta = meta or {}
+        if _metadata_visible(
+            meta,
+            scoped_wings=scoped_wings,
+            room=room,
+            source_file=source_file,
+            source_kinds=source_kinds,
+            include_cold=include_cold,
+        ):
+            yield doc, meta, dist
 
 
 def search_memories(
@@ -1057,6 +1260,9 @@ def search_memories(
     vector_disabled: bool = False,
     candidate_strategy: str = "vector",
     collection_name: str = None,
+    wings: List[str] = None,
+    source_kinds: List[str] = None,
+    include_cold: bool = False,
 ) -> dict:
     """Programmatic search — returns a dict instead of printing.
 
@@ -1099,6 +1305,8 @@ def search_memories(
     # regardless of whether the call routes through the vector path or
     # the BM25-only fallback below.
     _validate_candidate_strategy(candidate_strategy)
+    scoped_wings = _validate_scope(wing, wings)
+    kinds = _validate_source_kinds(source_kinds)
 
     if vector_disabled:
         return _vector_disabled_search(
@@ -1109,6 +1317,9 @@ def search_memories(
             n_results=n_results,
             collection_name=collection_name,
             source_file=source_file,
+            wings=wings,
+            source_kinds=kinds,
+            include_cold=include_cold,
         )
 
     drawers_col, open_error = _open_search_collection(palace_path, collection_name)
@@ -1116,7 +1327,14 @@ def search_memories(
         return open_error
 
     metric = _metric_for_collection(drawers_col)
-    where = build_where_filter(wing, room, source_file)
+    where = build_where_filter(
+        wing,
+        room,
+        source_file,
+        wings=wings,
+        source_kinds=kinds,
+        include_cold=include_cold,
+    )
 
     # Hybrid retrieval: always query drawers directly (the floor), then use
     # closet hits to boost rankings. Closets are a ranking SIGNAL, never a
@@ -1128,13 +1346,24 @@ def search_memories(
     try:
         dkwargs = {
             "query_texts": [query],
-            "n_results": n_results * 3,  # over-fetch for re-ranking
+            # Cold-tier filtering is post-query for legacy missing-as-hot
+            # semantics, so fetch a wider pool before trimming.
+            "n_results": _vector_candidate_limit(n_results, include_cold),
             "include": ["documents", "metadatas", "distances"],
         }
         if where:
             dkwargs["where"] = where
         drawer_results = _query_drawers_with_filter_fallback(
-            drawers_col, dkwargs, query, n_results, wing, room, source_file
+            drawers_col,
+            dkwargs,
+            query,
+            n_results,
+            wing,
+            room,
+            source_file,
+            wings=wings,
+            source_kinds=kinds,
+            include_cold=include_cold,
         )
     except Exception as e:
         return {"error": f"Search error: {e}"}
@@ -1173,12 +1402,14 @@ def search_memories(
     CLOSET_DISTANCE_CAP = 1.5  # cosine dist > 1.5 = too weak to use as signal
 
     scored: list = []
-    for doc, meta, dist in zip(
-        _first_or_empty(drawer_results, "documents"),
-        _first_or_empty(drawer_results, "metadatas"),
-        _first_or_empty(drawer_results, "distances"),
+    for doc, meta, dist in _visible_query_rows(
+        drawer_results,
+        scoped_wings=scoped_wings,
+        room=room,
+        source_file=source_file,
+        source_kinds=kinds,
+        include_cold=include_cold,
     ):
-        meta = meta or {}
         doc = doc or ""
         # Filter on raw distance before rounding to avoid precision loss.
         if max_distance > 0.0 and dist > max_distance:
@@ -1309,13 +1540,23 @@ def search_memories(
         n_results=n_results,
         max_distance=max_distance,
         source_file=source_file,
+        wings=wings,
+        source_kinds=kinds,
+        include_cold=include_cold,
     )
     if strategy_error:
         return strategy_error
 
     return {
         "query": query,
-        "filters": {"wing": wing, "room": room, "source_file": source_file},
+        "filters": _filter_envelope(
+            wing=wing,
+            wings=wings,
+            room=room,
+            source_file=source_file,
+            source_kinds=kinds,
+            include_cold=include_cold,
+        ),
         "total_before_filter": len(_first_or_empty(drawer_results, "documents")),
         "results": hits,
     }
