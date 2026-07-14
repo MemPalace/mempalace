@@ -1001,6 +1001,112 @@ def cmd_migrate_wings(args):
     )
 
 
+def cmd_reorganize(args):
+    """Build an auditable reorganization manifest without mutating the palace."""
+    import sqlite3
+    from collections import Counter
+
+    from .mcp_jobs import detect_linked_worktree
+    from .reorganize import (
+        collect_duplicate_evidence,
+        inventory_palace,
+        palace_snapshot,
+        plan_actions,
+        write_manifest,
+    )
+    from .repair import sqlite_integrity_errors
+
+    palace_path = (
+        getattr(args, "reorganize_palace", None)
+        or getattr(args, "palace", None)
+        or MempalaceConfig().palace_path
+    )
+    palace_path = os.path.abspath(os.path.expanduser(palace_path))
+    canonical_root = os.path.abspath(os.path.expanduser(args.canonical_root))
+    if not os.path.isdir(canonical_root):
+        print(f"  Canonical root is not a directory: {canonical_root}", file=sys.stderr)
+        sys.exit(1)
+
+    linked, primary_root = detect_linked_worktree(canonical_root)
+    if linked:
+        suffix = f"; primary checkout: {primary_root}" if primary_root else ""
+        print(
+            f"  Refusing linked worktree as canonical root: {canonical_root}{suffix}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    integrity_errors = sqlite_integrity_errors(palace_path)
+    if integrity_errors:
+        print("  SQLite integrity check failed; no manifest was written:", file=sys.stderr)
+        for error in integrity_errors[:5]:
+            print(f"    {error}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        before = palace_snapshot(palace_path)
+        records = inventory_palace(
+            palace_path,
+            canonical_root=canonical_root,
+            worktree_roots=args.worktree_root,
+            session_roots=args.session_root,
+        )
+        actions = plan_actions(records, hot_days=args.hot_days)
+        evidence = collect_duplicate_evidence(records, actions)
+        after_inventory = palace_snapshot(palace_path)
+    except (FileNotFoundError, OSError, RuntimeError, sqlite3.Error, ValueError) as exc:
+        print(f"  Could not build reorganization plan: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if before != after_inventory:
+        print(
+            "  Palace changed while it was being inventoried; retry when mining is idle.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        write_manifest(
+            args.manifest,
+            records,
+            actions,
+            evidence,
+            palace_path=palace_path,
+            sqlite_snapshot=before,
+        )
+        after_manifest = palace_snapshot(palace_path)
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"  Could not write reorganization manifest: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if before != after_manifest:
+        print(
+            "  Palace changed before the manifest completed; discard it and retry when mining is idle.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    origin_counts = Counter(record.origin for record in records)
+    action_counts = Counter(action.action for action in actions)
+    tier_counts = Counter(
+        str(action.metadata.get("memory_tier") or "unspecified") for action in actions
+    )
+    print("\n  Reorganization plan")
+    print(f"  Inventory: {len(records):,}")
+    print(f"  Canonical: {origin_counts['canonical']:,}")
+    print(f"  Sessions: {origin_counts['session']:,}")
+    print(f"  Worktree artifacts: {origin_counts['worktree']:,}")
+    print(f"  Verified duplicate candidates: {len(evidence):,}")
+    print(f"  Unique worktree artifacts: {action_counts['preserve_unique']:,}")
+    print(f"  Uncertain worktree artifacts: {action_counts['preserve_uncertain']:,}")
+    print(f"  Unclassified: {origin_counts['unclassified']:,}")
+    print(f"  Hot: {tier_counts['hot']:,}")
+    print(f"  Cold: {tier_counts['cold']:,}")
+    print(f"  Manifest: {os.path.abspath(os.path.expanduser(args.manifest))}")
+    print(f"  SQLite SHA-256: {before['sha256']} (unchanged)")
+    print("  Dry run only — no drawers were changed or deleted.")
+
+
 def cmd_hallways(args):
     """List within-wing entity hallways (the auto-built associative graph)."""
     from .hallways import list_hallways
@@ -2172,6 +2278,50 @@ def main():
     )
     p_migrate_wings.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
 
+    p_reorganize = sub.add_parser(
+        "reorganize",
+        help="Plan a read-only palace reorganization and write an audit manifest",
+    )
+    reorganize_sub = p_reorganize.add_subparsers(dest="reorganize_action")
+    p_reorganize_plan = reorganize_sub.add_parser(
+        "plan",
+        help="Inventory Chroma SQLite and write a dry-run manifest",
+    )
+    p_reorganize_plan.add_argument(
+        "--palace",
+        dest="reorganize_palace",
+        default=None,
+        help="Palace path (default: global --palace or configured palace)",
+    )
+    p_reorganize_plan.add_argument(
+        "--canonical-root",
+        required=True,
+        help="Primary repository checkout that owns canonical code memories",
+    )
+    p_reorganize_plan.add_argument(
+        "--worktree-root",
+        action="append",
+        default=[],
+        help="Linked worktree source root to classify; repeat for multiple roots",
+    )
+    p_reorganize_plan.add_argument(
+        "--session-root",
+        action="append",
+        default=[],
+        help="Conversation/session source root to classify; repeat for multiple roots",
+    )
+    p_reorganize_plan.add_argument(
+        "--hot-days",
+        type=int,
+        default=90,
+        help="Keep unpinned sessions hot for this many days (default: 90)",
+    )
+    p_reorganize_plan.add_argument(
+        "--manifest",
+        required=True,
+        help="Owner-only JSON manifest output path",
+    )
+
     p_hallways = sub.add_parser("hallways", help="List entity hallways (associative graph)")
     p_hallways.add_argument("--wing", default=None, help="Filter to one wing")
     p_hallways.add_argument("--limit", type=int, default=50, help="Max hallways to show")
@@ -2243,6 +2393,13 @@ def main():
             p_daemon.print_help()
             return
         cmd_daemon(args)
+        return
+
+    if args.command == "reorganize":
+        if getattr(args, "reorganize_action", None) != "plan":
+            p_reorganize.print_help()
+            return
+        cmd_reorganize(args)
         return
 
     dispatch = {

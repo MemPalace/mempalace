@@ -1,6 +1,7 @@
 """Tests for mempalace.cli — the main CLI dispatcher."""
 
 import argparse
+import hashlib
 import os
 import shlex
 import sqlite3
@@ -762,6 +763,102 @@ def test_cmd_split_all_options():
 
 
 # ── main() argparse dispatch ──────────────────────────────────────────
+
+
+def test_reorganize_plan_writes_manifest_without_changing_sqlite(tmp_path, capsys):
+    palace = tmp_path / "palace"
+    canonical = tmp_path / "repo"
+    worktree = tmp_path / "worktree"
+    sessions = tmp_path / "sessions"
+    for path in (palace, canonical, worktree, sessions):
+        path.mkdir()
+    db_path = palace / "chroma.sqlite3"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE collections (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+            CREATE TABLE segments (id INTEGER PRIMARY KEY, collection INTEGER NOT NULL);
+            CREATE TABLE embeddings (
+                id INTEGER PRIMARY KEY,
+                segment_id INTEGER NOT NULL,
+                embedding_id TEXT,
+                created_at TEXT
+            );
+            CREATE TABLE embedding_metadata (
+                id INTEGER,
+                key TEXT,
+                string_value TEXT,
+                int_value INTEGER,
+                float_value REAL,
+                bool_value INTEGER
+            );
+            INSERT INTO collections(id, name) VALUES (1, 'mempalace_drawers');
+            INSERT INTO segments(id, collection) VALUES (1, 1);
+            INSERT INTO embeddings(id, segment_id, embedding_id, created_at)
+                VALUES (1, 1, 'canonical', '2026-07-14T00:00:00Z');
+            """
+        )
+        conn.execute(
+            "INSERT INTO embedding_metadata(id, key, string_value) VALUES (1, ?, ?)",
+            ("chroma:document", "canonical text"),
+        )
+        conn.execute(
+            "INSERT INTO embedding_metadata(id, key, string_value) VALUES (1, ?, ?)",
+            ("source_file", str(canonical / "src/app.ts")),
+        )
+        conn.execute(
+            "INSERT INTO embedding_metadata(id, key, int_value) VALUES (1, ?, ?)",
+            ("chunk_index", 0),
+        )
+
+    before = hashlib.sha256(db_path.read_bytes()).hexdigest()
+    manifest = tmp_path / "private" / "manifest.json"
+    argv = [
+        "mempalace",
+        "reorganize",
+        "plan",
+        "--palace",
+        str(palace),
+        "--canonical-root",
+        str(canonical),
+        "--worktree-root",
+        str(worktree),
+        "--session-root",
+        str(sessions),
+        "--manifest",
+        str(manifest),
+    ]
+
+    with patch("sys.argv", argv):
+        main()
+
+    assert manifest.is_file()
+    assert hashlib.sha256(db_path.read_bytes()).hexdigest() == before
+    output = capsys.readouterr().out
+    assert "Dry run only" in output
+    assert "SQLite SHA-256" in output
+
+
+def test_reorganize_has_no_apply_option():
+    with (
+        patch(
+            "sys.argv",
+            [
+                "mempalace",
+                "reorganize",
+                "plan",
+                "--canonical-root",
+                "/repo",
+                "--manifest",
+                "/tmp/manifest.json",
+                "--apply",
+            ],
+        ),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        main()
+
+    assert exc_info.value.code == 2
 
 
 def test_main_no_args_prints_help(capsys):
