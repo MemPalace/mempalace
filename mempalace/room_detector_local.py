@@ -282,11 +282,18 @@ def get_user_approval(rooms: list) -> list:
 def save_config(project_dir: str, project_name: str, rooms: list):
     config = {
         "wing": project_name,
+        "source_kind": "code",
+        "reject_linked_worktrees": True,
         "rooms": [
             {
                 "name": r["name"],
                 "description": r["description"],
                 "keywords": r.get("keywords", [r["name"]]),
+                **(
+                    {"source_kind": r.get("source_kind", "documentation")}
+                    if r["name"] == "documentation" or r.get("source_kind")
+                    else {}
+                ),
             }
             for r in rooms
         ],

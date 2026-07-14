@@ -2,7 +2,11 @@ import hashlib
 
 import pytest
 
-from mempalace.source_metadata import SourceContext, build_source_metadata
+from mempalace.source_metadata import (
+    SourceContext,
+    build_source_metadata,
+    source_kind_for_room,
+)
 
 
 def test_build_source_metadata_is_scalar_and_deterministic(tmp_path):
@@ -61,3 +65,13 @@ def test_source_metadata_rejects_unknown_enums(tmp_path, field, value):
 
     with pytest.raises(ValueError, match=field):
         build_source_metadata(SourceContext(**values), "note", 0)
+
+
+def test_room_source_kind_overrides_project_default():
+    config = {
+        "source_kind": "code",
+        "rooms": [{"name": "docs", "source_kind": "documentation"}],
+    }
+
+    assert source_kind_for_room(config, "docs") == "documentation"
+    assert source_kind_for_room(config, "backend") == "code"

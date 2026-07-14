@@ -60,6 +60,23 @@ def _validate_context(context: SourceContext) -> None:
         raise ValueError(f"invalid source_canonicality: {context.source_canonicality!r}")
 
 
+def source_kind_for_room(config: dict, room_name: str) -> str:
+    """Resolve a validated per-room source kind with a project default."""
+    default = config.get("source_kind", "code")
+    room = next(
+        (
+            item
+            for item in config.get("rooms", [])
+            if isinstance(item, dict) and item.get("name") == room_name
+        ),
+        {},
+    )
+    value = room.get("source_kind", default)
+    if value not in SOURCE_KINDS:
+        raise ValueError(f"invalid source_kind: {value!r}")
+    return value
+
+
 def build_source_metadata(
     context: SourceContext,
     content: str,

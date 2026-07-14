@@ -46,10 +46,12 @@ from .collision_scan import assert_no_collisions
 from .hallways import compute_hallways_for_wing
 from .ids import ID_RECIPE, make_drawer_id_from_chunk
 from .source_metadata import (
+    SOURCE_KINDS,
     SourceContext,
     build_source_metadata,
     git_revision,
     sha256_file,
+    source_kind_for_room,
 )
 
 logger = logging.getLogger("mempalace_mcp")
@@ -516,6 +518,8 @@ def load_config(project_dir: str) -> dict:
             )
             return {
                 "wing": wing_name,
+                "source_kind": "code",
+                "reject_linked_worktrees": True,
                 "rooms": [
                     {
                         "name": "general",
@@ -525,7 +529,24 @@ def load_config(project_dir: str) -> dict:
                 ],
             }
     with open(config_path) as f:
-        return yaml.safe_load(f)
+        config = yaml.safe_load(f)
+    if not isinstance(config, dict):
+        raise ValueError(f"invalid project config in {config_path}: expected a mapping")
+    source_kind = config.setdefault("source_kind", "code")
+    if source_kind not in SOURCE_KINDS:
+        raise ValueError(f"invalid source_kind: {source_kind!r}")
+    reject_linked = config.setdefault("reject_linked_worktrees", True)
+    if not isinstance(reject_linked, bool):
+        raise ValueError("reject_linked_worktrees must be a boolean")
+    rooms = config.get("rooms", [])
+    if not isinstance(rooms, list):
+        raise ValueError("rooms must be a list")
+    for room in rooms:
+        if not isinstance(room, dict):
+            raise ValueError("each room must be a mapping")
+        if "source_kind" in room and room["source_kind"] not in SOURCE_KINDS:
+            raise ValueError(f"invalid source_kind: {room['source_kind']!r}")
+    return config
 
 
 # =============================================================================
@@ -1435,6 +1456,7 @@ def process_file(
     max_chunks_per_file: Optional[int] = None,
     source_revision: Optional[str] = None,
     source_canonicality: str = "canonical",
+    source_kind: str = "code",
 ) -> tuple:
     """Read, chunk, route, and file one file.
 
@@ -1464,7 +1486,10 @@ def process_file(
     source_context = SourceContext(
         root=str(project_path),
         source_file=source_file,
-        source_kind="code",
+        source_kind=source_kind_for_room(
+            {"source_kind": source_kind, "rooms": rooms},
+            room,
+        ),
         source_revision=source_revision,
         source_canonicality=source_canonicality,
         source_sha256=sha256_file(source_file),
@@ -1903,6 +1928,7 @@ def _mine_impl(
                     max_chunks_per_file=effective_chunk_cap,
                     source_revision=project_revision,
                     source_canonicality=source_canonicality,
+                    source_kind=config.get("source_kind", "code"),
                 )
             except KeyboardInterrupt:
                 # Re-raise so the outer handler prints the summary; we

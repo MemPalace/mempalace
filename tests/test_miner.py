@@ -312,6 +312,31 @@ def test_load_config_no_yaml_normalizes_hyphenated_wing():
         shutil.rmtree(parent)
 
 
+def test_load_config_rejects_unknown_source_kind(tmp_path):
+    (tmp_path / "mempalace.yaml").write_text("wing: x\nsource_kind: mystery\nrooms: []\n")
+
+    with pytest.raises(ValueError, match="source_kind"):
+        load_config(str(tmp_path))
+
+
+def test_load_config_rejects_unknown_room_source_kind(tmp_path):
+    (tmp_path / "mempalace.yaml").write_text(
+        "wing: x\nsource_kind: code\nrooms:\n  - name: docs\n    source_kind: mystery\n"
+    )
+
+    with pytest.raises(ValueError, match="source_kind"):
+        load_config(str(tmp_path))
+
+
+def test_load_config_rejects_non_boolean_worktree_policy(tmp_path):
+    (tmp_path / "mempalace.yaml").write_text(
+        "wing: x\nreject_linked_worktrees: sometimes\nrooms: []\n"
+    )
+
+    with pytest.raises(ValueError, match="reject_linked_worktrees"):
+        load_config(str(tmp_path))
+
+
 def test_scan_project_skips_mempalace_generated_files():
     with tempfile.TemporaryDirectory() as tmpdir:
         project_root = Path(tmpdir).resolve()

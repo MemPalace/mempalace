@@ -238,6 +238,23 @@ def test_save_config_valid_yaml(tmp_path):
     assert data["rooms"][0]["name"] == "general"
 
 
+def test_save_config_marks_documentation_source_kind(tmp_path):
+    rooms = [
+        {"name": "documentation", "description": "Docs", "keywords": ["docs"]},
+        {"name": "backend", "description": "Code", "keywords": ["api"]},
+    ]
+
+    save_config(str(tmp_path), "test_proj", rooms)
+
+    import yaml
+
+    data = yaml.safe_load((tmp_path / "mempalace.yaml").read_text())
+    docs = next(room for room in data["rooms"] if room["name"] == "documentation")
+    assert data["source_kind"] == "code"
+    assert data["reject_linked_worktrees"] is True
+    assert docs["source_kind"] == "documentation"
+
+
 # ── print_proposed_structure ──────────────────────────────────────────
 
 
