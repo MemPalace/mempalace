@@ -234,6 +234,29 @@ def test_daemon_http_lifecycle_executes_job(tmp_path, monkeypatch):
     _stop_server(client, thread, holders)
 
 
+def test_daemon_http_submit_reports_active_deduplication(tmp_path, monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+
+    def fake_execute(kind, payload):
+        started.set()
+        release.wait(2)
+        return {"success": True, "exit_code": 0}
+
+    client, thread, _palace, holders = _start_server(tmp_path, monkeypatch, fake_execute)
+    try:
+        first = client.submit("mine", {"source": "src"}, dedupe_key="same")
+        assert started.wait(1)
+        second = client.submit("mine", {"source": "src"}, dedupe_key="same")
+
+        assert first["deduplicated"] is False
+        assert second["deduplicated"] is True
+        assert second["id"] == first["id"]
+    finally:
+        release.set()
+        _stop_server(client, thread, holders)
+
+
 def test_submit_job_uses_client_and_waits(monkeypatch, tmp_path):
     palace = tmp_path / "palace"
     palace.mkdir()

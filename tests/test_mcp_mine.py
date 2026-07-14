@@ -260,3 +260,28 @@ def test_generic_exception_carries_error_class(monkeypatch, config, tmp_dir):
     assert result["success"] is False
     assert "mine failed" in result["error"]
     assert result.get("error_class") == "RuntimeError"
+
+
+def test_daemon_mode_returns_async_accepted_job(monkeypatch, config, tmp_dir):
+    from mempalace import mcp_jobs, mcp_server
+
+    _patch(monkeypatch, config)
+    monkeypatch.setenv(mcp_jobs.DAEMON_WRITES_ENV, "1")
+    src = os.path.join(tmp_dir, "proj")
+    os.makedirs(src)
+    monkeypatch.setattr(
+        mcp_jobs,
+        "submit_mine",
+        lambda palace_path, payload: {
+            "success": True,
+            "accepted": True,
+            "job_id": "job-1",
+            "state": "queued",
+            "deduplicated": False,
+        },
+    )
+
+    result = mcp_server.tool_mine(source=src, wing="se-code")
+
+    assert result["accepted"] is True
+    assert result["job_id"] == "job-1"

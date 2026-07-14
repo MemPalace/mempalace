@@ -2746,6 +2746,8 @@ def tool_mine(
     limit: int = 0,
     dry_run: bool = False,
     extract: str = "exchange",
+    allow_linked_worktree: bool = False,
+    priority: int = 0,
 ):
     """Mine a directory into the palace — the MCP equivalent of ``mempalace mine``.
 
@@ -2767,7 +2769,9 @@ def tool_mine(
     extract: convos extraction strategy — ``"exchange"`` (default) or
              ``"general"``; ignored by the other modes.
 
-    Runs synchronously and mirrors the :func:`tool_sync` contract: success
+    When ``MEMPALACE_MCP_DAEMON_WRITES`` is enabled, submits a durable daemon
+    job and immediately returns its ID. Otherwise runs synchronously and
+    mirrors the :func:`tool_sync` contract: success
     returns ``{success: True, mode, dry_run, output[, output_truncated]}`` where ``output`` is
     the miner's human-readable summary (captured so it cannot corrupt the
     JSON-RPC stream); failure returns ``{success: False, error[, error_class]}``.
@@ -2792,6 +2796,24 @@ def tool_mine(
     src = os.path.expanduser(source) if source else ""
     if not src or not os.path.isdir(src):
         return {"success": False, "error": f"source directory not found: {source!r}"}
+
+    from . import mcp_jobs
+
+    if mcp_jobs.daemon_writes_enabled():
+        return mcp_jobs.submit_mine(
+            _config.palace_path,
+            {
+                "source": src,
+                "mode": mode,
+                "wing": wing,
+                "agent": agent,
+                "limit": limit,
+                "dry_run": dry_run,
+                "extract": extract,
+                "allow_linked_worktree": allow_linked_worktree,
+                "priority": priority,
+            },
+        )
 
     def _run():
         if mode == "convos":
@@ -4356,10 +4378,10 @@ TOOLS = {
             "Mine a directory into the palace — the MCP equivalent of `mempalace mine`. "
             "mode='projects' (default) ingests code/docs; mode='convos' ingests chat "
             "transcripts; mode='extract' ingests office documents (PDF/DOCX/RTF, requires "
-            "the mempalace[extract] extra). Runs synchronously and returns the miner's "
-            "summary as `output`. The palace write lock is automatic; a concurrent mine "
-            "returns a structured already-running error. Orphan cleanup is separate — use "
-            "mempalace_sync."
+            "the mempalace[extract] extra). With MEMPALACE_MCP_DAEMON_WRITES enabled, "
+            "submits a durable asynchronous job and returns its ID; otherwise it runs "
+            "synchronously. Project mining rejects linked Git worktrees by default to avoid "
+            "duplicate indexing. Orphan cleanup is separate — use mempalace_sync."
         ),
         "input_schema": {
             "type": "object",
@@ -4399,6 +4421,16 @@ TOOLS = {
                         "Convos extraction strategy: exchange (default) or general. "
                         "Ignored by other modes."
                     ),
+                },
+                "allow_linked_worktree": {
+                    "type": "boolean",
+                    "description": (
+                        "Allow projects mode to mine a linked Git worktree. Default: false."
+                    ),
+                },
+                "priority": {
+                    "type": "integer",
+                    "description": "Daemon queue priority (higher runs first). Default: 0.",
                 },
             },
             "required": ["source"],

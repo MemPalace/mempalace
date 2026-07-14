@@ -903,7 +903,7 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
             if parsed.path == "/jobs":
                 try:
                     body = self._read_json()
-                    job = runtime.store.enqueue(
+                    job, deduplicated = runtime.store.enqueue_with_status(
                         str(body.get("kind") or ""),
                         body.get("payload") or {},
                         dedupe_key=body.get("dedupe_key"),
@@ -913,7 +913,14 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
                 except Exception as exc:  # noqa: BLE001 - client gets structured failure
                     _json_response(self, 400, {"error": str(exc)})
                     return
-                _json_response(self, 202, {"job": job_to_dict(job)})
+                _json_response(
+                    self,
+                    202,
+                    {
+                        "job": job_to_dict(job, redact_payload=True),
+                        "deduplicated": deduplicated,
+                    },
+                )
                 return
             if parsed.path == "/shutdown":
                 _json_response(self, 200, {"ok": True})
@@ -1084,11 +1091,14 @@ class DaemonClient:
         dedupe_key: str | None = None,
         priority: int = 0,
     ) -> dict[str, Any]:
-        return self.request(
+        response = self.request(
             "POST",
             "/jobs",
             {"kind": kind, "payload": payload, "dedupe_key": dedupe_key, "priority": priority},
-        )["job"]
+        )
+        job = response["job"]
+        job["deduplicated"] = bool(response.get("deduplicated", False))
+        return job
 
     def get_job(self, job_id: str) -> dict[str, Any]:
         return self.request("GET", f"/jobs/{job_id}")["job"]
