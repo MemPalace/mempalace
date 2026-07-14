@@ -2043,14 +2043,40 @@ def tool_search(
     max_distance: float = 1.5,
     min_similarity: float = None,
     context: str = None,
+    wings: list = None,
+    source_kinds: list = None,
+    include_cold: bool = False,
 ):
     global _last_active_maintenance_job_id
 
     limit = max(1, min(limit, _MAX_RESULTS))
     try:
+        if wing and wings:
+            raise ValueError("wing and wings are mutually exclusive")
         wing = _sanitize_optional_name(wing, "wing")
+        if wings is not None and not isinstance(wings, list):
+            raise ValueError("wings must be a list of strings")
+        sanitized_wings = []
+        for value in wings or []:
+            if not isinstance(value, str):
+                raise ValueError("wings must contain non-empty strings")
+            sanitized = _sanitize_optional_name(value, "wing")
+            if sanitized is None:
+                raise ValueError("wings must contain non-empty strings")
+            if sanitized not in sanitized_wings:
+                sanitized_wings.append(sanitized)
         room = _sanitize_optional_name(room, "room")
         source_file = _sanitize_optional_source_file(source_file)
+        if source_kinds is not None and not isinstance(source_kinds, list):
+            raise ValueError("source_kinds must be a list of strings")
+        from .source_metadata import SOURCE_KINDS
+
+        sanitized_source_kinds = []
+        for value in source_kinds or []:
+            if not isinstance(value, str) or value not in SOURCE_KINDS:
+                raise ValueError(f"invalid source_kind: {value!r}")
+            if value not in sanitized_source_kinds:
+                sanitized_source_kinds.append(value)
     except ValueError as e:
         return {"error": str(e)}
     # Backwards compat: accept old name
@@ -2071,6 +2097,9 @@ def tool_search(
             wing=wing,
             room=room,
             source_file=source_file,
+            wings=sanitized_wings,
+            source_kinds=sanitized_source_kinds,
+            include_cold=include_cold,
             n_results=limit,
             max_distance=dist,
             vector_disabled=vector_disabled,
@@ -4336,7 +4365,34 @@ TOOLS = {
                     "maximum": 100,
                 },
                 "wing": {"type": "string", "description": "Filter by wing (optional)"},
+                "wings": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Filter across multiple wings (optional). Mutually exclusive with wing."
+                    ),
+                },
                 "room": {"type": "string", "description": "Filter by room (optional)"},
+                "source_kinds": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": [
+                            "curated",
+                            "code",
+                            "documentation",
+                            "session",
+                            "worktree-artifact",
+                        ],
+                    },
+                    "description": "Filter by one or more source provenance kinds.",
+                },
+                "include_cold": {
+                    "type": "boolean",
+                    "description": (
+                        "Include cold history. Default false; legacy missing tiers remain hot."
+                    ),
+                },
                 "source_file": {
                     "type": "string",
                     "description": (

@@ -1369,6 +1369,49 @@ class TestSearchTool:
         result = tool_search(query="database", room="backend")
         assert all(r["room"] == "backend" for r in result["results"])
 
+    def test_search_forwards_multiwing_hot_scope(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_jobs, mcp_server
+
+        seen = {}
+        monkeypatch.setattr(mcp_jobs, "active_maintenance_job", lambda **kwargs: None)
+        monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", lambda: None)
+        monkeypatch.setattr(mcp_server, "_vector_disabled", False)
+        monkeypatch.setattr(
+            mcp_server,
+            "search_memories",
+            lambda *args, **kwargs: seen.update(kwargs) or {"results": []},
+        )
+
+        result = mcp_server.tool_search(
+            "why OCR",
+            wings=["se", "se-code"],
+            source_kinds=["curated", "code"],
+        )
+
+        assert result == {"results": []}
+        assert seen["wings"] == ["se", "se-code"]
+        assert seen["source_kinds"] == ["curated", "code"]
+        assert seen["include_cold"] is False
+
+    def test_search_rejects_singular_and_plural_wings(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "search_memories", lambda *a, **k: pytest.fail())
+
+        result = mcp_server.tool_search("ocr", wing="se", wings=["se-code"])
+
+        assert "mutually exclusive" in result["error"]
+
+    def test_search_rejects_unknown_source_kind(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        result = mcp_server.tool_search("ocr", source_kinds=["mystery"])
+
+        assert "source_kind" in result["error"]
+
     def test_search_with_source_file_filter(
         self, monkeypatch, config, palace_path, seeded_collection, kg
     ):
