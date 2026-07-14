@@ -14,6 +14,7 @@ import math
 import os
 import re
 import sqlite3
+from itertools import islice
 from pathlib import Path
 from typing import List, Optional
 
@@ -302,6 +303,53 @@ def _vector_candidate_limit(n_results: int, include_cold: bool) -> int:
     # which was both slower and incomplete when the first hot hit ranked 501.
     _ = include_cold
     return n_results * 3
+
+
+_DEFAULT_HOT_TIER_FILTER = {"memory_tier": {"$ne": "cold"}}
+_SPARSE_COLD_OVERFETCH_LIMIT = 256
+
+
+def _default_tier_query_plan(
+    collection, where: dict, candidate_limit: int
+) -> tuple[dict, int, int | None]:
+    """Avoid a near-full HNSW allow-list when only a few cold rows exist.
+
+    Chroma implements ``$ne`` vector filters as an allowed-ID set.  When almost
+    every drawer is hot, constructing and applying that large set costs more
+    than querying the unfiltered index.  Fetching ``candidate_limit + cold``
+    rows is complete for the requested hot candidate window: even if every cold
+    row ranks first, ``candidate_limit`` hot rows remain for the Python-side
+    visibility check.  The caller caps visible rows back to the original
+    candidate window before ranking.  Dense cold palaces keep the metadata
+    pushdown.
+    """
+    if where != _DEFAULT_HOT_TIER_FILTER:
+        return where, candidate_limit, None
+    try:
+        cold_result = collection.get(
+            where={"memory_tier": "cold"},
+            limit=_SPARSE_COLD_OVERFETCH_LIMIT + 1,
+            include=[],
+        )
+        cold_ids = cold_result.get("ids", [])
+        if not isinstance(cold_ids, list) or len(cold_ids) > _SPARSE_COLD_OVERFETCH_LIMIT:
+            return where, candidate_limit, None
+        total = collection.count()
+        if not isinstance(total, int) or total <= 0:
+            return where, candidate_limit, None
+    except Exception:
+        logger.debug("Cold-tier cardinality probe unavailable; retaining metadata filter")
+        return where, candidate_limit, None
+    query_limit = min(total, candidate_limit + min(len(cold_ids), candidate_limit))
+    safe_limit = min(total, candidate_limit + len(cold_ids))
+    return {}, query_limit, safe_limit if safe_limit > query_limit else None
+
+
+def _hot_result_count(result) -> int:
+    return sum(
+        (metadata or {}).get("memory_tier") != "cold"
+        for metadata in _first_or_empty(result, "metadatas")
+    )
 
 
 def build_where_filter(
@@ -1255,6 +1303,56 @@ def _visible_query_rows(
             yield doc, meta, dist
 
 
+def _hydrate_source_for_query(
+    drawers_col,
+    full_source: str,
+    parent_drawer_id: str | None,
+    query: str,
+    *,
+    max_chars: int = 10000,
+) -> tuple[str, int, int] | None:
+    """Return keyword-best neighboring chunks for one logical source group."""
+    try:
+        source_drawers = drawers_col.get_source_chunks(
+            full_source,
+            parent_drawer_id=parent_drawer_id,
+        )
+    except Exception:
+        logger.debug("Neighbor fetch failed for %s", full_source, exc_info=True)
+        return None
+    docs = source_drawers.documents
+    metadatas = source_drawers.metadatas
+    if len(docs) <= 1:
+        return None
+
+    indexed = []
+    for index, (document, metadata) in enumerate(zip(docs, metadatas)):
+        chunk_index = metadata.get("chunk_index", index) if isinstance(metadata, dict) else index
+        if not isinstance(chunk_index, int):
+            chunk_index = index
+        indexed.append((chunk_index, document))
+    indexed.sort(key=lambda pair: pair[0])
+    ordered_documents = [document for _, document in indexed]
+
+    query_terms = set(_tokenize(query))
+    best_index, best_score = 0, -1
+    for index, document in enumerate(ordered_documents):
+        lowered = document.lower()
+        score = sum(1 for term in query_terms if term in lowered)
+        if score > best_score:
+            best_score, best_index = score, index
+
+    start = max(0, best_index - 1)
+    end = min(len(ordered_documents), best_index + 2)
+    expanded = "\n\n".join(ordered_documents[start:end])
+    if len(expanded) > max_chars:
+        expanded = (
+            expanded[:max_chars] + f"\n\n[...truncated. {len(ordered_documents)} total drawers. "
+            "Use mempalace_get_drawer for full content.]"
+        )
+    return expanded, best_index, len(ordered_documents)
+
+
 def search_memories(
     query: str,
     palace_path: str,
@@ -1350,15 +1448,19 @@ def search_memories(
     # produces low-signal closets (regex extraction matches few topics)
     # and closet-first routing hides drawers that direct search would find.
     try:
+        drawer_candidate_limit = _vector_candidate_limit(n_results, include_cold)
+        drawer_where, drawer_limit, drawer_safe_limit = _default_tier_query_plan(
+            drawers_col,
+            where,
+            drawer_candidate_limit,
+        )
         dkwargs = {
             "query_texts": [query],
-            # Metadata filtering removes cold rows inside Chroma before ANN
-            # ranking; over-fetch only for later distance/closet ranking.
-            "n_results": _vector_candidate_limit(n_results, include_cold),
+            "n_results": drawer_limit,
             "include": ["documents", "metadatas", "distances"],
         }
-        if where:
-            dkwargs["where"] = where
+        if drawer_where:
+            dkwargs["where"] = drawer_where
         drawer_results = _query_drawers_with_filter_fallback(
             drawers_col,
             dkwargs,
@@ -1371,6 +1473,23 @@ def search_memories(
             source_kinds=kinds,
             include_cold=include_cold,
         )
+        if (
+            drawer_safe_limit is not None
+            and _hot_result_count(drawer_results) < drawer_candidate_limit
+        ):
+            dkwargs["n_results"] = drawer_safe_limit
+            drawer_results = _query_drawers_with_filter_fallback(
+                drawers_col,
+                dkwargs,
+                query,
+                n_results,
+                wing,
+                room,
+                source_file,
+                wings=wings,
+                source_kinds=kinds,
+                include_cold=include_cold,
+            )
     except Exception as e:
         return {"error": f"Search error: {e}"}
 
@@ -1378,25 +1497,49 @@ def search_memories(
     closet_boost_by_source: dict = {}  # source_file -> (rank, closet_dist, preview)
     try:
         closets_col = get_closets_collection(palace_path, create=False)
+        closet_candidate_limit = n_results * 2
+        closet_where, closet_limit, closet_safe_limit = _default_tier_query_plan(
+            closets_col,
+            where,
+            closet_candidate_limit,
+        )
         ckwargs = {
             "query_texts": [query],
-            "n_results": n_results * 2,
+            "n_results": closet_limit,
             "include": ["documents", "metadatas", "distances"],
         }
-        if where:
-            ckwargs["where"] = where
+        if closet_where:
+            ckwargs["where"] = closet_where
         closet_results = closets_col.query(**ckwargs)
-        for rank, (cdoc, cmeta, cdist) in enumerate(
-            zip(
-                _first_or_empty(closet_results, "documents"),
-                _first_or_empty(closet_results, "metadatas"),
-                _first_or_empty(closet_results, "distances"),
-            )
+        if (
+            closet_safe_limit is not None
+            and _hot_result_count(closet_results) < closet_candidate_limit
         ):
+            ckwargs["n_results"] = closet_safe_limit
+            closet_results = closets_col.query(**ckwargs)
+        closet_rows = zip(
+            _first_or_empty(closet_results, "documents"),
+            _first_or_empty(closet_results, "metadatas"),
+            _first_or_empty(closet_results, "distances"),
+        )
+        visible_rank = 0
+        for cdoc, cmeta, cdist in closet_rows:
             cmeta = cmeta or {}
+            if not _metadata_visible(
+                cmeta,
+                scoped_wings=scoped_wings,
+                room=room,
+                source_file=source_file,
+                source_kinds=kinds,
+                include_cold=include_cold,
+            ):
+                continue
+            if visible_rank >= n_results * 2:
+                break
             source = cmeta.get("source_file", "")
             if source and source not in closet_boost_by_source:
-                closet_boost_by_source[source] = (rank, cdist, cdoc[:200])
+                closet_boost_by_source[source] = (visible_rank, cdist, cdoc[:200])
+            visible_rank += 1
     except Exception:
         # No closets yet — hybrid degrades to pure drawer search.
         logger.debug("Closet collection unavailable; using drawer-only search", exc_info=True)
@@ -1408,13 +1551,17 @@ def search_memories(
     CLOSET_DISTANCE_CAP = 1.5  # cosine dist > 1.5 = too weak to use as signal
 
     scored: list = []
-    for doc, meta, dist in _visible_query_rows(
+    visible_drawers = _visible_query_rows(
         drawer_results,
         scoped_wings=scoped_wings,
         room=room,
         source_file=source_file,
         source_kinds=kinds,
         include_cold=include_cold,
+    )
+    for doc, meta, dist in islice(
+        visible_drawers,
+        _vector_candidate_limit(n_results, include_cold),
     ):
         doc = doc or ""
         # Filter on raw distance before rounding to avoid precision loss.
@@ -1475,58 +1622,29 @@ def search_memories(
     # neighbors instead of just the drawer vector search landed on. The
     # closet said "this source is relevant"; vector may have picked the
     # wrong chunk within it; grep picks the right one.
-    MAX_HYDRATION_CHARS = 10000
+    hydration_cache: dict[tuple[str, str | None], tuple[str, int, int] | None] = {}
     for h in hits:
         if h["matched_via"] == "drawer":
             continue
         full_source = h.get("_source_file_full") or ""
         if not full_source:
             continue
-        # Narrow by ``parent_drawer_id`` when present so unrelated
-        # chunked drawers sharing ``source_file`` do not stitch (#1580).
-        try:
-            source_drawers = drawers_col.get(
-                where=_scoped_source_filter(full_source, h.get("_parent_drawer_id")),
-                include=["documents", "metadatas"],
+        parent_drawer_id = h.get("_parent_drawer_id")
+        cache_key = (full_source, parent_drawer_id)
+        if cache_key not in hydration_cache:
+            # Narrow by ``parent_drawer_id`` when present so unrelated
+            # chunked drawers sharing ``source_file`` do not stitch (#1580).
+            hydration_cache[cache_key] = _hydrate_source_for_query(
+                drawers_col,
+                full_source,
+                parent_drawer_id,
+                query,
             )
-        except Exception:
-            logger.debug("Neighbor fetch failed for %s", full_source, exc_info=True)
+
+        hydrated = hydration_cache[cache_key]
+        if hydrated is None:
             continue
-        docs = source_drawers.documents
-        metas_ = source_drawers.metadatas
-        if len(docs) <= 1:
-            continue
-
-        # Sort by chunk_index so best_idx + neighbors are positional.
-        indexed = []
-        for idx, (d, m) in enumerate(zip(docs, metas_)):
-            ci = m.get("chunk_index", idx) if isinstance(m, dict) else idx
-            if not isinstance(ci, int):
-                ci = idx
-            indexed.append((ci, d))
-        indexed.sort(key=lambda p: p[0])
-        ordered_docs = [d for _, d in indexed]
-
-        query_terms = set(_tokenize(query))
-        best_idx, best_score = 0, -1
-        for idx, d in enumerate(ordered_docs):
-            d_lower = d.lower()
-            s = sum(1 for t in query_terms if t in d_lower)
-            if s > best_score:
-                best_score, best_idx = s, idx
-
-        start = max(0, best_idx - 1)
-        end = min(len(ordered_docs), best_idx + 2)
-        expanded = "\n\n".join(ordered_docs[start:end])
-        if len(expanded) > MAX_HYDRATION_CHARS:
-            expanded = (
-                expanded[:MAX_HYDRATION_CHARS]
-                + f"\n\n[...truncated. {len(ordered_docs)} total drawers. "
-                "Use mempalace_get_drawer for full content.]"
-            )
-        h["text"] = expanded
-        h["drawer_index"] = best_idx
-        h["total_drawers"] = len(ordered_docs)
+        h["text"], h["drawer_index"], h["total_drawers"] = hydrated
 
     # Candidate strategy hook: optionally widen the rerank pool's *source*
     # before ranking. Default ("vector") is a no-op; "union" merges top-K

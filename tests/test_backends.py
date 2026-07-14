@@ -313,6 +313,43 @@ def test_chroma_lexical_search_ids_roundtrip_through_get(tmp_path):
     backend.close()
 
 
+def test_chroma_get_source_chunks_scopes_parent_group(tmp_path):
+    backend = ChromaBackend()
+    palace = tmp_path / "palace"
+    col = backend.get_collection(str(palace), "mempalace_drawers", create=True)
+    col.add(
+        ids=["a-0", "a-1", "b-0"],
+        documents=["group a zero", "group a one", "group b zero"],
+        metadatas=[
+            {
+                "source_file": "/repo/shared.log",
+                "parent_drawer_id": "group-a",
+                "chunk_index": 0,
+            },
+            {
+                "source_file": "/repo/shared.log",
+                "parent_drawer_id": "group-a",
+                "chunk_index": 1,
+            },
+            {
+                "source_file": "/repo/shared.log",
+                "parent_drawer_id": "group-b",
+                "chunk_index": 0,
+            },
+        ],
+    )
+
+    chunks = col.get_source_chunks(
+        "/repo/shared.log",
+        parent_drawer_id="group-a",
+    )
+
+    assert chunks.ids == ["a-0", "a-1"]
+    assert chunks.documents == ["group a zero", "group a one"]
+    assert [metadata["chunk_index"] for metadata in chunks.metadatas] == [0, 1]
+    backend.close()
+
+
 def test_query_rejects_missing_input():
     fake = _FakeCollection()
     collection = ChromaCollection(fake)
@@ -453,6 +490,34 @@ def test_chroma_cache_picks_up_db_created_after_first_open(tmp_path):
     refreshed = backend._client(str(palace_path))
     assert refreshed is not sentinel
     assert backend._freshness[str(palace_path)] != (0, 0.0)
+
+
+def test_get_collection_does_not_invalidate_cache_after_its_own_thread_pin(tmp_path, monkeypatch):
+    """The hnsw thread-pin modify must not look like an external DB write."""
+    palace_path = str(tmp_path / "palace")
+    from mempalace.backends import chroma as chroma_module
+
+    real_pin = chroma_module._pin_hnsw_threads
+    pin_calls = []
+
+    def pin_once(collection):
+        pin_calls.append(collection.name)
+        return real_pin(collection)
+
+    monkeypatch.setattr(chroma_module, "_pin_hnsw_threads", pin_once)
+    backend = ChromaBackend()
+    try:
+        backend.get_collection(palace_path, "mempalace_drawers", create=True)
+        first_client = backend._clients[palace_path]
+        assert backend._freshness[palace_path] == backend._db_stat(palace_path)
+
+        backend.get_collection(palace_path, "mempalace_drawers", create=False)
+
+        assert backend._clients[palace_path] is first_client
+        assert backend._freshness[palace_path] == backend._db_stat(palace_path)
+        assert pin_calls == ["mempalace_drawers"]
+    finally:
+        backend.close()
 
 
 def test_base_collection_update_default_rejects_mismatched_lengths():
@@ -1426,7 +1491,32 @@ def test_pin_hnsw_threads_swallows_all_errors():
         def modify(self, *args, **kwargs):
             raise RuntimeError("boom")
 
-    _pin_hnsw_threads(_ExplodingCollection())  # must not raise
+    assert _pin_hnsw_threads(_ExplodingCollection()) is False
+
+
+def test_get_collection_retries_thread_pin_after_transient_failure(tmp_path, monkeypatch):
+    palace_path = str(tmp_path / "palace")
+    from mempalace.backends import chroma as chroma_module
+
+    outcomes = iter([False, True])
+    pin_calls = []
+
+    def flaky_pin(collection):
+        pin_calls.append(collection.name)
+        return next(outcomes)
+
+    monkeypatch.setattr(chroma_module, "_pin_hnsw_threads", flaky_pin)
+    backend = ChromaBackend()
+    try:
+        backend.get_collection(palace_path, "mempalace_drawers", create=True)
+        assert (palace_path, "mempalace_drawers") not in backend._pinned_collections
+
+        backend.get_collection(palace_path, "mempalace_drawers", create=False)
+
+        assert pin_calls == ["mempalace_drawers", "mempalace_drawers"]
+        assert (palace_path, "mempalace_drawers") in backend._pinned_collections
+    finally:
+        backend.close()
 
 
 def test_get_collection_applies_retrofit_on_existing_palace(tmp_path):

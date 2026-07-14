@@ -179,6 +179,20 @@ class EmbeddingCollection(BaseCollection):
         # ``lexical_search`` above.
         return self._inner.get_all_metadata(where=where)
 
+    def get_source_chunks(
+        self,
+        source_file: str,
+        *,
+        parent_drawer_id: Optional[str] = None,
+    ):
+        # Preserve backend-specific indexed source hydration. Without this
+        # explicit forwarder, BaseCollection's concrete fallback shadows the
+        # wrapped collection through normal MRO resolution.
+        return self._inner.get_source_chunks(
+            source_file,
+            parent_drawer_id=parent_drawer_id,
+        )
+
     def update(self, *, ids, documents=None, metadatas=None, embeddings=None):
         ids = _as_list(ids)
         if documents is not None:

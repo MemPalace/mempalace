@@ -403,6 +403,23 @@ class BaseCollection(ABC):
         include: Optional[list[str]] = None,
     ) -> GetResult: ...
 
+    def get_source_chunks(
+        self,
+        source_file: str,
+        *,
+        parent_drawer_id: Optional[str] = None,
+    ) -> GetResult:
+        """Fetch all chunks for one logical source group.
+
+        Backends may override this for an indexed source lookup.  The default
+        preserves behavior through the ordinary metadata-filtered ``get``.
+        """
+        clauses = [{"source_file": source_file}]
+        if parent_drawer_id:
+            clauses.append({"parent_drawer_id": parent_drawer_id})
+        where = clauses[0] if len(clauses) == 1 else {"$and": clauses}
+        return self.get(where=where, include=["documents", "metadatas"])
+
     @abstractmethod
     def delete(
         self,

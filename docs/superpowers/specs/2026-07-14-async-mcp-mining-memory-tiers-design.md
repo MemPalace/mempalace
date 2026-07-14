@@ -1,6 +1,6 @@
 # Async MCP Mining and Tiered Project Memory Design
 
-- **Status:** Runtime, source metadata, scoped retrieval, sales policy, and migration dry run implemented; copy/apply/activation pending
+- **Status:** Runtime, source metadata, scoped retrieval, sales policy, copied migration, and synthetic activation/rollback drill implemented; live activation pending explicit authorization
 - **Date:** 2026-07-14
 - **Target:** MemPalace MCP/daemon runtime plus the sales-enablement `se` rollout
 - **Baseline:** MemPalace `develop` at the start of this design
@@ -16,8 +16,18 @@
 > source metadata, retrieval supports wing/source-kind/hot-cold scopes, and the
 > canonical sales repository has an `se-code` mining policy. A SQLite-only,
 > plan-only command produced an owner-only manifest from the active palace
-> without changing its SHA-256. Applying the reviewed manifest to a copied
-> palace and activation remain separate gated work.
+> without changing its SHA-256. The reviewed manifest was applied to a separate
+> copied palace, which passed integrity, count, content-retention, retrieval,
+> and vector-readiness checks. Atomic activation/rollback and crash recovery
+> were exercised with synthetic palaces. The user's live palace remains
+> unchanged; live activation is a separate explicitly authorized operation.
+> Reviewed manifests are versioned. Version 2 adds a semantic SQLite snapshot
+> over every schema object and durable row. It normalizes Chroma's JSON
+> serialization fields and omits only append-only `acquire_write` lock-history
+> rows that are created by collection reopen. The lock table schema remains
+> hashed. This permits harmless Chroma bookkeeping while still rejecting real
+> schema or durable-row changes. Version-1 manifests retain strict
+> physical-snapshot behavior.
 
 ## Summary
 
@@ -333,7 +343,7 @@ Cleanup is a separate, one-time, project-specific operation. It is not hidden in
 
 1. Record palace, daemon, backend, and MemPalace versions.
 2. Produce a read-only JSON/Markdown inventory by wing, source root, source kind, age, and exact-content hash.
-3. Stop/suspend writers briefly, checkpoint SQLite WAL, and copy the full palace, daemon queue, hallways/tunnels, and configuration to an owner-only rollback directory.
+3. Stop/suspend writers briefly, checkpoint SQLite WAL, and copy the full palace, daemon queue, hallways/tunnels, and configuration to an owner-only rollback directory. Capture both the physical SQLite+WAL snapshot and the version-2 semantic SQLite snapshot.
 4. Verify SQLite integrity and checksums on the rollback copy before continuing.
 
 ### Phase 2: build a migrated copy
@@ -347,10 +357,14 @@ Apply the migration to a second full palace copy, leaving the active palace and 
 5. Delete a worktree drawer only when canonical source identity, full-source hash where available, chunk index, and exact verbatim content hash prove equivalence.
 6. Preserve non-equivalent worktree content in `se-sessions` as `worktree-artifact`, cold by default, with its original source path and revision.
 7. Collapse repeated transcript imports only when session/import identity and exact content hash match. Identical words from unrelated legitimate sources are not deduplicated.
-8. Leave any unclassified records untouched until each is assigned or explicitly approved for removal. The current dry run found none after all known roots were supplied.
+8. Leave any unclassified records untouched until each is assigned or explicitly approved for removal. The reviewed inventory retained 33 provenance-bearing records outside the known roots as unclassified.
 9. Rebuild derived closets, hallways, tunnels, and vector indexes in the migrated copy.
 
 The migration manifest records every old drawer ID, action, destination, reason, and checksum. It is resumable and idempotent.
+Completed rollback and staging copies are published with an OS-native atomic
+no-replace rename; a destination that appears after preflight is never
+overwritten, including when it is an empty directory. Unsupported platforms or
+filesystems fail closed instead of falling back to clobbering rename semantics.
 
 ### Phase 3: verify and activate
 
@@ -366,7 +380,17 @@ Before activation:
 - default searches exclude cold sessions;
 - explicit historical searches include them.
 
-Pause writers, confirm the active source palace did not change since the migration manifest snapshot, and atomically activate the migrated copy. Keep the previous palace for a defined rollback window. Rollback switches the active path back; old data is not deleted during activation.
+Pause writers, confirm the active source palace still matches the reviewed
+manifest, and atomically activate the migrated copy. Exact physical equality is
+accepted immediately. If only the physical checksum changed, version-2
+manifests require an exact semantic snapshot match across every SQLite schema
+object and durable row. Only JSON key-order/whitespace differences in Chroma's
+configuration fields and append-only `acquire_write` lock-history rows are
+normalized; the lock table schema is still hashed. Capture the current physical
+snapshot immediately before the swap so any concurrent durable change still
+aborts.
+Keep the previous palace for a defined rollback window. Rollback switches the
+active path back; old data is not deleted during activation.
 
 ### Expected reduction
 
@@ -409,6 +433,21 @@ Measured on a warm local daemon and a palace comparable to the current 13.6k-dra
 - No MCP request remains open for repository mining duration.
 - Progress writes are throttled to at most one per second; heartbeat gap is at most five seconds while healthy.
 - Hybrid-search latency after maintenance does not regress by more than 10% from the pre-change warm baseline.
+
+### Measured evidence (2026-07-14)
+
+The enforced synthetic benchmark used 1,000 drawers and the real loopback
+daemon with an actively blocked maintenance job. It measured mine submission
+p95 at 42.4 ms, job status p95 at 7.3 ms, job listing p95 at 19.6 ms,
+maintenance BM25 p95 at 14.8 ms, and post-maintenance hybrid median-round-p95
+improvement at 5.36%.
+
+The copied-palace benchmark compared the 13,653-drawer rollback baseline with
+the 10,138-drawer migrated copy over 240 queries per route. Baseline hybrid
+median round p95 was 55.6 ms and migrated hybrid median round p95 was 52.4 ms,
+a 0.9419 ratio (-5.81%). Migrated BM25 median round p95 was 23.6 ms. These
+results meet every performance budget above. Detailed evidence is recorded in
+`docs/superpowers/plans/2026-07-14-se-memory-migration-apply.md`.
 
 ## Test strategy
 
@@ -464,7 +503,7 @@ The sales-enablement rollout additionally validates the migration manifest/count
 3. Enable it in the local sales-enablement MemPalace service and soak async mine, queued checkpoints, and maintenance search fallback.
 4. Add source metadata/filtering and the repository `mempalace.yaml`.
 5. Run cleanup inventory and migration dry-run; review the manifest and exact projected counts.
-6. Create/verify rollback copy, build migrated copy, run acceptance searches, and activate.
+6. Create/verify rollback copy, build migrated copy, and run acceptance searches. Activate only after separate explicit authorization.
 7. Retain the old palace through the rollback window and monitor job/search errors.
 8. After upstream compatibility feedback, make daemon-backed MCP writes the default in an appropriate release and retain an explicit legacy escape hatch for one deprecation cycle.
 
@@ -491,4 +530,4 @@ The work is complete only when:
 7. `se`, `se-code`, and `se-sessions` follow the approved retrieval policy.
 8. No unique verbatim record is lost in cleanup.
 9. Every removed record is backed by exact duplicate evidence in the migration manifest.
-10. The migrated palace passes integrity, count, duplicate, representative retrieval, activation, and rollback checks.
+10. The migrated palace passes integrity, count, duplicate, and representative retrieval checks; atomic activation, rollback, and crash recovery pass against synthetic palaces. Live activation is an operational rollout step requiring separate explicit authorization.

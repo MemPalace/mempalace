@@ -1007,7 +1007,17 @@ def cmd_migrate_wings(args):
 
 
 def cmd_reorganize(args):
-    """Build an auditable reorganization manifest without mutating the palace."""
+    """Plan, build, activate, or roll back a reviewed palace migration."""
+    action = getattr(args, "reorganize_action", None)
+    if action == "prepare":
+        return _cmd_reorganize_prepare(args)
+    if action == "apply":
+        return _cmd_reorganize_apply(args)
+    if action == "activate":
+        return _cmd_reorganize_activate(args)
+    if action == "rollback":
+        return _cmd_reorganize_rollback(args)
+
     import sqlite3
     from collections import Counter
 
@@ -1126,6 +1136,108 @@ def cmd_reorganize(args):
     print(f"  Manifest: {os.path.abspath(os.path.expanduser(args.manifest))}")
     print(f"  SQLite SHA-256: {before['sha256']} (unchanged)")
     print("  Dry run only — no drawers were changed or deleted.")
+
+
+def _reorganize_palace_path(args) -> str:
+    palace_path = (
+        getattr(args, "reorganize_palace", None)
+        or getattr(args, "palace", None)
+        or MempalaceConfig().palace_path
+    )
+    return os.path.abspath(os.path.expanduser(palace_path))
+
+
+def _migration_scope_kwargs(args) -> dict:
+    return {
+        "source_palace": _reorganize_palace_path(args),
+        "reviewed_manifest": args.manifest,
+        "rollback_root": args.rollback_root,
+        "migrated_root": args.migrated_root,
+        "canonical_root": args.canonical_root,
+        "worktree_roots": args.worktree_root,
+        "session_roots": args.session_root,
+        "hot_days": args.hot_days,
+    }
+
+
+def _cmd_reorganize_prepare(args):
+    from .migration_bundle import prepare_migration_copies
+
+    try:
+        report = prepare_migration_copies(**_migration_scope_kwargs(args))
+    except Exception as exc:  # noqa: BLE001 - user-facing migration boundary
+        print(f"  Could not prepare migration copies: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+    print("\n  Rollback copy ready")
+    print(f"  Inventory: {report['inventory_total']:,}")
+    print(f"  Verified duplicate candidates: {report['duplicate_candidates']:,}")
+    print(f"  Rollback: {os.path.abspath(os.path.expanduser(args.rollback_root))}")
+    print(f"  Staging: {os.path.abspath(os.path.expanduser(args.migrated_root))}")
+
+
+def _cmd_reorganize_apply(args):
+    from .migration_bundle import apply_reviewed_migration
+
+    try:
+        report = apply_reviewed_migration(
+            **_migration_scope_kwargs(args),
+            batch_size=args.batch_size,
+        )
+    except Exception as exc:  # noqa: BLE001 - user-facing migration boundary
+        print(f"  Could not apply reviewed migration: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+    print("\n  Migrated copy verified")
+    print(f"  Before: {report['records_before']:,}")
+    print(f"  After: {report['records_expected_after']:,}")
+    print(f"  Removed with exact evidence: {report['records_deleted_as_verified_duplicates']:,}")
+    print(f"  Report: {os.path.abspath(os.path.expanduser(args.migrated_root))}/apply-report.json")
+
+
+def _require_explicit_activation(args, operation: str) -> None:
+    if getattr(args, "yes", False):
+        return
+    print(
+        f"  Refusing to {operation} without --yes; stop the daemon and review the paths first.",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+
+
+def _cmd_reorganize_activate(args):
+    from .migration_bundle import activate_migrated_palace
+
+    _require_explicit_activation(args, "activate the migrated palace")
+    try:
+        report = activate_migrated_palace(
+            active_palace=_reorganize_palace_path(args),
+            reviewed_manifest=args.manifest,
+            migrated_root=args.migrated_root,
+            previous_root=args.previous_root,
+        )
+    except Exception as exc:  # noqa: BLE001 - user-facing migration boundary
+        print(f"  Could not activate migration: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+    print("\n  Migration activated")
+    print(f"  Active palace: {report['active_palace']}")
+    print(f"  Previous palace retained at: {report['previous_root']}")
+
+
+def _cmd_reorganize_rollback(args):
+    from .migration_bundle import rollback_activated_palace
+
+    _require_explicit_activation(args, "roll back the migrated palace")
+    try:
+        report = rollback_activated_palace(
+            active_palace=_reorganize_palace_path(args),
+            migrated_root=args.migrated_root,
+            previous_root=args.previous_root,
+        )
+    except Exception as exc:  # noqa: BLE001 - user-facing migration boundary
+        print(f"  Could not roll back migration: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+    print("\n  Migration rolled back")
+    print(f"  Active palace: {report['active_palace']}")
+    print(f"  Migrated palace retained at: {report['migrated_root']}/palace")
 
 
 def cmd_hallways(args):
@@ -2343,6 +2455,127 @@ def main():
         help="Owner-only JSON manifest output path",
     )
 
+    def add_reviewed_migration_scope(parser, *, include_batch_size=False):
+        parser.add_argument(
+            "--palace",
+            dest="reorganize_palace",
+            default=None,
+            help="Active palace path (default: global --palace or configured palace)",
+        )
+        parser.add_argument(
+            "--canonical-root",
+            required=True,
+            help="Primary repository checkout used by the reviewed manifest",
+        )
+        parser.add_argument(
+            "--worktree-root",
+            action="append",
+            default=[],
+            help="Reviewed linked-worktree root; repeat for multiple roots",
+        )
+        parser.add_argument(
+            "--session-root",
+            action="append",
+            default=[],
+            help="Reviewed session root; repeat for multiple roots",
+        )
+        parser.add_argument(
+            "--hot-days",
+            type=int,
+            default=90,
+            help="Reviewed session hot-window in days (default: 90)",
+        )
+        parser.add_argument(
+            "--manifest",
+            required=True,
+            help="Previously reviewed owner-only manifest",
+        )
+        parser.add_argument(
+            "--rollback-root",
+            required=True,
+            help="Verified rollback bundle directory",
+        )
+        parser.add_argument(
+            "--migrated-root",
+            required=True,
+            help="Migrated staging bundle directory",
+        )
+        if include_batch_size:
+            parser.add_argument(
+                "--batch-size",
+                type=int,
+                default=250,
+                help="Bounded Chroma update/delete batch size (default: 250)",
+            )
+
+    p_reorganize_prepare = reorganize_sub.add_parser(
+        "prepare",
+        help="Create verified rollback and staging copies without changing the active palace",
+    )
+    add_reviewed_migration_scope(p_reorganize_prepare)
+    p_reorganize_apply = reorganize_sub.add_parser(
+        "apply",
+        help="Apply the exact reviewed actions to the staging copy and verify it",
+    )
+    add_reviewed_migration_scope(p_reorganize_apply, include_batch_size=True)
+
+    p_reorganize_activate = reorganize_sub.add_parser(
+        "activate",
+        help="Explicitly swap a completed staging palace into the stable active path",
+    )
+    p_reorganize_activate.add_argument(
+        "--palace",
+        dest="reorganize_palace",
+        default=None,
+        help="Stable active palace path",
+    )
+    p_reorganize_activate.add_argument(
+        "--manifest",
+        required=True,
+        help="Previously reviewed owner-only manifest",
+    )
+    p_reorganize_activate.add_argument(
+        "--migrated-root",
+        required=True,
+        help="Completed migrated staging bundle",
+    )
+    p_reorganize_activate.add_argument(
+        "--previous-root",
+        required=True,
+        help="New private slot that will retain the previous active palace",
+    )
+    p_reorganize_activate.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm the explicit activation swap",
+    )
+
+    p_reorganize_rollback = reorganize_sub.add_parser(
+        "rollback",
+        help="Reverse a reviewed activation without deleting either palace",
+    )
+    p_reorganize_rollback.add_argument(
+        "--palace",
+        dest="reorganize_palace",
+        default=None,
+        help="Stable active palace path",
+    )
+    p_reorganize_rollback.add_argument(
+        "--migrated-root",
+        required=True,
+        help="Migrated bundle that will receive the deactivated palace",
+    )
+    p_reorganize_rollback.add_argument(
+        "--previous-root",
+        required=True,
+        help="Retained previous-palace slot from activation",
+    )
+    p_reorganize_rollback.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm the explicit rollback swap",
+    )
+
     p_hallways = sub.add_parser("hallways", help="List entity hallways (associative graph)")
     p_hallways.add_argument("--wing", default=None, help="Filter to one wing")
     p_hallways.add_argument("--limit", type=int, default=50, help="Max hallways to show")
@@ -2417,7 +2650,7 @@ def main():
         return
 
     if args.command == "reorganize":
-        if getattr(args, "reorganize_action", None) != "plan":
+        if not getattr(args, "reorganize_action", None):
             p_reorganize.print_help()
             return
         cmd_reorganize(args)

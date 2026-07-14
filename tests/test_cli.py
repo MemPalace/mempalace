@@ -861,6 +861,135 @@ def test_reorganize_has_no_apply_option():
     assert exc_info.value.code == 2
 
 
+def test_reorganize_prepare_and_apply_dispatch_reviewed_bundle(tmp_path, capsys):
+    common = [
+        "--palace",
+        str(tmp_path / "palace"),
+        "--canonical-root",
+        str(tmp_path / "repo"),
+        "--worktree-root",
+        str(tmp_path / "worktree"),
+        "--session-root",
+        str(tmp_path / "sessions"),
+        "--manifest",
+        str(tmp_path / "manifest.json"),
+        "--rollback-root",
+        str(tmp_path / "rollback"),
+        "--migrated-root",
+        str(tmp_path / "migrated"),
+    ]
+    with (
+        patch(
+            "mempalace.migration_bundle.prepare_migration_copies",
+            return_value={"inventory_total": 10, "duplicate_candidates": 2},
+        ) as prepare,
+        patch("sys.argv", ["mempalace", "reorganize", "prepare", *common]),
+    ):
+        main()
+
+    prepare.assert_called_once()
+    assert prepare.call_args.kwargs["hot_days"] == 90
+    assert "Rollback copy ready" in capsys.readouterr().out
+
+    with (
+        patch(
+            "mempalace.migration_bundle.apply_reviewed_migration",
+            return_value={
+                "status": "complete",
+                "records_before": 10,
+                "records_expected_after": 8,
+                "records_deleted_as_verified_duplicates": 2,
+            },
+        ) as apply_migration,
+        patch(
+            "sys.argv",
+            ["mempalace", "reorganize", "apply", *common, "--batch-size", "25"],
+        ),
+    ):
+        main()
+
+    apply_migration.assert_called_once()
+    assert apply_migration.call_args.kwargs["batch_size"] == 25
+    assert "Migrated copy verified" in capsys.readouterr().out
+
+
+def test_reorganize_activation_requires_explicit_yes(tmp_path):
+    argv = [
+        "mempalace",
+        "reorganize",
+        "activate",
+        "--palace",
+        str(tmp_path / "palace"),
+        "--manifest",
+        str(tmp_path / "manifest.json"),
+        "--migrated-root",
+        str(tmp_path / "migrated"),
+        "--previous-root",
+        str(tmp_path / "previous"),
+    ]
+    with (
+        patch("sys.argv", argv),
+        patch("mempalace.migration_bundle.activate_migrated_palace") as activate,
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        main()
+
+    assert exc_info.value.code == 2
+    activate.assert_not_called()
+
+
+def test_reorganize_activate_and_rollback_dispatch_with_yes(tmp_path, capsys):
+    common = [
+        "--palace",
+        str(tmp_path / "palace"),
+        "--migrated-root",
+        str(tmp_path / "migrated"),
+        "--previous-root",
+        str(tmp_path / "previous"),
+        "--yes",
+    ]
+    with (
+        patch(
+            "mempalace.migration_bundle.activate_migrated_palace",
+            return_value={
+                "status": "active",
+                "active_palace": str(tmp_path / "palace"),
+                "previous_root": str(tmp_path / "previous"),
+            },
+        ) as activate,
+        patch(
+            "sys.argv",
+            [
+                "mempalace",
+                "reorganize",
+                "activate",
+                *common[:-1],
+                "--manifest",
+                str(tmp_path / "manifest.json"),
+                "--yes",
+            ],
+        ),
+    ):
+        main()
+    activate.assert_called_once()
+    assert "Migration activated" in capsys.readouterr().out
+
+    with (
+        patch(
+            "mempalace.migration_bundle.rollback_activated_palace",
+            return_value={
+                "status": "rolled_back",
+                "active_palace": str(tmp_path / "palace"),
+                "migrated_root": str(tmp_path / "migrated"),
+            },
+        ) as rollback,
+        patch("sys.argv", ["mempalace", "reorganize", "rollback", *common]),
+    ):
+        main()
+    rollback.assert_called_once()
+    assert "Migration rolled back" in capsys.readouterr().out
+
+
 def test_main_no_args_prints_help(capsys):
     with patch("sys.argv", ["mempalace"]):
         main()

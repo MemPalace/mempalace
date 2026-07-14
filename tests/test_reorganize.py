@@ -8,14 +8,20 @@ import sqlite3
 import stat
 from datetime import date
 
+import pytest
+
 from mempalace.reorganize import (
     InventoryRecord,
+    build_manifest_payload,
     collect_duplicate_evidence,
     exact_hash,
     inventory_palace,
+    palace_semantic_snapshot,
     palace_snapshot,
     plan_actions,
     prove_worktree_duplicate,
+    read_manifest,
+    validate_reviewed_manifest,
     write_manifest,
 )
 
@@ -403,6 +409,7 @@ def test_manifest_is_owner_only_deterministic_and_excludes_content(tmp_path):
     actions = plan_actions(records)
     evidence = collect_duplicate_evidence(records, actions)
     path = tmp_path / "manifest.json"
+    semantic_snapshot = {"table_count": 1, "row_count": 2, "sha256": "semantic-hash"}
 
     write_manifest(
         path,
@@ -411,6 +418,7 @@ def test_manifest_is_owner_only_deterministic_and_excludes_content(tmp_path):
         evidence,
         palace_path=tmp_path / "palace",
         sqlite_snapshot={"size": 10, "mtime_ns": 20, "sha256": "db-hash"},
+        source_semantic_snapshot=semantic_snapshot,
     )
     first = path.read_bytes()
     write_manifest(
@@ -420,16 +428,87 @@ def test_manifest_is_owner_only_deterministic_and_excludes_content(tmp_path):
         list(reversed(evidence)),
         palace_path=tmp_path / "palace",
         sqlite_snapshot={"size": 10, "mtime_ns": 20, "sha256": "db-hash"},
+        source_semantic_snapshot=semantic_snapshot,
     )
 
     assert path.read_bytes() == first
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert b"SECRET DRAWER TEXT" not in first
     payload = json.loads(first)
-    assert payload["version"] == 1
+    assert payload["version"] == 2
     assert payload["counts"]["inventory_total"] == 2
     assert payload["counts"]["verified_duplicate_candidates"] == 1
     assert payload["sqlite_snapshot"]["sha256"] == "db-hash"
+    assert payload["source_semantic_snapshot"] == semantic_snapshot
+
+
+def test_reviewed_manifest_requires_exact_current_plan(tmp_path):
+    records = [
+        _record("canonical", "canonical", content="A", relative_identity="src/a.ts"),
+        _record("worktree", "worktree", content="A", relative_identity="src/a.ts"),
+    ]
+    actions = plan_actions(records)
+    evidence = collect_duplicate_evidence(records, actions)
+    snapshot = {"size": 10, "mtime_ns": 20, "sha256": "db-hash"}
+    semantic_snapshot = {"table_count": 1, "row_count": 2, "sha256": "semantic-hash"}
+    reviewed = build_manifest_payload(
+        records,
+        actions,
+        evidence,
+        palace_path=tmp_path / "palace",
+        sqlite_snapshot=snapshot,
+        source_semantic_snapshot=semantic_snapshot,
+    )
+
+    validate_reviewed_manifest(
+        reviewed,
+        records,
+        actions,
+        evidence,
+        palace_path=tmp_path / "palace",
+        sqlite_snapshot=snapshot,
+        source_semantic_snapshot=semantic_snapshot,
+    )
+
+    drifted = json.loads(json.dumps(reviewed))
+    drifted["actions"][0]["content_sha256"] = "changed"
+    with pytest.raises(ValueError, match="does not match"):
+        validate_reviewed_manifest(
+            drifted,
+            records,
+            actions,
+            evidence,
+            palace_path=tmp_path / "palace",
+            sqlite_snapshot=snapshot,
+            source_semantic_snapshot=semantic_snapshot,
+        )
+
+    legacy = json.loads(json.dumps(reviewed))
+    legacy["version"] = 1
+    legacy.pop("source_semantic_snapshot")
+    validate_reviewed_manifest(
+        legacy,
+        records,
+        actions,
+        evidence,
+        palace_path=tmp_path / "palace",
+        sqlite_snapshot=snapshot,
+        source_semantic_snapshot=semantic_snapshot,
+    )
+
+
+def test_read_manifest_rejects_symlink_and_wrong_version(tmp_path):
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text('{"version": 3}')
+    with pytest.raises(ValueError, match="unsupported"):
+        read_manifest(manifest)
+
+    target = tmp_path / "target.json"
+    target.write_text('{"version": 1}')
+    alias = tmp_path / "alias.json"
+    alias.symlink_to(target)
+    with pytest.raises(ValueError, match="symlink"):
+        read_manifest(alias)
 
 
 def test_inventory_preserves_dotfile_relative_identity(tmp_path):
@@ -511,3 +590,49 @@ def test_palace_snapshot_tracks_wal_changes(tmp_path):
     assert with_wal["wal_present"] is True
     assert with_wal["wal_sha256"] == hashlib.sha256(b"pending write").hexdigest()
     assert with_wal != without_wal
+
+
+def test_palace_semantic_snapshot_includes_indexes_triggers_and_views(tmp_path):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    with sqlite3.connect(palace / "chroma.sqlite3") as connection:
+        connection.execute("CREATE TABLE records(id INTEGER PRIMARY KEY, value TEXT)")
+        connection.execute("INSERT INTO records(value) VALUES ('stable')")
+    initial = palace_semantic_snapshot(palace)
+
+    with sqlite3.connect(palace / "chroma.sqlite3") as connection:
+        connection.execute("CREATE INDEX records_value_idx ON records(value)")
+    indexed = palace_semantic_snapshot(palace)
+    assert indexed != initial
+
+    with sqlite3.connect(palace / "chroma.sqlite3") as connection:
+        connection.execute("CREATE VIEW record_values AS SELECT value FROM records")
+    viewed = palace_semantic_snapshot(palace)
+    assert viewed != indexed
+
+    with sqlite3.connect(palace / "chroma.sqlite3") as connection:
+        connection.execute(
+            "CREATE TRIGGER records_noop AFTER UPDATE ON records BEGIN SELECT 1; END"
+        )
+    assert palace_semantic_snapshot(palace) != viewed
+
+
+def test_palace_semantic_snapshot_ignores_chroma_acquire_write_history_only(tmp_path):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    with sqlite3.connect(palace / "chroma.sqlite3") as connection:
+        connection.execute(
+            "CREATE TABLE acquire_write(id INTEGER PRIMARY KEY, lock_status INTEGER)"
+        )
+        connection.execute("CREATE TABLE records(id INTEGER PRIMARY KEY, value TEXT)")
+        connection.execute("INSERT INTO acquire_write(lock_status) VALUES (1)")
+        connection.execute("INSERT INTO records(value) VALUES ('stable')")
+    initial = palace_semantic_snapshot(palace)
+
+    with sqlite3.connect(palace / "chroma.sqlite3") as connection:
+        connection.execute("INSERT INTO acquire_write(lock_status) VALUES (1)")
+    assert palace_semantic_snapshot(palace) == initial
+
+    with sqlite3.connect(palace / "chroma.sqlite3") as connection:
+        connection.execute("INSERT INTO records(value) VALUES ('real change')")
+    assert palace_semantic_snapshot(palace) != initial

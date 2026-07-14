@@ -274,6 +274,240 @@ class TestSearchMemories:
         assert hidden["results"] == []
         assert [hit["source_file"] for hit in visible["results"]] == ["session.jsonl"]
 
+    def test_sparse_cold_default_overfetches_without_large_hnsw_filter(self):
+        mock_col = MagicMock()
+        mock_col.get.return_value = {"ids": ["cold-1", "cold-2"]}
+        mock_col.count.return_value = 100
+        mock_col.query.return_value = {
+            "ids": [["cold-1", "hot-1"]],
+            "documents": [["cold result", "hot result"]],
+            "metadatas": [
+                [
+                    {
+                        "wing": "se-sessions",
+                        "room": "history",
+                        "source_file": "cold.jsonl",
+                        "memory_tier": "cold",
+                    },
+                    {
+                        "wing": "se-code",
+                        "room": "workers",
+                        "source_file": "hot.ts",
+                        "memory_tier": "hot",
+                    },
+                ]
+            ],
+            "distances": [[0.1, 0.2]],
+        }
+
+        with (
+            patch("mempalace.searcher.get_collection", return_value=mock_col),
+            patch(
+                "mempalace.searcher.get_closets_collection",
+                side_effect=RuntimeError("no closets"),
+            ),
+        ):
+            result = search_memories("needle", "/fake/path", n_results=5)
+
+        query_kwargs = mock_col.query.call_args.kwargs
+        assert "where" not in query_kwargs
+        assert query_kwargs["n_results"] == 17
+        assert [hit["source_file"] for hit in result["results"]] == ["hot.ts"]
+
+    def test_sparse_cold_retries_for_complete_hot_drawer_candidate_pool(self):
+        mock_col = MagicMock()
+        mock_col.get.return_value = {"ids": [f"cold-{index}" for index in range(20)]}
+        mock_col.count.return_value = 100
+        first_metadatas = [
+            {
+                "wing": "se-sessions",
+                "room": "history",
+                "source_file": f"cold-{index}.jsonl",
+                "memory_tier": "cold",
+            }
+            for index in range(20)
+        ] + [
+            {
+                "wing": "se-code",
+                "room": "workers",
+                "source_file": f"hot-{index}.ts",
+                "memory_tier": "hot",
+            }
+            for index in range(5)
+        ]
+        second_metadatas = [
+            {
+                "wing": "se-code",
+                "room": "workers",
+                "source_file": f"hot-{index}.ts",
+                "memory_tier": "hot",
+            }
+            for index in range(15)
+        ]
+        mock_col.query.side_effect = [
+            {
+                "ids": [[f"result-{index}" for index in range(25)]],
+                "documents": [[f"result {index}" for index in range(25)]],
+                "metadatas": [first_metadatas],
+                "distances": [[index / 100 for index in range(25)]],
+            },
+            {
+                "ids": [[f"hot-{index}" for index in range(15)]],
+                "documents": [[f"hot result {index}" for index in range(15)]],
+                "metadatas": [second_metadatas],
+                "distances": [[index / 100 for index in range(15)]],
+            },
+        ]
+
+        with (
+            patch("mempalace.searcher.get_collection", return_value=mock_col),
+            patch(
+                "mempalace.searcher.get_closets_collection",
+                side_effect=RuntimeError("no closets"),
+            ),
+        ):
+            result = search_memories("needle", "/fake/path", n_results=5)
+
+        assert mock_col.query.call_count == 2
+        assert mock_col.query.call_args_list[0].kwargs["n_results"] == 30
+        assert mock_col.query.call_args_list[1].kwargs["n_results"] == 35
+        assert len(result["results"]) == 5
+
+    def test_sparse_cold_retries_for_complete_hot_closet_candidate_pool(self):
+        drawers_col = MagicMock()
+        drawers_col.get.return_value = {"ids": []}
+        drawers_col.count.return_value = 20
+        drawers_col.query.return_value = {
+            "ids": [[f"drawer-{index}" for index in range(15)]],
+            "documents": [[f"drawer {index}" for index in range(15)]],
+            "metadatas": [
+                [
+                    {
+                        "wing": "se-code",
+                        "room": "workers",
+                        "source_file": f"hot-{index}.ts",
+                        "memory_tier": "hot",
+                    }
+                    for index in range(15)
+                ]
+            ],
+            "distances": [[index / 100 for index in range(15)]],
+        }
+
+        closets_col = MagicMock()
+        closets_col.get.return_value = {"ids": [f"cold-{index}" for index in range(20)]}
+        closets_col.count.return_value = 100
+        first_metadatas = [
+            {"source_file": f"cold-{index}.jsonl", "memory_tier": "cold"} for index in range(15)
+        ] + [{"source_file": f"hot-{index}.ts", "memory_tier": "hot"} for index in range(5)]
+        second_metadatas = [
+            {"source_file": f"hot-{index}.ts", "memory_tier": "hot"} for index in range(10)
+        ]
+        closets_col.query.side_effect = [
+            {
+                "ids": [[f"closet-{index}" for index in range(20)]],
+                "documents": [[f"closet {index}" for index in range(20)]],
+                "metadatas": [first_metadatas],
+                "distances": [[index / 100 for index in range(20)]],
+            },
+            {
+                "ids": [[f"hot-closet-{index}" for index in range(10)]],
+                "documents": [[f"hot closet {index}" for index in range(10)]],
+                "metadatas": [second_metadatas],
+                "distances": [[index / 100 for index in range(10)]],
+            },
+        ]
+
+        with (
+            patch("mempalace.searcher.get_collection", return_value=drawers_col),
+            patch("mempalace.searcher.get_closets_collection", return_value=closets_col),
+        ):
+            search_memories("needle", "/fake/path", n_results=5)
+
+        assert closets_col.query.call_count == 2
+        assert closets_col.query.call_args_list[0].kwargs["n_results"] == 20
+        assert closets_col.query.call_args_list[1].kwargs["n_results"] == 30
+
+    def test_dense_cold_default_keeps_hnsw_filter(self):
+        mock_col = MagicMock()
+        mock_col.get.return_value = {"ids": [f"cold-{index}" for index in range(257)]}
+        mock_col.query.return_value = {
+            "ids": [[]],
+            "documents": [[]],
+            "metadatas": [[]],
+            "distances": [[]],
+        }
+
+        with (
+            patch("mempalace.searcher.get_collection", return_value=mock_col),
+            patch(
+                "mempalace.searcher.get_closets_collection",
+                side_effect=RuntimeError("no closets"),
+            ),
+        ):
+            search_memories("needle", "/fake/path", n_results=5)
+
+        query_kwargs = mock_col.query.call_args.kwargs
+        assert query_kwargs["where"] == {"memory_tier": {"$ne": "cold"}}
+        assert query_kwargs["n_results"] == 15
+
+    def test_repeated_boosted_source_is_hydrated_once(self):
+        source = "/repo/large-session.jsonl"
+        drawers_col = MagicMock()
+        drawers_col.count.return_value = 5
+        drawers_col.query.return_value = {
+            "ids": [[f"drawer-{index}" for index in range(5)]],
+            "documents": [[f"matched chunk {index}" for index in range(5)]],
+            "metadatas": [
+                [
+                    {
+                        "wing": "se-sessions",
+                        "room": "history",
+                        "source_file": source,
+                        "chunk_index": index,
+                        "memory_tier": "hot",
+                    }
+                    for index in range(5)
+                ]
+            ],
+            "distances": [[0.1 + index / 100 for index in range(5)]],
+        }
+        source_drawers = MagicMock()
+        source_drawers.ids = [f"drawer-{index}" for index in range(5)]
+        source_drawers.documents = [f"source chunk {index}" for index in range(5)]
+        source_drawers.metadatas = [{"chunk_index": index} for index in range(5)]
+        drawers_col.get_source_chunks.return_value = source_drawers
+
+        def drawer_get(**kwargs):
+            if kwargs.get("where") == {"memory_tier": "cold"}:
+                return {"ids": []}
+            raise AssertionError("unexpected generic get")
+
+        drawers_col.get.side_effect = drawer_get
+
+        closets_col = MagicMock()
+        closets_col.count.return_value = 1
+        closets_col.get.return_value = {"ids": []}
+        closets_col.query.return_value = {
+            "ids": [["closet-1"]],
+            "documents": [["large session closet"]],
+            "metadatas": [[{"source_file": source, "memory_tier": "hot"}]],
+            "distances": [[0.2]],
+        }
+
+        with (
+            patch("mempalace.searcher.get_collection", return_value=drawers_col),
+            patch("mempalace.searcher.get_closets_collection", return_value=closets_col),
+        ):
+            result = search_memories("session", "/fake/path", n_results=5)
+
+        drawers_col.get_source_chunks.assert_called_once_with(
+            source,
+            parent_drawer_id=None,
+        )
+        assert len(result["results"]) == 5
+        assert all(hit["total_drawers"] == 5 for hit in result["results"])
+
     def test_n_results_limit(self, palace_path, seeded_collection):
         result = search_memories("code", palace_path, n_results=2)
         assert len(result["results"]) <= 2

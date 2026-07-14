@@ -22,6 +22,12 @@ from .config import sqlite_read_uri
 
 DRAWERS_COLLECTION = "mempalace_drawers"
 _PIN_KEYS = ("pinned", "memory_pinned", "is_pinned")
+_SEMANTIC_JSON_COLUMNS = {
+    ("collections", "config_json_str"),
+    ("collections", "schema_str"),
+    ("embeddings_queue_config", "config_json_str"),
+}
+_SEMANTIC_EPHEMERAL_ROW_TABLES = {"acquire_write"}
 
 
 @dataclass(frozen=True)
@@ -560,6 +566,116 @@ def palace_snapshot(palace_path: os.PathLike[str] | str) -> dict[str, Any]:
     return snapshot
 
 
+def _semantic_sqlite_value(table: str, column: str, value: Any) -> Any:
+    """Return a type-stable, JSON-serializable SQLite value."""
+    if isinstance(value, bytes):
+        return ["blob", value.hex()]
+    if isinstance(value, float):
+        return ["float", value.hex()]
+    if isinstance(value, str) and (table, column) in _SEMANTIC_JSON_COLUMNS:
+        try:
+            parsed = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            pass
+        else:
+            canonical = json.dumps(
+                parsed,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            return ["json", canonical]
+    if value is None:
+        return ["null", None]
+    return [type(value).__name__, value]
+
+
+def palace_semantic_snapshot(palace_path: os.PathLike[str] | str) -> dict[str, Any]:
+    """Hash SQLite schema and durable rows while normalizing Chroma bookkeeping.
+
+    Chroma may rewrite collection JSON with different whitespace or key order
+    when a collection is opened. That changes the physical database checksum
+    without changing its meaning. This snapshot remains stable across that
+    bookkeeping, but any schema, durable row, or non-equivalent JSON change
+    changes the digest. Chroma's append-only ``acquire_write`` lock history is
+    excluded because merely reopening a collection adds rows to it; its table
+    schema remains covered by the schema-object hash.
+    """
+    sqlite_path = _expanded_path(palace_path) / "chroma.sqlite3"
+    if not sqlite_path.is_file():
+        raise FileNotFoundError(f"Chroma SQLite database not found: {sqlite_path}")
+
+    digest = hashlib.sha256()
+    table_count = 0
+    schema_object_count = 0
+    row_count = 0
+    with sqlite3.connect(sqlite_read_uri(str(sqlite_path)), uri=True) as connection:
+        schema_objects = connection.execute(
+            """
+            SELECT type, name, tbl_name, sql
+            FROM sqlite_master
+            WHERE type IN ('table', 'index', 'trigger', 'view')
+              AND name NOT LIKE 'sqlite_%'
+            ORDER BY type, name
+            """
+        ).fetchall()
+        for object_type, object_name, table_name, schema_sql in schema_objects:
+            descriptor = json.dumps(
+                [
+                    "schema",
+                    str(object_type),
+                    str(object_name),
+                    str(table_name),
+                    str(schema_sql or ""),
+                ],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8", errors="surrogatepass")
+            digest.update(len(descriptor).to_bytes(8, "big"))
+            digest.update(descriptor)
+            schema_object_count += 1
+
+        tables = [item for item in schema_objects if item[0] == "table"]
+        for _object_type, table_name, _owning_table, _schema_sql in tables:
+            table = str(table_name)
+            quoted = table.replace('"', '""')
+            cursor = connection.execute(f'SELECT * FROM "{quoted}"')
+            columns = [str(item[0]) for item in (cursor.description or [])]
+            descriptor = json.dumps(
+                ["rows", table, columns],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8", errors="surrogatepass")
+            digest.update(len(descriptor).to_bytes(8, "big"))
+            digest.update(descriptor)
+
+            row_digests: list[bytes] = []
+            if table not in _SEMANTIC_EPHEMERAL_ROW_TABLES:
+                for row in cursor:
+                    encoded = json.dumps(
+                        [
+                            _semantic_sqlite_value(table, column, value)
+                            for column, value in zip(columns, row)
+                        ],
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8", errors="surrogatepass")
+                    row_digests.append(hashlib.sha256(encoded).digest())
+            row_digests.sort()
+            digest.update(len(row_digests).to_bytes(8, "big"))
+            for row_digest in row_digests:
+                digest.update(row_digest)
+            table_count += 1
+            row_count += len(row_digests)
+
+    return {
+        "schema_object_count": schema_object_count,
+        "table_count": table_count,
+        "row_count": row_count,
+        "sha256": digest.hexdigest(),
+    }
+
+
 def _manifest_counts(
     inventory: list[InventoryRecord],
     actions: list[MigrationAction],
@@ -591,22 +707,16 @@ def _manifest_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     return {key: metadata[key] for key in sorted(allowed & metadata.keys())}
 
 
-def write_manifest(
-    path: os.PathLike[str] | str,
+def build_manifest_payload(
     inventory: Iterable[InventoryRecord],
     actions: Iterable[MigrationAction],
     evidence: Iterable[DuplicateEvidence],
     *,
     palace_path: os.PathLike[str] | str | None = None,
     sqlite_snapshot: dict[str, Any] | None = None,
-) -> None:
-    """Write a deterministic, owner-only migration manifest.
-
-    Drawer text and source paths are intentionally excluded. The manifest
-    records stable IDs, relative identities, hashes, proposed metadata, and
-    duplicate evidence so it can be reviewed without duplicating the corpus.
-    """
-
+    source_semantic_snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return the deterministic reviewed-manifest payload without writing it."""
     inventory_list = sorted(inventory, key=lambda record: record.drawer_id)
     action_list = sorted(actions, key=lambda action: action.drawer_id)
     evidence_list = sorted(evidence, key=lambda item: item.worktree_drawer_id)
@@ -618,10 +728,18 @@ def write_manifest(
         if palace_path is not None
         else {}
     )
-    payload = {
-        "version": 1,
+    semantic_snapshot = (
+        dict(source_semantic_snapshot)
+        if source_semantic_snapshot is not None
+        else palace_semantic_snapshot(palace_string)
+        if palace_path is not None
+        else {}
+    )
+    return {
+        "version": 2,
         "palace_path_sha256": exact_hash(palace_string),
         "sqlite_snapshot": snapshot,
+        "source_semantic_snapshot": semantic_snapshot,
         "counts": _manifest_counts(inventory_list, action_list, evidence_list),
         "inventory": [
             {
@@ -658,6 +776,71 @@ def write_manifest(
             for item in evidence_list
         ],
     }
+
+
+def read_manifest(path: os.PathLike[str] | str) -> dict[str, Any]:
+    """Read a reviewed manifest and reject non-object or unsupported payloads."""
+    manifest_path = Path(path).expanduser()
+    if manifest_path.is_symlink():
+        raise ValueError(f"manifest must not be a symlink: {manifest_path}")
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict) or payload.get("version") not in {1, 2}:
+        raise ValueError("unsupported or malformed reorganization manifest")
+    return payload
+
+
+def validate_reviewed_manifest(
+    reviewed: dict[str, Any],
+    inventory: Iterable[InventoryRecord],
+    actions: Iterable[MigrationAction],
+    evidence: Iterable[DuplicateEvidence],
+    *,
+    palace_path: os.PathLike[str] | str,
+    sqlite_snapshot: dict[str, Any],
+    source_semantic_snapshot: dict[str, Any] | None = None,
+) -> None:
+    """Require exact equality with the plan that would be generated now."""
+    expected = build_manifest_payload(
+        inventory,
+        actions,
+        evidence,
+        palace_path=palace_path,
+        sqlite_snapshot=sqlite_snapshot,
+        source_semantic_snapshot=source_semantic_snapshot,
+    )
+    if reviewed.get("version") == 1:
+        expected["version"] = 1
+        expected.pop("source_semantic_snapshot", None)
+    if reviewed != expected:
+        raise ValueError("reviewed manifest does not match the current palace migration plan")
+
+
+def write_manifest(
+    path: os.PathLike[str] | str,
+    inventory: Iterable[InventoryRecord],
+    actions: Iterable[MigrationAction],
+    evidence: Iterable[DuplicateEvidence],
+    *,
+    palace_path: os.PathLike[str] | str | None = None,
+    sqlite_snapshot: dict[str, Any] | None = None,
+    source_semantic_snapshot: dict[str, Any] | None = None,
+) -> None:
+    """Write a deterministic, owner-only migration manifest.
+
+    Drawer text and source paths are intentionally excluded. The manifest
+    records stable IDs, relative identities, hashes, proposed metadata, and
+    duplicate evidence so it can be reviewed without duplicating the corpus.
+    """
+
+    payload = build_manifest_payload(
+        inventory,
+        actions,
+        evidence,
+        palace_path=palace_path,
+        sqlite_snapshot=sqlite_snapshot,
+        source_semantic_snapshot=source_semantic_snapshot,
+    )
     encoded = (json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode(
         "utf-8", errors="surrogatepass"
     )

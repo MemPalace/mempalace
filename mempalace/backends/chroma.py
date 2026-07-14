@@ -966,7 +966,7 @@ def _sqlite_wing_room_counts(
     return total, wing_rooms
 
 
-def _pin_hnsw_threads(collection) -> None:
+def _pin_hnsw_threads(collection) -> bool:
     """Best-effort retrofit: pin ``hnsw:num_threads=1`` on an existing collection.
 
     Fresh collections set this via ``metadata=`` at creation. Legacy palaces
@@ -975,9 +975,10 @@ def _pin_hnsw_threads(collection) -> None:
     ``collection.modify(configuration=...)`` lets us re-apply ``num_threads=1``
     in memory at load time so every new process is protected.
 
-    Note: in chromadb 1.5.x the modified ``configuration_json["hnsw"]`` does
-    not persist to disk across ``PersistentClient`` reopens, so this must
-    run on every ``get_collection`` call, not just once.
+    In chromadb 1.5.x the modification does not persist across
+    ``PersistentClient`` reopens. The backend therefore pins once per cached
+    client/collection and retries on later ``get_collection`` calls until the
+    first successful pin; replacing the client clears that success cache.
     """
     try:
         from chromadb.api.collection_configuration import (
@@ -986,13 +987,15 @@ def _pin_hnsw_threads(collection) -> None:
         )
     except ImportError:
         logger.debug("_pin_hnsw_threads skipped: chromadb too old", exc_info=True)
-        return
+        return False
     try:
         collection.modify(
             configuration=UpdateCollectionConfiguration(hnsw=UpdateHNSWConfiguration(num_threads=1))
         )
     except Exception:
         logger.debug("_pin_hnsw_threads modify failed", exc_info=True)
+        return False
+    return True
 
 
 _BLOB_FIX_MARKER = ".blob_seq_ids_migrated"
@@ -1594,6 +1597,102 @@ class ChromaCollection(BaseCollection):
             embeddings=[list(v) for v in out_embeds] if out_embeds is not None else None,
         )
 
+    def get_source_chunks(
+        self,
+        source_file: str,
+        *,
+        parent_drawer_id: Optional[str] = None,
+    ) -> GetResult:
+        """Fetch source chunks directly from Chroma's SQLite metadata index."""
+        fast = self._get_source_chunks_via_sqlite(source_file, parent_drawer_id)
+        if fast is not None:
+            return fast
+        return super().get_source_chunks(
+            source_file,
+            parent_drawer_id=parent_drawer_id,
+        )
+
+    def _get_source_chunks_via_sqlite(
+        self,
+        source_file: str,
+        parent_drawer_id: Optional[str],
+    ) -> Optional[GetResult]:
+        if not self._palace_path:
+            return None
+        collection_name = self._collection_name()
+        db_path = os.path.join(self._palace_path, "chroma.sqlite3")
+        if not collection_name or not os.path.isfile(db_path):
+            return None
+
+        parent_clause = ""
+        parameters: list[Any] = [source_file, collection_name]
+        if parent_drawer_id:
+            parent_clause = """
+                AND EXISTS (
+                    SELECT 1
+                    FROM embedding_metadata parent
+                    WHERE parent.id = e.id
+                      AND parent.key = 'parent_drawer_id'
+                      AND parent.string_value = ?
+                )
+            """
+            parameters.append(parent_drawer_id)
+
+        try:
+            conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+            conn.row_factory = sqlite3.Row
+        except sqlite3.Error:
+            logger.debug("Chroma source-chunk sqlite open failed", exc_info=True)
+            return None
+
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    e.embedding_id,
+                    document.string_value AS document,
+                    chunk.int_value AS chunk_index
+                FROM embeddings e
+                JOIN segments s ON e.segment_id = s.id
+                JOIN collections c ON s.collection = c.id
+                JOIN embedding_metadata source
+                 ON source.id = e.id
+                 AND source.key = 'source_file'
+                 AND source.string_value = ?
+                LEFT JOIN embedding_metadata document
+                  ON document.id = e.id
+                 AND document.key = 'chroma:document'
+                LEFT JOIN embedding_metadata chunk
+                  ON chunk.id = e.id
+                 AND chunk.key = 'chunk_index'
+                WHERE c.name = ?
+                {parent_clause}
+                ORDER BY chunk.int_value, e.id
+                """,
+                parameters,
+            ).fetchall()
+        except sqlite3.Error:
+            logger.debug("Chroma source-chunk sqlite read failed", exc_info=True)
+            return None
+        finally:
+            conn.close()
+
+        metadatas = []
+        for row in rows:
+            metadata = {"source_file": source_file}
+            if row["chunk_index"] is not None:
+                metadata["chunk_index"] = int(row["chunk_index"])
+            if parent_drawer_id:
+                metadata["parent_drawer_id"] = parent_drawer_id
+            metadatas.append(metadata)
+
+        return GetResult(
+            ids=[str(row["embedding_id"]) for row in rows],
+            documents=[str(row["document"] or "") for row in rows],
+            metadatas=metadatas,
+            embeddings=None,
+        )
+
     def delete(self, *, ids=None, where=None):
         _validate_where(where)
         kwargs: dict[str, Any] = {}
@@ -1931,7 +2030,15 @@ class ChromaBackend(BaseBackend):
         self._clients: dict[str, Any] = {}
         # palace_path -> (inode, mtime) of chroma.sqlite3 at cache time.
         self._freshness: dict[str, tuple[int, float]] = {}
+        # ``collection.modify(num_threads=1)`` is needed once per collection
+        # for each fresh client, not on every hot-path lookup.
+        self._pinned_collections: set[tuple[str, str]] = set()
         self._closed = False
+
+    def _forget_pinned_collections(self, palace_path: str) -> None:
+        self._pinned_collections = {
+            key for key in self._pinned_collections if key[0] != palace_path
+        }
 
     @staticmethod
     def _resolve_embedding_function():
@@ -2054,6 +2161,7 @@ class ChromaBackend(BaseBackend):
                 or (mtime_appeared and palace_path in self._freshness)
             ):
                 ChromaBackend._quarantined_paths.discard(palace_path)
+            self._forget_pinned_collections(palace_path)
             ChromaBackend._prepare_palace_for_open(palace_path)
             cached = chromadb.PersistentClient(path=palace_path)
             self._clients[palace_path] = cached
@@ -2208,7 +2316,14 @@ class ChromaBackend(BaseBackend):
                 if explanation:
                     raise ValueError(explanation) from e
                 raise
-        _pin_hnsw_threads(collection)
+        pin_key = (palace_path, collection_name)
+        if pin_key not in self._pinned_collections:
+            if _pin_hnsw_threads(collection):
+                self._pinned_collections.add(pin_key)
+                # ``_pin_hnsw_threads`` intentionally calls ``collection.modify``
+                # and advances chroma.sqlite3's mtime. Record that self-authored
+                # change so the next lookup does not treat it as an external write.
+                self._freshness[palace_path] = self._db_stat(palace_path)
         return ChromaCollection(collection, palace_path=palace_path)
 
     def close_palace(self, palace) -> None:
@@ -2224,12 +2339,14 @@ class ChromaBackend(BaseBackend):
             return
         _close_client(self._clients.pop(path, None))
         self._freshness.pop(path, None)
+        self._forget_pinned_collections(path)
 
     def close(self) -> None:
         for client in self._clients.values():
             _close_client(client)
         self._clients.clear()
         self._freshness.clear()
+        self._pinned_collections.clear()
         self._closed = True
 
     def health(self, palace: Optional[PalaceRef] = None) -> HealthStatus:
@@ -2271,6 +2388,8 @@ class ChromaBackend(BaseBackend):
     def delete_collection(self, palace_path: str, collection_name: str) -> None:
         """Delete ``collection_name`` from the palace at ``palace_path``."""
         self._client(palace_path).delete_collection(collection_name)
+        self._pinned_collections.discard((palace_path, collection_name))
+        self._freshness[palace_path] = self._db_stat(palace_path)
 
     def create_collection(
         self, palace_path: str, collection_name: str, hnsw_space: str = "cosine"
@@ -2287,6 +2406,8 @@ class ChromaBackend(BaseBackend):
             },
             **ef_kwargs,
         )
+        self._pinned_collections.add((palace_path, collection_name))
+        self._freshness[palace_path] = self._db_stat(palace_path)
         return ChromaCollection(collection, palace_path=palace_path)
 
 
