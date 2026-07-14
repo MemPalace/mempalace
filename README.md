@@ -209,10 +209,46 @@ Usage and tool reference:
 
 ## MCP server
 
-35 MCP tools cover palace reads/writes, knowledge-graph operations,
+37 MCP tools cover palace reads/writes, durable job inspection, knowledge-graph operations,
 cross-wing navigation, drawer management, and agent diaries. Installation
 and the full tool list:
 [mempalaceofficial.com/reference/mcp-tools](https://mempalaceofficial.com/reference/mcp-tools.html).
+
+### Durable MCP mining and writes
+
+Long mines do not need to keep an MCP request open. Start the local daemon,
+enable daemon-backed MCP writes in the MCP server environment, then submit a
+mine and poll its job ID:
+
+```bash
+mempalace daemon start
+export MEMPALACE_MCP_DAEMON_WRITES=1
+```
+
+`mempalace_mine` now returns an accepted receipt such as:
+
+```json
+{
+  "success": true,
+  "accepted": true,
+  "job_id": "<id>",
+  "state": "queued",
+  "deduplicated": false
+}
+```
+
+Use `mempalace_job_status` for progress and terminal results, or
+`mempalace_list_jobs` for recent safe summaries. Short MCP writes also use the
+single durable writer: they return their normal result when completed within
+250 ms, otherwise an accepted job receipt. While a mine is running, search
+continues through the read-only SQLite/BM25 index and reports
+`retrieval_mode: "bm25_sqlite"`.
+
+The daemon must already be running. When the flag is enabled, an unavailable
+daemon returns `DaemonUnavailable`; MemPalace never falls back to an unsafe
+direct write. To roll back during the compatibility window, unset
+`MEMPALACE_MCP_DAEMON_WRITES` and restart the MCP server; CLI mining remains
+synchronous in either mode.
 
 ## Agents
 

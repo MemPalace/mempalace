@@ -1,9 +1,16 @@
 # Async MCP Mining and Tiered Project Memory Design
 
-- **Status:** Approved design; implementation pending
+- **Status:** Runtime implemented; source metadata and sales migration pending
 - **Date:** 2026-07-14
 - **Target:** MemPalace MCP/daemon runtime plus the sales-enablement `se` rollout
 - **Baseline:** MemPalace `develop` at the start of this design
+
+> **Runtime implementation note (2026-07-14):** Daemon progress, asynchronous
+> MCP mine submission, durable short writes, job inspection, linked-worktree
+> protection, and maintenance-time BM25 search are implemented behind
+> `MEMPALACE_MCP_DAEMON_WRITES=1`. The daemon must be started separately. Unset
+> the flag and restart MCP to restore legacy direct mode; enabled mode never
+> falls back to direct writes.
 
 ## Summary
 
