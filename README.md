@@ -115,7 +115,7 @@ non-default backend is opt-in.
 
 | Backend | Mode | Install | Namespaces | Lexical | Configure with |
 | ------- | ---- | ------- | :--------: | :-----: | -------------- |
-| `chroma` _(default)_ | Local (embedded) | bundled | – | ✓ | – |
+| `chroma` _(default)_ | Local (embedded) · Server opt-in | bundled | – | ✓ | `MEMPALACE_CHROMA_MODE=http` |
 | `sqlite_exact` | Local (exact) | bundled | – | ✓ | – |
 | `milvus` | Local (Lite) · Server opt-in | `mempalace[milvus]` | ✓ | ✓ | `MEMPALACE_MILVUS_URI` |
 | `qdrant` | Server (REST) | bundled | ✓ | ✓ | `MEMPALACE_QDRANT_URL` |
@@ -125,6 +125,13 @@ Select with `--backend <name>`, `MEMPALACE_BACKEND=<name>`, or
 `"backend": "<name>"` in `config.json`. See
 [Storage backends](/guide/configuration#storage-backends) for connection
 variables, namespace behavior, and deployment notes.
+
+When more than one process shares a Chroma palace (multiple MCP servers,
+hook-triggered mines), embedded mode is unsafe — set
+`MEMPALACE_CHROMA_MODE=http` and run one standalone `chroma run` server
+that owns the palace directory; all MemPalace processes become thin HTTP
+clients with structured errors and hard timeouts. See
+[docs/chroma-client-server.md](docs/chroma-client-server.md).
 
 ## Quickstart
 
