@@ -1481,6 +1481,11 @@ def search_memories(
             "effective_distance": round(effective_dist, 4),
             "closet_boost": round(boost, 3),
             "matched_via": matched_via,
+            # The drawer's stored metadata rides through whole: consumers that
+            # filter or re-rank hits (session-aware recall, provenance rules,
+            # custom pipelines) need the fields they stamped at ingest — a hit
+            # flattened to display fields blinds every downstream filter.
+            "metadata": dict(meta or {}),
             # Internal: retain the full source_file path + chunk_index so the
             # enrichment step below doesn't have to reverse-lookup via
             # basename-suffix matching (which silently collides when two
