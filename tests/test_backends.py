@@ -410,8 +410,13 @@ def test_chroma_backend_sets_hnsw_bloat_guard_on_creation(tmp_path):
 
     client = chromadb.PersistentClient(path=str(palace_path))
     col = client.get_collection("mempalace_drawers")
-    assert col.metadata.get("hnsw:batch_size") == 50_000
-    assert col.metadata.get("hnsw:sync_threshold") == 50_000
+    # A 50K threshold never flushes the HNSW metadata for ordinary palaces
+    # below 50K drawers.  On restart that looks exactly like an interrupted
+    # write and the safety probe quarantines an otherwise healthy segment.
+    # 10K still reduces persistence churn by two orders of magnitude versus
+    # Chroma's defaults while guaranteeing a 20K-class palace is durable.
+    assert col.metadata.get("hnsw:batch_size") == 10_000
+    assert col.metadata.get("hnsw:sync_threshold") == 10_000
 
 
 def test_chroma_backend_create_collection_sets_hnsw_bloat_guard(tmp_path):
@@ -422,8 +427,8 @@ def test_chroma_backend_create_collection_sets_hnsw_bloat_guard(tmp_path):
 
     client = chromadb.PersistentClient(path=str(palace_path))
     col = client.get_collection("mempalace_drawers")
-    assert col.metadata.get("hnsw:batch_size") == 50_000
-    assert col.metadata.get("hnsw:sync_threshold") == 50_000
+    assert col.metadata.get("hnsw:batch_size") == 10_000
+    assert col.metadata.get("hnsw:sync_threshold") == 10_000
 
 
 def test_get_collection_create_true_is_idempotent(tmp_path):
@@ -449,7 +454,7 @@ def test_get_collection_create_true_preserves_existing_metadata(tmp_path):
     backend.get_collection(palace, collection_name="mempalace_drawers", create=True)
     col = backend.get_collection(palace, collection_name="mempalace_drawers", create=True)
     assert col._collection.metadata["hnsw:space"] == "cosine"
-    assert col._collection.metadata.get("hnsw:batch_size") == 50_000
+    assert col._collection.metadata.get("hnsw:batch_size") == 10_000
 
 
 def test_fix_blob_seq_ids_converts_blobs_to_integers(tmp_path):
@@ -690,6 +695,35 @@ def test_quarantine_stale_hnsw_leaves_empty_segment_without_metadata_alone(tmp_p
         sqlite_mtime=now,
         meta_bytes=None,
     )
+
+    moved = quarantine_stale_hnsw(str(palace), stale_seconds=3600.0)
+
+    assert moved == []
+    assert seg.exists()
+
+
+def test_quarantine_leaves_known_unflushed_collection_alone(tmp_path):
+    """A real collection below its sync threshold is healthy without a pickle.
+
+    Chroma preallocates a non-trivial data_level0.bin before the first HNSW
+    flush.  File size alone therefore cannot distinguish that normal state
+    from an interrupted flush; the persisted collection count and configured
+    sync threshold must break the tie.
+    """
+    palace = tmp_path / "palace"
+    backend = ChromaBackend()
+    col = backend.create_collection(str(palace), "mempalace_drawers")
+    col.upsert(ids=["d1"], documents=["small healthy palace"], metadatas=[{"wing": "w"}])
+    backend.close()
+
+    segment_dirs = [p for p in palace.iterdir() if p.is_dir() and "-" in p.name]
+    assert len(segment_dirs) == 1
+    seg = segment_dirs[0]
+    assert not (seg / "index_metadata.pickle").exists()
+
+    now = 1_700_000_000.0
+    os.utime(seg / "data_level0.bin", (now - 7200, now - 7200))
+    os.utime(palace / "chroma.sqlite3", (now, now))
 
     moved = quarantine_stale_hnsw(str(palace), stale_seconds=3600.0)
 

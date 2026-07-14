@@ -350,6 +350,8 @@ def test_unflushed_path_also_uses_dynamic_floor(tmp_path):
     info = hnsw_capacity_status(str(tmp_path), COLLECTION)
     assert info["hnsw_count"] is None
     assert info["diverged"] is False, info["message"]
+    assert info["status"] == "ok"
+    assert "below first sync threshold" in info["message"]
 
 
 # ── BM25-only sqlite fallback ─────────────────────────────────────────

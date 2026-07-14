@@ -1223,13 +1223,20 @@ def rebuild_from_sqlite(
             else:
                 print(f"    done: {upserted} rows in {cname}")
 
-        print(f"\n  Rebuild complete. {sum(counts.values())} total rows.")
-        if archive_path is not None:
-            print(f"  Original palace archived at: {archive_path}")
-        print(f"{'=' * 55}\n")
-        return counts
     finally:
         backend.close()
+
+    # Bulk Chroma upserts can leave the derived FTS5 index internally
+    # inconsistent even when all source rows landed.  Rebuild it only after
+    # the backend releases its SQLite handle; otherwise VACUUM cannot obtain
+    # the exclusive lock it needs on Windows.
+    _vacuum_and_rebuild_fts5(dest_palace)
+
+    print(f"\n  Rebuild complete. {sum(counts.values())} total rows.")
+    if archive_path is not None:
+        print(f"  Original palace archived at: {archive_path}")
+    print(f"{'=' * 55}\n")
+    return counts
 
 
 def status(palace_path=None, collection_name: Optional[str] = None) -> dict:

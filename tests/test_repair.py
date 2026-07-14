@@ -1672,6 +1672,32 @@ def test_rebuild_from_sqlite_roundtrips_via_real_chromadb(tmp_path):
     assert closet_row["metadatas"][0] == {"wing": "alpha"}
 
 
+def test_rebuild_from_sqlite_rebuilds_fts5_after_chroma_closes(tmp_path, monkeypatch):
+    """The SQLite recovery path must finish by rebuilding Chroma's FTS5 index.
+
+    Large bulk upserts can leave the derived full-text index malformed even
+    when every source drawer survived.  The repair is not complete until the
+    Chroma client releases its SQLite handle and FTS5 is rebuilt.
+    """
+    source = tmp_path / "source"
+    dest = tmp_path / "dest"
+    _seed_palace(source, "mempalace_drawers", [("d1", "doc", {"wing": "w"})])
+
+    calls = []
+    real_rebuild = repair._vacuum_and_rebuild_fts5
+
+    def _spy(path, progress=print):
+        calls.append(path)
+        return real_rebuild(path, progress=progress)
+
+    monkeypatch.setattr(repair, "_vacuum_and_rebuild_fts5", _spy)
+
+    counts = repair.rebuild_from_sqlite(str(source), str(dest))
+
+    assert counts["mempalace_drawers"] == 1
+    assert calls == [str(dest)]
+
+
 def test_rebuild_from_sqlite_refuses_existing_dest(tmp_path):
     """Refuse to write into a directory that already exists when source
     and dest differ. Without this, an unattended re-run would silently

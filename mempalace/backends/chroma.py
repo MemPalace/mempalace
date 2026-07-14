@@ -114,10 +114,12 @@ def _hnsw_payload_appears_sane(seg_dir: str) -> bool:
 # cycle compounding the next. Result: link_lists.bin grows into hundreds of
 # GB sparse, after which `status`/`search`/`repair` segfault.
 #
-# Setting large batch and sync thresholds at collection creation defers
-# persistence until a single large batch completes, breaking the resize+
-# persist feedback loop. Empirically validated on a 39,792-drawer rebuild
-# (palace 376 MB, link_lists.bin 0 bytes, no segfault) in 2026-04.
+# Setting moderately large batch and sync thresholds at collection creation
+# breaks the resize+persist feedback loop.  The original 50K guard prevented
+# any first flush for ordinary palaces below 50K drawers, leaving no durable
+# index_metadata.pickle and making healthy segments look interrupted after a
+# restart.  A 10K checkpoint preserves the bloat protection while ensuring a
+# 20K-class palace produces a durable HNSW index.
 #
 # Note: chromadb 1.5.x exposes a `collection.modify(configuration={"hnsw":
 # {"batch_size": ..., "sync_threshold": ...}})` retrofit path for already-
@@ -125,8 +127,8 @@ def _hnsw_payload_appears_sane(seg_dir: str) -> bool:
 # this PR doesn't pursue that — once link_lists.bin has bloated, the index
 # is already corrupt and the only known recovery is a fresh mine.
 _HNSW_BLOAT_GUARD = {
-    "hnsw:batch_size": 50_000,
-    "hnsw:sync_threshold": 50_000,
+    "hnsw:batch_size": 10_000,
+    "hnsw:sync_threshold": 10_000,
 }
 
 # Missing index_metadata.pickle is normal only while a segment is still fresh
@@ -218,6 +220,52 @@ def _segment_appears_healthy(seg_dir: str) -> bool:
     return len(head) == 2 and head[0] == 0x80 and tail == b"\x2e"
 
 
+def _segment_is_expected_unflushed(palace_path: str, segment_id: str) -> bool:
+    """Return True when a known vector segment has not reached its first flush.
+
+    Chroma preallocates ``data_level0.bin`` even when a collection contains
+    fewer rows than ``hnsw:sync_threshold``.  In that normal state there is no
+    ``index_metadata.pickle`` yet, so file-size heuristics alone produce a
+    false corruption signal.  SQLite is the source of truth for both the
+    collection's row count and configured flush threshold.
+
+    Unknown or unreadable state returns False so the quarantine remains
+    conservative for genuinely partial or hand-crafted segments.
+    """
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return False
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            row = conn.execute(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM embeddings e WHERE e.segment_id = s.id),
+                    COALESCE(
+                        (SELECT cm.int_value
+                         FROM collection_metadata cm
+                         WHERE cm.collection_id = c.id
+                           AND cm.key = 'hnsw:sync_threshold'),
+                        1000
+                    )
+                FROM segments s
+                JOIN collections c ON c.id = s.collection
+                WHERE s.id = ? AND s.scope = 'VECTOR'
+                LIMIT 1
+                """,
+                (segment_id,),
+            ).fetchone()
+            if not row or row[0] is None or row[1] is None:
+                return False
+            return int(row[0]) < int(row[1])
+        finally:
+            conn.close()
+    except (sqlite3.Error, TypeError, ValueError):
+        logger.debug("expected-unflushed probe failed for %s", segment_id, exc_info=True)
+        return False
+
+
 def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> list[str]:
     """Rename HNSW segment dirs that look unsafe to open.
 
@@ -274,6 +322,19 @@ def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> lis
         payload_corrupt = payload_ratio is not None and payload_ratio > _HNSW_LINK_TO_DATA_MAX_RATIO
 
         if not payload_corrupt and sqlite_mtime - hnsw_mtime < stale_seconds:
+            continue
+
+        meta_path = os.path.join(seg_dir, "index_metadata.pickle")
+        if (
+            not payload_corrupt
+            and not os.path.isfile(meta_path)
+            and _segment_is_expected_unflushed(palace_path, name)
+        ):
+            logger.info(
+                "HNSW segment %s is below its first sync threshold; "
+                "missing metadata is expected. Leaving in place.",
+                seg_dir,
+            )
             continue
 
         # Stage 2: integrity gate. Mtime drift alone is not corruption because
@@ -570,13 +631,23 @@ def hnsw_capacity_status(palace_path: str, collection_name: str = "mempalace_dra
         divergence_floor = max(_HNSW_DIVERGENCE_FALLBACK_FLOOR, 2 * sync_threshold)
 
         if hnsw_count is None:
-            # No pickle yet, so this probe cannot measure HNSW capacity.
-            # Chroma 1.5.x can have binary HNSW files without a flushed
-            # metadata pickle; absence of the pickle alone is not proof that
-            # vector search is unusable or dangerous. Keep the status unknown
-            # so MCP does not globally disable vectors on an inconclusive
-            # signal. Corrupt/invalid metadata, when present, is handled by
-            # quarantine_invalid_hnsw_metadata before Chroma opens.
+            # Below the configured first-sync threshold, no pickle is the
+            # documented healthy state: Chroma serves those rows from its
+            # brute-force buffer and has not persisted an HNSW graph yet.
+            if 0 < sqlite_count < sync_threshold:
+                out["status"] = "ok"
+                out["divergence"] = sqlite_count
+                out["message"] = (
+                    f"HNSW metadata not created yet: {sqlite_count:,} embeddings "
+                    f"are below first sync threshold {sync_threshold:,} (expected)"
+                )
+                return out
+
+            # Otherwise the probe cannot measure HNSW capacity. Absence of
+            # the pickle alone is not proof that vector search is unusable or
+            # dangerous, so keep the status unknown rather than disabling it.
+            # Corrupt metadata, when present, is handled by the quarantine
+            # check before Chroma opens.
             out["message"] = (
                 "HNSW capacity unavailable: metadata has not been flushed; "
                 "leaving vector search enabled"
