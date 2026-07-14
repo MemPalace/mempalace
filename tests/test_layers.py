@@ -71,13 +71,24 @@ def test_layer0_default_path():
 
 
 def _mock_chromadb_for_layer(docs, metas, monkeypatch=None):
-    """Return a mock collection whose get() returns docs/metas."""
+    """Return a mock collection emulating Layer1's two-step access pattern.
+
+    First a paginated metadata-only scan (returns ids + metadatas,
+    honouring limit/offset), then a documents fetch for the winning ids.
+    The old single-shot documents+metadatas shape predates the
+    full-corpus-scan rewrite and made every test see an empty palace.
+    """
     mock_col = MagicMock()
-    # First batch returns data, second batch returns empty (end of pagination)
-    mock_col.get.side_effect = [
-        {"documents": docs, "metadatas": metas},
-        {"documents": [], "metadatas": []},
-    ]
+    all_ids = [f"id{i}" for i in range(len(docs))]
+    doc_by_id = dict(zip(all_ids, docs))
+
+    def fake_get(ids=None, include=None, limit=None, offset=0, where=None):
+        if ids is not None:  # second step: documents for the winners
+            return {"ids": list(ids), "documents": [doc_by_id.get(d) for d in ids]}
+        end = len(all_ids) if limit is None else min(offset + limit, len(all_ids))
+        return {"ids": all_ids[offset:end], "metadatas": metas[offset:end]}
+
+    mock_col.get.side_effect = fake_get
     return mock_col
 
 
@@ -202,12 +213,30 @@ def test_layer1_importance_from_various_keys():
 
 
 def test_layer1_batch_exception_breaks():
-    """If col.get raises on a batch, loop breaks gracefully."""
+    """If col.get raises mid-scan, the loop breaks gracefully.
+
+    L1 must still render from the drawers scanned so far — a transient
+    chroma error partway through the corpus scan should degrade to a
+    shorter essential story, not an empty one. The first page must be
+    exactly one scan-batch long so Layer1 asks for a second page.
+    """
+    batch = 500  # Layer1's _BATCH page size
+    all_ids = [f"id{i}" for i in range(batch)]
+    all_metas = [{"room": "r", "source_file": f"s{i}.txt"} for i in range(batch)]
+    doc_by_id = {d: f"memory {d}" for d in all_ids}
+    scan_calls = []
+
+    def fake_get(ids=None, include=None, limit=None, offset=0, where=None):
+        if ids is not None:  # documents fetch for the winners
+            return {"ids": list(ids), "documents": [doc_by_id[d] for d in ids]}
+        scan_calls.append(offset)
+        if len(scan_calls) > 1:
+            raise RuntimeError("batch error")
+        return {"ids": all_ids[:limit], "metadatas": all_metas[:limit]}
+
     mock_col = MagicMock()
-    mock_col.get.side_effect = [
-        {"documents": ["doc1"], "metadatas": [{"room": "r"}]},
-        RuntimeError("batch error"),
-    ]
+    mock_col.get.side_effect = fake_get
+
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
         patch("mempalace.layers._get_collection", return_value=mock_col),
@@ -216,6 +245,7 @@ def test_layer1_batch_exception_breaks():
         layer = Layer1(palace_path="/fake")
         result = layer.generate()
 
+    assert len(scan_calls) == 2  # second page attempted, raised, absorbed
     assert "ESSENTIAL STORY" in result
 
 
