@@ -29,7 +29,7 @@
 - Consumes: source-kind and worktree configuration from the metadata plan.
 - Produces canonical wing `se-code` and deterministic rooms/exclusions.
 
-- [ ] **Step 1: Add the checked-in configuration**
+- [x] **Step 1: Add the checked-in configuration**
 
 ```yaml
 wing: se-code
@@ -55,17 +55,21 @@ rooms:
 exclude_patterns: [node_modules/, .nx/, dist/, coverage/, "*.map", workflow-bundle.js, package-lock.json]
 ```
 
-- [ ] **Step 2: Update AGENTS usage routing**
+- [x] **Step 2: Update AGENTS usage routing**
 
 Document that decisions use `se`, canonical code uses `se-code`, sessions use `se-sessions`, ambiguous questions search `se` + `se-code`, and cold sessions require explicit historical lookup.
 
-- [ ] **Step 3: Validate config without mining**
+- [x] **Step 3: Validate config without mining**
 
 Run: `/private/tmp/mempalace-fix/.venv/bin/python -c "from mempalace.miner import load_config; print(load_config('.')['wing'])"`
 
 Expected: `se-code`.
 
-- [ ] **Step 4: Commit in sales-enablement repo**
+- [x] **Step 4: Commit in sales-enablement repo**
+
+The repository-local `AGENTS.md` is intentionally excluded by that checkout's
+`.git/info/exclude`, so the routing guidance remains local while the checked-in
+`mempalace.yaml` was committed as `deb1792`.
 
 ```bash
 git add mempalace.yaml AGENTS.md
@@ -83,7 +87,7 @@ git commit -m "chore: configure canonical MemPalace mining"
 - Produces: `inventory_palace(palace_path, canonical_root, worktree_roots, session_roots) -> list[InventoryRecord]`.
 - Produces: `plan_actions(records, hot_days=90, now=None) -> list[MigrationAction]`.
 
-- [ ] **Step 1: Write synthetic SQLite inventory/classification tests**
+- [x] **Step 1: Write synthetic SQLite inventory/classification tests**
 
 ```python
 def test_plan_classifies_canonical_sessions_and_worktree_candidates():
@@ -97,13 +101,13 @@ def test_plan_classifies_canonical_sessions_and_worktree_candidates():
     assert actions[2].metadata["memory_tier"] == "cold"
 ```
 
-- [ ] **Step 2: Run and verify missing module failure**
+- [x] **Step 2: Run and verify missing module failure**
 
 Run: `.venv/bin/pytest tests/test_reorganize.py -q`
 
 Expected: FAIL importing `mempalace.reorganize`.
 
-- [ ] **Step 3: Implement read-only SQLite extraction and pure classification**
+- [x] **Step 3: Implement read-only SQLite extraction and pure classification**
 
 ```python
 @dataclass(frozen=True)
@@ -121,7 +125,7 @@ def exact_hash(content: str) -> str:
 
 Open `chroma.sqlite3` with `mode=ro`, reconstruct each drawer's document and scalar metadata from Chroma tables, normalize source roots without mutating them, and return actions in stable drawer-ID order.
 
-- [ ] **Step 4: Run tests and commit**
+- [x] **Step 4: Run tests and commit**
 
 Run: `.venv/bin/pytest tests/test_reorganize.py -q`
 
@@ -142,7 +146,7 @@ git commit -m "feat: plan palace reorganization without mutations"
 - Produces: `prove_worktree_duplicate(worktree, canonical) -> DuplicateEvidence | None`.
 - Produces: `write_manifest(path, inventory, actions, evidence) -> None`.
 
-- [ ] **Step 1: Write evidence rejection and owner-only manifest tests**
+- [x] **Step 1: Write evidence rejection and owner-only manifest tests**
 
 ```python
 def test_duplicate_requires_same_relative_identity_chunk_and_content_hash():
@@ -155,17 +159,17 @@ def test_manifest_is_owner_only(tmp_path):
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
 ```
 
-- [ ] **Step 2: Run tests and confirm failure**
+- [x] **Step 2: Run tests and confirm failure**
 
 Run: `.venv/bin/pytest tests/test_reorganize.py -k 'duplicate or manifest' -q`
 
 Expected: FAIL on missing evidence/writer functions.
 
-- [ ] **Step 3: Implement strict proof and deterministic manifest**
+- [x] **Step 3: Implement strict proof and deterministic manifest**
 
 Evidence requires equal canonical relative path, source hash when both records have it, chunk index, and content SHA-256. If any required identity is missing or ambiguous, emit `preserve_uncertain`, not delete eligibility. Manifest includes version, palace path hash, snapshot SQLite size/mtime, counts, every action, and evidence IDs; write via `os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)`.
 
-- [ ] **Step 4: Run tests and commit**
+- [x] **Step 4: Run tests and commit**
 
 Run: `.venv/bin/pytest tests/test_reorganize.py -q`
 
@@ -188,7 +192,7 @@ git commit -m "feat: emit evidence-backed memory migration manifests"
 - Adds: `mempalace reorganize plan --canonical-root PATH --worktree-root PATH --session-root PATH --manifest PATH`.
 - No `--apply` option in this implementation checkpoint.
 
-- [ ] **Step 1: Write CLI no-mutation test**
+- [x] **Step 1: Write CLI no-mutation test**
 
 ```python
 def test_reorganize_plan_writes_manifest_without_changing_sqlite(tmp_path):
@@ -198,29 +202,34 @@ def test_reorganize_plan_writes_manifest_without_changing_sqlite(tmp_path):
     assert sha256_file(palace / "chroma.sqlite3") == before
 ```
 
-- [ ] **Step 2: Run and verify missing command failure**
+- [x] **Step 2: Run and verify missing command failure**
 
 Run: `.venv/bin/pytest tests/test_cli.py tests/test_reorganize.py -k 'reorganize' -q`
 
 Expected: FAIL because command is absent.
 
-- [ ] **Step 3: Add plan-only CLI and report summary**
+- [x] **Step 3: Add plan-only CLI and report summary**
 
 The command prints counts for canonical, session, worktree candidate, verified duplicate candidate, unique artifact, unclassified, hot, and cold. It exits non-zero on SQLite integrity failure and refuses a linked canonical root.
 
-- [ ] **Step 4: Run focused/full verification**
+- [x] **Step 4: Run focused/full verification**
 
 Run: `.venv/bin/pytest tests/test_cli.py tests/test_reorganize.py -q && .venv/bin/ruff check mempalace/reorganize.py tests/test_reorganize.py`
 
 Expected: PASS/exit 0.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add mempalace/cli.py mempalace/reorganize.py tests/
 git commit -m "feat: add dry-run palace reorganization command"
 ```
 
-- [ ] **Step 6: Run against a copied/current palace in dry-run mode**
+- [x] **Step 6: Run against a copied/current palace in dry-run mode**
 
 Run with the active palace read-only and write the manifest under an owner-only temporary directory. Confirm the database SHA-256 is identical before and after. Report exact projected counts to the user and stop before any mutation or deletion.
+
+Completed against 13,653 drawers. The database SHA-256 remained
+`0e17be92a4cc7583054127ab4d295aa961ef8f06f565ffc6fd8a5958ebf9734b`.
+The manifest proves 3,515 duplicate candidates and preserves 59 unique plus 14
+uncertain worktree artifacts. No drawer was changed or deleted.

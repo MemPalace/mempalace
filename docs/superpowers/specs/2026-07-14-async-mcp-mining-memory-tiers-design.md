@@ -1,6 +1,6 @@
 # Async MCP Mining and Tiered Project Memory Design
 
-- **Status:** Runtime implemented; source metadata and sales migration pending
+- **Status:** Runtime, source metadata, scoped retrieval, sales policy, and migration dry run implemented; copy/apply/activation pending
 - **Date:** 2026-07-14
 - **Target:** MemPalace MCP/daemon runtime plus the sales-enablement `se` rollout
 - **Baseline:** MemPalace `develop` at the start of this design
@@ -11,6 +11,13 @@
 > `MEMPALACE_MCP_DAEMON_WRITES=1`. The daemon must be started separately. Unset
 > the flag and restart MCP to restore legacy direct mode; enabled mode never
 > falls back to direct writes.
+>
+> **Migration implementation note (2026-07-14):** New mines stamp canonical
+> source metadata, retrieval supports wing/source-kind/hot-cold scopes, and the
+> canonical sales repository has an `se-code` mining policy. A SQLite-only,
+> plan-only command produced an owner-only manifest from the active palace
+> without changing its SHA-256. Applying the reviewed manifest to a copied
+> palace and activation remain separate gated work.
 
 ## Summary
 
@@ -35,15 +42,15 @@ The existing daemon already provides the primitives needed for a better executio
 
 The MCP mine tool does not currently use those primitives. It also competes with the MCP process's lifetime peer-writer lease, so simply wrapping the current function in a thread would not solve ownership or responsiveness.
 
-The current `se` palace also mixes distinct retrieval concerns. A read-only inventory measured 13,649 active drawers:
+The current `se` palace also mixes distinct retrieval concerns. The implemented read-only inventory measured 13,653 active drawers:
 
 | Category | Drawers | Intended destination |
 |---|---:|---|
-| Codex/session transcripts | 5,249 | `se-sessions` |
+| Codex/session transcripts | 5,306 | `se-sessions` |
 | Canonical current repository | 4,667 | `se-code` |
 | Temporary linked-worktree copy | 3,588 | delete if equivalent; otherwise preserve as artifacts |
-| Curated records without a mined source | 55 | `se` |
-| Other/unclassified | 90 | manual classification |
+| Curated records without a mined source | 92 | `se` |
+| Other/unclassified | 0 | preserve if found by a future inventory |
 
 The linked-worktree copy alone accounts for 26.3% of the current records. Default retrieval is therefore paying for duplicate and historical material that should not compete with current decisions and code.
 
@@ -340,7 +347,7 @@ Apply the migration to a second full palace copy, leaving the active palace and 
 5. Delete a worktree drawer only when canonical source identity, full-source hash where available, chunk index, and exact verbatim content hash prove equivalence.
 6. Preserve non-equivalent worktree content in `se-sessions` as `worktree-artifact`, cold by default, with its original source path and revision.
 7. Collapse repeated transcript imports only when session/import identity and exact content hash match. Identical words from unrelated legitimate sources are not deduplicated.
-8. Leave the 90 unclassified records untouched until each is assigned or explicitly approved for removal.
+8. Leave any unclassified records untouched until each is assigned or explicitly approved for removal. The current dry run found none after all known roots were supplied.
 9. Rebuild derived closets, hallways, tunnels, and vector indexes in the migrated copy.
 
 The migration manifest records every old drawer ID, action, destination, reason, and checksum. It is resumable and idempotent.
@@ -363,7 +370,7 @@ Pause writers, confirm the active source palace did not change since the migrati
 
 ### Expected reduction
 
-The 3,588 known worktree records are the initial upper-bound candidate set, not an unconditional delete count. If all prove equivalent, removing them would reduce the current drawer count by approximately 26%; any record without exact evidence is preserved. Generated/lock/cache exclusions and repeated-import dedup may reduce the total further after measured dry-run results.
+The dry run classified all 3,588 known worktree records and proved 3,515 exact duplicate candidates. Removing only those reviewed candidates would reduce the current drawer count by 25.7%, from 13,653 to 10,138. The remaining 59 unique and 14 uncertain worktree records are preserved cold in `se-sessions`. Generated/lock/cache exclusions may reduce future mine growth; no repeated-session deletion is proposed by this checkpoint.
 
 Cold session classification reduces the default search set but not total storage. Reports always distinguish `records_deleted_as_verified_duplicates`, `records_preserved_cold`, and `records_excluded_from_future_mines`.
 
