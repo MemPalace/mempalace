@@ -6,12 +6,20 @@ import hashlib
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
-from .daemon import DaemonError, canonical_palace_path, submit_job
+from .daemon import (
+    TERMINAL_STATES,
+    DaemonError,
+    canonical_palace_path,
+    get_client_if_running,
+    submit_job,
+)
 
 DAEMON_WRITES_ENV = "MEMPALACE_MCP_DAEMON_WRITES"
+DAEMON_PROBE_TIMEOUT_SECONDS = 0.2
 
 
 def daemon_writes_enabled() -> bool:
@@ -146,3 +154,105 @@ def submit_mine(palace_path: str, payload: dict[str, Any]) -> dict[str, Any]:
         "wing": request.get("wing"),
         "submitted_at": job.get("created_at"),
     }
+
+
+def _daemon_unavailable(error: Exception | None = None) -> dict[str, Any]:
+    message = str(error) if error is not None else "daemon is not running"
+    return {
+        "success": False,
+        "error": message,
+        "error_class": "DaemonUnavailable",
+        "hint": "Run `mempalace daemon start` and retry.",
+    }
+
+
+def _running_client(palace_path: str | None):
+    return get_client_if_running(
+        canonical_palace_path(palace_path),
+        health_timeout=DAEMON_PROBE_TIMEOUT_SECONDS,
+    )
+
+
+def dispatch_daemon_write(
+    tool_name: str,
+    arguments: dict[str, Any],
+    *,
+    palace_path: str | None = None,
+    fast_wait_ms: int = 250,
+    priority: int = 0,
+) -> dict[str, Any]:
+    """Durably queue an MCP mutation and briefly wait for a fast completion."""
+    client = _running_client(palace_path)
+    if client is None:
+        return _daemon_unavailable()
+
+    try:
+        job = client.submit(
+            "mcp_tool",
+            {"name": tool_name, "arguments": arguments},
+            dedupe_key=None,
+            priority=priority,
+        )
+        current = job
+        deadline = time.monotonic() + max(0, fast_wait_ms) / 1000
+        while time.monotonic() < deadline:
+            current = client.get_job(job["id"])
+            if current.get("state") in TERMINAL_STATES:
+                result = dict(current.get("result") or {})
+                result.setdefault("success", current.get("state") == "succeeded")
+                if current.get("state") != "succeeded" and "error" not in result:
+                    error = current.get("error") or {}
+                    result["error"] = error.get("message") or "daemon write failed"
+                result["job_id"] = job["id"]
+                result["delivery"] = "completed"
+                return result
+            time.sleep(0.02)
+    except DaemonError as exc:
+        return _daemon_unavailable(exc)
+
+    return {
+        "success": True,
+        "accepted": True,
+        "job_id": job["id"],
+        "state": current.get("state", job.get("state", "queued")),
+        "delivery": "durable_queue",
+    }
+
+
+def tool_job_status(job_id: str, *, palace_path: str | None = None) -> dict[str, Any]:
+    client = _running_client(palace_path)
+    if client is None:
+        return _daemon_unavailable()
+    try:
+        return {"success": True, "job": client.get_job(job_id)}
+    except DaemonError as exc:
+        return {
+            "success": False,
+            "error": str(exc),
+            "error_class": "DaemonJobError",
+        }
+
+
+def tool_list_jobs(
+    limit: int = 20,
+    state: str | None = None,
+    kind: str | None = None,
+    *,
+    palace_path: str | None = None,
+) -> dict[str, Any]:
+    client = _running_client(palace_path)
+    if client is None:
+        return _daemon_unavailable()
+    try:
+        jobs = client.list_jobs(
+            limit=max(1, min(int(limit), 100)),
+            state=state or None,
+            kind=kind or None,
+        )
+        return {"success": True, "jobs": jobs}
+    except (DaemonError, ValueError, TypeError) as exc:
+        return {
+            "success": False,
+            "error": str(exc),
+            "error_class": "DaemonJobError",
+        }

@@ -29,6 +29,8 @@ _PER_JOB_ENV = (_PALACE_PATH_ENV, _BACKEND_ENV, _EXPLICIT_BACKEND_ENV)
 READ_TOOLS = frozenset(
     {
         "mempalace_status",
+        "mempalace_job_status",
+        "mempalace_list_jobs",
         "mempalace_list_wings",
         "mempalace_list_rooms",
         "mempalace_get_taxonomy",
@@ -61,6 +63,7 @@ WRITE_TOOLS = frozenset(
         "mempalace_diary_write",
         "mempalace_kg_add",
         "mempalace_kg_invalidate",
+        "mempalace_kg_supersede",
         "mempalace_create_tunnel",
         "mempalace_delete_tunnel",
         "mempalace_delete_hallway",

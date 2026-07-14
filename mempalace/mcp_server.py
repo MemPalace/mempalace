@@ -1481,6 +1481,25 @@ def _filed_at_in_window(
 # ==================== READ TOOLS ====================
 
 
+def tool_job_status(job_id: str):
+    """Return durable daemon job state and progress without touching the palace."""
+    from .mcp_jobs import tool_job_status as read_job_status
+
+    return read_job_status(job_id, palace_path=_config.palace_path)
+
+
+def tool_list_jobs(limit: int = 20, state: str = None, kind: str = None):
+    """List safe daemon job summaries without payloads or write results."""
+    from .mcp_jobs import tool_list_jobs as read_jobs
+
+    return read_jobs(
+        limit=limit,
+        state=state,
+        kind=kind,
+        palace_path=_config.palace_path,
+    )
+
+
 def _tool_status_via_sqlite() -> dict:
     """Pure-sqlite status reader for the #1222 fallback path.
 
@@ -3984,6 +4003,39 @@ TOOLS = {
         "input_schema": {"type": "object", "properties": {}},
         "handler": tool_status,
     },
+    "mempalace_job_status": {
+        "description": "Get durable daemon job state, progress, and terminal result by ID.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string", "description": "Daemon job ID."},
+            },
+            "required": ["job_id"],
+        },
+        "handler": tool_job_status,
+    },
+    "mempalace_list_jobs": {
+        "description": "List safe daemon job summaries without queued write payloads.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum jobs to return (1-100). Default: 20.",
+                },
+                "state": {
+                    "type": "string",
+                    "enum": ["queued", "running", "succeeded", "failed", "cancelled"],
+                    "description": "Optional state filter.",
+                },
+                "kind": {
+                    "type": "string",
+                    "description": "Optional job-kind filter, such as mine or mcp_tool.",
+                },
+            },
+        },
+        "handler": tool_list_jobs,
+    },
     "mempalace_list_wings": {
         "description": "List all wings with drawer counts",
         "input_schema": {"type": "object", "properties": {}},
@@ -4689,6 +4741,11 @@ def _mcp_tool_preflight_refusal(req_id, tool_name: str):
     if sqlite_integrity_error is not None:
         return sqlite_integrity_error
 
+    from .mcp_jobs import daemon_writes_enabled
+
+    if daemon_writes_enabled():
+        return None
+
     return _mcp_peer_writer_refusal(req_id, tool_name)
 
 
@@ -4838,7 +4895,18 @@ def handle_request(request):
             if "entry" not in tool_args or tool_args["entry"] is None:
                 tool_args["entry"] = content_val
         try:
-            result = _decorate_mcp_tool_result(tool_name, TOOLS[tool_name]["handler"](**tool_args))
+            from . import mcp_jobs
+            from .service import classify_tool
+
+            if mcp_jobs.daemon_writes_enabled() and classify_tool(tool_name) == "write":
+                result = mcp_jobs.dispatch_daemon_write(
+                    tool_name,
+                    tool_args,
+                    palace_path=_config.palace_path,
+                )
+            else:
+                result = TOOLS[tool_name]["handler"](**tool_args)
+            result = _decorate_mcp_tool_result(tool_name, result)
 
             return {
                 "jsonrpc": "2.0",

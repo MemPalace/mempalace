@@ -4,6 +4,28 @@ import subprocess
 from mempalace import mcp_jobs
 
 
+class FakeClient:
+    def __init__(self, submitted=None, jobs=None, listed=None):
+        self.submitted = submitted or {"id": "job-1", "state": "queued"}
+        self.jobs = list(jobs or [])
+        self.listed = listed or []
+        self.submit_calls = []
+        self.list_calls = []
+
+    def submit(self, kind, payload, dedupe_key=None, priority=0):
+        self.submit_calls.append((kind, payload, dedupe_key, priority))
+        return dict(self.submitted)
+
+    def get_job(self, job_id):
+        if self.jobs:
+            return dict(self.jobs.pop(0))
+        return {**self.submitted, "id": job_id}
+
+    def list_jobs(self, limit=20, state=None, kind=None):
+        self.list_calls.append((limit, state, kind))
+        return list(self.listed)
+
+
 def _init_repo(path):
     subprocess.run(["git", "init", str(path)], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(path), "config", "user.email", "test@example.com"], check=True)
@@ -130,3 +152,104 @@ def test_submit_mine_fails_fast_when_daemon_is_unavailable(monkeypatch, tmp_path
     assert result["success"] is False
     assert result["error_class"] == "DaemonUnavailable"
     assert "daemon start" in result["hint"]
+
+
+def test_daemon_write_returns_completed_result_on_fast_path(monkeypatch):
+    client = FakeClient(
+        submitted={"id": "j1", "state": "queued"},
+        jobs=[
+            {
+                "id": "j1",
+                "state": "succeeded",
+                "result": {"success": True, "drawer_id": "d1", "exit_code": 0},
+            }
+        ],
+    )
+    monkeypatch.setattr(mcp_jobs, "get_client_if_running", lambda *a, **k: client)
+
+    result = mcp_jobs.dispatch_daemon_write(
+        "mempalace_add_drawer",
+        {"wing": "se", "room": "decisions", "content": "verbatim"},
+        palace_path="/palace",
+        fast_wait_ms=250,
+    )
+
+    assert result == {
+        "success": True,
+        "drawer_id": "d1",
+        "exit_code": 0,
+        "job_id": "j1",
+        "delivery": "completed",
+    }
+    assert client.submit_calls == [
+        (
+            "mcp_tool",
+            {
+                "name": "mempalace_add_drawer",
+                "arguments": {"wing": "se", "room": "decisions", "content": "verbatim"},
+            },
+            None,
+            0,
+        )
+    ]
+
+
+def test_daemon_write_returns_accepted_when_not_done(monkeypatch):
+    client = FakeClient(
+        submitted={"id": "j1", "state": "queued"},
+        jobs=[{"id": "j1", "state": "running"}],
+    )
+    monkeypatch.setattr(mcp_jobs, "get_client_if_running", lambda *a, **k: client)
+    monkeypatch.setattr(mcp_jobs.time, "sleep", lambda _seconds: None)
+    ticks = iter((0.0, 0.0, 1.0))
+    monkeypatch.setattr(mcp_jobs.time, "monotonic", lambda: next(ticks, 1.0))
+
+    result = mcp_jobs.dispatch_daemon_write(
+        "mempalace_checkpoint",
+        {"items": []},
+        palace_path="/palace",
+        fast_wait_ms=1,
+    )
+
+    assert result == {
+        "success": True,
+        "accepted": True,
+        "job_id": "j1",
+        "state": "running",
+        "delivery": "durable_queue",
+    }
+
+
+def test_job_status_and_list_use_daemon_without_exposing_payload(monkeypatch):
+    client = FakeClient(
+        jobs=[{"id": "j1", "state": "running", "progress": {"phase": "mining"}}],
+        listed=[{"id": "j1", "kind": "mine", "state": "running"}],
+    )
+    monkeypatch.setattr(mcp_jobs, "get_client_if_running", lambda *a, **k: client)
+
+    status = mcp_jobs.tool_job_status("j1", palace_path="/palace")
+    listed = mcp_jobs.tool_list_jobs(
+        limit=5,
+        state="running",
+        kind="mine",
+        palace_path="/palace",
+    )
+
+    assert status == {
+        "success": True,
+        "job": {"id": "j1", "state": "running", "progress": {"phase": "mining"}},
+    }
+    assert listed == {
+        "success": True,
+        "jobs": [{"id": "j1", "kind": "mine", "state": "running"}],
+    }
+    assert client.list_calls == [(5, "running", "mine")]
+
+
+def test_job_tools_fail_closed_when_daemon_is_unavailable(monkeypatch):
+    monkeypatch.setattr(mcp_jobs, "get_client_if_running", lambda *a, **k: None)
+
+    result = mcp_jobs.tool_job_status("j1", palace_path="/palace")
+
+    assert result["success"] is False
+    assert result["error_class"] == "DaemonUnavailable"

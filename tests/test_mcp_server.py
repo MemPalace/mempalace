@@ -4803,6 +4803,86 @@ def test_peer_writer_guard_refuses_mutating_tool_before_handler(monkeypatch):
     assert response["error"]["data"]["tool"] == "mempalace_add_drawer"
 
 
+def test_daemon_mode_routes_write_without_peer_writer_lock_or_direct_handler(monkeypatch):
+    from mempalace import mcp_jobs, mcp_server
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("daemon-backed writes must not use the direct writer lane")
+
+    captured = {}
+
+    def dispatch(tool_name, arguments, **kwargs):
+        captured.update(tool_name=tool_name, arguments=arguments, kwargs=kwargs)
+        return {
+            "success": True,
+            "accepted": True,
+            "job_id": "j1",
+            "state": "queued",
+            "delivery": "durable_queue",
+        }
+
+    monkeypatch.setenv(mcp_jobs.DAEMON_WRITES_ENV, "1")
+    monkeypatch.setattr(mcp_server, "_acquire_mcp_writer_lock", forbidden)
+    monkeypatch.setattr(mcp_server, "_mcp_sqlite_integrity_refusal", lambda *a: None)
+    monkeypatch.setitem(mcp_server.TOOLS["mempalace_add_drawer"], "handler", forbidden)
+    monkeypatch.setattr(mcp_jobs, "dispatch_daemon_write", dispatch)
+
+    response = mcp_server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": {
+                "name": "mempalace_add_drawer",
+                "arguments": {
+                    "wing": "se",
+                    "room": "decisions",
+                    "content": "verbatim",
+                },
+            },
+        }
+    )
+
+    result = json.loads(response["result"]["content"][0]["text"])
+    assert result["job_id"] == "j1"
+    assert captured == {
+        "tool_name": "mempalace_add_drawer",
+        "arguments": {"wing": "se", "room": "decisions", "content": "verbatim"},
+        "kwargs": {"palace_path": mcp_server._config.palace_path},
+    }
+
+
+def test_job_read_tools_bypass_peer_writer_and_daemon_write_dispatch(monkeypatch):
+    from mempalace import mcp_jobs, mcp_server
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("job reads must bypass both writer lanes")
+
+    monkeypatch.setenv(mcp_jobs.DAEMON_WRITES_ENV, "1")
+    monkeypatch.setattr(mcp_server, "_acquire_mcp_writer_lock", forbidden)
+    monkeypatch.setattr(mcp_jobs, "dispatch_daemon_write", forbidden)
+    monkeypatch.setattr(
+        mcp_jobs,
+        "tool_job_status",
+        lambda job_id, palace_path=None: {
+            "success": True,
+            "job": {"id": job_id, "state": "running"},
+        },
+    )
+
+    response = mcp_server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": {"name": "mempalace_job_status", "arguments": {"job_id": "j1"}},
+        }
+    )
+
+    result = json.loads(response["result"]["content"][0]["text"])
+    assert result["job"] == {"id": "j1", "state": "running"}
+
+
 def test_peer_writer_guard_does_not_gate_read_tool(monkeypatch):
     from mempalace import mcp_server
 

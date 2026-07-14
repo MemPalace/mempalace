@@ -230,6 +230,10 @@ def test_daemon_http_lifecycle_executes_job(tmp_path, monkeypatch):
     assert finished["state"] == "succeeded"
     assert finished["result"]["stdout"] == "done\n"
     assert calls == [("mine", {"source": "src", "palace_path": str(palace.resolve())})]
+    summaries = client.list_jobs(limit=5, state="succeeded", kind="mine")
+    assert [summary["id"] for summary in summaries] == [job["id"]]
+    assert "payload" not in summaries[0]
+    assert "result" not in summaries[0]
 
     _stop_server(client, thread, holders)
 

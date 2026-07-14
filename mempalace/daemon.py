@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 from urllib import error as urlerror
 from urllib import request as urlrequest
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from .config import MempalaceConfig
 
@@ -631,6 +631,7 @@ def job_to_dict(
     job: Job,
     *,
     include_payload: bool = True,
+    include_result: bool = True,
     redact_payload: bool = False,
 ) -> dict[str, Any]:
     out = {
@@ -642,13 +643,14 @@ def job_to_dict(
         "created_at": job.created_at,
         "started_at": job.started_at,
         "finished_at": job.finished_at,
-        "result": job.result,
         "error": job.error,
         "attempts": job.attempts,
         "updated_at": job.updated_at,
         "heartbeat_at": job.heartbeat_at,
         "progress": job.progress,
     }
+    if include_result:
+        out["result"] = job.result
     if include_payload:
         payload: Any = job.payload
         if redact_payload and job.kind == "mcp_tool":
@@ -869,8 +871,11 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
             if parsed.path == "/jobs":
                 qs = parse_qs(parsed.query)
                 limit = int((qs.get("limit") or ["20"])[0])
+                state = (qs.get("state") or [None])[0]
+                kind = (qs.get("kind") or [None])[0]
                 jobs = [
-                    job_to_dict(job, include_payload=False) for job in runtime.store.list(limit)
+                    job_to_dict(job, include_payload=False, include_result=False)
+                    for job in runtime.store.list(limit, state=state, kind=kind)
                 ]
                 _json_response(self, 200, {"jobs": jobs})
                 return
@@ -1103,8 +1108,18 @@ class DaemonClient:
     def get_job(self, job_id: str) -> dict[str, Any]:
         return self.request("GET", f"/jobs/{job_id}")["job"]
 
-    def list_jobs(self, limit: int = 20) -> list[dict[str, Any]]:
-        return self.request("GET", f"/jobs?limit={int(limit)}")["jobs"]
+    def list_jobs(
+        self,
+        limit: int = 20,
+        state: str | None = None,
+        kind: str | None = None,
+    ) -> list[dict[str, Any]]:
+        query: dict[str, Any] = {"limit": int(limit)}
+        if state:
+            query["state"] = state
+        if kind:
+            query["kind"] = kind
+        return self.request("GET", f"/jobs?{urlencode(query)}")["jobs"]
 
     def wait(self, job_id: str, *, timeout: float = DEFAULT_WAIT_TIMEOUT) -> dict[str, Any]:
         deadline = time.monotonic() + timeout
