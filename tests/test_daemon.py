@@ -109,6 +109,70 @@ def test_queue_dedupes_and_recovers_running_jobs(tmp_path, monkeypatch):
     assert store.get(first.id).state == "queued"
 
 
+def test_queue_adds_progress_columns_and_updates_existing_database(tmp_path, monkeypatch):
+    monkeypatch.setenv(daemon.STATE_ROOT_ENV, str(tmp_path / "state"))
+    queue = tmp_path / "queue.sqlite3"
+    store = daemon.QueueStore(queue)
+    job = store.enqueue("mine", {"source": "/repo"})
+
+    updated = store.update_progress(
+        job.id,
+        {"phase": "scanning", "files_processed": 2},
+    )
+
+    assert updated.progress == {"phase": "scanning", "files_processed": 2}
+    assert updated.updated_at is not None
+    assert updated.heartbeat_at is not None
+
+
+def test_queue_filters_jobs_and_reports_active(tmp_path, monkeypatch):
+    monkeypatch.setenv(daemon.STATE_ROOT_ENV, str(tmp_path / "state"))
+    store = daemon.QueueStore(tmp_path / "queue.sqlite3")
+    mine = store.enqueue("mine", {"source": "/repo"})
+    write = store.enqueue("mcp_tool", {"name": "mempalace_checkpoint"})
+    store.claim_next()
+
+    assert [job.id for job in store.list(state="running", kind="mine")] == [mine.id]
+    assert [job.id for job in store.active(kind="mine")] == [mine.id]
+    assert [job.id for job in store.list(state="queued", kind="mcp_tool")] == [write.id]
+
+
+def test_enqueue_with_status_marks_active_deduplication(tmp_path, monkeypatch):
+    monkeypatch.setenv(daemon.STATE_ROOT_ENV, str(tmp_path / "state"))
+    store = daemon.QueueStore(tmp_path / "queue.sqlite3")
+
+    first, first_deduplicated = store.enqueue_with_status(
+        "mine", {"source": "/repo"}, dedupe_key="same"
+    )
+    second, second_deduplicated = store.enqueue_with_status(
+        "mine", {"source": "/repo"}, dedupe_key="same"
+    )
+
+    assert first_deduplicated is False
+    assert second_deduplicated is True
+    assert second.id == first.id
+
+
+def test_job_to_dict_redacts_verbatim_write_payload(tmp_path, monkeypatch):
+    monkeypatch.setenv(daemon.STATE_ROOT_ENV, str(tmp_path / "state"))
+    store = daemon.QueueStore(tmp_path / "queue.sqlite3")
+    job = store.enqueue(
+        "mcp_tool",
+        {
+            "name": "mempalace_add_drawer",
+            "arguments": {"content": "secret", "wing": "se", "room": "decisions"},
+        },
+    )
+
+    payload = daemon.job_to_dict(job, include_payload=True, redact_payload=True)
+
+    assert payload["payload"] == {
+        "name": "mempalace_add_drawer",
+        "arguments": "<redacted>",
+    }
+    assert "secret" not in str(payload)
+
+
 def test_daemon_http_lifecycle_executes_job(tmp_path, monkeypatch):
     calls = []
 

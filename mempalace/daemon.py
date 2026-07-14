@@ -216,6 +216,9 @@ class Job:
     result: dict[str, Any] | None
     error: dict[str, Any] | None
     attempts: int
+    updated_at: str | None
+    heartbeat_at: str | None
+    progress: dict[str, Any] | None
 
 
 class QueueStore:
@@ -263,10 +266,17 @@ class QueueStore:
                     finished_at TEXT,
                     result_json TEXT,
                     error_json TEXT,
-                    attempts INTEGER NOT NULL DEFAULT 0
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT,
+                    heartbeat_at TEXT,
+                    progress_json TEXT
                 )
                 """
             )
+            present = {str(row[1]) for row in conn.execute("PRAGMA table_info(jobs)")}
+            for name in ("updated_at", "heartbeat_at", "progress_json"):
+                if name not in present:
+                    conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} TEXT")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state, priority)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_dedupe ON jobs(dedupe_key, state)")
             # Unique partial index: at most one queued/running job per dedupe_key.
@@ -348,14 +358,14 @@ class QueueStore:
             )
             return int(cur.rowcount or 0)
 
-    def enqueue(
+    def enqueue_with_status(
         self,
         kind: str,
         payload: dict[str, Any],
         *,
         dedupe_key: str | None = None,
         priority: int = 0,
-    ) -> Job:
+    ) -> tuple[Job, bool]:
         payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         with self._lock, self._connect() as conn:
             if dedupe_key:
@@ -369,17 +379,19 @@ class QueueStore:
                     (dedupe_key,),
                 ).fetchone()
                 if row is not None:
-                    return self._row_to_job(row)
+                    return self._row_to_job(row), True
 
             job_id = uuid.uuid4().hex
+            created_at = _now()
             try:
                 conn.execute(
                     """
                     INSERT INTO jobs (
-                        id, kind, payload_json, state, priority, dedupe_key, created_at, attempts
-                    ) VALUES (?, ?, ?, 'queued', ?, ?, ?, 0)
+                        id, kind, payload_json, state, priority, dedupe_key,
+                        created_at, attempts, updated_at
+                    ) VALUES (?, ?, ?, 'queued', ?, ?, ?, 0, ?)
                     """,
-                    (job_id, kind, payload_json, int(priority), dedupe_key, _now()),
+                    (job_id, kind, payload_json, int(priority), dedupe_key, created_at, created_at),
                 )
             except sqlite3.IntegrityError:
                 # Unique partial index beat us in a cross-process race — return the
@@ -401,15 +413,41 @@ class QueueStore:
                     conn.execute(
                         """
                         INSERT INTO jobs (
-                            id, kind, payload_json, state, priority, dedupe_key, created_at, attempts
-                        ) VALUES (?, ?, ?, 'queued', ?, ?, ?, 0)
+                            id, kind, payload_json, state, priority, dedupe_key,
+                            created_at, attempts, updated_at
+                        ) VALUES (?, ?, ?, 'queued', ?, ?, ?, 0, ?)
                         """,
-                        (job_id, kind, payload_json, int(priority), dedupe_key, _now()),
+                        (
+                            job_id,
+                            kind,
+                            payload_json,
+                            int(priority),
+                            dedupe_key,
+                            created_at,
+                            created_at,
+                        ),
                     )
                     row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
-                return self._row_to_job(row)
+                    return self._row_to_job(row), False
+                return self._row_to_job(row), True
             row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
-            return self._row_to_job(row)
+            return self._row_to_job(row), False
+
+    def enqueue(
+        self,
+        kind: str,
+        payload: dict[str, Any],
+        *,
+        dedupe_key: str | None = None,
+        priority: int = 0,
+    ) -> Job:
+        job, _deduplicated = self.enqueue_with_status(
+            kind,
+            payload,
+            dedupe_key=dedupe_key,
+            priority=priority,
+        )
+        return job
 
     def claim_next(self) -> Job | None:
         # Atomic across processes: the UPDATE only fires if the row is still
@@ -432,10 +470,11 @@ class QueueStore:
             cur = conn.execute(
                 """
                 UPDATE jobs
-                SET state = 'running', started_at = ?, attempts = attempts + 1
+                SET state = 'running', started_at = ?, attempts = attempts + 1,
+                    updated_at = ?, heartbeat_at = ?
                 WHERE id = ? AND state = 'queued'
                 """,
-                (_now(), row["id"]),
+                (_now(), _now(), _now(), row["id"]),
             )
             if cur.rowcount != 1:
                 # Lost the race to another process — nothing to run this iteration.
@@ -463,7 +502,8 @@ class QueueStore:
             conn.execute(
                 f"""
                 UPDATE jobs
-                SET state = ?, finished_at = ?, result_json = ?, error_json = ?
+                SET state = ?, finished_at = ?, result_json = ?, error_json = ?,
+                    updated_at = ?, heartbeat_at = ?
                 {where}
                 """,
                 (
@@ -471,6 +511,8 @@ class QueueStore:
                     _now(),
                     json.dumps(result or {}, ensure_ascii=False),
                     json.dumps(error or {}, ensure_ascii=False) if error else None,
+                    _now(),
+                    _now(),
                     job_id,
                 ),
             )
@@ -484,11 +526,69 @@ class QueueStore:
                 raise DaemonError(f"unknown job id: {job_id}")
             return self._row_to_job(row)
 
-    def list(self, limit: int = 20) -> list[Job]:
+    def update_progress(self, job_id: str, progress: dict[str, Any]) -> Job:
+        now = _now()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE jobs
+                SET progress_json = ?, updated_at = ?, heartbeat_at = ?
+                WHERE id = ?
+                """,
+                (json.dumps(progress, ensure_ascii=False), now, now, job_id),
+            )
+            row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            if row is None:
+                raise DaemonError(f"unknown job id: {job_id}")
+            return self._row_to_job(row)
+
+    def heartbeat(self, job_id: str) -> Job:
+        now = _now()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE jobs SET heartbeat_at = ?, updated_at = ? WHERE id = ?",
+                (now, now, job_id),
+            )
+            row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            if row is None:
+                raise DaemonError(f"unknown job id: {job_id}")
+            return self._row_to_job(row)
+
+    def list(
+        self,
+        limit: int = 20,
+        *,
+        state: str | None = None,
+        kind: str | None = None,
+    ) -> list[Job]:
+        clauses = []
+        params: list[Any] = []
+        if state:
+            clauses.append("state = ?")
+            params.append(state)
+        if kind:
+            clauses.append("kind = ?")
+            params.append(kind)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(max(1, int(limit)))
         with self._lock, self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?",
-                (max(1, int(limit)),),
+                f"SELECT * FROM jobs{where} ORDER BY created_at DESC LIMIT ?",
+                params,
+            ).fetchall()
+            return [self._row_to_job(row) for row in rows]
+
+    def active(self, *, kind: str | None = None) -> list[Job]:
+        clauses = ["state IN ('queued', 'running')"]
+        params: list[Any] = []
+        if kind:
+            clauses.append("kind = ?")
+            params.append(kind)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM jobs WHERE {' AND '.join(clauses)} "
+                "ORDER BY priority DESC, created_at ASC",
+                params,
             ).fetchall()
             return [self._row_to_job(row) for row in rows]
 
@@ -520,10 +620,18 @@ class QueueStore:
             result=_loads(row["result_json"]),
             error=_loads(row["error_json"]),
             attempts=int(row["attempts"]),
+            updated_at=row["updated_at"],
+            heartbeat_at=row["heartbeat_at"],
+            progress=_loads(row["progress_json"]),
         )
 
 
-def job_to_dict(job: Job, *, include_payload: bool = True) -> dict[str, Any]:
+def job_to_dict(
+    job: Job,
+    *,
+    include_payload: bool = True,
+    redact_payload: bool = False,
+) -> dict[str, Any]:
     out = {
         "id": job.id,
         "kind": job.kind,
@@ -536,9 +644,20 @@ def job_to_dict(job: Job, *, include_payload: bool = True) -> dict[str, Any]:
         "result": job.result,
         "error": job.error,
         "attempts": job.attempts,
+        "updated_at": job.updated_at,
+        "heartbeat_at": job.heartbeat_at,
+        "progress": job.progress,
     }
     if include_payload:
-        out["payload"] = job.payload
+        payload: Any = job.payload
+        if redact_payload and job.kind == "mcp_tool":
+            payload = {
+                "name": job.payload.get("name"),
+                "arguments": "<redacted>",
+            }
+        elif redact_payload and job.kind not in {"mine", "sync"}:
+            payload = "<redacted>"
+        out["payload"] = payload
     return out
 
 
