@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
+import stat
 from datetime import date
 
 from mempalace.reorganize import (
     InventoryRecord,
+    collect_duplicate_evidence,
     exact_hash,
     inventory_palace,
     plan_actions,
+    prove_worktree_duplicate,
+    write_manifest,
 )
 
 
@@ -22,8 +27,14 @@ def _record(
     relative_identity: str | None = None,
     authored_at: str | None = None,
     pinned: bool = False,
+    chunk_index: int | None = 0,
+    source_sha256: str | None = None,
 ) -> InventoryRecord:
-    metadata = {"wing": "se", "chunk_index": 0}
+    metadata = {"wing": "se"}
+    if chunk_index is not None:
+        metadata["chunk_index"] = chunk_index
+    if source_sha256 is not None:
+        metadata["source_sha256"] = source_sha256
     if authored_at is not None:
         metadata["authored_at"] = authored_at
     if pinned:
@@ -209,3 +220,161 @@ def test_inventory_reads_chroma_sqlite_without_changing_it(tmp_path):
     }
     assert records[0].relative_identity == "src/a.ts"
     assert hashlib.sha256(db_path.read_bytes()).hexdigest() == before
+
+
+def test_duplicate_requires_same_relative_identity_chunk_and_content_hash():
+    canonical = _record(
+        "canonical",
+        "canonical",
+        content="A",
+        relative_identity="src/a.ts",
+        source_sha256="source-hash",
+    )
+
+    assert (
+        prove_worktree_duplicate(
+            _record(
+                "different-content",
+                "worktree",
+                content="B",
+                relative_identity="src/a.ts",
+                source_sha256="source-hash",
+            ),
+            canonical,
+        )
+        is None
+    )
+    assert (
+        prove_worktree_duplicate(
+            _record(
+                "different-chunk",
+                "worktree",
+                content="A",
+                relative_identity="src/a.ts",
+                chunk_index=1,
+                source_sha256="source-hash",
+            ),
+            canonical,
+        )
+        is None
+    )
+    assert (
+        prove_worktree_duplicate(
+            _record(
+                "different-source",
+                "worktree",
+                content="A",
+                relative_identity="src/a.ts",
+                source_sha256="other-source-hash",
+            ),
+            canonical,
+        )
+        is None
+    )
+    assert (
+        prove_worktree_duplicate(
+            _record(
+                "missing-identity",
+                "worktree",
+                content="A",
+                relative_identity=None,
+                source_sha256="source-hash",
+            ),
+            canonical,
+        )
+        is None
+    )
+
+
+def test_duplicate_proof_allows_legacy_pair_with_no_source_hash():
+    canonical = _record(
+        "canonical",
+        "canonical",
+        content="A",
+        relative_identity="src/a.ts",
+    )
+    worktree = _record(
+        "worktree",
+        "worktree",
+        content="A",
+        relative_identity="src/a.ts",
+    )
+
+    evidence = prove_worktree_duplicate(worktree, canonical)
+
+    assert evidence is not None
+    assert evidence.worktree_drawer_id == "worktree"
+    assert evidence.canonical_drawer_id == "canonical"
+    assert evidence.content_sha256 == exact_hash("A")
+
+
+def test_duplicate_with_only_one_source_hash_is_preserved_as_uncertain():
+    records = [
+        _record(
+            "canonical",
+            "canonical",
+            content="A",
+            relative_identity="src/a.ts",
+            source_sha256="known",
+        ),
+        _record(
+            "worktree",
+            "worktree",
+            content="A",
+            relative_identity="src/a.ts",
+        ),
+    ]
+
+    actions = plan_actions(records)
+
+    assert {action.drawer_id: action.action for action in actions}["worktree"] == (
+        "preserve_uncertain"
+    )
+    assert collect_duplicate_evidence(records, actions) == []
+
+
+def test_manifest_is_owner_only_deterministic_and_excludes_content(tmp_path):
+    records = [
+        _record(
+            "canonical",
+            "canonical",
+            content="SECRET DRAWER TEXT",
+            relative_identity="src/a.ts",
+        ),
+        _record(
+            "worktree",
+            "worktree",
+            content="SECRET DRAWER TEXT",
+            relative_identity="src/a.ts",
+        ),
+    ]
+    actions = plan_actions(records)
+    evidence = collect_duplicate_evidence(records, actions)
+    path = tmp_path / "manifest.json"
+
+    write_manifest(
+        path,
+        records,
+        actions,
+        evidence,
+        palace_path=tmp_path / "palace",
+        sqlite_snapshot={"size": 10, "mtime_ns": 20, "sha256": "db-hash"},
+    )
+    first = path.read_bytes()
+    write_manifest(
+        path,
+        list(reversed(records)),
+        list(reversed(actions)),
+        list(reversed(evidence)),
+        palace_path=tmp_path / "palace",
+        sqlite_snapshot={"size": 10, "mtime_ns": 20, "sha256": "db-hash"},
+    )
+
+    assert path.read_bytes() == first
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert b"SECRET DRAWER TEXT" not in first
+    payload = json.loads(first)
+    assert payload["version"] == 1
+    assert payload["counts"]["inventory_total"] == 2
+    assert payload["counts"]["verified_duplicate_candidates"] == 1
+    assert payload["sqlite_snapshot"]["sha256"] == "db-hash"

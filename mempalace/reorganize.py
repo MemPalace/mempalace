@@ -8,8 +8,10 @@ the HNSW index while producing a migration plan.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sqlite3
+from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -44,6 +46,18 @@ class MigrationAction:
     reason: str
     content_sha256: str
     metadata: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class DuplicateEvidence:
+    """Exact identity evidence linking a worktree drawer to a canonical one."""
+
+    worktree_drawer_id: str
+    canonical_drawer_id: str
+    relative_identity: str
+    chunk_index: int
+    content_sha256: str
+    source_sha256: str | None
 
 
 def exact_hash(content: str) -> str:
@@ -267,6 +281,65 @@ def _as_date(value: date | datetime | None) -> date:
     return value
 
 
+def _chunk_index(record: InventoryRecord) -> int | None:
+    value = record.metadata.get("chunk_index")
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
+def prove_worktree_duplicate(
+    worktree: InventoryRecord,
+    canonical: InventoryRecord,
+) -> DuplicateEvidence | None:
+    """Return strict duplicate evidence or ``None`` when proof is incomplete.
+
+    Legacy pairs where neither drawer has a file-level source hash can still be
+    proven by relative source identity, chunk coordinate, and an exact content
+    hash. If only one side has a source hash, or both hashes disagree, the pair
+    remains uncertain.
+    """
+
+    if worktree.origin != "worktree" or canonical.origin != "canonical":
+        return None
+    if not worktree.relative_identity or not canonical.relative_identity:
+        return None
+    if worktree.relative_identity != canonical.relative_identity:
+        return None
+
+    worktree_chunk = _chunk_index(worktree)
+    canonical_chunk = _chunk_index(canonical)
+    if worktree_chunk is None or canonical_chunk is None or worktree_chunk != canonical_chunk:
+        return None
+
+    worktree_content_hash = exact_hash(worktree.content)
+    if worktree_content_hash != exact_hash(canonical.content):
+        return None
+
+    worktree_source_hash = worktree.metadata.get("source_sha256")
+    canonical_source_hash = canonical.metadata.get("source_sha256")
+    if bool(worktree_source_hash) != bool(canonical_source_hash):
+        return None
+    if worktree_source_hash and str(worktree_source_hash) != str(canonical_source_hash):
+        return None
+
+    return DuplicateEvidence(
+        worktree_drawer_id=worktree.drawer_id,
+        canonical_drawer_id=canonical.drawer_id,
+        relative_identity=worktree.relative_identity,
+        chunk_index=worktree_chunk,
+        content_sha256=worktree_content_hash,
+        source_sha256=str(worktree_source_hash) if worktree_source_hash else None,
+    )
+
+
 def plan_actions(
     records: Iterable[InventoryRecord],
     hot_days: int = 90,
@@ -320,8 +393,12 @@ def plan_actions(
             key = (record.relative_identity or "", content_sha256)
             matches = canonical_matches.get(key, []) if record.relative_identity else []
             if len(matches) == 1:
-                action = "duplicate_candidate"
-                reason = "one canonical drawer has the same relative identity and content"
+                if prove_worktree_duplicate(record, matches[0]) is not None:
+                    action = "duplicate_candidate"
+                    reason = "one canonical drawer has strict exact-duplicate evidence"
+                else:
+                    action = "preserve_uncertain"
+                    reason = "candidate identity is incomplete or source hashes are asymmetric"
             elif matches:
                 action = "preserve_uncertain"
                 reason = "multiple canonical drawers match; deletion identity is ambiguous"
@@ -356,3 +433,174 @@ def plan_actions(
             )
         )
     return actions
+
+
+def collect_duplicate_evidence(
+    records: Iterable[InventoryRecord],
+    actions: Iterable[MigrationAction] | None = None,
+) -> list[DuplicateEvidence]:
+    """Collect evidence only for unambiguous ``duplicate_candidate`` actions."""
+
+    ordered = sorted(records, key=lambda record: record.drawer_id)
+    candidate_ids = (
+        {action.drawer_id for action in actions if action.action == "duplicate_candidate"}
+        if actions is not None
+        else {record.drawer_id for record in ordered if record.origin == "worktree"}
+    )
+    canonical_by_key: dict[tuple[str, str], list[InventoryRecord]] = {}
+    for record in ordered:
+        if record.origin != "canonical" or not record.relative_identity:
+            continue
+        key = (record.relative_identity, exact_hash(record.content))
+        canonical_by_key.setdefault(key, []).append(record)
+
+    evidence: list[DuplicateEvidence] = []
+    for record in ordered:
+        if record.drawer_id not in candidate_ids or record.origin != "worktree":
+            continue
+        key = (record.relative_identity or "", exact_hash(record.content))
+        matches = canonical_by_key.get(key, []) if record.relative_identity else []
+        if len(matches) != 1:
+            continue
+        proof = prove_worktree_duplicate(record, matches[0])
+        if proof is not None:
+            evidence.append(proof)
+    return sorted(evidence, key=lambda item: item.worktree_drawer_id)
+
+
+def sha256_file(path: os.PathLike[str] | str) -> str:
+    """Hash a file without loading it into memory."""
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def palace_snapshot(palace_path: os.PathLike[str] | str) -> dict[str, int | str]:
+    """Capture the read-only SQLite facts needed to audit a plan."""
+
+    sqlite_path = _expanded_path(palace_path) / "chroma.sqlite3"
+    stat_result = sqlite_path.stat()
+    return {
+        "size": stat_result.st_size,
+        "mtime_ns": stat_result.st_mtime_ns,
+        "sha256": sha256_file(sqlite_path),
+    }
+
+
+def _manifest_counts(
+    inventory: list[InventoryRecord],
+    actions: list[MigrationAction],
+    evidence: list[DuplicateEvidence],
+) -> dict[str, Any]:
+    origins = Counter(record.origin for record in inventory)
+    action_types = Counter(action.action for action in actions)
+    tiers = Counter(str(action.metadata.get("memory_tier") or "unspecified") for action in actions)
+    return {
+        "inventory_total": len(inventory),
+        "inventory_by_origin": dict(sorted(origins.items())),
+        "actions_by_type": dict(sorted(action_types.items())),
+        "memory_tiers": dict(sorted(tiers.items())),
+        "verified_duplicate_candidates": len(evidence),
+    }
+
+
+def _manifest_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    allowed = {
+        "chunk_index",
+        "content_sha256",
+        "memory_tier",
+        "source_canonicality",
+        "source_identity",
+        "source_kind",
+        "source_revision",
+        "source_sha256",
+    }
+    return {key: metadata[key] for key in sorted(allowed & metadata.keys())}
+
+
+def write_manifest(
+    path: os.PathLike[str] | str,
+    inventory: Iterable[InventoryRecord],
+    actions: Iterable[MigrationAction],
+    evidence: Iterable[DuplicateEvidence],
+    *,
+    palace_path: os.PathLike[str] | str | None = None,
+    sqlite_snapshot: dict[str, int | str] | None = None,
+) -> None:
+    """Write a deterministic, owner-only migration manifest.
+
+    Drawer text and source paths are intentionally excluded. The manifest
+    records stable IDs, relative identities, hashes, proposed metadata, and
+    duplicate evidence so it can be reviewed without duplicating the corpus.
+    """
+
+    inventory_list = sorted(inventory, key=lambda record: record.drawer_id)
+    action_list = sorted(actions, key=lambda action: action.drawer_id)
+    evidence_list = sorted(evidence, key=lambda item: item.worktree_drawer_id)
+    palace_string = str(_expanded_path(palace_path)) if palace_path is not None else "unspecified"
+    snapshot = (
+        dict(sqlite_snapshot)
+        if sqlite_snapshot is not None
+        else palace_snapshot(palace_string)
+        if palace_path is not None
+        else {}
+    )
+    payload = {
+        "version": 1,
+        "palace_path_sha256": exact_hash(palace_string),
+        "sqlite_snapshot": snapshot,
+        "counts": _manifest_counts(inventory_list, action_list, evidence_list),
+        "inventory": [
+            {
+                "drawer_id": record.drawer_id,
+                "origin": record.origin,
+                "relative_identity": record.relative_identity,
+                "content_sha256": exact_hash(record.content),
+                "source_path_sha256": (
+                    exact_hash(record.source_path) if record.source_path is not None else None
+                ),
+            }
+            for record in inventory_list
+        ],
+        "actions": [
+            {
+                "drawer_id": action.drawer_id,
+                "action": action.action,
+                "destination_wing": action.destination_wing,
+                "reason": action.reason,
+                "content_sha256": action.content_sha256,
+                "metadata": _manifest_metadata(action.metadata),
+            }
+            for action in action_list
+        ],
+        "duplicate_evidence": [
+            {
+                "worktree_drawer_id": item.worktree_drawer_id,
+                "canonical_drawer_id": item.canonical_drawer_id,
+                "relative_identity": item.relative_identity,
+                "chunk_index": item.chunk_index,
+                "content_sha256": item.content_sha256,
+                "source_sha256": item.source_sha256,
+            }
+            for item in evidence_list
+        ],
+    }
+    encoded = (json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode(
+        "utf-8", errors="surrogatepass"
+    )
+
+    manifest_path = Path(path)
+    manifest_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    file_descriptor = os.open(manifest_path, flags, 0o600)
+    try:
+        os.fchmod(file_descriptor, 0o600)
+        with os.fdopen(file_descriptor, "wb") as handle:
+            file_descriptor = -1
+            handle.write(encoded)
+    finally:
+        if file_descriptor >= 0:
+            os.close(file_descriptor)
