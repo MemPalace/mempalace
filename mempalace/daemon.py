@@ -747,6 +747,10 @@ class DaemonRuntime:
                 # Override, never trust the client: an authenticated request for
                 # palace A must not be able to retarget the daemon at palace B.
                 payload["palace_path"] = self.palace_path
+                # Stable across crash recovery/retry. Write handlers use this
+                # private key to derive deterministic storage IDs without
+                # exposing queue internals through their public MCP schemas.
+                payload["operation_id"] = job.id
                 if self.backend:
                     payload["backend"] = self.backend
 
@@ -755,7 +759,11 @@ class DaemonRuntime:
 
                 from .palace import mine_palace_lock
 
-                with mine_palace_lock(self.palace_path):
+                # Block briefly behind an in-flight shared vector-read gate.
+                # The durable job is already accepted, so failing it merely
+                # because one search won the transition race would violate the
+                # daemon contract.
+                with mine_palace_lock(self.palace_path, blocking=True):
                     result = self._execute_with_progress(
                         execute_job,
                         job.kind,
@@ -854,12 +862,13 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
         def _handle_get(self):
             parsed = urlparse(self.path)
             if parsed.path == "/health":
+                worker_alive = runtime.worker_alive()
                 _json_response(
                     self,
                     200,
                     {
-                        "ok": True,
-                        "worker_alive": runtime.worker_alive(),
+                        "ok": worker_alive,
+                        "worker_alive": worker_alive,
                         "pid": os.getpid(),
                         "palace_path": runtime.palace_path,
                         "backend": runtime.backend,
@@ -877,7 +886,7 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
                     job_to_dict(job, include_payload=False, include_result=False)
                     for job in runtime.store.list(limit, state=state, kind=kind)
                 ]
-                _json_response(self, 200, {"jobs": jobs})
+                _json_response(self, 200, {"jobs": jobs, "counts": runtime.store.counts()})
                 return
             if parsed.path.startswith("/jobs/"):
                 job_id = parsed.path.rsplit("/", 1)[-1]
@@ -1095,31 +1104,48 @@ class DaemonClient:
         *,
         dedupe_key: str | None = None,
         priority: int = 0,
+        timeout: float = 5.0,
     ) -> dict[str, Any]:
         response = self.request(
             "POST",
             "/jobs",
             {"kind": kind, "payload": payload, "dedupe_key": dedupe_key, "priority": priority},
+            timeout=timeout,
         )
         job = response["job"]
         job["deduplicated"] = bool(response.get("deduplicated", False))
         return job
 
-    def get_job(self, job_id: str) -> dict[str, Any]:
-        return self.request("GET", f"/jobs/{job_id}")["job"]
+    def get_job(self, job_id: str, *, timeout: float = 5.0) -> dict[str, Any]:
+        return self.request("GET", f"/jobs/{job_id}", timeout=timeout)["job"]
 
     def list_jobs(
         self,
         limit: int = 20,
         state: str | None = None,
         kind: str | None = None,
+        timeout: float = 5.0,
     ) -> list[dict[str, Any]]:
+        return self.list_jobs_summary(
+            limit=limit,
+            state=state,
+            kind=kind,
+            timeout=timeout,
+        )["jobs"]
+
+    def list_jobs_summary(
+        self,
+        limit: int = 20,
+        state: str | None = None,
+        kind: str | None = None,
+        timeout: float = 5.0,
+    ) -> dict[str, Any]:
         query: dict[str, Any] = {"limit": int(limit)}
         if state:
             query["state"] = state
         if kind:
             query["kind"] = kind
-        return self.request("GET", f"/jobs?{urlencode(query)}")["jobs"]
+        return self.request("GET", f"/jobs?{urlencode(query)}", timeout=timeout)
 
     def wait(self, job_id: str, *, timeout: float = DEFAULT_WAIT_TIMEOUT) -> dict[str, Any]:
         deadline = time.monotonic() + timeout
@@ -1142,7 +1168,9 @@ def get_client_if_running(palace_path: str, *, health_timeout: float = 5.0) -> D
     # hook for the default 5s before it falls back to the direct path.
     try:
         client = DaemonClient(palace_path)
-        client.health(timeout=health_timeout)
+        health = client.health(timeout=health_timeout)
+        if not health.get("ok") or health.get("worker_alive") is not True:
+            return None
         return client
     except DaemonError:
         return None
@@ -1284,10 +1312,14 @@ def start_daemon(
 
 
 def ensure_client(
-    palace_path: str, *, backend: str | None = None, auto_start: bool = True
+    palace_path: str,
+    *,
+    backend: str | None = None,
+    auto_start: bool = True,
+    health_timeout: float = 5.0,
 ) -> DaemonClient:
     palace_path = canonical_palace_path(palace_path)
-    client = get_client_if_running(palace_path)
+    client = get_client_if_running(palace_path, health_timeout=health_timeout)
     if client is not None:
         return client
     if not auto_start:
@@ -1306,6 +1338,8 @@ def submit_job(
     wait: bool = True,
     auto_start: bool = False,
     timeout: float = DEFAULT_WAIT_TIMEOUT,
+    health_timeout: float = 5.0,
+    request_timeout: float = 5.0,
 ) -> dict[str, Any]:
     # Strictly opt-in: callers that want the daemon auto-started must say so
     # explicitly (the CLI --daemon path passes auto_start=True). The default
@@ -1315,8 +1349,19 @@ def submit_job(
     payload["palace_path"] = resolved_palace  # override, never trust client input
     if backend:
         payload["backend"] = backend
-    client = ensure_client(resolved_palace, backend=backend, auto_start=auto_start)
-    job = client.submit(kind, payload, dedupe_key=dedupe_key, priority=priority)
+    client = ensure_client(
+        resolved_palace,
+        backend=backend,
+        auto_start=auto_start,
+        health_timeout=health_timeout,
+    )
+    job = client.submit(
+        kind,
+        payload,
+        dedupe_key=dedupe_key,
+        priority=priority,
+        timeout=request_timeout,
+    )
     if not wait:
         return job
     return client.wait(job["id"], timeout=timeout)

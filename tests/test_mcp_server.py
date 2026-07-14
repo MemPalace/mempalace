@@ -3286,6 +3286,34 @@ class TestDiaryTools:
         assert r["entries"][0]["topic"] == "architecture"
         assert "authentication" in r["entries"][0]["content"]
 
+    def test_diary_retry_with_same_operation_id_is_idempotent(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_diary_write
+
+        first = tool_diary_write(
+            agent_name="TestAgent",
+            entry="Committed before the daemon process crashed.",
+            topic="recovery",
+            _operation_id="job-stable-123",
+        )
+        count_after_commit = col.count()
+        retry = tool_diary_write(
+            agent_name="TestAgent",
+            entry="Committed before the daemon process crashed.",
+            topic="recovery",
+            _operation_id="job-stable-123",
+        )
+
+        assert first["success"] is True
+        assert retry["success"] is True
+        assert retry["reason"] == "already_exists"
+        assert retry["entry_id"] == first["entry_id"]
+        assert col.count() == count_after_commit == 1
+
     def test_diary_read_empty(self, monkeypatch, config, palace_path, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         _client, _col = _get_collection(palace_path, create=True)
@@ -4951,6 +4979,33 @@ def test_search_uses_sqlite_bm25_while_maintenance_is_active(monkeypatch):
     assert result["retrieval_mode"] == "bm25_sqlite"
 
 
+def test_search_uses_sqlite_when_writer_wins_status_transition_race(monkeypatch):
+    from contextlib import contextmanager
+
+    from mempalace import mcp_jobs, mcp_server, palace
+
+    captured = {}
+
+    @contextmanager
+    def busy_writer_gate(_palace_path):
+        yield False
+
+    def search(query, **kwargs):
+        captured.update(query=query, kwargs=kwargs)
+        return {"results": []}
+
+    monkeypatch.setattr(mcp_jobs, "active_maintenance_job", lambda **kwargs: None)
+    monkeypatch.setattr(palace, "palace_read_lock", busy_writer_gate)
+    monkeypatch.setattr(mcp_server, "search_memories", search)
+
+    result = mcp_server.tool_search("pdf ocr")
+
+    assert captured["kwargs"]["vector_disabled"] is True
+    assert result["index_state"] == "updating"
+    assert result["active_job_id"] is None
+    assert result["retrieval_mode"] == "bm25_sqlite"
+
+
 def test_search_resets_chroma_cache_after_maintenance_finishes(monkeypatch):
     from mempalace import mcp_jobs, mcp_server
 
@@ -4967,6 +5022,27 @@ def test_search_resets_chroma_cache_after_maintenance_finishes(monkeypatch):
     assert result == {"results": []}
     assert resets == [True]
     assert mcp_server._last_active_maintenance_job_id is None
+
+
+def test_non_search_chroma_read_refuses_while_maintenance_is_active(monkeypatch):
+    from mempalace import mcp_jobs, mcp_server
+
+    monkeypatch.setenv(mcp_jobs.DAEMON_WRITES_ENV, "1")
+    monkeypatch.setattr(
+        mcp_jobs,
+        "active_maintenance_job",
+        lambda **kwargs: {"id": "mine-1", "kind": "mine", "state": "running"},
+    )
+
+    def forbidden():
+        raise AssertionError("Chroma handler must not run during maintenance")
+
+    monkeypatch.setitem(mcp_server.TOOLS["mempalace_status"], "handler", forbidden)
+    result = mcp_server._invoke_direct_tool("mempalace_status", {})
+
+    assert result["success"] is False
+    assert result["error_class"] == "IndexUpdating"
+    assert result["active_job_id"] == "mine-1"
 
 
 def test_peer_writer_guard_does_not_gate_read_tool(monkeypatch):

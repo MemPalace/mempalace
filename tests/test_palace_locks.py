@@ -22,6 +22,7 @@ from mempalace.palace import (
     MineAlreadyRunning,
     mine_global_lock,
     mine_palace_lock,
+    palace_read_lock,
 )
 
 
@@ -119,6 +120,54 @@ def test_lock_reusable_after_release(tmp_path, monkeypatch):
     palace = str(tmp_path / "palace")
     with mine_palace_lock(palace):
         pass
+
+
+def test_shared_read_gate_prevents_writer_transition(tmp_path, monkeypatch):
+    """A vector reader already inside the gate must keep a writer out."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    palace = str(tmp_path / "palace")
+
+    with palace_read_lock(palace) as acquired:
+        assert acquired is True
+        with pytest.raises(MineAlreadyRunning):
+            with mine_palace_lock(palace):
+                pytest.fail("writer must not overlap an active vector reader")
+
+
+def test_process_holding_legacy_writer_lease_can_read(tmp_path, monkeypatch):
+    """A direct-mode MCP lease must not permanently disable its own vectors."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    palace = str(tmp_path / "palace")
+
+    with mine_palace_lock(palace):
+        with palace_read_lock(palace) as acquired:
+            assert acquired is True
+
+
+def test_blocking_writer_waits_for_shared_read_gate(tmp_path, monkeypatch):
+    """The durable writer waits for a reader and then acquires the gate."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    palace = str(tmp_path / "palace")
+    writer_entered = threading.Event()
+    writer_finished = threading.Event()
+
+    with palace_read_lock(palace) as acquired:
+        assert acquired is True
+
+        def writer():
+            with mine_palace_lock(palace, blocking=True):
+                writer_entered.set()
+            writer_finished.set()
+
+        thread = threading.Thread(target=writer)
+        thread.start()
+        time.sleep(0.05)
+        assert writer_entered.is_set() is False
+
+    thread.join(timeout=5)
+    assert thread.is_alive() is False
+    assert writer_entered.is_set() is True
+    assert writer_finished.is_set() is True
     # Re-acquire must succeed now that the previous holder released
     with mine_palace_lock(palace):
         pass

@@ -296,8 +296,12 @@ def _filter_envelope(
 
 
 def _vector_candidate_limit(n_results: int, include_cold: bool) -> int:
-    multiplier = 3 if include_cold else 15
-    return min(n_results * multiplier, 500)
+    # Visibility is enforced by Chroma's metadata filter, so the query only
+    # needs modest over-fetching for later distance/closet ranking.  The old
+    # hot-tier path fetched up to 500 rows and filtered cold rows afterwards,
+    # which was both slower and incomplete when the first hot hit ranked 501.
+    _ = include_cold
+    return n_results * 3
 
 
 def build_where_filter(
@@ -313,8 +317,9 @@ def build_where_filter(
 
     ChromaDB needs a ``$and`` only when ≥2 clauses are present; a single
     clause is returned bare and zero clauses yield an empty filter (#1815).
-    Tier visibility is post-filtered because Chroma cannot express
-    ``memory_tier is missing OR memory_tier != cold`` portably.
+    Chroma's ``$ne`` comparison includes records where the metadata key is
+    absent, preserving the legacy missing-as-hot behavior while excluding
+    cold records before nearest-neighbour ranking.
     """
     scoped_wings = _validate_scope(wing, wings)
     kinds = _validate_source_kinds(source_kinds)
@@ -329,7 +334,8 @@ def build_where_filter(
         clauses.append({"source_file": source_file})
     if kinds:
         clauses.append({"source_kind": {"$in": kinds}})
-    _ = include_cold
+    if not include_cold:
+        clauses.append({"memory_tier": {"$ne": "cold"}})
     if not clauses:
         return {}
     if len(clauses) == 1:
@@ -1346,8 +1352,8 @@ def search_memories(
     try:
         dkwargs = {
             "query_texts": [query],
-            # Cold-tier filtering is post-query for legacy missing-as-hot
-            # semantics, so fetch a wider pool before trimming.
+            # Metadata filtering removes cold rows inside Chroma before ANN
+            # ranking; over-fetch only for later distance/closet ranking.
             "n_results": _vector_candidate_limit(n_results, include_cold),
             "include": ["documents", "metadatas", "distances"],
         }

@@ -49,8 +49,8 @@ The current `se` palace also mixes distinct retrieval concerns. The implemented 
 | Codex/session transcripts | 5,306 | `se-sessions` |
 | Canonical current repository | 4,667 | `se-code` |
 | Temporary linked-worktree copy | 3,588 | delete if equivalent; otherwise preserve as artifacts |
-| Curated records without a mined source | 92 | `se` |
-| Other/unclassified | 0 | preserve if found by a future inventory |
+| Curated records without source provenance | 59 | `se` |
+| Provenance-bearing records outside known roots | 33 | preserve unclassified for review |
 
 The linked-worktree copy alone accounts for 26.3% of the current records. Default retrieval is therefore paying for duplicate and historical material that should not compete with current decisions and code.
 
@@ -370,7 +370,7 @@ Pause writers, confirm the active source palace did not change since the migrati
 
 ### Expected reduction
 
-The dry run classified all 3,588 known worktree records and proved 3,515 exact duplicate candidates. Removing only those reviewed candidates would reduce the current drawer count by 25.7%, from 13,653 to 10,138. The remaining 59 unique and 14 uncertain worktree records are preserved cold in `se-sessions`. Generated/lock/cache exclusions may reduce future mine growth; no repeated-session deletion is proposed by this checkpoint.
+The dry run classified all 3,588 known worktree records and proved 3,515 exact duplicate candidates. Removing only those reviewed candidates would reduce the current drawer count by 25.7%, from 13,653 to 10,138. The remaining 59 unique and 14 uncertain worktree records are preserved cold in `se-sessions`; 33 provenance-bearing records outside known roots remain explicitly unclassified for review. Generated/lock/cache exclusions may reduce future mine growth; no repeated-session deletion is proposed by this checkpoint.
 
 Cold session classification reduces the default search set but not total storage. Reports always distinguish `records_deleted_as_verified_duplicates`, `records_preserved_cold`, and `records_excluded_from_future_mines`.
 

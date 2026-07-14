@@ -1040,6 +1040,25 @@ def _format_lock_holder(content: str) -> str:
 _LOCK_SENTINEL_BYTES = 1
 
 
+def _palace_lock_details(palace_path: str) -> tuple[str, str, str]:
+    lock_dir = os.path.join(os.path.expanduser("~"), ".mempalace", "locks")
+    os.makedirs(lock_dir, exist_ok=True)
+    resolved = os.path.realpath(os.path.expanduser(palace_path))
+    lock_key_source = os.path.normcase(resolved)
+    palace_key = hashlib.sha256(lock_key_source.encode()).hexdigest()[:16]
+    return resolved, palace_key, os.path.join(lock_dir, f"mine_palace_{palace_key}.lock")
+
+
+def _ensure_palace_lock_file(lock_path: str) -> None:
+    if os.path.exists(lock_path):
+        return
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_WRONLY, 0o600)
+        os.close(fd)
+    except FileExistsError:
+        pass
+
+
 def _read_lock_holder(lock_file) -> str:
     """Read the prior holder's identity from the lock-file body, best-effort."""
     try:
@@ -1074,8 +1093,12 @@ def _write_lock_holder(lock_file) -> None:
 
 
 @contextlib.contextmanager
-def mine_palace_lock(palace_path: str):
-    """Per-palace non-blocking lock around the full `mine` pipeline.
+def mine_palace_lock(palace_path: str, *, blocking: bool = False):
+    """Per-palace lock around the full ``mine`` pipeline.
+
+    Direct callers fail fast by default.  The durable daemon worker may pass
+    ``blocking=True`` after accepting a job so it waits for any short-lived
+    vector readers that entered immediately before maintenance began.
 
     The per-file `mine_lock` only protects delete+insert interleave for a
     single source; it does not prevent N copies of `mempalace mine <dir>`
@@ -1106,12 +1129,7 @@ def mine_palace_lock(palace_path: str):
     lets the threaded MCP HTTP transport write from a worker thread while the
     long-lived writer-lease is held on another thread of the same process.
     """
-    lock_dir = os.path.join(os.path.expanduser("~"), ".mempalace", "locks")
-    os.makedirs(lock_dir, exist_ok=True)
-    resolved = os.path.realpath(os.path.expanduser(palace_path))
-    lock_key_source = os.path.normcase(resolved)
-    palace_key = hashlib.sha256(lock_key_source.encode()).hexdigest()[:16]
-    lock_path = os.path.join(lock_dir, f"mine_palace_{palace_key}.lock")
+    resolved, palace_key, lock_path = _palace_lock_details(palace_path)
 
     if _held_by_this_process(palace_key):
         # This process already holds the lock for this palace — pass through.
@@ -1125,14 +1143,7 @@ def mine_palace_lock(palace_path: str):
     # *current* position, so two contenders end up locking different bytes
     # and silently both acquire — observed as Windows-CI lock test
     # failures during #1264 development).
-    if not os.path.exists(lock_path):
-        # Touch atomically: O_CREAT|O_EXCL would fail if a concurrent
-        # contender just created it, which is fine — we proceed to open.
-        try:
-            fd = os.open(lock_path, os.O_CREAT | os.O_WRONLY, 0o600)
-            os.close(fd)
-        except FileExistsError:
-            pass
+    _ensure_palace_lock_file(lock_path)
     lf = open(lock_path, "r+b")
     acquired = False
     try:
@@ -1143,7 +1154,8 @@ def mine_palace_lock(palace_path: str):
             import msvcrt
 
             try:
-                msvcrt.locking(lf.fileno(), msvcrt.LK_NBLCK, 1)
+                mode = msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK
+                msvcrt.locking(lf.fileno(), mode, 1)
                 acquired = True
             except OSError as exc:
                 holder = _read_lock_holder(lf)
@@ -1155,7 +1167,8 @@ def mine_palace_lock(palace_path: str):
             import fcntl
 
             try:
-                fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                flags = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
+                fcntl.flock(lf, flags)
                 acquired = True
             except BlockingIOError as exc:
                 holder = _read_lock_holder(lf)
@@ -1186,6 +1199,65 @@ def mine_palace_lock(palace_path: str):
             except Exception:
                 pass
         lf.close()
+
+
+@contextlib.contextmanager
+def palace_read_lock(palace_path: str):
+    """Try to hold a cross-process read gate for one vector operation.
+
+    On POSIX this is a shared, non-blocking flock. A daemon writer takes the
+    matching exclusive lock in blocking mode, which closes the gap between an
+    MCP maintenance-status check and opening Chroma. Windows byte-range locks
+    have no shared mode, so readers use a short exclusive non-blocking gate.
+
+    Yields ``True`` when vector access is safe and ``False`` when a writer owns
+    the gate. Callers must use their SQLite-only fallback on ``False``.
+    """
+
+    _, palace_key, lock_path = _palace_lock_details(palace_path)
+    if _held_by_this_process(palace_key):
+        # Legacy/direct MCP mode deliberately holds the writer lease for the
+        # process lifetime.  Its own handlers are serialized in-process, so a
+        # same-process read is safe while peer processes remain excluded.
+        yield True
+        return
+    _ensure_palace_lock_file(lock_path)
+    lock_file = open(lock_path, "r+b")
+    acquired = False
+    try:
+        lock_file.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            try:
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                acquired = True
+            except OSError:
+                acquired = False
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                acquired = True
+            except BlockingIOError:
+                acquired = False
+        yield acquired
+    finally:
+        if acquired:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(lock_file, fcntl.LOCK_UN)
+            except Exception:
+                pass
+        lock_file.close()
 
 
 # Backward-compatible alias (previous patch iteration used a single global

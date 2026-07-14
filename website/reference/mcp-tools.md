@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-Detailed parameter schemas for all 35 MCP tools.
+Detailed parameter schemas for all 37 MCP tools.
 
 ## Palace — Read Tools
 
@@ -55,7 +55,10 @@ Semantic search. Returns verbatim drawer content with similarity scores.
 | `query` | string | **Yes** | What to search for |
 | `limit` | integer | No | Max results (default: 5) |
 | `wing` | string | No | Filter by wing |
+| `wings` | array of strings | No | Filter across multiple wings; mutually exclusive with `wing` |
 | `room` | string | No | Filter by room |
+| `source_kinds` | array of strings | No | Filter by `curated`, `code`, `documentation`, `session`, or `worktree-artifact` |
+| `include_cold` | boolean | No | Include cold historical memories (default: false; legacy records without a tier remain visible) |
 
 **Returns:** `{ query, filters, results: [{ text, wing, room, source_file, similarity }] }`
 
@@ -81,6 +84,34 @@ Returns the AAAK dialect specification.
 **Parameters:** None
 
 **Returns:** `{ aaak_spec: "..." }`
+
+---
+
+### `mempalace_job_status`
+
+Read one durable daemon job without opening the palace index. Use this after an
+asynchronous `mempalace_mine` or a queued write returns a `job_id`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `job_id` | string | **Yes** | Job ID returned by a daemon-backed MCP call |
+
+**Returns:** `{ success, job: { id, kind, state, attempts, created_at, started_at?, finished_at?, heartbeat_at?, progress?, result?, error? } }`. Results are present only for terminal jobs.
+
+---
+
+### `mempalace_list_jobs`
+
+List recent durable daemon jobs and safe operational summaries. Verbatim write
+payloads are never returned.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `limit` | integer | No | Recent jobs to return (default 20, max 100) |
+| `state` | string | No | Filter by job state |
+| `kind` | string | No | Filter by job kind, such as `mine` or `mcp_tool` |
+
+**Returns:** `{ success, jobs: [...], counts: { queued, running, succeeded, failed, cancelled } }`, with payload/result details redacted from list entries.
 
 ---
 
@@ -130,7 +161,12 @@ Delete a drawer by ID. Irreversible.
 
 ### `mempalace_mine`
 
-Mine a directory into the palace — the MCP equivalent of `mempalace mine`. Wraps the same in-process miners the CLI uses; runs synchronously and returns the miner's summary as `output`. The palace write lock is automatic — a concurrent mine returns a structured already-running error. Orphan cleanup is separate (see `mempalace_sync`).
+Mine a directory into the palace — the MCP equivalent of `mempalace mine`.
+With `MEMPALACE_MCP_DAEMON_WRITES=1`, validation durably submits the mine and
+returns immediately; poll `mempalace_job_status` for progress and the terminal
+result. The daemon must already be running, and enabled mode never falls back
+to direct writes. Without that opt-in flag, legacy synchronous behavior remains
+available. Orphan cleanup is separate (see `mempalace_sync`).
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -141,8 +177,12 @@ Mine a directory into the palace — the MCP equivalent of `mempalace mine`. Wra
 | `limit` | integer | No | Max files to process (0 = all; default 0) |
 | `dry_run` | boolean | No | Report what would be filed without writing (default false) |
 | `extract` | string | No | Convos extraction strategy: `exchange` (default) or `general`; ignored by other modes |
+| `allow_linked_worktree` | boolean | No | Allow `projects` mode to mine a linked Git worktree (default false) |
+| `priority` | integer | No | Daemon queue priority (default 0) |
 
-**Returns:** `{ success, mode, dry_run, output }` on success (`output` is the miner's human-readable summary; `output_truncated: true` is added when a very large summary is tail-trimmed), or `{ success: false, error, error_class? }` on failure.
+**Returns in daemon-backed mode:** `{ success, accepted, job_id, state, deduplicated, source, mode, wing, submitted_at }`.
+
+**Returns in legacy mode:** `{ success, mode, dry_run, output }` on success (`output` is the miner's human-readable summary; `output_truncated: true` is added when a very large summary is tail-trimmed), or `{ success: false, error, error_class? }` on failure.
 
 ---
 

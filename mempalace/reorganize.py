@@ -14,7 +14,7 @@ import sqlite3
 from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Iterable
 
 from .config import sqlite_read_uri
@@ -67,7 +67,7 @@ def exact_hash(content: str) -> str:
 
 
 def _expanded_path(value: os.PathLike[str] | str) -> Path:
-    return Path(os.path.abspath(os.path.expanduser(os.fspath(value))))
+    return Path(os.path.realpath(os.path.abspath(os.path.expanduser(os.fspath(value)))))
 
 
 def _normalized_roots(values: Iterable[os.PathLike[str] | str]) -> tuple[Path, ...]:
@@ -112,8 +112,25 @@ def _identity_from_metadata(metadata: dict[str, Any]) -> str | None:
         "curated",
     }:
         normalized = suffix
-    normalized = normalized.lstrip("./")
-    return normalized or None
+    return _safe_relative_identity(normalized)
+
+
+def _safe_relative_identity(identity: str) -> str | None:
+    normalized = str(identity).replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    path = PurePosixPath(normalized)
+    windows_path = PureWindowsPath(normalized)
+    if (
+        not normalized
+        or normalized == "."
+        or path.is_absolute()
+        or windows_path.drive
+        or windows_path.is_absolute()
+        or ".." in path.parts
+    ):
+        return None
+    return path.as_posix()
 
 
 def _classify_source(
@@ -147,7 +164,20 @@ def _classify_source(
         return "worktree", source_path, relative_identity
     if source_kind in {"code", "documentation"} and canonicality == "canonical":
         return "canonical", source_path, relative_identity
-    if source_kind == "curated" or metadata.get("wing") == "se":
+    if source_kind == "curated":
+        return "curated", source_path, relative_identity
+    provenance_keys = {
+        "source_file",
+        "source_path",
+        "source_root",
+        "source_identity",
+        "source_kind",
+        "source_canonicality",
+        "source_revision",
+        "source_sha256",
+    }
+    has_provenance = any(metadata.get(key) not in (None, "") for key in provenance_keys)
+    if metadata.get("wing") == "se" and not has_provenance:
         return "curated", source_path, relative_identity
     return "unclassified", source_path, relative_identity
 
@@ -309,9 +339,17 @@ def prove_worktree_duplicate(
 
     if worktree.origin != "worktree" or canonical.origin != "canonical":
         return None
-    if not worktree.relative_identity or not canonical.relative_identity:
+    worktree_identity = (
+        _safe_relative_identity(worktree.relative_identity) if worktree.relative_identity else None
+    )
+    canonical_identity = (
+        _safe_relative_identity(canonical.relative_identity)
+        if canonical.relative_identity
+        else None
+    )
+    if not worktree_identity or not canonical_identity:
         return None
-    if worktree.relative_identity != canonical.relative_identity:
+    if worktree_identity != canonical_identity:
         return None
 
     worktree_chunk = _chunk_index(worktree)
@@ -333,7 +371,7 @@ def prove_worktree_duplicate(
     return DuplicateEvidence(
         worktree_drawer_id=worktree.drawer_id,
         canonical_drawer_id=canonical.drawer_id,
-        relative_identity=worktree.relative_identity,
+        relative_identity=worktree_identity,
         chunk_index=worktree_chunk,
         content_sha256=worktree_content_hash,
         source_sha256=str(worktree_source_hash) if worktree_source_hash else None,
@@ -478,16 +516,48 @@ def sha256_file(path: os.PathLike[str] | str) -> str:
     return digest.hexdigest()
 
 
-def palace_snapshot(palace_path: os.PathLike[str] | str) -> dict[str, int | str]:
+def _stable_file_snapshot(path: Path) -> dict[str, int | str]:
+    before = path.stat()
+    digest = sha256_file(path)
+    after = path.stat()
+    before_identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    after_identity = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    if before_identity != after_identity:
+        raise RuntimeError(f"file changed while hashing: {path}")
+    return {
+        "size": after.st_size,
+        "mtime_ns": after.st_mtime_ns,
+        "sha256": digest,
+    }
+
+
+def palace_snapshot(palace_path: os.PathLike[str] | str) -> dict[str, Any]:
     """Capture the read-only SQLite facts needed to audit a plan."""
 
     sqlite_path = _expanded_path(palace_path) / "chroma.sqlite3"
-    stat_result = sqlite_path.stat()
-    return {
-        "size": stat_result.st_size,
-        "mtime_ns": stat_result.st_mtime_ns,
-        "sha256": sha256_file(sqlite_path),
-    }
+    snapshot: dict[str, Any] = _stable_file_snapshot(sqlite_path)
+    wal_path = Path(f"{sqlite_path}-wal")
+    try:
+        wal_snapshot = _stable_file_snapshot(wal_path)
+    except FileNotFoundError:
+        snapshot.update(
+            {
+                "wal_present": False,
+                "wal_size": None,
+                "wal_mtime_ns": None,
+                "wal_sha256": None,
+            }
+        )
+    else:
+        snapshot.update(
+            {
+                "wal_present": True,
+                "wal_size": wal_snapshot["size"],
+                "wal_mtime_ns": wal_snapshot["mtime_ns"],
+                "wal_sha256": wal_snapshot["sha256"],
+            }
+        )
+    return snapshot
 
 
 def _manifest_counts(
@@ -528,7 +598,7 @@ def write_manifest(
     evidence: Iterable[DuplicateEvidence],
     *,
     palace_path: os.PathLike[str] | str | None = None,
-    sqlite_snapshot: dict[str, int | str] | None = None,
+    sqlite_snapshot: dict[str, Any] | None = None,
 ) -> None:
     """Write a deterministic, owner-only migration manifest.
 

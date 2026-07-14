@@ -33,6 +33,7 @@ import os
 import sys
 import shlex
 import argparse
+import tempfile
 from pathlib import Path
 
 from .config import MempalaceConfig
@@ -581,6 +582,7 @@ def cmd_mine(args):
         )
 
     from .palace import MineAlreadyRunning, MineValidationError
+    from .source_metadata import LinkedWorktreeRejected
 
     try:
         if args.mode == "convos":
@@ -625,6 +627,9 @@ def cmd_mine(args):
         # palace. Surface the holder identity so the operator knows what
         # to wait for (or stop), and exit non-zero so wrappers like
         # nohup / scripts can detect the contention.
+        print(f"mempalace: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except LinkedWorktreeRejected as exc:
         print(f"mempalace: {exc}", file=sys.stderr)
         sys.exit(1)
     except MineValidationError as exc:
@@ -1065,9 +1070,19 @@ def cmd_reorganize(args):
         )
         sys.exit(1)
 
+    manifest_path = Path(os.path.abspath(os.path.expanduser(args.manifest)))
+    manifest_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary_manifest: Path | None = None
     try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{manifest_path.name}.",
+            suffix=".tmp",
+            dir=manifest_path.parent,
+        )
+        os.close(descriptor)
+        temporary_manifest = Path(temporary_name)
         write_manifest(
-            args.manifest,
+            temporary_manifest,
             records,
             actions,
             evidence,
@@ -1076,15 +1091,21 @@ def cmd_reorganize(args):
         )
         after_manifest = palace_snapshot(palace_path)
     except (OSError, RuntimeError, ValueError) as exc:
+        if temporary_manifest is not None:
+            temporary_manifest.unlink(missing_ok=True)
         print(f"  Could not write reorganization manifest: {exc}", file=sys.stderr)
         sys.exit(1)
 
+    assert temporary_manifest is not None
     if before != after_manifest:
+        temporary_manifest.unlink(missing_ok=True)
         print(
-            "  Palace changed before the manifest completed; discard it and retry when mining is idle.",
+            "  Palace changed before the manifest completed; no manifest was published.",
             file=sys.stderr,
         )
         sys.exit(1)
+
+    os.replace(temporary_manifest, manifest_path)
 
     origin_counts = Counter(record.origin for record in records)
     action_counts = Counter(action.action for action in actions)

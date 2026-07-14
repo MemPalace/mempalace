@@ -5,9 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import subprocess
 import time
-from pathlib import Path
 from typing import Any
 
 from .daemon import (
@@ -17,6 +15,7 @@ from .daemon import (
     get_client_if_running,
     submit_job,
 )
+from .source_metadata import detect_linked_worktree
 
 DAEMON_WRITES_ENV = "MEMPALACE_MCP_DAEMON_WRITES"
 DAEMON_PROBE_TIMEOUT_SECONDS = 0.2
@@ -62,49 +61,6 @@ def mine_dedupe_key(palace_path: str, payload: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _git_output(source: str, *args: str) -> str | None:
-    try:
-        result = subprocess.run(
-            ["git", "-C", source, *args],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=3,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if result.returncode != 0:
-        return None
-    return result.stdout.strip()
-
-
-def _primary_worktree(source: str) -> str | None:
-    listing = _git_output(source, "worktree", "list", "--porcelain")
-    if not listing:
-        return None
-    for line in listing.splitlines():
-        if line.startswith("worktree "):
-            return os.path.realpath(line.removeprefix("worktree ").strip())
-    return None
-
-
-def detect_linked_worktree(source: str) -> tuple[bool, str | None]:
-    source = os.path.realpath(os.path.expanduser(source))
-    git_dir_raw = _git_output(source, "rev-parse", "--absolute-git-dir")
-    common_raw = _git_output(source, "rev-parse", "--path-format=absolute", "--git-common-dir")
-    if not git_dir_raw or not common_raw:
-        return False, None
-
-    git_dir = Path(git_dir_raw).resolve()
-    common_dir = Path(common_raw).resolve()
-    linked_root = common_dir / "worktrees"
-    try:
-        linked = git_dir.is_relative_to(linked_root)
-    except ValueError:
-        linked = False
-    return linked, _primary_worktree(source)
-
-
 def submit_mine(palace_path: str, payload: dict[str, Any]) -> dict[str, Any]:
     request = dict(payload)
     source = os.path.realpath(os.path.expanduser(str(request.get("source") or "")))
@@ -134,6 +90,8 @@ def submit_mine(palace_path: str, payload: dict[str, Any]) -> dict[str, Any]:
             priority=priority,
             wait=False,
             auto_start=False,
+            health_timeout=DAEMON_PROBE_TIMEOUT_SECONDS,
+            request_timeout=DAEMON_PROBE_TIMEOUT_SECONDS,
         )
     except DaemonError as exc:
         return {
@@ -192,11 +150,12 @@ def dispatch_daemon_write(
             {"name": tool_name, "arguments": arguments},
             dedupe_key=None,
             priority=priority,
+            timeout=DAEMON_PROBE_TIMEOUT_SECONDS,
         )
         current = job
         deadline = time.monotonic() + max(0, fast_wait_ms) / 1000
         while time.monotonic() < deadline:
-            current = client.get_job(job["id"])
+            current = client.get_job(job["id"], timeout=DAEMON_PROBE_TIMEOUT_SECONDS)
             if current.get("state") in TERMINAL_STATES:
                 result = dict(current.get("result") or {})
                 result.setdefault("success", current.get("state") == "succeeded")
@@ -224,7 +183,10 @@ def tool_job_status(job_id: str, *, palace_path: str | None = None) -> dict[str,
     if client is None:
         return _daemon_unavailable()
     try:
-        return {"success": True, "job": client.get_job(job_id)}
+        return {
+            "success": True,
+            "job": client.get_job(job_id, timeout=DAEMON_PROBE_TIMEOUT_SECONDS),
+        }
     except DaemonError as exc:
         return {
             "success": False,
@@ -244,12 +206,17 @@ def tool_list_jobs(
     if client is None:
         return _daemon_unavailable()
     try:
-        jobs = client.list_jobs(
+        page = client.list_jobs_summary(
             limit=max(1, min(int(limit), 100)),
             state=state or None,
             kind=kind or None,
+            timeout=DAEMON_PROBE_TIMEOUT_SECONDS,
         )
-        return {"success": True, "jobs": jobs}
+        return {
+            "success": True,
+            "jobs": page.get("jobs", []),
+            "counts": page.get("counts", {}),
+        }
     except (DaemonError, ValueError, TypeError) as exc:
         return {
             "success": False,
@@ -266,7 +233,12 @@ def active_maintenance_job(*, palace_path: str | None = None) -> dict[str, Any] 
     if client is None:
         return None
     try:
-        jobs = client.list_jobs(limit=10, state="running", kind=None)
+        jobs = client.list_jobs(
+            limit=10,
+            state="running",
+            kind=None,
+            timeout=DAEMON_PROBE_TIMEOUT_SECONDS,
+        )
     except DaemonError:
         return None
     return next((job for job in jobs if job.get("kind") in {"mine", "sync"}), None)

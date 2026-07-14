@@ -104,6 +104,46 @@ def _capture(fn):
     return result, stdout.getvalue(), stderr.getvalue()
 
 
+def _verify_chroma_readiness(palace_path: str, collection_name: str) -> dict[str, Any]:
+    """Prove persisted vector state can be reopened and queried after mining."""
+    from .backends.chroma import hnsw_capacity_status
+
+    status = hnsw_capacity_status(palace_path, collection_name)
+    status["ready"] = False
+    if status.get("diverged"):
+        return status
+
+    try:
+        from .palace import get_backend_for_palace, get_collection
+
+        backend = get_backend_for_palace(palace_path, explicit="chroma")
+        backend.close_palace(palace_path)
+        collection = get_collection(
+            palace_path,
+            collection_name=collection_name,
+            create=False,
+            backend="chroma",
+        )
+        count = collection.count()
+        if count:
+            collection.query(
+                query_texts=["mempalace post-mine readiness probe"],
+                n_results=1,
+                include=["distances"],
+            )
+    except Exception as exc:
+        status.update(
+            status="unready",
+            message=f"persisted HNSW reopen/query failed after mine: {exc}",
+            readiness_error_class=type(exc).__name__,
+        )
+        return status
+
+    status["ready"] = True
+    status["query_ready"] = True
+    return status
+
+
 def execute_job(
     kind: str,
     payload: dict[str, Any],
@@ -170,6 +210,7 @@ def run_mine(payload: dict[str, Any], progress_callback=None) -> dict[str, Any]:
         _run_pass_zero(project_dir=source, palace_dir=palace_path, llm_provider=None)
 
     from .palace import MineAlreadyRunning, MineValidationError
+    from .source_metadata import LinkedWorktreeRejected
 
     try:
         if mode == "convos":
@@ -223,6 +264,15 @@ def run_mine(payload: dict[str, Any], progress_callback=None) -> dict[str, Any]:
             "error_class": "LockHeldByOtherProcess",
             "exit_code": 1,
         }
+    except LinkedWorktreeRejected as exc:
+        return {
+            "success": False,
+            "error": str(exc),
+            "error_class": "LinkedWorktreeRejected",
+            "source": exc.source,
+            "canonical_root": exc.canonical_root,
+            "exit_code": 1,
+        }
     except MineValidationError as exc:
         return {
             "success": False,
@@ -241,7 +291,30 @@ def run_mine(payload: dict[str, Any], progress_callback=None) -> dict[str, Any]:
     except Exception as exc:
         return {"success": False, "error": f"mine failed: {exc}", "exit_code": 1}
 
-    return {"success": True, "kind": "mine", "mode": mode, "dry_run": dry_run, "exit_code": 0}
+    result = {"success": True, "kind": "mine", "mode": mode, "dry_run": dry_run, "exit_code": 0}
+    if dry_run:
+        return result
+
+    # A committed SQLite transaction is not sufficient proof that vector
+    # retrieval is production-ready.  Validate Chroma's persisted HNSW state
+    # before the durable job becomes terminal so automation cannot mistake a
+    # capacity-diverged palace for a successful mine.
+    from .palace import resolve_backend_name
+
+    if resolve_backend_name(palace_path) == "chroma":
+        vector_status = _verify_chroma_readiness(
+            palace_path,
+            MempalaceConfig().collection_name,
+        )
+        result["vector_status"] = vector_status
+        if not vector_status.get("ready"):
+            result.update(
+                success=False,
+                error=vector_status.get("message") or "HNSW capacity diverged after mine",
+                error_class="VectorReadinessError",
+                exit_code=1,
+            )
+    return result
 
 
 def run_sync(payload: dict[str, Any]) -> dict[str, Any]:
@@ -361,6 +434,7 @@ def run_diary_write(payload: dict[str, Any]) -> dict[str, Any]:
         entry=payload.get("entry") or "",
         topic=payload.get("topic") or "general",
         wing=payload.get("wing") or "",
+        _operation_id=payload.get("operation_id"),
     )
     result.setdefault("exit_code", 0 if result.get("success") else 1)
     return result
@@ -392,7 +466,11 @@ def run_mcp_tool(payload: dict[str, Any]) -> dict[str, Any]:
 
     if name not in TOOLS:
         return {"success": False, "error": f"unknown MCP tool: {name}", "exit_code": 2}
-    result = TOOLS[name]["handler"](**arguments)
+    handler_arguments = dict(arguments)
+    if name in {"mempalace_diary_write", "mempalace_checkpoint"}:
+        handler_arguments.pop("_operation_id", None)
+        handler_arguments["_operation_id"] = payload.get("operation_id")
+    result = TOOLS[name]["handler"](**handler_arguments)
     if isinstance(result, dict):
         # Several write tools signal failure with a bare {"error": ...} and no
         # explicit success flag (e.g. tool_create_tunnel / tool_delete_tunnel

@@ -13,6 +13,7 @@ from mempalace.reorganize import (
     collect_duplicate_evidence,
     exact_hash,
     inventory_palace,
+    palace_snapshot,
     plan_actions,
     prove_worktree_duplicate,
     write_manifest,
@@ -222,6 +223,41 @@ def test_inventory_reads_chroma_sqlite_without_changing_it(tmp_path):
     assert hashlib.sha256(db_path.read_bytes()).hexdigest() == before
 
 
+def test_unknown_provenance_in_se_wing_stays_unclassified(tmp_path):
+    palace = tmp_path / "palace"
+    canonical = tmp_path / "repo"
+    elsewhere = tmp_path / "elsewhere"
+    for path in (palace, canonical, elsewhere):
+        path.mkdir()
+    _seed_palace(
+        palace,
+        [
+            ("curated", "decision", {"wing": "se", "room": "decisions"}),
+            (
+                "unknown",
+                "mystery",
+                {
+                    "wing": "se",
+                    "room": "general",
+                    "source_file": str(elsewhere / "unknown.txt"),
+                },
+            ),
+        ],
+    )
+
+    records = inventory_palace(
+        palace,
+        canonical_root=canonical,
+        worktree_roots=[],
+        session_roots=[],
+    )
+
+    assert {record.drawer_id: record.origin for record in records} == {
+        "curated": "curated",
+        "unknown": "unclassified",
+    }
+
+
 def test_duplicate_requires_same_relative_identity_chunk_and_content_hash():
     canonical = _record(
         "canonical",
@@ -244,6 +280,22 @@ def test_duplicate_requires_same_relative_identity_chunk_and_content_hash():
         )
         is None
     )
+
+    traversal_canonical = _record(
+        "traversal-canonical",
+        "canonical",
+        content="A",
+        relative_identity="../outside.ts",
+        source_sha256="source-hash",
+    )
+    traversal_worktree = _record(
+        "traversal-worktree",
+        "worktree",
+        content="A",
+        relative_identity="../outside.ts",
+        source_sha256="source-hash",
+    )
+    assert prove_worktree_duplicate(traversal_worktree, traversal_canonical) is None
     assert (
         prove_worktree_duplicate(
             _record(
@@ -378,3 +430,84 @@ def test_manifest_is_owner_only_deterministic_and_excludes_content(tmp_path):
     assert payload["counts"]["inventory_total"] == 2
     assert payload["counts"]["verified_duplicate_candidates"] == 1
     assert payload["sqlite_snapshot"]["sha256"] == "db-hash"
+
+
+def test_inventory_preserves_dotfile_relative_identity(tmp_path):
+    palace = tmp_path / "palace"
+    canonical = tmp_path / "repo"
+    palace.mkdir()
+    canonical.mkdir()
+    _seed_palace(
+        palace,
+        [
+            (
+                "dotfile",
+                "workflow",
+                {
+                    "wing": "se-code",
+                    "source_kind": "code",
+                    "source_canonicality": "canonical",
+                    "source_identity": "code:.github/workflows/ci.yml",
+                    "chunk_index": 0,
+                },
+            )
+        ],
+    )
+
+    records = inventory_palace(
+        palace,
+        canonical_root=canonical,
+        worktree_roots=[],
+        session_roots=[],
+    )
+
+    assert records[0].relative_identity == ".github/workflows/ci.yml"
+
+
+def test_windows_drive_identity_is_not_treated_as_relative(tmp_path):
+    palace = tmp_path / "palace"
+    canonical = tmp_path / "repo"
+    palace.mkdir()
+    canonical.mkdir()
+    _seed_palace(
+        palace,
+        [
+            (
+                "windows-absolute",
+                "content",
+                {
+                    "wing": "se-code",
+                    "source_kind": "code",
+                    "source_canonicality": "canonical",
+                    "source_identity": "code:C:/repo/src/app.ts",
+                    "chunk_index": 0,
+                },
+            )
+        ],
+    )
+
+    records = inventory_palace(
+        palace,
+        canonical_root=canonical,
+        worktree_roots=[],
+        session_roots=[],
+    )
+
+    assert records[0].relative_identity is None
+
+
+def test_palace_snapshot_tracks_wal_changes(tmp_path):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    db_path = palace / "chroma.sqlite3"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE example(value TEXT)")
+
+    without_wal = palace_snapshot(palace)
+    (palace / "chroma.sqlite3-wal").write_bytes(b"pending write")
+    with_wal = palace_snapshot(palace)
+
+    assert without_wal["wal_present"] is False
+    assert with_wal["wal_present"] is True
+    assert with_wal["wal_sha256"] == hashlib.sha256(b"pending write").hexdigest()
+    assert with_wal != without_wal

@@ -26,3 +26,20 @@ def test_progress_reporter_merges_state_and_throttles(monkeypatch):
 def test_progress_reporter_never_breaks_mining_when_callback_fails():
     reporter = ProgressReporter(lambda _event: (_ for _ in ()).throw(RuntimeError("boom")))
     reporter.emit(force=True, phase="scanning")
+
+
+def test_progress_callback_failure_is_still_throttled(monkeypatch):
+    attempts = []
+    ticks = iter([1.0, 1.1, 2.1])
+    monkeypatch.setattr("mempalace.progress.time.monotonic", lambda: next(ticks))
+
+    def broken(event):
+        attempts.append(event)
+        raise RuntimeError("queue unavailable")
+
+    reporter = ProgressReporter(broken, min_interval=1.0)
+    reporter.emit(files_processed=1)
+    reporter.emit(files_processed=2)
+    reporter.emit(files_processed=3)
+
+    assert [item["files_processed"] for item in attempts] == [1, 3]

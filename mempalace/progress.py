@@ -34,9 +34,11 @@ class ProgressReporter:
             and now - self._last_emitted_at < self.min_interval
         ):
             return
+        # Throttle delivery attempts as well as successes. A broken queue or
+        # callback must not turn per-file progress into an exception hot loop.
+        self._last_emitted_at = now
         try:
             self.callback(dict(self.state))
         except Exception:
             # Progress is observability only; it must never fail useful work.
             return
-        self._last_emitted_at = now

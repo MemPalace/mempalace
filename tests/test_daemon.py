@@ -229,7 +229,16 @@ def test_daemon_http_lifecycle_executes_job(tmp_path, monkeypatch):
 
     assert finished["state"] == "succeeded"
     assert finished["result"]["stdout"] == "done\n"
-    assert calls == [("mine", {"source": "src", "palace_path": str(palace.resolve())})]
+    assert calls == [
+        (
+            "mine",
+            {
+                "source": "src",
+                "palace_path": str(palace.resolve()),
+                "operation_id": job["id"],
+            },
+        )
+    ]
     summaries = client.list_jobs(limit=5, state="succeeded", kind="mine")
     assert [summary["id"] for summary in summaries] == [job["id"]]
     assert "payload" not in summaries[0]
@@ -269,7 +278,7 @@ def test_submit_job_uses_client_and_waits(monkeypatch, tmp_path):
         def __init__(self):
             self.submitted = None
 
-        def submit(self, kind, payload, dedupe_key=None, priority=0):
+        def submit(self, kind, payload, dedupe_key=None, priority=0, timeout=5.0):
             self.submitted = (kind, payload, dedupe_key, priority)
             return {"id": "job-1", "state": "queued"}
 
@@ -570,6 +579,7 @@ def test_worker_overrides_client_palace_path(tmp_path, monkeypatch):
 
     def fake_execute(kind, payload):
         seen["palace_path"] = payload.get("palace_path")
+        seen["operation_id"] = payload.get("operation_id")
         return {"success": True, "exit_code": 0}
 
     client, thread, palace, holders = _start_server(tmp_path, monkeypatch, fake_execute)
@@ -582,6 +592,7 @@ def test_worker_overrides_client_palace_path(tmp_path, monkeypatch):
         _stop_server(client, thread, holders)
     assert seen["palace_path"] == daemon.canonical_palace_path(str(palace))
     assert seen["palace_path"] != "/tmp/other-palace"
+    assert seen["operation_id"] == job["id"]
 
 
 def test_mcp_tool_allowlist_rejects_non_write_tools(tmp_path, monkeypatch):
@@ -803,17 +814,35 @@ def test_run_diary_write_forwards_args_and_sets_exit_code(monkeypatch):
 
     captured = {}
 
-    def fake_diary(agent_name, entry, topic, wing):
-        captured.update(agent_name=agent_name, entry=entry, topic=topic, wing=wing)
+    def fake_diary(agent_name, entry, topic, wing, _operation_id=None):
+        captured.update(
+            agent_name=agent_name,
+            entry=entry,
+            topic=topic,
+            wing=wing,
+            operation_id=_operation_id,
+        )
         return {"success": True}
 
     monkeypatch.setattr(mcp, "tool_diary_write", fake_diary)
     out = service.run_diary_write(
-        {"agent_name": "alice", "entry": "hello", "topic": "t", "wing": "w"}
+        {
+            "agent_name": "alice",
+            "entry": "hello",
+            "topic": "t",
+            "wing": "w",
+            "operation_id": "job-1",
+        }
     )
     assert out["success"] is True
     assert out["exit_code"] == 0
-    assert captured == {"agent_name": "alice", "entry": "hello", "topic": "t", "wing": "w"}
+    assert captured == {
+        "agent_name": "alice",
+        "entry": "hello",
+        "topic": "t",
+        "wing": "w",
+        "operation_id": "job-1",
+    }
 
 
 def test_run_mine_applies_backend_before_mode_validation(tmp_path):
@@ -826,6 +855,64 @@ def test_run_mine_applies_backend_before_mode_validation(tmp_path):
     out = service.run_mine({"palace_path": str(palace), "mode": "bogus", "backend": "chroma"})
     assert out["success"] is False
     assert out["exit_code"] == 2
+
+
+def test_run_mine_fails_terminal_job_when_hnsw_is_diverged(tmp_path, monkeypatch):
+    from mempalace import miner, service
+    from mempalace import palace as palace_module
+
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    source = tmp_path / "source"
+    source.mkdir()
+    monkeypatch.setattr(miner, "mine", lambda **kwargs: None)
+    monkeypatch.setattr(palace_module, "resolve_backend_name", lambda _path: "chroma")
+    monkeypatch.setattr(
+        service,
+        "_verify_chroma_readiness",
+        lambda *_args, **_kwargs: {
+            "status": "diverged",
+            "diverged": True,
+            "ready": False,
+            "message": "HNSW is behind SQLite",
+        },
+    )
+
+    out = service.run_mine({"palace_path": str(palace), "source": str(source), "mode": "projects"})
+
+    assert out["success"] is False
+    assert out["error_class"] == "VectorReadinessError"
+    assert out["vector_status"]["status"] == "diverged"
+    assert out["exit_code"] == 1
+
+
+def test_run_mine_accepts_inconclusive_capacity_only_after_query_probe(tmp_path, monkeypatch):
+    from mempalace import miner, service
+    from mempalace import palace as palace_module
+
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    source = tmp_path / "source"
+    source.mkdir()
+    monkeypatch.setattr(miner, "mine", lambda **kwargs: None)
+    monkeypatch.setattr(palace_module, "resolve_backend_name", lambda _path: "chroma")
+    monkeypatch.setattr(
+        service,
+        "_verify_chroma_readiness",
+        lambda *_args, **_kwargs: {
+            "status": "unknown",
+            "diverged": False,
+            "ready": True,
+            "query_ready": True,
+            "message": "metadata not flushed",
+        },
+    )
+
+    out = service.run_mine({"palace_path": str(palace), "source": str(source), "mode": "projects"})
+
+    assert out["success"] is True
+    assert out["vector_status"]["status"] == "unknown"
+    assert out["vector_status"]["query_ready"] is True
 
 
 def test_execute_job_dispatches_diary_write_mcp_tool_and_unknown(monkeypatch):
@@ -980,7 +1067,7 @@ def test_get_client_if_running_uses_short_probe_timeout(monkeypatch):
 
         def health(self, *, timeout):
             captured["timeout"] = timeout
-            return {"ok": True}
+            return {"ok": True, "worker_alive": True}
 
     monkeypatch.setattr(daemon, "DaemonClient", _FakeClient)
 
@@ -988,6 +1075,19 @@ def test_get_client_if_running_uses_short_probe_timeout(monkeypatch):
     client = daemon.get_client_if_running("/p", health_timeout=daemon.HOOK_PROBE_TIMEOUT)
     assert client is not None
     assert captured["timeout"] == daemon.HOOK_PROBE_TIMEOUT
+
+
+def test_get_client_if_running_rejects_dead_worker(monkeypatch):
+    class _FakeClient:
+        def __init__(self, palace_path):
+            pass
+
+        def health(self, *, timeout):
+            return {"ok": False, "worker_alive": False}
+
+    monkeypatch.setattr(daemon, "DaemonClient", _FakeClient)
+
+    assert daemon.get_client_if_running("/p", health_timeout=0.1) is None
 
 
 # --- _detached_kwargs ---

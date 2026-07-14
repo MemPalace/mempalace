@@ -337,6 +337,47 @@ def test_load_config_rejects_non_boolean_worktree_policy(tmp_path):
         load_config(str(tmp_path))
 
 
+def test_direct_mine_rejects_linked_worktree_by_default(tmp_path, monkeypatch):
+    from mempalace import source_metadata
+    from mempalace.source_metadata import LinkedWorktreeRejected
+
+    project = tmp_path / "linked"
+    project.mkdir()
+    (project / "mempalace.yaml").write_text("wing: linked\nrooms: []\n")
+    monkeypatch.setattr(
+        source_metadata,
+        "detect_linked_worktree",
+        lambda _source: (True, "/canonical/repository"),
+    )
+
+    with pytest.raises(LinkedWorktreeRejected, match="canonical/repository"):
+        mine(str(project), str(tmp_path / "palace"), dry_run=True)
+
+
+def test_explicit_linked_worktree_override_reaches_miner(tmp_path, monkeypatch):
+    from mempalace import embedding, source_metadata
+
+    project = tmp_path / "linked"
+    project.mkdir()
+    (project / "mempalace.yaml").write_text("wing: linked\nrooms: []\n")
+    monkeypatch.setattr(
+        source_metadata,
+        "detect_linked_worktree",
+        lambda _source: (True, "/canonical/repository"),
+    )
+    monkeypatch.setattr(embedding, "describe_device", lambda: "test")
+
+    # An explicit override is how the daemon carries
+    # allow_linked_worktree=true across the durable queue.
+    mine(
+        str(project),
+        str(tmp_path / "palace"),
+        dry_run=True,
+        files=[],
+        source_canonicality="linked-worktree",
+    )
+
+
 def test_scan_project_skips_mempalace_generated_files():
     with tempfile.TemporaryDirectory() as tmpdir:
         project_root = Path(tmpdir).resolve()

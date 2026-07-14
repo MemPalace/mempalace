@@ -382,6 +382,25 @@ _MCP_ALLOW_PEER_WRITER_ENV = "MEMPALACE_MCP_ALLOW_PEER_WRITER"
 # search can therefore use SQLite/BM25 while a direct operation is blocked.
 _PALACE_READ_LOCK = threading.RLock()
 _JOB_READ_TOOLS = frozenset({"mempalace_job_status", "mempalace_list_jobs"})
+_CHROMA_READ_TOOLS = frozenset(
+    {
+        "mempalace_status",
+        "mempalace_list_wings",
+        "mempalace_list_rooms",
+        "mempalace_get_taxonomy",
+        "mempalace_traverse",
+        "mempalace_find_tunnels",
+        "mempalace_graph_stats",
+        "mempalace_list_tunnels",
+        "mempalace_list_hallways",
+        "mempalace_follow_tunnels",
+        "mempalace_check_duplicate",
+        "mempalace_get_drawer",
+        "mempalace_list_drawers",
+        "mempalace_diary_read",
+        "mempalace_memories_filed_away",
+    }
+)
 _last_active_maintenance_job_id: str | None = None
 
 _MUTATING_TOOLS = frozenset(
@@ -2106,6 +2125,7 @@ def tool_search(
             collection_name=_config.collection_name,
         )
 
+    writer_gate_busy = False
     if active is not None:
         _last_active_maintenance_job_id = active.get("id")
         # The daemon owns the writer lease. Avoid Chroma entirely and use the
@@ -2114,31 +2134,48 @@ def tool_search(
         result = _search(vector_disabled=True)
     else:
         with _PALACE_READ_LOCK:
-            if _last_active_maintenance_job_id is not None:
-                _force_chroma_cache_reset()
-                _last_active_maintenance_job_id = None
-            # Ensure the vector-disabled probe has been run via the safe
-            # sqlite/pickle path before we touch chromadb. Calling _get_client()
-            # here would defeat the fallback — it constructs a PersistentClient
-            # which can segfault on segment load in the #1222 failure mode.
-            _refresh_vector_disabled_flag()
-            result = _search(vector_disabled=_vector_disabled)
-            if _is_transient_index_error(result):
+            from .palace import palace_read_lock
+
+            with palace_read_lock(_config.palace_path) as vector_safe:
+                if not vector_safe:
+                    # A writer won the transition race after the daemon-status
+                    # check. Never open Chroma/HNSW in this branch.
+                    writer_gate_busy = True
+                    active = active_maintenance_job(palace_path=_config.palace_path)
+                    if active is not None:
+                        _last_active_maintenance_job_id = active.get("id")
+                    result = _search(vector_disabled=True)
+                else:
+                    if _last_active_maintenance_job_id is not None:
+                        _force_chroma_cache_reset()
+                        _last_active_maintenance_job_id = None
+                    # Ensure the vector-disabled probe has been run via the safe
+                    # sqlite/pickle path before we touch chromadb. Calling
+                    # _get_client() here would defeat the fallback.
+                    _refresh_vector_disabled_flag()
+                    result = _search(vector_disabled=_vector_disabled)
+            if not writer_gate_busy and _is_transient_index_error(result):
                 # Post-bulk-write HNSW flush window (#1315): drop caches, give
-                # the segment a moment to settle, retry once. Caller never sees
-                # the transient unless the second attempt also fails.
+                # the segment a moment to settle, retry once under a fresh
+                # cross-process read gate.
                 _force_chroma_cache_reset()
                 time.sleep(2)
                 _refresh_vector_disabled_flag()
-                result = _search(vector_disabled=_vector_disabled)
-                if not _is_transient_index_error(result):
-                    result["index_recovered"] = True
+                with palace_read_lock(_config.palace_path) as vector_safe:
+                    if vector_safe:
+                        result = _search(vector_disabled=_vector_disabled)
+                        if not _is_transient_index_error(result):
+                            result["index_recovered"] = True
+                    else:
+                        writer_gate_busy = True
+                        active = active_maintenance_job(palace_path=_config.palace_path)
+                        result = _search(vector_disabled=True)
 
-    if active is not None:
+    if active is not None or writer_gate_busy:
         result.update(
             {
                 "index_state": "updating",
-                "active_job_id": active.get("id"),
+                "active_job_id": active.get("id") if active is not None else None,
                 "retrieval_mode": "bm25_sqlite",
             }
         )
@@ -3559,7 +3596,13 @@ def tool_kg_stats():
 # ==================== AGENT DIARY ====================
 
 
-def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: str = ""):
+def tool_diary_write(
+    agent_name: str,
+    entry: str,
+    topic: str = "general",
+    wing: str = "",
+    _operation_id: str | None = None,
+):
     """
     Write a diary entry for this agent. Entries are timestamped and
     accumulate over time in a diary room.
@@ -3588,10 +3631,46 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
         return _collection_error_or_no_palace()
 
     now = datetime.now()
-    entry_id = (
-        f"diary_{wing}_{now.strftime('%Y%m%d_%H%M%S%f')}_"
-        f"{hashlib.sha256(entry.encode()).hexdigest()[:12]}"
-    )
+    content_hash = hashlib.sha256(entry.encode()).hexdigest()[:12]
+    if _operation_id:
+        operation_hash = hashlib.sha256(str(_operation_id).encode()).hexdigest()[:24]
+        entry_id = f"diary_{wing}_job_{operation_hash}_{content_hash}"
+    else:
+        entry_id = f"diary_{wing}_{now.strftime('%Y%m%d_%H%M%S%f')}_{content_hash}"
+
+    chunk_size = _config.chunk_size
+    if len(entry) <= chunk_size:
+        expected_ids = [entry_id]
+    else:
+        expected_ids = [
+            f"{entry_id}_chunk_{index:06d}"
+            for index in range((len(entry) + chunk_size - 1) // chunk_size)
+        ]
+
+    if _operation_id:
+        try:
+            existing = set(col.get(ids=expected_ids, include=[]).get("ids") or [])
+        except Exception as exc:
+            logger.warning("Diary idempotency pre-check failed for %s", entry_id, exc_info=True)
+            return {"success": False, "error": f"diary idempotency check failed: {exc}"}
+        if existing == set(expected_ids):
+            result = {
+                "success": True,
+                "reason": "already_exists",
+                "entry_id": entry_id,
+                "agent": agent_name,
+                "topic": topic,
+                "chunks": len(expected_ids),
+            }
+            if len(expected_ids) > 1:
+                result["chunk_ids"] = expected_ids
+            return result
+        if existing:
+            return {
+                "success": False,
+                "error": "partial diary operation exists; refusing a duplicate retry",
+                "entry_id": entry_id,
+            }
 
     _wal_log(
         "diary_write",
@@ -3618,7 +3697,6 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
             "filed_at": now.isoformat(),
             "date": now.strftime("%Y-%m-%d"),
         }
-        chunk_size = _config.chunk_size
         if len(entry) <= chunk_size:
             col.add(
                 ids=[entry_id],
@@ -3978,7 +4056,7 @@ def tool_reconnect():
         return {"success": False, "error": str(e)}
 
 
-def tool_checkpoint(items, diary=None, dedup_threshold=0.9):
+def tool_checkpoint(items, diary=None, dedup_threshold=0.9, _operation_id: str | None = None):
     """Batch session save in a single call.
 
     Semantic-dedups each item, files the non-duplicates as drawers, then
@@ -4047,6 +4125,7 @@ def tool_checkpoint(items, diary=None, dedup_threshold=0.9):
                     entry=entry,
                     topic=diary.get("topic", "session-checkpoint"),
                     wing=diary.get("wing", ""),
+                    _operation_id=_operation_id,
                 )
     return out
 
@@ -4851,6 +4930,27 @@ def _invoke_direct_tool(tool_name: str, tool_args: dict):
     if daemon_writes_enabled() and tool_name == "mempalace_mine":
         return handler(**tool_args)
     with _PALACE_READ_LOCK:
+        if daemon_writes_enabled() and tool_name in _CHROMA_READ_TOOLS:
+            from .mcp_jobs import active_maintenance_job
+            from .palace import palace_read_lock
+
+            active = active_maintenance_job(palace_path=_config.palace_path)
+            if active is not None:
+                return {
+                    "success": False,
+                    "error": "vector index is updating; retry after maintenance",
+                    "error_class": "IndexUpdating",
+                    "active_job_id": active.get("id"),
+                }
+            with palace_read_lock(_config.palace_path) as vector_safe:
+                if not vector_safe:
+                    return {
+                        "success": False,
+                        "error": "vector index is updating; retry after maintenance",
+                        "error_class": "IndexUpdating",
+                        "active_job_id": None,
+                    }
+                return handler(**tool_args)
         return handler(**tool_args)
 
 

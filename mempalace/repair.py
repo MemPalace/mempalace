@@ -644,7 +644,10 @@ def print_sqlite_integrity_abort(palace_path: str, errors: list[str]) -> None:
 # intact ``embedding_fulltext_search_content`` shadow table, so rebuilding it
 # restores full-text search without touching any drawer rows. Concurrent
 # killed-mid-write mines are the usual cause (#1596).
-_FTS5_MALFORMED_RE = re.compile(r"malformed inverted index for FTS5 table", re.IGNORECASE)
+_FTS5_MALFORMED_RE = re.compile(
+    r"(?:malformed inverted index for FTS5 table|fts5:\s*corruption found reading blob)",
+    re.IGNORECASE,
+)
 
 
 def _errors_are_isolated_fts5(errors: list[str]) -> bool:

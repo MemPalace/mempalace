@@ -65,7 +65,7 @@ def _path_within_root(path: Path, root: Path) -> bool:
         return False
 
 
-def _read_text_no_follow(filepath: Path, root: Path) -> Optional[str]:
+def _read_source_no_follow(filepath: Path, root: Path) -> Optional[tuple[str, str]]:
     if not _path_within_root(filepath, root):
         return None
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -75,9 +75,13 @@ def _read_text_no_follow(filepath: Path, root: Path) -> Optional[str]:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_FILE_SIZE:
             return None
-        with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as f:
+        with os.fdopen(fd, "rb") as f:
             fd = -1
-            return f.read()
+            source_bytes = f.read()
+            return (
+                source_bytes.decode("utf-8", errors="replace"),
+                hashlib.sha256(source_bytes).hexdigest(),
+            )
     except OSError:
         return None
     finally:
@@ -86,6 +90,12 @@ def _read_text_no_follow(filepath: Path, root: Path) -> Optional[str]:
                 os.close(fd)
             except OSError:
                 pass
+
+
+def _read_text_no_follow(filepath: Path, root: Path) -> Optional[str]:
+    """Backward-compatible text-only view of the single-read source helper."""
+    result = _read_source_no_follow(filepath, root)
+    return result[0] if result is not None else None
 
 
 PHP_EXTENSIONS = {
@@ -1474,10 +1484,11 @@ def process_file(
     if not dry_run and file_already_mined(collection, source_file, check_mtime=True):
         return 0, "general", None
 
-    content = _read_text_no_follow(filepath, project_path)
-    if content is None:
+    source = _read_source_no_follow(filepath, project_path)
+    if source is None:
         return 0, "general", None
 
+    content, source_sha256 = source
     content = content.strip()
     if len(content) < effective_min:
         return 0, "general", None
@@ -1492,7 +1503,7 @@ def process_file(
         ),
         source_revision=source_revision,
         source_canonicality=source_canonicality,
-        source_sha256=sha256_file(source_file),
+        source_sha256=source_sha256,
     )
     chunks = chunk_text(
         content,
@@ -1846,6 +1857,13 @@ def _mine_impl(
         current_source="",
     )
     config = load_config(project_dir)
+    from .source_metadata import enforce_worktree_policy
+
+    source_canonicality = enforce_worktree_policy(
+        str(project_path),
+        config,
+        source_canonicality,
+    )
     palace_config = MempalaceConfig()
 
     cfg_chunk_size = palace_config.chunk_size

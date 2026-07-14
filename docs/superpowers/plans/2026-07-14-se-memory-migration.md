@@ -232,4 +232,6 @@ Run with the active palace read-only and write the manifest under an owner-only 
 Completed against 13,653 drawers. The database SHA-256 remained
 `0e17be92a4cc7583054127ab4d295aa961ef8f06f565ffc6fd8a5958ebf9734b`.
 The manifest proves 3,515 duplicate candidates and preserves 59 unique plus 14
-uncertain worktree artifacts. No drawer was changed or deleted.
+uncertain worktree artifacts. It retains 59 source-free curated records and
+preserves 33 provenance-bearing records outside known roots as unclassified.
+No drawer was changed or deleted.

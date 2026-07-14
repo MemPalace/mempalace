@@ -21,39 +21,74 @@ class TestBuildWhereFilter:
     """build_where_filter composes a ChromaDB where clause from optional
     wing / room / source_file constraints (#1815). ChromaDB needs a ``$and``
     only when ≥2 clauses are present; a single clause is returned bare and
-    zero clauses yield an empty filter."""
+    zero explicit scopes still yield the default hot-tier filter."""
 
     def test_no_filters_returns_empty(self):
-        assert build_where_filter() == {}
+        assert build_where_filter() == {"memory_tier": {"$ne": "cold"}}
 
     def test_wing_only(self):
-        assert build_where_filter(wing="backend") == {"wing": "backend"}
+        assert build_where_filter(wing="backend") == {
+            "$and": [
+                {"wing": "backend"},
+                {"memory_tier": {"$ne": "cold"}},
+            ]
+        }
 
     def test_room_only(self):
-        assert build_where_filter(room="auth") == {"room": "auth"}
+        assert build_where_filter(room="auth") == {
+            "$and": [
+                {"room": "auth"},
+                {"memory_tier": {"$ne": "cold"}},
+            ]
+        }
 
     def test_wing_and_room(self):
         assert build_where_filter(wing="backend", room="auth") == {
-            "$and": [{"wing": "backend"}, {"room": "auth"}]
+            "$and": [
+                {"wing": "backend"},
+                {"room": "auth"},
+                {"memory_tier": {"$ne": "cold"}},
+            ]
         }
 
     def test_source_file_only(self):
-        assert build_where_filter(source_file="auth.py") == {"source_file": "auth.py"}
+        assert build_where_filter(source_file="auth.py") == {
+            "$and": [
+                {"source_file": "auth.py"},
+                {"memory_tier": {"$ne": "cold"}},
+            ]
+        }
 
     def test_wing_and_source_file(self):
         assert build_where_filter(wing="backend", source_file="auth.py") == {
-            "$and": [{"wing": "backend"}, {"source_file": "auth.py"}]
+            "$and": [
+                {"wing": "backend"},
+                {"source_file": "auth.py"},
+                {"memory_tier": {"$ne": "cold"}},
+            ]
         }
 
     def test_room_and_source_file(self):
         assert build_where_filter(room="auth", source_file="auth.py") == {
-            "$and": [{"room": "auth"}, {"source_file": "auth.py"}]
+            "$and": [
+                {"room": "auth"},
+                {"source_file": "auth.py"},
+                {"memory_tier": {"$ne": "cold"}},
+            ]
         }
 
     def test_wing_room_and_source_file(self):
         assert build_where_filter(wing="backend", room="auth", source_file="auth.py") == {
-            "$and": [{"wing": "backend"}, {"room": "auth"}, {"source_file": "auth.py"}]
+            "$and": [
+                {"wing": "backend"},
+                {"room": "auth"},
+                {"source_file": "auth.py"},
+                {"memory_tier": {"$ne": "cold"}},
+            ]
         }
+
+    def test_include_cold_omits_tier_filter(self):
+        assert build_where_filter(include_cold=True) == {}
 
     def test_multiwing_source_kind_filter(self):
         where = build_where_filter(

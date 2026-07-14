@@ -309,9 +309,10 @@ def test_layer2_retrieve_no_filter():
         layer = Layer2(palace_path="/fake")
         layer.retrieve()
 
-    # No where filter should be passed
+    # Default retrieval excludes cold history while retaining legacy records
+    # whose memory_tier metadata is absent.
     call_kwargs = mock_col.get.call_args[1]
-    assert "where" not in call_kwargs
+    assert call_kwargs["where"] == {"memory_tier": {"$ne": "cold"}}
 
 
 def test_layer2_retrieve_error():
@@ -422,7 +423,12 @@ def test_layer3_search_with_wing_filter():
         layer.search("q", wing="proj")
 
     call_kwargs = mock_col.query.call_args[1]
-    assert call_kwargs["where"] == {"wing": "proj"}
+    assert call_kwargs["where"] == {
+        "$and": [
+            {"wing": "proj"},
+            {"memory_tier": {"$ne": "cold"}},
+        ]
+    }
 
 
 def test_layer3_search_with_room_filter():
@@ -441,7 +447,12 @@ def test_layer3_search_with_room_filter():
         layer.search("q", room="backend")
 
     call_kwargs = mock_col.query.call_args[1]
-    assert call_kwargs["where"] == {"room": "backend"}
+    assert call_kwargs["where"] == {
+        "$and": [
+            {"room": "backend"},
+            {"memory_tier": {"$ne": "cold"}},
+        ]
+    }
 
 
 def test_layer3_search_with_wing_and_room():

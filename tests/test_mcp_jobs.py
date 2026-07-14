@@ -12,18 +12,22 @@ class FakeClient:
         self.submit_calls = []
         self.list_calls = []
 
-    def submit(self, kind, payload, dedupe_key=None, priority=0):
-        self.submit_calls.append((kind, payload, dedupe_key, priority))
+    def submit(self, kind, payload, dedupe_key=None, priority=0, timeout=5.0):
+        self.submit_calls.append((kind, payload, dedupe_key, priority, timeout))
         return dict(self.submitted)
 
-    def get_job(self, job_id):
+    def get_job(self, job_id, timeout=5.0):
         if self.jobs:
             return dict(self.jobs.pop(0))
         return {**self.submitted, "id": job_id}
 
-    def list_jobs(self, limit=20, state=None, kind=None):
-        self.list_calls.append((limit, state, kind))
+    def list_jobs(self, limit=20, state=None, kind=None, timeout=5.0):
+        self.list_calls.append((limit, state, kind, timeout))
         return list(self.listed)
+
+    def list_jobs_summary(self, limit=20, state=None, kind=None, timeout=5.0):
+        self.list_calls.append((limit, state, kind, timeout))
+        return {"jobs": list(self.listed), "counts": {"running": len(self.listed)}}
 
 
 def _init_repo(path):
@@ -92,6 +96,8 @@ def test_submit_mine_returns_accepted_job_and_deduplication(monkeypatch, tmp_pat
         assert kind == "mine"
         assert kwargs["wait"] is False
         assert kwargs["auto_start"] is False
+        assert kwargs["health_timeout"] == mcp_jobs.DAEMON_PROBE_TIMEOUT_SECONDS
+        assert kwargs["request_timeout"] == mcp_jobs.DAEMON_PROBE_TIMEOUT_SECONDS
         assert kwargs["dedupe_key"] == mcp_jobs.mine_dedupe_key("/palace", payload)
         return {
             "id": "job-1",
@@ -190,6 +196,7 @@ def test_daemon_write_returns_completed_result_on_fast_path(monkeypatch):
             },
             None,
             0,
+            mcp_jobs.DAEMON_PROBE_TIMEOUT_SECONDS,
         )
     ]
 
@@ -242,8 +249,9 @@ def test_job_status_and_list_use_daemon_without_exposing_payload(monkeypatch):
     assert listed == {
         "success": True,
         "jobs": [{"id": "j1", "kind": "mine", "state": "running"}],
+        "counts": {"running": 1},
     }
-    assert client.list_calls == [(5, "running", "mine")]
+    assert client.list_calls == [(5, "running", "mine", mcp_jobs.DAEMON_PROBE_TIMEOUT_SECONDS)]
 
 
 def test_job_tools_fail_closed_when_daemon_is_unavailable(monkeypatch):
@@ -268,4 +276,4 @@ def test_active_maintenance_job_returns_running_mine(monkeypatch):
     active = mcp_jobs.active_maintenance_job(palace_path="/palace")
 
     assert active == {"id": "mine-1", "kind": "mine", "state": "running"}
-    assert client.list_calls == [(10, "running", None)]
+    assert client.list_calls == [(10, "running", None, mcp_jobs.DAEMON_PROBE_TIMEOUT_SECONDS)]

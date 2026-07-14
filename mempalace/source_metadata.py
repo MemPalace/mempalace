@@ -6,10 +6,23 @@ import hashlib
 import os
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 
 SOURCE_KINDS = frozenset({"curated", "code", "documentation", "session", "worktree-artifact"})
 MEMORY_TIERS = frozenset({"hot", "cold"})
 SOURCE_CANONICALITIES = frozenset({"canonical", "linked-worktree"})
+
+
+class LinkedWorktreeRejected(ValueError):
+    """Raised when project mining targets a non-canonical Git worktree."""
+
+    def __init__(self, source: str, canonical_root: str | None):
+        self.source = source
+        self.canonical_root = canonical_root
+        message = "linked Git worktree mining is disabled; mine the canonical checkout"
+        if canonical_root:
+            message += f" at {canonical_root}"
+        super().__init__(message)
 
 
 @dataclass(frozen=True)
@@ -49,6 +62,68 @@ def git_revision(root: str) -> str | None:
         return None
     revision = result.stdout.strip()
     return revision if result.returncode == 0 and revision else None
+
+
+def _git_output(source: str, *args: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", source, *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def _primary_worktree(source: str) -> str | None:
+    listing = _git_output(source, "worktree", "list", "--porcelain")
+    if not listing:
+        return None
+    for line in listing.splitlines():
+        if line.startswith("worktree "):
+            return os.path.realpath(line.removeprefix("worktree ").strip())
+    return None
+
+
+def detect_linked_worktree(source: str) -> tuple[bool, str | None]:
+    """Return whether ``source`` is a linked checkout and its primary root."""
+    source = os.path.realpath(os.path.expanduser(source))
+    roots = _git_output(
+        source,
+        "rev-parse",
+        "--absolute-git-dir",
+        "--path-format=absolute",
+        "--git-common-dir",
+    )
+    lines = roots.splitlines() if roots else []
+    if len(lines) != 2:
+        return False, None
+
+    git_dir = Path(lines[0]).resolve()
+    common_dir = Path(lines[1]).resolve()
+    try:
+        linked = git_dir.is_relative_to(common_dir / "worktrees")
+    except ValueError:
+        linked = False
+    return linked, _primary_worktree(source)
+
+
+def enforce_worktree_policy(
+    source: str,
+    config: dict,
+    requested_canonicality: str,
+) -> str:
+    """Apply project config and return canonical provenance for this source."""
+    linked, canonical_root = detect_linked_worktree(source)
+    explicitly_allowed = requested_canonicality == "linked-worktree"
+    if linked and config.get("reject_linked_worktrees", True) and not explicitly_allowed:
+        raise LinkedWorktreeRejected(source, canonical_root)
+    return "linked-worktree" if linked else "canonical"
 
 
 def _validate_context(context: SourceContext) -> None:
