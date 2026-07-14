@@ -253,3 +253,19 @@ def test_job_tools_fail_closed_when_daemon_is_unavailable(monkeypatch):
 
     assert result["success"] is False
     assert result["error_class"] == "DaemonUnavailable"
+
+
+def test_active_maintenance_job_returns_running_mine(monkeypatch):
+    client = FakeClient(
+        listed=[
+            {"id": "write-1", "kind": "mcp_tool", "state": "running"},
+            {"id": "mine-1", "kind": "mine", "state": "running"},
+        ]
+    )
+    monkeypatch.setenv(mcp_jobs.DAEMON_WRITES_ENV, "1")
+    monkeypatch.setattr(mcp_jobs, "get_client_if_running", lambda *a, **k: client)
+
+    active = mcp_jobs.active_maintenance_job(palace_path="/palace")
+
+    assert active == {"id": "mine-1", "kind": "mine", "state": "running"}
+    assert client.list_calls == [(10, "running", None)]

@@ -4883,6 +4883,49 @@ def test_job_read_tools_bypass_peer_writer_and_daemon_write_dispatch(monkeypatch
     assert result["job"] == {"id": "j1", "state": "running"}
 
 
+def test_search_uses_sqlite_bm25_while_maintenance_is_active(monkeypatch):
+    from mempalace import mcp_jobs, mcp_server
+
+    captured = {}
+
+    def search(query, **kwargs):
+        captured.update(query=query, kwargs=kwargs)
+        return {"results": []}
+
+    monkeypatch.setenv(mcp_jobs.DAEMON_WRITES_ENV, "1")
+    monkeypatch.setattr(
+        mcp_jobs,
+        "active_maintenance_job",
+        lambda **kwargs: {"id": "mine-1", "kind": "mine", "state": "running"},
+    )
+    monkeypatch.setattr(mcp_server, "search_memories", search)
+
+    result = mcp_server.tool_search("pdf ocr")
+
+    assert captured["kwargs"]["vector_disabled"] is True
+    assert result["index_state"] == "updating"
+    assert result["active_job_id"] == "mine-1"
+    assert result["retrieval_mode"] == "bm25_sqlite"
+
+
+def test_search_resets_chroma_cache_after_maintenance_finishes(monkeypatch):
+    from mempalace import mcp_jobs, mcp_server
+
+    resets = []
+    monkeypatch.setattr(mcp_jobs, "active_maintenance_job", lambda **kwargs: None)
+    monkeypatch.setattr(mcp_server, "_last_active_maintenance_job_id", "mine-1")
+    monkeypatch.setattr(mcp_server, "_force_chroma_cache_reset", lambda: resets.append(True))
+    monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", lambda: None)
+    monkeypatch.setattr(mcp_server, "_vector_disabled", False)
+    monkeypatch.setattr(mcp_server, "search_memories", lambda *a, **k: {"results": []})
+
+    result = mcp_server.tool_search("pdf ocr")
+
+    assert result == {"results": []}
+    assert resets == [True]
+    assert mcp_server._last_active_maintenance_job_id is None
+
+
 def test_peer_writer_guard_does_not_gate_read_tool(monkeypatch):
     from mempalace import mcp_server
 

@@ -377,6 +377,13 @@ _MCP_WRITER_LOCK_FAILED = False
 _MCP_WRITER_LOCK_ERROR = ""
 _MCP_ALLOW_PEER_WRITER_ENV = "MEMPALACE_MCP_ALLOW_PEER_WRITER"
 
+# Serialize direct Chroma/KG operations without serializing the whole HTTP
+# request. Daemon submissions and job reads never take this lock; maintenance
+# search can therefore use SQLite/BM25 while a direct operation is blocked.
+_PALACE_READ_LOCK = threading.RLock()
+_JOB_READ_TOOLS = frozenset({"mempalace_job_status", "mempalace_list_jobs"})
+_last_active_maintenance_job_id: str | None = None
+
 _MUTATING_TOOLS = frozenset(
     {
         "mempalace_kg_add",
@@ -2037,6 +2044,8 @@ def tool_search(
     min_similarity: float = None,
     context: str = None,
 ):
+    global _last_active_maintenance_job_id
+
     limit = max(1, min(limit, _MAX_RESULTS))
     try:
         wing = _sanitize_optional_name(wing, "wing")
@@ -2050,30 +2059,13 @@ def tool_search(
     dist = (1.0 - min_similarity) if min_similarity is not None else max_distance
     # Mitigate system prompt contamination (Issue #333)
     sanitized = sanitize_query(query)
-    # Ensure the vector-disabled probe has been run via the safe
-    # sqlite/pickle path before we touch chromadb. Calling _get_client()
-    # here would defeat the fallback — it constructs a PersistentClient
-    # which can segfault on segment load in the #1222 failure mode.
-    _refresh_vector_disabled_flag()
-    result = search_memories(
-        sanitized["clean_query"],
-        palace_path=_config.palace_path,
-        wing=wing,
-        room=room,
-        source_file=source_file,
-        n_results=limit,
-        max_distance=dist,
-        vector_disabled=_vector_disabled,
-        collection_name=_config.collection_name,
-    )
-    if _is_transient_index_error(result):
-        # Post-bulk-write HNSW flush window (#1315): drop caches, give
-        # the segment a moment to settle, retry once. Caller never sees
-        # the transient unless the second attempt also fails.
-        _force_chroma_cache_reset()
-        time.sleep(2)
-        _refresh_vector_disabled_flag()
-        result = search_memories(
+
+    from .mcp_jobs import active_maintenance_job
+
+    active = active_maintenance_job(palace_path=_config.palace_path)
+
+    def _search(*, vector_disabled: bool):
+        return search_memories(
             sanitized["clean_query"],
             palace_path=_config.palace_path,
             wing=wing,
@@ -2081,12 +2073,47 @@ def tool_search(
             source_file=source_file,
             n_results=limit,
             max_distance=dist,
-            vector_disabled=_vector_disabled,
+            vector_disabled=vector_disabled,
             collection_name=_config.collection_name,
         )
-        if not _is_transient_index_error(result):
-            result["index_recovered"] = True
-    if _vector_disabled:
+
+    if active is not None:
+        _last_active_maintenance_job_id = active.get("id")
+        # The daemon owns the writer lease. Avoid Chroma entirely and use the
+        # read-only SQLite/BM25 path, which observes committed rows without
+        # waiting for the maintenance job or the in-process palace lock.
+        result = _search(vector_disabled=True)
+    else:
+        with _PALACE_READ_LOCK:
+            if _last_active_maintenance_job_id is not None:
+                _force_chroma_cache_reset()
+                _last_active_maintenance_job_id = None
+            # Ensure the vector-disabled probe has been run via the safe
+            # sqlite/pickle path before we touch chromadb. Calling _get_client()
+            # here would defeat the fallback — it constructs a PersistentClient
+            # which can segfault on segment load in the #1222 failure mode.
+            _refresh_vector_disabled_flag()
+            result = _search(vector_disabled=_vector_disabled)
+            if _is_transient_index_error(result):
+                # Post-bulk-write HNSW flush window (#1315): drop caches, give
+                # the segment a moment to settle, retry once. Caller never sees
+                # the transient unless the second attempt also fails.
+                _force_chroma_cache_reset()
+                time.sleep(2)
+                _refresh_vector_disabled_flag()
+                result = _search(vector_disabled=_vector_disabled)
+                if not _is_transient_index_error(result):
+                    result["index_recovered"] = True
+
+    if active is not None:
+        result.update(
+            {
+                "index_state": "updating",
+                "active_job_id": active.get("id"),
+                "retrieval_mode": "bm25_sqlite",
+            }
+        )
+    elif _vector_disabled:
         result["vector_disabled"] = True
         result["vector_disabled_reason"] = _vector_disabled_reason
     # Attach sanitizer metadata for transparency
@@ -4758,6 +4785,19 @@ def _decorate_mcp_tool_result(tool_name: str, result):
     return result
 
 
+def _invoke_direct_tool(tool_name: str, tool_args: dict):
+    """Run a non-queued handler with the narrowest safe palace lock scope."""
+    from .mcp_jobs import daemon_writes_enabled
+
+    handler = TOOLS[tool_name]["handler"]
+    if tool_name in _JOB_READ_TOOLS or tool_name == "mempalace_search":
+        return handler(**tool_args)
+    if daemon_writes_enabled() and tool_name == "mempalace_mine":
+        return handler(**tool_args)
+    with _PALACE_READ_LOCK:
+        return handler(**tool_args)
+
+
 def handle_request(request):
     global _last_request_time
     if not isinstance(request, dict):
@@ -4905,7 +4945,7 @@ def handle_request(request):
                     palace_path=_config.palace_path,
                 )
             else:
-                result = TOOLS[tool_name]["handler"](**tool_args)
+                result = _invoke_direct_tool(tool_name, tool_args)
             result = _decorate_mcp_tool_result(tool_name, result)
 
             return {
@@ -5174,7 +5214,6 @@ def _json_rpc_parse_error(req_id=None):
 # Module-level constants for the HTTP transport.
 # Defined here (not inside main()) so _serve_http() / _build_http_server()
 # can reference them as free names without a NameError.
-_HTTP_REQUEST_LOCK = threading.Lock()
 _HTTP_MAX_REQUEST_BYTES = 16 * 1024 * 1024
 # Host literals that always denote this machine. Used both to decide whether a
 # bind is loopback (skip the network-exposure warning) and to pin the Host
@@ -5380,11 +5419,10 @@ def _build_http_server(host: str, port: int):
                 self._send_json(400, _json_rpc_parse_error())
                 return
 
-            # Preserve the single-process / single-palace-handle behavior that
-            # stdio deployments rely on. HTTP gives us a safer transport, not
-            # concurrent Chroma/HNSW mutation.
-            with _HTTP_REQUEST_LOCK:
-                response = handle_request(request)
+            # Request framing is concurrent. Individual palace operations are
+            # serialized by _PALACE_READ_LOCK; daemon submissions, job reads,
+            # and maintenance-time SQLite/BM25 search bypass that lock.
+            response = handle_request(request)
 
             if response is None:
                 # JSON-RPC notifications intentionally have no response body.
@@ -5527,7 +5565,7 @@ def _run_http_loop() -> None:
     if raw_warmup in _WARMUP_TRUTHY:
 
         def _warmup_with_lock():
-            with _HTTP_REQUEST_LOCK:
+            with _PALACE_READ_LOCK:
                 _maybe_eager_warmup_embedder()
 
         threading.Thread(

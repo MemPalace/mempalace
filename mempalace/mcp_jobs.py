@@ -256,3 +256,17 @@ def tool_list_jobs(
             "error": str(exc),
             "error_class": "DaemonJobError",
         }
+
+
+def active_maintenance_job(*, palace_path: str | None = None) -> dict[str, Any] | None:
+    """Return a running mine/sync summary, without reading queued payloads."""
+    if not daemon_writes_enabled():
+        return None
+    client = _running_client(palace_path)
+    if client is None:
+        return None
+    try:
+        jobs = client.list_jobs(limit=10, state="running", kind=None)
+    except DaemonError:
+        return None
+    return next((job for job in jobs if job.get("kind") in {"mine", "sync"}), None)

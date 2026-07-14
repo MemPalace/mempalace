@@ -961,8 +961,8 @@ def _validate_palace_fts5_after_mine(palace_path: str) -> None:
 # different worker thread. A thread-local guard makes those handlers fail to see
 # the process-held lease, re-acquire the flock, and self-conflict
 # ("palace ... is held by PID <self>"). flock is per-process and HTTP writes are
-# serialized by `_HTTP_REQUEST_LOCK`, so the process is the correct re-entrancy
-# boundary.
+# serialized at the palace-operation boundary by the MCP server (or by the
+# daemon's single worker), so the process is the correct re-entrancy boundary.
 #
 # The holder set is tagged with ``pid`` so that a forked child does NOT inherit
 # re-entrant credit from its parent: the OS-level flock IS NOT inherited as a

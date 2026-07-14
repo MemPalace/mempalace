@@ -20,6 +20,7 @@ Design constraints
 import http.client
 import json
 import threading
+import time
 
 import pytest
 
@@ -230,6 +231,100 @@ def test_read_only_off_exposes_mutating_tools(http_server):
     status, body = _post(port, "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
     names = {t["name"] for t in json.loads(body)["result"]["tools"]}
     assert "mempalace_add_drawer" in names
+
+
+def test_job_status_and_bm25_search_respond_while_palace_operation_is_blocked(
+    http_server, monkeypatch
+):
+    from mempalace import mcp_jobs
+
+    port, _ = http_server
+    started = threading.Event()
+    release = threading.Event()
+    blocked_response = {}
+
+    def blocked_sync(**kwargs):
+        started.set()
+        release.wait(3)
+        return {"success": True}
+
+    def run_blocked_request():
+        blocked_response["value"] = _post(
+            port,
+            "/mcp",
+            {
+                "jsonrpc": "2.0",
+                "id": 20,
+                "method": "tools/call",
+                "params": {"name": "mempalace_sync", "arguments": {}},
+            },
+        )
+
+    monkeypatch.delenv(mcp_jobs.DAEMON_WRITES_ENV, raising=False)
+    monkeypatch.setattr(mcp, "_mcp_tool_preflight_refusal", lambda *args: None)
+    monkeypatch.setitem(mcp.TOOLS["mempalace_sync"], "handler", blocked_sync)
+    monkeypatch.setattr(
+        mcp_jobs,
+        "tool_job_status",
+        lambda job_id, palace_path=None: {
+            "success": True,
+            "job": {"id": job_id, "state": "running"},
+        },
+    )
+    monkeypatch.setattr(
+        mcp_jobs,
+        "active_maintenance_job",
+        lambda **kwargs: {"id": "mine-1", "kind": "mine", "state": "running"},
+    )
+    monkeypatch.setattr(mcp, "search_memories", lambda *args, **kwargs: {"results": []})
+
+    blocked = threading.Thread(target=run_blocked_request, daemon=True)
+    blocked.start()
+    assert started.wait(1)
+    safety_release = threading.Timer(1.0, release.set)
+    safety_release.start()
+    try:
+        before = time.monotonic()
+        status, status_body = _post(
+            port,
+            "/mcp",
+            {
+                "jsonrpc": "2.0",
+                "id": 21,
+                "method": "tools/call",
+                "params": {
+                    "name": "mempalace_job_status",
+                    "arguments": {"job_id": "mine-1"},
+                },
+            },
+        )
+        status_elapsed = time.monotonic() - before
+
+        before = time.monotonic()
+        search_status, search_body = _post(
+            port,
+            "/mcp",
+            {
+                "jsonrpc": "2.0",
+                "id": 22,
+                "method": "tools/call",
+                "params": {"name": "mempalace_search", "arguments": {"query": "ocr"}},
+            },
+        )
+        search_elapsed = time.monotonic() - before
+    finally:
+        release.set()
+        safety_release.cancel()
+        blocked.join(timeout=3)
+
+    assert status == 200
+    assert json.loads(status_body)["result"]
+    assert search_status == 200
+    search_result = json.loads(json.loads(search_body)["result"]["content"][0]["text"])
+    assert search_result["retrieval_mode"] == "bm25_sqlite"
+    assert status_elapsed < 0.5
+    assert search_elapsed < 0.5
+    assert blocked_response["value"][0] == 200
 
 
 def _make_self_signed_cert(tmp_path):
