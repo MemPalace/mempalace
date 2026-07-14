@@ -2,6 +2,7 @@
 
 import os
 import sqlite3
+import threading
 from contextlib import closing
 from unittest.mock import MagicMock, call, patch
 
@@ -1356,6 +1357,45 @@ def test_sqlite_integrity_errors_returns_empty_for_healthy_db(tmp_path):
         conn.commit()
 
     assert repair.sqlite_integrity_errors(str(palace)) == []
+
+
+def test_sqlite_integrity_errors_waits_out_transient_writer_lock(tmp_path):
+    """A concurrent writer must read as contention, not corruption.
+
+    Python's sqlite3.connect ships a 5-second default busy timeout, but
+    real peer writes (batch mines, curator passes) routinely hold the
+    write lock longer than that. Before the explicit busy_timeout fix,
+    quick_check then failed with "database is locked" and the MCP startup
+    integrity gate (#1818) reported the palace as corrupt — every client
+    failed loudly (and typically reconnect-stormed) for the entire
+    duration of an otherwise healthy batch write.
+
+    The 7-second hold below is deliberate: over the 5 s default that
+    masked the bug, under the 15 s explicit timeout that fixes it.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    db_path = palace / "chroma.sqlite3"
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE dummy(id INTEGER PRIMARY KEY)")
+        conn.commit()
+
+    locker = sqlite3.connect(db_path, check_same_thread=False)
+    locker.execute("BEGIN EXCLUSIVE")
+
+    def _release():
+        locker.commit()
+        locker.close()
+
+    timer = threading.Timer(7.0, _release)
+    timer.start()
+    try:
+        errors = repair.sqlite_integrity_errors(str(palace))
+    finally:
+        timer.join()
+
+    assert errors == []
 
 
 def test_sqlite_integrity_errors_reports_unreadable_sqlite_file(tmp_path):

@@ -592,6 +592,14 @@ def sqlite_integrity_errors(palace_path: str) -> list[str]:
 
     try:
         with sqlite3.connect(sqlite_read_uri(sqlite_path), uri=True) as conn:
+            # SQLITE_BUSY from a concurrent writer is contention, not
+            # corruption. Without a busy_timeout, quick_check fails
+            # instantly with "database is locked" whenever another
+            # process holds the write lock (e.g. a long batch write on a
+            # rollback-journal palace), and callers — including the MCP
+            # startup integrity gate (#1818) — misreport a healthy palace
+            # as corrupt. Wait out transient writers before giving up.
+            conn.execute("PRAGMA busy_timeout = 15000")
             rows = conn.execute("PRAGMA quick_check").fetchall()
     except sqlite3.Error as e:
         return [f"PRAGMA quick_check failed: {e}"]
