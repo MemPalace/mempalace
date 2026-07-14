@@ -431,6 +431,16 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     if _truthy_env(_MCP_ALLOW_PEER_WRITER_ENV):
         return True, ""
 
+    if http_mode():
+        # HTTP mode: the standalone Chroma server serializes writes, so a
+        # peer MemPalace writer cannot corrupt another process's in-memory
+        # HNSW/FTS state — the hazard this lease guards against (#1818).
+        # Holding a process-lifetime lease here would turn the multi-process
+        # topology HTTP mode exists for into read-only peers (#1888).
+        # Individual mining passes still take mine_palace_lock for their
+        # own application-level atomicity.
+        return True, ""
+
     if _MCP_WRITER_LOCK_CM is not None:
         return True, ""
 

@@ -1340,9 +1340,14 @@ class ChromaCollection(BaseCollection):
     def _write_lock(self):
         """Acquire ``mine_palace_lock`` for the configured palace, if any.
 
-        No-op (yields immediately) when ``self._palace_path`` is None.
+        No-op (yields immediately) when ``self._palace_path`` is None, and in
+        HTTP mode: the flock guarded embedded ChromaDB's
+        multi-threaded HNSW corruption (#974/#965), but over HTTP the server
+        serializes writes itself. Kept on, the non-blocking flock turns the
+        multi-process topology this transport exists for (MCP servers + hook
+        CLI writing concurrently) into hard ``MineAlreadyRunning`` errors.
         """
-        if self._palace_path is None:
+        if self._palace_path is None or http_mode():
             yield
             return
         # Late import — palace.py imports ChromaBackend from this module.
