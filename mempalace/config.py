@@ -411,8 +411,16 @@ class MempalaceConfig:
 
     @property
     def collection_name(self):
-        """ChromaDB collection name."""
-        return self._file_config.get("collection_name", DEFAULT_COLLECTION_NAME)
+        """Drawer collection name.
+
+        ``MEMPALACE_COLLECTION_NAME`` is a process-level override used by
+        supervised daemon/bridge deployments. Otherwise the configured value
+        wins, followed by the stable default.
+        """
+        env_val = os.environ.get("MEMPALACE_COLLECTION_NAME")
+        if env_val and env_val.strip():
+            return env_val.strip()
+        return str(self._file_config.get("collection_name", DEFAULT_COLLECTION_NAME)).strip()
 
     @property
     def backend(self):

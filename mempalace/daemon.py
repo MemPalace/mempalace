@@ -38,6 +38,7 @@ from .palace import (
 
 HOST = "127.0.0.1"
 MCP_ALLOW_PEER_WRITER_ENV = "MEMPALACE_MCP_ALLOW_PEER_WRITER"
+COLLECTION_NAME_ENV = "MEMPALACE_COLLECTION_NAME"
 STATE_ROOT_ENV = "MEMPALACE_DAEMON_STATE_ROOT"
 DEFAULT_WAIT_TIMEOUT = 60.0 * 60.0
 # Liveness-probe timeout for the hook "is a daemon already running?" precheck.
@@ -117,6 +118,39 @@ def _now() -> str:
 def canonical_palace_path(path: str | None = None) -> str:
     value = path or MempalaceConfig().palace_path
     return os.path.abspath(os.path.realpath(os.path.expanduser(value)))
+
+
+def resolve_daemon_identity(
+    palace_path: str,
+    *,
+    backend: str | None = None,
+) -> dict[str, str]:
+    """Resolve the daemon's authoritative palace/backend/collection identity.
+
+    Resolution happens once, before the worker or MCP handler starts. The
+    resolved values are then pinned for the daemon lifetime so a later config
+    or environment change cannot silently retarget an already-running owner.
+    """
+    resolved_palace = canonical_palace_path(palace_path)
+
+    # Local import avoids pulling backend/Chroma machinery into module import
+    # time while still using the same precedence and artifact checks as every
+    # normal palace open.
+    from .palace import resolve_backend_name
+
+    effective_backend = resolve_backend_name(
+        resolved_palace,
+        explicit=backend,
+    )
+    collection_name = MempalaceConfig().collection_name.strip()
+    if not collection_name:
+        raise DaemonError("configured collection name must not be empty")
+
+    return {
+        "palace_path": resolved_palace,
+        "backend": effective_backend,
+        "collection_name": collection_name,
+    }
 
 
 def palace_key(palace_path: str) -> str:
@@ -684,8 +718,15 @@ def job_to_dict(job: Job, *, include_payload: bool = True) -> dict[str, Any]:
 
 class DaemonRuntime:
     def __init__(self, palace_path: str, backend: str | None = None):
-        self.palace_path = canonical_palace_path(palace_path)
-        self.backend = backend
+        identity = resolve_daemon_identity(palace_path, backend=backend)
+        self.palace_path = identity["palace_path"]
+
+        # Keep the original explicit argument separate so existing queued-job
+        # payload behavior remains unchanged. effective_backend is the
+        # independently resolved and authoritative daemon identity.
+        self.backend = str(backend).strip().lower() if backend else None
+        self.effective_backend = identity["backend"]
+        self.collection_name = identity["collection_name"]
         # One in-process writer gate for daemon-routed writes. Queue jobs and
         # MCP tools share this lock, while direct external writers keep the
         # existing fail-fast mine_palace_lock contract.
@@ -767,20 +808,26 @@ class DaemonRuntime:
     def _check_mcp_identity(self, identity: dict[str, Any]) -> None:
         expected = {
             "palace_path": self.palace_path,
-            "backend": str(self.backend or "").strip().lower(),
+            "backend": self.effective_backend,
             "read_only": bool(identity.get("read_only")),
-            "collection_name": str(identity.get("collection_name") or "").strip(),
+            "collection_name": self.collection_name,
         }
+
         received_backend = str(identity.get("backend") or "").strip().lower()
-        # A bridge without an explicit --backend inherits the daemon's selected
-        # backend; omission must not become a distinct, mismatching identity.
+        # Omission means "inherit the already-running daemon". An explicit,
+        # non-empty value must still match the daemon's resolved identity.
         if not received_backend:
             received_backend = expected["backend"]
+
+        received_collection = str(identity.get("collection_name") or "").strip()
+        if not received_collection:
+            received_collection = expected["collection_name"]
+
         received = {
             "palace_path": canonical_palace_path(str(identity.get("palace_path") or "")),
             "backend": received_backend,
             "read_only": bool(identity.get("read_only")),
-            "collection_name": str(identity.get("collection_name") or "").strip(),
+            "collection_name": received_collection,
         }
 
         if not expected["backend"] and not received["backend"]:
@@ -1004,6 +1051,7 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
         "MEMPALACE_BACKEND": os.environ.get("MEMPALACE_BACKEND"),
         "MEMPALACE_MCP_ALLOW_PEER_WRITER": os.environ.get("MEMPALACE_MCP_ALLOW_PEER_WRITER"),
         "MEMPALACE_MCP_READ_ONLY": os.environ.get("MEMPALACE_MCP_READ_ONLY"),
+        COLLECTION_NAME_ENV: os.environ.get(COLLECTION_NAME_ENV),
     }
     os.environ["MEMPALACE_PALACE_PATH"] = palace_path
     if backend:
@@ -1046,6 +1094,18 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
         writer_lease.close()
         _restore_server_process_state(previous_env, prev_umask)
         raise
+
+    # Pin the values that the daemon independently resolved. The MCP module is
+    # imported lazily, so without this pin it could observe a later environment
+    # or config change and open a different backend/collection than /health
+    # advertises.
+    os.environ["MEMPALACE_BACKEND_EXPLICIT"] = runtime.effective_backend
+    os.environ["MEMPALACE_BACKEND"] = runtime.effective_backend
+    os.environ[COLLECTION_NAME_ENV] = runtime.collection_name
+
+    from .config import get_configured_collection_name
+
+    get_configured_collection_name.cache_clear()
 
     class _Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -1092,7 +1152,8 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
                         "worker_alive": runtime.worker_alive(),
                         "pid": os.getpid(),
                         "palace_path": runtime.palace_path,
-                        "backend": runtime.backend,
+                        "backend": runtime.effective_backend,
+                        "collection_name": runtime.collection_name,
                         "active_job_id": runtime.active_job_id,
                         "counts": runtime.store.counts(),
                         "mcp_identity": runtime._mcp_identity,
@@ -1197,6 +1258,8 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
                 "port": actual_port,
                 "pid": os.getpid(),
                 "palace_path": palace_path,
+                "backend": runtime.effective_backend,
+                "collection_name": runtime.collection_name,
                 "started_at": _now(),
             }
             _write_private(endpoint_path(palace_path), json.dumps(endpoint, indent=2) + "\n")
@@ -1244,6 +1307,13 @@ def _drain_and_cleanup(
             os.environ.pop(key, None)
         else:
             os.environ[key] = value
+
+    # ``get_configured_collection_name`` is process-cached. Clear it after
+    # restoring the surrounding process environment so foreground/test daemon
+    # runs cannot leak their pinned collection into later work.
+    from .config import get_configured_collection_name
+
+    get_configured_collection_name.cache_clear()
 
 
 class DaemonClient:

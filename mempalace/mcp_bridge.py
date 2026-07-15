@@ -24,6 +24,7 @@ import sys
 from typing import Any
 
 from . import daemon
+from .config import MempalaceConfig
 
 _DISABLE_ENV = "MEMPALACE_MCP_DISABLE_DAEMON"
 _REQUEST_TIMEOUT_ENV = "MEMPALACE_MCP_DAEMON_REQUEST_TIMEOUT_SECONDS"
@@ -95,7 +96,7 @@ def _exec_raw_stdio_server(argv: list[str]) -> None:  # pragma: no cover
 
 def build_daemon_identity(args: argparse.Namespace) -> dict[str, Any]:
     palace_path = daemon.canonical_palace_path(args.palace)
-    collection_name = os.environ.get("MEMPALACE_COLLECTION_NAME", "").strip()
+    collection_name = MempalaceConfig().collection_name
     return {
         "palace_path": palace_path,
         "backend": _normalize_backend(
@@ -122,10 +123,18 @@ def validate_daemon_health(health: dict[str, Any], identity: dict[str, Any]) -> 
 
     # A blank expected backend means "use config/env/default", so it is
     # compatible with a daemon that reports None/blank.
-    if expected_backend and actual_backend and expected_backend != actual_backend:
+    if expected_backend and actual_backend != expected_backend:
         raise BridgeError(
             "MemPalace daemon is serving a different backend: "
             f"expected={expected_backend!r} actual={actual_backend!r}"
+        )
+
+    expected_collection = str(identity.get("collection_name") or "").strip()
+    actual_collection = str(health.get("collection_name") or "").strip()
+    if expected_collection and actual_collection != expected_collection:
+        raise BridgeError(
+            "MemPalace daemon is serving a different collection: "
+            f"expected={expected_collection!r} actual={actual_collection!r}"
         )
 
 

@@ -38,7 +38,14 @@ _posix_only_perms = pytest.mark.skipif(
 # fails (the 60+ test cascade seen on slow CI runners). The fixtures below force a
 # clean baseline around every daemon test so a leaked thread can't poison the
 # process for tests/test_mcp_server.py and friends (which have no such guard).
-_LEAK_ENV_KEYS = ("MEMPALACE_PALACE_PATH", "MEMPALACE_BACKEND", "MEMPALACE_BACKEND_EXPLICIT")
+_LEAK_ENV_KEYS = (
+    "MEMPALACE_PALACE_PATH",
+    "MEMPALACE_BACKEND",
+    "MEMPALACE_BACKEND_EXPLICIT",
+    "MEMPALACE_COLLECTION_NAME",
+    "MEMPALACE_MCP_ALLOW_PEER_WRITER",
+    "MEMPALACE_MCP_READ_ONLY",
+)
 
 
 @pytest.fixture(scope="module")

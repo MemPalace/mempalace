@@ -40,8 +40,19 @@ Raw stdio command:
 - Daemon queued jobs and MCP `tools/call` requests share one in-process writer lock.
 - Protocol traffic such as `initialize`, `ping`, and notifications remains outside the writer lock.
 - The daemon sets `MEMPALACE_MCP_ALLOW_PEER_WRITER=1` before importing `mempalace.mcp_server`, so the daemon does not hold the legacy server-lifetime peer-writer lease merely by existing.
-- The bridge validates daemon palace/backend identity before attaching.
+- The bridge validates the daemon's resolved palace/backend/collection identity before attaching.
 - MCP read-only identity is fixed on first daemon MCP use and mismatches are refused.
+
+
+## Effective identity
+
+The daemon resolves its backend and drawer collection once at startup, reports
+those values through `/health`, and pins them for the daemon lifetime. A bridge
+that omits a backend inherits the daemon's resolved backend; explicit backend
+or collection mismatches are refused.
+
+`MEMPALACE_COLLECTION_NAME` is the process-level collection override used by
+supervised bridge deployments.
 
 ## Notes for #1963
 
