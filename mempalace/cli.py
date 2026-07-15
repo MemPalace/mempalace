@@ -148,6 +148,34 @@ def _trim_samples_for_llm(samples: list) -> list:
     return [s[:_PASS_ZERO_LLM_PER_SAMPLE] for s in samples[:_PASS_ZERO_LLM_MAX_SAMPLES]]
 
 
+def _default_llm_model(provider_name: str) -> str:
+    """Default model id for a provider when ``--llm-model`` is not given.
+
+    Data-driven for Copilot: ``auto`` is the only model guaranteed present on
+    every Copilot account (it lets Copilot route to an available model and,
+    unlike pinned ids, never trips the model-availability pre-flight). Users can
+    pin a specific model (e.g. ``gpt-5.5``, ``claude-sonnet-4.5``) via
+    ``--llm-model``.
+    """
+    return {"copilot": "auto"}.get(provider_name, "gemma4:e4b")
+
+
+def _close_llm_provider(provider) -> None:
+    """Best-effort teardown of an LLM provider after the LLM-consuming passes.
+
+    Stateless HTTP providers (ollama/openai-compat/anthropic) inherit a no-op
+    ``close()``; the Copilot provider owns a runtime subprocess + loop thread
+    that should be reclaimed promptly rather than lingering (its atexit finalizer
+    is only a last-resort safety net). Never raises — teardown must not fail init.
+    """
+    if provider is None:
+        return
+    try:
+        provider.close()
+    except Exception:
+        pass
+
+
 def _run_pass_zero(project_dir, palace_dir, llm_provider) -> dict:
     """Pass 0: detect whether the corpus is AI-dialogue and persist the
     result to ``<palace>/.mempalace/origin.json``.
@@ -305,7 +333,8 @@ def cmd_init(args):
     llm_provider = None
     if not getattr(args, "no_llm", False):
         provider_name = getattr(args, "llm_provider", "ollama") or "ollama"
-        provider_model = getattr(args, "llm_model", "gemma4:e4b") or "gemma4:e4b"
+        provider_model = getattr(args, "llm_model", None) or _default_llm_model(provider_name)
+        candidate = None
         try:
             candidate = get_provider(
                 name=provider_name,
@@ -324,8 +353,11 @@ def cmd_init(args):
             else:
                 ok, msg = candidate.check_available()
             if ok:
-                llm_provider = candidate
                 print(f"  LLM enabled: {provider_name}/{provider_model}")
+                # Retain the provider only after any external-egress consent is
+                # granted (below). Until then llm_provider stays None so the
+                # `finally` closes the candidate on every early exit path.
+                authorized = True
                 # Privacy warning (issue #24): if the configured endpoint
                 # sends data off the user's machine/network, surface that
                 # before init proceeds. URL-based — Ollama on localhost,
@@ -339,20 +371,34 @@ def cmd_init(args):
                         f"retains, or uses your data. Pass --no-llm to keep "
                         f"init fully local."
                     )
-                    # Consent gate (issue #26): block init when the api_key
-                    # was acquired via env-fallback (stray credential in
-                    # shell env). Explicit --llm-api-key (api_key_source ==
-                    # "flag") means the user already opted in.
-                    # --accept-external-llm bypasses for CI / non-interactive.
+                    # Consent gate (issue #26): require explicit authorization
+                    # before any content leaves the machine. Already-authorized
+                    # signals that skip the prompt:
+                    #   • --accept-external-llm  (dedicated non-interactive opt-in)
+                    #   • explicit --llm-api-key (api_key_source == "flag")
+                    # Otherwise prompt. This covers env-fallback API keys
+                    # (openai-compat/anthropic) AND keyless external providers like
+                    # Copilot (api_key_source is None), which selecting
+                    # --llm-provider copilot deliberately opts into but which still
+                    # warrant an explicit egress acknowledgment. Non-interactive
+                    # (EOF) declines safely → heuristics-only. Note --yes does NOT
+                    # bypass this: entity auto-accept must not silently authorize an
+                    # external data send.
                     api_key_source = getattr(candidate, "api_key_source", None)
                     accept_flag = getattr(args, "accept_external_llm", False)
-                    if api_key_source == "env" and not accept_flag:
+                    explicit_key = api_key_source == "flag"
+                    if not accept_flag and not explicit_key:
+                        env_key_note = (
+                            "Your API key was loaded from the environment "
+                            "(not passed via --llm-api-key). "
+                            if api_key_source == "env"
+                            else ""
+                        )
                         try:
                             answer = (
                                 input(
-                                    "  Your API key was loaded from the environment "
-                                    "(not passed via --llm-api-key). Continue with "
-                                    "external LLM? [y/N] "
+                                    f"  {env_key_note}Continue sending folder content "
+                                    f"to external LLM '{provider_name}'? [y/N] "
                                 )
                                 .strip()
                                 .lower()
@@ -362,10 +408,19 @@ def cmd_init(args):
                         if answer != "y":
                             print(
                                 "  Declined — falling back to heuristics-only. "
-                                "Pass --llm-api-key explicitly or "
-                                "--accept-external-llm to skip this prompt."
+                                "Pass --accept-external-llm (or, for keyed "
+                                "providers, --llm-api-key) to authorize the "
+                                "external send non-interactively."
                             )
-                            llm_provider = None
+                            authorized = False
+                # Egress authorized (or provider is local) — retain it for the
+                # passes. Deferring this past the prompt means a declined consent,
+                # an EOF, or a KeyboardInterrupt raised inside input() all leave
+                # llm_provider = None, so the `finally` reliably closes the
+                # candidate whose check_available() may already have started the
+                # Copilot runtime (subprocess + loop thread).
+                if authorized:
+                    llm_provider = candidate
             else:
                 print(
                     f"  No LLM provider reachable ({msg}). "
@@ -375,29 +430,48 @@ def cmd_init(args):
             print(
                 f"  LLM init failed ({e}). Running heuristics-only — pass --no-llm to silence this."
             )
+        finally:
+            # Close any candidate we started but did not retain: declined
+            # consent, an unavailable/unreachable model, the openai-compat
+            # env-key skip, or a mid-check error. check_available() may already
+            # have started the Copilot runtime (subprocess + loop thread), so
+            # dropping the reference without close() would leak it. When the
+            # candidate WAS retained it stays open for Pass 0/1 and is closed
+            # later in the passes' own finally.
+            if candidate is not None and candidate is not llm_provider:
+                _close_llm_provider(candidate)
 
     # Pass 0: detect whether the corpus is AI-dialogue. Writes
     # <palace>/.mempalace/origin.json and supplies corpus context to the
     # entity classifier so it can correctly handle agent persona names
     # (e.g. "Echo", "Sparrow") without misclassifying them as people.
-    corpus_origin = _run_pass_zero(
-        project_dir=args.dir,
-        palace_dir=cfg.palace_path,
-        llm_provider=llm_provider,
-    )
+    #
+    # Pass 0 + Pass 1 are the only phases that use the LLM provider, so scope its
+    # lifetime to them: close it in `finally` to reclaim external-provider
+    # resources (the Copilot runtime subprocess + loop thread) promptly, whether
+    # a pass succeeds or raises.
+    try:
+        corpus_origin = _run_pass_zero(
+            project_dir=args.dir,
+            palace_dir=cfg.palace_path,
+            llm_provider=llm_provider,
+        )
 
-    # Pass 1: discover entities — manifests + git authors first, prose detection
-    # as supplement for names mentioned only in docs/notes. Optional phase-2
-    # LLM refinement runs inside discover_entities when llm_provider is given.
-    print(f"\n  Scanning for entities in: {args.dir}")
-    if languages_tuple != ("en",):
-        print(f"  Languages: {', '.join(languages_tuple)}")
-    detected = discover_entities(
-        args.dir,
-        languages=languages_tuple,
-        llm_provider=llm_provider,
-        corpus_origin=corpus_origin,
-    )
+        # Pass 1: discover entities — manifests + git authors first, prose
+        # detection as supplement for names mentioned only in docs/notes.
+        # Optional phase-2 LLM refinement runs inside discover_entities when
+        # llm_provider is given.
+        print(f"\n  Scanning for entities in: {args.dir}")
+        if languages_tuple != ("en",):
+            print(f"  Languages: {', '.join(languages_tuple)}")
+        detected = discover_entities(
+            args.dir,
+            languages=languages_tuple,
+            llm_provider=llm_provider,
+            corpus_origin=corpus_origin,
+        )
+    finally:
+        _close_llm_provider(llm_provider)
     total = (
         len(detected["people"])
         + len(detected["projects"])
@@ -1758,13 +1832,22 @@ def main():
     p_init.add_argument(
         "--llm-provider",
         default="ollama",
-        choices=["ollama", "openai-compat", "anthropic"],
-        help="LLM provider (default: ollama). Pass --no-llm to disable LLM-assisted refinement entirely.",
+        choices=["ollama", "openai-compat", "anthropic", "copilot"],
+        help=(
+            "LLM provider (default: ollama). 'copilot' drives your installed & "
+            "authenticated GitHub Copilot CLI (external — sends folder content to "
+            "GitHub's cloud models; requires the 'copilot' extra and Python 3.11+). "
+            "Pass --no-llm to disable LLM-assisted refinement entirely."
+        ),
     )
     p_init.add_argument(
         "--llm-model",
-        default="gemma4:e4b",
-        help="Model name for the chosen provider (default: gemma4:e4b for Ollama).",
+        default=None,
+        help=(
+            "Model name for the chosen provider. Defaults per provider: "
+            "'gemma4:e4b' for Ollama, 'auto' for Copilot (lets Copilot pick an "
+            "available model; pass e.g. 'gpt-5.5' or 'claude-sonnet-4.5' to pin one)."
+        ),
     )
     p_init.add_argument(
         "--llm-endpoint",
@@ -1786,9 +1869,11 @@ def main():
         "--accept-external-llm",
         action="store_true",
         help=(
-            "Bypass the interactive consent prompt that fires when an external "
-            "LLM is configured via an environment-variable API key (issue #26). "
-            "Use this in CI / non-interactive runs where you've already decided "
+            "Authorize sending folder content to an EXTERNAL LLM non-interactively, "
+            "bypassing the consent prompt. Applies to any external provider — an "
+            "openai-compat/anthropic endpoint configured via an environment-variable "
+            "API key (issue #26), or --llm-provider copilot (relays to GitHub's "
+            "cloud). Use in CI / non-interactive runs where you've already decided "
             "the external send is acceptable."
         ),
     )

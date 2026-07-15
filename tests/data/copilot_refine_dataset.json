@@ -1,0 +1,97 @@
+{
+  "description": "Data-driven fixture for the Copilot LLM provider. Each case is a capitalized token candidate plus a benign prose context. The deterministic pipeline test (tests/test_copilot_refine_dataset.py) drives these through llm_refine.refine_entities with an oracle Copilot SDK that echoes expected_label, proving the provider -> refine wiring routes every label into the correct bucket. The env-gated live suite (tests/test_copilot_live_e2e.py) replays the SAME cases against the real, authenticated Copilot CLI and asserts classification accuracy stays at or above the threshold.",
+  "min_live_accuracy": 0.8,
+  "label_to_bucket": {
+    "PERSON": "people",
+    "PROJECT": "projects",
+    "TOPIC": "topics",
+    "COMMON_WORD": "__dropped__",
+    "AMBIGUOUS": "uncertain"
+  },
+  "cases": [
+    {
+      "name": "Alice",
+      "input_bucket": "people",
+      "context": "Alice reviewed the pull request and left detailed comments.",
+      "expected_label": "PERSON",
+      "expected_bucket": "people"
+    },
+    {
+      "name": "Bob",
+      "input_bucket": "uncertain",
+      "context": "Bob and I paired on the migration bug all afternoon.",
+      "expected_label": "PERSON",
+      "expected_bucket": "people"
+    },
+    {
+      "name": "Priya",
+      "input_bucket": "uncertain",
+      "context": "Priya approved the design during the review meeting.",
+      "expected_label": "PERSON",
+      "expected_bucket": "people"
+    },
+    {
+      "name": "Terraform",
+      "input_bucket": "projects",
+      "context": "We provision all of our cloud infrastructure with Terraform.",
+      "expected_label": "TOPIC",
+      "expected_bucket": "topics"
+    },
+    {
+      "name": "MemPalace",
+      "input_bucket": "uncertain",
+      "context": "MemPalace is the local-first memory system we are building.",
+      "expected_label": "PROJECT",
+      "expected_bucket": "projects"
+    },
+    {
+      "name": "Postgres",
+      "input_bucket": "uncertain",
+      "context": "We migrated the primary database over to Postgres last week.",
+      "expected_label": "TOPIC",
+      "expected_bucket": "topics"
+    },
+    {
+      "name": "authentication",
+      "input_bucket": "uncertain",
+      "context": "The authentication flow needs hardening before launch.",
+      "expected_label": "TOPIC",
+      "expected_bucket": "topics"
+    },
+    {
+      "name": "onboarding",
+      "input_bucket": "uncertain",
+      "context": "We reworked the onboarding process for new hires this quarter.",
+      "expected_label": "TOPIC",
+      "expected_bucket": "topics"
+    },
+    {
+      "name": "performance",
+      "input_bucket": "uncertain",
+      "context": "Performance was the biggest concern raised during the sprint.",
+      "expected_label": "TOPIC",
+      "expected_bucket": "topics"
+    },
+    {
+      "name": "The",
+      "input_bucket": "uncertain",
+      "context": "The the the and the.",
+      "expected_label": "COMMON_WORD",
+      "expected_bucket": "__dropped__"
+    },
+    {
+      "name": "Meeting",
+      "input_bucket": "uncertain",
+      "context": "Meeting notes from the Monday standup.",
+      "expected_label": "COMMON_WORD",
+      "expected_bucket": "__dropped__"
+    },
+    {
+      "name": "Please",
+      "input_bucket": "uncertain",
+      "context": "Please review the changes whenever you get a chance.",
+      "expected_label": "COMMON_WORD",
+      "expected_bucket": "__dropped__"
+    }
+  ]
+}

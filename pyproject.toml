@@ -138,6 +138,15 @@ extract = [
     # covered by striprtf above.
     "markitdown[docx,pdf,pptx,xlsx]>=0.1.5; python_version >= '3.10'",
 ]
+# External BYOK LLM provider that drives the user's installed & authenticated
+# GitHub Copilot CLI via the official `github-copilot-sdk` (JSON-RPC over
+# stdio). Opt-in only — selected with `mempalace init --llm-provider copilot`;
+# never a default and never pulled into the core install. The SDK requires
+# Python 3.11+ (env marker keeps it off the 3.9/3.10 support tail — those
+# users still get ollama/openai-compat/anthropic). Importing
+# `mempalace.copilot_provider` succeeds without this extra; the actionable
+# install error surfaces only at check_available()/classify() time.
+copilot = ["github-copilot-sdk>=1.0.6; python_version >= '3.11'"]
 
 [dependency-groups]
 dev = [

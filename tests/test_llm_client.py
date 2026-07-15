@@ -46,6 +46,54 @@ def test_get_provider_unknown_raises():
         get_provider("nonsense", "x")
 
 
+def test_get_provider_unknown_lists_copilot():
+    """The unknown-provider error must advertise the lazily-registered copilot
+    backend so users can discover it."""
+    with pytest.raises(LLMError, match="copilot"):
+        get_provider("nonsense", "x")
+
+
+def test_get_provider_copilot_lazy():
+    """copilot resolves through the lazy registry without the SDK installed —
+    constructing the provider must not import github-copilot-sdk (it stays
+    behind ``_ensure_sdk``) and must not spin up the background loop thread."""
+    import threading
+
+    from mempalace.copilot_provider import CopilotProvider
+
+    before = {t.name for t in threading.enumerate()}
+    p = get_provider("copilot", "auto")
+    try:
+        assert isinstance(p, CopilotProvider)
+        assert p.name == "copilot"
+        assert p.model == "auto"
+        assert p.is_external_service is True
+        # No loop thread until a classify/check_available call starts it.
+        after = {t.name for t in threading.enumerate()}
+        assert "mempalace-copilot-loop" not in (after - before)
+    finally:
+        p.close()
+
+
+def test_resolve_provider_class():
+    """The resolver returns eager classes directly, imports lazy backends on
+    demand, and returns None for genuinely unknown names."""
+    from mempalace.copilot_provider import CopilotProvider
+    from mempalace.llm_client import _resolve_provider_class
+
+    assert _resolve_provider_class("ollama") is OllamaProvider
+    assert _resolve_provider_class("copilot") is CopilotProvider
+    assert _resolve_provider_class("nonsense") is None
+
+
+def test_base_close_is_noop():
+    """The base ``LLMProvider.close`` is a no-op so every provider — including
+    those without a teardown override — closes uniformly and idempotently."""
+    p = get_provider("ollama", "gemma4:e4b")
+    assert p.close() is None
+    assert p.close() is None  # idempotent
+
+
 # ── _http_post_json ─────────────────────────────────────────────────────
 
 

@@ -10,6 +10,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Features
 
+- **GitHub Copilot CLI as an LLM provider — `mempalace init {dir} --llm-provider copilot`.** Drives your already-installed and authenticated [GitHub Copilot CLI](https://github.com/github/copilot-sdk) (via `github-copilot-sdk`) for Pass-0 corpus-origin detection and Pass-1 entity refinement, so you can reuse your Copilot subscription instead of standing up a local Ollama model. The model runs with **all tools denied** (deny-all permission bridge) — it only ever sees the text MemPalace sends it and cannot read your filesystem. `--llm-model` defaults to `auto` (Copilot picks an available model; pin one with e.g. `--llm-model gpt-5.5` or `claude-sonnet-4.5`), and reasoning effort is applied only for models that advertise support for it. Copilot is **always treated as an external service** (the CLI relays prompts to GitHub's cloud models even over localhost), so it is gated behind the same explicit external-egress consent prompt as anthropic/openai-compat: it runs only after an interactive `y`, or non-interactively with `--accept-external-llm`. Requires the `copilot` extra (`pip install "mempalace[copilot]"`) and Python 3.11+. See [docs/COPILOT_PROVIDER.md](docs/COPILOT_PROVIDER.md). (#26)
+
 - **`supersede()` / `mempalace_kg_supersede` — atomic fact replacement.** Closes an open fact and opens its successor at a single shared instant, so a point-in-time query at the boundary returns only the new value. This is the primitive for a single-valued fact change (model, employer, address) instead of hand-rolling `kg_invalidate` + `kg_add`, which left the two facts sharing the transition day. `at` defaults to the current UTC instant. (#1913)
 
 ### Bug Fixes

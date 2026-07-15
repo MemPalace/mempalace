@@ -1504,6 +1504,203 @@ def _make_mock_dialect_module(dialect_instance):
     return mock_mod
 
 
+# ── Copilot LLM provider: default model, external warning & consent gate ─────
+#
+# These tests isolate cmd_init's LLM-acquisition + egress-consent branch by
+# injecting a fake provider candidate through ``mempalace.cli.get_provider`` and
+# stubbing the passes that would otherwise touch disk/network. They lock in the
+# data-driven decisions taken this feature: copilot defaults to the ``auto``
+# model (the only universally-available id — never gpt-5), external providers
+# require an explicit egress acknowledgment, and ``--yes`` (entity auto-accept)
+# must NOT silently authorize that external send.
+
+from contextlib import ExitStack  # noqa: E402
+
+
+class _FakeCandidate:
+    """Stand-in LLM provider for cmd_init's acquisition/consent branch."""
+
+    def __init__(self, *, external=True, api_key_source=None, available=True, msg="unreachable"):
+        self.is_external_service = external
+        self.api_key_source = api_key_source
+        self._available = available
+        self._msg = msg
+        self.name = "copilot"
+        self.closed = False
+
+    def check_available(self):
+        return (True, "") if self._available else (False, self._msg)
+
+    def close(self):
+        self.closed = True
+
+
+def _copilot_init_args(tmp_path, **overrides):
+    """Full argparse.Namespace for an init run through the LLM branch."""
+    ns = argparse.Namespace(
+        dir=str(tmp_path),
+        palace=None,
+        lang="en",
+        no_llm=False,
+        llm_provider="copilot",
+        llm_model=None,
+        llm_endpoint=None,
+        llm_api_key=None,
+        accept_external_llm=False,
+        yes=False,
+        auto_mine=False,
+        backend=None,
+    )
+    for key, value in overrides.items():
+        setattr(ns, key, value)
+    return ns
+
+
+def _patch_init_env(stack, candidate):
+    """Patch cmd_init's collaborators; return (get_provider_mock, pass_zero_mock)."""
+    gp = stack.enter_context(patch("mempalace.cli.get_provider", return_value=candidate))
+    pz = stack.enter_context(patch("mempalace.cli._run_pass_zero", return_value=None))
+    stack.enter_context(
+        patch(
+            "mempalace.project_scanner.discover_entities",
+            return_value={"people": [], "projects": [], "topics": [], "uncertain": []},
+        )
+    )
+    stack.enter_context(patch("mempalace.room_detector_local.detect_rooms_local"))
+    stack.enter_context(patch("mempalace.cli._maybe_run_mine_after_init"))
+    stack.enter_context(patch("mempalace.cli.MempalaceConfig"))
+    return gp, pz
+
+
+def test_default_llm_model_per_provider():
+    """copilot defaults to 'auto' (data-driven — gpt-5 is not on every account);
+    all other providers keep the local Ollama default."""
+    from mempalace.cli import _default_llm_model
+
+    assert _default_llm_model("copilot") == "auto"
+    assert _default_llm_model("ollama") == "gemma4:e4b"
+    assert _default_llm_model("anthropic") == "gemma4:e4b"
+    assert _default_llm_model("openai-compat") == "gemma4:e4b"
+
+
+def test_cmd_init_copilot_defaults_to_auto_and_closes(tmp_path):
+    """No --llm-model → copilot resolves 'auto'; the provider is used by the
+    passes and then closed (resource hygiene for the runtime subprocess)."""
+    candidate = _FakeCandidate()
+    args = _copilot_init_args(tmp_path, accept_external_llm=True)
+    with ExitStack() as stack:
+        gp, pz = _patch_init_env(stack, candidate)
+        cmd_init(args)
+    assert gp.call_args.kwargs["name"] == "copilot"
+    assert gp.call_args.kwargs["model"] == "auto"
+    # Provider survived the consent gate and reached Pass 0.
+    assert pz.call_args.kwargs["llm_provider"] is candidate
+    # And was torn down afterwards.
+    assert candidate.closed is True
+
+
+def test_cmd_init_copilot_external_warning_and_accept_flag_bypasses_prompt(tmp_path, capsys):
+    """--accept-external-llm authorizes egress non-interactively: the warning
+    prints, no prompt is shown, and the provider is used."""
+    candidate = _FakeCandidate()
+    args = _copilot_init_args(tmp_path, accept_external_llm=True)
+    with ExitStack() as stack:
+        _, pz = _patch_init_env(stack, candidate)
+        # input() must never be called on the bypass path.
+        stack.enter_context(patch("builtins.input", side_effect=AssertionError("prompted")))
+        cmd_init(args)
+    out = capsys.readouterr().out
+    assert "EXTERNAL API" in out
+    assert pz.call_args.kwargs["llm_provider"] is candidate
+
+
+def test_cmd_init_copilot_consent_decline_falls_back_to_heuristics(tmp_path, capsys):
+    """Answering 'n' at the prompt drops the provider → heuristics-only."""
+    candidate = _FakeCandidate()
+    args = _copilot_init_args(tmp_path, accept_external_llm=False)
+    with ExitStack() as stack:
+        _, pz = _patch_init_env(stack, candidate)
+        stack.enter_context(patch("builtins.input", return_value="n"))
+        cmd_init(args)
+    out = capsys.readouterr().out
+    assert "Declined" in out
+    assert pz.call_args.kwargs["llm_provider"] is None
+    # A declined provider is still closed (never leaked).
+    assert candidate.closed is True
+
+
+def test_cmd_init_copilot_consent_eof_declines_non_interactively(tmp_path):
+    """A non-interactive session (EOF on input) declines safely."""
+    candidate = _FakeCandidate()
+    args = _copilot_init_args(tmp_path, accept_external_llm=False)
+    with ExitStack() as stack:
+        _, pz = _patch_init_env(stack, candidate)
+        stack.enter_context(patch("builtins.input", side_effect=EOFError))
+        cmd_init(args)
+    assert pz.call_args.kwargs["llm_provider"] is None
+
+
+def test_cmd_init_copilot_consent_accept_interactive(tmp_path):
+    """Answering 'y' authorizes the send and keeps the provider."""
+    candidate = _FakeCandidate()
+    args = _copilot_init_args(tmp_path, accept_external_llm=False)
+    with ExitStack() as stack:
+        _, pz = _patch_init_env(stack, candidate)
+        stack.enter_context(patch("builtins.input", return_value="y"))
+        cmd_init(args)
+    assert pz.call_args.kwargs["llm_provider"] is candidate
+
+
+def test_cmd_init_yes_does_not_bypass_external_consent(tmp_path):
+    """DELIBERATE: --yes is entity auto-accept only. It must NOT authorize an
+    external data send — the prompt is still shown and a decline still drops
+    the provider."""
+    candidate = _FakeCandidate()
+    args = _copilot_init_args(tmp_path, yes=True, accept_external_llm=False)
+    with ExitStack() as stack:
+        _, pz = _patch_init_env(stack, candidate)
+        fake_input = MagicMock(return_value="n")
+        stack.enter_context(patch("builtins.input", fake_input))
+        cmd_init(args)
+    # The prompt WAS shown despite --yes, and declining dropped the provider.
+    fake_input.assert_called_once()
+    assert pz.call_args.kwargs["llm_provider"] is None
+
+
+def test_cmd_init_local_provider_skips_consent_gate(tmp_path, capsys):
+    """A local (non-external) provider is used with no warning and no prompt —
+    regression guard that the generalized gate didn't ensnare Ollama."""
+    candidate = _FakeCandidate(external=False)
+    candidate.name = "ollama"
+    args = _copilot_init_args(tmp_path, llm_provider="ollama")
+    with ExitStack() as stack:
+        _, pz = _patch_init_env(stack, candidate)
+        stack.enter_context(patch("builtins.input", side_effect=AssertionError("prompted")))
+        cmd_init(args)
+    out = capsys.readouterr().out
+    assert "EXTERNAL API" not in out
+    assert pz.call_args.kwargs["llm_provider"] is candidate
+
+
+def test_cmd_init_copilot_unavailable_model_heuristics(tmp_path, capsys):
+    """When the pinned model is not on the account (the live gpt-5 finding),
+    check_available() fails cleanly → heuristics-only, no crash."""
+    candidate = _FakeCandidate(
+        available=False, msg="model 'gpt-5' is not available to your Copilot account"
+    )
+    args = _copilot_init_args(tmp_path, llm_model="gpt-5", accept_external_llm=True)
+    with ExitStack() as stack:
+        _, pz = _patch_init_env(stack, candidate)
+        cmd_init(args)
+    out = capsys.readouterr().out
+    assert "No LLM provider reachable" in out
+    assert "gpt-5" in out
+    assert pz.call_args.kwargs["llm_provider"] is None
+    # check_available() may have started the runtime; the unretained candidate
+    # must be closed so no subprocess/loop thread leaks.
+    assert candidate.closed is True
+
+
 @patch("mempalace.cli.MempalaceConfig")
 def test_cmd_compress_dry_run(mock_config_cls, capsys):
     mock_config_cls.return_value.palace_path = "/fake/palace"
