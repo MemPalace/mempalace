@@ -2581,6 +2581,16 @@ def reconcile_index(
     re-embedding those documents and letting chromadb fold them into the
     existing index, with no delete-and-recreate.
 
+    Scope: reconcile is for a *flush-lag* gap — the HNSW binary is sound and
+    only the metadata pickle lags (or a crash truncated it). It opens the live
+    segment, so a genuinely corrupt / undersized HNSW (the #1222 / #1308 class,
+    where ``count`` / ``upsert`` fault natively) can still crash on open even at
+    a small divergence that clears the caps — a native access violation the
+    caps cannot predict and Python cannot catch. That is a
+    ``--mode from-sqlite --archive-existing`` rebuild case (from-sqlite reads
+    chroma.sqlite3 directly and never opens the failing segment), not a
+    reconcile case.
+
     Returns a result dict::
 
         {"missing", "reconciled", "fetched",
