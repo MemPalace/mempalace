@@ -11,27 +11,42 @@ def cmd_mine(args):
     for raw in args.include_ignored or []:
         include_ignored.extend(part.strip() for part in raw.split(",") if part.strip())
 
-    if getattr(args, "background", False) and not getattr(args, "daemon", False):
-        print("mempalace: --background requires --daemon", file=sys.stderr)
-        sys.exit(2)
+    payload = {
+        "source": os.path.abspath(os.path.expanduser(args.dir)),
+        "mode": mode,
+        "wing": args.wing,
+        "agent": args.agent,
+        "limit": args.limit,
+        "dry_run": args.dry_run,
+        "extract": args.extract,
+        "no_gitignore": args.no_gitignore,
+        "include_ignored": include_ignored,
+        "max_chunks_per_file": getattr(
+            args,
+            "max_chunks_per_file",
+            None,
+        ),
+        "redetect_origin": getattr(
+            args,
+            "redetect_origin",
+            False,
+        ),
+    }
+    if source_adapter:
+        payload["source_adapter"] = source_adapter
 
-    if getattr(args, "daemon", False):
-        payload = {
-            "source": os.path.abspath(os.path.expanduser(args.dir)),
-            "mode": mode,
-            "wing": args.wing,
-            "agent": args.agent,
-            "limit": args.limit,
-            "dry_run": args.dry_run,
-            "extract": args.extract,
-            "no_gitignore": args.no_gitignore,
-            "include_ignored": include_ignored,
-            "max_chunks_per_file": getattr(args, "max_chunks_per_file", None),
-            "redetect_origin": getattr(args, "redetect_origin", False),
-        }
-        if source_adapter:
-            payload["source_adapter"] = source_adapter
-        _submit_daemon_cli_job("mine", payload, args, background=getattr(args, "background", False))
+    routing = _resolve_cli_write_routing_or_exit(
+        args,
+        "mine",
+    )
+    if routing.use_daemon:
+        _submit_daemon_cli_job(
+            "mine",
+            payload,
+            args,
+            background=bool(getattr(args, "background", False)),
+            auto_start=routing.decision.auto_start_daemon,
+        )
         return
 
     from ..palace import MineAlreadyRunning, MineValidationError
@@ -316,6 +331,19 @@ def cmd_sweep(args):
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     target = os.path.expanduser(args.target)
 
+    routing = _resolve_cli_write_routing_or_exit(
+        args,
+        "sweep",
+    )
+    if routing.use_daemon:
+        _submit_daemon_cli_job(
+            "sweep",
+            {"target": target},
+            args,
+            background=bool(getattr(args, "background", False)),
+            auto_start=routing.decision.auto_start_daemon,
+        )
+        return
     if os.path.isfile(target):
         result = sweep(target, palace_path)
         print(
