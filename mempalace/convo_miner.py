@@ -132,22 +132,29 @@ def _is_regular_source_file(filepath: Path, root: Path) -> bool:
                 pass
 
 
-def _register_file(collection, source_file: str, wing: str, agent: str, extract_mode: str):
+def _register_file(
+    collection,
+    source_file: str,
+    wing: str,
+    agent: str,
+    extract_mode: str,
+    source_mtime: Optional[float] = None,
+):
     """Write a sentinel so file_already_mined() returns True for 0-chunk files.
 
     Without this, files that normalize to nothing or produce zero chunks are
     re-read and re-processed on every mine run because nothing was written to
     ChromaDB on the first pass.
 
-    Stamps source_mtime like every real drawer does, so a file that later
-    grows past the min-chunk-size floor (e.g. a short session that gets
-    extended) is correctly detected as changed on the next mine instead of
-    being skipped forever by this sentinel.
+    ``source_mtime``, when given, is used directly (captured at read time by
+    the caller's ``_read_source_file`` fstat); otherwise falls back to
+    ``os.path.getmtime`` for callers that don't have a read-time mtime.
     """
-    try:
-        source_mtime = os.path.getmtime(source_file)
-    except OSError:
-        source_mtime = None
+    if source_mtime is None:
+        try:
+            source_mtime = os.path.getmtime(source_file)
+        except OSError:
+            pass
     sentinel_id = make_convo_sentinel_id(source_file, extract_mode)
     meta = {
         "wing": wing,
@@ -1032,7 +1039,16 @@ def _upsert_chunk_batch(
 
 
 def _file_chunks_locked(
-    collection, source_file, chunks, wing, room, agent, extract_mode, authored_at=None, cursor=None
+    collection,
+    source_file,
+    chunks,
+    wing,
+    room,
+    agent,
+    extract_mode,
+    authored_at=None,
+    cursor=None,
+    source_mtime=None,
 ):
     """Lock the source file, purge stale drawers, and upsert fresh chunks.
 
@@ -1079,10 +1095,13 @@ def _file_chunks_locked(
         # one filed_at per source file so all transcript drawers share an
         # ingest timestamp.
         filed_at = datetime.now().isoformat()
-        try:
-            source_mtime = os.path.getmtime(source_file)
-        except OSError:
-            source_mtime = None
+        # source_mtime was captured at read time by the caller; fall back
+        # to getmtime only for legacy callers that don't pass it.
+        if source_mtime is None:
+            try:
+                source_mtime = os.path.getmtime(source_file)
+            except OSError:
+                pass
         drawers_added, room_counts_delta, dropped_count = _upsert_chunk_batch(
             collection,
             source_file,
@@ -1110,6 +1129,7 @@ def _file_chunks_locked_incremental(
     extract_mode,
     authored_at=None,
     cursor=None,
+    source_mtime=None,
 ):
     """Incremental-mining counterpart to ``_file_chunks_locked``: replaces
     only the drawers at or after ``replace_from_index`` instead of
@@ -1143,10 +1163,11 @@ def _file_chunks_locked_incremental(
             logger.debug("Incremental purge failed for %s", source_file, exc_info=True)
 
         filed_at = datetime.now().isoformat()
-        try:
-            source_mtime = os.path.getmtime(source_file)
-        except OSError:
-            source_mtime = None
+        if source_mtime is None:
+            try:
+                source_mtime = os.path.getmtime(source_file)
+            except OSError:
+                pass
         drawers_added, room_counts_delta, dropped_count = _upsert_chunk_batch(
             collection,
             source_file,
@@ -1488,6 +1509,7 @@ def _attempt_incremental_mine(
     cfg_min_chunk_size: int,
     mined_mtimes: dict,
     dry_run: bool,
+    source_mtime: Optional[float] = None,
 ) -> Optional[tuple]:
     """Try the incremental-mining path for one changed file: re-chunk only
     the trailing exchange onward instead of purging and rebuilding the
@@ -1574,6 +1596,7 @@ def _attempt_incremental_mine(
         extract_mode,
         authored_at=_extract_authored_at(filepath),
         cursor=new_cursor,
+        source_mtime=source_mtime,
     )
     return drawers_added, room_delta, skipped, room, dropped_count
 
@@ -1730,9 +1753,11 @@ def _mine_convos_impl(
         # computation further below, or the incremental-mining attempt
         # right after) could otherwise observe a different state of a
         # file that's actively being appended to than the one actually
-        # mined here.
+        # mined here.  The mtime captured at read time is threaded to
+        # every downstream write so it always describes the bytes that
+        # were actually parsed, not a later on-disk state.
         try:
-            raw_content = _read_source_file(str(filepath))
+            raw_content, read_mtime = _read_source_file(str(filepath))
         except (OSError, ValueError):
             if not dry_run:
                 _register_file(collection, source_file, file_wing, agent, extract_mode)
@@ -1758,6 +1783,7 @@ def _mine_convos_impl(
             cfg_min_chunk_size,
             mined_mtimes,
             dry_run,
+            source_mtime=read_mtime,
         )
         if incremental_result is not None:
             drawers_added, room_delta, skipped, room, dropped_count = incremental_result
@@ -1794,7 +1820,10 @@ def _mine_convos_impl(
 
         if not content or len(content.strip()) < cfg_min_chunk_size:
             if not dry_run:
-                _register_file(collection, source_file, file_wing, agent, extract_mode)
+                _register_file(
+                    collection, source_file, file_wing, agent, extract_mode,
+                    source_mtime=read_mtime,
+                )
             continue
 
         # Chunk — either exchange pairs or general extraction
@@ -1812,7 +1841,10 @@ def _mine_convos_impl(
 
         if not chunks:
             if not dry_run:
-                _register_file(collection, source_file, file_wing, agent, extract_mode)
+                _register_file(
+                    collection, source_file, file_wing, agent, extract_mode,
+                    source_mtime=read_mtime,
+                )
             continue
 
         # Detect room from content (general mode uses memory_type instead)
@@ -1879,6 +1911,7 @@ def _mine_convos_impl(
             extract_mode,
             authored_at=_extract_authored_at(filepath),
             cursor=cursor,
+            source_mtime=read_mtime,
         )
         drawers_delta, mined_delta, skipped_delta, dropped_delta, should_break = (
             _record_mine_outcome(

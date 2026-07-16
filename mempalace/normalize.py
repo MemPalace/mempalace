@@ -114,12 +114,16 @@ def strip_noise(text: str) -> str:
     return text.strip()
 
 
-def _read_source_file(filepath: str) -> str:
+def _read_source_file(filepath: str) -> tuple[str, Optional[float]]:
     """Hardened raw-content read shared by normalize() and any caller that
     needs the exact same raw content it would read (e.g. convo_miner's
     incremental-mining cursor computation, which needs raw JSONL lines
     alongside the parsed transcript). Rejects symlinks, requires a
     regular file, and caps size at 500 MB.
+
+    Returns ``(content, mtime)`` where *mtime* is captured from the same
+    ``fstat`` call used to validate the file descriptor, guaranteeing it
+    describes the bytes actually read -- not a later on-disk state.
 
     Centralizing this is what lets a caller read a file ONCE and hand
     the same string to both normalize() and a second consumer, instead
@@ -141,9 +145,10 @@ def _read_source_file(filepath: str) -> str:
             raise IOError(f"Could not read {filepath}: not a regular file")
         if file_stat.st_size > 500 * 1024 * 1024:  # 500 MB safety limit
             raise IOError(f"File too large ({file_stat.st_size // (1024 * 1024)} MB): {filepath}")
+        mtime = file_stat.st_mtime
         with os.fdopen(fd, "r", encoding="utf-8-sig", errors="replace") as f:
             fd = -1
-            return f.read()
+            return f.read(), mtime
     except OSError as e:
         raise IOError(f"Could not read {filepath}: {e}") from e
     finally:
@@ -169,7 +174,7 @@ def normalize(filepath: str, content: Optional[str] = None) -> str:
     change: the read happens exactly as before.
     """
     if content is None:
-        content = _read_source_file(filepath)
+        content, _mtime = _read_source_file(filepath)
 
     if not content.strip():
         return content
