@@ -1821,7 +1821,11 @@ def _mine_convos_impl(
         if not content or len(content.strip()) < cfg_min_chunk_size:
             if not dry_run:
                 _register_file(
-                    collection, source_file, file_wing, agent, extract_mode,
+                    collection,
+                    source_file,
+                    file_wing,
+                    agent,
+                    extract_mode,
                     source_mtime=read_mtime,
                 )
             continue
@@ -1842,7 +1846,11 @@ def _mine_convos_impl(
         if not chunks:
             if not dry_run:
                 _register_file(
-                    collection, source_file, file_wing, agent, extract_mode,
+                    collection,
+                    source_file,
+                    file_wing,
+                    agent,
+                    extract_mode,
                     source_mtime=read_mtime,
                 )
             continue

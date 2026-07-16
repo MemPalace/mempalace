@@ -57,9 +57,7 @@ def _path_within_root(path: Path, root: Path) -> bool:
         return False
 
 
-def _read_text_no_follow(
-    filepath: Path, root: Path
-) -> Optional[tuple[str, Optional[float]]]:
+def _read_text_no_follow(filepath: Path, root: Path) -> Optional[tuple[str, Optional[float]]]:
     """Read a regular file, rejecting symlinks and oversized files.
 
     Returns ``(content, mtime)`` on success, ``None`` on any failure.

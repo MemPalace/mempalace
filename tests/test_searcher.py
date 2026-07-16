@@ -644,6 +644,7 @@ class TestSearchCLI:
         mock_probe.assert_not_called()
         mock_open.assert_called_once_with(fake_palace_path, opener=get_collection)
 
+
 # ── find_near_duplicates ─────────────────────────────────────────────
 
 
