@@ -2009,13 +2009,18 @@ def _make_fts5_palace(tmp_path, *, corrupt: bool) -> str:
 
 def test_errors_are_isolated_fts5_classification():
     fts = "malformed inverted index for FTS5 table main.embedding_fulltext_search"
+    fts_blob = (
+        'fts5: corruption found reading blob 137438953474 from table "embedding_fulltext_search"'
+    )
     page = "Page 4 of B-tree 12345: database disk image is malformed"
     assert repair._errors_are_isolated_fts5([fts])
+    assert repair._errors_are_isolated_fts5([fts_blob])
     assert repair._errors_are_isolated_fts5([fts, fts])
     assert not repair._errors_are_isolated_fts5([])
     assert not repair._errors_are_isolated_fts5([page])
     # Any non-FTS5 error in the set means the data itself may be damaged.
     assert not repair._errors_are_isolated_fts5([fts, page])
+    assert not repair._errors_are_isolated_fts5([fts_blob, page])
 
 
 def test_maybe_autoheal_fts5_index_heals_isolated_corruption(tmp_path):

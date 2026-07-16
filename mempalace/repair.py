@@ -638,13 +638,20 @@ def print_sqlite_integrity_abort(palace_path: str, errors: list[str]) -> None:
     print("    6. Re-run `mempalace repair --yes`.")
 
 
-# quick_check labels a corrupt FTS5 inverted index like:
+# quick_check labels a corrupt FTS5 inverted index like either:
 #   "malformed inverted index for FTS5 table main.embedding_fulltext_search"
+#   'fts5: corruption found reading blob 137438953474 from table
+#    "embedding_fulltext_search"'
+# The latter wording is emitted by SQLite 3.53.x (#1925).
 # That specific failure is recoverable in place: the index is derived from the
 # intact ``embedding_fulltext_search_content`` shadow table, so rebuilding it
 # restores full-text search without touching any drawer rows. Concurrent
 # killed-mid-write mines are the usual cause (#1596).
-_FTS5_MALFORMED_RE = re.compile(r"malformed inverted index for FTS5 table", re.IGNORECASE)
+_RECOVERABLE_FTS5_CORRUPTION_RE = re.compile(
+    r"(?:malformed inverted index for FTS5 table|"
+    r'fts5:\s*corruption found reading blob \d+ from table "embedding_fulltext_search")',
+    re.IGNORECASE,
+)
 
 
 def _errors_are_isolated_fts5(errors: list[str]) -> bool:
@@ -655,7 +662,7 @@ def _errors_are_isolated_fts5(errors: list[str]) -> bool:
     quick_check also reports page/row corruption, the data itself may be damaged
     and rebuilding the index over it would mask real loss — that still aborts.
     """
-    return bool(errors) and all(_FTS5_MALFORMED_RE.search(e) for e in errors)
+    return bool(errors) and all(_RECOVERABLE_FTS5_CORRUPTION_RE.search(e) for e in errors)
 
 
 def maybe_autoheal_fts5_index(palace_path: str, errors: list[str], *, progress=print) -> list[str]:
