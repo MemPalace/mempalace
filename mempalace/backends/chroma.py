@@ -2499,9 +2499,23 @@ class ChromaBackend(BaseBackend):
         library default and its queries won't match the writer's vectors.
         """
         try:
-            from ..embedding import get_embedding_function
+            from ..embedding import (
+                EmbeddingDependencyError,
+                EmbeddingModelError,
+                get_embedding_function,
+            )
 
             return get_embedding_function()
+        except (EmbeddingDependencyError, EmbeddingModelError):
+            # The configured model cannot be served (sentence-transformers
+            # not installed / model unloadable). Falling back to the chromadb
+            # default here would silently embed with the wrong model while
+            # the identity sidecar records the configured one — the exact
+            # corruption RFC 001 exists to prevent. Both errors carry
+            # recovery hints; let them surface. Deliberately narrower than
+            # `except ImportError`: an unrelated import failure must not get
+            # mislabeled with the [multilingual] install hint.
+            raise
         except Exception:
             logger.exception("Failed to build embedding function; using chromadb default")
             return None
