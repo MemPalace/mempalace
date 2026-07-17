@@ -161,6 +161,19 @@ TOOLS = {
         "input_schema": {"type": "object", "properties": {}},
         "handler": tool_kg_stats,
     },
+    "mempalace_kg_wing_links": {
+        "description": "Area-to-area links derived from the knowledge graph: two wings linked by a shared or related entity (specificity-weighted so ubiquitous entities don't link everything). Only facts with drawer provenance participate. Read-only.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "Max links to return (default 40, max 200)",
+                },
+            },
+        },
+        "handler": tool_kg_wing_links,
+    },
     "mempalace_traverse": {
         "description": "Walk the palace graph from a room. Shows connected ideas across wings — the tunnels. Like following a thread through the palace: start at 'chromadb-setup' in wing_code, discover it connects to wing_myproject (planning) and wing_user (feelings about it).",
         "input_schema": {

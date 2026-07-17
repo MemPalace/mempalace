@@ -1149,6 +1149,25 @@ class KnowledgeGraph:
             "relationship_types": predicates,
         }
 
+    def current_triples_with_source(self):
+        """(subject, object, source_drawer_id) for every CURRENT fact that carries
+        drawer provenance, with subject and object as entity display names.
+        Lets a caller locate each entity in a wing (via the drawer's `wing`
+        metadata) — the basis for knowledge-graph-derived area links. Facts
+        without a source_drawer_id (older, pre-provenance) are skipped."""
+        with self._lock:
+            conn = self._conn()
+            rows = conn.execute(
+                "SELECT COALESCE(s.name, t.subject) AS sub_name, "
+                "COALESCE(o.name, t.object) AS obj_name, t.source_drawer_id "
+                "FROM triples t "
+                "LEFT JOIN entities s ON t.subject = s.id "
+                "LEFT JOIN entities o ON t.object = o.id "
+                "WHERE t.valid_to IS NULL AND t.source_drawer_id IS NOT NULL "
+                "AND t.source_drawer_id != ''"
+            ).fetchall()
+        return [(r["sub_name"], r["obj_name"], r["source_drawer_id"]) for r in rows]
+
     # ── Seed from known facts ─────────────────────────────────────────────
 
     def report_entity_id_collisions(self) -> list:
