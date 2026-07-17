@@ -131,3 +131,13 @@ Knowledge Graph:
 - **Adding a storage backend**: subclass `mempalace/backends/base.py`, register in `backends/__init__.py`
 - **Input validation**: `mempalace/config.py` — `sanitize_name()` / `sanitize_content()`
 - **Tests**: mirror source structure in `tests/test_<module>.py`
+
+## ASE-Workflow (verbindlich bei Code/Skripten)
+
+Der ASE-Workflow (projektlokale rse/ase-Umsetzung des universellen ASE-Arbeitsmodells) ist Pflicht:
+Briefing (`ase-task-edit`/`-grill`) → Umsetzung (`ase-task-implement`/`ase-code-craft`/`-resolve`/`-refactor`)
+→ Vorprüfung (`ase-task-preflight`, `--dry`) → evidenzbasierte Freigabe (`ase-meta-review`/`ase-meta-diff`)
+→ Commit-Messages (`ase-meta-commit`). Kein Ad-hoc-Durchbauen. Arbeitspakete = eigene ASE-Tasks: vor dem
+Agenten-Spawn per `ase_task_save` persistieren, der Agent lädt den Plan per `ase_task_load`, das Ergebnis
+wird in den Task zurückgeschrieben. rse/ase ist local installiert (`.claude/settings.local.json`).
+Begriffe + Kommando-Mapping: `~/.claude/workflows/ase-workflow.md`.
