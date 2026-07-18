@@ -1539,6 +1539,86 @@ def file_already_mined(
         return False
 
 
+def _backend_supports_facets(col) -> bool:
+    """True if the collection's backend implements server-side metadata facets
+    (qdrant/pgvector/milvus) with keyword-indexed metadata, so a per-file
+    ``where={"source_file": X}`` lookup is cheap."""
+    backend = getattr(col, "_backend", None)
+    caps = getattr(backend, "capabilities", None)
+    return isinstance(caps, (set, frozenset)) and "supports_metadata_facets" in caps
+
+
+class _LazyMinedSet:
+    """Drop-in for the dict ``prefetch_mined_set`` returns, backed by lazy,
+    cached, indexed per-``source_file`` lookups instead of a full-collection
+    scan. Implements the ``in`` / ``[]`` / ``.get`` the convo miner uses."""
+
+    _MISS = object()
+
+    def __init__(self, collection, extract_mode=None):
+        self._c = collection
+        self._em = extract_mode
+        self._cache: dict = {}
+
+    def _lookup(self, src):
+        if src in self._cache:
+            return self._cache[src]
+        val = self._MISS
+        # Mirrors the bulk scan's completeness rule (#2183): a source whose
+        # only surviving group is a mid-file partial (count < chunk_total) is
+        # a miss, so the caller re-mines instead of stranding the rest.
+        groups: dict = {}
+        try:
+            offset = 0
+            while True:
+                res = self._c.get(
+                    where={"source_file": src}, limit=1000, offset=offset, include=["metadatas"]
+                )
+                ids = res.get("ids") or []
+                for meta in res.get("metadatas") or []:
+                    meta = meta or {}
+                    if not _metadata_matches_extract_mode(meta, self._em):
+                        continue
+                    if meta.get("normalize_version", 1) < NORMALIZE_VERSION:
+                        continue
+                    stored_mtime = meta.get("source_mtime")
+                    mtime_key = float(stored_mtime) if stored_mtime is not None else None
+                    chunk_total = meta.get("chunk_total")
+                    if chunk_total is None:
+                        # Legacy / registry row: no completion marker — trust it.
+                        val = mtime_key
+                        break
+                    entry = groups.setdefault(mtime_key, {"count": 0, "chunk_total": None})
+                    entry["count"] += 1
+                    try:
+                        entry["chunk_total"] = int(chunk_total)
+                    except (TypeError, ValueError):
+                        entry["chunk_total"] = None
+                    if entry["chunk_total"] is None or entry["count"] >= entry["chunk_total"]:
+                        val = mtime_key
+                        break
+                if val is not self._MISS or not ids:
+                    break
+                offset += len(ids)
+        except Exception:
+            val = self._MISS
+        self._cache[src] = val
+        return val
+
+    def __contains__(self, src):
+        return self._lookup(src) is not self._MISS
+
+    def __getitem__(self, src):
+        val = self._lookup(src)
+        if val is self._MISS:
+            raise KeyError(src)
+        return val
+
+    def get(self, src, default=None):
+        val = self._lookup(src)
+        return default if val is self._MISS else val
+
+
 def prefetch_mined_set(
     collection, extract_mode: Optional[str] = None
 ) -> dict[str, Optional[float]]:
@@ -1573,7 +1653,16 @@ def prefetch_mined_set(
     `collection.get(where={"source_file": X})` costs ~2s on a 150k-drawer
     palace, making a 2000-file sweep take >1h of pure skip-checking. This
     helper drops that to a single paginated scan plus O(1) lookups.
+
+    On backends with server-side metadata facets (qdrant/pgvector/milvus) the
+    metadata is keyword-indexed, so a per-file ``where={"source_file": X}``
+    lookup is cheap and we return a lazy set that resolves each check on demand
+    (scoped to the files actually being mined) instead of scanning here. The
+    bulk scan is O(collection) and hangs every convo-mode mine (auto-save
+    hooks) on a large shared network-backed collection.
     """
+    if _backend_supports_facets(collection):
+        return _LazyMinedSet(collection, extract_mode)
     # Per source_file: per stored_mtime group → count + optional chunk_total.
     # A source is only "mined" once some group is complete.
     groups: dict[str, dict] = {}

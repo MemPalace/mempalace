@@ -46,6 +46,16 @@ from .dynamics import initialize_dynamics_fields
 
 logger = logging.getLogger("mempalace_hallways")
 
+
+def _backend_supports_facets(col) -> bool:
+    """True if the collection's backend implements server-side metadata facets
+    (qdrant/pgvector/milvus), i.e. a keyword-indexed ``where`` filter is cheap
+    and the client-side full scan below is unnecessary."""
+    backend = getattr(col, "_backend", None)
+    caps = getattr(backend, "capabilities", None)
+    return isinstance(caps, (set, frozenset)) and "supports_metadata_facets" in caps
+
+
 # Persistence target is resolved through ``_get_hallway_file`` below, which
 # mirrors ``palace_graph._get_tunnel_file`` (the 3.3.6 palace-scoped pattern)
 # so the storage layout is uniform across the two related primitives. Tests
@@ -245,26 +255,47 @@ def compute_hallways_for_wing(
 
     min_count = max(1, int(min_count))
 
-    # 1. Query drawers for this wing. Paginate the fetch and filter to the
-    #    wing client-side: a single get(where={"wing": wing}) binds one SQL
-    #    variable per matched id and overflows SQLite's
-    #    SQLITE_MAX_VARIABLE_NUMBER (32766) on wings > ~32k drawers (#1619).
-    #    Mirrors the established pagination in miner.status / palace /
-    #    palace_graph.
+    # 1. Query drawers for this wing.
+    #
+    # On backends with server-side metadata facets (qdrant/pgvector/milvus) a
+    # keyword-indexed ``where={"wing": wing}`` filter is cheap, so fetch only
+    # this wing's drawers. The legacy path streams the WHOLE collection and
+    # filters client-side, which is O(collection) on every mine and hangs on a
+    # large shared network-backed collection.
+    #
+    # For local ChromaDB we keep the client-side filter: Chroma's
+    # ``get(where={"wing": wing})`` binds one SQL variable per matched id and
+    # overflows SQLITE_MAX_VARIABLE_NUMBER (32766) on wings > ~32k drawers
+    # (#1619). Its local reads are cheap, so the full-scan cost is negligible.
     metadatas: list = []
+    server_filter = _backend_supports_facets(col)
     try:
-        total = col.count()
         batch_size = 5000
         offset = 0
-        while offset < total:
-            batch = col.get(limit=batch_size, offset=offset, include=["metadatas"])
-            batch_metas = (batch or {}).get("metadatas") or []
-            if not batch_metas:
-                break
-            metadatas.extend(
-                m for m in batch_metas if isinstance(m, dict) and m.get("wing") == wing
-            )
-            offset += len(batch_metas)
+        if server_filter:
+            while True:
+                batch = col.get(
+                    where={"wing": wing},
+                    limit=batch_size,
+                    offset=offset,
+                    include=["metadatas"],
+                )
+                batch_metas = (batch or {}).get("metadatas") or []
+                if not batch_metas:
+                    break
+                metadatas.extend(m for m in batch_metas if isinstance(m, dict))
+                offset += len(batch_metas)
+        else:
+            total = col.count()
+            while offset < total:
+                batch = col.get(limit=batch_size, offset=offset, include=["metadatas"])
+                batch_metas = (batch or {}).get("metadatas") or []
+                if not batch_metas:
+                    break
+                metadatas.extend(
+                    m for m in batch_metas if isinstance(m, dict) and m.get("wing") == wing
+                )
+                offset += len(batch_metas)
     except Exception:
         logger.warning(
             "compute_hallways_for_wing: collection fetch failed for %s", wing, exc_info=True

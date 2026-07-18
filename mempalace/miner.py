@@ -50,6 +50,15 @@ from .ids import ID_RECIPE, make_drawer_id_from_chunk
 logger = logging.getLogger("mempalace_mcp")
 
 
+def _backend_supports_facets(col) -> bool:
+    """True if the collection's backend implements server-side metadata facets
+    (qdrant/pgvector/milvus), so callers can count/filter remotely instead of
+    streaming the whole collection over the wire."""
+    backend = getattr(col, "_backend", None)
+    caps = getattr(backend, "capabilities", None)
+    return isinstance(caps, (set, frozenset)) and "supports_metadata_facets" in caps
+
+
 def _path_within_root(path: Path, root: Path) -> bool:
     try:
         path.expanduser().resolve().relative_to(root.expanduser().resolve())
@@ -2266,10 +2275,26 @@ def status(palace_path: str):
         print("  Run `mempalace repair --mode from-sqlite --archive-existing` first.")
         return
 
+    total = col.count()
+
+    # On backends with server-side metadata facets (qdrant/pgvector/milvus),
+    # count wing/room remotely instead of streaming every drawer's metadata
+    # over the wire — a full scan that costs minutes on a large shared
+    # collection. Mirrors the MCP status tool. Falls back to the paginated
+    # scan below on any facet error, and for local backends (chroma).
+    if _backend_supports_facets(col):
+        try:
+            wing_rooms: dict = {}
+            for wing in col.facet_counts("wing"):
+                wing_rooms[wing] = dict(col.facet_counts("room", where={"wing": wing}))
+            _print_status(total, wing_rooms)
+            return
+        except Exception:
+            logger.debug("status: facet counting failed, falling back to scan", exc_info=True)
+
     # Count by wing and room — paginate to avoid SQLite "too many SQL
     # variables" error on large palaces (see #802, #850).
-    total = col.count()
-    wing_rooms: dict = defaultdict(lambda: defaultdict(int))
+    wing_rooms = defaultdict(lambda: defaultdict(int))
     batch_size = 5000
     offset = 0
     while offset < total:
