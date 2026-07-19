@@ -2215,10 +2215,7 @@ def _run_reconcile_mode(palace_path: str, collection_name: str, dry_run: bool) -
         print(f"\n  {exc}")
         sys.exit(1)
     except MineAlreadyRunning as exc:
-        print(
-            f"\n  {exc}\n  A mine is holding the palace; "
-            "retry reconcile once it finishes."
-        )
+        print(f"\n  {exc}\n  A mine is holding the palace; retry reconcile once it finishes.")
         sys.exit(1)
 
 
