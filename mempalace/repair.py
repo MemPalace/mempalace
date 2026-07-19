@@ -2596,10 +2596,18 @@ def reconcile_index(
         {"missing", "reconciled", "fetched",
          "divergence_before", "divergence_after", "flushed"}
 
+    Concurrency: the complete transaction — integrity preflight, missing-ID
+    diff, sqlite extraction, every upsert batch, and the final verification —
+    runs under ONE per-palace writer lease (``mine_palace_lock``), so no
+    concurrent writer can move sqlite or the HNSW segment between phases and
+    the reconcile set always describes the generation being modified. Nested
+    ``ChromaCollection.upsert`` lock acquisitions pass through via the lock's
+    process-wide re-entrancy.
+
     Raises :class:`ReconcileNotSafe` when the gap exceeds the caps (opening the
-    live segment on a #1222-scale gap can crash natively). Propagates
-    :class:`~mempalace.palace.MineAlreadyRunning` when a mine holds the palace
-    — the caller should retry once the mine finishes.
+    live segment on a #1222-scale gap can crash natively). Raises
+    :class:`~mempalace.palace.MineAlreadyRunning` at entry when another writer
+    holds the palace — the caller should retry once it finishes.
     """
     palace_path = os.path.abspath(os.path.expanduser(palace_path))
 
@@ -2608,6 +2616,32 @@ def reconcile_index(
     print(f"{'=' * 55}\n")
     print(f"  Palace: {palace_path}")
 
+    # ONE palace writer lease for the COMPLETE transaction. Any phase running
+    # outside it lets a concurrent writer move sqlite/HNSW between phases: the
+    # missing-ID snapshot then describes an older generation than the state
+    # being modified — the safety cap no longer applies to the current state,
+    # already-repaired IDs get processed again, and stale extracted rows can
+    # overwrite a newer concurrent update. Nested ChromaCollection.upsert
+    # acquisitions pass through via the lock's process-wide re-entrancy; a
+    # foreign holder raises MineAlreadyRunning here, before any read. Lazy
+    # import for the same reason as maybe_autoheal_fts5_index's: keep
+    # repair.py's import graph light for callers that never hit this path.
+    from .palace import mine_palace_lock
+
+    with mine_palace_lock(palace_path):
+        return _reconcile_under_lease(
+            palace_path, collection_name, dry_run=dry_run, batch_size=batch_size
+        )
+
+
+def _reconcile_under_lease(
+    palace_path: str,
+    collection_name: str,
+    *,
+    dry_run: bool,
+    batch_size: int,
+) -> dict:
+    """Body of :func:`reconcile_index`; the caller holds the palace writer lease."""
     # Preflight: the same sqlite integrity gate the rebuild paths use. A
     # malformed DB must never be the source of a re-embed.
     sqlite_errors = sqlite_integrity_errors(palace_path)
