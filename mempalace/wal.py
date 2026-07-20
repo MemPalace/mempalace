@@ -100,6 +100,27 @@ def _ensure_wal() -> None:
     _WAL_INITIALIZED_DIR = wal_dir
 
 
+def wal_payload(value, limit: int = 200):
+    """Size a content value for the WAL: full when opted in, else a preview.
+
+    Callers historically passed ``value[:200]`` so the WAL held a bounded
+    preview. Redaction then replaced that preview outright, which is why the
+    truncation was invisible — a redacted 200-char slice and a redacted 20 KB
+    entry look identical in the log.
+
+    With ``wal_store_full_payload`` enabled the truncation becomes the binding
+    limit instead, so it has to lift too: recovering the first 200 characters
+    of a multi-kilobyte diary entry is not recovering it. Returns the value
+    untouched when full payloads are enabled, and the historical
+    ``value[:limit]`` preview otherwise.
+    """
+    if value is None:
+        return None
+    if _store_full_payload():
+        return value
+    return value[:limit]
+
+
 def _wal_log(operation: str, params: dict, result: dict = None):
     """Append a write operation to the write-ahead log.
 

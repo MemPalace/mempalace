@@ -251,6 +251,53 @@ def test_wal_full_payload_defaults_off_and_fails_closed(tmp_path, monkeypatch):
     assert wal._store_full_payload() is False
 
 
+def test_wal_payload_truncates_only_when_redacting(tmp_path, monkeypatch):
+    """The 200-char preview cap lifts with the flag, and holds without it.
+
+    Truncation and redaction stacked invisibly: a redacted 200-char slice and a
+    redacted 20 KB entry are the same string in the log. Once payloads are
+    stored, the cap becomes the binding limit on what is recoverable, so
+    recovering a long entry means lifting it.
+    """
+    from mempalace import wal
+
+    long_entry = "x" * 5000
+
+    monkeypatch.setattr(wal, "_WAL_FULL_PAYLOAD", False)
+    assert wal.wal_payload(long_entry) == "x" * 200
+
+    monkeypatch.setattr(wal, "_WAL_FULL_PAYLOAD", True)
+    assert wal.wal_payload(long_entry) == long_entry
+    assert wal.wal_payload(None) is None
+
+
+def test_long_diary_entry_fully_recoverable_from_wal(
+    tmp_path, monkeypatch, config, palace_path, kg
+):
+    """A diary entry past the preview cap survives in full, not as its first 200 chars.
+
+    Real diary entries run to several kilobytes, so a 200-char cap would leave
+    the WAL holding a few percent of a lost write while still reporting the
+    write as logged.
+    """
+    import json
+
+    from tests.test_mcp_server import _patch_mcp_server
+
+    _patch_mcp_server(monkeypatch, config, kg)
+    wal, wal_file = _wal_at(tmp_path, monkeypatch, True)
+
+    from mempalace.mcp_server import tool_diary_write
+
+    long_entry = "SESSION:2026-07-19|" + ("recoverable." * 500)
+    assert len(long_entry) > 200
+    assert tool_diary_write(agent_name="tester", entry=long_entry, topic="wal")["success"] is True
+
+    entries = [json.loads(line) for line in wal_file.read_text().splitlines() if line.strip()]
+    previews = [e["params"]["entry_preview"] for e in entries if e["operation"] == "diary_write"]
+    assert long_entry in previews, [p[:80] for p in previews]
+
+
 def test_diary_write_payload_recoverable_from_wal(tmp_path, monkeypatch, config, palace_path, kg):
     """End-to-end: a real diary_write leaves a reconstructable WAL record.
 
