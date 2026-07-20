@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "description": "Generic software-architecture nouns and language/runtime type names that are capitalized in technical prose and code but are NOT proper nouns. Without this filter they get false-positive detected as projects: a README that says 'the Handler calls the Manager' yields 'Handler' and 'Manager' as entities. Complements coca_content_words.json, which covers common *English* content words — these are shop-talk terms that never enter a general-English frequency list, so they cannot be added there without breaking that file's COCA-top-2000 provenance. POS coverage: common noun (n), verb (v) used as a type/trait name. Excludes real product and technology names (React, Rust, Tauri): those are legitimate entities a user may want detected, and multi-word ones are protected by known_systems.json.",
+  "source": "Curated from the terms named in issues #476 (Handler, Node, Service, Manager, Client, Server, Worker, Plugin, Module, Interface, Event, Config, Builder, Factory) and #348 (String, Vec, Debug, Serialize, Deserialize, Clone, Tree, Phase, Flow). Terms already covered by coca_content_words.json (service, client, worker, event, error, request, response, update, tree, debug, phase, flow) or by the entity stopwords in i18n/en.json (server) are deliberately NOT duplicated here. Plural forms are listed for the architecture nouns, whose plurals are idiomatic ('the Handlers retry'), because the candidate extractor matches whole words and treats 'Handlers' as a separate candidate; type and trait names are left singular, since 'Vecs' and 'Clones' do not occur in the prose these issues describe.",
+  "known_tradeoffs": "'node' is named by both issues but is deliberately NOT filtered. The candidate extractor splits 'Node.js' on the dot and yields 'Node', so filtering it would stop 'Node.js' from being detected at all — the filter would suppress a real technology, which is exactly what this list is supposed to avoid. Tier 3 cannot rescue it either: known_systems.json holds multi-word names only. Graph and DOM 'Node' therefore still reaches candidates, and closing that needs a fix the single-word path cannot express. 'builder' and 'factory' are kept, since their standalone use in prose is overwhelmingly generic and the products spelled with a domain ('Builder.io') do not reduce to the bare word.",
+  "case_handling": "Matching is case-insensitive. Callers must lowercase the candidate before lookup, exactly as with coca_content_words.json.",
+  "tier_2_interaction": "This file is applied alongside coca_content_words.json at the Tier 2 single-word filtering step, on all three extraction sites (entity_detector.extract_candidates, palace closet-line extraction, miner per-drawer entity metadata). It is deliberately NOT applied to the multi-word path: the phrase filter drops a whole phrase when any constituent word matches, so filtering compounds here would erase legitimate names like 'Node Package Manager' or 'Interface Builder'.",
+  "words": [
+    "handler",
+    "handlers",
+    "manager",
+    "managers",
+    "plugin",
+    "plugins",
+    "module",
+    "modules",
+    "interface",
+    "interfaces",
+    "config",
+    "configs",
+    "builder",
+    "builders",
+    "factory",
+    "factories",
+    "string",
+    "strings",
+    "vec",
+    "clone",
+    "serialize",
+    "deserialize"
+  ]
+}

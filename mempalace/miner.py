@@ -20,7 +20,7 @@ from datetime import datetime
 from collections import defaultdict
 from typing import Optional
 
-from .entity_detector import _apply_known_systems_prepass, _get_coca_filter
+from .entity_detector import _apply_known_systems_prepass, _get_coca_filter, _get_tech_terms
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
@@ -997,6 +997,7 @@ def _extract_entities_for_metadata(content: str) -> str:
             matched.add(name)
 
     coca_filter = _get_coca_filter()
+    tech_terms = _get_tech_terms()
     window = content[:_ENTITY_EXTRACT_WINDOW]
     # Tier 3 linguistics cleanup — known-systems compound pre-pass. Detects
     # multi-word product names atomically and masks them from the window so
@@ -1010,9 +1011,10 @@ def _extract_entities_for_metadata(content: str) -> str:
         if w in _ENTITY_STOPLIST:
             continue
         # Tier 2 linguistics cleanup — drop common English content words
-        # ("Code", "Line", "Note", "Phase", …) from per-drawer entity
+        # ("Code", "Line", "Note", "Phase", …) and generic technical nouns
+        # ("Handler", "Manager", "Module", …) from per-drawer entity
         # metadata so they don't poison hallways/tunnels/search.
-        if w.lower() in coca_filter:
+        if w.lower() in coca_filter or w.lower() in tech_terms:
             continue
         freq[w] = freq.get(w, 0) + 1
     for w, c in freq.items():

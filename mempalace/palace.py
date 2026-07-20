@@ -26,7 +26,7 @@ from .backends import (
     resolve_backend_for_palace,
 )
 from .backends.embedding_wrapper import EmbeddingCollection
-from .entity_detector import _apply_known_systems_prepass, _get_coca_filter
+from .entity_detector import _apply_known_systems_prepass, _get_coca_filter, _get_tech_terms
 
 logger = logging.getLogger("mempalace_mcp")
 
@@ -570,15 +570,17 @@ def build_closet_lines(source_file, drawer_ids, content, wing, room, drawer_meta
     working_window, compound_counts = _apply_known_systems_prepass(window)
 
     coca_filter = _get_coca_filter()
+    tech_terms = _get_tech_terms()
     words = _candidate_entity_words(working_window)
     word_freq: dict = dict(compound_counts)
     for w in words:
         if w in _ENTITY_STOPLIST:
             continue
         # Tier 2 linguistics cleanup — drop common English content words
-        # ("Code", "Line", "Note", "Phase", …) so they don't appear in
+        # ("Code", "Line", "Note", "Phase", …) and generic technical nouns
+        # ("Handler", "Manager", "Module", …) so they don't appear in
         # closet pointers as fake entities.
-        if w.lower() in coca_filter:
+        if w.lower() in coca_filter or w.lower() in tech_terms:
             continue
         word_freq[w] = word_freq.get(w, 0) + 1
     entities = sorted(

@@ -1059,3 +1059,196 @@ def test_zh_tw_known_limitation_inline_name_no_boundary():
     result = extract_candidates(text, languages=("zh-TW",))
     # Extraction is expected to miss this adversarial case.
     assert "朱宜振" not in result
+
+
+# ── tech-term filter (#476, #348) ────────────────────────────────────────
+
+
+def test_tech_terms_file_loads_with_expected_shape():
+    """The tech-term data file ships with the same schema as its COCA sibling."""
+    import mempalace
+
+    pkg_dir = Path(mempalace.__file__).parent
+    p = pkg_dir / "data" / "tech_terms.json"
+    assert p.exists(), f"tech-term wordlist must exist at {p}"
+    d = json.loads(p.read_text(encoding="utf-8"))
+    assert d.get("schema_version") == 1, (
+        f"schema_version must be 1; got {d.get('schema_version')!r}"
+    )
+    words = d.get("words")
+    assert isinstance(words, list) and words, "words must be a non-empty list"
+    assert all(isinstance(w, str) for w in words), "every entry must be a string"
+    assert all(w == w.lower() for w in words), (
+        "entries must be stored lowercased — lookup lowercases the candidate"
+    )
+    assert len(words) == len(set(words)), "entries must be unique"
+
+
+def test_extract_candidates_filters_generic_architecture_nouns():
+    """#476: 'the Handler calls the Manager' must not yield Handler/Manager
+    as projects. These read as proper nouns in technical prose only because
+    they are capitalized."""
+    text = (
+        "The Handler dispatches to the Manager. The Handler retries once. "
+        "The Manager owns the Module. The Module exposes an Interface. "
+        "The Handler logs. The Manager logs. The Module reloads. "
+        "The Interface is stable. The Plugin registers. The Plugin unloads. "
+        "The Plugin reloads. The Interface is versioned."
+    )
+    result = extract_candidates(text)
+    for term in ("Handler", "Manager", "Module", "Interface", "Plugin"):
+        assert term not in result, (
+            f"{term!r} is a generic architecture noun and must be filtered; got: {sorted(result)!r}"
+        )
+
+
+def test_extract_candidates_filters_language_type_names():
+    """#348: Rust/TypeScript type and trait names are not user projects."""
+    text = (
+        "String is owned. String derefs. String allocates. "
+        "Vec grows. Vec reallocs. Vec drops. "
+        "Clone is derived. Clone is cheap. Clone is explicit. "
+        "Serialize is derived. Serialize runs. Serialize emits."
+    )
+    result = extract_candidates(text)
+    for term in ("String", "Vec", "Clone", "Serialize"):
+        assert term not in result, (
+            f"{term!r} is a language type/trait name and must be filtered; got: {sorted(result)!r}"
+        )
+
+
+def test_extract_candidates_keeps_multi_word_phrase_with_tech_term_component():
+    """The tech-term filter is single-word only. A compound product name whose
+    parts are filtered individually must still be detected — otherwise adding
+    'interface' and 'builder' would erase 'Interface Builder'."""
+    text = (
+        "Interface Builder ships it. Interface Builder loads. "
+        "Interface Builder saves. Interface Builder exports. "
+        "Interface Builder renders."
+    )
+    result = extract_candidates(text)
+    assert "Interface Builder" in result, (
+        "multi-word phrase must survive even though both words are tech terms; "
+        f"got: {sorted(result)!r}"
+    )
+
+
+def test_tech_terms_do_not_shadow_real_technology_names():
+    """Real product/technology names stay detectable — the filter targets
+    generic nouns, not the tools a user actually works with.
+
+    Asserted on extraction, not just on list membership: a term absent from
+    the data file still has to come out of extract_candidates for the
+    guarantee to mean anything.
+    """
+    from mempalace.entity_detector import _get_tech_terms
+
+    terms = _get_tech_terms()
+    for real in ("react", "rust", "tauri", "django", "kubernetes"):
+        assert real not in terms, f"{real!r} is a real technology name and must remain detectable"
+
+    text = (
+        "React renders it. React updates. React hydrates. "
+        "Rust compiles it. Rust borrows. Rust drops. "
+        "Tauri bundles it. Tauri builds. Tauri signs."
+    )
+    result = extract_candidates(text)
+    for real in ("React", "Rust", "Tauri"):
+        assert real in result, (
+            f"{real!r} must survive extraction — suppressing a real technology "
+            f"trades one wrong answer for another; got: {sorted(result)!r}"
+        )
+
+
+def test_tech_terms_disjoint_from_coca_wordlist():
+    """The two lists have different provenance (shop-talk vs COCA top-2000),
+    so an entry must not be duplicated across them."""
+    from mempalace.entity_detector import _get_coca_filter, _get_tech_terms
+
+    overlap = _get_tech_terms() & _get_coca_filter()
+    assert not overlap, (
+        f"tech_terms.json duplicates COCA entries {sorted(overlap)!r} — "
+        "keep each term in exactly one list"
+    )
+
+
+def test_tech_terms_filter_degrades_gracefully_when_file_missing():
+    """A missing/corrupt data file must not crash extraction — it just stops
+    filtering, mirroring _get_coca_filter.
+
+    Extraction itself is exercised under the failure, not only the loader:
+    a loader that returns an empty set is worthless if the caller then
+    raises.
+    """
+    from mempalace.entity_detector import _get_tech_terms
+
+    text = "Riley shipped it. Riley reviewed it. Riley merged it. The Handler retried."
+
+    _get_tech_terms.cache_clear()
+    try:
+        with patch("mempalace.entity_detector.Path.read_text", side_effect=OSError("gone")):
+            assert _get_tech_terms() == frozenset()
+            # The unfiltered path must still produce results rather than raise.
+            assert "Riley" in extract_candidates(text)
+    finally:
+        _get_tech_terms.cache_clear()
+
+    # A structurally valid file whose "words" is the wrong type must also be
+    # survivable, not just an unreadable one.
+    _get_tech_terms.cache_clear()
+    try:
+        with patch("mempalace.entity_detector.Path.read_text", return_value='{"words": null}'):
+            assert _get_tech_terms() == frozenset()
+            assert "Riley" in extract_candidates(text)
+    finally:
+        _get_tech_terms.cache_clear()
+
+    _get_tech_terms.cache_clear()
+    try:
+        with patch("pathlib.Path.read_text", side_effect=OSError("gone")):
+            assert _get_tech_terms() == frozenset()
+    finally:
+        _get_tech_terms.cache_clear()
+
+
+def test_closet_lines_apply_tech_term_filter():
+    """palace.build_closet_lines is the second extraction site. Without the
+    filter there, generic nouns land in AAAK closet pointers even though
+    extract_candidates rejects them.
+
+    'Alice' is the control: she must survive, so a pass cannot come from the
+    function simply returning nothing.
+    """
+    from mempalace.palace import build_closet_lines
+
+    text = (
+        "Alice reviewed the Handler. Alice rewrote the Handler. "
+        "The Module imports Config. The Module reloads Config. "
+        "Alice shipped it. The Handler retried. The Module cached Config."
+    )
+    joined = " ".join(build_closet_lines("notes.md", ["d1"], text, "work", "day"))
+    assert "Alice" in joined, f"control entity must survive; got: {joined!r}"
+    for term in ("Handler", "Module", "Config"):
+        assert term not in joined, f"{term!r} must not reach closet pointers; got: {joined!r}"
+
+
+def test_drawer_entity_metadata_applies_tech_term_filter():
+    """miner._extract_entities_for_metadata is the third extraction site.
+    Unfiltered generic nouns there poison hallways, tunnels and search.
+
+    'Alice' is the control, and the known-entity registry is emptied so the
+    assertion tests the filter rather than the caller's own registry pass.
+    """
+    from mempalace import miner
+
+    text = (
+        "Alice reviewed the Handler. Alice rewrote the Handler. "
+        "The Module imports Config. The Module reloads Config. "
+        "Alice shipped it. The Handler retried. The Module cached Config."
+    )
+    with patch("mempalace.miner._load_known_entities", return_value=frozenset()):
+        entities = miner._extract_entities_for_metadata(text)
+    names = {n for n in entities.split(";") if n}
+    assert "Alice" in names, f"control entity must survive; got: {names!r}"
+    for term in ("Handler", "Module", "Config"):
+        assert term not in names, f"{term!r} must not reach drawer entity metadata; got: {names!r}"

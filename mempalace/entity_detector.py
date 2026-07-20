@@ -78,6 +78,44 @@ def _get_coca_filter() -> frozenset[str]:
         return frozenset()
 
 
+# ==================== TECH-TERM FILTER (Tier 2 linguistics cleanup) ====================
+#
+# Generic architecture nouns ("Handler", "Manager", "Module") and language /
+# runtime type names ("String", "Vec", "Clone") read as proper nouns in
+# technical prose, so a README saying "the Handler calls the Manager" yields
+# both as projects (#476, #348).
+#
+# These are shop-talk, not general English, so they cannot go into
+# ``coca_content_words.json`` without breaking its COCA-top-2000 provenance —
+# hence a sibling data file with the same shape and the same case handling.
+# Real technology names (React, Rust, Node.js) are deliberately absent: those
+# are entities a user may legitimately want detected.
+#
+# Data file: ``mempalace/data/tech_terms.json``. Loaded once on first call via
+# ``_get_tech_terms``. Applied only on the single-word path, next to the COCA
+# filter — never to the multi-word path, whose phrase filter drops an entire
+# phrase when any constituent word matches ("Node Package Manager").
+
+
+@functools.lru_cache(maxsize=1)
+def _get_tech_terms() -> frozenset[str]:
+    """Return the technical-term filter set (lowercased).
+
+    Loads ``mempalace/data/tech_terms.json`` on first call and caches the
+    resulting frozenset. Subsequent calls are O(1). Returns an empty
+    frozenset if the data file is missing or malformed — extraction then
+    degrades gracefully (no tech-term filter applied) rather than crashing,
+    matching ``_get_coca_filter``.
+    """
+    data_path = Path(__file__).parent / "data" / "tech_terms.json"
+    try:
+        raw = json.loads(data_path.read_text(encoding="utf-8"))
+        words = raw.get("words", [])
+        return frozenset(w.lower() for w in words if isinstance(w, str))
+    except (OSError, json.JSONDecodeError, AttributeError, TypeError):
+        return frozenset()
+
+
 # ==================== KNOWN-SYSTEMS COMPOUND LEXICON (Tier 3 linguistics cleanup) ====================
 #
 # Multi-word product / system names that must be detected atomically — NOT
@@ -285,6 +323,7 @@ def extract_candidates(text: str, languages=("en",)) -> dict:
     patterns = get_entity_patterns(langs)
     stopwords = _get_stopwords(langs)
     coca_filter = _get_coca_filter()
+    tech_terms = _get_tech_terms()
 
     counts: defaultdict = defaultdict(int)
 
@@ -307,10 +346,13 @@ def extract_candidates(text: str, languages=("en",)) -> dict:
             if wl in stopwords:
                 continue
             # Tier 2 linguistics cleanup: block common English content words
-            # (Code, Brutal, Phase, Line, Note, ...) from entity candidacy.
-            # Multi-word path below is intentionally not filtered so
-            # compound names like "Claude Code" still get detected.
-            if wl in coca_filter:
+            # (Code, Brutal, Phase, Line, Note, ...) and generic technical
+            # nouns (Handler, Manager, Module, String, ...) from entity
+            # candidacy. Multi-word path below is intentionally not filtered
+            # so compound names like "Claude Code" still get detected — and
+            # so a phrase is never dropped for containing "Node" or
+            # "Manager" ("Node Package Manager").
+            if wl in coca_filter or wl in tech_terms:
                 continue
             if len(word) < 2:
                 continue
