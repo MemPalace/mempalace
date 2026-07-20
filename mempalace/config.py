@@ -235,6 +235,10 @@ _MILVUS_CONSISTENCY_LEVELS = {
 # ``MempalaceConfig.max_backups``.
 DEFAULT_MAX_BACKUPS = 10
 
+# Whether the write-ahead log stores write payloads verbatim instead of
+# redacting them. Off by default — see ``MempalaceConfig.wal_store_full_payload``.
+DEFAULT_WAL_STORE_FULL_PAYLOAD = False
+
 
 def normalize_milvus_consistency_level(value) -> str:
     raw = str(value).strip() if value else DEFAULT_MILVUS_CONSISTENCY_LEVEL
@@ -884,6 +888,42 @@ class MempalaceConfig:
             self._file_config.get("max_backups", DEFAULT_MAX_BACKUPS), minimum=0
         )
         return DEFAULT_MAX_BACKUPS if coerced is None else coerced
+
+    @property
+    def wal_store_full_payload(self) -> bool:
+        """Whether the WAL records write payloads verbatim instead of redacting them.
+
+        The write-ahead log normally replaces the value of every content-bearing
+        parameter with ``[REDACTED N chars]``. That keeps memory text out of a
+        file an operator might attach to a bug report, but it also means the WAL
+        cannot answer the one question it is uniquely placed to answer after a
+        storage-layer fault: *what were we trying to write?* When a backend
+        acknowledges a write it never persisted, the redacted WAL proves only
+        that a write of some length was attempted, so the content is
+        unrecoverable even though MemPalace logged the call.
+
+        Enabling this trades that confidentiality for recoverability. It is
+        intended for self-hosted single-user palaces, where the operator and the
+        data subject are the same person and losing memory costs more than
+        writing it to a second local file. The WAL is created ``0o600`` inside a
+        ``0o700`` directory, so turning this on does not widen filesystem
+        exposure — it only changes what an operator who shares the file would be
+        sharing. Leave it off for shared or team servers.
+
+        Reads ``MEMPALACE_WAL_STORE_FULL_PAYLOAD`` env first, then
+        ``wal_store_full_payload`` in ``config.json``, then the default of
+        ``False``. Accepts ``true``/``1``/``yes``/``on`` (case-insensitive);
+        anything else is false, so a typo fails closed to redaction.
+        """
+        env_val = os.environ.get("MEMPALACE_WAL_STORE_FULL_PAYLOAD")
+        if env_val is not None:
+            return env_val.strip().lower() in ("true", "1", "yes", "on")
+        value = self._file_config.get("wal_store_full_payload", DEFAULT_WAL_STORE_FULL_PAYLOAD)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in ("true", "1", "yes", "on")
+        return DEFAULT_WAL_STORE_FULL_PAYLOAD
 
     @property
     def hook_silent_save(self):

@@ -164,6 +164,40 @@ The MCP server also accepts `--palace`:
 python -m mempalace.mcp_server --palace /custom/palace
 ```
 
+## Write-ahead log payloads
+
+MemPalace appends every write operation to `~/.mempalace/wal/write_log.jsonl`. By
+default the content-bearing fields (`entry`, `content`, `document`, `query`, …)
+are replaced with `[REDACTED N chars]`, so the log records that a write happened
+and how big it was, but not what it said.
+
+That default is right for shared and team servers. It has one cost: if the
+storage layer ever acknowledges a write it does not persist, the WAL can prove a
+write was attempted but cannot tell you what to restore.
+
+For a self-hosted single-user palace — where the operator and the data subject
+are the same person, and losing a memory costs more than writing it to a second
+local file — set:
+
+```json
+{
+  "wal_store_full_payload": true
+}
+```
+
+or `MEMPALACE_WAL_STORE_FULL_PAYLOAD=true`. Write payloads are then recorded
+verbatim and a dropped write is reconstructable from the log.
+
+The WAL file is created `0o600` inside a `0o700` directory either way, so this
+setting does not widen filesystem exposure — it changes what you would be
+handing over if you attached the log to a bug report. Leave it off if the palace
+serves more than one person.
+
+::: warning
+Turn this on *before* you need it. The WAL cannot retroactively un-redact
+records that were written while the setting was off.
+:::
+
 ## Environment Variables
 
 | Variable | Description |
@@ -171,4 +205,5 @@ python -m mempalace.mcp_server --palace /custom/palace
 | `MEMPALACE_PALACE_PATH` | Override palace path (same as `--palace`) |
 | `MEMPAL_DIR` | Directory for auto-mining in hooks |
 | `MEMPALACE_MAX_BACKUPS` | Override `max_backups` retention count (`0` disables pruning) |
+| `MEMPALACE_WAL_STORE_FULL_PAYLOAD` | Log write payloads verbatim instead of redacting them (default off) — see [Write-ahead log payloads](#write-ahead-log-payloads) |
 | `MEMPALACE_BACKEND` | Select the storage backend (default `chroma`) — see [Storage backends](#storage-backends) for each backend's connection variables |
