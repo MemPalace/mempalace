@@ -61,7 +61,9 @@ a variable, fixing a typo). Recall is question-driven, not reflexive.
   --archive-existing --yes`), not re-mine, which drops MCP-added drawers
   and diary entries (#1843). Do not repair in-process.
 - **Conflicting facts** — trust the knowledge graph's time-valid answer;
-  invalidate-then-add rather than overwriting silently.
+  use `mempalace_kg_supersede` for single-valued replacements,
+  `mempalace_kg_invalidate` for facts that ended without replacement,
+  and `mempalace_kg_add` for independent/coexisting facts.
 
 The canonical protocol, shared across all MemPalace integrations, lives
 in `integrations/shared/recall-protocol.md`.
