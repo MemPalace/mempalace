@@ -59,22 +59,41 @@ def _doc_tool_names() -> list:
 
 
 class TestToolCount:
-    """README claims '19 tools available through MCP' in multiple places."""
+    """The docs state a tool count; it must equal len(TOOLS)."""
+
+    # "36 tools" and "36 MCP tools" alike. The old pattern `(\d+)\s+tools`
+    # required the digits immediately before "tools", so "36 MCP tools" matched
+    # nothing and the test passed vacuously while the count was wrong — a green
+    # run that wasn't evidence the counts lined up.
+    _COUNT_RE = re.compile(r"(\d+)\s+(?:MCP\s+)?tools", re.IGNORECASE)
 
     def test_readme_tool_count_matches_code(self):
-        """Claim: README says 19 tools. Actual TOOLS dict may differ.
+        """Claim: the docs state a tool count. Actual TOOLS dict is the truth.
 
-        This test asserts the REAL tool count so the README can be updated.
-        If TOOLS has 25 entries, the README should say 25, not 19.
+        Scans README.md and the MCP tools reference for "<n> tools" / "<n> MCP
+        tools" and asserts every stated count equals len(TOOLS). Also asserts at
+        least one claim was found, so a phrasing the regex misses can't let this
+        pass silently.
         """
         actual_count = len(_tools_dict_keys())
-        readme = _readme()
-        # Find all "19 tools" claims in README
-        claimed_counts = re.findall(r"(\d+)\s+tools", readme)
-        for claimed in claimed_counts:
-            assert int(claimed) == actual_count, (
-                f"README claims {claimed} tools but TOOLS dict has {actual_count}. "
-                f"Update every occurrence of '{claimed} tools' to '{actual_count} tools'."
+        sources = {
+            README_PATH.name: _readme(),
+            MCP_TOOLS_DOC_PATH.relative_to(REPO_ROOT).as_posix(): _read(MCP_TOOLS_DOC_PATH),
+        }
+        claims = [
+            (src, int(n))
+            for src, text in sources.items()
+            for n in self._COUNT_RE.findall(text)
+        ]
+        assert claims, (
+            "No tool-count claim found in README.md or the MCP tools reference. "
+            "Expected a phrase like '<n> tools' / '<n> MCP tools' so the stated "
+            "count stays pinned to len(TOOLS)."
+        )
+        for src, claimed in claims:
+            assert claimed == actual_count, (
+                f"{src} claims {claimed} tools but TOOLS dict has {actual_count}. "
+                f"Update every occurrence to '{actual_count} tools'."
             )
 
 
