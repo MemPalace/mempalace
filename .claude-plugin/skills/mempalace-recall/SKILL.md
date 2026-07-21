@@ -44,8 +44,10 @@ a variable, fixing a typo). Recall is question-driven, not reflexive.
    stored content.
 4. After a substantive session, record continuity with
    `mempalace_diary_write` (skip if a background hook already saved).
-5. When a fact changes: `mempalace_kg_invalidate` the old fact, then
-   `mempalace_kg_add` the new one.
+5. When a fact changes: use `mempalace_kg_supersede` for
+   single-valued replacements, `mempalace_kg_invalidate` for facts that
+   ended without replacement, and `mempalace_kg_add` for
+   independent/coexisting facts.
 
 ## Unhappy paths
 
