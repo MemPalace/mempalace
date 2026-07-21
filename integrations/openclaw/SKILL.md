@@ -42,7 +42,7 @@ You have access to a local memory palace via MCP tools. The palace stores verbat
 2. **BEFORE RESPONDING** about any person, project, or past event: call `mempalace_search` or `mempalace_kg_query` FIRST. Never guess from memory — verify from the palace.
 3. **IF UNSURE** about a fact (name, age, relationship, preference): say "let me check" and query. Wrong is worse than slow.
 4. **AFTER EACH SESSION**: Call `mempalace_diary_write` to record what happened, what you learned, what matters.
-5. **WHEN FACTS CHANGE**: Call `mempalace_kg_invalidate` on the old fact, then `mempalace_kg_add` for the new one.
+5. **WHEN FACTS CHANGE**: For single-valued replacements (model, employer, owner, address, current status), call `mempalace_kg_supersede`. Use `mempalace_kg_invalidate` only when a fact ends without a replacement, and `mempalace_kg_add` for independent facts that can coexist.
 
 ## Available Tools
 
@@ -82,6 +82,10 @@ tool-specific workflow below says to.
   - `subject`, `predicate`, `object` (required)
   - `valid_from`: when this became true
   - `source_closet`: source reference
+- `mempalace_kg_supersede` — Atomically replace one single-valued fact with its successor at a shared boundary
+  - `subject`, `predicate`, `old_object`, `new_object` (required)
+  - `at`: boundary instant; defaults to now UTC
+  - Use for changing model, employer, address, owner, or current status so point-in-time queries return only the new value at the boundary
 - `mempalace_kg_invalidate` — Mark a fact as no longer true
   - `subject`, `predicate`, `object` (required)
   - `ended`: when it stopped being true (default: today)
@@ -208,6 +212,7 @@ claude mcp add mempalace -- python -m mempalace.mcp_server
 
 - Search is semantic (meaning-based), not keyword. "What did we discuss about database performance?" works better than "database".
 - The knowledge graph stores typed relationships with time windows. Use it for facts about people and projects — it knows WHEN things were true.
+- For single-valued facts that change, use `mempalace_kg_supersede`; do not hand-roll invalidate + add because boundary queries can briefly show both values.
 - Diary entries accumulate across sessions. Write one at the end of each conversation to build continuity.
 - Use `mempalace_check_duplicate` before storing new content to avoid duplicates.
 - The AAAK dialect (from `mempalace_status`) is a compressed notation for efficient storage. Read it naturally — expand codes mentally, treat *markers* as emotional context.
