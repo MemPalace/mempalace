@@ -5124,6 +5124,150 @@ def test_peer_writer_readonly_self_heals_after_peer_exits(monkeypatch):
     assert mcp_server._MCP_WRITER_READ_ONLY is False
 
 
+class _ReleasableDummyLock:
+    def __init__(self):
+        self.exited = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.exited += 1
+        return False
+
+
+def _install_writer_lease(monkeypatch, *, idle_env="0.01", last_mutation_age=999.0):
+    """Give the server a held dummy lease that is already past the idle window."""
+    import time
+
+    from mempalace import mcp_server
+
+    lock = _ReleasableDummyLock()
+    monkeypatch.delenv(mcp_server._MCP_ALLOW_PEER_WRITER_ENV, raising=False)
+    monkeypatch.setenv(mcp_server._MCP_WRITER_LEASE_IDLE_S_ENV, idle_env)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_CM", lock)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_READ_ONLY", False)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_FAILED", False)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_INFLIGHT", 0)
+    monkeypatch.setattr(
+        mcp_server, "_MCP_WRITER_LAST_MUTATION_TS", time.monotonic() - last_mutation_age
+    )
+    resets = []
+    monkeypatch.setattr(mcp_server, "_force_chroma_cache_reset", lambda: resets.append(1))
+    return lock, resets
+
+
+def test_writer_lease_released_after_idle(monkeypatch):
+    """An idle lease must be released AND the Chroma caches dropped, so a
+    later re-acquire reopens the palace from disk instead of writing through
+    a stale in-memory HNSW graph (#1888)."""
+    from mempalace import mcp_server
+
+    lock, resets = _install_writer_lease(monkeypatch)
+
+    assert mcp_server._release_mcp_writer_lock_if_idle() is True
+    assert mcp_server._MCP_WRITER_LOCK_CM is None
+    assert lock.exited == 1
+    assert resets == [1]
+
+
+def test_writer_lease_not_released_before_idle_window(monkeypatch):
+    from mempalace import mcp_server
+
+    lock, resets = _install_writer_lease(monkeypatch, idle_env="3600", last_mutation_age=1.0)
+
+    assert mcp_server._release_mcp_writer_lock_if_idle() is False
+    assert mcp_server._MCP_WRITER_LOCK_CM is lock
+    assert lock.exited == 0
+    assert resets == []
+
+
+def test_writer_lease_not_released_while_mutating_tool_in_flight(monkeypatch):
+    from mempalace import mcp_server
+
+    lock, resets = _install_writer_lease(monkeypatch)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_INFLIGHT", 1)
+
+    assert mcp_server._release_mcp_writer_lock_if_idle() is False
+    assert mcp_server._MCP_WRITER_LOCK_CM is lock
+    assert resets == []
+
+
+def test_writer_lease_release_disabled_by_env_zero(monkeypatch):
+    """MEMPALACE_MCP_WRITER_LEASE_IDLE_S=0 restores the legacy
+    hold-until-exit behavior."""
+    from mempalace import mcp_server
+
+    lock, resets = _install_writer_lease(monkeypatch, idle_env="0")
+
+    assert mcp_server._release_mcp_writer_lock_if_idle() is False
+    assert mcp_server._MCP_WRITER_LOCK_CM is lock
+    assert resets == []
+
+
+def test_writer_lease_invalid_idle_env_falls_back_to_default(monkeypatch):
+    from mempalace import mcp_server
+
+    monkeypatch.setenv(mcp_server._MCP_WRITER_LEASE_IDLE_S_ENV, "banana")
+    assert mcp_server._writer_lease_idle_seconds() == mcp_server._MCP_WRITER_LEASE_IDLE_S_DEFAULT
+
+    monkeypatch.setenv(mcp_server._MCP_WRITER_LEASE_IDLE_S_ENV, "-5")
+    assert mcp_server._writer_lease_idle_seconds() == 0.0
+
+
+def test_writer_lease_reacquired_after_idle_release(monkeypatch):
+    """After an idle release the next mutating call must transparently win
+    the lease back (same self-heal path as a peer exit)."""
+    from mempalace import mcp_server, palace
+
+    lock, _resets = _install_writer_lease(monkeypatch)
+    fresh = _ReleasableDummyLock()
+    monkeypatch.setattr(palace, "mine_palace_lock", lambda palace_path: fresh)
+
+    assert mcp_server._release_mcp_writer_lock_if_idle() is True
+    ok, reason = mcp_server._acquire_mcp_writer_lock()
+    assert ok is True
+    assert reason == ""
+    assert mcp_server._MCP_WRITER_LOCK_CM is fresh
+
+
+def test_writer_lease_activity_tracks_inflight_and_restarts_idle_clock(monkeypatch):
+    import time
+
+    from mempalace import mcp_server
+
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_INFLIGHT", 0)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LAST_MUTATION_TS", 0.0)
+
+    before = time.monotonic()
+    with mcp_server._writer_lease_activity("mempalace_add_drawer"):
+        assert mcp_server._MCP_WRITER_INFLIGHT == 1
+    assert mcp_server._MCP_WRITER_INFLIGHT == 0
+    assert mcp_server._MCP_WRITER_LAST_MUTATION_TS >= before
+
+    # Non-mutating tools never touch the lease bookkeeping.
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LAST_MUTATION_TS", 0.0)
+    with mcp_server._writer_lease_activity("mempalace_search"):
+        assert mcp_server._MCP_WRITER_INFLIGHT == 0
+    assert mcp_server._MCP_WRITER_LAST_MUTATION_TS == 0.0
+
+
+def test_writer_lease_atexit_release_uses_current_lease(monkeypatch):
+    """The once-registered atexit hook must release whatever lease is held at
+    exit time (a per-acquire callback would point at an already-exited CM
+    after an idle-release/re-acquire cycle)."""
+    from mempalace import mcp_server
+
+    lock, _resets = _install_writer_lease(monkeypatch)
+    mcp_server._release_mcp_writer_lock_at_exit()
+    assert lock.exited == 1
+    assert mcp_server._MCP_WRITER_LOCK_CM is None
+
+    # Idempotent when nothing is held.
+    mcp_server._release_mcp_writer_lock_at_exit()
+    assert lock.exited == 1
+
+
 def test_sqlite_integrity_gate_refuses_non_status_tool(monkeypatch):
     from mempalace import mcp_server
 

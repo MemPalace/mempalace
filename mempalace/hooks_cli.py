@@ -1555,6 +1555,36 @@ def hook_precompact(data: dict, harness: str):
     _output({})
 
 
+def _ignored_cwd(data: dict) -> bool:
+    """True when the session's cwd falls under ``hooks.ignore_paths`` (config).
+
+    Ephemeral worker sessions (e.g. objective-loop agents spawning dozens of
+    nested harness sessions per hour) each fire session-start/stop/session-end
+    ingests; ``hooks.ignore_paths`` lets an operator exempt those project dirs
+    from capture instead of flooding the store. Matches the hook payload's
+    ``cwd`` by path-prefix and, as a fallback, the dash-encoded project-dir
+    form inside ``transcript_path``.
+    """
+    try:
+        cfg = json.loads((PALACE_ROOT / "config.json").read_text())
+        paths = (cfg.get("hooks") or {}).get("ignore_paths") or []
+    except Exception:
+        return False
+    if not paths:
+        return False
+    cwd = str(data.get("cwd") or "")
+    transcript = str(data.get("transcript_path") or "")
+    for raw in paths:
+        p = os.path.expanduser(str(raw)).rstrip("/")
+        if not p:
+            continue
+        if cwd == p or cwd.startswith(p + "/"):
+            return True
+        if transcript and p.replace("/", "-") in transcript:
+            return True
+    return False
+
+
 def run_hook(hook_name: str, harness: str):
     """Main entry point: read stdin JSON, dispatch to hook handler."""
     try:
@@ -1562,6 +1592,12 @@ def run_hook(hook_name: str, harness: str):
     except (json.JSONDecodeError, EOFError):
         _log("WARNING: Failed to parse stdin JSON, proceeding with empty data")
         data = {}
+
+    if _ignored_cwd(data):
+        # Exempted project dir: no capture, no mine, no store open. Hooks
+        # must still hand valid JSON back to the harness.
+        print("{}")
+        return
 
     hooks = {
         "session-start": hook_session_start,
