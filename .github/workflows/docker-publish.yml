@@ -22,14 +22,14 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # Needed for the emulated linux/arm64 build on real pushes.
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       # Only authenticate + push for in-repo events. Fork PRs lack the
       # packages:write token, so they build (to validate the Dockerfile) but
@@ -79,10 +79,10 @@ jobs:
   build-gpu:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Build GPU image (validation only — not published)
         uses: docker/build-push-action@v7

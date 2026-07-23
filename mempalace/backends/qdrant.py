@@ -40,6 +40,7 @@ from .base import (
     PalaceNotFoundError,
     PalaceRef,
     QueryResult,
+    UnsupportedCapabilityError,
     UnsupportedFilterError,
     _IncludeSpec,
 )
@@ -543,6 +544,38 @@ class _QdrantRESTClient:
         result = response.get("result") or {}
         return int(result.get("count") or 0)
 
+    def facet_counts(
+        self,
+        collection: str,
+        *,
+        field: str,
+        qdrant_filter: Optional[dict] = None,
+        limit: int = 1000,
+    ) -> dict[str, int]:
+        body: dict[str, Any] = {
+            "key": field,
+            "exact": True,
+            "limit": limit,
+        }
+
+        if qdrant_filter:
+            body["filter"] = qdrant_filter
+
+        response = self.request(
+            "POST",
+            f"/collections/{urlparse.quote(collection, safe='')}/facet",
+            body=body,
+        )
+
+        result = response.get("result") or {}
+        hits = result.get("hits") or []
+
+        return {
+            str(hit["value"]): int(hit.get("count") or 0)
+            for hit in hits
+            if hit.get("value") is not None
+        }
+
     def delete_collection(self, collection: str) -> None:
         self.request("DELETE", f"/collections/{urlparse.quote(collection, safe='')}")
 
@@ -1035,6 +1068,34 @@ class QdrantCollection(BaseCollection):
         rows = self._rows(where=where)
         return [row["metadata"] for row in rows]
 
+    def facet_counts(
+        self,
+        field: str,
+        where: Optional[dict] = None,
+        limit: int = 1000,
+    ) -> dict[str, int]:
+        self._ensure_open()
+        # Validate the filter before the existence short-circuit so an
+        # unsupported local-only filter raises regardless of whether the
+        # collection has been materialized yet — matching the order used by
+        # get()/lexical_search() above (#1835 review).
+        _validate_where(where)
+        if _requires_local_filter(where):
+            raise UnsupportedCapabilityError("facet_counts does not support local-only filters")
+        if not self._remote_exists():
+            if self._marker_exists():
+                raise CollectionNotInitializedError(self._collection_name)
+            return {}
+
+        q_filter = _qdrant_filter(where)
+
+        return self._client.facet_counts(
+            self._remote_collection,
+            field=f"{_PAYLOAD_METADATA}.{field}",
+            qdrant_filter=q_filter,
+            limit=limit,
+        )
+
     def delete(self, *, ids=None, where=None):
         _validate_where(where)
         if not self._remote_exists():
@@ -1125,6 +1186,7 @@ class QdrantBackend(BaseBackend):
             "supports_embeddings_out",
             "supports_metadata_filters",
             "supports_lexical_search",
+            "supports_metadata_facets",
             "supports_namespace_isolation",
             "server_mode",
         }

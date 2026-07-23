@@ -8,8 +8,11 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 import mempalace.hooks_cli as hooks_cli_mod
+from mempalace.config import sanitize_name
 from mempalace.hooks_cli import (
     SAVE_INTERVAL,
     _count_human_messages,
@@ -23,6 +26,7 @@ from mempalace.hooks_cli import (
     _mine_already_running,
     _mine_sync,
     _parse_harness_input,
+    _safe_wing_slug,
     _sanitize_session_id,
     _save_diary_direct,
     _validate_transcript_path,
@@ -720,6 +724,84 @@ def test_wing_from_transcript_path_cwd_handles_non_string_cwd(tmp_path):
         encoding="utf-8",
     )
     assert _wing_from_transcript_path(str(transcript)) == "wing_proper_name"
+
+
+# --- _safe_wing_slug: special-character project dirs (e.g. +project) ---
+
+
+def test_safe_wing_slug_strips_leading_plus():
+    """Regression: a ``+``-prefixed folder (e.g. ``+project``) leaked ``+`` into the
+    slug, producing ``wing_+project`` which ``sanitize_name`` rejects — silently
+    breaking diary auto-save for that project."""
+    assert _safe_wing_slug("+project") == "project"
+
+
+def test_safe_wing_slug_replaces_inner_special_chars():
+    assert _safe_wing_slug("foo+bar") == "foo_bar"
+
+
+def test_safe_wing_slug_preserves_space_and_hyphen_behavior():
+    # spaces and hyphens still collapse to underscores (no regression)
+    assert _safe_wing_slug("React Native") == "react_native"
+    assert _safe_wing_slug("claude-code") == "claude_code"
+
+
+def test_safe_wing_slug_preserves_existing_valid_names():
+    """Backward compatibility: a name that already produced a valid wing keeps the
+    same slug, so previously-filed diary entries aren't orphaned (AGENTS.md: never
+    destroy existing data). ``.`` and ``'`` are both accepted by sanitize_name and
+    must survive."""
+    assert _safe_wing_slug("myapp") == "myapp"
+    assert _safe_wing_slug("my.app") == "my.app"
+    assert _safe_wing_slug("v1.2.3") == "v1.2.3"
+    assert _safe_wing_slug("o'brien") == "o'brien"
+
+
+def test_safe_wing_slug_collapses_double_dots():
+    """``..`` must collapse — sanitize_name rejects it as path traversal."""
+    assert _safe_wing_slug("my..app") == "my.app"
+    assert _safe_wing_slug("..hidden..") == "hidden"
+
+
+def test_safe_wing_slug_caps_length_for_sanitize_name():
+    """sanitize_name rejects names over 128 chars; the slug stays short enough that
+    wing_<slug> never trips that limit, even for very long directory names."""
+    slug = _safe_wing_slug("a" * 500)
+    assert len(slug) <= 120
+    sanitize_name(f"wing_{slug}")  # must not raise
+
+
+def test_safe_wing_slug_falls_back_to_sessions_when_empty():
+    # names made entirely of disallowed characters reduce to nothing
+    assert _safe_wing_slug("+") == "sessions"
+    assert _safe_wing_slug("@#$") == "sessions"
+
+
+def test_wing_from_transcript_path_cwd_plus_prefixed_dir(tmp_path):
+    """Reporter's case: a ``+``-prefixed working directory must yield a sanitizable
+    wing (``wing_project``), not the rejected ``wing_+project``."""
+    project_dir = tmp_path / "encoded-dir"
+    project_dir.mkdir()
+    transcript = project_dir / "session.jsonl"
+    transcript.write_text(
+        '{"type":"user","cwd":"/Users/me/code/+project","content":"hi"}\n',
+        encoding="utf-8",
+    )
+    assert _wing_from_transcript_path(str(transcript)) == "wing_project"
+
+
+def test_wing_from_transcript_path_legacy_plus_prefixed_project():
+    """Legacy ``-Projects-<name>`` path with a ``+``-prefixed project folder."""
+    path = "/Users/me/foo/-Projects-+app/session.jsonl"
+    assert _wing_from_transcript_path(path) == "wing_app"
+
+
+@given(st.text(min_size=1, max_size=300))
+def test_safe_wing_slug_always_yields_sanitizable_wing(name):
+    """Property: for ANY non-empty input, ``wing_<slug>`` must pass sanitize_name —
+    the entire contract of the helper (a rejected wing silently breaks auto-save)."""
+    wing = f"wing_{_safe_wing_slug(name)}"
+    assert sanitize_name(wing) == wing
 
 
 # --- _log ---

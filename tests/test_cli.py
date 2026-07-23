@@ -975,6 +975,16 @@ def test_main_repair_dispatches():
         mock_cmd.assert_called_once()
 
 
+def test_main_repair_rebuild_index_dispatches():
+    with (
+        patch("sys.argv", ["mempalace", "repair", "rebuild-index"]),
+        patch("mempalace.cli.cmd_repair") as mock_cmd,
+    ):
+        main()
+        args = mock_cmd.call_args.args[0]
+        assert args.repair_action == "rebuild-index"
+
+
 def test_main_compress_dispatches():
     with (
         patch("sys.argv", ["mempalace", "compress"]),
@@ -1767,3 +1777,57 @@ def test_cmd_repair_from_sqlite_success_does_not_exit(mock_config_cls, tmp_path)
     with patch("mempalace.repair.rebuild_from_sqlite", return_value=fake_counts):
         # Should return cleanly; no SystemExit raised.
         cmd_repair(args)
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_from_sqlite_cleanup_failure_exits_nonzero(mock_config_cls, tmp_path, capsys):
+    from mempalace.repair import RebuildCleanupError
+
+    palace_dir = tmp_path / "palace"
+    source_dir = tmp_path / "source"
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+    args = argparse.Namespace(
+        palace=str(palace_dir),
+        mode="from-sqlite",
+        source=str(source_dir),
+        archive_existing=False,
+        yes=True,
+    )
+    failure = RebuildCleanupError(
+        "cleanup failed",
+        counts={"mempalace_drawers": 1},
+        dest_palace=str(palace_dir),
+        archive_path=None,
+    )
+    with patch("mempalace.repair.rebuild_from_sqlite", side_effect=failure):
+        with pytest.raises(SystemExit) as excinfo:
+            cmd_repair(args)
+
+    assert excinfo.value.code == 1
+    assert "Rebuild cleanup failed" in capsys.readouterr().out
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_rebuild_index_alias_uses_sqlite_archive(mock_config_cls, tmp_path):
+    """``repair rebuild-index`` must bypass Chroma reads and rebuild from SQLite."""
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+
+    args = argparse.Namespace(
+        palace=str(palace_dir),
+        repair_action="rebuild-index",
+        mode="legacy",
+        source=None,
+        archive_existing=False,
+        yes=True,
+    )
+    fake_counts = {"mempalace_drawers": 1, "mempalace_closets": 0}
+    with patch("mempalace.repair.rebuild_from_sqlite", return_value=fake_counts) as rebuild:
+        cmd_repair(args)
+
+    rebuild.assert_called_once_with(
+        source_palace=str(palace_dir),
+        dest_palace=str(palace_dir),
+        archive_existing_dest=True,
+    )

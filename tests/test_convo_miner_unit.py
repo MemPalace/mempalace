@@ -8,6 +8,7 @@ import pytest
 from mempalace.convo_miner import (
     CHUNK_SIZE,
     _emit_bounded,
+    _extract_authored_at,
     _file_chunks_locked,
     chunk_exchanges,
     detect_convo_room,
@@ -362,6 +363,30 @@ class TestScanConvos:
         files = scan_convos(str(tmp_path))
         assert files == []
 
+    def test_scan_skips_tool_results_dirs(self, tmp_path):
+        # Claude Code pages large tool outputs to <session>/tool-results/*.txt
+        # inside ~/.claude/projects/<slug>/. These are raw machine dumps
+        # referenced from the transcript JSONL, not conversations — mining
+        # them floods the palace (12.8k drawers measured in the field, one
+        # single file produced 3.6k). The scanner must not descend into them.
+        session_dir = tmp_path / "1234-5678-session"
+        tool_results = session_dir / "tool-results"
+        tool_results.mkdir(parents=True)
+        (tool_results / "bipc8jdx0.txt").write_text("raw tool dump " * 100, encoding="utf-8")
+        (tmp_path / "session.jsonl").write_text('{"type": "user"}', encoding="utf-8")
+        files = scan_convos(str(tmp_path))
+        names = [f.name for f in files]
+        assert "session.jsonl" in names
+        assert "bipc8jdx0.txt" not in names
+
+    def test_scan_keeps_regular_nested_dirs(self, tmp_path):
+        # The tool-results skip must not turn into a blanket nested-dir skip.
+        nested = tmp_path / "archive"
+        nested.mkdir()
+        (nested / "old-chat.md").write_text("> q\na\n> q2\na2\n> q3\na3", encoding="utf-8")
+        files = scan_convos(str(tmp_path))
+        assert [f.name for f in files] == ["old-chat.md"]
+
     @pytest.mark.skipif(
         sys.platform == "win32",
         reason="symlink creation requires elevated privileges on Windows",
@@ -431,6 +456,59 @@ class TestScanConvos:
         assert "deep/subdir/nested.jsonl" in err
         assert "(symlink)" in err
 
+    def test_scan_skips_oversized_files(self, tmp_path, capsys, monkeypatch):
+        import re
+
+        import mempalace.convo_miner as convo_mod
+
+        monkeypatch.setattr(convo_mod, "MAX_FILE_SIZE", 100)
+
+        (tmp_path / "small.txt").write_text("hello " * 5, encoding="utf-8")
+        (tmp_path / "big.txt").write_text("hello " * 100, encoding="utf-8")
+
+        files = scan_convos(str(tmp_path))
+        names = [f.name for f in files]
+        assert "small.txt" in names
+        assert "big.txt" not in names
+
+        err = capsys.readouterr().err
+        # SKIP message goes to stderr, matching the existing
+        # `SKIP: <rel> (symlink)` line in the same function.
+        assert "SKIP: big.txt" in err
+        # Validate the full template so a drop of the MB suffix or a
+        # regression to bare-substring output trips the test.
+        assert re.search(r"SKIP: big\.txt \(\d+\.\d+ MB\) exceeds \d+ MB limit", err), err
+
+    def test_scan_skips_unreadable_files(self, tmp_path, capsys, monkeypatch):
+        from pathlib import Path
+
+        # .txt is in CONVO_EXTENSIONS so it reaches the size-check gate.
+        (tmp_path / "readable.txt").write_text("hi", encoding="utf-8")
+        unreadable = tmp_path / "unreadable.txt"
+        unreadable.write_text("hi", encoding="utf-8")
+
+        real_stat = Path.stat
+
+        def selective_stat(self, *args, **kwargs):
+            # On Py 3.10+, Path.is_symlink() routes through lstat ->
+            # stat(follow_symlinks=False). Only raise for the follow-symlinks
+            # call that the actual size-check makes, otherwise the test
+            # never reaches the size-check arm we want to exercise.
+            if self.name == "unreadable.txt" and kwargs.get("follow_symlinks", True):
+                raise PermissionError(13, "Permission denied", str(self))
+            return real_stat(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", selective_stat)
+
+        files = scan_convos(str(tmp_path))
+        names = [f.name for f in files]
+        assert "readable.txt" in names
+        assert "unreadable.txt" not in names
+
+        err = capsys.readouterr().err
+        assert "SKIP: unreadable.txt" in err
+        assert "stat error" in err
+
 
 class TestFileChunksLocked:
     def test_uses_bounded_upsert_batches(self, monkeypatch):
@@ -468,3 +546,100 @@ class TestFileChunksLocked:
         assert dict(room_counts) == {}
         assert skipped is False
         assert col.batch_sizes == [2, 2, 1]
+
+    def test_populates_entities_metadata(self, monkeypatch):
+        import mempalace.convo_miner as convo_miner
+
+        class FakeCol:
+            def __init__(self):
+                self.metas = []
+
+            def delete(self, *args, **kwargs):
+                pass
+
+            def get(self, ids=None, include=None, **kwargs):
+                return {"ids": [], "metadatas": []}
+
+            def upsert(self, documents, ids, metadatas):
+                self.metas.extend(metadatas)
+
+        chunks = [
+            {
+                "content": "We changed `MemoryStack` in rag/foo.py via do_thing_now().",
+                "chunk_index": 0,
+            }
+        ]
+        col = FakeCol()
+        monkeypatch.setattr(
+            convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
+        )
+        monkeypatch.setattr(convo_miner, "mine_lock", lambda source_file: contextlib.nullcontext())
+        monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda content: "conversations")
+
+        _file_chunks_locked(col, "chat.txt", chunks, "wing", "general", "agent", "exchange")
+
+        entities = col.metas[0]["entities"].split(";")
+        assert "MemoryStack" in entities
+        assert "rag/foo.py" in entities
+        assert "do_thing_now" in entities
+
+
+class TestExtractAuthoredAt:
+    """authored_at = max per-line ``timestamp`` in a transcript (real authored date,
+    independent of mine time). Both Claude Code and Codex JSONL carry a top-level
+    ISO-8601 ``timestamp`` per line."""
+
+    def test_returns_latest_timestamp(self, tmp_path):
+        f = tmp_path / "session.jsonl"
+        f.write_text(
+            '{"type": "user", "timestamp": "2026-06-21T10:00:00.000Z"}\n'
+            '{"type": "assistant", "timestamp": "2026-06-23T14:30:00.000Z"}\n'
+            '{"type": "user", "timestamp": "2026-06-22T09:00:00.000Z"}\n'
+        )
+        assert _extract_authored_at(f) == "2026-06-23T14:30:00.000Z"
+
+    def test_ignores_lines_without_timestamp(self, tmp_path):
+        f = tmp_path / "session.jsonl"
+        f.write_text(
+            '{"type": "summary", "summary": "x"}\n'
+            '{"type": "assistant", "timestamp": "2026-06-23T14:30:00.000Z"}\n'
+        )
+        assert _extract_authored_at(f) == "2026-06-23T14:30:00.000Z"
+
+    def test_tolerates_blank_and_malformed_lines(self, tmp_path):
+        f = tmp_path / "session.jsonl"
+        f.write_text(
+            "\n"
+            "not json\n"
+            "[1, 2, 3]\n"  # valid JSON, but no .get()
+            '{"timestamp": "2026-06-25T00:00:00.000Z"}\n'
+        )
+        assert _extract_authored_at(f) == "2026-06-25T00:00:00.000Z"
+
+    def test_none_for_non_jsonl(self, tmp_path):
+        f = tmp_path / "notes.md"
+        f.write_text("# heading\n")
+        assert _extract_authored_at(f) is None
+
+    def test_none_when_no_timestamps(self, tmp_path):
+        f = tmp_path / "session.jsonl"
+        f.write_text('{"type": "user", "content": "hi"}\n')
+        assert _extract_authored_at(f) is None
+
+    def test_none_for_missing_file(self, tmp_path):
+        assert _extract_authored_at(tmp_path / "absent.jsonl") is None
+
+    def test_non_string_timestamp_does_not_crash(self, tmp_path):
+        # A non-string timestamp must be skipped, not raise TypeError on compare.
+        f = tmp_path / "session.jsonl"
+        f.write_text(
+            '{"type": "user", "timestamp": 1234567890}\n'
+            '{"type": "assistant", "timestamp": {"nested": true}}\n'
+            '{"type": "user", "timestamp": "2026-06-24T00:00:00.000Z"}\n'
+        )
+        assert _extract_authored_at(f) == "2026-06-24T00:00:00.000Z"
+
+    def test_only_non_string_timestamps_returns_none(self, tmp_path):
+        f = tmp_path / "session.jsonl"
+        f.write_text('{"timestamp": 1}\n{"timestamp": false}\n')
+        assert _extract_authored_at(f) is None

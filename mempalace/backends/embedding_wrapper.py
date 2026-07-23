@@ -155,6 +155,30 @@ class EmbeddingCollection(BaseCollection):
     def lexical_search(self, *, query: str, n_results: int = 10, where: Optional[dict] = None):
         return self._inner.lexical_search(query=query, n_results=n_results, where=where)
 
+    def facet_counts(
+        self, field: str, where: Optional[dict] = None, limit: int = 1000
+    ) -> dict[str, int]:
+        # ``BaseCollection.facet_counts`` is a concrete method that raises
+        # ``UnsupportedCapabilityError`` as its default. MRO resolves it on
+        # this subclass before ``__getattr__`` ever fires, so without an
+        # explicit forwarder every facet call against a wrapped backend
+        # (qdrant, pgvector, sqlite_exact) raises and silently degrades to
+        # client-side counting in mcp_server's try/except.
+        return self._inner.facet_counts(field, where=where, limit=limit)
+
+    def get_all_metadata(self, where: Optional[dict] = None) -> list[dict]:
+        # ``BaseCollection.get_all_metadata`` ships a concrete default that
+        # pages through ``self.get(include=["metadatas"])``. Without this
+        # forwarder, MRO resolves the call here on the subclass and runs the
+        # base default — which routes back through ``self.get()`` (the
+        # wrapper's get, then ``__getattr__`` to the inner's get). Result:
+        # the inner's overridden ``get_all_metadata`` (e.g. pgvector's
+        # ``with_document=False`` fast path from #1892) is never reached,
+        # and every metadata-only fetch transfers the full document column
+        # over the wire. Same MRO-shadow pattern as ``facet_counts`` /
+        # ``lexical_search`` above.
+        return self._inner.get_all_metadata(where=where)
+
     def update(self, *, ids, documents=None, metadatas=None, embeddings=None):
         ids = _as_list(ids)
         if documents is not None:

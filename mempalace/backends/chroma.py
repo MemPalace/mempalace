@@ -8,6 +8,7 @@ import math
 import os
 import pickle
 import re
+import shlex
 import sqlite3
 import time
 from collections import defaultdict
@@ -81,13 +82,52 @@ def _hnsw_link_to_data_ratio(seg_dir: str) -> Optional[float]:
     return link_size / data_size
 
 
-def _hnsw_link_lists_is_usable_for_payload(seg_dir: str) -> bool:
-    """Return False when a non-trivial HNSW payload lacks usable link lists.
+def _hnsw_metadata_marker_intact(seg_dir: str) -> bool:
+    """Return True when ``index_metadata.pickle`` bears a complete envelope.
 
-    A missing or empty link_lists.bin is acceptable only for a fresh/empty
-    segment. Once data_level0.bin has real payload, a zero-byte link_lists.bin
-    is not a harmless async-flush shape: ChromaDB can later hand the broken
-    graph to hnswlib and crash in native code.
+    ChromaDB writes ``index_metadata.pickle`` last during a persist, so an
+    intact pickle envelope — protocol marker ``0x80`` at the head, ``STOP``
+    byte ``0x2e`` at the tail — proves the flush finished. Used as a
+    persist-completion marker: when present, the segment's on-disk shape
+    (including an all-layer-0 index with an empty ``link_lists.bin``) is the
+    one chromadb intentionally serialized, not a half-written one.
+
+    Deliberately byte-sniffs only; never deserializes. Deserialization can
+    execute arbitrary code, and the byte-sniff is enough to tell a complete
+    write from truncation or zero-fill. Assumes pickle protocol >= 2.
+    """
+    meta_path = os.path.join(seg_dir, "index_metadata.pickle")
+    try:
+        if not os.path.isfile(meta_path) or os.path.getsize(meta_path) < 16:
+            return False
+        with open(meta_path, "rb") as f:
+            head = f.read(2)
+            f.seek(-1, 2)  # last byte
+            tail = f.read(1)
+    except OSError:
+        return False
+    return len(head) == 2 and head[0] == 0x80 and tail == b"\x2e"
+
+
+def _hnsw_link_lists_is_usable_for_payload(seg_dir: str) -> bool:
+    """Return False when a non-trivial HNSW payload looks like a partial flush.
+
+    A zero-byte ``link_lists.bin`` is *not* corruption on its own. hnswlib
+    stores the entire layer-0 graph inside ``data_level0.bin`` and only writes
+    ``link_lists.bin`` for elements promoted to level > 0. A small or
+    low-fanout index where every element stays on layer 0 therefore
+    serializes an empty ``link_lists.bin`` and loads/searches fine (#1716).
+    Treating that shape as corruption produced a self-perpetuating quarantine
+    loop: repair rebuilt the byte-identical all-layer-0 segment, which the next
+    cold start quarantined again, accumulating drift dirs without bound.
+
+    An empty ``link_lists.bin`` only signals trouble when the persist was
+    interrupted before it could finish. ChromaDB writes
+    ``index_metadata.pickle`` last, so an intact metadata envelope proves the
+    flush completed and the empty ``link_lists.bin`` is the legitimate
+    all-layer-0 shape. Only when there is real payload, an empty
+    ``link_lists.bin``, *and* no completion marker do we treat the segment as a
+    partial flush.
     """
     data_path = os.path.join(seg_dir, "data_level0.bin")
     link_path = os.path.join(seg_dir, "link_lists.bin")
@@ -100,9 +140,15 @@ def _hnsw_link_lists_is_usable_for_payload(seg_dir: str) -> bool:
         if data_size <= _HNSW_MISSING_METADATA_DATA_FLOOR:
             return True
 
-        return os.path.isfile(link_path) and os.path.getsize(link_path) > 0
+        if os.path.isfile(link_path) and os.path.getsize(link_path) > 0:
+            return True
     except OSError:
         return False
+
+    # Real payload with an empty/absent link_lists.bin: legitimate only when
+    # the persist completed (all-layer-0 index), proven by an intact metadata
+    # marker. Otherwise it is a half-written segment chromadb could segfault on.
+    return _hnsw_metadata_marker_intact(seg_dir)
 
 
 def _hnsw_payload_appears_sane(seg_dir: str) -> bool:
@@ -336,17 +382,7 @@ def _segment_appears_healthy(seg_dir: str) -> bool:
     if not _hnsw_payload_appears_sane(seg_dir):
         return False
 
-    try:
-        size = os.path.getsize(meta_path)
-        if size < 16:
-            return False
-        with open(meta_path, "rb") as f:
-            head = f.read(2)
-            f.seek(-1, 2)  # last byte
-            tail = f.read(1)
-    except OSError:
-        return False
-    return len(head) == 2 and head[0] == 0x80 and tail == b"\x2e"
+    return _hnsw_metadata_marker_intact(seg_dir)
 
 
 def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> list[str]:
@@ -1339,8 +1375,8 @@ class ChromaCollection(BaseCollection):
 
     @staticmethod
     def _sanitize_documents_for_chromadb(documents):
-        """Strip lone UTF-16 surrogates from every document before it reaches
-        the chromadb client.
+        """Strip lone UTF-16 surrogates and embedded NUL characters from every
+        document before it reaches the chromadb client.
 
         A single lone surrogate (U+D800–U+DFFF) raises ``UnicodeEncodeError``
         inside chromadb's encode path and aborts the *entire* add/upsert batch
@@ -1353,18 +1389,29 @@ class ChromaCollection(BaseCollection):
         directly. Sanitising here makes the chokepoint catch-all complete: the
         sibling :meth:`_sanitize_metadatas_for_chromadb` already guarantees this
         for metadata one method over; documents get the same guarantee.
+
+        A document containing an embedded NUL (U+0000) — routine in mined
+        Bash tool output — is well-formed UTF-8, unlike a lone surrogate, but
+        can corrupt the FTS5 inverted index for the whole collection rather
+        than just failing to store that one row (a ChromaDB-side bug; tracked
+        upstream). Stripping it here is the same defense-in-depth already
+        applied to surrogates: sanitize input we don't control before it
+        reaches a datastore we don't control.
         """
         if documents is None:
             return None
-        from ..config import strip_lone_surrogates
+        from ..config import strip_lone_surrogates, strip_nul_bytes
+
+        def _sanitize(d):
+            return strip_nul_bytes(strip_lone_surrogates(d))
 
         # chromadb accepts OneOrMany[Document]: a bare str is a single document,
         # not an iterable of characters. Handle it explicitly so we don't split
         # it into per-character documents — that would be exactly the kind of
         # silent corruption this method exists to prevent.
         if isinstance(documents, str):
-            return strip_lone_surrogates(documents)
-        return [strip_lone_surrogates(d) if isinstance(d, str) else d for d in documents]
+            return _sanitize(documents)
+        return [_sanitize(d) if isinstance(d, str) else d for d in documents]
 
     def add(self, *, documents, ids, metadatas=None, embeddings=None):
         kwargs: dict[str, Any] = {
@@ -1924,6 +1971,7 @@ class ChromaBackend(BaseBackend):
             current_model = MempalaceConfig().embedding_model
         except Exception:
             current_model = "unknown"
+        rebuild_cmd = f"mempalace --palace {shlex.quote(palace_path)} repair rebuild-index"
         return (
             f"Embedding model mismatch reading palace at {palace_path!r}.\n"
             f"  Underlying ChromaDB error: {msg}\n"
@@ -1931,8 +1979,8 @@ class ChromaBackend(BaseBackend):
             f"  The palace was built with a different embedding model. Either:\n"
             f"    (a) revert the model: unset MEMPALACE_EMBEDDING_MODEL (or set "
             f"the previous value), or\n"
-            f"    (b) re-embed in place: `mempalace repair rebuild-index "
-            f"--palace {palace_path}` (writes new vectors with the current model)."
+            f"    (b) re-embed in place: `{rebuild_cmd}` "
+            f"(writes new vectors with the current model)."
         )
 
     # ------------------------------------------------------------------
@@ -2191,7 +2239,26 @@ class ChromaBackend(BaseBackend):
 
     @classmethod
     def detect(cls, path: str) -> bool:
-        return os.path.isfile(os.path.join(path, "chroma.sqlite3"))
+        """Return True when ``path`` looks like a chroma palace.
+
+        Verifies the SQLite magic header rather than file presence alone.
+        Bare ``sqlite3.connect()`` against a missing path leaves a 0-byte
+        file behind (the SQLite header is written on the first statement,
+        not on connection), so file-presence alone treats those artifacts
+        as real chroma palaces and breaks multi-backend resolution. The
+        16-byte ``SQLite format 3\\x00`` magic prefix is written as soon
+        as chromadb's ``PersistentClient`` does any work, so this check
+        accepts every real chroma palace while rejecting empty / garbage
+        files. See #1893.
+        """
+        db_path = os.path.join(path, "chroma.sqlite3")
+        if not os.path.isfile(db_path):
+            return False
+        try:
+            with open(db_path, "rb") as f:
+                return f.read(16) == b"SQLite format 3\x00"
+        except OSError:
+            return False
 
     # ------------------------------------------------------------------
     # Legacy (pre-RFC 001) surface — retained while callers migrate.

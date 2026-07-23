@@ -33,6 +33,7 @@ import argparse
 import os
 import shutil
 import sqlite3
+import stat
 import time
 from collections import defaultdict
 from contextlib import closing
@@ -55,6 +56,78 @@ REPAIR_TEMP_COLLECTION = f"{COLLECTION_NAME}__repair_tmp"
 # cross-palace AAAK lookups. Drawer collection name comes from config
 # (see ``_recoverable_collections``).
 CLOSETS_COLLECTION_NAME = "mempalace_closets"
+
+
+def _no_follow_flag() -> int:
+    return getattr(os, "O_NOFOLLOW", 0)
+
+
+def _open_regular_file_no_follow(path: str) -> int:
+    if os.path.islink(path):
+        raise RuntimeError(f"Refusing symlinked file: {path}")
+    fd = os.open(path, os.O_RDONLY | _no_follow_flag())
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise RuntimeError(f"Refusing non-regular file: {path}")
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _write_text_replace_no_follow(path: str, text: str) -> None:
+    directory = os.path.dirname(path) or "."
+    basename = os.path.basename(path)
+    tmp_path = os.path.join(
+        directory,
+        f".{basename}.{os.getpid()}.{int(time.time() * 1_000_000)}.tmp",
+    )
+    fd = os.open(
+        tmp_path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | _no_follow_flag(),
+        0o600,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _copy_file_no_follow(src: str, dst: str, *, replace: bool = False) -> None:
+    src_fd = _open_regular_file_no_follow(src)
+    try:
+        src_f = os.fdopen(src_fd, "rb")
+    except Exception:
+        os.close(src_fd)
+        raise
+    # ``src_f`` now owns ``src_fd`` and closes it on exit.
+    with src_f:
+        flags = os.O_WRONLY | os.O_CREAT | _no_follow_flag()
+        flags |= os.O_TRUNC if replace else os.O_EXCL
+        dst_fd = os.open(dst, flags, 0o600)
+        try:
+            dst_f = os.fdopen(dst_fd, "wb")
+        except Exception:
+            os.close(dst_fd)
+            raise
+        with dst_f:
+            shutil.copyfileobj(src_f, dst_f)
+    try:
+        shutil.copystat(src, dst, follow_symlinks=False)
+    except OSError:
+        pass
+
+
+def _unique_backup_path(path: str, label: str) -> str:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{path}.{label}.{stamp}.{os.getpid()}"
 
 
 def _drawers_collection_name() -> str:
@@ -316,9 +389,10 @@ def scan_palace(palace_path=None, only_wing=None, collection_name: Optional[str]
     print(f"  BAD:  {len(bad_set):,}  ({len(bad_set) / max(len(all_ids), 1) * 100:.1f}%)")
 
     bad_file = os.path.join(palace_path, "corrupt_ids.txt")
-    with open(bad_file, "w") as f:
-        for bid in sorted(bad_set):
-            f.write(bid + "\n")
+    _write_text_replace_no_follow(
+        bad_file,
+        "".join(f"{bid}\n" for bid in sorted(bad_set)),
+    )
     print(f"\n  Bad IDs written to: {bad_file}")
     return good_set, bad_set
 
@@ -499,6 +573,9 @@ def sqlite_drawer_count(palace_path: str, collection_name: Optional[str] = None)
         return None
 
 
+_SQLITE_INTEGRITY_BUSY_TIMEOUT_SECONDS = 15.0
+
+
 def sqlite_integrity_errors(palace_path: str) -> list[str]:
     """Return SQLite quick_check errors for chroma.sqlite3.
 
@@ -517,7 +594,16 @@ def sqlite_integrity_errors(palace_path: str) -> list[str]:
         return []
 
     try:
-        with sqlite3.connect(sqlite_read_uri(sqlite_path), uri=True) as conn:
+        # A writer holding SQLite's lock is contention, not corruption. The
+        # sqlite3 module defaults to five seconds, which is shorter than
+        # routine batch mines and curator writes on rollback-journal palaces.
+        # Give those writers a bounded grace period before surfacing BUSY to
+        # callers; genuine corruption still comes from PRAGMA quick_check.
+        with sqlite3.connect(
+            sqlite_read_uri(sqlite_path),
+            uri=True,
+            timeout=_SQLITE_INTEGRITY_BUSY_TIMEOUT_SECONDS,
+        ) as conn:
             rows = conn.execute("PRAGMA quick_check").fetchall()
     except sqlite3.Error as e:
         return [f"PRAGMA quick_check failed: {e}"]
@@ -562,6 +648,93 @@ def print_sqlite_integrity_abort(palace_path: str, errors: list[str]) -> None:
     print("    4. Recreate the FTS5 virtual table from intact embedding_metadata rows.")
     print("    5. Verify `PRAGMA integrity_check` returns `ok`.")
     print("    6. Re-run `mempalace repair --yes`.")
+
+
+# quick_check's wording for a corrupt FTS5 inverted index differs by SQLite
+# version — both forms describe the same recoverable condition:
+#   "malformed inverted index for FTS5 table main.embedding_fulltext_search"
+#     (older SQLite)
+#   "fts5: corruption found reading blob N from table \"embedding_fulltext_search\""
+#     (SQLite >= ~3.5x, confirmed on 3.53.2 / Python 3.13.7 — the exact
+#     message this repo's own test fixture produces on that build)
+# Either failure is recoverable in place: the index is derived from the
+# intact ``embedding_fulltext_search_content`` shadow table, so rebuilding it
+# restores full-text search without touching any drawer rows. Concurrent
+# killed-mid-write mines are the usual cause (#1596). A regex matching only
+# the older phrasing would silently decline to auto-heal on newer SQLite —
+# the exact failure this repo's own test suite caught (test_repair.py's two
+# auto-heal tests failed on this machine until this pattern was widened).
+_FTS5_MALFORMED_RE = re.compile(
+    r"malformed inverted index for fts5 table|fts5:\s*corruption found",
+    re.IGNORECASE,
+)
+
+
+def _errors_are_isolated_fts5(errors: list[str]) -> bool:
+    """True when every quick_check error is a malformed FTS5 inverted index.
+
+    Only an isolated FTS5 failure is safe to auto-heal: the inverted index is
+    derived data that ``rebuild`` regenerates from the content shadow table. If
+    quick_check also reports page/row corruption, the data itself may be damaged
+    and rebuilding the index over it would mask real loss — that still aborts.
+    """
+    return bool(errors) and all(_FTS5_MALFORMED_RE.search(e) for e in errors)
+
+
+def maybe_autoheal_fts5_index(palace_path: str, errors: list[str], *, progress=print) -> list[str]:
+    """Rebuild a malformed FTS5 inverted index in place; return remaining errors.
+
+    The repair preflight aborts when ``PRAGMA quick_check`` reports SQLite-layer
+    corruption. After concurrent killed-mid-write mines (#1596) the common
+    failure is an isolated ``malformed inverted index for FTS5 table``, which is
+    fully recoverable: the index rebuilds from the intact
+    ``embedding_fulltext_search_content`` table without touching drawer rows.
+
+    When the errors are isolated to FTS5, rebuild the index under the palace
+    write lock (so a live mine cannot race the rebuild) and re-run quick_check.
+    Returns the remaining quick_check errors — empty when the heal succeeded.
+    Broader corruption, a lock held by another writer, or a rebuild failure
+    leaves ``errors`` unchanged so the caller still aborts with the banner.
+    """
+    if not _errors_are_isolated_fts5(errors):
+        return errors
+
+    sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.exists(sqlite_path):
+        return errors
+
+    # Lazy import: palace.py is heavier and importing it at module load would
+    # widen repair.py's import graph for callers that never hit this path.
+    from .palace import MineAlreadyRunning, mine_palace_lock
+
+    progress(
+        "\n  Isolated FTS5 inverted-index corruption detected; attempting an\n"
+        "  in-place rebuild from the intact content table before aborting."
+    )
+    try:
+        with mine_palace_lock(palace_path):
+            with closing(sqlite3.connect(sqlite_path, isolation_level=None)) as conn:
+                conn.execute(
+                    "INSERT INTO embedding_fulltext_search"
+                    "(embedding_fulltext_search) VALUES('rebuild')"
+                )
+                conn.commit()
+    except MineAlreadyRunning as exc:
+        progress(
+            f"  Skipped FTS5 rebuild: palace is being written by another process ({exc}). "
+            "Stop it and re-run."
+        )
+        return errors
+    except Exception as exc:
+        progress(f"  FTS5 rebuild failed (leaving palace untouched): {exc}")
+        return errors
+
+    remaining = sqlite_integrity_errors(palace_path)
+    if remaining:
+        progress("  FTS5 rebuild did not clear quick_check; aborting for safety.")
+    else:
+        progress("  FTS5 index rebuilt from intact content; quick_check is clean.")
+    return remaining
 
 
 def index_read_recovery_guidance() -> str:
@@ -716,7 +889,12 @@ class _DefaultProgress:
         return f" (elapsed {_format_eta(elapsed)}, rate {rate:.1f}/s, ETA {_format_eta(eta)})"
 
 
-def _vacuum_and_rebuild_fts5(palace_path: str, progress=print) -> None:
+def _vacuum_and_rebuild_fts5(
+    palace_path: str,
+    progress=print,
+    *,
+    strict: bool = False,
+) -> None:
     """VACUUM the palace SQLite file and rebuild the FTS5 index if present.
 
     Repeated ``repair --yes`` runs delete and recreate the drawers collection,
@@ -725,12 +903,16 @@ def _vacuum_and_rebuild_fts5(palace_path: str, progress=print) -> None:
     internally inconsistent after multiple collection deletes; the rebuild
     command fixes it atomically without touching any row data.
 
-    Failures are non-fatal: a warning is printed and the caller continues.
-    The repair itself succeeded at this point — VACUUM/FTS5 are best-effort
-    cleanup, not correctness requirements.
+    Existing repair paths use the default best-effort behavior: failures log a
+    warning and return because their primary rebuild has already succeeded.
+    SQLite recovery passes ``strict=True`` because its bulk upserts can leave
+    this derived index malformed; that path must not report success until the
+    rebuild, VACUUM, and a final quick_check all complete.
     """
     sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
     if not os.path.exists(sqlite_path):
+        if strict:
+            raise FileNotFoundError(f"recovered palace has no SQLite database: {sqlite_path}")
         return
     try:
         with closing(sqlite3.connect(sqlite_path, isolation_level=None)) as conn:
@@ -746,7 +928,21 @@ def _vacuum_and_rebuild_fts5(palace_path: str, progress=print) -> None:
                 progress("  FTS5 index rebuilt.")
             conn.execute("VACUUM")
             progress("  SQLite VACUUM complete.")
+            if strict:
+                rows = conn.execute("PRAGMA quick_check").fetchall()
+                errors = [str(row[0]) for row in rows if row and str(row[0]).lower() != "ok"]
+                if errors:
+                    raise sqlite3.DatabaseError(
+                        "post-recovery quick_check failed: " + "; ".join(errors[:3])
+                    )
+                progress("  SQLite quick_check clean.")
     except Exception as exc:
+        if strict:
+            # Preserve the concrete SQLite/filesystem exception for callers
+            # that need to classify the failure. The strict recovery caller
+            # owns the user-facing error message, so logging here would also
+            # print the same failure twice.
+            raise
         progress(f"  Warning: post-repair cleanup failed (non-fatal): {exc}")
 
 
@@ -810,6 +1006,8 @@ def rebuild_index(
     # exit cleanly before chromadb's compactor touches the disk.
     sqlite_errors = sqlite_integrity_errors(palace_path)
     if sqlite_errors:
+        sqlite_errors = maybe_autoheal_fts5_index(palace_path, sqlite_errors, progress=progress)
+    if sqlite_errors:
         print_sqlite_integrity_abort(palace_path, sqlite_errors)
         return
 
@@ -858,10 +1056,10 @@ def rebuild_index(
 
     # Back up ONLY the SQLite database, not the bloated HNSW files
     sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
-    backup_path = sqlite_path + ".backup"
+    backup_path = _unique_backup_path(sqlite_path, "backup")
     if os.path.exists(sqlite_path):
         progress(f"  Backing up chroma.sqlite3 ({os.path.getsize(sqlite_path) / 1e6:.0f} MB)...")
-        shutil.copy2(sqlite_path, backup_path)
+        _copy_file_no_follow(sqlite_path, backup_path)
         progress(f"  Backup: {backup_path}")
 
     # Rebuild with correct HNSW settings
@@ -885,7 +1083,7 @@ def rebuild_index(
             try:
                 _close_chroma_handles(palace_path, backend=backend)
                 _delete_collection_if_exists(backend, palace_path, collection_name)
-                shutil.copy2(backup_path, sqlite_path)
+                _copy_file_no_follow(backup_path, sqlite_path, replace=True)
                 progress("  Backup restored. Palace is back to pre-repair state.")
             except Exception as restore_error:
                 progress(f"  Backup restore failed: {restore_error}")
@@ -926,6 +1124,29 @@ class RebuildPartialError(Exception):
         self.message = message
         self.partial_counts = partial_counts
         self.failed_collection = failed_collection
+        self.dest_palace = dest_palace
+        self.archive_path = archive_path
+
+
+class RebuildCleanupError(Exception):
+    """Raised when all recoverable rows landed but final cleanup failed.
+
+    The destination is intentionally retained for inspection, and an in-place
+    rebuild's original archive remains untouched. Callers must not treat this
+    as success because the derived FTS5 index has not been verified clean.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        counts: dict[str, int],
+        dest_palace: str,
+        archive_path: Optional[str],
+    ):
+        super().__init__(message)
+        self.message = message
+        self.counts = counts
         self.dest_palace = dest_palace
         self.archive_path = archive_path
 
@@ -1116,7 +1337,10 @@ def _preserve_knowledge_graph_sqlite(source_palace: str, dest_palace: str) -> li
             continue
 
         os.makedirs(dest_palace, exist_ok=True)
-        shutil.copy2(src, dst)
+        try:
+            _copy_file_no_follow(src, dst, replace=True)
+        except RuntimeError:
+            continue
         copied.append(filename)
 
     if copied:
@@ -1176,7 +1400,9 @@ def rebuild_from_sqlite(
     chromadb upsert fails partway through; the dest palace is left in
     place so the user can inspect what landed, and the in-place archive
     (when applicable) is reported in the error so the user can re-run
-    against it.
+    against it. Raises :class:`RebuildCleanupError` if all rows land but the
+    required FTS5 rebuild, VACUUM, or final quick_check fails; this prevents a
+    structurally unverified recovery from being reported as complete.
 
     .. warning::
 
@@ -1250,7 +1476,30 @@ def rebuild_from_sqlite(
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         archive_path = f"{dest_palace}.pre-rebuild-{ts}"
         print(f"  Archiving {dest_palace} → {archive_path}")
-        shutil.move(dest_palace, archive_path)
+        # os.rename, NOT shutil.move. When any file inside the palace is
+        # held open by another process (MCP server, a running mine, another
+        # harness), renaming the directory fails atomically UP FRONT on
+        # Windows and the palace is left untouched. shutil.move's fallback
+        # for a failed rename is copytree + rmtree — and that rmtree
+        # deletes the live palace file-by-file until it hits the first
+        # locked file, leaving the palace partially gutted next to a
+        # partial archive copy. Observed live (Windows 11, 2026-07-05/06):
+        # two interrupted in-place repairs; the palace survived only
+        # because the locked chroma.sqlite3/*.bin themselves could not be
+        # unlinked. Same lesson as the source-validation comment above:
+        # fail cleanly before touching anything.
+        try:
+            os.rename(dest_palace, archive_path)
+        except OSError as exc:
+            print(
+                f"\n  Cannot archive the existing palace: a file inside it "
+                f"is held open by another process (MCP server, running "
+                f"mine, another harness?).\n"
+                f"  Close those processes and retry. The palace was left "
+                f"untouched.\n"
+                f"  ({exc})"
+            )
+            return {}
         source_palace = archive_path
         src_db = os.path.join(source_palace, "chroma.sqlite3")
 
@@ -1302,13 +1551,38 @@ def rebuild_from_sqlite(
             else:
                 print(f"    done: {upserted} rows in {cname}")
 
-        print(f"\n  Rebuild complete. {sum(counts.values())} total rows.")
-        if archive_path is not None:
-            print(f"  Original palace archived at: {archive_path}")
-        print(f"{'=' * 55}\n")
-        return counts
     finally:
         backend.close()
+
+    # Bulk Chroma upserts can leave the derived FTS5 index internally
+    # inconsistent even when all source rows landed.  Rebuild it only after
+    # the backend releases its SQLite handle; otherwise VACUUM cannot obtain
+    # the exclusive lock it needs on Windows.
+    try:
+        _vacuum_and_rebuild_fts5(dest_palace, strict=True)
+    except Exception as exc:
+        message_parts = [
+            f"Post-recovery cleanup failed after {sum(counts.values())} rows were rebuilt: {exc}",
+            f"Recovered palace retained at: {dest_palace}",
+        ]
+        if archive_path is not None:
+            message_parts.append(f"Original palace remains archived at: {archive_path}")
+        else:
+            message_parts.append(f"Source palace is unchanged at: {source_palace}")
+        message = "\n  ".join(message_parts)
+        print(f"\n  ERROR: {message}")
+        raise RebuildCleanupError(
+            message,
+            counts=dict(counts),
+            dest_palace=dest_palace,
+            archive_path=archive_path,
+        ) from exc
+
+    print(f"\n  Rebuild complete. {sum(counts.values())} total rows.")
+    if archive_path is not None:
+        print(f"  Original palace archived at: {archive_path}")
+    print(f"{'=' * 55}\n")
+    return counts
 
 
 def status(palace_path=None, collection_name: Optional[str] = None) -> dict:

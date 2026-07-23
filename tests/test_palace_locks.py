@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import threading
 import time
 import sys
 
 import pytest
 
+import mempalace.palace as palace_mod
 from mempalace.palace import (
     _write_lock_holder,
     MineAlreadyRunning,
@@ -66,6 +68,45 @@ def _hold_lock(palace_path: str, ready_flag: str, release_flag: str) -> int:
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+def test_mine_palace_lock_reentrant_across_threads_same_process(tmp_path):
+    """Process-wide re-entrancy: a second acquisition from a *different thread*
+    of the same process passes through instead of self-conflicting.
+
+    Regression for the MCP HTTP transport (ThreadingHTTPServer): the writer
+    lease is acquired on one thread (mcp_server._acquire_mcp_writer_lock) but
+    write requests are dispatched on other worker threads. With the old
+    thread-local re-entrancy those handlers re-acquired the process-held flock
+    and raised MineAlreadyRunning ("palace ... is held by PID <self>").
+    Re-entrancy is now process-wide, so same-process cross-thread acquisition is
+    a pass-through.
+    """
+    palace = str(tmp_path / "palace")
+    os.makedirs(palace, exist_ok=True)
+
+    outer = mine_palace_lock(palace)
+    outer.__enter__()  # main thread holds the lease, like the MCP writer-lease
+    try:
+        result: dict = {}
+
+        def worker():
+            try:
+                with mine_palace_lock(palace):
+                    result["acquired"] = True
+            except MineAlreadyRunning as exc:  # pragma: no cover - failure path
+                result["error"] = str(exc)
+
+        t = threading.Thread(target=worker)
+        t.start()
+        t.join(timeout=5)
+
+        assert not t.is_alive(), "worker thread hung acquiring the palace lock"
+        assert result.get("acquired") is True, (
+            f"cross-thread same-process acquisition should pass through, got: {result}"
+        )
+    finally:
+        outer.__exit__(None, None, None)
 
 
 def test_single_acquire_succeeds(tmp_path, monkeypatch):
@@ -354,3 +395,47 @@ def test_mine_global_lock_is_alias_for_back_compat(tmp_path, monkeypatch):
     assert mine_global_lock is mine_palace_lock
     with mine_global_lock(str(tmp_path / "palace")):
         pass  # the alias accepts the same palace_path argument
+
+
+def test_holder_set_not_orphaned_by_interrupt_after_mark_held(tmp_path, monkeypatch):
+    """An async interrupt right after the hold is recorded must not leave the
+    palace key stranded in the process-wide holder set.
+
+    ``_mark_held`` sits inside the ``try`` whose ``finally`` runs
+    ``_mark_released``, so the two are paired on every exit. If ``_mark_held``
+    ran before the ``try``, a ``KeyboardInterrupt``/signal landing in the gap
+    would strand the key: the outer ``finally`` still frees the flock, so
+    ``_held_by_this_process`` would report a hold the OS lock no longer backs,
+    and the next re-entrant acquire in this process would pass through and
+    write without the flock (two concurrent writers into one palace).
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    palace = str(tmp_path / "palace")
+
+    before = set(palace_mod._palace_lock_keys)
+
+    # Model the interrupt: run the real _mark_held (records the hold), then
+    # raise, as a signal arriving at that instant would.
+    real_mark_held = palace_mod._mark_held
+
+    def _mark_then_interrupt(lock_key):
+        real_mark_held(lock_key)
+        raise KeyboardInterrupt
+
+    palace_mod._mark_held = _mark_then_interrupt
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            with mine_palace_lock(palace):
+                pass
+    finally:
+        # Restore by hand (not monkeypatch.setattr, which unpatches only at
+        # teardown) so the reuse check below calls the real _mark_held.
+        palace_mod._mark_held = real_mark_held
+
+    assert set(palace_mod._palace_lock_keys) == before, (
+        "palace key was stranded in the holder set after an interrupt: "
+        "the in-memory hold outlived the flock"
+    )
+    # The flock was freed and no stale hold remains, so the lock is reusable.
+    with mine_palace_lock(palace):
+        pass

@@ -108,39 +108,23 @@ CUDA-accelerated embeddings, build the GPU variant with
 
 ## Storage backends
 
-ChromaDB is the default. For the pluggable-backend preview, MemPalace also
-ships `sqlite_exact` for local exact-vector correctness checks, and two opt-in
-external service backends — `qdrant` (REST) and `pgvector` (Postgres). The two
-external backends exercise the storage contract on different substrates (a
-REST/dict store and a SQL/JSONB store), so it is not accidentally shaped around
-one vendor.
+ChromaDB is the default and needs no configuration. MemPalace also ships a
+pluggable backend contract, exercised across deliberately different substrates
+so the contract is never accidentally shaped around one vendor. Every
+non-default backend is opt-in.
 
-```bash
-# local no-service backend
-mempalace mine ~/projects/myapp --backend sqlite_exact
+| Backend | Mode | Install | Namespaces | Lexical | Configure with |
+| ------- | ---- | ------- | :--------: | :-----: | -------------- |
+| `chroma` _(default)_ | Local (embedded) | bundled | – | ✓ | – |
+| `sqlite_exact` | Local (exact) | bundled | – | ✓ | – |
+| `milvus` | Local (Lite) · Server opt-in | `mempalace[milvus]` | ✓ | ✓ | `MEMPALACE_MILVUS_URI` |
+| `qdrant` | Server (REST) | bundled | ✓ | ✓ | `MEMPALACE_QDRANT_URL` |
+| `pgvector` | Server (Postgres) | `mempalace[pgvector]` | ✓ | ✓ | `MEMPALACE_PGVECTOR_DSN` |
 
-# Qdrant backend, defaulting to http://localhost:6333
-MEMPALACE_QDRANT_URL=http://localhost:6333 \
-  mempalace mine ~/projects/myapp --backend qdrant
-
-# Postgres + pgvector backend, defaulting to postgresql://localhost:5432/mempalace
-#   needs the optional driver: pip install mempalace[pgvector]
-#   and the `vector` extension available on the server
-MEMPALACE_PGVECTOR_DSN=postgresql://localhost:5432/mempalace \
-  mempalace mine ~/projects/myapp --backend pgvector
-```
-
-Qdrant can also be configured with `MEMPALACE_QDRANT_API_KEY`,
-`MEMPALACE_QDRANT_NAMESPACE`, and `MEMPALACE_QDRANT_TIMEOUT`; pgvector with
-`MEMPALACE_PGVECTOR_NAMESPACE`. Both external backends isolate tenants by
-namespace (advertised via the `supports_namespace_isolation` capability) and
-write a local marker (`qdrant_backend.json` / `pgvector_backend.json`) to guard
-against silently opening a palace against the wrong server.
-
-When `MEMPALACE_QDRANT_URL` or `MEMPALACE_PGVECTOR_DSN` points anywhere other
-than your own local or trusted self-hosted service, MemPalace will send and
-store verbatim drawer text and metadata there. That is an explicit opt-in
-backend choice, never the default.
+Select with `--backend <name>`, `MEMPALACE_BACKEND=<name>`, or
+`"backend": "<name>"` in `config.json`. See
+[Storage backends](/guide/configuration#storage-backends) for connection
+variables, namespace behavior, and deployment notes.
 
 ## Quickstart
 
@@ -225,7 +209,7 @@ Usage and tool reference:
 
 ## MCP server
 
-35 MCP tools cover palace reads/writes, knowledge-graph operations,
+36 MCP tools cover palace reads/writes, knowledge-graph operations,
 cross-wing navigation, drawer management, and agent diaries. Installation
 and the full tool list:
 [mempalaceofficial.com/reference/mcp-tools](https://mempalaceofficial.com/reference/mcp-tools.html).
@@ -285,7 +269,7 @@ PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 MIT — see [LICENSE](LICENSE).
 
 <!-- Link Definitions -->
-[version-shield]: https://img.shields.io/badge/version-3.5.0-4dc9f6?style=flat-square&labelColor=0a0e14
+[version-shield]: https://img.shields.io/badge/version-3.6.0-4dc9f6?style=flat-square&labelColor=0a0e14
 [release-link]: https://github.com/MemPalace/mempalace/releases
 [python-shield]: https://img.shields.io/badge/python-3.9+-7dd8f8?style=flat-square&labelColor=0a0e14&logo=python&logoColor=7dd8f8
 [python-link]: https://www.python.org/

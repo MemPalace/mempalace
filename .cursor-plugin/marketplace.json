@@ -8,7 +8,7 @@
     {
       "name": "mempalace",
       "source": ".",
-      "description": "AI memory system — mine projects and conversations into a searchable palace. 35 MCP tools, slash commands, and a guided skill for Cursor.",
+      "description": "AI memory system — mine projects and conversations into a searchable palace. 36 MCP tools, slash commands, and a guided skill for Cursor.",
       "author": {
         "name": "milla-jovovich"
       }

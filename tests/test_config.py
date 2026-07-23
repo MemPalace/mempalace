@@ -70,6 +70,41 @@ def test_qdrant_config_from_env_and_file(tmp_path, monkeypatch):
     assert cfg.qdrant_timeout == 3.5
 
 
+def test_milvus_config_from_env_and_file(tmp_path, monkeypatch):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump(
+            {
+                "milvus_uri": "https://config.example",
+                "milvus_token": "config-token",
+                "milvus_db_name": "config-db",
+                "milvus_namespace": "config-ns",
+                "milvus_consistency_level": "bounded",
+            },
+            f,
+        )
+    monkeypatch.setenv("MEMPALACE_MILVUS_URI", "https://env.example")
+    monkeypatch.setenv("MEMPALACE_MILVUS_TOKEN", "env-token")
+    monkeypatch.setenv("MEMPALACE_MILVUS_DB_NAME", "env-db")
+    monkeypatch.setenv("MEMPALACE_MILVUS_NAMESPACE", "env-ns")
+    monkeypatch.setenv("MEMPALACE_MILVUS_CONSISTENCY_LEVEL", "eventually")
+
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+
+    assert cfg.milvus_uri == "https://env.example"
+    assert cfg.milvus_token == "env-token"
+    assert cfg.milvus_db_name == "env-db"
+    assert cfg.milvus_namespace == "env-ns"
+    assert cfg.milvus_consistency_level == "Eventually"
+
+
+def test_milvus_config_rejects_invalid_consistency_level(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEMPALACE_MILVUS_CONSISTENCY_LEVEL", "linearizable")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+
+    with pytest.raises(ValueError, match="milvus_consistency_level"):
+        cfg.milvus_consistency_level
+
+
 def test_set_backend_persists_choice(tmp_path):
     cfg = MempalaceConfig(config_dir=str(tmp_path))
     cfg.set_backend("sqlite_exact")
@@ -853,3 +888,18 @@ def test_max_backups_bad_env_falls_back_to_config(monkeypatch, tmp_path):
     monkeypatch.setenv("MEMPALACE_MAX_BACKUPS", "garbage")
     cfg = MempalaceConfig(config_dir=str(tmp_path))
     assert cfg.max_backups == 4
+
+
+def test_explicit_palace_path_overrides_env_and_file_config(monkeypatch, tmp_path):
+    configured = tmp_path / "configured" / "palace"
+    explicit = tmp_path / "explicit" / "../explicit" / "palace"
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"palace_path": str(configured)}, f)
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(tmp_path / "environment" / "palace"))
+
+    cfg = MempalaceConfig(config_dir=str(tmp_path), palace_path=str(explicit))
+
+    expected = os.path.abspath(os.path.expanduser(str(explicit)))
+    assert cfg.palace_path == expected
+    assert cfg.hallway_file == os.path.join(os.path.dirname(expected), "hallways.json")
+    assert cfg.tunnel_file == os.path.join(os.path.dirname(expected), "tunnels.json")

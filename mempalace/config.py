@@ -11,6 +11,14 @@ from datetime import date, datetime
 from functools import lru_cache
 from pathlib import Path
 
+from .write_routing import (
+    ResolvedWriteRoutingPolicy,
+    RoutingPolicyCandidate,
+    WriteRoutingError,
+    WriteRoutingPolicy,
+    resolve_write_routing_policy,
+)
+
 # ── Input validation ──────────────────────────────────────────────────────────
 # Shared sanitizers for wing/room/entity names. Prevents path traversal,
 # excessively long strings, and special characters that could cause issues
@@ -29,6 +37,22 @@ _LONE_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
 def strip_lone_surrogates(text: str) -> str:
     """Replace lone UTF-16 surrogates with U+FFFD so the string is legal UTF-8 (#1235)."""
     return _LONE_SURROGATE_RE.sub("�", text)
+
+
+# Tool output mined from real transcripts routinely embeds a NUL character
+# (U+0000) — e.g. captured Bash output where a reader raced a background
+# writer, or genuine binary/NUL-delimited command output. A document
+# containing one is otherwise valid, well-formed text (unlike a lone
+# surrogate, which is invalid UTF-8), but handing it to ChromaDB's
+# SQLite/FTS5 layer can corrupt the FTS5 inverted index for the *whole*
+# collection (``PRAGMA quick_check`` reports "malformed inverted index for
+# FTS5 table"), not just fail to store that one document. Stripping it
+# before it reaches the chromadb client is the same defense-in-depth this
+# module already applies to lone surrogates (#1235) — sanitize input we
+# don't control before it reaches a datastore we don't control.
+def strip_nul_bytes(text: str) -> str:
+    """Replace embedded NUL characters with U+FFFD before ChromaDB storage."""
+    return text.replace("\x00", "�")
 
 
 def normalize_wing_name(name: str) -> str:
@@ -197,12 +221,28 @@ def sanitize_content(value: str, max_length: int = 100_000) -> str:
 DEFAULT_PALACE_PATH = os.path.expanduser("~/.mempalace/palace")
 DEFAULT_COLLECTION_NAME = "mempalace_drawers"
 DEFAULT_BACKEND = "chroma"
+DEFAULT_MILVUS_CONSISTENCY_LEVEL = "Strong"
+_MILVUS_CONSISTENCY_LEVELS = {
+    "strong": "Strong",
+    "session": "Session",
+    "bounded": "Bounded",
+    "eventually": "Eventually",
+}
 
 # How many timestamped palace backups to retain before the oldest are
 # pruned. Applies to the accumulating backups written by ``mempalace
 # migrate`` and ``mempalace repair max-seq-id`` — see
 # ``MempalaceConfig.max_backups``.
 DEFAULT_MAX_BACKUPS = 10
+
+
+def normalize_milvus_consistency_level(value) -> str:
+    raw = str(value).strip() if value else DEFAULT_MILVUS_CONSISTENCY_LEVEL
+    normalized = _MILVUS_CONSISTENCY_LEVELS.get(raw.lower())
+    if normalized:
+        return normalized
+    allowed = ", ".join(_MILVUS_CONSISTENCY_LEVELS.values())
+    raise ValueError(f"milvus_consistency_level must be one of: {allowed}")
 
 
 def sqlite_read_uri(db_path: str) -> str:
@@ -310,18 +350,26 @@ class MempalaceConfig:
     Load order: env vars > config file > defaults.
     """
 
-    def __init__(self, config_dir=None):
+    def __init__(self, config_dir=None, palace_path=None):
         """Initialize config.
 
         Args:
             config_dir: Override config directory (useful for testing).
                         Defaults to ~/.mempalace.
+            palace_path: Explicit palace data directory. This is primarily
+                         used by CLI operations that received ``--palace``;
+                         it takes precedence over environment and file config.
         """
         self._config_dir = (
             Path(config_dir) if config_dir else Path(os.path.expanduser("~/.mempalace"))
         )
         self._config_file = self._config_dir / "config.json"
         self._people_map_file = self._config_dir / "people_map.json"
+        self._palace_path_override = (
+            os.path.abspath(os.path.expanduser(str(palace_path)))
+            if palace_path is not None
+            else None
+        )
         self._file_config = {}
 
         if self._config_file.exists():
@@ -334,13 +382,15 @@ class MempalaceConfig:
     @property
     def palace_path(self):
         """Path to the memory palace data directory."""
+        if self._palace_path_override is not None:
+            return self._palace_path_override
         env_val = os.environ.get("MEMPALACE_PALACE_PATH") or os.environ.get("MEMPAL_PALACE_PATH")
         if env_val:
             # Normalize: expand ~ and collapse .. to match the CLI --palace
             # code path (mcp_server.py:62) and prevent surprise redirection
             # when the env var contains unresolved components.
             return os.path.abspath(os.path.expanduser(env_val))
-        return self._file_config.get("palace_path", DEFAULT_PALACE_PATH)
+        return os.path.expanduser(self._file_config.get("palace_path", DEFAULT_PALACE_PATH))
 
     @property
     def tunnel_file(self):
@@ -420,6 +470,56 @@ class MempalaceConfig:
         except (TypeError, ValueError):
             timeout = 10.0
         return timeout if timeout > 0 else 10.0
+
+    @property
+    def milvus_uri(self):
+        """Milvus endpoint for the opt-in ``milvus`` backend.
+
+        Defaults to ``None`` so selecting Milvus uses per-palace Milvus Lite at
+        ``<palace>/milvus.db``. Set this only to deliberately use a shared
+        Milvus server, Zilliz Cloud, or a custom local Lite file.
+        """
+        env_val = os.environ.get("MEMPALACE_MILVUS_URI")
+        if env_val:
+            return env_val.strip()
+        value = self._file_config.get("milvus_uri")
+        return str(value).strip() if value else None
+
+    @property
+    def milvus_token(self):
+        """Token for the opt-in ``milvus`` backend, if configured."""
+        env_val = os.environ.get("MEMPALACE_MILVUS_TOKEN")
+        if env_val:
+            return env_val
+        value = self._file_config.get("milvus_token")
+        return str(value) if value else None
+
+    @property
+    def milvus_db_name(self):
+        """Optional Milvus database name for the opt-in ``milvus`` backend."""
+        env_val = os.environ.get("MEMPALACE_MILVUS_DB_NAME")
+        if env_val:
+            return env_val.strip()
+        value = self._file_config.get("milvus_db_name")
+        return str(value).strip() if value else None
+
+    @property
+    def milvus_namespace(self):
+        """Optional Milvus collection namespace/prefix."""
+        env_val = os.environ.get("MEMPALACE_MILVUS_NAMESPACE")
+        if env_val:
+            return env_val.strip()
+        value = self._file_config.get("milvus_namespace")
+        return str(value).strip() if value else None
+
+    @property
+    def milvus_consistency_level(self):
+        """Milvus read consistency level for the opt-in ``milvus`` backend."""
+        env_val = os.environ.get("MEMPALACE_MILVUS_CONSISTENCY_LEVEL")
+        if env_val:
+            return normalize_milvus_consistency_level(env_val)
+        value = self._file_config.get("milvus_consistency_level")
+        return normalize_milvus_consistency_level(value)
 
     @property
     def pgvector_dsn(self):
@@ -794,6 +894,102 @@ class MempalaceConfig:
     def hook_desktop_toast(self):
         """Whether the stop hook shows a desktop notification via notify-send."""
         return self._file_config.get("hooks", {}).get("desktop_toast", False)
+
+    def resolve_write_routing(self, scope: str) -> ResolvedWriteRoutingPolicy:
+        """Resolve the configured write policy for ``hooks`` or ``cli``.
+
+        Precedence is:
+
+        1. scope-specific environment variable;
+        2. global environment variable;
+        3. legacy hook environment variable;
+        4. scope-specific config value;
+        5. global config value;
+        6. legacy hook config value;
+        7. ``direct``.
+
+        This foundation does not change current hook or CLI behavior. The
+        policy-aware consumers are introduced by follow-up PRs.
+        """
+
+        normalized_scope = str(scope).strip().lower()
+        env_names = {
+            "hooks": "MEMPALACE_HOOK_WRITE_ROUTING",
+            "cli": "MEMPALACE_CLI_WRITE_ROUTING",
+        }
+
+        if normalized_scope not in env_names:
+            raise WriteRoutingError("write routing scope must be 'hooks' or 'cli'")
+
+        routing_config = self._file_config.get("write_routing", {})
+        if routing_config is None:
+            routing_config = {}
+
+        if not isinstance(routing_config, dict):
+            raise WriteRoutingError("config write_routing must be an object")
+
+        candidates = [
+            RoutingPolicyCandidate(
+                env_names[normalized_scope],
+                os.environ.get(env_names[normalized_scope]),
+            ),
+            RoutingPolicyCandidate(
+                "MEMPALACE_WRITE_ROUTING",
+                os.environ.get("MEMPALACE_WRITE_ROUTING"),
+            ),
+        ]
+
+        if normalized_scope == "hooks":
+            candidates.append(
+                RoutingPolicyCandidate(
+                    "MEMPALACE_HOOKS_DAEMON (legacy)",
+                    os.environ.get("MEMPALACE_HOOKS_DAEMON"),
+                    legacy_boolean=True,
+                )
+            )
+
+        candidates.extend(
+            [
+                RoutingPolicyCandidate(
+                    f"config write_routing.{normalized_scope}",
+                    routing_config.get(normalized_scope),
+                ),
+                RoutingPolicyCandidate(
+                    "config write_routing.default",
+                    routing_config.get("default"),
+                ),
+            ]
+        )
+
+        if normalized_scope == "hooks":
+            hooks_config = self._file_config.get("hooks", {})
+            if hooks_config is None:
+                hooks_config = {}
+
+            if not isinstance(hooks_config, dict):
+                raise WriteRoutingError("config hooks must be an object")
+
+            candidates.append(
+                RoutingPolicyCandidate(
+                    "config hooks.daemon (legacy)",
+                    hooks_config.get("daemon"),
+                    legacy_boolean=True,
+                )
+            )
+
+        return resolve_write_routing_policy(candidates)
+
+    @property
+    def hook_write_routing(self) -> WriteRoutingPolicy:
+        """Resolved future routing policy for hook-triggered writes."""
+
+        return self.resolve_write_routing("hooks").policy
+
+    @property
+    def cli_write_routing(self) -> WriteRoutingPolicy:
+        """Resolved future routing policy for routine CLI writes."""
+
+        return self.resolve_write_routing("cli").policy
 
     @property
     def hook_use_daemon(self):

@@ -19,6 +19,9 @@ Design constraints
 
 import http.client
 import json
+import logging
+import socketserver
+import ssl
 import threading
 
 import pytest
@@ -195,6 +198,184 @@ def test_bearer_token_enforced_when_configured(monkeypatch):
         httpd.shutdown()
         httpd.server_close()
         thread.join(timeout=5)
+
+
+def test_read_only_hides_and_refuses_mutating_tools(http_server, monkeypatch):
+    """Read-only mode (#1877): mutating tools are hidden from tools/list AND
+    refused at dispatch with -32003, while read tools still work."""
+    monkeypatch.setattr(mcp, "_READ_ONLY", True)
+    port, _ = http_server
+
+    status, body = _post(port, "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    assert status == 200
+    names = {t["name"] for t in json.loads(body)["result"]["tools"]}
+    assert "mempalace_search" in names  # read tool stays
+    assert "mempalace_add_drawer" not in names  # mutating tool hidden
+    assert names.isdisjoint(mcp._MUTATING_TOOLS)
+
+    status, body = _post(
+        port,
+        "/mcp",
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "mempalace_add_drawer", "arguments": {"content": "x"}},
+        },
+    )
+    assert status == 200
+    assert json.loads(body)["error"]["code"] == -32003
+
+
+def test_read_only_off_exposes_mutating_tools(http_server):
+    """Sanity: without read-only, mutating tools are present (guards the test above)."""
+    port, _ = http_server
+    status, body = _post(port, "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    names = {t["name"] for t in json.loads(body)["result"]["tools"]}
+    assert "mempalace_add_drawer" in names
+
+
+@pytest.mark.parametrize(
+    "disconnect_exc",
+    [
+        ConnectionResetError(104, "connection reset by peer"),
+        BrokenPipeError(32, "broken pipe"),
+        ssl.SSLEOFError("unexpected eof while reading"),
+    ],
+    ids=["connreset", "brokenpipe", "ssleof"],
+)
+def test_handle_error_quiets_client_disconnect(caplog, monkeypatch, disconnect_exc):
+    """Regression for #2003: a client that hangs up mid-response makes the send
+    path raise ConnectionError (BrokenPipeError / ConnectionResetError), or
+    ssl.SSLEOFError on the TLS transport. The server must log that quietly at
+    DEBUG instead of routing it to the default handler's per-request traceback.
+    """
+    httpd = mcp._build_http_server("127.0.0.1", 0)
+    try:
+        delegated = []
+        monkeypatch.setattr(
+            socketserver.BaseServer,
+            "handle_error",
+            lambda self, request, addr: delegated.append(addr),
+        )
+        addr = ("127.0.0.1", 51234)
+
+        with caplog.at_level(logging.DEBUG, logger="mempalace_mcp"):
+            try:
+                raise disconnect_exc
+            except type(disconnect_exc):
+                httpd.handle_error(None, addr)
+
+        assert delegated == []  # noisy default handler NOT invoked
+        rec = next(r for r in caplog.records if "disconnect" in r.getMessage().lower())
+        assert rec.levelno == logging.DEBUG
+        assert rec.name == "mempalace_mcp"
+    finally:
+        httpd.server_close()
+
+
+def test_handle_error_delegates_real_errors(monkeypatch):
+    """A genuine error is NOT misclassified as a disconnect: it reaches the
+    default handler, so its traceback is still surfaced.
+    """
+    httpd = mcp._build_http_server("127.0.0.1", 0)
+    try:
+        delegated = []
+        monkeypatch.setattr(
+            socketserver.BaseServer,
+            "handle_error",
+            lambda self, request, addr: delegated.append(addr),
+        )
+        addr = ("127.0.0.1", 51234)
+        try:
+            raise ValueError("boom")
+        except ValueError:
+            httpd.handle_error(None, addr)
+        assert delegated == [addr]
+    finally:
+        httpd.server_close()
+
+
+def _make_self_signed_cert(tmp_path):
+    """Write a throwaway self-signed cert/key via openssl; skip if unavailable."""
+    import shutil
+    import subprocess
+
+    if shutil.which("openssl") is None:
+        pytest.skip("openssl not available to generate a test certificate")
+    cert = tmp_path / "cert.pem"
+    key = tmp_path / "key.pem"
+    subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            str(key),
+            "-out",
+            str(cert),
+            "-days",
+            "1",
+            "-nodes",
+            "-subj",
+            "/CN=localhost",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return cert, key
+
+
+def test_tls_serves_https(tmp_path, monkeypatch):
+    """With --tls-cert/--tls-key (via env), the server speaks TLS: a plain HTTP
+    client cannot read it, and an HTTPS client trusting the cert can."""
+    import ssl
+
+    cert, key = _make_self_signed_cert(tmp_path)
+    monkeypatch.setenv("MEMPALACE_MCP_TLS_CERT", str(cert))
+    monkeypatch.setenv("MEMPALACE_MCP_TLS_KEY", str(key))
+
+    httpd = mcp._build_http_server("127.0.0.1", 0)
+    assert getattr(httpd, "scheme", "http") == "https"
+    port = httpd.server_address[1]
+    thread = threading.Thread(
+        target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+    )
+    thread.start()
+    try:
+        # Full verification on: trust the self-signed cert as the CA and dial
+        # "localhost" (the cert CN, resolves to 127.0.0.1) so hostname checking
+        # passes without being disabled.
+        ctx = ssl.create_default_context(cafile=str(cert))
+        conn = http.client.HTTPSConnection("localhost", port, context=ctx, timeout=5)
+        try:
+            conn.request("GET", "/healthz")
+            resp = conn.getresponse()
+            assert resp.status == 200
+            assert resp.read() == b"ok\n"
+        finally:
+            conn.close()
+
+        # A plaintext HTTP client must NOT be able to talk to the TLS socket.
+        with pytest.raises(Exception):
+            plain = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            plain.request("GET", "/healthz")
+            plain.getresponse()
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+
+
+def test_tls_requires_both_cert_and_key(tmp_path, monkeypatch):
+    """A cert without a key (or vice versa) is a startup error, not a silent skip."""
+    cert, _key = _make_self_signed_cert(tmp_path)
+    monkeypatch.setenv("MEMPALACE_MCP_TLS_CERT", str(cert))
+    monkeypatch.delenv("MEMPALACE_MCP_TLS_KEY", raising=False)
+    with pytest.raises(ValueError, match="both"):
+        mcp._build_http_server("127.0.0.1", 0)
 
 
 def test_loopback_and_origin_helpers():

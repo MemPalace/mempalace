@@ -42,6 +42,6 @@ search-before-answer so the agent reads the palace instead of guessing.
 
 ## Cursor-specific notes
 
-- The `mempalace-mcp` server is auto-registered by this plugin. Once installed, all 34 MemPalace MCP tools (`mempalace_search`, `mempalace_add_drawer`, `mempalace_diary_write`, `mempalace_check_duplicate`, `mempalace_diary_read`, etc.) are available to the agent without any further configuration.
+- The `mempalace-mcp` server is auto-registered by this plugin. Once installed, all 36 MemPalace MCP tools (`mempalace_search`, `mempalace_add_drawer`, `mempalace_diary_write`, `mempalace_check_duplicate`, `mempalace_diary_read`, etc.) are available to the agent without any further configuration.
 - For automatic background saving every N agent turns plus session-start memory recall, also install the Cursor hooks separately by running `hooks/cursor/install.sh --scope user` from a cloned MemPalace repo. See [`website/guide/cursor-hooks.md`](../../website/guide/cursor-hooks.md) for the full walkthrough.
 - The recommended `agent_name` when calling `mempalace_diary_write` from a Cursor session is `cursor-ide` (matches the precedent of `claude-code` and `codex`).

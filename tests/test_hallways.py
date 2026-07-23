@@ -92,6 +92,24 @@ class TestHallwayStorage:
 
 
 class TestComputeHallways:
+    def test_explicit_config_scopes_persistence_to_selected_palace(self, tmp_path):
+        from mempalace.config import MempalaceConfig
+
+        default_cfg = MempalaceConfig(palace_path=tmp_path / "default" / "palace")
+        selected_cfg = MempalaceConfig(palace_path=tmp_path / "selected" / "palace")
+        col = _fake_collection(
+            [
+                {"wing": "wing_aya", "room": "diary", "entities": "Aya;Lumi"},
+                {"wing": "wing_aya", "room": "letters", "entities": "Aya;Lumi"},
+            ]
+        )
+
+        created = hallways_mod.compute_hallways_for_wing("wing_aya", col=col, config=selected_cfg)
+
+        assert len(created) == 1
+        assert hallways_mod.list_hallways(config=selected_cfg) == created
+        assert hallways_mod.list_hallways(config=default_cfg) == []
+
     def test_returns_empty_for_unknown_wing(self, tmp_path, monkeypatch):
         """Wing with no drawers → no hallways, no crash."""
         _use_tmp_hallway_file(monkeypatch, tmp_path)
@@ -299,6 +317,19 @@ class TestHallwayQuery:
         _use_tmp_hallway_file(monkeypatch, tmp_path)
         hallways_mod._save_hallways([{"id": "h1", "wing": "wing_aya"}])
         assert hallways_mod.delete_hallway("nonexistent") is False
+
+    def test_delete_hallway_uses_selected_palace_config(self, tmp_path):
+        from mempalace.config import MempalaceConfig
+
+        default_cfg = MempalaceConfig(palace_path=tmp_path / "default" / "palace")
+        selected_cfg = MempalaceConfig(palace_path=tmp_path / "selected" / "palace")
+        record = {"id": "h1", "wing": "wing_aya"}
+        hallways_mod._save_hallways([record], default_cfg)
+        hallways_mod._save_hallways([record], selected_cfg)
+
+        assert hallways_mod.delete_hallway("h1", config=selected_cfg) is True
+        assert hallways_mod.list_hallways(config=selected_cfg) == []
+        assert hallways_mod.list_hallways(config=default_cfg) == [record]
 
 
 # ─────────────────────────────────────────────────────────────────────────────

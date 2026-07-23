@@ -14,6 +14,7 @@ import shlex
 import hashlib
 import fnmatch
 import logging
+import stat
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
@@ -46,6 +47,38 @@ from .hallways import compute_hallways_for_wing
 from .ids import ID_RECIPE, make_drawer_id_from_chunk
 
 logger = logging.getLogger("mempalace_mcp")
+
+
+def _path_within_root(path: Path, root: Path) -> bool:
+    try:
+        path.expanduser().resolve().relative_to(root.expanduser().resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _read_text_no_follow(filepath: Path, root: Path) -> Optional[str]:
+    if not _path_within_root(filepath, root):
+        return None
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = -1
+    try:
+        fd = os.open(filepath, flags)
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_FILE_SIZE:
+            return None
+        with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as f:
+            fd = -1
+            return f.read()
+    except OSError:
+        return None
+    finally:
+        if fd != -1:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
 
 PHP_EXTENSIONS = {
     # Compound Blade templates such as ``view.blade.php`` are covered by the
@@ -100,6 +133,8 @@ READABLE_EXTENSIONS = {
     ".csv",
     ".sql",
     ".toml",
+    ".tex",
+    ".bib",
     # C# / .NET
     ".cs",
     ".csproj",
@@ -209,20 +244,16 @@ class GitignoreMatcher:
         self.base_dir = base_dir
         self.rules = rules
 
-    @classmethod
-    def from_dir(cls, dir_path: Path):
-        gitignore_path = dir_path / ".gitignore"
-        if not gitignore_path.is_file():
-            return None
+    @staticmethod
+    def _parse_rules(lines):
+        """Parse an iterable of raw pattern strings into a list of rule dicts.
 
-        try:
-            lines = gitignore_path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except Exception:
-            return None
-
+        Shared by :meth:`from_dir` and :meth:`from_patterns` so both paths
+        stay in sync with the gitignore parsing semantics.
+        """
         rules = []
         for raw_line in lines:
-            line = raw_line.strip()
+            line = str(raw_line).strip()
             if not line:
                 continue
 
@@ -254,11 +285,45 @@ class GitignoreMatcher:
                     "negated": negated,
                 }
             )
+        return rules
 
-        if not rules:
+    @classmethod
+    def from_dir(cls, dir_path: Path):
+        gitignore_path = dir_path / ".gitignore"
+        if not gitignore_path.is_file():
             return None
 
+        try:
+            lines = gitignore_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            return None
+
+        rules = cls._parse_rules(lines)
+        if not rules:
+            return None
         return cls(dir_path, rules)
+
+    @classmethod
+    def from_patterns(cls, base_dir: Path, patterns):
+        """Create a matcher from an explicit list of gitignore-inspired pattern strings.
+
+        Supports a gitignore-inspired subset of pattern syntax for
+        ``exclude_patterns`` in ``mempalace.yaml``.  Patterns are parsed by
+        the same rule parser used for ``.gitignore`` files, so familiar
+        constructs (trailing ``/`` for dir-only, leading ``/`` for anchoring,
+        ``!`` negation, ``**`` globs) work as expected.  Full gitignore
+        semantics are not guaranteed for every edge case.
+
+        ``patterns`` must be a list of strings.  A single string is coerced
+        to a one-element list for convenience.  Non-string entries are
+        converted via ``str()``.
+        """
+        if isinstance(patterns, str):
+            patterns = [patterns]
+        rules = cls._parse_rules(patterns)
+        if not rules:
+            return None
+        return cls(base_dir, rules)
 
     def matches(self, path: Path, is_dir: bool = None):
         try:
@@ -385,6 +450,29 @@ def is_force_included(path: Path, project_path: Path, include_paths: set) -> boo
             return True
 
     return False
+
+
+def _apply_exclude_patterns_to_prescanned_files(
+    files: list, project_path: Path, exclude_patterns: list, include_ignored: list
+) -> list:
+    """Filter a caller-provided (already-scanned) file list by exclude_patterns.
+
+    scan_project() applies exclude_patterns itself, but a caller that passes
+    its own pre-scanned ``files`` list bypasses that -- so callers reusing a
+    scan (e.g. the init double-scan) still need per-project exclusions
+    applied here. force_include paths are preserved, matching scan_project's
+    own precedence.
+    """
+    include_paths = normalize_include_paths(include_ignored)
+    exclude_matcher = GitignoreMatcher.from_patterns(project_path, exclude_patterns)
+    if exclude_matcher is None:
+        return files
+    return [
+        file_path
+        for file_path in files
+        if is_force_included(file_path, project_path, include_paths)
+        or exclude_matcher.matches(file_path, is_dir=False) is not True
+    ]
 
 
 # =============================================================================
@@ -1341,9 +1429,8 @@ def process_file(
     if not dry_run and file_already_mined(collection, source_file, check_mtime=True):
         return 0, "general", None
 
-    try:
-        content = filepath.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    content = _read_text_no_follow(filepath, project_path)
+    if content is None:
         return 0, "general", None
 
     content = content.strip()
@@ -1497,6 +1584,7 @@ def scan_project(
     project_dir: str,
     respect_gitignore: bool = True,
     include_ignored: list = None,
+    exclude_patterns: list = None,
 ) -> list:
     """Return list of all readable file paths under ``project_dir``.
 
@@ -1509,6 +1597,7 @@ def scan_project(
     active_matchers = []
     matcher_cache = {}
     include_paths = normalize_include_paths(include_ignored)
+    exclude_matcher = GitignoreMatcher.from_patterns(project_path, exclude_patterns or [])
 
     for root, dirs, filenames in os.walk(project_path):
         root_path = Path(root)
@@ -1536,6 +1625,13 @@ def scan_project(
                 if is_force_included(root_path / d, project_path, include_paths)
                 or not is_gitignored(root_path / d, active_matchers, is_dir=True)
             ]
+        if exclude_matcher:
+            dirs[:] = [
+                d
+                for d in dirs
+                if is_force_included(root_path / d, project_path, include_paths)
+                or exclude_matcher.matches(root_path / d, is_dir=True) is not True
+            ]
 
         for filename in filenames:
             filepath = root_path / filename
@@ -1549,6 +1645,15 @@ def scan_project(
             if respect_gitignore and active_matchers and not force_include:
                 if is_gitignored(filepath, active_matchers, is_dir=False):
                     continue
+            # Skip files matching project-level exclude_patterns (mempalace.yaml).
+            # force_include paths bypass this check so callers can selectively
+            # re-include files that would otherwise be excluded.
+            if (
+                not force_include
+                and exclude_matcher
+                and exclude_matcher.matches(filepath, is_dir=False)
+            ):
+                continue
             # Skip symlinks — prevents following links to /dev/urandom, etc.
             if filepath.is_symlink():
                 rel = filepath.relative_to(project_path).as_posix()
@@ -1557,11 +1662,30 @@ def scan_project(
                 except OSError:
                     pass
                 continue
-            # Skip files exceeding size limit
+            # Skip files exceeding size limit, or those whose stat() raises
+            # (permission denied, racing delete, broken symlink that survived
+            # the earlier is_symlink check). Both branches log to stderr to
+            # match the SKIP: (symlink) line above; silent drops at this
+            # gate were the original #923 complaint.
             try:
-                if filepath.stat().st_size > MAX_FILE_SIZE:
+                file_size = filepath.stat().st_size
+                if file_size > MAX_FILE_SIZE:
+                    print(
+                        f"  SKIP: {filepath.name} ({file_size / (1024 * 1024):.1f} MB)"
+                        f" exceeds {MAX_FILE_SIZE // (1024 * 1024)} MB limit",
+                        file=sys.stderr,
+                    )
                     continue
-            except OSError:
+            except OSError as exc:
+                # Prefer ``exc.strerror`` so the path isn't duplicated in the
+                # output (PermissionError stringifies to
+                # ``[Errno 13] Permission denied: '<path>'`` and the path is
+                # already in the SKIP prefix). Falls back to the default repr
+                # when strerror is unset.
+                print(
+                    f"  SKIP: {filepath.name} (stat error: {exc.strerror or exc})",
+                    file=sys.stderr,
+                )
                 continue
             files.append(filepath)
     return files
@@ -1653,13 +1777,20 @@ def _mine_impl(
 
     wing = wing_override or config["wing"]
     rooms = config.get("rooms", [{"name": "general", "description": "All project files"}])
+    exclude_patterns = config.get("exclude_patterns", [])
 
     if files is None:
         files = scan_project(
             project_dir,
             respect_gitignore=respect_gitignore,
             include_ignored=include_ignored,
+            exclude_patterns=exclude_patterns,
         )
+    elif exclude_patterns:
+        files = _apply_exclude_patterns_to_prescanned_files(
+            files, project_path, exclude_patterns, include_ignored
+        )
+
     from .embedding import describe_device
 
     print(f"\n{'=' * 55}")
@@ -1742,12 +1873,15 @@ def _mine_impl(
                     break
 
         if not dry_run:
+            from .config import MempalaceConfig
+
+            graph_config = MempalaceConfig(palace_path=palace_path)
             # Cross-wing topic tunnels: after every file in this wing has been
             # processed, link this wing to any other wing that shares a
             # confirmed TOPIC label. Out of scope for v1: manifest-dependency
             # overlap, per-topic allow/deny lists, search-result surfacing.
             try:
-                tunnels_added = _compute_topic_tunnels_for_wing(wing)
+                tunnels_added = _compute_topic_tunnels_for_wing(wing, config=graph_config)
                 if tunnels_added:
                     print(f"\n  Topic tunnels: +{tunnels_added} cross-wing link(s)")
             except Exception as e:
@@ -1763,7 +1897,9 @@ def _mine_impl(
             # must never fail a mine; it's a derived analytic, not load-bearing
             # for the drawer write that already committed above.
             try:
-                hallways_created = compute_hallways_for_wing(wing, col=collection)
+                hallways_created = compute_hallways_for_wing(
+                    wing, col=collection, config=graph_config
+                )
                 if hallways_created:
                     print(f"\n  Hallways: +{len(hallways_created)} within-wing entity link(s)")
             except Exception as e:
@@ -1779,7 +1915,7 @@ def _mine_impl(
             # ``kind="entity"`` / ``kind="topic"``. Same fault-tolerance
             # pattern: never fail a mine over a derived analytic.
             try:
-                entity_tunnels_added = _compute_entity_tunnels_for_wing(wing)
+                entity_tunnels_added = _compute_entity_tunnels_for_wing(wing, config=graph_config)
                 if entity_tunnels_added:
                     print(f"\n  Entity tunnels: +{entity_tunnels_added} cross-wing entity link(s)")
             except Exception as e:
@@ -1903,7 +2039,7 @@ def _cleanup_mine_pid_file() -> None:
         pass
 
 
-def _compute_topic_tunnels_for_wing(wing: str) -> int:
+def _compute_topic_tunnels_for_wing(wing: str, config=None) -> int:
     """Drop tunnels between ``wing`` and every other wing that shares
     confirmed topics, honoring the ``topic_tunnel_min_count`` config knob.
 
@@ -1916,13 +2052,13 @@ def _compute_topic_tunnels_for_wing(wing: str) -> int:
     topics_map = get_topics_by_wing()
     if not topics_map or wing not in topics_map:
         return 0
-    cfg = MempalaceConfig()
+    cfg = config or MempalaceConfig()
     min_count = cfg.topic_tunnel_min_count
-    created = topic_tunnels_for_wing(wing, topics_map, min_count=min_count)
+    created = topic_tunnels_for_wing(wing, topics_map, min_count=min_count, config=cfg)
     return len(created)
 
 
-def _compute_entity_tunnels_for_wing(wing: str) -> int:
+def _compute_entity_tunnels_for_wing(wing: str, config=None) -> int:
     """Drop tunnels between ``wing`` and every other wing that shares an
     entity via the within-wing hallway primitive.
 
@@ -1940,10 +2076,10 @@ def _compute_entity_tunnels_for_wing(wing: str) -> int:
     from .hallways import list_hallways
     from .palace_graph import entity_tunnels_for_wing
 
-    hallways = list_hallways()
+    hallways = list_hallways(config=config)
     if not hallways:
         return 0
-    created = entity_tunnels_for_wing(wing, hallways)
+    created = entity_tunnels_for_wing(wing, hallways, config=config)
     return len(created)
 
 

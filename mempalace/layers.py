@@ -319,6 +319,9 @@ class Layer3:
             lines.append(f"      {snippet}")
             if source:
                 lines.append(f"      src: {source}")
+            authored = (meta.get("authored_at") or "")[:10]
+            if authored:
+                lines.append(f"      authored: {authored}")
 
         return "\n".join(lines)
 

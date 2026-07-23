@@ -1,7 +1,7 @@
 {
   "name": "mempalace",
-  "version": "3.5.0",
-  "description": "Give your AI a memory — mine projects and conversations into a searchable palace. 35 MCP tools, auto-save hooks, and guided setup.",
+  "version": "3.6.0",
+  "description": "Give your AI a memory — mine projects and conversations into a searchable palace. 36 MCP tools, auto-save hooks, and guided setup.",
   "author": {
     "name": "milla-jovovich"
   },

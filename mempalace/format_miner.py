@@ -750,7 +750,7 @@ def mine_formats(
     # min_chunk_size) are now threaded through chunk_text below, so users
     # who customized their config see the effect in format-mode mining.
     # Per PR #1555 review (Gemini #3).
-    palace_config = MempalaceConfig()
+    palace_config = MempalaceConfig(palace_path=palace_path)
 
     format_path = Path(format_dir).expanduser().resolve()
     if not wing:
@@ -945,7 +945,7 @@ def mine_formats(
         # skipped quietly.
         if not dry_run:
             try:
-                tunnels_added = _compute_topic_tunnels_for_wing(wing)
+                tunnels_added = _compute_topic_tunnels_for_wing(wing, config=palace_config)
                 if tunnels_added:
                     print(f"\n  Topic tunnels: +{tunnels_added} cross-wing link(s)")
             except Exception as exc:

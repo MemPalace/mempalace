@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-Detailed parameter schemas for all 35 MCP tools.
+Detailed parameter schemas for all 36 MCP tools.
 
 ## Palace — Read Tools
 
@@ -111,6 +111,7 @@ Save a whole session in one call. Semantic-dedups each item, files the non-dupli
 | `items` | array | **Yes** | Verbatim items to file. Each is `{ wing, room, content }` |
 | `diary` | object | No | Diary entry written after filing: `{ agent_name, entry, topic?, wing? }` (`entry` is AAAK-format) |
 | `dedup_threshold` | number | No | Similarity threshold 0–1 for the per-item dedup check (default 0.9) |
+| `added_by` | string | No | Who is filing these drawers. An explicit value takes precedence; otherwise the diary `agent_name`, else `checkpoint` |
 
 **Returns:** `{ added: [...], duplicates: [...], errors: [...], diary? }`
 
@@ -260,6 +261,22 @@ Mark a fact as no longer true.
 | `ended` | string | No | When it stopped being true (default: today) |
 
 **Returns:** `{ success, fact, ended }`
+
+---
+
+### `mempalace_kg_supersede`
+
+Atomically replace a fact with its successor at a single shared boundary. Use when a single-valued fact changes (model, employer, address) instead of a separate `mempalace_kg_invalidate` + `mempalace_kg_add` — a point-in-time query at the boundary then returns only the new value.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `subject` | string | **Yes** | Entity whose fact is changing |
+| `predicate` | string | **Yes** | Relationship (e.g. `uses_model`, `works_at`) |
+| `old_object` | string | **Yes** | Value being replaced |
+| `new_object` | string | **Yes** | New value |
+| `at` | string | No | Boundary instant (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ; default: now UTC) |
+
+**Returns:** `{ success, triple_id, fact, superseded }`
 
 ---
 

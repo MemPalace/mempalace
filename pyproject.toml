@@ -1,6 +1,6 @@
 [project]
 name = "mempalace"
-version = "3.5.0"
+version = "3.6.0"
 description = "Give your AI a memory — mine projects and conversations into a searchable palace. No API key required."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -60,6 +60,7 @@ mempalace-mcp = "mempalace.mcp_server:main"
 
 [project.entry-points."mempalace.backends"]
 chroma = "mempalace.backends.chroma:ChromaBackend"
+milvus = "mempalace.backends.milvus:MilvusBackend"
 pgvector = "mempalace.backends.pgvector:PgVectorBackend"
 qdrant = "mempalace.backends.qdrant:QdrantBackend"
 sqlite_exact = "mempalace.backends.sqlite_exact:SQLiteExactBackend"
@@ -78,7 +79,7 @@ dev = [
     # (wired only into the test-windows job in ci.yml, scoped to the specific
     # error). Local/Linux/macOS runs never rerun, so real failures stay loud.
     "pytest-rerunfailures>=12.0",
-    "ruff==0.15.18",
+    "ruff==0.15.20",
     "psutil>=5.9",
     # Property-based testing — generates hundreds of random inputs per
     # test to find counterexamples the hand-written positive tests miss.
@@ -99,6 +100,13 @@ dev = [
     "mypy>=1.0",
 ]
 spellcheck = ["autocorrect>=2.0"]
+# Opt-in Milvus backend. Defaults to per-palace Milvus Lite
+# (`<palace>/milvus.db`); set MEMPALACE_MILVUS_URI and
+# MEMPALACE_MILVUS_TOKEN to point at Milvus server or Zilliz Cloud.
+milvus = [
+    "pymilvus>=3.0.0",
+    "milvus-lite>=3.0; python_version >= '3.10' and sys_platform != 'win32'",
+]
 # Opt-in Postgres + pgvector backend. Only the psycopg driver is needed on the
 # client; the server must have the `vector` extension available. Selected via
 # MEMPALACE_BACKEND=pgvector / --backend pgvector; never required for the
@@ -139,7 +147,7 @@ dev = [
     # (wired only into the test-windows job in ci.yml, scoped to the specific
     # error). Local/Linux/macOS runs never rerun, so real failures stay loud.
     "pytest-rerunfailures>=12.0",
-    "ruff==0.15.18",
+    "ruff==0.15.20",
     "psutil>=5.9",
     "hypothesis>=6.0",
     "pre-commit>=3.0",

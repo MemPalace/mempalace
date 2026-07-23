@@ -928,12 +928,19 @@ def _validate_palace_fts5_after_mine(palace_path: str) -> None:
     Reuses the same primitive that `cmd_repair` already runs as preflight so the
     operator sees the same recovery banner regardless of which command surfaces
     the bug.
+
+    An isolated FTS5 inverted-index corruption (the common case after a
+    killed-mid-write mine, #1596) is auto-healed in place first via the same
+    `maybe_autoheal_fts5_index` rebuild `cmd_repair` already runs as its own
+    preflight step — so a normal `mine` self-heals the recoverable case
+    instead of forcing the operator to run `mempalace repair` by hand for a
+    derived index that regenerates from intact content.
     """
     if resolve_backend_name(palace_path) != "chroma":
         return
 
     # Defer-import: keeps the repair module graph out of mine's hot import path.
-    from .repair import _close_chroma_handles, sqlite_integrity_errors
+    from .repair import _close_chroma_handles, maybe_autoheal_fts5_index, sqlite_integrity_errors
 
     # Pass the live singleton so the writer's cached PersistentClient actually
     # gets closed and WAL flushes before the read-only sqlite3 re-open.
@@ -944,48 +951,88 @@ def _validate_palace_fts5_after_mine(palace_path: str) -> None:
 
     errors = sqlite_integrity_errors(palace_path)
     if errors:
+        # progress=logger.info, not the default print: this runs inside the
+        # MCP server process too (mcp_server.tool_mine -> miner.mine), where
+        # stdout is the JSON-RPC transport -- a stray print() here would
+        # corrupt the protocol stream and crash the connection.
+        errors = maybe_autoheal_fts5_index(palace_path, errors, progress=logger.info)
+    if errors:
         raise MineValidationError(palace_path, errors)
 
 
-# Per-thread record of palaces this thread already holds the lock for. Used by
-# `mine_palace_lock` to short-circuit re-entrant acquisition from the same
-# thread (e.g. miner.mine() acquires the outer lock then calls
+# Process-wide record of palaces this PROCESS already holds the lock for. Used
+# by `mine_palace_lock` to short-circuit re-entrant acquisition from the same
+# process (e.g. miner.mine() acquires the outer lock then calls
 # ChromaCollection.upsert which now also tries to acquire). Without this guard
 # the inner call would block on its own outer flock (Linux fcntl locks are per
-# open file description, so a same-thread second open of the lock file is a
-# distinct lock and self-deadlocks).
+# open file description, so a second open of the lock file from the same process
+# is a distinct lock and self-conflicts / EWOULDBLOCKs).
 #
-# The holder set is tagged with ``pid`` so that a forked child does NOT
-# inherit re-entrant credit from its parent: the OS-level flock IS NOT
-# inherited as a "we hold it" semantically — the child must reacquire — but
-# Python's ``threading.local`` IS inherited across fork. The pid check
-# clears stale state so a forked child correctly hits the fcntl path.
-_palace_lock_holders = threading.local()
+# This MUST be process-wide, not thread-local: the MCP HTTP transport
+# (ThreadingHTTPServer) acquires the long-lived writer-lease on one thread
+# (`mcp_server._acquire_mcp_writer_lock`) but dispatches each write request on a
+# different worker thread. A thread-local guard makes those handlers fail to see
+# the process-held lease, re-acquire the flock, and self-conflict
+# ("palace ... is held by PID <self>"). flock is per-process and HTTP writes are
+# serialized by `_HTTP_REQUEST_LOCK`, so the process is the correct re-entrancy
+# boundary.
+#
+# The holder set is tagged with ``pid`` so that a forked child does NOT inherit
+# re-entrant credit from its parent: the OS-level flock IS NOT inherited as a
+# "we hold it" semantically — the child must reacquire. The pid check clears
+# stale state so a forked child correctly hits the fcntl path. Access is guarded
+# by ``_palace_lock_guard`` because the set is now shared across threads.
+#
+# Fork safety: ``_palace_lock_guard`` is a real ``threading.Lock``, so a child
+# forked while another thread held it would inherit it locked (the holder thread
+# does not exist in the child) and deadlock on the next acquire. An at-fork
+# handler (registered below) replaces the guard with a fresh unlocked lock and
+# clears state in the child, which must reacquire the flock anyway.
+_palace_lock_guard = threading.Lock()
+_palace_lock_pid = None
+_palace_lock_keys = set()
 
 
-def _holder_state():
-    """Return the per-thread (pid, keys) record, refreshing after fork."""
-    keys = getattr(_palace_lock_holders, "keys", None)
-    pid = getattr(_palace_lock_holders, "pid", None)
+def _reset_palace_lock_state_after_fork() -> None:
+    """Reset lock state in a forked child to avoid an inherited-locked deadlock."""
+    global _palace_lock_guard, _palace_lock_pid, _palace_lock_keys
+    _palace_lock_guard = threading.Lock()
+    _palace_lock_keys = set()
+    _palace_lock_pid = os.getpid()
+
+
+# Availability: Unix (no-op elsewhere — Windows has no fork()).
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_palace_lock_state_after_fork)
+
+
+def _holder_keys_locked():
+    """Return the process-wide held-key set, refreshing after fork.
+
+    Caller MUST hold ``_palace_lock_guard``.
+    """
+    global _palace_lock_pid, _palace_lock_keys
     current_pid = os.getpid()
-    if keys is None or pid != current_pid:
-        keys = set()
-        _palace_lock_holders.keys = keys
-        _palace_lock_holders.pid = current_pid
-    return keys
+    if _palace_lock_pid != current_pid:
+        _palace_lock_keys = set()
+        _palace_lock_pid = current_pid
+    return _palace_lock_keys
 
 
-def _held_by_this_thread(lock_key: str) -> bool:
-    """Return True if this thread already holds ``mine_palace_lock`` for ``lock_key``."""
-    return lock_key in _holder_state()
+def _held_by_this_process(lock_key: str) -> bool:
+    """Return True if this process already holds ``mine_palace_lock`` for ``lock_key``."""
+    with _palace_lock_guard:
+        return lock_key in _holder_keys_locked()
 
 
 def _mark_held(lock_key: str) -> None:
-    _holder_state().add(lock_key)
+    with _palace_lock_guard:
+        _holder_keys_locked().add(lock_key)
 
 
 def _mark_released(lock_key: str) -> None:
-    _holder_state().discard(lock_key)
+    with _palace_lock_guard:
+        _holder_keys_locked().discard(lock_key)
 
 
 def _format_lock_holder(content: str) -> str:
@@ -1064,11 +1111,13 @@ def mine_palace_lock(palace_path: str):
     raise MineAlreadyRunning so the caller can exit cleanly instead of
     piling up as a waiting worker.
 
-    Re-entrant: if the current thread already holds the lock for the same
+    Re-entrant: if the current process already holds the lock for the same
     palace, the context manager passes through without re-acquiring. This
     lets ChromaCollection write methods (which acquire the lock themselves
     to protect MCP/direct callers) compose with miner.mine() (which holds
-    the outer lock for the entire mine pipeline) without self-deadlock.
+    the outer lock for the entire mine pipeline) without self-deadlock, and
+    lets the threaded MCP HTTP transport write from a worker thread while the
+    long-lived writer-lease is held on another thread of the same process.
     """
     lock_dir = os.path.join(os.path.expanduser("~"), ".mempalace", "locks")
     os.makedirs(lock_dir, exist_ok=True)
@@ -1077,8 +1126,8 @@ def mine_palace_lock(palace_path: str):
     palace_key = hashlib.sha256(lock_key_source.encode()).hexdigest()[:16]
     lock_path = os.path.join(lock_dir, f"mine_palace_{palace_key}.lock")
 
-    if _held_by_this_thread(palace_key):
-        # Same thread already holds the lock for this palace — pass through.
+    if _held_by_this_process(palace_key):
+        # This process already holds the lock for this palace — pass through.
         yield
         return
 
@@ -1129,8 +1178,14 @@ def mine_palace_lock(palace_path: str):
                 ) from exc
         # Record our own identity for any later contender's diagnostic message.
         _write_lock_holder(lf)
-        _mark_held(palace_key)
+        # Mark the hold from inside the try so it always pairs with
+        # _mark_released. If it sat before the try, an async exception
+        # (a SIGINT/KeyboardInterrupt) landing in the gap would orphan
+        # palace_key in the holder set while the outer finally frees the
+        # flock, so the in-memory hold would outlive the OS lock and a later
+        # re-entrant acquire would pass through and write without the flock.
         try:
+            _mark_held(palace_key)
             yield
         finally:
             _mark_released(palace_key)
@@ -1179,9 +1234,15 @@ def file_already_mined(
         schema (triggers silent rebuild after a normalization upgrade)
       - `check_mtime=True` and the file's mtime differs from the stored one
 
-    When check_mtime=True (used by project miner), also re-mines on content
-    change. When check_mtime=False (used by convo miner), transcripts are
-    assumed immutable, so only the version gate triggers a rebuild.
+    When check_mtime=True (used by the project miner, and by the convo
+    miner's in-lock recheck), also re-mines on content change. Conversation
+    transcripts are NOT assumed immutable: a Claude Code session keeps
+    appending to its own file while active, and /compact or /clear can
+    rewrite one in place. The convo miner's bulk skip-check uses
+    prefetch_mined_set()'s stored mtimes instead of calling this function
+    per file (same mtime-aware decision, without the O(n) per-file query
+    cost); this function's check_mtime=True path remains its per-file,
+    lock-held race-condition recheck.
 
     When extract_mode is set (used by convo miner), idempotency is scoped to
     that extraction mode so exchange-mode and general-mode drawers can coexist
@@ -1238,42 +1299,25 @@ def file_already_mined(
         return False
 
 
-def bulk_check_mined(collection) -> dict[str, float]:
-    """Pre-fetch source_file/source_mtime pairs for all documents in the collection.
+def prefetch_mined_set(
+    collection, extract_mode: Optional[str] = None
+) -> dict[str, Optional[float]]:
+    """Pre-fetch source_file -> stored source_mtime for files already mined
+    at the current NORMALIZE_VERSION, in one bulk pass instead of one
+    ChromaDB query per file.
 
-    Returns a dict mapping source_file -> source_mtime (as float) for every
-    document that has both fields.  Callers can check membership and compare
-    mtimes locally instead of issuing one ChromaDB query per file.
-
-    Fetches the full collection in paginated batches (like palace_graph.py)
-    since a WHERE-IN filter on thousands of paths is not supported by ChromaDB.
-    """
-    mined: dict[str, float] = {}
-    try:
-        total = collection.count()
-        offset = 0
-        while offset < total:
-            batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
-            for meta in batch["metadatas"]:
-                src = meta.get("source_file")
-                mtime = meta.get("source_mtime")
-                if src and mtime is not None:
-                    mined[src] = float(mtime)
-            if not batch["ids"]:
-                break
-            offset += len(batch["ids"])
-    except Exception:
-        logger.warning("bulk_check_mined: partial fetch, %d files loaded", len(mined))
-    return mined
-
-
-def prefetch_mined_set(collection, extract_mode: Optional[str] = None) -> set[str]:
-    """Pre-fetch the set of source_files already mined at the current NORMALIZE_VERSION.
-
-    Mirrors file_already_mined()'s version-gate semantics (check_mtime=False
-    branch) but in one bulk pass instead of one ChromaDB query per file.
-    Returns a set of source_file paths whose stored drawers are at or above
-    NORMALIZE_VERSION; callers do `if path in result_set: skip`.
+    Return type is a dict rather than a bare set so callers get mtime
+    awareness "for free": conversation transcripts are not immutable once
+    mined (a Claude Code session keeps appending to the same file while
+    active, and /compact or /clear can rewrite one in place), so "we've
+    seen this source_file before" is not suffient to skip it -- the caller
+    must also confirm its current on-disk mtime still matches what was
+    stored. `if src in mined_set` still means the same thing as the old
+    set-based return (dict `in` checks keys); a caller that wants staleness
+    detection reads `mined_set[src]` and compares against
+    os.path.getmtime(src) itself. `None` means either no mtime was ever
+    stored (drawers written before this field existed) or getmtime failed
+    when the drawer was written -- both should be treated as stale.
 
     When extract_mode is set, mirrors file_already_mined(..., extract_mode=...)
     so conversation mines skip per extraction mode rather than per source file.
@@ -1283,7 +1327,7 @@ def prefetch_mined_set(collection, extract_mode: Optional[str] = None) -> set[st
     palace, making a 2000-file sweep take >1h of pure skip-checking. This
     helper drops that to a single paginated scan plus O(1) lookups.
     """
-    mined: set[str] = set()
+    mined: dict[str, Optional[float]] = {}
     try:
         total = collection.count()
         offset = 0
@@ -1299,7 +1343,8 @@ def prefetch_mined_set(collection, extract_mode: Optional[str] = None) -> set[st
                 # Same default as file_already_mined: missing version == 1
                 version = meta.get("normalize_version", 1)
                 if version >= NORMALIZE_VERSION:
-                    mined.add(src)
+                    stored_mtime = meta.get("source_mtime")
+                    mined[src] = float(stored_mtime) if stored_mtime is not None else None
             if not batch["ids"]:
                 break
             offset += len(batch["ids"])
