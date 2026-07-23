@@ -45,6 +45,7 @@ _NOISE_TAGS = (
     "system-reminder",
     "command-message",
     "command-name",
+    "command-args",
     "task-notification",
     "user-prompt-submit-hook",
     "hook_output",
@@ -52,15 +53,16 @@ _NOISE_TAGS = (
 
 
 def _tag_pattern(name: str) -> "re.Pattern[str]":
-    # Opening tag must begin a line (optionally after a `> ` blockquote marker,
-    # since _messages_to_transcript prefixes lines with `> `). Body is lazy and
+    # Opening tag must begin a line — only a `> ` blockquote marker (added by
+    # _messages_to_transcript) and/or indentation may precede it, since Claude
+    # Code emits slash-command chrome with indented tags. Body is lazy and
     # may cross blank lines — task-notification and system-reminder blocks
     # legitimately carry multi-paragraph payloads (subagent results, recalled
     # memories) — but may not contain another opening of the same tag, so a
     # dangling open tag can never merge with a later block and eat the content
     # between them. Closing tag eats optional trailing whitespace + newline.
     return re.compile(
-        rf"(?m)^(?:> )?<{name}(?:\s[^>]*)?>"
+        rf"(?m)^(?:> )?[ \t]*<{name}(?:\s[^>]*)?>"
         rf"(?:(?!<{name}[\s>])[\s\S])*?"
         rf"</{name}>[ \t]*\n?"
     )
