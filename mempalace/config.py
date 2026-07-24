@@ -889,6 +889,21 @@ class MempalaceConfig:
         return DEFAULT_MAX_BACKUPS if coerced is None else coerced
 
     @property
+    def hook_transcript_wing(self) -> str:
+        """Destination policy for hook-driven transcript mining.
+
+        ``sessions`` preserves the historical shared wing. ``project`` derives a
+        stable per-project wing from the transcript JSONL cwd/path. Invalid values
+        fail safe to ``sessions`` so upgrades cannot silently relocate memories.
+        """
+
+        env_val = os.environ.get("MEMPALACE_HOOK_TRANSCRIPT_WING")
+        hooks = self._file_config.get("hooks", {})
+        raw = env_val if env_val is not None else hooks.get("transcript_wing", "sessions")
+        value = str(raw or "").strip().lower()
+        return value if value in {"sessions", "project"} else "sessions"
+
+    @property
     def hook_silent_save(self):
         """Whether the stop hook saves directly (True) or blocks for MCP calls (False)."""
         return self._file_config.get("hooks", {}).get("silent_save", True)

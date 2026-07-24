@@ -531,11 +531,18 @@ def _hooks_daemon_enabled() -> bool:
         return False
 
 
-def _daemon_mine_dedupe_key(source: str, mode: str) -> str:
+def _daemon_mine_dedupe_key(
+    source: str,
+    mode: str,
+    wing: str | None = None,
+) -> str:
     try:
         source_key = str(Path(source).expanduser().resolve())
     except OSError:
         source_key = str(Path(source).expanduser())
+    wing_key = str(wing or "").strip()
+    if wing_key:
+        return f"hook:mine:{mode}:{wing_key}:{source_key}"
     return f"hook:mine:{mode}:{source_key}"
 
 
@@ -1025,6 +1032,16 @@ def _save_diary_direct(
     return {"count": 0}
 
 
+def _transcript_ingest_wing(path: Path, config: MempalaceConfig) -> str:
+    """Resolve the hook transcript destination without breaking old installs."""
+
+    policy = str(getattr(config, "hook_transcript_wing", "sessions") or "").strip().lower()
+    if policy != "project":
+        return "sessions"
+    derived = _wing_from_transcript_path(str(path))
+    return derived if derived != "wing_sessions" else "sessions"
+
+
 def _ingest_transcript(transcript_path: str):
     """Mine a Claude Code session transcript into the palace as a conversation."""
     path = _validate_transcript_path(transcript_path)
@@ -1037,7 +1054,7 @@ def _ingest_transcript(transcript_path: str):
         return
 
     try:
-        MempalaceConfig()  # validate config loads
+        config = MempalaceConfig()
     except Exception:
         return
 
@@ -1045,6 +1062,8 @@ def _ingest_transcript(transcript_path: str):
     if routing.blocked:
         _log_hook_write_blocked(routing, "transcript ingest")
         return
+
+    transcript_wing = _transcript_ingest_wing(path, config)
 
     try:
         if routing.use_daemon:
@@ -1054,10 +1073,14 @@ def _ingest_transcript(transcript_path: str):
                     {
                         "source": str(path.parent),
                         "mode": "convos",
-                        "wing": "sessions",
+                        "wing": transcript_wing,
                         "agent": "mempalace",
                     },
-                    dedupe_key=_daemon_mine_dedupe_key(str(path.parent), "convos"),
+                    dedupe_key=_daemon_mine_dedupe_key(
+                        str(path.parent),
+                        "convos",
+                        transcript_wing,
+                    ),
                     wait=False,
                 )
                 _log(f"Transcript ingest submitted to daemon: {path.name}")
@@ -1079,7 +1102,7 @@ def _ingest_transcript(transcript_path: str):
                 "--mode",
                 "convos",
                 "--wing",
-                "sessions",
+                transcript_wing,
             ]
         )
         _log(f"Transcript ingest started: {path.name}")

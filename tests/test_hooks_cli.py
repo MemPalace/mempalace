@@ -12,7 +12,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 import mempalace.hooks_cli as hooks_cli_mod
-from mempalace.config import sanitize_name
+from mempalace.config import MempalaceConfig, sanitize_name
 from mempalace.hooks_cli import (
     SAVE_INTERVAL,
     _count_human_messages,
@@ -20,6 +20,7 @@ from mempalace.hooks_cli import (
     _extract_recent_messages,
     _get_mine_targets,
     _hooks_daemon_enabled,
+    _ingest_transcript,
     _log,
     _maybe_auto_ingest,
     _mempalace_python,
@@ -510,6 +511,107 @@ def test_hooks_daemon_enabled_requires_explicit_true():
         assert _hooks_daemon_enabled() is False
         mock_cfg_cls.return_value.hook_use_daemon = True
         assert _hooks_daemon_enabled() is True
+
+
+
+
+def _write_ingest_transcript(path: Path, *, cwd: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    entries = [
+        {"type": "user", "cwd": cwd, "content": "x" * 80},
+        {"message": {"role": "user", "content": "y" * 80}},
+    ]
+    path.write_text(
+        "".join(json.dumps(entry) + "\n" for entry in entries),
+        encoding="utf-8",
+    )
+
+
+def test_hook_transcript_wing_defaults_to_sessions(tmp_path, monkeypatch):
+    monkeypatch.delenv("MEMPALACE_HOOK_TRANSCRIPT_WING", raising=False)
+    assert MempalaceConfig(config_dir=tmp_path).hook_transcript_wing == "sessions"
+
+
+def test_hook_transcript_wing_reads_project_config(tmp_path, monkeypatch):
+    monkeypatch.delenv("MEMPALACE_HOOK_TRANSCRIPT_WING", raising=False)
+    (tmp_path / "config.json").write_text(
+        json.dumps({"hooks": {"transcript_wing": "project"}}),
+        encoding="utf-8",
+    )
+    assert MempalaceConfig(config_dir=tmp_path).hook_transcript_wing == "project"
+
+
+def test_hook_transcript_wing_env_overrides_config(tmp_path, monkeypatch):
+    (tmp_path / "config.json").write_text(
+        json.dumps({"hooks": {"transcript_wing": "sessions"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MEMPALACE_HOOK_TRANSCRIPT_WING", "project")
+    assert MempalaceConfig(config_dir=tmp_path).hook_transcript_wing == "project"
+
+
+def test_hook_transcript_wing_invalid_value_fails_safe_to_sessions(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEMPALACE_HOOK_TRANSCRIPT_WING", "surprise")
+    assert MempalaceConfig(config_dir=tmp_path).hook_transcript_wing == "sessions"
+
+
+def test_ingest_transcript_keeps_sessions_by_default(tmp_path):
+    transcript = tmp_path / "project" / "session.jsonl"
+    _write_ingest_transcript(transcript, cwd="/Users/eddie/git/Starframe-PC-Control")
+    config = MagicMock()
+    config.hook_transcript_wing = "sessions"
+    routing = MagicMock(blocked=False, use_daemon=False)
+
+    with (
+        patch("mempalace.hooks_cli.MempalaceConfig", return_value=config),
+        patch("mempalace.hooks_cli._current_hook_write_routing", return_value=routing),
+        patch("mempalace.hooks_cli._mempalace_python", return_value="/venv/python"),
+        patch("mempalace.hooks_cli._spawn_mine") as spawn,
+    ):
+        _ingest_transcript(str(transcript))
+
+    cmd = spawn.call_args.args[0]
+    assert cmd[cmd.index("--wing") + 1] == "sessions"
+
+
+def test_ingest_transcript_project_mode_uses_stable_cwd_wing(tmp_path):
+    transcript = tmp_path / ".claude" / "projects" / "-Users-eddie-Starframe-PC-Control" / "session.jsonl"
+    _write_ingest_transcript(transcript, cwd="/Users/eddie/git/Starframe-PC-Control")
+    config = MagicMock()
+    config.hook_transcript_wing = "project"
+    routing = MagicMock(blocked=False, use_daemon=False)
+
+    with (
+        patch("mempalace.hooks_cli.MempalaceConfig", return_value=config),
+        patch("mempalace.hooks_cli._current_hook_write_routing", return_value=routing),
+        patch("mempalace.hooks_cli._mempalace_python", return_value="/venv/python"),
+        patch("mempalace.hooks_cli._spawn_mine") as spawn,
+    ):
+        _ingest_transcript(str(transcript))
+
+    cmd = spawn.call_args.args[0]
+    assert cmd[cmd.index("--wing") + 1] == "wing_starframe_pc_control"
+
+
+def test_ingest_transcript_project_mode_routes_daemon_and_dedupe_by_wing(tmp_path):
+    transcript = tmp_path / ".claude" / "projects" / "-Users-eddie-Starframe-PC-Control" / "session.jsonl"
+    _write_ingest_transcript(transcript, cwd="/Users/eddie/git/Starframe-PC-Control")
+    config = MagicMock()
+    config.hook_transcript_wing = "project"
+    routing = MagicMock(blocked=False, use_daemon=True)
+
+    with (
+        patch("mempalace.hooks_cli.MempalaceConfig", return_value=config),
+        patch("mempalace.hooks_cli._current_hook_write_routing", return_value=routing),
+        patch("mempalace.hooks_cli._submit_daemon_job") as submit,
+    ):
+        _ingest_transcript(str(transcript))
+
+    submit.assert_called_once()
+    payload = submit.call_args.args[1]
+    assert payload["wing"] == "wing_starframe_pc_control"
+    dedupe_key = submit.call_args.kwargs["dedupe_key"]
+    assert ":convos:wing_starframe_pc_control:" in dedupe_key
 
 
 # --- hook_session_start ---
