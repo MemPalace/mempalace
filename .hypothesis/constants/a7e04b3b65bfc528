@@ -1,4 +1,0 @@
-# file: /home/runner/work/mempalace/mempalace/mempalace/wal.py
-# hypothesis_version: 6.141.1
-
-[384, 448, '[REDACTED]', 'a', 'content', 'content_preview', 'document', 'entry', 'entry_preview', 'operation', 'params', 'query', 'result', 'text', 'timestamp', 'utf-8', 'write_log.jsonl', '~/.mempalace/wal']

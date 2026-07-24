@@ -1,4 +1,0 @@
-# file: /home/runner/work/mempalace/mempalace/mempalace/query_sanitizer.py
-# hypothesis_version: 6.141.1
-
-[200, 250, '"', "'", '?', '[.!?。！？\\n]+', '[?？]\\s*["\\\']?\\s*$', 'clean_length', 'clean_query', 'mempalace_mcp', 'method', 'original_length', 'passthrough', 'question_extraction', 'tail_sentence', 'tail_truncation', 'was_sanitized', '？']

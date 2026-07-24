@@ -1,4 +1,0 @@
-# file: /home/runner/work/mempalace/mempalace/mempalace/backends/base.py
-# hypothesis_version: 6.141.1
-
-[1000, '1.0', 'GetResult', 'HealthStatus', 'MaintenanceResult', 'QueryResult', '_IncludeSpec', 'cosine', 'distances', 'documents', 'embeddings', 'ids', 'include', 'known_match', 'known_mismatch', 'limit', 'metadatas', 'offset', 'unknown', 'where']

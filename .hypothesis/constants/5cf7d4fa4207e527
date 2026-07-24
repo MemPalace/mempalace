@@ -1,4 +1,0 @@
-# file: /home/runner/work/mempalace/mempalace/mempalace/embedding.py
-# hypothesis_version: 6.141.1
-
-[1e-12, 384, 2048, 'CPUExecutionProvider', 'DmlExecutionProvider', '_data', 'attention_mask', 'auto', 'coreml', 'cpu', 'cuda', 'default', 'dml', 'embeddinggemma', 'embeddinggemma_300m', 'input_ids', 'mempalace[coreml]', 'mempalace[dml]', 'mempalace[gpu]', 'model.onnx', 'model_quantized.onnx', 'onnx', 'probe', 'sentence_embedding', 'tokenizer.json']

@@ -1,4 +1,0 @@
-# file: /home/runner/work/mempalace/mempalace/mempalace/backends/sqlite_exact.py
-# hypothesis_version: 6.141.1
-
-[b'SQLite format 3\x00', -1.0, 0.0, 0.5, 0.75, 1.0, 1.5, 448, 900, '\nLIMIT -1', '\nLIMIT ?', '\nOFFSET ?', ' OR ', '$', '$and', '$contains', '$eq', '$gt', '$gte', '$in', '$lt', '$lte', '$ne', '$nin', '$or', ',', '1', ':', '?', 'ANALYZE', 'LIMIT ?', 'PRAGMA page_count', 'SQLiteExactBackend', 'VACUUM', '\\w{2,}', 'analyze', 'backend closed', 'collection closed', 'collection_name', 'compact', 'create', 'dimension', 'document', 'documents', 'embedding', 'embeddings', 'freelist_pages', 'id', 'local_mode', 'metadata', 'metadatas', 'options', 'page_count', 'pages_after', 'pages_before', 'pages_reclaimed', 'palace', 'palace_path', 'ran', 'rb', 'row_count', 'sqlite_exact', 'sqlite_exact.sqlite3', 'vector_index']

@@ -1,4 +1,0 @@
-# file: /home/runner/work/mempalace/mempalace/mempalace/knowledge_graph.py
-# hypothesis_version: 6.141.1
-
-[1.0, 448, '%Y-%m-%dT%H:%M:%SZ', "'", '-', '2025-01-01', '_', 'adapter_name', 'animal', 'as_of', 'at', 'birthday', 'both', 'brother', 'child_of', 'cnt', 'confidence', 'current', 'current_facts', 'daughter', 'direction', 'dog', 'ended', 'entities', 'expired_facts', 'full_name', 'gender', 'husband', 'id', 'incoming', 'interests', 'is_child_of', 'is_partner_of', 'is_pet_of', 'is_sibling_of', 'loves', 'married_to', 'name', 'obj_name', 'object', 'outgoing', 'owner', 'parent', 'partner', 'person', 'predicate', 'relationship', 'relationship_types', 'sibling', 'source_closet', 'source_drawer_id', 'sub_name', 'subject', 't.valid_from', 't.valid_to', 'triples', 'type', 'unknown', 'valid_from', 'valid_to']
