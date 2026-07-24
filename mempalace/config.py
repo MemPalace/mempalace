@@ -1007,6 +1007,21 @@ class MempalaceConfig:
             return value.lower() in ("true", "1", "yes", "on")
         return value == 1
 
+    @property
+    def hook_wing(self):
+        """Optional canonical wing for hook-created diary checkpoints."""
+        value = os.environ.get("MEMPALACE_HOOK_WING")
+        if value is None:
+            hooks = self._file_config.get("hooks", {})
+            if hooks is None:
+                hooks = {}
+            if not isinstance(hooks, dict):
+                raise ValueError("config hooks must be an object")
+            value = hooks.get("wing")
+        if value is None or value == "":
+            return None
+        return sanitize_name(value, "hook wing")
+
     def set_hook_setting(self, key: str, value: bool):
         """Update a hook setting and write config to disk."""
         if "hooks" not in self._file_config:

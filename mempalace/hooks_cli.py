@@ -1258,6 +1258,18 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
     return "wing_sessions"
 
 
+def _resolved_hook_wing(transcript_path: str) -> str:
+    """Use an operator-selected canonical hook wing, or derive one per project."""
+    try:
+        configured = MempalaceConfig().hook_wing
+    except Exception as exc:
+        _log(f"WARNING: could not read hook wing: {exc}; deriving it from the transcript")
+        configured = None
+    if isinstance(configured, str) and configured:
+        return configured
+    return _wing_from_transcript_path(transcript_path)
+
+
 def hook_stop(data: dict, harness: str):
     """Stop hook: block every N messages for auto-save."""
     if not _palace_root_exists():
@@ -1325,7 +1337,7 @@ def hook_stop(data: dict, harness: str):
                 silent = True
                 toast = False
 
-            project_wing = _wing_from_transcript_path(transcript_path)
+            project_wing = _resolved_hook_wing(transcript_path)
 
             if silent:
                 # Save directly via Python API — systemMessage renders in terminal
@@ -1505,7 +1517,7 @@ def hook_session_end(data: dict, harness: str):
                 _save_diary_direct(
                     valid_transcript,
                     session_id,
-                    wing=_wing_from_transcript_path(valid_transcript),
+                    wing=_resolved_hook_wing(valid_transcript),
                     toast=toast,
                     agent_name=_diary_agent_for_harness(harness),
                 )

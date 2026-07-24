@@ -19,6 +19,7 @@ from mempalace.cli import (
     cmd_instructions,
     cmd_daemon,
     cmd_mine,
+    cmd_migrate_wings,
     cmd_repair,
     cmd_search,
     cmd_split,
@@ -26,6 +27,34 @@ from mempalace.cli import (
     cmd_wakeup,
     main,
 )
+
+
+def test_cmd_migrate_wings_passes_explicit_renames(tmp_path):
+    args = argparse.Namespace(
+        palace=str(tmp_path / "palace"),
+        dry_run=True,
+        yes=False,
+        rename=["wing_claude=sessions", "wing_codex=sessions"],
+    )
+    with patch("mempalace.migrate.migrate_wing_names") as migrate:
+        cmd_migrate_wings(args)
+    migrate.assert_called_once_with(
+        palace_path=str(tmp_path / "palace"),
+        dry_run=True,
+        confirm=False,
+        explicit_renames={"wing_claude": "sessions", "wing_codex": "sessions"},
+    )
+
+
+def test_cmd_migrate_wings_rejects_invalid_rename(tmp_path):
+    args = argparse.Namespace(
+        palace=str(tmp_path / "palace"),
+        dry_run=True,
+        yes=False,
+        rename=["wing_claude"],
+    )
+    with pytest.raises(SystemExit, match="OLD=NEW"):
+        cmd_migrate_wings(args)
 
 
 # ── CLI entry point: PYTHONPATH stripping ────────────────────────────────

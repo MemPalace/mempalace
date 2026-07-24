@@ -35,7 +35,7 @@ import shlex
 import argparse
 from pathlib import Path
 
-from .config import MempalaceConfig
+from .config import MempalaceConfig, sanitize_name
 from .corpus_origin import detect_origin_heuristic, detect_origin_llm
 from .llm_client import LLMError, get_provider
 from .version import __version__
@@ -996,10 +996,18 @@ def cmd_migrate_wings(args):
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     from .migrate import migrate_wing_names
 
+    explicit_renames = {}
+    for item in getattr(args, "rename", None) or []:
+        old, separator, new = item.partition("=")
+        if not separator or not old or not new:
+            raise SystemExit("--rename must use OLD=NEW")
+        explicit_renames[old] = sanitize_name(new, "target wing")
+
     migrate_wing_names(
         palace_path=palace_path,
         dry_run=args.dry_run,
         confirm=getattr(args, "yes", False),
+        explicit_renames=explicit_renames,
     )
 
 
@@ -2186,6 +2194,12 @@ def main():
         "--dry-run",
         action="store_true",
         help="Show what would change without modifying the palace",
+    )
+    p_migrate_wings.add_argument(
+        "--rename",
+        action="append",
+        metavar="OLD=NEW",
+        help="Re-label one wing; repeat to consolidate several wings",
     )
     p_migrate_wings.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
 
