@@ -81,7 +81,7 @@ from .palace import (
 # Module-level imports from .miner so tests can patch them via
 # mempalace.format_miner.<name>. Lazy imports inside functions would not
 # expose these as attributes of this module, breaking the test seams.
-from .config import MempalaceConfig, normalize_wing_name
+from .config import MempalaceConfig, normalize_wing_name, validate_memory_kind
 from .collision_scan import assert_no_collisions
 from .ids import ID_RECIPE, make_drawer_id_from_chunk
 from .miner import (
@@ -536,7 +536,12 @@ def _print_mine_summary(
 
 
 def _register_skip_sentinel_if_appropriate(
-    collection, source_file: str, wing: str, agent: str, status: ExtractionStatus
+    collection,
+    source_file: str,
+    wing: str,
+    agent: str,
+    status: ExtractionStatus,
+    memory_kind: str = "reference",
 ) -> None:
     """Write the ``file_already_mined`` sentinel ONLY when the skip is durable.
 
@@ -548,35 +553,48 @@ def _register_skip_sentinel_if_appropriate(
     """
     if status in _TRANSIENT_MISSING_DEP_STATUSES:
         return
-    _register_file(collection, source_file, wing, agent)
+    _register_file(collection, source_file, wing, agent, memory_kind)
 
 
-def _register_file(collection, source_file: str, wing: str, agent: str) -> None:
+def _register_file(
+    collection,
+    source_file: str,
+    wing: str,
+    agent: str,
+    memory_kind: str = "reference",
+) -> None:
     """Write a sentinel so file_already_mined() returns True for 0-chunk files.
 
     Without this, files that extract to nothing (or hit a SKIP status) get
     rescanned on every re-mine. The sentinel preserves the no-op outcome.
     Mirrors the helper of the same name in convo_miner.py.
     """
+    memory_kind = validate_memory_kind(memory_kind, default="reference")
+    try:
+        source_mtime = os.path.getmtime(source_file)
+    except OSError:
+        source_mtime = None
     sentinel_id = f"sentinel_{wing}_{hashlib.sha256(source_file.encode()).hexdigest()[:24]}"
+    metadata = {
+        "wing": wing,
+        "room": "documents",
+        "source_file": source_file,
+        "chunk_index": -1,
+        "added_by": agent,
+        "filed_at": datetime.now().isoformat(),
+        "memory_kind": memory_kind,
+        "ingest_mode": "extract",
+        "extract_mode": "format",
+        "normalize_version": NORMALIZE_VERSION,
+        "is_sentinel": True,
+    }
+    if source_mtime is not None:
+        metadata["source_mtime"] = source_mtime
     try:
         collection.upsert(
             documents=["[empty]"],
             ids=[sentinel_id],
-            metadatas=[
-                {
-                    "wing": wing,
-                    "room": "documents",
-                    "source_file": source_file,
-                    "chunk_index": -1,
-                    "added_by": agent,
-                    "filed_at": datetime.now().isoformat(),
-                    "ingest_mode": "extract",
-                    "extract_mode": "format",
-                    "normalize_version": NORMALIZE_VERSION,
-                    "is_sentinel": True,
-                }
-            ],
+            metadatas=[metadata],
         )
     except Exception:
         logger.debug("Sentinel write failed for %s", source_file, exc_info=True)
@@ -591,6 +609,7 @@ def _file_chunks_locked(
     agent,
     source_mtime: Optional[float] = None,
     content: Optional[str] = None,
+    memory_kind: str = "reference",
 ):
     """Lock the source file, purge stale drawers, and upsert fresh chunks.
 
@@ -610,6 +629,8 @@ def _file_chunks_locked(
     # module's package, so we defer these helpers until call time).
     from .miner import _extract_content_date, _extract_entities_for_metadata, detect_hall
 
+    memory_kind = validate_memory_kind(memory_kind, default="reference")
+
     # Tier 6a content-date: extract once per file (not per chunk). Format-mined
     # files often have date-rich content (RTF/PDF dates in body text, mtimes on
     # the binary source). Caller may pass ``content`` (full extracted text) for
@@ -628,7 +649,13 @@ def _file_chunks_locked(
         # drawers only — drawers from convo_miner / project miner on the same
         # source_file don't falsely indicate "already mined" to the format
         # miner. Per PR #1555 review (Copilot #12).
-        if file_already_mined(collection, source_file, check_mtime=True, extract_mode="format"):
+        if file_already_mined(
+            collection,
+            source_file,
+            check_mtime=True,
+            extract_mode="format",
+            memory_kind=memory_kind,
+        ):
             return 0, True
 
         try:
@@ -651,6 +678,7 @@ def _file_chunks_locked(
                     "chunk_index": chunk["chunk_index"],
                     "added_by": agent,
                     "filed_at": filed_at,
+                    "memory_kind": memory_kind,
                     "ingest_mode": "extract",
                     "extract_mode": "format",
                     "normalize_version": NORMALIZE_VERSION,
@@ -697,6 +725,7 @@ def mine_formats(
     agent: str = "mempalace",
     limit: int = 0,
     dry_run: bool = False,
+    memory_kind: Optional[str] = None,
 ) -> None:
     """Mine a directory of binary office-format files into the palace.
 
@@ -725,6 +754,10 @@ def mine_formats(
     dry_run :
         If True, walk + extract + chunk but do NOT open the collection or
         upsert any drawers. Just prints what would have been filed.
+    memory_kind :
+        Provenance classification. An explicit value overrides
+        ``mempalace.yaml``; otherwise format extraction defaults to
+        ``reference``.
 
     Notes
     -----
@@ -760,6 +793,7 @@ def mine_formats(
     # detect_room has real categories to route into. Mirrors miner.py:1154.
     # Fall back to a single "documents" room if no config exists — keeps the
     # detector well-defined without forcing a yaml on every format dir.
+    project_config = {}
     try:
         project_config = load_config(format_dir)
         rooms = project_config.get(
@@ -781,6 +815,10 @@ def mine_formats(
                 "keywords": ["documents"],
             }
         ]
+    memory_kind = validate_memory_kind(
+        memory_kind if memory_kind is not None else project_config.get("memory_kind"),
+        default="reference",
+    )
 
     # Initialize loop-state up-front so the outer try/except handlers and the
     # post-try summary print can run safely even if scan_formats or
@@ -806,6 +844,7 @@ def mine_formats(
         print("  MemPalace Mine — Format extraction")
         print(f"{'=' * 55}")
         print(f"  Wing:    {wing}")
+        print(f"  Kind:    {memory_kind}")
         print(f"  Source:  {format_path}")
         limit_suffix = f" (limit: {limit} new)" if limit > 0 else ""
         print(f"  Files:   {len(files)}{limit_suffix}")
@@ -837,7 +876,11 @@ def mine_formats(
                 # indicate "already mined" to the format miner. Per PR #1555
                 # review (Copilot #11).
                 if not dry_run and file_already_mined(
-                    collection, source_file, check_mtime=True, extract_mode="format"
+                    collection,
+                    source_file,
+                    check_mtime=True,
+                    extract_mode="format",
+                    memory_kind=memory_kind,
                 ):
                     files_skipped += 1
                     continue
@@ -848,7 +891,7 @@ def mine_formats(
                 if status != ExtractionStatus.OK or not text:
                     if not dry_run:
                         _register_skip_sentinel_if_appropriate(
-                            collection, source_file, wing, agent, status
+                            collection, source_file, wing, agent, status, memory_kind
                         )
                     print(f"  - [{i:4}/{len(files)}] {filepath.name[:50]:50} {status.name}")
                     continue
@@ -865,7 +908,7 @@ def mine_formats(
                 )
                 if not chunks:
                     if not dry_run:
-                        _register_file(collection, source_file, wing, agent)
+                        _register_file(collection, source_file, wing, agent, memory_kind)
                     print(f"  - [{i:4}/{len(files)}] {filepath.name[:50]:50} EMPTY_AFTER_CHUNK")
                     continue
 
@@ -892,6 +935,7 @@ def mine_formats(
                     agent,
                     source_mtime=source_mtime,
                     content=text,
+                    memory_kind=memory_kind,
                 )
                 if skipped:
                     files_skipped += 1

@@ -14,7 +14,7 @@ import os
 import sys
 from typing import Any
 
-from .config import MempalaceConfig
+from .config import MempalaceConfig, validate_memory_kind
 
 _EXPLICIT_BACKEND_ENV = "MEMPALACE_BACKEND_EXPLICIT"
 _PALACE_PATH_ENV = "MEMPALACE_PALACE_PATH"
@@ -174,6 +174,10 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
                 limit=limit,
                 dry_run=dry_run,
                 extract_mode=payload.get("extract") or "exchange",
+                memory_kind=validate_memory_kind(
+                    payload.get("memory_kind"),
+                    default="archive",
+                ),
             )
         elif mode == "extract":
             from .format_miner import mine_formats
@@ -185,6 +189,7 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
                 agent=agent,
                 limit=limit,
                 dry_run=dry_run,
+                memory_kind=payload.get("memory_kind"),
             )
         elif mode == "projects":
             include_ignored = payload.get("include_ignored") or []
@@ -200,6 +205,7 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
                 respect_gitignore=not bool(payload.get("no_gitignore")),
                 include_ignored=include_ignored,
                 max_chunks_per_file=payload.get("max_chunks_per_file"),
+                memory_kind=payload.get("memory_kind"),
             )
         else:
             return {"success": False, "error": f"invalid mine mode: {mode}", "exit_code": 2}
@@ -224,6 +230,13 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
             "error": str(exc),
             "error_class": "SystemExit",
             "exit_code": code,
+        }
+    except ValueError as exc:
+        return {
+            "success": False,
+            "error": str(exc),
+            "error_class": "ValueError",
+            "exit_code": 2,
         }
     except Exception as exc:
         return {"success": False, "error": f"mine failed: {exc}", "exit_code": 1}

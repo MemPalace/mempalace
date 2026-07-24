@@ -1220,11 +1220,16 @@ def _metadata_matches_extract_mode(meta: dict, extract_mode: Optional[str]) -> b
     return stored_mode == extract_mode or (extract_mode == "exchange" and stored_mode is None)
 
 
+def _metadata_matches_memory_kind(meta: dict, memory_kind: Optional[str]) -> bool:
+    return memory_kind is None or meta.get("memory_kind") == memory_kind
+
+
 def file_already_mined(
     collection,
     source_file: str,
     check_mtime: bool = False,
     extract_mode: Optional[str] = None,
+    memory_kind: Optional[str] = None,
 ) -> bool:
     """Check if a file has already been filed in the palace.
 
@@ -1233,6 +1238,7 @@ def file_already_mined(
       - the stored `normalize_version` is missing or older than the current
         schema (triggers silent rebuild after a normalization upgrade)
       - `check_mtime=True` and the file's mtime differs from the stored one
+      - ``memory_kind`` is set and the stored provenance classification differs
 
     When check_mtime=True (used by the project miner, and by the convo
     miner's in-lock recheck), also re-mines on content change. Conversation
@@ -1247,7 +1253,9 @@ def file_already_mined(
     When extract_mode is set (used by convo miner), idempotency is scoped to
     that extraction mode so exchange-mode and general-mode drawers can coexist
     for the same source transcript. Legacy drawers without extract_mode are
-    treated as exchange-mode drawers.
+    treated as exchange-mode drawers. When ``memory_kind`` is set, only an
+    exact metadata match is current; legacy drawers without the field are
+    re-mined without changing their deterministic IDs.
     """
     try:
         # Under the additive-mining model, a single ``source_file`` can have
@@ -1280,6 +1288,8 @@ def file_already_mined(
                     meta, extract_mode
                 ):
                     continue
+                if not _metadata_matches_memory_kind(meta, memory_kind):
+                    continue
                 # Pre-v2 drawers have no version field — treat them as stale.
                 stored_version = meta.get("normalize_version", 1)
                 if stored_version < NORMALIZE_VERSION:
@@ -1300,7 +1310,9 @@ def file_already_mined(
 
 
 def prefetch_mined_set(
-    collection, extract_mode: Optional[str] = None
+    collection,
+    extract_mode: Optional[str] = None,
+    memory_kind: Optional[str] = None,
 ) -> dict[str, Optional[float]]:
     """Pre-fetch source_file -> stored source_mtime for files already mined
     at the current NORMALIZE_VERSION, in one bulk pass instead of one
@@ -1321,6 +1333,8 @@ def prefetch_mined_set(
 
     When extract_mode is set, mirrors file_already_mined(..., extract_mode=...)
     so conversation mines skip per extraction mode rather than per source file.
+    When ``memory_kind`` is set, legacy or differently classified rows are
+    omitted so the caller re-mines them with the requested provenance.
 
     The convo miner walks thousands of transcript files; per-file
     `collection.get(where={"source_file": X})` costs ~2s on a 150k-drawer
@@ -1339,6 +1353,8 @@ def prefetch_mined_set(
                 if not src:
                     continue
                 if not _metadata_matches_extract_mode(meta, extract_mode):
+                    continue
+                if not _metadata_matches_memory_kind(meta, memory_kind):
                     continue
                 # Same default as file_already_mined: missing version == 1
                 version = meta.get("normalize_version", 1)

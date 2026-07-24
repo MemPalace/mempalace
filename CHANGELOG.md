@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Features
+
+- Added validated `archive`, `curated`, and `reference` memory provenance for mining, curated-only verbatim L1 wake-up selection, and `wake-up --identity-only`.
+
 ---
 
 ## [3.6.0] — 2026-07-14

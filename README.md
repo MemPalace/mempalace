@@ -130,15 +130,20 @@ variables, namespace behavior, and deployment notes.
 
 ```bash
 # Mine content into the palace
-mempalace mine ~/projects/myapp                    # project files
-mempalace mine ~/.claude/projects/ --mode convos   # Claude Code sessions (scope with --wing per project)
+mempalace mine ~/projects/myapp                    # project files (reference by default)
+mempalace mine ~/notes --memory-kind curated       # eligible for verbatim L1 wake-up
+mempalace mine ~/.claude/projects/ --mode convos   # Claude Code sessions (archive by default)
 
 # Search
 mempalace search "why did we switch to GraphQL"
 
-# Load context for a new session
+# Load identity + curated context, or identity alone
 mempalace wake-up
+mempalace wake-up --identity-only
 ```
+
+Project `mempalace.yaml` may set top-level `memory_kind: curated`; an explicit
+`--memory-kind` takes precedence.
 
 For Claude Code, Gemini CLI, [Antigravity](https://mempalaceofficial.com/guide/antigravity.html),
 MCP-compatible tools, and local models, see

@@ -40,6 +40,11 @@ def test_registered_in_tools():
     entry = mcp_server.TOOLS["mempalace_mine"]
     assert entry["handler"] is mcp_server.tool_mine
     assert entry["input_schema"]["required"] == ["source"]
+    assert entry["input_schema"]["properties"]["memory_kind"]["enum"] == [
+        "archive",
+        "curated",
+        "reference",
+    ]
 
 
 # ── Guard rails ──────────────────────────────────────────────────────────
@@ -67,6 +72,34 @@ def test_invalid_mode_returns_structured_error(monkeypatch, config, tmp_dir):
     result = mcp_server.tool_mine(source=src, mode="bogus")
     assert result["success"] is False
     assert "invalid mode" in result["error"].lower()
+
+
+def test_invalid_memory_kind_returns_structured_error(monkeypatch, config, tmp_dir):
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+    src = os.path.join(tmp_dir, "src-kind")
+    os.makedirs(src)
+    result = mcp_server.tool_mine(source=src, mode="projects", memory_kind="summary", dry_run=True)
+    assert result["success"] is False
+    assert result["error_class"] == "ValueError"
+
+
+def test_falsy_explicit_memory_kinds_are_rejected(monkeypatch, config, tmp_dir):
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+    src = os.path.join(tmp_dir, "src-falsy-kind")
+    os.makedirs(src)
+    for invalid in ("", 0, False):
+        result = mcp_server.tool_mine(
+            source=src,
+            mode="convos",
+            memory_kind=invalid,
+            dry_run=True,
+        )
+        assert result["success"] is False
+        assert result["error_class"] == "ValueError"
 
 
 def test_missing_source_dir_returns_structured_error(monkeypatch, config):

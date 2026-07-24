@@ -452,8 +452,8 @@ def collect_corpus_text(
 ) -> str:
     """Gather prose text from ``project_dir`` for use as LLM context source.
 
-    Stratified: reads up to ``max_files`` prose files (``.md``, ``.txt``,
-    ``.rst``), preferring recently-modified. Each file capped at
+    Stratified: reads up to ``max_files`` prose files (``.md``, ``.org``,
+    ``.txt``, ``.rst``), preferring recently-modified. Each file capped at
     ``max_bytes_per_file`` to bound total input.
     """
     from pathlib import Path
