@@ -1,0 +1,54 @@
+name: cleanup-issue-2057
+
+on:
+  push:
+    branches:
+      - fix/2057-hook-transcript-wing
+
+permissions:
+  contents: read
+
+jobs:
+  cleanup:
+    if: ${{ github.actor == github.repository_owner }}
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out owner-controlled repair branch
+        uses: actions/checkout@v4
+        with:
+          ref: fix/2057-hook-transcript-wing
+          fetch-depth: 0
+
+      - name: Remove generated test caches and temporary workflow
+        run: |
+          rm -rf .hypothesis
+          rm -f .github/workflows/cleanup-issue2057.yml
+
+      - name: Enforce exact three-file contribution
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          mapfile -t changed < <(git diff --name-only aa89bd82272f55381206c83b6f306e79351824eb | sort)
+          expected=(
+            mempalace/config.py
+            mempalace/hooks_cli.py
+            tests/test_hooks_cli.py
+          )
+          printf 'Changed files:\n%s\n' "${changed[*]}"
+          test "${#changed[@]}" -eq "${#expected[@]}"
+          for i in "${!expected[@]}"; do
+            test "${changed[$i]}" = "${expected[$i]}"
+          done
+
+      - name: Commit cleanup
+        run: |
+          git config user.name "Forgekeeper Repair Bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A
+          git diff --cached --stat
+          test -n "$(git diff --cached --name-only)"
+          git commit -m "chore: remove generated test caches from issue 2057"
+          git push origin HEAD:fix/2057-hook-transcript-wing
