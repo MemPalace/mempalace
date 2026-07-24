@@ -537,6 +537,7 @@ def test_cmd_mine_without_mode_preserves_projects_legacy_path(monkeypatch):
         respect_gitignore=True,
         include_ignored=[],
         max_chunks_per_file=None,
+        memory_kind=None,
     )
 
 

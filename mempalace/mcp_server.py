@@ -66,6 +66,7 @@ from .config import (  # noqa: E402
     sanitize_iso_temporal,
     sqlite_read_uri,
     strip_lone_surrogates,
+    validate_memory_kind,
 )
 from .version import __version__  # noqa: E402
 from chromadb.errors import NotFoundError as _ChromaNotFoundError  # noqa: E402
@@ -3436,6 +3437,7 @@ def tool_mine(
     limit: int = 0,
     dry_run: bool = False,
     extract: str = "exchange",
+    memory_kind: str = None,
 ):
     """Mine a directory into the palace — the MCP equivalent of ``mempalace mine``.
 
@@ -3504,6 +3506,7 @@ def tool_mine(
                 limit=limit,
                 dry_run=dry_run,
                 extract_mode=extract,
+                memory_kind=validate_memory_kind(memory_kind, default="archive"),
             )
         if mode == "extract":
             from .format_miner import mine_formats
@@ -3515,6 +3518,7 @@ def tool_mine(
                 agent=agent,
                 limit=limit,
                 dry_run=dry_run,
+                memory_kind=memory_kind,
             )
         from .miner import mine
 
@@ -3525,6 +3529,7 @@ def tool_mine(
             agent=agent,
             limit=limit,
             dry_run=dry_run,
+            memory_kind=memory_kind,
         )
 
     try:
@@ -5567,6 +5572,14 @@ TOOLS = {
                     "description": (
                         "Convos extraction strategy: exchange (default) or general. "
                         "Ignored by other modes."
+                    ),
+                },
+                "memory_kind": {
+                    "type": "string",
+                    "enum": ["archive", "curated", "reference"],
+                    "description": (
+                        "Provenance classification. Projects and extract mode default to "
+                        "reference; convos default to archive."
                     ),
                 },
             },
