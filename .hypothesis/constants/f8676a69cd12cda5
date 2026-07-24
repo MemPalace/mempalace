@@ -1,0 +1,4 @@
+# file: /home/runner/work/mempalace/mempalace/mempalace/write_routing.py
+# hypothesis_version: 6.141.1
+
+['0', '1', 'blocked', 'daemon', 'daemon-auto-start', 'daemon-available', 'default', 'direct', 'false', 'no', 'off', 'on', 'policy-direct', 'prefer', 'require', 'true', 'yes']

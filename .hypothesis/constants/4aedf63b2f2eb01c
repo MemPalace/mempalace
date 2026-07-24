@@ -1,0 +1,4 @@
+# file: /home/runner/work/mempalace/mempalace/mempalace/i18n/__init__.py
+# hypothesis_version: 6.141.1
+
+['*.json', '.', '\\b', 'boundary_chars', 'candidate_pattern', 'candidate_patterns', 'dialogue', 'dialogue_patterns', 'direct_address', 'en', 'entity', 'multi_word_pattern', 'multi_word_patterns', 'person_verb_patterns', 'person_verbs', 'project_verbs', 'pronoun_patterns', 'pronouns', 'regex', 'stopwords', 'utf-8']

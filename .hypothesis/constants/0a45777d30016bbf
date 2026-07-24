@@ -1,0 +1,4 @@
+# file: /home/runner/work/mempalace/mempalace/mempalace/hallways.py
+# hypothesis_version: 6.141.1
+
+[384, 5000, '(no room tags)', ', ', '.hallways-', '.mempalace', '.tmp', ';', 'access_count', 'auto', 'co_occurrence_count', 'created_at', 'created_by', 'delete_hallway', 'entities', 'entity_a', 'entity_b', 'hallways', 'hallways.json', 'id', 'is_sentinel', 'label', 'last_activated', 'list_hallways', 'mempalace_hallways', 'metadatas', 'room', 'rooms', 'schema_version', 'stability', 'strength', 'utf-8', 'w', 'wing', '~']

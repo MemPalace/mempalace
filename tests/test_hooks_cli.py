@@ -513,8 +513,6 @@ def test_hooks_daemon_enabled_requires_explicit_true():
         assert _hooks_daemon_enabled() is True
 
 
-
-
 def _write_ingest_transcript(path: Path, *, cwd: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     entries = [
@@ -575,7 +573,9 @@ def test_ingest_transcript_keeps_sessions_by_default(tmp_path):
 
 
 def test_ingest_transcript_project_mode_uses_stable_cwd_wing(tmp_path):
-    transcript = tmp_path / ".claude" / "projects" / "-Users-eddie-Starframe-PC-Control" / "session.jsonl"
+    transcript = (
+        tmp_path / ".claude" / "projects" / "-Users-eddie-Starframe-PC-Control" / "session.jsonl"
+    )
     _write_ingest_transcript(transcript, cwd="/Users/eddie/git/Starframe-PC-Control")
     config = MagicMock()
     config.hook_transcript_wing = "project"
@@ -594,7 +594,9 @@ def test_ingest_transcript_project_mode_uses_stable_cwd_wing(tmp_path):
 
 
 def test_ingest_transcript_project_mode_routes_daemon_and_dedupe_by_wing(tmp_path):
-    transcript = tmp_path / ".claude" / "projects" / "-Users-eddie-Starframe-PC-Control" / "session.jsonl"
+    transcript = (
+        tmp_path / ".claude" / "projects" / "-Users-eddie-Starframe-PC-Control" / "session.jsonl"
+    )
     _write_ingest_transcript(transcript, cwd="/Users/eddie/git/Starframe-PC-Control")
     config = MagicMock()
     config.hook_transcript_wing = "project"

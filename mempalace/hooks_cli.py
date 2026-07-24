@@ -534,7 +534,7 @@ def _hooks_daemon_enabled() -> bool:
 def _daemon_mine_dedupe_key(
     source: str,
     mode: str,
-    wing: str | None = None,
+    wing: Optional[str] = None,
 ) -> str:
     try:
         source_key = str(Path(source).expanduser().resolve())

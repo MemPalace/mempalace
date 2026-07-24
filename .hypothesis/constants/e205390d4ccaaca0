@@ -1,0 +1,4 @@
+# file: /home/runner/work/mempalace/mempalace/mempalace/backends/registry.py
+# hypothesis_version: 6.141.1
+
+['chroma', 'mempalace.backends', 'milvus', 'pgvector', 'qdrant', 'select', 'sqlite_exact']
