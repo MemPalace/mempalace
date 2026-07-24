@@ -1,0 +1,70 @@
+name: repair-issue-2057
+
+on:
+  push:
+    branches:
+      - fix/2057-hook-transcript-wing
+
+permissions:
+  contents: read
+
+jobs:
+  repair:
+    if: ${{ github.actor == github.repository_owner }}
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out owner-controlled repair branch
+        uses: actions/checkout@v4
+        with:
+          ref: fix/2057-hook-transcript-wing
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install focused dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+
+      - name: Run test-first repair
+        id: repair
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          python .github/repair_issue2057.py 2>&1 | tee /tmp/repair-issue2057.log
+
+      - name: Upload exact repair log
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: repair-issue2057-${{ github.run_id }}
+          path: /tmp/repair-issue2057.log
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: Stop on repair failure
+        if: ${{ steps.repair.outcome == 'failure' }}
+        run: exit 1
+
+      - name: Remove temporary repair machinery
+        if: ${{ steps.repair.outcome == 'success' }}
+        run: |
+          rm -f .github/repair_issue2057.py .github/workflows/repair-issue2057.yml
+          git diff --check
+
+      - name: Commit verified fix
+        if: ${{ steps.repair.outcome == 'success' }}
+        run: |
+          git config user.name "Forgekeeper Repair Bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A
+          git diff --cached --stat
+          test -n "$(git diff --cached --name-only)"
+          git commit -m "fix(hooks): route transcript ingest by configured wing"
+          git push origin HEAD:fix/2057-hook-transcript-wing
