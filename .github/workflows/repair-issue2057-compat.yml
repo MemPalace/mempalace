@@ -1,0 +1,71 @@
+name: repair-issue-2057-compat
+
+on:
+  push:
+    branches:
+      - fix/2057-hook-transcript-wing
+
+permissions:
+  contents: read
+
+jobs:
+  repair:
+    if: ${{ github.actor == github.repository_owner }}
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out owner-controlled repair branch
+        uses: actions/checkout@v4
+        with:
+          ref: fix/2057-hook-transcript-wing
+          fetch-depth: 0
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Install focused dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+          python -m pip install 'ruff==0.15.14'
+
+      - name: Repair compatibility and formatting
+        id: repair
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          python .github/repair_issue2057_compat.py 2>&1 | tee /tmp/repair-issue2057-compat.log
+
+      - name: Upload exact repair log
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: repair-issue2057-compat-${{ github.run_id }}
+          path: /tmp/repair-issue2057-compat.log
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: Stop on repair failure
+        if: ${{ steps.repair.outcome == 'failure' }}
+        run: exit 1
+
+      - name: Remove temporary repair machinery
+        if: ${{ steps.repair.outcome == 'success' }}
+        run: |
+          rm -f .github/repair_issue2057_compat.py .github/workflows/repair-issue2057-compat.yml
+          git diff --check
+
+      - name: Commit verified compatibility fix
+        if: ${{ steps.repair.outcome == 'success' }}
+        run: |
+          git config user.name "Forgekeeper Repair Bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A
+          git diff --cached --stat
+          test -n "$(git diff --cached --name-only)"
+          git commit -m "fix(hooks): keep transcript wing routing Python 3.9 compatible"
+          git push origin HEAD:fix/2057-hook-transcript-wing
