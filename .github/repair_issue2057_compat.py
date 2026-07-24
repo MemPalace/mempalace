@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# Temporary owner-controlled CI driver. It deletes itself after verification.
+
 import subprocess
 import sys
 from pathlib import Path
