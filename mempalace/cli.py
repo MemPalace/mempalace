@@ -35,7 +35,7 @@ import shlex
 import argparse
 from pathlib import Path
 
-from .config import MempalaceConfig
+from .config import MEMORY_KINDS, MempalaceConfig
 from .corpus_origin import detect_origin_heuristic, detect_origin_llm
 from .llm_client import LLMError, get_provider
 from .version import __version__
@@ -568,6 +568,7 @@ def cmd_mine(args):
             "include_ignored": include_ignored,
             "max_chunks_per_file": getattr(args, "max_chunks_per_file", None),
             "redetect_origin": getattr(args, "redetect_origin", False),
+            "memory_kind": getattr(args, "memory_kind", None),
         }
         _submit_daemon_cli_job("mine", payload, args, background=getattr(args, "background", False))
         return
@@ -596,6 +597,7 @@ def cmd_mine(args):
                 limit=args.limit,
                 dry_run=args.dry_run,
                 extract_mode=args.extract,
+                memory_kind=getattr(args, "memory_kind", None),
             )
         elif args.mode == "extract":
             from .format_miner import mine_formats
@@ -607,6 +609,7 @@ def cmd_mine(args):
                 agent=args.agent,
                 limit=args.limit,
                 dry_run=args.dry_run,
+                memory_kind=getattr(args, "memory_kind", None),
             )
         else:
             from .miner import mine
@@ -621,6 +624,7 @@ def cmd_mine(args):
                 respect_gitignore=not args.no_gitignore,
                 include_ignored=include_ignored,
                 max_chunks_per_file=getattr(args, "max_chunks_per_file", None),
+                memory_kind=getattr(args, "memory_kind", None),
             )
     except MineAlreadyRunning as exc:
         # A live MCP server or another mine is already writing to this
@@ -947,7 +951,7 @@ def cmd_wakeup(args):
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     stack = MemoryStack(palace_path=palace_path)
 
-    text = stack.wake_up(wing=args.wing)
+    text = stack.wake_up(wing=args.wing, identity_only=getattr(args, "identity_only", False))
     tokens = len(text) // 4
     print(f"Wake-up text (~{tokens} tokens):")
     print("=" * 50)
@@ -1815,6 +1819,15 @@ def main():
     )
     p_mine.add_argument("--wing", default=None, help="Wing name (default: directory name)")
     p_mine.add_argument(
+        "--memory-kind",
+        choices=MEMORY_KINDS,
+        default=None,
+        help=(
+            "Provenance classification. Projects and extract mode default to reference "
+            "and may set memory_kind in mempalace.yaml; convos default to archive."
+        ),
+    )
+    p_mine.add_argument(
         "--no-gitignore",
         action="store_true",
         help="Don't respect .gitignore files when scanning project files",
@@ -1955,6 +1968,11 @@ def main():
     # wake-up
     p_wakeup = sub.add_parser("wake-up", help="Show L0 + L1 wake-up context (~600-900 tokens)")
     p_wakeup.add_argument("--wing", default=None, help="Wake-up for a specific project/wing")
+    p_wakeup.add_argument(
+        "--identity-only",
+        action="store_true",
+        help="Show only L0 identity and skip palace access",
+    )
 
     # split
     p_split = sub.add_parser(

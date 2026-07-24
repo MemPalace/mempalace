@@ -164,6 +164,7 @@ from .config import (  # noqa: E402  (kept here for the legacy alias)
     DEFAULT_CHUNK_SIZE as CHUNK_SIZE,
     DEFAULT_CHUNK_OVERLAP as CHUNK_OVERLAP,
     DEFAULT_MIN_CHUNK_SIZE as MIN_CHUNK_SIZE,
+    validate_memory_kind,
 )
 
 DRAWER_UPSERT_BATCH_SIZE = 1000
@@ -1369,6 +1370,7 @@ def _build_drawer_metadata(
     line_start: Optional[int] = None,
     line_end: Optional[int] = None,
     content_date: Optional[str] = None,
+    memory_kind: str = "reference",
 ) -> dict:
     """Build the metadata dict for one drawer without upserting.
 
@@ -1392,6 +1394,7 @@ def _build_drawer_metadata(
         "chunk_index": chunk_index,
         "added_by": agent,
         "filed_at": datetime.now().isoformat(),
+        "memory_kind": validate_memory_kind(memory_kind),
         "normalize_version": NORMALIZE_VERSION,
         "id_recipe": ID_RECIPE,
     }
@@ -1453,6 +1456,7 @@ def process_file(
     chunk_overlap: int = None,
     min_chunk_size: int = None,
     max_chunks_per_file: Optional[int] = None,
+    memory_kind: str = "reference",
 ) -> tuple:
     """Read, chunk, route, and file one file.
 
@@ -1464,10 +1468,13 @@ def process_file(
     surface a separate counter in the mine summary (see #1455).
     """
     effective_min = min_chunk_size if min_chunk_size is not None else MIN_CHUNK_SIZE
+    memory_kind = validate_memory_kind(memory_kind)
 
     # Skip if already filed
     source_file = str(filepath)
-    if not dry_run and file_already_mined(collection, source_file, check_mtime=True):
+    if not dry_run and file_already_mined(
+        collection, source_file, check_mtime=True, memory_kind=memory_kind
+    ):
         return 0, "general", None
 
     content = _read_text_no_follow(filepath, project_path)
@@ -1511,7 +1518,7 @@ def process_file(
     # both delete, and both insert — creating duplicates or losing data.
     with mine_lock(source_file):
         # Re-check after acquiring lock — another agent may have just finished
-        if file_already_mined(collection, source_file, check_mtime=True):
+        if file_already_mined(collection, source_file, check_mtime=True, memory_kind=memory_kind):
             return 0, room, None
 
         # Purge stale drawers for this file before re-inserting the fresh chunks.
@@ -1566,6 +1573,7 @@ def process_file(
                         line_start=chunk.get("line_start"),
                         line_end=chunk.get("line_end"),
                         content_date=file_content_date,
+                        memory_kind=memory_kind,
                     )
                 )
             assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
@@ -1606,6 +1614,7 @@ def process_file(
                 "source_file": source_file,
                 "drawer_count": drawers_added,
                 "filed_at": datetime.now().isoformat(),
+                "memory_kind": memory_kind,
                 "normalize_version": NORMALIZE_VERSION,
             }
             if entities:
@@ -1748,6 +1757,7 @@ def mine(
     include_ignored: list = None,
     files: list = None,
     max_chunks_per_file: Optional[int] = None,
+    memory_kind: Optional[str] = None,
 ):
     """Mine a project directory into the palace.
 
@@ -1774,6 +1784,7 @@ def mine(
             include_ignored=include_ignored,
             files=files,
             max_chunks_per_file=max_chunks_per_file,
+            memory_kind=memory_kind,
         )
 
     # MineAlreadyRunning propagates so the CLI can render a clear holder-aware
@@ -1791,6 +1802,7 @@ def mine(
             include_ignored=include_ignored,
             files=files,
             max_chunks_per_file=max_chunks_per_file,
+            memory_kind=memory_kind,
         )
 
 
@@ -1805,6 +1817,7 @@ def _mine_impl(
     include_ignored: list = None,
     files: list = None,
     max_chunks_per_file: Optional[int] = None,
+    memory_kind: Optional[str] = None,
 ):
     from .config import MempalaceConfig
 
@@ -1817,6 +1830,10 @@ def _mine_impl(
     cfg_min_chunk_size = palace_config.min_chunk_size
 
     wing = wing_override or config["wing"]
+    memory_kind = validate_memory_kind(
+        memory_kind if memory_kind is not None else config.get("memory_kind"),
+        default="reference",
+    )
     rooms = config.get("rooms", [{"name": "general", "description": "All project files"}])
     exclude_patterns = config.get("exclude_patterns", [])
 
@@ -1838,6 +1855,7 @@ def _mine_impl(
     print("  MemPalace Mine")
     print(f"{'=' * 55}")
     print(f"  Wing:    {wing}")
+    print(f"  Kind:    {memory_kind}")
     print(f"  Rooms:   {', '.join(r['name'] for r in rooms)}")
     limit_suffix = f" (limit: {limit} new)" if limit > 0 else ""
     print(f"  Files:   {len(files)}{limit_suffix}")
@@ -1887,6 +1905,7 @@ def _mine_impl(
                     # otherwise a malformed env var would emit its warning
                     # per file.
                     max_chunks_per_file=effective_chunk_cap,
+                    memory_kind=memory_kind,
                 )
             except KeyboardInterrupt:
                 # Re-raise so the outer handler prints the summary; we

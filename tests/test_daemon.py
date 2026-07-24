@@ -630,6 +630,48 @@ def test_run_sync_returns_success_when_palace_has_no_backend_artifact(tmp_path):
     assert result["exit_code"] == 0
 
 
+def test_run_mine_threads_memory_kind_to_conversation_library(tmp_path, monkeypatch):
+    from mempalace import service
+
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    captured = {}
+
+    def fake_mine_convos(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr("mempalace.convo_miner.mine_convos", fake_mine_convos)
+    out = service.run_mine(
+        {
+            "palace_path": str(palace),
+            "source": str(tmp_path),
+            "mode": "convos",
+            "memory_kind": "curated",
+        }
+    )
+    assert out["success"] is True
+    assert captured["memory_kind"] == "curated"
+
+
+def test_run_mine_rejects_falsy_explicit_memory_kinds(tmp_path):
+    from mempalace import service
+
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    for invalid in ("", 0, False):
+        result = service.run_mine(
+            {
+                "palace_path": str(palace),
+                "source": str(tmp_path),
+                "mode": "convos",
+                "memory_kind": invalid,
+            }
+        )
+        assert result["success"] is False
+        assert result["error_class"] == "ValueError"
+        assert result["exit_code"] == 2
+
+
 def test_run_mine_invalid_mode_returns_structured_error(tmp_path):
     from mempalace import service
 

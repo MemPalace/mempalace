@@ -19,7 +19,6 @@ and ~/.mempalace/identity.txt.
 import os
 import sys
 from pathlib import Path
-from collections import defaultdict
 
 from .config import MempalaceConfig
 from .palace import get_collection as _get_collection
@@ -79,122 +78,151 @@ class Layer0:
 
 
 class Layer1:
-    """
-    ~500-800 tokens. Always loaded.
-    Auto-generated from the highest-weight / most-recent drawers in the palace.
-    Groups by room, picks the top N moments, compresses to a compact summary.
-    """
+    """Verbatim curated memories selected for startup context."""
 
-    MAX_DRAWERS = 15  # at most 15 moments in wake-up
-    MAX_CHARS = 3200  # hard cap on total L1 text (~800 tokens)
-    MAX_SCAN = 2000  # don't scan more than this for L1 generation
+    MAX_DRAWERS = 15
+    MAX_CHARS = 3200
+    MAX_SCAN = 2000
+    MAX_PER_SOURCE = 2
+    MAX_SNIPPET_CHARS = 400
 
     def __init__(self, palace_path: str = None, wing: str = None):
         cfg = MempalaceConfig()
         self.palace_path = palace_path or cfg.palace_path
         self.wing = wing
 
+    @staticmethod
+    def _importance(meta: dict) -> float:
+        for key in ("importance", "emotional_weight", "weight"):
+            value = meta.get(key)
+            if value is not None:
+                try:
+                    return float(value)
+                except (ValueError, TypeError):
+                    return 3.0
+        return 3.0
+
+    @staticmethod
+    def _recency(meta: dict) -> tuple[str, str]:
+        for key in ("authored_at", "content_date", "filed_at"):
+            value = meta.get(key)
+            if value:
+                return key, str(value)
+        return "", ""
+
+    @staticmethod
+    def _chunk_key(meta: dict) -> tuple[int, object]:
+        value = meta.get("chunk_index")
+        try:
+            return 0, int(value)
+        except (TypeError, ValueError):
+            return 1, str(value or "")
+
     def generate(self) -> str:
-        """Pull top drawers from ChromaDB and format as compact L1 text."""
+        """Select explicitly curated drawers and render their content verbatim."""
         try:
             col = _get_collection(self.palace_path, create=False)
         except Exception:
             return "## L1 — No palace found. Run: mempalace mine <dir>"
 
-        # Fetch all drawers in batches to avoid SQLite variable limit (~999)
-        _BATCH = 500
-        docs, metas = [], []
+        batch_size = 500
+        candidates = []
         offset = 0
-        while True:
-            kwargs = {"include": ["documents", "metadatas"], "limit": _BATCH, "offset": offset}
+        rows_scanned = 0
+        while rows_scanned < self.MAX_SCAN:
+            clauses = [{"memory_kind": "curated"}]
             if self.wing:
-                kwargs["where"] = {"wing": self.wing}
+                clauses.append({"wing": self.wing})
+            where = clauses[0] if len(clauses) == 1 else {"$and": clauses}
+            page_limit = min(batch_size, self.MAX_SCAN - rows_scanned)
             try:
-                batch = col.get(**kwargs)
+                batch = col.get(
+                    include=["documents", "metadatas"],
+                    limit=page_limit,
+                    offset=offset,
+                    where=where,
+                )
             except Exception:
                 break
-            batch_docs = batch.get("documents", [])
-            batch_metas = batch.get("metadatas", [])
-            if not batch_docs:
+            batch_docs = batch.get("documents") or []
+            batch_metas = batch.get("metadatas") or []
+            batch_ids = batch.get("ids") or []
+            row_count = max(len(batch_ids), len(batch_docs), len(batch_metas))
+            if not row_count:
                 break
-            docs.extend(batch_docs)
-            metas.extend(batch_metas)
-            offset += len(batch_docs)
-            if len(batch_docs) < _BATCH or len(docs) >= self.MAX_SCAN:
+            for index, (doc, meta) in enumerate(zip(batch_docs, batch_metas)):
+                meta = meta or {}
+                if meta.get("memory_kind") != "curated":
+                    continue
+                if meta.get("is_sentinel") or meta.get("ingest_mode") == "registry":
+                    continue
+                doc = doc or ""
+                if not doc:
+                    continue
+                drawer_id = (
+                    str(batch_ids[index])
+                    if index < len(batch_ids)
+                    else f"scan-{offset + index:012d}"
+                )
+                date_kind, recency = self._recency(meta)
+                source = str(meta.get("source_file") or "")
+                candidates.append(
+                    (
+                        self._importance(meta),
+                        recency,
+                        source,
+                        self._chunk_key(meta),
+                        drawer_id,
+                        date_kind,
+                        meta,
+                        doc,
+                    )
+                )
+            rows_scanned += row_count
+            offset += row_count
+            if row_count < page_limit:
                 break
 
-        if not docs:
-            return "## L1 — No memories yet."
+        if not candidates:
+            return "## L1 — No curated memories."
 
-        # Score each drawer: prefer high importance, then most-recent filing.
-        # NOTE: the ingest pipeline (miner, convo_miner, diary, add_drawer)
-        # records provenance metadata — wing/room/source/chunk/filed_at — but
-        # never an evaluative importance/weight field. So `importance` is
-        # absent on virtually every drawer and ties at the default, which used
-        # to collapse the sort to insertion order (oldest first). `filed_at`
-        # is present on every drawer, so it is the *effective* ordering signal:
-        # newest first. This keeps importance as the primary key for the day a
-        # scoring pass populates it, while making the "recent filing" half of
-        # the promise true today with data we already have.
-        scored = []
-        for doc, meta in zip(docs, metas):
-            meta = meta or {}
-            doc = doc or ""
-            importance = 3.0
-            # Try multiple metadata keys that might carry weight info
-            for key in ("importance", "emotional_weight", "weight"):
-                val = meta.get(key)
-                if val is not None:
-                    try:
-                        importance = float(val)
-                    except (ValueError, TypeError):
-                        pass
-                    break
-            # filed_at is an ISO-8601 string; ISO strings sort lexicographically
-            # in chronological order. Coerce to str so a missing/odd value sorts
-            # oldest rather than raising during the comparison.
-            recency = str(meta.get("filed_at") or "")
-            scored.append((importance, recency, meta, doc))
+        # Stable passes keep score/recency descending while every exact tie is
+        # deterministic by source, chunk, drawer id, then verbatim content.
+        candidates.sort(key=lambda item: (item[2], item[3], item[4], item[7]))
+        candidates.sort(key=lambda item: item[1], reverse=True)
+        candidates.sort(key=lambda item: item[0], reverse=True)
 
-        # Sort by importance desc, then recency (filed_at) desc; take top N.
-        scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
-        top = [(imp, meta, doc) for imp, _recency, meta, doc in scored[: self.MAX_DRAWERS]]
+        selected = []
+        source_counts = {}
+        for item in candidates:
+            source_key = item[2] or f"drawer:{item[4]}"
+            if source_counts.get(source_key, 0) >= self.MAX_PER_SOURCE:
+                continue
+            source_counts[source_key] = source_counts.get(source_key, 0) + 1
+            selected.append(item)
+            if len(selected) >= self.MAX_DRAWERS:
+                break
 
-        # Group by room for readability
-        by_room = defaultdict(list)
-        for imp, meta, doc in top:
-            room = meta.get("room", "general")
-            by_room[room].append((imp, meta, doc))
+        rendered = "## L1 — ESSENTIAL STORY (curated, verbatim)"
+        for _importance, date, source, _chunk_key, _drawer_id, date_kind, meta, doc in selected:
+            source_display = source if len(source) <= 240 else "…" + source[-239:]
+            provenance = [
+                f"{meta.get('wing', '?')}/{meta.get('room', '?')}",
+                f"source={source_display or '?'}",
+                f"chunk={meta.get('chunk_index', '?')}",
+            ]
+            if date:
+                provenance.append(f"{date_kind}={date}")
+            prefix = "\n\n- " + " | ".join(provenance) + "\n"
+            remaining = self.MAX_CHARS - len(rendered) - len(prefix)
+            if remaining <= 0:
+                break
+            snippet = doc[: min(self.MAX_SNIPPET_CHARS, remaining)]
+            if not snippet:
+                continue
+            rendered += prefix + snippet
 
-        # Build compact text
-        lines = ["## L1 — ESSENTIAL STORY"]
-
-        total_len = 0
-        for room, entries in sorted(by_room.items()):
-            room_line = f"\n[{room}]"
-            lines.append(room_line)
-            total_len += len(room_line)
-
-            for _imp, meta, doc in entries:
-                source = Path(meta.get("source_file", "")).name if meta.get("source_file") else ""
-
-                # Truncate doc to keep L1 compact
-                snippet = doc.strip().replace("\n", " ")
-                if len(snippet) > 200:
-                    snippet = snippet[:197] + "..."
-
-                entry_line = f"  - {snippet}"
-                if source:
-                    entry_line += f"  ({source})"
-
-                if total_len + len(entry_line) > self.MAX_CHARS:
-                    lines.append("  ... (more in L3 search)")
-                    return "\n".join(lines)
-
-                lines.append(entry_line)
-                total_len += len(entry_line)
-
-        return "\n".join(lines)
+        return rendered
 
 
 # ---------------------------------------------------------------------------
@@ -401,26 +429,14 @@ class MemoryStack:
         self.l2 = Layer2(self.palace_path)
         self.l3 = Layer3(self.palace_path)
 
-    def wake_up(self, wing: str = None) -> str:
-        """
-        Generate wake-up text: L0 (identity) + L1 (essential story).
-        Typically ~600-900 tokens. Inject into system prompt or first message.
-
-        Args:
-            wing: Optional wing filter for L1 (project-specific wake-up).
-        """
-        parts = []
-
-        # L0: Identity
-        parts.append(self.l0.render())
-        parts.append("")
-
-        # L1: Essential Story
+    def wake_up(self, wing: str = None, identity_only: bool = False) -> str:
+        """Generate L0 identity plus curated L1, or only L0 when requested."""
+        identity = self.l0.render()
+        if identity_only:
+            return identity
         if wing:
             self.l1.wing = wing
-        parts.append(self.l1.generate())
-
-        return "\n".join(parts)
+        return "\n".join((identity, "", self.l1.generate()))
 
     def recall(self, wing: str = None, room: str = None, n_results: int = 10) -> str:
         """On-demand L2 retrieval filtered by wing/room."""
@@ -472,8 +488,9 @@ if __name__ == "__main__":
         print("layers.py — 4-Layer Memory Stack")
         print()
         print("Usage:")
-        print("  python layers.py wake-up              Show L0 + L1")
-        print("  python layers.py wake-up --wing=NAME  Wake-up for a specific project")
+        print("  python -m mempalace.layers wake-up                  Show L0 + L1")
+        print("  python -m mempalace.layers wake-up --identity-only  Show only L0")
+        print("  python -m mempalace.layers wake-up --wing=NAME      Project wake-up")
         print("  python layers.py recall --wing=NAME   On-demand L2 retrieval")
         print("  python layers.py search <query>       Deep L3 search")
         print("  python layers.py status               Show layer status")
@@ -491,7 +508,9 @@ if __name__ == "__main__":
         if arg.startswith("--") and "=" in arg:
             key, val = arg.split("=", 1)
             flags[key.lstrip("-")] = val
-        elif not arg.startswith("--"):
+        elif arg.startswith("--"):
+            flags[arg.lstrip("-")] = True
+        else:
             positional.append(arg)
 
     palace_path = flags.get("palace")
@@ -499,7 +518,7 @@ if __name__ == "__main__":
 
     if cmd in ("wake-up", "wakeup"):
         wing = flags.get("wing")
-        text = stack.wake_up(wing=wing)
+        text = stack.wake_up(wing=wing, identity_only="identity-only" in flags)
         tokens = len(text) // 4
         print(f"Wake-up text (~{tokens} tokens):")
         print("=" * 50)

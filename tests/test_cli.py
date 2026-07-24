@@ -576,6 +576,7 @@ def test_cmd_mine_projects_mode(mock_config_cls):
             respect_gitignore=True,
             include_ignored=[],
             max_chunks_per_file=None,
+            memory_kind=None,
         )
 
 
@@ -604,7 +605,58 @@ def test_cmd_mine_convos_mode(mock_config_cls):
             limit=10,
             dry_run=True,
             extract_mode="general",
+            memory_kind=None,
         )
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_mine_extract_threads_memory_kind(mock_config_cls):
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    args = argparse.Namespace(
+        dir="/documents",
+        palace=None,
+        mode="extract",
+        wing="docs",
+        agent="me",
+        limit=3,
+        dry_run=True,
+        no_gitignore=False,
+        include_ignored=[],
+        extract="exchange",
+        memory_kind="curated",
+    )
+    with patch("mempalace.format_miner.mine_formats") as mock_mine:
+        cmd_mine(args)
+    mock_mine.assert_called_once_with(
+        format_dir="/documents",
+        palace_path="/fake/palace",
+        wing="docs",
+        agent="me",
+        limit=3,
+        dry_run=True,
+        memory_kind="curated",
+    )
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_mine_memory_kind_override(mock_config_cls):
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    args = argparse.Namespace(
+        dir="/src",
+        palace=None,
+        mode="projects",
+        wing=None,
+        agent="mempalace",
+        limit=0,
+        dry_run=False,
+        no_gitignore=False,
+        include_ignored=[],
+        extract="exchange",
+        memory_kind="curated",
+    )
+    with patch("mempalace.miner.mine") as mock_mine:
+        cmd_mine(args)
+    assert mock_mine.call_args.kwargs["memory_kind"] == "curated"
 
 
 @patch("mempalace.cli.MempalaceConfig")
@@ -661,6 +713,7 @@ def test_cmd_mine_daemon_background_submits_job(mock_config_cls, capsys):
     assert call_kwargs["wait"] is False
     payload = mock_submit.call_args.args[1]
     assert payload["include_ignored"] == ["a.txt", "b.txt"]
+    assert payload["memory_kind"] is None
     assert "job-1" in capsys.readouterr().out
 
 
@@ -732,14 +785,27 @@ def test_cmd_mine_exits_nonzero_on_lock_holder(mock_config_cls, capsys):
 @patch("mempalace.cli.MempalaceConfig")
 def test_cmd_wakeup(mock_config_cls, capsys):
     mock_config_cls.return_value.palace_path = "/fake/palace"
-    args = argparse.Namespace(palace=None, wing=None)
+    args = argparse.Namespace(palace=None, wing=None, identity_only=False)
     mock_stack = MagicMock()
     mock_stack.wake_up.return_value = "Hello world context"
     with patch("mempalace.layers.MemoryStack", return_value=mock_stack):
         cmd_wakeup(args)
+    mock_stack.wake_up.assert_called_once_with(wing=None, identity_only=False)
     out = capsys.readouterr().out
     assert "Hello world context" in out
     assert "tokens" in out
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_wakeup_identity_only(mock_config_cls, capsys):
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    args = argparse.Namespace(palace=None, wing="project", identity_only=True)
+    mock_stack = MagicMock()
+    mock_stack.wake_up.return_value = "Identity only"
+    with patch("mempalace.layers.MemoryStack", return_value=mock_stack):
+        cmd_wakeup(args)
+    mock_stack.wake_up.assert_called_once_with(wing="project", identity_only=True)
+    assert "Identity only" in capsys.readouterr().out
 
 
 # ── cmd_split ──────────────────────────────────────────────────────────
@@ -834,20 +900,25 @@ def test_main_init_dispatches():
 
 def test_main_mine_dispatches():
     with (
-        patch("sys.argv", ["mempalace", "mine", "/some/dir"]),
+        patch(
+            "sys.argv",
+            ["mempalace", "mine", "/some/dir", "--memory-kind", "curated"],
+        ),
         patch("mempalace.cli.cmd_mine") as mock_cmd,
     ):
         main()
         mock_cmd.assert_called_once()
+        assert mock_cmd.call_args.args[0].memory_kind == "curated"
 
 
 def test_main_wakeup_dispatches():
     with (
-        patch("sys.argv", ["mempalace", "wake-up"]),
+        patch("sys.argv", ["mempalace", "wake-up", "--identity-only"]),
         patch("mempalace.cli.cmd_wakeup") as mock_cmd,
     ):
         main()
         mock_cmd.assert_called_once()
+        assert mock_cmd.call_args.args[0].identity_only is True
 
 
 def test_main_split_dispatches():

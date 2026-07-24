@@ -33,6 +33,20 @@ _SAFE_NAME_RE = re.compile(r"^(?:[^\W_]|[^\W_][\w .'-]{0,126}[^\W_])$")
 # crashes ChromaDB add/upsert with -32000. See issue #1235.
 _LONE_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
 
+MEMORY_KINDS = ("archive", "curated", "reference")
+
+
+def validate_memory_kind(value, default=None) -> str:
+    """Return a canonical provenance classification or raise ``ValueError``."""
+    if value is None:
+        value = default
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"memory_kind must be one of: {', '.join(MEMORY_KINDS)}")
+    normalized = value.strip().lower()
+    if normalized not in MEMORY_KINDS:
+        raise ValueError(f"memory_kind must be one of: {', '.join(MEMORY_KINDS)}")
+    return normalized
+
 
 def strip_lone_surrogates(text: str) -> str:
     """Replace lone UTF-16 surrogates with U+FFFD so the string is legal UTF-8 (#1235)."""

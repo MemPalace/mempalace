@@ -22,6 +22,7 @@ from .collision_scan import assert_no_collisions
 from .ids import ID_RECIPE, make_convo_drawer_id, make_convo_sentinel_id
 from .normalize import normalize
 from .entities import entities_metadata
+from .config import validate_memory_kind
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
@@ -118,7 +119,14 @@ def _is_regular_source_file(filepath: Path, root: Path) -> bool:
                 pass
 
 
-def _register_file(collection, source_file: str, wing: str, agent: str, extract_mode: str):
+def _register_file(
+    collection,
+    source_file: str,
+    wing: str,
+    agent: str,
+    extract_mode: str,
+    memory_kind: str = "archive",
+):
     """Write a sentinel so file_already_mined() returns True for 0-chunk files.
 
     Without this, files that normalize to nothing or produce zero chunks are
@@ -141,6 +149,7 @@ def _register_file(collection, source_file: str, wing: str, agent: str, extract_
         "source_file": source_file,
         "added_by": agent,
         "filed_at": datetime.now().isoformat(),
+        "memory_kind": validate_memory_kind(memory_kind),
         "ingest_mode": "registry",
         "extract_mode": extract_mode,
         "normalize_version": NORMALIZE_VERSION,
@@ -488,7 +497,15 @@ def _extract_authored_at(filepath):
 
 
 def _file_chunks_locked(
-    collection, source_file, chunks, wing, room, agent, extract_mode, authored_at=None
+    collection,
+    source_file,
+    chunks,
+    wing,
+    room,
+    agent,
+    extract_mode,
+    memory_kind="archive",
+    authored_at=None,
 ):
     """Lock the source file, purge stale drawers, and upsert fresh chunks.
 
@@ -508,7 +525,13 @@ def _file_chunks_locked(
         # Re-check after lock — another agent may have just finished this file
         # at the current schema/mtime. A stale hit here returns False, so we
         # still fall through to the purge+rebuild path below.
-        if file_already_mined(collection, source_file, check_mtime=True, extract_mode=extract_mode):
+        if file_already_mined(
+            collection,
+            source_file,
+            check_mtime=True,
+            extract_mode=extract_mode,
+            memory_kind=memory_kind,
+        ):
             return 0, room_counts_delta, True
 
         # Purge stale drawers first. Fires both on a normalize-schema bump
@@ -552,6 +575,7 @@ def _file_chunks_locked(
                     "chunk_index": chunk["chunk_index"],
                     "added_by": agent,
                     "filed_at": filed_at,
+                    "memory_kind": memory_kind,
                     "entities": entities_metadata(chunk["content"]),
                     "authored_at": authored_at if authored_at is not None else filed_at,
                     "ingest_mode": "convos",
@@ -660,6 +684,7 @@ def mine_convos(
     limit: int = 0,
     dry_run: bool = False,
     extract_mode: str = "exchange",
+    memory_kind: str = "archive",
 ):
     """Mine a directory of conversation files into the palace.
 
@@ -692,6 +717,7 @@ def mine_convos(
             limit=limit,
             dry_run=dry_run,
             extract_mode=extract_mode,
+            memory_kind=memory_kind,
         )
 
     with mine_palace_lock(palace_path):
@@ -703,6 +729,7 @@ def mine_convos(
             limit=limit,
             dry_run=dry_run,
             extract_mode=extract_mode,
+            memory_kind=memory_kind,
         )
 
 
@@ -730,6 +757,7 @@ def _mine_convos_impl(
     limit: int = 0,
     dry_run: bool = False,
     extract_mode: str = "exchange",
+    memory_kind: str = "archive",
 ):
     from .config import MempalaceConfig
 
@@ -748,6 +776,7 @@ def _mine_convos_impl(
 
     convo_path = Path(convo_dir).expanduser().resolve()
     wing = _resolve_wing(convo_path, wing)
+    memory_kind = validate_memory_kind(memory_kind, default="archive")
 
     files = scan_convos(convo_dir)
 
@@ -755,6 +784,7 @@ def _mine_convos_impl(
     print("  MemPalace Mine — Conversations")
     print(f"{'=' * 55}")
     print(f"  Wing:    {wing}")
+    print(f"  Kind:    {memory_kind}")
     print(f"  Source:  {convo_path}")
     limit_suffix = f" (limit: {limit} new)" if limit > 0 else ""
     print(f"  Files:   {len(files)}{limit_suffix}")
@@ -772,7 +802,9 @@ def _mine_convos_impl(
     # prefetch_mined_set() does the same decisions in a single scan; loop
     # body becomes an O(1) dict lookup + a cheap local mtime comparison.
     mined_mtimes: dict = (
-        prefetch_mined_set(collection, extract_mode=extract_mode) if not dry_run else {}
+        prefetch_mined_set(collection, extract_mode=extract_mode, memory_kind=memory_kind)
+        if not dry_run
+        else {}
     )
 
     total_drawers = 0
@@ -806,12 +838,12 @@ def _mine_convos_impl(
             content = normalize(str(filepath))
         except (OSError, ValueError):
             if not dry_run:
-                _register_file(collection, source_file, wing, agent, extract_mode)
+                _register_file(collection, source_file, wing, agent, extract_mode, memory_kind)
             continue
 
         if not content or len(content.strip()) < cfg_min_chunk_size:
             if not dry_run:
-                _register_file(collection, source_file, wing, agent, extract_mode)
+                _register_file(collection, source_file, wing, agent, extract_mode, memory_kind)
             continue
 
         # Chunk — either exchange pairs or general extraction
@@ -829,7 +861,7 @@ def _mine_convos_impl(
 
         if not chunks:
             if not dry_run:
-                _register_file(collection, source_file, wing, agent, extract_mode)
+                _register_file(collection, source_file, wing, agent, extract_mode, memory_kind)
             continue
 
         # Detect room from content (general mode uses memory_type instead)
@@ -872,6 +904,7 @@ def _mine_convos_impl(
             room,
             agent,
             extract_mode,
+            memory_kind=memory_kind,
             authored_at=_extract_authored_at(filepath),
         )
         if skipped:
