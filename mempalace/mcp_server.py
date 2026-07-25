@@ -323,6 +323,9 @@ _READ_ONLY = bool(getattr(_args, "read_only", False)) or os.environ.get(
 
 _kg_by_path: dict[str, KnowledgeGraph] = {}
 _kg_cache_lock = threading.Lock()
+# Narrow guards so read paths do not depend on the (now write-only) global lock.
+_metadata_cache_lock = threading.Lock()
+_collection_cache_lock = threading.RLock()
 _palace_flag_given: bool = bool(_args.palace)
 
 # MCP server idle auto-exit (#1552).  Stale MCP servers from ended Claude
@@ -1065,23 +1068,27 @@ def _get_collection(create=False):
                 ):
                     _collection_open_error = None
                     return _collection_cache
-                _collection_cache = None
-                _collection_cache_backend = None
-                _collection_cache_palace = None
-                if _collection_cache is None:
-                    from .palace import get_collection as palace_get_collection
+                with _collection_cache_lock:
+                    # Double-checked locking: another thread may have rebuilt
+                    # the handle while we waited on the lock.
+                    if not (
+                        _collection_cache is not None
+                        and _collection_cache_backend == backend_name
+                        and _collection_cache_palace == _config.palace_path
+                    ):
+                        from .palace import get_collection as palace_get_collection
 
-                    _collection_cache = palace_get_collection(
-                        _config.palace_path,
-                        collection_name=_config.collection_name,
-                        create=create,
-                        backend=backend_name,
-                    )
-                    _collection_cache_backend = backend_name
-                    _collection_cache_palace = _config.palace_path
-                    _collection_open_error = None
-                    _metadata_cache = None
-                    _metadata_cache_time = 0
+                        _collection_cache = palace_get_collection(
+                            _config.palace_path,
+                            collection_name=_config.collection_name,
+                            create=create,
+                            backend=backend_name,
+                        )
+                        _collection_cache_backend = backend_name
+                        _collection_cache_palace = _config.palace_path
+                        _collection_open_error = None
+                        _metadata_cache = None
+                        _metadata_cache_time = 0
                 return _collection_cache
             except (BackendMismatchError, KeyError) as exc:
                 logger.warning("backend open failed for %s: %s", _config.palace_path, exc)
@@ -1384,8 +1391,9 @@ def _get_cached_metadata(col, where=None):
         return _metadata_cache
     result = _fetch_all_metadata(col, where=where)
     if where is None:
-        _metadata_cache = result
-        _metadata_cache_time = now
+        with _metadata_cache_lock:
+            _metadata_cache = result
+            _metadata_cache_time = now
     return result
 
 
@@ -5123,6 +5131,25 @@ def _json_rpc_parse_error(req_id=None):
 # Defined here (not inside main()) so _serve_http() / _build_http_server()
 # can reference them as free names without a NameError.
 _HTTP_REQUEST_LOCK = threading.Lock()
+
+# Only mutating tools acquire _HTTP_REQUEST_LOCK; all reads (and
+# initialize/ping/tools/list) run concurrently, lock-free. Derived from the
+# canonical _MUTATING_TOOLS set (defined above) so it cannot drift from it.
+# mempalace_reconnect is added on top because tool_reconnect() closes and
+# rebuilds the shared backend handle, which must not race a concurrent read.
+_WRITE_TOOLS = _MUTATING_TOOLS | {"mempalace_reconnect"}
+
+
+def _request_is_mutation(request):
+    # True only for a tools/call to a mutating tool; everything else is lock-free.
+    if not isinstance(request, dict):
+        return False
+    if request.get("method") != "tools/call":
+        return False
+    params = request.get("params") or {}
+    if not isinstance(params, dict):
+        return False
+    return params.get("name") in _WRITE_TOOLS
 _HTTP_MAX_REQUEST_BYTES = 16 * 1024 * 1024
 # Host literals that always denote this machine. Used both to decide whether a
 # bind is loopback (skip the network-exposure warning) and to pin the Host
@@ -5350,10 +5377,15 @@ def _build_http_server(host: str, port: int):
                 self._send_json(400, _json_rpc_parse_error())
                 return
 
-            # Preserve the single-process / single-palace-handle behavior that
-            # stdio deployments rely on. HTTP gives us a safer transport, not
-            # concurrent Chroma/HNSW mutation.
-            with _HTTP_REQUEST_LOCK:
+            # Write-only serialization: the global lock previously wrapped
+            # EVERY request, so a slow read (e.g. a list_wings full-scan) blocked
+            # all concurrent searches and stalled client connects. Only mutating
+            # tools take the single-writer guard now; reads (and
+            # initialize/ping/tools/list) run concurrently, lock-free.
+            if _request_is_mutation(request):
+                with _HTTP_REQUEST_LOCK:
+                    response = handle_request(request)
+            else:
                 response = handle_request(request)
 
             if response is None:
