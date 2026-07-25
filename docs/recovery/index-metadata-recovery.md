@@ -21,7 +21,7 @@ then creates a fresh empty segment under the same UUID. The previous vectors
 Vector search starts returning the "HNSW capacity divergence" message and
 falling back to BM25-only sqlite results. Operators see:
 
-- `mempalace search --query "<test>"` returns `"fallback": "bm25_only_via_sqlite"`,
+- `mempalace search "<test>"` returns `"fallback": "bm25_only_via_sqlite"`,
   `"vector_disabled": true`
 - HNSW element count drops from the expected N to <1000 (just the fresh
   empty segment's accumulating writes)
@@ -141,7 +141,7 @@ sudo systemctl start palace-daemon.service       # or your equivalent
 sleep 10  # warmup window
 
 # Confirm vector search is back (not BM25-only fallback):
-mempalace search --query "any-test-query" --limit 1
+mempalace search "any-test-query" --results 1
 # Look for: "matched_via": "drawer" with a real similarity score,
 # and absence of "fallback": "bm25_only_via_sqlite".
 
