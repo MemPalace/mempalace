@@ -238,7 +238,7 @@ print(status)
     # Expand a leading ~ in the transcript path so downstream
     # ``[ -f "$path" ]`` checks resolve correctly.
     case "$MEMPAL_TRANSCRIPT" in
-        '~/'*) MEMPAL_TRANSCRIPT="$HOME/${MEMPAL_TRANSCRIPT#~/}" ;;
+        '~/'*) MEMPAL_TRANSCRIPT="$HOME/${MEMPAL_TRANSCRIPT#"~/"}" ;;
     esac
 }
 
