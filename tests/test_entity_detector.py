@@ -3,6 +3,7 @@
 import contextlib
 import json
 import os
+import threading
 from pathlib import Path
 from unittest.mock import patch
 
@@ -10,6 +11,7 @@ from mempalace.entity_detector import (
     PROSE_EXTENSIONS,
     STOPWORDS,
     _print_entity_list,
+    _strip_long_tokens,
     classify_entity,
     confirm_entities,
     detect_entities,
@@ -1059,3 +1061,55 @@ def test_zh_tw_known_limitation_inline_name_no_boundary():
     result = extract_candidates(text, languages=("zh-TW",))
     # Extraction is expected to miss this adversarial case.
     assert "朱宜振" not in result
+
+
+# ── catastrophic-backtracking guard (issue #2063) ─────────────
+
+
+def _run_within(fn, timeout=10.0):
+    """Run ``fn`` in a worker thread and fail if it does not finish in time.
+
+    A regression that reintroduces the catastrophic backtracking would hang
+    ``re.findall`` for hours; this bounds the test instead of hanging CI.
+    """
+    box = {}
+
+    def target():
+        box["value"] = fn()
+
+    t = threading.Thread(target=target, daemon=True)
+    t.start()
+    t.join(timeout)
+    assert not t.is_alive(), "call did not complete in time — candidate regex hung"
+    return box["value"]
+
+
+def test_strip_long_tokens_collapses_long_runs():
+    # A run of 30+ non-whitespace chars is collapsed to a single space.
+    assert _strip_long_tokens("A" * 30) == " "
+    # 29 chars is under the threshold and is left untouched.
+    assert _strip_long_tokens("A" * 29) == "A" * 29
+    blob = "x" * 100
+    out = _strip_long_tokens("before " + blob + " after")
+    assert blob not in out
+    assert "before" in out and "after" in out
+
+
+def test_strip_long_tokens_preserves_natural_language():
+    text = "Riley said hello to Devon about the GraphQL migration."
+    assert _strip_long_tokens(text) == text
+
+
+def test_extract_candidates_neutralizes_pathological_blob():
+    """Base64 / minified content must not hang candidate extraction (#2063).
+
+    ``Xa`` enters the candidate pattern, the long uppercase run explodes the
+    nested ``(?:[A-Z][a-z]+|[A-Z]{2,})+`` quantifier, and the trailing digit
+    defeats the closing word boundary — unguarded, ``re.findall`` never
+    returns. The guard strips the whitespace-free run before the regex runs.
+    """
+    blob = "Xa" + ("B" * 45) + "1"
+    text = "Riley said hi. Riley laughed. Riley smiled. " + blob + " and Riley waved."
+    result = _run_within(lambda: extract_candidates(text))
+    assert "Riley" in result  # natural-language extraction still works
+    assert blob not in result  # the blob never becomes an entity

@@ -185,3 +185,28 @@ def test_open_collection_or_explain_distinguishes_collection_subclass(tmp_path, 
     assert result is None
     assert any("initialized but empty" in line for line in lines)
     assert not any("No palace found" in line for line in lines)
+
+
+def test_candidate_entity_words_neutralizes_pathological_blob():
+    """The per-drawer mining path must not hang on base64 / minified content.
+
+    ``_candidate_entity_words`` runs the same nested-quantifier candidate
+    patterns as ``entity_detector`` and is called for every drawer during
+    mining, so a base64 blob would pin the miner at 100% CPU indefinitely
+    (issue #2063). The guard strips the long whitespace-free run first.
+    """
+    import threading
+
+    from mempalace.palace import _candidate_entity_words
+
+    blob = "Xa" + ("B" * 45) + "1"
+    box: dict = {}
+
+    def target():
+        box["value"] = _candidate_entity_words("Alice " + blob + " Bob")
+
+    t = threading.Thread(target=target, daemon=True)
+    t.start()
+    t.join(10.0)
+    assert not t.is_alive(), "candidate extraction hung on base64 blob"
+    assert blob not in box["value"]
