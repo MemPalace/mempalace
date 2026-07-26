@@ -57,7 +57,14 @@ def _path_within_root(path: Path, root: Path) -> bool:
         return False
 
 
-def _read_text_no_follow(filepath: Path, root: Path) -> Optional[str]:
+def _read_text_no_follow(filepath: Path, root: Path) -> Optional[tuple[str, Optional[float]]]:
+    """Read a regular file, rejecting symlinks and oversized files.
+
+    Returns ``(content, mtime)`` on success, ``None`` on any failure.
+    The mtime is captured from the same ``fstat`` call used to validate the
+    file descriptor, so it is guaranteed to describe the bytes actually
+    read -- never a later on-disk state.
+    """
     if not _path_within_root(filepath, root):
         return None
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -67,9 +74,10 @@ def _read_text_no_follow(filepath: Path, root: Path) -> Optional[str]:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_FILE_SIZE:
             return None
+        mtime = st.st_mtime
         with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as f:
             fd = -1
-            return f.read()
+            return f.read(), mtime
     except OSError:
         return None
     finally:
@@ -492,15 +500,19 @@ def load_config(project_dir: str) -> dict:
         if legacy_path.exists():
             config_path = legacy_path
         else:
-            from .config import normalize_wing_name
+            from .config import normalize_wing_name, project_name_from_path
 
             # Normalize the dirname-derived fallback wing the same way
             # ``cmd_init`` and ``room_detector_local`` do — otherwise a
             # hyphenated project mined without a yaml file lands under a
             # raw-name wing while ``topics_by_wing`` was keyed under the
             # normalized slug, silently dropping every topic tunnel
-            # (the no-yaml branch of issue #1194).
-            wing_name = normalize_wing_name(resolved_project_dir.name)
+            # (the no-yaml branch of issue #1194). ``project_name_from_path``
+            # additionally collapses a ``.claude/worktrees/<name>`` suffix
+            # first, so mining from inside a git worktree resolves to the
+            # real project name instead of the worktree's own randomly-
+            # generated directory name.
+            wing_name = normalize_wing_name(project_name_from_path(str(resolved_project_dir)))
             print(
                 f"  No mempalace.yaml found in {resolved_project_dir} "
                 f"— using auto-detected defaults (wing='{wing_name}'). "
@@ -1410,19 +1422,31 @@ def _build_drawer_metadata(
 
 
 def add_drawer(
-    collection, wing: str, room: str, content: str, source_file: str, chunk_index: int, agent: str
+    collection,
+    wing: str,
+    room: str,
+    content: str,
+    source_file: str,
+    chunk_index: int,
+    agent: str,
+    source_mtime: Optional[float] = None,
 ):
     """Add one drawer to the palace.
 
     Kept for backward compatibility with external callers. In-tree the
     miner uses ``_build_drawer_metadata`` + a batched ``collection.upsert``
     to amortize the embedding model's forward-pass cost across chunks.
+
+    ``source_mtime``, when given, is used directly; otherwise falls back to
+    ``os.path.getmtime`` for backward compatibility with callers that don't
+    capture it at read time.
     """
     drawer_id = make_drawer_id_from_chunk(wing, room, source_file, chunk_index)
-    try:
-        source_mtime = os.path.getmtime(source_file)
-    except OSError:
-        source_mtime = None
+    if source_mtime is None:
+        try:
+            source_mtime = os.path.getmtime(source_file)
+        except OSError:
+            pass
     metadata = _build_drawer_metadata(
         wing, room, source_file, chunk_index, agent, content, source_mtime
     )
@@ -1469,10 +1493,11 @@ def process_file(
     if not dry_run and file_already_mined(collection, source_file, check_mtime=True):
         return 0, "general", None
 
-    content = _read_text_no_follow(filepath, project_path)
-    if content is None:
+    read_result = _read_text_no_follow(filepath, project_path)
+    if read_result is None:
         return 0, "general", None
 
+    content, source_mtime = read_result
     content = content.strip()
     if len(content) < effective_min:
         return 0, "general", None
@@ -1527,10 +1552,9 @@ def process_file(
         # chunks per forward pass without building one huge Chroma/SQLite
         # request for pathological files. A bad chunk can fail its sub-batch;
         # that is the deliberate trade-off for amortizing embedding overhead.
-        try:
-            source_mtime = os.path.getmtime(source_file)
-        except OSError:
-            source_mtime = None
+        # source_mtime was captured at read time by _read_text_no_follow's
+        # fstat, so it describes the bytes actually parsed -- not a later
+        # on-disk state that could race with an append.
 
         # Tier 6a content-date: extract once per file (not per chunk) and
         # share across all chunks. Reads filename / frontmatter / content /

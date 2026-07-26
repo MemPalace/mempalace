@@ -7,6 +7,7 @@ import pytest
 from mempalace.config import (
     MempalaceConfig,
     normalize_wing_name,
+    project_name_from_path,
     sanitize_iso_date,
     sanitize_iso_temporal,
     sanitize_kg_value,
@@ -314,6 +315,73 @@ def test_normalize_wing_name_strips_leading_separator():
 
 def test_normalize_wing_name_strips_trailing_separator():
     assert normalize_wing_name("project-") == "project"
+
+
+# --- project_name_from_path ---
+
+
+def _init_git_repo(path):
+    """Minimal on-disk .git dir -- enough for project_name_from_path's
+    directory-vs-file check without shelling out to git."""
+    (path / ".git").mkdir()
+
+
+def test_project_name_from_path_primary_checkout(tmp_path):
+    repo = tmp_path / "coolproj"
+    repo.mkdir()
+    _init_git_repo(repo)
+    assert project_name_from_path(str(repo)) == "coolproj"
+
+
+def test_project_name_from_path_resolves_linked_worktree(tmp_path):
+    """A linked worktree's .git is a file pointing back at
+    <primary>/.git/worktrees/<name> -- must resolve to the primary
+    checkout's own directory name, not the worktree's random one."""
+    primary = tmp_path / "coolproj"
+    primary.mkdir()
+    (primary / ".git").mkdir()
+    (primary / ".git" / "worktrees" / "ecstatic-meitner-b60440").mkdir(parents=True)
+
+    worktree = tmp_path / "some-random-worktree-dir"
+    worktree.mkdir()
+    (worktree / ".git").write_text(
+        f"gitdir: {primary / '.git' / 'worktrees' / 'ecstatic-meitner-b60440'}\n"
+    )
+
+    assert project_name_from_path(str(worktree)) == "coolproj"
+
+
+def test_project_name_from_path_resolves_from_nested_subdir(tmp_path):
+    """The caller may pass a file or a subdirectory inside the checkout,
+    not just the checkout root -- must still walk up to find .git."""
+    primary = tmp_path / "coolproj"
+    (primary / "src" / "nested").mkdir(parents=True)
+    _init_git_repo(primary)
+    assert project_name_from_path(str(primary / "src" / "nested")) == "coolproj"
+
+
+def test_project_name_from_path_falls_back_when_not_a_git_repo(tmp_path):
+    plain_dir = tmp_path / "not-a-repo"
+    plain_dir.mkdir()
+    assert project_name_from_path(str(plain_dir)) == "not-a-repo"
+
+
+def test_project_name_from_path_falls_back_for_nonexistent_path():
+    """A historical cwd from an old session transcript for a
+    since-deleted/moved project: no filesystem access is possible, so
+    this must fall back to the string-based .claude/worktrees collapse
+    rather than raising."""
+    cwd = "/Users/jrmurray/Code/forktail/forktail-app/.claude/worktrees/ecstatic-meitner-b60440"
+    assert project_name_from_path(cwd) == "forktail-app"
+
+
+def test_project_name_from_path_malformed_gitdir_file_falls_back(tmp_path):
+    """A .git file that doesn't parse as a linked-worktree pointer
+    (unexpected git-internals shape) must fall back rather than guess."""
+    weird = tmp_path / "weird-repo"
+    weird.mkdir()
+    (weird / ".git").write_text("not a real gitdir pointer\n")
+    assert project_name_from_path(str(weird)) == "weird-repo"
 
 
 # --- sanitize_name ---
@@ -962,3 +1030,160 @@ def test_explicit_palace_path_overrides_env_and_file_config(monkeypatch, tmp_pat
     assert cfg.palace_path == expected
     assert cfg.hallway_file == os.path.join(os.path.dirname(expected), "hallways.json")
     assert cfg.tunnel_file == os.path.join(os.path.dirname(expected), "tunnels.json")
+
+
+# ── duplicate_detection_enabled / duplicate_detection_threshold ─────────
+
+
+def test_duplicate_detection_disabled_by_default(monkeypatch, tmp_path):
+    monkeypatch.delenv("MEMPALACE_DUPLICATE_DETECTION", raising=False)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.duplicate_detection_enabled is False
+
+
+def test_duplicate_detection_enabled_from_config(monkeypatch, tmp_path):
+    monkeypatch.delenv("MEMPALACE_DUPLICATE_DETECTION", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"duplicate_detection": {"enabled": True}}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.duplicate_detection_enabled is True
+
+
+def test_duplicate_detection_env_override_true(monkeypatch, tmp_path):
+    monkeypatch.setenv("MEMPALACE_DUPLICATE_DETECTION", "yes")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.duplicate_detection_enabled is True
+
+
+def test_duplicate_detection_env_override_false_string(monkeypatch, tmp_path):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"duplicate_detection": {"enabled": True}}, f)
+    monkeypatch.setenv("MEMPALACE_DUPLICATE_DETECTION", "0")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.duplicate_detection_enabled is False
+
+
+def test_duplicate_detection_threshold_default(monkeypatch, tmp_path):
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.duplicate_detection_threshold == 0.9
+
+
+def test_duplicate_detection_threshold_from_config(monkeypatch, tmp_path):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"duplicate_detection": {"threshold": 0.85}}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.duplicate_detection_threshold == 0.85
+
+
+@pytest.mark.parametrize("bad", ["abc", 1.5, -0.1, None])
+def test_duplicate_detection_threshold_garbage_falls_back_to_default(monkeypatch, tmp_path, bad):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"duplicate_detection": {"threshold": bad}}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.duplicate_detection_threshold == 0.9
+
+
+# ── duplicate_drop_enabled / duplicate_drop_threshold ────────────────────
+
+
+def test_duplicate_drop_disabled_by_default(monkeypatch, tmp_path):
+    monkeypatch.delenv("MEMPALACE_DUPLICATE_DROP", raising=False)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.duplicate_drop_enabled is False
+
+
+def test_duplicate_drop_enabled_from_config(monkeypatch, tmp_path):
+    monkeypatch.delenv("MEMPALACE_DUPLICATE_DROP", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"duplicate_detection": {"drop_enabled": True}}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.duplicate_drop_enabled is True
+
+
+def test_duplicate_drop_env_override_true(monkeypatch, tmp_path):
+    monkeypatch.setenv("MEMPALACE_DUPLICATE_DROP", "yes")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.duplicate_drop_enabled is True
+
+
+def test_duplicate_drop_env_override_false_string(monkeypatch, tmp_path):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"duplicate_detection": {"drop_enabled": True}}, f)
+    monkeypatch.setenv("MEMPALACE_DUPLICATE_DROP", "0")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.duplicate_drop_enabled is False
+
+
+def test_duplicate_drop_threshold_default(monkeypatch, tmp_path):
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.duplicate_drop_threshold == 0.97
+
+
+def test_duplicate_drop_threshold_from_config(monkeypatch, tmp_path):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"duplicate_detection": {"drop_threshold": 0.98}}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.duplicate_drop_threshold == 0.98
+
+
+@pytest.mark.parametrize("bad", ["abc", 1.5, -0.1, None])
+def test_duplicate_drop_threshold_garbage_falls_back_to_default(monkeypatch, tmp_path, bad):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"duplicate_detection": {"drop_threshold": bad}}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.duplicate_drop_threshold == 0.97
+
+
+# ── incremental_mining_enabled ───────────────────────────────────────────
+
+
+def test_incremental_mining_enabled_by_default(monkeypatch, tmp_path):
+    """Default flipped to True after a real-corpus benchmark measured a
+    3.8x speedup with byte-identical final palace state vs a full
+    re-mine (see the property's docstring) -- no explicit config or env
+    var needed to get the incremental path."""
+    monkeypatch.delenv("MEMPALACE_INCREMENTAL_MINING", raising=False)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.incremental_mining_enabled is True
+
+
+def test_incremental_mining_can_be_disabled_via_config(monkeypatch, tmp_path):
+    monkeypatch.delenv("MEMPALACE_INCREMENTAL_MINING", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"incremental_mining": {"enabled": False}}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.incremental_mining_enabled is False
+
+
+def test_incremental_mining_enabled_explicitly_from_config(monkeypatch, tmp_path):
+    monkeypatch.delenv("MEMPALACE_INCREMENTAL_MINING", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"incremental_mining": {"enabled": True}}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.incremental_mining_enabled is True
+
+
+def test_incremental_mining_env_override_true(monkeypatch, tmp_path):
+    monkeypatch.setenv("MEMPALACE_INCREMENTAL_MINING", "yes")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.incremental_mining_enabled is True
+
+
+def test_incremental_mining_env_override_false_string(monkeypatch, tmp_path):
+    """Env var can opt back out even when config.json says True (or,
+    now that the default itself is True, when nothing overrides it at
+    all) -- confirmed here against an explicit config.json True so the
+    override behavior is unambiguous."""
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"incremental_mining": {"enabled": True}}, f)
+    monkeypatch.setenv("MEMPALACE_INCREMENTAL_MINING", "0")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.incremental_mining_enabled is False
+
+
+def test_incremental_mining_env_override_false_with_no_config(monkeypatch, tmp_path):
+    """The env var must be able to opt out of the new default (True)
+    on its own, with no config.json involved at all."""
+    monkeypatch.setenv("MEMPALACE_INCREMENTAL_MINING", "false")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.incremental_mining_enabled is False

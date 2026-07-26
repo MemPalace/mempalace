@@ -6,6 +6,7 @@ from pathlib import Path
 from mempalace.convo_scanner import (
     _decode_slug_fallback,
     _extract_cwd_from_session,
+    _project_name_from_cwd,
     _resolve_project_name,
     _safe_mtime,
     is_claude_projects_root,
@@ -112,7 +113,43 @@ def test_safe_mtime_returns_zero_on_stat_error(tmp_path, monkeypatch):
     assert _safe_mtime(f) == 0.0
 
 
+# ── _project_name_from_cwd ───────────────────────────────────────────────
+
+
+def test_project_name_from_cwd_plain_path():
+    assert _project_name_from_cwd("/Users/jrmurray/Code/forktail/forktail-app") == "forktail-app"
+
+
+def test_project_name_from_cwd_collapses_worktree_suffix():
+    """The worktree name itself (a randomly-generated label) must not be
+    treated as the project identity -- the real repo root, one level up
+    from `.claude/worktrees`, is."""
+    cwd = "/Users/jrmurray/Code/forktail/forktail-app/.claude/worktrees/ecstatic-meitner-b60440"
+    assert _project_name_from_cwd(cwd) == "forktail-app"
+
+
+def test_project_name_from_cwd_worktree_at_root_has_no_parent():
+    """Degenerate case: .claude/worktrees is the first two path segments,
+    so there's no parent segment to use as the project name -- falls back
+    to the worktree dir's own name rather than raising."""
+    cwd = "/.claude/worktrees/some-worktree"
+    assert _project_name_from_cwd(cwd) == "some-worktree"
+
+
+def test_project_name_from_cwd_no_worktree_segment_unaffected():
+    assert _project_name_from_cwd("/home/user/dev/myproj") == "myproj"
+
+
 # ── _resolve_project_name ───────────────────────────────────────────────
+
+
+def test_resolve_project_name_collapses_worktree_suffix(tmp_path):
+    pdir = tmp_path / "-home-user-dev-coolproj--claude-worktrees-silly-mcnulty"
+    pdir.mkdir()
+    session = pdir / "a.jsonl"
+    cwd = "/home/user/dev/cool-proj-real/.claude/worktrees/silly-mcnulty-d987f4"
+    session.write_text(json.dumps({"type": "user", "cwd": cwd}) + "\n")
+    assert _resolve_project_name(pdir) == "cool-proj-real"
 
 
 def test_resolve_project_name_uses_cwd(tmp_path):

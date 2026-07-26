@@ -303,10 +303,10 @@ def save_config(project_dir: str, project_name: str, rooms: list):
 
 def detect_rooms_local(project_dir: str, yes: bool = False):
     """Main entry point for local setup."""
-    from .config import normalize_wing_name
+    from .config import normalize_wing_name, project_name_from_path
 
     project_path = Path(project_dir).expanduser().resolve()
-    project_name = normalize_wing_name(project_path.name)
+    project_name = normalize_wing_name(project_name_from_path(str(project_path)))
 
     if not project_path.exists():
         print(f"ERROR: Directory not found: {project_dir}")

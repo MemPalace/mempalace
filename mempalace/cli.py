@@ -420,14 +420,14 @@ def cmd_init(args):
                 json.dump(confirmed, f, indent=2, ensure_ascii=False)
             print(f"  Entities saved: {entities_path}")
 
-            from .config import normalize_wing_name
+            from .config import normalize_wing_name, project_name_from_path
             from .miner import add_to_known_entities
 
             # Match the slug ``room_detector_local`` writes into
             # ``mempalace.yaml`` so the miner's tunnel lookup hits the
             # same key in ``topics_by_wing`` at mine time (issue #1194 —
             # without this, hyphenated dirnames silently lose tunnels).
-            wing = normalize_wing_name(project_path.name)
+            wing = normalize_wing_name(project_name_from_path(str(project_path)))
             registry_path = add_to_known_entities(confirmed, wing=wing)
             print(f"  Registry updated: {registry_path}")
     else:

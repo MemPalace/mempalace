@@ -10,6 +10,7 @@ import re
 from datetime import date, datetime
 from functools import lru_cache
 from pathlib import Path
+from typing import Optional
 
 from .write_routing import (
     ResolvedWriteRoutingPolicy,
@@ -68,6 +69,94 @@ def normalize_wing_name(name: str) -> str:
     would reject.
     """
     return name.lower().replace(" ", "_").replace("-", "_").strip("_")
+
+
+def _find_primary_repo_root(start_path: Path) -> Optional[Path]:
+    """Walk up from ``start_path`` looking for a ``.git`` entry, resolving
+    a linked worktree back to the primary checkout root. Filesystem-only
+    -- no ``git`` subprocess.
+
+    Git's own on-disk convention is what this reads: in a primary
+    checkout, ``.git`` is a directory. In a linked worktree, ``.git`` is a
+    plain file containing a single ``gitdir: <path>`` line, where
+    ``<path>`` always has the shape ``.../.git/worktrees/<name>``.
+    Stripping ``worktrees/<name>`` off that path lands on the primary
+    repo's real ``.git`` directory; its parent is the true project root,
+    structurally correct for any worktree (Claude Code's own convention
+    or a plain ``git worktree add`` anywhere else), not a naming
+    heuristic.
+
+    Returns None when no ``.git`` is found before the filesystem root
+    (not a git repo at all), or when a found ``.git`` file doesn't parse
+    as the expected linked-worktree pointer (unexpected git-internals
+    shape) -- both cases fall through to the caller's own fallback rather
+    than guessing.
+    """
+    current = start_path
+    while True:
+        git_entry = current / ".git"
+        if git_entry.is_dir():
+            return current
+        if git_entry.is_file():
+            try:
+                content = git_entry.read_text().strip()
+            except OSError:
+                return None
+            if content.startswith("gitdir:"):
+                gitdir_path = Path(content[len("gitdir:") :].strip())
+                if (
+                    gitdir_path.parent.name == "worktrees"
+                    and gitdir_path.parent.parent.name == ".git"
+                ):
+                    return gitdir_path.parent.parent.parent
+            return None
+        parent = current.parent
+        if parent == current:
+            return None  # reached filesystem root
+        current = parent
+
+
+def project_name_from_path(path: str) -> str:
+    """Recover the real project name from a path.
+
+    Prefers walking the filesystem to the primary git checkout root (see
+    ``_find_primary_repo_root``) -- structurally correct for any
+    worktree, not tied to a specific naming convention. Falls back to
+    collapsing a ``.claude/worktrees/<name>`` path suffix by string match
+    when no ``.git`` is found (the path doesn't currently exist on disk,
+    e.g. a historical ``cwd`` recorded in an old session transcript for a
+    since-deleted or since-moved project, or genuinely isn't a git repo).
+
+    The worktree name itself is an ephemeral, randomly-generated label
+    (e.g. ``ecstatic-meitner-b60440``), never the project identity --
+    plain ``Path(path).name`` would otherwise split one project's
+    history/config across as many identities as it has ever had
+    worktrees.
+
+    Shared by convo_scanner._extract_cwd_from_session's per-file wing
+    resolution (a session's recorded ``cwd``) and miner.load_config's
+    no-yaml fallback (the mined directory's own path) -- same collapsing
+    rule, two different kinds of path.
+    """
+    p = Path(path)
+    if p.exists():
+        primary_root = _find_primary_repo_root(p if p.is_dir() else p.parent)
+        if primary_root is not None:
+            return primary_root.name
+
+    parts = p.parts
+    anchor = p.anchor
+    for i in range(len(parts) - 1):
+        if parts[i] == ".claude" and parts[i + 1] == "worktrees":
+            # parts[i - 1] is only a real project-name segment when it
+            # isn't the path's own anchor ("/" on POSIX) -- a path like
+            # "/.claude/worktrees/x" has nothing meaningful before
+            # .claude, so fall through to the plain-basename default
+            # rather than returning the bare anchor as a "project name".
+            if i > 0 and parts[i - 1] != anchor:
+                return parts[i - 1]
+            return p.name or path
+    return p.name or path
 
 
 def sanitize_name(value: str, field_name: str = "name") -> str:
@@ -578,6 +667,141 @@ class MempalaceConfig:
     def hall_keywords(self):
         """Mapping of hall names to keyword lists."""
         return self._file_config.get("hall_keywords", DEFAULT_HALL_KEYWORDS)
+
+    @property
+    def duplicate_detection_enabled(self) -> bool:
+        """Whether bulk mining runs a cosine-similarity check against
+        existing drawers before inserting each chunk, flagging near-matches
+        with ``possible_duplicate_of``/``duplicate_similarity`` metadata
+        rather than skipping them (nothing is ever silently dropped).
+
+        Off by default: adds a similarity-search query per chunk on top of
+        the embedding mining already computes, a real per-chunk cost for
+        large corpora. Env var ``MEMPALACE_DUPLICATE_DETECTION`` takes
+        precedence over config.json's ``duplicate_detection.enabled``.
+        """
+        env_val = os.environ.get("MEMPALACE_DUPLICATE_DETECTION", "").strip()
+        if env_val:
+            return env_val.lower() in ("true", "1", "yes", "on")
+        value = self._file_config.get("duplicate_detection", {}).get("enabled", False)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.lower() in ("true", "1", "yes", "on")
+        return bool(value)
+
+    @property
+    def incremental_mining_enabled(self) -> bool:
+        """Whether convo mining, on finding a changed (grown) transcript
+        with a stored cursor from its last mine, tries re-chunking only
+        the trailing exchange onward instead of purging and re-chunking
+        the whole file.
+
+        On by default: measured 3.8x faster (11.15s -> 2.96s) re-mining
+        a real, representative Claude Code session (~12,700 lines, one
+        of this project's own transcripts) after a ~10%-of-file growth
+        increment, with the final palace state confirmed byte-for-byte
+        identical to a full re-mine either way -- both the speed claim
+        and the equivalence claim verified on real data, not just the
+        synthetic equivalence tests earlier steps of this feature relied
+        on. Real increments between mining passes are typically much
+        smaller than 10% of a whole file, where the relative speedup is
+        larger still, since full-rebuild cost scales with total file
+        size regardless of increment size. When enabled but no usable
+        cursor exists for a given file (wrong format, hash mismatch,
+        general mode, etc.), mining falls back to the existing full
+        rebuild automatically -- this flag only controls whether that
+        *attempt* is made, never removes the fallback, so turning it on
+        can't make a file mine incorrectly, only sometimes less than
+        maximally efficiently. Set ``MEMPALACE_INCREMENTAL_MINING=0`` or
+        config.json's ``incremental_mining.enabled: false`` to opt back
+        out; the env var takes precedence over config.json.
+
+        Known trade-off: an incremental update reuses the file's
+        existing room (topic) classification instead of recomputing it
+        against the grown content, since ``detect_convo_room`` only
+        samples the first ~3000 characters of the normalized
+        transcript -- for any file already past that size at its first
+        mine, a full re-mine would sample the same leading text and
+        classify identically anyway, so this matches full-remine
+        behavior in the common case. It only diverges for a file that
+        was still under ~3000 characters when first mined and later
+        grows past it -- there, the incremental path keeps the
+        original (now possibly stale) room indefinitely, rather than
+        picking up whatever a full re-mine's fresh sample would
+        classify. Content, chunk_index, and every other per-chunk field
+        stay exactly equivalent to a full re-mine regardless; only this
+        one coarse, already-soft classification can lag.
+        """
+        env_val = os.environ.get("MEMPALACE_INCREMENTAL_MINING", "").strip()
+        if env_val:
+            return env_val.lower() in ("true", "1", "yes", "on")
+        value = self._file_config.get("incremental_mining", {}).get("enabled", True)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.lower() in ("true", "1", "yes", "on")
+        return bool(value)
+
+    @property
+    def duplicate_detection_threshold(self) -> float:
+        """Cosine similarity (0-1) at or above which a chunk is flagged as
+        a possible duplicate of an existing drawer. Same default as the
+        MCP ``mempalace_check_duplicate`` tool for consistency.
+        """
+        try:
+            value = self._file_config.get("duplicate_detection", {}).get("threshold", 0.9)
+            value = float(value)
+        except (TypeError, ValueError):
+            return 0.9
+        return value if 0.0 <= value <= 1.0 else 0.9
+
+    @property
+    def duplicate_drop_enabled(self) -> bool:
+        """Whether a chunk whose closest match clears
+        ``duplicate_drop_threshold`` (a stricter bar than the flagging
+        threshold above) is skipped entirely rather than inserted and
+        flagged.
+
+        Off by default, and only takes effect when
+        ``duplicate_detection_enabled`` is also on -- dropping needs the
+        same similarity query flagging already runs, it just acts on the
+        result more aggressively. Unlike flagging (which never removes
+        anything), a false positive here means real content is
+        permanently lost, not just mistagged -- this is why it has its
+        own, separate opt-in and its own, stricter threshold rather than
+        reusing the flag threshold directly. Env var
+        ``MEMPALACE_DUPLICATE_DROP`` takes precedence over config.json's
+        ``duplicate_detection.drop_enabled``.
+        """
+        env_val = os.environ.get("MEMPALACE_DUPLICATE_DROP", "").strip()
+        if env_val:
+            return env_val.lower() in ("true", "1", "yes", "on")
+        value = self._file_config.get("duplicate_detection", {}).get("drop_enabled", False)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.lower() in ("true", "1", "yes", "on")
+        return bool(value)
+
+    @property
+    def duplicate_drop_threshold(self) -> float:
+        """Cosine similarity (0-1) at or above which a chunk is dropped
+        entirely instead of inserted, when ``duplicate_drop_enabled`` is
+        on. Deliberately defaults higher than
+        ``duplicate_detection_threshold`` (0.9) -- dropping is meant for
+        near-certain duplicates only, not merely "worth a human's
+        attention." The consumer of this value additionally clamps it to
+        never go below ``duplicate_detection_threshold`` at runtime, so
+        a misconfigured lower value here can't make dropping *easier*
+        to trigger than flagging.
+        """
+        try:
+            value = self._file_config.get("duplicate_detection", {}).get("drop_threshold", 0.97)
+            value = float(value)
+        except (TypeError, ValueError):
+            return 0.97
+        return value if 0.0 <= value <= 1.0 else 0.97
 
     @staticmethod
     def _try_coerce_int(value, minimum=None):

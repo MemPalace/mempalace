@@ -99,6 +99,17 @@ def _safe_mtime(path: Path) -> float:
         return 0.0
 
 
+def _project_name_from_cwd(cwd: str) -> str:
+    """Recover the real repo/project name from a session's cwd.
+
+    Thin wrapper over ``config.project_name_from_path`` -- see that
+    function's docstring for the worktree-collapsing rule this applies.
+    """
+    from mempalace.config import project_name_from_path
+
+    return project_name_from_path(cwd)
+
+
 def _resolve_project_name(project_dir: Path) -> str:
     """Read one session's cwd to recover the original project name.
 
@@ -112,7 +123,7 @@ def _resolve_project_name(project_dir: Path) -> str:
     for session in sessions:
         cwd = _extract_cwd_from_session(session)
         if cwd:
-            return Path(cwd).name or cwd
+            return _project_name_from_cwd(cwd)
     return _decode_slug_fallback(project_dir.name)
 
 
