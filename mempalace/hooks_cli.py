@@ -738,7 +738,15 @@ def _maybe_auto_ingest():
     target gets its own PID slot, so distinct targets never block each
     other but a re-fire of the same target while the previous one is
     still running is silently skipped.
+
+    Respects ``hooks.transcript_mining`` — when disabled, returns
+    immediately without spawning any mine subprocess.
     """
+    try:
+        if not MempalaceConfig().hooks_transcript_mining:
+            return
+    except Exception:
+        pass  # config unreadable: fall through to legacy behavior
     targets = _get_mine_targets()
     if not targets:
         return
@@ -778,7 +786,15 @@ def _mine_sync():
     Transcript convos are ingested separately via ``_ingest_transcript``
     in ``hook_precompact`` — keeping them out of this function avoids
     timeout stacking against the harness 30s ceiling (#1231 review).
+
+    Respects ``hooks.transcript_mining`` — when disabled, returns
+    immediately without running the sync mine.
     """
+    try:
+        if not MempalaceConfig().hooks_transcript_mining:
+            return
+    except Exception:
+        pass  # config unreadable: fall through to legacy behavior
     targets = _get_mine_targets()
     if not targets:
         return
@@ -1026,7 +1042,11 @@ def _save_diary_direct(
 
 
 def _ingest_transcript(transcript_path: str):
-    """Mine a Claude Code session transcript into the palace as a conversation."""
+    """Mine a Claude Code session transcript into the palace as a conversation.
+
+    Respects ``hooks.transcript_mining`` — when disabled, returns
+    immediately without spawning the transcript-mine subprocess.
+    """
     path = _validate_transcript_path(transcript_path)
     if path is None:
         return
@@ -1037,8 +1057,10 @@ def _ingest_transcript(transcript_path: str):
         return
 
     try:
-        MempalaceConfig()  # validate config loads
+        config = MempalaceConfig()  # validate config loads
     except Exception:
+        return
+    if not config.hooks_transcript_mining:
         return
 
     routing = _current_hook_write_routing()

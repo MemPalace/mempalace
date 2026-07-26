@@ -859,6 +859,80 @@ def test_hooks_auto_save_env_override_true():
         del os.environ["MEMPALACE_HOOKS_AUTO_SAVE"]
 
 
+# --- hooks.transcript_mining ---
+
+
+def test_hooks_transcript_mining_default(monkeypatch):
+    """Default is True — mining happens in hooks, matches pre-PR behavior."""
+    monkeypatch.delenv("MEMPALACE_HOOKS_TRANSCRIPT_MINING", raising=False)
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    assert cfg.hooks_transcript_mining is True
+
+
+def test_hooks_transcript_mining_from_config(monkeypatch, tmp_path):
+    monkeypatch.delenv("MEMPALACE_HOOKS_TRANSCRIPT_MINING", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"hooks": {"transcript_mining": False}}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.hooks_transcript_mining is False
+
+
+def test_hooks_transcript_mining_env_override_false(monkeypatch):
+    monkeypatch.setenv("MEMPALACE_HOOKS_TRANSCRIPT_MINING", "false")
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    assert cfg.hooks_transcript_mining is False
+
+
+def test_hooks_transcript_mining_env_override_zero(monkeypatch):
+    monkeypatch.setenv("MEMPALACE_HOOKS_TRANSCRIPT_MINING", "0")
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    assert cfg.hooks_transcript_mining is False
+
+
+def test_hooks_transcript_mining_env_override_no(monkeypatch):
+    monkeypatch.setenv("MEMPALACE_HOOKS_TRANSCRIPT_MINING", "no")
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    assert cfg.hooks_transcript_mining is False
+
+
+def test_hooks_transcript_mining_env_override_true(monkeypatch, tmp_path):
+    """Env var set to 'true' overrides config file even if config says false."""
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"hooks": {"transcript_mining": False}}, f)
+    monkeypatch.setenv("MEMPALACE_HOOKS_TRANSCRIPT_MINING", "true")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.hooks_transcript_mining is True
+
+
+def test_hooks_transcript_mining_masked_by_auto_save_off(monkeypatch, tmp_path):
+    """Master auto_save=False forces transcript_mining to False.
+
+    Preserves back-compat: existing users who have opted out of hooks
+    entirely via ``hooks.auto_save: false`` continue to get zero mining
+    activity, regardless of what ``hooks.transcript_mining`` is set to.
+    """
+    monkeypatch.delenv("MEMPALACE_HOOKS_TRANSCRIPT_MINING", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"hooks": {"auto_save": False, "transcript_mining": True}}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.hooks_auto_save is False
+    assert cfg.hooks_transcript_mining is False
+
+
+def test_hooks_transcript_mining_env_wins_over_auto_save_masking(monkeypatch, tmp_path):
+    """Env override is checked BEFORE the auto_save mask.
+
+    Intentional: an operator setting the env explicitly should not be
+    silently overridden by config-file state. This mirrors how
+    hooks_auto_save's own env override wins over config.
+    """
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"hooks": {"auto_save": False}}, f)
+    monkeypatch.setenv("MEMPALACE_HOOKS_TRANSCRIPT_MINING", "true")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.hooks_transcript_mining is True
+
+
 def test_hook_use_daemon_default_false(monkeypatch):
     monkeypatch.delenv("MEMPALACE_HOOKS_DAEMON", raising=False)
     cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
