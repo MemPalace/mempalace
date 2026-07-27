@@ -7917,3 +7917,270 @@ class TestSearchDateFilters:
         assert "before" in schema["properties"]
         assert schema["properties"]["since"]["type"] == "string"
         assert schema["properties"]["before"]["type"] == "string"
+
+
+def test_tool_sync_routes_changed_set_through_mcp_writer(monkeypatch, tmp_path):
+    """Changed paths are applied inside the MCP process that owns the writer lease."""
+    from mempalace import mcp_server
+
+    palace = tmp_path / "palace"
+    project = tmp_path / "project"
+    project.mkdir()
+    cfg = MagicMock()
+    cfg.palace_path = str(palace)
+    monkeypatch.setattr(mcp_server, "_config", cfg)
+
+    captured = {}
+
+    def _sync_changed_sources(**kwargs):
+        captured.update(kwargs)
+        return {
+            "changed": 1,
+            "deleted": 1,
+            "ignored": 0,
+            "reindexed": 1,
+            "drawers_added": 2,
+            "dry_run": False,
+        }
+
+    import mempalace.changed_set as changed_set_mod
+
+    monkeypatch.setattr(
+        changed_set_mod,
+        "sync_changed_sources",
+        _sync_changed_sources,
+    )
+
+    result = mcp_server.tool_sync(
+        project_dir=str(project),
+        wing="contextunity",
+        apply=True,
+        changed=["src/new.py"],
+        deleted=["src/old.py"],
+        agent="contextunity",
+    )
+
+    assert result["success"] is True
+    assert result["changed"] == 1
+    assert captured == {
+        "palace_path": str(palace),
+        "project_root": str(project),
+        "changed": ["src/new.py"],
+        "deleted": ["src/old.py"],
+        "wing": "contextunity",
+        "agent": "contextunity",
+        "dry_run": False,
+    }
+
+
+def test_tool_sync_changed_set_requires_project_dir(monkeypatch, tmp_path):
+    """Reject changed-set mode without an explicit project security boundary."""
+    from mempalace import mcp_server
+
+    cfg = MagicMock()
+    cfg.palace_path = str(tmp_path / "palace")
+    monkeypatch.setattr(mcp_server, "_config", cfg)
+
+    result = mcp_server.tool_sync(changed=["src/new.py"])
+
+    assert result["success"] is False
+    assert "project_dir" in result["error"]
+
+
+def test_tool_sync_schema_exposes_changed_set_arguments():
+    """Clients can discover the changed-set contract during MCP initialization."""
+    from mempalace import mcp_server
+
+    properties = mcp_server.TOOLS["mempalace_sync"]["input_schema"]["properties"]
+
+    assert properties["changed"]["items"] == {"type": "string"}
+    assert properties["deleted"]["items"] == {"type": "string"}
+    assert properties["agent"]["type"] == "string"
+
+
+def test_mcp_mine_is_submitted_without_waiting(monkeypatch, tmp_path):
+    from mempalace import daemon, mcp_server
+
+    submitted = {}
+
+    class _Client:
+        def submit(self, kind, payload, **kwargs):
+            submitted.update(kind=kind, payload=payload, kwargs=kwargs)
+            return {"id": "mine-1", "state": "queued"}
+
+        def wait(self, *args, **kwargs):
+            raise AssertionError("long-running maintenance must not block MCP")
+
+    monkeypatch.setattr(daemon, "ensure_client", lambda *args, **kwargs: _Client())
+    monkeypatch.setattr(
+        mcp_server,
+        "_config",
+        type("Config", (), {"palace_path": str(tmp_path), "backend": "chroma"})(),
+    )
+
+    result = mcp_server._submit_mcp_mutation(
+        "mempalace_mine",
+        {"source": "/project", "mode": "projects", "agent": "codex"},
+    )
+
+    assert result["accepted"] is True
+    assert result["job_id"] == "mine-1"
+    assert "poll_tool" not in result
+    assert submitted["kind"] == "mine"
+    assert submitted["payload"]["source"] == "/project"
+
+
+def test_quick_write_returns_result_or_job_handle_with_bounded_wait(monkeypatch, tmp_path):
+    from mempalace import daemon, mcp_server
+
+    class _Client:
+        def submit(self, kind, payload, **kwargs):
+            assert kind == "mcp_tool"
+            return {"id": "write-1", "state": "queued"}
+
+        def wait(self, job_id, *, timeout):
+            assert timeout == mcp_server._MCP_WRITE_WAIT_SECONDS
+            raise daemon.DaemonError("timed out waiting for job write-1")
+
+    monkeypatch.setattr(daemon, "ensure_client", lambda *args, **kwargs: _Client())
+    monkeypatch.setattr(
+        mcp_server,
+        "_config",
+        type("Config", (), {"palace_path": str(tmp_path), "backend": "chroma"})(),
+    )
+
+    result = mcp_server._submit_mcp_mutation(
+        "mempalace_add_drawer",
+        {"wing": "w", "room": "r", "content": "verbatim"},
+    )
+
+    assert result == {
+        "success": True,
+        "accepted": True,
+        "job_id": "write-1",
+        "state": "queued",
+    }
+
+
+def test_job_status_never_returns_queued_write_payload(monkeypatch, tmp_path):
+    from mempalace import daemon, mcp_server
+
+    class _Client:
+        def get_job(self, job_id):
+            return {
+                "id": job_id,
+                "state": "succeeded",
+                "payload": {"arguments": {"content": "secret verbatim text"}},
+                "result": {"success": True, "drawer_id": "drawer-1"},
+            }
+
+    monkeypatch.setattr(daemon, "get_client_if_running", lambda *args, **kwargs: _Client())
+    monkeypatch.setattr(
+        mcp_server,
+        "_config",
+        type("Config", (), {"palace_path": str(tmp_path)})(),
+    )
+
+    result = mcp_server.tool_job_status("write-1")
+
+    assert "payload" not in result
+    assert result["success"] is True
+    assert result["terminal"] is True
+    assert result["status"] == "succeeded"
+    assert result["result"]["drawer_id"] == "drawer-1"
+
+
+def test_job_status_reports_pending_without_false_failure(monkeypatch, tmp_path):
+    from mempalace import daemon, mcp_server
+
+    class _Client:
+        def get_job(self, job_id):
+            return {"id": job_id, "state": "running", "payload": {"secret": "value"}}
+
+    monkeypatch.setattr(daemon, "get_client_if_running", lambda *args, **kwargs: _Client())
+    monkeypatch.setattr(
+        mcp_server,
+        "_config",
+        type("Config", (), {"palace_path": str(tmp_path)})(),
+    )
+
+    result = mcp_server.tool_job_status("write-1")
+
+    assert result["status"] == "pending"
+    assert result["terminal"] is False
+    assert "succeeded" not in result
+    assert "payload" not in result
+
+
+def test_get_jobs_returns_only_active_sanitized_jobs(monkeypatch, tmp_path):
+    from mempalace import daemon, mcp_server
+
+    class _Client:
+        def list_jobs(self, limit):
+            assert limit == 100
+            return [
+                {"id": "job-1", "state": "succeeded", "payload": {"secret": "one"}},
+                {"id": "job-2", "state": "queued", "payload": {"secret": "two"}},
+                {"id": "job-3", "state": "running", "payload": {"secret": "three"}},
+            ]
+
+    monkeypatch.setattr(daemon, "get_client_if_running", lambda *args, **kwargs: _Client())
+    monkeypatch.setattr(
+        mcp_server,
+        "_config",
+        type("Config", (), {"palace_path": str(tmp_path)})(),
+    )
+
+    result = mcp_server.tool_get_jobs()
+
+    assert result["count"] == 2
+    assert [job["id"] for job in result["jobs"]] == ["job-2", "job-3"]
+    assert all(job["status"] == "pending" for job in result["jobs"])
+    assert all("payload" not in job for job in result["jobs"])
+
+
+def test_get_jobs_schema_requires_no_arguments():
+    from mempalace import mcp_server
+
+    schema = mcp_server.TOOLS["mempalace_get_jobs"]["input_schema"]
+
+    assert schema == {"type": "object", "properties": {}}
+
+
+def test_changed_set_enqueues_versioned_file_jobs_with_tombstone_precedence(monkeypatch, tmp_path):
+    from mempalace import daemon, mcp_server
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "a.py").write_text("print('new')\n", encoding="utf-8")
+    calls = []
+
+    class _Client:
+        def submit(self, kind, payload, **kwargs):
+            calls.append((kind, payload, kwargs))
+            return {"id": f"job-{len(calls)}", "state": "queued"}
+
+    monkeypatch.setattr(daemon, "ensure_client", lambda *args, **kwargs: _Client())
+    monkeypatch.setattr(
+        mcp_server,
+        "_config",
+        type("Config", (), {"palace_path": str(tmp_path / "palace")})(),
+    )
+
+    result = mcp_server._submit_mcp_mutation(
+        "mempalace_sync",
+        {
+            "project_dir": str(project),
+            "changed": ["a.py"],
+            "deleted": ["gone.py"],
+            "apply": True,
+        },
+    )
+
+    assert result["job_ids"] == ["job-1", "job-2"]
+    assert calls[0][2]["coalesce_key"].endswith(":a.py")
+    assert calls[0][1]["ingress"]["content_hash"] is None
+    assert calls[0][1]["ingress"]["hash_state"] == "deferred_to_worker"
+    assert calls[0][2]["tombstone"] is False
+    assert calls[1][2]["coalesce_key"].endswith(":gone.py")
+    assert calls[1][2]["tombstone"] is True

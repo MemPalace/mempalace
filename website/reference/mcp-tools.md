@@ -198,15 +198,33 @@ Bulk-delete every drawer mined from one `source_file` (exact match). Use this to
 
 ### `mempalace_sync`
 
-Prune drawers whose source files are gitignored, deleted, or moved. Returns a dry-run report by default; pass `apply=true` to commit deletions.
+Sync explicit repository changes inside the active MCP writer, or prune stale drawers across a project scope. Returns a dry-run report by default; pass `apply=true` to write.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `project_dir` | string | No | Project root to scope the sync (auto-detected from drawer metadata if omitted) |
 | `wing` | string | No | Limit to one wing |
-| `apply` | boolean | No | Actually delete drawers; default is dry-run preview |
+| `apply` | boolean | No | Apply reindex/deletion writes; default is dry-run preview |
+| `changed` | string[] | No | Repository-relative files to reindex; requires `project_dir` |
+| `deleted` | string[] | No | Repository-relative files to remove; requires `project_dir` |
+| `agent` | string | No | Agent recorded on reindexed drawers; default `mempalace` |
 
-**Returns:** `{ scanned, kept, gitignored, missing, no_source, out_of_scope, removed_drawers, removed_closets, dry_run, by_source }`
+With `changed` or `deleted`, the tool uses changed-set mode and returns `{ changed, deleted, ignored, reindexed, drawers_added, dry_run }`. Gitignored entries in `changed` are purge-only: existing drawers/closets are removed and the source is not reindexed. Otherwise it returns `{ scanned, kept, gitignored, missing, no_source, out_of_scope, removed_drawers, removed_closets, dry_run, by_source }`.
+
+---
+
+### `mempalace_job_status`
+
+Inspect one background job by `job_id` after an enqueue error or suspected
+stall. Queued and running jobs report `status: "pending"`; terminal jobs report
+`status: "succeeded"`, `"failed"`, or `"cancelled"`. The queued verbatim request
+payload is never returned.
+
+### `mempalace_get_jobs`
+
+Debug the current queued/running jobs without arguments. It returns sanitized
+`jobs` and `count`, or an empty list when no daemon is active. Accepted writes
+are fire-and-forget; callers should not invoke this tool after every enqueue.
 
 ---
 
