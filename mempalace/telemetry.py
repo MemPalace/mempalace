@@ -84,6 +84,7 @@ _TOOL_OPERATION: dict[str, str] = {
     "mempalace_diary_read": "read",
     "mempalace_hook_settings": "read",
     "mempalace_memories_filed_away": "read",
+    "mempalace_list_hallways": "read",
     # ---- write (mutating) ----------------------------------------------
     "mempalace_kg_add": "write",
     "mempalace_create_tunnel": "write",
@@ -94,8 +95,20 @@ _TOOL_OPERATION: dict[str, str] = {
     "mempalace_diary_write": "write",
     "mempalace_sync": "write",
     "mempalace_reconnect": "write",
+    # checkpoint files drawers + a diary entry; delete_by_source and
+    # delete_hallway remove palace state; mine ingests a directory — all
+    # mutate, so they are ``write`` (added after the 2026 fork sync
+    # introduced these tools; ISI-1920).
+    "mempalace_checkpoint": "write",
+    "mempalace_delete_by_source": "write",
+    "mempalace_delete_hallway": "write",
+    "mempalace_mine": "write",
     # ---- invalidate ----------------------------------------------------
     "mempalace_kg_invalidate": "invalidate",
+    # kg_supersede atomically retires a fact and writes its successor at a
+    # shared boundary — the retraction half makes it an ``invalidate`` in
+    # the memory-semconv taxonomy, matching kg_invalidate.
+    "mempalace_kg_supersede": "invalidate",
 }
 
 
