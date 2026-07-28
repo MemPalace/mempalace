@@ -407,6 +407,212 @@ def _truthy_env(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+# MCP write forwarding (opt-in; #1646 / #1497).
+#
+# When MEMPALACE_MCP_FORWARD_WRITES is set, mutating tool calls are submitted to
+# the long-lived write daemon (``mempalace.daemon``) as ``mcp_tool`` jobs
+# instead of executing in-process — so this MCP server never acquires the
+# per-palace writer lease, and any number of concurrent stdio sessions (plus
+# CLI/hook daemon jobs) converge on the daemon as the single palace writer.
+_MCP_FORWARD_WRITES_ENV = "MEMPALACE_MCP_FORWARD_WRITES"
+_MCP_FORWARD_TIMEOUT_ENV = "MEMPALACE_MCP_FORWARD_TIMEOUT"
+_MCP_FORWARD_TIMEOUT_DEFAULT = 120.0
+_mcp_forward_mode_warned = False
+
+
+def _mcp_forward_mode() -> str:
+    """Resolve MEMPALACE_MCP_FORWARD_WRITES to ``prefer``, ``require``, or ``""``.
+
+    - unset/empty or ``direct``: off — current direct-write behavior.
+    - ``prefer`` (or a legacy bare truthy value): forward writes to a running
+      daemon; fall back to the direct path when no daemon is reachable.
+    - ``require``: forward writes; refuse when no daemon is reachable. This
+      server then never takes the palace writer lease.
+
+    Parsing goes through the shared write-routing policy model
+    (``write_routing.parse_write_routing_policy``, #2027) so the MCP transport
+    accepts the same vocabulary as every other write caller. The routing
+    *decision* stays transport-specific: an MCP server discovers daemon
+    availability by submitting the job, not by probing first.
+    """
+    global _mcp_forward_mode_warned
+    raw = os.environ.get(_MCP_FORWARD_WRITES_ENV, "").strip()
+    if not raw:
+        return ""
+
+    from .write_routing import (
+        WriteRoutingError,
+        WriteRoutingPolicy,
+        parse_write_routing_policy,
+    )
+
+    try:
+        policy = parse_write_routing_policy(raw, legacy_boolean=True)
+    except WriteRoutingError:
+        if not _mcp_forward_mode_warned:
+            logger.warning(
+                "%s=%r not recognized (expected 'direct', 'prefer', or 'require'); "
+                "write forwarding stays OFF",
+                _MCP_FORWARD_WRITES_ENV,
+                raw,
+            )
+            _mcp_forward_mode_warned = True
+        return ""
+    if policy is WriteRoutingPolicy.DIRECT:
+        return ""
+    return policy.value
+
+
+def _mcp_forward_error(req_id, tool_name: str, message: str):
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {
+            "code": -32004,
+            "message": message,
+            "data": {"tool": tool_name},
+        },
+    }
+
+
+def _mcp_maybe_forward_write(req_id, tool_name: str, tool_args: dict):
+    """Forward a mutating tool call to the write daemon when enabled.
+
+    Returns a complete JSON-RPC response when the call was handled here
+    (forwarded, refused, or failed), or ``None`` to fall through to the direct
+    dispatch path.
+
+    Scope: the forwardable set is ``_MUTATING_TOOLS`` minus
+    ``service.MAINTENANCE_TOOLS``. Maintenance tools are not forwardable as
+    ``mcp_tool`` jobs (the daemon has dedicated job kinds for them, wired via
+    the CLI ``--daemon`` flag, and ``run_mcp_tool`` would reject them) — so
+    under ``prefer`` they keep the direct path, and under ``require`` they are
+    refused outright: running them in-process would take the writer lease this
+    mode promises never to take. Any remaining
+    tool that ``service.classify_tool`` does NOT report as ``write`` is
+    classifier drift, never a routing decision: under ``require`` the call is
+    refused (a silent direct write is the exact outcome forwarding exists to
+    prevent); under ``prefer`` it falls back to the documented direct path
+    with a warning. ``test_every_mutating_tool_is_classified_for_forwarding``
+    pins list parity so the drift branch is unreachable at a healthy commit.
+
+    Fallback safety: ``prefer`` mode falls back to the direct path ONLY when
+    the job was never submitted. After submission the daemon owns the write; a
+    wait/transport failure returns an error instead of retrying directly,
+    because re-applying a non-idempotent mutation (``diary_write``) could
+    double-write.
+    """
+    mode = _mcp_forward_mode()
+    if not mode or tool_name not in _MUTATING_TOOLS:
+        return None
+
+    from .service import MAINTENANCE_TOOLS, classify_tool
+
+    if tool_name in MAINTENANCE_TOOLS:
+        if mode == "require":
+            return _mcp_forward_error(
+                req_id,
+                tool_name,
+                f"{tool_name} is a maintenance operation with a dedicated daemon "
+                f"job kind, and running it in-process would take the palace "
+                f"writer lease — refused under {_MCP_FORWARD_WRITES_ENV}=require. "
+                "Run it through the CLI daemon path (e.g. `mempalace mine "
+                "--daemon`) or use prefer mode.",
+            )
+        return None
+
+    classification = classify_tool(tool_name)
+    if classification != "write":
+        if mode == "require":
+            return _mcp_forward_error(
+                req_id,
+                tool_name,
+                f"{tool_name} is a mutating tool the daemon's write classifier "
+                f"does not recognize (classify_tool -> {classification!r}); "
+                f"refusing a direct write under {_MCP_FORWARD_WRITES_ENV}=require. "
+                "service.WRITE_TOOLS is missing this tool.",
+            )
+        logger.warning(
+            "MCP write forwarding: %r is in _MUTATING_TOOLS but classify_tool() "
+            "returned %r; falling back to a direct write under prefer mode. "
+            "service.WRITE_TOOLS is likely missing this tool.",
+            tool_name,
+            classification,
+        )
+        return None
+
+    read_only_error = _mcp_read_only_refusal(req_id, tool_name)
+    if read_only_error is not None:
+        return read_only_error
+    sqlite_integrity_error = _mcp_sqlite_integrity_refusal(req_id, tool_name)
+    if sqlite_integrity_error is not None:
+        return sqlite_integrity_error
+
+    from . import daemon as daemon_mod
+
+    try:
+        client = daemon_mod.get_client_if_running(_config.palace_path)
+        if client is None:
+            raise daemon_mod.DaemonError(
+                f"no running mempalace write daemon for {_config.palace_path!r}"
+            )
+        payload = {
+            "name": tool_name,
+            "arguments": tool_args,
+            "palace_path": daemon_mod.canonical_palace_path(_config.palace_path),
+        }
+        job = client.submit("mcp_tool", payload)
+    except Exception as exc:
+        if mode == "require":
+            return _mcp_forward_error(
+                req_id,
+                tool_name,
+                f"write daemon unavailable and {_MCP_FORWARD_WRITES_ENV}=require: {exc}",
+            )
+        logger.warning(
+            "MCP write forwarding: daemon unavailable (%s); falling back to direct write for %r",
+            exc,
+            tool_name,
+        )
+        return None
+
+    try:
+        timeout_raw = os.environ.get(_MCP_FORWARD_TIMEOUT_ENV, "")
+        try:
+            timeout = float(timeout_raw) if timeout_raw else _MCP_FORWARD_TIMEOUT_DEFAULT
+        except ValueError:
+            timeout = _MCP_FORWARD_TIMEOUT_DEFAULT
+        job = client.wait(job["id"], timeout=timeout)
+    except Exception as exc:
+        return _mcp_forward_error(
+            req_id,
+            tool_name,
+            f"write daemon job {job.get('id')!r} did not report a result "
+            f"({exc}); the write may still complete — not retrying directly "
+            "to avoid a double-write",
+        )
+
+    result = job.get("result") if isinstance(job.get("result"), dict) else {}
+    if job.get("state") != "succeeded" or result.get("success") is False:
+        detail = result.get("error") or job.get("error") or f"job state: {job.get('state')}"
+        return _mcp_forward_error(req_id, tool_name, f"write daemon job failed: {detail}")
+
+    # Strip the daemon's job-transport keys so the forwarded result matches
+    # what the in-process handler would have returned.
+    for transport_key in ("stdout", "stderr", "exit_code"):
+        result.pop(transport_key, None)
+    decorated = _decorate_mcp_tool_result(tool_name, result)
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": {
+            "content": [
+                {"type": "text", "text": json.dumps(decorated, indent=2, ensure_ascii=False)}
+            ]
+        },
+    }
+
+
 def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     """Acquire this process's per-palace MCP writer lease.
 
@@ -4838,21 +5044,33 @@ def handle_request(request):
                     "error": {"code": -32602, "message": f"Invalid value for parameter '{key}'"},
                 }
         tool_args.pop("wait_for_previous", None)
-        preflight_error = _mcp_tool_preflight_refusal(req_id, tool_name)
-        if preflight_error is not None:
-            return preflight_error
 
         # 'content' is an accepted alias for diary_write's 'entry' (callers often
-        # reuse add_drawer's 'content' name). Map it in here, before dispatch, so a
-        # content-only call still satisfies the required 'entry' param while the
-        # signature-based missing-parameter diagnostic (-32602) keeps working.
-        # 'entry' wins if both are supplied.
+        # reuse add_drawer's 'content' name). Map it in here, before dispatch AND
+        # before write forwarding, so a content-only call still satisfies the
+        # required 'entry' param — and a forwarded job carries the resolved
+        # arguments — while the signature-based missing-parameter diagnostic
+        # (-32602) keeps working. 'entry' wins if both are supplied.
         if tool_name == "mempalace_diary_write" and "content" in tool_args:
             content_val = tool_args.pop("content")
             # Only fill from the alias when the caller did not supply 'entry' at
             # all (or passed it as null). An explicit entry — even "" — wins.
             if "entry" not in tool_args or tool_args["entry"] is None:
                 tool_args["entry"] = content_val
+
+        # Opt-in write forwarding (MEMPALACE_MCP_FORWARD_WRITES): mutating tools
+        # go to the write daemon so this server never takes the writer lease.
+        # Runs BEFORE _mcp_tool_preflight_refusal because that preflight's
+        # peer-writer gate ACQUIRES the lease for mutating tools; the read-only
+        # and sqlite-integrity gates are re-applied inside the forwarder.
+        forwarded = _mcp_maybe_forward_write(req_id, tool_name, tool_args)
+        if forwarded is not None:
+            return forwarded
+
+        preflight_error = _mcp_tool_preflight_refusal(req_id, tool_name)
+        if preflight_error is not None:
+            return preflight_error
+
         try:
             result = _decorate_mcp_tool_result(tool_name, TOOLS[tool_name]["handler"](**tool_args))
 
