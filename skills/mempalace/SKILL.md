@@ -29,9 +29,17 @@ MemPalace provides dynamic, version-correct instructions via the CLI. To get ins
 mempalace instructions <command>
 ```
 
-Where `<command>` is one of: `help`, `init`, `mine`, `search`, `status`.
+Where `<command>` is one of: `help`, `init`, `mine`, `search`, `status`, `kg`.
 
 Run the appropriate instructions command, then follow the returned instructions step by step.
+
+## Committing facts to the knowledge graph
+
+`kg` is the reviewed path for writing knowledge-graph triples. It proposes candidate facts
+from the session, shows them to the user, and only calls `mempalace_kg_add` on the ones
+approved. Drawers can hold a claim that later turns out wrong and still be an honest record;
+a KG triple is read back by future sessions as fact, so a wrong one actively misleads. That
+is why the graph is written by an explicit command and not by an automatic hook.
 
 ## Recalling past work
 
