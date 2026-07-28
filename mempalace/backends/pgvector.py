@@ -61,6 +61,20 @@ from .base import (
 
 logger = logging.getLogger(__name__)
 
+
+class _ConnectionLost(Exception):
+    """Internal signal: the server dropped the connection, retry is warranted.
+
+    Never escapes ``_PgVectorClient._execute`` — it is converted to
+    ``BackendError`` there, either after a successful retry never happens or
+    when a second attempt on a fresh connection is dropped too.
+    """
+
+    def __init__(self, cause: Exception):
+        super().__init__(str(cause))
+        self.cause = cause
+
+
 _DEFAULT_DSN = "postgresql://localhost:5432/mempalace"
 _MARKER_FILENAME = "pgvector_backend.json"
 _MAX_IDENTIFIER = 63  # Postgres identifier byte limit.
@@ -532,25 +546,94 @@ class _PgVectorClient:
                 raise BackendError(f"pgvector connection failed: {exc}") from exc
             return self._conn
 
+    def _discard_connection(self) -> None:
+        """Drop the pooled connection so the next ``_connect`` opens a new one.
+
+        Called only after the server has already dropped its end, so the close
+        is best-effort: the handle is being thrown away either way.
+        """
+        conn, self._conn = self._conn, None
+        if conn is None:
+            return
+        try:
+            conn.close()
+        except Exception:  # pragma: no cover - closing a dead handle is best effort
+            pass
+
+    @staticmethod
+    def _is_connection_lost(conn, exc: Exception) -> bool:
+        """True when ``exc`` means the server dropped the connection.
+
+        The pooled connection outlives any single query, so a Postgres restart
+        (package upgrade, failover, an operator's ``pg_ctl restart``) leaves a
+        handle that looks alive until the next statement runs on it. That first
+        statement is the one that surfaces the drop; retrying it on a fresh
+        connection is what a short-lived client would have done implicitly.
+
+        Two signals, both required to be about the *connection* rather than the
+        statement:
+
+        * SQLSTATE class ``57`` (operator intervention) — ``57P01`` admin
+          shutdown, ``57P02`` crash shutdown, ``57P03`` cannot connect now.
+        * A driver error raised on a handle psycopg has already marked closed
+          or broken, which is how a mid-query TCP drop arrives (no SQLSTATE,
+          because no server response came back to carry one).
+
+        A statement-level failure — bad SQL, constraint violation, type error —
+        leaves the connection usable and must propagate unchanged: retrying it
+        would run the same failing statement twice and report the second one.
+        """
+        sqlstate = getattr(exc, "sqlstate", None) or getattr(
+            getattr(exc, "diag", None), "sqlstate", None
+        )
+        if isinstance(sqlstate, str) and sqlstate.startswith("57"):
+            return True
+        # ``closed``/``broken`` are psycopg's own view of the handle; consult
+        # them only when no SQLSTATE arrived, so a live connection that merely
+        # rejected the statement is never treated as lost.
+        if sqlstate:
+            return False
+        return bool(getattr(conn, "closed", False) or getattr(conn, "broken", False))
+
+    def _execute_once(self, sql: str, params=None, *, fetch: bool = False, many: bool = False):
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                if many:
+                    cur.executemany(sql, params or [])
+                    rows = None
+                else:
+                    cur.execute(sql, params or [])
+                    rows = cur.fetchall() if fetch else None
+            conn.commit()
+        except Exception as exc:  # noqa: BLE001 - normalize to BackendError
+            try:
+                conn.rollback()
+            except Exception:  # pragma: no cover - rollback best effort
+                pass
+            raise (
+                _ConnectionLost(exc)
+                if self._is_connection_lost(conn, exc)
+                else BackendError(f"pgvector query failed: {exc}")
+            ) from exc
+        return rows
+
     def _execute(self, sql: str, params=None, *, fetch: bool = False, many: bool = False):
         with self._lock:
-            conn = self._connect()
             try:
-                with conn.cursor() as cur:
-                    if many:
-                        cur.executemany(sql, params or [])
-                        rows = None
-                    else:
-                        cur.execute(sql, params or [])
-                        rows = cur.fetchall() if fetch else None
-                conn.commit()
-            except Exception as exc:  # noqa: BLE001 - normalize to BackendError
+                return self._execute_once(sql, params, fetch=fetch, many=many)
+            except _ConnectionLost:
+                # The server dropped the connection out from under a statement
+                # that never ran on it. Reconnect and run it once more; a second
+                # drop is a real outage rather than a stale pooled handle, so it
+                # surfaces as the BackendError callers already expect.
+                self._discard_connection()
                 try:
-                    conn.rollback()
-                except Exception:  # pragma: no cover - rollback best effort
-                    pass
-                raise BackendError(f"pgvector query failed: {exc}") from exc
-        return rows
+                    return self._execute_once(sql, params, fetch=fetch, many=many)
+                except _ConnectionLost as second:
+                    raise BackendError(
+                        f"pgvector query failed after reconnect: {second.cause}"
+                    ) from second.cause
 
     def ping(self) -> None:
         self._execute("SELECT 1", fetch=True)
