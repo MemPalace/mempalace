@@ -61,6 +61,7 @@ WRITE_TOOLS = frozenset(
         "mempalace_diary_write",
         "mempalace_kg_add",
         "mempalace_kg_invalidate",
+        "mempalace_kg_supersede",
         "mempalace_create_tunnel",
         "mempalace_delete_tunnel",
         "mempalace_delete_hallway",

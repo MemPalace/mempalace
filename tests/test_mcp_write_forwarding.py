@@ -236,6 +236,29 @@ def test_maintenance_tools_keep_direct_path(monkeypatch, tmp_path):
     assert '"ok": "direct"' in response["result"]["content"][0]["text"]
 
 
+def test_require_refuses_maintenance_tools(monkeypatch, tmp_path):
+    """Under ``require`` a maintenance tool must be REFUSED, not run direct:
+    executing mempalace_mine in-process would take the palace writer lease
+    that require mode promises never to take. The daemon path for these is
+    the dedicated CLI job kind, not an mcp_tool job."""
+    monkeypatch.setenv("MEMPALACE_MCP_FORWARD_WRITES", "require")
+    called = _install(monkeypatch, tmp_path, client="unset", lock="forbid")
+    entry = dict(_WRITE_TOOL_ENTRY)
+
+    def _handler(**kwargs):
+        called["direct"] = True
+        return {"ok": "direct"}
+
+    entry["handler"] = _handler
+    monkeypatch.setitem(mcp_server.TOOLS, "mempalace_mine", entry)
+
+    response = _call(tool="mempalace_mine", arguments={"content": "x"})
+
+    assert called["direct"] is False
+    assert response["error"]["code"] == -32004
+    assert "writer lease" in response["error"]["message"]
+
+
 def test_diary_content_alias_resolves_before_forwarding(monkeypatch, tmp_path):
     """A diary_write call using the 'content' alias must forward with the
     resolved 'entry' argument, not the raw alias."""
@@ -299,9 +322,80 @@ def test_require_mode_read_only_gate_still_wins(monkeypatch, tmp_path):
         ("true", "prefer"),
         ("", ""),
         ("nonsense", ""),
+        # shared write-routing vocabulary (#2027)
+        ("direct", ""),
+        ("0", ""),
+        ("false", ""),
+        ("off", ""),
+        ("daemon", "prefer"),
+        ("REQUIRE", "require"),
     ],
 )
 def test_forward_mode_parsing(monkeypatch, raw, expected):
     monkeypatch.setenv("MEMPALACE_MCP_FORWARD_WRITES", raw)
     monkeypatch.setattr(mcp_server, "_mcp_forward_mode_warned", False)
     assert mcp_server._mcp_forward_mode() == expected
+
+
+def test_every_mutating_tool_is_classified_for_forwarding():
+    """Table-driven parity between ``_MUTATING_TOOLS`` and the daemon allowlist.
+
+    Every member of ``_MUTATING_TOOLS`` must be classified ``write`` by
+    ``service.classify_tool`` unless it is a documented maintenance tool with
+    its own daemon job kind (``service.MAINTENANCE_TOOLS``). A tool that fails
+    this parity lands in the forwarding gate's classifier-drift branch, and
+    under ``prefer`` would silently become a direct palace writer — the review
+    finding on mempalace_kg_supersede.
+    """
+    from mempalace.service import MAINTENANCE_TOOLS, classify_tool
+
+    misclassified = {
+        tool: classify_tool(tool)
+        for tool in sorted(mcp_server._MUTATING_TOOLS)
+        if tool not in MAINTENANCE_TOOLS and classify_tool(tool) != "write"
+    }
+
+    assert misclassified == {}, (
+        f"mutating tools missing from service.WRITE_TOOLS: {misclassified}"
+    )
+
+
+def test_require_refuses_drifted_mutating_tool(monkeypatch, tmp_path):
+    """A mutating tool unknown to the daemon classifier must be REFUSED under
+    ``require`` — never silently executed as a direct write, and never
+    submitted as a job the daemon would reject."""
+    import mempalace.service as service_mod
+
+    monkeypatch.setenv("MEMPALACE_MCP_FORWARD_WRITES", "require")
+    called = _install(monkeypatch, tmp_path, client="unset", lock="forbid")
+    monkeypatch.setattr(
+        service_mod,
+        "classify_tool",
+        lambda name: "unknown" if name == WRITE_TOOL else "write",
+    )
+
+    response = _call()
+
+    assert called["direct"] is False
+    assert response["error"]["code"] == -32004
+    assert "classifier" in response["error"]["message"]
+
+
+def test_prefer_falls_back_on_drifted_mutating_tool(monkeypatch, tmp_path):
+    """Under ``prefer``, a classifier-drifted tool takes the documented direct
+    fallback (with a warning) instead of a daemon submission that would be
+    rejected."""
+    import mempalace.service as service_mod
+
+    monkeypatch.setenv("MEMPALACE_MCP_FORWARD_WRITES", "prefer")
+    called = _install(monkeypatch, tmp_path, client="unset", lock="allow")
+    monkeypatch.setattr(
+        service_mod,
+        "classify_tool",
+        lambda name: "unknown" if name == WRITE_TOOL else "write",
+    )
+
+    response = _call()
+
+    assert called["direct"] is True
+    assert '"ok": "direct"' in response["result"]["content"][0]["text"]

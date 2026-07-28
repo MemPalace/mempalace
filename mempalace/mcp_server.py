@@ -423,28 +423,44 @@ _mcp_forward_mode_warned = False
 def _mcp_forward_mode() -> str:
     """Resolve MEMPALACE_MCP_FORWARD_WRITES to ``prefer``, ``require``, or ``""``.
 
-    - unset/empty: off — current direct-write behavior.
-    - ``prefer`` (or a bare truthy value): forward writes to a running daemon;
-      fall back to the direct path when no daemon is reachable.
+    - unset/empty or ``direct``: off — current direct-write behavior.
+    - ``prefer`` (or a legacy bare truthy value): forward writes to a running
+      daemon; fall back to the direct path when no daemon is reachable.
     - ``require``: forward writes; refuse when no daemon is reachable. This
       server then never takes the palace writer lease.
+
+    Parsing goes through the shared write-routing policy model
+    (``write_routing.parse_write_routing_policy``, #2027) so the MCP transport
+    accepts the same vocabulary as every other write caller. The routing
+    *decision* stays transport-specific: an MCP server discovers daemon
+    availability by submitting the job, not by probing first.
     """
     global _mcp_forward_mode_warned
-    raw = os.environ.get(_MCP_FORWARD_WRITES_ENV, "").strip().lower()
+    raw = os.environ.get(_MCP_FORWARD_WRITES_ENV, "").strip()
     if not raw:
         return ""
-    if raw in {"prefer", "require"}:
-        return raw
-    if raw in {"1", "true", "yes", "on"}:
-        return "prefer"
-    if not _mcp_forward_mode_warned:
-        logger.warning(
-            "%s=%r not recognized (expected 'prefer' or 'require'); write forwarding stays OFF",
-            _MCP_FORWARD_WRITES_ENV,
-            raw,
-        )
-        _mcp_forward_mode_warned = True
-    return ""
+
+    from .write_routing import (
+        WriteRoutingError,
+        WriteRoutingPolicy,
+        parse_write_routing_policy,
+    )
+
+    try:
+        policy = parse_write_routing_policy(raw, legacy_boolean=True)
+    except WriteRoutingError:
+        if not _mcp_forward_mode_warned:
+            logger.warning(
+                "%s=%r not recognized (expected 'direct', 'prefer', or 'require'); "
+                "write forwarding stays OFF",
+                _MCP_FORWARD_WRITES_ENV,
+                raw,
+            )
+            _mcp_forward_mode_warned = True
+        return ""
+    if policy is WriteRoutingPolicy.DIRECT:
+        return ""
+    return policy.value
 
 
 def _mcp_forward_error(req_id, tool_name: str, message: str):
@@ -466,11 +482,19 @@ def _mcp_maybe_forward_write(req_id, tool_name: str, tool_args: dict):
     (forwarded, refused, or failed), or ``None`` to fall through to the direct
     dispatch path.
 
-    Scope: only tools that are both in ``_MUTATING_TOOLS`` and classified
-    ``write`` by the daemon's own allowlist (``service.classify_tool``) are
-    forwarded. Maintenance tools (``mempalace_mine`` / ``mempalace_sync``) keep
-    the direct path — the daemon has dedicated job kinds for those (wired via
-    the CLI ``--daemon`` flag), and ``run_mcp_tool`` would reject them.
+    Scope: the forwardable set is ``_MUTATING_TOOLS`` minus
+    ``service.MAINTENANCE_TOOLS``. Maintenance tools are not forwardable as
+    ``mcp_tool`` jobs (the daemon has dedicated job kinds for them, wired via
+    the CLI ``--daemon`` flag, and ``run_mcp_tool`` would reject them) — so
+    under ``prefer`` they keep the direct path, and under ``require`` they are
+    refused outright: running them in-process would take the writer lease this
+    mode promises never to take. Any remaining
+    tool that ``service.classify_tool`` does NOT report as ``write`` is
+    classifier drift, never a routing decision: under ``require`` the call is
+    refused (a silent direct write is the exact outcome forwarding exists to
+    prevent); under ``prefer`` it falls back to the documented direct path
+    with a warning. ``test_every_mutating_tool_is_classified_for_forwarding``
+    pins list parity so the drift branch is unreachable at a healthy commit.
 
     Fallback safety: ``prefer`` mode falls back to the direct path ONLY when
     the job was never submitted. After submission the daemon owns the write; a
@@ -482,9 +506,39 @@ def _mcp_maybe_forward_write(req_id, tool_name: str, tool_args: dict):
     if not mode or tool_name not in _MUTATING_TOOLS:
         return None
 
-    from .service import classify_tool
+    from .service import MAINTENANCE_TOOLS, classify_tool
 
-    if classify_tool(tool_name) != "write":
+    if tool_name in MAINTENANCE_TOOLS:
+        if mode == "require":
+            return _mcp_forward_error(
+                req_id,
+                tool_name,
+                f"{tool_name} is a maintenance operation with a dedicated daemon "
+                f"job kind, and running it in-process would take the palace "
+                f"writer lease — refused under {_MCP_FORWARD_WRITES_ENV}=require. "
+                "Run it through the CLI daemon path (e.g. `mempalace mine "
+                "--daemon`) or use prefer mode.",
+            )
+        return None
+
+    classification = classify_tool(tool_name)
+    if classification != "write":
+        if mode == "require":
+            return _mcp_forward_error(
+                req_id,
+                tool_name,
+                f"{tool_name} is a mutating tool the daemon's write classifier "
+                f"does not recognize (classify_tool -> {classification!r}); "
+                f"refusing a direct write under {_MCP_FORWARD_WRITES_ENV}=require. "
+                "service.WRITE_TOOLS is missing this tool.",
+            )
+        logger.warning(
+            "MCP write forwarding: %r is in _MUTATING_TOOLS but classify_tool() "
+            "returned %r; falling back to a direct write under prefer mode. "
+            "service.WRITE_TOOLS is likely missing this tool.",
+            tool_name,
+            classification,
+        )
         return None
 
     read_only_error = _mcp_read_only_refusal(req_id, tool_name)
