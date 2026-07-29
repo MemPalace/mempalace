@@ -354,15 +354,28 @@ class MempalaceConfig:
         """Initialize config.
 
         Args:
-            config_dir: Override config directory (useful for testing).
-                        Defaults to ~/.mempalace.
+            config_dir: Explicit config directory. Takes precedence over the
+                        ``MEMPALACE_CONFIG_DIR`` environment variable, which in
+                        turn takes precedence over the ~/.mempalace default.
             palace_path: Explicit palace data directory. This is primarily
                          used by CLI operations that received ``--palace``;
                          it takes precedence over environment and file config.
         """
-        self._config_dir = (
-            Path(config_dir) if config_dir else Path(os.path.expanduser("~/.mempalace"))
-        )
+        # Explicit arg > MEMPALACE_CONFIG_DIR > ~/.mempalace, mirroring how
+        # ``palace_path`` resolves. A host that embeds mempalace as a library
+        # needs to point a spawned process at its own config root: without an
+        # env lever the directory hardwires to ~/.mempalace, so every spawned
+        # process reads a user-level config it does not own. The config file
+        # supplies backend, collection_name, embedding_model, write_routing and
+        # ~20 more, so an embedding host inherits all of them by default.
+        env_config_dir = os.environ.get("MEMPALACE_CONFIG_DIR")
+        if config_dir:
+            resolved_config_dir = str(config_dir)
+        elif env_config_dir and env_config_dir.strip():
+            resolved_config_dir = env_config_dir.strip()
+        else:
+            resolved_config_dir = "~/.mempalace"
+        self._config_dir = Path(os.path.expanduser(resolved_config_dir))
         self._config_file = self._config_dir / "config.json"
         self._people_map_file = self._config_dir / "people_map.json"
         self._palace_path_override = (
