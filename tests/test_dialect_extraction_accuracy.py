@@ -15,7 +15,23 @@ Two independent findings in mempalace/dialect.py:
        English decision-word list scores German text at ~0.
 """
 
+import pytest
+
+from mempalace import i18n
 from mempalace.dialect import Dialect
+
+
+@pytest.fixture(autouse=True)
+def _restore_lang():
+    """Restore the module-global current language after each test.
+
+    Dialect(lang="de") mutates i18n's process-global _current_lang; without
+    this, a later test that constructs Dialect() with no lang would inherit
+    German and lose the English decision words (test-isolation leak).
+    """
+    saved = i18n.current_lang()
+    yield
+    i18n.load_lang(saved)
 
 
 class TestEncodeEntityWholeWord:
