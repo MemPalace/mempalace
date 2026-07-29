@@ -379,7 +379,7 @@ class Dialect:
         self._stop_words = set(_sw.split()) if _sw else _STOP_WORDS
         # Tokenizer: locale topic_pattern captures the script's letters (incl.
         # umlauts); the ASCII default [a-zA-Z]... split German words at umlauts.
-        self._topic_pattern = self.lang_regex.get("topic_pattern") or r"[a-zA-Z][a-zA-Z_-]{2,}"
+        self._topic_pattern = self.lang_regex.get("topic_pattern") or r"[^\W\d_][\w-]{2,}"
         _dw = self.lang_regex.get("decision_words")
         self._decision_words = set(_dw.split()) if _dw else _DECISION_WORDS
 
