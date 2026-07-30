@@ -13,14 +13,26 @@ import sys
 import json
 import logging
 import stat
-from pathlib import Path
-from datetime import datetime
 from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime
+from itertools import islice
+from pathlib import Path
 from typing import Optional
 
 from .collision_scan import assert_no_collisions
 from .ids import ID_RECIPE, make_convo_drawer_id, make_convo_sentinel_id
 from .normalize import normalize
+from .normalized_conversations import (
+    SCHEMA as NORMALIZED_CONVERSATION_SCHEMA,
+    NormalizedConversation,
+    NormalizedConversationProbe,
+    count_normalized_conversation_chunks,
+    has_normalized_sidecar,
+    iter_normalized_conversation_chunks,
+    load_normalized_conversation,
+    probe_normalized_conversation,
+)
 from .entities import entities_metadata
 from .palace import (
     NORMALIZE_VERSION,
@@ -179,6 +191,279 @@ def _source_file_delete_ids(collection, source_file: str, extract_mode: str) -> 
             break
         offset += len(batch_ids)
     return ids
+
+
+def _normalized_generation_key(source_version: str, chunk_size: int) -> tuple:
+    return (source_version, chunk_size, NORMALIZE_VERSION, ID_RECIPE)
+
+
+@dataclass
+class NormalizedSourceState:
+    """Compact, wing-local completeness state for one normalized source."""
+
+    actual_count: int = 0
+    generations: set = field(default_factory=set)
+    expected_counts: set = field(default_factory=set)
+    ids_by_generation: dict = field(default_factory=lambda: defaultdict(list))
+    counts_by_generation: dict = field(default_factory=lambda: defaultdict(int))
+    expected_by_generation: dict = field(default_factory=lambda: defaultdict(set))
+
+    def record(self, metadata: dict, drawer_id: Optional[str] = None) -> None:
+        version = metadata.get("source_version")
+        chunk_size = metadata.get("source_chunk_size")
+        generation = (
+            version,
+            chunk_size,
+            metadata.get("normalize_version"),
+            metadata.get("id_recipe"),
+        )
+        expected = metadata.get("source_chunk_count")
+        self.actual_count += 1
+        self.generations.add(generation)
+        self.expected_counts.add(expected)
+        self.counts_by_generation[generation] += 1
+        self.expected_by_generation[generation].add(expected)
+        if drawer_id is not None:
+            self.ids_by_generation[generation].append(drawer_id)
+
+    def record_count(
+        self,
+        source_version,
+        chunk_size,
+        normalize_version,
+        id_recipe,
+        expected_count,
+        count: int,
+    ) -> None:
+        generation = (source_version, chunk_size, normalize_version, id_recipe)
+        self.actual_count += count
+        self.generations.add(generation)
+        self.expected_counts.add(expected_count)
+        self.counts_by_generation[generation] += count
+        self.expected_by_generation[generation].add(expected_count)
+
+    def generation_is_complete(
+        self, source_version: str, chunk_size: int, expected_count: int
+    ) -> bool:
+        generation = _normalized_generation_key(source_version, chunk_size)
+        return (
+            expected_count > 0
+            and self.counts_by_generation.get(generation, 0) == expected_count
+            and self.expected_by_generation.get(generation, set()) == {expected_count}
+        )
+
+    def is_only_complete(self, source_version: str, chunk_size: int) -> bool:
+        return (
+            self.actual_count > 0
+            and self.generations == {_normalized_generation_key(source_version, chunk_size)}
+            and len(self.expected_counts) == 1
+            and next(iter(self.expected_counts), None) == self.actual_count
+        )
+
+
+def _normalized_source_state(
+    collection,
+    source_file: str,
+    wing: str,
+    extract_mode: str,
+    *,
+    collect_ids: bool = False,
+) -> NormalizedSourceState:
+    state = NormalizedSourceState()
+    offset = 0
+    while True:
+        batch = collection.get(
+            where={"$and": [{"source_file": source_file}, {"wing": wing}]},
+            limit=1000,
+            offset=offset,
+            include=["metadatas"],
+        )
+        batch_ids = batch.get("ids") or []
+        for drawer_id, meta in zip(batch_ids, batch.get("metadatas") or []):
+            meta = meta or {}
+            if not _metadata_matches_extract_mode(meta, extract_mode):
+                continue
+            state.record(meta, drawer_id if collect_ids else None)
+        if not batch_ids:
+            break
+        offset += len(batch_ids)
+    return state
+
+
+def _prefetch_normalized_sources(
+    collection, wing: str, extract_mode: str
+) -> dict[str, NormalizedSourceState]:
+    """Fetch compact completeness state for all normalized sources once."""
+
+    states: dict[str, NormalizedSourceState] = {}
+    offset = 0
+    while True:
+        batch = collection.get(
+            where={
+                "$and": [
+                    {"normalized_schema": NORMALIZED_CONVERSATION_SCHEMA},
+                    {"wing": wing},
+                ]
+            },
+            limit=1000,
+            offset=offset,
+            include=["metadatas"],
+        )
+        batch_ids = batch.get("ids") or []
+        for meta in batch.get("metadatas") or []:
+            meta = meta or {}
+            source_file = meta.get("source_file")
+            if not source_file or not _metadata_matches_extract_mode(meta, extract_mode):
+                continue
+            states.setdefault(source_file, NormalizedSourceState()).record(meta)
+        if not batch_ids:
+            break
+        offset += len(batch_ids)
+    return states
+
+
+def normalized_conversation_delta(
+    convo_dir: str,
+    palace_path: str,
+    *,
+    wing: str,
+    extract_mode: str = "exchange",
+) -> dict:
+    """Report normalized source reconciliation without writing palace state."""
+
+    import sqlite3
+
+    from .config import MempalaceConfig, sqlite_read_uri
+
+    if extract_mode != "exchange":
+        raise ValueError("normalized conversation delta requires extract_mode=exchange")
+    source_root = Path(convo_dir).expanduser().resolve(strict=True)
+    stored: dict[str, NormalizedSourceState] = {}
+    palace_config = MempalaceConfig(palace_path=palace_path)
+    db_path = Path(palace_path) / "chroma.sqlite3"
+    if not db_path.is_file():
+        raise ValueError("read-only delta reporting currently requires an existing Chroma palace")
+    connection = sqlite3.connect(sqlite_read_uri(str(db_path)), uri=True)
+    try:
+        rows = connection.execute(
+            """
+            SELECT sf.string_value,
+                   sv.string_value,
+                   scs.int_value,
+                   nv.int_value,
+                   ir.string_value,
+                   scc.int_value,
+                   em.string_value,
+                   COUNT(*)
+              FROM embeddings e
+              JOIN segments s
+                ON e.segment_id = s.id AND s.scope = 'METADATA'
+              JOIN collections c
+                ON s.collection = c.id
+              JOIN embedding_metadata sf
+                ON sf.id = e.id AND sf.key = 'source_file'
+              JOIN embedding_metadata w
+                ON w.id = e.id AND w.key = 'wing'
+              JOIN embedding_metadata ns
+                ON ns.id = e.id AND ns.key = 'normalized_schema'
+              LEFT JOIN embedding_metadata sv
+                ON sv.id = e.id AND sv.key = 'source_version'
+              LEFT JOIN embedding_metadata scs
+                ON scs.id = e.id AND scs.key = 'source_chunk_size'
+              LEFT JOIN embedding_metadata nv
+                ON nv.id = e.id AND nv.key = 'normalize_version'
+              LEFT JOIN embedding_metadata ir
+                ON ir.id = e.id AND ir.key = 'id_recipe'
+              LEFT JOIN embedding_metadata scc
+                ON scc.id = e.id AND scc.key = 'source_chunk_count'
+              LEFT JOIN embedding_metadata em
+                ON em.id = e.id AND em.key = 'extract_mode'
+             WHERE c.name = ?
+               AND w.string_value = ?
+               AND ns.string_value = ?
+             GROUP BY sf.string_value, sv.string_value, scs.int_value,
+                      nv.int_value, ir.string_value, scc.int_value,
+                      em.string_value
+            """,
+            (palace_config.collection_name, wing, NORMALIZED_CONVERSATION_SCHEMA),
+        )
+        for (
+            source_file,
+            source_version,
+            source_chunk_size,
+            normalize_version,
+            id_recipe,
+            source_chunk_count,
+            stored_mode,
+            count,
+        ) in rows:
+            if not source_file or not _metadata_matches_extract_mode(
+                {"extract_mode": stored_mode}, extract_mode
+            ):
+                continue
+            stored.setdefault(source_file, NormalizedSourceState()).record_count(
+                source_version,
+                source_chunk_size,
+                normalize_version,
+                id_recipe,
+                source_chunk_count,
+                int(count),
+            )
+    finally:
+        connection.close()
+    stored = {
+        source_file: state
+        for source_file, state in stored.items()
+        if _path_within_root(Path(source_file), source_root)
+    }
+
+    current_paths: set[str] = set()
+    new: list[str] = []
+    changed: list[str] = []
+    unchanged: list[str] = []
+    projected_counts: dict[str, int] = {}
+    for path in scan_convos(str(source_root)):
+        if not has_normalized_sidecar(path):
+            continue
+        conversation = load_normalized_conversation(
+            path,
+            source_root,
+            extract_mode=extract_mode,
+        )
+        source_file = str(path)
+        current_paths.add(source_file)
+        projected_counts[source_file] = count_normalized_conversation_chunks(
+            conversation,
+            chunk_size=palace_config.chunk_size,
+        )
+        source_state = stored.get(source_file, NormalizedSourceState())
+        complete = source_state.is_only_complete(
+            conversation.source_version,
+            palace_config.chunk_size,
+        )
+        if complete:
+            unchanged.append(source_file)
+        elif source_state.actual_count:
+            changed.append(source_file)
+        else:
+            new.append(source_file)
+
+    removed = sorted(set(stored) - current_paths)
+    old_changed = sum(stored[path].actual_count for path in changed)
+    removed_drawers = sum(stored[path].actual_count for path in removed)
+    new_drawers = sum(projected_counts[path] for path in new)
+    changed_drawers = sum(projected_counts[path] for path in changed)
+    return {
+        "new": sorted(new),
+        "changed": sorted(changed),
+        "unchanged": sorted(unchanged),
+        "removed": removed,
+        "new_drawers": new_drawers,
+        "replacement_drawers": old_changed,
+        "changed_drawers": changed_drawers,
+        "removed_drawers": removed_drawers,
+        "net_drawers": new_drawers + changed_drawers - old_changed - removed_drawers,
+    }
 
 
 # =============================================================================
@@ -487,39 +772,89 @@ def _extract_authored_at(filepath):
 
 
 def _file_chunks_locked(
-    collection, source_file, chunks, wing, room, agent, extract_mode, authored_at=None
+    collection,
+    source_file,
+    chunks,
+    wing,
+    room,
+    agent,
+    extract_mode,
+    authored_at=None,
+    normalized: Optional[NormalizedConversation] = None,
+    chunk_count: Optional[int] = None,
+    source_chunk_size: Optional[int] = None,
 ):
-    """Lock the source file, purge stale drawers, and upsert fresh chunks.
+    """Lock one source and replace it without removing the last complete generation.
 
     Combines the per-file serialization that prevents concurrent agents from
-    duplicating work (via mine_lock) with the rebuild contract
-    (purge-before-insert so stale drawers never survive) that fires on
-    either a normalize-version bump OR a changed/grown source file (mtime
-    differs from what's stored) -- transcripts are not assumed immutable,
-    since a Claude Code session keeps appending to its own file while
-    active and /compact or /clear can rewrite one in place.
+    duplicating work with two replacement contracts. Generic sources retain
+    their established purge-before-upsert behavior. Normalized sources use
+    source-versioned IDs: remove only an incomplete target generation, stage
+    and verify the complete target, then retire older generations. A failed
+    stage therefore leaves the prior complete generation available.
 
     Returns (drawers_added, room_counts_delta, skipped).
     """
     room_counts_delta: dict = defaultdict(int)
     drawers_added = 0
+    expected_chunk_count = len(chunks) if chunk_count is None else chunk_count
+    normalized_chunk_size = source_chunk_size if source_chunk_size is not None else 0
     with mine_lock(source_file):
         # Re-check after lock — another agent may have just finished this file
         # at the current schema/mtime. A stale hit here returns False, so we
         # still fall through to the purge+rebuild path below.
-        if file_already_mined(collection, source_file, check_mtime=True, extract_mode=extract_mode):
+        if normalized is not None:
+            source_state = _normalized_source_state(
+                collection,
+                source_file,
+                wing,
+                extract_mode,
+                collect_ids=True,
+            )
+            already_mined = source_state.is_only_complete(
+                normalized.source_version,
+                normalized_chunk_size,
+            )
+        else:
+            source_state = None
+            already_mined = file_already_mined(
+                collection,
+                source_file,
+                check_mtime=True,
+                extract_mode=extract_mode,
+            )
+        if already_mined:
             return 0, room_counts_delta, True
 
-        # Purge stale drawers first. Fires both on a normalize-schema bump
-        # (file_already_mined() returned False for pre-v2 drawers) and on a
-        # changed/grown transcript (mtime differs) — clean them out so the
-        # source doesn't end up with mixed old/new drawers.
-        try:
-            delete_ids = _source_file_delete_ids(collection, source_file, extract_mode)
-            if delete_ids:
-                collection.delete(ids=delete_ids)
-        except Exception:
-            logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
+        if normalized is None:
+            try:
+                delete_ids = _source_file_delete_ids(collection, source_file, extract_mode)
+                if delete_ids:
+                    collection.delete(ids=delete_ids)
+            except Exception:
+                logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
+        elif not source_state.generation_is_complete(
+            normalized.source_version,
+            normalized_chunk_size,
+            expected_chunk_count,
+        ):
+            incomplete_target_ids = source_state.ids_by_generation.get(
+                _normalized_generation_key(normalized.source_version, normalized_chunk_size),
+                [],
+            )
+            if incomplete_target_ids:
+                collection.delete(ids=incomplete_target_ids)
+                cleared = _normalized_source_state(
+                    collection,
+                    source_file,
+                    wing,
+                    extract_mode,
+                )
+                if cleared.counts_by_generation.get(
+                    _normalized_generation_key(normalized.source_version, normalized_chunk_size),
+                    0,
+                ):
+                    raise RuntimeError("normalized target-generation purge left stale drawer(s)")
 
         # Batch chunks into bounded upserts so large transcripts keep most of
         # the embedding speedup without one huge Chroma/SQLite request. Keep
@@ -530,16 +865,30 @@ def _file_chunks_locked(
             source_mtime = os.path.getmtime(source_file)
         except OSError:
             source_mtime = None
-        for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
+        target_needs_upsert = normalized is None or not source_state.generation_is_complete(
+            normalized.source_version,
+            normalized_chunk_size,
+            expected_chunk_count,
+        )
+        chunk_iterator = iter(chunks) if target_needs_upsert else iter(())
+        while batch := list(islice(chunk_iterator, DRAWER_UPSERT_BATCH_SIZE)):
             batch_docs: list = []
             batch_ids: list = []
             batch_metas: list = []
-            for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
+            for chunk in batch:
                 chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
                 if extract_mode == "general":
                     room_counts_delta[chunk_room] += 1
                 drawer_id = make_convo_drawer_id(
-                    wing, chunk_room, source_file, extract_mode, chunk["chunk_index"]
+                    wing,
+                    chunk_room,
+                    source_file,
+                    extract_mode,
+                    chunk["chunk_index"],
+                    source_version=(normalized.source_version if normalized is not None else None),
+                    source_chunk_size=normalized_chunk_size,
+                    normalize_version=NORMALIZE_VERSION,
+                    id_recipe=ID_RECIPE,
                 )
                 batch_docs.append(chunk["content"])
                 batch_ids.append(drawer_id)
@@ -552,7 +901,13 @@ def _file_chunks_locked(
                     "added_by": agent,
                     "filed_at": filed_at,
                     "entities": entities_metadata(chunk["content"]),
-                    "authored_at": authored_at if authored_at is not None else filed_at,
+                    "authored_at": (
+                        chunk.get("authored_to")
+                        if normalized is not None
+                        else authored_at
+                        if authored_at is not None
+                        else filed_at
+                    ),
                     "ingest_mode": "convos",
                     "extract_mode": extract_mode,
                     "normalize_version": NORMALIZE_VERSION,
@@ -560,6 +915,27 @@ def _file_chunks_locked(
                 }
                 if source_mtime is not None:
                     meta["source_mtime"] = source_mtime
+                if normalized is not None:
+                    meta.update(
+                        {
+                            "authored_from": chunk["authored_from"],
+                            "authored_to": chunk["authored_to"],
+                            "message_from": chunk["message_from"],
+                            "message_to": chunk["message_to"],
+                            "message_ids": chunk["message_ids"],
+                            "message_count": chunk["message_count"],
+                            "source_version": normalized.source_version,
+                            "source_chunk_size": normalized_chunk_size,
+                            "source_chunk_count": expected_chunk_count,
+                            "source_fingerprint": normalized.metadata.source_fingerprint,
+                            "transformations": normalized.metadata.transformations,
+                            "exporter_version": normalized.metadata.exporter_version,
+                            "hermes_profile": normalized.metadata.hermes_profile,
+                            "hermes_session_id": normalized.metadata.hermes_session_id,
+                            "hermes_source": normalized.metadata.hermes_source,
+                            "normalized_schema": normalized.metadata.schema,
+                        }
+                    )
                 batch_metas.append(meta)
             assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
             try:
@@ -572,6 +948,41 @@ def _file_chunks_locked(
             except Exception as e:
                 if "already exists" not in str(e).lower():
                     raise
+
+        if normalized is not None:
+            staged = _normalized_source_state(
+                collection,
+                source_file,
+                wing,
+                extract_mode,
+                collect_ids=True,
+            )
+            if not staged.generation_is_complete(
+                normalized.source_version,
+                normalized_chunk_size,
+                expected_chunk_count,
+            ):
+                raise RuntimeError("normalized target generation is incomplete after staging")
+            stale_ids = [
+                drawer_id
+                for generation, version_ids in staged.ids_by_generation.items()
+                if generation
+                != _normalized_generation_key(normalized.source_version, normalized_chunk_size)
+                for drawer_id in version_ids
+            ]
+            if stale_ids:
+                collection.delete(ids=stale_ids)
+            committed = _normalized_source_state(
+                collection,
+                source_file,
+                wing,
+                extract_mode,
+            )
+            if not committed.is_only_complete(
+                normalized.source_version,
+                normalized_chunk_size,
+            ):
+                raise RuntimeError("normalized source replacement left stale drawer(s)")
     return drawers_added, room_counts_delta, False
 
 
@@ -721,6 +1132,74 @@ def _compute_hallways_for_wing_safe(wing, collection, drawers_filed, config=None
         print(f"  (hallways skipped: {exc})")
 
 
+def _probe_normalized_conversation(filepath: Path, source_root: Path, extract_mode: str):
+    if has_normalized_sidecar(filepath):
+        return probe_normalized_conversation(
+            filepath,
+            source_root,
+            extract_mode=extract_mode,
+        )
+    return None
+
+
+def _conversation_source_is_unchanged(
+    source_file: str,
+    probe: Optional[NormalizedConversationProbe],
+    chunk_size: int,
+    mined_mtimes: dict,
+    normalized_states: dict,
+) -> bool:
+    if probe is not None:
+        state = normalized_states.get(source_file, NormalizedSourceState())
+        return state.is_only_complete(probe.source_version, chunk_size)
+    return _is_unchanged_since_last_mine(source_file, mined_mtimes)
+
+
+def _chunk_conversation_content(
+    content: str,
+    normalized: Optional[NormalizedConversation],
+    extract_mode: str,
+    chunk_size: int,
+    min_chunk_size: int,
+) -> list:
+    if normalized is not None:
+        return iter_normalized_conversation_chunks(normalized, chunk_size=chunk_size)
+    if extract_mode == "general":
+        from .general_extractor import extract_memories
+
+        return extract_memories(content, chunk_size=chunk_size)
+    return chunk_exchanges(
+        content,
+        chunk_size=chunk_size,
+        min_chunk_size=min_chunk_size,
+    )
+
+
+def _conversation_room(
+    content: str,
+    normalized: Optional[NormalizedConversation],
+    extract_mode: str,
+) -> Optional[str]:
+    if normalized is not None:
+        return normalized.metadata.room
+    if extract_mode != "general":
+        return detect_convo_room(content)
+    return None
+
+
+def _prefetch_conversation_states(files, collection, dry_run: bool, wing: str, extract_mode: str):
+    if dry_run:
+        return {}, {}
+    normalized_files = {path for path in files if has_normalized_sidecar(path)}
+    mined_mtimes = {}
+    if len(normalized_files) != len(files):
+        mined_mtimes = prefetch_mined_set(collection, extract_mode=extract_mode)
+    normalized_states = {}
+    if normalized_files:
+        normalized_states = _prefetch_normalized_sources(collection, wing, extract_mode)
+    return mined_mtimes, normalized_states
+
+
 def _mine_convos_impl(
     convo_dir: str,
     palace_path: str,
@@ -770,8 +1249,12 @@ def _mine_convos_impl(
     # 2000-file sweep used to spend >1h just deciding to skip.
     # prefetch_mined_set() does the same decisions in a single scan; loop
     # body becomes an O(1) dict lookup + a cheap local mtime comparison.
-    mined_mtimes: dict = (
-        prefetch_mined_set(collection, extract_mode=extract_mode) if not dry_run else {}
+    mined_mtimes, normalized_states = _prefetch_conversation_states(
+        files,
+        collection,
+        dry_run,
+        wing,
+        extract_mode,
     )
 
     total_drawers = 0
@@ -783,16 +1266,27 @@ def _mine_convos_impl(
     for i, filepath in enumerate(files, 1):
         files_processed = i
         source_file = str(filepath)
+        probe = _probe_normalized_conversation(
+            filepath,
+            convo_path,
+            extract_mode,
+        )
 
         # Skip only if already filed at the current NORMALIZE_VERSION AND
         # unchanged on disk since. Transcripts are NOT assumed immutable:
         # a Claude Code session keeps appending to the same file while
         # active, and /compact or /clear can rewrite one in place -- so
         # "we've seen this source_file before" alone is not sufficient.
-        # Falling through re-mines: _file_chunks_locked purges this
-        # source_file's stale drawers before inserting fresh ones, so this
-        # never leaves duplicates behind.
-        if not dry_run and _is_unchanged_since_last_mine(source_file, mined_mtimes):
+        # Falling through re-mines. Normalized sources stage and verify a new
+        # source-versioned generation before retiring stale drawers; generic
+        # sources retain their established purge-and-upsert path.
+        if not dry_run and _conversation_source_is_unchanged(
+            source_file,
+            probe,
+            cfg_chunk_size,
+            mined_mtimes,
+            normalized_states,
+        ):
             files_skipped += 1
             continue
 
@@ -800,42 +1294,52 @@ def _mine_convos_impl(
             files_skipped += 1
             continue
 
-        # Normalize format
-        try:
-            content = normalize(str(filepath))
-        except (OSError, ValueError):
-            if not dry_run:
-                _register_file(collection, source_file, wing, agent, extract_mode)
-            continue
+        normalized = None
+        content = None
+        if probe is not None:
+            normalized = load_normalized_conversation(
+                filepath,
+                convo_path,
+                extract_mode=extract_mode,
+            )
+            content = normalized.transcript
 
-        if not content or len(content.strip()) < cfg_min_chunk_size:
+        # A validated normalized export is already canonical and must remain
+        # byte-for-byte intact. Every other source keeps the generic format
+        # detection, noise filtering, and optional spellcheck behavior.
+        if normalized is None:
+            try:
+                content = normalize(str(filepath))
+            except (OSError, ValueError):
+                if not dry_run:
+                    _register_file(collection, source_file, wing, agent, extract_mode)
+                continue
+        if not content or (normalized is None and len(content.strip()) < cfg_min_chunk_size):
             if not dry_run:
                 _register_file(collection, source_file, wing, agent, extract_mode)
             continue
 
         # Chunk — either exchange pairs or general extraction
-        if extract_mode == "general":
-            from .general_extractor import extract_memories
+        chunks = _chunk_conversation_content(
+            content,
+            normalized,
+            extract_mode,
+            cfg_chunk_size,
+            cfg_min_chunk_size,
+        )
+        chunk_count = (
+            count_normalized_conversation_chunks(normalized, chunk_size=cfg_chunk_size)
+            if normalized is not None
+            else len(chunks)
+        )
 
-            chunks = extract_memories(content, chunk_size=cfg_chunk_size)
-            # Each chunk already has memory_type; use it as the room name
-        else:
-            chunks = chunk_exchanges(
-                content,
-                chunk_size=cfg_chunk_size,
-                min_chunk_size=cfg_min_chunk_size,
-            )
-
-        if not chunks:
+        if chunk_count == 0:
             if not dry_run:
                 _register_file(collection, source_file, wing, agent, extract_mode)
             continue
 
         # Detect room from content (general mode uses memory_type instead)
-        if extract_mode != "general":
-            room = detect_convo_room(content)
-        else:
-            room = None  # set per-chunk below
+        room = _conversation_room(content, normalized, extract_mode)
 
         if dry_run:
             if extract_mode == "general":
@@ -845,8 +1349,8 @@ def _mine_convos_impl(
                 types_str = ", ".join(f"{t}:{n}" for t, n in type_counts.most_common())
                 print(f"    [DRY RUN] {filepath.name} → {len(chunks)} memories ({types_str})")
             else:
-                print(f"    [DRY RUN] {filepath.name} → room:{room} ({len(chunks)} drawers)")
-            total_drawers += len(chunks)
+                print(f"    [DRY RUN] {filepath.name} → room:{room} ({chunk_count} drawers)")
+            total_drawers += chunk_count
             # Track room counts
             if extract_mode == "general":
                 for c in chunks:
@@ -861,8 +1365,8 @@ def _mine_convos_impl(
         if extract_mode != "general":
             room_counts[room] += 1
 
-        # Lock + purge stale + file fresh chunks. Lock serializes concurrent
-        # agents; purge removes pre-v2 drawers so the schema bump applies.
+        # Lock + reconcile stale + file fresh chunks. The lock serializes
+        # concurrent agents for this source.
         drawers_added, room_delta, skipped = _file_chunks_locked(
             collection,
             source_file,
@@ -872,6 +1376,9 @@ def _mine_convos_impl(
             agent,
             extract_mode,
             authored_at=_extract_authored_at(filepath),
+            normalized=normalized,
+            chunk_count=chunk_count,
+            source_chunk_size=(cfg_chunk_size if normalized is not None else None),
         )
         if skipped:
             files_skipped += 1

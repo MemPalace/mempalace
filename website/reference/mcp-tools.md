@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-Detailed parameter schemas for all 36 MCP tools.
+Detailed parameter schemas for all 38 MCP tools.
 
 ## Palace — Read Tools
 
@@ -144,6 +144,42 @@ Mine a directory into the palace — the MCP equivalent of `mempalace mine`. Wra
 | `extract` | string | No | Convos extraction strategy: `exchange` (default) or `general`; ignored by other modes |
 
 **Returns:** `{ success, mode, dry_run, output }` on success (`output` is the miner's human-readable summary; `output_truncated: true` is added when a very large summary is tail-trimmed), or `{ success: false, error, error_class? }` on failure.
+
+---
+
+### `mempalace_normalized_conversation_delta`
+
+Operator inspection for a directory using the normalized-conversation
+sidecar contract. It compares composite source versions and reports new,
+changed, unchanged, and removed sources through SQLite read-only mode. It
+does not alter the source directory, palace drawers, or applied watermark.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `source` | string | **Yes** | Normalized transcript staging directory |
+| `wing` | string | **Yes** | Exact destination wing |
+| `extract` | string | No | Must be `exchange` when present |
+
+**Returns:** `{ success, dry_run: true, report: { new, changed, unchanged, removed, new_drawers, replacement_drawers, changed_drawers, removed_drawers, net_drawers } }`
+
+---
+
+### `mempalace_commit_applied_coverage`
+
+Operator-only commit of a content-free wing coverage receipt. Call this only
+after every source in one profile has an accepted receipt and mixed-version
+verification has passed. The registry update is serialized by the palace lock
+and atomically replaces a private `0600` file. `mempalace_status` reads this
+watermark but never advances it.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `receipt` | object | **Yes** | Closed `mempalace-applied-coverage/v1` receipt with wing, verified snapshot and authored bounds, covered source slugs, accepted/quarantine counts, profile receipt digest, and source version |
+
+**Returns:** `{ success, coverage }` or `{ success: false, error, error_class }`.
+
+Keep this raw tool behind operator authentication. Do not expose it through an
+agent-facing policy adapter.
 
 ---
 

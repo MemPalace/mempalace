@@ -78,6 +78,7 @@ from .backends.chroma import (  # noqa: E402
 )
 from .backends import BackendMismatchError, PalaceRef, detect_backend_for_path  # noqa: E402
 from .query_sanitizer import sanitize_query  # noqa: E402
+from .normalized_conversations import coverage_receipt_json_schema  # noqa: E402
 from .searcher import (  # noqa: E402
     _distance_to_similarity,
     _metric_for_collection,
@@ -396,6 +397,7 @@ _MUTATING_TOOLS = frozenset(
         "mempalace_checkpoint",
         "mempalace_delete_by_source",
         "mempalace_mine",
+        "mempalace_commit_applied_coverage",
         "mempalace_sync",
         "mempalace_update_drawer",
         "mempalace_diary_write",
@@ -1518,7 +1520,7 @@ def _tool_status_via_sqlite() -> dict:
 
     db_path = os.path.join(_config.palace_path, "chroma.sqlite3")
     if not os.path.isfile(db_path):
-        return _no_palace()
+        return _attach_applied_coverage(_no_palace())
     collection_name = _config.collection_name
 
     wings: dict = {}
@@ -1575,6 +1577,21 @@ def _tool_status_via_sqlite() -> dict:
             "hnsw_count": _vector_capacity_status.get("hnsw_count"),
             "divergence": _vector_capacity_status.get("divergence"),
         }
+    return _attach_applied_coverage(result)
+
+
+def _attach_applied_coverage(result: dict) -> dict:
+    """Attach the operator-committed watermark without changing it."""
+
+    try:
+        from .normalized_conversations import read_applied_coverage
+
+        result["applied_coverage"] = read_applied_coverage(_config.palace_path)
+    except Exception as exc:
+        logger.warning("applied coverage registry read failed: %s", exc)
+        result["applied_coverage"] = {}
+        result["applied_coverage_error"] = str(exc)
+        result["partial"] = True
     return result
 
 
@@ -1772,21 +1789,23 @@ def tool_status():
             wings[w] = wings.get(w, 0) + sum(room_counts.values())
             for r, n in room_counts.items():
                 rooms[r] = rooms.get(r, 0) + n
-        return {
-            "total_drawers": total,
-            "wings": wings,
-            "rooms": rooms,
-            "protocol": PALACE_PROTOCOL,
-            "aaak_dialect": AAAK_SPEC,
-            "backend": _selected_backend_name(),
-        }
+        return _attach_applied_coverage(
+            {
+                "total_drawers": total,
+                "wings": wings,
+                "rooms": rooms,
+                "protocol": PALACE_PROTOCOL,
+                "aaak_dialect": AAAK_SPEC,
+                "backend": _selected_backend_name(),
+            }
+        )
 
     # Use create=True only when a palace DB already exists on disk -- this
     # bootstraps the ChromaDB collection on a valid-but-empty palace without
     # accidentally creating a palace in a non-existent directory (#830).
     col = _get_collection(create=db_exists)
     if not col:
-        return _collection_error_or_no_palace()
+        return _attach_applied_coverage(_collection_error_or_no_palace())
     count = col.count()
     wings = {}
     rooms = {}
@@ -1844,7 +1863,7 @@ def tool_status():
         logger.exception("tool_status metadata fetch failed")
         result["error"] = str(e)
         result["partial"] = True
-    return result
+    return _attach_applied_coverage(result)
 
 
 # ── AAAK Dialect Spec ─────────────────────────────────────────────────────────
@@ -2915,6 +2934,62 @@ def tool_mine(
     finally:
         if not dry_run:
             _metadata_cache = None
+
+
+def tool_normalized_conversation_delta(
+    source: str,
+    wing: str,
+    extract: str = "exchange",
+):
+    """Return a read-only normalized-source reconciliation report."""
+
+    if not _config.palace_path:
+        return {
+            "success": False,
+            "error": "no palace configured",
+            "error_class": "PalaceNotConfigured",
+        }
+    src = os.path.expanduser(source) if source else ""
+    if not src or not os.path.isdir(src):
+        return {"success": False, "error": f"source directory not found: {source!r}"}
+    try:
+        from .convo_miner import normalized_conversation_delta
+
+        report = normalized_conversation_delta(
+            src,
+            _config.palace_path,
+            wing=sanitize_name(wing, "wing"),
+            extract_mode=extract,
+        )
+        return {"success": True, "dry_run": True, "report": report}
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": str(exc),
+            "error_class": type(exc).__name__,
+        }
+
+
+def tool_commit_applied_coverage(receipt: dict):
+    """Atomically commit an operator-verified, content-free wing watermark."""
+
+    if not _config.palace_path:
+        return {
+            "success": False,
+            "error": "no palace configured",
+            "error_class": "PalaceNotConfigured",
+        }
+    try:
+        from .normalized_conversations import commit_applied_coverage
+
+        committed = commit_applied_coverage(_config.palace_path, receipt)
+        return {"success": True, "coverage": committed}
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": str(exc),
+            "error_class": type(exc).__name__,
+        }
 
 
 def _purge_source_closets(source_file: str, *, commit: bool) -> int:
@@ -4452,6 +4527,42 @@ TOOLS = {
             "required": ["source"],
         },
         "handler": tool_mine,
+    },
+    "mempalace_normalized_conversation_delta": {
+        "description": (
+            "Operator inspection for normalized conversation staging. Reports "
+            "new, changed, unchanged, and removed sources without writing."
+        ),
+        "input_schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "source": {"type": "string", "description": "Normalized staging directory."},
+                "wing": {"type": "string", "description": "Exact destination wing."},
+                "extract": {
+                    "type": "string",
+                    "enum": ["exchange"],
+                    "description": "Normalized conversations support exchange mode only.",
+                },
+            },
+            "required": ["source", "wing"],
+        },
+        "handler": tool_normalized_conversation_delta,
+    },
+    "mempalace_commit_applied_coverage": {
+        "description": (
+            "Operator-only commit of a content-free coverage receipt after a "
+            "profile apply and mixed-version verification both pass."
+        ),
+        "input_schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "receipt": coverage_receipt_json_schema(),
+            },
+            "required": ["receipt"],
+        },
+        "handler": tool_commit_applied_coverage,
     },
     "mempalace_delete_by_source": {
         "description": "Bulk-delete every drawer mined from one source_file (exact match). Use to clean up benchmark/test data accidentally mined into a user wing (#1722). Returns a dry-run match count and sample by default; pass dry_run=false to commit. Irreversible.",
