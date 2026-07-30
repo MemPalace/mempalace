@@ -1,15 +1,3 @@
-> [!CAUTION]
-> **Scam alert.** The only official sources for MemPalace are this
-> [GitHub repository](https://github.com/MemPalace/mempalace), the
-> [PyPI package](https://pypi.org/project/mempalace/), and the docs site at
-> **[mempalaceofficial.com](https://mempalaceofficial.com)**. Any other
-> domain — including `mempalace.tech` — is an impostor and may distribute
-> malware. Details and timeline: [docs/HISTORY.md](docs/HISTORY.md).
-
-> [!IMPORTANT]
-> **🚨 Claude Code sessions expire in 30 days w/out auto-save hooks wired!** **[Read this →](https://github.com/MemPalace/mempalace/discussions/1388)**
-
-
 <div align="center">
 
 <img src="assets/mempalace_logo.png" alt="MemPalace" width="240">
@@ -24,6 +12,14 @@ Local-first AI memory. Verbatim storage, pluggable backend, 96.6% R@5 raw on Lon
 [![][discord-shield]][discord-link]
 
 </div>
+
+> [!CAUTION]
+> **Beware of impostor sites.** MemPalace has no other official websites. The **only** official sources are this **[GitHub repository](https://github.com/MemPalace/mempalace)**, the **[PyPI package](https://pypi.org/project/mempalace/)**, and the docs at **[mempalaceofficial.com](https://mempalaceofficial.com)**. Any other domain (including `.tech`, `.net`, or other `.com` variants) is an impostor and may distribute malware. Details and timeline: [docs/HISTORY.md](docs/HISTORY.md).
+
+> [!IMPORTANT]
+> **Claude Code sessions expire in 30 days without auto-save hooks wired.** [Read this →](https://github.com/MemPalace/mempalace/discussions/1388)
+>
+> Need the shortest recovery/setup path? Use the [Claude Code retention setup checklist](https://mempalaceofficial.com/guide/claude-code-retention.html).
 
 ---
 
@@ -49,6 +45,11 @@ Architecture, concepts, and mining flows:
 
 ## Install
 
+MemPalace ships a CLI, so install it in an isolated environment to avoid
+PEP 668 errors on Debian/Ubuntu/Homebrew Pythons and to keep mempalace's
+deps (`chromadb`, `numpy`, `grpcio`, …) from conflicting with anything
+else in your global site-packages.
+
 We recommend [`uv`](https://docs.astral.sh/uv/) — `uv tool install` puts
 the `mempalace` CLI in an isolated environment on your PATH:
 
@@ -57,7 +58,73 @@ uv tool install mempalace
 mempalace init ~/projects/myapp
 ```
 
-If you prefer pip, `pip install mempalace` still works.
+[`pipx`](https://pipx.pypa.io/) works the same way if you prefer it:
+`pipx install mempalace`.
+
+Prefer plain `pip` only inside an activated virtualenv where you
+explicitly want `import mempalace` available:
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install mempalace
+```
+
+### Docker
+
+A container image is also available for running the MCP server or the CLI
+without a local Python toolchain. Everything persists under `/data` (palace,
+config, and the cached embedding model), so mount a volume there.
+
+```bash
+# Build the image (CPU; bundles the `extract` + `spellcheck` extras)
+docker build -t mempalace .
+
+# MCP server over stdio — note the `-i` flag (JSON-RPC needs stdin)
+docker run -i --rm -v mempalace-data:/data mempalace
+
+# Run any CLI command instead (mount the host directory you want to mine)
+docker run --rm -v mempalace-data:/data -v /path/to/project:/work mempalace mine /work
+docker run --rm -v mempalace-data:/data mempalace search "why GraphQL"
+```
+
+Wire it into an MCP client (e.g. Claude Code) as a stdio server:
+
+```json
+{
+  "mcpServers": {
+    "mempalace": {
+      "command": "docker",
+      "args": ["run", "-i", "--rm", "-v", "mempalace-data:/data", "mempalace"]
+    }
+  }
+}
+```
+
+`docker compose run --rm mcp` works too (see `docker-compose.yml`). For
+CUDA-accelerated embeddings, build the GPU variant with
+`docker build -f Dockerfile.gpu -t mempalace:gpu .` and run it with
+`--gpus all`. Customise the bundled extras at build time, e.g.
+`docker build --build-arg EXTRAS="extract,spellcheck" -t mempalace .`.
+
+## Storage backends
+
+ChromaDB is the default and needs no configuration. MemPalace also ships a
+pluggable backend contract, exercised across deliberately different substrates
+so the contract is never accidentally shaped around one vendor. Every
+non-default backend is opt-in.
+
+| Backend | Mode | Install | Namespaces | Lexical | Configure with |
+| ------- | ---- | ------- | :--------: | :-----: | -------------- |
+| `chroma` _(default)_ | Local (embedded) | bundled | – | ✓ | – |
+| `sqlite_exact` | Local (exact) | bundled | – | ✓ | – |
+| `milvus` | Local (Lite) · Server opt-in | `mempalace[milvus]` | ✓ | ✓ | `MEMPALACE_MILVUS_URI` |
+| `qdrant` | Server (REST) | bundled | ✓ | ✓ | `MEMPALACE_QDRANT_URL` |
+| `pgvector` | Server (Postgres) | `mempalace[pgvector]` | ✓ | ✓ | `MEMPALACE_PGVECTOR_DSN` |
+
+Select with `--backend <name>`, `MEMPALACE_BACKEND=<name>`, or
+`"backend": "<name>"` in `config.json`. See
+[Storage backends](/guide/configuration#storage-backends) for connection
+variables, namespace behavior, and deployment notes.
 
 ## Quickstart
 
@@ -73,7 +140,8 @@ mempalace search "why did we switch to GraphQL"
 mempalace wake-up
 ```
 
-For Claude Code, Gemini CLI, MCP-compatible tools, and local models, see
+For Claude Code, Gemini CLI, [Antigravity](https://mempalaceofficial.com/guide/antigravity.html),
+MCP-compatible tools, and local models, see
 [mempalaceofficial.com/guide/getting-started](https://mempalaceofficial.com/guide/getting-started.html).
 
 ---
@@ -141,7 +209,7 @@ Usage and tool reference:
 
 ## MCP server
 
-29 MCP tools cover palace reads/writes, knowledge-graph operations,
+36 MCP tools cover palace reads/writes, knowledge-graph operations,
 cross-wing navigation, drawer management, and agent diaries. Installation
 and the full tool list:
 [mempalaceofficial.com/reference/mcp-tools](https://mempalaceofficial.com/reference/mcp-tools.html).
@@ -155,8 +223,19 @@ system prompt:
 
 ## Auto-save hooks
 
-Two Claude Code hooks save periodically and before context compression:
-[mempalaceofficial.com/guide/hooks](https://mempalaceofficial.com/guide/hooks.html).
+Auto-save hooks for **Claude Code, Codex CLI, and Cursor IDE** save
+periodically and before context compression:
+
+- Claude Code + Codex →
+  [mempalaceofficial.com/guide/hooks](https://mempalaceofficial.com/guide/hooks.html)
+- Cursor IDE (adds session-start recall and a transcript snapshot before
+  compaction) →
+  [mempalaceofficial.com/guide/cursor-hooks](https://mempalaceofficial.com/guide/cursor-hooks.html)
+
+If you are installing under time pressure, start with the
+[Claude Code retention setup checklist](https://mempalaceofficial.com/guide/claude-code-retention.html):
+wire the hooks, back up existing JSONL transcripts, and backfill them with
+`mempalace mine ~/.claude/projects/ --mode convos`.
 
 For per-message recall on top of the file-level chunks the hooks produce,
 run `mempalace sweep <transcript-dir>` periodically — it stores one
@@ -168,7 +247,7 @@ verbatim drawer per user/assistant message, idempotent and resume-safe.
 
 - Python 3.9+
 - A vector-store backend (ChromaDB by default)
-- ~300 MB disk for the default embedding model
+- ~300 MB disk for the embedding model. Onboarding (`python -m mempalace.onboarding`) offers `embeddinggemma-300m` (multilingual, 100+ languages, recommended) or `all-MiniLM-L6-v2` (English-only, ~30 MB). See the docstring at [`mempalace/embedding.py`](mempalace/embedding.py) for details and migration notes.
 
 No API key is required for the core benchmark path.
 
@@ -190,7 +269,7 @@ PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 MIT — see [LICENSE](LICENSE).
 
 <!-- Link Definitions -->
-[version-shield]: https://img.shields.io/badge/version-3.3.5-4dc9f6?style=flat-square&labelColor=0a0e14
+[version-shield]: https://img.shields.io/badge/version-3.6.0-4dc9f6?style=flat-square&labelColor=0a0e14
 [release-link]: https://github.com/MemPalace/mempalace/releases
 [python-shield]: https://img.shields.io/badge/python-3.9+-7dd8f8?style=flat-square&labelColor=0a0e14&logo=python&logoColor=7dd8f8
 [python-link]: https://www.python.org/

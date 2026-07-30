@@ -1,20 +1,33 @@
 """
-Hook logic for MemPalace — Python implementation of session-start, stop, and precompact hooks.
+Hook logic for MemPalace — Python implementation of session-start, stop, session-end, and precompact hooks.
 
 Reads JSON from stdin, outputs JSON to stdout.
-Supported hooks: session-start, stop, precompact
+Supported hooks: session-start, stop, session-end, precompact
 Supported harnesses: claude-code, codex (extensible to cursor, gemini, etc.)
 """
 
 import hashlib
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 import json
 import os
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+from mempalace.config import MempalaceConfig
+from mempalace.write_routing import (
+    ResolvedWriteRoutingPolicy,
+    WriteRoutingDecision,
+    WriteRoutingError,
+    WriteRoutingPolicy,
+    choose_write_route,
+)
 
 SAVE_INTERVAL = 15
 STATE_DIR = Path.home() / ".mempalace" / "hook_state"
@@ -22,7 +35,7 @@ PALACE_ROOT = Path.home() / ".mempalace"
 
 
 def _detached_popen_kwargs() -> dict:
-    """Kwargs that fully detach a Popen child so the hook process can exit.
+    """Kwargs that give a Popen child a hidden console so the hook can exit.
 
     Without these, Windows holds the parent open until the child closes the
     inherited stdout/stderr handles — manifesting as "Stop hook hangs" at
@@ -33,7 +46,7 @@ def _detached_popen_kwargs() -> dict:
     kwargs: dict = {"stdin": subprocess.DEVNULL, "close_fds": True}
     if os.name == "nt":
         flags = 0
-        for name in ("DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP", "CREATE_BREAKAWAY_FROM_JOB"):
+        for name in ("CREATE_NO_WINDOW", "CREATE_NEW_PROCESS_GROUP", "CREATE_BREAKAWAY_FROM_JOB"):
             flags |= getattr(subprocess, name, 0)
         if flags:
             kwargs["creationflags"] = flags
@@ -74,38 +87,41 @@ def _mempalace_python() -> str:
         return env_python
     # This file lives at <venv>/lib/pythonX.Y/site-packages/mempalace/hooks_cli.py
     # or <project>/mempalace/hooks_cli.py (editable install).
-    venv_bin = Path(__file__).resolve().parents[3] / "bin" / "python"
-    if venv_bin.is_file():
-        return str(venv_bin)
+    #
+    # ``parents[3]`` / ``parents[1]`` would raise IndexError when the package
+    # lives at a shallow filesystem path — Docker containers mounting at
+    # ``/work``, ``/opt/app``, or other minimal-prefix installs don't have 4
+    # (or sometimes even 2) parent directories. Use ``len(parents)`` to
+    # check the depth before indexing; LBYL is the standard Python idiom
+    # for bounded-integer lookups. Per PR #1580 review (gemini-code-assist,
+    # medium priority).
+    parents = Path(__file__).resolve().parents
+    if len(parents) > 3:
+        venv_bin = parents[3] / "bin" / "python"
+        if venv_bin.is_file():
+            return str(venv_bin)
     # Editable install: assumes project root has a venv/ sibling to mempalace/
-    project_venv = Path(__file__).resolve().parents[1] / "venv" / "bin" / "python"
-    if project_venv.is_file():
-        return str(project_venv)
+    if len(parents) > 1:
+        project_venv = parents[1] / "venv" / "bin" / "python"
+        if project_venv.is_file():
+            return str(project_venv)
     return sys.executable
 
 
 _RECENT_MSG_COUNT = 30  # how many recent user messages to summarize
 
 STOP_BLOCK_REASON = (
-    "AUTO-SAVE checkpoint (MemPalace). Save this session's key content:\n"
-    "1. mempalace_diary_write — session summary (what was discussed, "
-    "key decisions, current state of work)\n"
-    "2. mempalace_add_drawer — verbatim quotes, decisions, code snippets "
-    "(place in appropriate wing and room)\n"
-    "3. mempalace_kg_add — entity relationships (optional)\n"
-    "For THIS save, use MemPalace MCP tools only (not auto-memory .md files). "
-    "Use verbatim quotes where possible. Continue conversation after saving."
+    "MemPalace auto-save checkpoint. "
+    "Use mempalace_diary_write (session summary) and mempalace_add_drawer "
+    "(quotes, decisions, code) to save session content. "
+    "Do NOT use native auto-memory files."
 )
 
 PRECOMPACT_BLOCK_REASON = (
-    "COMPACTION IMMINENT (MemPalace). Save ALL session content before context is lost:\n"
-    "1. mempalace_diary_write — thorough session summary\n"
-    "2. mempalace_add_drawer — ALL verbatim quotes, decisions, code, context "
-    "(place each in appropriate wing and room)\n"
-    "3. mempalace_kg_add — entity relationships (optional)\n"
-    "For THIS save, use MemPalace MCP tools only (not auto-memory .md files). "
-    "Be thorough — after compaction this is all that survives. "
-    "Save everything to MemPalace, then allow compaction to proceed."
+    "MemPalace emergency save — compaction imminent. "
+    "Use mempalace_diary_write (thorough summary) and mempalace_add_drawer "
+    "(ALL quotes, decisions, code, context) to save ALL content before context is lost. "
+    "Do NOT use native auto-memory files."
 )
 
 
@@ -281,6 +297,31 @@ _MINE_PID_DIR = STATE_DIR / "mine_pids"
 # own slot on exit without scanning the whole directory.
 _MINE_PID_FILE_ENV = "MEMPALACE_MINE_PID_FILE"
 
+# Maximum wall-clock hours a mine subprocess is allowed to run before its
+# PID slot is treated as stale (even if the process is still alive).  A
+# wedged mine — e.g. one that is blocking indefinitely on ChromaDB
+# cold-init under concurrent Windows load (#1552) — would otherwise hold
+# its slot forever.  Set MEMPALACE_MINE_TIMEOUT_HOURS=0 to disable the
+# timeout (slots are reclaimed only when the PID is dead).
+_MINE_TIMEOUT_HOURS_ENV = "MEMPALACE_MINE_TIMEOUT_HOURS"
+_MINE_TIMEOUT_HOURS_DEFAULT = 2.0
+
+
+def _mine_slot_timeout_secs() -> float:
+    """Return the configured mine-slot timeout in seconds.
+
+    Reads ``MEMPALACE_MINE_TIMEOUT_HOURS`` from the environment (float).
+    Returns 0 if the env var is set to 0 or is not parseable.
+    """
+    raw = os.environ.get(_MINE_TIMEOUT_HOURS_ENV, "")
+    if raw:
+        try:
+            hours = float(raw)
+            return max(0.0, hours) * 3600
+        except ValueError:
+            return 0.0
+    return _MINE_TIMEOUT_HOURS_DEFAULT * 3600
+
 
 def _pid_file_for_cmd(cmd: list[str]) -> Path:
     """Return the per-target PID file path for a mine subcommand.
@@ -333,15 +374,70 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _mine_already_running(cmd: list[str]) -> bool:
-    """Return True if a previous mine for ``cmd``'s target is still alive."""
+    """Return True if a previous mine for ``cmd``'s target is still alive.
+
+    The PID file format is ``{pid} {unix_timestamp}`` (timestamp added in
+    #1552 to detect wedged subprocesses).  Old-format files (bare ``{pid}``)
+    use the PID file's mtime as the approximate start time so a still-running
+    pre-upgrade mine is not immediately misclassified as stale.
+
+    A process is considered stale (and this function returns False) when:
+    - the PID is dead, OR
+    - the configured mine timeout is > 0 AND the process has been running
+      longer than the timeout.
+    """
     pid_file = _pid_file_for_cmd(cmd)
     try:
         recorded = pid_file.read_text().strip()
     except OSError:
         return False
-    if not recorded.isdigit():
+    if not recorded:
         return False
-    return _pid_alive(int(recorded))
+    parts = recorded.split(None, 1)
+    if not parts[0].isdigit():
+        return False
+    pid = int(parts[0])
+    if not _pid_alive(pid):
+        return False
+    timeout_secs = _mine_slot_timeout_secs()
+    if timeout_secs > 0:
+        if len(parts) > 1 and parts[1]:
+            try:
+                start_ts = float(parts[1])
+            except ValueError:
+                return False
+        else:
+            try:
+                start_ts = pid_file.stat().st_mtime
+            except OSError:
+                return True
+        if time.time() - start_ts > timeout_secs:
+            return False
+    return True
+
+
+def _create_mine_slot_with_placeholder(pid_file: Path) -> Path:
+    """Atomically create a mine PID slot and write this hook PID into it.
+
+    The slot body is ``{pid} {unix_timestamp}`` so that stale-by-age
+    detection in ``_mine_already_running`` can determine how long the
+    recorded process has been running (#1552).
+    """
+    fd = os.open(str(pid_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="ascii") as f:
+            f.write(f"{os.getpid()} {int(time.time())}")
+    except OSError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            pid_file.unlink()
+        except OSError:
+            pass
+        raise
+    return pid_file
 
 
 def _claim_mine_slot(cmd: list[str]) -> Optional[Path]:
@@ -359,14 +455,14 @@ def _claim_mine_slot(cmd: list[str]) -> Optional[Path]:
     pid_file = _pid_file_for_cmd(cmd)
     pid_file.parent.mkdir(parents=True, exist_ok=True)
     try:
-        fd = os.open(str(pid_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        os.close(fd)
-        return pid_file
+        return _create_mine_slot_with_placeholder(pid_file)
     except FileExistsError:
         pass
+
     # Slot exists. If the holder is alive, defer.
     if _mine_already_running(cmd):
         return None
+
     # Stale entry; reclaim. The unlink+create is racy against another hook
     # firing right now, but the second create's O_EXCL will fail and that
     # caller will see the live PID via the next round.
@@ -376,10 +472,9 @@ def _claim_mine_slot(cmd: list[str]) -> Optional[Path]:
         pass
     except OSError:
         return None
+
     try:
-        fd = os.open(str(pid_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        os.close(fd)
-        return pid_file
+        return _create_mine_slot_with_placeholder(pid_file)
     except FileExistsError:
         return None
 
@@ -419,9 +514,216 @@ def _spawn_mine(cmd: list) -> None:
                 pass
             raise
     try:
-        pid_file.write_text(str(proc.pid))
+        pid_file.write_text(f"{proc.pid} {int(time.time())}")
     except OSError:
         pass
+
+
+def _hooks_daemon_enabled() -> bool:
+    """Legacy compatibility helper for the pre-policy hook setting.
+
+    New hook write paths use ``resolve_write_routing("hooks")``. This
+    helper remains for callers/tests that still inspect ``hooks.daemon``.
+    """
+    try:
+        return MempalaceConfig().hook_use_daemon is True
+    except Exception:
+        return False
+
+
+def _daemon_mine_dedupe_key(source: str, mode: str) -> str:
+    try:
+        source_key = str(Path(source).expanduser().resolve())
+    except OSError:
+        source_key = str(Path(source).expanduser())
+    return f"hook:mine:{mode}:{source_key}"
+
+
+def _daemon_available() -> bool:
+    """True iff a daemon is already running for the configured palace.
+
+    This is a fast localhost health check, not a spawn: the hook time budget
+    forbids cold-starting a long-lived daemon. ``prefer`` may fall back to the
+    direct path when this returns false; ``require`` must block the write.
+    """
+    from .daemon import HOOK_PROBE_TIMEOUT, get_client_if_running
+
+    try:
+        return (
+            get_client_if_running(MempalaceConfig().palace_path, health_timeout=HOOK_PROBE_TIMEOUT)
+            is not None
+        )
+    except Exception:
+        return False
+
+
+@dataclass(frozen=True)
+class HookWriteRouting:
+    """One hook invocation's resolved routing state."""
+
+    decision: Optional[WriteRoutingDecision]
+    source: str
+    error: Optional[str] = None
+
+    @property
+    def use_daemon(self) -> bool:
+        return self.decision is not None and self.decision.use_daemon
+
+    @property
+    def blocked(self) -> bool:
+        return self.error is not None or (self.decision is not None and self.decision.blocked)
+
+    @property
+    def notice(self) -> str:
+        if self.error is not None:
+            return (
+                "MemPalace hook writes were skipped because write-routing "
+                f"configuration is invalid: {self.error}. No direct ChromaDB "
+                "fallback was attempted."
+            )
+        if self.blocked:
+            return (
+                "MemPalace hook writes were skipped because routing is set to "
+                "'require' but the local daemon is unavailable. Start it with "
+                "`mempalace daemon start`; no direct ChromaDB fallback was attempted."
+            )
+        return ""
+
+
+_HOOK_WRITE_ROUTING_CONTEXT = ContextVar(
+    "mempalace_hook_write_routing",
+    default=None,
+)
+
+
+def _resolve_configured_hook_policy() -> ResolvedWriteRoutingPolicy:
+    """Resolve the new policy, with legacy-object compatibility."""
+
+    config = MempalaceConfig()
+    resolver = getattr(config, "resolve_write_routing", None)
+    if callable(resolver):
+        resolved = resolver("hooks")
+        if isinstance(resolved, ResolvedWriteRoutingPolicy):
+            return resolved
+
+    # Compatibility for older/custom config objects and existing tests that
+    # expose only the pre-policy ``hook_use_daemon`` property.
+    policy = (
+        WriteRoutingPolicy.PREFER
+        if getattr(config, "hook_use_daemon", False) is True
+        else WriteRoutingPolicy.DIRECT
+    )
+    return ResolvedWriteRoutingPolicy(
+        policy=policy,
+        source="legacy hook_use_daemon",
+    )
+
+
+def _compute_hook_write_routing() -> HookWriteRouting:
+    """Resolve hook policy and probe daemon liveness at most once."""
+
+    try:
+        resolved = _resolve_configured_hook_policy()
+    except WriteRoutingError as exc:
+        routing = HookWriteRouting(
+            decision=None,
+            source="configuration-error",
+            error=str(exc),
+        )
+        _log(routing.notice)
+        return routing
+    except Exception as exc:
+        # Preserve the historical save-on-config-read-failure behavior. An
+        # explicitly invalid routing value raises WriteRoutingError above and
+        # fails closed; an unrelated config I/O/runtime failure falls back to
+        # direct so a final checkpoint is not silently lost.
+        _log(f"WARNING: could not resolve hook write routing: {exc}; defaulting to direct")
+        resolved = ResolvedWriteRoutingPolicy(
+            policy=WriteRoutingPolicy.DIRECT,
+            source="config-unavailable fallback",
+        )
+
+    daemon_available = False
+    if resolved.policy is not WriteRoutingPolicy.DIRECT:
+        daemon_available = _daemon_available()
+
+    decision = choose_write_route(
+        resolved.policy,
+        daemon_available=daemon_available,
+        daemon_can_start=False,
+    )
+    routing = HookWriteRouting(
+        decision=decision,
+        source=resolved.source,
+    )
+
+    if decision.policy is not WriteRoutingPolicy.DIRECT:
+        _log(
+            "Hook write routing: "
+            f"policy={decision.policy.value} source={resolved.source} "
+            f"target={decision.target.value} reason={decision.reason}"
+        )
+
+    return routing
+
+
+def _current_hook_write_routing() -> HookWriteRouting:
+    routing = _HOOK_WRITE_ROUTING_CONTEXT.get()
+    if routing is not None:
+        return routing
+    return _compute_hook_write_routing()
+
+
+@contextmanager
+def _hook_write_routing_context():
+    """Share one policy resolution and one daemon probe across a hook fire."""
+
+    routing = _compute_hook_write_routing()
+    token = _HOOK_WRITE_ROUTING_CONTEXT.set(routing)
+    try:
+        yield routing
+    finally:
+        _HOOK_WRITE_ROUTING_CONTEXT.reset(token)
+
+
+def _log_hook_write_blocked(routing: HookWriteRouting, operation: str) -> None:
+    _log(f"{routing.notice} Operation skipped: {operation}.")
+
+
+def _blocked_hook_output(routing: HookWriteRouting) -> dict:
+    return {"systemMessage": routing.notice}
+
+
+def _submit_daemon_job(
+    kind: str,
+    payload: dict,
+    *,
+    dedupe_key: str = None,
+    priority: int = 0,
+    wait: bool = False,
+    timeout: float = 60.0,
+):
+    """Submit to an already-running daemon. Never auto-starts (see _daemon_available).
+
+    Raises DaemonError on a real failure (job rejected, timeout, daemon died
+    mid-submit). Callers must NOT fall back to the direct path on such errors —
+    the daemon may already have accepted the job, and re-running it would
+    duplicate verbatim content. Only an absent daemon (handled by the caller's
+    _daemon_available() precheck) should fall back.
+    """
+    from .daemon import submit_job
+
+    palace_path = MempalaceConfig().palace_path
+    return submit_job(
+        kind,
+        payload,
+        palace_path=palace_path,
+        dedupe_key=dedupe_key,
+        priority=priority,
+        wait=wait,
+        auto_start=False,
+        timeout=timeout,
+    )
 
 
 def _maybe_auto_ingest():
@@ -440,11 +742,34 @@ def _maybe_auto_ingest():
     targets = _get_mine_targets()
     if not targets:
         return
+
+    routing = _current_hook_write_routing()
+    if routing.blocked:
+        _log_hook_write_blocked(routing, "project auto-ingest")
+        return
+
     for mine_dir, mode in targets:
         try:
+            if routing.use_daemon:
+                try:
+                    _submit_daemon_job(
+                        "mine",
+                        {"source": mine_dir, "mode": mode, "agent": "mempalace"},
+                        dedupe_key=_daemon_mine_dedupe_key(mine_dir, mode),
+                        wait=False,
+                    )
+                except Exception as exc:
+                    # Daemon accepted context — don't fall back (would double-mine).
+                    _log(f"Daemon mine submission failed: {exc}")
+                continue
             _spawn_mine([_mempalace_python(), "-m", "mempalace", "mine", mine_dir, "--mode", mode])
         except OSError:
             pass
+        except Exception as exc:
+            # Non-daemon spawn path failed. Hooks must never crash the user's
+            # shell — log and continue. Do not label this a daemon failure: the
+            # daemon block above handles its own errors with its own message.
+            _log(f"mine hook failed: {exc}")
 
 
 def _mine_sync():
@@ -457,10 +782,32 @@ def _mine_sync():
     targets = _get_mine_targets()
     if not targets:
         return
+
+    routing = _current_hook_write_routing()
+    if routing.blocked:
+        _log_hook_write_blocked(routing, "synchronous project mine")
+        return
+
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     log_path = STATE_DIR / "hook.log"
     for mine_dir, mode in targets:
         try:
+            if routing.use_daemon:
+                try:
+                    job = _submit_daemon_job(
+                        "mine",
+                        {"source": mine_dir, "mode": mode, "agent": "mempalace"},
+                        dedupe_key=_daemon_mine_dedupe_key(mine_dir, mode),
+                        wait=True,
+                        timeout=60,
+                    )
+                    result = job.get("result") or {}
+                    if job.get("state") != "succeeded" or not result.get("success", True):
+                        _log(f"Daemon sync mine failed: {result.get('error', job.get('error'))}")
+                except Exception as exc:
+                    # Daemon accepted context — don't fall back (would double-mine).
+                    _log(f"Daemon sync mine submission failed: {exc}")
+                continue
             with open(log_path, "a") as log_f:
                 subprocess.run(
                     [
@@ -475,9 +822,19 @@ def _mine_sync():
                     stdout=log_f,
                     stderr=log_f,
                     timeout=60,
+                    # Windows: hide the conhost window this sync mine would
+                    # otherwise flash on every fire. Mirrors the async paths
+                    # (_spawn_mine / _desktop_toast) via _detached_popen_kwargs().
+                    # 0 is a no-op off-Windows.
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
         except (OSError, subprocess.TimeoutExpired):
             pass
+        except Exception as exc:
+            # Non-daemon sync spawn path failed. Hooks must never crash the
+            # user's shell — log and continue (not a daemon failure; the daemon
+            # block above handles its own errors).
+            _log(f"mine hook failed: {exc}")
 
 
 def _desktop_toast(body: str, title: str = "MemPalace"):
@@ -566,12 +923,16 @@ def _save_diary_direct(
     session_id: str,
     wing: str = "",
     toast: bool = False,
+    *,
+    agent_name: str,
 ) -> dict:
     """Write a diary checkpoint by calling the tool function directly (no MCP roundtrip).
 
-    If `wing` is set, the entry lands in that wing (typically the project wing
-    derived from the transcript path). Otherwise falls back to `tool_diary_write`'s
-    default of `wing_session-hook`.
+    The entry is filed under `agent_name` so the agent that later calls
+    `mempalace_diary_read(agent_name=...)` discovers it (#1693). If `wing` is
+    set, the entry lands in that wing (typically the project wing derived from
+    the transcript path); a `diary_read` with an empty wing spans every wing
+    the agent wrote to, so project-derived wings stay discoverable.
 
     Returns {"count": N, "themes": [...]} on success, {"count": 0} on failure.
     """
@@ -579,6 +940,15 @@ def _save_diary_direct(
     if not messages:
         _log("No recent messages to save")
         return {"count": 0}
+
+    routing = _current_hook_write_routing()
+    if routing.blocked:
+        _log_hook_write_blocked(routing, "diary checkpoint")
+        return {
+            "count": 0,
+            "routing_blocked": True,
+            "routing_message": routing.notice,
+        }
 
     themes = _extract_themes(messages)
 
@@ -591,10 +961,45 @@ def _save_diary_direct(
     )
 
     try:
+        if routing.use_daemon:
+            try:
+                job = _submit_daemon_job(
+                    "diary_write",
+                    {
+                        "agent_name": agent_name,
+                        "entry": entry,
+                        "topic": "checkpoint",
+                        "wing": wing,
+                    },
+                    priority=10,
+                    wait=True,
+                    timeout=30,
+                )
+            except Exception as exc:
+                # Daemon accepted context — don't fall back (would double-write).
+                _log(f"Daemon diary checkpoint failed: {exc}")
+                return {"count": 0}
+            result = job.get("result") or {}
+            if job.get("state") == "succeeded" and result.get("success"):
+                _log(f"Diary checkpoint saved: {result.get('entry_id', '?')}")
+                try:
+                    ack_file = STATE_DIR / "last_checkpoint"
+                    ack_file.write_text(
+                        json.dumps({"msgs": len(messages), "ts": now.isoformat()}),
+                        encoding="utf-8",
+                    )
+                except OSError:
+                    pass
+                if toast:
+                    _desktop_toast(f"Checkpoint saved - {len(messages)} messages archived")
+                return {"count": len(messages), "themes": themes}
+            _log(f"Daemon diary checkpoint failed: {result.get('error', job.get('error'))}")
+            return {"count": 0}
+
         from .mcp_server import tool_diary_write
 
         result = tool_diary_write(
-            agent_name="session-hook",
+            agent_name=agent_name,
             entry=entry,
             topic="checkpoint",
             wing=wing,
@@ -622,18 +1027,45 @@ def _save_diary_direct(
 
 def _ingest_transcript(transcript_path: str):
     """Mine a Claude Code session transcript into the palace as a conversation."""
-    path = Path(transcript_path).expanduser()
-    if not path.is_file() or path.stat().st_size < 100:
+    path = _validate_transcript_path(transcript_path)
+    if path is None:
         return
-
-    from .config import MempalaceConfig
+    try:
+        if not path.is_file() or path.stat().st_size < 100:
+            return
+    except OSError:
+        return
 
     try:
         MempalaceConfig()  # validate config loads
     except Exception:
         return
 
+    routing = _current_hook_write_routing()
+    if routing.blocked:
+        _log_hook_write_blocked(routing, "transcript ingest")
+        return
+
     try:
+        if routing.use_daemon:
+            try:
+                _submit_daemon_job(
+                    "mine",
+                    {
+                        "source": str(path.parent),
+                        "mode": "convos",
+                        "wing": "sessions",
+                        "agent": "mempalace",
+                    },
+                    dedupe_key=_daemon_mine_dedupe_key(str(path.parent), "convos"),
+                    wait=False,
+                )
+                _log(f"Transcript ingest submitted to daemon: {path.name}")
+            except Exception as exc:
+                # Daemon accepted context — don't fall back (would double-mine).
+                _log(f"Daemon transcript ingest failed: {exc}")
+            return
+
         # Route through ``_spawn_mine`` so the per-target PID guard kicks
         # in here too — repeated Stop/PreCompact fires for the same
         # transcript should not stack up parallel ingest mines.
@@ -653,9 +1085,28 @@ def _ingest_transcript(transcript_path: str):
         _log(f"Transcript ingest started: {path.name}")
     except OSError:
         pass
+    except Exception as exc:
+        # Non-daemon ingest spawn path failed. Hooks must never crash the
+        # user's shell — log and continue (not a daemon failure; the daemon
+        # block above handles its own errors).
+        _log(f"transcript ingest hook failed: {exc}")
 
 
 SUPPORTED_HARNESSES = {"claude-code", "codex"}
+
+
+def _diary_agent_for_harness(harness: str) -> str:
+    """Return the diary ``agent_name`` a session in ``harness`` reads under.
+
+    Stop-hook checkpoints must be filed beside the agent's own entries so
+    ``mempalace_diary_read(agent_name=...)`` surfaces them. The old code filed
+    them under a fixed ``"session-hook"`` identity that no reader ever queried,
+    hiding every checkpoint (#1693). A ``claude-code`` session reads its diary
+    as ``"claude"``; every other harness already reads under its own name, so
+    returning the harness name keeps a newly supported harness discoverable
+    instead of silently invisible again.
+    """
+    return "claude" if harness == "claude-code" else harness
 
 
 def _parse_harness_input(data: dict, harness: str) -> dict:
@@ -670,36 +1121,140 @@ def _parse_harness_input(data: dict, harness: str) -> dict:
     }
 
 
+# Common parent-dir tokens stripped from the encoded folder when no
+# explicit ``-Projects-`` segment is present. Order matters: only the
+# first match strips. These cover the bulk of Unix layouts; cwd-from-JSONL
+# (the primary path) handles the long tail correctly without heuristics.
+_ENCODED_PARENT_PREFIXES = (
+    "git-",
+    "dev-",
+    "projects-",
+    "Projects-",
+    "src-",
+    "code-",
+    "work-",
+    "Documents-",
+)
+
+
+def _safe_wing_slug(name: str) -> str:
+    """Normalize a project directory name into a wing slug ``sanitize_name`` accepts.
+
+    Builds on the historical space/hyphen handling: map characters outside
+    ``sanitize_name``'s set to ``_`` while keeping ``.`` and ``'`` so existing wings
+    for names like ``my.app`` are preserved (renaming a wing would orphan diary
+    entries already filed under it), collapse ``..`` which the validator rejects as
+    path traversal, trim edge separators it won't accept, and cap the length so
+    ``wing_<slug>`` stays within ``sanitize_name``'s 128-character limit. Without
+    this a folder containing e.g. a leading ``+`` produced ``wing_+project``, which
+    ``sanitize_name`` rejects — silently breaking diary auto-save. Falls back to
+    ``sessions`` when a name reduces to nothing (e.g. ``+``).
+    """
+    slug = name.lower().replace(" ", "_").replace("-", "_")
+    slug = re.sub(r"[^\w.']+", "_", slug)
+    slug = re.sub(r"\.{2,}", ".", slug)
+    slug = slug[:120].strip("_.'")
+    return slug or "sessions"
+
+
+def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
+    """Read ``cwd`` from the first JSONL line that records it.
+
+    Claude Code stores the absolute working directory on most message
+    types (tool_use, tool_result, user/assistant turns), but not all
+    (e.g. queue-operation lines lack it). Scan up to 200 lines to find
+    the first record that includes a non-empty cwd, then derive the
+    wing from its leaf path segment. Returns ``None`` if the file is
+    unreadable, empty, or contains no cwd.
+    """
+    try:
+        path = Path(transcript_path).expanduser()
+        if not path.is_file():
+            return None
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i >= 200:
+                    break
+                line = line.strip()
+                if not line or '"cwd"' not in line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                cwd = data.get("cwd")
+                if not cwd or not isinstance(cwd, str):
+                    continue
+                cwd_norm = cwd.replace("\\", "/").rstrip("/")
+                if not cwd_norm:
+                    continue
+                project = cwd_norm.rsplit("/", 1)[-1]
+                if project:
+                    return f"wing_{_safe_wing_slug(project)}"
+    except OSError:
+        pass
+    return None
+
+
 def _wing_from_transcript_path(transcript_path: str) -> str:
     """Derive a project wing name from a Claude Code transcript path.
 
-    Claude Code encodes the project's source directory by replacing path
-    separators with dashes, producing folders like:
-        ~/.claude/projects/-home-<user>-Projects-<project>/session.jsonl
-        ~/.claude/projects/-home-<user>-dev-<parent>-<project>/session.jsonl
-        ~/.claude/projects/-Users-<user>-<folder>-<project>/session.jsonl
+    Strategy (in priority order):
 
-    The project directory name is the final dash-separated token of the
-    encoded folder. Returns ``wing_<project>`` (lowercased, spaces → ``_``).
-    Falls back to ``wing_sessions`` if the path does not match a Claude Code
-    project-folder layout.
+    1. PRIMARY — Read ``cwd`` from the JSONL transcript. Claude Code records
+       the absolute working directory on most message types, so the project
+       name is whatever the leaf path segment of cwd is. This is the
+       canonical answer when present.
+
+    2. FALLBACK — Decode the encoded folder under ``.claude/projects/``.
+       Claude Code flattens path separators to dashes (``/Users/me/code/foo``
+       → ``-Users-me-code-foo``), so the original directory boundaries are
+       lost. We strip the platform user-home prefix (``Users-<user>-`` or
+       ``home-<user>-``) and one common parent-dir token (``git-``, ``dev-``,
+       ``projects-``, etc.), then convert the remaining dashes to
+       underscores. Unlike the previous "last token only" heuristic, this
+       never silently truncates a hyphenated project folder name like
+       ``claude-code``, ``react-native``, or ``customer-portal``.
+
+    3. LEGACY — Match an explicit ``-Projects-<name>`` segment for
+       transcripts not under the standard Claude Code projects dir.
+
+    4. DEFAULT — ``wing_sessions``.
+
+    Closes #1410.
     """
+    # 1. Primary — cwd from JSONL is the canonical source of truth
+    cwd_wing = _wing_from_jsonl_cwd(transcript_path)
+    if cwd_wing:
+        return cwd_wing
+
     # Normalize path separators for cross-platform (Windows backslashes)
     normalized = transcript_path.replace("\\", "/")
-    # Primary: pull the encoded project folder out of ``.claude/projects/``
-    # and take its last dash-separated token.
+
+    # 2. Fallback — encoded project folder under .claude/projects/
     match = re.search(r"/\.claude/projects/-([^/]+)", normalized)
     if match:
         encoded = match.group(1)
-        project = encoded.rsplit("-", 1)[-1]
-        if project:
-            return f"wing_{project.lower().replace(' ', '_')}"
-    # Legacy fallback: explicit ``-Projects-<name>`` segment, useful for
-    # transcripts not under the standard Claude Code projects dir.
+        # Strip platform user-home prefix so the wing isn't dominated by
+        # /Users/<user>/ or /home/<user>/.
+        m = re.match(r"(?:Users|home)-[^-]+-(.+)", encoded)
+        if m:
+            encoded = m.group(1)
+        # Strip one common parent-dir token if present, keeping the rest as
+        # the project path. Hyphens become underscores to preserve
+        # uniqueness for hyphenated project folder names.
+        for prefix in _ENCODED_PARENT_PREFIXES:
+            if encoded.startswith(prefix):
+                encoded = encoded[len(prefix) :]
+                break
+        return f"wing_{_safe_wing_slug(encoded)}"
+
+    # 3. Legacy — explicit -Projects-<name> segment
     match = re.search(r"-Projects-([^/]+?)(?:/|$)", normalized)
     if match:
-        project = match.group(1).lower().replace(" ", "_")
-        return f"wing_{project}"
+        return f"wing_{_safe_wing_slug(match.group(1))}"
+
+    # 4. Default
     return "wing_sessions"
 
 
@@ -713,6 +1268,11 @@ def hook_stop(data: dict, harness: str):
     stop_hook_active = parsed["stop_hook_active"]
     transcript_path = parsed["transcript_path"]
 
+    # Respect auto_save config toggle (clean opt-out)
+    if not MempalaceConfig().hooks_auto_save:
+        _output({})
+        return
+
     # If already in a block-mode save cycle, let through (infinite-loop prevention).
     # Silent mode saves directly without returning {"decision":"block"}, so there's
     # no loop to prevent — and Claude Code's plugin dispatch sets this flag on every
@@ -723,16 +1283,9 @@ def hook_stop(data: dict, harness: str):
         # (v3.3.0+), so if we can't read config, behave as if it's still on.
         silent_guard = True
         try:
-            from .config import MempalaceConfig
-        except ImportError as exc:
-            _log(
-                f"WARNING: could not import MempalaceConfig for stop guard: {exc}; defaulting to silent mode"
-            )
-        else:
-            try:
-                silent_guard = MempalaceConfig().hook_silent_save
-            except AttributeError as exc:
-                _log(f"WARNING: could not read hook_silent_save: {exc}; defaulting to silent mode")
+            silent_guard = MempalaceConfig().hook_silent_save
+        except AttributeError as exc:
+            _log(f"WARNING: could not read hook_silent_save: {exc}; defaulting to silent mode")
         if not silent_guard:
             _output({})
             return
@@ -755,62 +1308,70 @@ def hook_stop(data: dict, harness: str):
     _log(f"Session {session_id}: {exchange_count} exchanges, {since_last} since last save")
 
     if since_last >= SAVE_INTERVAL and exchange_count > 0:
-        _log(f"TRIGGERING SAVE at exchange {exchange_count}")
+        with _hook_write_routing_context() as routing:
+            if routing.blocked:
+                _log_hook_write_blocked(routing, "stop-hook checkpoint")
+                _output(_blocked_hook_output(routing))
+                return
 
-        # Read hook settings from config
-        from .config import MempalaceConfig
+            _log(f"TRIGGERING SAVE at exchange {exchange_count}")
 
-        try:
-            config = MempalaceConfig()
-            silent = config.hook_silent_save
-            toast = config.hook_desktop_toast
-        except Exception:
-            silent = True
-            toast = False
+            # Read hook settings from config
+            try:
+                config = MempalaceConfig()
+                silent = config.hook_silent_save
+                toast = config.hook_desktop_toast
+            except Exception:
+                silent = True
+                toast = False
 
-        project_wing = _wing_from_transcript_path(transcript_path)
+            project_wing = _wing_from_transcript_path(transcript_path)
 
-        if silent:
-            # Save directly via Python API — systemMessage renders in terminal
-            result = {"count": 0}
-            if transcript_path:
-                result = _save_diary_direct(
-                    transcript_path, session_id, wing=project_wing, toast=toast
-                )
-                _ingest_transcript(transcript_path)
-            _maybe_auto_ingest()
-            # Only advance save marker after successful save
-            count = result.get("count", 0)
-            if count > 0:
+            if silent:
+                # Save directly via Python API — systemMessage renders in terminal
+                result = {"count": 0}
+                if transcript_path:
+                    result = _save_diary_direct(
+                        transcript_path,
+                        session_id,
+                        wing=project_wing,
+                        toast=toast,
+                        agent_name=_diary_agent_for_harness(harness),
+                    )
+                    _ingest_transcript(transcript_path)
+                _maybe_auto_ingest()
+                # Only advance save marker after successful save
+                count = result.get("count", 0)
+                if count > 0:
+                    try:
+                        last_save_file.write_text(str(exchange_count), encoding="utf-8")
+                    except OSError:
+                        pass
+                    themes = result.get("themes", [])
+                    if themes:
+                        tag = " \u2014 " + ", ".join(themes)
+                    else:
+                        tag = ""
+                    _output(
+                        {
+                            "systemMessage": f"\u2726 {count} memories woven into the palace{tag}",
+                        }
+                    )
+                else:
+                    _output({})
+            else:
+                # Legacy: block and ask Claude to save via MCP tools.
+                # Marker advances before confirmed save — best-effort; if Claude
+                # fails to save, the checkpoint is lost but won't retry endlessly.
                 try:
                     last_save_file.write_text(str(exchange_count), encoding="utf-8")
                 except OSError:
                     pass
-                themes = result.get("themes", [])
-                if themes:
-                    tag = " \u2014 " + ", ".join(themes)
-                else:
-                    tag = ""
-                _output(
-                    {
-                        "systemMessage": f"\u2726 {count} memories woven into the palace{tag}",
-                    }
-                )
-            else:
-                _output({})
-        else:
-            # Legacy: block and ask Claude to save via MCP tools.
-            # Marker advances before confirmed save — best-effort; if Claude
-            # fails to save, the checkpoint is lost but won't retry endlessly.
-            try:
-                last_save_file.write_text(str(exchange_count), encoding="utf-8")
-            except OSError:
-                pass
-            if transcript_path:
-                _ingest_transcript(transcript_path)
-            _maybe_auto_ingest()
-            reason = STOP_BLOCK_REASON + f" Write diary entry to wing={project_wing}."
-            _output({"decision": "block", "reason": reason})
+                if transcript_path:
+                    _ingest_transcript(transcript_path)
+                _maybe_auto_ingest()
+                reason = STOP_BLOCK_REASON + f" Write diary entry to wing={project_wing}."
+                _output({"decision": "block", "reason": reason})
     else:
         _output({})
 
@@ -828,12 +1389,140 @@ def hook_session_start(data: dict, harness: str):
     # Initialize session state directory
     STATE_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Surface a required-daemon problem at session start instead of waiting
+    # until the first save is due. Hooks still never cold-start the daemon.
+    with _hook_write_routing_context() as routing:
+        if routing.blocked:
+            _log_hook_write_blocked(routing, "session-start readiness check")
+            _output(_blocked_hook_output(routing))
+            return
+
     # Pass through — no blocking on session start
     _output({})
 
 
+def _clear_session_last_save(session_id: str) -> None:
+    """Drop the per-session save marker once a session has ended.
+
+    ``hook_stop`` writes ``{session_id}_last_save`` but never had a clean-exit
+    cleanup path, so the marker lingered. The session is over by the time
+    ``hook_session_end`` runs, so removing it here keeps ``hook_state/`` from
+    accumulating dead markers. OS errors (including a missing marker, since
+    ``FileNotFoundError`` is an ``OSError``) are swallowed — this is best-effort
+    cleanup, never a reason to fail the hook.
+    """
+    try:
+        (STATE_DIR / f"{session_id}_last_save").unlink()
+    except OSError:
+        pass
+
+
+def hook_session_end(data: dict, harness: str):
+    """Session end hook: one final flush when a session exits cleanly.
+
+    Closes the gap (#1341) where a session that never crosses ``SAVE_INTERVAL``
+    on ``Stop`` and never triggers ``PreCompact`` exits with nothing saved —
+    the common case for short, useful sessions.
+
+    Why background instead of mine inline: Claude Code's hooks reference
+    documents a default SessionEnd timeout of 1.5 seconds, and "timeouts set on
+    plugin-provided hooks do not raise the budget"
+    (https://code.claude.com/docs/en/hooks). A cold ``mempalace`` start alone
+    exceeds 1.5s, so this handler must never mine in the hook foreground. The
+    shell wrapper backgrounds it and returns immediately; the heavy capture is
+    spawned *detached* via ``_ingest_transcript`` / ``_maybe_auto_ingest`` (both
+    route through ``_spawn_mine`` / ``_detached_popen_kwargs``). On POSIX that
+    detached child reliably outlives the session (verified). On Windows only the
+    mine grandchild (spawned with detached-process flags) is designed to break
+    away from the session; the backgrounded hook process and the in-process
+    diary write are best-effort there (no Windows CI coverage yet). This
+    honors the "background everything / hooks under 500ms" budget. SessionEnd
+    has no decision control, so this only ever saves; it never emits a block
+    payload.
+    """
+    if not _palace_root_exists():
+        _output({})
+        return
+
+    # Parse inside the try so a malformed payload (e.g. non-dict stdin that
+    # makes _parse_harness_input raise) still runs the finally cleanup below.
+    session_id = "unknown"
+    try:
+        parsed = _parse_harness_input(data, harness)
+        session_id = parsed["session_id"]
+        transcript_path = parsed["transcript_path"]
+
+        # Read config defensively (mirror hook_stop): a corrupt or unreadable
+        # config must not lose the final save, so default to auto-save on and
+        # toasts off rather than crashing the hook.
+        try:
+            config = MempalaceConfig()
+            auto_save = config.hooks_auto_save
+            toast = config.hook_desktop_toast
+        except Exception:
+            auto_save = True
+            toast = False
+
+        # Respect auto_save config toggle (clean opt-out)
+        if not auto_save:
+            _output({})
+            return
+
+        _log(f"SESSION END for session {session_id}")
+
+        # Validate the harness-provided transcript path before touching it
+        # (extension + ".." traversal check), mirroring the read path that
+        # already runs through _validate_transcript_path. A rejected path skips
+        # the transcript captures but still lets the independent MEMPAL_DIR mine
+        # run.
+        valid_transcript = ""
+        if transcript_path:
+            try:
+                validated = _validate_transcript_path(transcript_path)
+            except OSError:
+                validated = None
+            if validated is None:
+                _log(f"WARNING: transcript_path rejected by validator: {transcript_path!r}")
+            else:
+                valid_transcript = str(validated)
+
+        # Flush. The diary checkpoint (in-process ChromaDB write) runs FIRST,
+        # before any detached mine is spawned, so it never contends for the
+        # palace lock; this handler is already backgrounded by the wrapper, so it
+        # is not under the SessionEnd budget and has time to finish. The detached
+        # transcript ingest follows; re-mining a transcript ``Stop`` already
+        # captured is a near no-op (deterministic convo IDs + ``file_already_mined``
+        # short-circuit + upsert). ``reason`` is intentionally not branched on:
+        # every clean-exit reason (incl. ``/clear`` / ``resume``) warrants the
+        # flush. Order matches ``hook_stop``.
+        with _hook_write_routing_context() as routing:
+            if routing.blocked:
+                _log_hook_write_blocked(routing, "session-end flush")
+                _output(_blocked_hook_output(routing))
+                return
+
+            if valid_transcript:
+                _save_diary_direct(
+                    valid_transcript,
+                    session_id,
+                    wing=_wing_from_transcript_path(valid_transcript),
+                    toast=toast,
+                    agent_name=_diary_agent_for_harness(harness),
+                )
+                _ingest_transcript(valid_transcript)
+            _maybe_auto_ingest()
+
+        _output({})
+    finally:
+        _clear_session_last_save(session_id)
+
+
 def hook_precompact(data: dict, harness: str):
-    """Precompact hook: mine transcript synchronously, then allow compaction."""
+    """Precompact hook: mine transcript synchronously, then allow compaction.
+
+    Respects the ``hooks.auto_save`` config toggle — when disabled, returns
+    immediately without mining.
+    """
     if not _palace_root_exists():
         _output({})
         return
@@ -841,16 +1530,27 @@ def hook_precompact(data: dict, harness: str):
     session_id = parsed["session_id"]
     transcript_path = parsed["transcript_path"]
 
+    # Respect auto_save config toggle (clean opt-out)
+    if not MempalaceConfig().hooks_auto_save:
+        _output({})
+        return
+
     _log(f"PRE-COMPACT triggered for session {session_id}")
 
-    # Capture tool output via our normalize path before compaction loses it
-    if transcript_path:
-        _ingest_transcript(transcript_path)
+    with _hook_write_routing_context() as routing:
+        if routing.blocked:
+            _log_hook_write_blocked(routing, "precompact flush")
+            _output(_blocked_hook_output(routing))
+            return
 
-    # Mine MEMPAL_DIR synchronously so project data lands before
-    # compaction proceeds. Transcript convos were already kicked off
-    # above via _ingest_transcript.
-    _mine_sync()
+        # Capture tool output via our normalize path before compaction loses it
+        if transcript_path:
+            _ingest_transcript(transcript_path)
+
+        # Mine MEMPAL_DIR synchronously so project data lands before
+        # compaction proceeds. Transcript convos were already kicked off
+        # above via _ingest_transcript.
+        _mine_sync()
 
     _output({})
 
@@ -866,6 +1566,7 @@ def run_hook(hook_name: str, harness: str):
     hooks = {
         "session-start": hook_session_start,
         "stop": hook_stop,
+        "session-end": hook_session_end,
         "precompact": hook_precompact,
     }
 

@@ -80,7 +80,7 @@ That gives you a working local memory index.
 
 ## What Happens Next
 
-After the one-time setup, you don't run MemPalace commands manually. Your AI uses it for you through [MCP integration](/guide/mcp-integration) or a [Claude Code plugin](/guide/claude-code).
+After the one-time setup, you don't run MemPalace commands manually. Your AI uses it for you through [MCP integration](/guide/mcp-integration), the bundled Codex plugin, or a [Claude Code plugin](/guide/claude-code).
 
 Ask your AI anything:
 
@@ -91,5 +91,5 @@ It calls `mempalace_search` automatically, gets verbatim results, and answers yo
 ## Next Steps
 
 - [Mining Your Data](/guide/mining) — deep dive into mining modes
-- [MCP Integration](/guide/mcp-integration) — connect to Claude, ChatGPT, Cursor, Gemini
+- [MCP Integration](/guide/mcp-integration) — connect to Claude, Codex, ChatGPT, Cursor, Gemini
 - [The Palace](/concepts/the-palace) — understand wings, rooms, halls, and tunnels

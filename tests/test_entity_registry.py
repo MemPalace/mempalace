@@ -115,6 +115,52 @@ def test_save_preserves_previous_on_serialization_failure(tmp_path, monkeypatch)
     # Restore os.replace before reading so the assertion can rely on it.
     monkeypatch.setattr(_os, "replace", real_replace)
     assert target.read_text(encoding="utf-8") == original
+    # The .tmp sidecar must also be cleaned up — otherwise it litters the
+    # palace directory and a future diagnostic cannot distinguish stale
+    # debris from an in-flight write.
+    leftover = list(tmp_path.glob("entity_registry.json.tmp*"))
+    assert leftover == [], f"atomic write leaked tmp on rename failure: {leftover}"
+
+
+def test_save_cleans_tmp_on_write_failure(tmp_path, monkeypatch):
+    # Failure BEFORE the rename (disk full, FUSE break, IO error during
+    # write/fsync) must also clean up the .tmp sidecar. The existing
+    # rename-failure test only covers the post-write path; this exercises
+    # the gap between write and rename.
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    registry.seed(
+        mode="personal",
+        people=[{"name": "Alice", "relationship": "friend", "context": "personal"}],
+        projects=[],
+    )
+    registry.save()
+    target = tmp_path / "entity_registry.json"
+    original = target.read_text(encoding="utf-8")
+
+    # Force os.fsync to raise — simulates IO error after the bytes are in
+    # the kernel page cache but before they hit the platter.
+    import os as _os
+
+    real_fsync = _os.fsync
+
+    def boom(fd):
+        raise OSError("simulated fsync failure")
+
+    monkeypatch.setattr(_os, "fsync", boom)
+    with pytest.raises(OSError):
+        registry.seed(
+            mode="personal",
+            people=[{"name": "Bob", "relationship": "friend", "context": "personal"}],
+            projects=[],
+        )
+        registry.save()
+    monkeypatch.setattr(_os, "fsync", real_fsync)
+
+    # Previous registry intact (rename never happened — atomic guarantee).
+    assert target.read_text(encoding="utf-8") == original
+    # And the .tmp sidecar is gone, not litter on disk.
+    leftover = list(tmp_path.glob("entity_registry.json.tmp*"))
+    assert leftover == [], f"atomic write leaked tmp on fsync failure: {leftover}"
 
 
 # ── seed ────────────────────────────────────────────────────────────────

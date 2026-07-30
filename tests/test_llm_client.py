@@ -445,9 +445,9 @@ def test_openai_compat_api_key_source_flag_when_explicit(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-from-env-irrelevant")
     p = OpenAICompatProvider(model="x", endpoint="http://h", api_key="sk-from-flag")
     assert p.api_key == "sk-from-flag"
-    assert (
-        p.api_key_source == "flag"
-    ), f"Explicit api_key arg must produce api_key_source='flag'; got {p.api_key_source!r}"
+    assert p.api_key_source == "flag", (
+        f"Explicit api_key arg must produce api_key_source='flag'; got {p.api_key_source!r}"
+    )
 
 
 def test_openai_compat_api_key_source_env_when_fallback(monkeypatch):
@@ -458,9 +458,9 @@ def test_openai_compat_api_key_source_env_when_fallback(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-from-env")
     p = OpenAICompatProvider(model="x", endpoint="http://h")
     assert p.api_key == "sk-from-env"
-    assert (
-        p.api_key_source == "env"
-    ), f"Env-fallback api_key must produce api_key_source='env'; got {p.api_key_source!r}"
+    assert p.api_key_source == "env", (
+        f"Env-fallback api_key must produce api_key_source='env'; got {p.api_key_source!r}"
+    )
 
 
 def test_anthropic_api_key_source_tracking(monkeypatch):
@@ -468,14 +468,14 @@ def test_anthropic_api_key_source_tracking(monkeypatch):
     passed explicitly, 'env' when resolved from ANTHROPIC_API_KEY env."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-env")
     p_flag = AnthropicProvider(model="claude-haiku", api_key="sk-ant-flag")
-    assert (
-        p_flag.api_key_source == "flag"
-    ), f"Explicit api_key must produce 'flag'; got {p_flag.api_key_source!r}"
+    assert p_flag.api_key_source == "flag", (
+        f"Explicit api_key must produce 'flag'; got {p_flag.api_key_source!r}"
+    )
     p_env = AnthropicProvider(model="claude-haiku")
     assert p_env.api_key == "sk-ant-env"
-    assert (
-        p_env.api_key_source == "env"
-    ), f"Env-fallback must produce 'env'; got {p_env.api_key_source!r}"
+    assert p_env.api_key_source == "env", (
+        f"Env-fallback must produce 'env'; got {p_env.api_key_source!r}"
+    )
 
 
 def test_ollama_api_key_source_is_none():

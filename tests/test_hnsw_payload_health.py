@@ -111,3 +111,68 @@ def test_quarantine_leaves_reasonable_payload_in_place(tmp_path):
 
     assert moved == []
     assert seg_dir.exists()
+
+
+def test_segment_health_accepts_zero_byte_link_lists_with_valid_pickle(tmp_path):
+    """Regression #1716: an all-layer-0 HNSW index serializes an empty
+    link_lists.bin (level-0 links live in data_level0.bin). With a complete
+    index_metadata.pickle the persist finished, so the segment is healthy —
+    not the partial-flush corruption a missing marker would imply."""
+    seg_dir = tmp_path / "11111111-2222-3333-4444-555555555555"
+
+    _write_segment(
+        seg_dir,
+        data_size=2_000,
+        link_size=0,
+        write_metadata=True,
+    )
+
+    assert _segment_appears_healthy(str(seg_dir))
+
+
+def test_segment_health_rejects_zero_byte_link_lists_with_truncated_pickle(tmp_path):
+    """An empty link_lists.bin with real payload but a truncated metadata
+    envelope is a partial flush, not an all-layer-0 index — still rejected.
+    The completion marker (intact pickle), not link_lists content, is what
+    distinguishes the two."""
+    seg_dir = tmp_path / "11111111-2222-3333-4444-555555555555"
+
+    _write_segment(
+        seg_dir,
+        data_size=2_000,
+        link_size=0,
+        write_metadata=False,
+    )
+    # Persist started (0x80 head) but never wrote the STOP terminator.
+    (seg_dir / "index_metadata.pickle").write_bytes(b"\x80" + b"x" * 20)
+
+    assert not _segment_appears_healthy(str(seg_dir))
+
+
+def test_quarantine_leaves_zero_byte_link_lists_with_valid_pickle(tmp_path):
+    """Regression #1716: a stale all-layer-0 segment with a complete pickle is
+    left in place. Quarantining it spawned the self-perpetuating loop — repair
+    rebuilds the byte-identical empty-link_lists shape and it re-quarantines."""
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    db_path = palace / "chroma.sqlite3"
+    db_path.write_text("sqlite placeholder")
+
+    seg_dir = palace / "11111111-2222-3333-4444-555555555555"
+    _write_segment(
+        seg_dir,
+        data_size=2_000,
+        link_size=0,
+        write_metadata=True,
+    )
+
+    hnsw_time = 1_700_000_000
+    sqlite_time = hnsw_time + 1_000
+    os.utime(seg_dir / "data_level0.bin", (hnsw_time, hnsw_time))
+    os.utime(db_path, (sqlite_time, sqlite_time))
+
+    moved = quarantine_stale_hnsw(str(palace), stale_seconds=300)
+
+    assert moved == []
+    assert seg_dir.exists()

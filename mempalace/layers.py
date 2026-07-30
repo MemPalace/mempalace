@@ -23,7 +23,12 @@ from collections import defaultdict
 
 from .config import MempalaceConfig
 from .palace import get_collection as _get_collection
-from .searcher import _first_or_empty, build_where_filter
+from .searcher import (
+    _distance_to_similarity,
+    _first_or_empty,
+    _metric_for_collection,
+    build_where_filter,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -121,12 +126,21 @@ class Layer1:
         if not docs:
             return "## L1 — No memories yet."
 
-        # Score each drawer: prefer high importance, recent filing
+        # Score each drawer: prefer high importance, then most-recent filing.
+        # NOTE: the ingest pipeline (miner, convo_miner, diary, add_drawer)
+        # records provenance metadata — wing/room/source/chunk/filed_at — but
+        # never an evaluative importance/weight field. So `importance` is
+        # absent on virtually every drawer and ties at the default, which used
+        # to collapse the sort to insertion order (oldest first). `filed_at`
+        # is present on every drawer, so it is the *effective* ordering signal:
+        # newest first. This keeps importance as the primary key for the day a
+        # scoring pass populates it, while making the "recent filing" half of
+        # the promise true today with data we already have.
         scored = []
         for doc, meta in zip(docs, metas):
             meta = meta or {}
             doc = doc or ""
-            importance = 3
+            importance = 3.0
             # Try multiple metadata keys that might carry weight info
             for key in ("importance", "emotional_weight", "weight"):
                 val = meta.get(key)
@@ -136,11 +150,15 @@ class Layer1:
                     except (ValueError, TypeError):
                         pass
                     break
-            scored.append((importance, meta, doc))
+            # filed_at is an ISO-8601 string; ISO strings sort lexicographically
+            # in chronological order. Coerce to str so a missing/odd value sorts
+            # oldest rather than raising during the comparison.
+            recency = str(meta.get("filed_at") or "")
+            scored.append((importance, recency, meta, doc))
 
-        # Sort by importance descending, take top N
-        scored.sort(key=lambda x: x[0], reverse=True)
-        top = scored[: self.MAX_DRAWERS]
+        # Sort by importance desc, then recency (filed_at) desc; take top N.
+        scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        top = [(imp, meta, doc) for imp, _recency, meta, doc in scored[: self.MAX_DRAWERS]]
 
         # Group by room for readability
         by_room = defaultdict(list)
@@ -283,11 +301,12 @@ class Layer3:
         if not docs:
             return "No results found."
 
+        metric = _metric_for_collection(col)
         lines = [f'## L3 — SEARCH RESULTS for "{query}"']
         for i, (doc, meta, dist) in enumerate(zip(docs, metas, dists), 1):
             meta = meta or {}
             doc = doc or ""
-            similarity = round(max(0.0, 1 - dist), 3)
+            similarity = round(_distance_to_similarity(dist, metric), 3)
             wing_name = meta.get("wing", "?")
             room_name = meta.get("room", "?")
             source = Path(meta.get("source_file", "")).name if meta.get("source_file") else ""
@@ -300,6 +319,9 @@ class Layer3:
             lines.append(f"      {snippet}")
             if source:
                 lines.append(f"      src: {source}")
+            authored = (meta.get("authored_at") or "")[:10]
+            if authored:
+                lines.append(f"      authored: {authored}")
 
         return "\n".join(lines)
 
@@ -327,6 +349,7 @@ class Layer3:
         except Exception:
             return []
 
+        metric = _metric_for_collection(col)
         hits = []
         for doc, meta, dist in zip(
             _first_or_empty(results, "documents"),
@@ -346,7 +369,7 @@ class Layer3:
                     "wing": meta.get("wing", "unknown"),
                     "room": meta.get("room", "unknown"),
                     "source_file": Path(meta.get("source_file", "?")).name,
-                    "similarity": round(1 - dist, 3),
+                    "similarity": round(_distance_to_similarity(dist, metric), 3),
                     "metadata": meta,
                 }
             )

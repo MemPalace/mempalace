@@ -6,7 +6,19 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/mempal-stop-hook.sh\""
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/mempal-stop-hook.sh\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/mempal-session-end-hook.sh\"",
+            "timeout": 10
           }
         ]
       }
@@ -16,7 +28,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/mempal-precompact-hook.sh\""
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/mempal-precompact-hook.sh\"",
+            "timeout": 90
           }
         ]
       }

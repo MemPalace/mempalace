@@ -3,8 +3,8 @@ project_scanner.py — Detect projects and people from real signal.
 
 For a codebase with build manifests or git history, this beats regex-based
 entity detection by a wide margin: the project's own name is already written
-down in package.json / pyproject.toml / Cargo.toml / go.mod, and the people
-who worked on it are in `git log`.
+down in package.json / pyproject.toml / Cargo.toml / go.mod / pom.xml /
+Gradle manifests, and the people who worked on it are in `git log`.
 
 This module is used as the primary signal in `mempalace init`. The regex
 detector in entity_detector.py stays as a fallback for prose-only folders
@@ -21,6 +21,7 @@ import json
 import os
 import re
 import subprocess
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -164,11 +165,63 @@ def _parse_gomod(path: Path) -> Optional[str]:
     return None
 
 
+def _xml_local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+
+
+def _parse_pom(path: Path) -> Optional[str]:
+    try:
+        root = ET.parse(path).getroot()
+    except (ET.ParseError, OSError):
+        return None
+    for child in root:
+        if isinstance(child.tag, str) and _xml_local_name(child.tag) == "artifactId":
+            name = (child.text or "").strip()
+            return name or None
+    return None
+
+
+_GRADLE_ROOT_PROJECT_NAME_PATTERNS = [
+    re.compile(r"""(?m)^\s*rootProject\.name\s*=\s*(["'])(?P<name>[^"']+)\1"""),
+    re.compile(r"""(?m)^\s*rootProject\.name\.set\(\s*(["'])(?P<name>[^"']+)\1\s*\)"""),
+]
+
+
+def _parse_gradle_root_project_name(path: Path) -> Optional[str]:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for pattern in _GRADLE_ROOT_PROJECT_NAME_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            name = match.group("name").strip()
+            return name or None
+    return None
+
+
+def _parse_gradle(path: Path) -> Optional[str]:
+    if path.name.startswith("build.gradle"):
+        for settings_name in ("settings.gradle.kts", "settings.gradle"):
+            name = _parse_gradle_root_project_name(path.with_name(settings_name))
+            if name:
+                return name
+    name = _parse_gradle_root_project_name(path)
+    if name:
+        return name
+    return path.parent.name or None
+
+
 MANIFEST_PRIORITY = {
     "pyproject.toml": 0,
     "package.json": 1,
     "Cargo.toml": 2,
     "go.mod": 3,
+    "pom.xml": 4,
+    "settings.gradle": 5,
+    "settings.gradle.kts": 6,
+    "build.gradle": 7,
+    "build.gradle.kts": 8,
 }
 # Sentinel so unknown manifests always sort after the known manifest types above.
 UNKNOWN_MANIFEST_PRIORITY = max(MANIFEST_PRIORITY.values()) + 1
@@ -177,6 +230,18 @@ MANIFEST_PARSERS = {
     "pyproject.toml": _parse_pyproject,
     "Cargo.toml": _parse_cargo,
     "go.mod": _parse_gomod,
+    "pom.xml": _parse_pom,
+    "settings.gradle": _parse_gradle,
+    "settings.gradle.kts": _parse_gradle,
+    "build.gradle": _parse_gradle,
+    "build.gradle.kts": _parse_gradle,
+}
+JAVA_MANIFESTS = {
+    "pom.xml",
+    "settings.gradle",
+    "settings.gradle.kts",
+    "build.gradle",
+    "build.gradle.kts",
 }
 
 
@@ -461,10 +526,12 @@ def scan(root: str | os.PathLike) -> tuple[list[ProjectInfo], list[PersonInfo]]:
 
     for repo in repos:
         manifests = _collect_manifest_names(repo)
-        if manifests:
-            manifest_file, proj_name, _ = manifests[0]
+        root_manifest = next((entry for entry in manifests if entry[2] == repo), None)
+        if root_manifest:
+            manifest_file, proj_name, _ = root_manifest
         else:
             manifest_file, proj_name = None, repo.name
+        extra_manifests = [entry for entry in manifests if entry != root_manifest]
 
         authors = _git_authors(repo)
         non_bot_authors = [(name, email) for name, email in authors if not _is_bot(name, email)]
@@ -501,17 +568,35 @@ def scan(root: str | os.PathLike) -> tuple[list[ProjectInfo], list[PersonInfo]]:
         if existing is None or proj.user_commits > existing.user_commits:
             projects[proj_name] = proj
 
+        for extra_manifest, extra_name, extra_dir in extra_manifests:
+            if extra_manifest not in JAVA_MANIFESTS:
+                continue
+            existing = projects.get(extra_name)
+            if existing is not None and (
+                existing.manifest is not None or existing.repo_root != repo
+            ):
+                continue
+            projects[extra_name] = ProjectInfo(
+                name=extra_name,
+                repo_root=extra_dir,
+                manifest=extra_manifest,
+                has_git=True,
+                total_commits=total_commits,
+                user_commits=user_commits,
+                is_mine=is_mine,
+            )
+
     people = _dedupe_people(all_commits)
 
     # Handle case: root has manifests but no git repo anywhere
     if not repos:
         manifests = _collect_manifest_names(root_path)
-        for manifest_file, proj_name, _dirpath in manifests:
+        for manifest_file, proj_name, dirpath in manifests:
             if proj_name in projects:
                 continue
             projects[proj_name] = ProjectInfo(
                 name=proj_name,
-                repo_root=root_path,
+                repo_root=dirpath,
                 manifest=manifest_file,
                 has_git=False,
             )
@@ -605,8 +690,8 @@ def discover_entities(
     plugs into ``confirm_entities`` unchanged.
 
     Order of signal preference:
-      1. Package manifests (package.json, pyproject.toml, Cargo.toml, go.mod)
-         → canonical project names
+      1. Package manifests (package.json, pyproject.toml, Cargo.toml, go.mod,
+         pom.xml, Gradle manifests) → canonical project names
       2. Git commit authors → real people with real commit counts
       3. Claude Code conversation dirs (~/.claude/projects/) → per-session
          project names (pulled from each session's ``cwd`` metadata)

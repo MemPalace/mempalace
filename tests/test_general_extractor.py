@@ -246,3 +246,67 @@ def test_positive_words():
 def test_negative_words():
     assert "bug" in NEGATIVE_WORDS
     assert "crash" in NEGATIVE_WORDS
+
+
+# ── extract_memories — oversized segment chunking (#1539) ──────────────
+
+
+def test_extract_memories_oversized_segment_slices_with_label_preserved():
+    """Regression for #1539: a segment longer than chunk_size must be
+    split into multiple memories with the same memory_type. Joined
+    slices must equal the original (verbatim store per CLAUDE.md)."""
+    decision_phrase = "We decided to migrate to PostgreSQL because performance matters. "
+    long_segment = decision_phrase * 50  # ~3,200 chars, well above default 800
+    memories = extract_memories(long_segment)
+    assert len(memories) > 1, (
+        f"oversized segment must split into multiple slices; got {len(memories)}"
+    )
+    assert all(len(m["content"]) <= 800 for m in memories), (
+        f"all slices must be <= chunk_size=800; got max={max(len(m['content']) for m in memories)}"
+    )
+    types = {m["memory_type"] for m in memories}
+    assert len(types) == 1, f"all slices must share one memory_type; got {types}"
+    assert "decision" in types
+    joined = "".join(m["content"] for m in memories)
+    assert joined == long_segment.strip(), (
+        "joined slices must equal original (after strip) verbatim"
+    )
+
+
+def test_extract_memories_oversized_segment_with_custom_chunk_size():
+    """Regression for #1539: caller-supplied chunk_size must govern the
+    paragraph slicer in extract_memories."""
+    decision_phrase = "We decided on Redis because we measured the latency profile. "
+    long_segment = decision_phrase * 40  # ~2,500 chars
+    memories = extract_memories(long_segment, chunk_size=400)
+    assert len(memories) > 1
+    assert all(len(m["content"]) <= 400 for m in memories), (
+        f"all slices must be <= 400; got max={max(len(m['content']) for m in memories)}"
+    )
+
+
+def test_extract_memories_normal_segment_unchanged():
+    """Regression catch: a segment under chunk_size must produce
+    exactly one memory (existing pre-#1539 behaviour for sub-cap)."""
+    text = (
+        "We decided to use React because it fits our team workflow and "
+        "the migration path from our existing stack is clear."
+    )
+    memories = extract_memories(text)
+    assert len(memories) == 1
+    assert memories[0]["content"] == text
+    assert memories[0]["memory_type"] == "decision"
+
+
+def test_extract_memories_chunk_index_contiguous_across_segments():
+    """Regression for #1539: chunk_index must be sequential 0,1,2,...
+    across mixed normal + oversized segments without gaps."""
+    decision_phrase = "We decided to choose Postgres because the index plan works. "
+    long_segment = decision_phrase * 30  # ~1,800 chars → multiple slices at 800
+    second_short = "I prefer always writing tests first because it shapes the API better."
+    text = long_segment + "\n\n" + second_short
+    memories = extract_memories(text)
+    indices = [m["chunk_index"] for m in memories]
+    assert indices == list(range(len(memories))), (
+        f"chunk_index must be 0..N-1 sequential; got {indices}"
+    )

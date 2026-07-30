@@ -11,6 +11,13 @@ from datetime import date, datetime
 from functools import lru_cache
 from pathlib import Path
 
+from .write_routing import (
+    ResolvedWriteRoutingPolicy,
+    RoutingPolicyCandidate,
+    WriteRoutingError,
+    WriteRoutingPolicy,
+    resolve_write_routing_policy,
+)
 
 # ── Input validation ──────────────────────────────────────────────────────────
 # Shared sanitizers for wing/room/entity names. Prevents path traversal,
@@ -20,6 +27,33 @@ from pathlib import Path
 MAX_NAME_LENGTH = 128
 _SAFE_NAME_RE = re.compile(r"^(?:[^\W_]|[^\W_][\w .'-]{0,126}[^\W_])$")
 
+# MCP clients (e.g. Claude Desktop, WorkBuddy) occasionally relay lone UTF-16
+# surrogates (U+D800–U+DFFF) when proxying binary-in-Unicode or corrupted
+# clipboard input. Python's ``str.encode('utf-8')`` raises on these, which
+# crashes ChromaDB add/upsert with -32000. See issue #1235.
+_LONE_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
+
+
+def strip_lone_surrogates(text: str) -> str:
+    """Replace lone UTF-16 surrogates with U+FFFD so the string is legal UTF-8 (#1235)."""
+    return _LONE_SURROGATE_RE.sub("�", text)
+
+
+# Tool output mined from real transcripts routinely embeds a NUL character
+# (U+0000) — e.g. captured Bash output where a reader raced a background
+# writer, or genuine binary/NUL-delimited command output. A document
+# containing one is otherwise valid, well-formed text (unlike a lone
+# surrogate, which is invalid UTF-8), but handing it to ChromaDB's
+# SQLite/FTS5 layer can corrupt the FTS5 inverted index for the *whole*
+# collection (``PRAGMA quick_check`` reports "malformed inverted index for
+# FTS5 table"), not just fail to store that one document. Stripping it
+# before it reaches the chromadb client is the same defense-in-depth this
+# module already applies to lone surrogates (#1235) — sanitize input we
+# don't control before it reaches a datastore we don't control.
+def strip_nul_bytes(text: str) -> str:
+    """Replace embedded NUL characters with U+FFFD before ChromaDB storage."""
+    return text.replace("\x00", "�")
+
 
 def normalize_wing_name(name: str) -> str:
     """Lower-case + collapse separators (`-`, ` `) to `_` for wing slugs.
@@ -27,8 +61,13 @@ def normalize_wing_name(name: str) -> str:
     The same rule is applied by ``init`` when persisting `topics_by_wing`
     and when writing `mempalace.yaml`, so the miner's lookup matches at
     mine time regardless of the source dirname.
+
+    Leading/trailing separators are stripped so a path-encoded dirname like
+    ``-home-user-proj`` yields ``home_user_proj`` rather than a leading-
+    underscore slug that ``sanitize_name`` (and thus the MCP write tools)
+    would reject.
     """
-    return name.lower().replace(" ", "_").replace("-", "_")
+    return name.lower().replace(" ", "_").replace("-", "_").strip("_")
 
 
 def sanitize_name(value: str, field_name: str = "name") -> str:
@@ -80,7 +119,7 @@ def sanitize_kg_value(value: str, field_name: str = "value") -> str:
     if "\x00" in value:
         raise ValueError(f"{field_name} contains null bytes")
 
-    return value
+    return strip_lone_surrogates(value)
 
 
 # ISO-8601 temporal validator for knowledge-graph temporal parameters
@@ -176,11 +215,49 @@ def sanitize_content(value: str, max_length: int = 100_000) -> str:
         raise ValueError(f"content exceeds maximum length of {max_length} characters")
     if "\x00" in value:
         raise ValueError("content contains null bytes")
-    return value
+    return strip_lone_surrogates(value)
 
 
 DEFAULT_PALACE_PATH = os.path.expanduser("~/.mempalace/palace")
 DEFAULT_COLLECTION_NAME = "mempalace_drawers"
+DEFAULT_BACKEND = "chroma"
+DEFAULT_MILVUS_CONSISTENCY_LEVEL = "Strong"
+_MILVUS_CONSISTENCY_LEVELS = {
+    "strong": "Strong",
+    "session": "Session",
+    "bounded": "Bounded",
+    "eventually": "Eventually",
+}
+
+# How many timestamped palace backups to retain before the oldest are
+# pruned. Applies to the accumulating backups written by ``mempalace
+# migrate`` and ``mempalace repair max-seq-id`` — see
+# ``MempalaceConfig.max_backups``.
+DEFAULT_MAX_BACKUPS = 10
+
+
+def normalize_milvus_consistency_level(value) -> str:
+    raw = str(value).strip() if value else DEFAULT_MILVUS_CONSISTENCY_LEVEL
+    normalized = _MILVUS_CONSISTENCY_LEVELS.get(raw.lower())
+    if normalized:
+        return normalized
+    allowed = ", ".join(_MILVUS_CONSISTENCY_LEVELS.values())
+    raise ValueError(f"milvus_consistency_level must be one of: {allowed}")
+
+
+def sqlite_read_uri(db_path: str) -> str:
+    """Return a read-only ``file:`` URI for ``sqlite3.connect(..., uri=True)``.
+
+    A bare ``f"file:{db_path}?mode=ro"`` mis-parses paths containing spaces or
+    other URI-reserved characters — common in real home directories (a Windows
+    user folder like ``First Last``, many macOS paths). ``pathname2url``
+    percent-encodes the path and normalizes separators so the database opens on
+    every platform.
+    """
+    from urllib.request import pathname2url
+
+    db_path = os.fspath(db_path)
+    return f"file:{pathname2url(db_path)}?mode=ro"
 
 
 @lru_cache(maxsize=1)
@@ -188,6 +265,15 @@ def get_configured_collection_name() -> str:
     """Return the configured drawer collection name without repeated config-file reads."""
     return MempalaceConfig().collection_name
 
+
+# Single source of truth for chunking defaults. ``mempalace.miner``
+# imports these so the legacy module-level ``CHUNK_SIZE`` /
+# ``CHUNK_OVERLAP`` / ``MIN_CHUNK_SIZE`` constants stay in sync with
+# ``MempalaceConfig.chunk_*``. Putting them here (not in miner.py) keeps
+# the config layer self-contained and avoids circular imports.
+DEFAULT_CHUNK_SIZE = 800
+DEFAULT_CHUNK_OVERLAP = 100
+DEFAULT_MIN_CHUNK_SIZE = 50
 
 DEFAULT_TOPIC_WINGS = [
     "emotions",
@@ -235,8 +321,26 @@ DEFAULT_HALL_KEYWORDS = {
         "server",
     ],
     "identity": ["identity", "name", "who am i", "persona", "self"],
-    "family": ["family", "kids", "children", "daughter", "son", "parent", "mother", "father"],
-    "creative": ["game", "gameplay", "player", "app", "design", "art", "music", "story"],
+    "family": [
+        "family",
+        "kids",
+        "children",
+        "daughter",
+        "son",
+        "parent",
+        "mother",
+        "father",
+    ],
+    "creative": [
+        "game",
+        "gameplay",
+        "player",
+        "app",
+        "design",
+        "art",
+        "music",
+        "story",
+    ],
 }
 
 
@@ -246,18 +350,26 @@ class MempalaceConfig:
     Load order: env vars > config file > defaults.
     """
 
-    def __init__(self, config_dir=None):
+    def __init__(self, config_dir=None, palace_path=None):
         """Initialize config.
 
         Args:
             config_dir: Override config directory (useful for testing).
                         Defaults to ~/.mempalace.
+            palace_path: Explicit palace data directory. This is primarily
+                         used by CLI operations that received ``--palace``;
+                         it takes precedence over environment and file config.
         """
         self._config_dir = (
             Path(config_dir) if config_dir else Path(os.path.expanduser("~/.mempalace"))
         )
         self._config_file = self._config_dir / "config.json"
         self._people_map_file = self._config_dir / "people_map.json"
+        self._palace_path_override = (
+            os.path.abspath(os.path.expanduser(str(palace_path)))
+            if palace_path is not None
+            else None
+        )
         self._file_config = {}
 
         if self._config_file.exists():
@@ -270,18 +382,168 @@ class MempalaceConfig:
     @property
     def palace_path(self):
         """Path to the memory palace data directory."""
+        if self._palace_path_override is not None:
+            return self._palace_path_override
         env_val = os.environ.get("MEMPALACE_PALACE_PATH") or os.environ.get("MEMPAL_PALACE_PATH")
         if env_val:
             # Normalize: expand ~ and collapse .. to match the CLI --palace
             # code path (mcp_server.py:62) and prevent surprise redirection
             # when the env var contains unresolved components.
             return os.path.abspath(os.path.expanduser(env_val))
-        return self._file_config.get("palace_path", DEFAULT_PALACE_PATH)
+        return os.path.expanduser(self._file_config.get("palace_path", DEFAULT_PALACE_PATH))
+
+    @property
+    def tunnel_file(self):
+        """Path to the tunnel file, sibling of palace_path."""
+        return os.path.join(os.path.dirname(self.palace_path), "tunnels.json")
+
+    @property
+    def hallway_file(self):
+        """Path to the hallway file, sibling of palace_path.
+
+        Mirrors ``tunnel_file`` so within-wing hallway state is scoped to the
+        configured palace and survives palace rebuilds (it does not live in
+        ChromaDB which can be recreated). Prior to this property the path was
+        hardcoded under ``~/.mempalace/hallways.json`` and multiple palaces on
+        one host silently shared one file (see ``hallways._legacy_hallway_file``).
+        """
+        return os.path.join(os.path.dirname(self.palace_path), "hallways.json")
 
     @property
     def collection_name(self):
         """ChromaDB collection name."""
         return self._file_config.get("collection_name", DEFAULT_COLLECTION_NAME)
+
+    @property
+    def backend(self):
+        """Storage backend name.
+
+        Read from ``config.json`` first, then ``MEMPALACE_BACKEND``, then
+        ``"chroma"`` for backwards compatibility with existing palaces.
+        """
+        cfg_val = self._file_config.get("backend")
+        if cfg_val:
+            return str(cfg_val).strip().lower()
+        env_val = os.environ.get("MEMPALACE_BACKEND")
+        if env_val:
+            return env_val.strip().lower()
+        return DEFAULT_BACKEND
+
+    @property
+    def qdrant_url(self):
+        """Qdrant endpoint for the opt-in ``qdrant`` backend.
+
+        Defaults to localhost so selecting Qdrant never silently sends memory
+        to a remote service. Users can point at a LAN or cloud endpoint via
+        config or ``MEMPALACE_QDRANT_URL`` when they deliberately choose that.
+        """
+        env_val = os.environ.get("MEMPALACE_QDRANT_URL")
+        if env_val:
+            return env_val.strip()
+        return str(self._file_config.get("qdrant_url", "http://localhost:6333")).strip()
+
+    @property
+    def qdrant_api_key(self):
+        """API key for the opt-in ``qdrant`` backend, if configured."""
+        env_val = os.environ.get("MEMPALACE_QDRANT_API_KEY")
+        if env_val:
+            return env_val
+        value = self._file_config.get("qdrant_api_key")
+        return str(value) if value else None
+
+    @property
+    def qdrant_namespace(self):
+        """Optional Qdrant collection namespace/prefix."""
+        env_val = os.environ.get("MEMPALACE_QDRANT_NAMESPACE")
+        if env_val:
+            return env_val.strip()
+        value = self._file_config.get("qdrant_namespace")
+        return str(value).strip() if value else None
+
+    @property
+    def qdrant_timeout(self):
+        """Qdrant HTTP timeout in seconds."""
+        env_val = os.environ.get("MEMPALACE_QDRANT_TIMEOUT")
+        raw = env_val if env_val is not None else self._file_config.get("qdrant_timeout", 10.0)
+        try:
+            timeout = float(raw)
+        except (TypeError, ValueError):
+            timeout = 10.0
+        return timeout if timeout > 0 else 10.0
+
+    @property
+    def milvus_uri(self):
+        """Milvus endpoint for the opt-in ``milvus`` backend.
+
+        Defaults to ``None`` so selecting Milvus uses per-palace Milvus Lite at
+        ``<palace>/milvus.db``. Set this only to deliberately use a shared
+        Milvus server, Zilliz Cloud, or a custom local Lite file.
+        """
+        env_val = os.environ.get("MEMPALACE_MILVUS_URI")
+        if env_val:
+            return env_val.strip()
+        value = self._file_config.get("milvus_uri")
+        return str(value).strip() if value else None
+
+    @property
+    def milvus_token(self):
+        """Token for the opt-in ``milvus`` backend, if configured."""
+        env_val = os.environ.get("MEMPALACE_MILVUS_TOKEN")
+        if env_val:
+            return env_val
+        value = self._file_config.get("milvus_token")
+        return str(value) if value else None
+
+    @property
+    def milvus_db_name(self):
+        """Optional Milvus database name for the opt-in ``milvus`` backend."""
+        env_val = os.environ.get("MEMPALACE_MILVUS_DB_NAME")
+        if env_val:
+            return env_val.strip()
+        value = self._file_config.get("milvus_db_name")
+        return str(value).strip() if value else None
+
+    @property
+    def milvus_namespace(self):
+        """Optional Milvus collection namespace/prefix."""
+        env_val = os.environ.get("MEMPALACE_MILVUS_NAMESPACE")
+        if env_val:
+            return env_val.strip()
+        value = self._file_config.get("milvus_namespace")
+        return str(value).strip() if value else None
+
+    @property
+    def milvus_consistency_level(self):
+        """Milvus read consistency level for the opt-in ``milvus`` backend."""
+        env_val = os.environ.get("MEMPALACE_MILVUS_CONSISTENCY_LEVEL")
+        if env_val:
+            return normalize_milvus_consistency_level(env_val)
+        value = self._file_config.get("milvus_consistency_level")
+        return normalize_milvus_consistency_level(value)
+
+    @property
+    def pgvector_dsn(self):
+        """Postgres DSN for the opt-in ``pgvector`` backend.
+
+        Defaults to a localhost DSN so selecting pgvector never silently sends
+        memory to a remote database. Point at a LAN or cloud Postgres via config
+        or ``MEMPALACE_PGVECTOR_DSN`` only when deliberately chosen.
+        """
+        env_val = os.environ.get("MEMPALACE_PGVECTOR_DSN")
+        if env_val:
+            return env_val.strip()
+        return str(
+            self._file_config.get("pgvector_dsn", "postgresql://localhost:5432/mempalace")
+        ).strip()
+
+    @property
+    def pgvector_namespace(self):
+        """Optional pgvector table namespace/prefix for multi-tenant isolation."""
+        env_val = os.environ.get("MEMPALACE_PGVECTOR_NAMESPACE")
+        if env_val:
+            return env_val.strip()
+        value = self._file_config.get("pgvector_namespace")
+        return str(value).strip() if value else None
 
     @property
     def people_map(self):
@@ -295,6 +557,19 @@ class MempalaceConfig:
         return self._file_config.get("people_map", {})
 
     @property
+    def hooks_auto_save(self):
+        """Whether the stop/precompact hooks should block for auto-save.
+
+        When False, hooks pass through without blocking — equivalent to
+        disabling auto-save while keeping hook scripts installed.
+        """
+        env_val = os.environ.get("MEMPALACE_HOOKS_AUTO_SAVE")
+        if env_val is not None:
+            return env_val.lower() not in ("false", "0", "no")
+        hooks = self._file_config.get("hooks", {})
+        return hooks.get("auto_save", True)
+
+    @property
     def topic_wings(self):
         """List of topic wing names."""
         return self._file_config.get("topic_wings", DEFAULT_TOPIC_WINGS)
@@ -303,6 +578,116 @@ class MempalaceConfig:
     def hall_keywords(self):
         """Mapping of hall names to keyword lists."""
         return self._file_config.get("hall_keywords", DEFAULT_HALL_KEYWORDS)
+
+    @staticmethod
+    def _try_coerce_int(value, minimum=None):
+        """Coerce a raw config value to int, or ``None`` if it cannot be a
+        valid setting.
+
+        bool, empty/garbage string, non-numeric, and below-``minimum``
+        values all return ``None``. Shared by ``_coerce_config_int``
+        (which substitutes a documented default) and
+        ``min_chunk_size_explicit`` (which must distinguish "unusable"
+        from "explicitly set" without crashing the convo path).
+        """
+        if isinstance(value, bool):
+            return None
+        try:
+            if isinstance(value, str):
+                value = value.strip()
+                if not value:
+                    return None
+            value = int(value)
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError: JSON ``1e1000`` parses to float('inf'), and
+            # ``int(inf)`` raises it — still just garbage config, not a crash.
+            return None
+        if minimum is not None and value < minimum:
+            return None
+        return value
+
+    def _coerce_config_int(self, key: str, default: int, minimum=None) -> int:
+        """Read an int config value, falling back to ``default`` on bad input.
+
+        Hand-edited ``config.json`` is the most common source of garbage:
+        a string, a bool, a negative number, or a JSON null. None of those
+        should crash mining or hang ``chunk_text()`` — fall back silently
+        to the documented default rather than letting a typo break ingest.
+        """
+        coerced = self._try_coerce_int(self._file_config.get(key, default), minimum)
+        return default if coerced is None else coerced
+
+    def _validated_chunk_config(self):
+        """Return ``(chunk_size, chunk_overlap, min_chunk_size)`` post-validation.
+
+        Enforces the invariants the miner relies on:
+          * ``chunk_size >= 1``
+          * ``0 <= chunk_overlap <= chunk_size // 2``. A larger overlap can
+            loop the miner forever on short-line content (#2056)
+          * ``min_chunk_size <= chunk_size`` — otherwise no chunk is ever
+            large enough to file, and ingest silently produces 0 drawers
+
+        Repairs (rather than raises) on violation so a single bad
+        config.json key doesn't take ingest down.
+        """
+        chunk_size = self._coerce_config_int("chunk_size", DEFAULT_CHUNK_SIZE, minimum=1)
+        chunk_overlap = self._coerce_config_int("chunk_overlap", DEFAULT_CHUNK_OVERLAP, minimum=0)
+        min_chunk_size = self._coerce_config_int(
+            "min_chunk_size", DEFAULT_MIN_CHUNK_SIZE, minimum=0
+        )
+
+        if chunk_overlap > chunk_size // 2:
+            # Overlap past half the chunk size can hang miner.chunk_text's
+            # windowing loop on short-line content (#2056): a boundary pull can
+            # shrink a chunk below chunk_overlap, so
+            # ``start = end - chunk_overlap`` stops advancing. Repair to the
+            # default when it is still at most half, else clamp to the largest
+            # safe overlap.
+            chunk_overlap = min(DEFAULT_CHUNK_OVERLAP, chunk_size // 2)
+
+        if min_chunk_size > chunk_size:
+            min_chunk_size = (
+                DEFAULT_MIN_CHUNK_SIZE if DEFAULT_MIN_CHUNK_SIZE <= chunk_size else chunk_size
+            )
+
+        return chunk_size, chunk_overlap, min_chunk_size
+
+    @property
+    def chunk_size(self) -> int:
+        """Characters per drawer chunk (validated, ``>= 1``)."""
+        return self._validated_chunk_config()[0]
+
+    @property
+    def chunk_overlap(self) -> int:
+        """Overlap between adjacent chunks (validated, ``<= chunk_size // 2``)."""
+        return self._validated_chunk_config()[1]
+
+    @property
+    def min_chunk_size(self) -> int:
+        """Minimum chunk size — skip smaller chunks (validated, ``<= chunk_size``)."""
+        return self._validated_chunk_config()[2]
+
+    @property
+    def min_chunk_size_explicit(self):
+        """Validated ``min_chunk_size`` iff the user explicitly set it.
+
+        Returns the coerced int when ``config.json`` defines a usable
+        ``min_chunk_size`` (``>= 0`` and ``<= chunk_size``); ``None`` when
+        the key is absent/null or the value is unusable. ``convo_miner``
+        relies on the ``None`` sentinel to keep its lower 30-char floor
+        (more permissive than the 50-char project default, so short
+        exchanges are not dropped) for untuned users while still honoring
+        an explicit override —
+        replacing the raw, unvalidated ``_file_config`` reach that crashed
+        convo ingest on a bad key (#1024 review).
+        """
+        raw = self._file_config.get("min_chunk_size")
+        if raw is None:
+            return None
+        coerced = self._try_coerce_int(raw, minimum=0)
+        if coerced is None or coerced > self.chunk_size:
+            return None
+        return coerced
 
     @property
     def entity_languages(self):
@@ -358,6 +743,96 @@ class MempalaceConfig:
         return str(self._file_config.get("embedding_device", "auto")).strip().lower()
 
     @property
+    def embedding_model(self):
+        """Embedding model identifier.
+
+        Values: ``"minilm"`` (ChromaDB's all-MiniLM-L6-v2 — English-only),
+        ``"embeddinggemma"`` (multilingual, 100+ languages, default for
+        new installs since onboarding writes the choice). Read from env
+        ``MEMPALACE_EMBEDDING_MODEL`` first, then ``embedding_model`` in
+        ``config.json``, then ``"minilm"`` as a back-compat fallback for
+        palaces created before onboarding asked the question.
+
+        Switching models on an existing palace requires re-embedding
+        (different vector space) — ChromaDB rejects reads when the persisted
+        EF name doesn't match. Run ``mempalace repair rebuild-index`` after
+        changing this value.
+        """
+        env_val = os.environ.get("MEMPALACE_EMBEDDING_MODEL")
+        if env_val:
+            return env_val.strip().lower()
+        return str(self._file_config.get("embedding_model", "minilm")).strip().lower()
+
+    @property
+    def embedding_threads(self) -> int:
+        """Cap on the embedder's ONNX Runtime intra-op thread pool (#1068).
+
+        ChromaDB's ONNX embedder builds its ``InferenceSession`` with no thread
+        cap, so the intra-op pool defaults to the physical core count and a
+        background ``mine`` pins every core — stacked Stop-hook fires turn into
+        thermal events. ``OMP_NUM_THREADS`` is inert here (ORT owns its own
+        pool), so the cap is applied via ``SessionOptions`` in
+        :mod:`mempalace.embedding`.
+
+        Read from env ``MEMPALACE_EMBEDDING_THREADS`` first, then
+        ``embedding_threads`` in ``config.json``. Semantics:
+
+        - unset / ``"auto"`` → half the logical CPUs (min 1), so a background
+          mine leaves the machine usable out of the box.
+        - a positive integer → exactly that many intra-op threads.
+        - ``0`` or negative → uncapped: ORT's default (physical core count),
+          for users who want maximum indexing throughput.
+        """
+        raw = os.environ.get("MEMPALACE_EMBEDDING_THREADS")
+        if raw is None:
+            raw = self._file_config.get("embedding_threads")
+        if raw is None or str(raw).strip().lower() in ("", "auto"):
+            return max(1, (os.cpu_count() or 2) // 2)
+        try:
+            val = int(str(raw).strip())
+        except (TypeError, ValueError):
+            return max(1, (os.cpu_count() or 2) // 2)
+        return val if val > 0 else 0
+
+    def set_embedding_model(self, model: str) -> None:
+        """Persist the embedding-model choice to ``config.json``.
+
+        Onboarding calls this once on first run. Accepts ``"minilm"`` or
+        ``"embeddinggemma"``; other values are normalized to lowercase and
+        passed through (``embedding.get_embedding_function`` falls back to
+        minilm for unrecognized values).
+        """
+        self._file_config["embedding_model"] = str(model).strip().lower()
+        self._config_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(self._config_file, "w", encoding="utf-8") as f:
+                json.dump(self._file_config, f, indent=2, ensure_ascii=False)
+        except OSError:
+            pass
+        try:
+            self._config_file.chmod(0o600)
+        except (OSError, NotImplementedError):
+            pass
+
+    def set_backend(self, backend: str) -> None:
+        """Persist the storage backend choice to ``config.json``."""
+        backend = str(backend).strip().lower()
+        from .backends import get_backend_class
+
+        get_backend_class(backend)
+        self._file_config["backend"] = backend
+        self._config_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(self._config_file, "w", encoding="utf-8") as f:
+                json.dump(self._file_config, f, indent=2, ensure_ascii=False)
+        except OSError:
+            pass
+        try:
+            self._config_file.chmod(0o600)
+        except (OSError, NotImplementedError):
+            pass
+
+    @property
     def topic_tunnel_min_count(self):
         """Minimum number of overlapping confirmed topics required to create
         a cross-wing tunnel between two wings.
@@ -384,6 +859,36 @@ class MempalaceConfig:
         return max(1, parsed)
 
     @property
+    def max_backups(self) -> int:
+        """Number of timestamped palace backups to retain before pruning.
+
+        Applies to the accumulating, timestamped backups created by
+        ``mempalace migrate`` (``<palace>.pre-migrate.<timestamp>``) and
+        ``mempalace repair max-seq-id``
+        (``chroma.sqlite3.max-seq-id-backup-<timestamp>``). Each of those
+        commands writes a fresh full-size copy every run and historically
+        never deleted the old ones, so on a machine that mines or repairs on
+        a schedule the backup set could silently grow until it filled the
+        disk. After each backup is written, copies beyond this count (oldest
+        first) are removed.
+
+        Reads ``MEMPALACE_MAX_BACKUPS`` env first, then ``max_backups`` in
+        ``config.json``, then the default of ``10``. A value of ``0`` disables
+        pruning and keeps every backup (use when an external retention policy
+        manages cleanup). Negative or non-numeric values fall back to the
+        default rather than crashing migrate/repair.
+        """
+        env_val = os.environ.get("MEMPALACE_MAX_BACKUPS")
+        if env_val is not None:
+            coerced = self._try_coerce_int(env_val, minimum=0)
+            if coerced is not None:
+                return coerced
+        coerced = self._try_coerce_int(
+            self._file_config.get("max_backups", DEFAULT_MAX_BACKUPS), minimum=0
+        )
+        return DEFAULT_MAX_BACKUPS if coerced is None else coerced
+
+    @property
     def hook_silent_save(self):
         """Whether the stop hook saves directly (True) or blocks for MCP calls (False)."""
         return self._file_config.get("hooks", {}).get("silent_save", True)
@@ -392,6 +897,115 @@ class MempalaceConfig:
     def hook_desktop_toast(self):
         """Whether the stop hook shows a desktop notification via notify-send."""
         return self._file_config.get("hooks", {}).get("desktop_toast", False)
+
+    def resolve_write_routing(self, scope: str) -> ResolvedWriteRoutingPolicy:
+        """Resolve the configured write policy for ``hooks`` or ``cli``.
+
+        Precedence is:
+
+        1. scope-specific environment variable;
+        2. global environment variable;
+        3. legacy hook environment variable;
+        4. scope-specific config value;
+        5. global config value;
+        6. legacy hook config value;
+        7. ``direct``.
+
+        This foundation does not change current hook or CLI behavior. The
+        policy-aware consumers are introduced by follow-up PRs.
+        """
+
+        normalized_scope = str(scope).strip().lower()
+        env_names = {
+            "hooks": "MEMPALACE_HOOK_WRITE_ROUTING",
+            "cli": "MEMPALACE_CLI_WRITE_ROUTING",
+        }
+
+        if normalized_scope not in env_names:
+            raise WriteRoutingError("write routing scope must be 'hooks' or 'cli'")
+
+        routing_config = self._file_config.get("write_routing", {})
+        if routing_config is None:
+            routing_config = {}
+
+        if not isinstance(routing_config, dict):
+            raise WriteRoutingError("config write_routing must be an object")
+
+        candidates = [
+            RoutingPolicyCandidate(
+                env_names[normalized_scope],
+                os.environ.get(env_names[normalized_scope]),
+            ),
+            RoutingPolicyCandidate(
+                "MEMPALACE_WRITE_ROUTING",
+                os.environ.get("MEMPALACE_WRITE_ROUTING"),
+            ),
+        ]
+
+        if normalized_scope == "hooks":
+            candidates.append(
+                RoutingPolicyCandidate(
+                    "MEMPALACE_HOOKS_DAEMON (legacy)",
+                    os.environ.get("MEMPALACE_HOOKS_DAEMON"),
+                    legacy_boolean=True,
+                )
+            )
+
+        candidates.extend(
+            [
+                RoutingPolicyCandidate(
+                    f"config write_routing.{normalized_scope}",
+                    routing_config.get(normalized_scope),
+                ),
+                RoutingPolicyCandidate(
+                    "config write_routing.default",
+                    routing_config.get("default"),
+                ),
+            ]
+        )
+
+        if normalized_scope == "hooks":
+            hooks_config = self._file_config.get("hooks", {})
+            if hooks_config is None:
+                hooks_config = {}
+
+            if not isinstance(hooks_config, dict):
+                raise WriteRoutingError("config hooks must be an object")
+
+            candidates.append(
+                RoutingPolicyCandidate(
+                    "config hooks.daemon (legacy)",
+                    hooks_config.get("daemon"),
+                    legacy_boolean=True,
+                )
+            )
+
+        return resolve_write_routing_policy(candidates)
+
+    @property
+    def hook_write_routing(self) -> WriteRoutingPolicy:
+        """Resolved future routing policy for hook-triggered writes."""
+
+        return self.resolve_write_routing("hooks").policy
+
+    @property
+    def cli_write_routing(self) -> WriteRoutingPolicy:
+        """Resolved future routing policy for routine CLI writes."""
+
+        return self.resolve_write_routing("cli").policy
+
+    @property
+    def hook_use_daemon(self):
+        """Whether hooks should submit save/mine work to the opt-in daemon."""
+        env_val = os.environ.get("MEMPALACE_HOOKS_DAEMON")
+        if env_val is not None:
+            return env_val.lower() in ("true", "1", "yes", "on")
+        value = self._file_config.get("hooks", {}).get("daemon", False)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.lower() in ("true", "1", "yes", "on")
+        return value == 1
 
     def set_hook_setting(self, key: str, value: bool):
         """Update a hook setting and write config to disk."""
@@ -413,6 +1027,14 @@ class MempalaceConfig:
         except (OSError, NotImplementedError):
             pass  # Windows doesn't support Unix permissions
         if not self._config_file.exists():
+            # Chunking parameters (chunk_size, chunk_overlap, min_chunk_size)
+            # are intentionally NOT written here — convo_miner.py distinguishes
+            # "user has tuned this" from "user is on defaults" by checking
+            # ``_file_config.get("min_chunk_size") is None``. Writing the
+            # miner.py defaults (50) into config.json breaks that detection
+            # and silently overrides convo_miner's stricter 30-char floor,
+            # dropping legitimate short conversation exchanges. Module-level
+            # defaults already apply correctly when these keys are absent.
             default_config = {
                 "palace_path": DEFAULT_PALACE_PATH,
                 "collection_name": DEFAULT_COLLECTION_NAME,

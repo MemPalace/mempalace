@@ -1,5 +1,6 @@
 import os
 import json
+import sqlite3
 import tempfile
 
 import pytest
@@ -10,6 +11,7 @@ from mempalace.config import (
     sanitize_iso_temporal,
     sanitize_kg_value,
     sanitize_name,
+    sqlite_read_uri,
 )
 
 
@@ -17,6 +19,7 @@ def test_default_config():
     cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
     assert "palace" in cfg.palace_path
     assert cfg.collection_name == "mempalace_drawers"
+    assert cfg.backend == "chroma"
 
 
 def test_config_from_file():
@@ -25,6 +28,89 @@ def test_config_from_file():
         json.dump({"palace_path": "/custom/palace"}, f)
     cfg = MempalaceConfig(config_dir=tmpdir)
     assert cfg.palace_path == "/custom/palace"
+
+
+def test_backend_from_config_wins_over_env(tmp_path, monkeypatch):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"backend": "sqlite_exact"}, f)
+    monkeypatch.setenv("MEMPALACE_BACKEND", "chroma")
+
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.backend == "sqlite_exact"
+
+
+def test_backend_from_env_when_config_absent(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEMPALACE_BACKEND", "SQLite_Exact")
+
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.backend == "sqlite_exact"
+
+
+def test_qdrant_config_from_env_and_file(tmp_path, monkeypatch):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump(
+            {
+                "qdrant_url": "http://config.example:6333",
+                "qdrant_api_key": "config-key",
+                "qdrant_namespace": "config-ns",
+                "qdrant_timeout": 2,
+            },
+            f,
+        )
+    monkeypatch.setenv("MEMPALACE_QDRANT_URL", "http://env.example:6333")
+    monkeypatch.setenv("MEMPALACE_QDRANT_API_KEY", "env-key")
+    monkeypatch.setenv("MEMPALACE_QDRANT_NAMESPACE", "env-ns")
+    monkeypatch.setenv("MEMPALACE_QDRANT_TIMEOUT", "3.5")
+
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+
+    assert cfg.qdrant_url == "http://env.example:6333"
+    assert cfg.qdrant_api_key == "env-key"
+    assert cfg.qdrant_namespace == "env-ns"
+    assert cfg.qdrant_timeout == 3.5
+
+
+def test_milvus_config_from_env_and_file(tmp_path, monkeypatch):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump(
+            {
+                "milvus_uri": "https://config.example",
+                "milvus_token": "config-token",
+                "milvus_db_name": "config-db",
+                "milvus_namespace": "config-ns",
+                "milvus_consistency_level": "bounded",
+            },
+            f,
+        )
+    monkeypatch.setenv("MEMPALACE_MILVUS_URI", "https://env.example")
+    monkeypatch.setenv("MEMPALACE_MILVUS_TOKEN", "env-token")
+    monkeypatch.setenv("MEMPALACE_MILVUS_DB_NAME", "env-db")
+    monkeypatch.setenv("MEMPALACE_MILVUS_NAMESPACE", "env-ns")
+    monkeypatch.setenv("MEMPALACE_MILVUS_CONSISTENCY_LEVEL", "eventually")
+
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+
+    assert cfg.milvus_uri == "https://env.example"
+    assert cfg.milvus_token == "env-token"
+    assert cfg.milvus_db_name == "env-db"
+    assert cfg.milvus_namespace == "env-ns"
+    assert cfg.milvus_consistency_level == "Eventually"
+
+
+def test_milvus_config_rejects_invalid_consistency_level(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEMPALACE_MILVUS_CONSISTENCY_LEVEL", "linearizable")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+
+    with pytest.raises(ValueError, match="milvus_consistency_level"):
+        cfg.milvus_consistency_level
+
+
+def test_set_backend_persists_choice(tmp_path):
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    cfg.set_backend("sqlite_exact")
+
+    reloaded = MempalaceConfig(config_dir=str(tmp_path))
+    assert reloaded.backend == "sqlite_exact"
 
 
 def test_embedding_device_defaults_to_auto(monkeypatch):
@@ -49,6 +135,79 @@ def test_embedding_device_env_overrides_config(tmp_path, monkeypatch):
 
     cfg = MempalaceConfig(config_dir=str(tmp_path))
     assert cfg.embedding_device == "coreml"
+
+
+def test_embedding_threads_defaults_to_half_cpus(monkeypatch):
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_THREADS", raising=False)
+    monkeypatch.setattr("os.cpu_count", lambda: 10)
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    # unset / "auto" → half the logical CPUs so a background mine stays tame
+    assert cfg.embedding_threads == 5
+
+
+def test_embedding_threads_auto_keyword(tmp_path, monkeypatch):
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_THREADS", raising=False)
+    monkeypatch.setattr("os.cpu_count", lambda: 8)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"embedding_threads": "auto"}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.embedding_threads == 4
+
+
+def test_embedding_threads_positive_value_from_config(tmp_path, monkeypatch):
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_THREADS", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"embedding_threads": 3}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.embedding_threads == 3
+
+
+def test_embedding_threads_zero_means_uncapped(tmp_path, monkeypatch):
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_THREADS", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"embedding_threads": 0}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.embedding_threads == 0
+
+
+def test_embedding_threads_env_overrides_config(tmp_path, monkeypatch):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"embedding_threads": 2}, f)
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_THREADS", "6")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.embedding_threads == 6
+
+
+def test_embedding_threads_invalid_falls_back_to_auto(tmp_path, monkeypatch):
+    monkeypatch.setattr("os.cpu_count", lambda: 4)
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_THREADS", "not-a-number")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.embedding_threads == 2
+
+
+def test_sqlite_read_uri_opens_path_with_spaces(tmp_path):
+    """sqlite_read_uri must open a read-only DB whose path contains spaces,
+    which a bare f"file:{path}?mode=ro" mis-parses (especially on Windows)."""
+    db_dir = tmp_path / "palace with spaces"
+    db_dir.mkdir()
+    db_path = db_dir / "chroma.sqlite3"
+    setup = sqlite3.connect(str(db_path))
+    setup.execute("CREATE TABLE t (x INTEGER)")
+    setup.execute("INSERT INTO t VALUES (42)")
+    setup.commit()
+    setup.close()
+
+    uri = sqlite_read_uri(str(db_path))
+    assert "%20" in uri  # the space is percent-encoded, not left raw
+
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        assert conn.execute("SELECT x FROM t").fetchone()[0] == 42
+        # mode=ro is still honored through the encoded URI
+        with pytest.raises(sqlite3.OperationalError):
+            conn.execute("INSERT INTO t VALUES (1)")
+    finally:
+        conn.close()
 
 
 def test_env_override():
@@ -115,6 +274,17 @@ def test_init():
     cfg = MempalaceConfig(config_dir=tmpdir)
     cfg.init()
     assert os.path.exists(os.path.join(tmpdir, "config.json"))
+    with open(os.path.join(tmpdir, "config.json")) as f:
+        saved = json.load(f)
+    assert "backend" not in saved
+    assert MempalaceConfig(config_dir=tmpdir).backend == "chroma"
+
+
+def test_set_backend_rejects_unknown_backend(tmp_path):
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+
+    with pytest.raises(KeyError):
+        cfg.set_backend("does_not_exist")
 
 
 # --- normalize_wing_name ---
@@ -134,6 +304,16 @@ def test_normalize_wing_name_already_clean():
 
 def test_normalize_wing_name_mixed():
     assert normalize_wing_name("My-Cool App") == "my_cool_app"
+
+
+def test_normalize_wing_name_strips_leading_separator():
+    # Claude Code path-encoded project dirs begin with a separator; the slug
+    # must not start with "_" or sanitize_name / MCP writes would reject it.
+    assert normalize_wing_name("-home-user-linux-book") == "home_user_linux_book"
+
+
+def test_normalize_wing_name_strips_trailing_separator():
+    assert normalize_wing_name("project-") == "project"
 
 
 # --- sanitize_name ---
@@ -345,3 +525,440 @@ def test_iso_temporal_error_names_field():
 
 def test_iso_temporal_normalizes_plus_zero_offset_to_z():
     assert sanitize_iso_temporal("2026-05-06T14:23:00+00:00") == "2026-05-06T14:23:00Z"
+
+
+# ── Chunk-config validation ────────────────────────────────────────────
+# Backs the validated chunk_* properties added in #1024. Every property
+# resolves through ``_validated_chunk_config`` which (a) coerces to int
+# (or falls back to the documented default), (b) enforces the invariants
+# ``chunk_text()`` needs (chunk_size >= 1, chunk_overlap <= chunk_size // 2,
+# min_chunk_size <= chunk_size). A bad config.json must NEVER hang
+# ingest — repair, don't raise.
+
+
+def _write_config(tmp_path, **values):
+    """Helper: drop a config.json with the given keys into tmp_path."""
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump(values, f)
+    return MempalaceConfig(config_dir=str(tmp_path))
+
+
+def test_chunk_config_defaults_when_unset(tmp_path):
+    """No config.json → documented defaults."""
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.chunk_size == 800
+    assert cfg.chunk_overlap == 100
+    assert cfg.min_chunk_size == 50
+
+
+def test_chunk_config_user_overrides_honored(tmp_path):
+    """Valid file values pass through unchanged."""
+    cfg = _write_config(tmp_path, chunk_size=1200, chunk_overlap=200, min_chunk_size=80)
+    assert cfg.chunk_size == 1200
+    assert cfg.chunk_overlap == 200
+    assert cfg.min_chunk_size == 80
+
+
+def test_chunk_config_string_coerced_to_int(tmp_path):
+    """Hand-edited config can drop quotes around numbers — accept ``"1500"``."""
+    cfg = _write_config(tmp_path, chunk_size="1500", chunk_overlap="50")
+    assert cfg.chunk_size == 1500
+    assert cfg.chunk_overlap == 50
+
+
+def test_chunk_config_garbage_string_falls_back_to_default(tmp_path):
+    cfg = _write_config(tmp_path, chunk_size="not a number")
+    assert cfg.chunk_size == 800  # default, not a crash
+
+
+def test_chunk_config_bool_falls_back_to_default(tmp_path):
+    """``bool`` is a subclass of ``int`` in Python — a JSON ``true``
+    would otherwise coerce to 1 and quietly break ingest. Treat as bad
+    input."""
+    cfg = _write_config(tmp_path, chunk_size=True)
+    assert cfg.chunk_size == 800
+
+
+def test_chunk_config_negative_falls_back(tmp_path):
+    """Negative chunk_size/min_chunk_size violates ``minimum`` and reverts."""
+    cfg = _write_config(tmp_path, chunk_size=-100, min_chunk_size=-5)
+    assert cfg.chunk_size == 800
+    assert cfg.min_chunk_size == 50
+
+
+def test_chunk_config_zero_chunk_size_falls_back(tmp_path):
+    """``chunk_size=0`` would loop forever — must revert to default."""
+    cfg = _write_config(tmp_path, chunk_size=0)
+    assert cfg.chunk_size == 800
+
+
+def test_chunk_config_overlap_at_or_above_size_repaired(tmp_path):
+    """``chunk_overlap`` above ``chunk_size // 2`` is the hang condition
+    (#2056); repair to the documented default when it stays at or below
+    half, otherwise clamp to ``chunk_size // 2``. Here the default fits."""
+    cfg = _write_config(tmp_path, chunk_size=900, chunk_overlap=900)
+    assert cfg.chunk_size == 900
+    # 100 (default) is at most 900 // 2, so use the default.
+    assert cfg.chunk_overlap == 100
+    assert cfg.chunk_overlap <= cfg.chunk_size // 2
+
+
+def test_chunk_config_overlap_repair_when_default_doesnt_fit(tmp_path):
+    """Tiny chunk_size where the default overlap (100) exceeds half the
+    chunk size: clamp to ``chunk_size // 2``, the largest safe overlap."""
+    cfg = _write_config(tmp_path, chunk_size=50, chunk_overlap=100)
+    assert cfg.chunk_size == 50
+    assert cfg.chunk_overlap == 25  # min(DEFAULT_CHUNK_OVERLAP, chunk_size // 2)
+    assert cfg.chunk_overlap <= cfg.chunk_size // 2
+
+
+def test_chunk_config_overlap_above_half_repaired(tmp_path):
+    """#2056: an overlap between ``chunk_size // 2`` and ``chunk_size`` used
+    to pass validation and could hang the miner on short-line content. It is
+    now repaired down to a safe value."""
+    cfg = _write_config(tmp_path, chunk_size=100, chunk_overlap=80)
+    assert cfg.chunk_size == 100
+    assert cfg.chunk_overlap == 50  # min(100, 100 // 2)
+    assert cfg.chunk_overlap <= cfg.chunk_size // 2
+
+
+def test_chunk_config_overlap_at_half_preserved(tmp_path):
+    """Exactly 50% overlap (``== chunk_size // 2``) is safe and must be kept
+    unchanged."""
+    cfg = _write_config(tmp_path, chunk_size=800, chunk_overlap=400)
+    assert cfg.chunk_size == 800
+    assert cfg.chunk_overlap == 400
+    assert cfg.chunk_overlap <= cfg.chunk_size // 2
+
+
+def test_chunk_config_overlap_repair_odd_size_and_default_equals_half(tmp_path):
+    """Floor-boundary repairs (#2056): odd chunk_size floors ``// 2``, and the
+    case where DEFAULT_CHUNK_OVERLAP (100) equals chunk_size // 2 exactly."""
+    # Odd size: 101 // 2 == 50, so an over-half overlap clamps to min(100, 50).
+    cfg = _write_config(tmp_path, chunk_size=101, chunk_overlap=100)
+    assert cfg.chunk_overlap == 50
+    assert cfg.chunk_overlap <= cfg.chunk_size // 2
+    # DEFAULT_CHUNK_OVERLAP (100) == 200 // 2: repair clamps to exactly 100.
+    cfg2 = _write_config(tmp_path, chunk_size=200, chunk_overlap=180)
+    assert cfg2.chunk_overlap == 100
+    assert cfg2.chunk_overlap <= cfg2.chunk_size // 2
+
+
+def test_chunk_config_min_chunk_size_above_size_repaired(tmp_path):
+    """``min_chunk_size > chunk_size`` would silently produce 0 drawers
+    on every ingest — repair to default if it fits, else clamp to
+    chunk_size."""
+    cfg = _write_config(tmp_path, chunk_size=1000, min_chunk_size=2000)
+    assert cfg.min_chunk_size == 50  # default fits inside 1000
+
+    cfg2 = _write_config(tmp_path, chunk_size=20, min_chunk_size=200)
+    assert cfg2.min_chunk_size == 20  # default (50) > chunk_size, clamp
+
+
+# ── min_chunk_size_explicit (convo-path validated accessor) ────────────
+# Backs the #1024-review fix: convo_miner must distinguish "user tuned
+# min_chunk_size" from "untuned" WITHOUT reaching into raw _file_config.
+# Untuned/unusable → None (convo keeps its 30 floor). Usable → validated
+# int. A bad key must never reach the convo length-gate / chunk_exchanges
+# as a non-int and crash ingest.
+
+
+def test_min_chunk_size_explicit_none_when_unset(tmp_path):
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.min_chunk_size_explicit is None
+
+
+def test_min_chunk_size_explicit_none_when_json_null(tmp_path):
+    """Explicit JSON ``null`` is treated as untuned (preserves the prior
+    ``_file_config.get(...) is None`` sentinel semantics)."""
+    cfg = _write_config(tmp_path, min_chunk_size=None)
+    assert cfg.min_chunk_size_explicit is None
+
+
+def test_min_chunk_size_explicit_returns_validated_value(tmp_path):
+    cfg = _write_config(tmp_path, min_chunk_size=80)
+    assert cfg.min_chunk_size_explicit == 80
+
+
+def test_min_chunk_size_explicit_coerces_numeric_string(tmp_path):
+    cfg = _write_config(tmp_path, min_chunk_size="42")
+    assert cfg.min_chunk_size_explicit == 42
+
+
+@pytest.mark.parametrize("bad", ["abc", -5, True, "", "  "])
+def test_min_chunk_size_explicit_none_on_unusable_value(tmp_path, bad):
+    """Garbage / negative / bool / blank → None, NOT a crash and NOT the
+    miner.py default. convo_miner then falls back to its own 30 floor.
+    This is the exact class of value that used to TypeError the convo
+    length-gate or ValueError out of chunk_exchanges."""
+    cfg = _write_config(tmp_path, min_chunk_size=bad)
+    assert cfg.min_chunk_size_explicit is None
+
+
+def test_min_chunk_size_explicit_none_when_above_chunk_size(tmp_path):
+    """min_chunk_size > chunk_size would zero out ingest — treat as
+    unusable so convo falls back to its floor instead."""
+    cfg = _write_config(tmp_path, chunk_size=100, min_chunk_size=500)
+    assert cfg.min_chunk_size_explicit is None
+
+
+def test_convo_min_chunk_fallback_is_always_safe_int(tmp_path):
+    """Regression for #1024 review: the convo_miner fallback expression
+    must yield a usable int for ANY config — never a str/bool/negative
+    that would crash the length gate or chunk_exchanges."""
+    from mempalace.convo_miner import MIN_CHUNK_SIZE
+
+    for bad in ("not-a-number", -10, True, {}, []):
+        cfg = _write_config(tmp_path, min_chunk_size=bad)
+        explicit = cfg.min_chunk_size_explicit
+        effective = explicit if explicit is not None else MIN_CHUNK_SIZE
+        assert isinstance(effective, int) and not isinstance(effective, bool)
+        assert effective == MIN_CHUNK_SIZE  # untuned floor, no crash
+
+    cfg = _write_config(tmp_path, min_chunk_size=15)
+    explicit = cfg.min_chunk_size_explicit
+    assert (explicit if explicit is not None else MIN_CHUNK_SIZE) == 15
+
+
+def test_min_chunk_size_explicit_handles_json_infinity(tmp_path):
+    """JSON ``Infinity`` round-trips to float('inf'); ``int(inf)`` raises
+    OverflowError. That is still garbage config, not a crash — must fall
+    back to None (untuned), same as any other unusable value."""
+    cfg = _write_config(tmp_path, min_chunk_size=float("inf"))
+    assert cfg.min_chunk_size_explicit is None
+    # chunk_size path coerces the same value → documented default, no crash.
+    cfg2 = _write_config(tmp_path, chunk_size=float("inf"))
+    assert cfg2.chunk_size == 800
+
+
+def test_chunk_text_rejects_non_positive_chunk_size():
+    """Direct callers (tests, library users) that pass ``chunk_size <= 0``
+    must hit a clear ValueError, not loop forever."""
+    from mempalace.miner import chunk_text
+
+    with pytest.raises(ValueError, match="chunk_size"):
+        chunk_text("some content", "src.txt", chunk_size=0)
+    with pytest.raises(ValueError, match="chunk_size"):
+        chunk_text("some content", "src.txt", chunk_size=-1)
+
+
+def test_chunk_text_rejects_overlap_above_half_size():
+    """#2056: chunk_overlap > chunk_size // 2 can loop forever on short-line
+    content, so chunk_text now rejects it fast (not only overlap >= size)."""
+    from mempalace.miner import chunk_text
+
+    # overlap >= chunk_size (the original #1024 guard) stays rejected.
+    with pytest.raises(ValueError, match="chunk_overlap"):
+        chunk_text("some content", "src.txt", chunk_size=100, chunk_overlap=100)
+    with pytest.raises(ValueError, match="chunk_overlap"):
+        chunk_text("some content", "src.txt", chunk_size=100, chunk_overlap=200)
+    # NEW: overlap strictly above half is now rejected too.
+    with pytest.raises(ValueError, match="chunk_overlap"):
+        chunk_text("some content", "src.txt", chunk_size=100, chunk_overlap=51)
+    with pytest.raises(ValueError, match="chunk_overlap"):
+        chunk_text("some content", "src.txt", chunk_size=50, chunk_overlap=49)
+
+
+def test_chunk_text_overlap_boundary_at_half_size():
+    """The exact safety boundary is ``chunk_size // 2``: overlap == half is
+    accepted and terminates; overlap == half + 1 is rejected because it can
+    loop forever on content whose lines are about half the chunk size (#2056).
+    """
+    from mempalace.miner import chunk_text
+
+    worst = ("x" * 10 + "\n") * 40  # 11-char lines = 20 // 2 + 1
+    # overlap == chunk_size // 2 -> safe, returns a list (does not hang).
+    assert isinstance(chunk_text(worst, "src.txt", 20, 10), list)
+    # overlap == chunk_size // 2 + 1 -> rejected fast (would otherwise hang).
+    with pytest.raises(ValueError, match="chunk_overlap"):
+        chunk_text(worst, "src.txt", 20, 11)
+    # Odd chunk_size floors: 101 // 2 == 50, so 50 is accepted, 51 rejected.
+    assert isinstance(chunk_text("word " * 100, "src.txt", 101, 50), list)
+    with pytest.raises(ValueError, match="chunk_overlap"):
+        chunk_text("word " * 100, "src.txt", 101, 51)
+
+
+def test_chunk_text_rejects_negative_overlap():
+    from mempalace.miner import chunk_text
+
+    with pytest.raises(ValueError, match="chunk_overlap"):
+        chunk_text("some content", "src.txt", chunk_overlap=-1)
+
+
+def test_miner_constants_alias_config_defaults():
+    """Single source of truth: the legacy ``CHUNK_SIZE`` / ``CHUNK_OVERLAP``
+    / ``MIN_CHUNK_SIZE`` re-exports in ``mempalace.miner`` must equal the
+    canonical ``DEFAULT_CHUNK_*`` constants in ``mempalace.config``.
+    Pinned by this test so a future drift would surface as a unit failure.
+    """
+    from mempalace.miner import CHUNK_SIZE, CHUNK_OVERLAP, MIN_CHUNK_SIZE
+    from mempalace.config import (
+        DEFAULT_CHUNK_SIZE,
+        DEFAULT_CHUNK_OVERLAP,
+        DEFAULT_MIN_CHUNK_SIZE,
+    )
+
+    assert CHUNK_SIZE == DEFAULT_CHUNK_SIZE == 800
+    assert CHUNK_OVERLAP == DEFAULT_CHUNK_OVERLAP == 100
+    assert MIN_CHUNK_SIZE == DEFAULT_MIN_CHUNK_SIZE == 50
+
+
+# --- hooks.auto_save ---
+
+
+def test_hooks_auto_save_default():
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    assert cfg.hooks_auto_save is True
+
+
+def test_hooks_auto_save_from_config():
+    tmpdir = tempfile.mkdtemp()
+    with open(os.path.join(tmpdir, "config.json"), "w") as f:
+        json.dump({"hooks": {"auto_save": False}}, f)
+    cfg = MempalaceConfig(config_dir=tmpdir)
+    assert cfg.hooks_auto_save is False
+
+
+def test_hooks_auto_save_env_override_false():
+    os.environ["MEMPALACE_HOOKS_AUTO_SAVE"] = "false"
+    try:
+        cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+        assert cfg.hooks_auto_save is False
+    finally:
+        del os.environ["MEMPALACE_HOOKS_AUTO_SAVE"]
+
+
+def test_hooks_auto_save_env_override_zero():
+    os.environ["MEMPALACE_HOOKS_AUTO_SAVE"] = "0"
+    try:
+        cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+        assert cfg.hooks_auto_save is False
+    finally:
+        del os.environ["MEMPALACE_HOOKS_AUTO_SAVE"]
+
+
+def test_hooks_auto_save_env_override_no():
+    os.environ["MEMPALACE_HOOKS_AUTO_SAVE"] = "no"
+    try:
+        cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+        assert cfg.hooks_auto_save is False
+    finally:
+        del os.environ["MEMPALACE_HOOKS_AUTO_SAVE"]
+
+
+def test_hooks_auto_save_env_override_true():
+    """Env var set to 'true' overrides config file even if config says false."""
+    tmpdir = tempfile.mkdtemp()
+    with open(os.path.join(tmpdir, "config.json"), "w") as f:
+        json.dump({"hooks": {"auto_save": False}}, f)
+    os.environ["MEMPALACE_HOOKS_AUTO_SAVE"] = "true"
+    try:
+        cfg = MempalaceConfig(config_dir=tmpdir)
+        assert cfg.hooks_auto_save is True
+    finally:
+        del os.environ["MEMPALACE_HOOKS_AUTO_SAVE"]
+
+
+def test_hook_use_daemon_default_false(monkeypatch):
+    monkeypatch.delenv("MEMPALACE_HOOKS_DAEMON", raising=False)
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    assert cfg.hook_use_daemon is False
+
+
+def test_hook_use_daemon_from_config(monkeypatch, tmp_path):
+    monkeypatch.delenv("MEMPALACE_HOOKS_DAEMON", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"hooks": {"daemon": True}}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.hook_use_daemon is True
+
+
+def test_hook_use_daemon_string_config(monkeypatch, tmp_path):
+    monkeypatch.delenv("MEMPALACE_HOOKS_DAEMON", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"hooks": {"daemon": "yes"}}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.hook_use_daemon is True
+
+
+def test_hook_use_daemon_env_override(monkeypatch, tmp_path):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"hooks": {"daemon": False}}, f)
+    monkeypatch.setenv("MEMPALACE_HOOKS_DAEMON", "yes")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.hook_use_daemon is True
+
+
+# --- max_backups (backup retention) ---
+
+
+def test_max_backups_default(monkeypatch):
+    monkeypatch.delenv("MEMPALACE_MAX_BACKUPS", raising=False)
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    assert cfg.max_backups == 10
+
+
+def test_max_backups_from_config(monkeypatch, tmp_path):
+    monkeypatch.delenv("MEMPALACE_MAX_BACKUPS", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"max_backups": 3}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.max_backups == 3
+
+
+def test_max_backups_zero_disables(monkeypatch, tmp_path):
+    """0 is a valid, explicit "keep everything" — not garbage."""
+    monkeypatch.delenv("MEMPALACE_MAX_BACKUPS", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"max_backups": 0}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.max_backups == 0
+
+
+def test_max_backups_env_overrides_config(monkeypatch, tmp_path):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"max_backups": 3}, f)
+    monkeypatch.setenv("MEMPALACE_MAX_BACKUPS", "7")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.max_backups == 7
+
+
+@pytest.mark.parametrize("bad", ["abc", "", "-5", "1.5", "true"])
+def test_max_backups_garbage_falls_back_to_default(monkeypatch, tmp_path, bad):
+    """A hand-edited bad value must never crash migrate/repair."""
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"max_backups": bad}, f)
+    monkeypatch.delenv("MEMPALACE_MAX_BACKUPS", raising=False)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.max_backups == 10
+
+
+def test_max_backups_negative_in_config_falls_back(monkeypatch, tmp_path):
+    monkeypatch.delenv("MEMPALACE_MAX_BACKUPS", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"max_backups": -3}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.max_backups == 10
+
+
+def test_max_backups_bad_env_falls_back_to_config(monkeypatch, tmp_path):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"max_backups": 4}, f)
+    monkeypatch.setenv("MEMPALACE_MAX_BACKUPS", "garbage")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.max_backups == 4
+
+
+def test_explicit_palace_path_overrides_env_and_file_config(monkeypatch, tmp_path):
+    configured = tmp_path / "configured" / "palace"
+    explicit = tmp_path / "explicit" / "../explicit" / "palace"
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"palace_path": str(configured)}, f)
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(tmp_path / "environment" / "palace"))
+
+    cfg = MempalaceConfig(config_dir=str(tmp_path), palace_path=str(explicit))
+
+    expected = os.path.abspath(os.path.expanduser(str(explicit)))
+    assert cfg.palace_path == expected
+    assert cfg.hallway_file == os.path.join(os.path.dirname(expected), "hallways.json")
+    assert cfg.tunnel_file == os.path.join(os.path.dirname(expected), "tunnels.json")

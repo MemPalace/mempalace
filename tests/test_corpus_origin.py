@@ -112,17 +112,17 @@ class TestHeuristic:
             "anthropic's haiku model is cheap enough to run on every drawer",
         ]
         result = detect_origin_heuristic(samples)
-        assert (
-            result.likely_ai_dialogue is True
-        ), f"lowercase brand terms missed; evidence: {result.evidence}"
+        assert result.likely_ai_dialogue is True, (
+            f"lowercase brand terms missed; evidence: {result.evidence}"
+        )
         # Evidence must show MULTIPLE distinct case-insensitive brand matches.
         # 'chatgpt' lowercase only matches under case-insensitive search
         # (the brand list has 'ChatGPT' proper-cased only).
         evidence_str = " ".join(result.evidence).lower()
         matched = sum(t in evidence_str for t in ("chatgpt", "anthropic", "haiku", "gemini-pro"))
-        assert (
-            matched >= 2
-        ), f"case-insensitive brand matches did not fire — only got: {result.evidence}"
+        assert matched >= 2, (
+            f"case-insensitive brand matches did not fire — only got: {result.evidence}"
+        )
 
     def test_zodiac_corpus_not_flagged_as_ai(self):
         """An astrology forum post with high 'Gemini' density but ZERO
@@ -138,9 +138,9 @@ class TestHeuristic:
             "The Gemini twins in Greek mythology are Castor and Pollux.",
         ]
         result = detect_origin_heuristic(samples)
-        assert (
-            result.likely_ai_dialogue is False
-        ), f"zodiac corpus wrongly flagged AI; evidence: {result.evidence}"
+        assert result.likely_ai_dialogue is False, (
+            f"zodiac corpus wrongly flagged AI; evidence: {result.evidence}"
+        )
 
     def test_french_novel_with_claude_name_not_flagged(self):
         """A French novel where 'Claude' is a character name (Claude is a
@@ -155,9 +155,9 @@ class TestHeuristic:
             "Les amis de Claude s'étaient réunis chez lui pour fêter ses soixante ans.",
         ]
         result = detect_origin_heuristic(samples)
-        assert (
-            result.likely_ai_dialogue is False
-        ), f"French novel wrongly flagged AI; evidence: {result.evidence}"
+        assert result.likely_ai_dialogue is False, (
+            f"French novel wrongly flagged AI; evidence: {result.evidence}"
+        )
 
     def test_poetry_corpus_with_haiku_sonnet_not_flagged(self):
         """A poetry corpus with high 'haiku', 'sonnet', 'opus' density
@@ -172,9 +172,9 @@ class TestHeuristic:
             "Her first opus, published at twenty, was a song cycle for soprano.",
         ]
         result = detect_origin_heuristic(samples)
-        assert (
-            result.likely_ai_dialogue is False
-        ), f"poetry corpus wrongly flagged AI; evidence: {result.evidence}"
+        assert result.likely_ai_dialogue is False, (
+            f"poetry corpus wrongly flagged AI; evidence: {result.evidence}"
+        )
 
     def test_word_boundary_brand_matching(self):
         """Brand-term matching must use word boundaries. Embedded matches
@@ -208,9 +208,9 @@ class TestHeuristic:
             )
 
         # And classification should be not-AI (no real AI signals present).
-        assert (
-            result.likely_ai_dialogue is False
-        ), f"corpus has no real AI signals; evidence: {result.evidence}"
+        assert result.likely_ai_dialogue is False, (
+            f"corpus has no real AI signals; evidence: {result.evidence}"
+        )
 
     def test_ambiguous_brand_with_unambiguous_signal_flagged(self):
         """When an ambiguous brand term ('Gemini') co-occurs with an
@@ -224,9 +224,9 @@ class TestHeuristic:
             "MCP server config: Gemini as primary, OpenAI as fallback.",
         ]
         result = detect_origin_heuristic(samples)
-        assert (
-            result.likely_ai_dialogue is True
-        ), f"ambiguous+unambiguous co-occurrence missed; evidence: {result.evidence}"
+        assert result.likely_ai_dialogue is True, (
+            f"ambiguous+unambiguous co-occurrence missed; evidence: {result.evidence}"
+        )
 
 
 # ── Tier 2: LLM-assisted (mocked) ─────────────────────────────────────────
