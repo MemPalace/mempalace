@@ -336,7 +336,8 @@ def split_file(filepath: Path, content: str, max_lines: int, output_dir: Path) -
 
 def preprocess_file(
     filepath: Path,
-    output_dir: Path,
+    staging_dir: Path,
+    processed_dir: Path,
     max_lines: int,
     dry_run: bool = False,
 ) -> list[Path]:
@@ -367,7 +368,14 @@ def preprocess_file(
         print(f"  {filepath.name}: {original_lines} -> {cleaned_lines} lines")
         return []
 
-    return split_file(filepath, cleaned, max_lines, output_dir)
+    # Preserve the directory structure of the staging tree under processed/
+    # so that files with the same name in different subdirectories do not
+    # overwrite each other.
+    rel = filepath.relative_to(staging_dir)
+    output_dir = processed_dir / rel.parent
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    return split_file(rel, cleaned, max_lines, output_dir)
 
 
 def preprocess_directory(staging_dir: str, max_lines: int, dry_run: bool = False) -> dict[str, int]:
@@ -409,7 +417,7 @@ def preprocess_directory(staging_dir: str, max_lines: int, dry_run: bool = False
             continue
 
         try:
-            outputs = preprocess_file(filepath, processed_dir, max_lines, dry_run)
+            outputs = preprocess_file(filepath, staging, processed_dir, max_lines, dry_run)
             if outputs:
                 stats["processed"] += 1
                 stats["output_files"] += len(outputs)
