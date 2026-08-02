@@ -9,9 +9,11 @@ Run: pytest tests/test_proxy.py -v
 """
 
 import asyncio
+import json
 import os
 import sys
 
+import httpx
 import pytest
 
 # Add the proxy directory to path for imports
@@ -183,6 +185,7 @@ class TestNotificationHandling:
 
     def test_204_returns_none_payload(self):
         """204 No Content should also return None payload."""
+
         class MockResponse:
             status_code = 204
             content = b""
@@ -193,6 +196,7 @@ class TestNotificationHandling:
 
     def test_200_with_content_does_not_return_none(self):
         """200 with actual JSON content should NOT trigger the 202/204 path."""
+
         class MockResponse:
             status_code = 200
             content = b'{"jsonrpc": "2.0", "result": {}}'
@@ -203,6 +207,7 @@ class TestNotificationHandling:
 
     def test_200_with_empty_content_returns_none(self):
         """200 with empty content (edge case) should also return None."""
+
         class MockResponse:
             status_code = 200
             content = b""
@@ -278,7 +283,7 @@ class TestNoHardcodedPaths:
 
     def test_no_hardcoded_ips_in_proxy(self):
         proxy_path = os.path.join(
-            os.path.dirname(__file__), "..", "deploy", "proxy", "mempalace-mcp-proxy.py"
+            os.path.dirname(__file__), "..", "deploy", "proxy", "mempalace_mcp_proxy.py"
         )
         with open(proxy_path) as f:
             content = f.read()
@@ -293,7 +298,7 @@ class TestNoHardcodedPaths:
 
     def test_no_hardcoded_user_paths_in_proxy(self):
         proxy_path = os.path.join(
-            os.path.dirname(__file__), "..", "deploy", "proxy", "mempalace-mcp-proxy.py"
+            os.path.dirname(__file__), "..", "deploy", "proxy", "mempalace_mcp_proxy.py"
         )
         with open(proxy_path) as f:
             content = f.read()
@@ -320,3 +325,177 @@ class TestNoHardcodedPaths:
 
         assert "/Users/jacob" not in content, "Hardcoded /Users/jacob path found"
         assert "/home/orkidlabs" not in content, "Hardcoded /home/orkidlabs path found"
+
+
+class TestIdempotentRetry:
+    """Regressions for non-idempotent upstream requests.
+
+    The proxy must not retry JSON-RPC mutations. If a write (e.g. diary,
+    kg_add, add_drawer) commits upstream and the response is lost, replaying
+    it executes the mutation twice. Only read-only tools and methods may be
+    retried.
+    """
+
+    @staticmethod
+    def _fake_client(responses):
+        """Build a fake httpx.AsyncClient that returns queued responses/exceptions."""
+
+        class FakeResponse:
+            def __init__(self, status_code, content=b"{}", text=""):
+                self.status_code = status_code
+                self.content = content
+                self.text = text if text else content.decode()
+
+            def json(self):
+                if not self.content:
+                    raise ValueError("empty body")
+                return json.loads(self.content)
+
+        class FakeClient:
+            is_closed = False
+
+            def __init__(self, responses):
+                self.responses = list(responses)
+                self.calls = []
+
+            async def aclose(self):
+                pass
+
+            async def post(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+                if not self.responses:
+                    raise httpx.ReadTimeout("response lost")
+                resp = self.responses.pop(0)
+                if isinstance(resp, Exception):
+                    raise resp
+                return resp
+
+        return FakeClient(responses), FakeResponse
+
+    def _run_forward(self, body, responses):
+        import mempalace_mcp_proxy as proxy
+
+        client, FakeResponse = self._fake_client(responses)
+        old_client = proxy._http_client
+        old_circuit = dict(proxy._circuit)
+        try:
+            proxy._http_client = client
+            proxy._circuit["failures"] = 0
+            proxy._circuit["state"] = "closed"
+            max_attempts = proxy.MAX_RETRIES + 1 if proxy._is_retry_safe(body) else 1
+            loop = asyncio.new_event_loop()
+            try:
+                result = loop.run_until_complete(
+                    proxy._forward_to_upstream(body, {}, 1, max_attempts=max_attempts)
+                )
+            finally:
+                loop.close()
+            return result, client.calls
+        finally:
+            proxy._http_client = old_client
+            proxy._circuit.update(old_circuit)
+
+    def test_read_only_tool_is_retried(self):
+        """mempalace_search is read-only and may be retried on 5xx."""
+        import mempalace_mcp_proxy as proxy
+
+        body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "mempalace_search"},
+            }
+        ).encode()
+        assert proxy._is_retry_safe(body)
+
+        _, FakeResponse = self._fake_client([])
+        result, calls = self._run_forward(
+            body,
+            [
+                httpx.ConnectError("first attempt failed"),
+                FakeResponse(500, b"{}"),
+                FakeResponse(200, json.dumps({"jsonrpc": "2.0", "id": 1, "result": []}).encode()),
+            ],
+        )
+
+        assert len(calls) == 3, f"Expected 3 attempts, got {len(calls)}"
+        assert result[1] == 200
+
+    def test_mutating_tool_not_retried_on_5xx(self):
+        """mempalace_diary_write must not be replayed when upstream 5xxs."""
+        import mempalace_mcp_proxy as proxy
+
+        body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "mempalace_diary_write", "arguments": {"content": "test"}},
+            }
+        ).encode()
+        assert not proxy._is_retry_safe(body)
+
+        _, FakeResponse = self._fake_client([])
+        result, calls = self._run_forward(body, [FakeResponse(500, b"{}")])
+
+        assert len(calls) == 1, f"Mutation retried {len(calls)} times"
+        assert result[1] >= 500
+
+    def test_mutating_tool_not_retried_on_timeout(self):
+        """The first attempt commits but the response is lost — no replay."""
+        body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "mempalace_add_drawer"},
+            }
+        ).encode()
+
+        _, _ = self._fake_client([])
+        result, calls = self._run_forward(body, [httpx.ReadTimeout("timeout after commit")])
+
+        assert len(calls) == 1
+        assert result[1] == 504
+
+    def test_tools_list_is_retried(self):
+        """tools/list is read-only and may be retried."""
+        import mempalace_mcp_proxy as proxy
+
+        body = json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+        ).encode()
+        assert proxy._is_retry_safe(body)
+
+        _, FakeResponse = self._fake_client([])
+        result, calls = self._run_forward(
+            body,
+            [
+                FakeResponse(503, b"{}"),
+                FakeResponse(200, json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}).encode()),
+            ],
+        )
+
+        assert len(calls) == 2
+        assert result[1] == 200
+
+    def test_unknown_tool_not_retried(self):
+        """Tools not in the read-only allowlist are treated as mutating."""
+        import mempalace_mcp_proxy as proxy
+
+        body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "mempalace_future_tool"},
+            }
+        ).encode()
+        assert not proxy._is_retry_safe(body)
+
+        _, FakeResponse = self._fake_client([])
+        result, calls = self._run_forward(body, [FakeResponse(500, b"{}")])
+
+        assert len(calls) == 1
+        assert result[1] >= 500

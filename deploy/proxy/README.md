@@ -13,7 +13,7 @@ the operational tooling to keep it running unattended.
 
 | File | Purpose |
 |------|---------|
-| `mempalace-mcp-proxy.py` | Streamable-HTTP proxy with connection pooling, circuit breaker, retry |
+| `mempalace_mcp_proxy.py` | Streamable-HTTP proxy with connection pooling, circuit breaker, retry |
 | `mempalace-watchdog.sh` | Auto-restart watchdog (detects hangs, not just crashes) |
 | `mempalace-monitor.sh` | Proactive health monitor with desktop notifications |
 | `com.mempalace.proxy.plist` | macOS launchd template (auto-start + KeepAlive) |
@@ -52,7 +52,7 @@ export UPSTREAM_URL="http://127.0.0.1:8765/mcp"
 # If your server has MEMPALACE_MCP_HTTP_TOKEN set, match it here:
 # export UPSTREAM_TOKEN="your-secret-token"
 
-python mempalace-mcp-proxy.py
+python mempalace_mcp_proxy.py
 ```
 
 The proxy now listens on `127.0.0.1:8766` and speaks streamable-HTTP.
@@ -85,9 +85,9 @@ launchctl load ~/Library/LaunchAgents/com.mempalace.proxy.plist
 
 **Linux (systemd):**
 ```bash
-sudo cp mempalace-mcp-proxy.py /usr/local/bin/
+sudo cp mempalace_mcp_proxy.py /usr/local/bin/
 sudo cp mempalace-watchdog.sh /usr/local/bin/
-sudo chmod +x /usr/local/bin/mempalace-mcp-proxy.py /usr/local/bin/mempalace-watchdog.sh
+sudo chmod +x /usr/local/bin/mempalace_mcp_proxy.py /usr/local/bin/mempalace-watchdog.sh
 sudo cp proxy.env.example /etc/mempalace/proxy.env
 # Edit /etc/mempalace/proxy.env
 sudo cp mempalace-proxy.service /etc/systemd/system/
