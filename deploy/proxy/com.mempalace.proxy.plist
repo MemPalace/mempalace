@@ -23,7 +23,7 @@
     <array>
         <!-- Adjust this path to where you installed the proxy script -->
         <string>/usr/bin/python3</string>
-        <string>/usr/local/bin/mempalace-mcp-proxy.py</string>
+        <string>/usr/local/bin/mempalace_mcp_proxy.py</string>
     </array>
 
     <key>EnvironmentVariables</key>
