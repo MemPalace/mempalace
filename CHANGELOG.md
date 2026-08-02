@@ -8,6 +8,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Features
+
+- **The MCP writer lease can now be handed between processes.** A server that
+  owns a palace and is idle releases the lock to a peer that queues for it,
+  instead of keeping every other session read-only until the owner exits. The
+  handoff never happens while a write is in flight or a request is being
+  dispatched, and is refused inside a configurable minimum hold so two chatty
+  sessions cannot thrash the lease. `mempalace_status` reports a `writer_lease`
+  block naming the current owner. Tunable via `MEMPALACE_WRITER_HANDOFF_*` /
+  `MEMPALACE_WRITER_MIN_HOLD_SECONDS`, and `MEMPALACE_PALACE_LOCK_WAIT_SECONDS`
+  extends the same waiting to CLI callers (default `0` — unchanged fail-fast).
+  See `docs/writer-lease-handoff.md`.
+
 ---
 
 ## [3.7.0] — 2026-08-02
