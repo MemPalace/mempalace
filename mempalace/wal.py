@@ -28,6 +28,35 @@ _WAL_REDACT_KEYS = frozenset(
     {"content", "content_preview", "document", "entry", "entry_preview", "query", "text"}
 )
 
+# Resolved once per process by ``_store_full_payload``; None means "not yet
+# resolved". Cached because ``MempalaceConfig`` reads config.json in its
+# constructor, and the WAL is on the hot path of every write — re-reading the
+# file per call would put disk I/O inside the hook latency budget.
+_WAL_FULL_PAYLOAD = None
+
+
+def _store_full_payload() -> bool:
+    """Whether to log write payloads verbatim rather than redacting them.
+
+    Defaults to redaction and fails closed: any error resolving the setting —
+    unreadable config, import failure — keeps the historical behaviour rather
+    than writing memory text to disk because a lookup broke.
+
+    ``MempalaceConfig`` is imported lazily inside the function to preserve this
+    module's contract of having no import side effects (see the module
+    docstring and ``test_wal_import_has_no_mcp_server_side_effect``).
+    """
+    global _WAL_FULL_PAYLOAD
+    if _WAL_FULL_PAYLOAD is None:
+        try:
+            from .config import MempalaceConfig
+
+            _WAL_FULL_PAYLOAD = bool(MempalaceConfig().wal_store_full_payload)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug(f"WAL payload-mode lookup failed, defaulting to redaction: {e}")
+            _WAL_FULL_PAYLOAD = False
+    return _WAL_FULL_PAYLOAD
+
 
 def _ensure_wal() -> None:
     """Create (and re-harden) the WAL directory lazily, on the first write.
@@ -71,12 +100,39 @@ def _ensure_wal() -> None:
     _WAL_INITIALIZED_DIR = wal_dir
 
 
+def wal_payload(value, limit: int = 200):
+    """Size a content value for the WAL: full when opted in, else a preview.
+
+    Callers historically passed ``value[:200]`` so the WAL held a bounded
+    preview. Redaction then replaced that preview outright, which is why the
+    truncation was invisible — a redacted 200-char slice and a redacted 20 KB
+    entry look identical in the log.
+
+    With ``wal_store_full_payload`` enabled the truncation becomes the binding
+    limit instead, so it has to lift too: recovering the first 200 characters
+    of a multi-kilobyte diary entry is not recovering it. Returns the value
+    untouched when full payloads are enabled, and the historical
+    ``value[:limit]`` preview otherwise.
+    """
+    if value is None:
+        return None
+    if _store_full_payload():
+        return value
+    return value[:limit]
+
+
 def _wal_log(operation: str, params: dict, result: dict = None):
-    """Append a write operation to the write-ahead log."""
+    """Append a write operation to the write-ahead log.
+
+    Content-bearing params are redacted unless ``wal_store_full_payload`` is
+    enabled, in which case they are recorded verbatim so a write lost to a
+    storage-layer fault can be reconstructed from the log.
+    """
     # Redact sensitive content from params before logging
+    full_payload = _store_full_payload()
     safe_params = {}
     for k, v in params.items():
-        if k in _WAL_REDACT_KEYS:
+        if k in _WAL_REDACT_KEYS and not full_payload:
             safe_params[k] = f"[REDACTED {len(v)} chars]" if isinstance(v, str) else "[REDACTED]"
         else:
             safe_params[k] = v

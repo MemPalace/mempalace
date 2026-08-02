@@ -168,3 +168,159 @@ def test_wal_log_redacts_non_string_values(tmp_path, monkeypatch):
     entry = json.loads(wal_file.read_text().strip())
     assert entry["params"]["document"] == "[REDACTED]"
     assert entry["params"]["safe"] == "ok"
+
+
+def _wal_at(tmp_path, monkeypatch, full_payload):
+    """Point the WAL at tmp_path with an explicit payload mode.
+
+    The payload mode is a process-lifetime cache, so it is set through
+    monkeypatch to keep it from leaking into other tests in the session.
+    """
+    from mempalace import wal
+
+    wal_file = tmp_path / "wal" / "write_log.jsonl"
+    monkeypatch.setattr(wal, "_WAL_FILE", wal_file)
+    monkeypatch.setattr(wal, "_WAL_INITIALIZED_DIR", None)
+    monkeypatch.setattr(wal, "_WAL_FULL_PAYLOAD", full_payload)
+    return wal, wal_file
+
+
+def test_wal_stores_full_payload_when_enabled(tmp_path, monkeypatch):
+    """With the flag on, content-bearing params are logged verbatim.
+
+    This is the property that makes a silent storage-layer drop recoverable:
+    the 2026-04-30 MemPalace data loss was unrecoverable precisely because the
+    WAL held "[REDACTED 200 chars]" instead of the text of each lost write.
+    """
+    import json
+
+    wal, wal_file = _wal_at(tmp_path, monkeypatch, True)
+
+    secret = "the exact diary text that must survive a dropped write"
+    wal._wal_log("diary_write", {"entry": secret, "query": "find me", "safe": "ok"})
+
+    entry = json.loads(wal_file.read_text().strip())
+    assert entry["params"]["entry"] == secret
+    assert not entry["params"]["entry"].startswith("[REDACTED")
+    assert entry["params"]["query"] == "find me"
+    assert entry["params"]["safe"] == "ok"
+
+
+def test_wal_redacts_when_flag_disabled(tmp_path, monkeypatch):
+    """Backward compatibility: flag off reproduces the historical behaviour."""
+    import json
+
+    wal, wal_file = _wal_at(tmp_path, monkeypatch, False)
+
+    wal._wal_log("diary_write", {"entry": "secret diary text", "safe": "ok"})
+
+    entry = json.loads(wal_file.read_text().strip())
+    assert entry["params"]["entry"] == "[REDACTED 17 chars]"
+    assert entry["params"]["safe"] == "ok"
+
+
+def test_wal_full_payload_reads_env(tmp_path, monkeypatch):
+    """The setting resolves from the environment and caches for the process."""
+    from mempalace import wal
+
+    monkeypatch.setattr(wal, "_WAL_FULL_PAYLOAD", None)
+    monkeypatch.setenv("MEMPALACE_WAL_STORE_FULL_PAYLOAD", "true")
+    assert wal._store_full_payload() is True
+
+    # Cached: flipping the env afterwards must not change the resolved value.
+    monkeypatch.setenv("MEMPALACE_WAL_STORE_FULL_PAYLOAD", "false")
+    assert wal._store_full_payload() is True
+
+
+def test_wal_full_payload_defaults_off_and_fails_closed(tmp_path, monkeypatch):
+    """Unset env redacts; a broken config lookup redacts rather than leaking."""
+    from mempalace import wal
+
+    monkeypatch.setattr(wal, "_WAL_FULL_PAYLOAD", None)
+    monkeypatch.delenv("MEMPALACE_WAL_STORE_FULL_PAYLOAD", raising=False)
+    monkeypatch.setattr(wal, "_WAL_FILE", tmp_path / "wal" / "write_log.jsonl")
+    assert wal._store_full_payload() is False
+
+    monkeypatch.setattr(wal, "_WAL_FULL_PAYLOAD", None)
+    import mempalace.config as config_mod
+
+    def _boom(*args, **kwargs):
+        raise OSError("config unreadable")
+
+    monkeypatch.setattr(config_mod, "MempalaceConfig", _boom)
+    assert wal._store_full_payload() is False
+
+
+def test_wal_payload_truncates_only_when_redacting(tmp_path, monkeypatch):
+    """The 200-char preview cap lifts with the flag, and holds without it.
+
+    Truncation and redaction stacked invisibly: a redacted 200-char slice and a
+    redacted 20 KB entry are the same string in the log. Once payloads are
+    stored, the cap becomes the binding limit on what is recoverable, so
+    recovering a long entry means lifting it.
+    """
+    from mempalace import wal
+
+    long_entry = "x" * 5000
+
+    monkeypatch.setattr(wal, "_WAL_FULL_PAYLOAD", False)
+    assert wal.wal_payload(long_entry) == "x" * 200
+
+    monkeypatch.setattr(wal, "_WAL_FULL_PAYLOAD", True)
+    assert wal.wal_payload(long_entry) == long_entry
+    assert wal.wal_payload(None) is None
+
+
+def test_long_diary_entry_fully_recoverable_from_wal(
+    tmp_path, monkeypatch, config, palace_path, kg
+):
+    """A diary entry past the preview cap survives in full, not as its first 200 chars.
+
+    Real diary entries run to several kilobytes, so a 200-char cap would leave
+    the WAL holding a few percent of a lost write while still reporting the
+    write as logged.
+    """
+    import json
+
+    from tests.test_mcp_server import _patch_mcp_server
+
+    _patch_mcp_server(monkeypatch, config, kg)
+    wal, wal_file = _wal_at(tmp_path, monkeypatch, True)
+
+    from mempalace.mcp_server import tool_diary_write
+
+    long_entry = "SESSION:2026-07-19|" + ("recoverable." * 500)
+    assert len(long_entry) > 200
+    assert tool_diary_write(agent_name="tester", entry=long_entry, topic="wal")["success"] is True
+
+    entries = [json.loads(line) for line in wal_file.read_text().splitlines() if line.strip()]
+    previews = [e["params"]["entry_preview"] for e in entries if e["operation"] == "diary_write"]
+    assert long_entry in previews, [p[:80] for p in previews]
+
+
+def test_diary_write_payload_recoverable_from_wal(tmp_path, monkeypatch, config, palace_path, kg):
+    """End-to-end: a real diary_write leaves a reconstructable WAL record.
+
+    Exercises the actual tool rather than _wal_log directly, so the redact-key
+    name used by tool_diary_write ("entry_preview") stays covered — that key is
+    what was redacted during the 2.5-month silent-drop window.
+    """
+    import json
+
+    from tests.test_mcp_server import _patch_mcp_server
+
+    _patch_mcp_server(monkeypatch, config, kg)
+    wal, wal_file = _wal_at(tmp_path, monkeypatch, True)
+
+    from mempalace.mcp_server import tool_diary_write
+
+    secret = "SESSION:2026-07-19|payload that must be recoverable|★★★"
+    result = tool_diary_write(agent_name="tester", entry=secret, topic="wal")
+    assert result["success"] is True
+
+    entries = [json.loads(line) for line in wal_file.read_text().splitlines() if line.strip()]
+    diary = [e for e in entries if e["operation"] == "diary_write"]
+    assert diary, f"no diary_write WAL record in {entries}"
+    previews = [e["params"]["entry_preview"] for e in diary]
+    assert not any(p.startswith("[REDACTED") for p in previews), previews
+    assert any(secret in p for p in previews), previews

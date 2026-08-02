@@ -1088,7 +1088,7 @@ def _refresh_vector_disabled_flag() -> None:
 # CLI sync path and the daemon service layer can audit writes without importing
 # this module, whose import installs MCP stdio protection (os.dup2(2, 1) and
 # sys.stdout = sys.stderr) that would misroute their output.
-from .wal import _wal_log  # noqa: E402
+from .wal import _wal_log, wal_payload  # noqa: E402
 
 
 def _get_client():
@@ -2736,7 +2736,7 @@ def tool_add_drawer(
             "room": room,
             "added_by": added_by,
             "content_length": len(content),
-            "content_preview": content[:200],
+            "content_preview": wal_payload(content),
         },
     )
 
@@ -2853,7 +2853,7 @@ def tool_delete_drawer(drawer_id: str):
                 "drawer_id": drawer_id,
                 "deleted_ids": record["ids"],
                 "deleted_meta": record["metadata"],
-                "content_preview": record["content"][:200],
+                "content_preview": wal_payload(record["content"]),
             },
         )
 
@@ -3412,7 +3412,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
                 "new_wing": new_meta.get("wing", ""),
                 "new_room": new_meta.get("room", ""),
                 "content_changed": content is not None,
-                "content_preview": new_doc[:200] if content is not None else None,
+                "content_preview": wal_payload(new_doc) if content is not None else None,
             },
         )
 
@@ -3693,7 +3693,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
             "agent_name": agent_name,
             "topic": topic,
             "entry_id": entry_id,
-            "entry_preview": entry[:200],
+            "entry_preview": wal_payload(entry),
         },
     )
 

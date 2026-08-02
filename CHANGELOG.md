@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Features
+
+- **Opt-in verbatim write-ahead log payloads.** `wal_store_full_payload` (or `MEMPALACE_WAL_STORE_FULL_PAYLOAD`) records write payloads in the WAL instead of replacing them with `[REDACTED N chars]`, so a write lost to a storage-layer fault can be reconstructed from the log. Enabling it also lifts the 200-character preview cap that `add_drawer`, `delete_drawer`, `update_drawer`, and `diary_write` applied before logging — otherwise a multi-kilobyte entry would still be recoverable only as its first 200 characters. Off by default and fails closed, leaving existing behaviour byte-identical; intended for self-hosted single-user palaces, where the WAL is already `0o600` inside a `0o700` directory.
+
 ---
 
 ## [3.7.0] — 2026-08-02
