@@ -98,7 +98,7 @@ _TOOL_OPERATION: dict[str, str] = {
     # checkpoint files drawers + a diary entry; delete_by_source and
     # delete_hallway remove palace state; mine ingests a directory — all
     # mutate, so they are ``write`` (added after the 2026 fork sync
-    # introduced these tools; ISI-1920).
+    # introduced these tools).
     "mempalace_checkpoint": "write",
     "mempalace_delete_by_source": "write",
     "mempalace_delete_hallway": "write",
@@ -121,9 +121,7 @@ def operation_for_tool(tool_name: str) -> str:
     """
     op = _TOOL_OPERATION.get(tool_name)
     if op is None:
-        logger.debug(
-            "telemetry: no operation mapping for %s — defaulting to 'read'", tool_name
-        )
+        logger.debug("telemetry: no operation mapping for %s — defaulting to 'read'", tool_name)
         return "read"
     return op
 
@@ -383,9 +381,7 @@ def memory_operation(
     if parent_context is not _NO_PARENT_CONTEXT and parent_context is not None:
         ctx_kwargs["context"] = parent_context
 
-    with _TRACER.start_as_current_span(
-        span_name, attributes=span_attrs, **ctx_kwargs
-    ) as span:
+    with _TRACER.start_as_current_span(span_name, attributes=span_attrs, **ctx_kwargs) as span:
         try:
             yield span
         except Exception as exc:

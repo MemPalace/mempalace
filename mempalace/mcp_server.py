@@ -4886,7 +4886,9 @@ def handle_request(request):
                         tool_name,
                         operation_for_tool(tool_name),
                     )
-                result = _decorate_mcp_tool_result(tool_name, TOOLS[tool_name]["handler"](**tool_args))
+                result = _decorate_mcp_tool_result(
+                    tool_name, TOOLS[tool_name]["handler"](**tool_args)
+                )
 
             return {
                 "jsonrpc": "2.0",

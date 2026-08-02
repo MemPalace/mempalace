@@ -1,8 +1,8 @@
 // MemPalace OTel baseline verification queries (Dynatrace DQL).
 // Run after pointing a `mempalace-mcp` server with the [observability]
 // extra and OTEL_EXPORTER_OTLP_ENDPOINT at your tenant for ≥ 5 minutes
-// of typical traffic. Mirrors the kagent §1.2 empirical-verification
-// pattern from ISI-1068.
+// of typical traffic. Each query confirms the emitted telemetry matches
+// the memory-semconv contract (span names, operation kinds, attributes).
 
 // ─────────────────────────────────────────────────────────────────────
 // 1. Are MemPalace spans landing at all?
