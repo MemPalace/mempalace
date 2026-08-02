@@ -73,6 +73,8 @@ sqlite_exact = "mempalace.backends.sqlite_exact:SQLiteExactBackend"
 
 [project.optional-dependencies]
 dev = [
+    "aiohttp>=3.9",
+    "httpx>=0.27",
     "pytest>=7.0",
     "pytest-cov>=4.0",
     # Retries known-transient ChromaDB-on-Windows HNSW compaction failures in CI
@@ -141,6 +143,8 @@ extract = [
 
 [dependency-groups]
 dev = [
+    "aiohttp>=3.9",
+    "httpx>=0.27",
     "pytest>=7.0",
     "pytest-cov>=4.0",
     # Retries known-transient ChromaDB-on-Windows HNSW compaction failures in CI
