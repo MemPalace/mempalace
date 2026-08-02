@@ -64,6 +64,20 @@ def leased(tmp_path, monkeypatch):
         palace_mod._palace_lock_handoff.discard(key)
 
 
+def test_default_wait_outlasts_the_default_hold():
+    """The defaults are a system, not three independent numbers.
+
+    A contender must be willing to wait longer than the holder's floor plus one
+    probe interval. If a future bump to the minimum hold crosses the wait, every
+    handoff silently times out and the feature quietly stops working — with all
+    other tests still green, because they set the knobs explicitly.
+    """
+    assert (
+        mcp_server._MCP_WRITER_HANDOFF_WAIT_DEFAULT
+        > mcp_server._MCP_WRITER_MIN_HOLD_DEFAULT + mcp_server._MCP_WRITER_HANDOFF_POLL_DEFAULT
+    )
+
+
 def test_handoff_releases_the_lease_when_a_peer_is_queued(leased, monkeypatch):
     monkeypatch.setattr(palace_mod, "palace_lock_wanted", lambda path: True)
     discarded = []

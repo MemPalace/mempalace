@@ -893,7 +893,14 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
         resolved_backend = resolve_backend_name(palace_path, explicit=backend)
         if backend_requires_single_writer(resolved_backend):
             try:
-                writer_lease.enter_context(mine_palace_lock(palace_path))
+                # lease=True: this hold is ownership, not a write, so it leaves
+                # the palace write-depth at zero. Nothing hands the daemon's
+                # lease off today — the daemon is meant to BE the single owner
+                # and runs no handoff watchdog — but the flag keeps the depth
+                # accounting honest for whoever wires one up, instead of
+                # pinning depth at 1 forever and silently making every handoff
+                # attempt refuse. See docs/writer-lease-handoff.md.
+                writer_lease.enter_context(mine_palace_lock(palace_path, lease=True))
             except MineAlreadyRunning as exc:
                 raise DaemonError(
                     "writable daemon startup refused: another writer owns "
