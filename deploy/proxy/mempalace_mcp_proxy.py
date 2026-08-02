@@ -23,7 +23,7 @@ Requirements:
   pip install aiohttp httpx
 
 Usage:
-  python mempalace-mcp-proxy.py
+  python mempalace_mcp_proxy.py
 
 Environment variables (all have sensible defaults):
   UPSTREAM_URL       MemPalace HTTP endpoint (default: http://127.0.0.1:8765/mcp)
@@ -63,6 +63,49 @@ UPSTREAM_TIMEOUT = float(os.environ.get("UPSTREAM_TIMEOUT", "120"))
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "2"))
 SESSION_TTL = float(os.environ.get("SESSION_TTL", "1800"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+
+# ── Idempotency / retry safety ─────────────────────────────────────────────────
+#
+# The proxy must not retry non-idempotent MCP tool calls: if a mutation
+# (add/update/delete/diary/...) commits upstream and the response is lost,
+# replaying the request can execute the mutation twice. Only the JSON-RPC
+# methods and tools listed below are proven read-only and therefore safe to
+# retry on transient 5xx / timeout / connect failures.
+
+_READ_ONLY_METHODS = frozenset(
+    {
+        "initialize",
+        "notifications/initialized",
+        "tools/list",
+    }
+)
+
+_READ_ONLY_TOOLS = frozenset(
+    {
+        "mempalace_status",
+        "mempalace_list_wings",
+        "mempalace_list_rooms",
+        "mempalace_get_taxonomy",
+        "mempalace_get_aaak_spec",
+        "mempalace_kg_query",
+        "mempalace_kg_timeline",
+        "mempalace_kg_stats",
+        "mempalace_traverse",
+        "mempalace_find_tunnels",
+        "mempalace_graph_stats",
+        "mempalace_list_tunnels",
+        "mempalace_list_hallways",
+        "mempalace_follow_tunnels",
+        "mempalace_search",
+        "mempalace_check_duplicate",
+        "mempalace_get_drawer",
+        "mempalace_list_drawers",
+        "mempalace_diary_read",
+        "mempalace_hook_settings",
+        "mempalace_memories_filed_away",
+        "mempalace_reconnect",
+    }
+)
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 
@@ -171,24 +214,52 @@ def cleanup_expired_sessions():
 # ── Request Forwarding ─────────────────────────────────────────────────────────
 
 
+def _is_retry_safe(body: bytes) -> bool:
+    """Return True if a JSON-RPC request is idempotent and safe to retry.
+
+    The upstream MCP server handles mutations (add/update/delete/...) that may
+    commit even when the response is lost. Replaying those requests can execute
+    the mutation twice, so we only retry methods and tools that are proven
+    read-only.
+    """
+    try:
+        req = json.loads(body)
+    except Exception:
+        # If we cannot parse the request, we cannot prove it is safe.
+        return False
+
+    method = req.get("method", "")
+    if method in _READ_ONLY_METHODS:
+        return True
+
+    if method == "tools/call":
+        params = req.get("params") or {}
+        tool = params.get("name", "")
+        return tool in _READ_ONLY_TOOLS
+
+    # Notifications and other methods are not retried by default.
+    return False
+
+
 async def _forward_to_upstream(
-    body: bytes, headers: dict, req_id: any
+    body: bytes, headers: dict, req_id: any, max_attempts: int | None = None
 ) -> tuple[dict | None, int, str | None]:
     """Forward request to upstream with retry + circuit breaker."""
     if not circuit_check():
         return None, 503, "Circuit breaker open — upstream unavailable"
 
+    attempts = max_attempts if max_attempts is not None else MAX_RETRIES + 1
     client = await get_http_client()
     last_error = None
 
-    for attempt in range(MAX_RETRIES + 1):
+    for attempt in range(attempts):
         try:
             resp = await client.post(UPSTREAM_URL, content=body, headers=headers)
 
-            if resp.status_code >= 500 and attempt < MAX_RETRIES:
+            if resp.status_code >= 500 and attempt < attempts - 1:
                 last_error = f"Upstream returned {resp.status_code}"
                 log.warning(
-                    f"Upstream {resp.status_code} (attempt {attempt + 1}/{MAX_RETRIES + 1}), retrying..."
+                    f"Upstream {resp.status_code} (attempt {attempt + 1}/{attempts}), retrying..."
                 )
                 await asyncio.sleep(0.5 * (attempt + 1))
                 continue
@@ -223,8 +294,8 @@ async def _forward_to_upstream(
         except httpx.ConnectError as exc:
             last_error = str(exc)
             _metrics["connect_errors"] += 1
-            if attempt < MAX_RETRIES:
-                log.warning(f"Connect error (attempt {attempt + 1}/{MAX_RETRIES + 1}): {exc}")
+            if attempt < attempts - 1:
+                log.warning(f"Connect error (attempt {attempt + 1}/{attempts}): {exc}")
                 await asyncio.sleep(0.5 * (attempt + 1))
                 continue
             circuit_record_failure()
@@ -233,8 +304,8 @@ async def _forward_to_upstream(
         except httpx.ReadTimeout:
             last_error = f"Read timeout after {UPSTREAM_TIMEOUT}s"
             _metrics["timeout_errors"] += 1
-            if attempt < MAX_RETRIES:
-                log.warning(f"Read timeout (attempt {attempt + 1}/{MAX_RETRIES + 1})")
+            if attempt < attempts - 1:
+                log.warning(f"Read timeout (attempt {attempt + 1}/{attempts})")
                 await asyncio.sleep(1.0 * (attempt + 1))
                 continue
             circuit_record_failure()
@@ -243,7 +314,7 @@ async def _forward_to_upstream(
         except httpx.PoolTimeout as exc:
             last_error = str(exc)
             _metrics["pool_errors"] += 1
-            if attempt < MAX_RETRIES:
+            if attempt < attempts - 1:
                 await asyncio.sleep(0.2 * (attempt + 1))
                 continue
             return None, 503, f"Connection pool timeout: {exc}"
@@ -252,7 +323,7 @@ async def _forward_to_upstream(
             last_error = str(exc)
             _metrics["unexpected_errors"] += 1
             log.error(f"Unexpected upstream error: {type(exc).__name__}: {exc}")
-            if attempt < MAX_RETRIES:
+            if attempt < attempts - 1:
                 await asyncio.sleep(0.5 * (attempt + 1))
                 continue
             circuit_record_failure()
@@ -299,9 +370,16 @@ async def handle_mcp_post(request: web.Request) -> web.StreamResponse:
         req_id = None
         method = "?"
 
-    log.debug(f"[{request_id}] POST /mcp method={method}")
+    retry_safe = _is_retry_safe(body)
+    max_attempts = MAX_RETRIES + 1 if retry_safe else 1
+    if not retry_safe:
+        log.info(f"[{request_id}] Non-idempotent request; no retries method={method}")
 
-    payload, status, error = await _forward_to_upstream(body, headers, req_id)
+    log.debug(f"[{request_id}] POST /mcp method={method} retry_safe={retry_safe}")
+
+    payload, status, error = await _forward_to_upstream(
+        body, headers, req_id, max_attempts=max_attempts
+    )
 
     if payload is None:
         # 202/204 with no payload = successful notification (no response body)
