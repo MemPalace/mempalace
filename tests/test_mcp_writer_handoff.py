@@ -238,5 +238,33 @@ def test_status_names_the_holder_when_this_server_is_read_only(tmp_path, monkeyp
 
     lease_status = decorated["writer_lease"]
     assert lease_status["held_by_this_server"] is False
+    assert lease_status["palace_locked"] is True
     assert "PID" in lease_status["holder"], "status should name the recorded lock holder"
     assert lease_status["last_reason"] == "peer holds it"
+
+
+def test_status_does_not_name_a_dead_holder_once_the_lock_is_free(tmp_path, monkeypatch):
+    """The lock-file body outlives its writer — status must not quote it blindly.
+
+    After the previous owner exits, the body still reads "PID <dead>". Reporting
+    that as the current holder sends whoever is debugging a stuck write chasing
+    a process that no longer exists.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    palace_path = tmp_path / "palace"
+    palace_path.mkdir()
+    monkeypatch.setattr(
+        type(mcp_server._config), "palace_path", property(lambda self: str(palace_path))
+    )
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_CM", None)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_ERROR", "")
+
+    # Take and release the lock: the identity stays recorded in the file body.
+    with palace_mod.mine_palace_lock(str(palace_path), lease=True):
+        pass
+    assert "PID" in palace_mod.palace_lock_holder(str(palace_path))
+
+    lease_status = mcp_server._decorate_mcp_tool_result("mempalace_status", {})["writer_lease"]
+
+    assert lease_status["palace_locked"] is False
+    assert lease_status["holder"] is None

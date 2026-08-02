@@ -111,10 +111,17 @@ palace to a random peer mid-flight is an operator's decision.
   "handoff_enabled": true,
   "handoffs_granted": 1,
   "handoffs_taken": 0,
+  "palace_locked": true,
   "holder": "PID 3770678 (…/mcp_server.py --palace /srv/palace)",
   "last_reason": "writer lease handed to PID 3770678; this server reacquires it on its next write"
 }
 ```
+
+`palace_locked` comes from a kernel probe, `holder` from the lock-file body —
+and the body names whoever took the lock *last*, which may be a process that has
+since exited. When the probe says the palace is free, `holder` is `null` rather
+than a dead PID: a stale name here would send someone debugging a stuck write
+after a process that no longer exists.
 
 The server logs every transition:
 

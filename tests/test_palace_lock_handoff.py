@@ -33,6 +33,7 @@ from mempalace.palace import (
     end_palace_lock_handoff,
     mine_palace_lock,
     palace_lock_holder,
+    palace_lock_is_held,
     palace_lock_wanted,
 )
 
@@ -165,6 +166,21 @@ def test_env_default_opts_the_cli_into_waiting(palace, monkeypatch):
 # ---------------------------------------------------------------------------
 # Demand signalling
 # ---------------------------------------------------------------------------
+
+
+def test_ownership_probe_outlives_the_recorded_identity(palace):
+    """Ownership is what the kernel says, not what the lock file remembers.
+
+    The body keeps naming the last process to take the lock long after it is
+    gone, so the probe is the only honest answer to "is this palace locked?".
+    """
+    assert palace_lock_is_held(palace) is False
+
+    with mine_palace_lock(palace, lease=True):
+        assert palace_lock_is_held(palace) is True
+
+    assert palace_lock_is_held(palace) is False
+    assert "PID" in palace_lock_holder(palace), "the stale identity is still on disk"
 
 
 def test_no_demand_reported_when_nobody_is_queued(palace):

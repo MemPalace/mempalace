@@ -729,7 +729,7 @@ def _start_writer_handoff_watchdog() -> None:
 
 def _writer_lease_status() -> dict:
     """Ownership snapshot for ``mempalace_status`` — who writes, who waits."""
-    from .palace import palace_lock_holder, palace_lock_wanted
+    from .palace import palace_lock_holder, palace_lock_is_held, palace_lock_wanted
 
     held = _MCP_WRITER_LOCK_CM is not None
     status = {
@@ -742,7 +742,13 @@ def _writer_lease_status() -> dict:
         status["held_for_seconds"] = round(time.monotonic() - _MCP_WRITER_LEASE_SINCE, 1)
         status["peer_waiting"] = palace_lock_wanted(_config.palace_path)
     else:
-        status["holder"] = palace_lock_holder(_config.palace_path)
+        # Ask the kernel who owns the palace instead of trusting the lock-file
+        # body: the body names whoever took the lock *last*, so once that
+        # process exits it reports a dead PID as the current owner — a
+        # diagnostic that actively misleads whoever is debugging a stuck write.
+        owned = palace_lock_is_held(_config.palace_path)
+        status["palace_locked"] = owned
+        status["holder"] = palace_lock_holder(_config.palace_path) if owned else None
         if _MCP_WRITER_LOCK_ERROR:
             status["last_reason"] = _MCP_WRITER_LOCK_ERROR
     return status

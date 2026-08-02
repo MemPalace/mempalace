@@ -1416,10 +1416,38 @@ def palace_lock_holder(palace_path: str) -> str:
 
     Advisory only: the body is written by the last process to *take* the lock,
     so it can name a process that has since released or died. Ownership itself
-    is always decided by the OS lock, never by this string.
+    is always decided by the OS lock, never by this string — pair this with
+    :func:`palace_lock_is_held` before presenting it as the current owner.
     """
     lock_path, _ = _palace_lock_paths(palace_path)
     return _identity_in_lock_file(lock_path)
+
+
+def palace_lock_is_held(palace_path: str) -> bool:
+    """Return True if some process currently owns this palace's lock.
+
+    Asks the kernel instead of reading the lock-file body, which records only
+    whoever took the lock *last* and will happily name a process that has since
+    exited — reporting a dead PID as the current owner is worse than reporting
+    nothing. Probes on a fresh descriptor and releases immediately, so a free
+    lock is held for microseconds and a real owner is never disturbed.
+
+    An owner in this same process reports True: flock is per open file
+    description, so our own lease conflicts with the probe.
+    """
+    lock_path, _ = _palace_lock_paths(palace_path)
+    try:
+        probe = _open_palace_lock_file(lock_path)
+    except OSError:
+        logger.debug("Palace ownership probe could not open %s", lock_path, exc_info=True)
+        return False
+    try:
+        if _try_exclusive(probe):
+            _release_exclusive(probe)
+            return False
+        return True
+    finally:
+        probe.close()
 
 
 def _identity_in_lock_file(path: str) -> str:
