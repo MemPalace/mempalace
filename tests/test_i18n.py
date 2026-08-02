@@ -159,3 +159,39 @@ def test_direct_address_key_is_singular_string_for_all_locales():
                 f"{lang}: 'direct_address_pattern' must be str, got {type(val).__name__}"
             )
             assert val, f"{lang}: 'direct_address_pattern' is empty"
+
+
+def test_t_fallback_and_types():
+    """t() returns the key for missing entries and preserves the template when
+    interpolation variables are absent.  All public i18n helpers return the
+    expected types.
+    """
+    # Type assertions on public API surface
+    langs = available_languages()
+    assert isinstance(langs, list)
+    assert all(isinstance(lang, str) for lang in langs)
+
+    strings = load_lang("en")
+    assert isinstance(strings, dict)
+
+    result = t("cli.mine_complete", closets=5, drawers=20)
+    assert isinstance(result, str)
+
+    # Missing key → returns the key itself (graceful fallback)
+    assert t("definitely.missing") == "definitely.missing"
+    assert isinstance(t("another.missing.key"), str)
+
+    # Missing interpolation variables → silently returns raw template
+    # (ensures CLI never crashes on a bad format string)
+    raw = t("cli.mine_complete", closets=5)  # drawers omitted
+    assert "{drawers}" in raw
+    assert isinstance(raw, str)
+
+    raw_no_kwargs = t("cli.mine_complete")
+    assert "{closets}" in raw_no_kwargs
+    assert "{drawers}" in raw_no_kwargs
+    assert isinstance(raw_no_kwargs, str)
+
+    # current_lang() type
+    from mempalace.i18n import current_lang
+    assert isinstance(current_lang(), str)
