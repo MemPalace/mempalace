@@ -27,10 +27,14 @@ set -uo pipefail
 
 STAGING_DIR="${1:-${STAGING_DIR:-/tmp/mempalace-staging}}"
 PALACE_PATH="${2:-${PALACE_PATH:-$HOME/.mempalace/palace}}"
+# Normalize STAGING_DIR to an absolute, slash-free-tailing path so we can
+# safely derive archive names by stripping the prefix from file paths.
+STAGING_DIR=$(cd "$STAGING_DIR" && pwd)
 ARCHIVE_DIR="${ARCHIVE_DIR:-$STAGING_DIR/../archive}"
 MEMPALACE_BIN="${MEMPALACE_BIN:-mempalace}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 PREPROCESS_SCRIPT="$(dirname "$0")/preprocess_staging.py"
+VERIFY_SCRIPT="$(dirname "$0")/verify_mined.py"
 LOG_DIR="${LOG_DIR:-$HOME/.mempalace/logs}"
 LOG_FILE="$LOG_DIR/staging-watcher.log"
 DEBOUNCE_SECONDS="${DEBOUNCE_SECONDS:-30}"
@@ -126,37 +130,33 @@ mine_processed() {
     fi
 }
 
+build_batch_manifest() {
+    local processed_dir="$STAGING_DIR/processed"
+    local manifest="$STAGING_DIR/.batch_manifest"
+    find "$processed_dir" -type f ! -name 'mempalace.yaml' -print > "$manifest" 2>/dev/null
+    log "Built batch manifest with $(wc -l < "$manifest" | xargs) processed files"
+}
+
 verify_mined() {
     local processed_dir="$STAGING_DIR/processed"
+    local manifest="$STAGING_DIR/.batch_manifest"
     local sample_file
     sample_file=$(find "$processed_dir" -type f ! -name 'mempalace.yaml' 2>/dev/null | shuf -n 1)
 
     if [[ -z "$sample_file" ]]; then
-        log "Verify: no files to sample — skipping"
-        return 0
-    fi
-
-    local snippet
-    snippet=$(head -20 "$sample_file" | grep -v '^\s*$' | grep -v '^\s*#' | head -1 \
-        | sed 's/[^a-zA-Z0-9 ]//g' | tr -s ' ' | xargs)
-
-    if [[ -z "$snippet" || ${#snippet} -lt 10 ]]; then
-        log "Verify: could not extract snippet — skipping"
-        return 0
-    fi
-
-    log "Verify: searching for snippet from $(basename "$sample_file"): '${snippet:0:60}...'"
-
-    local search_result
-    search_result=$("$MEMPALACE_BIN" --palace "$PALACE_PATH" search "$snippet" \
-        --results 1 2>>"$LOG_FILE") || true
-
-    if echo "$search_result" | grep -qi "no results\|empty\|0 results"; then
-        log "Verify FAILED: no results for snippet from $(basename "$sample_file")"
+        log "Verify FAILED: no files to sample"
         return 1
     fi
 
-    log "Verify: search returned results — mine verified"
+    log "Verify: checking searchability of $sample_file against $manifest"
+
+    if ! "$PYTHON_BIN" "$VERIFY_SCRIPT" "$PALACE_PATH" "$sample_file" "$manifest" "$MEMPALACE_BIN" \
+        >> "$LOG_FILE" 2>&1; then
+        log "Verify FAILED: mined content not searchable for $sample_file"
+        return 1
+    fi
+
+    log "Verify: $sample_file searchable and matched in current batch"
     return 0
 }
 
@@ -188,20 +188,34 @@ archive_files() {
 
     local file_count=0
     while IFS= read -r -d '' file; do
-        local basename
-        basename=$(basename "$file")
-        [[ "$basename" == ".DS_Store" || "$basename" == "mempalace.yaml" ]] && continue
+        local rel_path
+        rel_path="${file#$STAGING_DIR/}"
+        [[ -z "$rel_path" ]] && continue
+        [[ "$rel_path" == .DS_Store || "$rel_path" == mempalace.yaml ]] && continue
+
+        local archive_name="$batch_archive/${rel_path}.gz"
+        mkdir -p "$(dirname "$archive_name")"
+
+        # Refuse to overwrite a duplicate archive path (failsafe even though
+        # the relative path should now be unique under the staging tree).
+        if [[ -e "$archive_name" ]]; then
+            log "Archive FAILED: duplicate path would overwrite $archive_name"
+            return 1
+        fi
 
         local checksum filesize
-        checksum=$(sha256sum "$file" | awk '{print $1}')
+        checksum=$(sha256sum "$file" 2>/dev/null | awk '{print $1}')
+        if [[ -z "$checksum" ]]; then
+            checksum=$(shasum -a 256 "$file" 2>/dev/null | awk '{print $1}')
+        fi
         filesize=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo "0")
 
-        gzip -c "$file" > "$batch_archive/${basename}.gz"
+        gzip -c "$file" > "$archive_name"
 
-        echo "file: $basename" >> "$manifest"
+        echo "file: $rel_path" >> "$manifest"
         echo "  sha256: $checksum" >> "$manifest"
         echo "  size: $filesize bytes" >> "$manifest"
-        echo "  archived: ${basename}.gz" >> "$manifest"
+        echo "  archived: ${rel_path}.gz" >> "$manifest"
         echo "" >> "$manifest"
 
         file_count=$((file_count + 1))
@@ -216,6 +230,8 @@ clear_staging() {
     find "$STAGING_DIR" -type f \
         ! -name '.DS_Store' ! -name 'mempalace.yaml' -delete 2>/dev/null
     rm -rf "$STAGING_DIR/processed" 2>/dev/null || true
+    # Remove any empty subdirectories left behind after file deletion.
+    find "$STAGING_DIR" -mindepth 1 -type d -empty -not -path "*/processed" -delete 2>/dev/null || true
     log "Staging cleared (ready for next batch)"
 }
 
@@ -232,6 +248,8 @@ process_batch() {
         return 1
     fi
 
+    build_batch_manifest
+
     if ! verify_mined; then
         log "ABORT: verify failed — files left for inspection"
         return 1
@@ -247,20 +265,22 @@ process_batch() {
 
 # ── Main loop ───────────────────────────────────────────────────────────
 
-log "=== staging_watcher started ==="
-log "Watching: $STAGING_DIR"
-log "Archive: $ARCHIVE_DIR"
-log "Palace: $PALACE_PATH"
-log "Pipeline: preprocess -> mine -> verify -> compress -> gzip -> archive"
-log "Debounce: ${DEBOUNCE_SECONDS}s, Max lines: $MAX_LINES"
+if [[ -z "${STAGING_WATCHER_TEST_MODE:-}" ]]; then
+    log "=== staging_watcher started ==="
+    log "Watching: $STAGING_DIR"
+    log "Archive: $ARCHIVE_DIR"
+    log "Palace: $PALACE_PATH"
+    log "Pipeline: preprocess -> mine -> verify -> compress -> gzip -> archive"
+    log "Debounce: ${DEBOUNCE_SECONDS}s, Max lines: $MAX_LINES"
 
-while true; do
-    while [[ $(count_files) -lt $MIN_FILES ]]; do
-        sleep 10
+    while true; do
+        while [[ $(count_files) -lt $MIN_FILES ]]; do
+            sleep 10
+        done
+
+        log "Files detected — waiting for stable period..."
+        wait_for_stable
+        process_batch
+        sleep 5
     done
-
-    log "Files detected — waiting for stable period..."
-    wait_for_stable
-    process_batch
-    sleep 5
-done
+fi
