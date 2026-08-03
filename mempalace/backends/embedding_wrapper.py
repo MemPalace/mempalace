@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from .base import BaseCollection
+from .base import BaseCollection, initialize_last_modified_metadata
 
 
 def _embed_texts(texts: list[str]) -> list[list[float]]:
@@ -91,7 +91,7 @@ class EmbeddingCollection(BaseCollection):
         documents = _as_list(documents)
         ids = _as_list(ids)
         if metadatas is not None:
-            metadatas = _as_list(metadatas)
+            metadatas = initialize_last_modified_metadata(_as_list(metadatas))
         if embeddings is None:
             embeddings = _embed_texts(documents)
         return self._inner.add(
@@ -105,7 +105,7 @@ class EmbeddingCollection(BaseCollection):
         documents = _as_list(documents)
         ids = _as_list(ids)
         if metadatas is not None:
-            metadatas = _as_list(metadatas)
+            metadatas = initialize_last_modified_metadata(_as_list(metadatas))
         if embeddings is None:
             embeddings = _embed_texts(documents)
         return self._inner.upsert(
