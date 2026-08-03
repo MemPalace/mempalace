@@ -1678,6 +1678,9 @@ class ChromaCollection(BaseCollection):
         return [_sanitize(d) if isinstance(d, str) else d for d in documents]
 
     def add(self, *, documents, ids, metadatas=None, embeddings=None):
+        if getattr(self, "_require_embeddings", False) and embeddings is None:
+            raise ValueError("caller-vector collection requires explicit embeddings")
+
         kwargs: dict[str, Any] = {
             "documents": self._sanitize_documents_for_chromadb(documents),
             "ids": ids,
@@ -1691,6 +1694,9 @@ class ChromaCollection(BaseCollection):
             self._collection.add(**kwargs)
 
     def upsert(self, *, documents, ids, metadatas=None, embeddings=None):
+        if getattr(self, "_require_embeddings", False) and embeddings is None:
+            raise ValueError("caller-vector collection requires explicit embeddings")
+
         kwargs: dict[str, Any] = {
             "documents": self._sanitize_documents_for_chromadb(documents),
             "ids": ids,
@@ -1711,8 +1717,16 @@ class ChromaCollection(BaseCollection):
         metadatas=None,
         embeddings=None,
     ):
+        if (
+            getattr(self, "_require_embeddings", False)
+            and documents is not None
+            and embeddings is None
+        ):
+            raise ValueError("caller-vector collection requires explicit embeddings")
+
         if documents is None and metadatas is None and embeddings is None:
             raise ValueError("update requires at least one of documents, metadatas, embeddings")
+
         kwargs: dict[str, Any] = {"ids": ids}
         if documents is not None:
             kwargs["documents"] = self._sanitize_documents_for_chromadb(documents)
@@ -1737,6 +1751,9 @@ class ChromaCollection(BaseCollection):
         where_document=None,
         include=None,
     ) -> QueryResult:
+        if getattr(self, "_require_embeddings", False) and query_texts is not None:
+            raise ValueError("caller-vector collection requires query_embeddings")
+
         _validate_where(where)
         _validate_where(where_document)
 
@@ -2431,6 +2448,7 @@ class ChromaBackend(BaseBackend):
         """
         palace_ref, collection_name, create, options = _normalize_get_collection_args(args, kwargs)
         self.require_namespace_support(palace_ref)
+        caller_vectors = bool(options and options.get("caller_vectors", False))
 
         palace_path = palace_ref.local_path
         if palace_path is None:
@@ -2448,7 +2466,7 @@ class ChromaBackend(BaseBackend):
 
         client = self._client(palace_path)
 
-        ef = self._resolve_embedding_function()
+        ef = None if caller_vectors else self._resolve_embedding_function()
         ef_kwargs = {"embedding_function": ef} if ef is not None else {}
 
         if create:
@@ -2476,7 +2494,13 @@ class ChromaBackend(BaseBackend):
                     raise ValueError(explanation) from e
                 raise
         _pin_hnsw_threads(collection)
-        return ChromaCollection(collection, palace_path=palace_path)
+
+        wrapped = ChromaCollection(
+            collection,
+            palace_path=palace_path,
+        )
+        wrapped._require_embeddings = caller_vectors
+        return wrapped
 
     def close_palace(self, palace) -> None:
         """Drop cached handles for ``palace`` and release its SQLite file lock.
