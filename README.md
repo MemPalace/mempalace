@@ -69,6 +69,15 @@ python -m venv .venv && source .venv/bin/activate
 pip install mempalace
 ```
 
+### Android / Termux
+
+Native Termux installation is not currently supported because compiled
+dependencies such as ChromaDB and ONNX Runtime publish Linux wheels, not
+Android wheels. Android ARM64 users can run the regular Linux packages in an
+isolated Debian PRoot container instead. See the
+[Termux installation guide](website/guide/termux.md) for the tested setup and
+an argv-preserving launcher.
+
 ### Docker
 
 A container image is also available for running the MCP server or the CLI

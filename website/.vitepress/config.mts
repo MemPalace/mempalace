@@ -51,6 +51,7 @@ export default withMermaid(
             text: 'Guide',
             items: [
               { text: 'Getting Started', link: '/guide/getting-started' },
+              { text: 'Android / Termux', link: '/guide/termux' },
               { text: 'Mining Your Data', link: '/guide/mining' },
               { text: 'Searching Memories', link: '/guide/searching' },
               { text: 'MCP Integration', link: '/guide/mcp-integration' },
