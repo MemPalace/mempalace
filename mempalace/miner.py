@@ -1545,36 +1545,55 @@ def process_file(
         # in production and the 4-segment pointer form lives only in tests.
         # Per PR #1584 review (Igor, 2026-05-22).
         all_metas: list = []
-        for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
-            batch_docs: list = []
-            batch_ids: list = []
-            batch_metas: list = []
-            for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
-                drawer_id = make_drawer_id_from_chunk(wing, room, source_file, chunk["chunk_index"])
-                batch_docs.append(chunk["content"])
-                batch_ids.append(drawer_id)
-                batch_metas.append(
-                    _build_drawer_metadata(
-                        wing,
-                        room,
-                        source_file,
-                        chunk["chunk_index"],
-                        agent,
-                        chunk["content"],
-                        source_mtime,
-                        line_start=chunk.get("line_start"),
-                        line_end=chunk.get("line_end"),
-                        content_date=file_content_date,
+        try:
+            for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
+                batch_docs: list = []
+                batch_ids: list = []
+                batch_metas: list = []
+                for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
+                    drawer_id = make_drawer_id_from_chunk(
+                        wing, room, source_file, chunk["chunk_index"]
                     )
+                    batch_docs.append(chunk["content"])
+                    batch_ids.append(drawer_id)
+                    batch_metas.append(
+                        _build_drawer_metadata(
+                            wing,
+                            room,
+                            source_file,
+                            chunk["chunk_index"],
+                            agent,
+                            chunk["content"],
+                            source_mtime,
+                            line_start=chunk.get("line_start"),
+                            line_end=chunk.get("line_end"),
+                            content_date=file_content_date,
+                        )
+                    )
+                assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
+                collection.upsert(
+                    documents=batch_docs,
+                    ids=batch_ids,
+                    metadatas=batch_metas,
                 )
-            assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
-            collection.upsert(
-                documents=batch_docs,
-                ids=batch_ids,
-                metadatas=batch_metas,
-            )
-            drawers_added += len(batch_docs)
-            all_metas.extend(batch_metas)
+                drawers_added += len(batch_docs)
+                all_metas.extend(batch_metas)
+        except Exception:
+            # A successful earlier batch has the source's current mtime. Leaving
+            # it behind would make the next run skip this incomplete rebuild.
+            # The source lock prevents this cleanup from deleting another
+            # miner's work for the same file.
+            try:
+                collection.delete(where={"source_file": source_file})
+            except Exception:
+                logger.warning(
+                    "Failed to clean partial drawers after upsert error for %s",
+                    source_file,
+                    exc_info=True,
+                )
+            if closets_col:
+                purge_file_closets(closets_col, source_file)
+            raise
 
         # Build closet — the searchable index pointing to these drawers.
         # Purge first: a re-mine (mtime change or normalize_version bump) must
