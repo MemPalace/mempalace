@@ -11,6 +11,7 @@ from mempalace.normalize import (
     _try_chatgpt_json,
     _try_claude_ai_json,
     _try_claude_code_jsonl,
+    _try_copilot_cli_jsonl,
     _try_codex_jsonl,
     _try_gemini_json,
     _try_gemini_jsonl,
@@ -19,6 +20,7 @@ from mempalace.normalize import (
     _try_pi_jsonl,
     _try_slack_json,
     normalize,
+    normalize_conversations,
     strip_noise,
 )
 
@@ -384,6 +386,183 @@ def test_claude_code_jsonl_non_dict_entries():
     ]
     result = _try_claude_code_jsonl("\n".join(lines))
     assert result is not None
+
+
+# ── _try_copilot_cli_jsonl ──────────────────────────────────────────────
+
+
+def test_copilot_cli_jsonl_valid():
+    lines = [
+        json.dumps({"type": "session.start", "data": {"sessionId": "session-1"}}),
+        json.dumps(
+            {
+                "type": "user.message",
+                "data": {
+                    "content": "What changed?",
+                    "source": "cli",
+                    "transformedContent": "<system-reminder>hidden</system-reminder>",
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "assistant.message",
+                "data": {"content": "The parser changed.", "phase": "final_answer"},
+            }
+        ),
+    ]
+
+    result = _try_copilot_cli_jsonl("\n".join(lines))
+
+    assert result is not None
+    assert "> What changed?" in result
+    assert "The parser changed." in result
+    assert "system-reminder" not in result
+
+
+def test_copilot_cli_jsonl_requires_session_start():
+    lines = [
+        json.dumps({"type": "user.message", "data": {"content": "Q"}}),
+        json.dumps({"type": "assistant.message", "data": {"content": "A"}}),
+    ]
+    assert _try_copilot_cli_jsonl("\n".join(lines)) is None
+
+
+def test_copilot_cli_jsonl_filters_generated_context_without_dropping_user_prompts():
+    lines = [
+        json.dumps({"type": "session.start", "data": {"sessionId": "session-1"}}),
+        json.dumps(
+            {
+                "type": "user.message",
+                "data": {"content": "generated skill context", "source": "skill-feature-dev"},
+            }
+        ),
+        json.dumps(
+            {
+                "type": "user.message",
+                "data": {"content": "Parented top-level prompt", "parentAgentTaskId": "task-1"},
+            }
+        ),
+        json.dumps({"type": "user.message", "data": {"content": "Top-level prompt"}}),
+        json.dumps(
+            {
+                "type": "assistant.message",
+                "data": {"content": "subagent answer", "parentToolCallId": "tool-1"},
+            }
+        ),
+        json.dumps(
+            {
+                "type": "assistant.message",
+                "data": {
+                    "content": "Top-level answer",
+                    "phase": "final_answer",
+                    "reasoningText": "private reasoning",
+                },
+            }
+        ),
+    ]
+
+    result = _try_copilot_cli_jsonl("\n".join(lines))
+
+    assert result is not None
+    assert "> Top-level prompt" in result
+    assert "> Parented top-level prompt" in result
+    assert "Top-level answer" in result
+    assert "generated skill context" not in result
+    assert "subagent answer" not in result
+    assert "private reasoning" not in result
+
+
+def test_copilot_cli_jsonl_normalizes_single_top_level_message():
+    lines = [
+        json.dumps({"type": "session.start", "data": {"sessionId": "session-1"}}),
+        json.dumps({"type": "user.message", "data": {"content": "Only prompt"}}),
+        json.dumps(
+            {
+                "type": "tool.execution_complete",
+                "data": {"result": {"content": "private tool output"}},
+            }
+        ),
+    ]
+
+    assert _try_copilot_cli_jsonl("\n".join(lines)) == "> Only prompt\n"
+
+
+def test_copilot_cli_jsonl_normalizes_empty_recognized_session():
+    content = json.dumps({"type": "session.start", "data": {"sessionId": "session-1"}})
+
+    assert _try_copilot_cli_jsonl(content) == ""
+
+
+def test_normalize_copilot_cli_events_file(tmp_path):
+    events = tmp_path / "events.jsonl"
+    events.write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "session.start", "data": {"sessionId": "session-1"}}),
+                json.dumps({"type": "user.message", "data": {"content": "Q"}}),
+                json.dumps({"type": "assistant.message", "data": {"content": "A"}}),
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert normalize(str(events)) == "> Q\nA\n"
+
+
+def test_normalize_empty_copilot_session_does_not_return_raw_json(tmp_path):
+    events = tmp_path / "events.jsonl"
+    events.write_text(
+        json.dumps({"type": "session.start", "data": {"sessionId": "session-1"}}),
+        encoding="utf-8",
+    )
+
+    assert normalize(str(events)) == ""
+
+
+def test_normalize_conversations_copilot_returns_single_verbatim_conversation(tmp_path):
+    """convo_miner mines via normalize_conversations(), so the Copilot parser
+    must hand back a *list* of conversations. Returning the bare transcript
+    string instead would make the caller's "\\n\\n".join(...) iterate it
+    character by character and shred every imported drawer.
+    """
+    events = tmp_path / "events.jsonl"
+    events.write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "session.start", "data": {"sessionId": "session-1"}}),
+                json.dumps({"type": "user.message", "data": {"content": "Q"}}),
+                json.dumps({"type": "assistant.message", "data": {"content": "A"}}),
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    conversations = normalize_conversations(str(events))
+
+    assert conversations == ["> Q\nA\n"]
+    assert "\n\n".join(conversations) == normalize(str(events))
+
+
+def test_normalize_conversations_empty_copilot_session_filters_to_nothing(tmp_path):
+    """A recognized-but-empty session must stay recognized (``[""]``) so the
+    miner files it as empty instead of falling through to the raw event JSON.
+    """
+    events = tmp_path / "events.jsonl"
+    events.write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "session.start", "data": {"sessionId": "session-1"}}),
+                json.dumps({"type": "tool.execution_complete", "data": {"result": "internals"}}),
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    conversations = normalize_conversations(str(events))
+
+    assert conversations == [""]
+    assert [c for c in conversations if c] == []
 
 
 # ── _try_codex_jsonl ───────────────────────────────────────────────────

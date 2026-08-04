@@ -8,7 +8,7 @@ The Python package that powers MemPalace. All modules, all logic.
 |--------|-------------|
 | `cli.py` | CLI entry point — routes to mine, search, init, compress, wake-up |
 | `config.py` | Configuration loading — `~/.mempalace/config.json`, env vars, defaults |
-| `normalize.py` | Converts 5 chat formats (Claude Code JSONL, Claude.ai JSON, ChatGPT JSON, Slack JSON, plain text) to standard transcript format |
+| `normalize.py` | Converts supported chat formats (Claude Code, GitHub Copilot CLI, Codex, Gemini, Pi, Claude.ai, ChatGPT, Continue, Slack, and plain text) to standard transcript format |
 | `miner.py` | Project file ingest — scans directories, chunks by paragraph, stores to ChromaDB |
 | `convo_miner.py` | Conversation ingest — chunks by exchange pair (Q+A), detects rooms from content |
 | `searcher.py` | Semantic search via ChromaDB vectors — filters by wing/room, returns verbatim + scores |

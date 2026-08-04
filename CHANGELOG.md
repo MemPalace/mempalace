@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Features
+
+- **GitHub Copilot CLI conversation imports.** `mempalace mine ~/.copilot/session-state --mode convos` now imports canonical `events.jsonl` transcripts while excluding generated skill context, subagent exchanges, system/tool events, and session sidecar files.
+
 ---
 
 ## [3.7.0] — 2026-08-02

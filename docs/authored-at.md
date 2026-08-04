@@ -1,7 +1,7 @@
 # Authored date (`authored_at`)
 
-Conversation transcripts carry a per-line ISO-8601 `timestamp` (both Claude Code and
-Codex JSONL). The miner records the most recent one per file as the drawer's
+Conversation transcripts carry a per-line ISO-8601 `timestamp` (Claude Code,
+GitHub Copilot CLI, and Codex JSONL). The miner records the most recent one per file as the drawer's
 **`authored_at`** — when the content was actually written.
 
 This is distinct from the ingest date:
@@ -29,10 +29,10 @@ current `NORMALIZE_VERSION`. Two options:
    ```bash
    python scripts/backfill_authored_at.py \
        --palace ~/.mempalace/palace \
-       --sessions ~/.claude --sessions ~/.codex          # dry run
+       --sessions ~/.claude --sessions ~/.copilot --sessions ~/.codex  # dry run
    python scripts/backfill_authored_at.py \
        --palace ~/.mempalace/palace \
-       --sessions ~/.claude --sessions ~/.codex --apply  # write
+       --sessions ~/.claude --sessions ~/.copilot --sessions ~/.codex --apply  # write
    ```
 
    For the Docker MCP image, mount the volume and session dirs read-only — see the header of

@@ -84,3 +84,72 @@ def test_unresolved_transcript_is_left_alone(tmp_path):
     assert stats["updated"] == 0
     assert stats["unresolved_files"] == 1
     assert "authored_at" not in col.get(ids=["d1"], include=["metadatas"])["metadatas"][0]
+
+
+def test_duplicate_copilot_basenames_resolve_by_exact_path(tmp_path):
+    sessions = tmp_path / ".copilot" / "session-state"
+    first = _transcript(sessions / "session-1", "events.jsonl", "2026-07-01T09:00:00.000Z")
+    second = _transcript(sessions / "session-2", "events.jsonl", "2026-07-02T10:00:00.000Z")
+    col = _collection()
+    _add(col, "d1", str(first))
+    _add(col, "d2", str(second))
+
+    stats = backfill_mod.backfill_authored_at(col, [str(sessions)], apply=True)
+
+    assert stats["updated"] == 2
+    assert stats["ambiguous_files"] == 0
+    first_meta = col.get(ids=["d1"], include=["metadatas"])["metadatas"][0]
+    second_meta = col.get(ids=["d2"], include=["metadatas"])["metadatas"][0]
+    assert first_meta["authored_at"] == "2026-07-01T09:00:00.000Z"
+    assert second_meta["authored_at"] == "2026-07-02T10:00:00.000Z"
+
+
+def test_moved_copilot_mount_resolves_by_session_directory(tmp_path):
+    sessions = tmp_path / "mounted" / "session-state"
+    _transcript(sessions / "session-1", "events.jsonl", "2026-07-01T09:00:00.000Z")
+    _transcript(sessions / "session-2", "events.jsonl", "2026-07-02T10:00:00.000Z")
+    col = _collection()
+    _add(col, "d1", "/old/mount/session-state/session-2/events.jsonl")
+
+    stats = backfill_mod.backfill_authored_at(col, [str(sessions)], apply=True)
+
+    assert stats["updated"] == 1
+    assert stats["ambiguous_files"] == 0
+    got = col.get(ids=["d1"], include=["metadatas"])["metadatas"][0]
+    assert got["authored_at"] == "2026-07-02T10:00:00.000Z"
+
+
+def test_windows_copilot_path_resolves_on_other_platforms(tmp_path):
+    sessions = tmp_path / "mounted" / "session-state"
+    _transcript(sessions / "session-1", "events.jsonl", "2026-07-01T09:00:00.000Z")
+    _transcript(sessions / "session-2", "events.jsonl", "2026-07-02T10:00:00.000Z")
+    col = _collection()
+    _add(col, "d1", r"C:\old\mount\session-state\session-2\events.jsonl")
+
+    stats = backfill_mod.backfill_authored_at(col, [str(sessions)], apply=True)
+
+    assert stats["updated"] == 1
+    assert stats["ambiguous_files"] == 0
+    got = col.get(ids=["d1"], include=["metadatas"])["metadatas"][0]
+    assert got["authored_at"] == "2026-07-02T10:00:00.000Z"
+
+
+def test_empty_source_path_does_not_resolve_to_working_directory(tmp_path):
+    index = backfill_mod._index_sessions([str(tmp_path)])
+
+    assert backfill_mod._resolve_session("", index) == (None, False)
+
+
+def test_ambiguous_transcript_is_left_alone(tmp_path):
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    _transcript(first_root / "same-session", "events.jsonl", "2026-07-01T09:00:00.000Z")
+    _transcript(second_root / "same-session", "events.jsonl", "2026-07-02T10:00:00.000Z")
+    col = _collection()
+    _add(col, "d1", "/old/mount/same-session/events.jsonl")
+
+    stats = backfill_mod.backfill_authored_at(col, [str(first_root), str(second_root)], apply=True)
+
+    assert stats["updated"] == 0
+    assert stats["ambiguous_files"] == 1
+    assert "authored_at" not in col.get(ids=["d1"], include=["metadatas"])["metadatas"][0]

@@ -7,6 +7,7 @@ Supported:
     - Claude.ai JSON export
     - ChatGPT conversations.json
     - Claude Code JSONL (with tool_use/tool_result block capture)
+    - GitHub Copilot CLI JSONL (~/.copilot/session-state/<session-id>/events.jsonl)
     - OpenAI Codex CLI JSONL
     - Gemini CLI JSONL (~/.gemini/tmp/<project_hash>/chats/session-*.jsonl)
     - Pi agent JSONL
@@ -164,7 +165,7 @@ def normalize(filepath: str) -> str:
     ext = Path(filepath).suffix.lower()
     if ext in (".json", ".jsonl") or content.strip()[:1] in ("{", "["):
         normalized = _try_normalize_json(content)
-        if normalized:
+        if normalized is not None:
             return normalized
 
     return content
@@ -221,6 +222,13 @@ def _try_normalize_json_split(content: str) -> Optional[list]:
 
     normalized = _try_claude_code_jsonl(content)
     if normalized:
+        return [normalized]
+
+    normalized = _try_copilot_cli_jsonl(content)
+    if normalized is not None:
+        # A recognized Copilot session with no user-visible turns normalizes
+        # to "". Returning [""] (not None) keeps it recognized, so the caller
+        # files it as empty instead of falling through to the raw event JSON.
         return [normalized]
 
     normalized = _try_codex_jsonl(content)
@@ -315,6 +323,64 @@ def _try_claude_code_jsonl(content: str) -> Optional[str]:
 
     if len(messages) >= 2:
         return _messages_to_transcript(messages)
+    return None
+
+
+def _try_copilot_cli_jsonl(content: str) -> Optional[str]:
+    """GitHub Copilot CLI sessions (``~/.copilot/session-state/*/events.jsonl``).
+
+    Copilot records all session activity in one event stream. Only top-level
+    ``user.message`` and ``assistant.message`` events are conversational turns.
+    Tool, system, hook, generated skill, and nested assistant events are
+    intentionally excluded so imported drawers match the user-visible conversation.
+    """
+    lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
+    messages = []
+    has_session_start = False
+
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+
+        entry_type = entry.get("type", "")
+        data = entry.get("data", {})
+        if not isinstance(data, dict):
+            continue
+
+        if entry_type == "session.start":
+            session_id = data.get("sessionId")
+            if isinstance(session_id, str) and session_id:
+                has_session_start = True
+            continue
+
+        if not has_session_start:
+            continue
+
+        if entry_type == "user.message":
+            # ``source`` is a generic event identifier, so preserve sourced
+            # prompts unless they use Copilot's known generated-skill prefix.
+            source = data.get("source")
+            is_skill_context = isinstance(source, str) and source.startswith("skill-")
+            if is_skill_context:
+                continue
+            role = "user"
+        elif entry_type == "assistant.message":
+            if data.get("parentToolCallId"):
+                continue
+            role = "assistant"
+        else:
+            continue
+
+        text = data.get("content")
+        if isinstance(text, str) and text.strip():
+            messages.append((role, text))
+
+    if has_session_start:
+        return _messages_to_transcript(messages, spellcheck=False)
     return None
 
 

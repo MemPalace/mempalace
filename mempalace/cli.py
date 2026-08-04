@@ -4,7 +4,7 @@ MemPalace — Give your AI a memory. No API key required.
 
 Three ways to ingest:
   Projects:      mempalace mine ~/projects/my_app                  (code, docs, notes)
-  Conversations: mempalace mine <convo-dir> --mode convos          (Claude Code, Claude.ai, ChatGPT, Slack exports)
+  Conversations: mempalace mine <convo-dir> --mode convos          (Claude Code, GitHub Copilot CLI, Claude.ai, ChatGPT, Slack exports)
   Documents:     mempalace mine <docs-dir> --mode extract          (PDF, DOCX, PPTX, XLSX, RTF, EPUB — requires mempalace[extract])
 
 Same palace. Same search. Different ingest strategies.
@@ -25,6 +25,7 @@ Examples:
     mempalace init ~/projects/my_app
     mempalace mine ~/projects/my_app
     mempalace mine ~/.claude/projects/-Users-you-Projects-my_app --mode convos --wing my_app
+    mempalace mine ~/.copilot/session-state --mode convos
     mempalace search "why did we switch to GraphQL"
     mempalace search "pricing discussion" --wing my_app --room costs
 """

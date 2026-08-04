@@ -388,6 +388,67 @@ class TestScanConvos:
         files = scan_convos(str(tmp_path))
         assert [f.name for f in files] == ["old-chat.md"]
 
+    def test_scan_copilot_sessions_keeps_only_event_logs(self, tmp_path):
+        copilot_root = tmp_path / ".copilot"
+        session = copilot_root / "session-state" / "session-id"
+        session.mkdir(parents=True)
+        (session / "events.jsonl").write_text(
+            '{"type":"session.start","data":{"sessionId":"session-id"}}\n',
+            encoding="utf-8",
+        )
+        (session / "plan.md").write_text("generated plan", encoding="utf-8")
+        (session / "metadata.json").write_text('{"generated":true}', encoding="utf-8")
+        incomplete_session = copilot_root / "session-state" / "incomplete-session"
+        incomplete_session.mkdir()
+        (incomplete_session / "plan.md").write_text("generated plan", encoding="utf-8")
+        (copilot_root / "config.json").write_text('{"remoteExport":false}', encoding="utf-8")
+
+        files = scan_convos(str(copilot_root))
+
+        assert [f.name for f in files] == ["events.jsonl"]
+
+    def test_scan_mounted_copilot_tree_keeps_only_event_logs(self, tmp_path):
+        copilot_root = tmp_path / "sessions" / "copilot"
+        session = copilot_root / "session-state" / "session-id"
+        session.mkdir(parents=True)
+        (session / "events.jsonl").write_text(
+            '{"type":"session.start","data":{"sessionId":"session-id"}}\n',
+            encoding="utf-8",
+        )
+        (session / "plan.md").write_text("generated plan", encoding="utf-8")
+        (session / "metadata.json").write_text('{"generated":true}', encoding="utf-8")
+        (copilot_root / "config.json").write_text('{"remoteExport":false}', encoding="utf-8")
+
+        files = scan_convos(str(copilot_root))
+
+        assert [f.name for f in files] == ["events.jsonl"]
+
+    def test_scan_unrelated_root_with_session_state_keeps_sibling_files(self, tmp_path):
+        root = tmp_path / "archive"
+        session = root / "session-state" / "session-id"
+        session.mkdir(parents=True)
+        (session / "plan.md").write_text("generated plan", encoding="utf-8")
+        (root / "chat.md").write_text("> q\na\n> q2\na2\n> q3\na3", encoding="utf-8")
+
+        files = scan_convos(str(root))
+
+        assert {f.name for f in files} == {"chat.md", "plan.md"}
+
+    def test_scan_single_copilot_session_keeps_only_event_log(self, tmp_path):
+        session = tmp_path / ".copilot" / "session-state" / "session-id"
+        nested = session / "files"
+        nested.mkdir(parents=True)
+        (session / "events.jsonl").write_text(
+            '{"type":"session.start","data":{"sessionId":"session-id"}}\n',
+            encoding="utf-8",
+        )
+        (session / "plan.md").write_text("generated plan", encoding="utf-8")
+        (nested / "index.md").write_text("generated index", encoding="utf-8")
+
+        files = scan_convos(str(session))
+
+        assert [f.name for f in files] == ["events.jsonl"]
+
     @pytest.mark.skipif(
         sys.platform == "win32",
         reason="symlink creation requires elevated privileges on Windows",
