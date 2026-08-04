@@ -450,3 +450,40 @@ def test_qdrant_enforcement_model_swap_raises(tmp_path, monkeypatch, clear_ident
     monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "embeddinggemma")
     with pytest.raises(EmbedderIdentityMismatchError):
         P._enforce_embedder_identity(col, str(tmp_path), "mempalace_drawers", create=False)
+
+
+# ---------------------------------------------------------------------------
+# CLI set-embedder covers every collection
+# ---------------------------------------------------------------------------
+
+
+def test_cli_set_embedder_records_closets_too(tmp_path, monkeypatch, clear_identity_cache):
+    """``palace set-embedder`` must cover closets, not just drawers.
+
+    Recording only drawers leaves closets in the ``unknown`` state, so the
+    fail-fast model-swap check never engages for closet vectors and a later
+    swap degrades closet search silently.
+    """
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "minilm")
+    from mempalace import cli
+    from mempalace import palace as P
+
+    for name in ("mempalace_drawers", "mempalace_closets"):
+        col = P.get_collection(
+            str(tmp_path), collection_name=name, create=True, _skip_identity_check=True
+        )
+        col.add(documents=["x"], ids=["a"], metadatas=[{}], embeddings=[[0.1, 0.2, 0.3, 0.4]])
+    P._VALIDATED_IDENTITY.clear()
+
+    cli.cmd_palace_set_embedder(
+        SimpleNamespace(palace=str(tmp_path), model="minilm", force=False, backend=None)
+    )
+
+    P._VALIDATED_IDENTITY.clear()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        for name in ("mempalace_drawers", "mempalace_closets"):
+            P.get_collection(str(tmp_path), collection_name=name, create=False)
