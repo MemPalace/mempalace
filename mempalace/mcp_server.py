@@ -351,6 +351,7 @@ def tool_search(
     dist = (1.0 - min_similarity) if min_similarity is not None else max_distance
     # Mitigate system prompt contamination (Issue #333)
     sanitized = sanitize_query(query)
+    decay_hl = _config.decay_half_life_days if _config.decay_enabled else 0.0
     result = search_memories(
         sanitized["clean_query"],
         palace_path=_config.palace_path,
@@ -358,6 +359,9 @@ def tool_search(
         room=room,
         n_results=limit,
         max_distance=dist,
+        decay_half_life_days=decay_hl,
+        durable_rooms=_config.decay_durable_rooms,
+        durable_wings=_config.decay_durable_wings,
     )
     # Attach sanitizer metadata for transparency
     if sanitized["was_sanitized"]:

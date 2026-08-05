@@ -174,6 +174,29 @@ class MempalaceConfig:
         return self._file_config.get("hall_keywords", DEFAULT_HALL_KEYWORDS)
 
     @property
+    def decay_enabled(self):
+        """Whether time-decay re-ranking is applied to search (default off)."""
+        return self._file_config.get("decay", {}).get("enabled", False)
+
+    @property
+    def decay_half_life_days(self):
+        """Ebbinghaus half-life in days for recency re-ranking."""
+        return self._file_config.get("decay", {}).get("half_life_days", 60)
+
+    @property
+    def decay_durable_rooms(self):
+        """Rooms exempt from decay (empty by default — room names are
+        auto-assigned by the miner, so exempt by wing or type= instead)."""
+        return self._file_config.get("decay", {}).get("durable_rooms", [])
+
+    @property
+    def decay_durable_wings(self):
+        """Curated wings exempt from decay (canonical notes shouldn't sink)."""
+        return self._file_config.get("decay", {}).get(
+            "durable_wings", ["memory", "identity"]
+        )
+
+    @property
     def hook_silent_save(self):
         """Whether the stop hook saves directly (True) or blocks for MCP calls (False)."""
         return self._file_config.get("hooks", {}).get("silent_save", True)
