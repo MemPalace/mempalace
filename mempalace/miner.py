@@ -21,6 +21,7 @@ from datetime import datetime
 from collections import defaultdict
 from typing import Optional
 
+from .backends import collection_supports_facets
 from .entity_detector import _apply_known_systems_prepass, _get_coca_filter
 from .palace import (
     NORMALIZE_VERSION,
@@ -48,15 +49,6 @@ from .hallways import compute_hallways_for_wing
 from .ids import ID_RECIPE, make_drawer_id_from_chunk
 
 logger = logging.getLogger("mempalace_mcp")
-
-
-def _backend_supports_facets(col) -> bool:
-    """True if the collection's backend implements server-side metadata facets
-    (qdrant/pgvector/milvus), so callers can count/filter remotely instead of
-    streaming the whole collection over the wire."""
-    backend = getattr(col, "_backend", None)
-    caps = getattr(backend, "capabilities", None)
-    return isinstance(caps, (set, frozenset)) and "supports_metadata_facets" in caps
 
 
 def _path_within_root(path: Path, root: Path) -> bool:
@@ -2282,7 +2274,7 @@ def status(palace_path: str):
     # over the wire — a full scan that costs minutes on a large shared
     # collection. Mirrors the MCP status tool. Falls back to the paginated
     # scan below on any facet error, and for local backends (chroma).
-    if _backend_supports_facets(col):
+    if collection_supports_facets(col):
         try:
             wing_rooms: dict = {}
             for wing in col.facet_counts("wing"):

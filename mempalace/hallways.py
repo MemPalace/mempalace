@@ -42,18 +42,10 @@ from datetime import datetime, timezone
 from itertools import combinations
 from typing import Optional
 
+from .backends import collection_supports_facets
 from .dynamics import initialize_dynamics_fields
 
 logger = logging.getLogger("mempalace_hallways")
-
-
-def _backend_supports_facets(col) -> bool:
-    """True if the collection's backend implements server-side metadata facets
-    (qdrant/pgvector/milvus), i.e. a keyword-indexed ``where`` filter is cheap
-    and the client-side full scan below is unnecessary."""
-    backend = getattr(col, "_backend", None)
-    caps = getattr(backend, "capabilities", None)
-    return isinstance(caps, (set, frozenset)) and "supports_metadata_facets" in caps
 
 
 # Persistence target is resolved through ``_get_hallway_file`` below, which
@@ -268,7 +260,7 @@ def compute_hallways_for_wing(
     # overflows SQLITE_MAX_VARIABLE_NUMBER (32766) on wings > ~32k drawers
     # (#1619). Its local reads are cheap, so the full-scan cost is negligible.
     metadatas: list = []
-    server_filter = _backend_supports_facets(col)
+    server_filter = collection_supports_facets(col)
     try:
         batch_size = 5000
         offset = 0

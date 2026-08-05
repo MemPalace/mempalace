@@ -20,6 +20,7 @@ from .backends import (
     CollectionNotInitializedError,
     PalaceNotFoundError,
     PalaceRef,
+    collection_supports_facets,
     detect_backend_for_path,
     detect_backends_for_path,
     get_backend,
@@ -1539,15 +1540,6 @@ def file_already_mined(
         return False
 
 
-def _backend_supports_facets(col) -> bool:
-    """True if the collection's backend implements server-side metadata facets
-    (qdrant/pgvector/milvus) with keyword-indexed metadata, so a per-file
-    ``where={"source_file": X}`` lookup is cheap."""
-    backend = getattr(col, "_backend", None)
-    caps = getattr(backend, "capabilities", None)
-    return isinstance(caps, (set, frozenset)) and "supports_metadata_facets" in caps
-
-
 class _LazyMinedSet:
     """Drop-in for the dict ``prefetch_mined_set`` returns, backed by lazy,
     cached, indexed per-``source_file`` lookups instead of a full-collection
@@ -1661,7 +1653,7 @@ def prefetch_mined_set(
     bulk scan is O(collection) and hangs every convo-mode mine (auto-save
     hooks) on a large shared network-backed collection.
     """
-    if _backend_supports_facets(collection):
+    if collection_supports_facets(collection):
         return _LazyMinedSet(collection, extract_mode)
     # Per source_file: per stored_mtime group → count + optional chunk_total.
     # A source is only "mined" once some group is complete.
