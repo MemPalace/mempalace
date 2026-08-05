@@ -533,23 +533,56 @@ class _PgVectorClient:
 
     def _execute(self, sql: str, params=None, *, fetch: bool = False, many: bool = False):
         with self._lock:
-            conn = self._connect()
-            try:
-                with conn.cursor() as cur:
-                    if many:
-                        cur.executemany(sql, params or [])
-                        rows = None
-                    else:
-                        cur.execute(sql, params or [])
-                        rows = cur.fetchall() if fetch else None
-                conn.commit()
-            except Exception as exc:  # noqa: BLE001 - normalize to BackendError
+            for attempt in (0, 1):
+                conn = self._connect()
                 try:
-                    conn.rollback()
-                except Exception:  # pragma: no cover - rollback best effort
-                    pass
-                raise BackendError(f"pgvector query failed: {exc}") from exc
-        return rows
+                    with conn.cursor() as cur:
+                        if many:
+                            cur.executemany(sql, params or [])
+                            rows = None
+                        else:
+                            cur.execute(sql, params or [])
+                            rows = cur.fetchall() if fetch else None
+                    conn.commit()
+                    return rows
+                except Exception as exc:  # noqa: BLE001 - normalize to BackendError
+                    try:
+                        conn.rollback()
+                    except Exception:  # pragma: no cover - rollback best effort
+                        pass
+                    # A long-lived idle connection can die under the process
+                    # (Postgres restart, NAT/idle-flow reap): the dead socket
+                    # is only discovered at the next statement. That is a
+                    # connection failure, not a query failure — discard the
+                    # connection and retry the statement once on a fresh one
+                    # instead of surfacing a spurious BackendError.
+                    if attempt == 0 and self._connection_dead(conn, exc):
+                        try:
+                            conn.close()
+                        except Exception:  # pragma: no cover - close best effort
+                            pass
+                        self._conn = None
+                        continue
+                    raise BackendError(f"pgvector query failed: {exc}") from exc
+
+    @staticmethod
+    def _connection_dead(conn, exc: Exception) -> bool:
+        """True when a query failure means the connection itself is gone."""
+        if getattr(conn, "closed", False) or getattr(conn, "broken", False):
+            return True
+        try:
+            import psycopg
+        except ImportError:  # pragma: no cover - _connect already required it
+            return False
+        conn_errors = tuple(
+            err
+            for err in (
+                getattr(psycopg, "OperationalError", None),
+                getattr(psycopg, "InterfaceError", None),
+            )
+            if isinstance(err, type)
+        )
+        return bool(conn_errors) and isinstance(exc, conn_errors)
 
     def ping(self) -> None:
         self._execute("SELECT 1", fetch=True)
