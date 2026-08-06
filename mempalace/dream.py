@@ -36,6 +36,35 @@ def _drawer_count(palace_path: str) -> int:
     return ChromaBackend().get_collection(palace_path, COLLECTION_NAME).count()
 
 
+def _cow_copytree(src: str, dst: str) -> None:
+    """Clone the palace copy-on-write when the filesystem supports it, else fall
+    back to a deep copy.
+
+    A dream only removes a handful of drawers from the candidate, so on a
+    copy-on-write filesystem the clone shares blocks with the original and costs
+    almost no extra time or disk regardless of palace size — only the blocks
+    dedup rewrites diverge, and they diverge on the candidate, never the source.
+    Uses APFS ``clonefile`` via ``cp -c`` on macOS and reflink via
+    ``cp --reflink=auto`` on Linux (both silently degrade to a normal copy when
+    the volume can't clone); ``shutil.copytree`` is the portable last resort.
+    """
+    import platform
+    import subprocess
+
+    if platform.system() == "Darwin":
+        cmd = ["cp", "-cR", src, dst]
+    else:
+        cmd = ["cp", "-a", "--reflink=auto", src, dst]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        # cp missing, unsupported flag, or clone refused -> portable deep copy.
+        if os.path.exists(dst):
+            shutil.rmtree(dst, ignore_errors=True)
+        shutil.copytree(src, dst)
+
+
 def detect_kg_conflicts(kg_db_path: str) -> list[dict]:
     """Active (subject, predicate) pairs that point at more than one object.
 
@@ -117,7 +146,9 @@ def dream(
         raise FileExistsError(f"candidate path already exists: {candidate_path}")
 
     # Non-destructive: consolidate the copy, leave the original untouched.
-    shutil.copytree(palace_path, candidate_path)
+    # Copy-on-write where the filesystem allows, so the candidate is cheap even
+    # for a large palace (see _cow_copytree).
+    _cow_copytree(palace_path, candidate_path)
 
     before = _drawer_count(candidate_path)
     dedup_palace(palace_path=candidate_path, threshold=threshold, dry_run=False, wing=wing)

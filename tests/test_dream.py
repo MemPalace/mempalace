@@ -96,3 +96,25 @@ def test_dream_missing_palace_raises(tmp_dir):
 
     with pytest.raises(FileNotFoundError):
         dream(os.path.join(tmp_dir, "nope"))
+
+
+def test_cow_copytree_is_independent_on_write(tmp_dir):
+    """The candidate must be independent of the source: whether the clone is
+    copy-on-write or a deep copy, writing the clone must not change the source.
+    This is what makes the dream non-destructive regardless of copy mechanism.
+    """
+    from mempalace.dream import _cow_copytree
+
+    src = os.path.join(tmp_dir, "src")
+    os.makedirs(os.path.join(src, "sub"))
+    with open(os.path.join(src, "sub", "f.txt"), "w") as f:
+        f.write("original")
+
+    dst = os.path.join(tmp_dir, "dst")
+    _cow_copytree(src, dst)
+    assert open(os.path.join(dst, "sub", "f.txt")).read() == "original"
+
+    with open(os.path.join(dst, "sub", "f.txt"), "w") as f:
+        f.write("changed")
+    assert open(os.path.join(src, "sub", "f.txt")).read() == "original"
+    assert open(os.path.join(dst, "sub", "f.txt")).read() == "changed"
