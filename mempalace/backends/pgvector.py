@@ -65,6 +65,13 @@ _DEFAULT_DSN = "postgresql://localhost:5432/mempalace"
 _MARKER_FILENAME = "pgvector_backend.json"
 _MAX_IDENTIFIER = 63  # Postgres identifier byte limit.
 _TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
+# Text-search configuration for the pushed-down lexical arm. 'simple' does no
+# stemming and no stop-word removal, so it tokenizes any script the same way
+# ``_TOKEN_RE`` does — Arabic, CJK and English drawers all stay searchable in
+# one palace. A language config ('english') would stem and drop stop words for
+# English while silently degrading every other language, which breaks the
+# verbatim-recall promise for a mixed corpus.
+_FTS_CONFIG = "simple"
 # Operators that translate to a JSONB containment predicate and so can be
 # pushed down to SQL. Comparisons, $or and $contains stay on the local exact
 # path (Python filtering), mirroring the Qdrant backend's local fallback.
@@ -122,6 +129,36 @@ def _tokenize(text: str) -> list[str]:
     if not text:
         return []
     return _TOKEN_RE.findall(text.lower())
+
+
+def _escape_tsquery_token(token: str) -> str:
+    """Quote one token so ``to_tsquery`` reads it as a literal lexeme.
+
+    ``to_tsquery`` parses its argument as a *query expression*, so an unquoted
+    token carrying ``& | ! ( ) : *`` or ``<->`` would either inject operators or
+    abort the whole search with a syntax error. Wrapping the token in single
+    quotes reduces it to one lexeme; inside those quotes only ``'`` and ``\\``
+    keep any meaning, and both are neutralized by doubling them.
+
+    Tokens produced by :func:`_tokenize` are ``\\w``-only and never need this,
+    but the escape keeps the SQL correct for any future caller that feeds
+    ``lexical_rows`` raw user text.
+    """
+    escaped = token.replace("\\", "\\\\").replace("'", "''")
+    return f"'{escaped}'"
+
+
+def _tsquery_or(tokens: list[str]) -> str:
+    """Build an OR-semantics tsquery string from tokenizer output.
+
+    ``websearch_to_tsquery`` ANDs bare terms, which is far stricter than the
+    any-term scoring the BM25 path it replaces uses: a five-word question would
+    match nothing. Joining with ``|`` keeps the lexical arm a recall-oriented
+    candidate generator, which is what the hybrid re-ranker expects.
+
+    Empty tokens are dropped — an empty quoted lexeme is a tsquery syntax error.
+    """
+    return " | ".join(_escape_tsquery_token(token) for token in tokens if token)
 
 
 def _bm25_scores(query: str, documents: list[str], k1: float = 1.5, b: float = 0.75) -> list[float]:
@@ -415,6 +452,16 @@ def _hnsw_index_name(table: str) -> str:
     return _pg_identifier(f"{table}_hnsw_idx")
 
 
+def _fts_index_name(table: str) -> str:
+    """Deterministic, collision-safe full-text index name for ``table``.
+
+    Table-qualified so two collections sharing a schema cannot claim one index,
+    and routed through :func:`_pg_identifier` for the same reason
+    :func:`_hnsw_index_name` is.
+    """
+    return _pg_identifier(f"{table}_fts_idx")
+
+
 def _field_sql(field: str, expression: Any, params: list) -> str:
     """Translate one field predicate to a JSONB containment expression."""
     if isinstance(expression, dict):
@@ -605,6 +652,33 @@ class _PgVectorClient:
             f"embedding vector({int(dimension)}), "
             "updated_at timestamptz)"
         )
+        self.create_fts_index(table)
+
+    def create_fts_index(self, table: str) -> None:
+        """Create the GIN expression index backing :meth:`lexical_rows`.
+
+        Built here rather than behind ``run_maintenance`` because the table is
+        empty at creation time, so the build is instant and cannot block
+        writers — unlike the HNSW index, which is opt-in precisely because a
+        late build takes ACCESS EXCLUSIVE on a populated table. A palace created
+        before this index existed still searches correctly; Postgres just falls
+        back to a sequential scan, which is one server-side scan instead of the
+        whole table crossing the wire.
+
+        Failure is logged and swallowed for the same reason
+        :meth:`ensure_extension` swallows: the index is a performance asset, not
+        a correctness one, and a restricted role must still be able to open a
+        collection.
+        """
+        qi = _quote_identifier(table)
+        idx = _quote_identifier(_fts_index_name(table))
+        try:
+            self._execute(
+                f"CREATE INDEX IF NOT EXISTS {idx} ON {qi} "
+                f"USING gin (to_tsvector('{_FTS_CONFIG}', document))"
+            )
+        except BackendError:
+            logger.debug("pgvector FTS index creation skipped", exc_info=True)
 
     def upsert_rows(self, table: str, rows: list[dict]) -> None:
         if not rows:
@@ -668,6 +742,43 @@ class _PgVectorClient:
             self._row(record, with_embedding=with_embedding, with_distance=True)
             for record in rows or []
         ]
+
+    def lexical_rows(
+        self,
+        table: str,
+        *,
+        tokens: list[str],
+        limit: int,
+        where: Optional[dict],
+    ) -> list[dict]:
+        """Rank rows by Postgres full-text relevance, top ``limit`` only.
+
+        ``where`` must already be pushdown-safe (see
+        :func:`_requires_local_filter`); the caller keeps anything broader on
+        the local path. Returns ``id``/``document``/``metadata``/``score``
+        dicts, ``score`` being ``ts_rank_cd`` — not BM25, which the hybrid
+        re-ranker recomputes in memory over the merged candidate pool anyway.
+        """
+        qi = _quote_identifier(table)
+        params: list = [_tsquery_or(tokens)]
+        where_sql = _where_to_sql(where, params) if where else "TRUE"
+        params.append(int(limit))
+        # SQL text order — tsquery %s in FROM, then WHERE params, then LIMIT %s
+        # — already matches positional binding order in ``params``.
+        sql = (
+            "SELECT id, document, metadata, "
+            f"ts_rank_cd(to_tsvector('{_FTS_CONFIG}', document), q) AS score "
+            f"FROM {qi}, to_tsquery('{_FTS_CONFIG}', %s) AS q "
+            f"WHERE to_tsvector('{_FTS_CONFIG}', document) @@ q AND ({where_sql}) "
+            "ORDER BY score DESC LIMIT %s"
+        )
+        rows = self._execute(sql, params, fetch=True)
+        out = []
+        for record in rows or []:
+            row = self._row(record, with_embedding=False, with_distance=False)
+            row["score"] = float(record[3]) if record[3] is not None else 0.0
+            out.append(row)
+        return out
 
     def scroll_rows(
         self,
@@ -1238,8 +1349,72 @@ class PgVectorCollection(BaseCollection):
             return {}
         return self._client.facet_counts(self._table, field=field, where=where, limit=limit)
 
-    def lexical_search(self, *, query: str, n_results: int = 10, where: Optional[dict] = None):
+    def lexical_search(
+        self, *, query: str, n_results: int = 10, where: Optional[dict] = None
+    ) -> LexicalResult:
+        """Rank drawers lexically, pushing the scan into Postgres when possible.
+
+        The local path below scrolls every row — documents included — to the
+        client and scores BM25 in Python, which costs O(table size) bytes over
+        the wire per query. On a remote palace of ~141k drawers that is minutes
+        per query and makes hybrid search unusable, so the default path hands
+        the work to Postgres full-text search instead.
+
+        Postgres is used only when ``where`` translates fully to SQL; anything
+        broader (``$or``, comparisons, ``$contains``) falls back to the exact
+        local path, as does a server-side failure, so the pushdown can never
+        change or drop results.
+        """
         _validate_where(where)
+        if not _requires_local_filter(where):
+            result = self._lexical_search_fts(query=query, n_results=n_results, where=where)
+            if result is not None:
+                return result
+        return self._lexical_search_local(query=query, n_results=n_results, where=where)
+
+    def _lexical_search_fts(
+        self, *, query: str, n_results: int, where: Optional[dict]
+    ) -> Optional[LexicalResult]:
+        """Postgres FTS arm of :meth:`lexical_search`; ``None`` means fall back."""
+        # Ordered exactly as the local path orders its checks: a closed
+        # collection raises before an empty query short-circuits.
+        self._ensure_open()
+        tokens = _tokenize(query)
+        if not tokens:
+            # No lexeme can match, and an empty tsquery is a syntax error.
+            return LexicalResult(hits=[])
+        if not self._table_exists():
+            if self._marker_exists():
+                raise CollectionNotInitializedError(self._collection_name)
+            return LexicalResult(hits=[])
+        try:
+            rows = self._client.lexical_rows(
+                self._table, tokens=tokens, limit=n_results, where=where
+            )
+        except BackendError:
+            # Fail open to the exact (slow) local path rather than silently
+            # dropping the lexical arm of a hybrid search.
+            logger.debug("pgvector FTS lexical search failed; falling back", exc_info=True)
+            return None
+        hits = [
+            LexicalHit(
+                id=row["id"],
+                document=row["document"],
+                metadata=row["metadata"],
+                score=row["score"],
+            )
+            for row in rows
+            # ``metadata @> ...`` is broader than the exact _matches_where
+            # contract for array/object values, so the filter is re-applied
+            # here exactly as the local path applies it.
+            if row["score"] > 0 and _matches_where(row["metadata"], where)
+        ]
+        return LexicalResult(hits=hits)
+
+    def _lexical_search_local(
+        self, *, query: str, n_results: int, where: Optional[dict]
+    ) -> LexicalResult:
+        """Exact client-side BM25 over a full scroll — the fallback path."""
         pushdown = None if _requires_local_filter(where) else where
         rows = self._scroll(where=pushdown, with_embedding=False)
         rows = [row for row in rows if _matches_where(row["metadata"], where)]

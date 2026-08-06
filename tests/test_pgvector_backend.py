@@ -5,6 +5,8 @@ import threading
 import types
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from _backend_conformance import assert_partition_isolation
 
@@ -26,6 +28,10 @@ from mempalace.backends.pgvector import (
     _as_vector_array,
     _strip_nul,
     _json_dumps,
+    _tokenize,
+    _escape_tsquery_token,
+    _tsquery_or,
+    _fts_index_name,
 )
 
 
@@ -45,6 +51,7 @@ class _FakePgVectorClient:
         self.query_calls: list = []
         self.scroll_calls: list = []
         self.facet_calls: list = []
+        self.lexical_calls: list = []
         _FakePgVectorClient.instances.append(self)
 
     def ping(self):
@@ -94,6 +101,36 @@ class _FakePgVectorClient:
             }
             out.append(item)
         return out
+
+    def lexical_rows(self, table, *, tokens, limit, where):
+        """Stand-in for the server-side ``to_tsquery``/``ts_rank_cd`` ranking.
+
+        Mirrors the two properties the real SQL guarantees and the collection
+        relies on: OR semantics over the tokens, and a descending rank where a
+        document matching more of the query outranks one matching less.
+        """
+        self.lexical_calls.append({"tokens": list(tokens), "limit": limit, "where": where})
+        wanted = set(tokens)
+        scored = []
+        for row in self._filtered(table, where):
+            overlap = len(wanted & set(_tokenize(row.get("document") or "")))
+            if overlap:
+                scored.append((float(overlap), row))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return [
+            {
+                "id": row["id"],
+                "document": row["document"],
+                "metadata": row.get("metadata") or {},
+                "embedding": None,
+                "distance": None,
+                "score": score,
+            }
+            for score, row in scored[:limit]
+        ]
+
+    def create_fts_index(self, table):
+        return None
 
     def scroll_rows(
         self,
@@ -1169,3 +1206,331 @@ def test_pgvector_facet_counts_passes_filter_to_sql_layer(tmp_path, fake_pgvecto
     _table, field, where, _limit = client.facet_calls[0]
     assert field == "room"
     assert where == {"wing": "engineering"}
+
+
+# ── Postgres FTS lexical search ────────────────────────────────────────
+
+
+def _capturing_client(monkeypatch):
+    """Real ``_PgVectorClient`` with ``_execute`` stubbed, plus the capture list.
+
+    Exercises the actual SQL-building code without psycopg or a server: every
+    statement and its bound parameters land in ``captured``.
+    """
+    captured = []
+
+    def fake_execute(sql, params=None, *, fetch=False, many=False):
+        captured.append({"sql": sql, "params": list(params or []), "fetch": fetch})
+        return []
+
+    client = _PgVectorClient(_PgVectorConfig(dsn="postgresql://localhost/unused", namespace=None))
+    monkeypatch.setattr(client, "_execute", fake_execute)
+    return client, captured
+
+
+def _unquote_tsquery_lexeme(escaped):
+    """Decode one escaped lexeme the way the Postgres tsquery lexer does.
+
+    Inside single quotes only ``''`` (a literal quote) and ``\\\\`` (a literal
+    backslash) are special; everything else is taken verbatim.
+    """
+    assert escaped.startswith("'") and escaped.endswith("'") and len(escaped) >= 2
+    body = escaped[1:-1]
+    out = []
+    i = 0
+    while i < len(body):
+        pair = body[i : i + 2]
+        if pair in ("''", "\\\\"):
+            out.append(pair[0])
+            i += 2
+        else:
+            out.append(body[i])
+            i += 1
+    return "".join(out)
+
+
+def test_escape_tsquery_token_neutralizes_operators():
+    """tsquery operators inside a token must become part of the lexeme, not syntax.
+
+    ``to_tsquery`` parses its argument as an expression, so an unescaped token
+    would let ``&``/``|``/``!``/``<->``/parens change which rows match — or abort
+    the search with a syntax error.
+    """
+    for raw in ("a&b", "a|b", "!a", "(a)", "a:b", "a:*", "a<->b", "a & b | !c"):
+        escaped = _escape_tsquery_token(raw)
+        assert escaped.startswith("'") and escaped.endswith("'")
+        assert _unquote_tsquery_lexeme(escaped) == raw
+
+
+def test_escape_tsquery_token_doubles_quotes_and_backslashes():
+    assert _escape_tsquery_token("it's") == "'it''s'"
+    assert _escape_tsquery_token("a\\b") == "'a\\\\b'"
+    # The classic break-out attempt: closing the quote to append an operator.
+    assert _escape_tsquery_token("x' | 'y") == "'x'' | ''y'"
+    # A trailing backslash must not escape the closing quote.
+    assert _escape_tsquery_token("x\\") == "'x\\\\'"
+
+
+def test_escape_tsquery_token_handles_non_latin_text():
+    """Arabic and CJK tokens pass through untouched — 'simple' is script-neutral."""
+    for raw in ("ذاكرة", "قصر_الذاكرة", "记忆", "メモリ"):
+        assert _escape_tsquery_token(raw) == f"'{raw}'"
+
+
+@given(st.text(min_size=0, max_size=40))
+def test_escape_tsquery_token_round_trips_any_input(raw):
+    """Any string survives escaping as exactly one lexeme.
+
+    Two properties together mean "cannot inject": the escaped form decodes back
+    to the input, and the quoted body holds no unpaired quote that could end the
+    lexeme early.
+    """
+    escaped = _escape_tsquery_token(raw)
+    assert _unquote_tsquery_lexeme(escaped) == raw
+    body = escaped[1:-1]
+    assert body.replace("''", "").count("'") == 0
+
+
+def test_tsquery_or_joins_tokens_with_or():
+    """OR semantics, not AND: the lexical arm is a recall-oriented candidate pool.
+
+    ``websearch_to_tsquery`` would AND the terms, so a multi-word question would
+    return nothing where the BM25 path it replaces scored every partial match.
+    """
+    assert _tsquery_or(["rareterm", "backend"]) == "'rareterm' | 'backend'"
+    assert _tsquery_or(["solo"]) == "'solo'"
+
+
+def test_tsquery_or_drops_empty_tokens():
+    """An empty quoted lexeme is a tsquery syntax error, so it must never appear."""
+    assert _tsquery_or([]) == ""
+    assert _tsquery_or(["", "kept", ""]) == "'kept'"
+
+
+@given(st.text(max_size=60))
+def test_tsquery_or_from_tokenizer_emits_one_lexeme_per_token(text):
+    tokens = _tokenize(text)
+    built = _tsquery_or(tokens)
+    assert built.count(" | ") == max(len(tokens) - 1, 0)
+    assert not built.endswith("|")
+    # Tokenizer output is \w-only, so nothing needs escaping and every token
+    # appears verbatim inside its own quotes.
+    for token in tokens:
+        assert f"'{token}'" in built
+
+
+def test_lexical_rows_sql_uses_simple_config_and_binds_query():
+    """The pushed-down query must rank server-side with the language-neutral config."""
+    client = _PgVectorClient(_PgVectorConfig(dsn="postgresql://localhost/unused", namespace=None))
+    captured = {}
+
+    def fake_execute(sql, params=None, *, fetch=False, many=False):
+        captured["sql"] = sql
+        captured["params"] = list(params or [])
+        return [("a", "doc", {"wing": "x"}, 0.5)]
+
+    client._execute = fake_execute
+    rows = client.lexical_rows("drawers", tokens=["rareterm", "backend"], limit=7, where=None)
+
+    sql = captured["sql"]
+    assert "to_tsquery('simple', %s)" in sql
+    assert "ts_rank_cd(to_tsvector('simple', document), q)" in sql
+    # Must match the indexed expression verbatim or the GIN index is not used.
+    assert "to_tsvector('simple', document) @@ q" in sql
+    assert "ORDER BY score DESC LIMIT %s" in sql
+    assert 'FROM "drawers"' in sql
+    assert "english" not in sql
+    # tsquery first, LIMIT last — the SQL text order.
+    assert captured["params"] == ["'rareterm' | 'backend'", 7]
+    assert rows == [
+        {
+            "id": "a",
+            "document": "doc",
+            "metadata": {"wing": "x"},
+            "embedding": None,
+            "distance": None,
+            "score": 0.5,
+        }
+    ]
+
+
+def test_lexical_rows_binds_where_between_query_and_limit():
+    """Pushdown filters bind as JSONB containment, ordered as they appear in the SQL."""
+    client = _PgVectorClient(_PgVectorConfig(dsn="postgresql://localhost/unused", namespace=None))
+    captured = {}
+
+    def fake_execute(sql, params=None, *, fetch=False, many=False):
+        captured["sql"] = sql
+        captured["params"] = list(params or [])
+        return []
+
+    client._execute = fake_execute
+    client.lexical_rows("drawers", tokens=["alpha"], limit=3, where={"wing": "project"})
+
+    assert "metadata @> %s::jsonb" in captured["sql"]
+    assert captured["params"] == ["'alpha'", _json_dumps({"wing": "project"}), 3]
+
+
+def test_create_table_also_creates_fts_gin_index(monkeypatch):
+    """Fresh collections get the FTS index automatically — no manual migration."""
+    client, captured = _capturing_client(monkeypatch)
+    client.create_table("mempalace_abc_drawers", 384)
+
+    statements = [item["sql"] for item in captured]
+    assert any(sql.startswith("CREATE TABLE IF NOT EXISTS") for sql in statements)
+    index_sql = [sql for sql in statements if sql.startswith("CREATE INDEX IF NOT EXISTS")]
+    assert len(index_sql) == 1
+    assert "USING gin (to_tsvector('simple', document))" in index_sql[0]
+    assert '"mempalace_abc_drawers_fts_idx"' in index_sql[0]
+    assert 'ON "mempalace_abc_drawers"' in index_sql[0]
+
+
+def test_fts_index_name_is_table_scoped_and_length_clamped():
+    """Two collections must not collide on one index name (both live in pg_class)."""
+    assert _fts_index_name("t_one") != _fts_index_name("t_two")
+    assert _fts_index_name("t_one") == "t_one_fts_idx"
+
+    long_a = "mempalace_" + "a" * 60
+    long_b = "mempalace_" + "a" * 59 + "b"
+    for name in (_fts_index_name(long_a), _fts_index_name(long_b)):
+        assert len(name.encode("utf-8")) <= 63
+    # Clamping hashes the overflow instead of truncating into a collision.
+    assert _fts_index_name(long_a) != _fts_index_name(long_b)
+    assert _fts_index_name(long_a) != long_a
+
+
+def test_create_fts_index_failure_does_not_break_table_creation():
+    """The index is a performance asset; a role that cannot build it still works."""
+    client = _PgVectorClient(_PgVectorConfig(dsn="postgresql://localhost/unused", namespace=None))
+    seen = []
+
+    def fake_execute(sql, params=None, *, fetch=False, many=False):
+        seen.append(sql)
+        if sql.startswith("CREATE INDEX"):
+            raise BackendError("permission denied")
+        return []
+
+    client._execute = fake_execute
+    client.create_table("drawers", 2)  # must not raise
+    assert any(sql.startswith("CREATE INDEX") for sql in seen)
+
+
+def test_lexical_search_pushes_down_instead_of_scrolling(tmp_path, fake_pgvector):
+    """The default path must never pull the table to the client."""
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a", "b", "c"],
+        documents=[
+            "alpha backend note",
+            "rareterm pgvector backend note",
+            "frontend design note",
+        ],
+        metadatas=[{"wing": "project"}, {"wing": "project"}, {"wing": "other"}],
+        embeddings=[[1, 0], [0.9, 0.1], [0, 1]],
+    )
+    client = fake_pgvector.instances[0]
+    client.scroll_calls.clear()
+
+    hits = col.lexical_search(query="rareterm backend", n_results=5, where={"wing": "project"}).hits
+
+    assert [hit.id for hit in hits] == ["b", "a"]
+    assert client.scroll_calls == [], "lexical search must not scroll the table"
+    assert client.lexical_calls == [
+        {"tokens": ["rareterm", "backend"], "limit": 5, "where": {"wing": "project"}}
+    ]
+
+
+def test_lexical_search_falls_back_for_non_pushdown_filter(tmp_path, fake_pgvector):
+    """A filter SQL cannot express keeps the exact client-side path."""
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a", "b"],
+        documents=["alpha backend note", "rareterm backend note"],
+        metadatas=[{"wing": "project", "rank": 1}, {"wing": "project", "rank": 3}],
+        embeddings=[[1, 0], [0.9, 0.1]],
+    )
+    client = fake_pgvector.instances[0]
+    client.scroll_calls.clear()
+
+    hits = col.lexical_search(query="backend", n_results=5, where={"rank": {"$gt": 1}}).hits
+
+    assert [hit.id for hit in hits] == ["b"]
+    assert client.lexical_calls == [], "$gt is not pushdown-safe"
+    assert client.scroll_calls, "fallback path scrolls"
+
+
+def test_lexical_search_falls_back_when_postgres_fails(tmp_path, fake_pgvector, monkeypatch):
+    """A server-side failure must degrade to the slow path, not drop the arm.
+
+    Dropping it would silently halve hybrid search recall, which is worse than
+    being slow.
+    """
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a", "b"],
+        documents=["alpha backend note", "rareterm backend note"],
+        metadatas=[{"wing": "project"}, {"wing": "project"}],
+        embeddings=[[1, 0], [0.9, 0.1]],
+    )
+    client = fake_pgvector.instances[0]
+
+    def boom(*_args, **_kwargs):
+        raise BackendError("to_tsquery: syntax error")
+
+    monkeypatch.setattr(client, "lexical_rows", boom)
+    client.scroll_calls.clear()
+
+    hits = col.lexical_search(query="rareterm backend", n_results=5).hits
+
+    assert [hit.id for hit in hits] == ["b", "a"]
+    assert client.scroll_calls, "failure must fall back to the client-side scan"
+
+
+def test_lexical_search_empty_query_issues_no_sql(tmp_path, fake_pgvector):
+    """No token means no match, so neither a tsquery nor a scroll is worth sending."""
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a"],
+        documents=["alpha backend note"],
+        metadatas=[{"wing": "project"}],
+        embeddings=[[1, 0]],
+    )
+    client = fake_pgvector.instances[0]
+    client.scroll_calls.clear()
+
+    for query in ("", "   ", "!!!", "a"):  # single chars are below the token floor
+        assert col.lexical_search(query=query, n_results=5).hits == []
+
+    assert client.lexical_calls == []
+    assert client.scroll_calls == []
+
+
+def test_lexical_search_matches_arabic_and_cjk(tmp_path, fake_pgvector):
+    """A mixed-script palace is the reason the config is 'simple', not 'english'."""
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["ar", "cjk", "en"],
+        documents=["قصر الذاكرة يحفظ كلماتك", "记忆 宫殿", "memory palace note"],
+        metadatas=[{"wing": "p"}, {"wing": "p"}, {"wing": "p"}],
+        embeddings=[[1, 0], [0, 1], [0.5, 0.5]],
+    )
+
+    assert [hit.id for hit in col.lexical_search(query="الذاكرة", n_results=5).hits] == ["ar"]
+    assert [hit.id for hit in col.lexical_search(query="记忆", n_results=5).hits] == ["cjk"]
+    # And the tokens reach SQL quoted, not mangled.
+    assert _tsquery_or(_tokenize("الذاكرة")) == "'الذاكرة'"
+
+
+def test_lexical_search_raises_when_table_missing_but_marker_exists(tmp_path, fake_pgvector):
+    """Same not-initialized contract as the scan path it replaces."""
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a"],
+        documents=["alpha backend note"],
+        metadatas=[{"wing": "project"}],
+        embeddings=[[1, 0]],
+    )
+    fake_pgvector.instances[0].tables.clear()  # marker on disk, table gone
+
+    with pytest.raises(CollectionNotInitializedError):
+        col.lexical_search(query="backend", n_results=5)

@@ -25,7 +25,7 @@ from mempalace.backends import (
     DimensionMismatchError,
     PalaceRef,
 )
-from mempalace.backends.pgvector import PgVectorBackend
+from mempalace.backends.pgvector import PgVectorBackend, _fts_index_name
 
 LIVE_DSN = os.environ.get("MEMPALACE_PGVECTOR_LIVE_DSN")
 
@@ -339,3 +339,56 @@ def test_live_analyze_maintenance(live, tmp_path):
     col.upsert(ids=["a"], documents=["one"], metadatas=[{}], embeddings=[[1, 0]])
     result = col.run_maintenance("analyze")
     assert result.status == "ran"
+
+
+def test_live_fts_index_created_with_table(live, tmp_path):
+    """A fresh collection carries the GIN index the lexical query needs.
+
+    The index expression must match the query expression character for
+    character, or Postgres silently plans a sequential scan and the pushdown
+    buys nothing.
+    """
+    _backend, make, _ns = live
+    col = make(tmp_path)
+    col.upsert(ids=["a"], documents=["one"], metadatas=[{}], embeddings=[[1, 0]])
+
+    rows = col._client._execute(
+        "SELECT indexdef FROM pg_indexes WHERE schemaname = current_schema() "
+        "AND tablename = %s AND indexname = %s",
+        [col._table, _fts_index_name(col._table)],
+        fetch=True,
+    )
+    assert rows, "create_table must build the FTS index"
+    indexdef = rows[0][0].lower()
+    assert "gin" in indexdef
+    # Postgres renders the config as 'simple'::regconfig in indexdef.
+    assert "to_tsvector('simple'" in indexdef and "document" in indexdef
+
+
+def test_live_lexical_search_is_multilingual_and_injection_proof(live, tmp_path):
+    """The live tsquery must survive non-Latin text and tsquery metacharacters.
+
+    'simple' is the whole reason an Arabic drawer is findable at all; the
+    escaping is the reason a query full of operators returns nothing instead of
+    raising a syntax error or matching everything.
+    """
+    _backend, make, _ns = live
+    col = make(tmp_path)
+    col.add(
+        ids=["ar", "cjk", "en"],
+        documents=["قصر الذاكرة يحفظ كلماتك", "记忆 宫殿", "memory palace note"],
+        metadatas=[{"wing": "p"}, {"wing": "p"}, {"wing": "p"}],
+        embeddings=[[1, 0], [0, 1], [0.5, 0.5]],
+    )
+
+    assert [h.id for h in col.lexical_search(query="الذاكرة", n_results=5).hits] == ["ar"]
+    assert [h.id for h in col.lexical_search(query="记忆", n_results=5).hits] == ["cjk"]
+    # OR semantics: one query, hits from two languages.
+    mixed = {h.id for h in col.lexical_search(query="الذاكرة 记忆", n_results=5).hits}
+    assert mixed == {"ar", "cjk"}
+    # Operators and quotes are lexeme content, not syntax: every one of these
+    # parses as a plain OR of its word tokens instead of raising or negating.
+    assert [h.id for h in col.lexical_search(query="!memory", n_results=5).hits] == ["en"]
+    assert [h.id for h in col.lexical_search(query="x' | 'memory", n_results=5).hits] == ["en"]
+    for hostile in ("memory & !palace", "a:*", "a <-> b", "'", "\\"):
+        col.lexical_search(query=hostile, n_results=5)
