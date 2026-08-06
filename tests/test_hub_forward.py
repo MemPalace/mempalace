@@ -34,6 +34,7 @@ def _mine_args(source_dir, **overrides):
         backend=None,
         global_backend=None,
         mode="convos",
+        source=None,
         wing=None,
         no_gitignore=False,
         include_ignored=None,
@@ -281,6 +282,7 @@ class TestForwardability:
             (dict(no_gitignore=True), []),
             (dict(max_chunks_per_file=10), []),
             (dict(backend="qdrant"), []),
+            (dict(source="ndjson"), []),
             (dict(), ["*.log"]),
         ],
     )
