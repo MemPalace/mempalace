@@ -120,6 +120,9 @@ pgvector = ["psycopg[binary]>=3.1"]
 gpu = ["onnxruntime-gpu>=1.16"]
 dml = ["onnxruntime-directml>=1.16"]
 coreml = ["onnxruntime>=1.16"]
+# Optional: lets --clamp-embedding-tokens read the embeddinggemma ONNX
+# graph's embed_tokens row count. Not required for normal embeddinggemma use.
+clamp = ["onnx>=1.14"]
 # Multilingual extra kept as a no-op alias for back-compat with
 # `pip install mempalace[multilingual]` — these deps now ship in core.
 multilingual = []

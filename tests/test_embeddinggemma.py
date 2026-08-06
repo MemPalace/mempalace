@@ -118,6 +118,106 @@ def patched_lazy_load(monkeypatch):
     return calls
 
 
+def _write_synthetic_embed_graph(tmp_path, quantized: bool):
+    """Build a tiny ONNX file shaped like embeddinggemma's embed_tokens lookup.
+
+    ``quantized=False`` mirrors the fp32 export (Gather reads the weight
+    initializer directly). ``quantized=True`` mirrors the q8 export used by
+    mempalace (Gather reads a DequantizeLinear output, one hop away from the
+    real weight initializer) — see #2114.
+    """
+    onnx = pytest.importorskip("onnx")
+    from onnx import TensorProto, helper
+
+    input_ids = helper.make_tensor_value_info("input_ids", TensorProto.INT64, ["batch", "seq"])
+    attention_mask = helper.make_tensor_value_info(
+        "attention_mask", TensorProto.INT64, ["batch", "seq"]
+    )
+
+    if quantized:
+        weight_q = helper.make_tensor(
+            "model.embed_tokens.weight_quantized", TensorProto.INT8, [500, 8], [0] * 4000
+        )
+        scale = helper.make_tensor("model.embed_tokens.weight_scale", TensorProto.FLOAT, [1], [1.0])
+        zero_point = helper.make_tensor(
+            "model.embed_tokens.weight_zero_point", TensorProto.INT8, [1], [0]
+        )
+        dequant = helper.make_node(
+            "DequantizeLinear",
+            [
+                "model.embed_tokens.weight_quantized",
+                "model.embed_tokens.weight_scale",
+                "model.embed_tokens.weight_zero_point",
+            ],
+            ["model.embed_tokens.weight_dequantized_tensor"],
+            name="/model/embed_tokens/DequantizeLinear",
+        )
+        gather = helper.make_node(
+            "Gather",
+            ["model.embed_tokens.weight_dequantized_tensor", "input_ids"],
+            ["embedded"],
+            name="/model/embed_tokens/Gather",
+        )
+        nodes = [dequant, gather]
+        initializers = [weight_q, scale, zero_point]
+    else:
+        weight = helper.make_tensor(
+            "model.embed_tokens.weight", TensorProto.FLOAT, [1000, 8], [0.0] * 8000
+        )
+        gather = helper.make_node(
+            "Gather",
+            ["model.embed_tokens.weight", "input_ids"],
+            ["embedded"],
+            name="/model/embed_tokens/Gather",
+        )
+        nodes = [gather]
+        initializers = [weight]
+
+    output = helper.make_tensor_value_info("embedded", TensorProto.FLOAT, ["batch", "seq", 8])
+    graph = helper.make_graph(
+        nodes, "g", [input_ids, attention_mask], [output], initializer=initializers
+    )
+    model = helper.make_model(graph, producer_name="mempalace-test")
+    path = str(tmp_path / "synthetic.onnx")
+    onnx.save_model(model, path)
+    return path
+
+
+def test_resolve_embed_tokens_row_count_direct_initializer(tmp_path):
+    """fp32-style export: Gather reads the weight initializer directly."""
+    path = _write_synthetic_embed_graph(tmp_path, quantized=False)
+    assert embedding._resolve_embed_tokens_row_count(path) == 1000
+
+
+def test_resolve_embed_tokens_row_count_dequantize_hop(tmp_path):
+    """q8-style export (mempalace's actual model): one DequantizeLinear hop
+    between the Gather and the real weight initializer (#2114)."""
+    path = _write_synthetic_embed_graph(tmp_path, quantized=True)
+    assert embedding._resolve_embed_tokens_row_count(path) == 500
+
+
+def test_resolve_embed_tokens_row_count_none_without_onnx_package(monkeypatch):
+    """The optional 'onnx' package (mempalace[clamp]) may not be installed —
+    resolution must degrade to None, not raise."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "onnx":
+            raise ImportError("no onnx")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    assert embedding._resolve_embed_tokens_row_count("/nonexistent.onnx") is None
+
+
+def test_resolve_embed_tokens_row_count_none_for_bad_path():
+    """A missing/unparseable file must degrade to None, not raise."""
+    pytest.importorskip("onnx")
+    assert embedding._resolve_embed_tokens_row_count("/nonexistent/path.onnx") is None
+
+
 def test_name_is_stable():
     """ChromaDB persists this on the collection — changing it breaks reads."""
     assert embedding.EmbeddinggemmaONNX.name() == "embeddinggemma_300m"
@@ -307,6 +407,117 @@ def test_bad_document_is_skipped_not_fatal(patched_lazy_load, monkeypatch):
     assert np.allclose(arr[1], 0.0)
     assert np.allclose(np.linalg.norm(arr[0]), 1.0, atol=1e-5)
     assert np.allclose(np.linalg.norm(arr[2]), 1.0, atol=1e-5)
+
+
+def test_clamp_token_ids_off_by_default():
+    """The opt-in flag (#2114) must default to False on the constructor."""
+    ef = embedding.EmbeddinggemmaONNX()
+    assert ef._clamp_token_ids is False
+    assert ef._embed_rows is None
+
+
+def test_clamp_disabled_still_uses_retry_and_skip(patched_lazy_load, monkeypatch):
+    """With clamp_token_ids=False (default), an out-of-range id must still
+    hit the pre-existing per-document retry-and-skip fallback, unchanged."""
+    fake_session_cls = _make_fake_session()
+
+    class _PoisonedSession(fake_session_cls):
+        def run(self, output_names, feed):
+            ids = feed["input_ids"]
+            if (ids >= 500).any():
+                raise RuntimeError("INVALID_ARGUMENT: Gather index out of bounds")
+            return super().run(output_names, feed)
+
+    import onnxruntime
+
+    monkeypatch.setattr(onnxruntime, "InferenceSession", lambda *a, **kw: _PoisonedSession())
+
+    class _OutOfRangeTokenizer(_FakeTokenizer):
+        def encode_batch(self, texts):
+            class _Enc:
+                def __init__(self, tid, n):
+                    self.ids = [tid] * n
+                    self.attention_mask = [1] * n
+
+            max_len = max(len(t.split()) for t in texts)
+            return [_Enc(999 if "poison" in t else 0, max_len) for t in texts]
+
+    import tokenizers
+
+    monkeypatch.setattr(
+        tokenizers.Tokenizer, "from_file", staticmethod(lambda _p: _OutOfRangeTokenizer())
+    )
+
+    ef = embedding.EmbeddinggemmaONNX(clamp_token_ids=False)
+    out = ef(["poison doc", "good doc"])
+
+    arr = np.asarray(out)
+    assert np.allclose(arr[0], 0.0), "unclamped poisoned doc must fall back to zero-vector"
+    assert np.allclose(np.linalg.norm(arr[1]), 1.0, atol=1e-5)
+
+
+def test_clamp_enabled_avoids_retry_and_returns_real_embedding(patched_lazy_load, monkeypatch):
+    """With clamp_token_ids=True and a resolvable row count (#2114), an
+    out-of-range id must be clamped before session.run() — the poisoned
+    document gets a real embedding, and the batched run never raises (so
+    the per-document retry path is never triggered)."""
+    monkeypatch.setattr(embedding, "_resolve_embed_tokens_row_count", lambda path: 500)
+
+    fake_session_cls = _make_fake_session()
+    run_calls = []
+
+    class _StrictSession(fake_session_cls):
+        def run(self, output_names, feed):
+            ids = feed["input_ids"]
+            run_calls.append(ids.copy())
+            if (ids >= 500).any() or (ids < 0).any():
+                raise RuntimeError("INVALID_ARGUMENT: Gather index out of bounds")
+            return super().run(output_names, feed)
+
+    import onnxruntime
+
+    monkeypatch.setattr(onnxruntime, "InferenceSession", lambda *a, **kw: _StrictSession())
+
+    class _OutOfRangeTokenizer(_FakeTokenizer):
+        def encode_batch(self, texts):
+            class _Enc:
+                def __init__(self, tid, n):
+                    self.ids = [tid] * n
+                    self.attention_mask = [1] * n
+
+            max_len = max(len(t.split()) for t in texts)
+            # 999 mirrors <image_soft_token>'s id landing past embed_tokens'
+            # 500-row bound in this synthetic setup.
+            return [_Enc(999 if "poison" in t else 0, max_len) for t in texts]
+
+    import tokenizers
+
+    monkeypatch.setattr(
+        tokenizers.Tokenizer, "from_file", staticmethod(lambda _p: _OutOfRangeTokenizer())
+    )
+
+    ef = embedding.EmbeddinggemmaONNX(clamp_token_ids=True)
+    out = ef(["poison doc", "good doc"])
+
+    assert len(run_calls) == 1, "clamping must avoid the per-document retry pass entirely"
+    assert (run_calls[0] < 500).all(), "ids must be clamped below the row count before run()"
+
+    arr = np.asarray(out)
+    assert np.allclose(np.linalg.norm(arr[0]), 1.0, atol=1e-5), (
+        "clamped poisoned doc must get a real embedding, not the zero-vector fallback"
+    )
+    assert np.allclose(np.linalg.norm(arr[1]), 1.0, atol=1e-5)
+
+
+def test_clamp_enabled_but_row_count_unresolvable_warns_and_skips(patched_lazy_load, monkeypatch):
+    """If embed_tokens row count can't be resolved (no 'onnx' package, or an
+    unexpected graph shape), clamping must be skipped — not raise — leaving
+    the retry-and-skip fallback as the only safety net."""
+    monkeypatch.setattr(embedding, "_resolve_embed_tokens_row_count", lambda path: None)
+
+    ef = embedding.EmbeddinggemmaONNX(clamp_token_ids=True)
+    ef._lazy_load()
+    assert ef._embed_rows is None
 
 
 def test_call_empty_input_returns_empty(patched_lazy_load):

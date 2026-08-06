@@ -185,6 +185,38 @@ def test_embedding_threads_invalid_falls_back_to_auto(tmp_path, monkeypatch):
     assert cfg.embedding_threads == 2
 
 
+def test_embedding_clamp_token_ids_default_off(tmp_path, monkeypatch):
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_CLAMP_TOKEN_IDS", raising=False)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.embedding_clamp_token_ids is False
+
+
+def test_embedding_clamp_token_ids_from_config(tmp_path, monkeypatch):
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_CLAMP_TOKEN_IDS", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"embedding_clamp_token_ids": True}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.embedding_clamp_token_ids is True
+
+
+def test_embedding_clamp_token_ids_env_overrides_config(tmp_path, monkeypatch):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"embedding_clamp_token_ids": True}, f)
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_CLAMP_TOKEN_IDS", "false")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.embedding_clamp_token_ids is False
+
+
+def test_embedding_clamp_token_ids_env_truthy_values(tmp_path, monkeypatch):
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    for value in ("true", "1", "yes", "TRUE"):
+        monkeypatch.setenv("MEMPALACE_EMBEDDING_CLAMP_TOKEN_IDS", value)
+        assert cfg.embedding_clamp_token_ids is True, f"expected True for {value!r}"
+    for value in ("false", "0", "no", ""):
+        monkeypatch.setenv("MEMPALACE_EMBEDDING_CLAMP_TOKEN_IDS", value)
+        assert cfg.embedding_clamp_token_ids is False, f"expected False for {value!r}"
+
+
 def test_sqlite_read_uri_opens_path_with_spaces(tmp_path):
     """sqlite_read_uri must open a read-only DB whose path contains spaces,
     which a bare f"file:{path}?mode=ro" mis-parses (especially on Windows)."""

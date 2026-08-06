@@ -551,6 +551,9 @@ def cmd_mine(args):
     for raw in args.include_ignored or []:
         include_ignored.extend(part.strip() for part in raw.split(",") if part.strip())
 
+    if getattr(args, "clamp_embedding_tokens", False):
+        os.environ["MEMPALACE_EMBEDDING_CLAMP_TOKEN_IDS"] = "true"
+
     if getattr(args, "background", False) and not getattr(args, "daemon", False):
         print("mempalace: --background requires --daemon", file=sys.stderr)
         sys.exit(2)
@@ -568,6 +571,7 @@ def cmd_mine(args):
             "include_ignored": include_ignored,
             "max_chunks_per_file": getattr(args, "max_chunks_per_file", None),
             "redetect_origin": getattr(args, "redetect_origin", False),
+            "clamp_embedding_tokens": getattr(args, "clamp_embedding_tokens", False),
         }
         _submit_daemon_cli_job("mine", payload, args, background=getattr(args, "background", False))
         return
@@ -1872,6 +1876,17 @@ def main():
             f"summary counter. Default {_CLI_MAX_CHUNKS_PER_FILE_DEFAULT} "
             f"(or MEMPALACE_MAX_CHUNKS_PER_FILE). Set 0 to disable. Lower this on "
             f"Windows if you hit ONNX bad_alloc (#1455)."
+        ),
+    )
+    p_mine.add_argument(
+        "--clamp-embedding-tokens",
+        action="store_true",
+        help=(
+            "With embedding_model=embeddinggemma, clamp token ids past the model's "
+            "embed_tokens row count (e.g. Gemma's <image_soft_token>) to the last "
+            "valid row instead of skipping the document. Default: off (or "
+            "MEMPALACE_EMBEDDING_CLAMP_TOKEN_IDS). Requires the optional 'onnx' "
+            "package (mempalace[clamp]); a no-op without it."
         ),
     )
 

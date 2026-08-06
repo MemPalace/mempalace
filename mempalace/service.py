@@ -19,11 +19,12 @@ from .config import MempalaceConfig
 _EXPLICIT_BACKEND_ENV = "MEMPALACE_BACKEND_EXPLICIT"
 _PALACE_PATH_ENV = "MEMPALACE_PALACE_PATH"
 _BACKEND_ENV = "MEMPALACE_BACKEND"
+_CLAMP_TOKEN_IDS_ENV = "MEMPALACE_EMBEDDING_CLAMP_TOKEN_IDS"
 # Env vars a job may mutate via _apply_backend / palace_path injection. They are
 # snapshotted per job and restored afterward so a job that switches the backend
 # (e.g. qdrant) cannot poison every later job in the same daemon process —
 # including mcp_tool jobs, which read MempalaceConfig (and thus the leaked env).
-_PER_JOB_ENV = (_PALACE_PATH_ENV, _BACKEND_ENV, _EXPLICIT_BACKEND_ENV)
+_PER_JOB_ENV = (_PALACE_PATH_ENV, _BACKEND_ENV, _EXPLICIT_BACKEND_ENV, _CLAMP_TOKEN_IDS_ENV)
 
 
 READ_TOOLS = frozenset(
@@ -147,6 +148,8 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
     )
     os.environ["MEMPALACE_PALACE_PATH"] = palace_path
     _apply_backend(payload.get("backend"))
+    if payload.get("clamp_embedding_tokens"):
+        os.environ[_CLAMP_TOKEN_IDS_ENV] = "true"
 
     source = payload.get("source") or payload.get("dir")
     mode = payload.get("mode") or "projects"

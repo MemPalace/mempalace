@@ -121,7 +121,7 @@ def test_get_embedding_function_threads_cap_passed_to_embeddinggemma(monkeypatch
     captured = {}
 
     class DummyGemma:
-        def __init__(self, preferred_providers=None, intra_op_num_threads=0):
+        def __init__(self, preferred_providers=None, intra_op_num_threads=0, clamp_token_ids=False):
             captured["threads"] = intra_op_num_threads
 
     monkeypatch.setattr(embedding, "EmbeddinggemmaONNX", DummyGemma)
@@ -182,6 +182,55 @@ def test_minilm_ef_model_override_falls_back_when_uncapped(monkeypatch):
     # Upstream leaves intra_op at ORT's default (0 = unset), confirming we
     # deferred to it rather than applying our cap.
     assert captured["sess_options"].intra_op_num_threads == 0
+
+
+def test_get_embedding_function_clamp_token_ids_passed_to_embeddinggemma(monkeypatch):
+    """The resolved config setting (#2114) must reach the EF constructor."""
+    captured = {}
+
+    class DummyGemma:
+        def __init__(self, preferred_providers=None, intra_op_num_threads=0, clamp_token_ids=False):
+            captured["clamp_token_ids"] = clamp_token_ids
+
+    monkeypatch.setattr(embedding, "EmbeddinggemmaONNX", DummyGemma)
+    monkeypatch.setattr(
+        embedding, "_resolve_providers", lambda device: (["CPUExecutionProvider"], "cpu")
+    )
+    monkeypatch.setattr(embedding, "_resolve_clamp_token_ids", lambda: True)
+
+    embedding.get_embedding_function("cpu", "embeddinggemma")
+
+    assert captured["clamp_token_ids"] is True
+
+
+def test_cache_key_separates_clamp_token_ids_setting(monkeypatch):
+    """A cached EF built with clamp off must not be served once clamp turns on.
+
+    Without ``clamp_token_ids`` in the cache key, a config change mid-process
+    (e.g. between two mine runs in the same daemon) would silently keep
+    serving the stale EF instance.
+    """
+    build_count = {"n": 0}
+
+    class DummyGemma:
+        def __init__(self, preferred_providers=None, intra_op_num_threads=0, clamp_token_ids=False):
+            build_count["n"] += 1
+            self.clamp_token_ids = clamp_token_ids
+
+    monkeypatch.setattr(embedding, "EmbeddinggemmaONNX", DummyGemma)
+    monkeypatch.setattr(
+        embedding, "_resolve_providers", lambda device: (["CPUExecutionProvider"], "cpu")
+    )
+
+    monkeypatch.setattr(embedding, "_resolve_clamp_token_ids", lambda: False)
+    off = embedding.get_embedding_function("cpu", "embeddinggemma")
+
+    monkeypatch.setattr(embedding, "_resolve_clamp_token_ids", lambda: True)
+    on = embedding.get_embedding_function("cpu", "embeddinggemma")
+
+    assert build_count["n"] == 2, "clamp on/off must not share a cache entry"
+    assert off.clamp_token_ids is False
+    assert on.clamp_token_ids is True
 
 
 def test_describe_device_uses_resolved_effective_device(monkeypatch):

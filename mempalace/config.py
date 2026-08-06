@@ -794,6 +794,31 @@ class MempalaceConfig:
             return max(1, (os.cpu_count() or 2) // 2)
         return val if val > 0 else 0
 
+    @property
+    def embedding_clamp_token_ids(self) -> bool:
+        """Whether to clamp out-of-range token ids before ``session.run()`` (#2114).
+
+        Only affects the ``embeddinggemma`` ONNX embedder. Off by default: a
+        document that tokenizes to an id past the model's ``embed_tokens`` row
+        count (e.g. Gemma's ``<image_soft_token>`` in the text-only ONNX
+        export) already falls back to a per-document retry-and-skip so one
+        poisoned document can't abort the whole mine. Turning this on instead
+        clamps the id to the last valid row before the forward pass, so the
+        affected document gets a (lossy) embedding instead of a zero vector.
+
+        Requires the optional ``onnx`` package to read the embedding matrix's
+        row count from the ONNX graph (``pip install mempalace[clamp]``);
+        without it, this setting is a no-op and the retry-and-skip fallback
+        remains in effect.
+
+        Read from env ``MEMPALACE_EMBEDDING_CLAMP_TOKEN_IDS`` first, then
+        ``embedding_clamp_token_ids`` in ``config.json``, then ``False``.
+        """
+        env_val = os.environ.get("MEMPALACE_EMBEDDING_CLAMP_TOKEN_IDS")
+        if env_val is not None:
+            return env_val.strip().lower() not in ("", "false", "0", "no")
+        return bool(self._file_config.get("embedding_clamp_token_ids", False))
+
     def set_embedding_model(self, model: str) -> None:
         """Persist the embedding-model choice to ``config.json``.
 

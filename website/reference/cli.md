@@ -52,6 +52,7 @@ mempalace mine <dir> --wing myapp
 | `--extract` | `exchange` | `exchange` or `general` (for convos mode) |
 | `--no-gitignore` | — | Don't respect .gitignore |
 | `--include-ignored` | — | Always scan these paths even if ignored |
+| `--clamp-embedding-tokens` | off | Clamp out-of-range embeddinggemma token ids instead of skipping the document (requires `mempalace[clamp]`) |
 
 ## `mempalace search`
 

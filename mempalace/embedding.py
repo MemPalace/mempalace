@@ -142,6 +142,17 @@ def _resolve_intra_op_threads() -> int:
         return 0
 
 
+def _resolve_clamp_token_ids() -> bool:
+    """Read the configured embed_tokens clamping setting (default off)."""
+    try:
+        from .config import MempalaceConfig
+
+        return MempalaceConfig().embedding_clamp_token_ids
+    except Exception:
+        logger.debug("embedding_clamp_token_ids resolution failed; defaulting off", exc_info=True)
+        return False
+
+
 def _build_ef_class():
     """Subclass ``ONNXMiniLM_L6_V2`` with name ``"default"``.
 
@@ -220,6 +231,56 @@ _EMBEDDINGGEMMA_MAX_LEN = 2048
 _EMBEDDINGGEMMA_BATCH_SIZE = 32
 
 
+def _resolve_embed_tokens_row_count(model_path: str) -> Optional[int]:
+    """Return the row count (vocab size) of the model's token-embedding matrix.
+
+    Finds the ``Gather`` node that reads directly from a graph input (the
+    ``input_ids`` embedding lookup) and returns the row count of whichever
+    initializer feeds its data operand, resolving through one quantize/
+    dequantize hop if present (the quantized export Gathers from
+    ``*.weight_quantized`` rather than ``*.weight`` directly). Parses graph
+    metadata only — ``load_external_data=False`` skips the multi-hundred-MB
+    weight blobs, so this is cheap even though the model itself is large.
+
+    Requires the optional ``onnx`` package (``pip install mempalace[clamp]``).
+    Returns ``None`` if it isn't installed or the graph doesn't match the
+    expected shape — callers must treat that as "row count unknown" and
+    skip clamping rather than fail.
+    """
+    try:
+        import onnx
+    except ImportError:
+        return None
+    try:
+        graph = onnx.load(model_path, load_external_data=False).graph
+        input_names = {i.name for i in graph.input}
+        gather = next(
+            (
+                n
+                for n in graph.node
+                if n.op_type == "Gather" and len(n.input) > 1 and n.input[1] in input_names
+            ),
+            None,
+        )
+        if gather is None:
+            return None
+        name_to_init = {init.name: init for init in graph.initializer}
+        init = name_to_init.get(gather.input[0])
+        if init is None:
+            # Quantized export: the Gather's data operand is produced by a
+            # DequantizeLinear (or similar) node, not an initializer directly.
+            # Its first initializer input is the actual weight matrix.
+            producer = next((n for n in graph.node if gather.input[0] in n.output), None)
+            if producer is not None:
+                init = next((name_to_init[i] for i in producer.input if i in name_to_init), None)
+        if init is None or len(init.dims) == 0:
+            return None
+        return int(init.dims[0])
+    except Exception:
+        logger.debug("embed_tokens row-count resolution failed", exc_info=True)
+        return None
+
+
 class EmbeddinggemmaONNX:
     """ChromaDB-compatible EF using embeddinggemma-300m ONNX (q8, MRL→384d).
 
@@ -246,6 +307,7 @@ class EmbeddinggemmaONNX:
         preferred_providers=None,
         batch_size: int = _EMBEDDINGGEMMA_BATCH_SIZE,
         intra_op_num_threads: int = 0,
+        clamp_token_ids: bool = False,
     ):
         if batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {batch_size}")
@@ -254,10 +316,16 @@ class EmbeddinggemmaONNX:
         )
         self._batch_size = batch_size
         self._intra_op_num_threads = intra_op_num_threads
+        # Opt-in: clamp out-of-range token ids before session.run() instead
+        # of relying solely on the per-document retry-and-skip in __call__.
+        self._clamp_token_ids = clamp_token_ids
         self._session = None
         self._tokenizer = None
         self._np = None
         self._output_idx = None
+        # Resolved lazily alongside the session; None means clamping is
+        # skipped (not requested, or the row count couldn't be resolved).
+        self._embed_rows: Optional[int] = None
         # Instances are shared across threads via _EF_CACHE; serialize the
         # one-time model load so concurrent cold calls cannot build (and
         # transiently hold) two full model sessions.
@@ -313,6 +381,15 @@ class EmbeddinggemmaONNX:
             self._output_idx = output_idx
             self._tokenizer = tokenizer
             self._np = np
+            if self._clamp_token_ids:
+                rows = _resolve_embed_tokens_row_count(model_path)
+                if rows is None:
+                    logger.warning(
+                        "clamp_token_ids requested but embed_tokens row count could not "
+                        "be resolved (is the 'onnx' package installed? see "
+                        "mempalace[clamp]) — falling back to per-document skip on error."
+                    )
+                self._embed_rows = rows
             # Session is assigned last: the unlocked fast path above treats a
             # non-None session as "fully loaded", so every other attribute
             # must already be in place when it becomes visible.
@@ -328,6 +405,12 @@ class EmbeddinggemmaONNX:
         encs = self._tokenizer.encode_batch(texts)
         input_ids = np.asarray([e.ids for e in encs], dtype=np.int64)
         attention_mask = np.asarray([e.attention_mask for e in encs], dtype=np.int64)
+        if self._embed_rows is not None:
+            # Land any id past the last embed_tokens row (e.g. Gemma's
+            # <image_soft_token>) on the last valid row instead of letting
+            # Gather raise. Lossy, but keeps the rest of the sub-batch out
+            # of the per-document retry path below.
+            np.clip(input_ids, 0, self._embed_rows - 1, out=input_ids)
         outputs = self._session.run(
             None, {"input_ids": input_ids, "attention_mask": attention_mask}
         )
@@ -404,7 +487,8 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
             model = cfg.embedding_model
 
     providers, effective = _resolve_providers(device)
-    cache_key = (model, tuple(providers))
+    clamp_token_ids = _resolve_clamp_token_ids()
+    cache_key = (model, tuple(providers), clamp_token_ids)
     cached = _EF_CACHE.get(cache_key)  # lock-free fast path; dict.get is GIL-atomic
     if cached is not None:
         return cached
@@ -415,7 +499,11 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
 
         threads = _resolve_intra_op_threads()
         if model == "embeddinggemma":
-            ef = EmbeddinggemmaONNX(preferred_providers=providers, intra_op_num_threads=threads)
+            ef = EmbeddinggemmaONNX(
+                preferred_providers=providers,
+                intra_op_num_threads=threads,
+                clamp_token_ids=clamp_token_ids,
+            )
         else:
             # Default: minilm (or anything we don't recognize — back-compat win).
             ef_cls = _build_ef_class()

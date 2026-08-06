@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- **Opt-in clamp for out-of-range embeddinggemma token ids.** `mempalace mine --clamp-embedding-tokens` (or `embedding_clamp_token_ids` in `config.json` / `MEMPALACE_EMBEDDING_CLAMP_TOKEN_IDS`) clamps token ids past the model's `embed_tokens` row count (e.g. Gemma's `<image_soft_token>`) to the last valid row before `session.run()`, so the affected document gets a real embedding instead of falling through to the zero-vector, per-document skip fallback. Off by default; requires the optional `onnx` package (`pip install mempalace[clamp]`) to read the row count from the ONNX graph. (#2114)
+
 ---
 
 ## [3.6.0] — 2026-07-14
