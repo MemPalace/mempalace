@@ -678,6 +678,7 @@ class _PgVectorClient:
         with_document: bool = True,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
+        order_field: Optional[str] = None,
     ) -> list[dict]:
         qi = _quote_identifier(table)
         params: list = []
@@ -695,7 +696,21 @@ class _PgVectorClient:
         # primary key gives OFFSET a stable order (an unordered scan may skip
         # or repeat rows across pages); callers that scroll the whole table
         # pass neither bound, leaving their SQL unchanged.
-        if limit is not None or offset:
+        if order_field is not None:
+            # Newest-first on an ISO-8601 metadata field. ISO-8601 sorts
+            # chronologically as text, so ``metadata->>field DESC`` needs no
+            # timestamp cast (a cast would also fail hard on one malformed
+            # value). NULLS LAST keeps records without the field at the end;
+            # ``id`` breaks ties so the order is total and stable.
+            params.append(order_field)
+            sql += " ORDER BY metadata->>%s DESC NULLS LAST, id"
+            if limit is not None:
+                params.append(int(limit))
+                sql += " LIMIT %s"
+            if offset:
+                params.append(int(offset))
+                sql += " OFFSET %s"
+        elif limit is not None or offset:
             sql += " ORDER BY id"
             if limit is not None:
                 params.append(int(limit))
@@ -893,6 +908,7 @@ class PgVectorCollection(BaseCollection):
         with_document=True,
         limit=None,
         offset=None,
+        order_field=None,
     ) -> list[dict]:
         self._ensure_open()
         if not self._table_exists():
@@ -906,6 +922,7 @@ class PgVectorCollection(BaseCollection):
             with_document=with_document,
             limit=limit,
             offset=offset,
+            order_field=order_field,
         )
 
     def get_all_metadata(self, where=None) -> list[dict]:
@@ -1194,6 +1211,42 @@ class PgVectorCollection(BaseCollection):
             embeddings=[row["embedding"] or [] for row in rows] if spec.embeddings else None,
         )
 
+    def get_recent(self, *, limit, where=None, order_field="filed_at", include=None):
+        """Newest-first fetch with the ordering pushed into SQL.
+
+        The base implementation scans a window in storage order and sorts it
+        locally, so on a collection larger than ``limit`` the genuinely newest
+        records can be missing from the window entirely (#1630). Postgres can
+        do the whole thing: ``ORDER BY metadata->>'filed_at' DESC ... LIMIT n``
+        is exact at any table size, which is why this backend advertises
+        ``supports_recency_order``.
+
+        Filters that ``metadata @> ...`` cannot express exactly fall back to
+        the local post-filter path (same correctness contract as ``get``), and
+        there the SQL order is still applied before the filter, so the result
+        is the newest ``limit`` rows *that match* only when the pushdown was
+        exact. The inexact case re-sorts locally after filtering.
+        """
+        if limit is not None and limit <= 0:
+            return GetResult.empty()
+        _validate_where(where)
+        spec = _IncludeSpec.resolve(include, default_distances=False)
+        local_filter = _requires_local_filter(where)
+        rows = self._scroll(
+            where=None if local_filter else where,
+            with_embedding=spec.embeddings,
+            limit=None if local_filter else limit,
+            order_field=order_field,
+        )
+        if local_filter:
+            rows = [row for row in rows if _matches_where(row["metadata"], where)][:limit]
+        return GetResult(
+            ids=[row["id"] for row in rows],
+            documents=[row["document"] for row in rows] if spec.documents else [],
+            metadatas=[row["metadata"] for row in rows] if spec.metadatas else [],
+            embeddings=[row["embedding"] or [] for row in rows] if spec.embeddings else None,
+        )
+
     def delete(self, *, ids=None, where=None):
         _validate_where(where)
         if not self._table_exists():
@@ -1336,6 +1389,7 @@ class PgVectorBackend(BaseBackend):
             "supports_metadata_filters",
             "supports_lexical_search",
             "supports_metadata_facets",
+            "supports_recency_order",
             "supports_namespace_isolation",
             "supports_server_side_indexes",
             "server_mode",

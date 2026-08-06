@@ -3,6 +3,7 @@
 import os
 from unittest.mock import MagicMock, patch
 
+from mempalace.backends.base import BaseCollection, GetResult
 from mempalace.layers import Layer0, Layer1, Layer2, Layer3, MemoryStack
 
 
@@ -71,13 +72,26 @@ def test_layer0_default_path():
 
 
 def _mock_chromadb_for_layer(docs, metas, monkeypatch=None):
-    """Return a mock collection whose get() returns docs/metas."""
+    """Return a mock collection whose get() returns docs/metas.
+
+    ``get_recent`` is bound to the ``BaseCollection`` default, so the double
+    behaves like a backend that has the capability but no storage-side
+    ordering: it pages through ``get`` and sorts the window locally.
+    """
     mock_col = MagicMock()
     # First batch returns data, second batch returns empty (end of pagination)
     mock_col.get.side_effect = [
         {"documents": docs, "metadatas": metas},
         {"documents": [], "metadatas": []},
     ]
+    mock_col.get_recent = lambda **kwargs: BaseCollection.get_recent(mock_col, **kwargs)
+    return mock_col
+
+
+def _mock_legacy_collection():
+    """A collection double predating ``get_recent`` (third-party backend)."""
+    mock_col = MagicMock()
+    del mock_col.get_recent
     return mock_col
 
 
@@ -114,7 +128,7 @@ def test_layer1_generates_essential_story():
 
 
 def test_layer1_empty_palace():
-    mock_col = MagicMock()
+    mock_col = _mock_legacy_collection()
     mock_col.get.return_value = {"documents": [], "metadatas": []}
     with (
         patch("mempalace.layers.MempalaceConfig") as mock_cfg,
@@ -224,7 +238,7 @@ def test_layer1_breaks_importance_ties_by_filed_at_recency():
 
 def test_layer1_batch_exception_breaks():
     """If col.get raises on a batch, loop breaks gracefully."""
-    mock_col = MagicMock()
+    mock_col = _mock_legacy_collection()
     mock_col.get.side_effect = [
         {"documents": ["doc1"], "metadatas": [{"room": "r"}]},
         RuntimeError("batch error"),
@@ -238,6 +252,198 @@ def test_layer1_batch_exception_breaks():
         result = layer.generate()
 
     assert "ESSENTIAL STORY" in result
+
+
+# ── Layer1 — recency fetch (capable backend vs scan fallback) ───────────
+
+
+def test_layer1_uses_backend_recency_capability():
+    """A backend with recency pushdown is asked for the newest window, not a scan."""
+    calls = {}
+
+    mock_col = MagicMock()
+
+    def fake_get_recent(*, limit, where=None, order_field="filed_at", include=None):
+        calls["limit"] = limit
+        calls["where"] = where
+        calls["order_field"] = order_field
+        return GetResult(
+            ids=["b", "a"],
+            documents=["The newest memory we filed today.", "An older memory from last year."],
+            metadatas=[
+                {"room": "moments", "filed_at": "2026-03-01T00:00:00Z"},
+                {"room": "moments", "filed_at": "2026-01-01T00:00:00Z"},
+            ],
+        )
+
+    mock_col.get_recent = fake_get_recent
+
+    with (
+        patch("mempalace.layers.MempalaceConfig") as mock_cfg,
+        patch("mempalace.layers._get_collection", return_value=mock_col),
+    ):
+        mock_cfg.return_value.palace_path = "/fake"
+        result = Layer1(palace_path="/fake").generate()
+
+    assert calls["limit"] == Layer1.MAX_SCAN
+    assert calls["order_field"] == "filed_at"
+    assert calls["where"] is None
+    # The capability answered, so the paging scan never ran.
+    mock_col.get.assert_not_called()
+    assert result.index("The newest memory") < result.index("An older memory")
+
+
+def test_layer1_recency_capability_receives_wing_filter():
+    captured = {}
+
+    mock_col = MagicMock()
+
+    def fake_get_recent(*, limit, where=None, order_field="filed_at", include=None):
+        captured["where"] = where
+        return GetResult(
+            ids=["a"],
+            documents=["A wing-scoped memory from the project."],
+            metadatas=[{"room": "r"}],
+        )
+
+    mock_col.get_recent = fake_get_recent
+
+    with (
+        patch("mempalace.layers.MempalaceConfig") as mock_cfg,
+        patch("mempalace.layers._get_collection", return_value=mock_col),
+    ):
+        mock_cfg.return_value.palace_path = "/fake"
+        Layer1(palace_path="/fake", wing="my_project").generate()
+
+    assert captured["where"] == {"wing": "my_project"}
+
+
+def test_layer1_falls_back_to_scan_when_capability_missing():
+    """Collections predating get_recent still wake up via the paged scan."""
+    mock_col = _mock_legacy_collection()
+    mock_col.get.side_effect = [
+        {
+            "documents": ["Legacy memory from a collection with no capability."],
+            "metadatas": [{"room": "r"}],
+        },
+        {"documents": [], "metadatas": []},
+    ]
+    with (
+        patch("mempalace.layers.MempalaceConfig") as mock_cfg,
+        patch("mempalace.layers._get_collection", return_value=mock_col),
+    ):
+        mock_cfg.return_value.palace_path = "/fake"
+        result = Layer1(palace_path="/fake").generate()
+
+    assert "Legacy memory" in result
+    assert mock_col.get.called
+
+
+def test_layer1_falls_back_to_scan_when_capability_raises():
+    """A backend error inside get_recent degrades to the scan, not to an empty L1."""
+    mock_col = MagicMock()
+    mock_col.get_recent.side_effect = RuntimeError("server said no")
+    mock_col.get.side_effect = [
+        {
+            "documents": ["Scanned memory recovered after the backend errored."],
+            "metadatas": [{"room": "r"}],
+        },
+        {"documents": [], "metadatas": []},
+    ]
+    with (
+        patch("mempalace.layers.MempalaceConfig") as mock_cfg,
+        patch("mempalace.layers._get_collection", return_value=mock_col),
+    ):
+        mock_cfg.return_value.palace_path = "/fake"
+        result = Layer1(palace_path="/fake").generate()
+
+    assert "Scanned memory" in result
+
+
+def _oversized_palace():
+    """A palace larger than MAX_SCAN whose newest drawer is filed last.
+
+    Storage order is oldest-first, so the newest drawer sits beyond the
+    MAX_SCAN window a scan-and-sort fetch can see (#1630 known limitation).
+    """
+    total = Layer1.MAX_SCAN + 5
+    docs = [f"Backfill drawer {i} from the original mine." for i in range(total - 1)]
+    docs.append("The newest session: we shipped the recency fetch and verified it.")
+    metas = [{"room": "r", "filed_at": f"2020-01-0{i % 9 + 1}T00:00:00Z"} for i in range(total - 1)]
+    metas.append({"room": "r", "filed_at": "2026-08-06T00:00:00Z"})
+    return docs, metas
+
+
+class _StorageOrderCollection(BaseCollection):
+    """Collection with no recency pushdown — inherits the BaseCollection default."""
+
+    def __init__(self, docs, metas):
+        self._docs = docs
+        self._metas = metas
+
+    def add(self, **kwargs): ...
+
+    def upsert(self, **kwargs): ...
+
+    def query(self, **kwargs): ...
+
+    def delete(self, **kwargs): ...
+
+    def count(self):
+        return len(self._docs)
+
+    def get(self, *, limit=None, offset=None, **kwargs):
+        start = offset or 0
+        end = start + (limit if limit is not None else len(self._docs))
+        return GetResult(
+            ids=[str(i) for i in range(start, min(end, len(self._docs)))],
+            documents=self._docs[start:end],
+            metadatas=self._metas[start:end],
+        )
+
+
+class _RecencyOrderCollection(_StorageOrderCollection):
+    """Collection that pushes the ordering into storage, like pgvector does."""
+
+    def get_recent(self, *, limit, where=None, order_field="filed_at", include=None):
+        order = sorted(
+            range(len(self._docs)),
+            key=lambda i: self._metas[i].get(order_field, ""),
+            reverse=True,
+        )[:limit]
+        return GetResult(
+            ids=[str(i) for i in order],
+            documents=[self._docs[i] for i in order],
+            metadatas=[self._metas[i] for i in order],
+        )
+
+
+def _generate_l1(col):
+    with (
+        patch("mempalace.layers.MempalaceConfig") as mock_cfg,
+        patch("mempalace.layers._get_collection", return_value=col),
+    ):
+        mock_cfg.return_value.palace_path = "/fake"
+        return Layer1(palace_path="/fake").generate()
+
+
+def test_layer1_capable_backend_surfaces_newest_beyond_scan_window():
+    """With pushdown, the newest drawer leads wake-up even past MAX_SCAN rows."""
+    docs, metas = _oversized_palace()
+    result = _generate_l1(_RecencyOrderCollection(docs, metas))
+    assert "The newest session" in result
+
+
+def test_layer1_scan_fallback_is_capped_at_max_scan():
+    """Without pushdown the window is still MAX_SCAN rows — the documented limit."""
+    docs, metas = _oversized_palace()
+    col = _StorageOrderCollection(docs, metas)
+    with patch("mempalace.layers.MempalaceConfig") as mock_cfg:
+        mock_cfg.return_value.palace_path = "/fake"
+        fetched_docs, _ = Layer1(palace_path="/fake")._fetch_candidates(col)
+    assert len(fetched_docs) == Layer1.MAX_SCAN
+    # The drawer filed beyond the window is exactly what a capable backend fixes.
+    assert "The newest session: we shipped the recency fetch and verified it." not in fetched_docs
 
 
 # ── Layer2 — mocked chromadb ────────────────────────────────────────────

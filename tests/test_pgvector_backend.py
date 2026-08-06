@@ -17,6 +17,7 @@ from mempalace.backends import (
     available_backends,
 )
 from mempalace.backends.base import UnsupportedCapabilityError
+from mempalace.backends.base import recency_sort_key as _recency_sort_key
 from mempalace.backends.pgvector import (
     PgVectorBackend,
     _PgVectorClient,
@@ -104,12 +105,33 @@ class _FakePgVectorClient:
         with_document=True,
         limit=None,
         offset=None,
+        order_field=None,
     ):
         self.scroll_calls.append(
-            {"where": where, "limit": limit, "offset": offset, "with_document": with_document}
+            {
+                "where": where,
+                "limit": limit,
+                "offset": offset,
+                "with_document": with_document,
+                "order_field": order_field,
+            }
         )
         rows = self._filtered(table, where)
-        if limit is not None or offset:
+        if order_field is not None:
+            # Mirror the real backend: ORDER BY metadata->>field DESC NULLS
+            # LAST, id — then LIMIT/OFFSET. Sorting by id first and then
+            # stable-sorting by the recency key reproduces that tiebreak.
+            rows = sorted(rows, key=lambda row: row["id"])
+            rows = sorted(
+                rows,
+                key=lambda row: _recency_sort_key(row.get("metadata") or {}, order_field),
+                reverse=True,
+            )
+            if offset:
+                rows = rows[offset:]
+            if limit is not None:
+                rows = rows[:limit]
+        elif limit is not None or offset:
             # Mirror the real backend: ORDER BY id, then LIMIT/OFFSET.
             rows = sorted(rows, key=lambda row: row["id"])
             if offset:
@@ -418,7 +440,9 @@ def test_pgvector_get_unfiltered_page_pushes_limit_offset(tmp_path, fake_pgvecto
 
     # An unfiltered page is pushed to SQL as LIMIT/OFFSET instead of fetching
     # the whole table and slicing in Python (the O(rows x pages) path).
-    assert client.scroll_calls == [{"where": None, "limit": 2, "offset": 1, "with_document": True}]
+    assert client.scroll_calls == [
+        {"where": None, "limit": 2, "offset": 1, "with_document": True, "order_field": None}
+    ]
     # ORDER BY id, then OFFSET 1 LIMIT 2 -> b, c.
     assert page.ids == ["b", "c"]
 
@@ -439,7 +463,13 @@ def test_pgvector_get_filtered_page_stays_on_full_scan(tmp_path, fake_pgvector):
     # A filtered get keeps the full-scan path (no LIMIT/OFFSET pushed) so the
     # exact _matches_where re-filter runs before pagination.
     assert client.scroll_calls == [
-        {"where": {"wing": "x"}, "limit": None, "offset": None, "with_document": True}
+        {
+            "where": {"wing": "x"},
+            "limit": None,
+            "offset": None,
+            "with_document": True,
+            "order_field": None,
+        }
     ]
     assert page.ids == ["c"]
 
@@ -458,7 +488,7 @@ def test_pgvector_get_offset_only_and_limit_only_push(tmp_path, fake_pgvector):
     client.scroll_calls.clear()
     page = col.get(offset=2, include=["metadatas"])
     assert client.scroll_calls == [
-        {"where": None, "limit": None, "offset": 2, "with_document": True}
+        {"where": None, "limit": None, "offset": 2, "with_document": True, "order_field": None}
     ]
     assert page.ids == ["c", "d"]
 
@@ -466,7 +496,7 @@ def test_pgvector_get_offset_only_and_limit_only_push(tmp_path, fake_pgvector):
     client.scroll_calls.clear()
     page = col.get(limit=2, include=["metadatas"])
     assert client.scroll_calls == [
-        {"where": None, "limit": 2, "offset": None, "with_document": True}
+        {"where": None, "limit": 2, "offset": None, "with_document": True, "order_field": None}
     ]
     assert page.ids == ["a", "b"]
 
@@ -486,7 +516,7 @@ def test_pgvector_get_negative_bounds_use_python_slice(tmp_path, fake_pgvector):
     # through to the unchanged full-scan + Python-slice path.
     page = col.get(offset=-1, include=["metadatas"])
     assert client.scroll_calls == [
-        {"where": None, "limit": None, "offset": None, "with_document": True}
+        {"where": None, "limit": None, "offset": None, "with_document": True, "order_field": None}
     ]
     assert page.ids == ["c"]
 
@@ -537,7 +567,7 @@ def test_pgvector_get_all_metadata_skips_document_column(tmp_path, fake_pgvector
 
     # Exactly one scroll, with_document=False (no document text on the wire).
     assert client.scroll_calls == [
-        {"where": None, "limit": None, "offset": None, "with_document": False}
+        {"where": None, "limit": None, "offset": None, "with_document": False, "order_field": None}
     ]
     # Returns just the metadata dicts (full set, any order — sort by wing+room for stability).
     metas_sorted = sorted(metas, key=lambda m: (m["wing"], m["room"]))
@@ -571,9 +601,149 @@ def test_pgvector_get_all_metadata_filtered_uses_fast_path(tmp_path, fake_pgvect
     # Exactly one scroll with with_document=False — pushdown forwards the
     # equality filter to SQL; no document text on the wire.
     assert client.scroll_calls == [
-        {"where": {"wing": "x"}, "limit": None, "offset": None, "with_document": False}
+        {
+            "where": {"wing": "x"},
+            "limit": None,
+            "offset": None,
+            "with_document": False,
+            "order_field": None,
+        }
     ]
     assert sorted(metas, key=lambda m: m["wing"]) == [{"wing": "x"}, {"wing": "x"}]
+
+
+def _fill_for_recency(col):
+    col.add(
+        ids=["old", "new", "middle", "undated"],
+        documents=["oldest drawer", "newest drawer", "middle drawer", "undated drawer"],
+        metadatas=[
+            {"wing": "x", "filed_at": "2024-01-01T00:00:00Z"},
+            {"wing": "y", "filed_at": "2026-08-06T00:00:00Z"},
+            {"wing": "x", "filed_at": "2025-05-05T00:00:00Z"},
+            {"wing": "x"},
+        ],
+        embeddings=[[1, 0], [0, 1], [0.5, 0.5], [0.2, 0.8]],
+    )
+
+
+def test_pgvector_advertises_recency_order_capability():
+    assert "supports_recency_order" in PgVectorBackend.capabilities
+
+
+def test_pgvector_get_recent_orders_newest_first_in_sql(tmp_path, fake_pgvector):
+    """The ordering is pushed into the scan, so no full table comes back."""
+    _backend, col = _collection(tmp_path)
+    _fill_for_recency(col)
+    client = fake_pgvector.instances[0]
+    client.scroll_calls.clear()
+
+    page = col.get_recent(limit=2)
+
+    assert page.ids == ["new", "middle"]
+    assert page.documents == ["newest drawer", "middle drawer"]
+    # One scan, ordered and limited by the database — not a full fetch + slice.
+    assert client.scroll_calls == [
+        {
+            "where": None,
+            "limit": 2,
+            "offset": None,
+            "with_document": True,
+            "order_field": "filed_at",
+        }
+    ]
+
+
+def test_pgvector_get_recent_sorts_missing_field_last(tmp_path, fake_pgvector):
+    _backend, col = _collection(tmp_path)
+    _fill_for_recency(col)
+    assert col.get_recent(limit=10).ids == ["new", "middle", "old", "undated"]
+
+
+def test_pgvector_get_recent_pushes_down_equality_filter(tmp_path, fake_pgvector):
+    _backend, col = _collection(tmp_path)
+    _fill_for_recency(col)
+    client = fake_pgvector.instances[0]
+    client.scroll_calls.clear()
+
+    page = col.get_recent(limit=10, where={"wing": "x"})
+
+    assert page.ids == ["middle", "old", "undated"]
+    assert client.scroll_calls == [
+        {
+            "where": {"wing": "x"},
+            "limit": 10,
+            "offset": None,
+            "with_document": True,
+            "order_field": "filed_at",
+        }
+    ]
+
+
+def test_pgvector_get_recent_local_filter_still_orders(tmp_path, fake_pgvector):
+    """A filter pgvector cannot push exactly falls back to the local post-filter."""
+    _backend, col = _collection(tmp_path)
+    _fill_for_recency(col)
+    client = fake_pgvector.instances[0]
+    client.scroll_calls.clear()
+
+    page = col.get_recent(limit=2, where={"$or": [{"wing": "x"}, {"wing": "y"}]})
+
+    assert page.ids == ["new", "middle"]
+    # No pushdown filter and no SQL LIMIT — the post-filter needs the rows.
+    assert client.scroll_calls == [
+        {
+            "where": None,
+            "limit": None,
+            "offset": None,
+            "with_document": True,
+            "order_field": "filed_at",
+        }
+    ]
+
+
+def test_pgvector_get_recent_honours_include_and_zero_limit(tmp_path, fake_pgvector):
+    _backend, col = _collection(tmp_path)
+    _fill_for_recency(col)
+    page = col.get_recent(limit=1, include=["metadatas"])
+    assert page.ids == ["new"]
+    assert page.documents == []
+    assert page.metadatas == [{"wing": "y", "filed_at": "2026-08-06T00:00:00Z"}]
+    assert col.get_recent(limit=0).ids == []
+
+
+def test_pgvector_get_recent_custom_order_field(tmp_path, fake_pgvector):
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a", "b"],
+        documents=["written first", "written second"],
+        metadatas=[
+            {"filed_at": "2026-01-01T00:00:00Z", "authored_at": "2020-01-01T00:00:00Z"},
+            {"filed_at": "2025-01-01T00:00:00Z", "authored_at": "2024-01-01T00:00:00Z"},
+        ],
+        embeddings=[[1, 0], [0, 1]],
+    )
+    assert col.get_recent(limit=2, order_field="authored_at").ids == ["b", "a"]
+
+
+def test_pgvector_scroll_rows_sql_orders_by_metadata_field():
+    """The generated SQL orders on the metadata key, with NULLS LAST and an id tiebreak."""
+    captured = {}
+
+    class _Recorder(_PgVectorClient):
+        def __init__(self):  # no connection
+            self._config = None
+
+        def _execute(self, sql, params=None, *, fetch=False, many=False):
+            captured["sql"] = sql
+            captured["params"] = params
+            return []
+
+    _Recorder().scroll_rows("tbl", limit=5, order_field="filed_at")
+
+    assert "ORDER BY metadata->>%s DESC NULLS LAST, id" in captured["sql"]
+    assert "LIMIT %s" in captured["sql"]
+    # Positional binding order matches the SQL text order: order key, then limit.
+    assert captured["params"] == ["filed_at", 5]
 
 
 def test_pgvector_delete_by_where_pushdown_and_local(tmp_path, fake_pgvector):

@@ -354,6 +354,30 @@ class LexicalResult:
     hits: list[LexicalHit]
 
 
+def recency_sort_key(meta: Optional[dict], order_field: str = "filed_at") -> tuple[int, str]:
+    """Sort key for newest-first ordering on an ISO-8601 metadata field.
+
+    Returns ``(1, value)`` for a usable timestamp string and ``(0, "")``
+    otherwise, so that with ``reverse=True`` records missing the field sort
+    last instead of raising on a str/None comparison. Backends that implement
+    :meth:`BaseCollection.get_recent` with a local sort MUST use this key so
+    every backend orders identically.
+    """
+    value = (meta or {}).get(order_field)
+    if not isinstance(value, str) or not value:
+        return (0, "")
+    return (1, value)
+
+
+def _recency_order(metadatas: list[dict], order_field: str) -> list[int]:
+    """Indices into ``metadatas``, newest first, missing timestamps last."""
+    return sorted(
+        range(len(metadatas)),
+        key=lambda i: recency_sort_key(metadatas[i], order_field),
+        reverse=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Collection contract
 # ---------------------------------------------------------------------------
@@ -503,6 +527,74 @@ class BaseCollection(ABC):
                 break
             offset += len(batch_meta)
         return all_meta
+
+    def get_recent(
+        self,
+        *,
+        limit: int,
+        where: Optional[dict] = None,
+        order_field: str = "filed_at",
+        include: Optional[list[str]] = None,
+    ) -> GetResult:
+        """Return up to ``limit`` records, newest first by ``order_field``.
+
+        ``order_field`` names a metadata key holding an ISO-8601 timestamp
+        string (``filed_at`` for drawers). Ordering is descending on that
+        string, which is chronological for ISO-8601. Records whose value is
+        missing, empty, or not a string sort last.
+
+        The default implementation pages through :meth:`get` in storage order
+        up to ``limit`` records and sorts that window locally. That is exact
+        for a collection no larger than ``limit`` and *approximate* above it:
+        the window is whatever the backend hands back first, so the genuinely
+        newest records can fall outside it (issue #1630's known limitation for
+        Layer 1 wake-up). Backends able to push the ordering into storage MUST
+        override this and advertise the ``supports_recency_order`` capability
+        token, which promises exactness at any collection size.
+
+        Callers that need the guarantee should check the token rather than
+        assume it; the default is always available so no backend breaks.
+        """
+        if limit <= 0:
+            return GetResult.empty()
+        include = ["documents", "metadatas"] if include is None else list(include)
+
+        ids: list[str] = []
+        documents: list[str] = []
+        metadatas: list[dict] = []
+        offset = 0
+        fetched = 0
+        page_size = min(500, limit)
+        while fetched < limit:
+            kwargs: dict = {"include": include, "limit": page_size, "offset": offset}
+            if where:
+                kwargs["where"] = where
+            batch = self.get(**kwargs)
+            batch_ids = list(batch.get("ids") or [])
+            batch_docs = list(batch.get("documents") or [])
+            batch_metas = list(batch.get("metadatas") or [])
+            page_len = max(len(batch_ids), len(batch_docs), len(batch_metas))
+            if not page_len:
+                break
+            # Pad the projections the caller did not request so the three
+            # lists stay index-aligned for the sort below.
+            ids.extend(batch_ids or [""] * page_len)
+            documents.extend(batch_docs or [""] * page_len)
+            metadatas.extend(batch_metas or [{}] * page_len)
+            offset += page_len
+            fetched += page_len
+            if page_len < page_size:
+                break
+
+        n = min(len(ids), len(documents), len(metadatas))
+        ids, documents, metadatas = ids[:n], documents[:n], metadatas[:n]
+        order = _recency_order(metadatas, order_field)[:limit]
+        return GetResult(
+            ids=[ids[i] for i in order],
+            documents=[documents[i] for i in order],
+            metadatas=[metadatas[i] for i in order],
+            embeddings=None,
+        )
 
     def facet_counts(
         self,

@@ -468,6 +468,113 @@ def test_base_collection_update_default_rejects_mismatched_lengths():
         BaseCollection.update(collection, ids=["1", "2"], metadatas=[{"k": 9}])
 
 
+class _PagedCollection:
+    """Minimal collection exposing only ``get`` with real limit/offset paging."""
+
+    def __init__(self, records):
+        self._records = records
+        self.calls = []
+
+    def get(self, *, ids=None, where=None, limit=None, offset=None, include=None, **kwargs):
+        self.calls.append({"where": where, "limit": limit, "offset": offset, "include": include})
+        rows = self._records
+        if where:
+            rows = [r for r in rows if all(r[1].get(k) == v for k, v in where.items())]
+        start = offset or 0
+        end = start + (limit if limit is not None else len(rows))
+        page = rows[start:end]
+        return GetResult(
+            ids=[r[0] for r in page],
+            documents=[r[2] for r in page],
+            metadatas=[r[1] for r in page],
+        )
+
+
+def _recent(collection, **kwargs):
+    from mempalace.backends.base import BaseCollection
+
+    return BaseCollection.get_recent(collection, **kwargs)
+
+
+def test_base_get_recent_default_sorts_window_newest_first():
+    """The ABC default scans a window and sorts it locally by filed_at."""
+    col = _PagedCollection(
+        [
+            ("a", {"filed_at": "2024-01-01T00:00:00Z"}, "oldest"),
+            ("b", {"filed_at": "2026-08-06T00:00:00Z"}, "newest"),
+            ("c", {"filed_at": "2025-05-05T00:00:00Z"}, "middle"),
+        ]
+    )
+    page = _recent(col, limit=10)
+    assert page.ids == ["b", "c", "a"]
+    assert page.documents == ["newest", "middle", "oldest"]
+
+
+def test_base_get_recent_default_sorts_missing_field_last():
+    col = _PagedCollection(
+        [
+            ("a", {}, "undated"),
+            ("b", {"filed_at": ""}, "empty"),
+            ("c", {"filed_at": 20260806}, "not-a-string"),
+            ("d", {"filed_at": "2025-01-01T00:00:00Z"}, "dated"),
+        ]
+    )
+    assert _recent(col, limit=10).ids[0] == "d"
+    assert set(_recent(col, limit=10).ids[1:]) == {"a", "b", "c"}
+
+
+def test_base_get_recent_default_window_is_capped_at_limit():
+    """The default is approximate above ``limit``: it only sees the first window.
+
+    This is exactly the scan-order limitation documented on #1630 — a backend
+    that can push ORDER BY into storage overrides the method to fix it.
+    """
+    records = [("old%d" % i, {"filed_at": "2020-01-01T00:00:00Z"}, "old") for i in range(1200)]
+    records.append(("newest", {"filed_at": "2026-08-06T00:00:00Z"}, "the newest drawer"))
+    col = _PagedCollection(records)
+
+    page = _recent(col, limit=1000)
+
+    assert len(page.ids) == 1000
+    assert "newest" not in page.ids
+    # Paged in 500-record batches rather than one giant fetch.
+    assert [c["limit"] for c in col.calls] == [500, 500]
+    assert [c["offset"] for c in col.calls] == [0, 500]
+
+
+def test_base_get_recent_default_passes_where_and_zero_limit():
+    col = _PagedCollection(
+        [
+            ("a", {"wing": "x", "filed_at": "2024-01-01T00:00:00Z"}, "x drawer"),
+            ("b", {"wing": "y", "filed_at": "2026-01-01T00:00:00Z"}, "y drawer"),
+        ]
+    )
+    page = _recent(col, limit=10, where={"wing": "x"})
+    assert page.ids == ["a"]
+    assert col.calls[0]["where"] == {"wing": "x"}
+
+    assert _recent(col, limit=0).ids == []
+
+
+def test_base_get_recent_default_accepts_dict_shaped_get():
+    """Collections still returning Chroma-shaped dicts page correctly."""
+
+    class _DictCollection:
+        def get(self, **kwargs):
+            if kwargs.get("offset"):
+                return {"ids": [], "documents": [], "metadatas": []}
+            return {
+                "ids": ["a", "b"],
+                "documents": ["older", "newer"],
+                "metadatas": [
+                    {"filed_at": "2024-01-01T00:00:00Z"},
+                    {"filed_at": "2026-01-01T00:00:00Z"},
+                ],
+            }
+
+    assert _recent(_DictCollection(), limit=5).documents == ["newer", "older"]
+
+
 def test_chroma_backend_accepts_palace_ref_kwarg(tmp_path):
     palace_path = tmp_path / "palace"
     backend = ChromaBackend()
