@@ -253,6 +253,62 @@ def test_batch_size_below_one_is_rejected():
         embedding.EmbeddinggemmaONNX(batch_size=-3)
 
 
+def test_bad_document_is_skipped_not_fatal(patched_lazy_load, monkeypatch):
+    """One document that blows up session.run() must not abort the batch.
+
+    __call__ must retry document-by-document and skip only the offending
+    one — every other document in the batch still gets a real vector.
+    """
+    calls = {"run": 0}
+    fake_session_cls = _make_fake_session()
+
+    class _PoisonedSession(fake_session_cls):
+        def run(self, output_names, feed):
+            calls["run"] += 1
+            batch = feed["input_ids"].shape[0]
+            if batch > 1:
+                # Batched calls always contains poisoned docs. Fail it,
+                # forcing the per-document retry path.
+                raise RuntimeError("INVALID_ARGUMENT: Gather index out of bounds")
+            # Single-document retry: poisoned doc (id 0 in this fixtures
+            # tokenizer) still fails; everything else succeeds.
+            if feed["input_ids"][0][0] == 999:
+                raise RuntimeError("INVALID_ARGUMENT: Gather index out of bounds")
+            return super().run(output_names, feed)
+
+    import onnxruntime
+
+    monkeypatch.setattr(onnxruntime, "InferenceSession", lambda *a, **kw: _PoisonedSession())
+
+    class _PoisonAwareTokenizer(_FakeTokenizer):
+        def encode_batch(self, texts):
+            class _Enc:
+                def __init__(self, tid, n):
+                    self.ids = [tid] * n
+                    self.attention_mask = [1] * n
+
+            max_len = max(len(t.split()) for t in texts)
+            return [_Enc(999 if "poison" in t else 0, max_len) for t in texts]
+
+    import tokenizers
+
+    monkeypatch.setattr(
+        tokenizers.Tokenizer, "from_file", staticmethod(lambda _p: _PoisonAwareTokenizer())
+    )
+
+    ef = embedding.EmbeddinggemmaONNX()
+    out = ef(["good one", "poison doc", "good two"])
+
+    assert len(out) == 3
+    arr = np.asarray(out)
+    assert arr.shape == (3, 384)
+    # The poisoned row is the zero-vector fallback. Good rows are still
+    # unit-normalized real embeddings.
+    assert np.allclose(arr[1], 0.0)
+    assert np.allclose(np.linalg.norm(arr[0]), 1.0, atol=1e-5)
+    assert np.allclose(np.linalg.norm(arr[2]), 1.0, atol=1e-5)
+
+
 def test_call_empty_input_returns_empty(patched_lazy_load):
     """Zero docs must yield zero embeddings without loading the model."""
     ef = embedding.EmbeddinggemmaONNX()

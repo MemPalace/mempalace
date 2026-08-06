@@ -318,6 +318,25 @@ class EmbeddinggemmaONNX:
             # must already be in place when it becomes visible.
             self._session = session
 
+    def _run_batch(self, texts: list[str]) -> list[list[float]]:
+        """Tokenize + ``session.run`` one sub-batch, truncated and L2-normalized.
+
+        Split out of ``__call__`` so it can be retried at batch size 1 (see
+        the per-document fallback there) without duplicating the tensor prep.
+        """
+        np = self._np
+        encs = self._tokenizer.encode_batch(texts)
+        input_ids = np.asarray([e.ids for e in encs], dtype=np.int64)
+        attention_mask = np.asarray([e.attention_mask for e in encs], dtype=np.int64)
+        outputs = self._session.run(
+            None, {"input_ids": input_ids, "attention_mask": attention_mask}
+        )
+        sent_emb = outputs[self._output_idx][:, :_EMBEDDINGGEMMA_DIM]
+        # L2-normalize so cosine similarity == dot product (matches what the
+        # MTEB methodology assumes; ChromaDB's distance is configured for it).
+        norms = np.linalg.norm(sent_emb, axis=1, keepdims=True) + 1e-12
+        return (sent_emb / norms).tolist()
+
     def __call__(self, input: str | list[str] | None) -> list[list[float]]:  # noqa: A002 — ChromaDB EF protocol
         if isinstance(input, str):
             # A bare string would be iterated character by character below,
@@ -329,7 +348,6 @@ class EmbeddinggemmaONNX:
             # sequence is not rejected by ambiguous-truth-value semantics.
             return []
         self._lazy_load()
-        np = self._np
         embeddings: list[list[float]] = []
         # Tokenize and run per sub-batch, not over the whole input: padding
         # is to the longest sequence in the sub-batch, and the ONNX runtime
@@ -338,17 +356,25 @@ class EmbeddinggemmaONNX:
         for start in range(0, len(input), self._batch_size):
             chunk = input[start : start + self._batch_size]
             texts = [_EMBEDDINGGEMMA_PREFIX + t for t in chunk]
-            encs = self._tokenizer.encode_batch(texts)
-            input_ids = np.asarray([e.ids for e in encs], dtype=np.int64)
-            attention_mask = np.asarray([e.attention_mask for e in encs], dtype=np.int64)
-            outputs = self._session.run(
-                None, {"input_ids": input_ids, "attention_mask": attention_mask}
-            )
-            sent_emb = outputs[self._output_idx][:, :_EMBEDDINGGEMMA_DIM]
-            # L2-normalize so cosine similarity == dot product (matches what the
-            # MTEB methodology assumes; ChromaDB's distance is configured for it).
-            norms = np.linalg.norm(sent_emb, axis=1, keepdims=True) + 1e-12
-            embeddings.extend((sent_emb / norms).tolist())
+            try:
+                embeddings.extend(self._run_batch(texts))
+            except Exception:
+                # Token ids past embed_tokens row count, e.g. gemma
+                # <image_soft_token>, makes session.run() raise for the whole
+                # sub-batch (see #2114). Therefore, retry one document at a
+                # time and drop only the offender, so we can still mine the
+                # rest of the batch. Note: ollama (llama-ollama-compat.cpp)
+                # truncates tokenizer arrays for the same class of bugs.
+                for text in texts:
+                    try:
+                        embeddings.extend(self._run_batch([text]))
+                    except Exception:
+                        logger.warning(
+                            "Skipping one document, embedding failed: %.80r",
+                            text,
+                            exc_info=True,
+                        )
+                        embeddings.append([0.0] * _EMBEDDINGGEMMA_DIM)
         return embeddings
 
     def embed_query(self, input: list[str]) -> list[list[float]]:  # noqa: A002 — ChromaDB EF protocol
