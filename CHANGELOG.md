@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Features
+
+- **Kimi Code CLI session import.** `mempalace mine ~/.kimi-code/sessions --mode convos` now parses Kimi Code `wire.jsonl` transcripts. The parser reads the event stream (user turns from `turn.prompt` / `context.append_message` filtered to `origin.kind == "user"`, assistant replies from `content.part` text parts), filters out injection / system-trigger chrome, and dedupes the prompt-vs-message double record. `NORMALIZE_VERSION` bumped to 3 so any previously raw-JSON-ingested Kimi sessions are rebuilt cleanly. (#2180)
+
 ---
 
 ## [3.7.0] — 2026-08-02
