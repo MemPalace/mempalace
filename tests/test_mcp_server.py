@@ -5634,3 +5634,66 @@ def test_ensure_sqlite_integrity_status_joins_inflight_probe(monkeypatch):
         release_probe.set()
         background.join(5)
         consumer_thread.join(5)
+
+
+def test_stdio_loop_pins_utf8_and_lf_newlines(monkeypatch):
+    from mempalace import mcp_server
+
+    class FakeStream:
+        def __init__(self):
+            self.reconfigure_calls = []
+
+        def reconfigure(self, **kwargs):
+            self.reconfigure_calls.append(kwargs)
+
+        def readline(self):
+            return ""
+
+    class FakeThread:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self):
+            pass
+
+    fake_stdin = FakeStream()
+    fake_stdout = FakeStream()
+    monkeypatch.setattr(mcp_server, "_restore_stdout", lambda: None)
+    monkeypatch.setattr(mcp_server.sys, "stdin", fake_stdin)
+    monkeypatch.setattr(mcp_server.sys, "stdout", fake_stdout)
+    monkeypatch.setattr(mcp_server.threading, "Thread", FakeThread)
+    monkeypatch.setattr(mcp_server, "_maybe_eager_warmup_embedder", lambda: None)
+    monkeypatch.setattr(mcp_server, "_start_idle_exit_watchdog", lambda: None)
+
+    mcp_server._run_stdio_loop()
+
+    expected = {"encoding": "utf-8", "errors": "replace", "newline": "\n"}
+    assert fake_stdin.reconfigure_calls == [expected]
+    assert fake_stdout.reconfigure_calls == [expected]
+
+
+def test_stdio_loop_tolerates_reconfigure_without_newline_support(monkeypatch):
+    from mempalace import mcp_server
+
+    class LegacyStream:
+        def reconfigure(self, **kwargs):
+            raise TypeError("newline is not supported")
+
+        def readline(self):
+            return ""
+
+    class FakeThread:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(mcp_server, "_restore_stdout", lambda: None)
+    monkeypatch.setattr(mcp_server.sys, "stdin", LegacyStream())
+    monkeypatch.setattr(mcp_server.sys, "stdout", LegacyStream())
+    monkeypatch.setattr(mcp_server.threading, "Thread", FakeThread)
+    monkeypatch.setattr(mcp_server, "_maybe_eager_warmup_embedder", lambda: None)
+    monkeypatch.setattr(mcp_server, "_start_idle_exit_watchdog", lambda: None)
+
+    mcp_server._run_stdio_loop()
