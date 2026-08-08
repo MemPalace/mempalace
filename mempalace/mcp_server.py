@@ -99,6 +99,7 @@ from .hallways import (  # noqa: E402
 )
 
 from .knowledge_graph import KnowledgeGraph, DEFAULT_KG_PATH  # noqa: E402
+from .kg_store import BaseKGStore  # noqa: E402
 from .collision_scan import assert_no_collisions  # noqa: E402
 from .ids import ID_RECIPE, make_drawer_id_from_content  # noqa: E402
 
@@ -895,7 +896,7 @@ def _canonicalize_kg_path(path: str) -> str:
     return os.path.normcase(os.path.realpath(path))
 
 
-def _get_kg(canonical_path=None) -> KnowledgeGraph:
+def _get_kg(canonical_path=None) -> BaseKGStore:
     """Return the cached ``KnowledgeGraph`` for the resolved palace.
 
     When ``canonical_path`` is ``None`` (default), the path is resolved
@@ -917,7 +918,9 @@ def _get_kg(canonical_path=None) -> KnowledgeGraph:
     with _kg_cache_lock:
         kg = _kg_by_path.get(path)
         if kg is None:
-            kg = KnowledgeGraph(db_path=path)
+            from .kg_store import get_kg_store
+
+            kg = get_kg_store(db_path=path)
             _kg_by_path[path] = kg
     return kg
 

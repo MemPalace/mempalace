@@ -4666,8 +4666,9 @@ class TestStructuredErrors:
         monkeypatch.setattr(mcp_server, "_kg_by_path", cache)
 
         # Second _get_kg() call (after the cache eviction) constructs a new
-        # KG. Patch the constructor so we don't open a real sqlite file.
-        monkeypatch.setattr(mcp_server, "KnowledgeGraph", lambda **_: _FreshKG())
+        # KG via the get_kg_store factory seam. Patch the factory so we
+        # don't open a real sqlite file.
+        monkeypatch.setattr("mempalace.kg_store.get_kg_store", lambda **_: _FreshKG())
 
         result = mcp_server._call_kg(lambda kg: kg.query_entity("Alice"))
         assert result == [{"entity": "Alice"}]
@@ -4692,7 +4693,6 @@ class TestStructuredErrors:
         monkeypatch.setattr(
             mcp_server, "_kg_by_path", {mcp_server._canonicalize_kg_path(path): _FailingKG()}
         )
-        monkeypatch.setattr(mcp_server, "KnowledgeGraph", lambda **_: _FailingKG())
 
         with pytest.raises(ValueError, match="bad input"):
             mcp_server._call_kg(lambda kg: kg.query_entity("Alice"))
@@ -4717,7 +4717,7 @@ class TestStructuredErrors:
 
         cache = {}
         monkeypatch.setattr(mcp_server, "_kg_by_path", cache)
-        monkeypatch.setattr(mcp_server, "KnowledgeGraph", lambda **_: _AlwaysClosedKG())
+        monkeypatch.setattr("mempalace.kg_store.get_kg_store", lambda **_: _AlwaysClosedKG())
 
         with pytest.raises(_sqlite3.ProgrammingError):
             mcp_server._call_kg(lambda kg: kg.query_entity("Alice"))
@@ -4880,7 +4880,7 @@ class TestStructuredErrors:
                 constructed.append(db_path)
 
         monkeypatch.setattr(mcp_server, "_kg_by_path", {})
-        monkeypatch.setattr(mcp_server, "KnowledgeGraph", _StubKG)
+        monkeypatch.setattr("mempalace.kg_store.get_kg_store", _StubKG)
 
         paths = iter([real_db, link_db])
         monkeypatch.setattr(mcp_server, "_resolve_kg_path", lambda: next(paths))
