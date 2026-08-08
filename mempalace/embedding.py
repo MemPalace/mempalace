@@ -1,7 +1,7 @@
 """Embedding function factory with hardware acceleration.
 
 Returns a ChromaDB-compatible embedding function bound to a user-selected
-ONNX Runtime execution provider.
+backend and device.
 
 Two embedding models are available, selected via ``MEMPALACE_EMBEDDING_MODEL``
 or ``embedding_model`` in ``~/.mempalace/config.json``:
@@ -16,17 +16,48 @@ or ``embedding_model`` in ``~/.mempalace/config.json``:
   on an existing palace requires ``mempalace repair rebuild-index``
   (different vector space).
 
+Independently of model choice, the *backend* that runs the model can be
+either ONNX Runtime (default) or, for the ``mps`` device specifically,
+PyTorch + sentence-transformers. Switching backend/device does not
+invalidate an existing palace — the same model weights and vector space
+are used either way.
+
 Supported devices (env ``MEMPALACE_EMBEDDING_DEVICE`` or ``embedding_device``
 in ``~/.mempalace/config.json``):
 
-* ``auto`` — prefer CUDA ▸ CoreML ▸ DirectML, fall back to CPU
-* ``cpu`` — force CPU (the historical default)
+* ``auto`` — prefer ``mps`` ▸ ``cuda`` ▸ ``coreml`` ▸ ``dml``, fall back to CPU
+* ``cpu`` — force ONNX Runtime on CPU (the historical default)
 * ``cuda`` — NVIDIA GPU via ``onnxruntime-gpu`` (``pip install mempalace[gpu]``)
-* ``coreml`` — Apple Neural Engine (macOS)
+* ``coreml`` — Apple Neural Engine via ONNX Runtime CoreML provider (macOS)
 * ``dml`` — DirectML (Windows / AMD / Intel GPUs)
+* ``mps`` — Apple Metal GPU via PyTorch + sentence-transformers
+  (``pip install mempalace[mps]``)
 
-Requesting an unavailable accelerator emits a warning and falls back to CPU
-rather than hard-failing — mining must still work on a laptop without CUDA.
+Why ``mps`` is its own path: on Apple Silicon, ChromaDB's bundled ONNX
+embedding function enables ``CoreMLExecutionProvider`` by default, which
+silently falls back op-by-op to CPU for ``all-MiniLM-L6-v2`` because some
+ops are not yet implemented in CoreML's MLProgram lowering. The resulting
+ANE↔CPU copies cost more than they save (measured 60–256× slowdown vs.
+PyTorch MPS on the same hardware, M5, 200 real chunks). Routing
+``mps`` through sentence-transformers + PyTorch bypasses CoreML
+entirely. The ``coreml`` device is retained for users who want ONNX
+Runtime's CoreML provider explicitly (e.g. on an M1 base where the
+ANE↔CPU thrash is less pronounced).
+
+The ``mps`` and ``cuda``/``coreml``/``dml`` paths produce embeddings that
+differ by ~1e-6 (numerical FP drift between ONNX Runtime and PyTorch
+implementations of the same MiniLM weights). This drift is well below the
+noise floor of cosine retrieval, so backends can be switched on an
+existing palace without re-mining. The HNSW *index* itself is
+order- and value-sensitive, so an index built end-to-end on one backend
+will not be bit-identical to one built on another (graph neighbor lists
+differ); query results stay correct, but exact ``recall@k`` can shift by
+a hit or two between runtimes. Pin ``MEMPALACE_EMBEDDING_DEVICE`` if you
+need strict reproducibility.
+
+Requesting an unavailable accelerator emits a warning and falls back to
+CPU rather than hard-failing — mining must still work on a laptop without
+CUDA, MPS, or CoreML.
 """
 
 from __future__ import annotations
@@ -38,20 +69,33 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# Sentinel returned in the provider list to mark the PyTorch-MPS path.
+# Anything that consumes a (providers, device) pair must treat this as a
+# signal to take the sentence-transformers branch rather than passing the
+# providers through to ONNX Runtime.
+_MPS_SENTINEL = "__mempalace_torch_mps__"
+
 _PROVIDER_MAP = {
     "cpu": ["CPUExecutionProvider"],
     "cuda": ["CUDAExecutionProvider", "CPUExecutionProvider"],
     "coreml": ["CoreMLExecutionProvider", "CPUExecutionProvider"],
     "dml": ["DmlExecutionProvider", "CPUExecutionProvider"],
+    # "mps" is resolved without consulting onnxruntime — the sentinel exists so
+    # cache_key / EF-construction code can stay uniform across backends.
+    "mps": [_MPS_SENTINEL, "CPUExecutionProvider"],
 }
 
 _DEVICE_EXTRA = {
     "cuda": "mempalace[gpu]",
     "coreml": "mempalace[coreml]",
     "dml": "mempalace[dml]",
+    "mps": "mempalace[mps]",
 }
 
-_AUTO_ORDER = [
+# auto-resolution order. MPS is preferred over CoreML on Apple Silicon
+# because sentence-transformers + torch.mps avoids the CoreML op-fallback
+# thrash that pins ``onnx_default`` to ~2 chunks/s on this model.
+_AUTO_ORDER_ONNX = [
     ("CUDAExecutionProvider", "cuda"),
     ("CoreMLExecutionProvider", "coreml"),
     ("DmlExecutionProvider", "dml"),
@@ -65,13 +109,53 @@ _EF_CACHE_LOCK = threading.Lock()
 _WARNED: set = set()
 
 
+def _torch_mps_available() -> bool:
+    """Return True iff PyTorch is installed AND its MPS backend is usable.
+
+    Wrapped in a broad ``except`` because torch can raise platform-specific
+    errors on non-Apple Silicon hosts (NotImplementedError, RuntimeError),
+    and we want a clean False fallback rather than a stack trace.
+    """
+    try:
+        import torch
+
+        return (
+            hasattr(torch.backends, "mps")
+            and torch.backends.mps.is_available()
+            and torch.backends.mps.is_built()
+        )
+    except Exception:
+        return False
+
+
+def _sentence_transformers_available() -> bool:
+    """True iff both ``torch`` and ``sentence_transformers`` import cleanly."""
+    try:
+        import sentence_transformers  # noqa: F401
+        import torch  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
 def _resolve_providers(device: str) -> tuple[list, str]:
     """Return ``(provider_list, effective_device)`` for ``device``.
 
+    For ONNX devices the first element of ``provider_list`` is the
+    onnxruntime provider name. For the ``mps`` device the first element is
+    :data:`_MPS_SENTINEL` and the rest of the system reads ``effective``
+    to take the sentence-transformers branch.
+
     Falls back to CPU (with a one-shot warning) when the requested
-    accelerator is not compiled into the installed ``onnxruntime``.
+    accelerator is not compiled into the installed ``onnxruntime`` or when
+    the optional ``mempalace[mps]`` extra is missing.
     """
     device = (device or "auto").strip().lower()
+
+    # MPS is special: it does not consult onnxruntime providers at all.
+    if device == "mps":
+        return _resolve_mps_or_cpu()
 
     try:
         import onnxruntime as ort
@@ -81,7 +165,12 @@ def _resolve_providers(device: str) -> tuple[list, str]:
         return (["CPUExecutionProvider"], "cpu")
 
     if device == "auto":
-        for provider, name in _AUTO_ORDER:
+        # Prefer MPS on Apple Silicon when the optional extra is installed —
+        # CoreML thrashes on this model, so MPS is materially faster even
+        # though both target the same physical GPU.
+        if _torch_mps_available() and _sentence_transformers_available():
+            return ([_MPS_SENTINEL, "CPUExecutionProvider"], "mps")
+        for provider, name in _AUTO_ORDER_ONNX:
             if provider in available:
                 return ([provider, "CPUExecutionProvider"], name)
         return (["CPUExecutionProvider"], "cpu")
@@ -140,6 +229,28 @@ def _resolve_intra_op_threads() -> int:
     except Exception:
         logger.debug("embedding_threads resolution failed; leaving ORT default", exc_info=True)
         return 0
+
+
+def _resolve_mps_or_cpu() -> tuple[list, str]:
+    """Return MPS providers if torch+MPS+ST available, else warn and fall to CPU."""
+    if not _sentence_transformers_available():
+        if "mps" not in _WARNED:
+            logger.warning(
+                "embedding_device='mps' requested but the optional 'mps' extra "
+                "is not installed — falling back to CPU. Install %s.",
+                _DEVICE_EXTRA["mps"],
+            )
+            _WARNED.add("mps")
+        return (["CPUExecutionProvider"], "cpu")
+    if not _torch_mps_available():
+        if "mps" not in _WARNED:
+            logger.warning(
+                "embedding_device='mps' requested but torch.backends.mps is "
+                "not available on this host — falling back to CPU."
+            )
+            _WARNED.add("mps")
+        return (["CPUExecutionProvider"], "cpu")
+    return ([_MPS_SENTINEL, "CPUExecutionProvider"], "mps")
 
 
 def _build_ef_class():
@@ -447,6 +558,33 @@ class EmbeddinggemmaONNX:
         return self(input)
 
 
+def _build_mps_ef(model_name: str = "all-MiniLM-L6-v2"):
+    """Build a sentence-transformers EF on torch MPS, named ``"default"``.
+
+    The ``name()`` override mirrors :func:`_build_ef_class` — it lets a
+    palace persisted by ChromaDB's bundled default EF reopen with this EF
+    without tripping the 1.x ``Embedding function conflict`` guard. The
+    embeddings produced agree with ONNX Runtime's to ~1e-6 (same MiniLM
+    weights, FP32 vs ANE/MPS arithmetic ordering), well below cosine
+    retrieval's noise floor.
+
+    Only builds ``all-MiniLM-L6-v2`` — there is no sentence-transformers
+    equivalent wired up for ``embeddinggemma`` here (only its ONNX artifact
+    via :class:`EmbeddinggemmaONNX`). Callers must not route
+    ``model="embeddinggemma"`` through this function.
+    """
+    from chromadb.utils.embedding_functions.sentence_transformer_embedding_function import (
+        SentenceTransformerEmbeddingFunction,
+    )
+
+    class _MempalaceMPS(SentenceTransformerEmbeddingFunction):
+        @staticmethod
+        def name() -> str:
+            return "default"
+
+    return _MempalaceMPS(model_name=model_name, device="mps")
+
+
 def get_embedding_function(device: Optional[str] = None, model: Optional[str] = None):
     """Return a cached embedding function for the requested device + model.
 
@@ -465,6 +603,21 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
             model = cfg.embedding_model
 
     providers, effective = _resolve_providers(device)
+
+    if effective == "mps" and model == "embeddinggemma":
+        # _build_mps_ef only has a verified build for all-MiniLM-L6-v2.
+        # Silently taking the mps path here would build MiniLM vectors
+        # under an EF the palace still expects to be embeddinggemma-shaped
+        # — a vector-space correctness bug, not just a missed speedup.
+        # Fall back to embeddinggemma's own (CPU) ONNX path instead.
+        if "mps-embeddinggemma" not in _WARNED:
+            logger.warning(
+                "embedding_device='mps' has no embeddinggemma implementation; "
+                "using CPU for model='embeddinggemma' instead."
+            )
+            _WARNED.add("mps-embeddinggemma")
+        providers, effective = ["CPUExecutionProvider"], "cpu"
+
     cache_key = (model, tuple(providers))
     cached = _EF_CACHE.get(cache_key)  # lock-free fast path; dict.get is GIL-atomic
     if cached is not None:
@@ -477,6 +630,8 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
         threads = _resolve_intra_op_threads()
         if model == "embeddinggemma":
             ef = EmbeddinggemmaONNX(preferred_providers=providers, intra_op_num_threads=threads)
+        elif providers and providers[0] == _MPS_SENTINEL:
+            ef = _build_mps_ef()
         else:
             # Default: minilm (or anything we don't recognize — back-compat win).
             ef_cls = _build_ef_class()
