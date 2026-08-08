@@ -556,6 +556,58 @@ def test_base_get_recent_default_passes_where_and_zero_limit():
     assert _recent(col, limit=0).ids == []
 
 
+def test_base_get_recent_default_honours_include_projection():
+    """Unrequested projections come back empty, as they do from ``get``.
+
+    ``metadatas`` is fetched from the backend regardless because the local
+    sort reads ``order_field`` out of it, but it is only returned when the
+    caller asked for it. Without that, a backend without recency pushdown
+    would answer ``include=["metadatas"]`` with a list of padding strings
+    while pgvector answers with ``[]``.
+    """
+
+    class _ProjectingCollection:
+        """Honours ``include`` the way the real backends do."""
+
+        def __init__(self):
+            self.calls = []
+
+        def get(self, *, include=None, limit=None, offset=None, **kwargs):
+            self.calls.append(list(include or []))
+            if offset:
+                return GetResult(ids=[], documents=[], metadatas=[])
+            keys = set(include or [])
+            return GetResult(
+                ids=["a", "b"],
+                documents=["older", "newer"] if "documents" in keys else [],
+                metadatas=(
+                    [
+                        {"filed_at": "2024-01-01T00:00:00Z"},
+                        {"filed_at": "2026-01-01T00:00:00Z"},
+                    ]
+                    if "metadatas" in keys
+                    else []
+                ),
+            )
+
+    col = _ProjectingCollection()
+    page = _recent(col, limit=5, include=["metadatas"])
+    assert page.ids == ["b", "a"]
+    assert page.documents == []
+    assert page.metadatas == [
+        {"filed_at": "2026-01-01T00:00:00Z"},
+        {"filed_at": "2024-01-01T00:00:00Z"},
+    ]
+
+    col = _ProjectingCollection()
+    page = _recent(col, limit=5, include=["documents"])
+    # metadatas are fetched anyway so the sort has order_field to read...
+    assert "metadatas" in col.calls[0]
+    # ...which is why the newest document leads, but they are not returned.
+    assert page.documents == ["newer", "older"]
+    assert page.metadatas == []
+
+
 def test_base_get_recent_default_accepts_dict_shaped_get():
     """Collections still returning Chroma-shaped dicts page correctly."""
 

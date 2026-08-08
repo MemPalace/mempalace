@@ -16,6 +16,7 @@ from mempalace.backends import (
     PalaceRef,
     available_backends,
 )
+from mempalace.backends import pgvector as pgvector_module
 from mempalace.backends.base import UnsupportedCapabilityError
 from mempalace.backends.base import recency_sort_key as _recency_sort_key
 from mempalace.backends.pgvector import (
@@ -689,16 +690,167 @@ def test_pgvector_get_recent_local_filter_still_orders(tmp_path, fake_pgvector):
     page = col.get_recent(limit=2, where={"$or": [{"wing": "x"}, {"wing": "y"}]})
 
     assert page.ids == ["new", "middle"]
-    # No pushdown filter and no SQL LIMIT — the post-filter needs the rows.
+    # The predicate cannot ride along, but the ORDER BY and the LIMIT still
+    # do: one bounded page, not a fetch of the whole table.
     assert client.scroll_calls == [
         {
             "where": None,
-            "limit": None,
+            "limit": 500,
             "offset": None,
             "with_document": True,
             "order_field": "filed_at",
         }
     ]
+
+
+def test_pgvector_get_recent_local_filter_does_not_fetch_whole_table(tmp_path, fake_pgvector):
+    """Reviewer scenario from #2168: 800 rows, an $or filter, limit=5.
+
+    The predicate is not pushdown-safe, so it is evaluated in Python — but the
+    scan that feeds it must still be bounded. Before the fix this issued one
+    LIMIT-less scroll and dragged all 800 rows over the wire to keep 5.
+    """
+    _backend, col = _collection(tmp_path)
+    rows = 800
+    col.add(
+        ids=[f"d{i:04d}" for i in range(rows)],
+        documents=[f"drawer {i}" for i in range(rows)],
+        # Every row matches the $or, so the first page already answers it.
+        metadatas=[
+            {"wing": "w1" if i % 2 else "w2", "filed_at": f"2026-01-01T00:00:{i % 60:02d}Z"}
+            for i in range(rows)
+        ],
+        embeddings=[[1, 0]] * rows,
+    )
+    client = fake_pgvector.instances[0]
+    client.scroll_calls.clear()
+
+    page = col.get_recent(limit=5, where={"$or": [{"wing": "w1"}, {"wing": "w2"}]})
+
+    assert len(page.ids) == 5
+    # Every scroll carries a SQL LIMIT, and the total rows requested is a
+    # small multiple of the answer rather than the whole table.
+    assert client.scroll_calls, "expected at least one scroll"
+    assert all(call["limit"] is not None for call in client.scroll_calls)
+    assert sum(call["limit"] for call in client.scroll_calls) < rows
+    # One page suffices when the filter is not selective.
+    assert len(client.scroll_calls) == 1
+
+
+def test_pgvector_get_recent_local_filter_pages_until_enough_match(tmp_path, fake_pgvector):
+    """A selective filter walks further, still newest-first and still bounded."""
+    _backend, col = _collection(tmp_path)
+    rows = 1200
+    # Only the 3 oldest rows match, so the walk has to reach the far end.
+    col.add(
+        ids=[f"d{i:04d}" for i in range(rows)],
+        documents=[f"drawer {i}" for i in range(rows)],
+        metadatas=[
+            {"wing": "hit" if i < 3 else "miss", "filed_at": f"2026-01-01T00:00:00.{i:06d}Z"}
+            for i in range(rows)
+        ],
+        embeddings=[[1, 0]] * rows,
+    )
+    client = fake_pgvector.instances[0]
+    client.scroll_calls.clear()
+
+    page = col.get_recent(limit=5, where={"$or": [{"wing": "hit"}, {"wing": "nobody"}]})
+
+    # Newest-first among the matches: d0002 was filed after d0001 after d0000.
+    assert page.ids == ["d0002", "d0001", "d0000"]
+    # Paged, every page bounded, and OFFSET advances rather than re-reading.
+    assert len(client.scroll_calls) == 3
+    assert [call["limit"] for call in client.scroll_calls] == [500, 500, 500]
+    assert [call["offset"] for call in client.scroll_calls] == [None, 500, 1000]
+
+
+def test_pgvector_get_recent_local_filter_caps_pathological_scan(
+    tmp_path, fake_pgvector, monkeypatch
+):
+    """A filter matching nothing stops at the row cap instead of walking on."""
+    monkeypatch.setattr(pgvector_module, "_RECENT_SCAN_ROW_CAP", 20)
+    monkeypatch.setattr(pgvector_module, "_RECENT_SCAN_PAGE_MIN", 10)
+    _backend, col = _collection(tmp_path)
+    rows = 100
+    col.add(
+        ids=[f"d{i:04d}" for i in range(rows)],
+        documents=[f"drawer {i}" for i in range(rows)],
+        metadatas=[
+            {"wing": "miss", "filed_at": f"2026-01-01T00:00:{i % 60:02d}Z"} for i in range(rows)
+        ],
+        embeddings=[[1, 0]] * rows,
+    )
+    client = fake_pgvector.instances[0]
+    client.scroll_calls.clear()
+
+    page = col.get_recent(limit=5, where={"$or": [{"wing": "nope"}, {"wing": "nada"}]})
+
+    assert page.ids == []
+    # Two pages of 10 == the cap, then it stops. Not 100 rows.
+    assert sum(call["limit"] for call in client.scroll_calls) == 20
+
+
+def test_pgvector_get_recent_local_filter_dedupes_rows_shifted_by_a_write(
+    tmp_path, fake_pgvector, monkeypatch
+):
+    """A row pushed across a page boundary by a concurrent insert is not returned twice.
+
+    OFFSET paging is only stable while the table is. Inserting a row that
+    sorts newer than the page boundary shifts everything below it down by one,
+    so the next OFFSET re-serves the last row of the previous page. The ``id``
+    dedupe is what keeps that out of the result.
+    """
+    # Force pages smaller than the limit so there is a boundary to shift across.
+    monkeypatch.setattr(pgvector_module, "_RECENT_SCAN_PAGE_MIN", 2)
+    monkeypatch.setattr(pgvector_module, "_RECENT_SCAN_PAGE_MAX", 2)
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=[f"d{i}" for i in range(6)],
+        documents=[f"drawer {i}" for i in range(6)],
+        metadatas=[{"wing": "hit", "filed_at": f"2026-01-0{i + 1}T00:00:00Z"} for i in range(6)],
+        embeddings=[[1, 0]] * 6,
+    )
+    client = fake_pgvector.instances[0]
+
+    real_scroll_rows = client.scroll_rows
+    inserted = {"done": False}
+
+    def _scroll_and_insert(table, **kwargs):
+        rows = real_scroll_rows(table, **kwargs)
+        if not inserted["done"]:
+            inserted["done"] = True
+            # Newest of all, so every page below shifts down by one row.
+            col.add(
+                ids=["intruder"],
+                documents=["filed mid-scan"],
+                metadatas=[{"wing": "hit", "filed_at": "2026-12-31T00:00:00Z"}],
+                embeddings=[[1, 0]],
+            )
+        return rows
+
+    monkeypatch.setattr(client, "scroll_rows", _scroll_and_insert)
+
+    page = col.get_recent(limit=6, where={"$or": [{"wing": "hit"}, {"wing": "nobody"}]})
+
+    assert len(page.ids) == len(set(page.ids)), page.ids
+    # Still newest-first over whatever the shifting scan managed to see.
+    assert page.ids[0] == "d5"
+
+
+def test_pgvector_get_recent_local_filter_projects_out_document(tmp_path, fake_pgvector):
+    """The post-filter reads only metadata, so unrequested documents stay off the wire."""
+    _backend, col = _collection(tmp_path)
+    _fill_for_recency(col)
+    client = fake_pgvector.instances[0]
+    client.scroll_calls.clear()
+
+    page = col.get_recent(
+        limit=2, where={"$or": [{"wing": "x"}, {"wing": "y"}]}, include=["metadatas"]
+    )
+
+    assert page.ids == ["new", "middle"]
+    assert page.documents == []
+    assert all(call["with_document"] is False for call in client.scroll_calls)
 
 
 def test_pgvector_get_recent_honours_include_and_zero_limit(tmp_path, fake_pgvector):

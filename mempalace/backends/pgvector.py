@@ -72,6 +72,16 @@ _SUPPORTED_OPERATORS = frozenset(
     {"$eq", "$ne", "$in", "$nin", "$and", "$or", "$contains", "$gt", "$gte", "$lt", "$lte"}
 )
 _PUSHDOWN_OPERATORS = frozenset({"$eq", "$ne", "$in", "$nin", "$and"})
+# Bounds for the local-post-filter branch of ``get_recent``. The pushdown
+# branch needs none — SQL does ORDER BY ... LIMIT n and returns exactly n
+# rows. The post-filter branch cannot push the predicate, so it walks the
+# table newest-first in pages and stops as soon as ``limit`` rows match.
+# The page size trades round trips against rows on the wire; the row cap
+# bounds the pathological case (a filter that matches nothing in a large
+# table) so one call can never walk unboundedly.
+_RECENT_SCAN_PAGE_MIN = 500
+_RECENT_SCAN_PAGE_MAX = 5000
+_RECENT_SCAN_ROW_CAP = 50_000
 
 
 def _utcnow() -> str:
@@ -1211,6 +1221,70 @@ class PgVectorCollection(BaseCollection):
             embeddings=[row["embedding"] or [] for row in rows] if spec.embeddings else None,
         )
 
+    def _scroll_recent_local(self, *, where, limit, order_field, with_embedding, with_document):
+        """Newest-first paged scan with the filter applied in Python.
+
+        Used when ``where`` is not exactly expressible as ``metadata @> ...``
+        ($or, comparisons, ...). The predicate cannot ride along, but the
+        *ordering* still can, so instead of dragging the whole table across
+        the wire to keep ``limit`` rows we walk it newest-first one SQL page
+        at a time and stop at the first page that completes the answer. On
+        the common shape (a filter most rows match) that is a single page.
+
+        Page stability: ``ORDER BY metadata->>field DESC NULLS LAST, id`` is a
+        total order because ``id`` is the primary key, so OFFSET paging is
+        well defined — the same guarantee the existing ``ORDER BY id`` paging
+        in :meth:`_PgVectorClient.scroll_rows` relies on. Concurrent writes
+        can still shift rows across a page boundary: an insert of a newer row
+        pushes one row down and would hand it back twice, which the ``seen``
+        set drops, and a delete pulls one row up and can skip it. That skip
+        window is inherent to OFFSET paging and is unchanged from the
+        pre-existing paged ``get``; a keyset cursor would close it and is a
+        separate change.
+
+        Bounded, not exhaustive: the walk stops after ``_RECENT_SCAN_ROW_CAP``
+        rows, so a filter that matches almost nothing in a huge table returns
+        fewer than ``limit`` rows rather than reading the table. Because the
+        walk is newest-first, what it does return is still the newest matching
+        rows within the newest ``_RECENT_SCAN_ROW_CAP`` records — a much
+        tighter approximation than the base class's storage-order window, but
+        an approximation, unlike the pushdown branch which is exact at any
+        table size.
+        """
+        # ``limit`` is ``int`` in the contract; the ``None`` the caller's
+        # guard tolerates means "no bound", which on this branch is the cap.
+        target = _RECENT_SCAN_ROW_CAP if limit is None else int(limit)
+        page_size = max(_RECENT_SCAN_PAGE_MIN, min(target, _RECENT_SCAN_PAGE_MAX))
+        matched: list[dict] = []
+        seen: set[str] = set()
+        offset = 0
+        scanned = 0
+        while len(matched) < target and scanned < _RECENT_SCAN_ROW_CAP:
+            want = min(page_size, _RECENT_SCAN_ROW_CAP - scanned)
+            page = self._scroll(
+                where=None,
+                with_embedding=with_embedding,
+                with_document=with_document,
+                limit=want,
+                offset=offset or None,
+                order_field=order_field,
+            )
+            if not page:
+                break
+            scanned += len(page)
+            offset += len(page)
+            for row in page:
+                if row["id"] in seen:
+                    continue
+                seen.add(row["id"])
+                if _matches_where(row["metadata"], where):
+                    matched.append(row)
+                    if len(matched) >= target:
+                        break
+            if len(page) < want:
+                break  # short page — end of table
+        return matched[:target]
+
     def get_recent(self, *, limit, where=None, order_field="filed_at", include=None):
         """Newest-first fetch with the ordering pushed into SQL.
 
@@ -1218,28 +1292,74 @@ class PgVectorCollection(BaseCollection):
         locally, so on a collection larger than ``limit`` the genuinely newest
         records can be missing from the window entirely (#1630). Postgres can
         do the whole thing: ``ORDER BY metadata->>'filed_at' DESC ... LIMIT n``
-        is exact at any table size, which is why this backend advertises
-        ``supports_recency_order``.
+        picks the true top ``limit`` under that ordering at any table size,
+        which is why this backend advertises ``supports_recency_order``.
 
-        Filters that ``metadata @> ...`` cannot express exactly fall back to
-        the local post-filter path (same correctness contract as ``get``), and
-        there the SQL order is still applied before the filter, so the result
-        is the newest ``limit`` rows *that match* only when the pushdown was
-        exact. The inexact case re-sorts locally after filtering.
+        Filters that ``metadata @> ...`` cannot express exactly ($or,
+        comparisons, ...) keep the local post-filter contract that ``get``
+        uses, but they do *not* fetch the table to do it: the ordering is
+        still pushed into SQL and :meth:`_scroll_recent_local` walks the
+        result newest-first a page at a time, stopping as soon as ``limit``
+        rows match.
+
+        **This is the one case where ``supports_recency_order`` is weaker than
+        it sounds.** That walk is capped, so a non-pushdown filter matching
+        very little in a very large table returns fewer than ``limit`` records
+        rather than reading the table. The token covers the filters this
+        backend can push down, which is every filter Layer 1 uses (``None`` or
+        ``{"wing": ...}``) and everything built from ``$eq``/``$ne``/``$in``/
+        ``$nin``/``$and``. See :meth:`_scroll_recent_local` for the bound and
+        for what the capped answer still guarantees.
+
+        ``limit=None`` is outside the contract (the signature is ``int``). The
+        pushdown branch treats it as unbounded; the local branch cannot, and
+        treats it as the scan cap.
+
+        Ordering is on the JSON *text* of ``order_field``, matching the text
+        ordering :func:`recency_sort_key` already applies in Layer 1. See that
+        function for what text ordering does and does not promise; this method
+        inherits those limits rather than introducing them. At least three
+        places where the SQL order and ``recency_sort_key`` differ, none of
+        them reachable through anything that writes ``filed_at``:
+
+        * a JSON value that is not a string sorts by its text form here but
+          sorts last there;
+        * an empty string sorts above SQL NULL here but ties with a missing
+          key there;
+        * both ``metadata->>%s`` and the ``id`` tiebreak sort under the
+          database collation, while ``recency_sort_key`` sorts by Python
+          codepoint. Under a collation such as ``en_US.UTF-8`` punctuation is
+          weighted differently, so the two can disagree on timestamps that
+          differ only in punctuation (``+00:00`` against ``Z``). The test
+          double emulates the ordering in Python and so cannot catch this.
         """
         if limit is not None and limit <= 0:
             return GetResult.empty()
         _validate_where(where)
         spec = _IncludeSpec.resolve(include, default_distances=False)
-        local_filter = _requires_local_filter(where)
-        rows = self._scroll(
-            where=None if local_filter else where,
-            with_embedding=spec.embeddings,
-            limit=None if local_filter else limit,
-            order_field=order_field,
-        )
-        if local_filter:
-            rows = [row for row in rows if _matches_where(row["metadata"], where)][:limit]
+        if _requires_local_filter(where):
+            rows = self._scroll_recent_local(
+                where=where,
+                limit=limit,
+                order_field=order_field,
+                with_embedding=spec.embeddings,
+                # The post-filter reads only ``metadata``, and this branch can
+                # scan far more rows than it returns, so project the document
+                # text out unless the caller actually asked for it (#1840's
+                # wire-byte win). The pushdown branch below is left alone: it
+                # fetches ``limit`` rows, so the projection is worth little
+                # there and not worth changing that path's SQL for. (It would
+                # still pay off for ``limit=None``, which is outside the
+                # contract; fold it in when that path grows a real caller.)
+                with_document=spec.documents,
+            )
+        else:
+            rows = self._scroll(
+                where=where,
+                with_embedding=spec.embeddings,
+                limit=limit,
+                order_field=order_field,
+            )
         return GetResult(
             ids=[row["id"] for row in rows],
             documents=[row["document"] for row in rows] if spec.documents else [],
