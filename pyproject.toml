@@ -79,7 +79,7 @@ dev = [
     # (wired only into the test-windows job in ci.yml, scoped to the specific
     # error). Local/Linux/macOS runs never rerun, so real failures stay loud.
     "pytest-rerunfailures>=12.0",
-    "ruff==0.15.20",
+    "ruff==0.16.1",
     "psutil>=5.9",
     # Property-based testing — generates hundreds of random inputs per
     # test to find counterexamples the hand-written positive tests miss.
@@ -147,7 +147,7 @@ dev = [
     # (wired only into the test-windows job in ci.yml, scoped to the specific
     # error). Local/Linux/macOS runs never rerun, so real failures stay loud.
     "pytest-rerunfailures>=12.0",
-    "ruff==0.15.20",
+    "ruff==0.16.1",
     "psutil>=5.9",
     "hypothesis>=6.0",
     "pre-commit>=3.0",
@@ -164,7 +164,11 @@ packages = ["mempalace"]
 [tool.ruff]
 line-length = 100
 target-version = "py39"
-extend-exclude = ["benchmarks"]
+# "*.md": ruff 0.16 began formatting Python inside markdown fences, which
+# pulls ~96 docs into scope and reflows hand-aligned example code (the
+# column-aligned field comments in docs/rfcs/002 are deliberate). Docs are
+# authored prose, not linted source — keep the formatter on real modules.
+extend-exclude = ["benchmarks", "*.md"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "C901"]

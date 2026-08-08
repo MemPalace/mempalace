@@ -216,7 +216,9 @@ _EMBEDDINGGEMMA_MAX_LEN = 2048
 # matches the internal batch size of chromadb's ONNXMiniLM_L6_V2, whose
 # chunked _forward survives the same call sites. embeddinggemma's
 # sentence_embedding output is attention-masked, so sub-batch padding
-# does not change any row's vector.
+# does not change any row's vector. __call__ decides which documents share
+# a sub-batch by size rather than by arrival order (#2104), because the run
+# is priced on that padded length and not on the document count.
 _EMBEDDINGGEMMA_BATCH_SIZE = 32
 
 
@@ -356,6 +358,33 @@ class EmbeddinggemmaONNX:
             self._session = session
 
     def __call__(self, input: str | list[str] | None) -> list[list[float]]:  # noqa: A002 — ChromaDB EF protocol
+        """Embed ``input``, returning one vector per document in input order.
+
+        Documents are grouped by size before the sub-batch split. The
+        tokenizer pads every row of a sub-batch to the longest sequence in
+        it, and attention cost per layer is batch x heads x length^2, so one
+        long document drags a whole sub-batch up to its own length. Without
+        grouping the bill is set by arrival order: a verbatim transcript
+        whose long tool results sit between one-line replies pays the long
+        length for nearly every row (#2104).
+
+        An input that fits a single sub-batch is left in arrival order: every
+        row pads to the same width either way, so the keys would buy nothing
+        on the one-document search path.
+
+        Regrouping does not change what a row means. The model's
+        ``sentence_embedding`` output is attention-masked, so padding never
+        enters a row's values; what does move is float32 rounding, because a
+        different padded width changes the reduction order inside the GEMMs.
+        Measured against the same documents embedded in arrival order, that
+        residual peaks at one float32 ULP (1.2e-07 absolute, cosine
+        0.99999992).
+
+        The key is UTF-8 byte length rather than character count: this model
+        is multilingual, and bytes per token vary far less across scripts
+        than characters per token do. The sort is stable, so equal-size
+        documents keep arrival order and the split stays reproducible.
+        """
         if isinstance(input, str):
             # A bare string would be iterated character by character below,
             # silently producing one garbage vector per character.
@@ -367,14 +396,21 @@ class EmbeddinggemmaONNX:
             return []
         self._lazy_load()
         np = self._np
-        embeddings: list[list[float]] = []
-        # Tokenize and run per sub-batch, not over the whole input: padding
-        # is to the longest sequence in the sub-batch, and the ONNX runtime
-        # only ever holds batch_size rows of attention buffers at a time
-        # (#1770).
-        for start in range(0, len(input), self._batch_size):
-            chunk = input[start : start + self._batch_size]
-            texts = [_EMBEDDINGGEMMA_PREFIX + t for t in chunk]
+        # One sub-batch pads identically whatever the order, so the sort is
+        # only worth its keys once the input splits into several.
+        order: range | list[int] = range(len(input))
+        if len(input) > self._batch_size:
+            order = sorted(range(len(input)), key=lambda i: len(input[i].encode("utf-8")))
+        # Row i is filled by the sub-batch that carries document i. ``order``
+        # is a permutation of every index, so no placeholder survives; callers
+        # (ChromaDB included) zip the result against their ids positionally.
+        embeddings: list[list[float] | None] = [None] * len(input)
+        # Tokenize and run per sub-batch, not over the whole input: the ONNX
+        # runtime only ever holds batch_size rows of attention buffers at a
+        # time (#1770).
+        for start in range(0, len(order), self._batch_size):
+            idxs = order[start : start + self._batch_size]
+            texts = [_EMBEDDINGGEMMA_PREFIX + input[i] for i in idxs]
             encs = self._tokenizer.encode_batch(texts)
             input_ids = np.asarray([e.ids for e in encs], dtype=np.int64)
             input_ids = _sanitize_embeddinggemma_input_ids(
@@ -390,7 +426,16 @@ class EmbeddinggemmaONNX:
             # L2-normalize so cosine similarity == dot product (matches what the
             # MTEB methodology assumes; ChromaDB's distance is configured for it).
             norms = np.linalg.norm(sent_emb, axis=1, keepdims=True) + 1e-12
-            embeddings.extend((sent_emb / norms).tolist())
+            rows = (sent_emb / norms).tolist()
+            if len(rows) != len(idxs):
+                # zip would truncate silently and leave a None in the result,
+                # which only surfaces far downstream in the caller's array
+                # conversion. Fail on the sub-batch that came back short.
+                raise RuntimeError(
+                    f"embeddinggemma returned {len(rows)} rows for a {len(idxs)}-document sub-batch"
+                )
+            for row_index, row in zip(idxs, rows):
+                embeddings[row_index] = row
         return embeddings
 
     def embed_query(self, input: list[str]) -> list[list[float]]:  # noqa: A002 — ChromaDB EF protocol

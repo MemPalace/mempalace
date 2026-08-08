@@ -1215,6 +1215,195 @@ def test_cmd_repair_uses_configured_collection(mock_config_cls, tmp_path, capsys
 
 
 @patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_default_mode_dry_run_writes_nothing(mock_config_cls, tmp_path, capsys):
+    """``repair --dry-run`` with no --mode must print a plan and leave the palace alone.
+
+    #2095 / #2133 fixed this for ``--mode from-sqlite``; the default (legacy)
+    path still ran the backup copy and the full rebuild.
+    """
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    sqlite3.connect(str(palace_dir / "chroma.sqlite3")).close()
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
+    args = argparse.Namespace(palace=None, yes=True, dry_run=True)
+    mock_col = MagicMock()
+    mock_col.count.return_value = 2
+    # A concrete extract payload, so that if the dry-run guard ever regresses
+    # this test fails on its assertions instead of spinning in _extract_drawers.
+    mock_col.get.return_value = {
+        "ids": ["id1", "id2"],
+        "documents": ["doc1", "doc2"],
+        "metadatas": [{"wing": "a"}, {"wing": "b"}],
+    }
+    mock_backend = _mock_backend_for(col=mock_col)
+
+    with (
+        patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend),
+        patch("mempalace.repair.sqlite_drawer_count", return_value=2) as mock_count,
+        patch("mempalace.migrate.confirm_destructive_action") as mock_confirm,
+    ):
+        cmd_repair(args)
+
+    out = capsys.readouterr().out
+    assert "DRY RUN — no changes will be made." in out
+    assert "holds 2 rows" in out
+    assert "Repair complete" not in out
+    # The count comes from read-only SQLite, never from a chromadb client:
+    # opening one is itself a write to chroma.sqlite3.
+    mock_count.assert_called_once_with(str(palace_dir), "mempalace_drawers")
+    mock_backend.get_collection.assert_not_called()
+    mock_col.get.assert_not_called()
+    mock_backend.create_collection.assert_not_called()
+    mock_backend.delete_collection.assert_not_called()
+    mock_confirm.assert_not_called()
+    assert not (tmp_path / "palace.backup").exists()
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_default_mode_dry_run_honours_custom_collection(
+    mock_config_cls, tmp_path, capsys
+):
+    """The preview must target the configured collection, not a hardcoded name."""
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    sqlite3.connect(str(palace_dir / "chroma.sqlite3")).close()
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+    mock_config_cls.return_value.collection_name = "custom_drawers"
+    args = argparse.Namespace(palace=None, yes=True, dry_run=True)
+
+    with (
+        patch("mempalace.backends.chroma.ChromaBackend", return_value=_mock_backend_for()),
+        patch("mempalace.repair.sqlite_drawer_count", return_value=7) as mock_count,
+    ):
+        cmd_repair(args)
+
+    assert "[custom_drawers]" in capsys.readouterr().out
+    mock_count.assert_called_once_with(str(palace_dir), "custom_drawers")
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_default_mode_dry_run_reports_healable_fts5_and_continues(
+    mock_config_cls, tmp_path, capsys
+):
+    """An isolated FTS5 error is auto-healed by a real run, so the preview must not abort.
+
+    Aborting here would hand the operator the manual ``sqlite3 .recover``
+    recipe for a palace ``maybe_autoheal_fts5_index`` repairs by itself (#1596).
+    """
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    sqlite3.connect(str(palace_dir / "chroma.sqlite3")).close()
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
+    args = argparse.Namespace(palace=None, yes=True, dry_run=True)
+
+    with (
+        patch(
+            "mempalace.repair.sqlite_integrity_errors",
+            return_value=["malformed inverted index for FTS5 table x"],
+        ),
+        patch("mempalace.repair.maybe_autoheal_fts5_index") as mock_autoheal,
+        patch("mempalace.repair.sqlite_drawer_count", return_value=4),
+        patch("mempalace.backends.chroma.ChromaBackend", return_value=_mock_backend_for()),
+    ):
+        cmd_repair(args)
+
+    out = capsys.readouterr().out
+    mock_autoheal.assert_not_called()
+    assert "isolated FTS5 inverted-index error" in out
+    assert "ABORT" not in out
+    assert "holds 4 rows" in out
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_default_mode_dry_run_still_aborts_on_broad_corruption(
+    mock_config_cls, tmp_path, capsys
+):
+    """Corruption a real run cannot heal must still abort the preview with exit 1."""
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    sqlite3.connect(str(palace_dir / "chroma.sqlite3")).close()
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
+    args = argparse.Namespace(palace=None, yes=True, dry_run=True)
+
+    with (
+        patch(
+            "mempalace.repair.sqlite_integrity_errors",
+            return_value=["*** in database main *** Page 42 is never used"],
+        ),
+        patch("mempalace.repair.maybe_autoheal_fts5_index") as mock_autoheal,
+        patch("mempalace.backends.chroma.ChromaBackend"),
+        pytest.raises(SystemExit) as excinfo,
+    ):
+        cmd_repair(args)
+
+    assert excinfo.value.code == 1
+    mock_autoheal.assert_not_called()
+    assert "ABORT" in capsys.readouterr().out
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_non_dry_run_still_autoheals_fts5(mock_config_cls, tmp_path, capsys):
+    """The real path must keep calling the autoheal — the patch restructured this branch."""
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    sqlite3.connect(str(palace_dir / "chroma.sqlite3")).close()
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
+    args = argparse.Namespace(palace=None, yes=True)
+    mock_col = MagicMock()
+    mock_col.count.return_value = 0
+
+    with (
+        patch(
+            "mempalace.repair.sqlite_integrity_errors",
+            return_value=["malformed inverted index for FTS5 table x"],
+        ),
+        patch("mempalace.repair.maybe_autoheal_fts5_index", return_value=[]) as mock_autoheal,
+        patch(
+            "mempalace.backends.chroma.ChromaBackend",
+            return_value=_mock_backend_for(col=mock_col),
+        ),
+    ):
+        cmd_repair(args)
+
+    mock_autoheal.assert_called_once()
+    assert "Nothing to repair" in capsys.readouterr().out
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_default_mode_dry_run_refuses_to_invent_zero(mock_config_cls, tmp_path, capsys):
+    """An unreadable count must refuse AND exit non-zero, like the from-sqlite preview.
+
+    Otherwise ``repair --dry-run && repair --yes`` walks into the destructive
+    run after a preview that could not be produced.
+    """
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    sqlite3.connect(str(palace_dir / "chroma.sqlite3")).close()
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
+    args = argparse.Namespace(palace=None, yes=True, dry_run=True)
+    mock_backend = _mock_backend_for(col=MagicMock())
+
+    with (
+        patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend),
+        patch("mempalace.repair.sqlite_drawer_count", return_value=None),
+        pytest.raises(SystemExit) as excinfo,
+    ):
+        cmd_repair(args)
+
+    out = capsys.readouterr().out
+    assert excinfo.value.code == 1
+    assert "Cannot preview [mempalace_drawers]" in out
+    assert "refusing to invent zero counts" in out
+    assert "would extract" not in out
+    mock_backend.get_collection.assert_not_called()
+
+
+@patch("mempalace.cli.MempalaceConfig")
 def test_cmd_repair_restores_backup_on_live_rebuild_failure(mock_config_cls, tmp_path, capsys):
     """When the live swap fails after the delete, recovery must PROMOTE the
     verified temp copy instead of restoring a sqlite-only file backup."""

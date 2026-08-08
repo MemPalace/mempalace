@@ -169,21 +169,56 @@ Other MCP clients use the same two ingredients — the `…/mcp` URL and an
 
 ```bash
 curl https://memory.example.com/healthz        # -> ok
+curl https://memory.example.com/statusz \
+  -H "Authorization: Bearer $MEMPALACE_MCP_HTTP_TOKEN"
 ```
 
 Once connected, all of MemPalace's [MCP tools](/guide/mcp-integration) operate
 against the shared palace — searches and saved memories are visible to the
 whole team.
 
+A shared hub also gives your agents a coordination channel: the
+[agent logstream](/concepts/agent-logstream) lets one agent delegate work
+(`mempalace_event_append`), another long-poll for it
+(`mempalace_event_wait`), and patches move as verified artifacts
+(`mempalace_patch_submit` / `mempalace_artifact_get`) — no human relaying
+messages between machines.
+
 ## Operating notes
 
 - **Mining** still happens via the CLI (`mempalace mine …`) on the server host
-  against the same backend, so the central palace stays populated.
+  against the same backend, so the central palace stays populated. While the
+  server is running it owns the palace's writer lease, so the CLI (and the
+  save hooks, which spawn it) automatically detect the live server and hand
+  the mine to it over HTTP instead of being refused. This needs nothing from
+  you — the server records its endpoint under `~/.mempalace/server/` at
+  startup. Set `MEMPALACE_HUB_FORWARD=0` to force direct mines (they will be
+  refused while the server holds the lease).
 - **One writer-lease per process**: a single `mempalace-mcp --transport http`
   process safely handles concurrent reads and writes. Don't point two server
   processes at the same backend collection.
 - **Health checks**: `GET /healthz` returns `200 ok` without a token, so it
-  works as a load-balancer/Kubernetes liveness probe.
+  works as a load-balancer/Kubernetes liveness probe. For machine-readable
+  server state, `GET /statusz` returns JSON with version, uptime, request
+  counters, SQLite integrity, writer mode, and recent observed MCP clients.
+  `/statusz` follows the bearer-token policy because it exposes operational
+  metadata; it is not a public liveness probe.
+- **Fronting proxies (Tailscale, nginx)**: the recommended personal-fleet
+  setup is a loopback bind behind a tailnet-only proxy — nothing touches the
+  physical LAN and the tailnet provides encryption plus device identity:
+
+  ```bash
+  MEMPALACE_MCP_HTTP_TOKEN="$(cat ~/.mempalace/server/<key>/token)" \
+  MEMPALACE_MCP_EXTRA_ALLOWED_HOSTS="yourbox.your-tailnet.ts.net" \
+    mempalace serve --host 127.0.0.1 --port 8765
+  tailscale serve --bg --https=443 http://127.0.0.1:8765
+  ```
+
+  Clients connect to `https://yourbox.your-tailnet.ts.net/mcp` with the same
+  bearer token. `MEMPALACE_MCP_EXTRA_ALLOWED_HOSTS` (comma-separated `host`
+  or `host:port` values) is required because proxies preserve the public
+  name in the `Host` header, which the loopback bind's DNS-rebinding pin
+  would otherwise reject.
 - **Backups** are now your storage backend's responsibility (Milvus / Zilliz
   Cloud backups, Qdrant snapshots, or Postgres backups) rather than a single
   laptop's palace directory.

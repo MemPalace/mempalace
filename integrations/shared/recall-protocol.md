@@ -116,5 +116,10 @@ added through the MCP server and diary entries, which have no source file
 
 - [`integrations/openclaw/SKILL.md`](../openclaw/SKILL.md) — the original
   full-protocol skill this is distilled from.
+- [`coordination-protocol.md`](coordination-protocol.md) — the shared-brain
+  companion protocol: when agents delegate work to each other over the
+  hub, they use the logstream (`mempalace_event_append` /
+  `mempalace_event_wait`), not drawers. Recall answers questions;
+  the logstream moves work.
 - MemPalace design principles (verbatim, local-first, never summarize):
   <https://github.com/MemPalace/mempalace>

@@ -1715,6 +1715,21 @@ def rebuild_from_sqlite(
         )
 
 
+def _print_unreadable_count_refusal(*, collection_name: str, palace_path: str) -> None:
+    """Refuse to preview a collection whose SQLite row count cannot be read.
+
+    Fail closed: inventing 0 would hide an unreadable source and make the
+    operator believe a real run would upsert nothing (review note on #1654 /
+    #2095). Shared by both previews so the wording cannot drift apart.
+    """
+    print(
+        f"\n  Cannot preview [{collection_name}]: SQLite row count is unreadable "
+        f"at {os.path.join(palace_path, 'chroma.sqlite3')}.\n"
+        "  Fix source readability (schema, lock, permissions) and re-run "
+        "--dry-run; refusing to invent zero counts."
+    )
+
+
 def _preview_rebuild_from_sqlite(
     *,
     source_palace: str,
@@ -1739,15 +1754,7 @@ def _preview_rebuild_from_sqlite(
     for cname in _recoverable_collections():
         n = sqlite_drawer_count(source_palace, cname)
         if n is None:
-            # Fail closed: inventing 0 would hide an unreadable source and
-            # make the operator believe a real rebuild would upsert nothing
-            # (review note on #1654 / #2095).
-            print(
-                f"\n  Cannot preview [{cname}]: SQLite row count is unreadable "
-                f"at {os.path.join(source_palace, 'chroma.sqlite3')}.\n"
-                "  Fix source readability (schema, lock, permissions) and re-run "
-                "--dry-run; refusing to invent zero counts."
-            )
+            _print_unreadable_count_refusal(collection_name=cname, palace_path=source_palace)
             return {}
         counts[cname] = n
         print(f"  [{cname}] would re-embed and upsert {n} rows")
@@ -1756,6 +1763,116 @@ def _preview_rebuild_from_sqlite(
     )
     print(f"{'=' * 55}\n")
     return counts
+
+
+def _preview_legacy_repair(
+    *,
+    palace_path: str,
+    collection_name: str,
+    confirm_truncation_ok: bool = False,
+) -> dict[str, int]:
+    """Read-only preview for the default (legacy) ``repair`` path (``dry_run=True``).
+
+    Never opens a chromadb client, takes a lock, or writes. Opening a client is
+    itself a write to ``chroma.sqlite3``, so the row count comes from the
+    read-only SQLite ground truth :func:`check_extraction_safety` already
+    trusts. That is a different source than the real run rebuilds from (it
+    re-files what the chromadb collection layer returns), so the plan below
+    states the ``#1208`` contingency rather than promising the number.
+
+    ``confirm_truncation_ok`` mirrors the real run's flag: it switches that
+    contingency off, so the preview has to say the guard is disabled rather
+    than promise an abort that would not happen.
+
+    Returns ``{}`` when the count is unreadable so a broken preview cannot look
+    like a valid plan (#1654, #2095, #2133).
+    """
+    print("\n  DRY RUN — no changes will be made.")
+    n = sqlite_drawer_count(palace_path, collection_name)
+    if n is None:
+        _print_unreadable_count_refusal(collection_name=collection_name, palace_path=palace_path)
+        print(f"{'=' * 55}\n")
+        return {}
+
+    if n == 0:
+        # The real run stops at ``total == 0`` with "Nothing to repair.", or —
+        # when the collection is absent altogether — at the index-read error
+        # that points to --mode from-sqlite. Neither backs up nor rebuilds, so
+        # promising a backup and a VACUUM here would describe a run that does
+        # not happen.
+        print(
+            f"  [{collection_name}] chroma.sqlite3 holds no rows. A real run would report\n"
+            "  nothing to repair, or an index read error, and change nothing."
+        )
+        print(f"{'=' * 55}\n")
+        return {collection_name: 0}
+
+    backup_path = os.path.normpath(palace_path) + ".backup"
+    if confirm_truncation_ok:
+        print(
+            f"  [{collection_name}] chroma.sqlite3 holds {n} rows, and --confirm-truncation-ok\n"
+            "  is set, so the #1208 truncation guard is DISABLED. A real run would re-file\n"
+            f"  whatever the chromadb collection layer returns, even if that is fewer than {n}\n"
+            "  rows, and the difference would be destroyed. It would, in order:"
+        )
+    else:
+        print(
+            f"  [{collection_name}] chroma.sqlite3 holds {n} rows. A real run would extract them\n"
+            "  through the chromadb collection layer first and abort without changes if that\n"
+            f"  returns fewer than {n} (#1208 truncation guard). It would then, in order:"
+        )
+    if os.path.exists(backup_path):
+        print(f"    1. DELETE the existing backup at {backup_path} — or refuse outright")
+        print("       if it is not a palace — and copy the live palace in its place")
+    else:
+        print(f"    1. copy the palace directory to {backup_path}")
+    print(f"    2. DELETE the live '{collection_name}' collection and re-file the extracted rows")
+    print("       into a fresh one, staged and verified in a temp collection first")
+    print("    3. rebuild the FTS5 index and VACUUM chroma.sqlite3")
+    print("\n  Without --yes it would ask for confirmation before step 1.")
+    print("  Re-run without --dry-run to execute.")
+    print(f"{'=' * 55}\n")
+    return {collection_name: n}
+
+
+def resolve_repair_preflight_errors(
+    palace_path: str,
+    errors: list[str],
+    *,
+    dry_run: bool,
+    progress=print,
+) -> list[str]:
+    """Return the quick_check errors that still block a repair.
+
+    A real run heals an isolated malformed FTS5 inverted index in place and
+    carries on (#1596). ``--dry-run`` must not perform that write, so it
+    classifies the errors with the same :func:`_errors_are_isolated_fts5`
+    predicate the real path gates on: an isolated FTS5 error is reported and
+    cleared, anything broader still aborts. Without this a preview would print
+    the ABORT banner — offline ``sqlite3 .recover``, recreate the FTS5 table —
+    for a palace the tool repairs by itself.
+
+    The prediction is deliberately the optimistic branch, and it is stated as
+    an attempt rather than a promise: the real heal still returns the errors
+    unchanged when another process holds the mine lock, when the rebuild
+    raises, or when ``quick_check`` is still dirty afterwards. A dry run cannot
+    tell those apart without taking the lock and writing, which is exactly what
+    it must not do, so the wording names them instead.
+    """
+    if not errors:
+        return errors
+    if not dry_run:
+        return maybe_autoheal_fts5_index(palace_path, errors, progress=progress)
+    if _errors_are_isolated_fts5(errors):
+        progress(
+            "\n  DRY RUN — quick_check reports an isolated FTS5 inverted-index error.\n"
+            "  A real run would attempt an in-place rebuild of that index from the\n"
+            "  intact content table and continue if it succeeds; it aborts instead if\n"
+            "  another process holds the mine lock or the rebuild leaves quick_check\n"
+            "  dirty. This preview leaves the index untouched."
+        )
+        return []
+    return errors
 
 
 def _rebuild_from_sqlite_locked(

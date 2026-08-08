@@ -5,7 +5,8 @@ normalize.py — Convert any chat export format to MemPalace transcript format.
 Supported:
     - Plain text with > markers (pass through)
     - Claude.ai JSON export
-    - ChatGPT conversations.json
+    - ChatGPT conversations.json (a single conversation, or the top-level
+      array of them that a real data export ships)
     - Claude Code JSONL (with tool_use/tool_result block capture)
     - GitHub Copilot CLI JSONL (~/.copilot/session-state/<session-id>/events.jsonl)
     - OpenAI Codex CLI JSONL
@@ -183,9 +184,13 @@ def normalize_conversations(filepath: str) -> list:
     the existing conversations did. This returns the pieces un-joined so
     callers can hash and dedup per conversation instead.
 
-    Non-bundle formats (a single Claude Code session, a ChatGPT export,
-    plain text, ...) always normalize to one conversation, so this returns
-    a one-element list for those — identical dedup granularity to before.
+    A ChatGPT data export is a bundle for the same reason: its
+    ``conversations.json`` is an array of conversations, so it splits per
+    conversation too.
+
+    Non-bundle formats (a single Claude Code session, plain text, ...)
+    always normalize to one conversation, so this returns a one-element
+    list for those — identical dedup granularity to before.
     """
     content = _read_transcript_file(filepath)
 
@@ -253,6 +258,10 @@ def _try_normalize_json_split(content: str) -> Optional[list]:
         return [normalized]
 
     split = _try_claude_ai_json_split(data)
+    if split:
+        return split
+
+    split = _try_chatgpt_export_json_split(data)
     if split:
         return split
 
@@ -689,8 +698,14 @@ def _collect_claude_messages(items) -> list:
 
 
 def _try_chatgpt_json(data) -> Optional[str]:
-    """ChatGPT conversations.json with mapping tree."""
-    if not isinstance(data, dict) or "mapping" not in data:
+    """ChatGPT conversations.json with mapping tree.
+
+    Every nested shape is type-checked rather than assumed: this parser is
+    reached from ``_try_chatgpt_export_json_split`` for each element of any
+    top-level JSON array, so it must return None on unrelated payloads that
+    merely carry a ``mapping`` key instead of raising.
+    """
+    if not isinstance(data, dict) or not isinstance(data.get("mapping"), dict):
         return None
     mapping = data["mapping"]
     messages = []
@@ -698,6 +713,8 @@ def _try_chatgpt_json(data) -> Optional[str]:
     root_id = None
     fallback_root = None
     for node_id, node in mapping.items():
+        if not isinstance(node, dict):
+            continue
         if node.get("parent") is None:
             if node.get("message") is None:
                 root_id = node_id
@@ -711,22 +728,63 @@ def _try_chatgpt_json(data) -> Optional[str]:
         visited = set()
         while current_id and current_id not in visited:
             visited.add(current_id)
-            node = mapping.get(current_id, {})
+            node = mapping.get(current_id)
+            if not isinstance(node, dict):
+                break
             msg = node.get("message")
-            if msg:
-                role = msg.get("author", {}).get("role", "")
+            if isinstance(msg, dict):
+                author = msg.get("author")
+                role = author.get("role", "") if isinstance(author, dict) else ""
                 content = msg.get("content", {})
-                parts = content.get("parts", []) if isinstance(content, dict) else []
+                parts = content.get("parts") if isinstance(content, dict) else None
+                if not isinstance(parts, list):
+                    parts = []
                 text = " ".join(str(p) for p in parts if isinstance(p, str) and p).strip()
                 if role == "user" and text:
                     messages.append(("user", text))
                 elif role == "assistant" and text:
                     messages.append(("assistant", text))
-            children = node.get("children", [])
-            current_id = children[0] if children else None
+            children = node.get("children")
+            next_id = children[0] if isinstance(children, list) and children else None
+            # Node ids index a dict and a visited set, so anything unhashable
+            # (a nested child object rather than an id) ends the walk.
+            current_id = next_id if isinstance(next_id, str) else None
     if len(messages) >= 2:
         return _messages_to_transcript(messages)
     return None
+
+
+def _try_chatgpt_export_json_split(data) -> Optional[list]:
+    """ChatGPT data export: top-level array of conversation objects.
+
+    The ``conversations.json`` OpenAI ships is an *array*, while
+    ``_try_chatgpt_json`` handles the single conversation object inside it.
+    Without this the whole export falls through to the plain-text path and is
+    chunked as raw JSON: the drawers hold serialized structure sliced at
+    arbitrary offsets, and every speaker turn is gone.
+
+    Each conversation is kept as its own segment rather than concatenated, so
+    per-conversation dedup survives a re-export (see ``normalize_conversations``);
+    the joined form is reached through ``_try_normalize_json``.
+
+    Runs after ``_try_gemini_json`` and ``_try_claude_ai_json_split`` and before
+    the ``_try_chatgpt_json``/``_try_continue_json``/``_try_slack_json`` loop.
+    That position is safe in both directions: Gemini requires a ``role="model"``
+    entry and Claude.ai requires ``chat_messages``/``messages`` on the first
+    element, neither of which a ChatGPT conversation object has, while Slack
+    entries carry no ``mapping`` and Continue.dev sessions are not arrays at
+    all, so this parser declines them and they fall through unchanged.
+    """
+    if not isinstance(data, list):
+        return None
+
+    transcripts = []
+    for convo in data:
+        transcript = _try_chatgpt_json(convo)
+        if transcript:
+            transcripts.append(transcript)
+    # None, not [], so an array of other JSON still reaches the later parsers.
+    return transcripts or None
 
 
 def _try_slack_json(data) -> Optional[str]:

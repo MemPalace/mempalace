@@ -546,6 +546,139 @@ def _maybe_run_mine_after_init(args, cfg) -> None:
         sys.exit(1)
 
 
+_HUB_FORWARD_ENV = "MEMPALACE_HUB_FORWARD"
+_HUB_HEALTH_TIMEOUT_S = 0.75
+# A backfill mine over a large transcript tree can legitimately run for many
+# minutes inside the hub; the forwarder is a background/CLI process, not a
+# hook-budgeted one, so it waits.
+_HUB_MINE_TIMEOUT_S = 3600.0
+
+
+def _hub_forward_disabled() -> bool:
+    return os.environ.get(_HUB_FORWARD_ENV, "").strip().lower() in {"0", "false", "no", "off"}
+
+
+def _mine_args_forwardable(args, include_ignored) -> bool:
+    """Only forward mines the ``mempalace_mine`` MCP tool can express.
+
+    Flags the tool has no parameters for (kg-extract, gitignore handling,
+    chunking overrides, origin redetection, explicit backend) keep the
+    direct path — where a held writer lease still surfaces as the existing
+    MineAlreadyRunning error rather than being silently dropped.
+    """
+    if getattr(args, "kg_extract", False) or getattr(args, "redetect_origin", False):
+        return False
+    if args.no_gitignore or include_ignored:
+        return False
+    if getattr(args, "max_chunks_per_file", None) is not None:
+        return False
+    if _backend_arg(args):
+        return False
+    return True
+
+
+def _forward_mine_to_hub(args, palace_path: str) -> bool:
+    """Run this mine inside the palace's HTTP hub, if one is alive.
+
+    A long-lived hub (``mempalace serve``) holds the MCP writer lease for
+    its whole lifetime, so a direct mine from this process — including the
+    background save hooks, which spawn exactly this CLI — would be refused
+    and transcript capture would silently stop on the hub machine. The hub
+    itself may mine (the palace lock is process-re-entrant there, #1859),
+    so the fix is to hand it the job over HTTP.
+
+    Returns True when the hub handled the mine (this function has already
+    printed the outcome and exited non-zero on failure). Returns False when
+    there is no usable hub — the caller proceeds with the direct path.
+    Once the hub has accepted the request there is no fallback: the job may
+    already be running, and re-mining directly would race it.
+    """
+    import json
+    import urllib.error
+    import urllib.request
+
+    from . import server_registry
+
+    if _hub_forward_disabled():
+        return False
+    info = server_registry.read_live_serverinfo(palace_path)
+    if not info or info.get("read_only"):
+        return False
+
+    base_url = server_registry.client_base_url(info)
+    headers = {"Content-Type": "application/json"}
+    token = server_registry.load_server_token(palace_path)
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    try:
+        health = urllib.request.Request(f"{base_url}/healthz", headers=headers)
+        with urllib.request.urlopen(health, timeout=_HUB_HEALTH_TIMEOUT_S) as resp:
+            if resp.status != 200:
+                return False
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+    arguments = {
+        "source": os.path.abspath(os.path.expanduser(args.dir)),
+        "mode": args.mode,
+        "agent": args.agent,
+        "limit": args.limit or 0,
+        "dry_run": bool(args.dry_run),
+        "extract": args.extract,
+    }
+    if args.wing:
+        arguments["wing"] = args.wing
+    body = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "mempalace_mine", "arguments": arguments},
+        }
+    ).encode("utf-8")
+
+    print(f"mempalace: forwarding mine to palace hub {base_url} (pid {info.get('pid')})")
+    try:
+        request = urllib.request.Request(f"{base_url}/mcp", data=body, headers=headers)
+        with urllib.request.urlopen(request, timeout=_HUB_MINE_TIMEOUT_S) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        # The hub answered — the request reached it, so no direct fallback.
+        print(f"mempalace: hub rejected mine ({exc.code} {exc.reason})", file=sys.stderr)
+        sys.exit(1)
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        print(
+            f"mempalace: hub at {base_url} did not complete the mine ({exc}); "
+            "not retrying directly — the hub may still be running the job. "
+            f"Set {_HUB_FORWARD_ENV}=0 to force direct mines.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if payload.get("error"):
+        err = payload["error"]
+        print(
+            f"mempalace: hub refused mine: {err.get('message', 'unknown error')}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        result = json.loads(payload["result"]["content"][0]["text"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        print("mempalace: hub returned an unrecognized mine response", file=sys.stderr)
+        sys.exit(1)
+
+    output = result.get("output")
+    if output:
+        print(output)
+    if not result.get("success", False):
+        print(f"mempalace: hub mine failed: {result.get('error', 'unknown')}", file=sys.stderr)
+        sys.exit(1)
+    return True
+
+
 def cmd_mine(args):
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     include_ignored = []
@@ -571,6 +704,13 @@ def cmd_mine(args):
             "redetect_origin": getattr(args, "redetect_origin", False),
         }
         _submit_daemon_cli_job("mine", payload, args, background=getattr(args, "background", False))
+        return
+
+    # A live HTTP hub for this palace holds the MCP writer lease, so a
+    # direct mine here would be refused. Hand the job to the hub instead —
+    # this is how the save hooks keep capturing transcripts on a machine
+    # that runs `mempalace serve`.
+    if _mine_args_forwardable(args, include_ignored) and _forward_mine_to_hub(args, palace_path):
         return
 
     # --redetect-origin re-runs corpus_origin on the current corpus state
@@ -1060,6 +1200,295 @@ def cmd_status(args):
     status(palace_path=palace_path)
 
 
+# ── Logstream (RFC 003 agent coordination) ────────────────────────────────
+
+
+def _open_logstream(args):
+    """Open the palace logstream database for a CLI command.
+
+    Direct SQLite access is safe alongside a running hub: logstream.sqlite3
+    is WAL-mode and independent of Chroma, so CLI writes are immediately
+    visible to hub readers without the mine-style forwarding Chroma needs.
+    """
+    from .logstream import LOGSTREAM_DB_FILENAME, Logstream
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    return Logstream(db_path=os.path.join(palace_path, LOGSTREAM_DB_FILENAME))
+
+
+def _logstream_fail(message: str, as_json: bool):
+    import json
+
+    if as_json:
+        print(json.dumps({"error": message}))
+    else:
+        print(f"Error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def _read_stdin_exact() -> str:
+    """Read stdin as bytes and decode — never through the text layer.
+
+    ``sys.stdin.read()`` applies universal-newline translation, turning
+    CRLF into LF before we ever see it. For a store addressed by sha256
+    over the exact bytes, that is silent corruption: a patch piped in from
+    a Windows agent would be stored as different content with a different
+    digest than the one that produced it. ``.buffer`` is absent when stdin
+    has been replaced by a plain StringIO, so fall back to the text read
+    rather than crashing.
+    """
+    buffer = getattr(sys.stdin, "buffer", None)
+    if buffer is None:
+        return sys.stdin.read()
+    return buffer.read().decode("utf-8")
+
+
+def _write_stdout_exact(content: str) -> None:
+    """Write content to stdout as bytes, bypassing newline translation.
+
+    The counterpart to :func:`_read_stdin_exact` — ``mempalace artifact get
+    ID | git apply`` must deliver the stored bytes, not a re-translated
+    copy of them.
+    """
+    buffer = getattr(sys.stdout, "buffer", None)
+    if buffer is None:
+        sys.stdout.write(content)
+        return
+    sys.stdout.flush()
+    buffer.write(content.encode("utf-8"))
+    buffer.flush()
+
+
+def _read_text_arg(inline, file_arg, default=""):
+    """Resolve inline text vs --*-file (with '-' meaning stdin).
+
+    File and stdin reads are byte-exact (see :func:`_read_stdin_exact`):
+    the logstream's contract is verbatim content, so line endings must
+    reach the store exactly as the author wrote them.
+    """
+    if inline is not None and file_arg is not None:
+        raise ValueError("pass inline text or a file, not both")
+    if file_arg is not None:
+        if file_arg == "-":
+            return _read_stdin_exact()
+        return Path(os.path.expanduser(file_arg)).read_bytes().decode("utf-8")
+    if inline is not None:
+        return inline
+    return default
+
+
+def _parse_metadata_arg(raw):
+    import json
+
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw)
+    except ValueError as exc:
+        raise ValueError(f"--metadata is not valid JSON: {exc}") from None
+    if not isinstance(value, dict):
+        raise ValueError("--metadata must be a JSON object")
+    return value
+
+
+def _print_event_line(event):
+    target = event["to_agent"] or "*"
+    corr = f" corr={event['correlation_id']}" if event["correlation_id"] else ""
+    status = f" [{event['status']}]" if event["status"] else ""
+    arts = f" artifacts={len(event['artifact_ids'])}" if event["artifact_ids"] else ""
+    body = event["body"].replace("\n", " ")
+    if len(body) > 80:
+        body = body[:77] + "..."
+    body = f" :: {body}" if body else ""
+    print(
+        f"  {event['id']}  {event['created_at']}  {event['type']}  "
+        f"{event['stream']}/{event['room']}  {event['from_agent']}->{target}"
+        f"{status}{corr}{arts}{body}"
+    )
+
+
+def cmd_logstream(args):
+    import json
+
+    as_json = getattr(args, "json", False)
+    try:
+        ls = _open_logstream(args)
+    except Exception as exc:
+        _logstream_fail(str(exc), as_json)
+    try:
+        if args.logstream_action == "append":
+            try:
+                body = _read_text_arg(args.body, args.body_file)
+                event = ls.append_event(
+                    type=args.type,
+                    stream=args.stream,
+                    room=args.room,
+                    from_agent=args.from_agent,
+                    to_agent=args.to_agent,
+                    correlation_id=args.correlation_id,
+                    branch=args.branch,
+                    base_commit=args.base_commit,
+                    status=args.status,
+                    body=body,
+                    metadata=_parse_metadata_arg(args.metadata),
+                    artifact_ids=args.artifact_id or None,
+                )
+            except (ValueError, OSError) as exc:
+                _logstream_fail(str(exc), as_json)
+            if as_json:
+                print(json.dumps(event, indent=2, ensure_ascii=False))
+            else:
+                print("Appended:")
+                _print_event_line(event)
+        elif args.logstream_action in ("list", "wait"):
+            filters = {
+                "stream": args.stream,
+                "room": args.room,
+                "type": args.type,
+                "to_agent": args.to_agent,
+                "from_agent": args.from_agent,
+                "correlation_id": args.correlation_id,
+                "status": args.status,
+                "since_event_id": args.since_event_id,
+                "since_created_at": args.since_created_at,
+            }
+            try:
+                if args.logstream_action == "list":
+                    events = ls.list_events(limit=args.limit, **filters)
+                    result = {"events": events, "count": len(events)}
+                else:
+                    result = ls.wait_events(timeout_ms=args.timeout_ms, limit=args.limit, **filters)
+                    result["count"] = len(result["events"])
+            except ValueError as exc:
+                _logstream_fail(str(exc), as_json)
+            if as_json:
+                print(json.dumps(result, indent=2, ensure_ascii=False))
+            else:
+                if result.get("timed_out"):
+                    print("Timed out; no matching events.")
+                elif not result["events"]:
+                    print("No matching events.")
+                else:
+                    print(f"{result['count']} event(s):")
+                    for event in result["events"]:
+                        _print_event_line(event)
+            if result.get("timed_out"):
+                sys.exit(2)
+        elif args.logstream_action == "sync":
+            from .logsync import load_peers, sync_all, sync_with_peer
+
+            palace_path = (
+                os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+            )
+            try:
+                if args.peer:
+                    results = [sync_with_peer(ls, args.peer, args.token or "")]
+                else:
+                    if not load_peers(palace_path):
+                        _logstream_fail(
+                            f"no peers configured ({palace_path}/peers.json) and no --peer given",
+                            as_json,
+                        )
+                    results = sync_all(ls, palace_path)
+            except Exception as exc:
+                _logstream_fail(str(exc), as_json)
+            if as_json:
+                print(json.dumps(results, indent=2, ensure_ascii=False))
+            else:
+                for stats in results:
+                    if stats.get("error"):
+                        print(
+                            f"  {stats.get('peer_name', stats['peer_url'])}: ERROR {stats['error']}"
+                        )
+                    else:
+                        print(
+                            f"  {stats.get('peer_name', stats['peer_url'])} "
+                            f"({stats['peer_replica']}): +{stats['pulled_events']} events, "
+                            f"+{stats['pulled_artifacts']} artifacts"
+                        )
+            if any(s.get("error") for s in results):
+                sys.exit(1)
+        elif args.logstream_action == "ack":
+            try:
+                event = ls.ack_event(
+                    args.event_id,
+                    from_agent=args.from_agent,
+                    status=args.status,
+                    body=args.body or "",
+                )
+            except ValueError as exc:
+                _logstream_fail(str(exc), as_json)
+            if as_json:
+                print(json.dumps(event, indent=2, ensure_ascii=False))
+            else:
+                print("Acknowledged:")
+                _print_event_line(event)
+    finally:
+        ls.close()
+
+
+def cmd_artifact(args):
+    import json
+
+    as_json = getattr(args, "json", False)
+    try:
+        ls = _open_logstream(args)
+    except Exception as exc:
+        _logstream_fail(str(exc), as_json)
+    try:
+        if args.artifact_action == "put":
+            try:
+                content = _read_text_arg(args.content, args.file, default=None)
+                if content is None:
+                    content = _read_stdin_exact()
+                artifact = ls.put_artifact(
+                    kind=args.kind,
+                    content=content,
+                    created_by=args.created_by,
+                    metadata=_parse_metadata_arg(args.metadata),
+                )
+            except (ValueError, OSError) as exc:
+                _logstream_fail(str(exc), as_json)
+            if as_json:
+                print(json.dumps(artifact, indent=2, ensure_ascii=False))
+            else:
+                print(f"Stored {artifact['id']}  kind={artifact['kind']}")
+                print(f"  sha256={artifact['sha256']}")
+                print(f"  size={artifact['size_bytes']} bytes")
+            # Warnings go to stderr in both modes so `--json | jq` stays
+            # clean while interactive callers still can't miss them.
+            for warning in artifact.get("warnings", []):
+                print(f"Warning: {warning}", file=sys.stderr)
+        elif args.artifact_action == "get":
+            try:
+                artifact = ls.get_artifact(args.artifact_id)
+            except ValueError as exc:
+                _logstream_fail(str(exc), as_json)
+            if artifact is None:
+                _logstream_fail(f"artifact {args.artifact_id!r} not found", as_json)
+            if args.out:
+                # write_bytes, not write_text: on Windows the text layer
+                # expands LF back to CRLF, so the file on disk would not
+                # match the sha256 the user is told to verify.
+                Path(os.path.expanduser(args.out)).write_bytes(artifact["content"].encode("utf-8"))
+            if as_json:
+                if args.out:
+                    artifact = {**artifact, "content_written_to": args.out}
+                    artifact.pop("content")
+                print(json.dumps(artifact, indent=2, ensure_ascii=False))
+            elif args.out:
+                print(f"Wrote {artifact['size_bytes']} bytes to {args.out}")
+                print(f"  sha256={artifact['sha256']}")
+            else:
+                # Exact content on stdout so `mempalace artifact get ID | git apply`
+                # works; metadata would corrupt the stream. Written through
+                # .buffer because the text layer would re-translate newlines
+                # on Windows — the pipe must carry the stored bytes.
+                _write_stdout_exact(artifact["content"])
+    finally:
+        ls.close()
+
+
 def cmd_palace_set_embedder(args):
     """Record (or force-override) a palace's embedder identity (RFC 001).
 
@@ -1141,13 +1570,14 @@ def cmd_repair(args):
         _close_chroma_handles,
         _extract_drawers,
         _post_rebuild_cleanup,
+        _preview_legacy_repair,
         _promote_temp_collection,
         _rebuild_collection_via_temp,
         check_extraction_safety,
         index_read_recovery_guidance,
-        maybe_autoheal_fts5_index,
         maybe_repair_poisoned_max_seq_id_before_rebuild,
         print_sqlite_integrity_abort,
+        resolve_repair_preflight_errors,
         sqlite_integrity_errors,
     )
 
@@ -1251,9 +1681,13 @@ def cmd_repair(args):
     # stack trace instead of the friendly abort message. Run quick_check
     # here so we can surface the clear recovery instructions and exit
     # cleanly before chromadb's compactor touches the disk.
-    sqlite_errors = sqlite_integrity_errors(palace_path)
-    if sqlite_errors:
-        sqlite_errors = maybe_autoheal_fts5_index(palace_path, sqlite_errors)
+    dry_run = getattr(args, "dry_run", False)
+    # The FTS5 autoheal inside this call is a write, so a --dry-run predicts
+    # its outcome instead of performing it (#1596 is auto-healable and must
+    # not surface as an abort in a preview).
+    sqlite_errors = resolve_repair_preflight_errors(
+        palace_path, sqlite_integrity_errors(palace_path), dry_run=dry_run
+    )
     if sqlite_errors:
         print_sqlite_integrity_abort(palace_path, sqlite_errors)
         sys.exit(1)
@@ -1261,7 +1695,7 @@ def cmd_repair(args):
     preflight = maybe_repair_poisoned_max_seq_id_before_rebuild(
         palace_path,
         backup=getattr(args, "backup", True),
-        dry_run=getattr(args, "dry_run", False),
+        dry_run=dry_run,
         assume_yes=getattr(args, "yes", False),
     )
     if preflight is not None:
@@ -1271,6 +1705,24 @@ def cmd_repair(args):
     print(" MemPalace Repair")
     print(f"{'=' * 55}\n")
     print(f"  Palace: {palace_path}")
+
+    if dry_run:
+        # Return before the backend is used at all: the chromadb client this
+        # path opens is itself a write to chroma.sqlite3 (measured — the file
+        # hash changes on get_collection alone, before count()), so a preview
+        # that reached it could not be inert. Staying off the chromadb layer
+        # also keeps a dry run clear of the layer repair is separately reported
+        # to segfault in on a large palace (#2113). Exit non-zero on an
+        # unreadable count for parity with the from-sqlite preview above, so
+        # `--dry-run && repair --yes` cannot walk into the destructive run
+        # after a failed preview (#2095, #2133).
+        if not _preview_legacy_repair(
+            palace_path=palace_path,
+            collection_name=collection_name,
+            confirm_truncation_ok=getattr(args, "confirm_truncation_ok", False),
+        ):
+            sys.exit(1)
+        return
 
     backend = ChromaBackend()
 
@@ -1428,13 +1880,13 @@ def _server_token_path(palace_path: str) -> Path:
     """Per-palace location for the auto-generated server bearer token.
 
     Distinct from the daemon's token dir; keyed by the canonical palace path so
-    one server per palace reuses a stable token across restarts.
+    one server per palace reuses a stable token across restarts. Delegates to
+    ``server_registry`` so the token and the hub serverinfo record share one
+    directory convention.
     """
-    import hashlib
+    from .server_registry import server_token_path
 
-    canonical = os.path.abspath(os.path.realpath(os.path.expanduser(palace_path)))
-    key = hashlib.sha256(os.path.normcase(canonical).encode("utf-8")).hexdigest()[:24]
-    return Path.home() / ".mempalace" / "server" / key / "token"
+    return server_token_path(palace_path)
 
 
 def _load_or_create_server_token(palace_path: str) -> tuple[str, bool]:
@@ -2136,7 +2588,7 @@ def main():
     p_repair.add_argument(
         "--dry-run",
         action="store_true",
-        help="Print detected poisoned rows and exit without mutation (--mode max-seq-id only)",
+        help="Print what the repair would do and exit without modifying the palace",
     )
 
     # repair-status — read-only HNSW capacity health check (#1222)
@@ -2246,6 +2698,126 @@ def main():
         help="Storage backend to use for status (default: config/env/detected/chroma)",
     )
 
+    # logstream (RFC 003 agent coordination)
+    p_logstream = sub.add_parser(
+        "logstream",
+        help="Agent coordination events — delegate work, wait for replies (RFC 003)",
+    )
+    logstream_sub = p_logstream.add_subparsers(dest="logstream_action")
+
+    def _add_logstream_filters(p):
+        p.add_argument("--stream", default=None, help="Stream, e.g. project/mempalace")
+        p.add_argument("--room", default=None, help="Room, e.g. delegation, patches")
+        p.add_argument("--type", default=None, help="Event type, e.g. task.request")
+        p.add_argument("--to-agent", default=None, help="Target agent (also matches '*')")
+        p.add_argument("--from-agent", default=None, help="Writer agent")
+        p.add_argument("--correlation-id", default=None, help="Task/conversation id")
+        p.add_argument(
+            "--status",
+            default=None,
+            help="open|claimed|ready|applied|blocked|failed|superseded",
+        )
+        p.add_argument("--since-event-id", default=None, help="Only events strictly after this id")
+        p.add_argument(
+            "--since-created-at",
+            default=None,
+            help="Only events at/after this time (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ)",
+        )
+
+    p_ls_append = logstream_sub.add_parser("append", help="Append a coordination event")
+    p_ls_append.add_argument("--type", required=True, help="Event type, e.g. task.request")
+    p_ls_append.add_argument("--stream", required=True, help="Stream, e.g. project/mempalace")
+    p_ls_append.add_argument("--room", required=True, help="Room, e.g. delegation")
+    p_ls_append.add_argument("--from-agent", required=True, help="Writer agent identity")
+    p_ls_append.add_argument("--to-agent", default=None, help="Target agent or '*'")
+    p_ls_append.add_argument("--correlation-id", default=None, help="Task/conversation id")
+    p_ls_append.add_argument("--branch", default=None, help="Git branch")
+    p_ls_append.add_argument("--base-commit", default=None, help="Git commit work started from")
+    p_ls_append.add_argument(
+        "--status",
+        default=None,
+        help="open|claimed|ready|applied|blocked|failed|superseded",
+    )
+    p_ls_append.add_argument("--body", default=None, help="Verbatim body text")
+    p_ls_append.add_argument(
+        "--body-file", default=None, help="Read body from file ('-' for stdin)"
+    )
+    p_ls_append.add_argument("--metadata", default=None, help="Extra fields as a JSON object")
+    p_ls_append.add_argument(
+        "--artifact-id",
+        action="append",
+        default=None,
+        help="Reference an already-stored artifact (repeatable)",
+    )
+    p_ls_append.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    p_ls_list = logstream_sub.add_parser("list", help="List events, oldest first")
+    _add_logstream_filters(p_ls_list)
+    p_ls_list.add_argument("--limit", type=int, default=50, help="Max events (default 50)")
+    p_ls_list.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    p_ls_wait = logstream_sub.add_parser(
+        "wait", help="Block until a matching event exists (exit 2 on timeout)"
+    )
+    _add_logstream_filters(p_ls_wait)
+    p_ls_wait.add_argument(
+        "--timeout-ms",
+        type=int,
+        default=60000,
+        help="How long to wait in ms (default 60000, max 300000)",
+    )
+    p_ls_wait.add_argument(
+        "--limit", type=int, default=50, help="Max events to return on match (default 50)"
+    )
+    p_ls_wait.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    p_ls_ack = logstream_sub.add_parser(
+        "ack", help="Acknowledge an event (appends event.ack, never mutates)"
+    )
+    p_ls_ack.add_argument("event_id", help="Event id to acknowledge")
+    p_ls_ack.add_argument("--from-agent", required=True, help="Acknowledging agent identity")
+    p_ls_ack.add_argument(
+        "--status",
+        default=None,
+        help="open|claimed|ready|applied|blocked|failed|superseded",
+    )
+    p_ls_ack.add_argument("--body", default=None, help="Verbatim ack notes")
+    p_ls_ack.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    p_ls_sync = logstream_sub.add_parser(
+        "sync", help="Pull missing events/artifacts from peer replicas (RFC 004)"
+    )
+    p_ls_sync.add_argument(
+        "--peer", default=None, help="Peer base URL (default: all peers in peers.json)"
+    )
+    p_ls_sync.add_argument("--token", default=None, help="Bearer token for --peer")
+    p_ls_sync.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    # artifact (RFC 003 exact content exchange)
+    p_artifact = sub.add_parser(
+        "artifact", help="Exact artifact exchange for agent handoffs (RFC 003)"
+    )
+    artifact_sub = p_artifact.add_subparsers(dest="artifact_action")
+
+    p_art_put = artifact_sub.add_parser("put", help="Store exact artifact content")
+    p_art_put.add_argument("--kind", required=True, help="patch|file|log|json|note")
+    p_art_put.add_argument("--created-by", required=True, help="Writer agent identity")
+    p_art_put.add_argument("--content", default=None, help="Inline content")
+    p_art_put.add_argument(
+        "--file", default=None, help="Read content from file ('-' for stdin; default stdin)"
+    )
+    p_art_put.add_argument("--metadata", default=None, help="Extra fields as a JSON object")
+    p_art_put.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    p_art_get = artifact_sub.add_parser(
+        "get", help="Fetch exact artifact content (stdout pipes into git apply)"
+    )
+    p_art_get.add_argument("artifact_id", help="Artifact id")
+    p_art_get.add_argument("--out", default=None, help="Write content to this file instead")
+    p_art_get.add_argument(
+        "--json", action="store_true", help="Metadata as JSON (content omitted with --out)"
+    )
+
     p_palace = sub.add_parser("palace", help="Palace maintenance commands")
     palace_sub = p_palace.add_subparsers(dest="palace_action")
     p_set_embedder = palace_sub.add_parser(
@@ -2300,6 +2872,20 @@ def main():
             cmd_palace_set_embedder(args)
         else:
             p_palace.print_help()
+        return
+
+    if args.command == "logstream":
+        if not getattr(args, "logstream_action", None):
+            p_logstream.print_help()
+            return
+        cmd_logstream(args)
+        return
+
+    if args.command == "artifact":
+        if not getattr(args, "artifact_action", None):
+            p_artifact.print_help()
+            return
+        cmd_artifact(args)
         return
 
     if args.command == "daemon":

@@ -509,6 +509,31 @@ def test_chroma_backend_create_true_creates_directory_and_collection(tmp_path):
     client.get_collection("mempalace_drawers")
 
 
+def test_palace_wrapper_embeds_for_chroma(tmp_path, monkeypatch):
+    """Normal Chroma callers should not rely on Chroma's internal ONNX embedder."""
+    import mempalace.backends.embedding_wrapper as embedding_wrapper
+    from mempalace.backends.embedding_wrapper import EmbeddingCollection
+    from mempalace.palace import get_collection
+
+    calls = []
+
+    def fake_embed(texts):
+        texts = list(texts)
+        calls.append(texts)
+        return [[float(len(text)), 1.0, 0.0, 0.0] for text in texts]
+
+    monkeypatch.setattr(embedding_wrapper, "_embed_texts", fake_embed)
+
+    col = get_collection(str(tmp_path), create=True, backend="chroma")
+    assert isinstance(col, EmbeddingCollection)
+
+    col.add(ids=["a"], documents=["alpha"], metadatas=[{"wing": "w"}])
+    result = col.query(query_texts=["alpha"], n_results=1)
+
+    assert result.ids == [["a"]]
+    assert calls == [["alpha"], ["alpha"]]
+
+
 def test_chroma_backend_creates_collection_with_cosine_distance(tmp_path):
     palace_path = tmp_path / "palace"
 

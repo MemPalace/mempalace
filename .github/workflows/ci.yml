@@ -64,6 +64,10 @@ jobs:
       # Keep this pin identical to the `ruff==` pin in pyproject.toml
       # ([project.optional-dependencies].dev and [dependency-groups].dev)
       # so CI and `pip install -e ".[dev]"` format/lint identically.
-      - run: pip install "ruff==0.15.14"
+      # This drifted once (CI on 0.15.14 against pyproject's 0.15.20) and the
+      # drift was invisible: the lint job never installs from pyproject, so a
+      # dependabot bump to the pin there passes CI without the new version
+      # ever running. test_ruff_pins_match asserts the two stay equal.
+      - run: pip install "ruff==0.16.1"
       - run: ruff check .
       - run: ruff format --check .

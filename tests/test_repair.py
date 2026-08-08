@@ -2420,6 +2420,239 @@ def test_rebuild_from_sqlite_dry_run_fails_closed_when_count_unreadable(tmp_path
     assert not dest.exists()
 
 
+# ── _preview_legacy_repair — the default (legacy) repair --dry-run ─────
+
+
+def test_preview_legacy_repair_leaves_the_palace_byte_identical(tmp_path, capsys):
+    """The preview must not change a single byte of a real palace."""
+    import hashlib
+
+    palace = tmp_path / "palace"
+    _seed_palace(palace, "mempalace_drawers", [(f"d{i}", f"b{i}", {"wing": "w"}) for i in range(6)])
+    db = palace / "chroma.sqlite3"
+    before = hashlib.sha256(db.read_bytes()).hexdigest()
+    tree_before = sorted((p.name, p.stat().st_size) for p in palace.iterdir())
+
+    counts = repair._preview_legacy_repair(
+        palace_path=str(palace), collection_name="mempalace_drawers"
+    )
+
+    assert counts == {"mempalace_drawers": 6}
+    assert hashlib.sha256(db.read_bytes()).hexdigest() == before
+    assert sorted((p.name, p.stat().st_size) for p in palace.iterdir()) == tree_before
+    assert [p for p in tmp_path.iterdir() if p.name.endswith(".backup")] == []
+    out = capsys.readouterr().out
+    assert "holds 6 rows" in out
+    assert "#1208 truncation guard" in out
+
+
+def test_cmd_repair_dry_run_leaves_a_real_palace_byte_identical(tmp_path, capsys):
+    """End-to-end: everything cmd_repair touches ahead of the preview is read-only.
+
+    The helper test above covers ``_preview_legacy_repair`` on its own. This one
+    covers the calls ``cmd_repair`` makes before reaching it — the quick_check
+    preflight and the poisoned-bookmark detector — against a palace that really
+    exists on disk, which is the only assertion that would catch a write
+    sneaking into any of them.
+    """
+    import argparse
+    import hashlib
+
+    from mempalace.cli import cmd_repair
+
+    palace = tmp_path / "palace"
+    _seed_palace(palace, "mempalace_drawers", [(f"d{i}", f"b{i}", {"wing": "w"}) for i in range(4)])
+
+    def snapshot():
+        return {
+            str(p.relative_to(palace)): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in sorted(palace.rglob("*"))
+            if p.is_file()
+        }
+
+    before = snapshot()
+    args = argparse.Namespace(palace=str(palace), yes=True, dry_run=True)
+
+    with patch("mempalace.cli.MempalaceConfig") as mock_config_cls:
+        mock_config_cls.return_value.palace_path = str(palace)
+        mock_config_cls.return_value.collection_name = "mempalace_drawers"
+        cmd_repair(args)
+
+    out = capsys.readouterr().out
+    assert snapshot() == before
+    assert not (tmp_path / "palace.backup").exists()
+    assert "DRY RUN — no changes will be made." in out
+    assert "holds 4 rows" in out
+    assert "Repair complete" not in out
+
+
+def test_preview_legacy_repair_zero_rows_promises_no_backup(tmp_path, capsys):
+    """A real run stops at "Nothing to repair." — the preview must not promise a rebuild.
+
+    ``sqlite_drawer_count`` returns 0 (not None) for an absent collection, so
+    the fail-closed guard does not cover this case.
+    """
+    palace = tmp_path / "palace"
+    _seed_palace(palace, "mempalace_drawers", [("d1", "b1", {"wing": "w"})])
+
+    counts = repair._preview_legacy_repair(
+        palace_path=str(palace), collection_name="collection_that_does_not_exist"
+    )
+
+    out = capsys.readouterr().out
+    assert counts == {"collection_that_does_not_exist": 0}
+    assert "holds no rows" in out
+    assert "copy the palace directory" not in out
+    assert "VACUUM" not in out
+
+
+def test_preview_legacy_repair_warns_it_would_delete_an_existing_backup(tmp_path, capsys):
+    """Destroying the operator's previous backup is the step a preview must not hide."""
+    palace = tmp_path / "palace"
+    _seed_palace(palace, "mempalace_drawers", [("d1", "b1", {"wing": "w"})])
+    backup = tmp_path / "palace.backup"
+    backup.mkdir()
+
+    repair._preview_legacy_repair(palace_path=str(palace), collection_name="mempalace_drawers")
+
+    out = capsys.readouterr().out
+    assert f"DELETE the existing backup at {backup}" in out
+    assert backup.exists()
+
+
+def test_preview_legacy_repair_warns_when_the_backup_path_is_a_file(tmp_path, capsys):
+    """The real run branches on exists(), not isdir().
+
+    A regular file at <palace>.backup makes a real run refuse at the backup
+    validation step, so a preview that promised a plain copy would describe a
+    run that never happens.
+    """
+    palace = tmp_path / "palace"
+    _seed_palace(palace, "mempalace_drawers", [("d1", "b1", {"wing": "w"})])
+    backup = tmp_path / "palace.backup"
+    backup.write_text("not a palace")
+
+    repair._preview_legacy_repair(palace_path=str(palace), collection_name="mempalace_drawers")
+
+    out = capsys.readouterr().out
+    assert f"DELETE the existing backup at {backup}" in out
+    assert "refuse outright" in out
+    assert "copy the palace directory" not in out
+    assert backup.read_text() == "not a palace"
+
+
+def test_preview_legacy_repair_names_the_live_collection_delete(tmp_path, capsys):
+    """The real run calls delete_collection on the live collection.
+
+    "re-file via a staged temp copy" alone reads as additive, which is the one
+    thing an operator must not misread about a destructive rebuild.
+    """
+    palace = tmp_path / "palace"
+    _seed_palace(palace, "mempalace_drawers", [("d1", "b1", {"wing": "w"})])
+
+    repair._preview_legacy_repair(palace_path=str(palace), collection_name="mempalace_drawers")
+
+    out = capsys.readouterr().out
+    assert "DELETE the live 'mempalace_drawers' collection" in out
+
+
+def test_preview_legacy_repair_reports_the_truncation_guard_as_disabled(tmp_path, capsys):
+    """--confirm-truncation-ok switches the #1208 abort off, so the preview must say so.
+
+    The abort message the guard prints tells operators to re-run with this
+    flag, so the flag plus --dry-run is a combination they are actively
+    steered into. Promising the guard there would be a false safety claim.
+    """
+    palace = tmp_path / "palace"
+    _seed_palace(palace, "mempalace_drawers", [(f"d{i}", f"b{i}", {"wing": "w"}) for i in range(3)])
+
+    counts = repair._preview_legacy_repair(
+        palace_path=str(palace),
+        collection_name="mempalace_drawers",
+        confirm_truncation_ok=True,
+    )
+
+    out = capsys.readouterr().out
+    assert counts == {"mempalace_drawers": 3}
+    assert "#1208 truncation guard is DISABLED" in out
+    assert "the difference would be destroyed" in out
+    assert "abort without changes" not in out
+
+
+def test_preview_legacy_repair_fails_closed_when_count_unreadable(tmp_path, capsys, monkeypatch):
+    """Unreadable count must return {} rather than render a zero-row plan."""
+    palace = tmp_path / "palace"
+    _seed_palace(palace, "mempalace_drawers", [("d1", "b1", {"wing": "w"})])
+    monkeypatch.setattr(repair, "sqlite_drawer_count", lambda *a, **k: None)
+
+    counts = repair._preview_legacy_repair(
+        palace_path=str(palace), collection_name="mempalace_drawers"
+    )
+
+    out = capsys.readouterr().out
+    assert counts == {}
+    assert "refusing to invent zero counts" in out
+    assert "holds" not in out
+
+
+# ── resolve_repair_preflight_errors ───────────────────────────────────
+
+
+def test_resolve_preflight_dry_run_clears_isolated_fts5_without_healing(tmp_path, capsys):
+    """A dry run predicts the autoheal instead of performing its write."""
+    called = []
+    errs = ["malformed inverted index for FTS5 table x"]
+
+    out_errors = repair.resolve_repair_preflight_errors(
+        str(tmp_path),
+        errs,
+        dry_run=True,
+        progress=lambda *a, **k: called.append(a),
+    )
+
+    assert out_errors == []
+    assert called and "isolated FTS5 inverted-index error" in called[0][0]
+
+
+def test_resolve_preflight_dry_run_keeps_broad_corruption(tmp_path):
+    """Errors a real run cannot heal must survive so the caller still aborts."""
+    errs = ["*** in database main *** Page 42 is never used"]
+
+    assert repair.resolve_repair_preflight_errors(str(tmp_path), errs, dry_run=True) == errs
+
+
+def test_resolve_preflight_real_run_delegates_to_autoheal(tmp_path, monkeypatch):
+    """Outside a dry run the behaviour is unchanged: hand off to the autoheal."""
+    seen = {}
+
+    def fake_autoheal(path, errors, *, progress=print):
+        seen["args"] = (path, errors)
+        return []
+
+    monkeypatch.setattr(repair, "maybe_autoheal_fts5_index", fake_autoheal)
+    errs = ["malformed inverted index for FTS5 table x"]
+
+    assert repair.resolve_repair_preflight_errors(str(tmp_path), errs, dry_run=False) == []
+    assert seen["args"] == (str(tmp_path), errs)
+
+
+def test_resolve_preflight_passes_empty_errors_through(tmp_path, monkeypatch):
+    """A clean quick_check must not invoke the autoheal at all.
+
+    Asserting only on the return value would pass with the early-out deleted,
+    since the autoheal hands empty errors straight back.
+    """
+    called = []
+    monkeypatch.setattr(
+        repair,
+        "maybe_autoheal_fts5_index",
+        lambda path, errors, **kw: called.append(path) or errors,
+    )
+
+    assert repair.resolve_repair_preflight_errors(str(tmp_path), [], dry_run=False) == []
+    assert called == []
+
+
 def test_rebuild_from_sqlite_in_place_validates_source_before_archiving(tmp_path):
     """In-place + archive_existing_dest=True with a dir that lacks
     chroma.sqlite3 must NOT rename the dir before bailing. An earlier

@@ -50,6 +50,21 @@ def _seed_strong_closet_for(palace_path, drawer_id, source_file, topics):
             "generated_by": "test",
         },
     )
+    # Keep this fixture above Chroma's batch_size=2 persistence floor. A
+    # single-row closet collection can intermittently query as "Nothing found on
+    # disk" on Windows when the deterministic test embedder makes writes fast.
+    col.upsert(
+        ids=[f"closet_{drawer_id}_sentinel"],
+        documents=["test sentinel unrelated stabilization topic"],
+        metadatas=[
+            {
+                "wing": "backend",
+                "room": "auth",
+                "source_file": f"{source_file}#sentinel",
+                "generated_by": "test",
+            }
+        ],
+    )
 
 
 # ── core invariant: closets can only HELP, never HIDE ─────────────────────
