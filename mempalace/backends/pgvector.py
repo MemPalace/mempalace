@@ -78,7 +78,7 @@ _MAX_IDENTIFIER = 63  # Postgres identifier byte limit.
 _TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
 # Shared-namespace normalization (see _shared_namespace_slug): separators that
 # fold to "_", and the character set the result must then consist of.
-_SHARED_NAMESPACE_SEPARATOR_RE = re.compile(r"[\s\-./:]+")
+_SHARED_NAMESPACE_SEPARATOR_RE = re.compile(r"[\s\-./:_]+")
 _SHARED_NAMESPACE_RE = re.compile(r"^[a-z0-9_]*[a-z0-9][a-z0-9_]*$")
 # Operators that translate to a JSONB containment predicate and so can be
 # pushed down to SQL. Comparisons, $or and $contains stay on the local exact
@@ -404,9 +404,14 @@ def _shared_namespace_slug(value: str) -> str:
     * lower-cased — identifiers are quoted by this backend, so ``Fleet`` and
       ``fleet`` would otherwise be two different tables and re-introduce the
       silent sharding this setting exists to prevent;
-    * common separators (whitespace, ``-``, ``.``, ``/``, ``:``) collapse to a
-      single ``_``, and leading/trailing ``_`` are trimmed, so ``atk-fleet`` and
-      ``atk_fleet`` are the same namespace;
+    * common separators (whitespace, ``-``, ``.``, ``/``, ``:`` and ``_``
+      itself) collapse to a *single* ``_``, and leading/trailing ``_`` are
+      trimmed, so ``atk-fleet``, ``atk fleet``, ``atk__fleet`` and
+      ``atk_fleet`` are one namespace. ``_`` has to fold like every other
+      separator: leaving it alone made ``atk--fleet`` equal ``atk-fleet`` while
+      ``atk__fleet`` stayed distinct, so a doubled underscore in one node's
+      config sharded the fleet silently, which is the exact failure this
+      setting exists to prevent;
     * anything left outside ``[a-z0-9_]`` — quotes, semicolons, non-ASCII — is
       **rejected** with ``ValueError``.
 
@@ -419,9 +424,14 @@ def _shared_namespace_slug(value: str) -> str:
     is meant to make impossible. A loud error at config time is cheap; silently
     mismatched fleet memory is not.
 
-    Over-length values are clamped by :func:`_slug` (35 chars + a 12-hex digest
-    of the value), which is deterministic across nodes; the final table name is
-    additionally clamped to Postgres' 63-byte limit by :func:`_pg_identifier`.
+    Over-length values are clamped here rather than by :func:`_slug`: 35 chars
+    (trailing ``_`` trimmed) plus a 12-hex digest of the normalized value, which
+    is deterministic across nodes. The clamp is written out instead of delegated
+    so the result never contains a doubled ``_``, which keeps this function
+    idempotent — :class:`_PgVectorConfig` re-normalizes an already-normalized
+    value on every reconstruction, so ``f(f(x)) != f(x)`` would silently move a
+    long namespace onto a second table. The final table name is additionally
+    clamped to Postgres' 63-byte limit by :func:`_pg_identifier`.
     """
     if not isinstance(value, str):
         raise ValueError("pgvector_shared_namespace must be a string")
@@ -432,7 +442,40 @@ def _shared_namespace_slug(value: str) -> str:
             "digit and may only use letters, digits, '_', '-', '.', '/', ':' and "
             f"spaces (got {value!r})"
         )
-    return _slug(normalized, "shared")
+    if len(normalized) <= 48:
+        return normalized
+    digest = sha256(normalized.encode("utf-8")).hexdigest()[:12]
+    return f"{normalized[:35].rstrip('_')}_{digest}"
+
+
+def _shared_namespace_key(namespace_slug: str, shared_namespace: str) -> str:
+    """Unambiguous table-prefix segment for a shared namespace.
+
+    The prefix is ``_``-joined and both the tenant namespace slug and the shared
+    namespace slug are variable length, so the readable spelling alone does not
+    determine the pair: namespace ``acme`` with shared namespace ``prod_fleet``
+    and namespace ``acme_prod`` with shared namespace ``fleet`` both render
+    ``mempalace_acme_prod_fleet``. Two unrelated tenants would land on one table
+    with no error — the same silent merge this feature exists to prevent, but
+    across the isolation boundary the backend advertises with
+    ``supports_namespace_isolation``.
+
+    A fixed-width digest of the *pair*, with an explicit boundary between the
+    two components, restores the information the join loses. It also keeps a
+    shared namespace from ever colliding with the default per-palace slot: that
+    slot is 16 hex characters, and ``<slug>_<12 hex>`` cannot spell 16 hex
+    characters because ``_`` is not a hex digit.
+
+    ``namespace_slug`` is the *slugged* tenant segment, not the raw setting, so
+    the tenant dimension keeps exactly the identity it has today: two raw
+    namespaces that already slug alike stay one tenant whether or not a shared
+    namespace is set.
+
+    Palaces without a shared namespace keep byte-identical table names, so this
+    costs no migration.
+    """
+    digest = sha256(f"{namespace_slug}\x00{shared_namespace}".encode("utf-8")).hexdigest()[:12]
+    return f"{shared_namespace}_{digest}"
 
 
 def _pg_identifier(name: str) -> str:
@@ -1461,12 +1504,18 @@ class PgVectorBackend(BaseBackend):
         distinct local palace paths are declared to *be* the same logical palace,
         so the per-palace partition no longer applies to them. Palaces that must
         stay apart need distinct namespaces (or no shared namespace at all).
-        ``namespace`` — the tenant dimension — still partitions either way.
+        ``namespace`` — the tenant dimension — still partitions either way, and
+        :func:`_shared_namespace_key` carries a digest of the pair so the
+        variable-length join cannot smear the two dimensions into each other.
         """
         parts = ["mempalace"]
-        if config.namespace:
-            parts.append(_slug(config.namespace, "namespace"))
-        parts.append(config.shared_namespace or self._palace_hash(palace))
+        namespace_slug = _slug(config.namespace, "namespace") if config.namespace else ""
+        if namespace_slug:
+            parts.append(namespace_slug)
+        if config.shared_namespace:
+            parts.append(_shared_namespace_key(namespace_slug, config.shared_namespace))
+        else:
+            parts.append(self._palace_hash(palace))
         return "_".join(parts)
 
     def _table_name(

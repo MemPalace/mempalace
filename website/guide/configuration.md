@@ -124,9 +124,12 @@ drops out of the table name and every node resolves the same tables.
 - Setting it on a palace that already has data points at *new*, empty tables;
   MemPalace refuses to open the palace rather than appear to lose data, so
   choose the namespace before you mine.
+- Every palace that shares a namespace shares its memory, including two palaces
+  on the *same* machine. The setting declares "these are one logical palace", so
+  give anything that must stay separate its own namespace.
 - Allowed characters are letters, digits and `_ - . / :` or spaces; the value is
-  lower-cased and separators fold to `_`, so `Team-A` and `team_a` are the same
-  namespace. Anything else is rejected.
+  lower-cased and runs of separators fold to a single `_`, so `Team-A`,
+  `team_a` and `team__a` are all the same namespace. Anything else is rejected.
 - It is independent of `MEMPALACE_PGVECTOR_NAMESPACE`: that one still isolates
   tenants, and the two can be combined.
 

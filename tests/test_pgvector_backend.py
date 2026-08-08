@@ -25,6 +25,7 @@ from mempalace.backends.pgvector import (
     _matches_where,
     _vector_distance,
     _as_vector_array,
+    _shared_namespace_key,
     _shared_namespace_slug,
     _strip_nul,
     _json_dumps,
@@ -406,7 +407,7 @@ def test_pgvector_shared_namespace_is_path_independent(tmp_path, fake_pgvector):
     tables = [
         _shared_collection(backend, tmp_path / label)._table for label in ("node-a", "node-b")
     ]
-    assert tables[0] == tables[1] == "mempalace_fleet_drawers"
+    assert tables[0] == tables[1] == f"mempalace_{_shared_namespace_key('', 'fleet')}_drawers"
     # No component of the name is derived from the local path.
     for label in ("node-a", "node-b"):
         path = tmp_path / label
@@ -436,8 +437,8 @@ def test_pgvector_shared_namespace_separates_distinct_namespaces(tmp_path, fake_
     backend = PgVectorBackend()
     col_a = _shared_collection(backend, tmp_path / "a", shared="fleet-one")
     col_b = _shared_collection(backend, tmp_path / "b", shared="fleet-two")
-    assert col_a._table == "mempalace_fleet_one_drawers"
-    assert col_b._table == "mempalace_fleet_two_drawers"
+    assert col_a._table == f"mempalace_{_shared_namespace_key('', 'fleet_one')}_drawers"
+    assert col_b._table == f"mempalace_{_shared_namespace_key('', 'fleet_two')}_drawers"
     assert_partition_isolation(backend, col_a, col_b, embedding=[1.0, 0.0])
 
 
@@ -447,14 +448,29 @@ def test_pgvector_shared_namespace_keeps_tenant_namespace_partition(tmp_path, fa
     backend = PgVectorBackend()
     col_a = _shared_collection(backend, tmp_path / "a", namespace="tenant-a")
     col_b = _shared_collection(backend, tmp_path / "b", namespace="tenant-b")
-    assert col_a._table == "mempalace_tenant_a_fleet_drawers"
-    assert col_b._table == "mempalace_tenant_b_fleet_drawers"
+    assert col_a._table == (
+        f"mempalace_tenant_a_{_shared_namespace_key('tenant_a', 'fleet')}_drawers"
+    )
+    assert col_b._table == (
+        f"mempalace_tenant_b_{_shared_namespace_key('tenant_b', 'fleet')}_drawers"
+    )
     assert_partition_isolation(backend, col_a, col_b, embedding=[1.0, 0.0])
 
 
 @pytest.mark.parametrize(
     "value",
-    ["fleet", "Fleet", "FLEET", " fleet ", "fleet\n", "_fleet_", "-fleet-", "fleet/", ":fleet"],
+    [
+        "fleet",
+        "Fleet",
+        "FLEET",
+        " fleet ",
+        "fleet\n",
+        "_fleet_",
+        "-fleet-",
+        "fleet/",
+        ":fleet",
+        "__fleet__",
+    ],
 )
 def test_pgvector_shared_namespace_normalization_equivalences(value):
     """Case and separator spelling must not fork a fleet into two table sets."""
@@ -470,6 +486,11 @@ def test_pgvector_shared_namespace_normalization_equivalences(value):
         ("atk/fleet", "atk_fleet"),
         ("atk:fleet", "atk_fleet"),
         ("ATK  Fleet", "atk_fleet"),
+        # "_" folds like every other separator: a doubled underscore in one
+        # node's config must not silently shard the fleet.
+        ("atk__fleet", "atk_fleet"),
+        ("atk-_fleet", "atk_fleet"),
+        ("atk_-_fleet", "atk_fleet"),
         ("fleet2", "fleet2"),
         ("2fleet", "2fleet"),
     ],
@@ -1351,3 +1372,79 @@ def test_pgvector_facet_counts_passes_filter_to_sql_layer(tmp_path, fake_pgvecto
     _table, field, where, _limit = client.facet_calls[0]
     assert field == "room"
     assert where == {"wing": "engineering"}
+
+
+def _one_database(monkeypatch):
+    """Make the fake client behave like ONE Postgres server.
+
+    The stock fake gives every ``_PgVectorConfig`` its own private table store,
+    so two configurations whose table *names* collide still cannot see each
+    other's rows. That hides exactly the class of bug these tests exist to
+    catch, so share the store the way a real server does.
+    """
+    store: dict = {}
+    original_init = _FakePgVectorClient.__init__
+
+    def _init(self, config):
+        original_init(self, config)
+        self.tables = store
+
+    monkeypatch.setattr(_FakePgVectorClient, "__init__", _init)
+    return store
+
+
+def test_pgvector_shared_namespace_cannot_smear_into_tenant_namespace(
+    tmp_path, fake_pgvector, monkeypatch
+):
+    """The prefix is ``_``-joined and both namespace segments are variable
+    length, so ``acme`` + ``prod_fleet`` and ``acme_prod`` + ``fleet`` spell the
+    same readable prefix. They must still resolve to different tables: this is
+    the isolation boundary the backend advertises with
+    ``supports_namespace_isolation``, and a silent merge here is a cross-tenant
+    read, not just a shared palace.
+    """
+    _one_database(monkeypatch)
+    backend = PgVectorBackend()
+    col_a = _shared_collection(backend, tmp_path / "a", namespace="acme", shared="prod-fleet")
+    col_b = _shared_collection(backend, tmp_path / "b", namespace="acme-prod", shared="fleet")
+    assert col_a._table != col_b._table
+    assert_partition_isolation(backend, col_a, col_b, embedding=[1.0, 0.0])
+
+
+def test_pgvector_shared_namespace_cannot_hijack_a_default_palace(
+    tmp_path, fake_pgvector, monkeypatch
+):
+    """A shared namespace occupies the slot a palace-path hash normally fills.
+    Spelling one as a palace hash must not resolve to that palace's tables.
+    """
+    _one_database(monkeypatch)
+    backend = PgVectorBackend()
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    victim_hash = sha256(str(victim).encode("utf-8")).hexdigest()[:16]
+    col_victim = backend.get_collection(
+        palace=PalaceRef(id=str(victim), local_path=str(victim)),
+        collection_name="drawers",
+        create=True,
+    )
+    col_other = _shared_collection(backend, tmp_path / "other", shared=victim_hash)
+    assert col_other._table != col_victim._table
+    assert_partition_isolation(backend, col_victim, col_other, embedding=[1.0, 0.0])
+
+
+def test_pgvector_shared_namespace_underscore_spelling_does_not_shard(
+    tmp_path, fake_pgvector, monkeypatch
+):
+    """``atk-fleet``, ``atk__fleet`` and ``atk fleet`` are one fleet.
+
+    Folding ``-`` but not ``_`` meant a doubled underscore on one node silently
+    produced a private table set, which is the failure this setting exists to
+    prevent.
+    """
+    _one_database(monkeypatch)
+    backend = PgVectorBackend()
+    tables = {
+        spelling: _shared_collection(backend, tmp_path / str(index), shared=spelling)._table
+        for index, spelling in enumerate(("atk-fleet", "atk__fleet", "atk fleet", "ATK--Fleet"))
+    }
+    assert len(set(tables.values())) == 1, tables
