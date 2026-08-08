@@ -19,7 +19,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: 'pip'
       - run: pip install -e ".[dev]"
-      - run: python -m pytest tests/ -v --ignore=tests/benchmarks --cov=mempalace --cov-report=term-missing --cov-fail-under=80 --durations=10
+      - run: python -m pytest tests/ -v --ignore=tests/benchmarks --cov=mempalace --cov-report=term-missing --cov-fail-under=85 --durations=10
 
   test-windows:
     runs-on: windows-latest
@@ -52,7 +52,7 @@ jobs:
           python-version: "3.13"
           cache: 'pip'
       - run: pip install -e ".[dev]"
-      - run: python -m pytest tests/ -v --ignore=tests/benchmarks --cov=mempalace --cov-report=term-missing --cov-fail-under=80 --durations=10
+      - run: python -m pytest tests/ -v --ignore=tests/benchmarks --cov=mempalace --cov-report=term-missing --cov-fail-under=85 --durations=10
   lint:
     runs-on: ubuntu-latest
     steps:
@@ -64,6 +64,6 @@ jobs:
       # Keep this pin identical to the `ruff==` pin in pyproject.toml
       # ([project.optional-dependencies].dev and [dependency-groups].dev)
       # so CI and `pip install -e ".[dev]"` format/lint identically.
-      - run: pip install "ruff==0.15.14"
+      - run: pip install "ruff==0.15.20"
       - run: ruff check .
       - run: ruff format --check .

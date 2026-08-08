@@ -742,6 +742,44 @@ class TestReadmeToolCountConsistency:
             )
 
 
+class TestMCPToolSurfaceDocs:
+    """Public docs must describe the registered MCP tool surface exactly."""
+
+    def test_mcp_reference_count_matches_tools_dict(self):
+        actual_count = len(_tools_dict_keys())
+        doc = _read(MCP_TOOLS_DOC_PATH)
+
+        assert f"all {actual_count} MCP tools" in doc, (
+            f"{MCP_TOOLS_DOC_PATH.relative_to(REPO_ROOT)} should say "
+            f"'all {actual_count} MCP tools' because TOOLS has {actual_count} entries."
+        )
+
+    def test_package_readme_count_matches_tools_dict(self):
+        actual_count = len(_tools_dict_keys())
+        package_readme = _read(MEMPALACE_PKG / "README.md")
+
+        assert f"MCP server — {actual_count} tools" in package_readme, (
+            "mempalace/README.md should keep the mcp_server.py module count "
+            f"in sync with TOOLS ({actual_count})."
+        )
+
+    def test_backticked_mcp_tool_names_exist(self):
+        code_tools = set(_tools_dict_keys())
+        docs = "\n".join(
+            [
+                _read(README_PATH),
+                _read(MCP_TOOLS_DOC_PATH),
+                _read(MEMPALACE_PKG / "README.md"),
+            ]
+        )
+        mentioned_tools = sorted(set(re.findall(r"`(mempalace_\w+)`", docs)))
+        unknown_tools = [name for name in mentioned_tools if name not in code_tools]
+
+        assert unknown_tools == [], (
+            f"Docs mention MCP tool names that are not registered in TOOLS: {unknown_tools}."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Bonus: get_aaak_spec tool handler exists
 # ---------------------------------------------------------------------------

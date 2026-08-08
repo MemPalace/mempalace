@@ -216,9 +216,9 @@ and the full tool list:
 
 ## Agents
 
-Each specialist agent gets its own wing and diary in the palace.
-Discoverable at runtime via `mempalace_list_agents` — no bloat in your
-system prompt:
+Each specialist agent can get its own wing and diary in the palace.
+Use `mempalace_diary_write` to record entries and `mempalace_diary_read`
+to retrieve them — no bloat in your system prompt:
 [mempalaceofficial.com/concepts/agents](https://mempalaceofficial.com/concepts/agents.html).
 
 ## Auto-save hooks
