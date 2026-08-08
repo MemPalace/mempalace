@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Features
+
+- **Layer 1 wake-up filters for salience.** Drawers that are structurally not prose are skipped: a harness wrapper opening the text, a bare timestamp, table soup, or too few letters to be writing at all. Outcome-shaped prose ranks first; prose carrying tool noise (fences, exit codes, tool-call names) is ranked lower but never dropped, since engineering writing quotes those constantly. No source file contributes more than two lines; near-duplicates collapse; snippets start and end on sentence/word boundaries. Deterministic and lexical, no LLM call in the hook path. Skipped drawers stay verbatim in the palace and in L2/L3 results. (#1629)
+
 ### Bug Fixes
 
 - **`sweep` books a failed `stat` as a failure again.** The non-regular-file gate added in 3.7.1 reads `stat.S_ISREG(f.stat().st_mode)` inside a `try`, and its `except OSError` printed `SKIP` and moved on. A dangling symlink, a symlink loop and a file unlinked between `rglob` and the gate all raise there, and before the gate existed every one of them reached `sweep()` and was booked in `failures` — so `sweep` went from reporting a transcript it could not read to reporting success. A failed probe is now an error, not a benign file type: it is logged, printed as `WARNING`, and appended to `failures`, while a probe that succeeds and says "not regular" still skips silently. (#2221)

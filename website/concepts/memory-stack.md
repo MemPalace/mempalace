@@ -48,6 +48,36 @@ The generation process:
   - Switched to blue-green deploys after the January outage  (session_2026-02-01.md)
 ```
 
+### What Layer 1 leaves out
+
+Wake-up has room for about 15 lines, so the selection filters before it
+renders. It is deterministic and lexical — no LLM call, nothing that would
+blow the hook's latency budget:
+
+- Drawers that are structurally not prose are skipped: a harness wrapper such
+  as `<system-reminder>` *opening* the text, a bare timestamp, table soup, or
+  too few letters to be writing at all.
+- Mentioning tooling is not disqualifying. A drawer that quotes a fenced
+  command, an exit code or a tool-call name is still someone's account of what
+  happened, so it ranks lower but is never dropped. Only the shape of the text
+  decides, which is why raw JSON, log lines and command output fail while a
+  sentence quoting a path passes.
+- Drawers whose wording reports an outcome (shipped, fixed, decided, reverted,
+  root cause) rank above ordinary prose. The keyword list is the module
+  constant `L1_OUTCOME_KEYWORDS` in `mempalace/layers.py` and is English. It is
+  the one language-specific part of Layer 1: drawers in another language are
+  ranked by the remaining signals instead. To change it, replace the tuple and
+  recompile the derived regex with `_l1_compile_outcome_re`.
+- No single source file contributes more than two lines, so one long
+  transcript cannot own the whole story.
+- Near-duplicate drawers collapse to one line.
+- Snippets start at a sentence boundary and cut on a word boundary, so a line
+  never opens or ends mid-word.
+
+Nothing is deleted or rewritten by this: skipped drawers stay in the palace
+verbatim and are still returned by Layer 2 and Layer 3. If every candidate is
+filtered out, Layer 1 renders the unfiltered top drawers rather than nothing.
+
 ## Layer 2: On-Demand Recall
 
 Loaded when a specific topic or wing comes up in conversation. Retrieves drawers filtered by wing and/or room — typically ~200–500 tokens.
