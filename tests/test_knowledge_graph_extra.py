@@ -103,3 +103,25 @@ class TestQueryRelationshipWithTime:
         objects = [r["object"] for r in results]
         assert "Acme" in objects
         assert "NewCo" not in objects
+
+
+# ── current_triples_with_source (kg_wing_links basis) ─────────────────────────
+
+def test_current_triples_with_source_only_provenanced(kg):
+    kg.add_triple("Amber", "lives_at", "Villa", source_drawer_id="dr1")
+    kg.add_triple("Jon", "owns", "Villa", source_drawer_id="dr2")
+    kg.add_triple("Ghost", "x", "Y")  # no source_drawer_id
+    kg.add_triple("Empty", "x", "Z", source_drawer_id="")  # blank source
+    rows = kg.current_triples_with_source()
+    # Only facts with a non-empty source_drawer_id participate (Ghost + Empty excluded).
+    assert len(rows) == 2
+    assert all(r[2] for r in rows)  # every returned row carries a source_drawer_id
+    subjects = " ".join(r[0] for r in rows).lower()
+    assert "amber" in subjects and "jon" in subjects
+
+
+def test_current_triples_with_source_excludes_expired(kg):
+    kg.add_triple("A", "rel", "B", source_drawer_id="dr1")
+    kg.invalidate("A", "rel", "B")  # supersede -> valid_to set
+    rows = kg.current_triples_with_source()
+    assert rows == []

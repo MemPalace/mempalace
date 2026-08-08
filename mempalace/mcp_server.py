@@ -2365,6 +2365,80 @@ def tool_traverse_graph(start_room: str, max_hops: int = 2):
     return traverse(start_room, col=col, max_hops=max_hops)
 
 
+def tool_kg_wing_links(limit: int = 40):
+    """Area-to-area links derived from the knowledge graph: two wings are linked
+    when they share (or are related through) the same ENTITY. A stronger signal
+    than a shared room *name* — the connection is what the memories are about.
+
+    Weighted by specificity: an entity that appears in many wings contributes
+    little (it links everything, so it means little); one shared by just two wings
+    counts full. Only facts with drawer provenance (source_drawer_id) can be placed
+    in a wing, so pre-provenance facts don't participate.
+    """
+    limit = max(1, min(int(limit or 40), 200))
+    col = _get_collection()
+    if not col:
+        return _collection_error_or_no_palace()
+
+    # drawer_id -> wing, over the whole collection
+    d2w = {}
+    offset = 0
+    while True:
+        batch = col.get(limit=1000, offset=offset, include=["metadatas"])
+        ids = batch.get("ids") or []
+        metas = batch.get("metadatas") or []
+        if not ids:
+            break
+        for i, did in enumerate(ids):
+            meta = _safe_meta(metas[i] if i < len(metas) else {})
+            wing = meta.get("wing")
+            if wing:
+                d2w[did] = wing
+        if len(ids) < 1000:
+            break
+        offset += 1000
+
+    try:
+        triples = _call_kg(lambda kg: kg.current_triples_with_source())
+    except Exception as e:  # noqa: BLE001 - degrade to no links rather than 500
+        return {"error": str(e)}
+
+    # entity -> set(wings it is mentioned in)
+    ent_wings = {}
+    for subj, obj, did in triples:
+        wing = d2w.get(did)
+        if not wing:
+            continue
+        for ent in (subj, obj):
+            if ent:
+                ent_wings.setdefault(ent, set()).add(wing)
+
+    import math
+
+    pair_w = {}
+    pair_ent = {}
+    for ent, wings in ent_wings.items():
+        n = len(wings)
+        if n < 2:
+            continue
+        contrib = 1.0 / math.log2(1 + n)  # specificity down-weight
+        ws = sorted(wings)
+        for i in range(len(ws)):
+            for j in range(i + 1, len(ws)):
+                key = (ws[i], ws[j])
+                pair_w[key] = pair_w.get(key, 0.0) + contrib
+                prev = pair_ent.get(key)
+                if prev is None or n < prev[1]:
+                    pair_ent[key] = (ent, n)  # most-specific shared entity = label
+
+    links = [
+        {"a": a, "b": b, "weight": round(w, 3), "entity": pair_ent[(a, b)][0]}
+        for (a, b), w in pair_w.items()
+    ]
+    links.sort(key=lambda link: link["weight"], reverse=True)
+    return {"links": links[:limit], "count": len(links)}
+
+
 def tool_find_tunnels(wing_a: str = None, wing_b: str = None):
     """Find rooms that bridge two wings — the hallways connecting domains."""
     try:
@@ -4370,6 +4444,16 @@ TOOLS = {
             "required": ["start_room"],
         },
         "handler": tool_traverse_graph,
+    },
+    "mempalace_kg_wing_links": {
+        "description": "Area-to-area links derived from the knowledge graph: two wings linked by a shared or related entity (specificity-weighted so ubiquitous entities don't link everything). Powers the 3D memory map's knowledge-graph edges. Read-only.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Max links to return (default 40, max 200)"},
+            },
+        },
+        "handler": tool_kg_wing_links,
     },
     "mempalace_find_tunnels": {
         "description": "Find rooms that bridge two wings — the hallways connecting different domains. E.g. what topics connect wing_code to wing_team?",

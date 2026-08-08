@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-Detailed parameter schemas for all 36 MCP tools.
+Detailed parameter schemas for all 37 MCP tools.
 
 ## Palace — Read Tools
 
@@ -299,6 +299,18 @@ Knowledge graph overview.
 **Parameters:** None
 
 **Returns:** `{ entities, triples, current_facts, expired_facts, relationship_types }`
+
+---
+
+### `mempalace_kg_wing_links`
+
+Area-to-area links derived from the knowledge graph: two wings are linked when they share (or are related through) the same entity. A stronger signal than a shared room *name* — a specific shared entity is meaningful, whereas a generic room name like "Notes" is often coincidence. Links are weighted by specificity (`1 / log2(1 + n_wings)`), so an entity that appears in many wings contributes little while one shared by just two wings counts full; each link is labelled with its most-specific shared entity. Only facts carrying drawer provenance (`source_drawer_id`) can be located in a wing, so pre-provenance facts don't participate. Read-only.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `limit` | integer | No | Max links to return (default 40, max 200) |
+
+**Returns:** `{ links: [{ a, b, weight, entity }], count }`
 
 ---
 

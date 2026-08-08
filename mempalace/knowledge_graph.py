@@ -653,6 +653,20 @@ class KnowledgeGraph:
             "relationship_types": predicates,
         }
 
+    def current_triples_with_source(self):
+        """(subject, object, source_drawer_id) for every CURRENT fact that carries
+        drawer provenance. Lets a caller locate each entity in a wing (via the
+        drawer's `wing` metadata) — the basis for knowledge-graph-derived area links.
+        Facts without a source_drawer_id (older, pre-provenance) are skipped."""
+        with self._lock:
+            conn = self._conn()
+            rows = conn.execute(
+                "SELECT subject, object, source_drawer_id FROM triples "
+                "WHERE valid_to IS NULL AND source_drawer_id IS NOT NULL "
+                "AND source_drawer_id != ''"
+            ).fetchall()
+        return [(r["subject"], r["object"], r["source_drawer_id"]) for r in rows]
+
     # ── Seed from known facts ─────────────────────────────────────────────
 
     def seed_from_entity_facts(self, entity_facts: dict):
