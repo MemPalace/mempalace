@@ -475,6 +475,48 @@ def test_copilot_cli_jsonl_filters_generated_context_without_dropping_user_promp
     assert "private reasoning" not in result
 
 
+def test_copilot_cli_jsonl_excludes_agent_authored_prompts():
+    """``source: "agent-*"`` marks a kickoff/handoff prompt written by another
+    agent and delivered into the session as a user turn. Keeping it would file
+    an agent's words in the human's voice. ``command-*`` (slash commands) and
+    unsourced prompts are genuine user input and must survive.
+    """
+    lines = [
+        json.dumps({"type": "session.start", "data": {"sessionId": "session-1"}}),
+        json.dumps(
+            {
+                "type": "user.message",
+                "data": {
+                    "content": "agent kickoff prompt",
+                    "source": "agent-0b45bd8b-fbf4-4912-9279-5ca93f4ac8",
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "user.message",
+                "data": {"content": "named agent prompt", "source": "agent-plan-010-author"},
+            }
+        ),
+        json.dumps(
+            {
+                "type": "user.message",
+                "data": {"content": "Slash command input", "source": "command-abc123"},
+            }
+        ),
+        json.dumps({"type": "user.message", "data": {"content": "Typed by the human"}}),
+        json.dumps({"type": "assistant.message", "data": {"content": "Reply"}}),
+    ]
+
+    result = _try_copilot_cli_jsonl("\n".join(lines))
+
+    assert result is not None
+    assert "> Typed by the human" in result
+    assert "> Slash command input" in result
+    assert "agent kickoff prompt" not in result
+    assert "named agent prompt" not in result
+
+
 def test_copilot_cli_jsonl_normalizes_single_top_level_message():
     lines = [
         json.dumps({"type": "session.start", "data": {"sessionId": "session-1"}}),

@@ -335,13 +335,20 @@ def _try_claude_code_jsonl(content: str) -> Optional[str]:
     return None
 
 
+# ``user.message`` ``source`` prefixes that mark generated context rather than
+# words the human typed. Kept as a tuple so ``str.startswith`` matches any of
+# them in one call.
+_COPILOT_GENERATED_SOURCES = ("skill-", "agent-")
+
+
 def _try_copilot_cli_jsonl(content: str) -> Optional[str]:
     """GitHub Copilot CLI sessions (``~/.copilot/session-state/*/events.jsonl``).
 
     Copilot records all session activity in one event stream. Only top-level
     ``user.message`` and ``assistant.message`` events are conversational turns.
-    Tool, system, hook, generated skill, and nested assistant events are
-    intentionally excluded so imported drawers match the user-visible conversation.
+    Tool, system, hook, generated skill, agent-authored, and nested assistant
+    events are intentionally excluded so imported drawers match the
+    user-visible conversation and never attribute generated text to the user.
     """
     lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
     messages = []
@@ -370,11 +377,18 @@ def _try_copilot_cli_jsonl(content: str) -> Optional[str]:
             continue
 
         if entry_type == "user.message":
-            # ``source`` is a generic event identifier, so preserve sourced
-            # prompts unless they use Copilot's known generated-skill prefix.
+            # ``source`` is a generic event identifier, so sourced prompts are
+            # preserved unless the prefix marks them as generated context the
+            # user never typed:
+            #   ``skill-*``  — injected <skill-context> payloads
+            #   ``agent-*``  — kickoff/handoff prompts authored by another
+            #                  agent and delivered into this session as a user
+            #                  turn. Filing these in the user's voice would
+            #                  attribute an agent's words to the human.
+            # Other sources (``command-*`` slash-command invocations, bare
+            # ``None``) are genuine user input and are kept.
             source = data.get("source")
-            is_skill_context = isinstance(source, str) and source.startswith("skill-")
-            if is_skill_context:
+            if isinstance(source, str) and source.startswith(_COPILOT_GENERATED_SOURCES):
                 continue
             role = "user"
         elif entry_type == "assistant.message":
