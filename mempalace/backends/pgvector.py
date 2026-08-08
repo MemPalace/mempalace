@@ -65,13 +65,13 @@ _DEFAULT_DSN = "postgresql://localhost:5432/mempalace"
 _MARKER_FILENAME = "pgvector_backend.json"
 _MAX_IDENTIFIER = 63  # Postgres identifier byte limit.
 _TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
-# Text-search configuration for the pushed-down lexical arm. 'simple' does no
-# stemming and no stop-word removal, so it tokenizes any script the same way
-# ``_TOKEN_RE`` does — Arabic, CJK and English drawers all stay searchable in
-# one palace. A language config ('english') would stem and drop stop words for
-# English while silently degrading every other language, which breaks the
-# verbatim-recall promise for a mixed corpus.
-_FTS_CONFIG = "simple"
+# Column holding ``len(_tokenize(document))`` for each row. BM25 needs the mean
+# document length over the *whole* corpus, not just over the rows a query
+# matched; keeping the count beside the row lets one cheap aggregate supply it
+# without the documents themselves crossing the wire. Written by Python (not a
+# generated column) so the stored value is by construction the same number
+# ``_bm25_scores`` computes — no second tokenizer to drift against.
+_TOKEN_COUNT_COLUMN = "token_count"
 # Operators that translate to a JSONB containment predicate and so can be
 # pushed down to SQL. Comparisons, $or and $contains stay on the local exact
 # path (Python filtering), mirroring the Qdrant backend's local fallback.
@@ -131,37 +131,54 @@ def _tokenize(text: str) -> list[str]:
     return _TOKEN_RE.findall(text.lower())
 
 
-def _escape_tsquery_token(token: str) -> str:
-    """Quote one token so ``to_tsquery`` reads it as a literal lexeme.
+def _token_count(document: str) -> int:
+    """The BM25 document length of ``document``, as stored in ``token_count``."""
+    return len(_tokenize(document))
 
-    ``to_tsquery`` parses its argument as a *query expression*, so an unquoted
-    token carrying ``& | ! ( ) : *`` or ``<->`` would either inject operators or
-    abort the whole search with a syntax error. Wrapping the token in single
-    quotes reduces it to one lexeme; inside those quotes only ``'`` and ``\\``
-    keep any meaning, and both are neutralized by doubling them.
 
-    Tokens produced by :func:`_tokenize` are ``\\w``-only and never need this,
-    but the escape keeps the SQL correct for any future caller that feeds
-    ``lexical_rows`` raw user text.
+def _like_pattern(token: str) -> str:
+    """Build the ``ILIKE`` pattern that tests whether ``token`` occurs in a document.
+
+    Every token :func:`_tokenize` produces is, by construction, a literal
+    substring of ``text.lower()`` — the regex only ever returns spans it matched
+    in that string. So ``document ILIKE '%<token>%'`` is true for *every*
+    document :func:`_bm25_scores` can score above zero, which is exactly the
+    superset property the pushdown needs to stay lossless.
+
+    ``%`` and ``_`` are LIKE wildcards and ``\\`` is the escape character; a
+    ``\\w`` token can only ever contain ``_``, but all three are escaped so the
+    pattern stays a literal-substring test for any future caller passing raw
+    text.
     """
-    escaped = token.replace("\\", "\\\\").replace("'", "''")
-    return f"'{escaped}'"
+    escaped = token.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+    return f"%{escaped}%"
 
 
-def _tsquery_or(tokens: list[str]) -> str:
-    """Build an OR-semantics tsquery string from tokenizer output.
+def _bm25_scores(
+    query: str,
+    documents: list[str],
+    k1: float = 1.5,
+    b: float = 0.75,
+    *,
+    corpus_size: Optional[int] = None,
+    corpus_avgdl: Optional[float] = None,
+) -> list[float]:
+    """Score ``documents`` against ``query`` with Okapi BM25.
 
-    ``websearch_to_tsquery`` ANDs bare terms, which is far stricter than the
-    any-term scoring the BM25 path it replaces uses: a five-word question would
-    match nothing. Joining with ``|`` keeps the lexical arm a recall-oriented
-    candidate generator, which is what the hybrid re-ranker expects.
+    ``corpus_size`` and ``corpus_avgdl`` describe the collection the documents
+    were drawn from. They matter when ``documents`` is a *filtered* candidate
+    pool rather than the whole collection: BM25's IDF term is a function of the
+    collection size and its length normalization is a function of the mean
+    document length, so scoring a pool with pool-derived statistics produces
+    different numbers — and therefore a different top-N — than scoring the whole
+    collection would. Supplying the collection-wide values makes the two
+    identical. Both default to the statistics of ``documents`` itself, which is
+    correct when the caller really did pass the whole collection.
 
-    Empty tokens are dropped — an empty quoted lexeme is a tsquery syntax error.
+    Document frequency needs no such treatment: a document containing a query
+    term always survives a filter built from those same terms, so counting
+    within the pool already yields the collection-wide count.
     """
-    return " | ".join(_escape_tsquery_token(token) for token in tokens if token)
-
-
-def _bm25_scores(query: str, documents: list[str], k1: float = 1.5, b: float = 0.75) -> list[float]:
     query_terms = set(_tokenize(query))
     n_docs = len(documents)
     if not query_terms or n_docs == 0:
@@ -171,7 +188,9 @@ def _bm25_scores(query: str, documents: list[str], k1: float = 1.5, b: float = 0
     doc_lens = [len(toks) for toks in tokenized]
     if not any(doc_lens):
         return [0.0] * n_docs
-    avgdl = sum(doc_lens) / n_docs or 1.0
+    avgdl = corpus_avgdl if corpus_avgdl else (sum(doc_lens) / n_docs or 1.0)
+    if corpus_size:
+        n_docs = corpus_size
 
     df = {term: 0 for term in query_terms}
     for toks in tokenized:
@@ -327,6 +346,31 @@ def _requires_local_filter(where: Optional[dict], where_document: Optional[dict]
     return False
 
 
+def _has_null_operand(where: Optional[dict]) -> bool:
+    """True when ``where`` compares against JSON null anywhere.
+
+    ``metadata @> '{"k": null}'`` demands the key be *present* holding null,
+    while :func:`_matches_where` reads ``meta.get(key)`` and so also accepts the
+    key being absent — the containment predicate is strictly narrower, and no
+    amount of post-filtering can put back a row SQL never returned. The lexical
+    pushdown declines these filters rather than inherit the difference, because
+    it derives the BM25 corpus statistics from the SQL scope and needs that
+    scope to be the one the local path would have scored.
+    """
+    if not where:
+        return False
+    stack: list = [where]
+    while stack:
+        node = stack.pop()
+        if node is None:
+            return True
+        if isinstance(node, dict):
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    return False
+
+
 def _validate_write_batch(
     *,
     documents: list[str],
@@ -452,14 +496,14 @@ def _hnsw_index_name(table: str) -> str:
     return _pg_identifier(f"{table}_hnsw_idx")
 
 
-def _fts_index_name(table: str) -> str:
-    """Deterministic, collision-safe full-text index name for ``table``.
+def _trgm_index_name(table: str) -> str:
+    """Deterministic, collision-safe trigram index name for ``table``.
 
     Table-qualified so two collections sharing a schema cannot claim one index,
     and routed through :func:`_pg_identifier` for the same reason
     :func:`_hnsw_index_name` is.
     """
-    return _pg_identifier(f"{table}_fts_idx")
+    return _pg_identifier(f"{table}_trgm_idx")
 
 
 def _field_sql(field: str, expression: Any, params: list) -> str:
@@ -552,6 +596,10 @@ class _PgVectorClient:
         self._conn = None
         self._closed = False
         self._lock = threading.RLock()
+        # table -> whether it carries the token_count column. Guarded by the
+        # same lock every _execute takes, so concurrent collections sharing one
+        # client cannot see a half-written entry.
+        self._token_count_columns: dict[str, bool] = {}
 
     def _connect(self):
         try:
@@ -650,69 +698,155 @@ class _PgVectorClient:
             "document text NOT NULL DEFAULT '', "
             "metadata jsonb NOT NULL DEFAULT '{}'::jsonb, "
             f"embedding vector({int(dimension)}), "
-            "updated_at timestamptz)"
+            f"updated_at timestamptz, "
+            f"{_quote_identifier(_TOKEN_COUNT_COLUMN)} integer)"
         )
-        self.create_fts_index(table)
+        self.ensure_lexical_assets(table)
 
-    def create_fts_index(self, table: str) -> None:
-        """Create the GIN expression index backing :meth:`lexical_rows`.
+    def ensure_lexical_assets(self, table: str) -> None:
+        """Add the column and index the pushed-down lexical path wants.
 
-        Built here rather than behind ``run_maintenance`` because the table is
-        empty at creation time, so the build is instant and cannot block
-        writers — unlike the HNSW index, which is opt-in precisely because a
-        late build takes ACCESS EXCLUSIVE on a populated table. A palace created
-        before this index existed still searches correctly; Postgres just falls
-        back to a sequential scan, which is one server-side scan instead of the
-        whole table crossing the wire.
+        Both are best-effort. ``token_count`` is what makes the pushdown exact,
+        so a table without it simply stays on the local path — a correctness
+        floor, not a crash. The trigram index only makes the substring predicate
+        fast; without it Postgres sequentially scans, which is still one
+        server-side scan instead of the whole table crossing the wire.
 
-        Failure is logged and swallowed for the same reason
-        :meth:`ensure_extension` swallows: the index is a performance asset, not
-        a correctness one, and a restricted role must still be able to open a
+        Failures are logged and swallowed for the same reason
+        :meth:`ensure_extension` swallows: a restricted role that may not run
+        ``CREATE EXTENSION`` or ``ALTER TABLE`` must still be able to open a
         collection.
+
+        Deliberately *not* a ``to_tsvector`` expression index. Postgres caps a
+        tsvector at 1 MB, and that cap is enforced at write time by an
+        expression index, so indexing one would turn a large drawer from a slow
+        write into a failed write. A trigram index has no such cap.
         """
         qi = _quote_identifier(table)
-        idx = _quote_identifier(_fts_index_name(table))
+        col = _quote_identifier(_TOKEN_COUNT_COLUMN)
         try:
+            self._execute(f"ALTER TABLE {qi} ADD COLUMN IF NOT EXISTS {col} integer")
+        except BackendError:
+            logger.debug("pgvector token_count column not available", exc_info=True)
+        self._token_count_columns.pop(table, None)
+        try:
+            self._execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
             self._execute(
-                f"CREATE INDEX IF NOT EXISTS {idx} ON {qi} "
-                f"USING gin (to_tsvector('{_FTS_CONFIG}', document))"
+                f"CREATE INDEX IF NOT EXISTS {_quote_identifier(_trgm_index_name(table))} "
+                f"ON {qi} USING gin (document gin_trgm_ops)"
             )
         except BackendError:
-            logger.debug("pgvector FTS index creation skipped", exc_info=True)
+            logger.debug("pgvector trigram index creation skipped", exc_info=True)
+        self.backfill_token_counts(table)
+
+    def has_token_count(self, table: str) -> bool:
+        """Whether ``table`` carries the ``token_count`` column, memoized.
+
+        A palace created before this column existed keeps working; the lexical
+        path just sees ``False`` and stays local.
+        """
+        cached = self._token_count_columns.get(table)
+        if cached is not None:
+            return cached
+        try:
+            rows = self._execute(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND table_name = %s AND column_name = %s",
+                [table, _TOKEN_COUNT_COLUMN],
+                fetch=True,
+            )
+            present = bool(rows)
+        except BackendError:
+            logger.debug("pgvector token_count probe failed", exc_info=True)
+            present = False
+        self._token_count_columns[table] = present
+        return present
+
+    def backfill_token_counts(self, table: str, batch: int = 2000) -> int:
+        """Fill ``token_count`` for rows written before the column existed.
+
+        Counted in Python, by the same :func:`_tokenize` BM25 uses, rather than
+        by a Postgres regex that only *approximately* agrees with it — a
+        backfilled length that is off by one silently changes every future
+        ranking for that collection.
+
+        The one-time cost is a single pass of the documents over the wire, which
+        is what *every* lexical query used to cost. Returns the number of rows
+        filled; best-effort, so a role without UPDATE just leaves the collection
+        on the local path.
+        """
+        if not self.has_token_count(table):
+            return 0
+        qi = _quote_identifier(table)
+        col = _quote_identifier(_TOKEN_COUNT_COLUMN)
+        filled = 0
+        try:
+            while True:
+                rows = self._execute(
+                    f"SELECT id, document FROM {qi} WHERE {col} IS NULL LIMIT {int(batch)}",
+                    fetch=True,
+                )
+                if not rows:
+                    return filled
+                self._execute(
+                    f"UPDATE {qi} SET {col} = %s WHERE id = %s",
+                    [(_token_count(record[1] or ""), record[0]) for record in rows],
+                    many=True,
+                )
+                filled += len(rows)
+        except BackendError:
+            logger.debug("pgvector token_count backfill skipped", exc_info=True)
+            return filled
 
     def upsert_rows(self, table: str, rows: list[dict]) -> None:
         if not rows:
             return
         qi = _quote_identifier(table)
+        # The token_count column is only written when the table has it: a palace
+        # created before this release keeps ingesting, it just does not gain the
+        # exact-statistics fast path until ensure_lexical_assets runs.
+        with_counts = self.has_token_count(table)
+        col = _quote_identifier(_TOKEN_COUNT_COLUMN)
+        count_col = f", {col}" if with_counts else ""
+        count_val = ", %s" if with_counts else ""
+        count_set = f", {col} = EXCLUDED.{col}" if with_counts else ""
         sql = (
-            f"INSERT INTO {qi} (id, document, metadata, embedding, updated_at) "
-            "VALUES (%s, %s, %s::jsonb, %s::vector, %s) "
+            f"INSERT INTO {qi} (id, document, metadata, embedding, updated_at{count_col}) "
+            f"VALUES (%s, %s, %s::jsonb, %s::vector, %s{count_val}) "
             "ON CONFLICT (id) DO UPDATE SET "
             "document = EXCLUDED.document, metadata = EXCLUDED.metadata, "
             "embedding = EXCLUDED.embedding, updated_at = EXCLUDED.updated_at"
+            f"{count_set}"
         )
-        params = [
-            (
-                # Strip both unstorable byte classes Postgres rejects before
-                # binding, so one stray byte in a transcript cannot abort the
-                # whole mine (#1829 NUL, #1833 lone surrogate).
-                #
-                # Order matters for metadata: NUL must be stripped *before*
-                # serialization (json escapes it to \\u0000, which the jsonb cast
-                # rejects), while a lone surrogate must be stripped *after*
-                # serialization (json.dumps(ensure_ascii=False) leaves it raw, so
-                # one pass over the serialized string cleans it without walking
-                # the dict). id/document are plain strings, so the two passes
-                # commute there. ids are NUL- and surrogate-free in practice, so
-                # those passes are defensive no-ops on the ON CONFLICT key.
+
+        def _bind(row: dict) -> tuple:
+            # Strip both unstorable byte classes Postgres rejects before
+            # binding, so one stray byte in a transcript cannot abort the
+            # whole mine (#1829 NUL, #1833 lone surrogate).
+            #
+            # Order matters for metadata: NUL must be stripped *before*
+            # serialization (json escapes it to \\u0000, which the jsonb cast
+            # rejects), while a lone surrogate must be stripped *after*
+            # serialization (json.dumps(ensure_ascii=False) leaves it raw, so
+            # one pass over the serialized string cleans it without walking
+            # the dict). id/document are plain strings, so the two passes
+            # commute there. ids are NUL- and surrogate-free in practice, so
+            # those passes are defensive no-ops on the ON CONFLICT key.
+            document = strip_lone_surrogates(_strip_nul(row["document"]))
+            bound = (
                 strip_lone_surrogates(_strip_nul(row["id"])),
-                strip_lone_surrogates(_strip_nul(row["document"])),
+                document,
                 strip_lone_surrogates(_json_dumps(_strip_nul(row.get("metadata")))),
                 _vector_literal(row["embedding"]),
                 row.get("updated_at") or _utcnow(),
             )
-            for row in rows
-        ]
+            # Counted from the stripped text, not the caller's: stripping a NUL
+            # can fuse two tokens into one ("ab\\x00cd" -> "abcd"), and the
+            # stored length has to describe the stored document.
+            return bound + ((_token_count(document),) if with_counts else ())
+
+        params = [_bind(row) for row in rows]
         self._execute(sql, params, many=True)
 
     def query_rows(
@@ -743,42 +877,71 @@ class _PgVectorClient:
             for record in rows or []
         ]
 
-    def lexical_rows(
+    def lexical_corpus_stats(
+        self, table: str, where: Optional[dict]
+    ) -> Optional[tuple[int, float]]:
+        """Collection-wide ``(row_count, mean_token_count)`` for BM25, or ``None``.
+
+        ``None`` means the exact statistics are unavailable — some row in scope
+        has never had its ``token_count`` written (a table filled before the
+        column existed) — and the caller must take the local path rather than
+        score against an approximation.
+
+        Scope is the SQL ``where``, which is what the local path scrolls before
+        it applies :func:`_matches_where`; the Python filter only ever removes
+        rows the SQL predicate already admitted, so the two corpora agree.
+        """
+        col = _quote_identifier(_TOKEN_COUNT_COLUMN)
+        params: list = []
+        where_sql = _where_to_sql(where, params) if where else "TRUE"
+        rows = self._execute(
+            f"SELECT count(*), sum({col}), count(*) FILTER (WHERE {col} IS NULL) "
+            f"FROM {_quote_identifier(table)} WHERE {where_sql}",
+            params,
+            fetch=True,
+        )
+        if not rows:
+            return None
+        total, token_sum, missing = rows[0]
+        total = int(total or 0)
+        if int(missing or 0) or total == 0:
+            return None
+        return total, float(token_sum or 0) / total
+
+    def lexical_candidates(
         self,
         table: str,
         *,
         tokens: list[str],
-        limit: int,
         where: Optional[dict],
     ) -> list[dict]:
-        """Rank rows by Postgres full-text relevance, top ``limit`` only.
+        """Every row that could score above zero for ``tokens``. No limit, no ranking.
+
+        The predicate is an OR of literal-substring tests, one per token, which
+        :func:`_like_pattern` guarantees is a superset of the rows BM25 scores
+        above zero. Ranking and the ``n_results`` cut stay in Python so the
+        pushdown decides only *which rows do not need to cross the wire*, never
+        which rows win — pushing an ORDER BY and LIMIT into SQL would let a
+        server-side ranking silently pick a different top-N than BM25 does.
 
         ``where`` must already be pushdown-safe (see
         :func:`_requires_local_filter`); the caller keeps anything broader on
-        the local path. Returns ``id``/``document``/``metadata``/``score``
-        dicts, ``score`` being ``ts_rank_cd`` — not BM25, which the hybrid
-        re-ranker recomputes in memory over the merged candidate pool anyway.
+        the local path.
         """
         qi = _quote_identifier(table)
-        params: list = [_tsquery_or(tokens)]
+        params: list = [_like_pattern(token) for token in tokens]
+        match_sql = " OR ".join(["document ILIKE %s ESCAPE '\\'"] * len(params))
+        # SQL text order — the ILIKE patterns, then the WHERE params — already
+        # matches positional binding order in ``params``.
         where_sql = _where_to_sql(where, params) if where else "TRUE"
-        params.append(int(limit))
-        # SQL text order — tsquery %s in FROM, then WHERE params, then LIMIT %s
-        # — already matches positional binding order in ``params``.
-        sql = (
-            "SELECT id, document, metadata, "
-            f"ts_rank_cd(to_tsvector('{_FTS_CONFIG}', document), q) AS score "
-            f"FROM {qi}, to_tsquery('{_FTS_CONFIG}', %s) AS q "
-            f"WHERE to_tsvector('{_FTS_CONFIG}', document) @@ q AND ({where_sql}) "
-            "ORDER BY score DESC LIMIT %s"
+        rows = self._execute(
+            f"SELECT id, document, metadata FROM {qi} WHERE ({match_sql}) AND ({where_sql})",
+            params,
+            fetch=True,
         )
-        rows = self._execute(sql, params, fetch=True)
-        out = []
-        for record in rows or []:
-            row = self._row(record, with_embedding=False, with_distance=False)
-            row["score"] = float(record[3]) if record[3] is not None else 0.0
-            out.append(row)
-        return out
+        return [
+            self._row(record, with_embedding=False, with_distance=False) for record in rows or []
+        ]
 
     def scroll_rows(
         self,
@@ -988,6 +1151,10 @@ class PgVectorCollection(BaseCollection):
                 self._client.create_table(self._table, dimension)
                 self._known_dimension = dimension
                 return
+            # A collection created before token_count existed picks it up on
+            # first use, so the lexical pushdown becomes available to palaces
+            # that were never recreated.
+            self._client.ensure_lexical_assets(self._table)
             existing_dim = self._client.table_dimension(self._table)
             if existing_dim is not None and existing_dim != dimension:
                 raise DimensionMismatchError(
@@ -1352,64 +1519,83 @@ class PgVectorCollection(BaseCollection):
     def lexical_search(
         self, *, query: str, n_results: int = 10, where: Optional[dict] = None
     ) -> LexicalResult:
-        """Rank drawers lexically, pushing the scan into Postgres when possible.
+        """Rank drawers lexically, keeping non-matching rows off the wire.
 
         The local path below scrolls every row — documents included — to the
         client and scores BM25 in Python, which costs O(table size) bytes over
         the wire per query. On a remote palace of ~141k drawers that is minutes
-        per query and makes hybrid search unusable, so the default path hands
-        the work to Postgres full-text search instead.
+        per query and makes hybrid search unusable.
 
-        Postgres is used only when ``where`` translates fully to SQL; anything
-        broader (``$or``, comparisons, ``$contains``) falls back to the exact
-        local path, as does a server-side failure, so the pushdown can never
-        change or drop results.
+        The pushdown removes that cost without moving the decision: Postgres
+        evaluates only a *filter*, and the filter admits a superset of the rows
+        BM25 can score above zero, so scoring, ranking and the ``n_results`` cut
+        all still happen here, over the same numbers the local path would
+        produce. What it does not do is let Postgres rank — a server-side
+        ``ORDER BY ... LIMIT`` would return whichever rows *its* relevance
+        function likes best, which is not the set BM25 picks.
+
+        Preconditions for the pushdown, any of which sends the query to the
+        local path unchanged: ``where`` must translate fully to SQL (``$or``,
+        comparisons and ``$contains`` do not), every row in scope must carry a
+        ``token_count`` so the collection-wide BM25 statistics are exact, and
+        the server must answer without error.
         """
         _validate_where(where)
-        if not _requires_local_filter(where):
-            result = self._lexical_search_fts(query=query, n_results=n_results, where=where)
+        if not _requires_local_filter(where) and not _has_null_operand(where):
+            result = self._lexical_search_pushdown(query=query, n_results=n_results, where=where)
             if result is not None:
                 return result
         return self._lexical_search_local(query=query, n_results=n_results, where=where)
 
-    def _lexical_search_fts(
+    def _lexical_search_pushdown(
         self, *, query: str, n_results: int, where: Optional[dict]
     ) -> Optional[LexicalResult]:
-        """Postgres FTS arm of :meth:`lexical_search`; ``None`` means fall back."""
+        """Filter-pushdown arm of :meth:`lexical_search`; ``None`` means fall back."""
         # Ordered exactly as the local path orders its checks: a closed
-        # collection raises before an empty query short-circuits.
+        # collection raises, then a missing table decides, then the query.
         self._ensure_open()
-        tokens = _tokenize(query)
-        if not tokens:
-            # No lexeme can match, and an empty tsquery is a syntax error.
-            return LexicalResult(hits=[])
-        if not self._table_exists():
-            if self._marker_exists():
-                raise CollectionNotInitializedError(self._collection_name)
-            return LexicalResult(hits=[])
         try:
-            rows = self._client.lexical_rows(
-                self._table, tokens=tokens, limit=n_results, where=where
-            )
+            if not self._table_exists():
+                if self._marker_exists():
+                    raise CollectionNotInitializedError(self._collection_name)
+                return LexicalResult(hits=[])
+            tokens = _tokenize(query)
+            if not tokens:
+                # Nothing to match: the local path would scroll the table only
+                # to score every row zero.
+                return LexicalResult(hits=[])
+            if not self._client.has_token_count(self._table):
+                return None
+            stats = self._client.lexical_corpus_stats(self._table, where)
+            if stats is None:
+                # A row in scope predates the token_count column, so the
+                # collection-wide statistics would be a guess. Guessing changes
+                # the ranking, so take the slow exact path instead.
+                return None
+            rows = self._client.lexical_candidates(self._table, tokens=tokens, where=where)
+        except UnsupportedFilterError:
+            # RFC 001 forbids silently ignoring an operator the backend does not
+            # understand. _requires_local_filter and _field_sql are separate
+            # whitelists, so if they ever drift this must stay a hard error
+            # instead of degrading into a slow path that quietly drops it.
+            raise
         except BackendError:
             # Fail open to the exact (slow) local path rather than silently
             # dropping the lexical arm of a hybrid search.
-            logger.debug("pgvector FTS lexical search failed; falling back", exc_info=True)
+            logger.debug("pgvector lexical pushdown failed; falling back", exc_info=True)
             return None
-        hits = [
-            LexicalHit(
-                id=row["id"],
-                document=row["document"],
-                metadata=row["metadata"],
-                score=row["score"],
-            )
-            for row in rows
-            # ``metadata @> ...`` is broader than the exact _matches_where
-            # contract for array/object values, so the filter is re-applied
-            # here exactly as the local path applies it.
-            if row["score"] > 0 and _matches_where(row["metadata"], where)
-        ]
-        return LexicalResult(hits=hits)
+        corpus_size, corpus_avgdl = stats
+        # ``metadata @> ...`` and the exact _matches_where contract can disagree
+        # on non-scalar values, so the filter is re-applied here exactly as the
+        # local path applies it.
+        rows = [row for row in rows if _matches_where(row["metadata"], where)]
+        scores = _bm25_scores(
+            query,
+            [row["document"] for row in rows],
+            corpus_size=corpus_size,
+            corpus_avgdl=corpus_avgdl,
+        )
+        return self._lexical_result(rows, scores, n_results)
 
     def _lexical_search_local(
         self, *, query: str, n_results: int, where: Optional[dict]
@@ -1419,6 +1605,17 @@ class PgVectorCollection(BaseCollection):
         rows = self._scroll(where=pushdown, with_embedding=False)
         rows = [row for row in rows if _matches_where(row["metadata"], where)]
         scores = _bm25_scores(query, [row["document"] for row in rows])
+        return self._lexical_result(rows, scores, n_results)
+
+    @staticmethod
+    def _lexical_result(rows: list[dict], scores: list[float], n_results: int) -> LexicalResult:
+        """Rank and cut, identically for both paths.
+
+        The tiebreak on ``id`` is what makes "same scores" mean "same answer":
+        without it two rows on equal scores keep whatever order the server
+        returned them in, and the cut at ``n_results`` could then fall either
+        way for reasons no caller can see.
+        """
         hits = [
             LexicalHit(
                 id=row["id"],
@@ -1429,7 +1626,7 @@ class PgVectorCollection(BaseCollection):
             for row, score in zip(rows, scores)
             if score > 0
         ]
-        hits.sort(key=lambda hit: hit.score, reverse=True)
+        hits.sort(key=lambda hit: (-hit.score, hit.id))
         return LexicalResult(hits=hits[:n_results])
 
     def close(self) -> None:
@@ -1446,13 +1643,23 @@ class PgVectorCollection(BaseCollection):
         return HealthStatus.healthy()
 
     def maintenance_state(self) -> dict:
-        empty = {"row_count": 0, "vector_index": None, "index_build_complete": False}
+        empty = {
+            "row_count": 0,
+            "vector_index": None,
+            "index_build_complete": False,
+            "lexical_pushdown": False,
+        }
         self._ensure_open()
         try:
             if not self._table_exists():
                 return empty
             rows = self._client.count_rows(self._table)
             has_index = self._client.has_vector_index(self._table)
+            # Whether lexical_search can keep documents off the wire. Reported
+            # because every reason it cannot is a silent fallback to a path that
+            # is correct but O(table) per query, and an operator otherwise has
+            # no way to see which one they are paying for.
+            lexical_pushdown = self._client.lexical_corpus_stats(self._table, None) is not None
         except Exception:  # noqa: BLE001 - state report must not raise
             logger.debug("pgvector maintenance state probe failed", exc_info=True)
             return empty
@@ -1460,6 +1667,7 @@ class PgVectorCollection(BaseCollection):
             "row_count": rows,
             "vector_index": "hnsw" if has_index else None,
             "index_build_complete": has_index,
+            "lexical_pushdown": lexical_pushdown,
         }
 
     def run_maintenance(self, kind: str):

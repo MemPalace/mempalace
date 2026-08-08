@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Performance
+
+- **pgvector lexical search no longer scrolls the whole table.** `lexical_search` pushed every document over the wire on every call, which made hybrid search unusable on a remote palace of ~141k drawers. Postgres now evaluates a substring filter that is a provable superset of the documents BM25 can score above zero, so only candidate rows cross the wire. Scoring, ranking and the `n_results` cut stay client-side and produce the same ids and the same scores as before. Collections gain a `token_count` column and a `pg_trgm` index; a palace created earlier picks both up on open and is backfilled once. `maintenance_state()` now reports `lexical_pushdown` so an operator can see which path a collection is on. (#2165)
+
 ### Bug Fixes
 
 - **`sweep` books a failed `stat` as a failure again.** The non-regular-file gate added in 3.7.1 reads `stat.S_ISREG(f.stat().st_mode)` inside a `try`, and its `except OSError` printed `SKIP` and moved on. A dangling symlink, a symlink loop and a file unlinked between `rglob` and the gate all raise there, and before the gate existed every one of them reached `sweep()` and was booked in `failures` — so `sweep` went from reporting a transcript it could not read to reporting success. A failed probe is now an error, not a benign file type: it is logged, printed as `WARNING`, and appended to `failures`, while a probe that succeeds and says "not regular" still skips silently. (#2221)
