@@ -105,6 +105,19 @@ def test_extract_memories_emotional():
     assert any(m["memory_type"] == "emotional" for m in result)
 
 
+def test_extract_memories_markdown_emphasis_is_not_emotional():
+    text = (
+        "We decided to use PostgreSQL instead of MongoDB. "
+        "**Key reasons:** better transactional guarantees and mature tooling. "
+        "The migration script needs testing before **Friday's** deploy. "
+        "This fixes the connection-pool exhaustion problem we saw last week."
+    )
+    result = extract_memories(text)
+
+    assert result
+    assert all(memory["memory_type"] != "emotional" for memory in result)
+
+
 # ── extract_memories — chunk_index ──────────────────────────────────────
 
 
