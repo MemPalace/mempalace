@@ -33,6 +33,7 @@ import os
 import sys
 import shlex
 import argparse
+import time
 from pathlib import Path
 
 from .config import MempalaceConfig
@@ -1192,11 +1193,57 @@ def cmd_hallways(args):
         print(f"    {label}")
 
 
+def _warn_if_hooks_active_daemon_off(palace_path: str) -> None:
+    """Warn when stop-hooks are actively saving but the daemon isn't running.
+
+    This is the at-risk topology from epic #1963: when hooks fire
+    concurrently without the daemon serializing them, ``mine_palace_lock``
+    fails fast on the loser and the write is deferred. The repeated
+    concurrent-open pressure against ChromaDB's single-writer HNSW segment
+    contributes to recurring divergence. Surfacing this state in
+    ``mempalace status`` is the cheapest adoption nudge — users running
+    status (a common command) learn the daemon exists and that they're
+    not using it.
+
+    Best-effort: never raises, never blocks the status output. A daemon
+    probe that fails just means we can't tell, so we stay silent rather
+    than crying wolf.
+    """
+    try:
+        from .daemon import get_client_if_running
+
+        if get_client_if_running(palace_path) is not None:
+            return  # Daemon is up — hook saves are serialized through it.
+    except Exception:
+        return  # Don't let probe failures break status.
+
+    # Evidence of recent hook activity: ~/.mempalace/hook_state/hook.log
+    # touched in the last week. Older than that and the user isn't actively
+    # using hooks, so the warning would be noise.
+    hook_log = os.path.join(os.path.expanduser("~"), ".mempalace", "hook_state", "hook.log")
+    if not os.path.exists(hook_log):
+        return
+    seven_days_s = 7 * 24 * 3600
+    try:
+        if time.time() - os.path.getmtime(hook_log) > seven_days_s:
+            return
+    except OSError:
+        return
+
+    print()
+    print("  WARNING: hooks are active but the daemon is not running.")
+    print("           Concurrent hook saves fail-fast and the repeated")
+    print("           concurrent-open pressure contributes to recurring HNSW")
+    print("           divergence (epic #1963). Run `mempalace daemon start`")
+    print("           to serialize hook writes through a single ChromaDB client.")
+
+
 def cmd_status(args):
     from .miner import status
 
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     status(palace_path=palace_path)
+    _warn_if_hooks_active_daemon_off(palace_path)
 
 
 # ── Logstream (RFC 003 agent coordination) ────────────────────────────────
