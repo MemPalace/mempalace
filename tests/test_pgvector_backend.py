@@ -1060,3 +1060,142 @@ def test_strip_lone_surrogates_reuses_config_util():
     cleaned = strip_lone_surrogates(raw)
     assert chr(0xD800) not in cleaned
     assert json.loads(cleaned) == {"k": f"v{chr(0xFFFD)}w"}
+
+
+def _install_fake_psycopg(monkeypatch, connect):
+    fake_psycopg = types.ModuleType("psycopg")
+
+    class OperationalError(Exception):
+        pass
+
+    class InterfaceError(Exception):
+        pass
+
+    fake_psycopg.OperationalError = OperationalError
+    fake_psycopg.InterfaceError = InterfaceError
+    fake_psycopg.connect = connect
+    monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
+    return fake_psycopg
+
+
+def test_client_retries_statement_once_on_dead_connection(monkeypatch):
+    """A statement that fails because the connection died under the process
+    (Postgres restart, idle-flow reap) must be retried once on a fresh
+    connection instead of surfacing a BackendError.
+
+    The first fake connection raises ``OperationalError`` on execute — the
+    shape psycopg produces when it discovers a dead socket. The client must
+    discard it, reconnect, and run the statement on the replacement.
+    """
+    created = []
+
+    class _DeadOnExecuteCursor:
+        def __init__(self, error):
+            self._error = error
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def execute(self, sql, params=None):
+            if self._error is not None:
+                raise self._error
+
+        def executemany(self, sql, params=None):
+            return None
+
+        def fetchall(self):
+            return [(1,)]
+
+    class _FakeConn:
+        def __init__(self, error=None):
+            self.closed = False
+            self._error = error
+
+        def cursor(self):
+            return _DeadOnExecuteCursor(self._error)
+
+        def commit(self):
+            return None
+
+        def rollback(self):
+            if self._error is not None:
+                raise self._error
+
+        def close(self):
+            self.closed = True
+
+    def connect(dsn):
+        error = None
+        if not created:
+            error = sys.modules["psycopg"].OperationalError(
+                "server closed the connection unexpectedly"
+            )
+        conn = _FakeConn(error)
+        created.append(conn)
+        return conn
+
+    _install_fake_psycopg(monkeypatch, connect)
+
+    client = _PgVectorClient(_PgVectorConfig(dsn="postgresql://localhost/unused", namespace=None))
+    client.ping()
+
+    assert len(created) == 2
+    assert created[0].closed
+    assert client._conn is created[1]
+    client.close()
+
+
+def test_client_does_not_retry_query_errors(monkeypatch):
+    """A failure with the connection still healthy is a query error — it must
+    surface as BackendError immediately, with no reconnect."""
+    created = []
+
+    class _FailingCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def execute(self, sql, params=None):
+            raise ValueError("bad statement")
+
+        def executemany(self, sql, params=None):
+            return None
+
+        def fetchall(self):
+            return [(1,)]
+
+    class _FakeConn:
+        def __init__(self):
+            self.closed = False
+
+        def cursor(self):
+            return _FailingCursor()
+
+        def commit(self):
+            return None
+
+        def rollback(self):
+            return None
+
+        def close(self):
+            self.closed = True
+
+    def connect(dsn):
+        conn = _FakeConn()
+        created.append(conn)
+        return conn
+
+    _install_fake_psycopg(monkeypatch, connect)
+
+    client = _PgVectorClient(_PgVectorConfig(dsn="postgresql://localhost/unused", namespace=None))
+    with pytest.raises(BackendError):
+        client.ping()
+
+    assert len(created) == 1
+    assert client._conn is created[0]
+    client.close()
