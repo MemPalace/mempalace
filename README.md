@@ -293,6 +293,9 @@ verbatim drawer per user/assistant message, idempotent and resume-safe.
 - Python 3.9+
 - A vector-store backend (ChromaDB by default)
 - ~300 MB disk for the embedding model. Onboarding (`python -m mempalace.onboarding`) offers `embeddinggemma-300m` (multilingual, 100+ languages, recommended) or `all-MiniLM-L6-v2` (English-only, ~30 MB). See the docstring at [`mempalace/embedding.py`](mempalace/embedding.py) for details and migration notes.
+  If you skip onboarding (e.g. after `uv tool install`), the first `mine` defaults to `all-MiniLM-L6-v2` (`minilm`).
+  For the multilingual model, set `MEMPALACE_EMBEDDING_MODEL=embeddinggemma` (or run onboarding) before the first `mine`.
+  To switch an existing palace after mining, set `MEMPALACE_EMBEDDING_MODEL=embeddinggemma` and run `mempalace repair rebuild-index` (the variable must be set for the rebuild, or it falls back to `minilm` again).
 
 No API key is required for the core benchmark path.
 
