@@ -58,6 +58,19 @@ def test_plan_renames_collision_maps_both_to_same_target():
     assert {u[1]["wing"] for u in updates} == {"gamma"}
 
 
+def test_plan_renames_applies_explicit_consolidation_map():
+    summary, updates = plan_wing_renames(
+        [
+            ("d1", {"wing": "wing_claude", "room": "diary"}),
+            ("d2", {"wing": "sessions", "room": "general"}),
+            ("d3", {"wing": "master-brain", "room": "projects"}),
+        ],
+        explicit_renames={"wing_claude": "sessions"},
+    )
+    assert dict(summary) == {("wing_claude", "sessions"): 1}
+    assert updates == [("d1", {"wing": "sessions", "room": "diary"})]
+
+
 # --- integration over a real backend collection ---------------------------
 
 
@@ -129,6 +142,47 @@ def test_migrate_merges_collision_into_existing_wing(tmp_path):
 
     assert _wing_ids(palace, "gamma") == {"drawer_gamma_r_1", "drawer__gamma_r_2"}
     assert _wing_ids(palace, "_gamma") == set()
+
+
+def test_migrate_applies_explicit_consolidation_map(tmp_path):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    _seed(
+        palace,
+        [
+            {
+                "id": "drawer_sessions_r_1",
+                "doc": "current",
+                "meta": _meta("sessions", "r", "s.py", 0),
+            },
+            {
+                "id": "drawer_wing_claude_r_2",
+                "doc": "legacy",
+                "meta": _meta("wing_claude", "r", "c.py", 0),
+            },
+            {
+                "id": "drawer_master_r_3",
+                "doc": "knowledge",
+                "meta": _meta("master-brain", "r", "m.py", 0),
+            },
+        ],
+    )
+
+    assert (
+        migrate_wing_names(
+            str(palace),
+            confirm=True,
+            explicit_renames={"wing_claude": "sessions"},
+        )
+        is True
+    )
+
+    assert _wing_ids(palace, "sessions") == {
+        "drawer_sessions_r_1",
+        "drawer_wing_claude_r_2",
+    }
+    assert _wing_ids(palace, "wing_claude") == set()
+    assert _wing_ids(palace, "master-brain") == {"drawer_master_r_3"}
 
 
 def test_migrate_dry_run_changes_nothing(tmp_path):

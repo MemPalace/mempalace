@@ -437,18 +437,24 @@ def _normalized_wing_target(wing):
     return target
 
 
-def plan_wing_renames(items):
+def plan_wing_renames(items, explicit_renames=None):
     """Pure planner over ``(id, metadata)`` pairs.
 
     Returns ``(summary, updates)`` where ``summary`` is ``{(old, new): count}``
     and ``updates`` is ``[(id, new_metadata), ...]`` for only the records whose
     wing changes. Metadata is copied; only the ``wing`` key is rewritten.
     """
+    explicit_renames = explicit_renames or {}
     summary = defaultdict(int)
     updates = []
     for rec_id, meta in items:
         meta = dict(meta or {})
-        target = _normalized_wing_target(meta.get("wing"))
+        current = meta.get("wing")
+        target = explicit_renames.get(current)
+        if target is None and not explicit_renames:
+            target = _normalized_wing_target(current)
+        elif target == current:
+            target = None
         if target is None:
             continue
         summary[(meta["wing"], target)] += 1
@@ -479,7 +485,7 @@ def _apply_wing_updates(col, updates, batch_size=500):
         col.update(ids=[u[0] for u in chunk], metadatas=[u[1] for u in chunk])
 
 
-def _plan_topics_by_wing_renames():
+def _plan_topics_by_wing_renames(explicit_renames=None):
     """Return ``{old_wing: new_wing}`` for ``topics_by_wing`` keys to normalize."""
     try:
         from .miner import _load_known_entities_raw
@@ -490,9 +496,14 @@ def _plan_topics_by_wing_renames():
     tbw = reg.get("topics_by_wing")
     if not isinstance(tbw, dict):
         return {}
+    explicit_renames = explicit_renames or {}
     renames = {}
     for wing in list(tbw.keys()):
-        target = _normalized_wing_target(wing)
+        target = explicit_renames.get(wing)
+        if target is None and not explicit_renames:
+            target = _normalized_wing_target(wing)
+        elif target == wing:
+            target = None
         if target is not None:
             renames[wing] = target
     return renames
@@ -538,7 +549,12 @@ def _apply_topics_by_wing_renames(renames):
         raise
 
 
-def migrate_wing_names(palace_path: str, dry_run: bool = False, confirm: bool = False) -> bool:
+def migrate_wing_names(
+    palace_path: str,
+    dry_run: bool = False,
+    confirm: bool = False,
+    explicit_renames=None,
+) -> bool:
     """Normalize legacy wing names in ``palace_path`` (strip leading/trailing
     separators), so palaces built before #1675 keep their memories discoverable.
 
@@ -557,20 +573,21 @@ def migrate_wing_names(palace_path: str, dry_run: bool = False, confirm: bool = 
 
     d_items = list(_iter_collection_items(drawers))
     all_wings = {(m or {}).get("wing") for _, m in d_items if (m or {}).get("wing")}
-    d_summary, d_updates = plan_wing_renames(d_items)
+    explicit_renames = explicit_renames or {}
+    d_summary, d_updates = plan_wing_renames(d_items, explicit_renames)
 
     closets = None
     c_summary, c_updates = defaultdict(int), []
     try:
         closets = get_closets_collection(palace_path, create=False)
-        c_summary, c_updates = plan_wing_renames(_iter_collection_items(closets))
+        c_summary, c_updates = plan_wing_renames(_iter_collection_items(closets), explicit_renames)
     except Exception:
         closets = None
 
-    topic_renames = _plan_topics_by_wing_renames()
+    topic_renames = _plan_topics_by_wing_renames(explicit_renames)
 
     if not d_updates and not c_updates and not topic_renames:
-        print("  All wing names are already normalized — nothing to migrate.")
+        print("  No wing names need migration — nothing to migrate.")
         return False
 
     print("\n  Wing-name migration plan:")

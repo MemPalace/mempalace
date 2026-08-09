@@ -889,6 +889,35 @@ def test_hook_use_daemon_env_override(monkeypatch, tmp_path):
     assert cfg.hook_use_daemon is True
 
 
+def test_hook_wing_defaults_to_none(monkeypatch):
+    monkeypatch.delenv("MEMPALACE_HOOK_WING", raising=False)
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    assert cfg.hook_wing is None
+
+
+def test_hook_wing_from_config(monkeypatch, tmp_path):
+    monkeypatch.delenv("MEMPALACE_HOOK_WING", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"hooks": {"wing": "sessions"}}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.hook_wing == "sessions"
+
+
+def test_hook_wing_env_overrides_config(monkeypatch, tmp_path):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"hooks": {"wing": "per_project"}}, f)
+    monkeypatch.setenv("MEMPALACE_HOOK_WING", "sessions")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.hook_wing == "sessions"
+
+
+def test_hook_wing_rejects_invalid_name(monkeypatch, tmp_path):
+    monkeypatch.setenv("MEMPALACE_HOOK_WING", "../sessions")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    with pytest.raises(ValueError, match="invalid path"):
+        _ = cfg.hook_wing
+
+
 # --- max_backups (backup retention) ---
 
 

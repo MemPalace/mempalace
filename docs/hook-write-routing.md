@@ -110,3 +110,19 @@ Configuration file:
         "hooks": "require"
       }
     }
+
+## Canonical diary wing
+
+By default, hook-created diary checkpoints derive a wing from the session's
+project directory. Operators who keep all session history in one wing can set
+an explicit canonical target:
+
+    {
+      "hooks": {
+        "wing": "sessions"
+      }
+    }
+
+`MEMPALACE_HOOK_WING=sessions` provides the equivalent environment override.
+Transcript mining already accepts an explicit wing independently; this setting
+only controls hook-created diary checkpoints.

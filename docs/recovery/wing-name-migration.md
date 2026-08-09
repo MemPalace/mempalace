@@ -39,6 +39,18 @@ mempalace migrate-wings           # prompts for confirmation
 mempalace migrate-wings --yes     # no prompt
 ```
 
+To consolidate multiple historical wings into one canonical wing, repeat
+`--rename` and preview the exact counts first:
+
+```bash
+mempalace migrate-wings --dry-run \
+  --rename wing_claude=sessions \
+  --rename wing_codex=sessions
+mempalace migrate-wings --yes \
+  --rename wing_claude=sessions \
+  --rename wing_codex=sessions
+```
+
 ## What it does
 
 - Re-keys the `wing` **metadata field** on drawers and closets to the normalized
