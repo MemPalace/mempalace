@@ -7,8 +7,10 @@ Produces:
     wing_name/
       room_name.md        — one file per room, drawers as sections
 
-Streams drawers in paginated batches so memory usage stays bounded
-regardless of palace size.
+The markdown export streams drawers in paginated batches so memory usage
+stays bounded regardless of palace size; the JSONL export buffers the
+grouped drawers so files can be written fully sorted, so its memory use is
+proportional to the total exported text.
 """
 
 import errno

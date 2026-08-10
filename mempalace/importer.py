@@ -90,13 +90,20 @@ def _add_batch(col, batch, stats):
         )
         stats["imported"] += len(new)
     except Exception:
+        # Retry per item, and classify each failure AFTER it happens: an id
+        # that exists post-failure (a concurrent writer, or a partial commit
+        # of the batch above) is a skip; anything else re-raises so a real
+        # backend error is never silently converted into a merge.
         for doc_id, document, meta in new:
-            got = col.get(ids=[doc_id], include=[])
-            if got.get("ids"):
-                stats["skipped_existing"] += 1
-                continue
-            col.add(ids=[doc_id], documents=[document], metadatas=[meta])
-            stats["imported"] += 1
+            try:
+                col.add(ids=[doc_id], documents=[document], metadatas=[meta])
+                stats["imported"] += 1
+            except Exception:
+                got = col.get(ids=[doc_id], include=[])
+                if got.get("ids"):
+                    stats["skipped_existing"] += 1
+                else:
+                    raise
 
 
 def import_palace(palace_path: str, input_dir: str, dry_run: bool = False) -> dict:
@@ -163,12 +170,13 @@ def import_palace(palace_path: str, input_dir: str, dry_run: bool = False) -> di
                     pending.append((doc_id, document, meta))
                     if len(pending) >= _ADD_BATCH_SIZE:
                         _flush()
-        except UnicodeDecodeError:
-            # The rest of this file is unreadable; already-flushed batches
-            # stand (idempotent re-import picks up a repaired file cleanly).
+        except (OSError, UnicodeDecodeError) as exc:
+            # Unreadable input (a directory named *.jsonl, permissions, bad
+            # UTF-8, I/O errors): count it and continue; already-flushed
+            # batches stand (idempotent re-import picks up a repaired file).
             stats["malformed"] += 1
             if len(malformed_examples) < 5:
-                malformed_examples.append(f"{path} (not valid UTF-8)")
+                malformed_examples.append(f"{path} ({type(exc).__name__})")
     _flush()
 
     if stats["imported"] and not dry_run:
