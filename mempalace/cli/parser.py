@@ -293,8 +293,37 @@ def main():
         help="Actually delete drawers (overrides --dry-run; requires --wing or a project root)",
     )
 
-    # search
+    # export
     add_cli_write_routing_flags(p_sync)
+    p_export = sub.add_parser(
+        "export",
+        help="Export the palace to a portable directory tree (JSONL for sync, markdown for browsing)",
+    )
+    p_export.add_argument(
+        "--output",
+        default="~/.mempalace/export",
+        help="Directory to write the export tree into (default: ~/.mempalace/export)",
+    )
+    p_export.add_argument(
+        "--format",
+        choices=["jsonl", "markdown"],
+        default="jsonl",
+        help="jsonl (git-friendly, importable; default) or markdown (browsable, one-way)",
+    )
+
+    # import
+    p_import = sub.add_parser(
+        "import",
+        help="Merge a JSONL export into the palace (adds new drawers, skips existing by id)",
+    )
+    p_import.add_argument("dir", help="Directory containing a JSONL palace export")
+    p_import.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report what would be imported without writing anything",
+    )
+
+    # search
     p_search = sub.add_parser("search", help="Find anything, exact words")
     p_search.add_argument("query", help="What to search for")
     p_search.add_argument(
@@ -971,6 +1000,8 @@ def main():
         "search": cmd_search,
         "sweep": cmd_sweep,
         "sync": cmd_sync,
+        "export": cmd_export,
+        "import": cmd_import,
         "mcp": cmd_mcp,
         "serve": cmd_serve,
         "compress": cmd_compress,

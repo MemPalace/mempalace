@@ -1,0 +1,44 @@
+# Loaded into mempalace.cli via exec (see __init__.py). Not a standalone module.
+if __name__ != "mempalace.cli":
+    raise ImportError(f"{__name__} is an implementation fragment; import mempalace.cli")
+
+
+def cmd_export(args):
+    """Export the palace to a portable directory tree (#452)."""
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+
+    from ..backends import detect_backend_for_path
+
+    if not os.path.isdir(palace_path) or detect_backend_for_path(palace_path) is None:
+        print(f"\n  No palace found at {palace_path}", file=sys.stderr)
+        sys.exit(1)
+
+    output_dir = os.path.expanduser(args.output)
+    print(f"\n{'=' * 55}")
+    print(f"  Exporting palace ({args.format})")
+    print(f"{'=' * 55}\n")
+    if args.format == "jsonl":
+        from ..exporter import export_palace_jsonl
+
+        export_palace_jsonl(palace_path, output_dir)
+    else:
+        from ..exporter import export_palace
+
+        export_palace(palace_path, output_dir)
+
+
+def cmd_import(args):
+    """Merge a JSONL export into the palace (#452)."""
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    input_dir = os.path.expanduser(args.dir)
+
+    from ..importer import import_palace
+
+    print(f"\n{'=' * 55}")
+    print("  Importing palace export" + (" (dry run)" if args.dry_run else ""))
+    print(f"{'=' * 55}\n")
+    try:
+        import_palace(palace_path, input_dir, dry_run=args.dry_run)
+    except ValueError as exc:
+        print(f"  ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
