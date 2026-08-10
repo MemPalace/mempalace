@@ -1578,12 +1578,30 @@ def search_memories(
     if strategy_error:
         return strategy_error
 
+    _record_recall_metrics(hits)
+
     return {
         "query": query,
         "filters": {"wing": wing, "room": room, "source_file": source_file},
         "total_before_filter": len(_first_or_empty(drawer_results, "documents")),
         "results": hits,
     }
+
+
+def _record_recall_metrics(hits: list) -> None:
+    """Emit ``memory-semconv v0.1.0`` recall metrics for one search call.
+
+    No-op when telemetry is disabled. Records the post-rerank result
+    count and the cosine similarity of the top hit (``None`` when the
+    result set is empty). See ``mempalace/telemetry.py``.
+    """
+    try:
+        from .telemetry import record_recall
+
+        top_sim = hits[0]["similarity"] if hits else None
+        record_recall(len(hits), top_sim)
+    except Exception:
+        logger.debug("telemetry: record_recall failed", exc_info=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

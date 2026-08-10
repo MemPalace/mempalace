@@ -5732,11 +5732,43 @@ def handle_request(request):
             # all (or passed it as null). An explicit entry — even "" — wins.
             if "entry" not in tool_args or tool_args["entry"] is None:
                 tool_args["entry"] = content_val
+
+        # Telemetry: emit a memory-semconv ``memory.<op>`` span around the
+        # handler call. No-op when OTEL_EXPORTER_OTLP_ENDPOINT is unset
+        # (see ``mempalace.telemetry``). Argument values are NEVER attached
+        # to the span — only the tool name and operation kind — to keep
+        # raw memory content out of the trace pipeline.
+        #
+        # Trace context propagation: ``params._meta`` MAY carry W3C
+        # tracecontext headers (``traceparent`` / ``tracestate``) injected
+        # by the MCP client. We extract them into an OTel Context so the
+        # ``memory.<op>`` span starts as a child of the remote parent —
+        # an agent + MemPalace then share one trace.
+        from .telemetry import (
+            extract_trace_context,
+            is_enabled as _otel_is_enabled,
+            memory_operation,
+            operation_for_tool,
+        )
+
+        parent_ctx = extract_trace_context(params.get("_meta"))
+
         try:
-            with _write_stall_watch(tool_name):
-                result = _decorate_mcp_tool_result(
-                    tool_name, TOOLS[tool_name]["handler"](**tool_args)
-                )
+            with memory_operation(tool_name, parent_context=parent_ctx):
+                # The structured dispatch log line exists for trace
+                # correlation. Only emit when telemetry is on — otherwise
+                # we'd add noise to the default install path's stderr
+                # for no consumer benefit.
+                if _otel_is_enabled():
+                    logger.info(
+                        "memory.dispatch tool=%s operation=%s",
+                        tool_name,
+                        operation_for_tool(tool_name),
+                    )
+                with _write_stall_watch(tool_name):
+                    result = _decorate_mcp_tool_result(
+                        tool_name, TOOLS[tool_name]["handler"](**tool_args)
+                    )
 
             return {
                 "jsonrpc": "2.0",
@@ -7256,6 +7288,16 @@ def _run_stdio_loop() -> None:
                 pass
 
     logger.info("MemPalace MCP Server starting...")
+
+    # Opt-in OpenTelemetry — no-op unless OTEL_EXPORTER_OTLP_ENDPOINT is set
+    # AND the [observability] extra is installed.
+    try:
+        from .telemetry import init_telemetry
+
+        init_telemetry()
+    except Exception:
+        # Telemetry must never block server startup.
+        logger.debug("telemetry: init_telemetry raised", exc_info=True)
 
     # Pre-flight in a background thread: PRAGMA quick_check reads every page
     # of chroma.sqlite3 (20s+ on multi-GB palaces) and running it before the
