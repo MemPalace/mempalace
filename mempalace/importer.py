@@ -140,17 +140,22 @@ def import_palace(palace_path: str, input_dir: str, dry_run: bool = False) -> di
     pending: list = []
     malformed_examples: list = []
 
-    def _flush():
-        if not pending:
+    def _flush_batch(batch):
+        if not batch:
             return
         if dry_run:
-            stats["imported"] += len(pending)
+            stats["imported"] += len(batch)
         else:
-            _add_batch(col, pending, stats)
-        pending.clear()
+            _add_batch(col, batch, stats)
 
     for path in jsonl_files:
         stats["files"] += 1
+        # Read under a guard, flush outside it: the guard must catch only
+        # filesystem failures on THIS file, never a backend error from a
+        # flush (which would be miscounted as malformed input and leave the
+        # batch pending). Lines parsed before a mid-file read error still
+        # import; idempotent re-import picks up a repaired file cleanly.
+        triples: list = []
         try:
             with open(path, encoding="utf-8") as f:
                 for lineno, raw in enumerate(f, 1):
@@ -167,17 +172,20 @@ def import_palace(palace_path: str, input_dir: str, dry_run: bool = False) -> di
                     if doc_id in seen_ids:
                         continue
                     seen_ids.add(doc_id)
-                    pending.append((doc_id, document, meta))
-                    if len(pending) >= _ADD_BATCH_SIZE:
-                        _flush()
+                    triples.append((doc_id, document, meta))
         except (OSError, UnicodeDecodeError) as exc:
-            # Unreadable input (a directory named *.jsonl, permissions, bad
-            # UTF-8, I/O errors): count it and continue; already-flushed
-            # batches stand (idempotent re-import picks up a repaired file).
+            # Unreadable input: a directory named *.jsonl, permissions,
+            # bad UTF-8, I/O errors. Count it and continue.
             stats["malformed"] += 1
             if len(malformed_examples) < 5:
                 malformed_examples.append(f"{path} ({type(exc).__name__})")
-    _flush()
+        pending.extend(triples)
+        while len(pending) >= _ADD_BATCH_SIZE:
+            _flush_batch(pending[:_ADD_BATCH_SIZE])
+            del pending[:_ADD_BATCH_SIZE]
+    if pending:
+        _flush_batch(pending)
+        pending.clear()
 
     if stats["imported"] and not dry_run:
         print(
