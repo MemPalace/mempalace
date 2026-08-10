@@ -12,6 +12,7 @@ regardless of palace size.
 """
 
 import errno
+import json
 import os
 import re
 from collections import defaultdict
@@ -212,3 +213,109 @@ def _quote_content(text: str) -> str:
     """Format content for a markdown blockquote, handling multiline."""
     lines = text.rstrip("\n").split("\n")
     return "\n> ".join(lines)
+
+
+def export_palace_jsonl(palace_path: str, output_dir: str) -> dict:
+    """Export all palace drawers as JSONL files organized by wing/room.
+
+    Produces a git-friendly tree suitable for cross-device sync (#452)::
+
+        output_dir/
+          export-manifest.json      — format version + counts
+          wing_name/
+            room_name.jsonl         — one drawer per line
+
+    Each line is a JSON object with the drawer's ``id``, ``document``, and
+    ``metadata`` — the exact triple needed to re-file it on another machine.
+    Embeddings are deliberately not included: they are large, binary, and tied
+    to the embedding model; import re-embeds instead.
+
+    Output is deterministic (keys sorted, drawers sorted by id within each
+    room, no timestamps), so re-exporting an unchanged palace produces a
+    byte-identical tree and therefore an empty git diff.
+
+    Streams drawers in paginated batches like :func:`export_palace`, but
+    buffers each room's lines in memory so they can be written fully sorted;
+    memory is proportional to the exported text, which for a palace is a few
+    tens of MB at most.
+
+    Returns:
+        Stats dict: {"wings": N, "rooms": N, "drawers": N}
+    """
+    col = get_collection(palace_path)
+    total = col.count()
+
+    if total == 0:
+        print("  Palace is empty — nothing to export.")
+        return {"wings": 0, "rooms": 0, "drawers": 0}
+
+    _reject_symlink(output_dir, "output_dir")
+    os.makedirs(output_dir, exist_ok=True)
+    try:
+        os.chmod(output_dir, 0o700)
+    except (OSError, NotImplementedError):
+        pass
+
+    # {wing: {room: {id: line_dict}}} — buffered so each file writes sorted.
+    grouped: dict[str, dict[str, dict[str, dict]]] = defaultdict(lambda: defaultdict(dict))
+
+    print(f"  Streaming {total} drawers...")
+    offset = 0
+    while offset < total:
+        batch = col.get(limit=1000, offset=offset, include=["documents", "metadatas"])
+        if not batch["ids"]:
+            break
+        for doc_id, doc, meta in zip(batch["ids"], batch["documents"], batch["metadatas"]):
+            meta = meta or {}
+            wing = meta.get("wing", "unknown")
+            room = meta.get("room", "general")
+            grouped[wing][room][doc_id] = {
+                "id": doc_id,
+                "document": doc,
+                "metadata": meta,
+            }
+        offset += len(batch["ids"])
+
+    total_drawers = 0
+    room_count = 0
+    for wing in sorted(grouped):
+        safe_wing = _safe_path_component(wing)
+        wing_dir = os.path.join(output_dir, safe_wing)
+        _reject_symlink(wing_dir, f"wing directory {safe_wing!r}")
+        os.makedirs(wing_dir, exist_ok=True)
+        try:
+            os.chmod(wing_dir, 0o700)
+        except (OSError, NotImplementedError):
+            pass
+
+        for room in sorted(grouped[wing]):
+            drawers = grouped[wing][room]
+            safe_room = _safe_path_component(room)
+            room_path = os.path.join(wing_dir, f"{safe_room}.jsonl")
+            with _safe_open_for_write(room_path, "w") as f:
+                for doc_id in sorted(drawers):
+                    f.write(json.dumps(drawers[doc_id], ensure_ascii=False, sort_keys=True))
+                    f.write("\n")
+            room_count += 1
+            total_drawers += len(drawers)
+        print(
+            f"  {wing}: {len(grouped[wing])} rooms, {sum(len(r) for r in grouped[wing].values())} drawers"
+        )
+
+    manifest = {
+        "format_version": 1,
+        "wings": len(grouped),
+        "rooms": room_count,
+        "drawers": total_drawers,
+    }
+    manifest_path = os.path.join(output_dir, "export-manifest.json")
+    with _safe_open_for_write(manifest_path, "w") as f:
+        f.write(json.dumps(manifest, indent=2, sort_keys=True))
+        f.write("\n")
+
+    stats = {"wings": len(grouped), "rooms": room_count, "drawers": total_drawers}
+    print(
+        f"\n  Exported {stats['drawers']} drawers across {stats['wings']} wings, {stats['rooms']} rooms"
+    )
+    print(f"  Output: {output_dir}")
+    return stats

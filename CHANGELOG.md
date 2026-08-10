@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Features
+
+- **Cross-device sync: `mempalace export` / `mempalace import`.** `export` (default `--format jsonl`)
+  writes a deterministic, git-friendly JSONL tree organized by wing/room — sorted ids, sorted keys, no
+  timestamps, so re-exporting an unchanged palace is a zero git diff — and `import <dir>` merges an
+  export into another machine's palace by drawer id: adds new drawers, skips existing ones, idempotent
+  on re-import, and re-embeds locally since exports deliberately carry no vectors. `--format markdown`
+  exposes the existing browsable markdown exporter on the CLI for the first time. (#452)
+
 ### Bug Fixes
 
 - **`sweep` books a failed `stat` as a failure again.** The non-regular-file gate added in 3.7.1 reads `stat.S_ISREG(f.stat().st_mode)` inside a `try`, and its `except OSError` printed `SKIP` and moved on. A dangling symlink, a symlink loop and a file unlinked between `rglob` and the gate all raise there, and before the gate existed every one of them reached `sweep()` and was booked in `failures` — so `sweep` went from reporting a transcript it could not read to reporting success. A failed probe is now an error, not a benign file type: it is logged, printed as `WARNING`, and appended to `failures`, while a probe that succeeds and says "not regular" still skips silently. (#2221)
