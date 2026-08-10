@@ -1,7 +1,7 @@
 ---
 name: mempalace
 description: "MemPalace — Local AI memory with 96.6% recall. Semantic search, temporal knowledge graph, palace architecture (wings/rooms/drawers). Free, no cloud, no API keys."
-version: 3.6.0
+version: 3.7.0
 homepage: https://github.com/MemPalace/mempalace
 user-invocable: true
 metadata:

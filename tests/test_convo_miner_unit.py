@@ -10,6 +10,7 @@ from mempalace.convo_miner import (
     _emit_bounded,
     _extract_authored_at,
     _file_chunks_locked,
+    _source_file_delete_ids,
     chunk_exchanges,
     detect_convo_room,
     scan_convos,
@@ -583,6 +584,75 @@ class TestFileChunksLocked:
         assert "rag/foo.py" in entities
         assert "do_thing_now" in entities
 
+    def test_aborts_when_stale_drawer_purge_fails(self, monkeypatch):
+        """#105: a failed purge must abort the mine attempt, not silently
+        proceed to upsert on top of it — the same swallow already fixed
+        for miner.py's process_file at #23, own instance here."""
+        import mempalace.convo_miner as convo_miner
+
+        class FailingPurgeCol:
+            def __init__(self):
+                self.upsert_called = False
+
+            def get(self, *args, **kwargs):
+                raise RuntimeError("simulated transient backend error")
+
+            def delete(self, *args, **kwargs):
+                pass
+
+            def upsert(self, documents, ids, metadatas):
+                self.upsert_called = True
+
+        chunks = [{"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(3)]
+        col = FailingPurgeCol()
+        monkeypatch.setattr(
+            convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
+        )
+        monkeypatch.setattr(convo_miner, "mine_lock", lambda source_file: contextlib.nullcontext())
+        monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda content: "conversations")
+
+        drawers, room_counts, skipped = _file_chunks_locked(
+            col, "chat.txt", chunks, "wing", "general", "agent", "exchange"
+        )
+
+        assert col.upsert_called is False, (
+            "_file_chunks_locked inserted new chunks even though the "
+            "stale-drawer purge raised — old and new rows can now coexist "
+            "as duplicates/orphans"
+        )
+        assert drawers == 0
+        assert skipped is True
+
+
+class TestSourceFileDeleteIds:
+    """#104: the sweeper writes drawers with no extract_mode at all
+    (ingest_mode="sweep"). convo_miner's default exchange-mode purge
+    must not scoop those up — they were never meant to carry
+    extract_mode, unlike a genuine legacy pre-schema convo_miner row."""
+
+    def test_excludes_sweeper_rows_from_exchange_mode_purge(self):
+        class FakeCol:
+            def get(self, where=None, limit=None, offset=0, include=None):
+                if offset > 0:
+                    return {"ids": [], "metadatas": []}
+                return {
+                    "ids": ["sweep_1", "exchange_1", "legacy_1"],
+                    "metadatas": [
+                        {"ingest_mode": "sweep", "session_id": "s1", "role": "user"},
+                        {"ingest_mode": "convos", "extract_mode": "exchange"},
+                        {"source_file": "chat.txt"},  # pre-ingest_mode legacy row
+                    ],
+                }
+
+        delete_ids = _source_file_delete_ids(FakeCol(), "chat.txt", "exchange")
+
+        assert "sweep_1" not in delete_ids, (
+            "sweeper's drawer was scooped into convo_miner's default "
+            "exchange-mode purge and would be deleted on the next re-mine"
+        )
+        assert "exchange_1" in delete_ids
+        assert "legacy_1" in delete_ids
+
 
 class TestExtractAuthoredAt:
     """authored_at = max per-line ``timestamp`` in a transcript (real authored date,
@@ -643,3 +713,21 @@ class TestExtractAuthoredAt:
         f = tmp_path / "session.jsonl"
         f.write_text('{"timestamp": 1}\n{"timestamp": false}\n')
         assert _extract_authored_at(f) is None
+
+
+def test_scan_convos_accepts_one_file_without_scanning_siblings(
+    tmp_path,
+):
+    selected = tmp_path / "selected.jsonl"
+    sibling = tmp_path / "sibling.jsonl"
+
+    selected.write_text(
+        '{"type": "user"}\n',
+        encoding="utf-8",
+    )
+    sibling.write_text(
+        '{"type": "user"}\n',
+        encoding="utf-8",
+    )
+
+    assert scan_convos(str(selected)) == [selected.resolve()]

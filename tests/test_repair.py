@@ -78,6 +78,131 @@ def test_paginate_ids_offset_exception_fallback():
     assert "id1" in ids
 
 
+def test_paginate_ids_offset_broken_over_page_size_raises_instead_of_truncating():
+    """When offset is broken, the no-offset fallback is structurally
+    stuck at the first `page` (1000) results, and the collection's own
+    count() confirms there really are MORE ids than that (a genuinely
+    truncated case) -- silently returning a truncated ID list is worse than
+    failing loudly, since callers (scan_palace, rebuild) treat the result as
+    the full palace and can act on incomplete data."""
+    col = MagicMock()
+    full_page = [f"id{i}" for i in range(1000)]
+    col.get.side_effect = [
+        Exception("offset bug"),
+        {"ids": full_page},
+        Exception("offset bug"),
+        {"ids": full_page},  # same 1000 ids again -- no offset means no progress
+    ]
+    col.count.return_value = 1500  # collection genuinely holds more than the page
+    with pytest.raises(RuntimeError, match="truncated"):
+        repair._paginate_ids(col)
+
+
+def test_paginate_ids_offset_broken_exactly_page_size_completes_without_raising():
+    """The page-boundary case is ambiguous from the fetched page alone: a
+    collection that genuinely holds exactly `page` ids looks identical to a
+    truncated one. count() disambiguates -- when it confirms the collected
+    count IS the true total, this must complete normally, not raise."""
+    col = MagicMock()
+    full_page = [f"id{i}" for i in range(1000)]
+    col.get.side_effect = [
+        Exception("offset bug"),
+        {"ids": full_page},
+        Exception("offset bug"),
+        {"ids": full_page},
+    ]
+    col.count.return_value = 1000  # exactly what was collected -- genuinely complete
+    ids = repair._paginate_ids(col)
+    assert len(ids) == 1000
+
+
+def test_paginate_ids_offset_broken_count_unreadable_raises_conservatively():
+    """If count() itself cannot disambiguate (raises), do not assume
+    completeness -- refusing to silently return a possibly-truncated list is
+    the safer default."""
+    col = MagicMock()
+    full_page = [f"id{i}" for i in range(1000)]
+    col.get.side_effect = [
+        Exception("offset bug"),
+        {"ids": full_page},
+        Exception("offset bug"),
+        {"ids": full_page},
+    ]
+    col.count.side_effect = Exception("count also broken")
+    with pytest.raises(RuntimeError, match="truncated"):
+        repair._paginate_ids(col)
+
+
+def test_paginate_ids_offset_broken_under_page_size_still_breaks_cleanly():
+    """A collection genuinely smaller than `page` must still return normally
+    when offset is broken -- only the >=page truncation case should raise."""
+    col = MagicMock()
+    col.get.side_effect = [
+        Exception("offset bug"),
+        {"ids": ["id1", "id2"]},
+        Exception("offset bug"),
+        {"ids": ["id1", "id2"]},
+    ]
+    ids = repair._paginate_ids(col)
+    assert ids == ["id1", "id2"]
+
+
+# ── _paginate_ids: double-failure + filtered-count (PR #2086 review) ───
+# fatkobra's CHANGES_REQUESTED on PR #2086: the truncation-detection fix
+# left two loud-failure gaps. The whole point of the fix is to refuse to
+# act on an incomplete palace, so both gaps must raise, not return a
+# partial/empty list, and the global count() must never be used as proof
+# of truncation for a *filtered* (where=) result.
+
+
+def test_paginate_ids_double_failure_after_progress_raises_not_partial():
+    """Offset get() fails, then the no-offset fallback ALSO fails, after at
+    least one page was already collected. The function must NOT return the
+    partial first page as if it were complete -- it must raise so callers
+    (scan_palace, rebuild) never treat a truncated palace as whole."""
+    col = MagicMock()
+    first_page = [f"id{i}" for i in range(1000)]
+    col.get.side_effect = [
+        {"ids": first_page},  # page 1 lands normally via offset path
+        Exception("offset bug"),  # page 2 offset request fails
+        Exception("fallback also down"),  # no-offset fallback ALSO fails
+    ]
+    with pytest.raises(RuntimeError):
+        repair._paginate_ids(col)
+
+
+def test_paginate_ids_double_failure_on_first_page_raises_not_empty():
+    """Both the offset request and its no-offset fallback fail on the very
+    first page. Returning [] here is a silent lie -- scan_palace would print
+    'Nothing to scan.' on a palace it never actually read. Must raise."""
+    col = MagicMock()
+    col.get.side_effect = [
+        Exception("offset bug"),  # first offset request fails
+        Exception("fallback also down"),  # no-offset fallback fails too
+    ]
+    with pytest.raises(RuntimeError):
+        repair._paginate_ids(col)
+
+
+def test_paginate_ids_filtered_exactly_page_size_does_not_use_global_count():
+    """A wing filter selects exactly 1000 rows; the collection holds more in
+    OTHER wings. Offset is broken but the fallback returns the complete 1000
+    filtered rows. The global count() (1500) is NOT authoritative for the
+    filtered set, so it must not be treated as proof of truncation -- the
+    function must return the complete 1000 filtered rows without raising."""
+    col = MagicMock()
+    filtered_page = [f"id{i}" for i in range(1000)]
+    col.get.side_effect = [
+        Exception("offset bug"),
+        {"ids": filtered_page},
+        Exception("offset bug"),
+        {"ids": filtered_page},  # same 1000 filtered ids -- fallback stuck
+    ]
+    col.count.return_value = 1500  # collection-wide, NOT the filtered total
+    ids = repair._paginate_ids(col, where={"wing": "w"})
+    assert len(ids) == 1000
+
+
 # ── _extract_drawers ──────────────────────────────────────────────────
 
 
@@ -177,6 +302,20 @@ def _install_mock_backend(mock_backend_cls, collection):
     return mock_backend
 
 
+@patch("mempalace.repair.hnsw_capacity_status")
+@patch("mempalace.repair.ChromaBackend")
+def test_scan_palace_aborts_on_hnsw_divergence(mock_backend_cls, mock_capacity, tmp_path):
+    """count() on a diverged HNSW segment can hard-crash the process
+    (#1222) -- a try/except cannot save it. scan_palace must never reach
+    ChromaBackend().get_collection()/count() when hnsw_capacity_status
+    reports divergence (#91)."""
+    mock_capacity.return_value = {"diverged": True, "message": "test divergence"}
+    good, bad = repair.scan_palace(palace_path=str(tmp_path))
+    assert good == set()
+    assert bad == set()
+    mock_backend_cls.assert_not_called()
+
+
 @patch("mempalace.repair.ChromaBackend")
 def test_scan_palace_no_ids(mock_backend_cls, tmp_path):
     mock_col = MagicMock()
@@ -248,6 +387,18 @@ def test_scan_palace_with_wing_filter(mock_backend_cls, tmp_path):
 
 
 # ── prune_corrupt ─────────────────────────────────────────────────────
+
+
+@patch("mempalace.repair.hnsw_capacity_status")
+@patch("mempalace.repair.ChromaBackend")
+def test_prune_corrupt_aborts_on_hnsw_divergence(mock_backend_cls, mock_capacity, tmp_path):
+    """Same guard as scan_palace: a failed purge attempt against a
+    diverged segment must never reach count()/delete() (#91)."""
+    bad_file = tmp_path / "corrupt_ids.txt"
+    bad_file.write_text("bad1\n")
+    mock_capacity.return_value = {"diverged": True, "message": "test divergence"}
+    repair.prune_corrupt(palace_path=str(tmp_path), confirm=True)
+    mock_backend_cls.assert_not_called()
 
 
 @patch("mempalace.repair.ChromaBackend")
@@ -385,6 +536,71 @@ def test_rebuild_index_success(mock_backend_cls, mock_copy, tmp_path):
     mock_temp_col.upsert.assert_called_once()
     mock_new_col.upsert.assert_called_once()
     mock_new_col.add.assert_not_called()
+
+
+@patch("mempalace.repair.hnsw_capacity_status")
+@patch("mempalace.repair.ChromaBackend")
+def test_rebuild_index_aborts_on_hnsw_divergence_preflight(
+    mock_backend_cls, mock_capacity, tmp_path
+):
+    """count() on a diverged HNSW segment can hard-crash the process
+    (#1222); rebuild_index's legacy path -- the one the CLI's rebuild-index
+    subcommand dispatches straight to -- must preflight divergence before
+    ever opening the collection, not just wrap count() in except Exception
+    (#10)."""
+    sqlite_path = tmp_path / "chroma.sqlite3"
+    with sqlite3.connect(sqlite_path) as conn:
+        conn.execute("CREATE TABLE dummy(id INTEGER PRIMARY KEY)")
+        conn.commit()
+    mock_capacity.return_value = {"diverged": True, "message": "test divergence"}
+    msgs: list[str] = []
+    repair.rebuild_index(palace_path=str(tmp_path), progress=msgs.append)
+    mock_backend_cls.assert_not_called()
+    assert "diverged" in "\n".join(msgs).lower()
+
+
+@patch("mempalace.repair._copy_file_no_follow")
+@patch("mempalace.repair.hnsw_capacity_status")
+@patch("mempalace.repair.ChromaBackend")
+def test_rebuild_index_warns_when_closets_still_diverged(
+    mock_backend_cls, mock_capacity, mock_copy, tmp_path, capsys
+):
+    """rebuild_index only ever rebuilds the drawers collection passed to
+    it; if closets is still diverged afterward, the printed summary must
+    say so instead of an unqualified 'Repair complete', since closets is
+    just as capable of crashing reads via the same #1222 mechanism (#13)."""
+    sqlite_path = tmp_path / "chroma.sqlite3"
+    with sqlite3.connect(sqlite_path) as conn:
+        conn.execute("CREATE TABLE dummy(id INTEGER PRIMARY KEY)")
+        conn.commit()
+
+    mock_col = MagicMock()
+    mock_col.count.return_value = 2
+    mock_col.get.return_value = {
+        "ids": ["id1", "id2"],
+        "documents": ["doc1", "doc2"],
+        "metadatas": [{"wing": "a"}, {"wing": "b"}],
+    }
+    mock_new_col = MagicMock()
+    mock_new_col.count.return_value = 2
+    mock_temp_col = MagicMock()
+    mock_temp_col.count.return_value = 2
+    mock_backend = _install_mock_backend(mock_backend_cls, mock_col)
+    mock_backend.create_collection.side_effect = [mock_temp_col, mock_new_col]
+
+    # First call: drawers preflight (not diverged, rebuild proceeds).
+    # Second call: post-rebuild closets check (still diverged).
+    mock_capacity.side_effect = [
+        {"diverged": False, "message": ""},
+        {"diverged": True, "message": "closets still diverged"},
+    ]
+
+    repair.rebuild_index(palace_path=str(tmp_path))
+
+    out = capsys.readouterr().out
+    assert "Repair complete" in out
+    assert "closets" in out.lower()
+    assert "closets still diverged" in out
 
 
 @patch("mempalace.repair._copy_file_no_follow")
@@ -785,6 +1001,9 @@ def test_rebuild_index_stage_failure_leaves_live_collection_untouched(
 @patch("mempalace.repair._copy_file_no_follow")
 @patch("mempalace.repair.ChromaBackend")
 def test_rebuild_index_live_failure_restores_backup(mock_backend_cls, mock_copy, tmp_path):
+    """When the live swap fails after the delete, recovery must PROMOTE
+    the verified temp copy (not restore a sqlite-only file backup, whose
+    on-disk HNSW segments are already gone)."""
     sqlite_path = tmp_path / "chroma.sqlite3"
     sqlite3.connect(str(sqlite_path)).close()
 
@@ -805,9 +1024,11 @@ def test_rebuild_index_live_failure_restores_backup(mock_backend_cls, mock_copy,
     mock_temp_col.count.return_value = 2
     mock_new_col = MagicMock()
     mock_new_col.upsert.side_effect = RuntimeError("live upsert failed")
+    mock_promoted_col = MagicMock()
+    mock_promoted_col.count.return_value = 2
     active_backend = MagicMock()
     active_backend.get_collection.return_value = mock_col
-    active_backend.create_collection.side_effect = [mock_temp_col, mock_new_col]
+    active_backend.create_collection.side_effect = [mock_temp_col, mock_new_col, mock_promoted_col]
     helper_backend = MagicMock()
     mock_backend_cls.side_effect = [active_backend, helper_backend]
 
@@ -815,13 +1036,16 @@ def test_rebuild_index_live_failure_restores_backup(mock_backend_cls, mock_copy,
         repair.rebuild_index(palace_path=str(tmp_path))
 
     assert excinfo.value.live_replaced is True
-    assert mock_copy.call_count == 2
+    # Only the initial pre-rebuild backup copies a file now -- recovery
+    # promotes from the temp collection, it never touches the sqlite file.
+    assert mock_copy.call_count == 1
     assert active_backend.delete_collection.call_args_list == [
-        call(str(tmp_path), "mempalace_drawers__repair_tmp"),
-        call(str(tmp_path), "mempalace_drawers"),
-        call(str(tmp_path), "mempalace_drawers__repair_tmp"),
-        call(str(tmp_path), "mempalace_drawers"),
+        call(str(tmp_path), "mempalace_drawers__repair_tmp"),  # pre-clean stale temp
+        call(str(tmp_path), "mempalace_drawers"),  # live delete before re-upload
+        call(str(tmp_path), "mempalace_drawers"),  # delete broken live before promotion
+        call(str(tmp_path), "mempalace_drawers__repair_tmp"),  # temp cleaned after promotion
     ]
+    assert mock_promoted_col.upsert.called
     active_backend.close_palace.assert_called_once_with(str(tmp_path))
     helper_backend.close_palace.assert_not_called()
 
@@ -831,6 +1055,8 @@ def test_rebuild_index_live_failure_restores_backup(mock_backend_cls, mock_copy,
 def test_rebuild_index_live_delete_missing_still_restores_backup(
     mock_backend_cls, mock_copy, tmp_path
 ):
+    """Promotion must tolerate the broken live collection already being gone
+    (ChromaNotFoundError) when clearing it before recreating from temp."""
     sqlite_path = tmp_path / "chroma.sqlite3"
     sqlite3.connect(str(sqlite_path)).close()
 
@@ -849,26 +1075,33 @@ def test_rebuild_index_live_delete_missing_still_restores_backup(
     }
     mock_temp_col = MagicMock()
     mock_temp_col.count.return_value = 2
+    mock_promoted_col = MagicMock()
+    mock_promoted_col.count.return_value = 2
     mock_backend = _install_mock_backend(mock_backend_cls, mock_col)
-    mock_backend.create_collection.side_effect = [mock_temp_col, RuntimeError("create failed")]
+    mock_backend.create_collection.side_effect = [
+        mock_temp_col,
+        RuntimeError("create failed"),
+        mock_promoted_col,
+    ]
     mock_backend.delete_collection.side_effect = [
-        None,
-        None,
-        None,
-        repair.ChromaNotFoundError("missing"),
+        None,  # pre-clean stale temp
+        None,  # live delete before re-upload
+        repair.ChromaNotFoundError("missing"),  # delete-broken-live tolerates already-gone
+        None,  # temp cleaned after successful promotion
     ]
 
     with pytest.raises(repair.RebuildCollectionError) as excinfo:
         repair.rebuild_index(palace_path=str(tmp_path))
 
     assert excinfo.value.live_replaced is True
-    assert mock_copy.call_count == 2
+    assert mock_copy.call_count == 1
     assert mock_backend.delete_collection.call_args_list == [
         call(str(tmp_path), "mempalace_drawers__repair_tmp"),
         call(str(tmp_path), "mempalace_drawers"),
-        call(str(tmp_path), "mempalace_drawers__repair_tmp"),
         call(str(tmp_path), "mempalace_drawers"),
+        call(str(tmp_path), "mempalace_drawers__repair_tmp"),
     ]
+    assert mock_promoted_col.upsert.called
 
 
 @patch("mempalace.repair._copy_file_no_follow")
@@ -876,17 +1109,13 @@ def test_rebuild_index_live_delete_missing_still_restores_backup(
 def test_rebuild_index_restore_failure_preserves_original_error(
     mock_backend_cls, mock_copy, tmp_path, capsys
 ):
+    """If even the temp-promotion recovery fails, the ORIGINAL rebuild
+    error must still be what's raised, and the message must point the
+    operator at the still-surviving verified temp copy -- never silently
+    lose track of it."""
     sqlite_path = tmp_path / "chroma.sqlite3"
     sqlite3.connect(str(sqlite_path)).close()
-
-    def _copy_side_effect(src, dst, **_):
-        # The restore copy reads from the timestamped backup file.
-        if ".backup." in str(src):
-            raise PermissionError("locked sqlite")
-        with open(dst, "w") as handle:
-            handle.write("backup")
-
-    mock_copy.side_effect = _copy_side_effect
+    mock_copy.side_effect = lambda src, dst, **_: open(dst, "w").close()
 
     mock_col = MagicMock()
     mock_col.count.return_value = 2
@@ -900,14 +1129,20 @@ def test_rebuild_index_restore_failure_preserves_original_error(
     mock_new_col = MagicMock()
     mock_new_col.upsert.side_effect = RuntimeError("live upsert failed")
     mock_backend = _install_mock_backend(mock_backend_cls, mock_col)
-    mock_backend.create_collection.side_effect = [mock_temp_col, mock_new_col]
+    # 3rd create_collection call is the promotion attempt -- fails too.
+    mock_backend.create_collection.side_effect = [
+        mock_temp_col,
+        mock_new_col,
+        RuntimeError("promotion also failed"),
+    ]
 
     with pytest.raises(repair.RebuildCollectionError) as excinfo:
         repair.rebuild_index(palace_path=str(tmp_path))
 
     out = capsys.readouterr().out
-    assert "locked sqlite" in out
-    assert "Manual restore required" in out
+    assert "Automatic recovery failed" in out
+    assert "still survives under" in out
+    assert "do NOT delete it" in out
     assert "live upsert failed" in str(excinfo.value)
 
 
@@ -915,14 +1150,16 @@ def test_rebuild_index_restore_failure_preserves_original_error(
 def test_rebuild_collection_via_temp_keeps_original_error_when_cleanup_fails(
     mock_backend_cls,
 ):
+    """A failure while still STAGING (live_replaced=False) legitimately cleans
+    up the not-yet-promoted temp collection; if that cleanup itself also
+    fails, the original staging error must still be the one raised."""
     mock_col = MagicMock()
     mock_col.count.return_value = 2
     mock_temp_col = MagicMock()
-    mock_temp_col.count.return_value = 2
+    mock_temp_col.upsert.side_effect = RuntimeError("staging upsert failed")
     mock_backend = _install_mock_backend(mock_backend_cls, mock_col)
-    mock_backend.create_collection.side_effect = [mock_temp_col, RuntimeError("live build failed")]
+    mock_backend.create_collection.side_effect = [mock_temp_col]
     mock_backend.delete_collection.side_effect = [
-        None,
         None,
         RuntimeError("cleanup failed"),
     ]
@@ -938,13 +1175,134 @@ def test_rebuild_collection_via_temp_keeps_original_error_when_cleanup_fails(
             progress=lambda *args, **kwargs: None,
         )
 
-    assert "live build failed" in str(excinfo.value)
-    assert excinfo.value.live_replaced is True
+    assert "staging upsert failed" in str(excinfo.value)
+    assert excinfo.value.live_replaced is False
     assert mock_backend.delete_collection.call_args_list == [
         call("/palace", "mempalace_drawers__repair_tmp"),
-        call("/palace", "mempalace_drawers"),
         call("/palace", "mempalace_drawers__repair_tmp"),
     ]
+
+
+@patch("mempalace.repair.ChromaBackend")
+def test_rebuild_collection_via_temp_preserves_temp_when_live_replaced_and_reupload_fails(
+    mock_backend_cls,
+):
+    """Once the live collection is deleted (live_replaced=True), the
+    verified temp copy is the ONLY intact data left. A failure re-uploading
+    into the fresh live collection must NOT delete the temp copy -- it must
+    survive so the operator can recover from it."""
+    mock_col = MagicMock()
+    mock_col.count.return_value = 2
+    mock_temp_col = MagicMock()
+    mock_temp_col.count.return_value = 2
+    mock_new_col = MagicMock()
+    mock_new_col.upsert.side_effect = RuntimeError("live upsert failed")
+    mock_backend = _install_mock_backend(mock_backend_cls, mock_col)
+    mock_backend.create_collection.side_effect = [mock_temp_col, mock_new_col]
+
+    with pytest.raises(repair.RebuildCollectionError) as excinfo:
+        repair._rebuild_collection_via_temp(
+            mock_backend,
+            "/palace",
+            ["id1", "id2"],
+            ["doc1", "doc2"],
+            [{"wing": "a"}, {"wing": "b"}],
+            batch_size=5000,
+            progress=lambda *args, **kwargs: None,
+        )
+
+    assert "live upsert failed" in str(excinfo.value)
+    assert excinfo.value.live_replaced is True
+    # The temp collection must never be deleted once it is the only good copy.
+    assert (
+        call("/palace", "mempalace_drawers__repair_tmp")
+        not in mock_backend.delete_collection.call_args_list[1:]
+    )
+    assert mock_backend.delete_collection.call_args_list == [
+        call(
+            "/palace", "mempalace_drawers__repair_tmp"
+        ),  # pre-existing stale temp, cleaned before staging
+        call("/palace", "mempalace_drawers"),  # the actual live-collection swap
+    ]
+    # The error must point the operator at the surviving good copy.
+    assert "mempalace_drawers__repair_tmp" in str(excinfo.value)
+
+
+def test_promote_temp_collection_reads_from_temp_not_broken_live():
+    """Direct unit test for the temp-promotion recovery helper. Two mutations a future
+    refactor could introduce would silently corrupt recovered data and must
+    be caught here, not only via a weaker 'was upsert called at all' check:
+    (1) reading the source from the wrong collection name, (2) swapping the
+    ids/documents payload on upsert."""
+    mock_temp_col = MagicMock()
+    mock_temp_col.get.return_value = {
+        "ids": ["id1", "id2"],
+        "documents": ["doc1", "doc2"],
+        "metadatas": [{"wing": "a"}, {"wing": "b"}],
+    }
+    mock_new_col = MagicMock()
+    mock_new_col.count.return_value = 2
+    backend = MagicMock()
+    backend.get_collection.return_value = mock_temp_col
+    backend.create_collection.return_value = mock_new_col
+
+    result = repair._promote_temp_collection(
+        backend,
+        "/palace",
+        "mempalace_drawers__repair_tmp",
+        "mempalace_drawers",
+        expected=2,
+        batch_size=5000,
+        progress=lambda *a, **kw: None,
+    )
+
+    assert result == 2
+    # Must read the SOURCE from the verified temp collection specifically,
+    # never from the (broken/partial) live collection name.
+    backend.get_collection.assert_called_once_with("/palace", "mempalace_drawers__repair_tmp")
+    # The broken live collection is cleared, then recreated under its own name.
+    backend.delete_collection.assert_any_call("/palace", "mempalace_drawers")
+    backend.create_collection.assert_called_once_with("/palace", "mempalace_drawers")
+    # The exact extracted payload must land in the new collection, unmodified
+    # and unswapped (ids must stay ids, documents must stay documents).
+    mock_new_col.upsert.assert_called_once_with(
+        documents=["doc1", "doc2"],
+        ids=["id1", "id2"],
+        metadatas=[{"wing": "a"}, {"wing": "b"}],
+    )
+    # The temp copy is only removed after the promotion is verified.
+    backend.delete_collection.assert_any_call("/palace", "mempalace_drawers__repair_tmp")
+
+
+def test_promote_temp_collection_survives_when_final_temp_cleanup_fails():
+    """The temp copy is redundant (already promoted+verified) by the time it
+    is deleted -- a failure cleaning it up must not be reported as a
+    promotion failure, matching the identical convention already used for
+    the same cleanup step in _rebuild_collection_via_temp's success path."""
+    mock_temp_col = MagicMock()
+    mock_temp_col.get.return_value = {
+        "ids": ["id1"],
+        "documents": ["doc1"],
+        "metadatas": [{"wing": "a"}],
+    }
+    mock_new_col = MagicMock()
+    mock_new_col.count.return_value = 1
+    backend = MagicMock()
+    backend.get_collection.return_value = mock_temp_col
+    backend.create_collection.return_value = mock_new_col
+    backend.delete_collection.side_effect = [None, RuntimeError("transient lock")]
+
+    result = repair._promote_temp_collection(
+        backend,
+        "/palace",
+        "mempalace_drawers__repair_tmp",
+        "mempalace_drawers",
+        expected=1,
+        batch_size=5000,
+        progress=lambda *a, **kw: None,
+    )
+
+    assert result == 1  # promotion itself succeeded despite the cleanup failure
 
 
 @patch("mempalace.repair._copy_file_no_follow")
@@ -1750,6 +2108,51 @@ def test_extract_via_sqlite_missing_palace_yields_nothing(tmp_path):
     assert list(repair.extract_via_sqlite(str(empty), "mempalace_drawers")) == []
 
 
+def test_extract_via_sqlite_yields_rows_with_zero_metadata_rows(tmp_path):
+    """A drawer whose embedding has ZERO rows in ``embedding_metadata``
+    (no ``chroma:document``, no other key) must still be yielded, not
+    silently dropped.
+
+    This is the same "sparse historical write" condition ``_extract_drawers``
+    already sanitizes for the collection-layer rebuild path (see the
+    ``sanitized_metas`` comment above, and #1458) — current chromadb
+    validates against empty metadata on write, so this only happens to
+    rows already sitting in an older palace. Modeled here by seeding a
+    real chromadb collection, then stripping one drawer's metadata rows
+    directly via SQLite, mirroring how such a row actually looks on disk.
+
+    An INNER JOIN driven from ``embedding_metadata`` can never see a row
+    with zero metadata rows: it must be driven from ``embeddings`` instead.
+    """
+    rows = [
+        ("drawer_ok", "normal document", {"wing": "w"}),
+        ("drawer_sparse", "will lose all its metadata rows", {"wing": "w"}),
+    ]
+    _seed_palace(tmp_path, "mempalace_drawers", rows)
+
+    sqlite_path = os.path.join(str(tmp_path), "chroma.sqlite3")
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        emb_row = conn.execute(
+            "SELECT id FROM embeddings WHERE embedding_id = ?", ("drawer_sparse",)
+        ).fetchone()
+        assert emb_row is not None, "seed helper didn't create the expected embedding row"
+        conn.execute("DELETE FROM embedding_metadata WHERE id = ?", (emb_row[0],))
+        conn.commit()
+    finally:
+        conn.close()
+
+    extracted = list(repair.extract_via_sqlite(str(tmp_path), "mempalace_drawers"))
+    ids = {emb_id for emb_id, _doc, _meta in extracted}
+
+    assert "drawer_sparse" in ids, (
+        "extract_via_sqlite silently dropped a drawer with zero "
+        "embedding_metadata rows — the INNER JOIN starting at "
+        "embedding_metadata structurally excludes it"
+    )
+    assert "drawer_ok" in ids
+
+
 def test_rebuild_from_sqlite_roundtrips_via_real_chromadb(tmp_path):
     """End-to-end: seed source palace, rebuild into a fresh dest, then
     open dest with a fresh ChromaBackend and verify ``count()`` and
@@ -1972,6 +2375,282 @@ def test_rebuild_from_sqlite_source_missing_chroma_db(tmp_path):
     counts = repair.rebuild_from_sqlite(str(source), str(dest))
     assert counts == {}
     assert not dest.exists()
+
+
+def test_rebuild_from_sqlite_dry_run_cross_palace_writes_nothing(tmp_path):
+    """``dry_run=True`` must report would-be counts without creating dest (#2133)."""
+    source = tmp_path / "source"
+    dest = tmp_path / "dest"
+    drawer_rows = [(f"d{i}", f"body {i}", {"wing": "w", "room": "r"}) for i in range(12)]
+    _seed_palace(source, "mempalace_drawers", drawer_rows)
+    _seed_palace(source, "mempalace_closets", [("c1", "abbrev", {"wing": "w"})])
+
+    counts = repair.rebuild_from_sqlite(str(source), str(dest), dry_run=True)
+
+    assert counts == {"mempalace_drawers": 12, "mempalace_closets": 1}
+    assert not dest.exists()
+    assert (source / "chroma.sqlite3").exists()
+
+
+def test_rebuild_from_sqlite_dry_run_in_place_does_not_archive(tmp_path):
+    """In-place dry-run must not move the live palace aside (#2095, #2133)."""
+    palace = tmp_path / "palace"
+    _seed_palace(palace, "mempalace_drawers", [(f"d{i}", f"b{i}", {"wing": "w"}) for i in range(8)])
+    sqlite_before = (palace / "chroma.sqlite3").stat().st_size
+
+    counts = repair.rebuild_from_sqlite(
+        str(palace), str(palace), archive_existing_dest=True, dry_run=True
+    )
+
+    assert counts == {"mempalace_drawers": 8, "mempalace_closets": 0}
+    assert (palace / "chroma.sqlite3").stat().st_size == sqlite_before
+    assert [p for p in tmp_path.iterdir() if "pre-rebuild" in p.name] == []
+
+
+def test_rebuild_from_sqlite_dry_run_fails_closed_when_count_unreadable(tmp_path, monkeypatch):
+    """Unreadable ``sqlite_drawer_count`` must not invent zero-row previews."""
+    source = tmp_path / "source"
+    dest = tmp_path / "dest"
+    _seed_palace(source, "mempalace_drawers", [("d1", "doc", {"wing": "w"})])
+
+    monkeypatch.setattr(repair, "sqlite_drawer_count", lambda *a, **k: None)
+    counts = repair.rebuild_from_sqlite(str(source), str(dest), dry_run=True)
+
+    assert counts == {}
+    assert not dest.exists()
+
+
+# ── _preview_legacy_repair — the default (legacy) repair --dry-run ─────
+
+
+def test_preview_legacy_repair_leaves_the_palace_byte_identical(tmp_path, capsys):
+    """The preview must not change a single byte of a real palace."""
+    import hashlib
+
+    palace = tmp_path / "palace"
+    _seed_palace(palace, "mempalace_drawers", [(f"d{i}", f"b{i}", {"wing": "w"}) for i in range(6)])
+    db = palace / "chroma.sqlite3"
+    before = hashlib.sha256(db.read_bytes()).hexdigest()
+    tree_before = sorted((p.name, p.stat().st_size) for p in palace.iterdir())
+
+    counts = repair._preview_legacy_repair(
+        palace_path=str(palace), collection_name="mempalace_drawers"
+    )
+
+    assert counts == {"mempalace_drawers": 6}
+    assert hashlib.sha256(db.read_bytes()).hexdigest() == before
+    assert sorted((p.name, p.stat().st_size) for p in palace.iterdir()) == tree_before
+    assert [p for p in tmp_path.iterdir() if p.name.endswith(".backup")] == []
+    out = capsys.readouterr().out
+    assert "holds 6 rows" in out
+    assert "#1208 truncation guard" in out
+
+
+def test_cmd_repair_dry_run_leaves_a_real_palace_byte_identical(tmp_path, capsys):
+    """End-to-end: everything cmd_repair touches ahead of the preview is read-only.
+
+    The helper test above covers ``_preview_legacy_repair`` on its own. This one
+    covers the calls ``cmd_repair`` makes before reaching it — the quick_check
+    preflight and the poisoned-bookmark detector — against a palace that really
+    exists on disk, which is the only assertion that would catch a write
+    sneaking into any of them.
+    """
+    import argparse
+    import hashlib
+
+    from mempalace.cli import cmd_repair
+
+    palace = tmp_path / "palace"
+    _seed_palace(palace, "mempalace_drawers", [(f"d{i}", f"b{i}", {"wing": "w"}) for i in range(4)])
+
+    def snapshot():
+        return {
+            str(p.relative_to(palace)): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in sorted(palace.rglob("*"))
+            if p.is_file()
+        }
+
+    before = snapshot()
+    args = argparse.Namespace(palace=str(palace), yes=True, dry_run=True)
+
+    with patch("mempalace.cli.MempalaceConfig") as mock_config_cls:
+        mock_config_cls.return_value.palace_path = str(palace)
+        mock_config_cls.return_value.collection_name = "mempalace_drawers"
+        cmd_repair(args)
+
+    out = capsys.readouterr().out
+    assert snapshot() == before
+    assert not (tmp_path / "palace.backup").exists()
+    assert "DRY RUN — no changes will be made." in out
+    assert "holds 4 rows" in out
+    assert "Repair complete" not in out
+
+
+def test_preview_legacy_repair_zero_rows_promises_no_backup(tmp_path, capsys):
+    """A real run stops at "Nothing to repair." — the preview must not promise a rebuild.
+
+    ``sqlite_drawer_count`` returns 0 (not None) for an absent collection, so
+    the fail-closed guard does not cover this case.
+    """
+    palace = tmp_path / "palace"
+    _seed_palace(palace, "mempalace_drawers", [("d1", "b1", {"wing": "w"})])
+
+    counts = repair._preview_legacy_repair(
+        palace_path=str(palace), collection_name="collection_that_does_not_exist"
+    )
+
+    out = capsys.readouterr().out
+    assert counts == {"collection_that_does_not_exist": 0}
+    assert "holds no rows" in out
+    assert "copy the palace directory" not in out
+    assert "VACUUM" not in out
+
+
+def test_preview_legacy_repair_warns_it_would_delete_an_existing_backup(tmp_path, capsys):
+    """Destroying the operator's previous backup is the step a preview must not hide."""
+    palace = tmp_path / "palace"
+    _seed_palace(palace, "mempalace_drawers", [("d1", "b1", {"wing": "w"})])
+    backup = tmp_path / "palace.backup"
+    backup.mkdir()
+
+    repair._preview_legacy_repair(palace_path=str(palace), collection_name="mempalace_drawers")
+
+    out = capsys.readouterr().out
+    assert f"DELETE the existing backup at {backup}" in out
+    assert backup.exists()
+
+
+def test_preview_legacy_repair_warns_when_the_backup_path_is_a_file(tmp_path, capsys):
+    """The real run branches on exists(), not isdir().
+
+    A regular file at <palace>.backup makes a real run refuse at the backup
+    validation step, so a preview that promised a plain copy would describe a
+    run that never happens.
+    """
+    palace = tmp_path / "palace"
+    _seed_palace(palace, "mempalace_drawers", [("d1", "b1", {"wing": "w"})])
+    backup = tmp_path / "palace.backup"
+    backup.write_text("not a palace")
+
+    repair._preview_legacy_repair(palace_path=str(palace), collection_name="mempalace_drawers")
+
+    out = capsys.readouterr().out
+    assert f"DELETE the existing backup at {backup}" in out
+    assert "refuse outright" in out
+    assert "copy the palace directory" not in out
+    assert backup.read_text() == "not a palace"
+
+
+def test_preview_legacy_repair_names_the_live_collection_delete(tmp_path, capsys):
+    """The real run calls delete_collection on the live collection.
+
+    "re-file via a staged temp copy" alone reads as additive, which is the one
+    thing an operator must not misread about a destructive rebuild.
+    """
+    palace = tmp_path / "palace"
+    _seed_palace(palace, "mempalace_drawers", [("d1", "b1", {"wing": "w"})])
+
+    repair._preview_legacy_repair(palace_path=str(palace), collection_name="mempalace_drawers")
+
+    out = capsys.readouterr().out
+    assert "DELETE the live 'mempalace_drawers' collection" in out
+
+
+def test_preview_legacy_repair_reports_the_truncation_guard_as_disabled(tmp_path, capsys):
+    """--confirm-truncation-ok switches the #1208 abort off, so the preview must say so.
+
+    The abort message the guard prints tells operators to re-run with this
+    flag, so the flag plus --dry-run is a combination they are actively
+    steered into. Promising the guard there would be a false safety claim.
+    """
+    palace = tmp_path / "palace"
+    _seed_palace(palace, "mempalace_drawers", [(f"d{i}", f"b{i}", {"wing": "w"}) for i in range(3)])
+
+    counts = repair._preview_legacy_repair(
+        palace_path=str(palace),
+        collection_name="mempalace_drawers",
+        confirm_truncation_ok=True,
+    )
+
+    out = capsys.readouterr().out
+    assert counts == {"mempalace_drawers": 3}
+    assert "#1208 truncation guard is DISABLED" in out
+    assert "the difference would be destroyed" in out
+    assert "abort without changes" not in out
+
+
+def test_preview_legacy_repair_fails_closed_when_count_unreadable(tmp_path, capsys, monkeypatch):
+    """Unreadable count must return {} rather than render a zero-row plan."""
+    palace = tmp_path / "palace"
+    _seed_palace(palace, "mempalace_drawers", [("d1", "b1", {"wing": "w"})])
+    monkeypatch.setattr(repair, "sqlite_drawer_count", lambda *a, **k: None)
+
+    counts = repair._preview_legacy_repair(
+        palace_path=str(palace), collection_name="mempalace_drawers"
+    )
+
+    out = capsys.readouterr().out
+    assert counts == {}
+    assert "refusing to invent zero counts" in out
+    assert "holds" not in out
+
+
+# ── resolve_repair_preflight_errors ───────────────────────────────────
+
+
+def test_resolve_preflight_dry_run_clears_isolated_fts5_without_healing(tmp_path, capsys):
+    """A dry run predicts the autoheal instead of performing its write."""
+    called = []
+    errs = ["malformed inverted index for FTS5 table x"]
+
+    out_errors = repair.resolve_repair_preflight_errors(
+        str(tmp_path),
+        errs,
+        dry_run=True,
+        progress=lambda *a, **k: called.append(a),
+    )
+
+    assert out_errors == []
+    assert called and "isolated FTS5 inverted-index error" in called[0][0]
+
+
+def test_resolve_preflight_dry_run_keeps_broad_corruption(tmp_path):
+    """Errors a real run cannot heal must survive so the caller still aborts."""
+    errs = ["*** in database main *** Page 42 is never used"]
+
+    assert repair.resolve_repair_preflight_errors(str(tmp_path), errs, dry_run=True) == errs
+
+
+def test_resolve_preflight_real_run_delegates_to_autoheal(tmp_path, monkeypatch):
+    """Outside a dry run the behaviour is unchanged: hand off to the autoheal."""
+    seen = {}
+
+    def fake_autoheal(path, errors, *, progress=print):
+        seen["args"] = (path, errors)
+        return []
+
+    monkeypatch.setattr(repair, "maybe_autoheal_fts5_index", fake_autoheal)
+    errs = ["malformed inverted index for FTS5 table x"]
+
+    assert repair.resolve_repair_preflight_errors(str(tmp_path), errs, dry_run=False) == []
+    assert seen["args"] == (str(tmp_path), errs)
+
+
+def test_resolve_preflight_passes_empty_errors_through(tmp_path, monkeypatch):
+    """A clean quick_check must not invoke the autoheal at all.
+
+    Asserting only on the return value would pass with the early-out deleted,
+    since the autoheal hands empty errors straight back.
+    """
+    called = []
+    monkeypatch.setattr(
+        repair,
+        "maybe_autoheal_fts5_index",
+        lambda path, errors, **kw: called.append(path) or errors,
+    )
+
+    assert repair.resolve_repair_preflight_errors(str(tmp_path), [], dry_run=False) == []
+    assert called == []
 
 
 def test_rebuild_from_sqlite_in_place_validates_source_before_archiving(tmp_path):

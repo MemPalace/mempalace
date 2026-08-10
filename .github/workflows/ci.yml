@@ -30,13 +30,18 @@ jobs:
           python-version: "3.13"
           cache: 'pip'
       - run: pip install -e ".[dev]"
-      # ChromaDB's rust HNSW core intermittently fails compaction on Windows
-      # ("Failed to apply logs to the hnsw segment writer") regardless of our
-      # code — a long-standing, non-reproducible-on-Linux/macOS flake. Retry
-      # ONLY that specific transient error (via --only-rerun) so real,
+      # ChromaDB's rust HNSW core intermittently fails compaction or reader
+      # initialization on Windows ("Failed to apply logs to the hnsw segment
+      # writer" / "Error creating hnsw segment reader: Nothing found on disk")
+      # regardless of our code — long-standing, non-reproducible-on-Linux/macOS
+      # flakes. Retry ONLY those specific transient errors (via --only-rerun) so real,
       # deterministic failures still fail on the first run. Linux/macOS jobs
       # deliberately run with no reruns so genuine regressions surface there.
-      - run: python -m pytest tests/ -v --ignore=tests/benchmarks --cov=mempalace --cov-report=term-missing --cov-fail-under=80 --durations=10 --reruns 2 --reruns-delay 5 --only-rerun "Failed to apply logs to the hnsw segment writer"
+      - run: >-
+          python -m pytest tests/ -v --ignore=tests/benchmarks --cov=mempalace
+          --cov-report=term-missing --cov-fail-under=80 --durations=10 --reruns 2
+          --reruns-delay 5 --only-rerun
+          "Failed to apply logs to the hnsw segment writer|Error creating hnsw segment reader: Nothing found on disk"
 
   test-macos:
     runs-on: macos-latest
@@ -59,6 +64,10 @@ jobs:
       # Keep this pin identical to the `ruff==` pin in pyproject.toml
       # ([project.optional-dependencies].dev and [dependency-groups].dev)
       # so CI and `pip install -e ".[dev]"` format/lint identically.
-      - run: pip install "ruff==0.15.14"
+      # This drifted once (CI on 0.15.14 against pyproject's 0.15.20) and the
+      # drift was invisible: the lint job never installs from pyproject, so a
+      # dependabot bump to the pin there passes CI without the new version
+      # ever running. test_ruff_pins_match asserts the two stay equal.
+      - run: pip install "ruff==0.16.1"
       - run: ruff check .
       - run: ruff format --check .

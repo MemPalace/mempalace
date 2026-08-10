@@ -16,8 +16,49 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  # Run the image before anyone can publish it. A green `build` only proves the
+  # Dockerfile compiles — it never started a container, so defects that break
+  # the first documented command shipped anyway (#2187, #2188). This builds
+  # amd64 natively, loads it into the local daemon, and exercises the README
+  # paths: CLI mine + verbatim search across two containers, a real MCP stdio
+  # handshake, and `compose config` on both shipped Compose files.
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # amd64 only and `load: true`: the smoke run needs a real image in the
+      # local daemon, and buildx cannot load a multi-arch manifest. Shares the
+      # `build` job's gha cache scope, so this is mostly a cache hit.
+      - name: Build image for smoke test
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: mempalace:smoke
+          # Read the publish job's cache too (its amd64 layers are identical),
+          # but write to a private scope so an amd64-only export never lands on
+          # top of that job's multi-arch one. Same split as `scope=gpu` below.
+          cache-from: |
+            type=gha
+            type=gha,scope=smoke
+          cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,mode=max,scope=smoke' || '' }}
+
+      # Reaches Chroma's S3 once to fetch the ~80 MB embedding model, so it is
+      # network-dependent; that download is itself part of a user's first run.
+      - name: Smoke test
+        run: ./scripts/docker-smoke.sh mempalace:smoke
+
   build:
     runs-on: ubuntu-latest
+    # Never publish an image the smoke test has not cleared.
+    needs: smoke
     permissions:
       contents: read
       packages: write

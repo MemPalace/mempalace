@@ -289,9 +289,9 @@ def test_capacity_status_quiet_for_empty_palace(tmp_path):
 def test_capacity_status_tolerates_lag_under_large_sync_threshold(tmp_path):
     """Regression for the PR #1191 / PR #1227 conflict.
 
-    Palaces created via mempalace's _HNSW_BLOAT_GUARD (sync_threshold=
-    50_000) naturally accumulate up to ~50K queued entries between
-    flushes. The pickle-vs-sqlite probe must scale its tolerance to
+    A palace carrying a large sync_threshold (50_000) naturally accumulates
+    up to ~50K queued entries between flushes. The pickle-vs-sqlite probe
+    must scale its tolerance to
     ``2 × sync_threshold`` so this expected lag is not flagged as
     corruption — otherwise vector search disables for ~80% of the
     write cycle on any actively-mined ≥100K palace.

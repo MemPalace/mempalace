@@ -198,6 +198,33 @@ def test_extract_drawers_returns_drawers(tmp_path):
     assert drawers[0]["metadata"] == {"wing": "personal", "room": "2026-04-26"}
 
 
+def test_migrate_skips_count_on_hnsw_divergence(tmp_path, capsys):
+    """count() on a diverged HNSW segment can hard-crash the process
+    (#1222); migrate() must route straight to the SQLite-extraction
+    fallback -- the same path the except Exception branch already falls
+    back to -- instead of ever calling col.count() when
+    hnsw_capacity_status reports divergence (#90)."""
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    (palace_dir / "chroma.sqlite3").write_text("db")
+
+    with (
+        patch("mempalace.migrate.detect_chromadb_version", return_value="1.x"),
+        patch("mempalace.backends.chroma.ChromaBackend") as mock_backend,
+        patch(
+            "mempalace.backends.chroma.hnsw_capacity_status",
+            return_value={"diverged": True, "message": "test divergence"},
+        ),
+        patch("mempalace.migrate.extract_drawers_from_sqlite", return_value=[]),
+    ):
+        mock_backend.backend_version.return_value = "1.5.8"
+        migrate(str(palace_dir), dry_run=True)
+
+    mock_backend.return_value.get_collection.assert_not_called()
+    out = capsys.readouterr().out
+    assert "HNSW index diverged" in out
+
+
 def test_migrate_dry_run_rebuilds_when_collection_is_readable_but_not_writable(tmp_path, capsys):
     palace_dir = tmp_path / "palace"
     palace_dir.mkdir()

@@ -160,33 +160,100 @@ def _hnsw_payload_appears_sane(seg_dir: str) -> bool:
     return ratio is None or ratio <= _HNSW_LINK_TO_DATA_MAX_RATIO
 
 
-# HNSW batch/sync thresholds applied at collection creation.
+# HNSW batch/sync thresholds applied at collection creation — chromadb's own
+# documented defaults (chromadb/api/configuration.py:263-273,
+# chromadb/api/collection_configuration.py:451-454,
+# chromadb/segment/impl/vector/hnsw_params.py:79-80, and
+# https://docs.trychroma.com/docs/collections/configure).
 #
-# chromadb's Rust HNSW segment writes index_metadata.pickle and
-# link_lists.bin only when internal counters cross both thresholds
-# (batch_size gates _apply_batch; sync_threshold gates _persist).
-# Records below both thresholds stay in memory and are lost on exit.
+# Both ran at 2 to answer #1579 (a sub-threshold mine left index_metadata.pickle
+# absent, and quarantine_stale_hnsw renamed the segment away). Three findings on
+# chromadb 1.5.9 (PersistentClient / Rust bindings, single writer) retire that:
 #
-# Previously 50k/50k to work around link_lists.bin sparse-file bloat
-# in pre-1.5.x Python chromadb (#344).  chromadb >=1.5.4 Rust bindings
-# (the minimum mempalace supports) do not exhibit that bloat; verified
-# at batch_size=2 with 20k records: link_lists.bin = 171 KB, no
-# sparse-file inflation.
+#   * 2 SITS OUTSIDE CHROMA'S OWN DECLARED VALID RANGE. hnsw_params.py:21-22
+#     validates both knobs as `isinstance(p, int) and p > 2`. Not an inequality
+#     between the two — a floor on each.
 #
-# The 50k guard caused #1579: mines under 50k drawers never triggered
-# _persist(), leaving index_metadata.pickle absent and link_lists.bin
-# empty.  quarantine_stale_hnsw then renamed the segment on every cold
-# open after a 300s mtime gap, accumulating .drift-* directories.
+#   * IT COSTS WRITE AMPLIFICATION, measured. Bytes written (/proc/self/io) for
+#     one mine of N records, 64-dim, num_threads=1, identical corpus and seed:
 #
-# Lowered to 2 (empirical Rust-side minimum for chromadb >=1.5.4; the
-# Rust bindings reject 1 with InvalidArgumentError) so any mine of 2+
-# drawers triggers a natural persist.  Existing palaces created under
-# the old 50k guard keep those thresholds in their collection metadata
-# until the user runs repair --mode from-sqlite --archive-existing.
-_HNSW_BLOAT_GUARD = {
-    "hnsw:batch_size": 2,
-    "hnsw:sync_threshold": 2,
+#         N        2/2        100/1000     ratio
+#         10,000    47.1 MB    28.1 MB     1.67x
+#         20,000   127.4 MB    60.0 MB     2.12x
+#         40,000   390.3 MB   134.0 MB     2.91x
+#
+#     Two runs at N=20,000 reproduced within 0.1%. sync_threshold dominates:
+#     3/3 measured identical to 2/2, and 1000/1000 identical to 100/1000. The
+#     ratio grows with collection size, so the cost is worst on the largest
+#     palaces.
+#
+#   * IT BUYS NOTHING. A 5-record collection at 100/1000 — far below the
+#     threshold, so no persist ever fires — reads back whole from a FRESH
+#     PROCESS (count and vector query both answer). On that artifact
+#     link_lists.bin is 0 bytes with no index_metadata.pickle, which is #1579's
+#     trigger shape exactly, and quarantine_stale_hnsw() creates no drift dir:
+#     _segment_appears_healthy reads it as never-persisted rather than as a torn
+#     persist.
+#
+# NOT claimed here: that a small sync_threshold is a known chroma failure mode.
+# No such report was found in chroma's issues or docs, and chroma's own guidance
+# runs the other way (raise sync_threshold for bulk inserts). The Python
+# persist path that #1579 and chroma#6975 describe does not execute under the
+# Rust bindings at all — hnswlib is not a dependency of this line.
+#
+# A palace keeps whatever thresholds it was created under;
+# `repair --mode from-sqlite --archive-existing` re-creates it under these.
+_HNSW_WRITE_DEFAULTS = {
+    "hnsw:batch_size": 100,
+    "hnsw:sync_threshold": 1000,
 }
+
+
+def _hnsw_creation_metadata(options: Optional[dict]) -> dict:
+    """Build the ``metadata=`` dict for a fresh collection from caller options.
+
+    Centralizes the HNSW knobs so a multi-collection palace can tune each
+    collection at creation while the base keeps every config value in the
+    ``collection_metadata`` table where the divergence guard, the cosine-space
+    detector (``ChromaCollection.distance_metric``), and ``_read_sync_threshold``
+    already read it. The legacy ``metadata=`` keys are kept deliberately: the
+    modern ``configuration=`` API stores the same parameters in
+    ``configuration_json`` instead, leaving ``collection.metadata`` empty and
+    silently blinding all of that existing tooling.
+
+    Caller option -> chromadb metadata key:
+
+    * ``hnsw_space``       -> ``hnsw:space``        (default ``"cosine"``)
+    * ``num_threads``      -> ``hnsw:num_threads``  (default 1; serializes inserts)
+    * ``ef_construction``  -> ``hnsw:construction_ef``
+    * ``max_neighbors``    -> ``hnsw:M``
+    * ``sync_threshold``   -> ``hnsw:sync_threshold``
+    * ``batch_size``       -> ``hnsw:batch_size``
+
+    ``sync_threshold``/``batch_size`` default to chromadb's own values
+    (:data:`_HNSW_WRITE_DEFAULTS`), which amortize the index flush across a
+    mine. A caller tunes them per collection; a caller writing far fewer
+    records than the threshold still keeps them (the Rust writer holds the
+    sub-threshold tail durable — see :data:`_HNSW_WRITE_DEFAULTS`).
+    ``ef_construction``/``max_neighbors`` are omitted when the caller does not
+    set them, so chromadb applies its own defaults.
+    """
+    opts = options if isinstance(options, dict) else {}
+    md: dict[str, Any] = {
+        "hnsw:space": opts.get("hnsw_space", "cosine"),
+        "hnsw:num_threads": int(opts.get("num_threads", 1)),
+        **_HNSW_WRITE_DEFAULTS,
+    }
+    if "ef_construction" in opts and opts["ef_construction"] is not None:
+        md["hnsw:construction_ef"] = int(opts["ef_construction"])
+    if "max_neighbors" in opts and opts["max_neighbors"] is not None:
+        md["hnsw:M"] = int(opts["max_neighbors"])
+    if "sync_threshold" in opts and opts["sync_threshold"] is not None:
+        md["hnsw:sync_threshold"] = int(opts["sync_threshold"])
+    if "batch_size" in opts and opts["batch_size"] is not None:
+        md["hnsw:batch_size"] = int(opts["batch_size"])
+    return md
+
 
 # Below this size, data_level0.bin is too small for a meaningful HNSW graph.
 # Used by _hnsw_link_lists_is_usable_for_payload (empty link_lists is fine
@@ -633,9 +700,10 @@ def _hnsw_element_count(palace_path: str, segment_id: str) -> Optional[int]:
 # read the collection metadata (older palaces missing the row, sqlite
 # unreadable). 2000 = 2 × chromadb's default sync_threshold of 1000.
 #
-# Why dynamic: legacy palaces may still carry ``sync_threshold = 50_000``
-# (the pre-#1579 guard), so flush-lag can grow up to 50K on those palaces.
-# New palaces use sync_threshold=2 (#1579) and flush almost immediately.
+# Why dynamic: a palace carries whatever ``sync_threshold`` it was created
+# under, and flush-lag grows to that threshold before a persist fires — up
+# to 50K on a palace created under an old large guard, and 2 on one created
+# under the small guard that #1308 traces back to.
 # A fixed 2000 floor would flag actively-written legacy palaces as
 # DIVERGED the moment their queue exceeded 10% of sqlite_count, even
 # though chromadb is behaving correctly. The floor must scale with the
@@ -2085,6 +2153,7 @@ class ChromaBackend(BaseBackend):
     name = "chroma"
     capabilities = frozenset(
         {
+            "requires_explicit_embeddings",
             "supports_embeddings_in",
             "supports_embeddings_passthrough",
             "supports_embeddings_out",
@@ -2355,11 +2424,7 @@ class ChromaBackend(BaseBackend):
             except _ChromaNotFoundError:
                 collection = client.create_collection(
                     collection_name,
-                    metadata={
-                        "hnsw:space": hnsw_space,
-                        "hnsw:num_threads": 1,
-                        **_HNSW_BLOAT_GUARD,
-                    },
+                    metadata=_hnsw_creation_metadata(options),
                     **ef_kwargs,
                 )
             except ValueError as e:
@@ -2449,11 +2514,7 @@ class ChromaBackend(BaseBackend):
         ef_kwargs = {"embedding_function": ef} if ef is not None else {}
         collection = self._client(palace_path).create_collection(
             collection_name,
-            metadata={
-                "hnsw:space": hnsw_space,
-                "hnsw:num_threads": 1,
-                **_HNSW_BLOAT_GUARD,
-            },
+            metadata=_hnsw_creation_metadata({"hnsw_space": hnsw_space}),
             **ef_kwargs,
         )
         return ChromaCollection(collection, palace_path=palace_path)

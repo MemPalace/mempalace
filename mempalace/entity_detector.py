@@ -272,6 +272,34 @@ SKIP_FILENAMES = {
 # ==================== CANDIDATE EXTRACTION ====================
 
 
+# Entity-candidate matching is ReDoS-prone: the English candidate pattern's
+# nested alternation (i18n/en.json) backtracks catastrophically on a long
+# unbroken run of printable ASCII (base64, minified JS, hashes, data URIs),
+# pinning a mine on one ~5000-char window for hours (#2063). Such a run is never
+# a name, so it is collapsed to a space before single-word matching. Scope:
+#   * ASCII-only ([!-~]): non-ASCII scripts (CJK, Cyrillic, Devanagari,
+#     accented Latin) are deliberately left untouched — a CJK paragraph is one
+#     unbroken run with no ASCII whitespace, and those locales' candidate
+#     patterns are bounded and never backtrack, so collapsing them would
+#     silently destroy their entity detection.
+#   * The threshold sits above the 20-char cap of the simple-name pattern
+#     ([A-Z][a-z]{1,19}), so no real single-word name is dropped. A CamelCase
+#     code identifier glued inside a long ASCII run (a path/URL/dotted name) is
+#     dropped as noise; whitespace-delimited proper nouns are unaffected.
+_MAX_CANDIDATE_TOKEN_LEN = 24
+_LONG_ASCII_RUN_RX = re.compile(rf"[!-~]{{{_MAX_CANDIDATE_TOKEN_LEN},}}")
+
+
+def _collapse_long_ascii_runs(text: str) -> str:
+    """Collapse a long unbroken run of printable ASCII to a single space (#2063).
+
+    Applied only before single-word candidate matching — the whitespace-delimited
+    multi-word patterns cannot backtrack on such runs. See ``_LONG_ASCII_RUN_RX``
+    for scope and rationale.
+    """
+    return _LONG_ASCII_RUN_RX.sub(" ", text)
+
+
 def extract_candidates(text: str, languages=("en",)) -> dict:
     """
     Extract all capitalized proper noun candidates from text.
@@ -296,13 +324,15 @@ def extract_candidates(text: str, languages=("en",)) -> dict:
     for compound, n in compound_counts.items():
         counts[compound] += n
 
-    # Single-word candidates — one pre-wrapped pattern per language
+    # Single-word candidates — one pre-wrapped pattern per language.
+    # Collapse long ASCII blobs first (base64/minified) to defuse ReDoS (#2063).
+    candidate_text = _collapse_long_ascii_runs(working_text)
     for wrapped_pat in patterns["candidate_patterns"]:
         try:
             rx = re.compile(wrapped_pat)
         except re.error:
             continue
-        for word in rx.findall(working_text):
+        for word in rx.findall(candidate_text):
             wl = word.lower()
             if wl in stopwords:
                 continue

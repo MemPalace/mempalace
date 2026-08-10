@@ -11,6 +11,9 @@ instead of the real user profile.
 """
 
 import os
+import hashlib
+import math
+import re
 import shutil
 import tempfile
 
@@ -33,6 +36,60 @@ import pytest  # noqa: E402
 from mempalace.config import MempalaceConfig  # noqa: E402
 from mempalace.knowledge_graph import KnowledgeGraph  # noqa: E402
 
+_TEST_EMBED_DIM = 384
+_TEST_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+_REAL_EMBEDDING_TEST_MODULES = {
+    "test_embedding",
+    "test_embeddinggemma",
+}
+
+
+def _stable_test_embedding(text: str) -> list[float]:
+    """Small deterministic embedding for tests that do not test ONNX itself."""
+    vec = [0.0] * _TEST_EMBED_DIM
+    tokens = _TEST_TOKEN_RE.findall((text or "").lower())
+    if not tokens:
+        tokens = [""]
+    for token in tokens:
+        digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
+        vec[int.from_bytes(digest[:4], "little") % _TEST_EMBED_DIM] += 1.0
+    norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+    return [v / norm for v in vec]
+
+
+class _StableTestEmbeddingFunction:
+    @staticmethod
+    def name() -> str:
+        return "default"
+
+    @staticmethod
+    def build_from_config(config):
+        _StableTestEmbeddingFunction.validate_config(config)
+        return _StableTestEmbeddingFunction()
+
+    @staticmethod
+    def validate_config(config) -> None:
+        return
+
+    def get_config(self) -> dict:
+        return {}
+
+    def is_legacy(self) -> bool:
+        return False
+
+    def default_space(self) -> str:
+        return "cosine"
+
+    def supported_spaces(self) -> list[str]:
+        return ["cosine", "l2", "ip"]
+
+    def embed_query(self, input):
+        return self(input=input)
+
+    def __call__(self, input):
+        return [_stable_test_embedding(str(text)) for text in list(input or [])]
+
+
 # Redirect ChromaDB's ONNX model cache back to the real user's cache so tests
 # don't re-download the 79 MB model on every run. The HOME redirect above
 # would otherwise point ONNXMiniLM_L6_V2.DOWNLOAD_PATH at the empty temp dir.
@@ -49,6 +106,39 @@ try:
             ONNXMiniLM_L6_V2.DOWNLOAD_PATH = _real_cache
 except ImportError:
     pass
+
+
+@pytest.fixture(autouse=True)
+def _stable_embedding_function_for_tests(request, monkeypatch):
+    """Keep ordinary tests off ChromaDB's native ONNX embedding path.
+
+    Module-sized Windows runs were crashing inside onnxruntime after many raw
+    Chroma add/query calls. The embedding-specific tests opt out below; every
+    other test gets a deterministic in-process EF so it still exercises vector
+    writes/search without loading native ONNX sessions.
+    """
+    module_name = getattr(getattr(request, "module", None), "__name__", "")
+    if module_name in _REAL_EMBEDDING_TEST_MODULES:
+        yield
+        return
+
+    ef = _StableTestEmbeddingFunction()
+
+    import mempalace.backends.chroma as chroma_mod
+    import mempalace.backends.embedding_wrapper as embedding_wrapper
+    import mempalace.embedding as embedding_mod
+    from chromadb.api.types import DefaultEmbeddingFunction
+
+    monkeypatch.setattr(DefaultEmbeddingFunction, "__call__", lambda self, input: ef(input=input))
+    monkeypatch.setattr(
+        DefaultEmbeddingFunction, "embed_query", lambda self, input: ef(input=input)
+    )
+    monkeypatch.setattr(embedding_mod, "get_embedding_function", lambda *_, **__: ef)
+    monkeypatch.setattr(
+        chroma_mod.ChromaBackend, "_resolve_embedding_function", staticmethod(lambda: ef)
+    )
+    monkeypatch.setattr(embedding_wrapper, "_embed_texts", lambda texts: ef(input=list(texts)))
+    yield
 
 
 @pytest.fixture(autouse=True)

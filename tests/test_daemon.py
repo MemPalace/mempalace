@@ -1,5 +1,7 @@
 import os
+import sqlite3
 import subprocess
+import sys
 import threading
 import time
 
@@ -9,6 +11,16 @@ from _chroma_palace_helper import make_minimal_chroma_sqlite
 
 from mempalace import daemon
 from mempalace import service
+
+_LOCK_CONTENDER = """
+from mempalace.palace import MineAlreadyRunning, mine_palace_lock
+import sys
+try:
+    with mine_palace_lock(sys.argv[1]):
+        raise SystemExit(0)
+except MineAlreadyRunning:
+    raise SystemExit(23)
+"""
 
 # POSIX file-mode bits (0600/0700) are not representable on Windows: os.chmod
 # can only toggle the read-only attribute, so a "private" file still reports
@@ -132,6 +144,31 @@ def test_daemon_http_lifecycle_executes_job(tmp_path, monkeypatch):
     _stop_server(client, thread, holders)
 
 
+def test_daemon_holds_local_backend_writer_lease_for_lifetime(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    client, thread, palace, holders = _start_server(
+        tmp_path, monkeypatch, lambda kind, payload: {"success": True, "exit_code": 0}
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", _LOCK_CONTENDER, str(palace)],
+            check=False,
+            env=os.environ.copy(),
+            timeout=10,
+        )
+        assert result.returncode == 23
+    finally:
+        _stop_server(client, thread, holders)
+
+    released = subprocess.run(
+        [sys.executable, "-c", _LOCK_CONTENDER, str(palace)],
+        check=False,
+        env=os.environ.copy(),
+        timeout=10,
+    )
+    assert released.returncode == 0
+
+
 def test_submit_job_uses_client_and_waits(monkeypatch, tmp_path):
     palace = tmp_path / "palace"
     palace.mkdir()
@@ -144,7 +181,7 @@ def test_submit_job_uses_client_and_waits(monkeypatch, tmp_path):
             self.submitted = (kind, payload, dedupe_key, priority)
             return {"id": "job-1", "state": "queued"}
 
-        def wait(self, job_id, timeout=daemon.DEFAULT_WAIT_TIMEOUT):
+        def wait(self, job_id, timeout=daemon.DEFAULT_WAIT_TIMEOUT, stop_on_lock_deferral=False):
             assert job_id == "job-1"
             return {
                 "id": "job-1",
@@ -340,8 +377,30 @@ def test_shutdown_cancels_active_job(tmp_path, monkeypatch):
     # And recover_running must not re-queue a cancelled job.
     assert store.recover_running() == 0
 
+    # The server thread is gone, but its timed-out worker is still executing.
+    # Writer ownership must stay with that worker until it truly exits.
+    contender = subprocess.run(
+        [sys.executable, "-c", _LOCK_CONTENDER, str(palace)],
+        check=False,
+        env=os.environ.copy(),
+        timeout=10,
+    )
+    assert contender.returncode == 23
+
     # Release the blocked worker so it (and the daemon thread) can exit.
     block.set()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        released = subprocess.run(
+            [sys.executable, "-c", _LOCK_CONTENDER, str(palace)],
+            check=False,
+            env=os.environ.copy(),
+            timeout=10,
+        )
+        if released.returncode == 0:
+            break
+        time.sleep(0.02)
+    assert released.returncode == 0
 
 
 def test_recover_running_dead_letters_exhausted_jobs(tmp_path, monkeypatch):
@@ -365,6 +424,488 @@ def test_recover_running_dead_letters_exhausted_jobs(tmp_path, monkeypatch):
     final = store.get(job.id)
     assert final.state == "failed"
     assert final.attempts == daemon.MAX_ATTEMPTS
+
+
+# --- #2014: a lease refusal is a deferral, not a failure ---
+
+
+def test_lease_refusal_defers_job_and_runs_it_on_the_next_claim(tmp_path, monkeypatch):
+    """A LockHeldByOtherProcess refusal means the palace write never landed, so
+    re-running it cannot duplicate content. It must be deferred and picked up
+    again, not dead-lettered. Regression for #2014, where a lock conflict ended
+    terminal 'failed' and only ever ran again if some hook happened to re-submit
+    equivalent work."""
+    calls = {"n": 0}
+
+    def fake_execute(kind, payload):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {
+                "success": False,
+                "error": "palace /p is held by PID 999 (mempalace-mcp)",
+                "error_class": daemon.LOCK_REFUSAL_ERROR_CLASS,
+                "exit_code": 1,
+            }
+        return {"success": True, "exit_code": 0}
+
+    monkeypatch.setattr(daemon, "LOCK_DEFER_BACKOFF_SECONDS", 0.05)
+    client, thread, palace, holders = _start_server(tmp_path, monkeypatch, fake_execute)
+    try:
+        job = client.submit("diary_write", {"entry": "verbatim"})
+        finished = client.wait(job["id"], timeout=10)
+        assert finished["state"] == "succeeded"
+        assert calls["n"] == 2  # refused once, then executed for real
+        # The refusal spent no attempt: only the successful claim counted.
+        assert finished["attempts"] == 1
+    finally:
+        _stop_server(client, thread, holders)
+
+
+def test_repeated_lease_refusal_never_exhausts_attempts(tmp_path, monkeypatch):
+    """#2014's actual promise: a palace locked across many claims must never
+    dead-letter the work. One refusal cannot show that -- MAX_ATTEMPTS is 3, so
+    the job has to survive more refusals than that and still run."""
+    calls = {"n": 0}
+    refusals = daemon.MAX_ATTEMPTS + 2
+
+    def fake_execute(kind, payload):
+        calls["n"] += 1
+        if calls["n"] <= refusals:
+            return {
+                "success": False,
+                "error": "palace /p is held by PID 999",
+                "error_class": daemon.LOCK_REFUSAL_ERROR_CLASS,
+                "exit_code": 1,
+            }
+        return {"success": True, "exit_code": 0}
+
+    monkeypatch.setattr(daemon, "LOCK_DEFER_BACKOFF_SECONDS", 0.02)
+    client, thread, palace, holders = _start_server(tmp_path, monkeypatch, fake_execute)
+    try:
+        job = client.submit("mine", {"source": "src"})
+        finished = client.wait(job["id"], timeout=20)
+        assert finished["state"] == "succeeded"
+        assert calls["n"] == refusals + 1
+        assert finished["attempts"] == 1  # every refusal refunded its claim
+    finally:
+        _stop_server(client, thread, holders)
+
+
+def test_wait_returns_a_lock_deferred_job_instead_of_waiting_out_the_holder(tmp_path, monkeypatch):
+    """An interactive caller must not block until a deferred job goes terminal --
+    it never will while the holder lives, so the default hour-long wait would
+    strand the terminal behind a peer session. Background waiters keep waiting."""
+
+    def fake_execute(kind, payload):
+        return {
+            "success": False,
+            "error": "palace /p is held by PID 999 (mempalace-mcp)",
+            "error_class": daemon.LOCK_REFUSAL_ERROR_CLASS,
+            "exit_code": 1,
+        }
+
+    monkeypatch.setattr(daemon, "LOCK_DEFER_BACKOFF_SECONDS", 5.0)
+    client, thread, palace, holders = _start_server(tmp_path, monkeypatch, fake_execute)
+    try:
+        job = client.submit("mine", {"source": "src"})
+        parked = client.wait(job["id"], timeout=10, stop_on_lock_deferral=True)
+        assert parked["state"] == "queued"  # returned early, not terminal
+        assert daemon.job_deferred_by_lock(parked)
+        assert "PID 999" in parked["error"]["message"]
+
+        # Without the flag the same job is not terminal, so the wait times out
+        # rather than returning -- the hang a naive deferral would introduce.
+        with pytest.raises(daemon.DaemonError):
+            client.wait(job["id"], timeout=0.5)
+    finally:
+        _stop_server(client, thread, holders)
+
+
+def test_job_deferred_by_lock_ignores_ordinary_queued_and_failed_jobs(tmp_path, monkeypatch):
+    """The predicate must not mistake a job merely awaiting its turn -- or a
+    genuinely failed one -- for a lock deferral, or the CLI would bail out of a
+    healthy queue."""
+    assert not daemon.job_deferred_by_lock({"state": "queued", "error": None})
+    assert not daemon.job_deferred_by_lock({"state": "queued", "error": {}})
+    assert not daemon.job_deferred_by_lock(
+        {"state": "failed", "error": {"error_class": daemon.LOCK_REFUSAL_ERROR_CLASS}}
+    )
+    assert not daemon.job_deferred_by_lock(
+        {"state": "queued", "error": {"error_class": "ValueError"}}
+    )
+    assert daemon.job_deferred_by_lock(
+        {"state": "queued", "error": {"error_class": daemon.LOCK_REFUSAL_ERROR_CLASS}}
+    )
+
+
+def test_claim_clears_a_stale_deferral_reason(tmp_path, monkeypatch):
+    """The reason defer parks on a queued job describes the claim that ended.
+    Leaving it would outlive its cause: the predicate would report a lock
+    refusal for a job that later crashed, and recover_running's dead-letter
+    (which COALESCEs error_json) would blame the lock instead of
+    MaxAttemptsExceeded."""
+    monkeypatch.setenv(daemon.STATE_ROOT_ENV, str(tmp_path / "state"))
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    store = daemon.QueueStore(daemon.queue_path(str(palace)))
+    job = store.enqueue("diary_write", {"entry": "x"})
+
+    store.claim_next()
+    store.defer(job.id, error={"error_class": daemon.LOCK_REFUSAL_ERROR_CLASS, "message": "held"})
+    assert daemon.job_deferred_by_lock(daemon.job_to_dict(store.get(job.id)))
+
+    claimed = store.claim_next()
+    assert claimed.error is None  # the refusal belonged to the previous claim
+
+    # Now crash out at MAX_ATTEMPTS: the dead-letter must name the real cause.
+    with store._lock, store._connect() as conn:
+        conn.execute(
+            "UPDATE jobs SET state='running', attempts=? WHERE id=?",
+            (daemon.MAX_ATTEMPTS, job.id),
+        )
+    store.recover_running()
+    final = store.get(job.id)
+    assert final.state == "failed"
+    assert final.error["error_class"] == "MaxAttemptsExceeded"
+
+
+def test_defer_records_why_the_job_went_back_to_the_queue(tmp_path, monkeypatch):
+    """A job parked behind the palace lock must be distinguishable from one
+    merely awaiting its turn.
+
+    The reason is what job_deferred_by_lock keys on, and what the foreground CLI
+    and the hook log quote back at the operator; without it a parked job and a
+    job simply waiting its turn are the same row. (`daemon jobs` prints only
+    id/state/kind/created_at, so it does not show this -- surfacing it there is
+    a separate change.)"""
+    monkeypatch.setenv(daemon.STATE_ROOT_ENV, str(tmp_path / "state"))
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    store = daemon.QueueStore(daemon.queue_path(str(palace)))
+    job = store.enqueue("mine", {"source": "src"})
+    store.claim_next()
+
+    deferred = store.defer(
+        job.id,
+        error={"error_class": daemon.LOCK_REFUSAL_ERROR_CLASS, "message": "held by PID 999"},
+    )
+    assert deferred.state == "queued"
+    assert deferred.error["error_class"] == daemon.LOCK_REFUSAL_ERROR_CLASS
+    assert "PID 999" in deferred.error["message"]
+
+
+def test_invalid_lock_backoff_env_falls_back_to_the_default(monkeypatch):
+    """Anything that is not a positive, finite number yields the default.
+
+    A typo must not crash the daemon at import; 0 or a negative value would make
+    the cooldown expire instantly and spin the worker against a lock it cannot
+    take; and inf/nan are the sharp edges of float() -- inf parses fine and is
+    > 0, so a bare positivity check would park the job until the daemon
+    restarts, which is exactly the dropped work #2014 is about."""
+    for bad in ("not-a-float", "-5", "0", "", "inf", "-inf", "nan"):
+        monkeypatch.setenv("MEMPALACE_DAEMON_LOCK_BACKOFF_SECONDS", bad)
+        assert daemon._lock_defer_backoff_seconds() == daemon._DEFAULT_LOCK_BACKOFF_SECONDS, bad
+
+    monkeypatch.setenv("MEMPALACE_DAEMON_LOCK_BACKOFF_SECONDS", "0.5")
+    assert daemon._lock_defer_backoff_seconds() == 0.5
+
+    monkeypatch.delenv("MEMPALACE_DAEMON_LOCK_BACKOFF_SECONDS")
+    assert daemon._lock_defer_backoff_seconds() == daemon._DEFAULT_LOCK_BACKOFF_SECONDS
+
+
+def test_defer_returns_job_to_queued_without_spending_an_attempt(tmp_path, monkeypatch):
+    """defer must undo claim_next's increment, so a palace held across many
+    claims cannot walk a job to MAX_ATTEMPTS on work that never landed."""
+    monkeypatch.setenv(daemon.STATE_ROOT_ENV, str(tmp_path / "state"))
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    store = daemon.QueueStore(daemon.queue_path(str(palace)))
+    job = store.enqueue("mine", {"source": "src"})
+
+    claimed = store.claim_next()
+    assert claimed.attempts == 1
+    assert claimed.state == "running"
+
+    deferred = store.defer(job.id)
+    assert deferred.state == "queued"
+    assert deferred.attempts == 0
+    assert deferred.started_at is None
+    # Still claimable -- the work is held, not lost.
+    assert store.claim_next().id == job.id
+
+
+def test_defer_scoped_to_a_stale_claim_is_a_no_op(tmp_path, monkeypatch):
+    """defer is scoped to the claim that was refused. If the row was meanwhile
+    re-queued and re-claimed (recover_running on another daemon start), a late
+    defer keyed to the old claim must not flip the newer claim back to 'queued'
+    -- that would refund its attempt and re-run work whose outcome the newer
+    claimant already owns."""
+    monkeypatch.setenv(daemon.STATE_ROOT_ENV, str(tmp_path / "state"))
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    store = daemon.QueueStore(daemon.queue_path(str(palace)))
+    job = store.enqueue("mine", {"source": "s"})
+
+    # started_at is the claim token this test compares, and adjacent claims can
+    # land inside one clock tick on hosts with a coarse wall clock (Windows
+    # datetime.now() ticks at ~15.6ms before 3.13). Make every stamp unique so
+    # the assertions exercise the guard, not the clock.
+    real_now = daemon._now
+    stamps = iter(range(10_000))
+    monkeypatch.setattr(daemon, "_now", lambda: f"{real_now()}#{next(stamps):04d}")
+
+    stale = store.claim_next()  # the claim that got the refusal
+    deferred = store.defer(job.id, claimed_started_at=stale.started_at)
+    assert deferred.state == "queued"  # scoping to one's own claim still defers
+
+    fresh = store.claim_next()  # the row is claimed again behind the first claimant
+    assert fresh.state == "running"
+
+    late = store.defer(job.id, claimed_started_at=stale.started_at)
+    assert late.state == "running", "a defer scoped to a stale claim must not fire"
+    assert late.attempts == fresh.attempts
+
+
+def test_defer_preserves_attempts_spent_on_earlier_real_executions(tmp_path, monkeypatch):
+    """The refund undoes one claim, not the job's whole history. An execution
+    that crashed left an unknown outcome and must keep costing its attempt --
+    otherwise an alternating crash/refusal pattern would defeat MAX_ATTEMPTS and
+    re-file verbatim content forever."""
+    monkeypatch.setenv(daemon.STATE_ROOT_ENV, str(tmp_path / "state"))
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    store = daemon.QueueStore(daemon.queue_path(str(palace)))
+    job = store.enqueue("diary_write", {"entry": "x"})
+
+    store.claim_next()  # attempt 1: crashes mid-execution (outcome unknown)
+    assert store.recover_running() == 1  # re-queued, attempt NOT refunded
+    assert store.get(job.id).attempts == 1
+
+    store.claim_next()  # attempt 2: refused the lock this time
+    deferred = store.defer(job.id)
+    assert deferred.attempts == 1  # only the refused claim was refunded, not the crash
+
+
+def test_shutdown_while_a_job_is_cooling_leaves_it_queued(tmp_path, monkeypatch):
+    """A job already deferred must survive shutdown as 'queued', not be swept
+    into a terminal state and dropped.
+
+    The worker does not hold a deferred job: it records the cooldown and moves
+    on, so `finally` clears active_job_id and the drain (which joins the worker
+    before reading it) finds nothing in flight to cancel. Pin that, because a
+    shutdown that cancelled a deferred job would be #2014 again."""
+    monkeypatch.setattr(daemon, "LOCK_DEFER_BACKOFF_SECONDS", 5.0)
+
+    def fake_execute(kind, payload):
+        return {
+            "success": False,
+            "error": "palace /p is held by PID 999",
+            "error_class": daemon.LOCK_REFUSAL_ERROR_CLASS,
+            "exit_code": 1,
+        }
+
+    client, thread, palace, holders = _start_server(tmp_path, monkeypatch, fake_execute)
+    try:
+        job = client.submit("diary_write", {"entry": "verbatim"})
+        # Wait for the REFUSAL, not merely for 'queued': a job is queued the moment
+        # it is submitted, so waiting on the state alone would pass this test before
+        # any deferral had happened. The marker only appears once defer ran.
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if daemon.job_deferred_by_lock(client.get_job(job["id"])):
+                break
+            time.sleep(0.02)
+        assert daemon.job_deferred_by_lock(client.get_job(job["id"])), "never reached a deferral"
+    finally:
+        _stop_server(client, thread, holders)
+
+    store = daemon.QueueStore(daemon.queue_path(str(palace)))
+    final = store.get(job["id"])
+    assert final.state == "queued", "a deferred job must not be cancelled by shutdown"
+    assert store.claim_next().id == job["id"]  # still runnable on the next start
+
+
+def test_defer_does_not_resurrect_a_cancelled_job(tmp_path, monkeypatch):
+    """defer mirrors finish(only_if_running=True): once shutdown cancelled an
+    in-flight job, a late deferral must not queue it for re-execution."""
+    monkeypatch.setenv(daemon.STATE_ROOT_ENV, str(tmp_path / "state"))
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    store = daemon.QueueStore(daemon.queue_path(str(palace)))
+    job = store.enqueue("diary_write", {"entry": "x"})
+    store.claim_next()
+    store.finish(job.id, state="cancelled", result={})
+
+    after = store.defer(job.id)
+    assert after.state == "cancelled"
+    assert store.claim_next() is None
+
+
+def test_claim_next_skips_excluded_jobs_without_binding_a_parameter_each(tmp_path, monkeypatch):
+    """The cooling set must not be spliced into the SQL as one host parameter per
+    job: SQLITE_MAX_VARIABLE_NUMBER defaults to 999 below SQLite 3.32 and this
+    project still supports Python 3.9. Over the cap the query raises into the
+    worker's catch-all, which retries against a set that only ages out on the
+    cooldown, so the queue stalls in cooldown-long fits. It also has to keep
+    picking the right row: the oldest queued job that is not excluded."""
+    monkeypatch.setenv(daemon.STATE_ROOT_ENV, str(tmp_path / "state"))
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    store = daemon.QueueStore(daemon.queue_path(str(palace)))
+
+    first = store.enqueue("mine", {"source": "first"})
+    second = store.enqueue("mine", {"source": "second"})
+
+    # Excluding the oldest hands back the next one, not None.
+    claimed = store.claim_next(exclude={first.id})
+    assert claimed is not None
+    assert claimed.id == second.id
+
+    # Excluding every queued job yields nothing rather than the wrong job.
+    store.defer(second.id)
+    assert store.claim_next(exclude={first.id, second.id}) is None
+
+    if not hasattr(sqlite3.Connection, "setlimit"):  # setlimit is 3.11+
+        pytest.skip("sqlite3.Connection.setlimit needed to pin the parameter cap")
+
+    # Force the pre-3.32 cap of 999 rather than trusting whatever SQLite this
+    # interpreter bundles: on a build with a large cap the old
+    # `id NOT IN (?, ?, ...)` shape passes and this test would guard nothing.
+    real_connect = sqlite3.connect
+
+    def capped_connect(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", capped_connect)
+
+    huge = {f"cooling-{i:07d}" for i in range(5_000)}  # 5x the cap
+    claimed = store.claim_next(exclude=huge)
+    assert claimed is not None
+    assert claimed.id == first.id  # priority DESC, created_at ASC still honoured
+
+    # And priority still wins over age, with an exclusion in play.
+    store.defer(first.id)
+    urgent = store.enqueue("diary_write", {"entry": "x"}, priority=10)
+    assert store.claim_next(exclude=huge).id == urgent.id
+
+
+def test_submit_job_forwards_stop_on_lock_deferral_to_wait(monkeypatch):
+    """submit_job is the only door the CLI and the hooks use, so if it drops the
+    flag on the floor every caller silently goes back to waiting out a holder
+    that may never let go. Nothing else in the suite covers the forwarding."""
+    seen = {}
+
+    class _Client:
+        def submit(self, kind, payload, dedupe_key=None, priority=0):
+            return {"id": "job-1", "state": "queued"}
+
+        def wait(self, job_id, *, timeout=None, stop_on_lock_deferral=False):
+            seen["stop_on_lock_deferral"] = stop_on_lock_deferral
+            return {"id": job_id, "state": "queued"}
+
+    monkeypatch.setattr(daemon, "ensure_client", lambda *a, **kw: _Client())
+
+    daemon.submit_job("mine", {"source": "s"}, palace_path="/p", stop_on_lock_deferral=True)
+    assert seen["stop_on_lock_deferral"] is True
+
+    daemon.submit_job("mine", {"source": "s"}, palace_path="/p")
+    assert seen["stop_on_lock_deferral"] is False  # default stays the old waiting behaviour
+
+
+def test_a_deferred_job_does_not_stall_unrelated_queued_work(tmp_path, monkeypatch):
+    """The worker is the only one, and claim_next hands back the oldest queued
+    job -- which, after a refusal, is the deferred job itself. If the worker
+    waited out the cooldown in line, that one job would hold the queue hostage
+    for as long as the holder lived (the flock is held while the write runs, and
+    a wedged write holds it indefinitely, #2024), and nothing else would run.
+    The cooldown must skip the job, not block the loop."""
+    monkeypatch.setattr(daemon, "LOCK_DEFER_BACKOFF_SECONDS", 30.0)
+    ran = []
+
+    def fake_execute(kind, payload):
+        ran.append(kind)
+        if kind == "mine":  # older, and refused for the whole test
+            return {
+                "success": False,
+                "error": "palace /p is held by PID 999",
+                "error_class": daemon.LOCK_REFUSAL_ERROR_CLASS,
+                "exit_code": 1,
+            }
+        return {"success": True, "exit_code": 0}
+
+    client, thread, palace, holders = _start_server(tmp_path, monkeypatch, fake_execute)
+    try:
+        blocked = client.submit("mine", {"source": "src"})
+        unrelated = client.submit("diary_write", {"entry": "verbatim"})
+
+        # The unrelated job must run despite a 30s cooldown on the older one.
+        done = client.wait(unrelated["id"], timeout=10)
+        assert done["state"] == "succeeded"
+        assert "diary_write" in ran
+
+        # And the blocked job is still held, not lost.
+        parked = client.get_job(blocked["id"])
+        assert parked["state"] == "queued"
+        assert daemon.job_deferred_by_lock(parked)
+    finally:
+        _stop_server(client, thread, holders)
+
+
+def test_a_job_queued_behind_a_deferred_one_gets_its_own_refusal_marker(tmp_path, monkeypatch):
+    """A caller waiting on a job that is merely queued behind a deferred job has
+    nothing to key on: the job was never claimed, so it carries no marker, and
+    stop_on_lock_deferral cannot fire. It would wait out its full timeout and
+    then report a failure that never happened -- #2014 through the back door.
+    Because the cooldown skips the deferred job instead of blocking the worker,
+    the second job is claimed, refused, and marked on its own."""
+    monkeypatch.setattr(daemon, "LOCK_DEFER_BACKOFF_SECONDS", 30.0)
+
+    def fake_execute(kind, payload):
+        return {
+            "success": False,
+            "error": "palace /p is held by PID 999 (mempalace-mcp)",
+            "error_class": daemon.LOCK_REFUSAL_ERROR_CLASS,
+            "exit_code": 1,
+        }
+
+    client, thread, palace, holders = _start_server(tmp_path, monkeypatch, fake_execute)
+    try:
+        first = client.submit("mine", {"source": "a"})
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if daemon.job_deferred_by_lock(client.get_job(first["id"])):
+                break
+            time.sleep(0.02)
+        assert daemon.job_deferred_by_lock(client.get_job(first["id"]))
+
+        # Submitted while the first job is cooling: it must still be claimed.
+        second = client.submit("mine", {"source": "b"})
+        parked = client.wait(second["id"], timeout=10, stop_on_lock_deferral=True)
+        assert parked["state"] == "queued"
+        assert daemon.job_deferred_by_lock(parked), "the CLI/hook short-circuit cannot fire"
+        assert "PID 999" in parked["error"]["message"]
+    finally:
+        _stop_server(client, thread, holders)
+
+
+def test_failure_that_is_not_a_lease_refusal_stays_terminal(tmp_path, monkeypatch):
+    """Only a lease refusal defers. A genuine failure has an unknown outcome --
+    the daemon may have written before dying -- which is exactly what MAX_ATTEMPTS
+    guards, so it must stay terminal and never be blindly re-run."""
+
+    def fake_execute(kind, payload):
+        return {"success": False, "error": "boom", "error_class": "ValueError", "exit_code": 1}
+
+    client, thread, palace, holders = _start_server(tmp_path, monkeypatch, fake_execute)
+    try:
+        job = client.submit("diary_write", {"entry": "x"})
+        finished = client.wait(job["id"], timeout=10)
+        assert finished["state"] == "failed"
+        assert finished["error"]["message"] == "boom"
+    finally:
+        _stop_server(client, thread, holders)
 
 
 def test_claim_next_does_not_reclaim_running_job(tmp_path, monkeypatch):
@@ -753,6 +1294,53 @@ def test_run_sync_structured_errors_on_sync_failures(tmp_path, monkeypatch):
     r = service.run_sync({"palace_path": str(palace), "dry_run": True})
     assert r["success"] is False
     assert "sync failed" in r["error"]
+
+
+def test_run_mine_lease_refusal_returns_the_lock_error_class(tmp_path, monkeypatch):
+    """run_mine is the sole source of the refusal marker for kind 'mine' -- the
+    primary #2014 vector, submitted by the hooks and the CLI. The worker's
+    defer-vs-dead-letter gate keys on this error_class, so if a refactor drops
+    it (say, a broad handler reordered above MineAlreadyRunning), the daemon
+    silently goes back to dead-lettering refused mines while every worker test
+    stays green: they all inject the marker by hand."""
+    import mempalace.miner as miner_module
+    from mempalace import service
+    from mempalace.palace import MineAlreadyRunning
+
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    def _locked(**kw):
+        raise MineAlreadyRunning("palace is held by PID 999")
+
+    monkeypatch.setattr(miner_module, "mine", _locked)
+    r = service.run_mine(
+        {"palace_path": str(palace), "source": str(tmp_path / "src"), "mode": "projects"}
+    )
+    assert r["success"] is False
+    assert r["error_class"] == daemon.LOCK_REFUSAL_ERROR_CLASS
+    assert r["exit_code"] == 1
+
+
+def test_safe_defer_swallows_store_errors_and_leaves_the_job_running(tmp_path, monkeypatch):
+    """_safe_defer mirrors _safe_finish: a queue-DB hiccup during defer must not
+    kill the worker. The job stays 'running' for recover_running to re-queue on
+    the next start. Dropping the swallow would let the error reach the worker's
+    outer except, which dead-letters the lock-refused job -- the #2014 outcome
+    this branch exists to remove."""
+    monkeypatch.setenv(daemon.STATE_ROOT_ENV, str(tmp_path / "state"))
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    runtime = daemon.DaemonRuntime(str(palace))
+    job = runtime.store.enqueue("mine", {"source": "s"})
+    runtime.store.claim_next()
+
+    def _boom(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(runtime.store, "defer", _boom)
+    runtime._safe_defer(job.id, error={"error_class": daemon.LOCK_REFUSAL_ERROR_CLASS})
+    assert runtime.store.get(job.id).state == "running"
 
 
 # --- post-merge review follow-ups (Copilot review on #1826) ---

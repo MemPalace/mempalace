@@ -186,14 +186,70 @@ def _paginate_ids(col, where=None):
         except Exception:
             try:
                 r = col.get(where=where, include=[], limit=page)
-                new_ids = [i for i in r["ids"] if i not in set(ids)]
-                if not new_ids:
-                    break
-                ids.extend(new_ids)
-                offset += len(new_ids)
-                continue
-            except Exception:
+            except Exception as fallback_exc:
+                # Both the offset request AND the no-offset fallback failed.
+                # Whatever is in ``ids`` so far is a partial (or empty) prefix
+                # of the collection, not a complete listing. Returning it
+                # would make scan_palace/rebuild act on a truncated palace as
+                # though it were whole (or, on the first page, print "Nothing
+                # to scan." for a palace we never actually read). The whole
+                # point of this path is to fail loudly rather than silently
+                # truncate, so raise instead of breaking.
+                raise RuntimeError(
+                    f"_paginate_ids: both offset-based pagination and the "
+                    f"no-offset fallback failed after collecting {len(ids)} "
+                    f"ids. Refusing to return a silently truncated ID list -- "
+                    f"investigate the collection, or use a repair mode that "
+                    f"does not depend on offset paging (e.g. --mode "
+                    f"from-sqlite). Underlying error: {fallback_exc}"
+                ) from fallback_exc
+            new_ids = [i for i in r["ids"] if i not in set(ids)]
+            if not new_ids:
+                # Offset is broken and the no-offset fallback always
+                # re-fetches the same first `page` results, so it can never
+                # advance past that boundary. Landing exactly on that
+                # boundary (len(ids) >= page) is ambiguous from the fetched
+                # page alone: it could mean "collection has exactly `page`
+                # ids, genuinely complete" or "collection has more and we
+                # are truncating" -- those two states are indistinguishable
+                # without an authoritative count. Disambiguate against the
+                # collection's own count() (same pattern already used by
+                # _verify_collection_count in this file; shares its known
+                # native-crash-surface caveat on a corrupted collection,
+                # which is out of scope for this fix -- see the deferred
+                # HNSW-preflight-sweep work).
+                #
+                # ``col.count()`` is collection-wide and takes no ``where``
+                # argument, so it is only authoritative when this call is
+                # UNFILTERED. With a ``where`` filter, a global count > the
+                # collected rows does NOT prove the filtered set is truncated
+                # (the extra rows may belong to other wings), so we cannot use
+                # it as proof and treat filtered completeness as unknown
+                # rather than raising a false-positive truncation error.
+                # This raise is intentionally OUTSIDE the narrow try/except
+                # above so it propagates instead of being swallowed as a
+                # get()-failure.
+                if where is None and len(ids) >= page and len(r["ids"] or []) >= page:
+                    try:
+                        total = col.count()
+                    except Exception:
+                        total = None
+                    if total is None or total > len(ids):
+                        raise RuntimeError(
+                            f"_paginate_ids: offset-based pagination failed "
+                            f"and the no-offset fallback cannot advance past "
+                            f"the first {page} results ({len(ids)} collected, "
+                            f"collection reports "
+                            f"{total if total is not None else 'an unreadable'} "
+                            f"total). Refusing to return a silently truncated "
+                            f"ID list -- investigate the collection, or use a "
+                            f"repair mode that does not depend on offset "
+                            f"paging (e.g. --mode from-sqlite)."
+                        )
                 break
+            ids.extend(new_ids)
+            offset += len(new_ids)
+            continue
         n = len(r["ids"]) if r["ids"] else 0
         if n == 0:
             break
@@ -311,11 +367,71 @@ def _rebuild_collection_via_temp(
             pass
         return rebuilt
     except Exception as exc:
-        try:
-            _delete_collection_if_exists(backend, palace_path, temp_name)
-        except Exception:
-            pass
-        raise RebuildCollectionError(str(exc), live_replaced=live_replaced) from exc
+        if not live_replaced:
+            # The live collection was never touched -- the temp build is a
+            # discardable in-progress copy, safe to clean up on failure.
+            try:
+                _delete_collection_if_exists(backend, palace_path, temp_name)
+            except Exception:
+                pass
+            raise RebuildCollectionError(str(exc), live_replaced=live_replaced) from exc
+        # The live collection was already deleted (line 294) before this
+        # failure. `temp_name` is now the ONLY intact, verified copy of the
+        # data left on disk -- never delete it here. Point the operator
+        # at it instead of destroying the one thing that can still recover.
+        raise RebuildCollectionError(
+            f"{exc}. The live collection '{collection_name}' was already "
+            f"replaced and the re-upload into it failed. The fully-verified "
+            f"pre-swap copy survives under '{temp_name}' -- do NOT delete it. "
+            f"Recover by removing the broken '{collection_name}' collection "
+            f"and promoting '{temp_name}' in its place.",
+            live_replaced=live_replaced,
+        ) from exc
+
+
+def _promote_temp_collection(
+    backend,
+    palace_path: str,
+    temp_name: str,
+    collection_name: str,
+    expected: int,
+    batch_size: int,
+    progress=print,
+) -> int:
+    """Recover a failed live-swap by promoting the verified temp copy.
+
+    `_rebuild_collection_via_temp` fully verifies `temp_name` before it ever
+    touches the live collection. If the post-swap re-upload into a fresh live
+    collection then fails, the honest recovery is to copy directly from that
+    verified temp copy -- NOT to restore a pre-rebuild sqlite3 file backup,
+    whose on-disk HNSW segment directories were already destroyed by the
+    live-collection delete and would leave the palace referencing segment
+    UUIDs that no longer exist on disk.
+    """
+    temp_col = backend.get_collection(palace_path, temp_name)
+    ids, docs, metas = _extract_drawers(temp_col, expected, batch_size)
+    _delete_collection_if_exists(backend, palace_path, collection_name)
+    new_col = backend.create_collection(palace_path, collection_name)
+    promoted = 0
+    for i in range(0, len(ids), batch_size):
+        new_col.upsert(
+            documents=docs[i : i + batch_size],
+            ids=ids[i : i + batch_size],
+            metadatas=metas[i : i + batch_size],
+        )
+        promoted += len(ids[i : i + batch_size])
+        progress(f"  Promoted {promoted}/{expected} drawers from verified temp copy...")
+    _verify_collection_count(new_col, expected, "promoted temp collection")
+    # Promotion has already fully succeeded and verified at this point --
+    # cleaning up the now-redundant temp copy is best-effort, matching the
+    # identical post-success cleanup in _rebuild_collection_via_temp above.
+    # A failure here (e.g. a transient Windows file lock) must not turn a
+    # successful recovery into a reported failure.
+    try:
+        _delete_collection_if_exists(backend, palace_path, temp_name)
+    except Exception:
+        pass
+    return promoted
 
 
 def scan_palace(palace_path=None, only_wing=None, collection_name: Optional[str] = None):
@@ -330,6 +446,17 @@ def scan_palace(palace_path=None, only_wing=None, collection_name: Optional[str]
     collection_name = collection_name or _drawers_collection_name()
     print(f"\n  Palace: {palace_path}")
     print("  Loading...")
+
+    # Preflight HNSW divergence before opening the collection: count() on a
+    # diverged segment can hit the #1222 SIGSEGV/panic class, which a
+    # try/except around count() cannot catch (a native crash takes the
+    # whole process down). scan_palace is meant to find corruption, not
+    # crash on the exact corruption class it should be reporting.
+    capacity_info = hnsw_capacity_status(palace_path, collection_name)
+    if capacity_info.get("diverged"):
+        print(f"\n  HNSW index is diverged: {capacity_info.get('message', '')}")
+        print(index_read_recovery_guidance())
+        return set(), set()
 
     col = ChromaBackend().get_collection(palace_path, collection_name)
 
@@ -414,6 +541,15 @@ def prune_corrupt(palace_path=None, confirm=False, collection_name: Optional[str
     if not confirm:
         print("\n  DRY RUN — no deletions performed.")
         print("  Re-run with --confirm to actually delete.")
+        return
+
+    # Preflight HNSW divergence before opening the collection — see
+    # scan_palace's identical guard for why this can't rely on except
+    # Exception around count() alone.
+    capacity_info = hnsw_capacity_status(palace_path, collection_name)
+    if capacity_info.get("diverged"):
+        print(f"\n  HNSW index is diverged: {capacity_info.get('message', '')}")
+        print(index_read_recovery_guidance())
         return
 
     col = ChromaBackend().get_collection(palace_path, collection_name)
@@ -1018,6 +1154,19 @@ def rebuild_index(
     if preflight is not None:
         return
 
+    # Preflight HNSW divergence before opening the collection: status()
+    # already has this same guard via hnsw_capacity_status (docstring above
+    # this module's status() references it as "the safe pattern"), but
+    # rebuild_index -- the legacy rebuild the CLI's rebuild-index subcommand
+    # dispatches straight to -- opens the collection and calls col.count()
+    # directly, wrapped only in except Exception, which cannot catch the
+    # #1222 SIGSEGV/panic class a diverged segment triggers.
+    capacity_info = hnsw_capacity_status(palace_path, collection_name)
+    if capacity_info.get("diverged"):
+        progress(f"\n  HNSW index is diverged: {capacity_info.get('message', '')}")
+        progress(index_read_recovery_guidance())
+        return
+
     backend = ChromaBackend()
     try:
         col = backend.get_collection(palace_path, collection_name)
@@ -1078,18 +1227,37 @@ def rebuild_index(
     except RebuildCollectionError as e:
         progress(f"\n  ERROR during rebuild: {e}")
         progress("  Rebuild aborted before completion.")
-        if e.live_replaced and os.path.exists(backup_path):
-            progress(f"  Restoring from backup: {backup_path}")
+        if e.live_replaced:
+            # Restoring the pre-rebuild chroma.sqlite3 file here would be
+            # misleading: the live collection's on-disk HNSW segment
+            # directories were already destroyed by the delete that
+            # preceded this failure, so a sqlite-only restore leaves the
+            # palace referencing segment UUIDs that no longer exist.
+            # The verified good copy is the temp collection instead --
+            # promote it directly.
+            temp_name = f"{collection_name}__repair_tmp"
+            progress(f"  Attempting recovery: promoting verified copy from '{temp_name}'...")
             try:
                 _close_chroma_handles(palace_path, backend=backend)
-                _delete_collection_if_exists(backend, palace_path, collection_name)
-                _copy_file_no_follow(backup_path, sqlite_path, replace=True)
-                progress("  Backup restored. Palace is back to pre-repair state.")
-            except Exception as restore_error:
-                progress(f"  Backup restore failed: {restore_error}")
-                progress(f"  Manual restore required from: {backup_path}")
-        elif e.live_replaced:
-            progress("  No backup available. Re-mine from source files to recover.")
+                _promote_temp_collection(
+                    backend,
+                    palace_path,
+                    temp_name,
+                    collection_name,
+                    len(all_ids),
+                    batch_size,
+                    progress=progress,
+                )
+                progress(
+                    "  Recovery succeeded: live collection restored from the verified temp copy."
+                )
+            except Exception as promote_error:
+                progress(f"  Automatic recovery failed: {promote_error}")
+                progress(
+                    f"  The verified pre-swap copy still survives under '{temp_name}' -- "
+                    f"do NOT delete it. Recover manually by promoting it, or re-mine "
+                    f"from source files."
+                )
         else:
             print("  Live collection was not replaced; leaving the original palace untouched.")
         raise
@@ -1098,6 +1266,23 @@ def rebuild_index(
 
     print(f"\n  Repair complete. {filed} drawers rebuilt.")
     print("  HNSW index is now clean with cosine distance metric.")
+
+    # rebuild_index only ever touches collection_name (drawers by default).
+    # status() checks divergence for BOTH drawers and closets and recommends
+    # --mode from-sqlite (which rebuilds both via _recoverable_collections()),
+    # but a caller who ran this legacy rebuild instead would otherwise see
+    # an unqualified "Repair complete" even when closets remains diverged
+    # and just as capable of crashing reads via the same #1222 mechanism (#13).
+    if collection_name == _drawers_collection_name():
+        closets_info = hnsw_capacity_status(palace_path, CLOSETS_COLLECTION_NAME)
+        if closets_info.get("diverged"):
+            print(
+                f"\n  NOTE: the closets index is still diverged "
+                f"({closets_info.get('message', '')}).\n"
+                "  This rebuild only covers drawers. Run "
+                "`mempalace repair --mode from-sqlite --archive-existing`\n"
+                "  to rebuild closets too."
+            )
     print(f"\n{'=' * 55}\n")
 
 
@@ -1260,6 +1445,13 @@ def extract_via_sqlite(palace_path: str, collection_name: str) -> Iterator[tuple
     returned as the document; this matches how chromadb itself stores
     ``add(documents=...)``.
 
+    Driven from ``embeddings`` (LEFT JOIN ``embedding_metadata``), not
+    the other way around: an embedding with zero ``embedding_metadata``
+    rows — a sparse historical write with no ``chroma:document`` and no
+    other key, the same condition ``_extract_drawers`` already sanitizes
+    for the collection-layer path, see #1458 — must still be yielded
+    with an empty metadata dict, not silently excluded by the join.
+
     Silent on missing palace, missing ``chroma.sqlite3``, or unknown
     collection name — yields nothing. Callers that need to distinguish
     "empty collection" from "collection not present" should query
@@ -1289,15 +1481,21 @@ def extract_via_sqlite(palace_path: str, collection_name: str) -> Iterator[tuple
             """
             SELECT e.embedding_id, em.key, em.string_value, em.int_value,
                    em.float_value, em.bool_value
-            FROM embedding_metadata em
-            JOIN embeddings e ON em.id = e.id
+            FROM embeddings e
+            LEFT JOIN embedding_metadata em ON em.id = e.id
             WHERE e.segment_id = ?
-            ORDER BY em.id
+            ORDER BY e.id
             """,
             (segment_id,),
         ):
             if emb_id not in per_id:
                 order.append(emb_id)
+            if key is None:
+                # LEFT JOIN unmatched row: this embedding has zero
+                # embedding_metadata rows. `order`/`per_id` already
+                # account for it via the defaultdict below; nothing to
+                # merge for this row.
+                continue
             if sv is not None:
                 per_id[emb_id][key] = sv
             elif iv is not None:
@@ -1355,6 +1553,7 @@ def rebuild_from_sqlite(
     *,
     archive_existing_dest: bool = False,
     batch_size: int = 1000,
+    dry_run: bool = False,
 ) -> dict[str, int]:
     """Rebuild a palace by reading drawers from ``source_palace``'s
     ``chroma.sqlite3`` and upserting them into a fresh palace at
@@ -1386,6 +1585,17 @@ def rebuild_from_sqlite(
       ``<dest_palace>.pre-rebuild-<timestamp>`` and read from there
       instead. Used by the in-place CLI flow where ``--source`` defaults
       to the same path as ``--palace``.
+
+    ``dry_run`` (CLI: ``--dry-run``) previews the rebuild without making any
+    change: source validation runs as normal, then per-collection row counts
+    are read from the source SQLite and printed, and the function returns
+    those would-be counts *without* archiving the existing palace, taking the
+    mine-lock, creating collections, or re-embedding (#2095, #2133). Useful
+    before a multi-hour rebuild on a large palace. A dry run returns a
+    populated dict (one key per recoverable collection) so CLI callers treat
+    it as success; a validation refusal still returns ``{}`` exactly as a real
+    run would. If SQLite row counts cannot be read, the preview fails closed
+    with ``{}`` rather than inventing zeros.
 
     Returns a ``{collection_name: row_count}`` dict so callers (CLI,
     tests) can verify the per-collection rebuild count without parsing
@@ -1471,6 +1681,216 @@ def rebuild_from_sqlite(
             )
             return {}
 
+    # --dry-run: validation has passed, so report what a real run would do
+    # and stop before the first irreversible step (mine-lock + archive).
+    # Counts come from ``sqlite_drawer_count`` — the same SQLite ground-truth
+    # helper repair uses elsewhere — so the preview matches the per-collection
+    # counts a real rebuild upserts. Reads the original ``source_palace``
+    # (not yet archived). Must never take the mine-lock or rename anything.
+    if dry_run:
+        return _preview_rebuild_from_sqlite(
+            source_palace=source_palace,
+            dest_palace=dest_palace,
+            in_place=in_place,
+        )
+
+    # Acquire the single-writer mine-lock BEFORE the archive/rename. The
+    # rebuild upserts into ``dest_palace`` through the same backend write
+    # path that takes ``mine_palace_lock`` per batch; if a daemon or a
+    # concurrent mine already holds it, those upserts used to fail *after*
+    # ``shutil.move`` had already stranded the existing palace aside
+    # (renamed to ``.pre-rebuild-…`` with no rebuilt replacement, leaving a
+    # partial/archived mess). Taking the lock up front makes contention
+    # fail CLEAN — no archive, no partial dest, the palace left untouched —
+    # and runs the whole rebuild as one writer (the inner per-batch
+    # acquires pass through re-entrantly on this thread).
+    from .palace import mine_palace_lock
+
+    with mine_palace_lock(dest_palace):
+        return _rebuild_from_sqlite_locked(
+            source_palace=source_palace,
+            dest_palace=dest_palace,
+            in_place=in_place,
+            batch_size=batch_size,
+        )
+
+
+def _print_unreadable_count_refusal(*, collection_name: str, palace_path: str) -> None:
+    """Refuse to preview a collection whose SQLite row count cannot be read.
+
+    Fail closed: inventing 0 would hide an unreadable source and make the
+    operator believe a real run would upsert nothing (review note on #1654 /
+    #2095). Shared by both previews so the wording cannot drift apart.
+    """
+    print(
+        f"\n  Cannot preview [{collection_name}]: SQLite row count is unreadable "
+        f"at {os.path.join(palace_path, 'chroma.sqlite3')}.\n"
+        "  Fix source readability (schema, lock, permissions) and re-run "
+        "--dry-run; refusing to invent zero counts."
+    )
+
+
+def _preview_rebuild_from_sqlite(
+    *,
+    source_palace: str,
+    dest_palace: str,
+    in_place: bool,
+) -> dict[str, int]:
+    """Read-only preview for :func:`rebuild_from_sqlite` (``dry_run=True``).
+
+    Never archives, locks, or writes. Returns ``{}`` if SQLite counts are
+    unreadable so a broken preview cannot look like a successful zero-row plan.
+    """
+    print("\n  DRY RUN — no changes will be made.")
+    if in_place:
+        print(
+            f"  Would archive {dest_palace} → "
+            f"{dest_palace}.pre-rebuild-<timestamp>, then rebuild from the copy."
+        )
+    else:
+        print(f"  Would rebuild into {dest_palace} from {source_palace}.")
+
+    counts: dict[str, int] = {}
+    for cname in _recoverable_collections():
+        n = sqlite_drawer_count(source_palace, cname)
+        if n is None:
+            _print_unreadable_count_refusal(collection_name=cname, palace_path=source_palace)
+            return {}
+        counts[cname] = n
+        print(f"  [{cname}] would re-embed and upsert {n} rows")
+    print(
+        f"\n  Would rebuild {sum(counts.values())} total rows. Re-run without --dry-run to execute."
+    )
+    print(f"{'=' * 55}\n")
+    return counts
+
+
+def _preview_legacy_repair(
+    *,
+    palace_path: str,
+    collection_name: str,
+    confirm_truncation_ok: bool = False,
+) -> dict[str, int]:
+    """Read-only preview for the default (legacy) ``repair`` path (``dry_run=True``).
+
+    Never opens a chromadb client, takes a lock, or writes. Opening a client is
+    itself a write to ``chroma.sqlite3``, so the row count comes from the
+    read-only SQLite ground truth :func:`check_extraction_safety` already
+    trusts. That is a different source than the real run rebuilds from (it
+    re-files what the chromadb collection layer returns), so the plan below
+    states the ``#1208`` contingency rather than promising the number.
+
+    ``confirm_truncation_ok`` mirrors the real run's flag: it switches that
+    contingency off, so the preview has to say the guard is disabled rather
+    than promise an abort that would not happen.
+
+    Returns ``{}`` when the count is unreadable so a broken preview cannot look
+    like a valid plan (#1654, #2095, #2133).
+    """
+    print("\n  DRY RUN — no changes will be made.")
+    n = sqlite_drawer_count(palace_path, collection_name)
+    if n is None:
+        _print_unreadable_count_refusal(collection_name=collection_name, palace_path=palace_path)
+        print(f"{'=' * 55}\n")
+        return {}
+
+    if n == 0:
+        # The real run stops at ``total == 0`` with "Nothing to repair.", or —
+        # when the collection is absent altogether — at the index-read error
+        # that points to --mode from-sqlite. Neither backs up nor rebuilds, so
+        # promising a backup and a VACUUM here would describe a run that does
+        # not happen.
+        print(
+            f"  [{collection_name}] chroma.sqlite3 holds no rows. A real run would report\n"
+            "  nothing to repair, or an index read error, and change nothing."
+        )
+        print(f"{'=' * 55}\n")
+        return {collection_name: 0}
+
+    backup_path = os.path.normpath(palace_path) + ".backup"
+    if confirm_truncation_ok:
+        print(
+            f"  [{collection_name}] chroma.sqlite3 holds {n} rows, and --confirm-truncation-ok\n"
+            "  is set, so the #1208 truncation guard is DISABLED. A real run would re-file\n"
+            f"  whatever the chromadb collection layer returns, even if that is fewer than {n}\n"
+            "  rows, and the difference would be destroyed. It would, in order:"
+        )
+    else:
+        print(
+            f"  [{collection_name}] chroma.sqlite3 holds {n} rows. A real run would extract them\n"
+            "  through the chromadb collection layer first and abort without changes if that\n"
+            f"  returns fewer than {n} (#1208 truncation guard). It would then, in order:"
+        )
+    if os.path.exists(backup_path):
+        print(f"    1. DELETE the existing backup at {backup_path} — or refuse outright")
+        print("       if it is not a palace — and copy the live palace in its place")
+    else:
+        print(f"    1. copy the palace directory to {backup_path}")
+    print(f"    2. DELETE the live '{collection_name}' collection and re-file the extracted rows")
+    print("       into a fresh one, staged and verified in a temp collection first")
+    print("    3. rebuild the FTS5 index and VACUUM chroma.sqlite3")
+    print("\n  Without --yes it would ask for confirmation before step 1.")
+    print("  Re-run without --dry-run to execute.")
+    print(f"{'=' * 55}\n")
+    return {collection_name: n}
+
+
+def resolve_repair_preflight_errors(
+    palace_path: str,
+    errors: list[str],
+    *,
+    dry_run: bool,
+    progress=print,
+) -> list[str]:
+    """Return the quick_check errors that still block a repair.
+
+    A real run heals an isolated malformed FTS5 inverted index in place and
+    carries on (#1596). ``--dry-run`` must not perform that write, so it
+    classifies the errors with the same :func:`_errors_are_isolated_fts5`
+    predicate the real path gates on: an isolated FTS5 error is reported and
+    cleared, anything broader still aborts. Without this a preview would print
+    the ABORT banner — offline ``sqlite3 .recover``, recreate the FTS5 table —
+    for a palace the tool repairs by itself.
+
+    The prediction is deliberately the optimistic branch, and it is stated as
+    an attempt rather than a promise: the real heal still returns the errors
+    unchanged when another process holds the mine lock, when the rebuild
+    raises, or when ``quick_check`` is still dirty afterwards. A dry run cannot
+    tell those apart without taking the lock and writing, which is exactly what
+    it must not do, so the wording names them instead.
+    """
+    if not errors:
+        return errors
+    if not dry_run:
+        return maybe_autoheal_fts5_index(palace_path, errors, progress=progress)
+    if _errors_are_isolated_fts5(errors):
+        progress(
+            "\n  DRY RUN — quick_check reports an isolated FTS5 inverted-index error.\n"
+            "  A real run would attempt an in-place rebuild of that index from the\n"
+            "  intact content table and continue if it succeeds; it aborts instead if\n"
+            "  another process holds the mine lock or the rebuild leaves quick_check\n"
+            "  dirty. This preview leaves the index untouched."
+        )
+        return []
+    return errors
+
+
+def _rebuild_from_sqlite_locked(
+    *,
+    source_palace: str,
+    dest_palace: str,
+    in_place: bool,
+    batch_size: int,
+) -> dict[str, int]:
+    """Body of :func:`rebuild_from_sqlite`, run while holding
+    ``mine_palace_lock(dest_palace)`` so the archive/rename and the
+    upserts form one atomic single-writer operation.
+
+    Split out so the lock acquired in :func:`rebuild_from_sqlite` wraps
+    every destructive step (the archive ``shutil.move`` below included).
+    Raising :class:`MineAlreadyRunning` from the wrapping ``with`` happens
+    before this body runs, so a held lock never reaches the archive.
+    """
     archive_path: Optional[str] = None
     if in_place:
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -1501,7 +1921,6 @@ def rebuild_from_sqlite(
             )
             return {}
         source_palace = archive_path
-        src_db = os.path.join(source_palace, "chroma.sqlite3")
 
         # In-place only: drop chromadb's process-wide System registry so
         # the new client at dest_palace builds a fresh System. Without

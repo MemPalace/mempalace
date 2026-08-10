@@ -9,12 +9,14 @@ weak closets (regex extraction on narrative content) can only help, never
 hide drawers the direct path would have found.
 """
 
+import functools
 import logging
 import math
 import os
 import re
 import sqlite3
 from pathlib import Path
+from typing import Optional
 
 from .backends import (
     BackendError,
@@ -23,7 +25,8 @@ from .backends import (
     PalaceNotFoundError,
     UnsupportedCapabilityError,
 )
-from .config import sqlite_read_uri
+from .config import MempalaceConfig, sqlite_read_uri
+from .i18n import _canonical_lang, get_stopwords
 from .palace import (
     _open_collection_or_explain,
     get_closets_collection,
@@ -60,16 +63,102 @@ def _first_or_empty(results, key: str) -> list:
     return outer[0] or []
 
 
-def _tokenize(text: str) -> list:
+def _aligned_query_ids(results, document_count: int) -> list:
+    """Return query IDs padded to match the document result column.
+
+    Production backends return an ID for every document. Some legacy test
+    mocks omit IDs, so pad with ``None`` instead of letting ``zip`` discard
+    otherwise valid mocked results.
+    """
+    ids = list(_first_or_empty(results, "ids"))
+    if len(ids) < document_count:
+        ids.extend([None] * (document_count - len(ids)))
+    return ids[:document_count]
+
+
+def _result_drawer_id(meta, stored_drawer_id):
+    """Return the ID that round-trips through ``mempalace_get_drawer``.
+
+    Chunk metadata carries the logical-group id under ``parent_drawer_id``
+    (``tool_add_drawer``) or ``parent_entry_id`` (``tool_diary_write``);
+    resolving both means a hit on a chunked diary entry reports the id that
+    fetches the WHOLE entry rather than the one chunk that matched (#2185).
+    Kept in sync with ``mcp_server._PARENT_ID_KEYS``.
+    """
+    meta = meta or {}
+    return meta.get("parent_drawer_id") or meta.get("parent_entry_id") or stored_drawer_id
+
+
+def _tokenize(text: str, stop_words: frozenset = frozenset()) -> list:
     """Lowercase + strip to alphanumeric tokens of length ≥ 2.
 
     Tolerates ``None`` documents — Chroma can return ``None`` in the
     ``documents`` field for drawers without text content, which would
     otherwise raise ``AttributeError`` mid-rerank.
+
+    When ``stop_words`` is non-empty, filters tokens that match any entry.
+    The set is expected to already be lowercased so callers can share one
+    instance across query + document tokenization.
     """
     if not text:
         return []
-    return _TOKEN_RE.findall(text.lower())
+    tokens = _TOKEN_RE.findall(text.lower())
+    if stop_words:
+        return [t for t in tokens if t not in stop_words]
+    return tokens
+
+
+@functools.lru_cache(maxsize=16)
+def _stopwords_for_canonical(canonical_lang: str) -> frozenset:
+    """Cached stop-word set keyed by a canonical locale code.
+
+    Splitting canonicalization out of the cache key avoids thrashing when
+    callers pass equivalent variants (``"EN"``, ``"en"``, ``"en-US"``) —
+    they all hit the same cache slot.
+    """
+    return frozenset(get_stopwords(canonical_lang))
+
+
+def _stopwords_for_lang(lang: str) -> frozenset:
+    """Resolve raw ``lang`` to its canonical form before cache lookup.
+
+    Kept as the public-shaped helper (callers and tests reach for this
+    name) while the lru_cache lives on ``_stopwords_for_canonical`` to
+    keep the cache key normalized.
+    """
+    canonical = _canonical_lang(lang) or lang.lower()
+    return _stopwords_for_canonical(canonical)
+
+
+def _resolve_stop_words(lang: Optional[str]) -> frozenset:
+    """Return the BM25 stop-word set for ``lang`` as an opt-in feature.
+
+    When ``lang`` is an explicit string, loads that locale's stop words.
+    When ``lang`` is ``None``, resolution order is:
+
+    1. ``MEMPALACE_LANG`` / ``MEMPAL_LANG`` environment variable.
+    2. ``MempalaceConfig().lang_explicit`` (which itself reads the env vars
+       first, then ``config.json["lang"]``).
+
+    The env-var fast path avoids constructing ``MempalaceConfig`` (which
+    reads ``config.json`` from disk) on the hot search path when the user
+    has set the env var — the common case for explicit-locale palaces.
+    Palaces that never configured a language get an empty set, preserving
+    pre-PR scoring byte-for-byte.
+    """
+    if lang is None:
+        env_val = os.environ.get("MEMPALACE_LANG") or os.environ.get("MEMPAL_LANG")
+        if env_val and env_val.strip():
+            lang = env_val.strip()
+        else:
+            try:
+                lang = MempalaceConfig().lang_explicit
+            except Exception:
+                logger.debug("lang resolution failed, skipping stop-word filter", exc_info=True)
+                return frozenset()
+        if lang is None:
+            return frozenset()
+    return _stopwords_for_lang(lang)
 
 
 def _bm25_scores(
@@ -77,6 +166,7 @@ def _bm25_scores(
     documents: list,
     k1: float = 1.5,
     b: float = 0.75,
+    stop_words: frozenset = frozenset(),
 ) -> list:
     """Compute Okapi-BM25 scores for ``query`` against each document.
 
@@ -94,11 +184,11 @@ def _bm25_scores(
     Returns a list of scores in the same order as ``documents``.
     """
     n_docs = len(documents)
-    query_terms = set(_tokenize(query))
+    query_terms = set(_tokenize(query, stop_words))
     if not query_terms or n_docs == 0:
         return [0.0] * n_docs
 
-    tokenized = [_tokenize(d) for d in documents]
+    tokenized = [_tokenize(d, stop_words) for d in documents]
     doc_lens = [len(toks) for toks in tokenized]
     if not any(doc_lens):
         return [0.0] * n_docs
@@ -187,6 +277,7 @@ def _hybrid_rank(
     vector_weight: float = 0.6,
     bm25_weight: float = 0.4,
     metric: str = "cosine",
+    stop_words: frozenset = frozenset(),
 ) -> list:
     """Re-rank ``results`` by a convex combination of vector similarity and BM25.
 
@@ -211,7 +302,7 @@ def _hybrid_rank(
         return results
 
     docs = [r.get("text", "") for r in results]
-    bm25_raw = _bm25_scores(query, docs)
+    bm25_raw = _bm25_scores(query, docs, stop_words=stop_words)
     max_bm25 = max(bm25_raw) if bm25_raw else 0.0
     bm25_norm = [s / max_bm25 for s in bm25_raw] if max_bm25 > 0 else [0.0] * len(bm25_raw)
 
@@ -435,7 +526,12 @@ def _hnsw_capacity_diverged(palace_path: str) -> bool:
 
 
 def _print_search_results_bm25_only(
-    query: str, palace_path: str, wing: str, room: str, n_results: int
+    query: str,
+    palace_path: str,
+    wing: str,
+    room: str,
+    n_results: int,
+    stop_words: frozenset = frozenset(),
 ) -> None:
     """CLI fallback printer for when HNSW divergence fences off vector search.
 
@@ -443,6 +539,11 @@ def _print_search_results_bm25_only(
     the format they expect, plus a clear notice pointing at
     ``mempalace repair``. Replaces the silent SIGBUS users otherwise hit
     when the CLI called ``col.query()`` against a diverged segment.
+
+    ``stop_words`` reaches the BM25 scorer here for the same reason
+    :func:`_vector_disabled_search` forwards it on the MCP side: this path
+    still ranks by BM25, so dropping the filter would rank a diverged
+    palace by different rules than a healthy one.
     """
     result = _bm25_only_via_sqlite(
         query=query,
@@ -450,6 +551,7 @@ def _print_search_results_bm25_only(
         wing=wing,
         room=room,
         n_results=n_results,
+        stop_words=stop_words,
     )
     hits = result.get("results", [])
 
@@ -493,6 +595,10 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
     Search the palace. Returns verbatim drawer content.
     Optionally filter by wing (project) or room (aspect).
     """
+    # Resolved before the fence below: both exits from this function rank by
+    # BM25, so the filter has to be in hand on either branch.
+    stop_words = _resolve_stop_words(None)
+
     # Probe a Chroma palace before get_collection(). Opening the client can
     # load native index state, and embedder-identity enforcement may call
     # collection.count(); both happen before the old query-only guard and can
@@ -508,7 +614,9 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
         backend_name = None
 
     if backend_name == "chroma" and _hnsw_capacity_diverged(palace_path):
-        return _print_search_results_bm25_only(query, palace_path, wing, room, n_results)
+        return _print_search_results_bm25_only(
+            query, palace_path, wing, room, n_results, stop_words=stop_words
+        )
 
     col = _open_collection_or_explain(palace_path, opener=get_collection)
     if col is None:
@@ -558,7 +666,7 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
         {"text": doc or "", "distance": float(dist), "metadata": meta or {}}
         for doc, meta, dist in zip(docs, metas, dists)
     ]
-    hits = _hybrid_rank(hits, query, metric=metric)
+    hits = _hybrid_rank(hits, query, metric=metric, stop_words=stop_words)
 
     print(f"\n{'=' * 60}")
     print(f'  Results for: "{query}"')
@@ -599,6 +707,7 @@ def _bm25_only_via_sqlite(
     max_candidates: int = 500,
     _include_internal: bool = False,
     collection_name: str = None,
+    stop_words: frozenset = frozenset(),
 ) -> dict:
     """BM25-only search reading drawers directly from chroma.sqlite3.
 
@@ -618,10 +727,10 @@ def _bm25_only_via_sqlite(
     """
     db_path = os.path.join(palace_path, "chroma.sqlite3")
     if not os.path.isfile(db_path):
-        return {
-            "error": "No palace found",
-            "hint": "Run: mempalace init <dir> && mempalace mine <dir>",
-        }
+        return _search_error_result(
+            "No palace found",
+            hint="Run: mempalace init <dir> && mempalace mine <dir>",
+        )
     if collection_name is None:
         from .config import get_configured_collection_name
 
@@ -655,7 +764,7 @@ def _bm25_only_via_sqlite(
     try:
         conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
     except sqlite3.Error as e:
-        return {"error": f"sqlite open failed: {e}"}
+        return _search_error_result(f"sqlite open failed: {e}")
 
     try:
         # FTS5 MATCH expects whitespace-separated tokens. Drop tokens
@@ -752,9 +861,10 @@ def _bm25_only_via_sqlite(
         placeholders = ",".join(["?"] * len(candidate_ids))
         meta_rows = conn.execute(
             f"""
-            SELECT id, key, string_value, int_value
-            FROM embedding_metadata
-            WHERE id IN ({placeholders})
+            SELECT m.id, e.embedding_id, m.key, m.string_value, m.int_value
+            FROM embedding_metadata AS m
+            JOIN embeddings AS e ON e.id = m.id
+            WHERE m.id IN ({placeholders})
             """,
             candidate_ids,
         ).fetchall()
@@ -763,8 +873,16 @@ def _bm25_only_via_sqlite(
 
     # Group metadata rows into per-drawer dicts.
     drawers: dict[int, dict] = {}
-    for emb_id, key, sval, ival in meta_rows:
-        d = drawers.setdefault(emb_id, {"_id": emb_id, "metadata": {}, "text": ""})
+    for emb_id, stored_drawer_id, key, sval, ival in meta_rows:
+        d = drawers.setdefault(
+            emb_id,
+            {
+                "_id": emb_id,
+                "_stored_drawer_id": stored_drawer_id,
+                "metadata": {},
+                "text": "",
+            },
+        )
         if key == "chroma:document":
             d["text"] = sval or ""
         else:
@@ -784,6 +902,7 @@ def _bm25_only_via_sqlite(
         full_source = meta.get("source_file", "") or ""
         candidates.append(
             {
+                "drawer_id": _result_drawer_id(meta, d["_stored_drawer_id"]),
                 "text": d["text"],
                 "wing": meta.get("wing", "unknown"),
                 "room": meta.get("room", "unknown"),
@@ -807,7 +926,7 @@ def _bm25_only_via_sqlite(
 
     # Local BM25 over the candidate set.
     docs = [c["text"] for c in candidates]
-    bm25_raw = _bm25_scores(query, docs)
+    bm25_raw = _bm25_scores(query, docs, stop_words=stop_words)
     max_bm25 = max(bm25_raw) if bm25_raw else 0.0
     for c, raw in zip(candidates, bm25_raw):
         c["bm25_score"] = round(raw, 3)
@@ -842,6 +961,7 @@ def _merge_bm25_union_candidates(
     n_results: int,
     max_distance: float = 0.0,
     source_file: str = None,
+    stop_words: frozenset = frozenset(),
 ) -> None:
     """Append top-K backend lexical candidates into ``hits`` in place.
 
@@ -887,6 +1007,7 @@ def _merge_bm25_union_candidates(
         full_source = meta.get("source_file", "") or ""
         bm25_extra.append(
             {
+                "drawer_id": _result_drawer_id(meta, hit.id),
                 "text": hit.document or "",
                 "wing": meta.get("wing", "unknown"),
                 "room": meta.get("room", "unknown"),
@@ -990,6 +1111,7 @@ def _finalize_candidate_hits(
     n_results: int,
     max_distance: float,
     source_file: str = None,
+    stop_words: frozenset = frozenset(),
 ) -> tuple:
     try:
         _apply_candidate_strategy(
@@ -1004,13 +1126,17 @@ def _finalize_candidate_hits(
             source_file=source_file,
         )
     except UnsupportedCapabilityError:
-        return [], {
-            "error": "candidate_strategy='union' requires a backend with lexical_search support",
-            "unsupported_capability": "supports_lexical_search",
-            "hint": "Use candidate_strategy='vector' or select a backend that supports lexical search.",
-        }
+        return [], _search_error_result(
+            "candidate_strategy='union' requires a backend with lexical_search support",
+            unsupported_capability="supports_lexical_search",
+            hint=(
+                "Use candidate_strategy='vector' or select a backend that supports lexical search."
+            ),
+        )
 
-    hits = _hybrid_rank(hits, query, metric=_metric_for_collection(drawers_col))[:n_results]
+    hits = _hybrid_rank(
+        hits, query, metric=_metric_for_collection(drawers_col), stop_words=stop_words
+    )[:n_results]
     for h in hits:
         h.pop("_sort_key", None)
         h.pop("_source_file_full", None)
@@ -1019,20 +1145,32 @@ def _finalize_candidate_hits(
     return hits, None
 
 
+def _search_error_result(error: str, **extra) -> dict:
+    """Error envelope for programmatic search callers.
+
+    Always includes ``results: []`` so callers can safely index
+    ``result["results"]`` without a KeyError when the palace failed to
+    open or the query raised mid-flight (Windows CI flake surface).
+    """
+    out = {"error": error, "results": []}
+    out.update(extra)
+    return out
+
+
 def _backend_mismatch_result(error: BackendMismatchError) -> dict:
-    return {
-        "error": "Backend mismatch",
-        "details": str(error),
-        "hint": "Select the matching backend or use a fresh palace directory.",
-    }
+    return _search_error_result(
+        "Backend mismatch",
+        details=str(error),
+        hint="Select the matching backend or use a fresh palace directory.",
+    )
 
 
 def _unknown_backend_result(error: KeyError) -> dict:
-    return {
-        "error": "Unknown backend",
-        "details": str(error),
-        "hint": "Check MEMPALACE_BACKEND or the configured backend name.",
-    }
+    return _search_error_result(
+        "Unknown backend",
+        details=str(error),
+        hint="Check MEMPALACE_BACKEND or the configured backend name.",
+    )
 
 
 def _vector_disabled_search(
@@ -1044,6 +1182,7 @@ def _vector_disabled_search(
     n_results: int,
     collection_name: str,
     source_file: str = None,
+    stop_words: frozenset = frozenset(),
 ) -> dict:
     try:
         backend_name = resolve_backend_name(palace_path)
@@ -1052,12 +1191,12 @@ def _vector_disabled_search(
     except KeyError as e:
         return _unknown_backend_result(e)
     if backend_name != "chroma":
-        return {
-            "error": "vector_disabled fallback is Chroma-only",
-            "unsupported_capability": "chroma_hnsw_fallback",
-            "backend": backend_name,
-            "hint": "Disable vector_disabled for non-Chroma backends.",
-        }
+        return _search_error_result(
+            "vector_disabled fallback is Chroma-only",
+            unsupported_capability="chroma_hnsw_fallback",
+            backend=backend_name,
+            hint="Disable vector_disabled for non-Chroma backends.",
+        )
     return _bm25_only_via_sqlite(
         query,
         palace_path,
@@ -1066,6 +1205,7 @@ def _vector_disabled_search(
         source_file=source_file,
         n_results=n_results,
         collection_name=collection_name,
+        stop_words=stop_words,
     )
 
 
@@ -1078,23 +1218,23 @@ def _open_search_collection(palace_path: str, collection_name: str):
         return None, _unknown_backend_result(e)
     except (CollectionNotInitializedError, PalaceNotFoundError) as e:
         logger.error("No palace found at %s: %s", palace_path, e)
-        return None, {
-            "error": "No palace found",
-            "hint": "Run: mempalace init <dir> && mempalace mine <dir>",
-        }
+        return None, _search_error_result(
+            "No palace found",
+            hint="Run: mempalace init <dir> && mempalace mine <dir>",
+        )
     except BackendError as e:
         logger.error("Backend error opening palace at %s: %s", palace_path, e)
-        return None, {
-            "error": "Backend error",
-            "details": str(e),
-            "hint": "Check the selected backend configuration and availability.",
-        }
+        return None, _search_error_result(
+            "Backend error",
+            details=str(e),
+            hint="Check the selected backend configuration and availability.",
+        )
     except Exception as e:
         logger.error("No palace found at %s: %s", palace_path, e)
-        return None, {
-            "error": "No palace found",
-            "hint": "Run: mempalace init <dir> && mempalace mine <dir>",
-        }
+        return None, _search_error_result(
+            "No palace found",
+            hint="Run: mempalace init <dir> && mempalace mine <dir>",
+        )
 
 
 def _query_drawers_with_filter_fallback(
@@ -1125,9 +1265,12 @@ def _query_drawers_with_filter_fallback(
             n_results=min(n_results * 15, 500),
             include=["documents", "metadatas", "distances"],
         )
-        fdocs, fmetas, fdists = [], [], []
-        for doc, meta, dist in zip(
-            _first_or_empty(raw, "documents"),
+        raw_docs = _first_or_empty(raw, "documents")
+        raw_ids = _aligned_query_ids(raw, len(raw_docs))
+        fids, fdocs, fmetas, fdists = [], [], [], []
+        for stored_drawer_id, doc, meta, dist in zip(
+            raw_ids,
+            raw_docs,
             _first_or_empty(raw, "metadatas"),
             _first_or_empty(raw, "distances"),
         ):
@@ -1138,10 +1281,16 @@ def _query_drawers_with_filter_fallback(
                 continue
             if source_file and meta.get("source_file") != source_file:
                 continue
+            fids.append(stored_drawer_id)
             fdocs.append(doc)
             fmetas.append(meta)
             fdists.append(dist)
-        return {"documents": [fdocs], "metadatas": [fmetas], "distances": [fdists]}
+        return {
+            "ids": [fids],
+            "documents": [fdocs],
+            "metadatas": [fmetas],
+            "distances": [fdists],
+        }
 
 
 def search_memories(
@@ -1155,6 +1304,7 @@ def search_memories(
     vector_disabled: bool = False,
     candidate_strategy: str = "vector",
     collection_name: str = None,
+    lang: Optional[str] = None,
 ) -> dict:
     """Programmatic search — returns a dict instead of printing.
 
@@ -1192,11 +1342,22 @@ def search_memories(
               When ``max_distance > 0.0`` is also set, BM25-only candidates
               are skipped — they have no vector distance and would silently
               violate the requested distance threshold.
+        lang: Locale code for BM25 stop-word filtering (opt-in). When
+            omitted, reads ``MempalaceConfig().lang_explicit`` — returns an
+            empty set unless the user has set ``MEMPALACE_LANG`` /
+            ``MEMPAL_LANG`` or ``config.json["lang"]``. Palaces without an
+            explicit language skip filtering entirely, preserving pre-PR
+            byte-identical scoring.
     """
     # Validate the strategy eagerly so invalid values fail the same way
     # regardless of whether the call routes through the vector path or
     # the BM25-only fallback below.
     _validate_candidate_strategy(candidate_strategy)
+
+    # Resolve stop words once up-front so every BM25 site (the vector path's
+    # `_hybrid_rank`, the `vector_disabled` fallback, and the union-merge
+    # candidate gather) tokenizes against the same locale.
+    stop_words = _resolve_stop_words(lang)
 
     if vector_disabled:
         return _vector_disabled_search(
@@ -1207,6 +1368,7 @@ def search_memories(
             n_results=n_results,
             collection_name=collection_name,
             source_file=source_file,
+            stop_words=stop_words,
         )
 
     drawers_col, open_error = _open_search_collection(palace_path, collection_name)
@@ -1235,7 +1397,7 @@ def search_memories(
             drawers_col, dkwargs, query, n_results, wing, room, source_file
         )
     except Exception as e:
-        return {"error": f"Search error: {e}"}
+        return _search_error_result(f"Search error: {e}")
 
     # Gather closet hits (best-per-source) to build a boost lookup.
     closet_boost_by_source: dict = {}  # source_file -> (rank, closet_dist, preview)
@@ -1271,8 +1433,11 @@ def search_memories(
     CLOSET_DISTANCE_CAP = 1.5  # cosine dist > 1.5 = too weak to use as signal
 
     scored: list = []
-    for doc, meta, dist in zip(
-        _first_or_empty(drawer_results, "documents"),
+    drawer_docs = _first_or_empty(drawer_results, "documents")
+    stored_drawer_ids = _aligned_query_ids(drawer_results, len(drawer_docs))
+    for stored_drawer_id, doc, meta, dist in zip(
+        stored_drawer_ids,
+        drawer_docs,
         _first_or_empty(drawer_results, "metadatas"),
         _first_or_empty(drawer_results, "distances"),
     ):
@@ -1301,6 +1466,7 @@ def search_memories(
         # inverting the ranking so the best hybrid matches sort last.
         effective_dist = max(0.0, min(2.0, dist - boost))
         entry = {
+            "drawer_id": _result_drawer_id(meta, stored_drawer_id),
             "text": doc,
             "wing": meta.get("wing", "unknown"),
             "room": meta.get("room", "unknown"),
@@ -1368,7 +1534,7 @@ def search_memories(
         indexed.sort(key=lambda p: p[0])
         ordered_docs = [d for _, d in indexed]
 
-        query_terms = set(_tokenize(query))
+        query_terms = set(_tokenize(query, stop_words))
         best_idx, best_score = 0, -1
         for idx, d in enumerate(ordered_docs):
             d_lower = d.lower()
@@ -1407,6 +1573,7 @@ def search_memories(
         n_results=n_results,
         max_distance=max_distance,
         source_file=source_file,
+        stop_words=stop_words,
     )
     if strategy_error:
         return strategy_error

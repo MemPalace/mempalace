@@ -44,6 +44,7 @@ except (OSError, AttributeError):
 sys.stdout = sys.stderr
 
 import argparse  # noqa: E402  (deferred until after stdio protection above)
+import contextlib  # noqa: E402
 import json  # noqa: E402
 import logging  # noqa: E402
 import re  # noqa: E402
@@ -55,6 +56,7 @@ import time  # noqa: E402
 from datetime import date, datetime  # noqa: E402
 from pathlib import Path  # noqa: E402
 from typing import Optional  # noqa: E402
+from urllib.parse import urlparse  # noqa: E402
 
 from .config import (  # noqa: E402
     MempalaceConfig,
@@ -71,7 +73,7 @@ from chromadb.errors import NotFoundError as _ChromaNotFoundError  # noqa: E402
 from .backends.chroma import (  # noqa: E402
     ChromaBackend,
     ChromaCollection,
-    _HNSW_BLOAT_GUARD,
+    _HNSW_WRITE_DEFAULTS,
     _pin_hnsw_threads,
     hnsw_capacity_status,
     reset_hnsw_capacity_cache,
@@ -98,6 +100,7 @@ from .hallways import (  # noqa: E402
 )
 
 from .knowledge_graph import KnowledgeGraph, DEFAULT_KG_PATH  # noqa: E402
+from .logstream import LOGSTREAM_DB_FILENAME, Logstream  # noqa: E402
 from .collision_scan import assert_no_collisions  # noqa: E402
 from .ids import ID_RECIPE, make_drawer_id_from_content  # noqa: E402
 
@@ -290,8 +293,8 @@ def _parse_args():
     parser.add_argument(
         "--read-only",
         action="store_true",
-        help="Serve a read-only tool surface: the mutating tools are hidden from "
-        "tools/list and refused at dispatch (env MEMPALACE_MCP_READ_ONLY)",
+        help="Serve a read-only tool surface: the tools that change state are hidden "
+        "from tools/list and refused at dispatch (env MEMPALACE_MCP_READ_ONLY)",
     )
     args, unknown = parser.parse_known_args()
     if unknown:
@@ -313,16 +316,21 @@ if _args.backend:
 
 _config = MempalaceConfig()
 
-# Read-only server mode: when on, the mutating tools are hidden from tools/list
-# and refused at dispatch (-32003). Resolved once at startup from --read-only or
-# MEMPALACE_MCP_READ_ONLY. Computed inline (not via _truthy_env, defined below)
-# so it is available to the request path regardless of import order.
+# Read-only server mode: when on, the tools in _READ_ONLY_REFUSED_TOOLS (defined
+# below) are hidden from tools/list and refused at dispatch (-32003). That is a
+# wider set than the _MUTATING_TOOLS the peer-writer guard uses. Resolved once at
+# startup from --read-only or MEMPALACE_MCP_READ_ONLY. Computed inline (not via
+# _truthy_env, defined below) so it is available to the request path regardless
+# of import order.
 _READ_ONLY = bool(getattr(_args, "read_only", False)) or os.environ.get(
     "MEMPALACE_MCP_READ_ONLY", ""
 ).strip().lower() in {"1", "true", "yes", "on"}
 
 _kg_by_path: dict[str, KnowledgeGraph] = {}
 _kg_cache_lock = threading.Lock()
+
+_logstream_by_path: dict[str, Logstream] = {}
+_logstream_cache_lock = threading.Lock()
 _palace_flag_given: bool = bool(_args.palace)
 
 # MCP server idle auto-exit (#1552).  Stale MCP servers from ended Claude
@@ -353,6 +361,21 @@ _SQLITE_INTEGRITY_ALLOWED_TOOLS = frozenset(
     {
         "mempalace_status",
         "mempalace_reconnect",
+        # RFC 003: logstream lives in its own logstream.sqlite3 with no
+        # Chroma/FTS5 dependency, so agent coordination stays available
+        # even while the main palace index is corrupt and under repair.
+        "mempalace_event_append",
+        "mempalace_event_list",
+        "mempalace_event_wait",
+        "mempalace_event_ack",
+        "mempalace_artifact_put",
+        "mempalace_artifact_get",
+        "mempalace_patch_submit",
+        # RFC 004: the estate is observability — logstream + sync state +
+        # peers.json, no FTS5 dependency (the profile's drawer count
+        # degrades gracefully). A damaged palace is exactly when mesh
+        # visibility matters most; caught live on the third replica.
+        "mempalace_mesh_peers",
     }
 )
 
@@ -381,6 +404,7 @@ _MCP_WRITER_LOCK_CM = None
 _MCP_WRITER_READ_ONLY = False
 _MCP_WRITER_LOCK_FAILED = False
 _MCP_WRITER_LOCK_ERROR = ""
+_MCP_WRITER_ATEXIT_REGISTERED = False
 _MCP_ALLOW_PEER_WRITER_ENV = "MEMPALACE_MCP_ALLOW_PEER_WRITER"
 
 _MUTATING_TOOLS = frozenset(
@@ -399,12 +423,180 @@ _MUTATING_TOOLS = frozenset(
         "mempalace_sync",
         "mempalace_update_drawer",
         "mempalace_diary_write",
+        "mempalace_event_append",
+        "mempalace_event_ack",
+        "mempalace_artifact_put",
+        "mempalace_patch_submit",
     }
 )
+
+# Logstream mutating tools (RFC 003) write only to logstream.sqlite3 — an
+# independent WAL database with no Chroma/HNSW in-memory state — so the
+# peer-writer lease that protects Chroma does not apply to them. Exempting
+# them keeps agent coordination alive while a CLI mine or a peer stdio
+# writer holds the palace lock. They remain in _MUTATING_TOOLS so operator
+# read-only mode (--read-only / MEMPALACE_MCP_READ_ONLY) still hides and
+# refuses them.
+_PEER_WRITER_EXEMPT_TOOLS = frozenset(
+    {
+        "mempalace_event_append",
+        "mempalace_event_ack",
+        "mempalace_artifact_put",
+        "mempalace_patch_submit",
+    }
+)
+
+# The subset of _MUTATING_TOOLS whose write path reaches the chroma vector
+# segment. Deliberately narrower: the knowledge-graph and tunnel/hallway tools
+# keep their own sqlite/JSON state and never touch HNSW, so an unusable vector
+# index has no say over them.
+#
+# The distinction earns its keep because a write into a diverged HNSW segment
+# does not fail — it blocks inside chromadb's Rust upsert with no timeout of its
+# own, for the life of the process, while this server holds the palace mine lock
+# and the writer lease. One stuck call becomes a palace-wide outage that a still
+# healthy handshake hides.
+_VECTOR_WRITE_TOOLS = frozenset(
+    {
+        "mempalace_add_drawer",
+        "mempalace_update_drawer",
+        "mempalace_delete_drawer",
+        "mempalace_delete_by_source",
+        "mempalace_diary_write",
+        "mempalace_checkpoint",
+        "mempalace_mine",
+        "mempalace_sync",
+    }
+)
+
+_DIVERGED_INDEX_ERROR_CODE = -32004
+
+# Read-only mode (#1877) refuses a wider set than the peer-writer guard above.
+#
+# _MUTATING_TOOLS is the *palace-write* set: _mcp_peer_writer_refusal consults it
+# to decide which calls need this process to hold the palace mine lock. A tool
+# that never touches Chroma or the knowledge graph has to stay out of that set,
+# or a server that lost the lease to a peer would start refusing calls the lease
+# has no say over.
+#
+# Two tools are exactly that shape, and read-only has to name both because it is
+# a capability boundary rather than a lock: it exists so a shared server can
+# serve recall to a client that must not change server state.
+#
+#   mempalace_hook_settings, given an argument, writes the server's
+#   ~/.mempalace/config.json through MempalaceConfig.set_hook_setting.
+#   service.WRITE_TOOLS already classifies it as a write, which the daemon uses
+#   as an allowlist, so read-only was the odd one out.
+#
+#   mempalace_memories_filed_away unlinks ~/.mempalace/hook_state/last_checkpoint
+#   on both of its branches. Consuming the file is the contract of the tool, but
+#   it is still a delete of state that outlives the process, on behalf of a
+#   client with no write access. (service.classify_tool calls this one "read",
+#   which is wrong for the same reason.)
+#
+# mempalace_reconnect is deliberately NOT here even though it is not write-free:
+# it clears ChromaBackend._quarantined_paths, so the reopen that follows can let
+# quarantine_stale_hnsw rename a segment directory. It is the only way to pick up
+# an external writer's changes, and _SQLITE_INTEGRITY_ALLOWED_TOOLS already keeps
+# it reachable for recovery, so gating it would strand a read-only server on a
+# stale index. This set means "refuse what a client asked to change", not
+# "nothing past here touches the disk" -- opening the palace or the knowledge
+# graph materialises files on its own, which no name-based gate can express.
+_READ_ONLY_REFUSED_TOOLS = _MUTATING_TOOLS | {
+    "mempalace_hook_settings",
+    "mempalace_memories_filed_away",
+}
 
 
 def _truthy_env(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _discard_mcp_storage_handles() -> None:
+    """Close cached storage handles before changing writer-lease state.
+
+    A stdio reader can hold a genuine read-only ``sqlite_exact`` collection
+    while another process owns the palace. Once this process promotes to
+    writer, that cached collection must not keep routing the mutating request
+    through its ``query_only`` connection. The inverse matters for embedded
+    HTTP: close writable handles before releasing the lifetime lease so no
+    storage client survives beyond the ownership interval.
+
+    Also clears per-process embedder-identity validation for this palace:
+    a prior read-only open of an empty collection may have cached a "validated"
+    key without recording identity on disk; promotion must re-run enforcement
+    so the first writable open still labels drawers with the active model.
+    """
+
+    global \
+        _client_cache, \
+        _collection_cache, \
+        _collection_cache_backend, \
+        _collection_cache_palace, \
+        _collection_open_error, \
+        _palace_db_inode, \
+        _palace_db_mtime, \
+        _metadata_cache, \
+        _metadata_cache_time
+
+    cached_client = _client_cache
+    try:
+        from .palace import clear_validated_embedder_identity, get_backend_for_palace
+
+        backend = get_backend_for_palace(_config.palace_path)
+        backend.close_palace(PalaceRef(id=_config.palace_path, local_path=_config.palace_path))
+        clear_validated_embedder_identity(_config.palace_path)
+    except Exception:
+        logger.debug("Failed to close cached backend while changing MCP ownership", exc_info=True)
+        try:
+            from .palace import clear_validated_embedder_identity
+
+            clear_validated_embedder_identity(getattr(_config, "palace_path", None))
+        except Exception:
+            logger.debug(
+                "Failed to clear embedder-identity cache while changing MCP ownership",
+                exc_info=True,
+            )
+
+    if cached_client is not None:
+        try:
+            close = getattr(cached_client, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            logger.debug(
+                "Failed to close MCP-local client while changing ownership",
+                exc_info=True,
+            )
+
+    _client_cache = None
+    _collection_cache = None
+    _collection_cache_backend = None
+    _collection_cache_palace = None
+    _collection_open_error = None
+    _palace_db_inode = 0
+    _palace_db_mtime = 0.0
+    _metadata_cache = None
+    _metadata_cache_time = 0
+
+
+def _release_mcp_writer_lock() -> None:
+    """Close writable handles and release this process's palace lease."""
+
+    global _MCP_WRITER_LOCK_CM, _MCP_WRITER_READ_ONLY
+
+    lock_cm = _MCP_WRITER_LOCK_CM
+    if lock_cm is None:
+        return
+
+    try:
+        _discard_mcp_storage_handles()
+    finally:
+        # Clear first so the atexit callback and embedded hosts can call this
+        # repeatedly without exiting the same context manager twice.
+        _MCP_WRITER_LOCK_CM = None
+        _MCP_WRITER_READ_ONLY = False
+        lock_cm.__exit__(None, None, None)
 
 
 def _acquire_mcp_writer_lock() -> tuple[bool, str]:
@@ -419,29 +611,40 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     the original holder exits — the OS releases its flock on process death —
     the next mutating call transparently promotes this server to writer, with
     no restart. The flock is arbitrated by the kernel (LOCK_NB), so two servers
-    can never both win the retry. ``_MCP_WRITER_READ_ONLY`` is now only a
-    status flag; it no longer short-circuits the retry (that sticky latch used
-    to strand a server read-only for life even after the peer was long gone).
+    can never both win the retry. ``_MCP_WRITER_READ_ONLY`` and
+    ``_MCP_WRITER_LOCK_FAILED`` are now only status flags for the last attempt;
+    neither short-circuits a later retry. Peer ownership and transient setup
+    failures can both be corrected without restarting the MCP host.
     """
 
     global _MCP_WRITER_LOCK_CM, _MCP_WRITER_READ_ONLY, _MCP_WRITER_LOCK_FAILED
-    global _MCP_WRITER_LOCK_ERROR
-
-    if _truthy_env(_MCP_ALLOW_PEER_WRITER_ENV):
-        return True, ""
+    global _MCP_WRITER_LOCK_ERROR, _MCP_WRITER_ATEXIT_REGISTERED
 
     if _MCP_WRITER_LOCK_CM is not None:
         return True, ""
 
-    # NB: deliberately NO sticky read-only short-circuit here. If a peer held
-    # the lease at startup we fall through and retry mine_palace_lock below, so
-    # the server self-heals into the writer the moment the peer exits. A broken
-    # lock *mechanism* (below) is still cached, since retrying it can't help.
-    if _MCP_WRITER_LOCK_FAILED:
-        return True, _MCP_WRITER_LOCK_ERROR
+    # Deliberately no sticky failure short-circuit here. A peer can exit, a
+    # backend mismatch can be corrected, and lock-directory permissions can be
+    # repaired while this long-lived stdio host remains alive. Each mutating
+    # request therefore gets a fresh ownership attempt.
 
     try:
-        from .palace import MineAlreadyRunning, mine_palace_lock
+        from .palace import (
+            MineAlreadyRunning,
+            backend_requires_single_writer,
+            mine_palace_lock,
+            resolve_backend_name,
+        )
+
+        backend_name = resolve_backend_name(_config.palace_path)
+        if _truthy_env(_MCP_ALLOW_PEER_WRITER_ENV):
+            if not backend_requires_single_writer(backend_name):
+                return True, ""
+            logger.warning(
+                "%s cannot bypass the single-writer requirement for local backend %r",
+                _MCP_ALLOW_PEER_WRITER_ENV,
+                backend_name,
+            )
 
         lock_cm = mine_palace_lock(_config.palace_path)
         lock_cm.__enter__()
@@ -456,16 +659,23 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
         _MCP_WRITER_LOCK_FAILED = True
         _MCP_WRITER_LOCK_ERROR = (
             "could not acquire MCP peer-writer lock for "
-            f"{_config.palace_path!r}: {exc!r}; continuing without "
-            "peer-writer protection"
+            f"{_config.palace_path!r}: {exc!r}; refusing this mutating tool "
+            "because peer-writer protection could not be established; a later "
+            "mutating request will retry ownership"
         )
-        logger.warning(_MCP_WRITER_LOCK_ERROR)
-        return True, _MCP_WRITER_LOCK_ERROR
+        logger.error(_MCP_WRITER_LOCK_ERROR)
+        return False, _MCP_WRITER_LOCK_ERROR
 
     _MCP_WRITER_LOCK_CM = lock_cm
     import atexit
 
-    atexit.register(lambda: lock_cm.__exit__(None, None, None))
+    if not _MCP_WRITER_ATEXIT_REGISTERED:
+        atexit.register(_release_mcp_writer_lock)
+        _MCP_WRITER_ATEXIT_REGISTERED = True
+    # Reads performed before promotion may have cached a query-only SQLite
+    # collection. Drop it while ownership is held so the pending mutating
+    # request reopens a writable handle rather than failing on query_only.
+    _discard_mcp_storage_handles()
     _MCP_WRITER_READ_ONLY = False
     _MCP_WRITER_LOCK_FAILED = False
     _MCP_WRITER_LOCK_ERROR = ""
@@ -473,7 +683,7 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
 
 
 def _mcp_peer_writer_refusal(req_id, tool_name: str):
-    if tool_name not in _MUTATING_TOOLS:
+    if tool_name not in _MUTATING_TOOLS or tool_name in _PEER_WRITER_EXEMPT_TOOLS:
         return None
 
     ok, reason = _acquire_mcp_writer_lock()
@@ -794,6 +1004,62 @@ def _call_kg(op):
             raise
 
 
+def _resolve_logstream_path() -> str:
+    """Resolve the RFC 003 logstream database path in the active palace.
+
+    Fails clearly (ValueError) when no palace path is configured — the
+    logstream must never silently write outside the palace directory.
+    """
+    palace_path = getattr(_config, "palace_path", None) or MempalaceConfig().palace_path
+    if not palace_path:
+        raise ValueError("no palace path configured; run mempalace init first")
+    return os.path.join(os.path.expanduser(palace_path), LOGSTREAM_DB_FILENAME)
+
+
+def _get_logstream(canonical_path=None) -> Logstream:
+    """Return the cached ``Logstream`` for the resolved palace.
+
+    Same canonical-key contract as :func:`_get_kg`: callers inside a retry
+    loop pass the captured key through so insert and evict keys cannot
+    drift apart under palace-path rotation.
+    """
+    path = (
+        canonical_path
+        if canonical_path is not None
+        else _canonicalize_kg_path(_resolve_logstream_path())
+    )
+    ls = _logstream_by_path.get(path)
+    if ls is not None:
+        return ls
+    with _logstream_cache_lock:
+        ls = _logstream_by_path.get(path)
+        if ls is None:
+            ls = Logstream(db_path=path)
+            _logstream_by_path[path] = ls
+    return ls
+
+
+def _call_logstream(op):
+    """Run ``op(logstream)`` with one-shot retry on a closed connection.
+
+    Mirrors :func:`_call_kg`: ``tool_reconnect`` on another thread can
+    close the cached handle between lookup and use; evict the stale entry
+    and retry once with a fresh instance.
+    """
+    path = _canonicalize_kg_path(_resolve_logstream_path())
+    for attempt in range(2):
+        ls = _get_logstream(path)
+        try:
+            return op(ls)
+        except sqlite3.ProgrammingError:
+            if attempt == 0:
+                with _logstream_cache_lock:
+                    if _logstream_by_path.get(path) is ls:
+                        _logstream_by_path.pop(path, None)
+                continue
+            raise
+
+
 _client_cache = None
 _collection_cache = None
 _collection_cache_backend = None
@@ -1039,6 +1305,11 @@ def _get_collection(create=False):
         _palace_db_mtime, \
         _metadata_cache, \
         _metadata_cache_time
+    # Operator read-only mode must never bootstrap a collection. In
+    # particular, sqlite_exact's normal create/open path initializes WAL,
+    # schema, FTS metadata, and commits before the first read.
+    if _READ_ONLY:
+        create = False
     try:
         backend_name = _selected_backend_name()
     except (BackendMismatchError, KeyError) as exc:
@@ -1056,6 +1327,18 @@ def _get_collection(create=False):
         return None
 
     if backend_name != "chroma":
+        # Normal stdio MCP remains capable of promotion to writer, but until
+        # it actually owns the palace it must not open sqlite_exact through
+        # the schema-initializing read/write path. This lets recall coexist
+        # with a daemon/HTTP writer. _acquire_mcp_writer_lock() discards this
+        # cached read-only collection before a promoted mutation is handled.
+        collection_read_only = _READ_ONLY or (
+            backend_name == "sqlite_exact"
+            and getattr(_args, "transport", "stdio") == "stdio"
+            and _MCP_WRITER_LOCK_CM is None
+        )
+        if collection_read_only:
+            create = False
         for attempt in range(2):
             try:
                 if (
@@ -1076,6 +1359,7 @@ def _get_collection(create=False):
                         collection_name=_config.collection_name,
                         create=create,
                         backend=backend_name,
+                        read_only=collection_read_only,
                     )
                     _collection_cache_backend = backend_name
                     _collection_cache_palace = _config.palace_path
@@ -1176,7 +1460,7 @@ def _get_collection(create=False):
                         metadata={
                             "hnsw:space": "cosine",
                             "hnsw:num_threads": 1,
-                            **_HNSW_BLOAT_GUARD,
+                            **_HNSW_WRITE_DEFAULTS,
                         },
                         **ef_kwargs,
                     )
@@ -2204,6 +2488,14 @@ def tool_graph_stats():
     return graph_stats(col=col)
 
 
+def tool_mesh_peers():
+    """Mesh estate snapshot — the committed compat surface for PalaceMind's
+    mesh view: exactly the GET /sync/peers payload, produced by the same
+    function so the tool and the endpoint can never drift. Read-only;
+    peers.json tokens are never included."""
+    return _mesh_peers_payload()
+
+
 def tool_create_tunnel(
     source_wing: str,
     source_room: str,
@@ -2338,10 +2630,44 @@ def _single_drawer_record(col, drawer_id: str):
     }
 
 
+# Two write paths stamp the logical-group id under different keys:
+# ``tool_add_drawer`` chunks carry ``parent_drawer_id`` (#1539, resolved as a
+# logical drawer by #1782) while ``tool_diary_write`` chunks carry
+# ``parent_entry_id`` (#1539). Both mean the same thing -- "physical chunk of
+# this logical drawer" -- so every read path must resolve either one, or the
+# id a write path hands back is unusable with get/update/delete (#2185).
+# New diary writes stamp both keys; the read paths below still accept the
+# ``parent_entry_id``-only shape so palaces written before this fix keep
+# working with no data migration.
+_PARENT_ID_KEYS = ("parent_drawer_id", "parent_entry_id")
+
+
+def _logical_parent_id(meta):
+    """Return the logical-group id from chunk metadata, whichever key holds it.
+
+    Returns ``None`` for rows that are not chunks of a larger drawer.
+    """
+    for key in _PARENT_ID_KEYS:
+        value = (meta or {}).get(key)
+        if value:
+            return value
+    return None
+
+
+def _logical_parent_where(drawer_id: str) -> dict:
+    """Chroma ``where`` matching every chunk of ``drawer_id`` under either key.
+
+    A chunk carrying both keys (diary writes after #2185) matches both
+    branches of the ``$or`` but is still returned once -- Chroma dedupes by
+    physical id -- so the joined content never repeats a chunk.
+    """
+    return {"$or": [{key: drawer_id} for key in _PARENT_ID_KEYS]}
+
+
 def _logical_chunk_group(col, drawer_id: str):
     try:
         result = col.get(
-            where={"parent_drawer_id": drawer_id},
+            where=_logical_parent_where(drawer_id),
             include=["documents", "metadatas"],
         )
     except Exception:
@@ -2449,7 +2775,7 @@ def _collapse_drawer_rows(ids, documents, metadatas):
     for idx, drawer_id in enumerate(ids):
         doc = documents[idx] if idx < len(documents) else ""
         meta = _safe_meta(metadatas[idx] if idx < len(metadatas) else {})
-        parent_id = meta.get("parent_drawer_id")
+        parent_id = _logical_parent_id(meta)
 
         if parent_id:
             groups.setdefault(parent_id, []).append(
@@ -2800,6 +3126,7 @@ def tool_mine(
     mining — use ``mempalace_sync`` for that.
     """
     global _metadata_cache
+    from .daemon import LOCK_REFUSAL_ERROR_CLASS
     from .palace import MineAlreadyRunning, MineValidationError
 
     if not _config.palace_path:
@@ -2862,7 +3189,7 @@ def tool_mine(
             return {
                 "success": False,
                 "error": f"another mine is in progress: {exc}",
-                "error_class": "LockHeldByOtherProcess",
+                "error_class": LOCK_REFUSAL_ERROR_CLASS,
             }
         except MineValidationError as exc:
             return {
@@ -3072,6 +3399,7 @@ def tool_delete_by_source(source_file: str, dry_run: bool = True):
 def tool_sync(project_dir: str = None, wing: str = None, apply: bool = False):
     """Prune drawers whose source files are gitignored, missing, or moved (#1252)."""
     global _metadata_cache
+    from .daemon import LOCK_REFUSAL_ERROR_CLASS
     from .palace import MineAlreadyRunning
     from .sync import sync_palace
 
@@ -3096,7 +3424,7 @@ def tool_sync(project_dir: str = None, wing: str = None, apply: bool = False):
             return {
                 "success": False,
                 "error": f"another mine is in progress: {exc}",
-                "error_class": "LockHeldByOtherProcess",
+                "error_class": LOCK_REFUSAL_ERROR_CLASS,
             }
         except ValueError as exc:
             return {"success": False, "error": str(exc)}
@@ -3498,6 +3826,9 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
     that diary reads are case-insensitive (see #1243). "Claude",
     "claude", and "CLAUDE" all resolve to the same agent.
     """
+    from .daemon import LOCK_REFUSAL_ERROR_CLASS
+    from .palace import MineAlreadyRunning
+
     try:
         agent_name = sanitize_name(agent_name, "agent_name").lower()
         entry = sanitize_content(entry)
@@ -3564,14 +3895,17 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
 
         # Oversized entry: split into bounded per-chunk drawers so the
         # embedding model never sees a document above ``chunk_size``.
-        # Every chunk carries ``parent_entry_id`` so search can rejoin
-        # them and ``chunk_index`` for ordered reconstruction (#1539).
-        # Note on ``entry_id`` in the return value: for the chunked
-        # path the returned ``entry_id`` is the LOGICAL group handle
-        # (no drawer is stored under that exact id). The physical
-        # drawer ids are in ``chunk_ids``. Callers wanting to fetch
-        # by id should iterate ``chunk_ids``; callers wanting to
-        # query by metadata can filter on ``parent_entry_id``.
+        # Every chunk carries ``chunk_index`` for ordered reconstruction
+        # and the group id under BOTH ``parent_entry_id`` (the original
+        # #1539 key, kept so existing readers and palaces are unaffected)
+        # and ``parent_drawer_id`` (the key the logical-id read paths were
+        # built around in #1782) -- see ``_PARENT_ID_KEYS`` (#2185).
+        # Note on ``entry_id`` in the return value: for the chunked path
+        # the returned ``entry_id`` is the LOGICAL group handle -- no
+        # drawer is stored under that exact id, but it resolves through
+        # ``mempalace_get_drawer`` / ``update_drawer`` / ``delete_drawer``
+        # to the whole entry, exactly as an oversized ``add_drawer`` id
+        # does. The physical drawer ids remain available in ``chunk_ids``.
         # Use a single batched ``add`` so the embedding pass either
         # commits all chunks or none — avoids a half-written palace
         # if the embedding model fails mid-loop. ``col.add`` (not
@@ -3593,6 +3927,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
                     **base_metadata,
                     "chunk_index": chunk_idx,
                     "parent_entry_id": entry_id,
+                    "parent_drawer_id": entry_id,
                 }
             )
         col.add(ids=chunk_ids, documents=chunk_docs, metadatas=chunk_metas)
@@ -3605,6 +3940,21 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
             "timestamp": now.isoformat(),
             "chunks": len(chunk_ids),
             "chunk_ids": chunk_ids,
+        }
+    except MineAlreadyRunning as e:
+        # Order matters: this typed handler precedes the bare Exception below,
+        # mirroring tool_mine / tool_sync. The lock wraps ``col.add`` itself, so
+        # a peer holding it means no entry was filed -- a refusal, not a write
+        # failure -- and the daemon defers such a job rather than dead-lettering
+        # it (#2014). Swallowed into the generic branch the refusal loses
+        # ``error_class``, becomes indistinguishable from a genuine write error,
+        # and the queued diary entry is dropped. The daemon's constant, not a
+        # literal: the two sides are a wire contract, and drift on either end
+        # silently un-fixes #2014.
+        return {
+            "success": False,
+            "error": f"another mine is in progress: {e}",
+            "error_class": LOCK_REFUSAL_ERROR_CLASS,
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -3853,6 +4203,13 @@ def tool_reconnect():
             except Exception:
                 pass
         _kg_by_path.clear()
+    with _logstream_cache_lock:
+        for ls in _logstream_by_path.values():
+            try:
+                ls.close()
+            except Exception:
+                pass
+        _logstream_by_path.clear()
     _refresh_sqlite_integrity_status()
     if _sqlite_integrity_errors:
         result = {
@@ -3996,6 +4353,223 @@ def tool_checkpoint(items, diary=None, dedup_threshold=0.9, added_by=None):
                     wing=diary.get("wing", ""),
                 )
     return out
+
+
+# ==================== LOGSTREAM TOOLS (RFC 003) ====================
+#
+# Agent coordination over the shared hub: durable append-only events plus
+# exact artifacts, stored in logstream.sqlite3 in the active palace dir.
+# No Chroma dependency and no vector index open — these handlers must never
+# call _get_collection().
+
+
+def tool_event_append(
+    type: str,
+    stream: str,
+    room: str,
+    from_agent: str,
+    to_agent: str = None,
+    correlation_id: str = None,
+    branch: str = None,
+    base_commit: str = None,
+    status: str = None,
+    body: str = "",
+    metadata: dict = None,
+    artifact_ids: list = None,
+):
+    """Append one immutable coordination event."""
+    try:
+        event = _call_logstream(
+            lambda ls: ls.append_event(
+                type=type,
+                stream=stream,
+                room=room,
+                from_agent=from_agent,
+                to_agent=to_agent,
+                correlation_id=correlation_id,
+                branch=branch,
+                base_commit=base_commit,
+                status=status,
+                body=body,
+                metadata=metadata,
+                artifact_ids=artifact_ids,
+            )
+        )
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+    return {"success": True, "event": event}
+
+
+_PREVIEW_BODY_CHARS = 200
+
+
+def _preview_event(event: dict) -> dict:
+    """Truncate a verbatim body to a scannable excerpt (preview mode).
+
+    Event bodies are stored verbatim and fleet status updates run to several
+    KB, so listing many events full-body is a large payload. Preview keeps all
+    routing/metadata fields and trims only ``body`` — enough to scan the stream
+    and decide which events to re-fetch in full (a targeted ``since_event_id``
+    call returns the untouched body)."""
+    body = event.get("body") or ""
+    if len(body) <= _PREVIEW_BODY_CHARS:
+        return event
+    out = dict(event)
+    out["body"] = body[:_PREVIEW_BODY_CHARS]
+    out["body_truncated"] = True
+    out["body_length"] = len(body)
+    return out
+
+
+def tool_event_list(
+    stream: str = None,
+    room: str = None,
+    type: str = None,
+    to_agent: str = None,
+    from_agent: str = None,
+    correlation_id: str = None,
+    status: str = None,
+    since_event_id: str = None,
+    since_created_at: str = None,
+    limit: int = 50,
+    preview: bool = False,
+):
+    """List coordination events with structured filters, oldest first.
+
+    ``preview=True`` truncates each event's verbatim body to a short excerpt
+    (marking ``body_truncated`` + ``body_length``) so scanning many events
+    stays cheap; re-fetch a specific event's full body with a targeted
+    ``since_event_id``.
+    """
+    try:
+        events = _call_logstream(
+            lambda ls: ls.list_events(
+                stream=stream,
+                room=room,
+                type=type,
+                to_agent=to_agent,
+                from_agent=from_agent,
+                correlation_id=correlation_id,
+                status=status,
+                since_event_id=since_event_id,
+                since_created_at=since_created_at,
+                limit=limit,
+            )
+        )
+    except ValueError as e:
+        return {"error": str(e)}
+    if preview:
+        events = [_preview_event(e) for e in events]
+    return {"events": events, "count": len(events)}
+
+
+def tool_event_wait(
+    stream: str = None,
+    room: str = None,
+    type: str = None,
+    to_agent: str = None,
+    from_agent: str = None,
+    correlation_id: str = None,
+    status: str = None,
+    since_event_id: str = None,
+    since_created_at: str = None,
+    timeout_ms: int = 60000,
+    limit: int = 50,
+):
+    """Block until a matching event exists or the timeout expires.
+
+    ``limit`` mirrors ``event_list`` so the two tools accept the same
+    filter set — agents kept tripping over wait rejecting a parameter
+    that list accepts (reported by windows-codex during dogfood).
+    """
+    try:
+        result = _call_logstream(
+            lambda ls: ls.wait_events(
+                timeout_ms=timeout_ms,
+                stream=stream,
+                room=room,
+                type=type,
+                to_agent=to_agent,
+                from_agent=from_agent,
+                correlation_id=correlation_id,
+                status=status,
+                since_event_id=since_event_id,
+                since_created_at=since_created_at,
+                limit=limit,
+            )
+        )
+    except ValueError as e:
+        return {"error": str(e)}
+    result["count"] = len(result["events"])
+    return result
+
+
+def tool_event_ack(event_id: str, from_agent: str, status: str = None, body: str = ""):
+    """Append an event.ack referencing a prior event (never mutates it)."""
+    try:
+        event = _call_logstream(
+            lambda ls: ls.ack_event(event_id, from_agent=from_agent, status=status, body=body)
+        )
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+    return {"success": True, "event": event}
+
+
+def tool_artifact_put(kind: str, content: str, created_by: str, metadata: dict = None):
+    """Store exact artifact content (patch, file, log, json, note)."""
+    try:
+        artifact = _call_logstream(
+            lambda ls: ls.put_artifact(
+                kind=kind, content=content, created_by=created_by, metadata=metadata
+            )
+        )
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+    return {"success": True, "artifact": artifact}
+
+
+def tool_artifact_get(artifact_id: str):
+    """Fetch an artifact by id — exact content and metadata."""
+    try:
+        artifact = _call_logstream(lambda ls: ls.get_artifact(artifact_id))
+    except ValueError as e:
+        return {"error": str(e)}
+    if artifact is None:
+        return {"error": f"artifact {artifact_id!r} not found"}
+    return {"artifact": artifact}
+
+
+def tool_patch_submit(
+    content: str,
+    from_agent: str,
+    stream: str,
+    room: str = "patches",
+    to_agent: str = None,
+    correlation_id: str = None,
+    branch: str = None,
+    base_commit: str = None,
+    body: str = "",
+    metadata: dict = None,
+):
+    """Store a patch artifact and append its patch.ready event in one call."""
+    try:
+        result = _call_logstream(
+            lambda ls: ls.submit_patch(
+                content=content,
+                from_agent=from_agent,
+                stream=stream,
+                room=room,
+                to_agent=to_agent,
+                correlation_id=correlation_id,
+                branch=branch,
+                base_commit=base_commit,
+                body=body,
+                metadata=metadata,
+            )
+        )
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+    return {"success": True, "artifact": result["artifact"], "event": result["event"]}
 
 
 # ==================== MCP PROTOCOL ====================
@@ -4178,6 +4752,11 @@ TOOLS = {
         "description": "Palace graph overview: total rooms, tunnel connections, edges between wings.",
         "input_schema": {"type": "object", "properties": {}},
         "handler": tool_graph_stats,
+    },
+    "mempalace_mesh_peers": {
+        "description": "Mesh estate snapshot (RFC 004): this replica's identity, version vector and node profile; each configured peer's reachability, last sync outcome, remote version vector and advertised profile; origins known only transitively; and origin_profiles keyed by replica_id. Exactly the GET /sync/peers payload — tokens are never included.",
+        "input_schema": {"type": "object", "properties": {}},
+        "handler": tool_mesh_peers,
     },
     "mempalace_create_tunnel": {
         "description": "Create a cross-wing tunnel linking two palace locations. Use when content in one project relates to another — e.g., an API design in project_api connects to a database schema in project_database.",
@@ -4645,6 +5224,246 @@ TOOLS = {
         },
         "handler": tool_reconnect,
     },
+    "mempalace_event_append": {
+        "description": (
+            "Append an immutable agent-coordination event to the logstream (RFC 003). Use for"
+            " delegating work (task.request), replying (task.reply), and announcing artifacts"
+            " (patch.ready). Events are append-only; corrections are new events."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "description": "Event type, e.g. 'task.request', 'task.reply', 'patch.ready'",
+                },
+                "stream": {
+                    "type": "string",
+                    "description": "Logical stream, e.g. 'project/mempalace' or 'shared_agent_brain'",
+                },
+                "room": {
+                    "type": "string",
+                    "description": "Sub-channel, e.g. 'delegation', 'patches', 'reviews', 'status'",
+                },
+                "from_agent": {"type": "string", "description": "Writer agent identity"},
+                "to_agent": {
+                    "type": "string",
+                    "description": "Target agent, or '*' for broadcast (optional)",
+                },
+                "correlation_id": {
+                    "type": "string",
+                    "description": "Task/conversation id tying request and reply events (optional)",
+                },
+                "branch": {"type": "string", "description": "Git branch, when relevant (optional)"},
+                "base_commit": {
+                    "type": "string",
+                    "description": "Git commit the work started from (optional)",
+                },
+                "status": {
+                    "type": "string",
+                    "description": (
+                        "One of: open, claimed, ready, applied, blocked, failed, superseded"
+                        " (optional)"
+                    ),
+                },
+                "body": {
+                    "type": "string",
+                    "description": "Verbatim human-readable content (optional, max 256 KiB)",
+                },
+                "metadata": {
+                    "type": "object",
+                    "description": "Extra structured fields, stored verbatim (optional)",
+                },
+                "artifact_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Ids of already-stored artifacts to reference (optional)",
+                },
+            },
+            "required": ["type", "stream", "room", "from_agent"],
+        },
+        "handler": tool_event_append,
+    },
+    "mempalace_event_list": {
+        "description": (
+            "List agent-coordination events with structured filters, oldest first. Use"
+            " since_event_id as the precise resume cursor (strictly after that event)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "stream": {"type": "string", "description": "Filter by stream (optional)"},
+                "room": {"type": "string", "description": "Filter by room (optional)"},
+                "type": {"type": "string", "description": "Filter by event type (optional)"},
+                "to_agent": {
+                    "type": "string",
+                    "description": "Filter by target agent; also matches '*' broadcasts (optional)",
+                },
+                "from_agent": {"type": "string", "description": "Filter by writer (optional)"},
+                "correlation_id": {
+                    "type": "string",
+                    "description": "Filter by correlation id (optional)",
+                },
+                "status": {"type": "string", "description": "Filter by status (optional)"},
+                "since_event_id": {
+                    "type": "string",
+                    "description": "Return only events strictly after this event id (optional)",
+                },
+                "since_created_at": {
+                    "type": "string",
+                    "description": (
+                        "Return events created at or after this time"
+                        " (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ, optional)"
+                    ),
+                },
+                "limit": {"type": "integer", "description": "Max events to return (default 50)"},
+                "preview": {
+                    "type": "boolean",
+                    "description": (
+                        "Truncate each event body to a short excerpt (marks body_truncated +"
+                        " body_length) so scanning many events stays cheap; re-fetch a specific"
+                        " event's full body with a targeted since_event_id (default false)"
+                    ),
+                },
+            },
+        },
+        "handler": tool_event_list,
+    },
+    "mempalace_event_wait": {
+        "description": (
+            "Block until a matching coordination event exists or the timeout expires (max 5"
+            " minutes). Returns {timed_out: true, events: []} on timeout instead of an error."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "stream": {"type": "string", "description": "Filter by stream (optional)"},
+                "room": {"type": "string", "description": "Filter by room (optional)"},
+                "type": {"type": "string", "description": "Filter by event type (optional)"},
+                "to_agent": {
+                    "type": "string",
+                    "description": "Filter by target agent; also matches '*' broadcasts (optional)",
+                },
+                "from_agent": {"type": "string", "description": "Filter by writer (optional)"},
+                "correlation_id": {
+                    "type": "string",
+                    "description": "Filter by correlation id (optional)",
+                },
+                "status": {"type": "string", "description": "Filter by status (optional)"},
+                "since_event_id": {
+                    "type": "string",
+                    "description": "Only match events strictly after this event id (optional)",
+                },
+                "since_created_at": {
+                    "type": "string",
+                    "description": (
+                        "Only match events created at or after this time"
+                        " (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ, optional)"
+                    ),
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "description": "How long to wait in milliseconds (default 60000, max 300000)",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max events to return when matches exist (default 50)",
+                },
+            },
+        },
+        "handler": tool_event_wait,
+    },
+    "mempalace_event_ack": {
+        "description": (
+            "Acknowledge a coordination event: appends a new event.ack routed back to the"
+            " original writer with the correlation id copied. Never mutates the target event."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "event_id": {"type": "string", "description": "Id of the event to acknowledge"},
+                "from_agent": {"type": "string", "description": "Acknowledging agent identity"},
+                "status": {
+                    "type": "string",
+                    "description": (
+                        "One of: open, claimed, ready, applied, blocked, failed, superseded"
+                        " (optional)"
+                    ),
+                },
+                "body": {"type": "string", "description": "Verbatim ack notes (optional)"},
+            },
+            "required": ["event_id", "from_agent"],
+        },
+        "handler": tool_event_ack,
+    },
+    "mempalace_artifact_put": {
+        "description": (
+            "Store exact artifact content (unified diff patch, file, log, json, note) for agent"
+            " handoffs. Returns id, sha256, and size_bytes. UTF-8 text only, max 4 MiB."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "description": "One of: patch, file, log, json, note",
+                },
+                "content": {"type": "string", "description": "Exact artifact content"},
+                "created_by": {"type": "string", "description": "Writer agent identity"},
+                "metadata": {
+                    "type": "object",
+                    "description": "Extra structured fields, e.g. branch/base_commit (optional)",
+                },
+            },
+            "required": ["kind", "content", "created_by"],
+        },
+        "handler": tool_artifact_put,
+    },
+    "mempalace_artifact_get": {
+        "description": (
+            "Fetch a coordination artifact by id — exact content plus sha256 for verification."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "artifact_id": {"type": "string", "description": "Artifact id to fetch"},
+            },
+            "required": ["artifact_id"],
+        },
+        "handler": tool_artifact_get,
+    },
+    "mempalace_patch_submit": {
+        "description": (
+            "Convenience: store a patch artifact and append its patch.ready event in one call."
+            " Use when handing completed work to another agent."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "string", "description": "Unified diff content"},
+                "from_agent": {"type": "string", "description": "Submitting agent identity"},
+                "stream": {
+                    "type": "string",
+                    "description": "Logical stream, e.g. 'project/mempalace'",
+                },
+                "room": {"type": "string", "description": "Sub-channel (default 'patches')"},
+                "to_agent": {"type": "string", "description": "Target agent or '*' (optional)"},
+                "correlation_id": {
+                    "type": "string",
+                    "description": "Task id tying this patch to its request (optional)",
+                },
+                "branch": {"type": "string", "description": "Git branch (optional)"},
+                "base_commit": {
+                    "type": "string",
+                    "description": "Git commit the patch applies to (optional)",
+                },
+                "body": {"type": "string", "description": "Verbatim notes (optional)"},
+                "metadata": {"type": "object", "description": "Extra structured fields (optional)"},
+            },
+            "required": ["content", "from_agent", "stream"],
+        },
+        "handler": tool_patch_submit,
+    },
 }
 
 
@@ -4672,15 +5491,19 @@ def _internal_tool_error(req_id, tool_name: str, exc: BaseException = None) -> d
 
 
 def _mcp_read_only_refusal(req_id, tool_name: str):
-    """Refuse mutating tools when the server runs in read-only mode (#1877).
+    """Refuse state-changing tools when the server runs in read-only mode (#1877).
 
     Read-only is an operator-set server mode (``--read-only`` /
     ``MEMPALACE_MCP_READ_ONLY``), distinct from the dynamic peer-writer lock:
     it is an unconditional gate so a shared team server can expose recall
     without write access. Enforced at dispatch, not merely hidden from
     tools/list, so a client that calls a mutating tool by name is still refused.
+
+    Gates on ``_READ_ONLY_REFUSED_TOOLS``, not ``_MUTATING_TOOLS``: a tool can
+    write outside the palace database, which the peer-writer lease has no reason
+    to arbitrate but read-only still has to refuse.
     """
-    if not _READ_ONLY or tool_name not in _MUTATING_TOOLS:
+    if not _READ_ONLY or tool_name not in _READ_ONLY_REFUSED_TOOLS:
         return None
 
     return {
@@ -4690,6 +5513,57 @@ def _mcp_read_only_refusal(req_id, tool_name: str):
             "code": -32003,
             "message": "Server is in read-only mode; this tool is disabled",
             "data": {"tool": tool_name},
+        },
+    }
+
+
+def _mcp_diverged_index_refusal(req_id, tool_name: str):
+    """Refuse vector writes while the HNSW segment is known to be diverged.
+
+    The capacity probe (#1222) already routes *reads* around a diverged index:
+    ``search`` and ``check_duplicate`` fall back to BM25-only sqlite. Writes had
+    no such gate — they went straight to chromadb, where an upsert into that same
+    index can never come back. Observed on a 3.7.0 palace whose flushed segment
+    held 803 of 820 embeddings: three of five freshly generated vectors blocked
+    forever (25+ minutes, then killed), the other two committed in 0.03 s, and
+    the same vector reproduced the same verdict on every retry — so a write's
+    fate depended on where its embedding landed in the damaged graph. After
+    ``mempalace repair rebuild-index`` all five committed.
+
+    Refusing is also the honest answer for the write that does not hang: chromadb
+    acknowledges it into sqlite and the metadata segment, then leaves it out of
+    the HNSW segment. That drawer is filed and reported as success while being
+    invisible to vector search — 16 such drawers came out of a single checkpoint
+    that returned "completed successfully in 2s".
+
+    The probe behind this is pure sqlite + pickle, so the gate costs no chromadb
+    interaction on the path it is protecting.
+    """
+    if tool_name not in _VECTOR_WRITE_TOOLS:
+        return None
+
+    _refresh_vector_disabled_flag()
+
+    if not _vector_disabled:
+        return None
+
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {
+            "code": _DIVERGED_INDEX_ERROR_CODE,
+            "message": ("Palace vector index is diverged; refusing the write until it is rebuilt"),
+            "data": {
+                "tool": tool_name,
+                "palace": _config.palace_path or "",
+                "vector_disabled_reason": _vector_disabled_reason,
+                "hint": (
+                    "Stop the MemPalace MCP servers, run `mempalace repair rebuild-index`, "
+                    "then mempalace_reconnect. Recall keeps working meanwhile through the "
+                    "BM25 fallback; writes stay refused so they can neither hang inside "
+                    "chromadb nor land outside the index."
+                ),
+            },
         },
     }
 
@@ -4704,6 +5578,10 @@ def _mcp_tool_preflight_refusal(req_id, tool_name: str):
     sqlite_integrity_error = _mcp_sqlite_integrity_refusal(req_id, tool_name)
     if sqlite_integrity_error is not None:
         return sqlite_integrity_error
+
+    diverged_index_error = _mcp_diverged_index_refusal(req_id, tool_name)
+    if diverged_index_error is not None:
+        return diverged_index_error
 
     return _mcp_peer_writer_refusal(req_id, tool_name)
 
@@ -4752,8 +5630,9 @@ def handle_request(request):
         # Notifications (no id) never get a response per JSON-RPC spec
         return None
     elif method == "tools/list":
-        # In read-only mode, hide the mutating tools so clients don't advertise
+        # In read-only mode, hide the refused tools so clients don't advertise
         # write capabilities they can't use (dispatch also refuses them, #1877).
+        # Same set on both sides, or a tool would be listed and then rejected.
         return {
             "jsonrpc": "2.0",
             "id": req_id,
@@ -4761,7 +5640,7 @@ def handle_request(request):
                 "tools": [
                     {"name": n, "description": t["description"], "inputSchema": t["input_schema"]}
                     for n, t in TOOLS.items()
-                    if not (_READ_ONLY and n in _MUTATING_TOOLS)
+                    if not (_READ_ONLY and n in _READ_ONLY_REFUSED_TOOLS)
                 ]
             },
         }
@@ -4886,9 +5765,10 @@ def handle_request(request):
                         tool_name,
                         operation_for_tool(tool_name),
                     )
-                result = _decorate_mcp_tool_result(
-                    tool_name, TOOLS[tool_name]["handler"](**tool_args)
-                )
+                with _write_stall_watch(tool_name):
+                    result = _decorate_mcp_tool_result(
+                        tool_name, TOOLS[tool_name]["handler"](**tool_args)
+                    )
 
             return {
                 "jsonrpc": "2.0",
@@ -5114,6 +5994,130 @@ def _maybe_eager_warmup_embedder() -> None:
         )
 
 
+_WRITE_STALL_WARN_ENV = "MEMPALACE_MCP_WRITE_STALL_WARN_SECS"
+_WRITE_STALL_WARN_DEFAULT = 60.0
+_WRITE_STALL_EXIT_ENV = "MEMPALACE_MCP_WRITE_STALL_EXIT_SECS"
+_WRITE_STALL_EXIT_DEFAULT = 0.0
+# EX_TEMPFAIL: the palace is fine, this process is not. A client that restarts
+# the server gets a working one; a zero exit would read as an orderly shutdown.
+_WRITE_STALL_EXIT_CODE = 75
+
+_write_stall_lock = threading.Lock()
+# Optional[dict]: {"tool": str, "since": float(monotonic), "warned": bool}
+_write_stall_inflight: Optional[dict] = None
+
+
+def _write_stall_secs(env_name: str, default: float) -> float:
+    raw = os.environ.get(env_name, "")
+    if not raw.strip():
+        return default
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        logger.warning("%s=%r is not a number; using %.0fs", env_name, raw, default)
+        return default
+
+
+def _write_stall_action(elapsed: float, warn_secs: float, exit_secs: float, warned: bool):
+    """Decide what an in-flight vector write has earned: ``None``/warn/exit.
+
+    Pure so the thresholds can be tested without a stalled write; ``exit`` is
+    checked first so a single tick can escalate straight past an unsent warning.
+    """
+    if exit_secs > 0 and elapsed >= exit_secs:
+        return "exit"
+    if warn_secs > 0 and elapsed >= warn_secs and not warned:
+        return "warn"
+    return None
+
+
+@contextlib.contextmanager
+def _write_stall_watch(tool_name: str):
+    """Register a vector write as in flight for the stall watchdog."""
+    global _write_stall_inflight
+
+    if tool_name not in _VECTOR_WRITE_TOOLS:
+        yield
+        return
+
+    with _write_stall_lock:
+        _write_stall_inflight = {
+            "tool": tool_name,
+            "since": time.monotonic(),
+            "warned": False,
+        }
+    try:
+        yield
+    finally:
+        with _write_stall_lock:
+            _write_stall_inflight = None
+
+
+def _start_write_stall_watchdog() -> None:
+    """Start a daemon thread that reports a vector write that stopped returning.
+
+    A chromadb write has no timeout of its own. When one blocks, this process
+    holds the dispatch lock, the palace mine lock and the writer lease, so it
+    answers nothing else and every peer session drops to read-only — and no log
+    on the server side says why. The only trace of a 25-minute outage was the
+    client's own "tool still running" ticks; the handshake stayed healthy, and
+    ``mempalace_status`` could not answer because the dispatch lock was held by
+    the stuck call. So the report has to come from a thread that is not waiting
+    on that lock, and it has to reach stderr, where the MCP host records it.
+
+    ``MEMPALACE_MCP_WRITE_STALL_WARN_SECS`` (default 60, 0 disables) sets when to
+    warn. ``MEMPALACE_MCP_WRITE_STALL_EXIT_SECS`` (default 0 = never) lets an
+    operator turn the wedge into a restartable failure: a server stuck inside
+    chromadb will not recover, and exiting is what releases the locks its peers
+    are queued behind.
+    """
+    warn_secs = _write_stall_secs(_WRITE_STALL_WARN_ENV, _WRITE_STALL_WARN_DEFAULT)
+    exit_secs = _write_stall_secs(_WRITE_STALL_EXIT_ENV, _WRITE_STALL_EXIT_DEFAULT)
+    if warn_secs <= 0 and exit_secs <= 0:
+        return
+
+    thresholds = [t for t in (warn_secs, exit_secs) if t > 0]
+    interval = max(1.0, min(15.0, min(thresholds) / 4))
+
+    def _watchdog() -> None:
+        while True:
+            time.sleep(interval)
+            with _write_stall_lock:
+                inflight = _write_stall_inflight
+                if inflight is None:
+                    continue
+                elapsed = time.monotonic() - inflight["since"]
+                action = _write_stall_action(elapsed, warn_secs, exit_secs, inflight["warned"])
+                tool = inflight["tool"]
+                if action == "warn":
+                    inflight["warned"] = True
+            if action == "warn":
+                logger.warning(
+                    "%s has been inside the palace write path for %.0fs and has not "
+                    "returned. chromadb writes have no timeout: this server now answers "
+                    "nothing else and holds the writer lease, so peer sessions are "
+                    "read-only. Check `mempalace repair --dry-run` for HNSW divergence; "
+                    "restarting this MCP server releases the locks.",
+                    tool,
+                    elapsed,
+                )
+            elif action == "exit":
+                logger.error(
+                    "%s stalled in the palace write path for %.0fs (limit %s=%.0fs); "
+                    "exiting so the palace locks are released and the client can "
+                    "reconnect. The stalled write is lost — rebuild the index before "
+                    "retrying it.",
+                    tool,
+                    elapsed,
+                    _WRITE_STALL_EXIT_ENV,
+                    exit_secs,
+                )
+                os._exit(_WRITE_STALL_EXIT_CODE)
+
+    t = threading.Thread(target=_watchdog, name="mcp-write-stall-watchdog", daemon=True)
+    t.start()
+
+
 def _start_idle_exit_watchdog() -> None:
     """Start a daemon thread that exits the process after an idle period.
 
@@ -5158,6 +6162,34 @@ def _json_rpc_parse_error(req_id=None):
 # can reference them as free names without a NameError.
 _HTTP_REQUEST_LOCK = threading.Lock()
 _HTTP_MAX_REQUEST_BYTES = 16 * 1024 * 1024
+_HTTP_ACTIVE_CLIENT_WINDOW_S = 120.0
+
+# RFC 003 phase 5: logstream tools touch only logstream.sqlite3 (its own WAL
+# database with internal locking) — never Chroma or the KG. Dispatching them
+# outside _HTTP_REQUEST_LOCK keeps a five-minute mempalace_event_wait
+# long-poll from stalling every other agent on a shared hub, and lets the
+# SSE stream coexist with normal tool traffic.
+_HTTP_LOCK_FREE_TOOLS = frozenset(
+    {
+        "mempalace_event_append",
+        "mempalace_event_list",
+        "mempalace_event_wait",
+        "mempalace_event_ack",
+        "mempalace_artifact_put",
+        "mempalace_artifact_get",
+        "mempalace_patch_submit",
+    }
+)
+
+# SSE stream limits (GET /logstream/stream). Each connected client holds one
+# handler thread, so the cap is a thread-exhaustion guard, not a rate limit.
+_SSE_MAX_CLIENTS_ENV = "MEMPALACE_SSE_MAX_CLIENTS"
+_SSE_MAX_CLIENTS_DEFAULT = 8
+_SSE_HEARTBEAT_S = 15.0
+_SSE_POLL_BASE_S = 0.3
+_SSE_POLL_JITTER_S = 0.4
+_SSE_BATCH_LIMIT = 500
+_HTTP_RECENT_CLIENT_LIMIT = 50
 # Host literals that always denote this machine. Used both to decide whether a
 # bind is loopback (skip the network-exposure warning) and to pin the Host
 # header against DNS rebinding when serving on loopback.
@@ -5201,6 +6233,9 @@ def _http_is_loopback(host: str) -> bool:
     return (host or "").strip().lower() in _HTTP_LOOPBACK_HOSTS
 
 
+_HTTP_EXTRA_ALLOWED_HOSTS_ENV = "MEMPALACE_MCP_EXTRA_ALLOWED_HOSTS"
+
+
 def _http_allowed_host_values(bind_host: str, port: int) -> set:
     """Host-header values accepted when Host pinning is enforced.
 
@@ -5209,6 +6244,13 @@ def _http_allowed_host_values(bind_host: str, port: int) -> set:
     so we pin ``Host`` to the loopback literals (and the bound host) with and
     without the port. Computed from the *actual* bound port so an ephemeral
     ``port=0`` bind (tests) still matches.
+
+    ``MEMPALACE_MCP_EXTRA_ALLOWED_HOSTS`` (comma-separated ``host`` or
+    ``host:port`` values) extends the pin for the documented fronting-proxy
+    pattern ("terminate TLS at a proxy"): a loopback-bound server behind
+    ``tailscale serve``/nginx receives the *public* name in ``Host``, which
+    the loopback pin would otherwise reject. Entries are matched exactly
+    (lowercased); a bare hostname also matches ``host:<bound port>``.
     """
     names = set(_HTTP_LOOPBACK_HOSTS)
     if bind_host:
@@ -5217,6 +6259,13 @@ def _http_allowed_host_values(bind_host: str, port: int) -> set:
     for name in names:
         values.add(name)
         values.add(f"{name}:{port}")
+    for raw in os.environ.get(_HTTP_EXTRA_ALLOWED_HOSTS_ENV, "").split(","):
+        entry = raw.strip().lower()
+        if not entry:
+            continue
+        values.add(entry)
+        if ":" not in entry:
+            values.add(f"{entry}:{port}")
     return values
 
 
@@ -5237,6 +6286,609 @@ def _http_origin_allowed(origin: str) -> bool:
     return host in ("127.0.0.1", "localhost", "::1")
 
 
+def _http_client_identity(handler) -> tuple[str, dict]:
+    headers = handler.headers
+    peer = handler.client_address[0] if handler.client_address else ""
+    forwarded_for = (headers.get("X-Forwarded-For") or "").split(",", 1)[0].strip()
+    real_ip = (headers.get("X-Real-IP") or "").strip()
+    tailnet_user = (headers.get("Tailscale-User-Login") or "").strip()
+    user_agent = (headers.get("User-Agent") or "").strip()
+    host_hdr = (headers.get("Host") or "").strip()
+    peer_hint = forwarded_for or real_ip or peer
+    basis = "|".join([peer_hint, tailnet_user, user_agent, host_hdr])
+    client_id = hashlib.sha256(basis.encode("utf-8", "replace")).hexdigest()[:16]
+    return client_id, {
+        "client_id": client_id,
+        "peer": peer,
+        "peer_hint": peer_hint,
+        "host": host_hdr,
+        "user_agent": user_agent[:160],
+        "tailscale_user": tailnet_user[:160],
+    }
+
+
+def _http_record_request(httpd, handler, status: int) -> None:
+    now = time.time()
+    now_iso = datetime.now().isoformat()
+    client_id, identity = _http_client_identity(handler)
+    with httpd.stats_lock:
+        httpd.request_count += 1
+        httpd.status_counts[str(status)] = httpd.status_counts.get(str(status), 0) + 1
+        entry = dict(httpd.recent_clients.get(client_id, identity))
+        entry.update(identity)
+        entry["last_seen"] = now_iso
+        entry["last_seen_monotonic"] = now
+        entry["request_count"] = int(entry.get("request_count", 0)) + 1
+        entry["last_method"] = handler.command
+        entry["last_path"] = urlparse(handler.path).path
+        entry["last_status"] = status
+        entry["authenticated"] = bool(
+            httpd.auth_token
+            and hmac.compare_digest(
+                handler.headers.get("Authorization", ""), f"Bearer {httpd.auth_token}"
+            )
+        )
+        httpd.recent_clients[client_id] = entry
+        overflow = len(httpd.recent_clients) - _HTTP_RECENT_CLIENT_LIMIT
+        if overflow > 0:
+            oldest = sorted(
+                httpd.recent_clients.items(),
+                key=lambda item: item[1].get("last_seen_monotonic", 0.0),
+            )
+            for stale_id, _entry in oldest[:overflow]:
+                httpd.recent_clients.pop(stale_id, None)
+
+
+def _http_status_payload(httpd) -> dict:
+    now = time.time()
+    with httpd.stats_lock:
+        recent = sorted(
+            (dict(entry) for entry in httpd.recent_clients.values()),
+            key=lambda entry: entry.get("last_seen_monotonic", 0.0),
+            reverse=True,
+        )
+        request_count = httpd.request_count
+        status_counts = dict(httpd.status_counts)
+
+    active = []
+    for entry in recent:
+        last_seen_monotonic = entry.pop("last_seen_monotonic", 0.0)
+        if now - last_seen_monotonic <= _HTTP_ACTIVE_CLIENT_WINDOW_S:
+            active.append(dict(entry))
+
+    writer = {
+        "read_only": _READ_ONLY,
+        "peer_writer_read_only": _MCP_WRITER_READ_ONLY,
+        "peer_writer_lock_failed": _MCP_WRITER_LOCK_FAILED,
+    }
+    if _MCP_WRITER_LOCK_ERROR:
+        writer["peer_writer_lock_error"] = _MCP_WRITER_LOCK_ERROR
+
+    integrity = _sqlite_integrity_payload()
+    palace_path = (
+        os.path.abspath(os.path.expanduser(_config.palace_path)) if _config.palace_path else ""
+    )
+    return {
+        "ok": bool(integrity.get("ok")),
+        "server": {
+            "name": "mempalace",
+            "version": __version__,
+            "transport": "http",
+            "scheme": getattr(httpd, "scheme", "http"),
+            "bind_host": httpd.bind_host,
+            "port": httpd.server_address[1],
+            "started_at": httpd.started_at,
+            "uptime_seconds": round(time.monotonic() - httpd.started_monotonic, 3),
+        },
+        "palace": {
+            "path_hash": hashlib.sha256(palace_path.encode("utf-8")).hexdigest()[:16]
+            if _config.palace_path
+            else "",
+            "backend": _config.backend,
+            "sqlite_integrity": integrity,
+        },
+        "writer": writer,
+        "requests": {
+            "total": request_count,
+            "by_status": status_counts,
+        },
+        "clients": {
+            "active_window_seconds": _HTTP_ACTIVE_CLIENT_WINDOW_S,
+            "active": active,
+            "recent": recent,
+        },
+    }
+
+
+def _http_request_rejected(handler, require_auth: bool) -> bool:
+    """Enforce HTTP Host/Origin/auth policy before dispatching a request."""
+    srv = handler.server
+    if srv.enforce_host_pin:
+        host_hdr = (handler.headers.get("Host") or "").strip().lower()
+        if host_hdr not in srv.allowed_hosts:
+            logger.warning("HTTP request rejected: Host %r not allowed", host_hdr)
+            handler.send_error(403, "Forbidden")
+            return True
+    origin = handler.headers.get("Origin")
+    if origin and not _http_origin_allowed(origin):
+        logger.warning("HTTP request rejected: cross-origin %r", origin)
+        handler.send_error(403, "Forbidden")
+        return True
+    if require_auth and srv.auth_token:
+        provided = handler.headers.get("Authorization", "")
+        if not hmac.compare_digest(provided, f"Bearer {srv.auth_token}"):
+            logger.warning("HTTP request rejected: missing/invalid bearer token")
+            handler.send_error(401, "Unauthorized")
+            return True
+    return False
+
+
+def _sse_max_clients() -> int:
+    try:
+        return max(0, int(os.environ.get(_SSE_MAX_CLIENTS_ENV, "") or _SSE_MAX_CLIENTS_DEFAULT))
+    except ValueError:
+        return _SSE_MAX_CLIENTS_DEFAULT
+
+
+def _http_dispatch(request):
+    """Dispatch one JSON-RPC request with the transport's locking policy.
+
+    The global request lock preserves the single-process / single-palace-
+    handle behavior stdio deployments rely on. Logstream tools are the one
+    exception: they never touch Chroma/KG state and carry their own database
+    lock, and serializing them would let one agent's event_wait long-poll
+    (up to 5 minutes) starve the whole hub.
+    """
+    if (
+        isinstance(request, dict)
+        and request.get("method") == "tools/call"
+        and isinstance(request.get("params"), dict)
+        and request["params"].get("name") in _HTTP_LOCK_FREE_TOOLS
+    ):
+        return handle_request(request)
+    with _HTTP_REQUEST_LOCK:
+        return handle_request(request)
+
+
+def _http_handle_get(handler) -> None:
+    """Route GET requests. Module-level (like the other _http_* helpers) to
+    keep _build_http_server under the C901 complexity ceiling.
+
+    /healthz is the only credential-free route (liveness probes); everything
+    else follows the bearer policy because it exposes palace/ops metadata.
+    """
+    path = urlparse(handler.path).path
+    if path == "/healthz":
+        if not handler._request_rejected(require_auth=False):
+            handler._send_bytes(200, b"ok\n", "text/plain; charset=utf-8")
+        return
+    if path == "/statusz":
+        if not handler._request_rejected(require_auth=True):
+            handler._send_json(200, handler._status_payload())
+        return
+    if path == "/logstream/stream":
+        # Events and artifacts expose work metadata and patch contents;
+        # the stream always follows the bearer policy.
+        if not handler._request_rejected(require_auth=True):
+            _http_serve_logstream_stream(handler)
+        return
+    if path.startswith("/sync/"):
+        if handler._request_rejected(require_auth=True):
+            return
+        if not _http_serve_sync(handler, path):
+            handler.send_error(404, "Not Found")
+        return
+    if handler._request_rejected(require_auth=False):
+        return
+    handler.send_error(404, "Not Found")
+
+
+def _http_serve_sync(handler, path: str) -> bool:
+    """RFC 004 step 0: pull-based anti-entropy endpoints for peer replicas.
+
+    GET /sync/version_vector           → {replica_id, version_vector}
+    GET /sync/ops?origin=&after=&limit → {origin, events, count} (author order)
+    GET /sync/artifact?id=             → {artifact} (exact content + sha256)
+
+    Bearer policy enforced by the caller; served lock-free like all
+    logstream traffic. Returns False when the path is not a sync route.
+    """
+    from urllib.parse import parse_qsl
+
+    query = dict(parse_qsl(urlparse(handler.path).query))
+    try:
+        if path == "/sync/version_vector":
+            handler._send_json(
+                200,
+                {
+                    "replica_id": _call_logstream(lambda ls: ls.replica_id),
+                    "version_vector": _call_logstream(lambda ls: ls.version_vector()),
+                    # Node-profile advertisement (additive): our own
+                    # self-description plus every profile we can relay, so
+                    # carriers propagate profiles for transitively-known
+                    # origins. Old peers ignore these fields.
+                    "profile": _node_profile(),
+                    "profiles": _known_profiles_snapshot(),
+                },
+            )
+            return True
+        if path == "/sync/ops":
+            origin = query.get("origin") or ""
+            after = int(query.get("after", "0") or 0)
+            limit = int(query.get("limit", "500") or 500)
+            events = _call_logstream(lambda ls: ls.list_ops(origin, after_seq=after, limit=limit))
+            handler._send_json(200, {"origin": origin, "events": events, "count": len(events)})
+            return True
+        if path == "/sync/artifact":
+            artifact_id = query.get("id") or ""
+            artifact = _call_logstream(lambda ls: ls.get_artifact(artifact_id))
+            if artifact is None:
+                handler._send_json(404, {"error": f"artifact {artifact_id!r} not found"})
+            else:
+                handler._send_json(200, {"artifact": artifact})
+            return True
+        if path == "/sync/peers":
+            handler._send_json(200, _mesh_peers_payload())
+            return True
+    except (ValueError, TypeError) as exc:
+        handler._send_json(400, {"error": str(exc)})
+        return True
+    return False
+
+
+# Estate data (RFC 004 A.1): what the mesh looks like from THIS replica.
+# Written by the sync loop after every round, read by /sync/peers. Values
+# are whole-entry replacements under the GIL, so readers never see a
+# half-updated peer record.
+_PEER_SYNC_STATE: dict = {}
+
+# Node profiles learned from peers (their self-descriptions, relayed
+# transitively), keyed by replica_id. LWW by advertised_at. The estate
+# renders roles/accelerator/counts from these instead of UI guesses.
+_KNOWN_PROFILES: dict = {}
+
+# Self profile is recomputed at most every TTL seconds — peers request it
+# every sync round and the drawer count / provider probe should not run
+# per request.
+_NODE_PROFILE_TTL_S = 60.0
+_node_profile_cache: dict = {}
+
+_ACCELERATOR_NAMES = {"cuda": "CUDA", "dml": "DirectML", "coreml": "CoreML", "cpu": "CPU"}
+
+
+def _node_profile() -> dict:
+    """This node's self-described profile — every field is pure derivation
+    (palace presence, logstream authorship, resolved onnxruntime provider),
+    never configuration, so the estate can render truth without guesses."""
+    import platform
+
+    cached = _node_profile_cache.get("profile")
+    if cached and time.monotonic() - _node_profile_cache.get("at", 0) < _NODE_PROFILE_TTL_S:
+        return cached
+
+    roles = []
+    drawers = None
+    try:
+        col = _get_collection(create=False)
+        if col is not None:
+            drawers = col.count()
+            roles.append("replica")
+    except Exception:
+        logger.debug("node profile: drawer count unavailable", exc_info=True)
+    try:
+        authored = _call_logstream(lambda ls: ls.version_vector().get(ls.replica_id, 0))
+        if authored:
+            roles.append("agents")
+    except Exception:
+        logger.debug("node profile: logstream authorship unavailable", exc_info=True)
+    accelerator = None
+    try:
+        from .embedding import _resolve_providers, current_model_name
+
+        device = getattr(_config, "embedding_device", None) or "auto"
+        _providers, effective = _resolve_providers(device)
+        accelerator = {
+            "provider": _ACCELERATOR_NAMES.get(effective, effective),
+            "embedder": current_model_name(),
+        }
+        roles.append("compute")
+    except Exception:
+        logger.debug("node profile: embedder resolution unavailable", exc_info=True)
+
+    profile = {
+        "roles": roles,
+        "accelerator": accelerator,
+        "drawers": drawers,
+        "hardware": platform.platform(),
+        "advertised_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    _node_profile_cache["profile"] = profile
+    _node_profile_cache["at"] = time.monotonic()
+    return profile
+
+
+def _merge_known_profiles(profiles: dict) -> None:
+    """Fold relayed profiles in, last-writer-wins by advertised_at."""
+    if not isinstance(profiles, dict):
+        return
+    for origin, profile in profiles.items():
+        if not isinstance(origin, str) or not isinstance(profile, dict):
+            continue
+        prior = _KNOWN_PROFILES.get(origin)
+        if prior and (prior.get("advertised_at") or "") >= (profile.get("advertised_at") or ""):
+            continue
+        _KNOWN_PROFILES[origin] = profile
+
+
+def _known_profiles_snapshot() -> dict:
+    """Every origin profile this node can vouch for having seen — learned
+    ones first, own fresh self-profile last so it always wins for self."""
+    snapshot = dict(_KNOWN_PROFILES)
+    try:
+        snapshot[_call_logstream(lambda ls: ls.replica_id)] = _node_profile()
+    except Exception:
+        logger.debug("node profile: self profile unavailable", exc_info=True)
+    return snapshot
+
+
+def _record_peer_sync(stats: dict) -> None:
+    """Fold one peer's round outcome into the estate state."""
+    name = stats.get("peer_name") or stats.get("peer_url") or "?"
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    prior = _PEER_SYNC_STATE.get(name) or {}
+    if stats.get("error"):
+        entry = {
+            "url": stats.get("peer_url") or prior.get("url"),
+            "replica_id": prior.get("replica_id"),
+            "reachable": False,
+            "last_error": stats["error"],
+            "last_error_at": now,
+            "last_success_at": prior.get("last_success_at"),
+            "remote_version_vector": prior.get("remote_version_vector"),
+            # Unreachable peers keep their last advertised profile — the
+            # estate renders "last seen as", never a blank node.
+            "profile": prior.get("profile"),
+        }
+    else:
+        entry = {
+            "url": stats.get("peer_url"),
+            "replica_id": stats.get("peer_replica"),
+            "reachable": True,
+            "last_error": None,
+            "last_error_at": prior.get("last_error_at"),
+            "last_success_at": now,
+            "last_pulled_events": stats.get("pulled_events", 0),
+            "last_pulled_artifacts": stats.get("pulled_artifacts", 0),
+            "remote_version_vector": stats.get("remote_version_vector") or {},
+            "profile": stats.get("remote_profile") or prior.get("profile"),
+        }
+        _merge_known_profiles(stats.get("remote_profiles") or {})
+        if stats.get("remote_profile") and stats.get("peer_replica"):
+            _merge_known_profiles({stats["peer_replica"]: stats["remote_profile"]})
+    _PEER_SYNC_STATE[name] = entry
+
+
+def _mesh_peers_payload() -> dict:
+    """The estate answer for one replica: who its peers are, whether they
+    were reachable last round, their vectors (drift is peer vector vs
+    self vector — computed by the consumer), and origins known only
+    transitively. peers.json tokens are NEVER included.
+    """
+    import socket
+
+    from .logsync import load_peers
+
+    replica_id = _call_logstream(lambda ls: ls.replica_id)
+    local_vector = _call_logstream(lambda ls: ls.version_vector())
+    try:
+        configured = load_peers(getattr(_config, "palace_path", None) or "")
+    except (ValueError, TypeError):
+        configured = []
+    named_origins = {replica_id}
+    peers = []
+    for peer in configured:
+        name = peer.get("name") or peer["url"]
+        state = dict(_PEER_SYNC_STATE.get(name) or {})
+        state.pop("url", None)  # peers.json is authoritative for the url
+        if state.get("replica_id"):
+            named_origins.add(state["replica_id"])
+        peers.append({"name": name, "url": peer["url"], **state})
+    return {
+        "self": {
+            "replica_id": replica_id,
+            "name": socket.gethostname(),
+            "version_vector": local_vector,
+            "profile": _node_profile(),
+        },
+        "peers": peers,
+        # Origins present in the local log but not configured as peers —
+        # replicas this node only knows transitively (gossip carriers).
+        "unnamed_origins": sorted(set(local_vector) - named_origins),
+        # Every self-described profile known here, keyed by replica_id —
+        # including profiles of unnamed origins relayed through carriers.
+        "origin_profiles": _known_profiles_snapshot(),
+        "sync_interval_s": _peer_sync_interval_s(),
+    }
+
+
+def _peer_sync_interval_s() -> float:
+    try:
+        return float(os.environ.get("MEMPALACE_SYNC_INTERVAL", "") or 15)
+    except ValueError:
+        return 15.0
+
+
+def _start_peer_sync_thread() -> None:
+    """Background anti-entropy loop for the logstream (RFC 004 step 0).
+
+    Runs in the serving process so a hub with configured peers converges
+    with zero extra processes. Interval via MEMPALACE_SYNC_INTERVAL
+    (seconds, default 15; 0 disables). Errors are logged, never fatal —
+    a dead peer must not take the loop down (R1).
+
+    Membership is re-read from peers.json every round, never latched at
+    startup: joining the mesh is "write peers.json", and requiring a hub
+    restart for a file the docs describe as picked up "within one sync
+    cycle" is a silent no-op for anyone following the guide in order (hub
+    first, peers after). A malformed peers.json logs once per transition
+    rather than every round, so a typo is visible without flooding the log.
+    """
+    from .logsync import sync_all
+
+    palace_path = getattr(_config, "palace_path", None)
+    if not palace_path:
+        return
+    interval = _peer_sync_interval_s()
+    if interval <= 0:
+        return
+
+    def _loop():
+        malformed_logged = False
+        while True:
+            time.sleep(interval)
+            try:
+                ls = _get_logstream()
+                for stats in sync_all(ls, palace_path):
+                    _record_peer_sync(stats)
+                    if stats.get("error"):
+                        logger.warning("peer sync %s: %s", stats.get("peer_name"), stats["error"])
+                    elif stats.get("pulled_events"):
+                        logger.info(
+                            "peer sync %s: pulled %d event(s), %d artifact(s)",
+                            stats.get("peer_name"),
+                            stats["pulled_events"],
+                            stats["pulled_artifacts"],
+                        )
+                malformed_logged = False
+            except ValueError as exc:
+                if not malformed_logged:
+                    logger.error("peers.json is malformed; skipping peer sync: %s", exc)
+                    malformed_logged = True
+            except Exception:
+                logger.warning("peer sync round failed", exc_info=True)
+
+    thread = threading.Thread(target=_loop, name="mempalace-logsync", daemon=True)
+    thread.start()
+    logger.info("peer sync thread started (interval %.0fs)", interval)
+
+
+def _sse_acquire_slot(httpd) -> bool:
+    with httpd.sse_lock:
+        if httpd.sse_clients >= httpd.sse_max_clients:
+            return False
+        httpd.sse_clients += 1
+        return True
+
+
+def _sse_release_slot(httpd) -> None:
+    with httpd.sse_lock:
+        httpd.sse_clients -= 1
+
+
+def _http_serve_logstream_stream(handler) -> None:
+    """RFC 003 phase 5: live logstream tail over Server-Sent Events.
+
+    Query params are exactly the ``event_list`` filters plus
+    ``since_event_id`` (or the standard ``Last-Event-ID`` header): with a
+    cursor the server replays everything after it, then tails live; without
+    one it tails only post-connect events. Each event is one SSE frame
+    (``id:`` = event id, ``event: logstream``, ``data:`` = the same JSON
+    envelope event_list returns), with a ``: ping`` comment every ~15s so
+    proxies keep the pipe open. Never touches _HTTP_REQUEST_LOCK — the
+    stream must coexist with normal tool traffic, not starve it. Defined at
+    module level (like the other _http_* helpers) to keep
+    _build_http_server under the C901 complexity ceiling.
+    """
+    import random
+    from urllib.parse import parse_qsl
+
+    global _last_request_time
+
+    query = dict(parse_qsl(urlparse(handler.path).query))
+    filters = {
+        key: (query.get(key) or None)
+        for key in (
+            "stream",
+            "room",
+            "type",
+            "to_agent",
+            "from_agent",
+            "correlation_id",
+            "status",
+        )
+    }
+    cursor = query.get("since_event_id") or handler.headers.get("Last-Event-ID") or None
+
+    def _list_after(after_id):
+        return _call_logstream(
+            lambda ls: ls.list_events(since_event_id=after_id, limit=_SSE_BATCH_LIMIT, **filters)
+        )
+
+    try:
+        if cursor is None:
+            # Live tail: only post-connect events. On an empty log the
+            # cursor stays None and the whole log is post-connect.
+            cursor = _call_logstream(lambda ls: ls.latest_event_id())
+        # Validate filters (and an explicit cursor) before committing to a
+        # streaming response — errors must be a clean 400, not a half-open
+        # stream.
+        if cursor:
+            _list_after(cursor)
+        else:
+            _call_logstream(lambda ls: ls.list_events(limit=1, **filters))
+    except ValueError as exc:
+        handler._send_json(400, {"error": str(exc)})
+        return
+
+    if not _sse_acquire_slot(handler.server):
+        handler._record_request(503)
+        handler.send_response(503)
+        handler.send_header("Retry-After", "5")
+        handler.send_header("Content-Length", "0")
+        handler.send_header("Connection", "close")
+        handler.end_headers()
+        handler.close_connection = True
+        return
+
+    try:
+        handler._record_request(200)
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        handler.send_header("Cache-Control", "no-cache")
+        handler.send_header("X-Accel-Buffering", "no")
+        handler.end_headers()
+
+        last_write = time.monotonic()
+        while True:
+            _last_request_time = time.monotonic()
+            events = (
+                _list_after(cursor)
+                if cursor
+                else _call_logstream(lambda ls: ls.list_events(limit=_SSE_BATCH_LIMIT, **filters))
+            )
+            for event in events:
+                frame = (
+                    f"id: {event['id']}\n"
+                    f"event: logstream\n"
+                    f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                )
+                handler.wfile.write(frame.encode("utf-8"))
+                cursor = event["id"]
+                last_write = time.monotonic()
+            if events:
+                handler.wfile.flush()
+            elif time.monotonic() - last_write >= _SSE_HEARTBEAT_S:
+                handler.wfile.write(b": ping\n\n")
+                handler.wfile.flush()
+                last_write = time.monotonic()
+            time.sleep(_SSE_POLL_BASE_S + random.random() * _SSE_POLL_JITTER_S)
+    except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+        pass  # client went away — the normal way an SSE stream ends
+    finally:
+        _sse_release_slot(handler.server)
+        handler.close_connection = True
+
+
 def _build_http_server(host: str, port: int):
     """Construct (but do not start) the MCP HTTP server.
 
@@ -5247,7 +6899,6 @@ def _build_http_server(host: str, port: int):
     allowlist, Origin check, optional bearer token) is attached as attributes.
     """
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-    from urllib.parse import urlparse
 
     auth_token = os.environ.get("MEMPALACE_MCP_HTTP_TOKEN", "").strip()
     if (
@@ -5299,7 +6950,18 @@ def _build_http_server(host: str, port: int):
         def log_message(self, fmt, *args):
             logger.info("HTTP %s - " + fmt, self.client_address[0], *args)
 
+        def send_error(self, code, message=None, explain=None):
+            self._record_request(code)
+            return super().send_error(code, message, explain)
+
+        def _record_request(self, status: int) -> None:
+            _http_record_request(self.server, self, status)
+
+        def _status_payload(self) -> dict:
+            return _http_status_payload(self.server)
+
         def _send_bytes(self, status: int, body: bytes, content_type: str) -> None:
+            self._record_request(status)
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
@@ -5313,44 +6975,10 @@ def _build_http_server(host: str, port: int):
             self._send_bytes(status, body, "application/json; charset=utf-8")
 
         def _request_rejected(self, require_auth: bool) -> bool:
-            """Enforce the transport's access policy before any dispatch.
-
-            The palace is the most sensitive data MemPalace holds and ``/mcp``
-            is unauthenticated by default, so this guards the two ways a local
-            HTTP server leaks to the network: DNS rebinding (Host/Origin) and,
-            when the operator opts in, a missing/incorrect bearer token.
-            """
-            srv = self.server
-            if srv.enforce_host_pin:
-                host_hdr = (self.headers.get("Host") or "").strip().lower()
-                if host_hdr not in srv.allowed_hosts:
-                    logger.warning("HTTP request rejected: Host %r not allowed", host_hdr)
-                    self.send_error(403, "Forbidden")
-                    return True
-            origin = self.headers.get("Origin")
-            if origin and not _http_origin_allowed(origin):
-                logger.warning("HTTP request rejected: cross-origin %r", origin)
-                self.send_error(403, "Forbidden")
-                return True
-            if require_auth and srv.auth_token:
-                provided = self.headers.get("Authorization", "")
-                if not hmac.compare_digest(provided, f"Bearer {srv.auth_token}"):
-                    logger.warning("HTTP request rejected: missing/invalid bearer token")
-                    self.send_error(401, "Unauthorized")
-                    return True
-            return False
+            return _http_request_rejected(self, require_auth)
 
         def do_GET(self):
-            # Liveness probe is policy-gated for Host/Origin but never requires
-            # the token, so an orchestrator's health check works without creds.
-            if self._request_rejected(require_auth=False):
-                return
-            path = urlparse(self.path).path
-            if path == "/healthz":
-                self._send_bytes(200, b"ok\n", "text/plain; charset=utf-8")
-                return
-
-            self.send_error(404, "Not Found")
+            _http_handle_get(self)
 
         def do_POST(self):
             if self._request_rejected(require_auth=True):
@@ -5384,14 +7012,13 @@ def _build_http_server(host: str, port: int):
                 self._send_json(400, _json_rpc_parse_error())
                 return
 
-            # Preserve the single-process / single-palace-handle behavior that
-            # stdio deployments rely on. HTTP gives us a safer transport, not
-            # concurrent Chroma/HNSW mutation.
-            with _HTTP_REQUEST_LOCK:
-                response = handle_request(request)
+            # Locking policy lives in _http_dispatch: global lock for
+            # Chroma-touching tools, lock-free for logstream tools.
+            response = _http_dispatch(request)
 
             if response is None:
                 # JSON-RPC notifications intentionally have no response body.
+                self._record_request(202)
                 self.send_response(202)
                 self.send_header("Content-Length", "0")
                 self.send_header("Connection", "close")
@@ -5411,6 +7038,16 @@ def _build_http_server(host: str, port: int):
     httpd.allowed_hosts = _http_allowed_host_values(host, bound_port)
     httpd.auth_token = auth_token
     httpd.scheme = "http"
+    httpd.bind_host = host
+    httpd.started_at = datetime.now().isoformat()
+    httpd.started_monotonic = time.monotonic()
+    httpd.stats_lock = threading.Lock()
+    httpd.request_count = 0
+    httpd.status_counts = {}
+    httpd.recent_clients = {}
+    httpd.sse_lock = threading.Lock()
+    httpd.sse_clients = 0
+    httpd.sse_max_clients = _sse_max_clients()
     if tls_cert:
         httpd.socket = _wrap_tls(httpd.socket, tls_cert, tls_key)
         httpd.scheme = "https"
@@ -5432,6 +7069,31 @@ def _serve_http(host: str, port: int) -> None:
         sys.exit(1)
 
     bound_port = httpd.server_address[1]
+
+    # Register this process as the palace's hub so local short-lived writers
+    # (save hooks, plain `mempalace mine`) forward their writes here instead
+    # of colliding with the MCP writer lease. Best-effort: discovery is an
+    # optimization, serving must not fail because the record could not be
+    # written.
+    _registered_palace = _config.palace_path
+    if _registered_palace:
+        try:
+            from . import server_registry
+
+            server_registry.write_serverinfo(
+                _registered_palace,
+                host=host,
+                port=bound_port,
+                scheme=getattr(httpd, "scheme", "http"),
+                read_only=_READ_ONLY,
+            )
+            import atexit
+
+            atexit.register(server_registry.clear_serverinfo, _registered_palace)
+        except Exception:
+            logger.debug("Failed to write hub serverinfo", exc_info=True)
+            _registered_palace = None
+
     if not _http_is_loopback(host):
         if httpd.auth_token:
             logger.warning(
@@ -5446,6 +7108,10 @@ def _serve_http(host: str, port: int) -> None:
                 host,
                 _HTTP_ALLOW_INSECURE_NO_TOKEN_ENV,
             )
+
+    # RFC 004 step 0: converge with peer replicas when peers.json exists.
+    _start_peer_sync_thread()
+
     with httpd:
         logger.info(
             "MemPalace MCP HTTP server listening on %s://%s:%s/mcp%s%s",
@@ -5459,6 +7125,14 @@ def _serve_http(host: str, port: int) -> None:
             httpd.serve_forever(poll_interval=0.5)
         except KeyboardInterrupt:
             logger.info("MemPalace MCP HTTP server shutting down")
+        finally:
+            if _registered_palace:
+                try:
+                    from . import server_registry
+
+                    server_registry.clear_serverinfo(_registered_palace)
+                except Exception:
+                    logger.debug("Failed to clear hub serverinfo", exc_info=True)
 
 
 def _startup_preflight() -> None:
@@ -5474,6 +7148,129 @@ def _startup_preflight() -> None:
         _refresh_vector_disabled_flag()
     except Exception:
         logger.exception("startup preflight failed")
+
+
+def _drop_broken_stdout() -> None:
+    """Point fd 1 at devnull after a stdout write failed with a pipe error.
+
+    The response line that failed mid-write can leave bytes buffered in
+    ``sys.stdout``; the interpreter's shutdown flush would then re-raise
+    ``BrokenPipeError`` and turn a clean exit into status 120. With fd 1
+    on devnull that final flush drains harmlessly, so the process exits 0
+    and any held flocks (e.g. ``mine_palace``) release via normal
+    teardown.
+    """
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        os.close(devnull)
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
+# Stdio→hub proxying. When a long-lived HTTP hub (`mempalace serve`) owns
+# this palace, a stdio server spawned by an agent harness must not open its
+# own Chroma handles: it could only ever be a read-only peer (writer lease,
+# #1818), and racing writers are exactly what corrupted FTS5 indexes in the
+# wild. Instead the stdio process forwards every JSON-RPC request to the hub
+# verbatim, adding the local bearer token. This makes stdio-only harnesses
+# (plugins, desktop apps) share the hub with zero client-side reconfiguration.
+# Shares the CLI forwarder's kill switch (MEMPALACE_HUB_FORWARD=0).
+_HUB_FORWARD_ENV = "MEMPALACE_HUB_FORWARD"
+_HUB_PROXY_TIMEOUT_S = 600.0
+_hub_proxy_announced = False
+
+
+def _hub_proxy_target():
+    """Return (base_url, headers) for a live hub serving our palace, or None."""
+    global _hub_proxy_announced
+    if _truthy_env_off(_HUB_FORWARD_ENV):
+        return None
+    try:
+        from . import server_registry
+
+        info = server_registry.read_live_serverinfo(_config.palace_path)
+        if not info or info.get("pid") == os.getpid():
+            return None
+        base_url = server_registry.client_base_url(info)
+        headers = {"Content-Type": "application/json"}
+        token = server_registry.load_server_token(_config.palace_path)
+    except Exception:
+        logger.debug("hub discovery failed; serving locally", exc_info=True)
+        return None
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if not _hub_proxy_announced:
+        _hub_proxy_announced = True
+        logger.info("Live palace hub detected at %s; proxying stdio requests to it", base_url)
+    return base_url, headers
+
+
+def _truthy_env_off(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"0", "false", "no", "off"}
+
+
+def _forward_request_to_hub(base_url: str, headers: dict, request: dict):
+    """POST one JSON-RPC request to the hub; None for notifications (202)."""
+    import urllib.request
+
+    body = json.dumps(request, ensure_ascii=False).encode("utf-8")
+    http_request = urllib.request.Request(f"{base_url}/mcp", data=body, headers=headers)
+    with urllib.request.urlopen(http_request, timeout=_HUB_PROXY_TIMEOUT_S) as resp:
+        raw = resp.read()
+    if not raw:
+        return None
+    return json.loads(raw.decode("utf-8"))
+
+
+def _request_is_mutating(request: dict) -> bool:
+    if request.get("method") != "tools/call":
+        return False
+    name = ((request.get("params") or {}).get("name")) or ""
+    return name in _MUTATING_TOOLS
+
+
+def _dispatch_stdio_request(request: dict):
+    """Route one stdio request: live hub first, local handling otherwise.
+
+    The hub check runs per request (a tiny local JSON read), so a hub that
+    starts, restarts on a new port, or dies mid-session is picked up without
+    restarting this process. Fallback to local handling is allowed only when
+    the failure provably happened before the hub accepted the request — a
+    mutating call that failed mid-flight must NOT be replayed locally (the
+    hub may still be executing it), so it surfaces as a JSON-RPC error.
+    """
+    import urllib.error
+
+    target = _hub_proxy_target()
+    if target is None:
+        return handle_request(request)
+    base_url, headers = target
+    try:
+        return _forward_request_to_hub(base_url, headers, request)
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
+        reached_hub = isinstance(exc, urllib.error.HTTPError)
+        if not reached_hub and not _request_is_mutating(request):
+            logger.warning("Hub at %s unreachable (%s); handling request locally", base_url, exc)
+            return handle_request(request)
+        if request.get("id") is None:
+            return None
+        return {
+            "jsonrpc": "2.0",
+            "id": request.get("id"),
+            "error": {
+                "code": -32000,
+                "message": f"palace hub proxy failed: {exc}",
+                "data": {
+                    "hub": base_url,
+                    "hint": (
+                        "The palace hub did not complete this request. Mutating tools "
+                        "are not replayed locally — the hub may still be executing the "
+                        "call. Check the hub process, then retry."
+                    ),
+                },
+            },
+        }
 
 
 def _run_stdio_loop() -> None:
@@ -5525,26 +7322,56 @@ def _run_stdio_loop() -> None:
     # that outlived their Claude Code session (#1552).
     _start_idle_exit_watchdog()
 
+    # Say so when a chromadb write stops coming back, from a thread the stuck
+    # call is not blocking.
+    _start_write_stall_watchdog()
+
     while True:
         try:
             line = sys.stdin.readline()
-            if not line:
-                break
+        except KeyboardInterrupt:
+            break
+        except OSError as exc:
+            # An orphaned pty/pipe surfaces as EIO/EBADF here instead of a
+            # clean EOF — same meaning: the client is gone. Never loop on
+            # it: an orphaned stdio server holding the mine_palace flock
+            # blocked all palace writes for hours (2026-07-10 outage).
+            logger.info("stdin read failed (%s) — client disconnected, shutting down", exc)
+            break
+        if not line:
+            logger.info("stdin EOF — client disconnected, shutting down")
+            break
 
-            line = line.strip()
-            if not line:
-                continue
+        line = line.strip()
+        if not line:
+            continue
 
+        payload = None
+        try:
             request = json.loads(line)
-            response = handle_request(request)
-
+            response = _dispatch_stdio_request(request)
             if response is not None:
-                sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
-                sys.stdout.flush()
+                payload = json.dumps(response, ensure_ascii=False)
         except KeyboardInterrupt:
             break
         except Exception as e:
             logger.error(f"Server error: {e}")
+            continue
+
+        if payload is None:
+            continue
+        try:
+            sys.stdout.write(payload + "\n")
+            sys.stdout.flush()
+        except KeyboardInterrupt:
+            break
+        except (BrokenPipeError, OSError) as exc:
+            # The client's read end is gone; every future response write
+            # would fail the same way, so treat it like stdin EOF and
+            # shut down instead of swallowing it in the generic handler.
+            logger.info("stdout write failed (%s) — client disconnected, shutting down", exc)
+            _drop_broken_stdout()
+            break
 
 
 def _run_http_loop() -> None:
@@ -5553,30 +7380,52 @@ def _run_http_loop() -> None:
     # still cannot masquerade as an HTTP response.
     logger.info("MemPalace MCP HTTP server starting...")
 
-    # The HTTP transport exists for long-lived deployments. Do the cheap
-    # filesystem-only probe before binding, but never make the listener wait on
-    # optional embedder/HNSW warmup. Operators and tests should see /healthz as
-    # soon as the process is alive.
-    _refresh_vector_disabled_flag()
-    _start_idle_exit_watchdog()
+    # A writable HTTP server is a long-lived storage client, so it must own the
+    # local palace before it binds. Refusing at startup avoids advertising a
+    # writable service that will only fail (or race) on its first mutation.
+    # Explicit read-only HTTP remains safe to run beside the one writer owner.
+    owns_writer_lease = False
+    if not _READ_ONLY:
+        writer_ok, writer_reason = _acquire_mcp_writer_lock()
+        if not writer_ok:
+            logger.error("Writable MCP HTTP startup refused: %s", writer_reason)
+            raise SystemExit(2)
+        owns_writer_lease = True
 
-    raw_warmup = os.environ.get("MEMPALACE_EAGER_WARMUP", "").strip().lower()
-    if raw_warmup in _WARMUP_TRUTHY:
+    try:
+        # The HTTP transport exists for long-lived deployments. Do the cheap
+        # filesystem-only probe before binding, but never make the listener wait on
+        # optional embedder/HNSW warmup. Operators and tests should see /healthz as
+        # soon as the process is alive.
+        _refresh_vector_disabled_flag()
+        _start_idle_exit_watchdog()
+        _start_write_stall_watchdog()
 
-        def _warmup_with_lock():
+        raw_warmup = os.environ.get("MEMPALACE_EAGER_WARMUP", "").strip().lower()
+        if raw_warmup in _WARMUP_TRUTHY:
+
+            def _warmup_with_lock():
+                with _HTTP_REQUEST_LOCK:
+                    _maybe_eager_warmup_embedder()
+
+            threading.Thread(
+                target=_warmup_with_lock,
+                name="mcp-http-eager-warmup",
+                daemon=True,
+            ).start()
+        elif raw_warmup and raw_warmup not in _WARMUP_FALSY:
+            # Keep the same warning behavior as stdio mode for typo values.
+            _maybe_eager_warmup_embedder()
+
+        _serve_http(_args.host, _args.port)
+    finally:
+        if owns_writer_lease:
+            # _serve_http uses daemon request threads, so synchronize with the
+            # dispatch lock before closing storage and exposing the palace to
+            # another process. Response serialization happens after this lock
+            # and no longer touches the backend.
             with _HTTP_REQUEST_LOCK:
-                _maybe_eager_warmup_embedder()
-
-        threading.Thread(
-            target=_warmup_with_lock,
-            name="mcp-http-eager-warmup",
-            daemon=True,
-        ).start()
-    elif raw_warmup and raw_warmup not in _WARMUP_FALSY:
-        # Keep the same warning behavior as stdio mode for typo values.
-        _maybe_eager_warmup_embedder()
-
-    _serve_http(_args.host, _args.port)
+                _release_mcp_writer_lock()
 
 
 def main():

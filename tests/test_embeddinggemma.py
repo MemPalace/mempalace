@@ -70,6 +70,12 @@ class _FakeTokenizer:
         self._truncation_enabled = True
         self._truncation_max = max_length
 
+    def get_vocab_size(self, with_added_tokens=True):
+        return 262145 if with_added_tokens else 262144
+
+    def token_to_id(self, token):
+        return 3 if token == "<unk>" else None
+
     def encode_batch(self, texts):
         class _Enc:
             def __init__(self, n):
@@ -184,7 +190,9 @@ def test_call_chunks_large_batches(patched_lazy_load, monkeypatch):
     monkeypatch.setattr(_FakeTokenizer, "encode_batch", recording_encode_batch)
     ef = embedding.EmbeddinggemmaONNX()
     n = embedding._EMBEDDINGGEMMA_BATCH_SIZE * 2 + 6
-    docs = [f"doc {i}" for i in range(n)]
+    # Descending sizes, so size-sorted order is the reverse of arrival order
+    # and the assertion below cannot pass on both.
+    docs = [f"{'x' * (n - i)} doc {i}" for i in range(n)]
     out = ef(docs)
 
     assert batch_sizes == [
@@ -192,9 +200,11 @@ def test_call_chunks_large_batches(patched_lazy_load, monkeypatch):
         embedding._EMBEDDINGGEMMA_BATCH_SIZE,
         6,
     ], f"expected bounded sub-batches, got {batch_sizes}"
-    # Sub-batches must cover the input in order; combined with the per-chunk
-    # extend in __call__ this pins output row order to input order.
-    assert captured_texts == [embedding._EMBEDDINGGEMMA_PREFIX + d for d in docs]
+    # Sub-batches cover the input in size-sorted order; the scatter in
+    # __call__ puts every row back at its own input index afterwards.
+    ordered = sorted(docs, key=lambda d: len(d.encode("utf-8")))
+    assert ordered != docs, "fixture must not already be in size order"
+    assert captured_texts == [embedding._EMBEDDINGGEMMA_PREFIX + d for d in ordered]
     arr = np.asarray(out)
     assert arr.shape == (n, 384), f"chunked outputs must concatenate to (n, 384), got {arr.shape}"
     assert np.allclose(np.linalg.norm(arr, axis=1), 1.0, atol=1e-5)
@@ -243,6 +253,200 @@ def test_custom_batch_size_is_honored(patched_lazy_load, monkeypatch):
     out = ef([f"doc {i}" for i in range(24)])
     assert batch_sizes == [10, 10, 4]
     assert len(out) == 24
+
+
+# Bound before any test can monkeypatch the method, so the width helper
+# below measures with the real fake and never re-enters a recorder.
+_UNPATCHED_ENCODE_BATCH = _FakeTokenizer.encode_batch
+
+
+def _record_batches(monkeypatch, sink):
+    """Capture the texts handed to each encode_batch call, in order."""
+
+    def recording_encode_batch(self, texts):
+        sink.append(list(texts))
+        return _UNPATCHED_ENCODE_BATCH(self, texts)
+
+    monkeypatch.setattr(_FakeTokenizer, "encode_batch", recording_encode_batch)
+
+
+def _fake_padded_width(batches):
+    """Total padded token slots the fake tokenizer produces for `batches`.
+
+    Measured by encoding, not by re-deriving the fake's padding rule, so the
+    two cannot drift apart and quietly turn the assertion into a tautology.
+    """
+    tokenizer = _FakeTokenizer()
+    return sum(sum(len(e.ids) for e in _UNPATCHED_ENCODE_BATCH(tokenizer, b)) for b in batches)
+
+
+def test_call_groups_documents_by_size(patched_lazy_load, monkeypatch):
+    """Similar-size documents must share a sub-batch.
+
+    encode_batch pads every row to the longest sequence in the sub-batch and
+    attention cost per layer is batch x heads x length^2, so interleaving one
+    long document with short ones makes the short ones pay the long length
+    (#2104). Grouping by size is what keeps that bill proportional to the
+    text actually being embedded.
+    """
+    batches = []
+    _record_batches(monkeypatch, batches)
+    # One long document per sub-batch's worth of short ones: the pathological
+    # arrival order a verbatim transcript sweep produces.
+    long_doc = " ".join(["word"] * 200)
+    docs = [long_doc if i % _B == 0 else f"short {i}" for i in range(4 * _B)]
+
+    ef = embedding.EmbeddinggemmaONNX()
+    out = ef(docs)
+    assert len(out) == len(docs)
+
+    for texts in batches:
+        sizes = [len(t.encode("utf-8")) for t in texts]
+        assert sizes == sorted(sizes), f"sub-batch is not size-grouped: {sizes}"
+
+    prefixed = [embedding._EMBEDDINGGEMMA_PREFIX + d for d in docs]
+    arrival_order = [prefixed[s : s + _B] for s in range(0, len(prefixed), _B)]
+    assert _fake_padded_width(batches) < _fake_padded_width(arrival_order), (
+        "size grouping must lower the total padded width"
+    )
+
+
+def test_call_groups_by_utf8_size_not_character_count(patched_lazy_load, monkeypatch):
+    """The key is UTF-8 bytes, because this model is multilingual.
+
+    A CJK document is ~3 bytes per character and roughly a token per
+    character, so ordering by character count would file it next to Latin
+    documents several times cheaper to embed.
+    """
+    batches = []
+    _record_batches(monkeypatch, batches)
+    # Same character count, very different byte count (and token count).
+    docs = ["a" * 90] * _B + ["中" * 90] * _B
+    ef = embedding.EmbeddinggemmaONNX()
+    ef(list(reversed(docs)))
+
+    assert len(batches) == 2, f"expected two sub-batches, got {len(batches)}"
+    sizes = [[len(t.encode("utf-8")) for t in b] for b in batches]
+    assert max(sizes[0]) < min(sizes[1]), (
+        f"CJK documents must not share a sub-batch with Latin ones: {sizes}"
+    )
+
+
+def test_call_size_grouping_is_stable(patched_lazy_load, monkeypatch):
+    """Equal-size documents keep their arrival order.
+
+    An unstable sort would make the sub-batch split depend on nothing the
+    caller can see, so two identical inputs could take different code paths.
+    """
+    batches = []
+    _record_batches(monkeypatch, batches)
+    docs = [f"doc{i:03d}" for i in range(_B + 8)]  # identical size, distinct text
+    ef = embedding.EmbeddinggemmaONNX()
+    ef(docs)
+    captured = [t for b in batches for t in b]
+    assert captured == [embedding._EMBEDDINGGEMMA_PREFIX + d for d in docs]
+
+
+def test_call_keeps_arrival_order_within_a_single_sub_batch(patched_lazy_load, monkeypatch):
+    """An input that fits one sub-batch is not reordered.
+
+    Every row pads to the same width either way, so the sort would buy
+    nothing and only add keys to compute on the search hot path.
+    """
+    batches = []
+    _record_batches(monkeypatch, batches)
+    docs = [f"{'x' * (_B - i)} doc {i}" for i in range(_B)]  # descending size
+    ef = embedding.EmbeddinggemmaONNX()
+    ef(docs)
+    assert batches == [[embedding._EMBEDDINGGEMMA_PREFIX + d for d in docs]]
+
+
+class _MarkerTokenizer(_FakeTokenizer):
+    """Tokenizer whose first token id carries that document's own length.
+
+    ``_FakeTokenizer`` emits all-zero ids padded to one width, so a fake
+    session cannot tell its rows apart, which is exactly what an
+    order-restoration test has to observe.
+    """
+
+    def encode_batch(self, texts):
+        widths = [len(t) for t in texts]
+        padded = max(widths)
+
+        class _Enc:
+            def __init__(self, marker):
+                self.ids = [marker] + [0] * (padded - 1)
+                self.attention_mask = [1] * marker + [0] * (padded - marker)
+
+        return [_Enc(w) for w in widths]
+
+
+class _MarkerSession:
+    """Emit a vector whose first two dims encode the row's marker id.
+
+    Both dims scale by the same L2 norm, so ``row[0] / row[1]`` survives
+    normalization and identifies which document produced the row.
+    """
+
+    _WIDTH = 2 * embedding._EMBEDDINGGEMMA_DIM
+
+    def run(self, _output_names, feed):
+        ids = feed["input_ids"]
+        batch, length = ids.shape
+        sent = np.zeros((batch, self._WIDTH), dtype=np.float64)
+        sent[:, 0] = ids[:, 0]
+        sent[:, 1] = 1.0
+        return [np.zeros((batch, length, self._WIDTH), dtype=np.float64), sent]
+
+
+def _marker_ef(patched_lazy_load, session=None):
+    """An EF wired to the marker fakes, with the real lazy load short-circuited."""
+    # patched_lazy_load is taken so a future tightening of _lazy_load's
+    # early-return cannot turn these tests into a 300 MB model download.
+    ef = embedding.EmbeddinggemmaONNX()
+    ef._tokenizer = _MarkerTokenizer()
+    ef._session = session if session is not None else _MarkerSession()
+    ef._output_idx = 1
+    ef._np = np
+    return ef
+
+
+def test_call_returns_rows_at_their_input_index(patched_lazy_load):
+    """Row i of the result must be the embedding of document i.
+
+    Sub-batching by size reorders the work; ChromaDB zips the returned
+    vectors against the ids positionally, so grouping without the matching
+    scatter would file every drawer under another drawer's vector. That
+    half-applied state is what this pins: arrival order trivially satisfies
+    it, so it is the grouping tests that cover the other direction.
+    """
+    ef = _marker_ef(patched_lazy_load)
+    # Strictly descending sizes, so grouping reverses arrival order and an
+    # unscattered result would be visibly wrong.
+    docs = ["x" * n for n in range(200, 200 - 3 * _B, -1)]
+    out = ef(docs)
+
+    assert len(out) == len(docs)
+    assert all(row is not None for row in out), "every index must be filled"
+    markers = [round(row[0] / row[1]) for row in out]
+    assert markers == [len(embedding._EMBEDDINGGEMMA_PREFIX + d) for d in docs]
+
+
+def test_call_rejects_a_short_row_count_from_the_session(patched_lazy_load):
+    """A session returning fewer rows than documents must fail loudly.
+
+    Scattering by index would otherwise leave a None in the result and the
+    caller would only trip over it much later, converting to an array.
+    """
+
+    class _ShortSession(_MarkerSession):
+        def run(self, output_names, feed):
+            last_hidden, sent = super().run(output_names, feed)
+            return [last_hidden, sent[:-1]]
+
+    ef = _marker_ef(patched_lazy_load, session=_ShortSession())
+    with pytest.raises(RuntimeError, match="rows for a"):
+        ef(["x" * n for n in range(200, 200 - 2 * _B, -1)])
 
 
 def test_batch_size_below_one_is_rejected():
@@ -397,3 +601,59 @@ def test_config_embedding_model_default_is_minilm(monkeypatch):
 
     monkeypatch.delenv("MEMPALACE_EMBEDDING_MODEL", raising=False)
     assert MempalaceConfig().embedding_model == "minilm"
+
+
+def test_out_of_range_added_token_is_remapped_to_unknown(
+    patched_lazy_load,
+    monkeypatch,
+    caplog,
+):
+    class EncodingWithAddedToken:
+        ids = [2, 262144, 1]
+        attention_mask = [1, 1, 1]
+
+    def encode_with_added_token(_self, texts):
+        return [EncodingWithAddedToken() for _ in texts]
+
+    monkeypatch.setattr(
+        _FakeTokenizer,
+        "encode_batch",
+        encode_with_added_token,
+    )
+
+    captured = {}
+    fake_session_class = _make_fake_session()
+
+    class BoundsCheckingSession(fake_session_class):
+        def run(self, output_names, feed):
+            captured["input_ids"] = feed["input_ids"].copy()
+
+            assert np.all(feed["input_ids"] >= 0)
+            assert np.all(feed["input_ids"] < 262144)
+
+            return super().run(
+                output_names,
+                feed,
+            )
+
+    import onnxruntime
+
+    monkeypatch.setattr(
+        onnxruntime,
+        "InferenceSession",
+        lambda *_args, **_kwargs: BoundsCheckingSession(),
+    )
+
+    caplog.set_level(
+        "WARNING",
+        logger=embedding.__name__,
+    )
+
+    embedding_function = embedding.EmbeddinggemmaONNX()
+
+    result = embedding_function(["literal <image_soft_token> in source"])
+
+    assert captured["input_ids"].tolist() == [[2, 3, 1]]
+    assert np.asarray(result).shape == (1, 384)
+    assert "remapping to <unk>" in caplog.text
+    assert patched_lazy_load["hf_hub_download"] == 3

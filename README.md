@@ -72,39 +72,83 @@ pip install mempalace
 ### Docker
 
 A container image is also available for running the MCP server or the CLI
-without a local Python toolchain. Everything persists under `/data` (palace,
-config, and the cached embedding model), so mount a volume there.
+without a local Python toolchain. Multi-arch (amd64 + arm64), so it runs
+natively on Apple Silicon:
 
 ```bash
-# Build the image (CPU; bundles the `extract` + `spellcheck` extras)
-docker build -t mempalace .
-
-# MCP server over stdio — note the `-i` flag (JSON-RPC needs stdin)
-docker run -i --rm -v mempalace-data:/data mempalace
-
-# Run any CLI command instead (mount the host directory you want to mine)
-docker run --rm -v mempalace-data:/data -v /path/to/project:/work mempalace mine /work
-docker run --rm -v mempalace-data:/data mempalace search "why GraphQL"
+docker pull ghcr.io/mempalace/mempalace:latest
 ```
 
-Wire it into an MCP client (e.g. Claude Code) as a stdio server:
+Everything persists under `/data` — palace, config, and the cached embedding
+model — so mount a volume there and reuse it across runs:
+
+```bash
+# MCP server over stdio — note the `-i` flag (JSON-RPC needs stdin)
+docker run -i --rm -v mempalace-data:/data ghcr.io/mempalace/mempalace
+
+# Run any CLI command instead. The container only sees what you mount, so
+# mount the directory you want to mine — read-only is enough, mining never
+# writes to the source.
+docker run --rm -v mempalace-data:/data -v /path/to/project:/work:ro \
+  ghcr.io/mempalace/mempalace mine /work
+docker run --rm -v mempalace-data:/data ghcr.io/mempalace/mempalace search "why GraphQL"
+```
+
+The first command that needs embeddings downloads the model into `/data`
+(~80 MB for the default `minilm`, ~300 MB for `embeddinggemma`). It is a
+one-off as long as the volume persists, but it does mean the first call is
+slow and needs network — worth knowing before assuming a hung container.
+
+Wire it into an MCP client (e.g. Claude Code) as a stdio server. Mount
+anything you want the server to be able to mine — it cannot reach your
+transcripts otherwise:
 
 ```json
 {
   "mcpServers": {
     "mempalace": {
       "command": "docker",
-      "args": ["run", "-i", "--rm", "-v", "mempalace-data:/data", "mempalace"]
+      "args": [
+        "run", "-i", "--rm",
+        "-v", "mempalace-data:/data",
+        "-v", "/absolute/path/to/.claude/projects:/transcripts:ro",
+        "ghcr.io/mempalace/mempalace"
+      ]
     }
   }
 }
 ```
 
-`docker compose run --rm mcp` works too (see `docker-compose.yml`). For
-CUDA-accelerated embeddings, build the GPU variant with
-`docker build -f Dockerfile.gpu -t mempalace:gpu .` and run it with
-`--gpus all`. Customise the bundled extras at build time, e.g.
-`docker build --build-arg EXTRAS="extract,spellcheck" -t mempalace .`.
+Use a real absolute path there — `~` and `$HOME` are not expanded by every
+MCP client. Paths are container paths from then on: mine `/transcripts`, not
+`~/.claude/projects`.
+
+**Mount permissions on Linux.** The image runs as uid 1000 and bind mounts
+keep their host ownership, so a mounted directory has to be readable by that
+uid — an ordinary `0755` checkout is fine, a `0700` directory is not, and the
+failure surfaces as `PermissionError: [Errno 13]` rather than anything about
+Docker. Docker Desktop maps uids on macOS and Windows, so this only bites on
+Linux. Do **not** work around it with `--user`: `/data` is owned by uid 1000
+inside the image, so another uid cannot write the palace at all.
+
+`docker compose run --rm mcp` works too (see `docker-compose.yml`), and
+`deploy/docker-compose.server.yml` stands up the team server. To build the
+image yourself instead of pulling — required for the GPU variant, which is not
+published:
+
+```bash
+docker build -t mempalace .                                  # CPU
+docker build --build-arg EXTRAS="extract,spellcheck" -t mempalace .
+docker build -f Dockerfile.gpu -t mempalace:gpu .            # CUDA; run with --gpus all
+```
+
+The GPU image is x86_64-only: `onnxruntime-gpu` publishes no aarch64 Linux
+wheels, so that last build fails on an ARM host (including Apple Silicon) with
+a dependency-resolution error rather than an obvious one.
+
+Note that a build from a clone uses whatever branch you checked out; `develop`
+is the default branch, so pull the published image if you want the released
+version.
 
 ## Storage backends
 
@@ -209,8 +253,9 @@ Usage and tool reference:
 
 ## MCP server
 
-36 MCP tools cover palace reads/writes, knowledge-graph operations,
-cross-wing navigation, drawer management, and agent diaries. Installation
+44 MCP tools cover palace reads/writes, knowledge-graph operations,
+cross-wing navigation, drawer management, agent diaries, and agent
+coordination (logstream events + artifact handoffs). Installation
 and the full tool list:
 [mempalaceofficial.com/reference/mcp-tools](https://mempalaceofficial.com/reference/mcp-tools.html).
 
@@ -269,7 +314,7 @@ PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 MIT — see [LICENSE](LICENSE).
 
 <!-- Link Definitions -->
-[version-shield]: https://img.shields.io/badge/version-3.6.0-4dc9f6?style=flat-square&labelColor=0a0e14
+[version-shield]: https://img.shields.io/badge/version-3.7.0-4dc9f6?style=flat-square&labelColor=0a0e14
 [release-link]: https://github.com/MemPalace/mempalace/releases
 [python-shield]: https://img.shields.io/badge/python-3.9+-7dd8f8?style=flat-square&labelColor=0a0e14&logo=python&logoColor=7dd8f8
 [python-link]: https://www.python.org/

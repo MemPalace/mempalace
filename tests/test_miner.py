@@ -1020,6 +1020,31 @@ def test_status_palace_dir_without_db_reports_uninitialized(tmp_path, capsys):
     assert list(palace_path.iterdir()) == []
 
 
+def test_status_aborts_on_hnsw_divergence(tmp_path, capsys):
+    """count() on a diverged HNSW segment can hard-crash the process
+    (#1222); status()'s ChromaDB-client fallback (used when the direct
+    sqlite read is unavailable) must preflight divergence before ever
+    calling count(), not just wrap it in except Exception (#93)."""
+    from unittest.mock import patch
+
+    class FakeCol:
+        def count(self):
+            raise AssertionError("count() must not be called when diverged")
+
+    with (
+        patch("mempalace.miner._open_collection_or_explain", return_value=FakeCol()),
+        patch(
+            "mempalace.backends.chroma.hnsw_capacity_status",
+            return_value={"diverged": True, "message": "test divergence"},
+        ),
+    ):
+        status(str(tmp_path))
+
+    out = capsys.readouterr().out
+    assert "HNSW index is diverged" in out
+    assert "MemPalace Status" not in out
+
+
 def test_status_handles_none_metadata_without_crash(tmp_path, capsys):
     """status must not crash when col.get returns a None entry in metadatas.
 

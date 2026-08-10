@@ -723,7 +723,31 @@ def _submit_daemon_job(
         wait=wait,
         auto_start=False,
         timeout=timeout,
+        # A job refused the palace lock is deferred, not failed (#2014), so it
+        # is never terminal while the holder lives. The waiting callers below
+        # wait on purpose, but a parked job cannot reach the state they wait
+        # for: they would burn the whole timeout and then report a failure that
+        # did not happen. Take the parked job back instead; the daemon still
+        # runs it once the lock frees.
+        stop_on_lock_deferral=True,
     )
+
+
+def _job_deferred_by_lock(job: dict) -> bool:
+    """True when the daemon parked this job behind the palace write lock.
+
+    Imported lazily like ``submit_job`` above: only callers that actually reach
+    the daemon pay for the module, and by this point it is already loaded.
+    """
+    from .daemon import job_deferred_by_lock
+
+    return job_deferred_by_lock(job)
+
+
+def _lock_deferral_reason(job: dict) -> str:
+    """Operator-facing reason a job is parked, for the hook log."""
+    reason = (job.get("error") or {}).get("message") or "the palace write lock is held"
+    return f"{reason} (job {job.get('id')} stays queued and runs when the holder exits)"
 
 
 def _maybe_auto_ingest():
@@ -802,7 +826,12 @@ def _mine_sync():
                         timeout=60,
                     )
                     result = job.get("result") or {}
-                    if job.get("state") != "succeeded" or not result.get("success", True):
+                    if _job_deferred_by_lock(job):
+                        # Parked behind the palace lock, not failed: the daemon
+                        # runs it once the holder exits. Saying "failed" here
+                        # would be the false report #2014 is about.
+                        _log(f"Daemon sync mine deferred: {_lock_deferral_reason(job)}")
+                    elif job.get("state") != "succeeded" or not result.get("success", True):
                         _log(f"Daemon sync mine failed: {result.get('error', job.get('error'))}")
                 except Exception as exc:
                     # Daemon accepted context — don't fall back (would double-mine).
@@ -935,6 +964,9 @@ def _save_diary_direct(
     the agent wrote to, so project-derived wings stay discoverable.
 
     Returns {"count": N, "themes": [...]} on success, {"count": 0} on failure.
+    A daemon lock deferral also returns {"count": 0}: nothing is filed yet, but
+    the entry is queued and the daemon files it once the holder exits, so the
+    checkpoint marker is deliberately not advanced.
     """
     messages = _extract_recent_messages(transcript_path)
     if not messages:
@@ -993,6 +1025,12 @@ def _save_diary_direct(
                 if toast:
                     _desktop_toast(f"Checkpoint saved - {len(messages)} messages archived")
                 return {"count": len(messages), "themes": themes}
+            if _job_deferred_by_lock(job):
+                # Queued behind the palace lock: the entry is held and the daemon
+                # files it once the holder exits. Not a failure, and not a reason
+                # to re-file it here -- that would duplicate verbatim content.
+                _log(f"Daemon diary checkpoint deferred: {_lock_deferral_reason(job)}")
+                return {"count": 0}
             _log(f"Daemon diary checkpoint failed: {result.get('error', job.get('error'))}")
             return {"count": 0}
 
@@ -1052,12 +1090,12 @@ def _ingest_transcript(transcript_path: str):
                 _submit_daemon_job(
                     "mine",
                     {
-                        "source": str(path.parent),
+                        "source": str(path),
                         "mode": "convos",
                         "wing": "sessions",
                         "agent": "mempalace",
                     },
-                    dedupe_key=_daemon_mine_dedupe_key(str(path.parent), "convos"),
+                    dedupe_key=_daemon_mine_dedupe_key(str(path), "convos"),
                     wait=False,
                 )
                 _log(f"Transcript ingest submitted to daemon: {path.name}")
@@ -1075,7 +1113,7 @@ def _ingest_transcript(transcript_path: str):
                 "-m",
                 "mempalace",
                 "mine",
-                str(path.parent),
+                str(path),
                 "--mode",
                 "convos",
                 "--wing",

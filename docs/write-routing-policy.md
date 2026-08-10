@@ -109,6 +109,42 @@ Invalid values fail with a source-specific error rather than silently falling
 back. This is important because silently turning a misspelled `require` into a
 direct write would violate the safety purpose of the policy.
 
+## Local backend single-writer safety
+
+File-backed backends such as `chroma`, `sqlite_exact`, and Milvus Lite support
+exactly one writable process per palace. Serializing individual calls is not
+enough because each long-lived process can retain SQLite/WAL, FTS, or vector
+index state between calls.
+
+- A writable daemon owns the palace writer lease for its full lifetime.
+- Writable MCP HTTP acquires that lease before binding, holds it through the
+  full serving lifetime, and releases it after active requests stop.
+- MCP stdio opens `sqlite_exact` read-only until it acquires the writer lease.
+  It may therefore coexist for reads; mutating tools refuse while another
+  process owns the lease and reopen writable storage after that owner exits.
+- Read-only MCP HTTP may coexist with the writer.
+- Read-only `sqlite_exact` clients use an immutable connection for a clean
+  checkpointed database, or `mode=ro` when an active writer's complete WAL
+  sidecar pair must remain visible. Both paths enable `query_only` and skip
+  schema, WAL, FTS, migration, and metadata initialization.
+- Direct CLI and hook writes must not run beside a writable daemon or MCP HTTP
+  owner. Route them through the daemon with `require` when the daemon owns the
+  palace.
+- Direct `sqlite_exact` collection mutations contend for the same palace lease,
+  and full LLM closet regeneration owns it before opening collections or
+  calling the configured model.
+
+`MEMPALACE_MCP_ALLOW_PEER_WRITER` cannot bypass this protection for local
+file-backed or unknown plugin backends. It is retained only for explicitly
+remote service backends (`qdrant`, `pgvector`, and Milvus server/Zilliz Cloud)
+that coordinate concurrent clients themselves. Milvus Lite remains protected
+as local file-backed storage.
+
+Do not delete or unlink a live palace lock to recover ownership. Stop the
+owning process cleanly; the operating system releases its lock automatically.
+If corruption is suspected, back up the palace and run integrity/repair
+operations offline, with no writable service running.
+
 ## Follow-up PRs
 
 Hook-triggered writes now consume this policy; see

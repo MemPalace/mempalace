@@ -26,7 +26,11 @@ from .backends import (
     resolve_backend_for_palace,
 )
 from .backends.embedding_wrapper import EmbeddingCollection
-from .entity_detector import _apply_known_systems_prepass, _get_coca_filter
+from .entity_detector import (
+    _apply_known_systems_prepass,
+    _collapse_long_ascii_runs,
+    _get_coca_filter,
+)
 
 logger = logging.getLogger("mempalace_mcp")
 
@@ -74,6 +78,23 @@ NORMALIZE_VERSION = 2
 # process, so the identity check (one metadata read) runs at most once per
 # collection per run — keeps the hot get_collection path cheap.
 _VALIDATED_IDENTITY: set = set()
+
+
+def clear_validated_embedder_identity(palace_path: Optional[str] = None) -> None:
+    """Drop cached embedder-identity verdicts so the next open re-checks.
+
+    Read-only opens of an empty collection can mark a key as validated without
+    recording identity on disk (``create=False``). When MCP later promotes that
+    reader to a writable owner, the writable open must re-run enforcement so
+    the first drawers still get labelled with the active model.
+    """
+    if palace_path is None:
+        _VALIDATED_IDENTITY.clear()
+        return
+    palace_key = str(palace_path)
+    stale = [key for key in _VALIDATED_IDENTITY if key and key[0] == palace_key]
+    for key in stale:
+        _VALIDATED_IDENTITY.discard(key)
 
 
 def _enforce_embedder_identity(collection, palace_path, collection_name, *, create) -> None:
@@ -138,10 +159,29 @@ def _enforce_embedder_identity(collection, palace_path, collection_name, *, crea
         return
 
     if state == "unknown" and stored is None:
+        # Preflight HNSW divergence before touching count(): this is the
+        # universal chokepoint every tool passes through via
+        # get_collection(), and count() on a diverged segment can raise
+        # chromadb's rust-level pyo3_runtime.PanicException or hard-segfault
+        # (#1222) -- neither of which the except Exception below can catch,
+        # since a native crash takes the whole process down regardless of
+        # any Python try/except. A diverged palace must never reach count()
+        # here; this bookkeeping-only identity check simply skips itself
+        # (count treated as unknown, matching the except-Exception fallback
+        # already below) rather than risk the read.
         try:
-            count = collection.count()
+            from .backends.chroma import hnsw_capacity_status
+
+            diverged = hnsw_capacity_status(str(palace_path), str(collection_name)).get("diverged")
         except Exception:
+            diverged = False
+        if diverged:
             count = None
+        else:
+            try:
+                count = collection.count()
+            except Exception:
+                count = None
         if count == 0:
             if create:
                 try:
@@ -165,9 +205,14 @@ def get_collection(
     collection_name: Optional[str] = None,
     create: bool = True,
     backend: Optional[str] = None,
+    read_only: bool = False,
     _skip_identity_check: bool = False,
 ):
     """Get the palace collection through the backend layer.
+
+    ``read_only=True`` asks local backends to open storage without schema
+    initialization, migrations, or metadata writes. Backends that support a
+    genuine read-only mode receive it through the backend ``options`` mapping.
 
     ``_skip_identity_check`` bypasses the embedder-identity enforcement so the
     ``set-embedder`` override path can open a palace whose recorded model
@@ -179,20 +224,52 @@ def get_collection(
         collection_name = get_configured_collection_name()
     backend_obj = get_backend_for_palace(palace_path, explicit=backend)
     palace_ref = PalaceRef(id=palace_path, local_path=palace_path)
+    backend_options = {"read_only": True} if read_only else None
+    preferred_kwargs = {
+        "palace": palace_ref,
+        "collection_name": collection_name,
+        "create": create,
+    }
+    if backend_options is not None:
+        preferred_kwargs["options"] = backend_options
     try:
-        collection = backend_obj.get_collection(
-            palace=palace_ref,
-            collection_name=collection_name,
-            create=create,
-        )
+        collection = backend_obj.get_collection(**preferred_kwargs)
     except TypeError as exc:
-        if "unexpected keyword argument 'palace'" not in str(exc):
+        msg = str(exc)
+        # Plugin backends may still use the pre-options signature. Drop
+        # ``options`` first so read_only degrades gracefully instead of
+        # hard-failing TypeError on third-party entry points.
+        if backend_options is not None and "options" in msg:
+            preferred_kwargs.pop("options", None)
+            try:
+                collection = backend_obj.get_collection(**preferred_kwargs)
+            except TypeError as nested:
+                if "unexpected keyword argument 'palace'" not in str(nested):
+                    raise
+                collection = backend_obj.get_collection(
+                    palace_path,
+                    collection_name=collection_name,
+                    create=create,
+                )
+        elif "unexpected keyword argument 'palace'" not in msg:
             raise
-        collection = backend_obj.get_collection(
-            palace_path,
-            collection_name=collection_name,
-            create=create,
-        )
+        else:
+            legacy_kwargs = {
+                "collection_name": collection_name,
+                "create": create,
+            }
+            if backend_options is not None:
+                legacy_kwargs["options"] = backend_options
+            try:
+                collection = backend_obj.get_collection(palace_path, **legacy_kwargs)
+            except TypeError as nested:
+                if backend_options is None or "options" not in str(nested):
+                    raise
+                collection = backend_obj.get_collection(
+                    palace_path,
+                    collection_name=collection_name,
+                    create=create,
+                )
     if "requires_explicit_embeddings" in getattr(backend_obj, "capabilities", frozenset()):
         collection = EmbeddingCollection(collection)
     if not _skip_identity_check:
@@ -330,6 +407,29 @@ def resolve_backend_name(palace_path: str, explicit: Optional[str] = None) -> st
             f"but {selected!r} was selected"
         )
     return selected
+
+
+_MULTI_PROCESS_WRITER_BACKENDS = frozenset({"pgvector", "qdrant"})
+
+
+def backend_requires_single_writer(backend_name: str) -> bool:
+    """Return whether a backend needs one process-lifetime writer owner.
+
+    Local file-backed backends cannot safely coordinate independent long-lived
+    clients by serializing only individual calls: each process may retain
+    SQLite/WAL, FTS, or vector-index state across operations. Unknown and
+    plugin backends are treated conservatively. Only backends whose storage
+    service is explicitly responsible for cross-process concurrency opt out.
+    """
+    normalized = backend_name.strip().lower()
+    if normalized == "milvus":
+        # Only embedded Milvus Lite is local single-writer storage. A remote
+        # Milvus server or Zilliz Cloud coordinates concurrent clients itself.
+        from .backends.milvus import milvus_uri_is_server
+        from .config import MempalaceConfig
+
+        return not milvus_uri_is_server(MempalaceConfig().milvus_uri)
+    return normalized not in _MULTI_PROCESS_WRITER_BACKENDS
 
 
 def get_backend_for_palace(palace_path: str, explicit: Optional[str] = None):
@@ -530,9 +630,12 @@ def _candidate_entity_words(text: str) -> list:
             except re.error:
                 continue
         _CANDIDATE_RX_CACHE = rxs
+    # Defuse ReDoS on long ASCII blobs before matching (#2063); see
+    # entity_detector._collapse_long_ascii_runs.
+    stripped = _collapse_long_ascii_runs(text)
     words = []
     for rx in _CANDIDATE_RX_CACHE:
-        words.extend(rx.findall(text))
+        words.extend(rx.findall(stripped))
     return words
 
 
@@ -1214,10 +1317,26 @@ mine_global_lock = mine_palace_lock
 
 
 def _metadata_matches_extract_mode(meta: dict, extract_mode: Optional[str]) -> bool:
+    """Scope a drawer to a convo-miner extraction mode.
+
+    A missing ``extract_mode`` is treated as a legacy exchange-mode row
+    ONLY when the drawer is otherwise convo_miner's own (no ``ingest_mode``
+    at all -- pre-``ingest_mode``-schema convo drawers -- or the convo
+    miner's own ``"convos"`` tag). A drawer from a different producer that
+    never set ``extract_mode`` because it was never meant to carry one --
+    e.g. the sweeper's ``ingest_mode="sweep"`` rows -- must not match: the
+    legacy-compat rule otherwise scoops every sweeper drawer for a shared
+    transcript into convo_miner's default "exchange" purge/idempotency
+    scope and silently deletes them on the very next re-mine (#104).
+    """
     if extract_mode is None:
         return True
     stored_mode = meta.get("extract_mode")
-    return stored_mode == extract_mode or (extract_mode == "exchange" and stored_mode is None)
+    if stored_mode == extract_mode:
+        return True
+    if stored_mode is not None:
+        return False
+    return extract_mode == "exchange" and meta.get("ingest_mode") in (None, "convos")
 
 
 def file_already_mined(
@@ -1351,3 +1470,61 @@ def prefetch_mined_set(
     except Exception:
         logger.warning("prefetch_mined_set: partial fetch, %d files loaded", len(mined))
     return mined
+
+
+def prefetch_content_hashes(
+    collection, extract_mode: Optional[str] = None
+) -> dict[tuple[str, str], str]:
+    """Pre-fetch (wing, content_hash) -> source_file for drawers already
+    filed at the current NORMALIZE_VERSION, in one bulk pass.
+
+    Repeated exports from Claude/ChatGPT land under a new filename each run
+    (timestamped bundle, regenerated slug, etc.) even when the conversation
+    itself hasn't changed. `prefetch_mined_set` only recognizes a file as
+    already-mined by its exact path, so the same conversation re-exported
+    under a new path always looked "new" and got re-mined as a duplicate
+    drawer. This does the same bulk scan but keyed on the SHA-256 of the
+    normalized transcript text, so the convo miner can recognize "this exact
+    conversation is already filed under a different path" and skip it.
+
+    Keyed by (wing, content_hash) rather than content_hash alone — mining
+    the same transcript into a second wing is a deliberate re-file, not a
+    duplicate, and should produce real drawers in that wing rather than
+    just the registry sentinel.
+
+    A drawer's ``content_hash`` metadata may hold several comma-joined
+    SHA-256 hashes: a privacy-export bundle normalizes to one conversation
+    per drawer set, but the hash is computed per conversation so that a
+    re-export with one new conversation added doesn't change the hash of
+    the ones that didn't. Only the first source_file seen for a given
+    (wing, hash) pair is kept — good enough to detect and skip a repeat,
+    the point is not to track every alias.
+    """
+    hashes: dict[tuple[str, str], str] = {}
+    try:
+        total = collection.count()
+        offset = 0
+        while offset < total:
+            batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
+            for meta in batch["metadatas"]:
+                meta = meta or {}
+                content_hash_field = meta.get("content_hash")
+                src = meta.get("source_file")
+                wing = meta.get("wing")
+                if not content_hash_field or not src or not wing:
+                    continue
+                if not _metadata_matches_extract_mode(meta, extract_mode):
+                    continue
+                version = meta.get("normalize_version", 1)
+                if version < NORMALIZE_VERSION:
+                    continue
+                for content_hash in content_hash_field.split(","):
+                    key = (wing, content_hash)
+                    if content_hash and key not in hashes:
+                        hashes[key] = src
+            if not batch["ids"]:
+                break
+            offset += len(batch["ids"])
+    except Exception:
+        logger.warning("prefetch_content_hashes: partial fetch, %d hashes loaded", len(hashes))
+    return hashes

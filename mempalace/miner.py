@@ -2138,7 +2138,7 @@ def status(palace_path: str):
     un-bootstrapped collection, or an unexpected schema); the fallback also
     emits the state-specific guidance for absent/empty palaces.
     """
-    from .backends.chroma import _sqlite_wing_room_counts
+    from .backends.chroma import _sqlite_wing_room_counts, hnsw_capacity_status
 
     counts = _sqlite_wing_room_counts(palace_path, "mempalace_drawers")
     if counts is not None:
@@ -2148,6 +2148,17 @@ def status(palace_path: str):
 
     col = _open_collection_or_explain(palace_path)
     if col is None:
+        return
+
+    # Preflight HNSW divergence before falling back to the ChromaDB client
+    # path: count() on a diverged segment can hit the #1222 SIGSEGV/panic
+    # class, which a try/except around count() cannot catch. This fallback
+    # only runs when the direct sqlite read above was unavailable, so it's
+    # the one place in this function that still touches count() directly.
+    capacity_info = hnsw_capacity_status(palace_path, "mempalace_drawers")
+    if capacity_info.get("diverged"):
+        print(f"\n  HNSW index is diverged: {capacity_info.get('message', '')}")
+        print("  Run `mempalace repair --mode from-sqlite --archive-existing` first.")
         return
 
     # Count by wing and room — paginate to avoid SQLite "too many SQL
