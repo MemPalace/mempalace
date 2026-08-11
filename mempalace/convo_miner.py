@@ -28,7 +28,7 @@ from .ids import (
     make_convo_sentinel_id,
     make_exchange_drawer_id,
 )
-from .normalize import normalize_conversations
+from .normalize import MAX_STREAMING_JSONL_FILE_SIZE, normalize_conversations
 from .entities import entities_metadata
 from .palace import (
     NORMALIZE_VERSION,
@@ -166,13 +166,15 @@ _LINE_GROUP_SIZE = 25  # lines per fallback group when no paragraph breaks
 _LINE_FALLBACK_MIN_NEWLINES = 20  # trigger line-group fallback above this newline count
 DRAWER_UPSERT_BATCH_SIZE = 1000
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB — skip files larger than this.
-# Matches miner.py at 500 MB. Long Claude Code sessions, multi-year
-# ChatGPT exports, and lifetime Slack dumps routinely exceed 10 MB; the
-# cap at that level silently dropped them with `continue`. Per-drawer
-# size is bounded by CHUNK_SIZE, but larger source files still produce
-# more drawers and therefore more embedding/storage work — and content
-# is normalized and loaded fully into memory before chunking, so memory
-# use also scales with source size.
+# Matches miner.py for formats that still require whole-file reads. Known
+# JSONL formats use a bounded streaming normalizer and can safely use its
+# larger limit without admitting multi-gigabyte JSON bundles or plain text.
+
+
+def _source_file_size_limit(filepath: Path) -> int:
+    if filepath.suffix.lower() == ".jsonl":
+        return MAX_STREAMING_JSONL_FILE_SIZE
+    return MAX_FILE_SIZE
 
 
 def _path_within_root(path: Path, root: Path) -> bool:
@@ -201,7 +203,7 @@ def _is_regular_source_file(filepath: Path, root: Path) -> bool:
                 raise
             fd = os.open(filepath, flags & ~getattr(os, "O_NONBLOCK", 0))
         st = os.fstat(fd)
-        return stat.S_ISREG(st.st_mode) and st.st_size <= MAX_FILE_SIZE
+        return stat.S_ISREG(st.st_mode) and st.st_size <= _source_file_size_limit(filepath)
     except OSError:
         return False
     finally:
@@ -565,10 +567,11 @@ def scan_convos(convo_dir: str, include_subagents: bool = False) -> list:
                         )
                         continue
                     file_size = file_stat.st_size
-                    if file_size > MAX_FILE_SIZE:
+                    file_size_limit = _source_file_size_limit(filepath)
+                    if file_size > file_size_limit:
                         print(
                             f"  SKIP: {filepath.name} ({file_size / (1024 * 1024):.1f} MB)"
-                            f" exceeds {MAX_FILE_SIZE // (1024 * 1024)} MB limit",
+                            f" exceeds {file_size_limit // (1024 * 1024)} MB limit",
                             file=sys.stderr,
                         )
                         continue

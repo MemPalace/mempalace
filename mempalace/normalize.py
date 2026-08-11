@@ -24,14 +24,18 @@ import json
 import os
 import re
 import stat
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Iterable, Iterator, Optional, TextIO
 
 # Provenance footer appended to Slack transcript output so downstream consumers
 # know the speaker roles are positionally assigned, not verified.
 _SLACK_PROVENANCE_FOOTER = (
     "\n[source: slack-export | multi-party chat — speaker roles are positional, not verified]"
 )
+
+MAX_IN_MEMORY_FILE_SIZE = 500 * 1024 * 1024
+MAX_STREAMING_JSONL_FILE_SIZE = 2 * 1024 * 1024 * 1024
 
 
 # ─── Noise stripping ─────────────────────────────────────────────────────
@@ -116,11 +120,11 @@ def strip_noise(text: str) -> str:
     return text.strip()
 
 
-def _read_transcript_file(filepath: str) -> str:
-    """Read a transcript source file with the same safety checks normalize()
-    and normalize_conversations() both need: no symlinks, regular files only,
-    size-capped, BOM-tolerant.
-    """
+@contextmanager
+def _open_transcript_file(
+    filepath: str, max_file_size: int = MAX_IN_MEMORY_FILE_SIZE
+) -> Iterator[TextIO]:
+    """Open a transcript source with the shared safety checks applied."""
     # O_NONBLOCK keeps the "not a regular file" check below reachable: a
     # blocking open of a FIFO waits in the kernel for a writer, so the
     # S_ISREG test never runs. See ``miner._read_text_no_follow``, including
@@ -141,12 +145,15 @@ def _read_transcript_file(filepath: str) -> str:
             # Text stays prefix-free: this raise is inside the ``try``, so the
             # ``except OSError`` below composes "Could not read <path>: ...".
             raise IOError("not a regular file")
-        if file_stat.st_size > 500 * 1024 * 1024:  # 500 MB safety limit
+        if file_stat.st_size > max_file_size:
             # Prefix-free for the same reason as the branch above.
-            raise IOError(f"file too large ({file_stat.st_size // (1024 * 1024)} MB)")
+            raise IOError(
+                f"file too large ({file_stat.st_size // (1024 * 1024)} MB; "
+                f"limit {max_file_size // (1024 * 1024)} MB)"
+            )
         with os.fdopen(fd, "r", encoding="utf-8-sig", errors="replace") as f:
             fd = -1
-            return f.read()
+            yield f
     except OSError as e:
         raise IOError(f"Could not read {filepath}: {e}") from e
     finally:
@@ -157,11 +164,23 @@ def _read_transcript_file(filepath: str) -> str:
                 pass
 
 
+def _read_transcript_file(filepath: str) -> str:
+    """Read a validated transcript source into memory."""
+    with _open_transcript_file(filepath) as f:
+        return f.read()
+
+
 def normalize(filepath: str) -> str:
     """
     Load a file and normalize to transcript format if it's a chat export.
     Plain text files pass through unchanged.
     """
+    ext = Path(filepath).suffix.lower()
+    if ext == ".jsonl":
+        normalized = _try_normalize_jsonl_file(filepath)
+        if normalized:
+            return normalized
+
     content = _read_transcript_file(filepath)
 
     if not content.strip():
@@ -175,7 +194,6 @@ def normalize(filepath: str) -> str:
     # Try JSON normalization. strip_noise is applied inside the Claude Code
     # JSONL parser (the only format that injects system tags/hook chrome);
     # other formats pass through verbatim.
-    ext = Path(filepath).suffix.lower()
     if ext in (".json", ".jsonl") or content.strip()[:1] in ("{", "["):
         normalized = _try_normalize_json(content)
         if normalized:
@@ -204,6 +222,12 @@ def normalize_conversations(filepath: str) -> list:
     always normalize to one conversation, so this returns a one-element
     list for those — identical dedup granularity to before.
     """
+    ext = Path(filepath).suffix.lower()
+    if ext == ".jsonl":
+        normalized = _try_normalize_jsonl_file(filepath)
+        if normalized:
+            return [normalized]
+
     content = _read_transcript_file(filepath)
 
     if not content.strip():
@@ -213,7 +237,6 @@ def normalize_conversations(filepath: str) -> list:
     if sum(1 for line in lines if line.strip().startswith(">")) >= 3:
         return [content]
 
-    ext = Path(filepath).suffix.lower()
     if ext in (".json", ".jsonl") or content.strip()[:1] in ("{", "["):
         split = _try_normalize_json_split(content)
         if split:
@@ -278,13 +301,65 @@ def _try_normalize_json_split(content: str) -> Optional[list]:
     return None
 
 
+def _try_normalize_jsonl_file(filepath: str) -> Optional[str]:
+    """Try known JSONL schemas without loading the complete file.
+
+    A bounded preflight selects a parser from the format's required header or
+    message shape, then that parser consumes a fresh validated stream. Unknown
+    JSONL still falls back to the regular read path so plain-text pass-through
+    is unchanged.
+    """
+    with _open_transcript_file(filepath, MAX_STREAMING_JSONL_FILE_SIZE) as lines:
+        parser = _detect_jsonl_line_parser(lines)
+    if parser is None:
+        return None
+    with _open_transcript_file(filepath, MAX_STREAMING_JSONL_FILE_SIZE) as lines:
+        return parser(lines)
+
+
+def _detect_jsonl_line_parser(
+    lines: Iterable[str],
+) -> Optional[Callable[[Iterable[str]], Optional[str]]]:
+    """Select a JSONL parser from at most the first 1,000 records."""
+    for line_number, raw_line in enumerate(lines):
+        if line_number >= 1000:
+            break
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+
+        entry_type = entry.get("type", "")
+        if entry_type == "session_meta":
+            return _try_codex_jsonl_lines
+        if entry_type == "session_metadata":
+            return _try_gemini_jsonl_lines
+        if entry_type == "session" and "version" in entry:
+            return _try_pi_jsonl_lines
+        if entry_type in ("human", "user", "assistant") and isinstance(entry.get("message"), dict):
+            return _try_claude_code_jsonl_lines
+    return None
+
+
 def _try_claude_code_jsonl(content: str) -> Optional[str]:
     """Claude Code JSONL sessions."""
-    lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
+    return _try_claude_code_jsonl_lines(content.split("\n"))
+
+
+def _try_claude_code_jsonl_lines(lines: Iterable[str]) -> Optional[str]:
+    """Parse Claude Code JSONL from an iterable of lines."""
     messages = []
     tool_use_map = {}  # tool_use_id → tool_name
 
-    for line in lines:
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
         try:
             entry = json.loads(line)
         except json.JSONDecodeError:
@@ -347,10 +422,17 @@ def _try_codex_jsonl(content: str) -> Optional[str]:
     the canonical conversation turns. response_item entries are skipped because
     they include synthetic context injections and duplicate the real messages.
     """
-    lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
+    return _try_codex_jsonl_lines(content.split("\n"))
+
+
+def _try_codex_jsonl_lines(lines: Iterable[str]) -> Optional[str]:
+    """Parse OpenAI Codex CLI JSONL from an iterable of lines."""
     messages = []
     has_session_meta = False
-    for line in lines:
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
         try:
             entry = json.loads(line)
         except json.JSONDecodeError:
@@ -406,10 +488,17 @@ def _try_gemini_jsonl(content: str) -> Optional[str]:
     single message's content array are concatenated in order, separated
     by newlines.
     """
-    lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
+    return _try_gemini_jsonl_lines(content.split("\n"))
+
+
+def _try_gemini_jsonl_lines(lines: Iterable[str]) -> Optional[str]:
+    """Parse Gemini CLI JSONL from an iterable of lines."""
     messages = []
     has_session_metadata = False
-    for line in lines:
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
         try:
             entry = json.loads(line)
         except json.JSONDecodeError:
@@ -467,10 +556,17 @@ def _try_pi_jsonl(content: str) -> Optional[str]:
 
     Format documented at github.com/badlogic/pi-mono session.md.
     """
-    lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
+    return _try_pi_jsonl_lines(content.split("\n"))
+
+
+def _try_pi_jsonl_lines(lines: Iterable[str]) -> Optional[str]:
+    """Parse Pi agent JSONL from an iterable of lines."""
     messages = []
     has_session_header = False
-    for line in lines:
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
         try:
             entry = json.loads(line)
         except json.JSONDecodeError:
