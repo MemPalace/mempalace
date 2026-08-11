@@ -19,6 +19,7 @@ Supported:
 No API key. No internet. Everything local.
 """
 
+import errno
 import json
 import os
 import re
@@ -120,17 +121,29 @@ def _read_transcript_file(filepath: str) -> str:
     and normalize_conversations() both need: no symlinks, regular files only,
     size-capped, BOM-tolerant.
     """
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    # O_NONBLOCK keeps the "not a regular file" check below reachable: a
+    # blocking open of a FIFO waits in the kernel for a writer, so the
+    # S_ISREG test never runs. See ``miner._read_text_no_follow``, including
+    # why the EAGAIN branch re-checks the type and retries without the flag.
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     if os.path.islink(filepath):
         raise IOError(f"Could not read {filepath}: symlinked files are skipped")
     fd = -1
     try:
-        fd = os.open(filepath, flags)
+        try:
+            fd = os.open(filepath, flags)
+        except OSError as exc:
+            if exc.errno != errno.EAGAIN or not stat.S_ISREG(os.lstat(filepath).st_mode):
+                raise
+            fd = os.open(filepath, flags & ~getattr(os, "O_NONBLOCK", 0))
         file_stat = os.fstat(fd)
         if not stat.S_ISREG(file_stat.st_mode):
-            raise IOError(f"Could not read {filepath}: not a regular file")
+            # Text stays prefix-free: this raise is inside the ``try``, so the
+            # ``except OSError`` below composes "Could not read <path>: ...".
+            raise IOError("not a regular file")
         if file_stat.st_size > 500 * 1024 * 1024:  # 500 MB safety limit
-            raise IOError(f"File too large ({file_stat.st_size // (1024 * 1024)} MB): {filepath}")
+            # Prefix-free for the same reason as the branch above.
+            raise IOError(f"file too large ({file_stat.st_size // (1024 * 1024)} MB)")
         with os.fdopen(fd, "r", encoding="utf-8-sig", errors="replace") as f:
             fd = -1
             return f.read()

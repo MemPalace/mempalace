@@ -30,6 +30,7 @@ Usage (from CLI):
 """
 
 import argparse
+import errno
 import os
 import shutil
 import sqlite3
@@ -62,10 +63,29 @@ def _no_follow_flag() -> int:
     return getattr(os, "O_NOFOLLOW", 0)
 
 
+def _non_blocking_flag() -> int:
+    """Return O_NONBLOCK, or 0 where the platform has no such flag (Windows).
+
+    Without it the ``S_ISREG`` refusal in ``_open_regular_file_no_follow``
+    is unreachable for a FIFO: opening one for reading blocks in the kernel
+    until a writer appears, so ``repair`` would wedge instead of refusing.
+    """
+    return getattr(os, "O_NONBLOCK", 0)
+
+
 def _open_regular_file_no_follow(path: str) -> int:
     if os.path.islink(path):
         raise RuntimeError(f"Refusing symlinked file: {path}")
-    fd = os.open(path, os.O_RDONLY | _no_follow_flag())
+    flags = os.O_RDONLY | _no_follow_flag() | _non_blocking_flag()
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        # EAGAIN here is a write-lease break, which the kernel grants on
+        # regular files only, so re-check the type and open the way this
+        # helper did before the flag existed. Anything else propagates.
+        if exc.errno != errno.EAGAIN or not stat.S_ISREG(os.lstat(path).st_mode):
+            raise
+        fd = os.open(path, flags & ~_non_blocking_flag())
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):

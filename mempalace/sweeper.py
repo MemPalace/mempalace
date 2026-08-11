@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import json
 import logging
+import stat
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -101,7 +102,16 @@ def parse_claude_jsonl(path: str) -> Iterator[dict]:
     queue-operation, last-prompt) are filtered out. Malformed lines are
     skipped silently — data quality is the transcript writer's problem,
     not ours.
+
+    Raises ``OSError`` when ``path`` is not a regular file. ``rglob`` in
+    ``sweep_directory`` lists a FIFO named ``session.jsonl`` like any
+    other match, and opening one for reading blocks in the kernel until a
+    writer appears — an unbounded hang for the whole sweep. ``stat`` never
+    blocks on one, and it raises for a missing path exactly as ``open``
+    did before, so callers see the same error for the same mistake.
     """
+    if not stat.S_ISREG(Path(path).stat().st_mode):
+        raise OSError(f"Refusing non-regular file: {path}")
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
             line = line.strip()
@@ -337,6 +347,27 @@ def sweep_directory(dir_path: str, palace_path: str) -> dict:
 
     failures: list[dict] = []
     for f in files:
+        # A non-regular match is not a sweep failure, it is nothing to sweep.
+        # ``rglob`` lists a FIFO or a symlink to /dev/null like any other
+        # ``*.jsonl``; report it the way ``miner.scan_project`` reports one
+        # and leave ``failures`` (and the exit status) for real errors.
+        # ``parse_claude_jsonl`` still refuses one, for callers arriving by
+        # another route.
+        try:
+            regular = stat.S_ISREG(f.stat().st_mode)
+        except OSError as exc:
+            # A stat that FAILS is a real error, not a benign type. A dangling
+            # symlink, a symlink loop and a file unlinked between rglob and
+            # here all land here, and every one of them used to reach ``open``
+            # and be booked below. Keep booking them, or ``sweep`` reports
+            # success on a transcript it could not read.
+            logger.error("sweeper: stat failed on %s: %s", f, exc)
+            print(f"  WARNING: stat failed on {f}: {exc}", file=sys.stderr)
+            failures.append({"file": str(f), "error": str(exc)})
+            continue
+        if not regular:
+            print(f"  SKIP: {f.name} (not a regular file)", file=sys.stderr)
+            continue
         try:
             result = sweep(str(f), palace_path, source_label=str(f))
         except Exception as exc:

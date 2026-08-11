@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- **Ingest commands no longer hang on a named pipe.** A FIFO carrying a mined suffix (`notes.md`, `session.jsonl`) parked `mine`, `mine --mode convos`, `sweep`, `init`, `compress` and `split` in a blocking `open()` forever, because every reader decided by name and checked the file type only after opening. The four affected opens now pass `O_NONBLOCK` so the `S_ISREG` refusal already written there is reachable, and the discovery walks drop non-regular entries with a `SKIP: <name> (not a regular file)` line. (#2221)
+
 ---
 
 ## [3.7.0] — 2026-08-11

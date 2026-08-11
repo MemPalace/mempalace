@@ -26,6 +26,7 @@ import argparse
 import json
 import os
 import re
+import stat
 from pathlib import Path
 
 HOME = Path.home()
@@ -223,6 +224,14 @@ def split_file(filepath, output_dir, dry_run=False):
         if dry_run:
             print(f"  [{i + 1}/{len(boundaries) - 1}] {name}  ({len(chunk)} lines)")
         else:
+            # The gate in ``main`` covers the files the glob listed; this name
+            # is built here, so nothing has vetted it. Opening a pre-existing
+            # FIFO for writing blocks in the kernel until a reader appears.
+            # ``os.path`` rather than ``Path``: neither call can raise, so a
+            # write that fails still fails at ``write_text`` as it always did.
+            if os.path.exists(out_path) and not os.path.isfile(out_path):
+                print(f"  SKIP: {name} (not a regular file)")
+                continue
             out_path.write_text("".join(chunk), encoding="utf-8")
             print(f"  + {name}  ({len(chunk)} lines)")
 
@@ -272,7 +281,14 @@ def main():
     mega_files = []
     max_scan_size = 500 * 1024 * 1024  # 500 MB
     for f in files:
-        if f.stat().st_size > max_scan_size:
+        file_stat = f.stat()
+        # ``glob`` lists a FIFO named ``x.txt`` like any other match, and
+        # read_text() on one blocks in the kernel until a writer appears.
+        # stat() never blocks, so the type decides before the open does.
+        if not stat.S_ISREG(file_stat.st_mode):
+            print(f"  SKIP: {f.name} (not a regular file)")
+            continue
+        if file_stat.st_size > max_scan_size:
             print(f"  SKIP: {f.name} exceeds {max_scan_size // (1024 * 1024)} MB limit")
             continue
         lines = f.read_text(errors="replace").splitlines(keepends=True)

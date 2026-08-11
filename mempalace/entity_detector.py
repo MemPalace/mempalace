@@ -628,6 +628,13 @@ def detect_entities(
         if files_read >= max_files:
             break
         try:
+            # Decide by file type before opening: ``scan_for_detection``
+            # picks candidates by extension, so a FIFO named ``notes.md``
+            # reaches this loop and a blocking open of one waits in the
+            # kernel for a writer that may never come. ``is_file()`` stats
+            # instead of opening and never blocks.
+            if not Path(filepath).is_file():
+                continue
             with open(filepath, encoding="utf-8", errors="replace") as f:
                 content = f.read(MAX_BYTES_PER_FILE)
             all_text.append(content)

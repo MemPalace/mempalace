@@ -7,6 +7,7 @@ Routes each file to the right room based on content.
 Stores verbatim chunks as drawers. No summaries. Ever.
 """
 
+import errno
 import os
 import re
 import sys
@@ -60,10 +61,30 @@ def _path_within_root(path: Path, root: Path) -> bool:
 def _read_text_no_follow(filepath: Path, root: Path) -> Optional[str]:
     if not _path_within_root(filepath, root):
         return None
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    # O_NONBLOCK is what makes the S_ISREG check below reachable. Opening a
+    # FIFO for reading parks in the kernel until a writer shows up, so
+    # without it the fstat never runs and a named pipe carrying a
+    # READABLE_EXTENSIONS suffix wedges the mine forever. With it the open
+    # returns immediately and the *file type* decides — no errno guesswork,
+    # and a FIFO that does have a live writer is rejected just the same.
+    # Linux open(2): "this flag has no effect for regular files and block
+    # devices". POSIX leaves it unspecified outside FIFOs and special files,
+    # and one Linux case is not a no-op — see the EAGAIN branch below.
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     fd = -1
     try:
-        fd = os.open(filepath, flags)
+        try:
+            fd = os.open(filepath, flags)
+        except OSError as exc:
+            # A reader that breaks a write lease gets EAGAIN when it passes
+            # O_NONBLOCK, where a blocking open waits out lease-break-time
+            # and succeeds. The kernel grants leases on regular files only
+            # (F_SETLEASE on a pipe fails EINVAL), so re-check the type and
+            # then read it the way this code did before the flag existed;
+            # dropping it would silently lose a file that used to be mined.
+            if exc.errno != errno.EAGAIN or not stat.S_ISREG(os.lstat(filepath).st_mode):
+                raise
+            fd = os.open(filepath, flags & ~getattr(os, "O_NONBLOCK", 0))
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_FILE_SIZE:
             return None
@@ -486,10 +507,14 @@ def load_config(project_dir: str) -> dict:
 
     resolved_project_dir = Path(project_dir).expanduser().resolve()
     config_path = resolved_project_dir / "mempalace.yaml"
-    if not config_path.exists():
+    # ``is_file()`` rather than ``exists()``: the latter is true for a FIFO,
+    # and the ``open`` at the end of this function would then block in the
+    # kernel until a writer appears. A config that is not a regular file is
+    # treated as absent, which lands on the auto-detected defaults below.
+    if not config_path.is_file():
         # Fallback to legacy name
         legacy_path = resolved_project_dir / "mempal.yaml"
-        if legacy_path.exists():
+        if legacy_path.is_file():
             config_path = legacy_path
         else:
             from .config import normalize_wing_name
@@ -1708,7 +1733,19 @@ def scan_project(
             # match the SKIP: (symlink) line above; silent drops at this
             # gate were the original #923 complaint.
             try:
-                file_size = filepath.stat().st_size
+                file_stat = filepath.stat()
+                # Reject anything that is not a regular file before it can
+                # reach a reader. os.walk lists FIFOs, sockets and device
+                # nodes as plain filenames and the extension filter above
+                # decides by name, so ``notes.md`` can be a named pipe.
+                # stat() itself never blocks on one; opening it can.
+                if not stat.S_ISREG(file_stat.st_mode):
+                    print(
+                        f"  SKIP: {filepath.name} (not a regular file)",
+                        file=sys.stderr,
+                    )
+                    continue
+                file_size = file_stat.st_size
                 if file_size > MAX_FILE_SIZE:
                     print(
                         f"  SKIP: {filepath.name} ({file_size / (1024 * 1024):.1f} MB)"

@@ -8,6 +8,7 @@ Normalizes format, chunks by exchange pair (Q+A = one unit), files to palace.
 Same palace as project mining. Different ingest strategy.
 """
 
+import errno
 import os
 import sys
 import json
@@ -185,10 +186,20 @@ def _path_within_root(path: Path, root: Path) -> bool:
 def _is_regular_source_file(filepath: Path, root: Path) -> bool:
     if not _path_within_root(filepath, root):
         return False
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    # O_NONBLOCK keeps the S_ISREG verdict below reachable: a blocking open
+    # of a FIFO waits in the kernel for a writer, so a named pipe called
+    # ``session.jsonl`` would hang this check instead of failing it. See the
+    # matching comment in ``miner._read_text_no_follow``, including why the
+    # EAGAIN branch re-checks the type and then opens without the flag.
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     fd = -1
     try:
-        fd = os.open(filepath, flags)
+        try:
+            fd = os.open(filepath, flags)
+        except OSError as exc:
+            if exc.errno != errno.EAGAIN or not stat.S_ISREG(os.lstat(filepath).st_mode):
+                raise
+            fd = os.open(filepath, flags & ~getattr(os, "O_NONBLOCK", 0))
         st = os.fstat(fd)
         return stat.S_ISREG(st.st_mode) and st.st_size <= MAX_FILE_SIZE
     except OSError:
@@ -543,7 +554,17 @@ def scan_convos(convo_dir: str, include_subagents: bool = False) -> list:
                 # to stderr to match the SKIP: (symlink) line above; silent
                 # drops at this gate were the original #923 complaint.
                 try:
-                    file_size = filepath.stat().st_size
+                    file_stat = filepath.stat()
+                    # Drop non-regular entries (FIFO, socket, device node)
+                    # before any reader touches them — see the matching
+                    # gate in ``miner.scan_project``.
+                    if not stat.S_ISREG(file_stat.st_mode):
+                        print(
+                            f"  SKIP: {filepath.name} (not a regular file)",
+                            file=sys.stderr,
+                        )
+                        continue
+                    file_size = file_stat.st_size
                     if file_size > MAX_FILE_SIZE:
                         print(
                             f"  SKIP: {filepath.name} ({file_size / (1024 * 1024):.1f} MB)"

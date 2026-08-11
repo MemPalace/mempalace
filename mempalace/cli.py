@@ -131,6 +131,13 @@ def _gather_origin_samples(project_dir) -> list:
         if total_chars >= _PASS_ZERO_TOTAL_CAP:
             break
         try:
+            # ``scan_for_detection`` picks candidates by extension, so a FIFO
+            # named ``notes.md`` reaches this loop; opening one for reading
+            # blocks until a writer appears. ``is_file()`` stats instead.
+            # It belongs inside the try: it raises PermissionError on an
+            # unreadable directory, which the open below used to absorb.
+            if not filepath.is_file():
+                continue
             with open(filepath, encoding="utf-8", errors="replace") as f:
                 content = f.read(_PASS_ZERO_PER_FILE_CAP)
         except OSError:
@@ -263,9 +270,17 @@ def _ensure_mempalace_files_gitignored(project_dir) -> bool:
     if not (project_path / ".git").exists():
         return False
     gitignore = project_path / ".gitignore"
+    # ``exists()`` is true for a FIFO, and both the read below and the append
+    # at the end of this function would block in the kernel on one. Decide by
+    # type instead: an absent file still yields "" as before, a regular one
+    # is read, and anything else is left untouched.
+    if gitignore.exists() and not gitignore.is_file():
+        return False
     # Force UTF-8: Windows defaults to GBK and chokes on non-ASCII .gitignore
     # comments, killing auto-init even though the file is valid UTF-8.
-    existing = gitignore.read_text(encoding="utf-8", errors="replace") if gitignore.exists() else ""
+    existing = (
+        gitignore.read_text(encoding="utf-8", errors="replace") if gitignore.is_file() else ""
+    )
     existing_lines = {line.strip() for line in existing.splitlines()}
     missing = [p for p in _MEMPALACE_PROJECT_FILES if p not in existing_lines]
     if not missing:
@@ -420,9 +435,19 @@ def cmd_init(args):
         if confirmed["people"] or confirmed["projects"] or confirmed.get("topics"):
             project_path = Path(args.dir).expanduser().resolve()
             entities_path = project_path / "entities.json"
-            with open(entities_path, "w", encoding="utf-8") as f:
-                json.dump(confirmed, f, indent=2, ensure_ascii=False)
-            print(f"  Entities saved: {entities_path}")
+            # Opening a pre-existing FIFO for writing blocks in the kernel
+            # until a reader appears. Only a regular file is a valid target
+            # for the per-project audit trail; the global registry merge
+            # below is unaffected either way.
+            if entities_path.exists() and not entities_path.is_file():
+                print(
+                    f"  ! Not writing entities: {entities_path} is not a regular file",
+                    file=sys.stderr,
+                )
+            else:
+                with open(entities_path, "w", encoding="utf-8") as f:
+                    json.dump(confirmed, f, indent=2, ensure_ascii=False)
+                print(f"  Entities saved: {entities_path}")
 
             from .config import normalize_wing_name
             from .miner import add_to_known_entities
@@ -438,7 +463,14 @@ def cmd_init(args):
         print("  No entities detected -- proceeding with directory-based rooms.")
 
     # Pass 2: detect rooms from folder structure
-    detect_rooms_local(project_dir=args.dir, yes=getattr(args, "yes", False))
+    try:
+        detect_rooms_local(project_dir=args.dir, yes=getattr(args, "yes", False))
+    except OSError as exc:
+        # Writing mempalace.yaml is the point of init; a target it cannot
+        # write (a pre-existing pipe, a full disk) is a hard failure, and a
+        # message beats the traceback this used to produce.
+        print(f"\n  ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
     cfg.init()
     backend = _backend_arg(args)
     if backend:
@@ -2219,12 +2251,15 @@ def cmd_compress(args):
     # Load dialect (with optional entity config)
     config_path = args.config
     if not config_path:
+        # ``isfile`` rather than ``exists``: the latter is true for a FIFO,
+        # and ``Dialect.from_config`` opens whatever it is handed, which
+        # blocks in the kernel on a pipe named entities.json in the cwd.
         for candidate in ["entities.json", os.path.join(palace_path, "entities.json")]:
-            if os.path.exists(candidate):
+            if os.path.isfile(candidate):
                 config_path = candidate
                 break
 
-    if config_path and os.path.exists(config_path):
+    if config_path and os.path.isfile(config_path):
         dialect = Dialect.from_config(config_path)
         print(f"  Loaded entity config: {config_path}")
     else:

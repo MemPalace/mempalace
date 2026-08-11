@@ -292,6 +292,11 @@ def save_config(project_dir: str, project_name: str, rooms: list):
         ],
     }
     config_path = Path(project_dir).expanduser().resolve() / "mempalace.yaml"
+    # Opening a pre-existing FIFO for writing blocks in the kernel until a
+    # reader appears. Only a regular file is a valid config target; refuse
+    # loudly rather than park ``init`` with no output.
+    if config_path.exists() and not config_path.is_file():
+        raise OSError(f"Refusing to write config: {config_path} is not a regular file")
     with open(config_path, "w") as f:
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
