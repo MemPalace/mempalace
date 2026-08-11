@@ -1243,6 +1243,82 @@ def test_process_file_uses_bounded_upsert_batches(tmp_path, monkeypatch):
     assert col.batch_sizes == [2, 2, 1]
 
 
+def test_process_file_cleans_partial_drawers_after_a_batch_upsert_failure(tmp_path, monkeypatch):
+    """A failed later batch must not leave mtime-stamped drawers that skip retry (#2122)."""
+    from mempalace import miner
+
+    class FailingCollection:
+        def __init__(self):
+            self.records = []
+            self.upsert_calls = 0
+            self.deleted_sources = []
+
+        def get(self, where=None, limit=None, offset=0, include=None):
+            records = self.records
+            if where and "source_file" in where:
+                records = [
+                    record
+                    for record in records
+                    if record["metadata"]["source_file"] == where["source_file"]
+                ]
+            page = records[offset : offset + (limit or len(records))]
+            return {
+                "ids": [record["id"] for record in page],
+                "metadatas": [record["metadata"] for record in page],
+            }
+
+        def delete(self, where=None):
+            source_file = where.get("source_file") if where else None
+            self.deleted_sources.append(source_file)
+            self.records = [
+                record
+                for record in self.records
+                if record["metadata"]["source_file"] != source_file
+            ]
+
+        def upsert(self, documents, ids, metadatas):
+            self.upsert_calls += 1
+            if self.upsert_calls == 2:
+                raise RuntimeError("simulated second-batch failure")
+            self.records.extend(
+                {"id": drawer_id, "metadata": metadata}
+                for drawer_id, metadata in zip(ids, metadatas)
+            )
+
+    class FakeClosets:
+        def __init__(self):
+            self.deleted_sources = []
+
+        def delete(self, where=None):
+            self.deleted_sources.append(where.get("source_file"))
+
+    source = tmp_path / "src.py"
+    source.write_text("print('hello')\n" * 20, encoding="utf-8")
+    chunks = [{"content": f"chunk {index} " * 20, "chunk_index": index} for index in range(3)]
+    collection = FailingCollection()
+    closets = FakeClosets()
+    monkeypatch.setattr(miner, "DRAWER_UPSERT_BATCH_SIZE", 2)
+    monkeypatch.setattr(miner, "chunk_text", lambda content, source_file, **kwargs: chunks)
+    monkeypatch.setattr(miner, "assert_no_collisions", lambda *args, **kwargs: None)
+
+    with pytest.raises(RuntimeError, match="second-batch failure"):
+        miner.process_file(
+            source,
+            tmp_path,
+            collection,
+            "wing",
+            [{"name": "general", "description": "General"}],
+            "agent",
+            False,
+            closets_col=closets,
+        )
+
+    assert collection.deleted_sources == [str(source), str(source)]
+    assert collection.records == []
+    assert closets.deleted_sources == [str(source)]
+    assert file_already_mined(collection, str(source), check_mtime=True) is False
+
+
 # ── normalize_version schema gate ───────────────────────────────────────
 #
 # When the normalization pipeline changes shape (e.g., strip_noise lands),
