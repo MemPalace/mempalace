@@ -62,6 +62,31 @@ If no closets exist (palace created before this feature) — or all closet hits 
 
 > **BM25 hybrid re-rank** is on the roadmap (deferred to a follow-up PR alongside generic `LLM_*` env-var support); the current closet search ranks purely by ChromaDB cosine distance against the closet text.
 
+### One result per logical source
+
+A closet is evidence that a *source* is relevant; it does not make every
+chunk from that source a separate agent-facing answer. A chunked source can
+have several high-ranking drawer hits. When closet enrichment expands a hit,
+it chooses the query-best chunk from that source and includes its neighbors.
+Applying that enrichment independently to every matching chunk therefore
+produced the same expanded text repeatedly.
+
+Search now keeps the best ranked result for each logical source before
+enrichment. The grouping key is the full `source_file` path plus
+`parent_drawer_id` when present, so unrelated logical drawers that share a
+file name remain separate. Records without a `source_file` remain
+chunk-level results.
+
+To reproduce this regression in a throwaway palace, run:
+
+```bash
+uv run python examples/reproduce_duplicate_hydrated_results.py
+```
+
+Before this behavior was fixed, that example found three results for one
+source and each one hydrated around the same query-best chunk. The expected
+result is now one `drawer+closet` response for that source.
+
 ## Limits
 
 | Setting | Value | Reason |
