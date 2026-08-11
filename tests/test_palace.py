@@ -31,14 +31,24 @@ def test_visible_collection_applies_limit_after_hiding_generations(tmp_path):
     store = SourceLifecycleStore(str(tmp_path / "knowledge_graph.sqlite3"))
     active = store.begin(adapter_name="fixture", source_file="fixture://one", version="v2")
     store.activate(active)
-    raw = _OrderedGetCollection(GetResult(
-        ids=["hidden", "active"],
-        documents=["old", "new"],
-        metadatas=[
-            {"adapter_name": "fixture", "source_file": "fixture://one", "source_generation": "old"},
-            {"adapter_name": "fixture", "source_file": "fixture://one", "source_generation": active.generation},
-        ],
-    ))
+    raw = _OrderedGetCollection(
+        GetResult(
+            ids=["hidden", "active"],
+            documents=["old", "new"],
+            metadatas=[
+                {
+                    "adapter_name": "fixture",
+                    "source_file": "fixture://one",
+                    "source_generation": "old",
+                },
+                {
+                    "adapter_name": "fixture",
+                    "source_file": "fixture://one",
+                    "source_generation": active.generation,
+                },
+            ],
+        )
+    )
     collection = _VisibleDrawersCollection(raw, str(tmp_path))
 
     result = collection.get(where={"source_file": "fixture://one"}, limit=1)

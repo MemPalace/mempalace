@@ -10,7 +10,10 @@ def test_generation_is_invisible_until_activated(tmp_path):
     assert store.active(adapter_name="fixture", source_file="fixture://one") is None
 
     assert store.activate(staged) is None
-    assert store.active(adapter_name="fixture", source_file="fixture://one").generation == staged.generation
+    assert (
+        store.active(adapter_name="fixture", source_file="fixture://one").generation
+        == staged.generation
+    )
 
 
 def test_activation_retires_prior_generation(tmp_path):
@@ -52,7 +55,9 @@ def test_read_only_lookup_does_not_create_lifecycle_schema(tmp_path):
 
     assert store.active(adapter_name="fixture", source_file="fixture://one") is None
     with sqlite3.connect(db_path) as conn:
-        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        tables = {
+            row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
     assert tables == {"existing"}
 
 

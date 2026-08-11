@@ -67,9 +67,7 @@ class _VisibleDrawersCollection:
         if self._lifecycle is None:
             from .sources.lifecycle import SourceLifecycleStore
 
-            self._lifecycle = SourceLifecycleStore(
-                self._lifecycle_db_path, initialize=False
-            )
+            self._lifecycle = SourceLifecycleStore(self._lifecycle_db_path, initialize=False)
         key = (adapter_name, source_file)
         if key not in active_generations:
             active_generations[key] = self._lifecycle.active(
@@ -87,7 +85,9 @@ class _VisibleDrawersCollection:
         result = self._collection.get(**kwargs)
         metas = result.get("metadatas") or []
         active_generations = {}
-        keep = [index for index, meta in enumerate(metas) if self._visible(meta, active_generations)]
+        keep = [
+            index for index, meta in enumerate(metas) if self._visible(meta, active_generations)
+        ]
         # The common path retains the backend's pagination exactly. Only
         # widen when a hidden generation actually consumed the requested
         # window; an exact visible pagination pass then follows below.
@@ -103,11 +103,10 @@ class _VisibleDrawersCollection:
             metas = result.get("metadatas") or []
             active_generations = {}
             keep = [
-                index for index, meta in enumerate(metas)
-                if self._visible(meta, active_generations)
+                index for index, meta in enumerate(metas) if self._visible(meta, active_generations)
             ]
             if requested_limit is not None:
-                keep = keep[requested_offset:requested_offset + requested_limit]
+                keep = keep[requested_offset : requested_offset + requested_limit]
             elif requested_offset:
                 keep = keep[requested_offset:]
         if isinstance(result, GetResult):
@@ -150,7 +149,8 @@ class _VisibleDrawersCollection:
             embeddings = [] if result.embeddings is not None else None
             for batch_index, metas in enumerate(metas_batches):
                 keep = [
-                    index for index, meta in enumerate(metas or [])
+                    index
+                    for index, meta in enumerate(metas or [])
                     if self._visible(meta, active_generations)
                 ]
                 if wanted is not None:
@@ -171,11 +171,16 @@ class _VisibleDrawersCollection:
             )
         for batch_index, metas in enumerate(metas_batches):
             keep = [
-                index for index, meta in enumerate(metas or [])
+                index
+                for index, meta in enumerate(metas or [])
                 if self._visible(meta, active_generations)
             ]
             for key, value in list(result.items()):
-                if isinstance(value, list) and batch_index < len(value) and isinstance(value[batch_index], list):
+                if (
+                    isinstance(value, list)
+                    and batch_index < len(value)
+                    and isinstance(value[batch_index], list)
+                ):
                     result[key][batch_index] = [value[batch_index][index] for index in keep]
                     if wanted is not None:
                         result[key][batch_index] = result[key][batch_index][:wanted]
@@ -184,19 +189,13 @@ class _VisibleDrawersCollection:
     def lexical_search(self, *, query, n_results=10, where=None):
         result = self._collection.lexical_search(query=query, n_results=n_results, where=where)
         active_generations = {}
-        hits = [
-            hit for hit in result.hits
-            if self._visible(hit.metadata, active_generations)
-        ]
+        hits = [hit for hit in result.hits if self._visible(hit.metadata, active_generations)]
         if len(hits) != len(result.hits):
             result = self._collection.lexical_search(
                 query=query, n_results=max(n_results, self._collection.count()), where=where
             )
             active_generations = {}
-            hits = [
-                hit for hit in result.hits
-                if self._visible(hit.metadata, active_generations)
-            ]
+            hits = [hit for hit in result.hits if self._visible(hit.metadata, active_generations)]
         hits = hits[:n_results]
         return LexicalResult(hits=hits)
 
@@ -225,6 +224,7 @@ class _VisibleEmbeddingCollection(EmbeddingCollection):
 
     def __init__(self, collection, palace_path):
         super().__init__(_VisibleDrawersCollection(collection, palace_path))
+
 
 SKIP_DIRS = {
     ".git",
@@ -412,6 +412,7 @@ def get_collection(
     differs from the current one (the very state it exists to repair).
     """
     from .config import get_configured_collection_name
+
     configured_drawer_collection = get_configured_collection_name()
     if collection_name is None:
         collection_name = configured_drawer_collection

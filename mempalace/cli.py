@@ -887,7 +887,7 @@ class _DryRunKnowledgeGraphProxy:
         self.operations.append(("supersede", args, kwargs))
 
 
-def mine_source_adapter(
+def mine_source_adapter(  # noqa: C901 - incremental lifecycle states are deliberately co-located
     *,
     source_name: str,
     source_path: str,
@@ -966,9 +966,11 @@ def mine_source_adapter(
             )
 
             def _existing_source(source_file):
-                active = lifecycle.active(
-                    adapter_name=adapter.name, source_file=source_file
-                ) if lifecycle is not None else None
+                active = (
+                    lifecycle.active(adapter_name=adapter.name, source_file=source_file)
+                    if lifecycle is not None
+                    else None
+                )
                 if active is not None:
                     existing = drawer_collection.get(
                         where={
@@ -1015,14 +1017,6 @@ def mine_source_adapter(
                 nonlocal pending_item, pending_generation
                 if pending_generation is None:
                     return
-                staged = drawer_collection.get(
-                    where={
-                        "$and": [
-                            {"source_file": pending_item.source_file},
-                            {"source_generation": pending_generation.generation},
-                        ]
-                    }
-                )
                 # Switching the registry is the atomic visibility boundary.
                 # Staged rows stay physically marked ``staging`` forever;
                 # ordinary collection views resolve their visibility against
@@ -1030,7 +1024,7 @@ def mine_source_adapter(
                 # of the new item and a failure during cleanup cannot restore
                 # retired content.
                 generation = pending_generation
-                previous = lifecycle.activate(generation)
+                lifecycle.activate(generation)
                 # From this point on the registry is authoritative. A failed
                 # physical cleanup may leave unreachable rows behind, but it
                 # must never trigger the outer rollback path and remove this
@@ -1108,7 +1102,9 @@ def mine_source_adapter(
                                 source_file=result.source_file,
                                 version=result.version,
                             )
-                            context.begin_source_item(result, generation=pending_generation.generation)
+                            context.begin_source_item(
+                                result, generation=pending_generation.generation
+                            )
                         continue
                     warnings.warn(
                         f"Source adapter {adapter_name!r} yielded non-incremental item "

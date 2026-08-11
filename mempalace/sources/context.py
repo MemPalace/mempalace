@@ -80,7 +80,9 @@ class _IncrementalCollectionFacade:
             meta = dict(metadata or {})
             source_file = meta.get("source_file", self._item.source_file)
             if source_file != self._item.source_file:
-                raise ValueError("incremental collection writes must target the current source item")
+                raise ValueError(
+                    "incremental collection writes must target the current source item"
+                )
             chunk_index = meta.get("chunk_index")
             if chunk_index is None:
                 chunk_index = self._next_chunk_index
@@ -89,8 +91,7 @@ class _IncrementalCollectionFacade:
                 self._next_chunk_index = max(self._next_chunk_index, chunk_index + 1)
             if chunk_index in self._seen_chunk_indexes:
                 raise ValueError(
-                    "incremental source item yielded duplicate chunk_index "
-                    f"{chunk_index!r}"
+                    f"incremental source item yielded duplicate chunk_index {chunk_index!r}"
                 )
             self._seen_chunk_indexes.add(chunk_index)
             record = DrawerRecord(
@@ -168,7 +169,9 @@ class PalaceContext:
     # drawer from the last complete generation.
     _current_item: Optional[SourceItemMetadata] = field(default=None, init=False, repr=False)
     _current_generation: Optional[str] = field(default=None, init=False, repr=False)
-    _unscoped_drawer_collection: Optional[_CollectionLike] = field(default=None, init=False, repr=False)
+    _unscoped_drawer_collection: Optional[_CollectionLike] = field(
+        default=None, init=False, repr=False
+    )
 
     # Internal: flag set by :meth:`skip_current_item` and checked by the core
     # mine loop between yields. Not part of the adapter-facing contract; the
