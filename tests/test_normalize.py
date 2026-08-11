@@ -3,6 +3,8 @@ import stat
 from unittest.mock import patch
 
 from mempalace.normalize import (
+    MAX_IN_MEMORY_FILE_SIZE,
+    MAX_STREAMING_JSONL_FILE_SIZE,
     _SLACK_PROVENANCE_FOOTER,
     _extract_content,
     _format_tool_result,
@@ -83,6 +85,82 @@ def test_normalize_whitespace_only(tmp_path):
     f.write_text("   \n  \n  ")
     result = normalize(str(f))
     assert result.strip() == ""
+
+
+def test_known_jsonl_formats_bypass_full_file_read(tmp_path):
+    """Known JSONL schemas use the streaming path in both public entry points."""
+    cases = {
+        "claude.jsonl": (
+            _try_claude_code_jsonl,
+            [
+                {"type": "human", "message": {"content": "Q"}},
+                {"type": "assistant", "message": {"content": "A"}},
+            ],
+        ),
+        "codex.jsonl": (
+            _try_codex_jsonl,
+            [
+                {"type": "session_meta", "payload": {}},
+                {"type": "event_msg", "payload": {"type": "user_message", "message": "Q"}},
+                {"type": "event_msg", "payload": {"type": "agent_message", "message": "A"}},
+            ],
+        ),
+        "gemini.jsonl": (
+            _try_gemini_jsonl,
+            [
+                {"type": "session_metadata", "sessionId": "s"},
+                {"type": "user", "content": [{"text": "Q"}]},
+                {"type": "gemini", "content": [{"text": "A"}]},
+            ],
+        ),
+        "pi.jsonl": (
+            _try_pi_jsonl,
+            [
+                {"type": "session", "version": 1},
+                {"type": "message", "message": {"role": "user", "content": "Q"}},
+                {"type": "message", "message": {"role": "assistant", "content": "A"}},
+            ],
+        ),
+    }
+
+    for filename, (parser, entries) in cases.items():
+        content = "\n".join(json.dumps(entry) for entry in entries)
+        source = tmp_path / filename
+        source.write_text(content, encoding="utf-8")
+        expected = parser(content)
+
+        with patch(
+            "mempalace.normalize._read_transcript_file",
+            side_effect=AssertionError("known JSONL must not be read in full"),
+        ):
+            assert normalize(str(source)) == expected
+            assert normalize_conversations(str(source)) == [expected]
+
+
+def test_known_jsonl_can_exceed_in_memory_limit(tmp_path):
+    """The larger safety rail applies only after a known JSONL schema is detected."""
+    source = tmp_path / "codex.jsonl"
+    source.write_text(
+        "\n".join(
+            json.dumps(entry)
+            for entry in (
+                {"type": "session_meta", "payload": {}},
+                {"type": "event_msg", "payload": {"type": "user_message", "message": "Q"}},
+                {"type": "event_msg", "payload": {"type": "agent_message", "message": "A"}},
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    class _LargeRegularFile:
+        st_mode = stat.S_IFREG | 0o644
+        st_size = MAX_IN_MEMORY_FILE_SIZE + 1
+
+    with patch("mempalace.normalize.os.fstat", return_value=_LargeRegularFile()):
+        result = normalize(str(source))
+
+    assert result.startswith("> Q")
+    assert MAX_STREAMING_JSONL_FILE_SIZE > MAX_IN_MEMORY_FILE_SIZE
 
 
 # ── _extract_content ───────────────────────────────────────────────────
