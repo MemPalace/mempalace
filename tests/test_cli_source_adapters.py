@@ -43,9 +43,39 @@ class _FixtureAdapter(BaseSourceAdapter):
 class _FakeCollection:
     def __init__(self):
         self.upserts = []
+        self.rows = {}
 
     def upsert(self, **kwargs):
         self.upserts.append(kwargs)
+        for drawer_id, document, metadata in zip(
+            kwargs["ids"], kwargs["documents"], kwargs["metadatas"]
+        ):
+            self.rows[drawer_id] = {"document": document, "metadata": metadata}
+
+    def get(self, *, where=None, limit=None, **_kwargs):
+        def matches(row):
+            if not where:
+                return True
+            if "$and" in where:
+                return all(_matches(row["metadata"], clause) for clause in where["$and"])
+            return _matches(row["metadata"], where)
+
+        rows = [(key, value) for key, value in self.rows.items() if matches(value)]
+        if limit is not None:
+            rows = rows[:limit]
+        return {
+            "ids": [key for key, _ in rows],
+            "documents": [value["document"] for _, value in rows],
+            "metadatas": [value["metadata"] for _, value in rows],
+        }
+
+    def delete(self, *, ids=None, **_kwargs):
+        for drawer_id in ids or []:
+            self.rows.pop(drawer_id, None)
+
+
+def _matches(metadata, where):
+    return all(metadata.get(key) == value for key, value in where.items())
 
 
 class _FakeKnowledgeGraph:
@@ -103,7 +133,8 @@ class _IncrementalAdapter(BaseSourceAdapter):
     capabilities = frozenset({"supports_incremental"})
 
     def ingest(self, *, source, palace):
-        raise AssertionError("incremental adapters must be rejected before ingest")
+        yield SourceItemMetadata(source_file="fixture://incremental", version="v1")
+        yield DrawerRecord(content="incremental content", source_file="fixture://incremental")
 
     def describe_schema(self):
         return AdapterSchema(version="1.0", fields={})
@@ -384,15 +415,23 @@ def test_mine_source_dry_run_preserves_initialized_sqlite_exact_artifacts(tmp_pa
     assert after == before
 
 
-def test_mine_source_rejects_incremental_adapter_before_ingest():
-    register("incremental", _IncrementalAdapter)
+def test_mine_source_runs_incremental_adapter(monkeypatch, tmp_path):
+    from mempalace import knowledge_graph, palace
 
-    with pytest.raises(cli.UnsupportedSourceAdapterProtocolError, match="incremental ingestion"):
-        cli.mine_source_adapter(
-            source_name="incremental",
-            source_path="/source",
-            palace_path="/fake/palace",
-        )
+    collection = _FakeCollection()
+    register("incremental", _IncrementalAdapter)
+    monkeypatch.setattr(cli, "MempalaceConfig", _FakeConfig)
+    monkeypatch.setattr(palace, "get_collection", lambda *_a, **_k: collection)
+    monkeypatch.setattr(knowledge_graph, "KnowledgeGraph", _FakeKnowledgeGraph)
+
+    assert cli.mine_source_adapter(
+        source_name="incremental",
+        source_path="/source",
+        palace_path=str(tmp_path),
+    ) == 1
+    metadata = next(iter(collection.rows.values()))["metadata"]
+    assert metadata["source_generation_state"] == "staging"
+    assert metadata["source_version"] == "v1"
 
 
 def test_mine_source_accepts_non_incremental_metadata(monkeypatch, recwarn):

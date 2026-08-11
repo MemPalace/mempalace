@@ -315,6 +315,66 @@ def test_palace_context_skip_current_item_sets_flag():
     assert ctx._skip_requested is True
 
 
+def test_palace_context_generation_namespaces_drawer_ids_and_stamps_version():
+    from mempalace.sources.context import _build_drawer_id
+
+    drawers = _FakeCollection()
+    ctx = PalaceContext(
+        drawer_collection=drawers,
+        knowledge_graph=_FakeKG(),
+        palace_path="/tmp/p",
+        adapter_name="test-adapter",
+        adapter_version="0.1.0",
+    )
+    item = SourceItemMetadata(source_file="fixture://item", version="v2")
+    record = DrawerRecord(content="content", source_file=item.source_file)
+
+    ctx.begin_source_item(item, generation="generation-two")
+    ctx.upsert_drawer(record)
+
+    written = drawers.upserts[0]
+    assert written["ids"][0] != _build_drawer_id(record)
+    assert written["metadatas"][0]["source_generation"] == "generation-two"
+    assert written["metadatas"][0]["source_version"] == "v2"
+
+
+def test_incremental_collection_facade_cannot_overwrite_other_source():
+    drawers = _FakeCollection()
+    ctx = PalaceContext(
+        drawer_collection=drawers,
+        knowledge_graph=_FakeKG(),
+        palace_path="/tmp/p",
+    )
+    item = SourceItemMetadata(source_file="fixture://item", version="v2")
+
+    ctx.begin_source_item(item, generation="generation-two")
+    with pytest.raises(ValueError, match="current source item"):
+        ctx.drawer_collection.upsert(
+            documents=["content"], ids=["malicious-id"], metadatas=[{"source_file": "other"}]
+        )
+
+
+def test_incremental_collection_facade_owns_ids_and_provenance():
+    drawers = _FakeCollection()
+    ctx = PalaceContext(
+        drawer_collection=drawers,
+        knowledge_graph=_FakeKG(),
+        palace_path="/tmp/p",
+    )
+    item = SourceItemMetadata(source_file="fixture://item", version="v2")
+
+    ctx.begin_source_item(item, generation="generation-two")
+    ctx.drawer_collection.upsert(
+        documents=["content"], ids=["adapter-id"], metadatas=[{"chunk_index": 7}]
+    )
+
+    written = drawers.upserts[0]
+    assert written["ids"] != ["adapter-id"]
+    assert written["metadatas"][0]["source_file"] == item.source_file
+    assert written["metadatas"][0]["source_version"] == "v2"
+    assert written["metadatas"][0]["source_generation_state"] == "staging"
+
+
 def test_palace_context_emit_dispatches_to_hooks_and_swallows_errors():
     calls = []
     err_calls = []

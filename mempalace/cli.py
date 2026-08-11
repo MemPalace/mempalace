@@ -909,6 +909,7 @@ def mine_source_adapter(
         get_adapter,
         resolve_adapter_for_source,
     )
+    from .sources.lifecycle import SourceLifecycleStore
 
     adapter_name = resolve_adapter_for_source(explicit=source_name)
     try:
@@ -919,10 +920,11 @@ def mine_source_adapter(
             "check the adapter name with `mempalace mine --help`"
         ) from exc
 
-    if "supports_incremental" in adapter.capabilities:
+    incremental = "supports_incremental" in adapter.capabilities
+    if incremental and "supports_kg_triples" in adapter.capabilities:
         raise UnsupportedSourceAdapterProtocolError(
-            f"source adapter {adapter_name!r} requires incremental ingestion, which "
-            "mempalace mine does not support yet"
+            f"source adapter {adapter_name!r} combines incremental drawer ingestion with "
+            "knowledge-graph writes; generation-safe KG replacement is not supported yet"
         )
 
     # A dry run must never open a collection: backend opens can create or
@@ -932,12 +934,19 @@ def mine_source_adapter(
     lock = mine_palace_lock(palace_path) if not dry_run else contextlib.nullcontext()
     with lock:
         knowledge_graph = None
+        lifecycle = None
+        pending_item = None
+        pending_generation = None
+        pending_prior_ids = []
         try:
             if dry_run:
                 drawer_collection = _DryRunCollectionProxy()
                 knowledge_graph = _DryRunKnowledgeGraphProxy()
             else:
-                drawer_collection = get_collection(palace_path)
+                if incremental:
+                    drawer_collection = get_collection(palace_path, _include_staging=True)
+                else:
+                    drawer_collection = get_collection(palace_path)
                 knowledge_graph = KnowledgeGraph(
                     db_path=os.path.join(palace_path, "knowledge_graph.sqlite3")
                 )
@@ -950,15 +959,106 @@ def mine_source_adapter(
                 adapter_version=adapter.adapter_version,
             )
             drawers_written = 0
+            lifecycle = (
+                SourceLifecycleStore(os.path.join(palace_path, "knowledge_graph.sqlite3"))
+                if incremental and not dry_run
+                else None
+            )
+
+            def _existing_source(source_file):
+                existing = drawer_collection.get(where={"source_file": source_file}, limit=1)
+                metadatas = existing.get("metadatas") or []
+                return existing, (metadatas[0] if metadatas else None)
+
+            def _cleanup_staged(generation):
+                staged = drawer_collection.get(
+                    where={
+                        "$and": [
+                            {"source_file": generation.source_file},
+                            {"source_generation": generation.generation},
+                        ]
+                    }
+                )
+                ids = staged.get("ids") or []
+                if ids:
+                    drawer_collection.delete(ids=ids)
+                lifecycle.abandon(generation)
+
+            def _commit_pending():
+                nonlocal pending_item, pending_generation, pending_prior_ids
+                if pending_generation is None:
+                    return
+                staged = drawer_collection.get(
+                    where={
+                        "$and": [
+                            {"source_file": pending_item.source_file},
+                            {"source_generation": pending_generation.generation},
+                        ]
+                    }
+                )
+                ids = staged.get("ids") or []
+                documents = staged.get("documents") or []
+                metadatas = staged.get("metadatas") or []
+                if not ids:
+                    _cleanup_staged(pending_generation)
+                    raise ValueError(
+                        f"incremental source item {pending_item.source_file!r} yielded no drawers"
+                    )
+                # Switching the registry is the atomic visibility boundary.
+                # Staged rows stay physically marked ``staging`` forever;
+                # ordinary collection views resolve their visibility against
+                # the registry, so a failure before this point exposes none
+                # of the new item and a failure during cleanup cannot restore
+                # retired content.
+                previous = lifecycle.activate(pending_generation)
+                if previous is not None:
+                    old = drawer_collection.get(
+                        where={
+                            "$and": [
+                                {"source_file": previous.source_file},
+                                {"source_generation": previous.generation},
+                            ]
+                        }
+                    )
+                    old_ids = old.get("ids") or []
+                    if old_ids:
+                        drawer_collection.delete(ids=old_ids)
+                elif pending_prior_ids:
+                    # The first incremental run may be replacing drawers from
+                    # a pre-lifecycle adapter version.  They lack generation
+                    # metadata, so retire the snapshot captured before this
+                    # generation was staged.
+                    drawer_collection.delete(ids=pending_prior_ids)
+                pending_item = None
+                pending_generation = None
+                pending_prior_ids = []
+                context.finish_source_item()
+
             for result in adapter.ingest(
                 source=SourceRef(local_path=source_path),
                 palace=context,
             ):
                 if isinstance(result, SourceItemMetadata):
-                    # Non-incremental adapters may report a cursor or version
-                    # while still doing a complete re-extract.  Incremental
-                    # adapters are rejected before ingest above, so accepting
-                    # this avoids a late partial-ingest failure.
+                    if incremental:
+                        _commit_pending()
+                        existing, existing_metadata = _existing_source(result.source_file)
+                        context.begin_source_item(result)
+                        if adapter.is_current(item=result, existing_metadata=existing_metadata):
+                            context.skip_current_item()
+                        elif dry_run:
+                            # Preserve dry-run's no-storage invariant while
+                            # still exercising the RFC currentness handshake.
+                            pending_item = result
+                        else:
+                            pending_item = result
+                            pending_generation = lifecycle.begin(
+                                adapter_name=adapter.name,
+                                source_file=result.source_file,
+                                version=result.version,
+                            )
+                            pending_prior_ids = existing.get("ids") or []
+                            context.begin_source_item(result, generation=pending_generation.generation)
+                        continue
                     warnings.warn(
                         f"Source adapter {adapter_name!r} yielded non-incremental item "
                         "metadata; ignoring it during complete ingest",
@@ -967,6 +1067,14 @@ def mine_source_adapter(
                     )
                     continue
                 if isinstance(result, DrawerRecord):
+                    if incremental and pending_item is None:
+                        raise ValueError(
+                            "incremental adapters must yield SourceItemMetadata before drawers"
+                        )
+                    if incremental and context._skip_requested:
+                        raise ValueError(
+                            "incremental adapter yielded drawers after core marked its item current"
+                        )
                     drawers_written += 1
                     context.upsert_drawer(result)
                     continue
@@ -974,7 +1082,13 @@ def mine_source_adapter(
                     f"source adapter {adapter_name!r} yielded unsupported result type "
                     f"{type(result).__name__}"
                 )
+            _commit_pending()
             return drawers_written
+        except Exception:
+            if pending_generation is not None and lifecycle is not None:
+                _cleanup_staged(pending_generation)
+                context.finish_source_item()
+            raise
         finally:
             if knowledge_graph is not None and hasattr(knowledge_graph, "close"):
                 knowledge_graph.close()

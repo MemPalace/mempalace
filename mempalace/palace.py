@@ -5,6 +5,7 @@ Consolidates collection access patterns used by both miners and the MCP server.
 """
 
 import contextlib
+from dataclasses import replace
 import hashlib
 import logging
 import os
@@ -26,6 +27,7 @@ from .backends import (
     get_backend_class,
     resolve_backend_for_palace,
 )
+from .backends.base import GetResult, QueryResult
 from .backends.embedding_wrapper import EmbeddingCollection
 from .entity_detector import (
     _apply_known_systems_prepass,
@@ -34,6 +36,103 @@ from .entity_detector import (
 )
 
 logger = logging.getLogger("mempalace_mcp")
+
+
+class _VisibleDrawersCollection:
+    """Hide incomplete RFC 002 generations from ordinary palace reads.
+
+    Source-adapter ingestion obtains an explicit internal view while staging
+    and committing.  Everyone else sees legacy drawers plus complete
+    generations only.  This is deliberately a collection wrapper rather than
+    a backend-specific filter: plugin backends receive the same safety rule.
+    """
+
+    def __init__(self, collection, palace_path):
+        self._collection = collection
+        from .sources.lifecycle import SourceLifecycleStore
+
+        self._lifecycle = SourceLifecycleStore(
+            os.path.join(palace_path, "knowledge_graph.sqlite3")
+        )
+
+    def _visible(self, metadata):
+        metadata = metadata or {}
+        generation = metadata.get("source_generation")
+        adapter_name = metadata.get("adapter_name")
+        source_file = metadata.get("source_file")
+        if not adapter_name or not source_file:
+            return True
+        active = self._lifecycle.active(adapter_name=adapter_name, source_file=source_file)
+        if generation:
+            return active is not None and active.generation == generation
+        # Once an RFC 002 adapter has an active generation, its earlier
+        # unversioned drawers are superseded. Unrelated legacy drawers remain
+        # visible because they do not carry this adapter identity.
+        return active is None
+
+    def get(self, **kwargs):
+        result = self._collection.get(**kwargs)
+        metas = result.get("metadatas") or []
+        keep = [index for index, meta in enumerate(metas) if self._visible(meta)]
+        if isinstance(result, GetResult):
+            return replace(
+                result,
+                ids=[result.ids[index] for index in keep],
+                documents=[result.documents[index] for index in keep],
+                metadatas=[result.metadatas[index] for index in keep],
+                embeddings=(
+                    [result.embeddings[index] for index in keep]
+                    if result.embeddings is not None
+                    else None
+                ),
+            )
+        for key, value in list(result.items()):
+            if isinstance(value, list) and len(value) == len(metas):
+                result[key] = [value[index] for index in keep]
+        return result
+
+    def query(self, **kwargs):
+        # A backend can return a staging item among its nearest candidates.
+        # Fetch the full collection to avoid letting that hidden item reduce
+        # the caller's visible result window.
+        wanted = kwargs.get("n_results")
+        if wanted is not None:
+            kwargs = dict(kwargs)
+            kwargs["n_results"] = max(wanted, self._collection.count())
+        result = self._collection.query(**kwargs)
+        metas_batches = result.get("metadatas") or []
+        if isinstance(result, QueryResult):
+            ids, documents, metadatas, distances = [], [], [], []
+            embeddings = [] if result.embeddings is not None else None
+            for batch_index, metas in enumerate(metas_batches):
+                keep = [index for index, meta in enumerate(metas or []) if self._visible(meta)]
+                if wanted is not None:
+                    keep = keep[:wanted]
+                ids.append([result.ids[batch_index][index] for index in keep])
+                documents.append([result.documents[batch_index][index] for index in keep])
+                metadatas.append([result.metadatas[batch_index][index] for index in keep])
+                distances.append([result.distances[batch_index][index] for index in keep])
+                if embeddings is not None:
+                    embeddings.append([result.embeddings[batch_index][index] for index in keep])
+            return replace(
+                result,
+                ids=ids,
+                documents=documents,
+                metadatas=metadatas,
+                distances=distances,
+                embeddings=embeddings,
+            )
+        for batch_index, metas in enumerate(metas_batches):
+            keep = [index for index, meta in enumerate(metas or []) if self._visible(meta)]
+            for key, value in list(result.items()):
+                if isinstance(value, list) and batch_index < len(value) and isinstance(value[batch_index], list):
+                    result[key][batch_index] = [value[batch_index][index] for index in keep]
+                    if wanted is not None:
+                        result[key][batch_index] = result[key][batch_index][:wanted]
+        return result
+
+    def __getattr__(self, name):
+        return getattr(self._collection, name)
 
 SKIP_DIRS = {
     ".git",
@@ -208,6 +307,7 @@ def get_collection(
     backend: Optional[str] = None,
     read_only: bool = False,
     _skip_identity_check: bool = False,
+    _include_staging: bool = False,
 ):
     """Get the palace collection through the backend layer.
 
@@ -275,6 +375,8 @@ def get_collection(
         collection = EmbeddingCollection(collection)
     if not _skip_identity_check:
         _enforce_embedder_identity(collection, palace_path, collection_name, create=create)
+    if not _include_staging:
+        collection = _VisibleDrawersCollection(collection, palace_path)
     return collection
 
 
