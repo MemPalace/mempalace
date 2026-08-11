@@ -71,11 +71,20 @@ it chooses the query-best chunk from that source and includes its neighbors.
 Applying that enrichment independently to every matching chunk therefore
 produced the same expanded text repeatedly.
 
-Search now keeps the best ranked result for each logical source before
-enrichment. The grouping key is the full `source_file` path plus
-`parent_drawer_id` when present, so unrelated logical drawers that share a
-file name remain separate. Records without a `source_file` remain
-chunk-level results.
+Search now keeps the best ranked result for each logical source only when
+closet enrichment will run. The grouping key is the full `source_file` path
+plus `parent_drawer_id` when present, so unrelated logical drawers that share
+a file name remain separate. Direct `drawer` results and records without a
+`source_file` retain their established chunk-level behavior.
+
+This follows the same retrieval principle as [Qdrant's grouped
+search](https://qdrant.tech/documentation/search/search/#grouping): group
+chunk matches by document identity and keep one representative hit
+(`group_size=1`) to avoid redundant document answers. It is deliberately
+narrower than Qdrant's groups API: MemPalace does not return group envelopes,
+does not add a public `group_by` parameter, and does not collapse ordinary
+direct drawer search. It prevents only the duplicate response introduced by
+closet hydration.
 
 To reproduce this regression in a throwaway palace, run:
 

@@ -1303,17 +1303,22 @@ def _finalize_candidate_hits(
     return hits, None
 
 
-def _best_hit_per_source_group(scored: list, n_results: int) -> list:
-    """Keep the best hit per logical source before closet hydration.
+def _limit_hits_before_hydration(scored: list, n_results: int) -> list:
+    """Limit candidates while collapsing duplicate closet-hydrated results.
 
     A closet establishes relevance at the source level. Returning several
     chunks from the same logical source would hydrate each hit around the same
-    keyword-best chunk, producing duplicate agent-facing results. Unscoped
-    records (without source_file) stay distinct at chunk granularity.
+    keyword-best chunk, producing duplicate agent-facing results. Direct
+    drawer results keep their established chunk-level behavior.
     """
     hits = []
     seen_source_groups = set()
     for candidate in scored:
+        if candidate.get("matched_via") != "drawer+closet":
+            hits.append(candidate)
+            if len(hits) == n_results:
+                break
+            continue
         source = candidate.get("_source_file_full") or ""
         parent = candidate.get("_parent_drawer_id")
         group_key = (
@@ -1844,7 +1849,7 @@ def search_memories(
 
     scored.sort(key=lambda h: h["_sort_key"])
 
-    hits = _best_hit_per_source_group(scored, n_results)
+    hits = _limit_hits_before_hydration(scored, n_results)
 
     # Drawer-grep enrichment: for closet-boosted hits whose source has
     # multiple drawers, return the keyword-best chunk + its immediate
