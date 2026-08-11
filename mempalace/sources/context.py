@@ -6,11 +6,10 @@ progress hooks. Adapters receive a ``PalaceContext`` instance and MUST NOT
 import ``mempalace.palace`` directly — that coupling is what the facade
 exists to prevent.
 
-This module publishes the shape third-party adapters target. Core's mine
-loop will construct a concrete ``PalaceContext`` and pass it to adapters
-when the filesystem/conversations miners are migrated onto ``BaseSourceAdapter``
-in a follow-up PR; until then, no in-tree code constructs one, but the
-contract is stable.
+This module publishes the shape third-party adapters target. Core constructs a
+concrete ``PalaceContext`` for explicit source-adapter mining; legacy
+filesystem and conversation miners retain their established paths until they
+are migrated separately.
 """
 
 from __future__ import annotations
@@ -54,10 +53,21 @@ class _IncrementalCollectionFacade:
     ``palace.drawer_collection.upsert`` directly.
     """
 
-    def __init__(self, collection: _CollectionLike, item: SourceItemMetadata, generation: str):
+    def __init__(
+        self,
+        collection: _CollectionLike,
+        item: SourceItemMetadata,
+        generation: str,
+        adapter_name: str,
+        adapter_version: str,
+    ):
         self._collection = collection
         self._item = item
         self._generation = generation
+        self._adapter_name = adapter_name
+        self._adapter_version = adapter_version
+        self._next_chunk_index = 0
+        self._seen_chunk_indexes = set()
 
     def upsert(self, *, documents, ids=None, metadatas=None, **kwargs: Any) -> None:
         documents = list(documents)
@@ -71,7 +81,18 @@ class _IncrementalCollectionFacade:
             source_file = meta.get("source_file", self._item.source_file)
             if source_file != self._item.source_file:
                 raise ValueError("incremental collection writes must target the current source item")
-            chunk_index = meta.get("chunk_index", index)
+            chunk_index = meta.get("chunk_index")
+            if chunk_index is None:
+                chunk_index = self._next_chunk_index
+                self._next_chunk_index += 1
+            else:
+                self._next_chunk_index = max(self._next_chunk_index, chunk_index + 1)
+            if chunk_index in self._seen_chunk_indexes:
+                raise ValueError(
+                    "incremental source item yielded duplicate chunk_index "
+                    f"{chunk_index!r}"
+                )
+            self._seen_chunk_indexes.add(chunk_index)
             record = DrawerRecord(
                 content=documents[index], source_file=source_file, chunk_index=chunk_index
             )
@@ -82,6 +103,10 @@ class _IncrementalCollectionFacade:
                 source_generation=self._generation,
                 source_generation_state="staging",
             )
+            if self._adapter_name:
+                meta["adapter_name"] = self._adapter_name
+            if self._adapter_version:
+                meta["adapter_version"] = self._adapter_version
             normalized.append(meta)
             generated_ids.append(_build_drawer_id(record, generation=self._generation))
         self._collection.upsert(
@@ -165,9 +190,9 @@ class PalaceContext:
         meta.setdefault("source_file", record.source_file)
         meta.setdefault("chunk_index", record.chunk_index)
         if self.adapter_name:
-            meta.setdefault("adapter_name", self.adapter_name)
+            meta["adapter_name"] = self.adapter_name
         if self.adapter_version:
-            meta.setdefault("adapter_version", self.adapter_version)
+            meta["adapter_version"] = self.adapter_version
         if self._current_item is not None:
             if record.source_file != self._current_item.source_file:
                 raise ValueError(
@@ -209,7 +234,11 @@ class PalaceContext:
         if generation is not None:
             self._unscoped_drawer_collection = self.drawer_collection
             self.drawer_collection = _IncrementalCollectionFacade(
-                self.drawer_collection, item, generation
+                self.drawer_collection,
+                item,
+                generation,
+                self.adapter_name,
+                self.adapter_version,
             )
 
     def finish_source_item(self) -> None:

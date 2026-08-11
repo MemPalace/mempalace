@@ -38,3 +38,31 @@ def test_abandon_keeps_active_generation(tmp_path):
 
     active = store.active(adapter_name="fixture", source_file="fixture://one")
     assert active.generation == first.generation
+
+
+def test_read_only_lookup_does_not_create_lifecycle_schema(tmp_path):
+    db_path = tmp_path / "knowledge_graph.sqlite3"
+    # A pre-existing KG database without RFC 002 lifecycle state is normal.
+    import sqlite3
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE existing (id INTEGER PRIMARY KEY)")
+
+    store = SourceLifecycleStore(str(db_path), initialize=False)
+
+    assert store.active(adapter_name="fixture", source_file="fixture://one") is None
+    with sqlite3.connect(db_path) as conn:
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    assert tables == {"existing"}
+
+
+def test_tombstone_supersedes_active_generation(tmp_path):
+    store = SourceLifecycleStore(str(tmp_path / "knowledge_graph.sqlite3"))
+    first = store.begin(adapter_name="fixture", source_file="fixture://one", version="v1")
+    store.activate(first)
+
+    tombstone = store.tombstone(adapter_name="fixture", source_file="fixture://one")
+
+    active = store.active(adapter_name="fixture", source_file="fixture://one")
+    assert active.generation == tombstone.generation
+    assert active.version == "__deleted__"

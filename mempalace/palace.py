@@ -27,7 +27,7 @@ from .backends import (
     get_backend_class,
     resolve_backend_for_palace,
 )
-from .backends.base import GetResult, QueryResult
+from .backends.base import GetResult, LexicalResult, QueryResult
 from .backends.embedding_wrapper import EmbeddingCollection
 from .entity_detector import (
     _apply_known_systems_prepass,
@@ -49,20 +49,33 @@ class _VisibleDrawersCollection:
 
     def __init__(self, collection, palace_path):
         self._collection = collection
-        from .sources.lifecycle import SourceLifecycleStore
+        self._lifecycle_db_path = os.path.join(palace_path, "knowledge_graph.sqlite3")
+        self._lifecycle = None
 
-        self._lifecycle = SourceLifecycleStore(
-            os.path.join(palace_path, "knowledge_graph.sqlite3")
-        )
-
-    def _visible(self, metadata):
+    def _visible(self, metadata, active_generations):
         metadata = metadata or {}
         generation = metadata.get("source_generation")
         adapter_name = metadata.get("adapter_name")
         source_file = metadata.get("source_file")
         if not adapter_name or not source_file:
             return True
-        active = self._lifecycle.active(adapter_name=adapter_name, source_file=source_file)
+        # Do not create a knowledge-graph database merely because a normal
+        # collection was opened. A lifecycle store exists only after an
+        # incremental adapter has actually started work in this palace.
+        if not os.path.exists(self._lifecycle_db_path):
+            return True
+        if self._lifecycle is None:
+            from .sources.lifecycle import SourceLifecycleStore
+
+            self._lifecycle = SourceLifecycleStore(
+                self._lifecycle_db_path, initialize=False
+            )
+        key = (adapter_name, source_file)
+        if key not in active_generations:
+            active_generations[key] = self._lifecycle.active(
+                adapter_name=adapter_name, source_file=source_file
+            )
+        active = active_generations[key]
         if generation:
             return active is not None and active.generation == generation
         # Once an RFC 002 adapter has an active generation, its earlier
@@ -73,7 +86,30 @@ class _VisibleDrawersCollection:
     def get(self, **kwargs):
         result = self._collection.get(**kwargs)
         metas = result.get("metadatas") or []
-        keep = [index for index, meta in enumerate(metas) if self._visible(meta)]
+        active_generations = {}
+        keep = [index for index, meta in enumerate(metas) if self._visible(meta, active_generations)]
+        # The common path retains the backend's pagination exactly. Only
+        # widen when a hidden generation actually consumed the requested
+        # window; an exact visible pagination pass then follows below.
+        if len(keep) == len(metas):
+            return result
+        requested_limit = kwargs.get("limit")
+        requested_offset = kwargs.get("offset") or 0
+        if requested_limit is not None or requested_offset:
+            widened = dict(kwargs)
+            widened.pop("limit", None)
+            widened.pop("offset", None)
+            result = self._collection.get(**widened)
+            metas = result.get("metadatas") or []
+            active_generations = {}
+            keep = [
+                index for index, meta in enumerate(metas)
+                if self._visible(meta, active_generations)
+            ]
+            if requested_limit is not None:
+                keep = keep[requested_offset:requested_offset + requested_limit]
+            elif requested_offset:
+                keep = keep[requested_offset:]
         if isinstance(result, GetResult):
             return replace(
                 result,
@@ -92,20 +128,31 @@ class _VisibleDrawersCollection:
         return result
 
     def query(self, **kwargs):
-        # A backend can return a staging item among its nearest candidates.
-        # Fetch the full collection to avoid letting that hidden item reduce
-        # the caller's visible result window.
         wanted = kwargs.get("n_results")
-        if wanted is not None:
-            kwargs = dict(kwargs)
-            kwargs["n_results"] = max(wanted, self._collection.count())
         result = self._collection.query(**kwargs)
         metas_batches = result.get("metadatas") or []
+        active_generations = {}
+        hidden_seen = False
+        for metas in metas_batches:
+            if any(not self._visible(meta, active_generations) for meta in metas or []):
+                hidden_seen = True
+                break
+        if hidden_seen and wanted is not None:
+            # Vector backends do not expose a stable result offset. Widen
+            # only after hidden candidates are actually observed.
+            kwargs = dict(kwargs)
+            kwargs["n_results"] = max(wanted, self._collection.count())
+            result = self._collection.query(**kwargs)
+            metas_batches = result.get("metadatas") or []
+            active_generations = {}
         if isinstance(result, QueryResult):
             ids, documents, metadatas, distances = [], [], [], []
             embeddings = [] if result.embeddings is not None else None
             for batch_index, metas in enumerate(metas_batches):
-                keep = [index for index, meta in enumerate(metas or []) if self._visible(meta)]
+                keep = [
+                    index for index, meta in enumerate(metas or [])
+                    if self._visible(meta, active_generations)
+                ]
                 if wanted is not None:
                     keep = keep[:wanted]
                 ids.append([result.ids[batch_index][index] for index in keep])
@@ -123,7 +170,10 @@ class _VisibleDrawersCollection:
                 embeddings=embeddings,
             )
         for batch_index, metas in enumerate(metas_batches):
-            keep = [index for index, meta in enumerate(metas or []) if self._visible(meta)]
+            keep = [
+                index for index, meta in enumerate(metas or [])
+                if self._visible(meta, active_generations)
+            ]
             for key, value in list(result.items()):
                 if isinstance(value, list) and batch_index < len(value) and isinstance(value[batch_index], list):
                     result[key][batch_index] = [value[batch_index][index] for index in keep]
@@ -131,8 +181,50 @@ class _VisibleDrawersCollection:
                         result[key][batch_index] = result[key][batch_index][:wanted]
         return result
 
+    def lexical_search(self, *, query, n_results=10, where=None):
+        result = self._collection.lexical_search(query=query, n_results=n_results, where=where)
+        active_generations = {}
+        hits = [
+            hit for hit in result.hits
+            if self._visible(hit.metadata, active_generations)
+        ]
+        if len(hits) != len(result.hits):
+            result = self._collection.lexical_search(
+                query=query, n_results=max(n_results, self._collection.count()), where=where
+            )
+            active_generations = {}
+            hits = [
+                hit for hit in result.hits
+                if self._visible(hit.metadata, active_generations)
+            ]
+        hits = hits[:n_results]
+        return LexicalResult(hits=hits)
+
+    def get_all_metadata(self, where=None):
+        result = self.get(where=where, include=["metadatas"])
+        return result.metadatas if hasattr(result, "metadatas") else result.get("metadatas", [])
+
+    def count(self):
+        # Preserve the backend's fast operational count. Visibility filtering
+        # applies to content-returning reads; cleanup reconciliation removes
+        # unreachable rows after successful incremental replacements.
+        return self._collection.count()
+
+    def estimated_count(self):
+        return self.count()
+
+    def facet_counts(self, field, where=None, limit=1000):
+        return self._collection.facet_counts(field, where=where, limit=limit)
+
     def __getattr__(self, name):
         return getattr(self._collection, name)
+
+
+class _VisibleEmbeddingCollection(EmbeddingCollection):
+    """Visibility filtering that preserves the public embedding wrapper type."""
+
+    def __init__(self, collection, palace_path):
+        super().__init__(_VisibleDrawersCollection(collection, palace_path))
 
 SKIP_DIRS = {
     ".git",
@@ -319,10 +411,11 @@ def get_collection(
     ``set-embedder`` override path can open a palace whose recorded model
     differs from the current one (the very state it exists to repair).
     """
+    from .config import get_configured_collection_name
+    configured_drawer_collection = get_configured_collection_name()
     if collection_name is None:
-        from .config import get_configured_collection_name
-
-        collection_name = get_configured_collection_name()
+        collection_name = configured_drawer_collection
+    is_drawer_collection = collection_name == configured_drawer_collection
     backend_obj = get_backend_for_palace(palace_path, explicit=backend)
     palace_ref = PalaceRef(id=palace_path, local_path=palace_path)
     backend_options = {"read_only": True} if read_only else None
@@ -375,8 +468,11 @@ def get_collection(
         collection = EmbeddingCollection(collection)
     if not _skip_identity_check:
         _enforce_embedder_identity(collection, palace_path, collection_name, create=create)
-    if not _include_staging:
-        collection = _VisibleDrawersCollection(collection, palace_path)
+    if is_drawer_collection and not _include_staging and hasattr(collection, "get"):
+        if isinstance(collection, EmbeddingCollection):
+            collection = _VisibleEmbeddingCollection(collection, palace_path)
+        else:
+            collection = _VisibleDrawersCollection(collection, palace_path)
     return collection
 
 

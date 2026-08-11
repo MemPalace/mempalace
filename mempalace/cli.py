@@ -33,6 +33,7 @@ Examples:
 
 import argparse
 import contextlib
+import logging
 import os
 import shlex
 import sys
@@ -937,7 +938,6 @@ def mine_source_adapter(
         lifecycle = None
         pending_item = None
         pending_generation = None
-        pending_prior_ids = []
         try:
             if dry_run:
                 drawer_collection = _DryRunCollectionProxy()
@@ -966,9 +966,36 @@ def mine_source_adapter(
             )
 
             def _existing_source(source_file):
-                existing = drawer_collection.get(where={"source_file": source_file}, limit=1)
+                active = lifecycle.active(
+                    adapter_name=adapter.name, source_file=source_file
+                ) if lifecycle is not None else None
+                if active is not None:
+                    existing = drawer_collection.get(
+                        where={
+                            "$and": [
+                                {"source_file": source_file},
+                                {"source_generation": active.generation},
+                            ]
+                        },
+                        limit=1,
+                    )
+                else:
+                    # First incremental replacement may be upgrading legacy
+                    # drawers, which have no generation metadata.
+                    existing = drawer_collection.get(where={"source_file": source_file}, limit=1)
                 metadatas = existing.get("metadatas") or []
-                return existing, (metadatas[0] if metadatas else None)
+                if metadatas:
+                    return existing, metadatas[0]
+                if active is not None:
+                    # Empty items and tombstones have an active lifecycle
+                    # generation but no drawer from which to read provenance.
+                    # The registry remains the palace cursor in that case.
+                    return existing, {
+                        "source_file": source_file,
+                        "source_version": active.version,
+                        "adapter_name": adapter.name,
+                    }
+                return existing, None
 
             def _cleanup_staged(generation):
                 staged = drawer_collection.get(
@@ -985,7 +1012,7 @@ def mine_source_adapter(
                 lifecycle.abandon(generation)
 
             def _commit_pending():
-                nonlocal pending_item, pending_generation, pending_prior_ids
+                nonlocal pending_item, pending_generation
                 if pending_generation is None:
                     return
                 staged = drawer_collection.get(
@@ -996,42 +1023,45 @@ def mine_source_adapter(
                         ]
                     }
                 )
-                ids = staged.get("ids") or []
-                documents = staged.get("documents") or []
-                metadatas = staged.get("metadatas") or []
-                if not ids:
-                    _cleanup_staged(pending_generation)
-                    raise ValueError(
-                        f"incremental source item {pending_item.source_file!r} yielded no drawers"
-                    )
                 # Switching the registry is the atomic visibility boundary.
                 # Staged rows stay physically marked ``staging`` forever;
                 # ordinary collection views resolve their visibility against
                 # the registry, so a failure before this point exposes none
                 # of the new item and a failure during cleanup cannot restore
                 # retired content.
-                previous = lifecycle.activate(pending_generation)
-                if previous is not None:
-                    old = drawer_collection.get(
-                        where={
-                            "$and": [
-                                {"source_file": previous.source_file},
-                                {"source_generation": previous.generation},
-                            ]
-                        }
-                    )
-                    old_ids = old.get("ids") or []
-                    if old_ids:
-                        drawer_collection.delete(ids=old_ids)
-                elif pending_prior_ids:
-                    # The first incremental run may be replacing drawers from
-                    # a pre-lifecycle adapter version.  They lack generation
-                    # metadata, so retire the snapshot captured before this
-                    # generation was staged.
-                    drawer_collection.delete(ids=pending_prior_ids)
-                pending_item = None
+                generation = pending_generation
+                previous = lifecycle.activate(generation)
+                # From this point on the registry is authoritative. A failed
+                # physical cleanup may leave unreachable rows behind, but it
+                # must never trigger the outer rollback path and remove this
+                # newly active generation.
                 pending_generation = None
-                pending_prior_ids = []
+                try:
+                    candidates = drawer_collection.get(
+                        where={"source_file": generation.source_file}
+                    )
+                    stale_ids = [
+                        drawer_id
+                        for drawer_id, metadata in zip(
+                            candidates.get("ids") or [], candidates.get("metadatas") or []
+                        )
+                        if (metadata or {}).get("adapter_name") == adapter.name
+                        and (metadata or {}).get("source_generation") != generation.generation
+                    ]
+                    if stale_ids:
+                        drawer_collection.delete(ids=stale_ids)
+                    lifecycle.prune_retired(
+                        adapter_name=adapter.name, source_file=generation.source_file
+                    )
+                except Exception:
+                    logging.getLogger(__name__).warning(
+                        "incremental source cleanup failed after activating %s; "
+                        "the retired generation remains hidden and will be retried "
+                        "on the next replacement",
+                        generation.source_file,
+                        exc_info=True,
+                    )
+                pending_item = None
                 context.finish_source_item()
 
             for result in adapter.ingest(
@@ -1041,6 +1071,28 @@ def mine_source_adapter(
                 if isinstance(result, SourceItemMetadata):
                     if incremental:
                         _commit_pending()
+                        if result.version == "__deleted__":
+                            if "supports_deletion_tombstones" not in adapter.capabilities:
+                                raise UnsupportedSourceAdapterProtocolError(
+                                    f"source adapter {adapter_name!r} yielded a deletion tombstone "
+                                    "without supports_deletion_tombstones"
+                                )
+                            if not dry_run:
+                                lifecycle.tombstone(
+                                    adapter_name=adapter.name,
+                                    source_file=result.source_file,
+                                )
+                                # Physical deletion is deliberately after the
+                                # registry switch: an interrupted purge leaves
+                                # drawers hidden rather than falsely visible.
+                                stale = drawer_collection.get(
+                                    where={"source_file": result.source_file}
+                                )
+                                stale_ids = stale.get("ids") or []
+                                if stale_ids:
+                                    drawer_collection.delete(ids=stale_ids)
+                            context.finish_source_item()
+                            continue
                         existing, existing_metadata = _existing_source(result.source_file)
                         context.begin_source_item(result)
                         if adapter.is_current(item=result, existing_metadata=existing_metadata):
@@ -1056,7 +1108,6 @@ def mine_source_adapter(
                                 source_file=result.source_file,
                                 version=result.version,
                             )
-                            pending_prior_ids = existing.get("ids") or []
                             context.begin_source_item(result, generation=pending_generation.generation)
                         continue
                     warnings.warn(
@@ -1090,8 +1141,21 @@ def mine_source_adapter(
                 context.finish_source_item()
             raise
         finally:
-            if knowledge_graph is not None and hasattr(knowledge_graph, "close"):
-                knowledge_graph.close()
+            primary_error = sys.exc_info()[0] is not None
+            try:
+                adapter.close()
+            except Exception:
+                if primary_error:
+                    logging.getLogger(__name__).warning(
+                        "source adapter %r close failed while handling an ingest error",
+                        adapter_name,
+                        exc_info=True,
+                    )
+                else:
+                    raise
+            finally:
+                if knowledge_graph is not None and hasattr(knowledge_graph, "close"):
+                    knowledge_graph.close()
 
 
 def cmd_sweep(args):

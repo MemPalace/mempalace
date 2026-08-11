@@ -344,6 +344,8 @@ def test_incremental_collection_facade_cannot_overwrite_other_source():
         drawer_collection=drawers,
         knowledge_graph=_FakeKG(),
         palace_path="/tmp/p",
+        adapter_name="fixture",
+        adapter_version="0.2.0",
     )
     item = SourceItemMetadata(source_file="fixture://item", version="v2")
 
@@ -360,6 +362,8 @@ def test_incremental_collection_facade_owns_ids_and_provenance():
         drawer_collection=drawers,
         knowledge_graph=_FakeKG(),
         palace_path="/tmp/p",
+        adapter_name="fixture",
+        adapter_version="0.2.0",
     )
     item = SourceItemMetadata(source_file="fixture://item", version="v2")
 
@@ -373,6 +377,45 @@ def test_incremental_collection_facade_owns_ids_and_provenance():
     assert written["metadatas"][0]["source_file"] == item.source_file
     assert written["metadatas"][0]["source_version"] == "v2"
     assert written["metadatas"][0]["source_generation_state"] == "staging"
+    assert written["metadatas"][0]["adapter_name"] == "fixture"
+    assert written["metadatas"][0]["adapter_version"] == "0.2.0"
+
+
+def test_incremental_collection_facade_assigns_distinct_fallback_chunk_indexes():
+    drawers = _FakeCollection()
+    ctx = PalaceContext(
+        drawer_collection=drawers,
+        knowledge_graph=_FakeKG(),
+        palace_path="/tmp/p",
+    )
+    ctx.begin_source_item(
+        SourceItemMetadata(source_file="fixture://item", version="v2"),
+        generation="generation-two",
+    )
+
+    ctx.drawer_collection.upsert(documents=["first"], ids=["one"], metadatas=[{}])
+    ctx.drawer_collection.upsert(documents=["second"], ids=["two"], metadatas=[{}])
+
+    assert [call["metadatas"][0]["chunk_index"] for call in drawers.upserts] == [0, 1]
+    assert drawers.upserts[0]["ids"] != drawers.upserts[1]["ids"]
+
+
+def test_incremental_collection_facade_rejects_duplicate_chunk_indexes():
+    ctx = PalaceContext(
+        drawer_collection=_FakeCollection(),
+        knowledge_graph=_FakeKG(),
+        palace_path="/tmp/p",
+    )
+    ctx.begin_source_item(
+        SourceItemMetadata(source_file="fixture://item", version="v2"),
+        generation="generation-two",
+    )
+    ctx.drawer_collection.upsert(documents=["first"], ids=["one"], metadatas=[{"chunk_index": 0}])
+
+    with pytest.raises(ValueError, match="duplicate chunk_index"):
+        ctx.drawer_collection.upsert(
+            documents=["second"], ids=["two"], metadatas=[{"chunk_index": 0}]
+        )
 
 
 def test_palace_context_emit_dispatches_to_hooks_and_swallows_errors():
