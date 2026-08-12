@@ -340,12 +340,74 @@ def _try_claude_code_jsonl(content: str) -> Optional[str]:
     return None
 
 
+def _extract_codex_event_turn(entry) -> Optional[tuple[str, str]]:
+    """Return a canonical Codex conversation turn from one rollout event.
+
+    Legacy rollouts store text directly on ``user_message`` / ``agent_message``
+    payloads. Current paginated rollouts store it in ``item_completed`` turn
+    items. Only ``event_msg`` records are accepted: ``response_item`` records
+    can duplicate conversation turns and carry synthetic context. Legacy text
+    is returned verbatim, including an empty string, so the hook counter can
+    preserve its historical exchange-counting contract; transcript consumers
+    already discard blank turns.
+    """
+    if not isinstance(entry, dict) or entry.get("type") != "event_msg":
+        return None
+
+    payload = entry.get("payload")
+    if not isinstance(payload, dict):
+        return None
+
+    payload_type = payload.get("type")
+    if payload_type == "user_message":
+        role = "user"
+        text = payload.get("message", "")
+    elif payload_type == "agent_message":
+        role = "assistant"
+        text = payload.get("message", "")
+    elif payload_type == "item_completed":
+        item = payload.get("item")
+        if not isinstance(item, dict):
+            return None
+        item_type = item.get("type")
+        if item_type == "UserMessage":
+            role = "user"
+        elif item_type == "AgentMessage":
+            role = "assistant"
+        else:
+            return None
+
+        content = item.get("content")
+        if not isinstance(content, list):
+            return None
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+                continue
+            if not isinstance(block, dict):
+                continue
+            block_text = block.get("text")
+            if isinstance(block_text, str):
+                parts.append(block_text)
+        text = "\n".join(parts)
+    else:
+        return None
+
+    if not isinstance(text, str):
+        return None
+    if payload_type == "item_completed" and not text.strip():
+        return None
+    return role, text
+
+
 def _try_codex_jsonl(content: str) -> Optional[str]:
     """OpenAI Codex CLI sessions (~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl).
 
-    Uses only event_msg entries (user_message / agent_message) which represent
-    the canonical conversation turns. response_item entries are skipped because
-    they include synthetic context injections and duplicate the real messages.
+    Uses only canonical ``event_msg`` conversation turns from both legacy
+    ``user_message`` / ``agent_message`` payloads and current ``item_completed``
+    turn items. ``response_item`` entries are skipped because they can include
+    synthetic context injections and duplicate the real messages.
     """
     lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
     messages = []
@@ -363,25 +425,14 @@ def _try_codex_jsonl(content: str) -> Optional[str]:
             has_session_meta = True
             continue
 
-        if entry_type != "event_msg":
+        turn = _extract_codex_event_turn(entry)
+        if turn is None:
             continue
-
-        payload = entry.get("payload", {})
-        if not isinstance(payload, dict):
-            continue
-
-        payload_type = payload.get("type", "")
-        msg = payload.get("message")
-        if not isinstance(msg, str):
-            continue
+        role, msg = turn
         text = msg.strip()
         if not text:
             continue
-
-        if payload_type == "user_message":
-            messages.append(("user", text))
-        elif payload_type == "agent_message":
-            messages.append(("assistant", text))
+        messages.append((role, text))
 
     if len(messages) >= 2 and has_session_meta:
         return _messages_to_transcript(messages)

@@ -13,6 +13,8 @@ import os
 import re
 import sys
 
+from .normalize import _extract_codex_event_turn
+
 
 _SESSION_ID_RE = re.compile(r"[^a-zA-Z0-9_-]")
 _CONTROL_CHARS_RE = re.compile(r"[\x00\r\n]")
@@ -67,9 +69,9 @@ def parse_precompact_payload(payload: dict) -> tuple[str, str]:
 
 
 def count_human_messages(path: str) -> int:
-    """Count user messages in a Claude transcript JSONL file.
+    """Count user messages in a Claude or Codex transcript JSONL file.
 
-    Claude transcripts are UTF-8. Windows Python defaults to cp1252 in many
+    Transcripts are UTF-8. Windows Python defaults to cp1252 in many
     environments, so the encoding must be explicit. Invalid bytes are ignored
     to match the hooks' fail-soft behavior.
 
@@ -90,13 +92,23 @@ def count_human_messages(path: str) -> int:
                 entry = json.loads(line)
             except Exception:
                 continue
-
-            msg = entry.get("message", {})
-            if not isinstance(msg, dict) or msg.get("role") != "user":
+            if not isinstance(entry, dict):
                 continue
 
-            content = msg.get("content", "")
-            if isinstance(content, str) and "<command-message>" in content:
+            msg = entry.get("message", {})
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, str) and "<command-message>" in content:
+                    continue
+
+                count += 1
+                continue
+
+            turn = _extract_codex_event_turn(entry)
+            if turn is None:
+                continue
+            role, text = turn
+            if role != "user" or "<command-message>" in text:
                 continue
 
             count += 1

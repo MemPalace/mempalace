@@ -86,6 +86,58 @@ def test_count_human_messages_reads_utf8_transcripts_tolerantly(tmp_path):
     assert result.stdout.strip() == "1"
 
 
+def test_count_human_messages_supports_codex_rollout_events(tmp_path):
+    transcript = tmp_path / "codex.jsonl"
+    entries = [
+        {"type": "event_msg", "payload": {"type": "user_message", "message": "legacy"}},
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {"type": "UserMessage", "content": ["bare", {"text": "block"}]},
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {"type": "AgentMessage", "content": ["answer"]},
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "type": "UserMessage",
+                    "content": ["<command-message>status</command-message>"],
+                },
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "item_completed",
+                "item": {"type": "UserMessage", "content": ["duplicate"]},
+            },
+        },
+    ]
+    transcript.write_text(
+        "\n".join(json.dumps(entry) for entry in entries) + "\n",
+        encoding="utf-8",
+    )
+
+    assert hook_shell.count_human_messages(str(transcript)) == 2
+
+    result = subprocess.run(
+        [sys.executable, "-m", "mempalace.hook_shell", "count-human-messages", str(transcript)],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert result.stdout.strip() == "2"
+
+
 def test_parse_stop_cli_fails_loud_on_malformed_nonempty_stdin():
     result = subprocess.run(
         [sys.executable, "-m", "mempalace.hook_shell", "parse-stop"],
