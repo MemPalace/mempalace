@@ -406,6 +406,47 @@ def test_invalid_json_returns_parse_error(http_server):
     assert json.loads(body)["error"]["code"] == -32700
 
 
+def test_non_string_method_gets_jsonrpc_error(http_server):
+    """A malformed envelope must come back as JSON-RPC, not a dropped socket."""
+    port, _ = http_server
+    status, body = _post(port, "/mcp", {"jsonrpc": "2.0", "id": 3, "method": 123})
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["id"] == 3
+    assert payload["error"]["code"] == -32601
+
+
+def test_dispatch_failure_returns_jsonrpc_error(http_server, monkeypatch):
+    """An unexpected dispatch failure answers -32603 instead of closing the socket."""
+    port, _ = http_server
+
+    def _boom(_request):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(mcp, "_http_dispatch", _boom)
+
+    status, body = _post(port, "/mcp", {"jsonrpc": "2.0", "id": 4, "method": "ping"})
+    assert status == 500
+    payload = json.loads(body)
+    assert payload["id"] == 4
+    assert payload["error"]["code"] == -32603
+    assert "kaboom" not in body.decode("utf-8")
+
+
+def test_dispatch_failure_on_notification_sends_no_body(http_server, monkeypatch):
+    """A notification is owed no response body, a failed one included."""
+    port, _ = http_server
+
+    def _boom(_request):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(mcp, "_http_dispatch", _boom)
+
+    status, body = _post(port, "/mcp", {"jsonrpc": "2.0", "method": "notifications/initialized"})
+    assert status == 500
+    assert body == b""
+
+
 def test_oversized_request_rejected_413(http_server):
     """A declared Content-Length over the cap is rejected before the body is read."""
     port, _ = http_server

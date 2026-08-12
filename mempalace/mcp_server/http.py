@@ -365,7 +365,10 @@ def _http_dispatch(request):
     the lock; palace writes take it exclusively. Unclassified tools fail
     closed onto the exclusive side.
     """
-    method = request.get("method") or "" if isinstance(request, dict) else ""
+    # Same envelope trap as handle_request, on a dispatcher added after it: the
+    # `or ""` fallback only rescues falsy values, so a truthy non-string method
+    # reached .startswith() below and raised out of the handler thread.
+    method, _ = _normalize_envelope(request) if isinstance(request, dict) else ("", {})
     if method in _HTTP_PROTOCOL_METHODS or method.startswith("notifications/"):
         return handle_request(request)
     tool_name = None
@@ -1012,7 +1015,29 @@ def _build_http_server(host: str, port: int):
 
             # Locking policy lives in _http_dispatch: global lock for
             # Chroma-touching tools, lock-free for logstream tools.
-            response = _http_dispatch(request)
+            try:
+                response = _http_dispatch(request)
+            except Exception:
+                # Without this the exception escaped into BaseHTTPRequestHandler,
+                # which closes the connection with no reply at all -- the client
+                # sees a dropped socket instead of a JSON-RPC error. Log with the
+                # traceback: -32603 tells the client nothing diagnostic, so the
+                # stack is the only record of what actually failed.
+                logger.exception("HTTP JSON-RPC dispatch error")
+                req_id = request.get("id") if isinstance(request, dict) else None
+                if req_id is None:
+                    # A notification is owed no response body, failure included,
+                    # matching the 202 branch below and the stdio loop. The
+                    # status still reports the failure at the transport level.
+                    self._record_request(500)
+                    self.send_response(500)
+                    self.send_header("Content-Length", "0")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.close_connection = True
+                    return
+                self._send_json(500, _json_rpc_internal_error(req_id))
+                return
 
             if response is None:
                 # JSON-RPC notifications intentionally have no response body.
