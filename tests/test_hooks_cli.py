@@ -505,6 +505,54 @@ def test_save_diary_direct_daemon_opt_in_submits_job(tmp_path):
     assert (tmp_path / "last_checkpoint").exists()
 
 
+def test_save_diary_daemon_lock_deferral_does_not_stall_the_hook(tmp_path):
+    """A refused job is deferred, not failed (#2014), so it is never terminal
+    while the holder lives.
+
+    This path waits on purpose -- a real diary write takes its time -- but it
+    waits for a state that a parked job cannot reach. Without
+    stop_on_lock_deferral it burns its whole 30s timeout on every session stop
+    and then reports a submission failure that never happened: the entry is
+    queued and the daemon files it once the lock frees."""
+    transcript = tmp_path / "t.jsonl"
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"message {i}"}} for i in range(3)],
+    )
+    env = {"MEMPALACE_HOOKS_DAEMON": "yes", "MEMPALACE_PALACE_PATH": str(palace_dir)}
+    parked = {
+        "id": "job-parked",
+        "state": "queued",
+        "error": {
+            "error_class": "LockHeldByOtherProcess",
+            "message": "palace /p is held by PID 999 (mempalace-mcp)",
+        },
+        "result": None,
+    }
+
+    with patch.dict("os.environ", env):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli._daemon_available", return_value=True):
+                with patch("mempalace.daemon.submit_job", return_value=parked) as mock_submit:
+                    with patch("mempalace.hooks_cli._log") as mock_log:
+                        result = _save_diary_direct(
+                            str(transcript), "sess1", wing="wing_project", agent_name="claude"
+                        )
+
+    # The hook must ask the daemon to hand a parked job straight back.
+    assert mock_submit.call_args.kwargs["stop_on_lock_deferral"] is True
+
+    assert result["count"] == 0  # nothing filed yet -- the daemon still owes the write
+    assert not (tmp_path / "last_checkpoint").exists()  # and it must not be acked
+
+    logged = " ".join(str(c.args[0]) for c in mock_log.call_args_list)
+    assert "deferred" in logged
+    assert "PID 999" in logged
+    assert "Daemon diary checkpoint failed" not in logged, "a parked job is not a failure"
+
+
 def test_hooks_daemon_enabled_requires_explicit_true():
     with patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls:
         assert _hooks_daemon_enabled() is False
@@ -1203,6 +1251,40 @@ def test_mine_sync_with_env_uses_projects_mode(tmp_path):
                 assert cmd[cmd.index("--mode") + 1] == "projects"
 
 
+def test_mine_sync_daemon_lock_deferral_is_not_reported_as_a_failure(tmp_path):
+    """The precompact sync path waits (wait=True, timeout=60) but is documented as
+    living under the harness 30s ceiling, so a job it can never see go terminal is
+    doubly bad here: without stop_on_lock_deferral it burns past the ceiling and
+    then logs a failure for work the daemon still holds and will run."""
+    mempal_dir = tmp_path / "project"
+    mempal_dir.mkdir()
+    parked = {
+        "id": "job-parked",
+        "state": "queued",
+        "error": {
+            "error_class": "LockHeldByOtherProcess",
+            "message": "palace /p is held by PID 999 (mempalace-mcp)",
+        },
+        "result": None,
+    }
+    env = {"MEMPAL_DIR": str(mempal_dir), "MEMPALACE_HOOKS_DAEMON": "yes"}
+    with patch.dict("os.environ", env):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli._daemon_available", return_value=True):
+                with patch("mempalace.daemon.submit_job", return_value=parked) as mock_submit:
+                    with patch("mempalace.hooks_cli._log") as mock_log:
+                        with patch("mempalace.hooks_cli.subprocess.run") as mock_run:
+                            _mine_sync()
+
+    assert mock_submit.call_args.kwargs["stop_on_lock_deferral"] is True
+    mock_run.assert_not_called()  # the daemon owns it; spawning a mine would double-write
+
+    logged = " ".join(str(c.args[0]) for c in mock_log.call_args_list)
+    assert "deferred" in logged
+    assert "PID 999" in logged
+    assert "Daemon sync mine failed" not in logged, "a parked job is not a failure"
+
+
 def test_mine_sync_uses_mempalace_python(tmp_path):
     """Sync mine command uses _mempalace_python(), not bare sys.executable."""
     mempal_dir = tmp_path / "project"
@@ -1526,9 +1608,56 @@ def test_ingest_transcript_daemon_opt_in_submits_job(tmp_path):
     mock_popen.assert_not_called()
     mock_submit.assert_called_once()
     payload = mock_submit.call_args.args[1]
-    assert payload["source"] == str(tmp_path)
+    assert payload["source"] == str(transcript.resolve())
     assert payload["mode"] == "convos"
-    assert payload["wing"] == "sessions"
+    # No cwd in the transcript and no alias file → the ``wing_sessions``
+    # catch-all. Previously this asserted a hardcoded ``sessions``; the daemon
+    # payload now goes through the same alias-aware resolver as the spawn path.
+    assert payload["wing"] == "wing_sessions"
+
+
+def test_ingest_transcript_daemon_payload_follows_alias(tmp_path, monkeypatch):
+    """The daemon submit path honors ``wing_aliases.json`` too.
+
+    The spawn fallback resolved the alias while the daemon payload hardcoded
+    ``sessions``, so enabling the hooks daemon silently made the alias map
+    inert and re-pooled every project's transcripts into one wing.
+    """
+    palace_root = tmp_path / ".mempalace"
+    palace_root.mkdir(exist_ok=True)
+    (palace_root / "wing_aliases.json").write_text(
+        json.dumps({"aliases": {"joy-web*": "wing_joy_web"}})
+    )
+    monkeypatch.setattr(hooks_cli_mod, "PALACE_ROOT", palace_root)
+    monkeypatch.setattr(hooks_cli_mod, "_WING_ALIASES_CACHE", {})
+
+    project_dir = tmp_path / ".claude" / "projects" / "-Users-me-Claude-joy-web-3"
+    project_dir.mkdir(parents=True)
+    transcript = project_dir / "session.jsonl"
+    transcript.write_text(
+        json.dumps({"type": "user", "cwd": "/Users/me/Claude/joy-web-3", "content": "x" * 200})
+        + "\n",
+        encoding="utf-8",
+    )
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+
+    env = {"MEMPALACE_HOOKS_DAEMON": "yes", "MEMPALACE_PALACE_PATH": str(palace_dir)}
+    with patch.dict("os.environ", env):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli._daemon_available", return_value=True):
+                with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                    with patch(
+                        "mempalace.daemon.submit_job", return_value={"id": "job"}
+                    ) as mock_submit:
+                        from mempalace.hooks_cli import _ingest_transcript
+
+                        _ingest_transcript(str(transcript))
+
+    mock_popen.assert_not_called()
+    mock_submit.assert_called_once()
+    payload = mock_submit.call_args.args[1]
+    assert payload["wing"] == "wing_joy_web", f"expected alias wing, got {payload['wing']!r}"
 
 
 def test_ingest_transcript_skips_when_target_running(tmp_path):
@@ -1553,7 +1682,7 @@ def test_ingest_transcript_skips_when_target_running(tmp_path):
                     "-m",
                     "mempalace",
                     "mine",
-                    str(transcript.parent),
+                    str(transcript.resolve()),
                     "--mode",
                     "convos",
                     "--wing",
@@ -1979,7 +2108,7 @@ def test_precompact_with_timeout(tmp_path):
     assert result == {}
 
 
-def test_precompact_mines_transcript_dir(tmp_path, monkeypatch):
+def test_precompact_mines_only_active_transcript(tmp_path, monkeypatch):
     """Precompact ingests the active transcript via _ingest_transcript.
 
     With no MEMPAL_DIR, _mine_sync is a no-op; the transcript ingest is
@@ -2003,8 +2132,8 @@ def test_precompact_mines_transcript_dir(tmp_path, monkeypatch):
     mock_run.assert_not_called()
     mock_popen.assert_called_once()
     cmd = mock_popen.call_args[0][0]
-    # Mines the transcript's parent dir as convos, into wing "sessions".
-    assert str(tmp_path) in cmd
+    # Mines only the active transcript as convos, into wing "sessions".
+    assert str(transcript.resolve()) in cmd
     assert cmd[cmd.index("--mode") + 1] == "convos"
     # Wing is derived from the transcript (alias-aware); a loose tmp
     # transcript with no cwd resolves to the wing_sessions catch-all.

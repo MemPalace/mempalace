@@ -97,6 +97,35 @@ def get_regex() -> dict:
     return _strings.get("regex", {})
 
 
+def get_stopwords(lang: Optional[str] = None) -> set:
+    """Return BM25 stop words for ``lang`` as a lowercase set.
+
+    When ``lang`` is given, loads that locale's regex section directly and
+    does not touch global state. When omitted, reads from the currently
+    loaded language. Returns an empty set if the locale is unknown or its
+    ``regex.stop_words`` field is missing.
+
+    ``regex.stop_words`` is stored as a space-separated string in each
+    locale JSON so non-ASCII particles (e.g. Japanese ``は/が/を``) stay
+    authorable without JSON-array escaping overhead.
+    """
+    if lang is not None:
+        canonical = _canonical_lang(lang)
+        if canonical is None:
+            return set()
+        lang_file = _LANG_DIR / f"{canonical}.json"
+        try:
+            data = json.loads(lang_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return set()
+        sw_str = data.get("regex", {}).get("stop_words", "")
+    else:
+        sw_str = get_regex().get("stop_words", "")
+    if not isinstance(sw_str, str):
+        return set()
+    return {w.lower() for w in sw_str.split() if w}
+
+
 def _load_entity_section(lang: str) -> dict:
     """Load the raw entity section for one language. Returns {} if missing."""
     canonical = _canonical_lang(lang)

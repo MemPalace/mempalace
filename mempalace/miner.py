@@ -244,20 +244,16 @@ class GitignoreMatcher:
         self.base_dir = base_dir
         self.rules = rules
 
-    @classmethod
-    def from_dir(cls, dir_path: Path):
-        gitignore_path = dir_path / ".gitignore"
-        if not gitignore_path.is_file():
-            return None
+    @staticmethod
+    def _parse_rules(lines):
+        """Parse an iterable of raw pattern strings into a list of rule dicts.
 
-        try:
-            lines = gitignore_path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except Exception:
-            return None
-
+        Shared by :meth:`from_dir` and :meth:`from_patterns` so both paths
+        stay in sync with the gitignore parsing semantics.
+        """
         rules = []
         for raw_line in lines:
-            line = raw_line.strip()
+            line = str(raw_line).strip()
             if not line:
                 continue
 
@@ -289,11 +285,45 @@ class GitignoreMatcher:
                     "negated": negated,
                 }
             )
+        return rules
 
-        if not rules:
+    @classmethod
+    def from_dir(cls, dir_path: Path):
+        gitignore_path = dir_path / ".gitignore"
+        if not gitignore_path.is_file():
             return None
 
+        try:
+            lines = gitignore_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            return None
+
+        rules = cls._parse_rules(lines)
+        if not rules:
+            return None
         return cls(dir_path, rules)
+
+    @classmethod
+    def from_patterns(cls, base_dir: Path, patterns):
+        """Create a matcher from an explicit list of gitignore-inspired pattern strings.
+
+        Supports a gitignore-inspired subset of pattern syntax for
+        ``exclude_patterns`` in ``mempalace.yaml``.  Patterns are parsed by
+        the same rule parser used for ``.gitignore`` files, so familiar
+        constructs (trailing ``/`` for dir-only, leading ``/`` for anchoring,
+        ``!`` negation, ``**`` globs) work as expected.  Full gitignore
+        semantics are not guaranteed for every edge case.
+
+        ``patterns`` must be a list of strings.  A single string is coerced
+        to a one-element list for convenience.  Non-string entries are
+        converted via ``str()``.
+        """
+        if isinstance(patterns, str):
+            patterns = [patterns]
+        rules = cls._parse_rules(patterns)
+        if not rules:
+            return None
+        return cls(base_dir, rules)
 
     def matches(self, path: Path, is_dir: bool = None):
         try:
@@ -420,6 +450,29 @@ def is_force_included(path: Path, project_path: Path, include_paths: set) -> boo
             return True
 
     return False
+
+
+def _apply_exclude_patterns_to_prescanned_files(
+    files: list, project_path: Path, exclude_patterns: list, include_ignored: list
+) -> list:
+    """Filter a caller-provided (already-scanned) file list by exclude_patterns.
+
+    scan_project() applies exclude_patterns itself, but a caller that passes
+    its own pre-scanned ``files`` list bypasses that -- so callers reusing a
+    scan (e.g. the init double-scan) still need per-project exclusions
+    applied here. force_include paths are preserved, matching scan_project's
+    own precedence.
+    """
+    include_paths = normalize_include_paths(include_ignored)
+    exclude_matcher = GitignoreMatcher.from_patterns(project_path, exclude_patterns)
+    if exclude_matcher is None:
+        return files
+    return [
+        file_path
+        for file_path in files
+        if is_force_included(file_path, project_path, include_paths)
+        or exclude_matcher.matches(file_path, is_dir=False) is not True
+    ]
 
 
 # =============================================================================
@@ -580,13 +633,19 @@ def chunk_text(
         raise ValueError(f"chunk_size must be a positive int, got {chunk_size!r}")
     if not isinstance(chunk_overlap, int) or chunk_overlap < 0:
         raise ValueError(f"chunk_overlap must be a non-negative int, got {chunk_overlap!r}")
-    if chunk_overlap >= chunk_size:
-        # ``start = end - chunk_overlap`` would not advance (or would go
-        # backward) when overlap >= size, producing an infinite loop on
-        # any non-empty input.
+    if chunk_overlap > chunk_size // 2:
+        # The windowing loop pulls ``end`` back to a boundary only when that
+        # boundary is past ``start + chunk_size // 2`` (the rfind guards below),
+        # so a pulled chunk always spans more than ``chunk_size // 2`` chars.
+        # ``start = end - chunk_overlap`` therefore advances only while
+        # ``chunk_overlap <= chunk_size // 2``; a larger overlap makes ``start``
+        # stall or move backward and the loop spins forever on short-line
+        # content (#2056). The largest safe value is ``chunk_size // 2`` (half,
+        # rounded down for odd sizes), which still advances and stays allowed.
         raise ValueError(
-            f"chunk_overlap ({chunk_overlap}) must be less than chunk_size "
-            f"({chunk_size}); equality or greater would loop forever"
+            f"chunk_overlap ({chunk_overlap}) must be at most chunk_size // 2 "
+            f"({chunk_size // 2}); a larger overlap can loop forever on "
+            f"short-line content (#2056)"
         )
     if not isinstance(min_chunk_size, int) or min_chunk_size < 0:
         raise ValueError(f"min_chunk_size must be a non-negative int, got {min_chunk_size!r}")
@@ -599,6 +658,28 @@ def chunk_text(
     chunks = []
     start = 0
     chunk_index = 0
+
+    # Running newline tallies for the 1-indexed (line_start, line_end)
+    # locators emitted below. These replace the previous per-chunk
+    # ``content.count("\n", 0, pos)`` full-prefix rescans, which were O(pos)
+    # each and O(N*K) over K chunks: a 287 MB / ~433k-chunk file scanned
+    # ~1.2e14 bytes and ran for days, indistinguishable from a hang (#2054).
+    # ``start`` and ``end`` each advance monotonically for any
+    # ``chunk_overlap < chunk_size // 2`` (the default 800/100 config and
+    # every sane override), so counting only the newly-scanned span is O(N)
+    # total. Each position sequence keeps its own anchor; a backward step
+    # (a paragraph-boundary pull under a pathological near-``chunk_size``
+    # overlap, or a negative index) falls back to the exact full-prefix
+    # count. That fallback is defensive and does not fire on a terminating
+    # mine: the current windowing cannot send a filed chunk's ``start``
+    # backward without also entering a pre-existing infinite loop (overlap
+    # >= chunk_size // 2), so the else-branches read as uncovered. They keep
+    # every value byte-identical to the old form if the windowing ever gains
+    # a loop guard that admits backward steps.
+    _nl_before_start = 0
+    _start_anchor = 0
+    _nl_before_end = 0
+    _end_anchor = 0
 
     while start < len(content):
         end = min(start + chunk_size, len(content))
@@ -618,13 +699,25 @@ def chunk_text(
             # Tier 6a — 1-indexed line range in the stripped source.
             # Approximate locator (±1 at boundaries is fine for "jump to
             # roughly here"); exact-quote positioning is a future tier.
-            # Use the bounds form of ``str.count`` (counts on the original
-            # string with start/end limits) instead of slicing — slicing
-            # would allocate a new substring per chunk and produce O(N^2)
-            # work on a 500MB file with 50K chunks. Per PR #1579 review
-            # (gemini-code-assist, medium priority).
-            line_start = content.count("\n", 0, start) + 1
-            line_end = content.count("\n", 0, end) + 1
+            # ``str.count`` with bounds (not slicing) still avoids allocating
+            # a substring per chunk, the original PR #1579 review concern
+            # (gemini-code-assist, medium priority). The incremental anchors
+            # additionally avoid rescanning the whole prefix each time, the
+            # actual O(N*K) cost (#2054). Two anchors because ``start`` and
+            # ``end`` are distinct monotonic sequences; a backward step
+            # re-derives the value exactly from position 0.
+            if start >= _start_anchor:
+                _nl_before_start += content.count("\n", _start_anchor, start)
+                _start_anchor = start
+                line_start = _nl_before_start + 1
+            else:
+                line_start = content.count("\n", 0, start) + 1
+            if end >= _end_anchor:
+                _nl_before_end += content.count("\n", _end_anchor, end)
+                _end_anchor = end
+                line_end = _nl_before_end + 1
+            else:
+                line_end = content.count("\n", 0, end) + 1
             chunks.append(
                 {
                     "content": chunk,
@@ -1531,6 +1624,7 @@ def scan_project(
     project_dir: str,
     respect_gitignore: bool = True,
     include_ignored: list = None,
+    exclude_patterns: list = None,
 ) -> list:
     """Return list of all readable file paths under ``project_dir``.
 
@@ -1543,6 +1637,7 @@ def scan_project(
     active_matchers = []
     matcher_cache = {}
     include_paths = normalize_include_paths(include_ignored)
+    exclude_matcher = GitignoreMatcher.from_patterns(project_path, exclude_patterns or [])
 
     for root, dirs, filenames in os.walk(project_path):
         root_path = Path(root)
@@ -1570,6 +1665,13 @@ def scan_project(
                 if is_force_included(root_path / d, project_path, include_paths)
                 or not is_gitignored(root_path / d, active_matchers, is_dir=True)
             ]
+        if exclude_matcher:
+            dirs[:] = [
+                d
+                for d in dirs
+                if is_force_included(root_path / d, project_path, include_paths)
+                or exclude_matcher.matches(root_path / d, is_dir=True) is not True
+            ]
 
         for filename in filenames:
             filepath = root_path / filename
@@ -1583,6 +1685,15 @@ def scan_project(
             if respect_gitignore and active_matchers and not force_include:
                 if is_gitignored(filepath, active_matchers, is_dir=False):
                     continue
+            # Skip files matching project-level exclude_patterns (mempalace.yaml).
+            # force_include paths bypass this check so callers can selectively
+            # re-include files that would otherwise be excluded.
+            if (
+                not force_include
+                and exclude_matcher
+                and exclude_matcher.matches(filepath, is_dir=False)
+            ):
+                continue
             # Skip symlinks — prevents following links to /dev/urandom, etc.
             if filepath.is_symlink():
                 rel = filepath.relative_to(project_path).as_posix()
@@ -1706,13 +1817,20 @@ def _mine_impl(
 
     wing = wing_override or config["wing"]
     rooms = config.get("rooms", [{"name": "general", "description": "All project files"}])
+    exclude_patterns = config.get("exclude_patterns", [])
 
     if files is None:
         files = scan_project(
             project_dir,
             respect_gitignore=respect_gitignore,
             include_ignored=include_ignored,
+            exclude_patterns=exclude_patterns,
         )
+    elif exclude_patterns:
+        files = _apply_exclude_patterns_to_prescanned_files(
+            files, project_path, exclude_patterns, include_ignored
+        )
+
     from .embedding import describe_device
 
     print(f"\n{'=' * 55}")
@@ -1725,7 +1843,7 @@ def _mine_impl(
     print(f"  Palace:  {palace_path}")
     print(f"  Device:  {describe_device()}")
     if dry_run:
-        print("  DRY RUN — nothing will be filed")
+        print("  DRY RUN -- nothing will be filed")
     if not respect_gitignore:
         print("  .gitignore: DISABLED")
     if include_ignored:
@@ -1795,12 +1913,15 @@ def _mine_impl(
                     break
 
         if not dry_run:
+            from .config import MempalaceConfig
+
+            graph_config = MempalaceConfig(palace_path=palace_path)
             # Cross-wing topic tunnels: after every file in this wing has been
             # processed, link this wing to any other wing that shares a
             # confirmed TOPIC label. Out of scope for v1: manifest-dependency
             # overlap, per-topic allow/deny lists, search-result surfacing.
             try:
-                tunnels_added = _compute_topic_tunnels_for_wing(wing)
+                tunnels_added = _compute_topic_tunnels_for_wing(wing, config=graph_config)
                 if tunnels_added:
                     print(f"\n  Topic tunnels: +{tunnels_added} cross-wing link(s)")
             except Exception as e:
@@ -1816,7 +1937,9 @@ def _mine_impl(
             # must never fail a mine; it's a derived analytic, not load-bearing
             # for the drawer write that already committed above.
             try:
-                hallways_created = compute_hallways_for_wing(wing, col=collection)
+                hallways_created = compute_hallways_for_wing(
+                    wing, col=collection, config=graph_config
+                )
                 if hallways_created:
                     print(f"\n  Hallways: +{len(hallways_created)} within-wing entity link(s)")
             except Exception as e:
@@ -1832,7 +1955,7 @@ def _mine_impl(
             # ``kind="entity"`` / ``kind="topic"``. Same fault-tolerance
             # pattern: never fail a mine over a derived analytic.
             try:
-                entity_tunnels_added = _compute_entity_tunnels_for_wing(wing)
+                entity_tunnels_added = _compute_entity_tunnels_for_wing(wing, config=graph_config)
                 if entity_tunnels_added:
                     print(f"\n  Entity tunnels: +{entity_tunnels_added} cross-wing entity link(s)")
             except Exception as e:
@@ -1956,7 +2079,7 @@ def _cleanup_mine_pid_file() -> None:
         pass
 
 
-def _compute_topic_tunnels_for_wing(wing: str) -> int:
+def _compute_topic_tunnels_for_wing(wing: str, config=None) -> int:
     """Drop tunnels between ``wing`` and every other wing that shares
     confirmed topics, honoring the ``topic_tunnel_min_count`` config knob.
 
@@ -1969,13 +2092,13 @@ def _compute_topic_tunnels_for_wing(wing: str) -> int:
     topics_map = get_topics_by_wing()
     if not topics_map or wing not in topics_map:
         return 0
-    cfg = MempalaceConfig()
+    cfg = config or MempalaceConfig()
     min_count = cfg.topic_tunnel_min_count
-    created = topic_tunnels_for_wing(wing, topics_map, min_count=min_count)
+    created = topic_tunnels_for_wing(wing, topics_map, min_count=min_count, config=cfg)
     return len(created)
 
 
-def _compute_entity_tunnels_for_wing(wing: str) -> int:
+def _compute_entity_tunnels_for_wing(wing: str, config=None) -> int:
     """Drop tunnels between ``wing`` and every other wing that shares an
     entity via the within-wing hallway primitive.
 
@@ -1993,10 +2116,10 @@ def _compute_entity_tunnels_for_wing(wing: str) -> int:
     from .hallways import list_hallways
     from .palace_graph import entity_tunnels_for_wing
 
-    hallways = list_hallways()
+    hallways = list_hallways(config=config)
     if not hallways:
         return 0
-    created = entity_tunnels_for_wing(wing, hallways)
+    created = entity_tunnels_for_wing(wing, hallways, config=config)
     return len(created)
 
 
@@ -2015,7 +2138,7 @@ def status(palace_path: str):
     un-bootstrapped collection, or an unexpected schema); the fallback also
     emits the state-specific guidance for absent/empty palaces.
     """
-    from .backends.chroma import _sqlite_wing_room_counts
+    from .backends.chroma import _sqlite_wing_room_counts, hnsw_capacity_status
 
     counts = _sqlite_wing_room_counts(palace_path, "mempalace_drawers")
     if counts is not None:
@@ -2025,6 +2148,17 @@ def status(palace_path: str):
 
     col = _open_collection_or_explain(palace_path)
     if col is None:
+        return
+
+    # Preflight HNSW divergence before falling back to the ChromaDB client
+    # path: count() on a diverged segment can hit the #1222 SIGSEGV/panic
+    # class, which a try/except around count() cannot catch. This fallback
+    # only runs when the direct sqlite read above was unavailable, so it's
+    # the one place in this function that still touches count() directly.
+    capacity_info = hnsw_capacity_status(palace_path, "mempalace_drawers")
+    if capacity_info.get("diverged"):
+        print(f"\n  HNSW index is diverged: {capacity_info.get('message', '')}")
+        print("  Run `mempalace repair --mode from-sqlite --archive-existing` first.")
         return
 
     # Count by wing and room — paginate to avoid SQLite "too many SQL
@@ -2049,7 +2183,7 @@ def status(palace_path: str):
 def _print_status(total: int, wing_rooms: dict[str, dict[str, int]]) -> None:
     """Render the wing/room histogram shared by both status code paths."""
     print(f"\n{'=' * 55}")
-    print(f"  MemPalace Status — {total} drawers")
+    print(f"  MemPalace Status -- {total} drawers")
     print(f"{'=' * 55}\n")
     for wing, rooms in sorted(wing_rooms.items()):
         print(f"  WING: {wing}")

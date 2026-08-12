@@ -7,6 +7,7 @@ the two filenames to `.gitignore` when `<dir>` is a git repository.
 """
 
 from pathlib import Path
+from unittest.mock import mock_open, patch
 
 from mempalace.cli import _ensure_mempalace_files_gitignored
 
@@ -60,3 +61,20 @@ def test_handles_gitignore_without_trailing_newline(tmp_path):
     assert "dist\n" in contents
     assert "mempalace.yaml" in contents
     assert "entities.json" in contents
+
+
+def test_gitignore_io_pins_utf8_and_defensive_decode(tmp_path):
+    """Regression for #1648: never fall back to the Windows locale codec."""
+    _git_init(tmp_path)
+    gitignore = tmp_path / ".gitignore"
+    gitignore.write_text("# café\n", encoding="utf-8")
+    append_handle = mock_open()
+
+    with (
+        patch.object(Path, "read_text", return_value="# café\n") as read_text,
+        patch("builtins.open", append_handle),
+    ):
+        assert _ensure_mempalace_files_gitignored(tmp_path) is True
+
+    read_text.assert_called_once_with(encoding="utf-8", errors="replace")
+    append_handle.assert_called_once_with(gitignore, "a", encoding="utf-8")

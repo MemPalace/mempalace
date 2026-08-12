@@ -36,6 +36,7 @@ No vendor lock-in. No hidden dependency on any specific provider. Zero deps
 added to pyproject — uses stdlib urllib.
 """
 
+import contextlib
 import json
 import os
 import re
@@ -51,6 +52,7 @@ from .palace import (
     get_closets_collection,
     get_collection,
     mine_lock,
+    mine_palace_lock,
     purge_file_closets,
     upsert_closet_lines,
 )
@@ -225,8 +227,31 @@ def regenerate_closets(
         print("or pass --endpoint / --model / --key on the CLI.")
         return {"error": "missing-config", "missing": missing}
 
-    drawers_col = get_collection(palace_path, create=False)
-    closets_col = get_closets_collection(palace_path)
+    # A full regeneration is one long-lived read/LLM/purge/upsert operation.
+    # Acquire ownership before opening either collection or calling the LLM so
+    # a conflicting local writer fails immediately. The palace lock is
+    # process-wide and re-entrant, so daemon/MCP-owned calls compose safely.
+    lease = contextlib.nullcontext() if dry_run else mine_palace_lock(palace_path)
+    with lease:
+        return _regenerate_closets_owned(
+            palace_path,
+            wing=wing,
+            sample=sample,
+            dry_run=dry_run,
+            cfg=cfg,
+        )
+
+
+def _regenerate_closets_owned(
+    palace_path,
+    *,
+    wing,
+    sample,
+    dry_run,
+    cfg: LLMConfig,
+):
+    drawers_col = get_collection(palace_path, create=False, read_only=dry_run)
+    closets_col = None if dry_run else get_closets_collection(palace_path)
 
     total = drawers_col.count()
     if total == 0:
@@ -303,6 +328,7 @@ def regenerate_closets(
         # otherwise a regex closet rebuild mid-regenerate races with our
         # purge+upsert cycle and leaves mixed regex/LLM lines.
         with mine_lock(source):
+            assert closets_col is not None
             purge_file_closets(closets_col, source)
             upsert_closet_lines(
                 closets_col,

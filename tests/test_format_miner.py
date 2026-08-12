@@ -1158,7 +1158,9 @@ def test_mine_formats_calls_compute_topic_tunnels_after_loop(_mine_formats_mocks
         patch("mempalace.format_miner._compute_topic_tunnels_for_wing", return_value=0) as p_tun,
     ):
         mine_formats(format_dir=str(tmp), palace_path=str(tmp / "palace"), wing="wing_aya")
-    p_tun.assert_called_once_with("wing_aya")
+    p_tun.assert_called_once()
+    assert p_tun.call_args.args == ("wing_aya",)
+    assert p_tun.call_args.kwargs["config"].palace_path == str(tmp / "palace")
 
 
 def test_mine_formats_tunnel_failure_does_not_crash_mine(_mine_formats_mocks):
@@ -1518,13 +1520,16 @@ def test_mine_formats_threads_chunk_size_from_user_config(monkeypatch, tmp_path:
 
     # Inject custom config values via a fake MempalaceConfig.
     class _FakeMempalaceConfig:
+        def __init__(self, **kwargs):
+            self._palace_path = kwargs.get("palace_path", str(tmp_path / "palace"))
+
         chunk_size = 1234
         chunk_overlap = 56
         min_chunk_size = 78
 
         @property
         def palace_path(self):
-            return str(tmp_path / "palace")
+            return self._palace_path
 
     monkeypatch.setattr(format_miner, "MempalaceConfig", _FakeMempalaceConfig)
 

@@ -630,6 +630,66 @@ class KnowledgeGraph:
 
     # ── Stats ─────────────────────────────────────────────────────────────
 
+    # -- Replication (RFC 004 step 1: read-replica snapshot) ---------------
+
+    _REPLICATION_TABLES = {
+        "entities": ("id", "name", "type", "properties", "created_at"),
+        "triples": (
+            "id",
+            "subject",
+            "predicate",
+            "object",
+            "valid_from",
+            "valid_to",
+            "confidence",
+            "source_closet",
+            "source_file",
+            "source_drawer_id",
+            "adapter_name",
+            "extracted_at",
+        ),
+    }
+
+    def dump_rows(self, table: str, after_rowid: int = 0, limit: int = 500) -> list:
+        """Page KG rows in rowid order for snapshot replication.
+
+        Rows are returned verbatim with a ``_rowid`` pagination cursor.
+        rowid order is deterministic, so pages never skip under concurrent
+        appends (updates in earlier pages are caught by the next full pass).
+        """
+        columns = self._REPLICATION_TABLES.get(table)
+        if columns is None:
+            raise ValueError(f"table must be one of {sorted(self._REPLICATION_TABLES)}")
+        with self._lock:
+            conn = self._conn()
+            rows = conn.execute(
+                f"SELECT rowid, {', '.join(columns)} FROM {table} "
+                "WHERE rowid > ? ORDER BY rowid ASC LIMIT ?",
+                (int(after_rowid), max(1, min(int(limit), 1000))),
+            ).fetchall()
+        return [dict(row) | {"_rowid": row["rowid"]} for row in rows]
+
+    def apply_row(self, table: str, row: dict) -> None:
+        """Fold one replicated KG row in, keyed by id (INSERT OR REPLACE).
+
+        REPLACE makes invalidations (valid_to updates) and entity edits
+        converge on re-pull; rows are never deleted by replication.
+        """
+        columns = self._REPLICATION_TABLES.get(table)
+        if columns is None:
+            raise ValueError(f"table must be one of {sorted(self._REPLICATION_TABLES)}")
+        if not row.get("id"):
+            raise ValueError("replicated row is missing 'id'")
+        values = [row.get(col) for col in columns]
+        with self._lock:
+            conn = self._conn()
+            with conn:
+                conn.execute(
+                    f"INSERT OR REPLACE INTO {table} ({', '.join(columns)}) "
+                    f"VALUES ({', '.join('?' for _ in columns)})",
+                    values,
+                )
+
     def stats(self):
         with self._lock:
             conn = self._conn()

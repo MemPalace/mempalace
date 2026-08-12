@@ -41,3 +41,20 @@ def test_local_backends_do_not_claim_namespace_isolation():
     advertise the namespace-isolation capability (RFC 001 isolation contract)."""
     assert "supports_namespace_isolation" not in ChromaBackend.capabilities
     assert "supports_namespace_isolation" not in SQLiteExactBackend.capabilities
+
+
+@pytest.mark.parametrize("backend_cls", _LOCAL_BACKENDS)
+def test_local_backends_reject_populated_namespace(backend_cls, tmp_path):
+    """RFC 001 section 4.4 no-silent-drop: non-advertising backends MUST raise when
+    PalaceRef.namespace is set rather than accept-and-ignore."""
+    from mempalace.backends.base import UnsupportedCapabilityError
+
+    backend = backend_cls()
+    try:
+        path = tmp_path / "palace"
+        path.mkdir()
+        ref = PalaceRef(id=str(path), local_path=str(path), namespace="tenant-a")
+        with pytest.raises(UnsupportedCapabilityError):
+            backend.get_collection(palace=ref, collection_name="mempalace_drawers", create=True)
+    finally:
+        backend.close()

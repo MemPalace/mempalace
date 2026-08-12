@@ -95,8 +95,8 @@ def test_mine_computes_hallways_for_wing_post_mine(monkeypatch):
 
     hallway_calls = []
 
-    def fake_compute(wing, col=None, min_count=2):
-        hallway_calls.append({"wing": wing, "col": col, "min_count": min_count})
+    def fake_compute(wing, col=None, min_count=2, config=None):
+        hallway_calls.append({"wing": wing, "col": col, "min_count": min_count, "config": config})
         return []  # no hallways materialized — that's not what we're testing
 
     # Patch at the call site (mempalace.miner.compute_hallways_for_wing) so
@@ -134,6 +134,7 @@ def test_mine_computes_hallways_for_wing_post_mine(monkeypatch):
         assert call["col"] is not None, (
             "must pass the live collection so hallways can query drawers"
         )
+        assert call["config"].palace_path == str(palace_path)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -147,7 +148,7 @@ def test_mine_hallway_failure_does_not_crash_mine(monkeypatch):
     """
     from mempalace import miner as miner_mod
 
-    def angry_compute(wing, col=None, min_count=2):
+    def angry_compute(wing, col=None, min_count=2, config=None):
         raise RuntimeError("simulated hallway-compute explosion")
 
     monkeypatch.setattr(miner_mod, "compute_hallways_for_wing", angry_compute)
@@ -194,8 +195,8 @@ def test_mine_computes_entity_tunnels_for_wing_post_mine(monkeypatch):
 
     entity_tunnel_calls = []
 
-    def fake_compute(wing):
-        entity_tunnel_calls.append({"wing": wing})
+    def fake_compute(wing, config=None):
+        entity_tunnel_calls.append({"wing": wing, "config": config})
         return 0  # no tunnels — that's not what we're testing here
 
     # Patch at the call site (mempalace.miner._compute_entity_tunnels_for_wing)
@@ -227,6 +228,7 @@ def test_mine_computes_entity_tunnels_for_wing_post_mine(monkeypatch):
             f"got {len(entity_tunnel_calls)}"
         )
         assert entity_tunnel_calls[0]["wing"] == "test_project"
+        assert entity_tunnel_calls[0]["config"].palace_path == str(palace_path)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -241,7 +243,7 @@ def test_mine_entity_tunnel_failure_does_not_crash_mine(monkeypatch):
     """
     from mempalace import miner as miner_mod
 
-    def angry_compute(wing):
+    def angry_compute(wing, config=None):
         raise RuntimeError("simulated entity-tunnel-compute explosion")
 
     monkeypatch.setattr(miner_mod, "_compute_entity_tunnels_for_wing", angry_compute)
@@ -589,6 +591,115 @@ def test_scan_project_logs_nested_symlink_with_relative_path(tmp_path, capsys):
     assert "(symlink)" in err
 
 
+def test_scan_project_exclude_patterns_skips_matching_files():
+    tmpdir = tempfile.mkdtemp()
+    try:
+        project_root = Path(tmpdir).resolve()
+
+        write_file(project_root / "src" / "app.py", "print('app')\n" * 20)
+        write_file(project_root / "docs" / "guide.md", "# Guide\n" * 20)
+        write_file(project_root / "README.md", "# README\n" * 20)
+
+        # *.md excludes README.md and docs/guide.md; docs/* would also cover docs/
+        # subtree.  Patterns follow .gitignore syntax via GitignoreMatcher.
+        assert scanned_files(
+            project_root,
+            exclude_patterns=["*.md", "docs/*"],
+        ) == ["src/app.py"]
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_scan_project_exclude_patterns_prunes_entire_directory():
+    tmpdir = tempfile.mkdtemp()
+    try:
+        project_root = Path(tmpdir).resolve()
+
+        write_file(project_root / "src" / "app.py", "print('app')\n" * 20)
+        write_file(project_root / "docs" / "sub" / "deep.md", "# Deep\n" * 20)
+
+        # A trailing-slash pattern (dir-only) prunes the whole directory so
+        # os.walk never descends into it.
+        assert scanned_files(project_root, exclude_patterns=["docs/"]) == ["src/app.py"]
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_scan_project_exclude_patterns_include_ignored_bypasses_exclusion():
+    tmpdir = tempfile.mkdtemp()
+    try:
+        project_root = Path(tmpdir).resolve()
+
+        write_file(project_root / "src" / "app.py", "print('app')\n" * 20)
+        write_file(project_root / ".gitignore", "docs/\n")
+        write_file(project_root / "docs" / "guide.md", "# Guide\n" * 20)
+
+        # docs/ is both gitignored and matched by exclude_patterns, but
+        # include_ignored should override both filters and bring it back.
+        assert scanned_files(
+            project_root,
+            exclude_patterns=["docs/*"],
+            include_ignored=["docs"],
+        ) == ["docs/guide.md", "src/app.py"]
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_mine_exclude_patterns_applied_to_prescan_files(monkeypatch):
+    """exclude_patterns from config must be applied when mine() is given a pre-scanned list.
+
+    The init command calls scan_project() first to show a file-count estimate,
+    then passes the result to mine(..., files=...) to avoid walking the tree
+    twice.  The _mine_impl elif branch must apply exclude_patterns to that list
+    so per-project exclusions still take effect.
+    """
+    import mempalace.miner as miner_mod
+
+    tmpdir = tempfile.mkdtemp()
+    try:
+        project_root = Path(tmpdir).resolve()
+
+        write_file(project_root / "src" / "app.py", "print('app')\n" * 20)
+        write_file(project_root / "docs" / "guide.md", "# Guide\n" * 20)
+        write_file(project_root / "README.md", "# README\n" * 20)
+
+        with open(project_root / "mempalace.yaml", "w") as f:
+            yaml.dump(
+                {
+                    "wing": "test_project",
+                    "rooms": [{"name": "general", "description": "General"}],
+                    "exclude_patterns": ["*.md", "docs/"],
+                },
+                f,
+            )
+
+        # Simulate the init double-scan: scan without exclude_patterns first
+        # (representing the caller that doesn't know the config), then pass
+        # the full list to mine() so the elif branch applies the config exclusions.
+        prescan = scan_project(str(project_root), exclude_patterns=None)
+        assert len(prescan) >= 2, "prescan should include .md files before filtering"
+
+        # Capture which files process_file is called with during dry_run
+        processed = []
+        _real_process_file = miner_mod.process_file
+
+        def _capture_process_file(filepath, **kwargs):
+            processed.append(filepath)
+            return _real_process_file(filepath, **kwargs)
+
+        monkeypatch.setattr(miner_mod, "process_file", _capture_process_file)
+
+        palace_path = project_root / "palace"
+        mine(str(project_root), str(palace_path), dry_run=True, files=prescan)
+
+        processed_rel = [p.relative_to(project_root).as_posix() for p in processed]
+        assert "src/app.py" in processed_rel
+        assert "docs/guide.md" not in processed_rel
+        assert "README.md" not in processed_rel
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def test_entity_metadata_finds_cyrillic_names(monkeypatch):
     """Entity extraction must find non-Latin names when entity_languages includes the locale."""
     import mempalace.palace as palace_mod
@@ -909,6 +1020,31 @@ def test_status_palace_dir_without_db_reports_uninitialized(tmp_path, capsys):
     assert list(palace_path.iterdir()) == []
 
 
+def test_status_aborts_on_hnsw_divergence(tmp_path, capsys):
+    """count() on a diverged HNSW segment can hard-crash the process
+    (#1222); status()'s ChromaDB-client fallback (used when the direct
+    sqlite read is unavailable) must preflight divergence before ever
+    calling count(), not just wrap it in except Exception (#93)."""
+    from unittest.mock import patch
+
+    class FakeCol:
+        def count(self):
+            raise AssertionError("count() must not be called when diverged")
+
+    with (
+        patch("mempalace.miner._open_collection_or_explain", return_value=FakeCol()),
+        patch(
+            "mempalace.backends.chroma.hnsw_capacity_status",
+            return_value={"diverged": True, "message": "test divergence"},
+        ),
+    ):
+        status(str(tmp_path))
+
+    out = capsys.readouterr().out
+    assert "HNSW index is diverged" in out
+    assert "MemPalace Status" not in out
+
+
 def test_status_handles_none_metadata_without_crash(tmp_path, capsys):
     """status must not crash when col.get returns a None entry in metadatas.
 
@@ -957,7 +1093,7 @@ def test_status_does_not_cold_load_vector_index(palace_path, seeded_collection, 
 
     sentinel.assert_not_called()
     out = capsys.readouterr().out
-    assert "MemPalace Status — 4 drawers" in out
+    assert "MemPalace Status -- 4 drawers" in out
     assert "WING: project" in out
     assert "WING: notes" in out
 
@@ -992,7 +1128,7 @@ def test_status_falls_back_to_chroma_when_sqlite_unreadable(palace_path, seeded_
         status(palace_path)
 
     out = capsys.readouterr().out
-    assert "MemPalace Status — 4 drawers" in out
+    assert "MemPalace Status -- 4 drawers" in out
     assert "WING: project" in out
 
 
@@ -1929,6 +2065,79 @@ class TestChunkTextLineRanges:
         assert len(chunks) == 1
         assert chunks[0]["line_start"] == 1
         assert chunks[0]["line_end"] == 5
+
+
+def _naive_chunk_line_ranges(content, *, chunk_size, chunk_overlap, min_chunk_size):
+    """Pre-#2054 reference implementation of chunk_text's line locators.
+
+    Same windowing as ``chunk_text`` but recomputes ``(line_start, line_end)``
+    with the original full-prefix ``content.count("\\n", 0, pos)`` form. The
+    incremental-anchor rewrite must stay byte-identical to this on every input,
+    so this is the golden reference the tests below compare against.
+    """
+    content = content.strip()
+    if not content:
+        return []
+    out = []
+    start = 0
+    while start < len(content):
+        end = min(start + chunk_size, len(content))
+        if end < len(content):
+            newline_pos = content.rfind("\n\n", start, end)
+            if newline_pos > start + chunk_size // 2:
+                end = newline_pos
+            else:
+                newline_pos = content.rfind("\n", start, end)
+                if newline_pos > start + chunk_size // 2:
+                    end = newline_pos
+        chunk = content[start:end].strip()
+        if len(chunk) >= min_chunk_size:
+            out.append((content.count("\n", 0, start) + 1, content.count("\n", 0, end) + 1))
+        start = end - chunk_overlap if end < len(content) else end
+    return out
+
+
+class TestChunkTextLineRangesIncremental:
+    """#2054: the O(N) incremental newline tally must match the old O(N*K)
+    full-prefix ``str.count`` form byte-for-byte across varied corpora and
+    configs. Configs stay at ``overlap < size//2`` so ``start``/``end`` advance
+    monotonically (the fast path); the code's from-scratch fallback for a
+    backward step is a defensive guard; a real backward step would also trip a
+    pre-existing infinite loop in the windowing itself, which is out of scope
+    for this locator-perf fix.
+    """
+
+    def test_line_ranges_match_full_prefix_reference(self):
+        import random
+
+        from mempalace.miner import chunk_text
+
+        rng = random.Random(2054)
+        corpora = [
+            "\n".join(f"line {i}" for i in range(1, 501)),  # many short lines
+            "\n\n".join(f"para {i} " + "x" * rng.randint(0, 300) for i in range(60)),
+            "no newlines at all " * 500,  # zero newlines
+            "\n" * 200 + "tail",  # leading blank lines
+            "".join(rng.choice("ab \n\n") for _ in range(5000)),  # random newline density
+            "αβγ\nδεζ\n" * 400,  # non-ASCII
+        ]
+        configs = [
+            (800, 100, 50),  # default config
+            (200, 20, 10),
+            (400, 50, 5),
+            (1000, 200, 30),
+            (2000, 0, 1),  # zero overlap
+        ]
+        for content in corpora:
+            for cs, co, mc in configs:
+                chunks = chunk_text(
+                    content, "/x.md", chunk_size=cs, chunk_overlap=co, min_chunk_size=mc
+                )
+                got = [(c["line_start"], c["line_end"]) for c in chunks]
+                expected = _naive_chunk_line_ranges(
+                    content, chunk_size=cs, chunk_overlap=co, min_chunk_size=mc
+                )
+                assert got == expected, f"cs={cs} co={co} mc={mc}: {got[:6]} != {expected[:6]}"
 
 
 class TestBuildDrawerMetadataLineRange:

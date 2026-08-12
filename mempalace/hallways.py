@@ -199,6 +199,7 @@ def compute_hallways_for_wing(
     wing: str,
     col=None,
     min_count: int = 2,
+    config=None,
 ) -> list[dict]:
     """Compute entity-pair hallways for one wing.
 
@@ -229,6 +230,10 @@ def compute_hallways_for_wing(
             hallway between two entities. Default 2 — single co-occurrences
             are noise (entities mentioned together once in one drawer);
             two or more is a real signal. Clamped to ``>=1``.
+        config: Optional ``MempalaceConfig`` selecting the palace-scoped
+            hallway sidecar. Callers using an explicit palace path must pass
+            the matching config so derived graph state cannot leak into the
+            default palace.
 
     Returns:
         List of hallway dicts created for this wing. Records for other
@@ -310,7 +315,7 @@ def compute_hallways_for_wing(
     #    across recomputes. Without this preservation, every mine wipes
     #    the connection weights accumulated through use — defeating the
     #    living-connection layer entirely.
-    existing = _load_hallways()
+    existing = _load_hallways(config)
     existing_dynamics_lookup: dict = {}
     for h in existing:
         if h.get("wing") != wing:
@@ -360,7 +365,7 @@ def compute_hallways_for_wing(
 
     # 4. Persist — preserve other-wing records, replace this wing's records.
     preserved_other_wings = [h for h in existing if h.get("wing") != wing]
-    _save_hallways(preserved_other_wings + created)
+    _save_hallways(preserved_other_wings + created, config)
 
     return created
 
@@ -370,19 +375,19 @@ def compute_hallways_for_wing(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def list_hallways(wing: Optional[str] = None) -> list[dict]:
+def list_hallways(wing: Optional[str] = None, config=None) -> list[dict]:
     """List hallway records. Filter by ``wing`` if specified."""
-    all_hallways = _load_hallways()
+    all_hallways = _load_hallways(config)
     if wing is None:
         return list(all_hallways)
     return [h for h in all_hallways if h.get("wing") == wing]
 
 
-def delete_hallway(hallway_id: str) -> bool:
+def delete_hallway(hallway_id: str, config=None) -> bool:
     """Remove one hallway record by id. Returns True if a record was removed."""
-    hallways = _load_hallways()
+    hallways = _load_hallways(config)
     filtered = [h for h in hallways if h.get("id") != hallway_id]
     if len(filtered) == len(hallways):
         return False
-    _save_hallways(filtered)
+    _save_hallways(filtered, config)
     return True

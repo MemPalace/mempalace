@@ -665,7 +665,7 @@ def run_benchmark(
                 palace_cache = json.load(f)
             print(f"  Palace cache: {len(palace_cache)} room assignments loaded")
 
-    rerank_label = f" + LLM re-rank ({llm_model.split('-')[1]})" if llm_rerank_enabled else ""
+    rerank_label = f" + LLM re-rank ({llm_model})" if llm_rerank_enabled else ""
 
     print(f"\n{'=' * 60}")
     print("  MemPal × LoCoMo Benchmark")
