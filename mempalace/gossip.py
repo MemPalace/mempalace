@@ -295,6 +295,7 @@ class GossipMessage:
     priority: str = "normal"
     topic: Optional[str] = None
     hops: int = 0
+    max_hops: int = 3
     ttl_seconds: int = 60
     _started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -316,6 +317,7 @@ class GossipMessage:
             priority=self.priority,
             topic=self.topic,
             hops=self.hops + 1,
+            max_hops=self.max_hops,
             ttl_seconds=self.ttl_seconds,
             _started_at=self._started_at,
         )
@@ -438,7 +440,7 @@ class GossipProtocol:
         """Apply gossip probability, chatter level, and TTL checks."""
         if message.is_expired():
             return False
-        if message.hops >= self.config.get("max_hops", 3):
+        if message.hops >= getattr(message, "max_hops", self.config.get("max_hops", 3)):
             return False
         base = self.config.get("gossip_probability", 0.7)
         level_mult = CHATTER_LEVEL_MULTIPLIER.get(node.chatter_level, 1.0)
@@ -461,6 +463,7 @@ class GossipProtocol:
         source_room: Optional[str] = None,
         priority: Optional[str] = None,
         fanout: Optional[int] = None,
+        max_hops: Optional[int] = None,
         room_graph: Optional[tuple[dict, list]] = None,
         kg_path: Optional[str] = None,
     ) -> dict[str, Any]:
@@ -482,6 +485,7 @@ class GossipProtocol:
             priority=priority,
             topic=detected_topic,
             ttl_seconds=self.config.get("ttl_seconds", 60),
+            max_hops=max_hops if max_hops is not None else self.config.get("max_hops", 3),
         )
 
         selected = self.select_chatter_nodes(message, fanout=fanout)
