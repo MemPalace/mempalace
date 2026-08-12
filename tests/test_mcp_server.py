@@ -3976,6 +3976,43 @@ class TestKGTools:
         assert "YYYY-MM-DDTHH:MM:SSZ" in result["error"]
 
 
+# ── Gossip Tools ────────────────────────────────────────────────────────
+
+
+class TestGossipTools:
+    def test_gossip_status(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_gossip_status
+
+        result = tool_gossip_status()
+        assert "error" not in result
+        assert result["version"] == "1.0"
+        assert len(result["chatter_nodes"]) == 7
+
+    def test_gossip_propagates_and_writes_triples(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_gossip
+
+        result = tool_gossip(
+            subject="audit",
+            predicate="found",
+            object="security vulnerability",
+            source_wing="orkid",
+            source_room="contracts",
+        )
+        assert "error" not in result
+        assert result["topic"] == "security_issues"
+        assert result["priority"] == "critical"
+        assert result["triples_written"] >= 1
+
+        # Verify the gossip triple reached the KG.
+        facts = kg.query_entity("audit", direction="outgoing")
+        gossip_facts = [f for f in facts if f["predicate"].startswith("gossiped_")]
+        assert len(gossip_facts) >= 1
+
+
 # ── Diary Tools ─────────────────────────────────────────────────────────
 
 
