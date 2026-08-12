@@ -101,6 +101,7 @@ from .hallways import (  # noqa: E402
 )
 
 from .knowledge_graph import KnowledgeGraph, DEFAULT_KG_PATH  # noqa: E402
+from .gossip import GossipProtocol  # noqa: E402
 from .logstream import LOGSTREAM_DB_FILENAME, Logstream  # noqa: E402
 from .collision_scan import assert_no_collisions  # noqa: E402
 from .ids import ID_RECIPE, make_drawer_id_from_content  # noqa: E402
@@ -424,6 +425,7 @@ _MUTATING_TOOLS = frozenset(
         "mempalace_sync",
         "mempalace_update_drawer",
         "mempalace_diary_write",
+        "mempalace_gossip",
         "mempalace_event_append",
         "mempalace_event_ack",
         "mempalace_artifact_put",
@@ -2551,6 +2553,56 @@ def tool_graph_stats():
     if not col:
         return _collection_error_or_no_palace()
     return graph_stats(col=col)
+
+
+def tool_gossip(
+    subject: str,
+    predicate: str,
+    object: str,
+    source_wing: str = None,
+    source_room: str = None,
+    priority: str = None,
+    fanout: int = None,
+):
+    """Propagate a fact through the palace gossip network.
+
+    Matches the fact to specialized chatter nodes, routes it through palace
+    graph tunnels and rooms, and writes TTL-bounded gossip triples into the
+    knowledge graph. Higher-priority keywords (security, breakthrough, launch,
+    ...) spread faster and to more chatter nodes.
+    """
+    protocol = GossipProtocol(
+        mempalace_config=_config,
+        kg=_get_kg(_resolve_kg_path()),
+    )
+    cfg = protocol.config
+    fanout = fanout if fanout is not None else cfg.get("fanout", 5)
+    try:
+        return protocol.propagate(
+            subject,
+            predicate,
+            object,
+            source_wing=source_wing,
+            source_room=source_room,
+            priority=priority,
+            fanout=fanout,
+        )
+    except Exception as e:
+        logger.exception("gossip tool failed")
+        return {"error": f"gossip failed: {e}"}
+
+
+def tool_gossip_status():
+    """Return the gossip protocol configuration and chatter-node status."""
+    try:
+        protocol = GossipProtocol(
+            mempalace_config=_config,
+            kg=_get_kg(_resolve_kg_path()),
+        )
+        return protocol.chatter_status()
+    except Exception as e:
+        logger.exception("gossip_status tool failed")
+        return {"error": f"gossip_status failed: {e}"}
 
 
 def tool_mesh_peers():
@@ -4940,6 +4992,28 @@ TOOLS = {
         "description": "Palace graph overview: total rooms, tunnel connections, edges between wings.",
         "input_schema": {"type": "object", "properties": {}},
         "handler": tool_graph_stats,
+    },
+    "mempalace_gossip": {
+        "description": "Propagate a fact through the palace gossip network. Matches specialized chatter nodes, routes through palace graph tunnels, and writes TTL-bounded gossip triples into the knowledge graph.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "subject": {"type": "string", "description": "Entity the fact is about"},
+                "predicate": {"type": "string", "description": "Relationship type (e.g. 'found', 'announced')"},
+                "object": {"type": "string", "description": "The target/value of the relationship"},
+                "source_wing": {"type": "string", "description": "Wing the fact originated from (optional)"},
+                "source_room": {"type": "string", "description": "Room the fact originated from (optional)"},
+                "priority": {"type": "string", "description": "critical, high, medium, or low (optional; detected from keywords if omitted)"},
+                "fanout": {"type": "integer", "description": "Max chatter nodes to involve (optional)"},
+            },
+            "required": ["subject", "predicate", "object"],
+        },
+        "handler": tool_gossip,
+    },
+    "mempalace_gossip_status": {
+        "description": "Return the gossip protocol configuration and chatter-node status.",
+        "input_schema": {"type": "object", "properties": {}},
+        "handler": tool_gossip_status,
     },
     "mempalace_mesh_peers": {
         "description": "Mesh estate snapshot (RFC 004): this replica's identity, version vector and node profile; each configured peer's reachability, last sync outcome, remote version vector and advertised profile; origins known only transitively; origin_profiles keyed by replica_id; and estate_source saying whether the peer status was observed in this process or published by the palace's hub (with published_at and whether that hub is still alive). Exactly the GET /sync/peers payload — tokens are never included.",
