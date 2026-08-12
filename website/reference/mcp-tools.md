@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-Detailed parameter schemas for all 44 MCP tools.
+Detailed parameter schemas for all 46 MCP tools.
 
 ## Palace — Read Tools
 
@@ -343,6 +343,34 @@ Palace graph overview: nodes, tunnels, edges, connectivity.
 **Parameters:** None
 
 **Returns:** `{ total_rooms, tunnel_rooms, total_edges, rooms_per_wing, top_tunnels }`
+
+---
+
+### `mempalace_gossip`
+
+Propagate a fact through the palace gossip network. Specialized chatter nodes route the fact through palace graph tunnels and rooms, then write TTL-bounded gossip triples into the knowledge graph. Priority is detected from keywords (`security`, `breakthrough`, `launch`, ...).
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `subject` | string | **Yes** | Entity the fact is about |
+| `predicate` | string | **Yes** | Relationship type (e.g. `found`, `announced`) |
+| `object` | string | **Yes** | Target/value of the relationship |
+| `source_wing` | string | No | Wing the fact originated from |
+| `source_room` | string | No | Room the fact originated from |
+| `priority` | string | No | `critical`, `high`, `medium`, or `low` (detected if omitted) |
+| `fanout` | integer | No | Max chatter nodes to involve (default from config) |
+
+**Returns:** `{ subject, predicate, object, topic, priority, chatter_nodes, propagated, suppressed, triples_written }`
+
+---
+
+### `mempalace_gossip_status`
+
+Return the gossip protocol configuration and chatter-node status.
+
+**Parameters:** None
+
+**Returns:** `{ version, max_hops, ttl_seconds, fanout, chatter_nodes, topics }`
 
 ---
 
