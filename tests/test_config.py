@@ -5,6 +5,7 @@ import tempfile
 
 import pytest
 from mempalace.config import (
+    DEFAULT_PALACE_PATH,
     MempalaceConfig,
     normalize_wing_name,
     sanitize_iso_date,
@@ -28,6 +29,20 @@ def test_config_from_file():
         json.dump({"palace_path": "/custom/palace"}, f)
     cfg = MempalaceConfig(config_dir=tmpdir)
     assert cfg.palace_path == "/custom/palace"
+
+
+@pytest.mark.parametrize("payload", [None, [], "oops", 42, True])
+def test_non_object_config_document_falls_back_to_defaults(tmp_path, payload):
+    """Valid JSON scalars/arrays are not valid MemPalace configurations."""
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump(payload, f)
+
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+
+    assert cfg.palace_path == DEFAULT_PALACE_PATH
+    assert cfg.collection_name == "mempalace_drawers"
+    assert cfg.backend == "chroma"
+    assert cfg.hooks_auto_save is True
 
 
 def test_backend_from_config_wins_over_env(tmp_path, monkeypatch):
