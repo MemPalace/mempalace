@@ -22,6 +22,8 @@ import logging
 import os
 import random
 import tempfile
+import threading
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -556,45 +558,25 @@ class GossipProtocol:
         end = message._started_at + timedelta(seconds=message.ttl_seconds)
         return end.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    def propagate(
+    def _propagate_message(
         self,
-        subject: str,
-        predicate: str,
-        obj: str,
-        source_wing: Optional[str] = None,
-        source_room: Optional[str] = None,
-        priority: Optional[str] = None,
+        message: GossipMessage,
         fanout: Optional[int] = None,
-        max_hops: Optional[int] = None,
         room_graph: Optional[tuple[dict, list]] = None,
         kg_path: Optional[str] = None,
-    ) -> dict[str, Any]:
-        """Propagate a fact through the gossip network.
+    ) -> tuple[dict[str, Any], list[GossipMessage]]:
+        """Propagate one message and return (report, child_messages).
 
-        Returns a report describing which chatter nodes fired, which targets
-        were reached, and which triples were written to the knowledge graph.
+        The report describes which chatter nodes fired and which triples were
+        written. The child messages carry the fact forward to each (wing, room)
+        target with an incremented hop count. Callers such as ``GossipDaemon``
+        can re-queue children for multi-hop gossip waves.
         """
-        text = f"{subject} {predicate} {obj}"
-        detected_topic, detected_priority = self.detect_topic(text, priority)
-        priority = priority or detected_priority
-
-        message = GossipMessage(
-            subject=subject,
-            predicate=predicate,
-            obj=obj,
-            source_wing=source_wing,
-            source_room=source_room,
-            priority=priority,
-            topic=detected_topic,
-            ttl_seconds=self.config.get("ttl_seconds", 60),
-            max_hops=max_hops if max_hops is not None else self.config.get("max_hops", 3),
-        )
-
         selected = self.select_chatter_nodes(message, fanout=fanout)
         report: dict[str, Any] = {
-            "subject": subject,
-            "predicate": predicate,
-            "object": obj,
+            "subject": message.subject,
+            "predicate": message.predicate,
+            "object": message.obj,
             "topic": message.topic,
             "priority": message.priority,
             "chatter_nodes": [],
@@ -602,6 +584,7 @@ class GossipProtocol:
             "propagated": [],
             "triples_written": 0,
         }
+        children: list[GossipMessage] = []
 
         kg = self._knowledge_graph(kg_path)
         valid_to = self._compute_valid_to(message)
@@ -636,9 +619,9 @@ class GossipProtocol:
                 node_report["attempted_targets"] += 1
                 try:
                     kg.add_triple(
-                        subject,
+                        message.subject,
                         pred,
-                        obj,
+                        message.obj,
                         valid_from=message._started_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
                         valid_to=valid_to,
                         confidence=0.8,
@@ -650,8 +633,11 @@ class GossipProtocol:
                         {"wing": target_wing, "room": target_room}
                     )
                     any_success = True
+                    children.append(message.child(target_wing, target_room))
                 except Exception as exc:
-                    logger.debug("gossip: kg add failed for %s/%s", target_wing, target_room, exc_info=True)
+                    logger.debug(
+                        "gossip: kg add failed for %s/%s", target_wing, target_room, exc_info=True
+                    )
                     node_report["failed_targets"].append(
                         {
                             "wing": target_wing,
@@ -664,6 +650,45 @@ class GossipProtocol:
             if any_success:
                 report["propagated"].append(node.id)
 
+        return report, children
+
+    def propagate(
+        self,
+        subject: str,
+        predicate: str,
+        obj: str,
+        source_wing: Optional[str] = None,
+        source_room: Optional[str] = None,
+        priority: Optional[str] = None,
+        fanout: Optional[int] = None,
+        max_hops: Optional[int] = None,
+        room_graph: Optional[tuple[dict, list]] = None,
+        kg_path: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Propagate a fact through the gossip network.
+
+        Returns a report describing which chatter nodes fired, which targets
+        were reached, and which triples were written to the knowledge graph.
+        """
+        text = f"{subject} {predicate} {obj}"
+        detected_topic, detected_priority = self.detect_topic(text, priority)
+        priority = priority or detected_priority
+
+        message = GossipMessage(
+            subject=subject,
+            predicate=predicate,
+            obj=obj,
+            source_wing=source_wing,
+            source_room=source_room,
+            priority=priority,
+            topic=detected_topic,
+            ttl_seconds=self.config.get("ttl_seconds", 60),
+            max_hops=max_hops if max_hops is not None else self.config.get("max_hops", 3),
+        )
+
+        report, _ = self._propagate_message(
+            message, fanout=fanout, room_graph=room_graph, kg_path=kg_path
+        )
         return report
 
     def chatter_status(self) -> dict[str, Any]:
@@ -676,6 +701,158 @@ class GossipProtocol:
             "chatter_nodes": [asdict(n) for n in self._chatter_nodes],
             "topics": self.config.get("topics", []),
         }
+
+
+class GossipDaemon:
+    """Background daemon for multi-hop gossip propagation and TTL cleanup.
+
+    The daemon holds a queue of ``GossipMessage`` objects. Each ``run_once``
+    call drains the queue, propagates each active message through the protocol,
+    and enqueues the resulting child messages so the next tick can continue the
+    wave. Messages that have expired or exceeded ``max_hops`` are dropped.
+
+    ``start`` spawns a background thread; ``stop`` signals it to exit cleanly.
+    """
+
+    def __init__(
+        self,
+        protocol: GossipProtocol,
+        interval_seconds: float = 30.0,
+        max_requeue: int = 1000,
+    ):
+        self.protocol = protocol
+        self.interval_seconds = max(1.0, float(interval_seconds))
+        self.max_requeue = max_requeue
+        self._queue: deque[GossipMessage] = deque()
+        self._stop_event = threading.Event()
+        self._worker: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+
+    def schedule(
+        self,
+        subject: str,
+        predicate: str,
+        obj: str,
+        source_wing: Optional[str] = None,
+        source_room: Optional[str] = None,
+        priority: Optional[str] = None,
+        max_hops: Optional[int] = None,
+    ) -> GossipMessage:
+        """Create a gossip message and add it to the daemon queue."""
+        text = f"{subject} {predicate} {obj}"
+        detected_topic, detected_priority = self.protocol.detect_topic(text, priority)
+        priority = priority or detected_priority
+
+        message = GossipMessage(
+            subject=subject,
+            predicate=predicate,
+            obj=obj,
+            source_wing=source_wing,
+            source_room=source_room,
+            priority=priority,
+            topic=detected_topic,
+            ttl_seconds=self.protocol.config.get("ttl_seconds", 60),
+            max_hops=max_hops
+            if max_hops is not None
+            else self.protocol.config.get("max_hops", 3),
+        )
+        with self._lock:
+            self._queue.append(message)
+        return message
+
+    def run_once(
+        self,
+        fanout: Optional[int] = None,
+        room_graph: Optional[tuple[dict, list]] = None,
+        kg_path: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Process the current queue once and return a summary report.
+
+        Exceptions during a single message are isolated so one bad message does
+        not discard unprocessed siblings or already-produced children.
+        """
+        with self._lock:
+            pending = list(self._queue)
+            self._queue.clear()
+
+        report: dict[str, Any] = {
+            "processed": 0,
+            "suppressed": 0,
+            "expired": 0,
+            "triples_written": 0,
+            "children_queued": 0,
+            "failed": 0,
+        }
+        children: list[GossipMessage] = []
+
+        for idx, message in enumerate(pending):
+            if message.is_expired():
+                report["expired"] += 1
+                continue
+            if message.hops >= message.max_hops:
+                report["suppressed"] += 1
+                continue
+
+            try:
+                node_report, child_messages = self.protocol._propagate_message(
+                    message,
+                    fanout=fanout,
+                    room_graph=room_graph,
+                    kg_path=kg_path,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "gossip-daemon: message %s failed; re-queueing remaining pending messages",
+                    idx,
+                    exc_info=True,
+                )
+                report["failed"] += 1
+                # Re-queue this and all remaining pending messages.
+                with self._lock:
+                    self._queue.extend(pending[idx:])
+                return report
+
+            report["processed"] += 1
+            report["triples_written"] += node_report["triples_written"]
+            children.extend(child_messages)
+
+        # Enqueue children while respecting the cap, accounting for any messages
+        # that concurrent schedulers may have added.
+        with self._lock:
+            available = max(0, self.max_requeue - len(self._queue))
+            kept = [
+                c
+                for c in children
+                if not c.is_expired() and c.hops < c.max_hops
+            ][:available]
+            for c in kept:
+                self._queue.append(c)
+        report["children_queued"] = len(kept)
+
+        return report
+
+    def _loop(self) -> None:
+        """Background thread entry point."""
+        while not self._stop_event.is_set():
+            try:
+                self.run_once()
+            except Exception:
+                logger.warning("gossip-daemon: run_once failed", exc_info=True)
+            self._stop_event.wait(self.interval_seconds)
+
+    def start(self) -> None:
+        """Start the background thread if it is not already running."""
+        if self._worker is not None and self._worker.is_alive():
+            return
+        self._stop_event.clear()
+        self._worker = threading.Thread(target=self._loop, daemon=True)
+        self._worker.start()
+
+    def stop(self) -> None:
+        """Signal the background thread to stop and wait for it."""
+        self._stop_event.set()
+        if self._worker is not None and self._worker.is_alive():
+            self._worker.join(timeout=2.0)
 
 
 def gossip(
