@@ -710,6 +710,97 @@ def test_chatter_status_includes_channels():
     assert status["amplification_factor"] == 1.5
 
 
+def test_echo_chamber_attenuates_repeated_similar_messages():
+    """A node that has already carried similar messages is attenuated, then
+    suppressed once the reinforcement count is reached."""
+    kg_path = _temp_db()
+    try:
+        protocol = GossipProtocol(kg_path=kg_path, config=EXAMPLE_GOSSIP_CONFIG)
+        node = protocol._chatter_nodes[0]
+        message = GossipMessage(
+            subject="audit",
+            predicate="found",
+            obj="risk",
+            source_wing="orkid",
+            priority="high",
+            path=[f"{node.id}:audit found risk"],
+        )
+
+        # One prior similar visit should reduce the probability.
+        with unittest.mock.patch.object(random, "random", return_value=0.0):
+            assert protocol._should_forward(message, node) is True
+
+        # The message is still forwardable because probability after one
+        # attenuation (0.7 * 0.5 = 0.35) is above the patched random value of 0.0.
+        # With the default reinforcement_count=3 it should not yet be suppressed.
+        assert protocol._attenuate_echo_chamber(message, node, 0.7) > 0
+    finally:
+        Path(kg_path).unlink(missing_ok=True)
+
+
+def test_echo_chamber_suppresses_after_reinforcement_count():
+    """Once a node has seen the same message enough times it is fully suppressed."""
+    kg_path = _temp_db()
+    try:
+        config = dict(EXAMPLE_GOSSIP_CONFIG)
+        config["echo_chamber_reinforcement_count"] = 2
+        config["echo_chamber_attenuation"] = 0.5
+        protocol = GossipProtocol(kg_path=kg_path, config=config)
+        node = protocol._chatter_nodes[0]
+        message = GossipMessage(
+            subject="audit",
+            predicate="found",
+            obj="risk",
+            source_wing="orkid",
+            priority="high",
+            # Two prior similar visits meet the reinforcement count.
+            path=[
+                f"{node.id}:audit found risk",
+                f"{node.id}:audit found risk",
+            ],
+        )
+
+        assert protocol._attenuate_echo_chamber(message, node, 0.7) == 0.0
+        with unittest.mock.patch.object(random, "random", return_value=0.0):
+            assert protocol._should_forward(message, node) is False
+    finally:
+        Path(kg_path).unlink(missing_ok=True)
+
+
+def test_echo_chamber_similarity_threshold_ignores_dissimilar():
+    """A dissimilar prior visit should not trigger attenuation."""
+    kg_path = _temp_db()
+    try:
+        config = dict(EXAMPLE_GOSSIP_CONFIG)
+        config["echo_chamber_similarity_threshold"] = 0.8
+        protocol = GossipProtocol(kg_path=kg_path, config=config)
+        node = protocol._chatter_nodes[0]
+        message = GossipMessage(
+            subject="audit",
+            predicate="found",
+            obj="risk",
+            source_wing="orkid",
+            priority="high",
+            # The stored text is completely different from the current text.
+            path=[f"{node.id}:completely unrelated message text"],
+        )
+
+        original = 0.7
+        attenuated = protocol._attenuate_echo_chamber(message, node, original)
+        # No echo visits, so the probability is unchanged.
+        assert attenuated == original
+    finally:
+        Path(kg_path).unlink(missing_ok=True)
+
+
+def test_chatter_status_includes_echo_chamber_config():
+    protocol = GossipProtocol(config=EXAMPLE_GOSSIP_CONFIG)
+    status = protocol.chatter_status()
+    assert status["echo_chamber_reinforcement_count"] == 3
+    assert status["echo_chamber_attenuation"] == 0.5
+    assert status["echo_chamber_similarity_threshold"] == 0.8
+
+
 def test_random_walk_swap_only_picks_off_radius_nodes():
     """Random walk replacements must be outside the source's gossip radius."""
     protocol = GossipProtocol(config=EXAMPLE_GOSSIP_CONFIG)
