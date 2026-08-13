@@ -605,3 +605,35 @@ def test_daemon_requeue_respects_max_requeue():
         assert report["children_queued"] <= 1
     finally:
         Path(kg_path).unlink(missing_ok=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Analytics
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_gossip_analytics_snapshot():
+    kg_path = _temp_db()
+    try:
+        kg = KnowledgeGraph(db_path=kg_path)
+        protocol = GossipProtocol(kg=kg, config=EXAMPLE_GOSSIP_CONFIG)
+
+        # Seed several gossip triples about the same fact to make it viral.
+        protocol.propagate(
+            "audit",
+            "found",
+            "security vulnerability",
+            source_wing="orkid",
+            source_room="contracts",
+            fanout=5,
+        )
+
+        analytics = protocol.analytics()
+
+        assert "trending_topics" in analytics
+        assert "viral_facts" in analytics
+        assert "network_health" in analytics
+        assert analytics["network_health"]["active_triples"] >= 1
+        assert analytics["network_health"]["topic_coverage"] >= 1
+    finally:
+        Path(kg_path).unlink(missing_ok=True)

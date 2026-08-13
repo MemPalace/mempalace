@@ -115,6 +115,33 @@ class TestQueries:
         results = seeded_kg.query_relationship("does")
         assert len(results) == 2  # swimming + chess
 
+    def test_query_gossip_triples(self, kg):
+        kg.add_triple(
+            "X",
+            "gossiped_in_orkid",
+            "Y",
+            valid_from="2026-08-01T00:00:00Z",
+            source_file="gossip://security_issues",
+        )
+        kg.add_triple(
+            "X",
+            "gossiped_in_room_contracts",
+            "Y",
+            valid_from="2026-08-01T00:00:00Z",
+            source_file="gossip://security_issues",
+        )
+        kg.add_triple(
+            "A",
+            "knows",
+            "B",
+            valid_from="2026-08-01T00:00:00Z",
+            source_file="memory://other",
+        )
+
+        gossip = kg.query_gossip_triples()
+        assert len(gossip) == 2
+        assert all(t["source_file"].startswith("gossip://") for t in gossip)
+
 
 class TestInvalidation:
     def test_invalidate_sets_valid_to(self, seeded_kg):
