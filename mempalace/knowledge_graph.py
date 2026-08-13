@@ -41,7 +41,7 @@ import sqlite3
 import threading
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from .config import sanitize_iso_temporal
 from .ids import make_triple_id
 
@@ -584,6 +584,49 @@ class KnowledgeGraph:
                         "valid_from": row["valid_from"],
                         "valid_to": row["valid_to"],
                         "current": row["valid_to"] is None,
+                    }
+                )
+        return results
+
+    def query_gossip_triples(self, as_of: str = None) -> list[dict]:
+        """Return all triples whose ``source_file`` is gossip-derived.
+
+        Gossip triples are written with ``source_file = "gossip://<topic>"``.
+        This query is used by meta-gossip analytics (trending topics,
+        viral facts, network health) without requiring callers to enumerate
+        every ``gossiped_*`` predicate variant.
+        """
+        as_of = sanitize_iso_temporal(as_of, "as_of")
+
+        query = """
+            SELECT t.*, s.name as sub_name, o.name as obj_name
+            FROM triples t
+            JOIN entities s ON t.subject = s.id
+            JOIN entities o ON t.object = o.id
+            WHERE t.source_file LIKE 'gossip://%'
+        """
+        params: list[Any] = []
+
+        if as_of:
+            temporal_sql, temporal_params = _temporal_filter_sql(as_of)
+            query += temporal_sql
+            params.extend(temporal_params)
+
+        query += " ORDER BY t.valid_from ASC NULLS LAST"
+
+        results = []
+        with self._lock:
+            conn = self._conn()
+            for row in conn.execute(query, params).fetchall():
+                results.append(
+                    {
+                        "subject": row["sub_name"],
+                        "predicate": row["predicate"],
+                        "object": row["obj_name"],
+                        "valid_from": row["valid_from"],
+                        "valid_to": row["valid_to"],
+                        "current": row["valid_to"] is None,
+                        "source_file": row["source_file"],
                     }
                 )
         return results

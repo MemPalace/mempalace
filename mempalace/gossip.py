@@ -23,7 +23,7 @@ import os
 import random
 import tempfile
 import threading
-from collections import deque
+from collections import Counter, deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -588,7 +588,9 @@ class GossipProtocol:
 
         kg = self._knowledge_graph(kg_path)
         valid_to = self._compute_valid_to(message)
-        source_file = f"gossip://{message.topic}"
+        # Encode the original predicate so analytics can recover the source
+        # fact identity without being confused by destination predicates.
+        source_file = f"gossip://{message.topic}/{message.predicate}"
 
         for node in selected:
             if not self._should_forward(message, node):
@@ -700,6 +702,140 @@ class GossipProtocol:
             "fanout": self.config.get("fanout", 5),
             "chatter_nodes": [asdict(n) for n in self._chatter_nodes],
             "topics": self.config.get("topics", []),
+        }
+
+    def analytics(self, as_of: str = None) -> dict[str, Any]:
+        """Return meta-gossip analytics for this protocol's knowledge graph."""
+        return GossipAnalytics(self._knowledge_graph()).snapshot(
+            self._chatter_nodes, self.config, as_of=as_of
+        )
+
+
+class GossipAnalytics:
+    """Meta-gossip: analyze the gossip triple graph for trends and health."""
+
+    def __init__(self, kg: KnowledgeGraph):
+        self.kg = kg
+
+    @staticmethod
+    def _parse_topic(source_file: Optional[str]) -> Optional[str]:
+        if not source_file or not source_file.startswith("gossip://"):
+            return None
+        # Format is "gossip://<topic>" or "gossip://<topic>/<original_predicate>".
+        return source_file[9:].split("/")[0] or "unknown"
+
+    @staticmethod
+    def _parse_original_predicate(source_file: Optional[str]) -> Optional[str]:
+        if not source_file or not source_file.startswith("gossip://"):
+            return None
+        parts = source_file[9:].split("/")
+        return parts[1] if len(parts) > 1 else None
+
+    def _active_triples(self, as_of: str = None) -> list[dict]:
+        """Return gossip triples active at ``as_of`` (or now)."""
+        reference = as_of or datetime.now(timezone.utc).isoformat()
+        triples = self.kg.query_gossip_triples(as_of=reference)
+        return [
+            t
+            for t in triples
+            if t.get("valid_to") is None or t["valid_to"] > reference
+        ]
+
+    def trending_topics(
+        self, n: int = 5, as_of: str = None
+    ) -> list[dict[str, Any]]:
+        """Return the top N topics by active gossip triple count."""
+        triples = self._active_triples(as_of=as_of)
+        topic_counts = Counter(
+            self._parse_topic(t.get("source_file")) for t in triples
+        )
+        total = max(1, sum(topic_counts.values()))
+        ranked = topic_counts.most_common(n)
+        return [
+            {
+                "topic": topic,
+                "count": count,
+                "share": round(count / total, 3),
+            }
+            for topic, count in ranked
+        ]
+
+    def viral_facts(
+        self, min_count: int = 2, as_of: str = None
+    ) -> list[dict[str, Any]]:
+        """Return facts that appear in multiple gossip triples (viral content).
+
+        Facts are identified by the original (subject, predicate, object) so that
+        spreading a fact to many wings/rooms does not fragment its identity.
+        The count is the total number of derived triples, and ``destinations``
+        is the number of distinct gossiped-in destinations.
+        """
+        triples = self._active_triples(as_of=as_of)
+        FactKey = tuple[str, str, str]
+        fact_counts: dict[FactKey, int] = Counter()
+        fact_dests: dict[FactKey, set[str]] = {}
+        for t in triples:
+            original_pred = self._parse_original_predicate(t.get("source_file")) or t["predicate"]
+            fact = (t["subject"], original_pred, t["object"])
+            fact_counts[fact] += 1
+            fact_dests.setdefault(fact, set()).add(t["predicate"])
+
+        viral = [
+            {
+                "subject": fact[0],
+                "predicate": fact[1],
+                "object": fact[2],
+                "count": count,
+                "destinations": len(fact_dests.get(fact, set())),
+            }
+            for fact, count in fact_counts.items()
+            if count >= min_count
+        ]
+        return sorted(viral, key=lambda x: x["count"], reverse=True)
+
+    def network_health(
+        self, chatter_nodes: list[ChatterNode], config: dict[str, Any], as_of: str = None
+    ) -> dict[str, Any]:
+        """Return gossip network health metrics as of one reference timestamp."""
+        reference = as_of or datetime.now(timezone.utc).isoformat()
+        triples = self._active_triples(as_of=reference)
+        total = len(triples)
+        expired = [
+            t
+            for t in self.kg.query_gossip_triples()
+            if t.get("valid_to") is not None
+            and t["valid_to"] <= reference
+            and t.get("valid_from") is not None
+            and t["valid_from"] <= reference
+        ]
+
+        by_topic = Counter(
+            self._parse_topic(t.get("source_file")) for t in triples
+        )
+
+        return {
+            "active_triples": total,
+            "expired_triples": len(expired),
+            "chatter_nodes": len(chatter_nodes),
+            "fanout": config.get("fanout", 5),
+            "ttl_seconds": config.get("ttl_seconds", 60),
+            "topic_coverage": len(by_topic),
+            "topics": dict(by_topic.most_common()),
+        }
+
+    def snapshot(
+        self,
+        chatter_nodes: list[ChatterNode],
+        config: dict[str, Any],
+        as_of: str = None,
+    ) -> dict[str, Any]:
+        """Return a single analytics snapshot."""
+        return {
+            "trending_topics": self.trending_topics(as_of=as_of),
+            "viral_facts": self.viral_facts(as_of=as_of),
+            "network_health": self.network_health(
+                chatter_nodes, config, as_of=as_of
+            ),
         }
 
 

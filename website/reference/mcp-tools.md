@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-Detailed parameter schemas for all 46 MCP tools.
+Detailed parameter schemas for all 47 MCP tools.
 
 ## Palace — Read Tools
 
@@ -371,6 +371,16 @@ Return the gossip protocol configuration and chatter-node status.
 **Parameters:** None
 
 **Returns:** `{ version, max_hops, ttl_seconds, fanout, chatter_nodes, topics }`
+
+---
+
+### `mempalace_gossip_analytics`
+
+Return meta-gossip analytics: trending topics, viral facts, and gossip network health.
+
+**Parameters:** None
+
+**Returns:** `{ trending_topics, viral_facts, network_health }`
 
 ---
 
