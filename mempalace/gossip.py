@@ -29,6 +29,7 @@ from typing import Any, Optional
 from .config import MempalaceConfig, normalize_wing_name
 from .knowledge_graph import KnowledgeGraph
 from .palace_graph import build_graph as _build_graph
+from .hallways import list_hallways
 
 logger = logging.getLogger("mempalace_gossip")
 
@@ -392,18 +393,83 @@ class GossipProtocol:
             return "general", priority
         return "general", "normal"
 
+    def _get_hallway_context(
+        self, message: GossipMessage
+    ) -> tuple[dict[str, float], set[str]]:
+        """Return (hall_scores, related_entities) derived from within-wing hallways.
+
+        Hallways are entity-pair co-occurrence records built at mine time. When a
+        gossip message mentions an entity that co-occurs with other entities in
+        the source wing, we use those co-occurrences to boost chatter nodes that
+        live in the same rooms/halls or cover the related entities.
+        """
+        if not message.source_wing:
+            return {}, set()
+        try:
+            hallways = list_hallways(
+                wing=message.source_wing, config=self.mempalace_config
+            )
+        except Exception:
+            logger.debug("gossip: could not load hallways", exc_info=True)
+            return {}, set()
+
+        entities = {message.subject.lower(), message.obj.lower()}
+        hall_scores: dict[str, float] = {}
+        related: set[str] = set()
+
+        for h in hallways:
+            a = (h.get("entity_a") or "").lower()
+            b = (h.get("entity_b") or "").lower()
+            if a in entities or b in entities:
+                other = b if a in entities else a
+                related.add(other)
+                count = h.get("co_occurrence_count") or 1
+                for room in h.get("rooms") or []:
+                    room_key = room.lower()
+                    # Accumulate a small boost per co-occurrence in this room.
+                    hall_scores[room_key] = hall_scores.get(room_key, 0.0) + min(
+                        0.15, 0.05 + count * 0.01
+                    )
+
+        return hall_scores, related
+
     def select_chatter_nodes(
         self,
         message: GossipMessage,
         fanout: Optional[int] = None,
     ) -> list[ChatterNode]:
-        """Rank and select chatter nodes for a given message."""
+        """Rank and select chatter nodes for a given message.
+
+        Selection combines the base specialty/topic score with within-wing
+        hallway context: chatter nodes in the source wing whose hall/room
+        appears in co-occurrence records for the subject/object get a boost, as
+        do nodes whose specialties overlap with related entities.
+        """
         fanout = fanout if fanout is not None else self.config.get("fanout", 5)
-        scored = [
-            (node, node.match_score(message.text, message.source_wing))
-            for node in self._chatter_nodes
-        ]
-        scored = [(n, s) for n, s in scored if s > 0]
+        hall_scores, related_entities = self._get_hallway_context(message)
+
+        scored = []
+        for node in self._chatter_nodes:
+            score = node.match_score(message.text, message.source_wing)
+
+            # Hallway-aware boosts (only for nodes in the source wing).
+            if message.source_wing and normalize_wing_name(
+                message.source_wing
+            ) == normalize_wing_name(node.wing):
+                if node.hall and node.hall.lower() in hall_scores:
+                    score += hall_scores[node.hall.lower()]
+
+                # Also boost if a related entity matches a specialty.
+                if related_entities and node.specialties:
+                    overlaps = related_entities & {
+                        s.lower() for s in node.specialties
+                    }
+                    score += min(0.3, len(overlaps) * 0.1)
+
+            score = max(0.0, min(2.0, score))
+            if score > 0:
+                scored.append((node, score))
+
         scored.sort(key=lambda x: x[1], reverse=True)
         return [n for n, _ in scored[:fanout]]
 

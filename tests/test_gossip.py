@@ -20,6 +20,7 @@ from mempalace.gossip import (
     load_gossip_config,
     save_gossip_config,
 )
+import mempalace.gossip as gossip_mod
 from mempalace.knowledge_graph import KnowledgeGraph
 
 
@@ -393,3 +394,71 @@ def test_gossip_config_is_json_serializable():
         with open(path, "r", encoding="utf-8") as f:
             on_disk = json.load(f)
         assert on_disk["chatter_nodes"][0]["id"] == saved["chatter_nodes"][0]["id"]
+
+
+def test_select_chatter_nodes_uses_hallway_room(monkeypatch):
+    """A hallway matching the subject and the node's hall/room boosts selection."""
+    kg_path = _temp_db()
+    try:
+        protocol = GossipProtocol(kg_path=kg_path)
+
+        def _fake_list_hallways(wing=None, config=None):
+            if wing != "orkid":
+                return []
+            return [
+                {
+                    "id": "hallway_orkid_audit_risk_abc12345",
+                    "wing": "orkid",
+                    "entity_a": "audit",
+                    "entity_b": "risk",
+                    "co_occurrence_count": 4,
+                    "rooms": ["security"],
+                },
+                {
+                    "id": "hallway_orkid_audit_compliance_abc12345",
+                    "wing": "orkid",
+                    "entity_a": "audit",
+                    "entity_b": "compliance",
+                    "co_occurrence_count": 2,
+                    "rooms": ["contracts"],
+                },
+            ]
+
+        monkeypatch.setattr(gossip_mod, "list_hallways", _fake_list_hallways)
+
+        msg = GossipMessage(
+            subject="audit",
+            predicate="found",
+            obj="risk",
+            source_wing="orkid",
+            priority="high",
+        )
+        nodes = protocol.select_chatter_nodes(msg, fanout=3)
+        ids = [n.id for n in nodes]
+
+        # chatter_security is in hall "security" and has specialties audit/risk/compliance.
+        assert "chatter_security" in ids
+        assert ids[0] == "chatter_security"
+    finally:
+        Path(kg_path).unlink(missing_ok=True)
+
+
+def test_select_chatter_nodes_without_hallways(monkeypatch):
+    """When hallways are empty, selection falls back to base scoring."""
+    kg_path = _temp_db()
+    try:
+        protocol = GossipProtocol(kg_path=kg_path)
+        monkeypatch.setattr(gossip_mod, "list_hallways", lambda *a, **kw: [])
+
+        msg = GossipMessage(
+            subject="audit",
+            predicate="found",
+            obj="risk",
+            source_wing="orkid",
+            priority="high",
+        )
+        nodes = protocol.select_chatter_nodes(msg, fanout=3)
+        # chatter_security still wins on specialty/topic match.
+        assert any(n.id == "chatter_security" for n in nodes)
+    finally:
+        Path(kg_path).unlink(missing_ok=True)
