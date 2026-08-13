@@ -2605,6 +2605,19 @@ def tool_gossip_status():
         return {"error": f"gossip_status failed: {e}"}
 
 
+def tool_gossip_analytics():
+    """Return meta-gossip analytics: trending topics, viral facts, and network health."""
+    try:
+        protocol = GossipProtocol(
+            mempalace_config=_config,
+            kg=_get_kg(_resolve_kg_path()),
+        )
+        return protocol.analytics()
+    except Exception as e:
+        logger.exception("gossip_analytics tool failed")
+        return {"error": f"gossip_analytics failed: {e}"}
+
+
 def tool_mesh_peers():
     """Mesh estate snapshot — the committed compat surface for PalaceMind's
     mesh view: exactly the GET /sync/peers payload, produced by the same
@@ -5014,6 +5027,11 @@ TOOLS = {
         "description": "Return the gossip protocol configuration and chatter-node status.",
         "input_schema": {"type": "object", "properties": {}},
         "handler": tool_gossip_status,
+    },
+    "mempalace_gossip_analytics": {
+        "description": "Return meta-gossip analytics: trending topics, viral facts, and gossip network health.",
+        "input_schema": {"type": "object", "properties": {}},
+        "handler": tool_gossip_analytics,
     },
     "mempalace_mesh_peers": {
         "description": "Mesh estate snapshot (RFC 004): this replica's identity, version vector and node profile; each configured peer's reachability, last sync outcome, remote version vector and advertised profile; origins known only transitively; origin_profiles keyed by replica_id; and estate_source saying whether the peer status was observed in this process or published by the palace's hub (with published_at and whether that hub is still alive). Exactly the GET /sync/peers payload — tokens are never included.",
