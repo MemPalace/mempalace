@@ -8,11 +8,14 @@ passed as explicit tuples to avoid pulling in a Chroma/pgvector collection.
 import json
 import os
 import tempfile
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from mempalace.gossip import (
     EXAMPLE_GOSSIP_CONFIG,
     ChatterNode,
+    GossipDaemon,
     GossipMessage,
     GossipProtocol,
     _default_gossip_path,
@@ -463,5 +466,125 @@ def test_select_chatter_nodes_without_hallways(monkeypatch):
         nodes = protocol.select_chatter_nodes(msg, fanout=3)
         # chatter_security still wins on specialty/topic match.
         assert any(n.id == "chatter_security" for n in nodes)
+    finally:
+        Path(kg_path).unlink(missing_ok=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Daemon
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_daemon_run_once_propagates_scheduled_message():
+    kg_path = _temp_db()
+    try:
+        kg = KnowledgeGraph(db_path=kg_path)
+        protocol = GossipProtocol(kg=kg, config=EXAMPLE_GOSSIP_CONFIG)
+        daemon = GossipDaemon(protocol, interval_seconds=60.0)
+
+        daemon.schedule(
+            "audit",
+            "found",
+            "risk",
+            source_wing="orkid",
+            priority="high",
+        )
+        report = daemon.run_once()
+
+        assert report["processed"] == 1
+        assert report["expired"] == 0
+        assert report["triples_written"] >= 1
+        # A child message should be queued for the next tick (hops incremented).
+        assert report["children_queued"] >= 1
+    finally:
+        Path(kg_path).unlink(missing_ok=True)
+
+
+def test_daemon_drops_expired_message():
+    kg_path = _temp_db()
+    try:
+        protocol = GossipProtocol(kg_path=kg_path, config=EXAMPLE_GOSSIP_CONFIG)
+        daemon = GossipDaemon(protocol, interval_seconds=60.0)
+
+        msg = daemon.schedule("x", "is", "y", source_wing="orkid")
+        # Force expiry by backdating start time.
+        msg._started_at = datetime.now(timezone.utc) - timedelta(seconds=120)
+        msg.ttl_seconds = 60
+
+        report = daemon.run_once()
+        assert report["expired"] == 1
+        assert report["processed"] == 0
+        assert report["triples_written"] == 0
+    finally:
+        Path(kg_path).unlink(missing_ok=True)
+
+
+def test_daemon_start_stop_background_thread():
+    protocol = GossipProtocol(config=EXAMPLE_GOSSIP_CONFIG)
+    daemon = GossipDaemon(protocol, interval_seconds=0.05)
+    daemon.start()
+    assert daemon._worker is not None
+    assert daemon._worker.is_alive()
+
+    daemon.schedule("test", "is", "active", source_wing="orkid")
+    time.sleep(0.15)
+
+    daemon.stop()
+    assert not daemon._worker.is_alive()
+
+
+def test_daemon_run_once_isolates_message_failures():
+    """An exception in one message does not discard later messages or prior children."""
+    kg_path = _temp_db()
+    try:
+        kg = KnowledgeGraph(db_path=kg_path)
+        protocol = GossipProtocol(kg=kg, config=EXAMPLE_GOSSIP_CONFIG)
+        daemon = GossipDaemon(protocol, interval_seconds=60.0, max_requeue=100)
+
+        daemon.schedule("audit", "found", "risk", source_wing="orkid", priority="high")
+        daemon.schedule("will", "explode", "now", source_wing="orkid", priority="high")
+        daemon.schedule("launch", "is", "active", source_wing="orkid", priority="high")
+
+        # Make the second message's propagation raise.
+        original = protocol._propagate_message
+
+        def _boom_on_second(*a, **kw):
+            raise RuntimeError("simulated failure")
+
+        protocol._propagate_message = _boom_on_second
+
+        report = daemon.run_once()
+
+        assert report["processed"] == 1
+        assert report["failed"] == 1
+        # The queue must still contain the third message, and possibly a child
+        # from the first message (no test patches room graph, so children may
+        # also be requeued).
+        with daemon._lock:
+            assert len(daemon._queue) >= 1
+            ids = {m.subject for m in daemon._queue}
+            assert "launch" in ids
+    finally:
+        Path(kg_path).unlink(missing_ok=True)
+
+
+def test_daemon_requeue_respects_max_requeue():
+    """Children are dropped once the queue reaches max_requeue."""
+    kg_path = _temp_db()
+    try:
+        kg = KnowledgeGraph(db_path=kg_path)
+        protocol = GossipProtocol(kg=kg, config=EXAMPLE_GOSSIP_CONFIG)
+        # Pre-fill the queue to leave only one slot.
+        daemon = GossipDaemon(protocol, interval_seconds=60.0, max_requeue=2)
+        daemon.schedule("pre-existing", "is", "queued", source_wing="orkid")
+        daemon.schedule("audit", "found", "risk", source_wing="orkid", priority="high")
+
+        report = daemon.run_once()
+
+        assert report["processed"] == 2
+        # At most one child can be enqueued because one slot is already taken.
+        with daemon._lock:
+            assert len(daemon._queue) <= 2
+        assert report["children_queued"] <= 1
     finally:
         Path(kg_path).unlink(missing_ok=True)
