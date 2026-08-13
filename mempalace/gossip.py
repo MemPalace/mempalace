@@ -53,6 +53,9 @@ DEFAULT_GOSSIP_CONFIG: dict[str, Any] = {
     "chatter_frequency_ms": 1000,
     "noise_tolerance": 0.2,
     "amplification_factor": 1.5,
+    "randomness_factor": 0.3,
+    "redundancy_handling": "deduplicate",
+    "gossip_decay": "exponential",
     "chatter_nodes": [],
     "topics": [],
 }
@@ -69,6 +72,9 @@ EXAMPLE_GOSSIP_CONFIG: dict[str, Any] = {
     "chatter_frequency_ms": 1000,
     "noise_tolerance": 0.2,
     "amplification_factor": 1.5,
+    "randomness_factor": 0.3,
+    "redundancy_handling": "deduplicate",
+    "gossip_decay": "exponential",
     "chatter_nodes": [
         {
             "id": "chatter_orkid_tech",
@@ -188,10 +194,42 @@ EXAMPLE_GOSSIP_CONFIG: dict[str, Any] = {
         },
     ],
     "channels": {
-        "critical": {"latency_ms": 5, "reliability": 0.99, "capacity": "unlimited"},
-        "high": {"latency_ms": 50, "reliability": 0.95, "capacity": "high"},
-        "medium": {"latency_ms": 200, "reliability": 0.90, "capacity": "medium"},
-        "low": {"latency_ms": 1000, "reliability": 0.85, "capacity": "low"},
+        "critical": {
+            "latency_ms": 5,
+            "reliability": 0.99,
+            "capacity": "unlimited",
+            "ttl_seconds": 30,
+            "fanout": 7,
+            "gossip_probability": 0.95,
+            "max_hops": 3,
+        },
+        "high": {
+            "latency_ms": 50,
+            "reliability": 0.95,
+            "capacity": "high",
+            "ttl_seconds": 60,
+            "fanout": 5,
+            "gossip_probability": 0.85,
+            "max_hops": 3,
+        },
+        "medium": {
+            "latency_ms": 200,
+            "reliability": 0.90,
+            "capacity": "medium",
+            "ttl_seconds": 120,
+            "fanout": 4,
+            "gossip_probability": 0.75,
+            "max_hops": 3,
+        },
+        "low": {
+            "latency_ms": 1000,
+            "reliability": 0.85,
+            "capacity": "low",
+            "ttl_seconds": 300,
+            "fanout": 2,
+            "gossip_probability": 0.60,
+            "max_hops": 2,
+        },
     },
 }
 
@@ -324,9 +362,11 @@ class GossipMessage:
     source_room: Optional[str] = None
     priority: str = "normal"
     topic: Optional[str] = None
+    channel: str = "medium"
     hops: int = 0
     max_hops: int = 3
     ttl_seconds: int = 60
+    gossip_probability: Optional[float] = None
     _started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     @property
@@ -346,9 +386,11 @@ class GossipMessage:
             source_room=room,
             priority=self.priority,
             topic=self.topic,
+            channel=self.channel,
             hops=self.hops + 1,
             max_hops=self.max_hops,
             ttl_seconds=self.ttl_seconds,
+            gossip_probability=self.gossip_probability,
             _started_at=self._started_at,
         )
 
@@ -444,6 +486,62 @@ class GossipProtocol:
 
         return room_scores, related
 
+    def _channel_for_priority(self, priority: str) -> str:
+        """Map a message priority to a channel key."""
+        mapping = {
+            "critical": "critical",
+            "high": "high",
+            "medium": "medium",
+            "low": "low",
+        }
+        return mapping.get(priority, "medium")
+
+    def _channel_params(self, message: GossipMessage) -> dict[str, Any]:
+        """Return channel-overridden propagation parameters."""
+        channel = self.config.get("channels", {}).get(message.channel, {})
+        defaults = {
+            "ttl_seconds": self.config.get("ttl_seconds", 60),
+            "fanout": self.config.get("fanout", 5),
+            "gossip_probability": self.config.get("gossip_probability", 0.7),
+            "max_hops": self.config.get("max_hops", 3),
+            "randomness_factor": self.config.get("randomness_factor", 0.3),
+            "noise_tolerance": self.config.get("noise_tolerance", 0.2),
+        }
+        if not isinstance(channel, dict):
+            return defaults
+        return {**defaults, **{k: v for k, v in channel.items() if k in defaults}}
+
+    def _random_walk_swap(
+        self, message: GossipMessage, selected: list[ChatterNode]
+    ) -> list[ChatterNode]:
+        """Occasionally replace selected nodes with random off-radius nodes."""
+        params = self._channel_params(message)
+        randomness = float(params.get("randomness_factor", 0.3))
+        max_steps = 5
+
+        if not message.source_wing:
+            return selected
+
+        source = normalize_wing_name(message.source_wing)
+        off_radius = [
+            n
+            for n in self._chatter_nodes
+            if n not in selected
+            and source not in {normalize_wing_name(w) for w in n.gossip_radius}
+        ]
+        if not off_radius:
+            return selected
+
+        swapped = list(selected)
+        swaps = 0
+        for i in range(len(swapped)):
+            if random.random() < randomness and swaps < max_steps:
+                replacement = random.choice(off_radius)
+                swapped[i] = replacement
+                off_radius.remove(replacement)
+                swaps += 1
+        return swapped
+
     def select_chatter_nodes(
         self,
         message: GossipMessage,
@@ -452,11 +550,18 @@ class GossipProtocol:
         """Rank and select chatter nodes for a given message.
 
         Selection combines the base specialty/topic score with within-wing
-        hallway context: chatter nodes in the source wing whose ``rooms``
-        overlap with the co-occurrence rooms get a boost, as do nodes whose
-        specialties overlap with related entities.
+        hallway context and the active channel's fanout, noise tolerance, and
+        random-walk swap parameters. Nodes whose ``rooms`` overlap with the
+        co-occurrence rooms or whose specialties match related entities get a
+        boost before the noise tolerance filter is applied.
         """
-        fanout = fanout if fanout is not None else self.config.get("fanout", 5)
+        params = self._channel_params(message)
+        fanout = (
+            fanout
+            if fanout is not None
+            else params.get("fanout", self.config.get("fanout", 5))
+        )
+        noise_tolerance = float(params.get("noise_tolerance", 0.2))
         room_scores, related_entities = self._get_hallway_context(message)
 
         scored = []
@@ -467,7 +572,7 @@ class GossipProtocol:
             if message.source_wing and normalize_wing_name(
                 message.source_wing
             ) == normalize_wing_name(node.wing):
-                # Boost by room-level affinity.  A node's hall and the
+                # Boost by room-level affinity. A node's hall and the
                 # co-occurrence rooms are in different namespaces, so we match
                 # rooms to the node's ``rooms`` list rather than to ``hall``.
                 if room_scores and node.rooms:
@@ -485,11 +590,15 @@ class GossipProtocol:
                     score += min(0.3, len(overlaps) * 0.1)
 
             score = max(0.0, min(2.0, score))
-            if score > 0:
+            if score >= noise_tolerance:
                 scored.append((node, score))
-
         scored.sort(key=lambda x: x[1], reverse=True)
-        return [n for n, _ in scored[:fanout]]
+        selected = [n for n, _ in scored[:fanout]]
+
+        # Random walk: occasionally swap a selected node for a random one.
+        selected = self._random_walk_swap(message, selected)
+
+        return selected
 
     def _resolve_targets(
         self,
@@ -541,14 +650,26 @@ class GossipProtocol:
         return unique
 
     def _should_forward(self, message: GossipMessage, node: ChatterNode) -> bool:
-        """Apply gossip probability, chatter level, and TTL checks."""
+        """Apply gossip probability, chatter level, amplification, and TTL checks."""
         if message.is_expired():
             return False
         if message.hops >= getattr(message, "max_hops", self.config.get("max_hops", 3)):
             return False
-        base = self.config.get("gossip_probability", 0.7)
+
+        params = self._channel_params(message)
+        base = (
+            message.gossip_probability
+            if message.gossip_probability is not None
+            else float(params.get("gossip_probability", self.config.get("gossip_probability", 0.7)))
+        )
         level_mult = CHATTER_LEVEL_MULTIPLIER.get(node.chatter_level, 1.0)
         probability = min(1.0, base * level_mult)
+
+        # Amplification factor boosts high-priority information.
+        if message.priority in {"critical", "high"}:
+            amp = float(self.config.get("amplification_factor", 1.5))
+            probability = min(1.0, probability * amp)
+
         return random.random() < probability
 
     def _compute_valid_to(self, message: GossipMessage) -> Optional[str]:
@@ -676,7 +797,8 @@ class GossipProtocol:
         detected_topic, detected_priority = self.detect_topic(text, priority)
         priority = priority or detected_priority
 
-        message = GossipMessage(
+        # Build a preliminary message to resolve the channel and its parameters.
+        preliminary = GossipMessage(
             subject=subject,
             predicate=predicate,
             obj=obj,
@@ -686,6 +808,29 @@ class GossipProtocol:
             topic=detected_topic,
             ttl_seconds=self.config.get("ttl_seconds", 60),
             max_hops=max_hops if max_hops is not None else self.config.get("max_hops", 3),
+        )
+        channel = self._channel_for_priority(priority)
+        params = self.config.get("channels", {}).get(channel, {})
+
+        # Preserve explicit caller arguments over channel defaults.
+        final_max_hops = (
+            max_hops
+            if max_hops is not None
+            else params.get("max_hops", preliminary.max_hops)
+        )
+
+        message = GossipMessage(
+            subject=subject,
+            predicate=predicate,
+            obj=obj,
+            source_wing=source_wing,
+            source_room=source_room,
+            priority=priority,
+            topic=detected_topic,
+            channel=channel,
+            ttl_seconds=params.get("ttl_seconds", preliminary.ttl_seconds),
+            max_hops=final_max_hops,
+            gossip_probability=params.get("gossip_probability"),
         )
 
         report, _ = self._propagate_message(
@@ -700,8 +845,13 @@ class GossipProtocol:
             "max_hops": self.config.get("max_hops", 3),
             "ttl_seconds": self.config.get("ttl_seconds", 60),
             "fanout": self.config.get("fanout", 5),
+            "gossip_probability": self.config.get("gossip_probability", 0.7),
+            "randomness_factor": self.config.get("randomness_factor", 0.3),
+            "noise_tolerance": self.config.get("noise_tolerance", 0.2),
+            "amplification_factor": self.config.get("amplification_factor", 1.5),
             "chatter_nodes": [asdict(n) for n in self._chatter_nodes],
             "topics": self.config.get("topics", []),
+            "channels": self.config.get("channels", {}),
         }
 
     def analytics(self, as_of: str = None) -> dict[str, Any]:
