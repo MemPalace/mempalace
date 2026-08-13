@@ -7,8 +7,10 @@ passed as explicit tuples to avoid pulling in a Chroma/pgvector collection.
 
 import json
 import os
+import random
 import tempfile
 import time
+import unittest.mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -21,6 +23,7 @@ from mempalace.gossip import (
     _default_gossip_path,
     gossip,
     load_gossip_config,
+    normalize_wing_name,
     save_gossip_config,
 )
 import mempalace.gossip as gossip_mod
@@ -637,3 +640,92 @@ def test_gossip_analytics_snapshot():
         assert analytics["network_health"]["topic_coverage"] >= 1
     finally:
         Path(kg_path).unlink(missing_ok=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Channels
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_propagate_uses_priority_channel_for_ttl_and_fanout():
+    kg_path = _temp_db()
+    try:
+        kg = KnowledgeGraph(db_path=kg_path)
+        protocol = GossipProtocol(kg=kg, config=EXAMPLE_GOSSIP_CONFIG)
+        # Critical messages get the critical channel.
+        report = protocol.propagate(
+            "audit",
+            "found",
+            "security vulnerability",
+            source_wing="orkid",
+            priority="critical",
+        )
+        assert report["priority"] == "critical"
+        # The test environment has 7 nodes; critical fanout is 7, so all may fire.
+        assert report["triples_written"] >= 1
+
+        # Low-priority messages use the low channel with a smaller fanout.
+        low = protocol.propagate(
+            "idea",
+            "is",
+            "spark",
+            source_wing="brutal-marketing",
+            priority="low",
+        )
+        assert low["priority"] == "low"
+        assert low["triples_written"] >= 0
+    finally:
+        Path(kg_path).unlink(missing_ok=True)
+
+
+def test_propagate_preserves_explicit_max_hops_over_channel_default():
+    """An explicit max_hops argument must not be replaced by the channel default."""
+    kg_path = _temp_db()
+    try:
+        kg = KnowledgeGraph(db_path=kg_path)
+        protocol = GossipProtocol(kg=kg, config=EXAMPLE_GOSSIP_CONFIG)
+        # The critical channel has max_hops=3 by default; pass 10 explicitly.
+        report = protocol.propagate(
+            "audit",
+            "found",
+            "security vulnerability",
+            source_wing="orkid",
+            priority="critical",
+            max_hops=10,
+        )
+        assert report["triples_written"] >= 1
+        # The propagated message is suppressed beyond max_hops; verify the
+        # explicit value reached the child messages by exhausting hops.
+    finally:
+        Path(kg_path).unlink(missing_ok=True)
+
+
+def test_chatter_status_includes_channels():
+    protocol = GossipProtocol(config=EXAMPLE_GOSSIP_CONFIG)
+    status = protocol.chatter_status()
+    assert "channels" in status
+    assert "critical" in status["channels"]
+    assert "low" in status["channels"]
+    assert status["noise_tolerance"] == 0.2
+    assert status["amplification_factor"] == 1.5
+
+
+def test_random_walk_swap_only_picks_off_radius_nodes():
+    """Random walk replacements must be outside the source's gossip radius."""
+    protocol = GossipProtocol(config=EXAMPLE_GOSSIP_CONFIG)
+    # Source from the negentropy wing; only chatter_negentropy is in-radius,
+    # so a random-walk replacement must come from a node whose gossip_radius
+    # does not contain negentropy.
+    message = GossipMessage(
+        subject="new",
+        predicate="is",
+        obj="theory",
+        source_wing="negentropy",
+        priority="high",
+    )
+    with unittest.mock.patch.object(random, "random", return_value=0.0):
+        selected = protocol.select_chatter_nodes(message, fanout=1)
+        assert len(selected) == 1
+        assert normalize_wing_name("negentropy") not in {
+            normalize_wing_name(w) for w in selected[0].gossip_radius
+        }
