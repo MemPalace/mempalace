@@ -56,6 +56,9 @@ DEFAULT_GOSSIP_CONFIG: dict[str, Any] = {
     "randomness_factor": 0.3,
     "redundancy_handling": "deduplicate",
     "gossip_decay": "exponential",
+    "echo_chamber_reinforcement_count": 3,
+    "echo_chamber_attenuation": 0.5,
+    "echo_chamber_similarity_threshold": 0.8,
     "chatter_nodes": [],
     "topics": [],
 }
@@ -75,6 +78,9 @@ EXAMPLE_GOSSIP_CONFIG: dict[str, Any] = {
     "randomness_factor": 0.3,
     "redundancy_handling": "deduplicate",
     "gossip_decay": "exponential",
+    "echo_chamber_reinforcement_count": 3,
+    "echo_chamber_attenuation": 0.5,
+    "echo_chamber_similarity_threshold": 0.8,
     "chatter_nodes": [
         {
             "id": "chatter_orkid_tech",
@@ -367,6 +373,7 @@ class GossipMessage:
     max_hops: int = 3
     ttl_seconds: int = 60
     gossip_probability: Optional[float] = None
+    path: list[str] = field(default_factory=list)
     _started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     @property
@@ -376,8 +383,11 @@ class GossipMessage:
     def is_expired(self) -> bool:
         return (datetime.now(timezone.utc) - self._started_at).total_seconds() > self.ttl_seconds
 
-    def child(self, wing: str, room: Optional[str] = None) -> GossipMessage:
-        """Return a copy with incremented hop count."""
+    def child(self, wing: str, room: Optional[str] = None, node_id: Optional[str] = None) -> GossipMessage:
+        """Return a copy with incremented hop count and updated path."""
+        new_path = list(self.path)
+        if node_id:
+            new_path.append(node_id)
         return GossipMessage(
             subject=self.subject,
             predicate=self.predicate,
@@ -391,6 +401,7 @@ class GossipMessage:
             max_hops=self.max_hops,
             ttl_seconds=self.ttl_seconds,
             gossip_probability=self.gossip_probability,
+            path=new_path,
             _started_at=self._started_at,
         )
 
@@ -649,8 +660,51 @@ class GossipProtocol:
                 unique.append(t)
         return unique
 
+    def _attenuate_echo_chamber(
+        self, message: GossipMessage, node: ChatterNode, probability: float
+    ) -> float:
+        """Dampen probability when the node has already seen similar messages.
+
+        Each path entry is either a node id or ``node_id:message_text``.  The
+        similarity threshold determines whether a prior visit counts as an echo.
+        """
+        threshold = float(
+            self.config.get("echo_chamber_similarity_threshold", 0.8)
+        )
+        reinforcement_count = int(
+            self.config.get("echo_chamber_reinforcement_count", 3)
+        )
+        attenuation = float(self.config.get("echo_chamber_attenuation", 0.5))
+
+        current_text = message.text
+        current_tokens = set(current_text.lower().split())
+        echo_visits = 0
+
+        for entry in message.path or []:
+            if not entry:
+                continue
+            if ":" in entry:
+                stored_id, stored_text = entry.split(":", 1)
+            else:
+                stored_id = entry
+                stored_text = current_text
+            if stored_id != node.id:
+                continue
+            stored_tokens = set(stored_text.lower().split())
+            union = current_tokens | stored_tokens
+            if not union:
+                continue
+            if len(current_tokens & stored_tokens) / len(union) >= threshold:
+                echo_visits += 1
+
+        if echo_visits >= reinforcement_count:
+            return 0.0
+        for _ in range(echo_visits):
+            probability *= attenuation
+        return probability
+
     def _should_forward(self, message: GossipMessage, node: ChatterNode) -> bool:
-        """Apply gossip probability, chatter level, amplification, and TTL checks."""
+        """Apply gossip probability, chatter level, amplification, TTL, and echo checks."""
         if message.is_expired():
             return False
         if message.hops >= getattr(message, "max_hops", self.config.get("max_hops", 3)):
@@ -670,6 +724,7 @@ class GossipProtocol:
             amp = float(self.config.get("amplification_factor", 1.5))
             probability = min(1.0, probability * amp)
 
+        probability = self._attenuate_echo_chamber(message, node, probability)
         return random.random() < probability
 
     def _compute_valid_to(self, message: GossipMessage) -> Optional[str]:
@@ -756,7 +811,7 @@ class GossipProtocol:
                         {"wing": target_wing, "room": target_room}
                     )
                     any_success = True
-                    children.append(message.child(target_wing, target_room))
+                    children.append(message.child(target_wing, target_room, node_id=node.id))
                 except Exception as exc:
                     logger.debug(
                         "gossip: kg add failed for %s/%s", target_wing, target_room, exc_info=True
@@ -849,6 +904,15 @@ class GossipProtocol:
             "randomness_factor": self.config.get("randomness_factor", 0.3),
             "noise_tolerance": self.config.get("noise_tolerance", 0.2),
             "amplification_factor": self.config.get("amplification_factor", 1.5),
+            "echo_chamber_reinforcement_count": self.config.get(
+                "echo_chamber_reinforcement_count", 3
+            ),
+            "echo_chamber_attenuation": self.config.get(
+                "echo_chamber_attenuation", 0.5
+            ),
+            "echo_chamber_similarity_threshold": self.config.get(
+                "echo_chamber_similarity_threshold", 0.8
+            ),
             "chatter_nodes": [asdict(n) for n in self._chatter_nodes],
             "topics": self.config.get("topics", []),
             "channels": self.config.get("channels", {}),
