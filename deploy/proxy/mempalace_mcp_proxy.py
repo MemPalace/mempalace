@@ -238,20 +238,63 @@ def cleanup_expired_sessions():
 # ── Request Forwarding ─────────────────────────────────────────────────────────
 
 
+def _is_valid_jsonrpc_request(body: bytes) -> tuple[bool, str | None]:
+    """Validate the JSON-RPC 2.0 envelope and return (ok, error_message).
+
+    The proxy relies on a well-formed envelope to make retry-safety and
+    routing decisions.  Malformed requests are rejected before forwarding.
+    """
+    try:
+        req = json.loads(body)
+    except Exception as exc:
+        return False, f"Invalid JSON: {exc}"
+
+    if not isinstance(req, dict):
+        return False, "JSON-RPC request must be an object"
+
+    if req.get("jsonrpc") != "2.0":
+        return False, "Invalid or missing jsonrpc version (expected '2.0')"
+
+    method = req.get("method")
+    if not isinstance(method, str) or not method:
+        return False, "method must be a non-empty string"
+
+    # id may be absent (notification), but if present must be a valid type.
+    if "id" in req and not (
+        isinstance(req["id"], (str, int, float)) or req["id"] is None
+    ):
+        return False, "id must be a string, number, or null"
+
+    params = req.get("params")
+    if params is not None and not isinstance(params, (dict, list)):
+        return False, "params must be an object or array"
+
+    if method == "tools/call":
+        if not isinstance(params, dict):
+            return False, "tools/call requires a params object"
+        tool = params.get("name")
+        if not isinstance(tool, str) or not tool:
+            return False, "tools/call params must contain a non-empty 'name' string"
+        arguments = params.get("arguments")
+        if arguments is not None and not isinstance(arguments, dict):
+            return False, "tools/call 'arguments' must be an object"
+
+    return True, None
+
+
 def _is_retry_safe(body: bytes) -> bool:
     """Return True if a JSON-RPC request is idempotent and safe to retry.
 
     The upstream MCP server handles mutations (add/update/delete/...) that may
     commit even when the response is lost. Replaying those requests can execute
     the mutation twice, so we only retry methods and tools that are proven
-    read-only.
+    read-only.  Only well-formed JSON-RPC requests can be considered safe.
     """
-    try:
-        req = json.loads(body)
-    except Exception:
-        # If we cannot parse the request, we cannot prove it is safe.
+    ok, _ = _is_valid_jsonrpc_request(body)
+    if not ok:
         return False
 
+    req = json.loads(body)
     method = req.get("method", "")
     if method in _READ_ONLY_METHODS:
         return True
@@ -460,15 +503,23 @@ async def handle_mcp_post(request: web.Request) -> web.StreamResponse:
     if session_id:
         headers["Mcp-Session-Id"] = session_id
 
-    try:
-        req_json = json.loads(body)
-        is_initialize = req_json.get("method") == "initialize"
-        req_id = req_json.get("id")
-        method = req_json.get("method", "?")
-    except Exception:
-        is_initialize = False
-        req_id = None
-        method = "?"
+    is_valid, validation_error = _is_valid_jsonrpc_request(body)
+    if not is_valid:
+        log.warning(f"[{request_id}] Rejected malformed JSON-RPC: {validation_error}")
+        _metrics["requests_failed"] += 1
+        return web.json_response(
+            {
+                "jsonrpc": "2.0",
+                "id": None,
+                "error": {"code": -32700, "message": validation_error},
+            },
+            status=400,
+        )
+
+    req_json = json.loads(body)
+    is_initialize = req_json.get("method") == "initialize"
+    req_id = req_json.get("id")
+    method = req_json.get("method", "?")
 
     retry_safe = _is_retry_safe(body)
     max_attempts = MAX_RETRIES + 1 if retry_safe else 1
