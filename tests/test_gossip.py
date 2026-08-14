@@ -397,10 +397,11 @@ def test_gossip_config_is_json_serializable():
 
 
 def test_select_chatter_nodes_uses_hallway_room(monkeypatch):
-    """A hallway matching the subject and the node's hall/room boosts selection."""
+    """A hallway's co-occurrence rooms boost nodes whose rooms match, even when
+    the room name differs from the node's hall name."""
     kg_path = _temp_db()
     try:
-        protocol = GossipProtocol(kg_path=kg_path)
+        protocol = GossipProtocol(kg_path=kg_path, config=EXAMPLE_GOSSIP_CONFIG)
 
         def _fake_list_hallways(wing=None, config=None):
             if wing != "orkid":
@@ -412,7 +413,8 @@ def test_select_chatter_nodes_uses_hallway_room(monkeypatch):
                     "entity_a": "audit",
                     "entity_b": "risk",
                     "co_occurrence_count": 4,
-                    "rooms": ["security"],
+                    # room name is intentionally different from the node's hall.
+                    "rooms": ["audit_report"],
                 },
                 {
                     "id": "hallway_orkid_audit_compliance_abc12345",
@@ -436,7 +438,8 @@ def test_select_chatter_nodes_uses_hallway_room(monkeypatch):
         nodes = protocol.select_chatter_nodes(msg, fanout=3)
         ids = [n.id for n in nodes]
 
-        # chatter_security is in hall "security" and has specialties audit/risk/compliance.
+        # chatter_security has hall "security" but room "audit_report"; the
+        # co-occurrence room "audit_report" should boost it to first place.
         assert "chatter_security" in ids
         assert ids[0] == "chatter_security"
     finally:
@@ -447,7 +450,7 @@ def test_select_chatter_nodes_without_hallways(monkeypatch):
     """When hallways are empty, selection falls back to base scoring."""
     kg_path = _temp_db()
     try:
-        protocol = GossipProtocol(kg_path=kg_path)
+        protocol = GossipProtocol(kg_path=kg_path, config=EXAMPLE_GOSSIP_CONFIG)
         monkeypatch.setattr(gossip_mod, "list_hallways", lambda *a, **kw: [])
 
         msg = GossipMessage(
