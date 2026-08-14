@@ -11,6 +11,7 @@ import tempfile
 from pathlib import Path
 
 from mempalace.gossip import (
+    EXAMPLE_GOSSIP_CONFIG,
     ChatterNode,
     GossipMessage,
     GossipProtocol,
@@ -72,7 +73,19 @@ def test_load_default_config_writes_file():
         cfg = load_gossip_config(path=path)
         assert os.path.exists(path)
         assert "chatter_nodes" in cfg
-        assert len(cfg["chatter_nodes"]) == 7
+        assert len(cfg["chatter_nodes"]) == 0
+        assert cfg["topics"] == []
+
+
+def test_default_config_does_not_leak_project_topology():
+    """A neutral palace gets an empty gossip config with no project-specific names."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "gossip_config.json")
+        cfg = load_gossip_config(path=path)
+        combined = json.dumps(cfg)
+        assert "orkid" not in combined
+        assert "brutal-marketing" not in combined
+        assert "negentropy" not in combined
 
 
 def test_save_and_reload_config():
@@ -148,7 +161,7 @@ def test_gossip_message_expiry():
 def test_detect_topic_matches_security_keywords():
     kg_path = _temp_db()
     try:
-        protocol = GossipProtocol(kg_path=kg_path)
+        protocol = GossipProtocol(kg_path=kg_path, config=EXAMPLE_GOSSIP_CONFIG)
         topic, priority = protocol.detect_topic("new security vulnerability found")
         assert topic == "security_issues"
         assert priority == "critical"
@@ -159,7 +172,7 @@ def test_detect_topic_matches_security_keywords():
 def test_detect_topic_defaults_to_normal():
     kg_path = _temp_db()
     try:
-        protocol = GossipProtocol(kg_path=kg_path)
+        protocol = GossipProtocol(kg_path=kg_path, config=EXAMPLE_GOSSIP_CONFIG)
         topic, priority = protocol.detect_topic("something random happened")
         assert topic == "general"
         assert priority == "normal"
@@ -170,7 +183,7 @@ def test_detect_topic_defaults_to_normal():
 def test_detect_topic_honors_explicit_priority():
     kg_path = _temp_db()
     try:
-        protocol = GossipProtocol(kg_path=kg_path)
+        protocol = GossipProtocol(kg_path=kg_path, config=EXAMPLE_GOSSIP_CONFIG)
         topic, priority = protocol.detect_topic("random", priority="high")
         assert topic == "general"
         assert priority == "high"
@@ -181,7 +194,7 @@ def test_detect_topic_honors_explicit_priority():
 def test_select_chatter_nodes_respects_fanout():
     kg_path = _temp_db()
     try:
-        protocol = GossipProtocol(kg_path=kg_path)
+        protocol = GossipProtocol(kg_path=kg_path, config=EXAMPLE_GOSSIP_CONFIG)
         msg = GossipMessage(
             subject="s",
             predicate="p",
@@ -200,7 +213,7 @@ def test_propagate_writes_triples_and_returns_report():
     kg_path = _temp_db()
     try:
         kg = KnowledgeGraph(db_path=kg_path)
-        protocol = GossipProtocol(kg=kg)
+        protocol = GossipProtocol(kg=kg, config=EXAMPLE_GOSSIP_CONFIG)
         report = protocol.propagate(
             "audit",
             "found",
@@ -230,7 +243,7 @@ def test_propagate_with_no_room_graph_still_runs():
     kg_path = _temp_db()
     try:
         kg = KnowledgeGraph(db_path=kg_path)
-        protocol = GossipProtocol(kg=kg)
+        protocol = GossipProtocol(kg=kg, config=EXAMPLE_GOSSIP_CONFIG)
         report = protocol.propagate(
             "new",
             "is",
@@ -245,11 +258,86 @@ def test_propagate_with_no_room_graph_still_runs():
         Path(kg_path).unlink(missing_ok=True)
 
 
+def test_propagate_report_distinguishes_failed_writes():
+    """A node is not reported as propagated when every KG write fails."""
+    kg_path = _temp_db()
+    try:
+        kg = KnowledgeGraph(db_path=kg_path)
+        protocol = GossipProtocol(kg=kg, config=EXAMPLE_GOSSIP_CONFIG)
+
+        def _boom(*a, **kw):
+            raise RuntimeError("kg is down")
+
+        # Patch the protocol's knowledge graph directly.
+        protocol.kg.add_triple = _boom
+
+        report = protocol.propagate(
+            "audit",
+            "found",
+            "security vulnerability",
+            source_wing="orkid",
+            source_room="contracts",
+            room_graph=_sample_room_graph(),
+            fanout=5,
+        )
+
+        assert report["triples_written"] == 0
+        assert report["propagated"] == []
+        assert len(report["chatter_nodes"]) >= 1
+        for node_report in report["chatter_nodes"]:
+            assert node_report["attempted_targets"] > 0
+            assert node_report["successful_targets"] == 0
+            assert len(node_report["failed_targets"]) > 0
+            assert node_report["targets"] == []
+    finally:
+        Path(kg_path).unlink(missing_ok=True)
+
+
+def test_propagate_report_records_partial_write_success():
+    """A node with at least one successful write is reported as propagated."""
+    kg_path = _temp_db()
+    try:
+        kg = KnowledgeGraph(db_path=kg_path)
+        protocol = GossipProtocol(kg=kg, config=EXAMPLE_GOSSIP_CONFIG)
+
+        attempts = {"count": 0}
+
+        def _maybe_boom(subject, predicate, obj, **kw):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise RuntimeError("first target fails")
+            return None
+
+        protocol.kg.add_triple = _maybe_boom
+
+        report = protocol.propagate(
+            "audit",
+            "found",
+            "security vulnerability",
+            source_wing="orkid",
+            source_room="contracts",
+            room_graph=_sample_room_graph(),
+            fanout=5,
+        )
+
+        assert report["triples_written"] >= 1
+        assert len(report["propagated"]) >= 1
+        for node_report in report["chatter_nodes"]:
+            if node_report["successful_targets"] > 0:
+                assert node_report["attempted_targets"] > node_report["successful_targets"]
+                assert len(node_report["failed_targets"]) > 0
+                break
+        else:
+            raise AssertionError("expected at least one partial-success node")
+    finally:
+        Path(kg_path).unlink(missing_ok=True)
+
+
 def test_propagate_suppresses_beyond_max_hops():
     kg_path = _temp_db()
     try:
         kg = KnowledgeGraph(db_path=kg_path)
-        protocol = GossipProtocol(kg=kg)
+        protocol = GossipProtocol(kg=kg, config=EXAMPLE_GOSSIP_CONFIG)
         # Manually craft an already-old message via a child
         msg = GossipMessage(
             subject="x",
@@ -269,7 +357,7 @@ def test_propagate_suppresses_beyond_max_hops():
 def test_chatter_status():
     kg_path = _temp_db()
     try:
-        protocol = GossipProtocol(kg_path=kg_path)
+        protocol = GossipProtocol(kg_path=kg_path, config=EXAMPLE_GOSSIP_CONFIG)
         status = protocol.chatter_status()
         assert "chatter_nodes" in status
         assert len(status["chatter_nodes"]) == 7
@@ -290,6 +378,7 @@ def test_gossip_convenience_function_uses_passed_kg():
             source_wing="brutal-marketing",
             kg=kg,
             fanout=3,
+            config=EXAMPLE_GOSSIP_CONFIG,
         )
         assert report["triples_written"] >= 0
     finally:
@@ -297,10 +386,10 @@ def test_gossip_convenience_function_uses_passed_kg():
 
 
 def test_gossip_config_is_json_serializable():
-    """Default config can be written and re-read without mutation."""
+    """Example config can be written and re-read without mutation."""
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "gossip_config.json")
-        saved = save_gossip_config(load_gossip_config(path=path), path=path)
+        saved = save_gossip_config(EXAMPLE_GOSSIP_CONFIG, path=path)
         with open(path, "r", encoding="utf-8") as f:
             on_disk = json.load(f)
         assert on_disk["chatter_nodes"][0]["id"] == saved["chatter_nodes"][0]["id"]
