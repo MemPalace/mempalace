@@ -75,6 +75,7 @@ EXAMPLE_GOSSIP_CONFIG: dict[str, Any] = {
             "hall": "technical",
             "role": "technical_gossip",
             "specialties": ["contracts", "backend", "defi", "trading"],
+            "rooms": ["contracts"],
             "gossip_radius": ["orkid", "past-performance"],
             "chatter_level": "high",
             "propagation_speed": "instant",
@@ -86,6 +87,7 @@ EXAMPLE_GOSSIP_CONFIG: dict[str, Any] = {
             "hall": "general",
             "role": "marketing_gossip",
             "specialties": ["brand", "messaging", "content", "storytelling"],
+            "rooms": ["launch_blog"],
             "gossip_radius": ["brutal-marketing", "orkid"],
             "chatter_level": "high",
             "propagation_speed": "instant",
@@ -97,6 +99,7 @@ EXAMPLE_GOSSIP_CONFIG: dict[str, Any] = {
             "hall": "analytics",
             "role": "performance_gossip",
             "specialties": ["metrics", "validation", "optimization", "data"],
+            "rooms": ["audit_report"],
             "gossip_radius": ["past-performance", "orkid"],
             "chatter_level": "high",
             "propagation_speed": "instant",
@@ -108,6 +111,7 @@ EXAMPLE_GOSSIP_CONFIG: dict[str, Any] = {
             "hall": "strategy",
             "role": "strategy_gossip",
             "specialties": ["trading", "revenue", "business", "planning"],
+            "rooms": ["contracts"],
             "gossip_radius": ["orkid", "brutal-marketing"],
             "chatter_level": "medium",
             "propagation_speed": "fast",
@@ -119,6 +123,7 @@ EXAMPLE_GOSSIP_CONFIG: dict[str, Any] = {
             "hall": "security",
             "role": "security_gossip",
             "specialties": ["audit", "compliance", "risk", "validation"],
+            "rooms": ["audit_report"],
             "gossip_radius": ["orkid", "brutal-marketing"],
             "chatter_level": "medium",
             "propagation_speed": "fast",
@@ -130,6 +135,7 @@ EXAMPLE_GOSSIP_CONFIG: dict[str, Any] = {
             "hall": "creative",
             "role": "creative_gossip",
             "specialties": ["design", "visual", "brand", "aesthetic"],
+            "rooms": ["launch_blog"],
             "gossip_radius": ["brutal-marketing", "orkid"],
             "chatter_level": "medium",
             "propagation_speed": "fast",
@@ -141,6 +147,7 @@ EXAMPLE_GOSSIP_CONFIG: dict[str, Any] = {
             "hall": "creative",
             "role": "theory_gossip",
             "specialties": ["information theory", "physics", "complexity", "optimization"],
+            "rooms": ["launch_blog"],
             "gossip_radius": ["negentropy", "orkid"],
             "chatter_level": "low",
             "propagation_speed": "normal",
@@ -278,6 +285,7 @@ class ChatterNode:
     hall: str
     role: str
     specialties: list[str] = field(default_factory=list)
+    rooms: list[str] = field(default_factory=list)
     gossip_radius: list[str] = field(default_factory=list)
     chatter_level: str = "medium"
     propagation_speed: str = "normal"
@@ -396,12 +404,13 @@ class GossipProtocol:
     def _get_hallway_context(
         self, message: GossipMessage
     ) -> tuple[dict[str, float], set[str]]:
-        """Return (hall_scores, related_entities) derived from within-wing hallways.
+        """Return (room_scores, related_entities) derived from within-wing hallways.
 
         Hallways are entity-pair co-occurrence records built at mine time. When a
         gossip message mentions an entity that co-occurs with other entities in
-        the source wing, we use those co-occurrences to boost chatter nodes that
-        live in the same rooms/halls or cover the related entities.
+        the source wing, we use those co-occurrences to boost chatter nodes whose
+        ``rooms`` overlap with the co-occurrence rooms, as well as nodes whose
+        specialties overlap with the related entities.
         """
         if not message.source_wing:
             return {}, set()
@@ -414,7 +423,7 @@ class GossipProtocol:
             return {}, set()
 
         entities = {message.subject.lower(), message.obj.lower()}
-        hall_scores: dict[str, float] = {}
+        room_scores: dict[str, float] = {}
         related: set[str] = set()
 
         for h in hallways:
@@ -427,11 +436,11 @@ class GossipProtocol:
                 for room in h.get("rooms") or []:
                     room_key = room.lower()
                     # Accumulate a small boost per co-occurrence in this room.
-                    hall_scores[room_key] = hall_scores.get(room_key, 0.0) + min(
+                    room_scores[room_key] = room_scores.get(room_key, 0.0) + min(
                         0.15, 0.05 + count * 0.01
                     )
 
-        return hall_scores, related
+        return room_scores, related
 
     def select_chatter_nodes(
         self,
@@ -441,12 +450,12 @@ class GossipProtocol:
         """Rank and select chatter nodes for a given message.
 
         Selection combines the base specialty/topic score with within-wing
-        hallway context: chatter nodes in the source wing whose hall/room
-        appears in co-occurrence records for the subject/object get a boost, as
-        do nodes whose specialties overlap with related entities.
+        hallway context: chatter nodes in the source wing whose ``rooms``
+        overlap with the co-occurrence rooms get a boost, as do nodes whose
+        specialties overlap with related entities.
         """
         fanout = fanout if fanout is not None else self.config.get("fanout", 5)
-        hall_scores, related_entities = self._get_hallway_context(message)
+        room_scores, related_entities = self._get_hallway_context(message)
 
         scored = []
         for node in self._chatter_nodes:
@@ -456,8 +465,15 @@ class GossipProtocol:
             if message.source_wing and normalize_wing_name(
                 message.source_wing
             ) == normalize_wing_name(node.wing):
-                if node.hall and node.hall.lower() in hall_scores:
-                    score += hall_scores[node.hall.lower()]
+                # Boost by room-level affinity.  A node's hall and the
+                # co-occurrence rooms are in different namespaces, so we match
+                # rooms to the node's ``rooms`` list rather than to ``hall``.
+                if room_scores and node.rooms:
+                    overlaps = set(room_scores.keys()) & {
+                        r.lower() for r in node.rooms
+                    }
+                    for room in overlaps:
+                        score += room_scores[room]
 
                 # Also boost if a related entity matches a specialty.
                 if related_entities and node.specialties:
