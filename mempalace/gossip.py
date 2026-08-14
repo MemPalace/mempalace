@@ -59,6 +59,15 @@ DEFAULT_GOSSIP_CONFIG: dict[str, Any] = {
     "echo_chamber_reinforcement_count": 3,
     "echo_chamber_attenuation": 0.5,
     "echo_chamber_similarity_threshold": 0.8,
+    "gossip_on_gossip": {
+        "enabled": True,
+        "interval_seconds": 60,
+        "trending_threshold": 0.25,
+        "viral_min_count": 2,
+        "max_trending": 3,
+        "max_viral": 3,
+        "health_hysteresis_passes": 2,
+    },
     "chatter_nodes": [],
     "topics": [],
 }

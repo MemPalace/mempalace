@@ -5,6 +5,7 @@ SQLite path so they do not touch the user's real palace. Room graphs are
 passed as explicit tuples to avoid pulling in a Chroma/pgvector collection.
 """
 
+import copy
 import json
 import os
 import random
@@ -827,7 +828,9 @@ def test_gossip_on_gossip_propagates_trending_and_viral():
     kg_path = _temp_db()
     try:
         kg = KnowledgeGraph(db_path=kg_path)
-        protocol = GossipProtocol(kg=kg)
+        cfg = copy.deepcopy(EXAMPLE_GOSSIP_CONFIG)
+        cfg["randomness_factor"] = 0.0
+        protocol = GossipProtocol(kg=kg, config=cfg)
 
         # Seed a topic with enough share to cross the trending threshold.
         for _ in range(3):
