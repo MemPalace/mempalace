@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import shutil
 import sys
 from pathlib import Path
 
@@ -388,10 +389,13 @@ def preprocess_directory(staging_dir: str, max_lines: int, dry_run: bool = False
     processed_dir = staging / "processed"
 
     if not dry_run:
-        processed_dir.mkdir(exist_ok=True)
-        for f in processed_dir.iterdir():
-            if f.is_file():
-                f.unlink()
+        # Remove and recreate the complete processed tree so a failed batch
+        # cannot leave nested `processed/processed/...` artefacts from a
+        # previous run.  This also prevents files from being re-preprocessed
+        # into deeper and deeper directories.
+        if processed_dir.exists():
+            shutil.rmtree(processed_dir)
+        processed_dir.mkdir(parents=True, exist_ok=True)
 
     stats = {
         "total_files": 0,
@@ -405,7 +409,11 @@ def preprocess_directory(staging_dir: str, max_lines: int, dry_run: bool = False
     for filepath in sorted(staging.rglob("*")):
         if not filepath.is_file():
             continue
-        if filepath.parent.name == "processed":
+        # Exclude anything inside the processed/ tree, including nested
+        # directories like processed/processed/... that could appear after
+        # failed retries.
+        rel = filepath.relative_to(staging)
+        if "processed" in rel.parts:
             continue
         if filepath.name == "mempalace.yaml":
             continue
@@ -457,3 +465,7 @@ if __name__ == "__main__":
     print(f"  Files skipped:       {stats['skipped']}")
     print(f"  Output files:        {stats['output_files']}")
     print(f"  Errors:              {stats['errors']}")
+
+    if stats["errors"] > 0:
+        print("Preprocessing failed due to errors — leaving staging intact.", file=sys.stderr)
+        sys.exit(1)
