@@ -545,46 +545,63 @@ def test_daemon_run_once_isolates_message_failures():
         daemon.schedule("will", "explode", "now", source_wing="orkid", priority="high")
         daemon.schedule("launch", "is", "active", source_wing="orkid", priority="high")
 
-        # Make the second message's propagation raise.
         original = protocol._propagate_message
+        calls = {"count": 0}
 
         def _boom_on_second(*a, **kw):
-            raise RuntimeError("simulated failure")
+            calls["count"] += 1
+            if calls["count"] == 2:
+                raise RuntimeError("simulated failure")
+            return original(*a, **kw)
 
         protocol._propagate_message = _boom_on_second
 
         report = daemon.run_once()
 
-        assert report["processed"] == 1
+        assert report["processed"] == 2
         assert report["failed"] == 1
-        # The queue must still contain the third message, and possibly a child
-        # from the first message (no test patches room graph, so children may
-        # also be requeued).
+        # The failed message is not requeued; the third message is processed and
+        # may produce children, and the first message's children are preserved.
         with daemon._lock:
             assert len(daemon._queue) >= 1
-            ids = {m.subject for m in daemon._queue}
-            assert "launch" in ids
+            # The failed subject should not be in the queue.
+            assert "will" not in {m.subject for m in daemon._queue}
     finally:
         Path(kg_path).unlink(missing_ok=True)
 
 
 def test_daemon_requeue_respects_max_requeue():
-    """Children are dropped once the queue reaches max_requeue."""
+    """Children are dropped once the queue reaches max_requeue, accounting for
+    entries added by concurrent callers while run_once() is processing."""
     kg_path = _temp_db()
     try:
         kg = KnowledgeGraph(db_path=kg_path)
         protocol = GossipProtocol(kg=kg, config=EXAMPLE_GOSSIP_CONFIG)
-        # Pre-fill the queue to leave only one slot.
         daemon = GossipDaemon(protocol, interval_seconds=60.0, max_requeue=2)
-        daemon.schedule("pre-existing", "is", "queued", source_wing="orkid")
-        daemon.schedule("audit", "found", "risk", source_wing="orkid", priority="high")
 
+        # Simulate a concurrent schedule that occurs while run_once() processes
+        # the first message. The scheduled message is not part of the current
+        # pending batch, so at requeue time it occupies one slot.
+        original = protocol._propagate_message
+        scheduled = {"done": False}
+
+        def _schedule_concurrent(*a, **kw):
+            if not scheduled["done"]:
+                daemon.schedule("concurrent", "is", "active", source_wing="orkid")
+                scheduled["done"] = True
+            return original(*a, **kw)
+
+        protocol._propagate_message = _schedule_concurrent
+
+        daemon.schedule("audit", "found", "risk", source_wing="orkid", priority="high")
         report = daemon.run_once()
 
-        assert report["processed"] == 2
-        # At most one child can be enqueued because one slot is already taken.
+        assert report["processed"] == 1
         with daemon._lock:
+            # concurrent message + at most one child == at most 2.
             assert len(daemon._queue) <= 2
+            assert len(daemon._queue) >= 1
+        # With max_requeue=2 and one concurrent message, only one child fits.
         assert report["children_queued"] <= 1
     finally:
         Path(kg_path).unlink(missing_ok=True)
