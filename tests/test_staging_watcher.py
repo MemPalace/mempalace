@@ -110,6 +110,64 @@ class TestVerifyMined:
         )
         assert _run_verify(sample, manifest, fake) == 1
 
+    def test_verify_all_requires_every_manifest_entry(self, tmp_path):
+        """Complete-manifest verification fails if any entry is not searchable."""
+        good = tmp_path / "good.md"
+        bad = tmp_path / "bad.md"
+        good.write_text("hello world this is good\n", encoding="utf-8")
+        bad.write_text("this is also a stable snippet for the bad file\n", encoding="utf-8")
+
+        manifest = tmp_path / "manifest.txt"
+        manifest.write_text(
+            str(good.resolve()) + "\n" + str(bad.resolve()) + "\n",
+            encoding="utf-8",
+        )
+
+        # Fake returns a hit only for `good`; `bad` gets an empty result.
+        fake = tmp_path / "mempalace"
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys, json\n"
+            "args = sys.argv\n"
+            "source = args[args.index('--source-file') + 1] if '--source-file' in args else ''\n"
+            f"good = '{str(good.resolve())}'\n"
+            "if source == good:\n"
+            "    print(json.dumps({'results': [{'source_file': good}]}))\n"
+            "else:\n"
+            "    print(json.dumps({'results': []}))\n",
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+
+        # Passing the manifest as both sample and manifest enables --all mode.
+        assert _run_verify(manifest, manifest, fake) == 1
+
+    def test_verify_all_passes_when_all_entries_searchable(self, tmp_path):
+        a = tmp_path / "a.md"
+        b = tmp_path / "b.md"
+        a.write_text("hello world this is file a\n", encoding="utf-8")
+        b.write_text("hello world this is file b\n", encoding="utf-8")
+
+        manifest = tmp_path / "manifest.txt"
+        manifest.write_text(
+            str(a.resolve()) + "\n" + str(b.resolve()) + "\n",
+            encoding="utf-8",
+        )
+
+        # Fake returns a hit for whichever source-file was requested.
+        fake = tmp_path / "mempalace"
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys, json\n"
+            "args = sys.argv\n"
+            "source = args[args.index('--source-file') + 1] if '--source-file' in args else ''\n"
+            "print(json.dumps({'results': [{'source_file': source}]}))\n",
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+
+        assert _run_verify(manifest, manifest, fake) == 0
+
 
 class TestArchiveFiles:
     """Regressions for archive name collisions (mvalentsev review)."""
@@ -177,6 +235,41 @@ class TestArchiveFiles:
         assert archived.exists()
         with gzip.open(archived, "rt", encoding="utf-8") as f:
             assert f.read() == "preserve this text\n"
+
+    def test_archive_fails_when_archive_dir_unwritable(self, tmp_path):
+        """Archive errors must be a cleanup gate — staging stays intact."""
+        staging = tmp_path / "staging"
+        staging.mkdir()
+        archive = tmp_path / "archive"
+        log = tmp_path / "watcher.log"
+        original = staging / "file.txt"
+        original.write_text("keep me\n", encoding="utf-8")
+
+        # Make the archive directory unwritable (parent is still writable).
+        archive.mkdir()
+        archive.chmod(0o000)
+
+        env = os.environ.copy()
+        env["STAGING_DIR"] = str(staging)
+        env["ARCHIVE_DIR"] = str(archive)
+        env["LOG_FILE"] = str(log)
+        env["STAGING_WATCHER_TEST_MODE"] = "1"
+
+        result = subprocess.run(
+            ["bash", "-c", f"source '{_TOOLS_DIR / 'staging_watcher.sh'}' && archive_files"],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+        archive.chmod(0o755)
+
+        assert result.returncode != 0
+        # Staging original must not have been removed by this function.
+        assert original.exists()
+        # No final archive directory should be left at the top level.
+        final_batches = [d for d in archive.iterdir() if d.is_dir() and not d.name.startswith(".")]
+        assert len(final_batches) == 0
 
 
 class TestPreprocessSubdirectories:

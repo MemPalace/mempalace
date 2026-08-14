@@ -317,6 +317,50 @@ def test_preprocess_directory_preserves_mempalace_yaml(tmp_path):
     assert all(f.name != "mempalace.yaml" for f in processed)
 
 
+def test_preprocess_directory_cleans_processed_tree_between_runs(tmp_path):
+    """A failed batch with nested processed/ trees must be fully removed."""
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    (staging / "code.py").write_text("print('hello')\n", encoding="utf-8")
+
+    # Simulate a previous failed run that created nested processed/processed/.
+    old_processed = staging / "processed" / "processed"
+    old_processed.mkdir(parents=True)
+    (old_processed / "stale.md").write_text("stale\n", encoding="utf-8")
+
+    pp.preprocess_directory(str(staging), max_lines=4000)
+
+    # The old nested tree should be gone.
+    assert not (staging / "processed" / "processed" / "stale.md").exists()
+    # The new run should only contain the real output.
+    processed_files = list((staging / "processed").rglob("*"))
+    assert any(f.name == "code.py" for f in processed_files)
+
+
+def test_preprocess_directory_excludes_processed_descendants(tmp_path):
+    """Files inside any processed/ directory must not be re-preprocessed."""
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    (staging / "real.py").write_text(
+        "x = 1\n"
+        "y = 2\n"
+        "z = 3\n"
+        "def main():\n"
+        "    print('hello')\n",
+        encoding="utf-8",
+    )
+
+    pre_existing = staging / "processed" / "leftover"
+    pre_existing.mkdir(parents=True)
+    (pre_existing / "leftover.py").write_text("y = 2\n", encoding="utf-8")
+
+    stats = pp.preprocess_directory(str(staging), max_lines=4000)
+
+    # The leftover inside processed/ must not be counted or re-output.
+    assert stats["processed"] == 1
+    assert not (staging / "processed" / "processed").exists()
+
+
 def test_preprocess_directory_empty_content_skipped(tmp_path):
     staging = tmp_path / "staging"
     staging.mkdir()
