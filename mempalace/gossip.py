@@ -37,7 +37,26 @@ logger = logging.getLogger("mempalace_gossip")
 # Default configuration — mirrors the 2026-07-09 spec
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Default configuration installed for new palaces. It is deliberately neutral
+# (no project-specific wings, halls, or topics) so that enabling gossip does
+# not silently inject an unrelated organizational model into the user's palace.
 DEFAULT_GOSSIP_CONFIG: dict[str, Any] = {
+    "version": "1.0",
+    "max_hops": 3,
+    "ttl_seconds": 60,
+    "fanout": 5,
+    "gossip_probability": 0.7,
+    "initiation_probability": 0.3,
+    "chatter_frequency_ms": 1000,
+    "noise_tolerance": 0.2,
+    "amplification_factor": 1.5,
+    "chatter_nodes": [],
+    "topics": [],
+}
+
+# Example configuration used by tests and documentation. It illustrates a
+# populated gossip network but is never written automatically.
+EXAMPLE_GOSSIP_CONFIG: dict[str, Any] = {
     "version": "1.0",
     "max_hops": 3,
     "ttl_seconds": 60,
@@ -337,9 +356,10 @@ class GossipProtocol:
         mempalace_config: Optional[MempalaceConfig] = None,
         kg: Optional[KnowledgeGraph] = None,
         kg_path: Optional[str] = None,
+        config: Optional[dict[str, Any]] = None,
     ):
         self.mempalace_config = mempalace_config
-        self.config = load_gossip_config(config_path, mempalace_config)
+        self.config = config if config is not None else load_gossip_config(config_path, mempalace_config)
         self._chatter_nodes = [ChatterNode.from_dict(n) for n in self.config["chatter_nodes"]]
         self.kg = kg
         self._kg_path = kg_path
@@ -518,8 +538,12 @@ class GossipProtocol:
                 "chatter_id": node.id,
                 "chatter_name": node.name,
                 "targets": [],
+                "attempted_targets": 0,
+                "successful_targets": 0,
+                "failed_targets": [],
             }
 
+            any_success = False
             for target_wing, target_room in targets:
                 # The derived fact is the original fact plus a gossip provenance.
                 # We write one triple per (wing, room) target.
@@ -527,6 +551,7 @@ class GossipProtocol:
                 if target_room:
                     pred = f"gossiped_in_room_{target_room}"
 
+                node_report["attempted_targets"] += 1
                 try:
                     kg.add_triple(
                         subject,
@@ -538,14 +563,24 @@ class GossipProtocol:
                         source_file=source_file,
                     )
                     report["triples_written"] += 1
+                    node_report["successful_targets"] += 1
                     node_report["targets"].append(
                         {"wing": target_wing, "room": target_room}
                     )
-                except Exception:
+                    any_success = True
+                except Exception as exc:
                     logger.debug("gossip: kg add failed for %s/%s", target_wing, target_room, exc_info=True)
+                    node_report["failed_targets"].append(
+                        {
+                            "wing": target_wing,
+                            "room": target_room,
+                            "error": str(exc),
+                        }
+                    )
 
             report["chatter_nodes"].append(node_report)
-            report["propagated"].append(node.id)
+            if any_success:
+                report["propagated"].append(node.id)
 
         return report
 
@@ -571,9 +606,10 @@ def gossip(
     fanout: Optional[int] = None,
     config_path: Optional[str] = None,
     kg: Optional[KnowledgeGraph] = None,
+    config: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Convenience wrapper: create a protocol and propagate a single fact."""
-    protocol = GossipProtocol(config_path=config_path, kg=kg)
+    protocol = GossipProtocol(config_path=config_path, kg=kg, config=config)
     return protocol.propagate(
         subject,
         predicate,
