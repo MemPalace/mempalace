@@ -566,7 +566,7 @@ class GossipProtocol:
         swapped = list(selected)
         swaps = 0
         for i in range(len(swapped)):
-            if random.random() < randomness and swaps < max_steps:
+            if off_radius and random.random() < randomness and swaps < max_steps:
                 replacement = random.choice(off_radius)
                 swapped[i] = replacement
                 off_radius.remove(replacement)
