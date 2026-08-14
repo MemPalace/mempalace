@@ -785,7 +785,7 @@ class GossipDaemon:
         }
         children: list[GossipMessage] = []
 
-        for idx, message in enumerate(pending):
+        for message in pending:
             if message.is_expired():
                 report["expired"] += 1
                 continue
@@ -800,17 +800,16 @@ class GossipDaemon:
                     room_graph=room_graph,
                     kg_path=kg_path,
                 )
-            except Exception as exc:
+            except Exception:
                 logger.warning(
-                    "gossip-daemon: message %s failed; re-queueing remaining pending messages",
-                    idx,
+                    "gossip-daemon: message %s failed; moving to retry and continuing",
+                    message.subject,
                     exc_info=True,
                 )
                 report["failed"] += 1
-                # Re-queue this and all remaining pending messages.
-                with self._lock:
-                    self._queue.extend(pending[idx:])
-                return report
+                # Isolated failure: do not requeue the failed message, do not
+                # discard children already produced or pending messages.
+                continue
 
             report["processed"] += 1
             report["triples_written"] += node_report["triples_written"]
