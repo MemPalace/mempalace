@@ -909,6 +909,10 @@ def print_sqlite_integrity_abort(palace_path: str, errors: list[str]) -> None:
     print("  the SQLite database failed `PRAGMA quick_check`.")
     print()
     print(f"  Database: {sqlite_path}")
+    # The verdict is only as good as the SQLite that produced it: a build that
+    # cannot see a given FTS5 fault reports the same "ok" as one that can, and
+    # without this line the two are indistinguishable in a bug report (#2240).
+    print(f"  SQLite:   {sqlite3.sqlite_version} (the build that produced this verdict)")
     print()
     print("  quick_check output:")
     for message in preview:
@@ -942,8 +946,40 @@ def print_sqlite_integrity_abort(palace_path: str, errors: list[str]) -> None:
 # the older phrasing would silently decline to auto-heal on newer SQLite —
 # the exact failure this repo's own test suite caught (test_repair.py's two
 # auto-heal tests failed on this machine until this pattern was widened).
+#
+# The "intact content table" above is an assumption the message does not
+# carry, and it does not always hold: measured on 3.45.1 and 3.47.1, editing
+# bytes inside `%_content` produces that SAME older wording, so the heal
+# rebuilds the index from damaged text and reports success, silently replacing
+# the affected text in the index with whatever the content table now holds.
+# Out of scope here, and narrowing the older wording is not the answer either:
+# it is the only phrasing that makes the heal reachable at all on 3.45.x.
+#
+# Do NOT widen this to every message carrying the fts5 module's `fts5:`
+# prefix. SQLite 3.51.2 emits `fts5: checksum mismatch for table "..."` for
+# BOTH a damaged index and a damaged content table, byte for byte the same
+# string, and a rebuild reads FROM content. Measured on 3.51.2: editing eight
+# bytes inside `%_content` (same length, same token count, so docsize and
+# totals stay valid) yields that message while the inverted index still holds
+# the original token; rebuilding then makes that text unreachable by search
+# and leaves quick_check clean. Single-byte damage to an index leaf yields the
+# same string too -- 60 of the 114 flips that registered at all in a 120-trial
+# run -- so the message does not separate the two cases even statistically. Declining is the safe answer
+# for a message that does not name the damaged side.
+#
+# Both alternatives are anchored. sqlite_integrity_errors returns the probe's
+# own failure as `PRAGMA quick_check failed: <error>`, and an unanchored match
+# classifies such a row as isolated FTS5 whenever the wrapped text contains one
+# of these phrases, authorizing a write on a database whose state was never
+# established. SQLite really does produce such a row: dropping the `%_config`
+# shadow table yields `vtable constructor failed: <table name>` on 3.45.1,
+# 3.47.1 and 3.51.2 alike, with the table name interpolated, so a table named
+# after one of these phrases yields it. A chroma palace only ever has `embedding_fulltext_search`, so this
+# is hardening rather than a fix for anything reachable from here, but the
+# anchor costs nothing and the classifier should not depend on the wrapper's
+# shape.
 _FTS5_MALFORMED_RE = re.compile(
-    r"malformed inverted index for fts5 table|fts5:\s*corruption found",
+    r"\A\s*(?:malformed inverted index for fts5 table|fts5:\s*corruption found)",
     re.IGNORECASE,
 )
 
@@ -1039,6 +1075,54 @@ def _fts5_content_census(conn: sqlite3.Connection) -> tuple[int, int, int]:
     return int(checked), int(unverifiable), int(unkeyed)
 
 
+def _fts5_autoheal_declined_message(reason: str, *, preview: bool = False) -> str:
+    """Explain a declined in-place FTS5 heal, naming the build that decided.
+
+    Declining used to be a silent ``return errors``. The operator then saw only
+    the ABORT banner, with no sign that an in-place heal had been considered,
+    and no way to tell a verdict from a SQLite that can detect a given FTS5
+    fault from one that cannot (#2240). Shared with the ``--dry-run`` preview
+    so a preview and a real run explain the same decision.
+
+    ``preview`` changes the opening line only. A preview that reported the
+    decision in the past tense would be indistinguishable from the run it is
+    predicting, which is the one thing a preview must never be: ``--dry-run``
+    exists so an operator can read what would happen without it having
+    happened.
+
+    ``reason`` is passed in because the two decline sites are not the same
+    event: one is a classification outcome, the other is the database going
+    missing between the probe and the rebuild. The classification wording
+    deliberately reports what the classifier concluded rather than guessing at
+    a cause, because quick_check may have failed to run at all, reported damage
+    outside the index, or reported an FTS5 fault in a wording this build does
+    not recognize. Saying "quick_check reported an error" would be false in the
+    first of those.
+
+    No leading blank line: ``progress`` is ``logger.warning`` on the post-mine
+    path, where one renders as a bare ``WARNING:mempalace_mcp:`` header above
+    an empty line. The console paths add their own spacing.
+    """
+    opening = (
+        f"DRY RUN (SQLite {sqlite3.sqlite_version}) — a real run would decline\n"
+        "  to auto-heal the FTS5 index:"
+        if preview
+        else f"Not auto-healing the FTS5 index (SQLite {sqlite3.sqlite_version}):"
+    )
+    return (
+        f"  {opening}\n"
+        f"  {reason}\n"
+        "  A rebuild regenerates the index from the content table, so it cannot\n"
+        "  repair damage that lies anywhere else and would hide it instead. The\n"
+        "  palace is left untouched."
+    )
+
+
+_FTS5_NOT_RECOGNIZED_AS_ISOLATED = (
+    "quick_check did not report a fault this build recognizes as confined\n  to that index."
+)
+
+
 def maybe_autoheal_fts5_index(palace_path: str, errors: list[str], *, progress=print) -> list[str]:
     """Rebuild a malformed FTS5 inverted index in place; return remaining errors.
 
@@ -1065,11 +1149,19 @@ def maybe_autoheal_fts5_index(palace_path: str, errors: list[str], *, progress=p
     a rebuild failure, or a quick_check still dirty afterwards leaves ``errors``
     unchanged so the caller still aborts with the banner.
     """
+    if not errors:
+        return errors
     if not _errors_are_isolated_fts5(errors):
+        progress(_fts5_autoheal_declined_message(_FTS5_NOT_RECOGNIZED_AS_ISOLATED))
         return errors
 
     sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
     if not os.path.exists(sqlite_path):
+        # Reachable only as a race: sqlite_integrity_errors returns [] when the
+        # file is missing, so a non-empty error list means it was there when the
+        # probe ran. Returning quietly here would leave exactly the gap the
+        # decline message above closes.
+        progress(_fts5_autoheal_declined_message(f"{sqlite_path} is not there to rebuild."))
         return errors
 
     # Lazy import: palace.py is heavier and importing it at module load would
@@ -1161,13 +1253,20 @@ def maybe_autoheal_fts5_index(palace_path: str, errors: list[str], *, progress=p
         return errors
 
     remaining = sqlite_integrity_errors(palace_path)
-    if remaining:
-        progress("  FTS5 rebuild did not clear quick_check; aborting for safety.")
-    else:
-        progress(
-            f"  FTS5 index rebuilt from content checked against embedding_metadata "
-            f"({checked} row(s)); quick_check is clean."
+    # Both outcomes name the build. #2240's third observation is that a rebuild
+    # issued by one SQLite can leave state another rejects, so the build that
+    # rebuilt and then re-checked is the one fact that makes either verdict
+    # actionable. On the clean branch it is also the only thing naming it: the
+    # caller prints no banner after a heal that worked.
+    verdict = (
+        "FTS5 rebuild did not clear quick_check; aborting for safety"
+        if remaining
+        else (
+            "FTS5 index rebuilt from content checked against embedding_metadata "
+            f"({checked} row(s)); quick_check is clean"
         )
+    )
+    progress(f"  {verdict} (SQLite {sqlite3.sqlite_version}).")
     return remaining
 
 
@@ -1367,9 +1466,10 @@ def _vacuum_and_rebuild_fts5(
                 errors = [str(row[0]) for row in rows if row and str(row[0]).lower() != "ok"]
                 if errors:
                     raise sqlite3.DatabaseError(
-                        "post-recovery quick_check failed: " + "; ".join(errors[:3])
+                        f"post-recovery quick_check failed (SQLite {sqlite3.sqlite_version}): "
+                        + "; ".join(errors[:3])
                     )
-                progress("  SQLite quick_check clean.")
+                progress(f"  quick_check is clean (SQLite {sqlite3.sqlite_version}).")
     except Exception as exc:
         if strict:
             # Preserve the concrete SQLite/filesystem exception for callers
@@ -2189,14 +2289,22 @@ def resolve_repair_preflight_errors(
         return maybe_autoheal_fts5_index(palace_path, errors, progress=progress)
     if _errors_are_isolated_fts5(errors):
         progress(
-            "\n  DRY RUN — quick_check reports an isolated FTS5 inverted-index error.\n"
-            "  A real run would check the content table against embedding_metadata,\n"
-            "  restore any row that disagrees, rebuild the index from it and continue\n"
-            "  if that succeeds; it aborts instead if another process holds the mine\n"
-            "  lock, if the content table cannot be checked or restored, or if the\n"
-            "  rebuild leaves quick_check dirty. This preview leaves the index untouched."
+            f"\n  DRY RUN (SQLite {sqlite3.sqlite_version}) — quick_check reports an\n"
+            "  isolated FTS5 inverted-index error. A real run would check the content\n"
+            "  table against embedding_metadata, restore any row that disagrees,\n"
+            "  rebuild the index from it and continue if that succeeds; it aborts\n"
+            "  instead if another process holds the mine lock, if the content table\n"
+            "  cannot be checked or restored, or if the rebuild leaves quick_check\n"
+            "  dirty. This preview leaves the index untouched."
         )
         return []
+    # A preview that goes quiet here would predict the abort without saying a
+    # heal was considered, which is the gap the real path just closed. The
+    # blank line is added at this call site rather than inside the shared
+    # builder because this function's only caller is the CLI, while the builder
+    # also feeds logger.warning, where a leading newline renders as an empty
+    # record under a bare level/name header.
+    progress("\n" + _fts5_autoheal_declined_message(_FTS5_NOT_RECOGNIZED_AS_ISOLATED, preview=True))
     return errors
 
 

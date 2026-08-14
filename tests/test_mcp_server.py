@@ -6,10 +6,13 @@ dispatch layer (integration-level). Uses isolated palace + KG fixtures
 via monkeypatch to avoid touching real data.
 """
 
+import copy
 from datetime import datetime
 import json
+import logging
 import os
 from pathlib import Path
+import re
 import sqlite3
 from types import SimpleNamespace
 import subprocess
@@ -19,6 +22,34 @@ from unittest.mock import MagicMock
 import pytest
 
 from _chroma_palace_helper import make_minimal_chroma_sqlite
+
+
+@pytest.fixture(autouse=True)
+def _restore_sqlite_integrity_globals():
+    """Put the module's integrity globals back after every test.
+
+    monkeypatch restores what a test sets, not what production code writes
+    under it: ``test_refresh_sqlite_integrity_status_skips_oversized_db`` calls
+    the real refresh, which leaves these set for whatever runs next. The suite
+    passed only because of the order tests happen to appear in this file, and
+    adding a fifth global to the group was enough to make four unrelated tests
+    fail. They are written as a group by one function, so they are restored as
+    a group here.
+    """
+    from mempalace import mcp_server
+
+    names = (
+        "_sqlite_integrity_checked",
+        "_sqlite_integrity_errors",
+        "_sqlite_integrity_check_error",
+        "_sqlite_integrity_no_verdict_reason",
+    )
+    saved = {name: copy.copy(getattr(mcp_server, name)) for name in names}
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            setattr(mcp_server, name, value)
 
 
 # ── MCP entry point: PYTHONPATH stripping ────────────────────────────────
@@ -6082,6 +6113,39 @@ def test_sqlite_integrity_payload_not_applicable_on_non_chroma_backend(monkeypat
     assert payload["errors"] == []
 
 
+def test_a_recorded_chroma_reason_does_not_speak_for_another_backend(monkeypatch):
+    """The backend decides first, and only then why a chroma probe has no verdict.
+
+    Both recorded reasons — a database over the startup size limit (#2240) and
+    a chroma palace with no database at all (#2290) — describe a
+    ``chroma.sqlite3``. A server whose backend is something else has to be told
+    that instead: handing it "there was no SQLite database to open" names a
+    file it would never have opened, and hides which backend is actually
+    running. Only the order of the two questions decides this, so nothing about
+    the payload's shape catches it.
+    """
+    from mempalace import mcp_server
+
+    monkeypatch.setattr(mcp_server, "_selected_backend_name", lambda: "qdrant")
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", True)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", [])
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+    monkeypatch.setattr(
+        mcp_server,
+        "_sqlite_integrity_no_verdict_reason",
+        "no quick_check ran: /p/chroma.sqlite3 does not exist, so there was no "
+        "SQLite database to open",
+    )
+
+    payload = mcp_server._sqlite_integrity_payload()
+
+    assert payload["checked"] is False
+    assert payload["ok"] is None
+    assert "qdrant" in payload["reason"]
+    assert "chroma.sqlite3 does not exist" not in payload["reason"]
+    assert payload["sqlite_path"] == ""
+
+
 def test_sqlite_integrity_payload_reports_no_verdict_when_the_database_is_absent(
     monkeypatch, tmp_path
 ):
@@ -6323,6 +6387,48 @@ def test_sqlite_integrity_payload_full_shape_on_chroma_backend(monkeypatch):
     assert "reason" not in payload
 
 
+def test_sqlite_integrity_payload_names_the_sqlite_build(monkeypatch):
+    """#2240: an `ok` from a build that cannot detect a given FTS5 fault reads
+    identically to an `ok` from one that can. Name the build that produced it.
+
+    Every shape carries it — this test covers the chroma one and the
+    not-applicable one, the skipped-probe shape has its own test below. The key
+    is a property of the process, not of the backend, and the shapes are
+    deliberately kept parallel so a client can read it unconditionally.
+    """
+    from mempalace import mcp_server
+
+    monkeypatch.setattr(mcp_server, "_selected_backend_name", lambda: "chroma")
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", True)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", [])
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+    # A clean verdict has no reason for having none, and the refresh clears the
+    # field whenever it records one. Stating that here rather than inheriting
+    # whatever the module was left holding: a server whose own palace has no
+    # database records a reason at import, which is a state this test is not
+    # about and which reads as an absent verdict rather than a clean one.
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_no_verdict_reason", "")
+
+    clean = mcp_server._sqlite_integrity_payload()
+    assert clean["ok"] is True
+    assert clean["sqlite_version"] == sqlite3.sqlite_version
+
+    monkeypatch.setattr(
+        mcp_server,
+        "_sqlite_integrity_errors",
+        ["malformed inverted index for FTS5 table main.embedding_fulltext_search"],
+    )
+    dirty = mcp_server._sqlite_integrity_payload()
+    assert dirty["ok"] is False
+    assert dirty["sqlite_version"] == sqlite3.sqlite_version
+
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", [])
+    monkeypatch.setattr(mcp_server, "_selected_backend_name", lambda: "qdrant")
+    not_applicable = mcp_server._sqlite_integrity_payload()
+    assert not_applicable["checked"] is False
+    assert not_applicable["sqlite_version"] == sqlite3.sqlite_version
+
+
 def test_sqlite_integrity_reconnect_allowed_when_corrupt(monkeypatch):
     from mempalace import mcp_server
 
@@ -6386,6 +6492,7 @@ def test_refresh_sqlite_integrity_status_records_quick_check_errors(monkeypatch,
     monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", False)
     monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", [])
     monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_no_verdict_reason", "")
 
     mcp_server._refresh_sqlite_integrity_status()
 
@@ -6427,8 +6534,246 @@ def test_refresh_sqlite_integrity_status_skips_oversized_db(monkeypatch, tmp_pat
     assert called["n"] == 0
     assert mcp_server._sqlite_integrity_checked is True
     assert mcp_server._sqlite_integrity_errors == []
-    assert mcp_server._sqlite_integrity_no_verdict_reason == ""
+    # This exit names itself (#2240), which keeps the previous probe's reason
+    # out more strongly than clearing it did: the palace is described as one
+    # whose probe was skipped for size, rather than as one with no database at
+    # all, and either way not as one that came back clean.
+    assert "over the 1 MB limit" in mcp_server._sqlite_integrity_no_verdict_reason
+    assert "stale" not in mcp_server._sqlite_integrity_no_verdict_reason
     assert "does not exist" not in json.dumps(mcp_server._sqlite_integrity_payload())
+
+
+def test_sqlite_integrity_payload_reports_no_verdict_when_probe_was_skipped(monkeypatch, tmp_path):
+    """#2240: a skipped probe must not be reported as a clean verdict.
+
+    Above the size limit no quick_check runs at all, yet the payload used to
+    say ``checked: true, ok: true`` — a build examined the palace and found it
+    clean, when none ever opened it. The palace in #2240 is about four times
+    the default limit, so this is the shape its operator would actually see.
+    Reuses the not-applicable shape #1931 introduced for the same reason.
+    """
+    from mempalace import mcp_server, repair
+
+    (tmp_path / "chroma.sqlite3").write_bytes(b"\0" * (2 * 1024 * 1024))
+    monkeypatch.setattr(mcp_server, "_is_chroma_backend", lambda: True)
+    monkeypatch.setattr(mcp_server, "_selected_backend_name", lambda: "chroma")
+    monkeypatch.setattr(
+        type(mcp_server._config), "palace_path", property(lambda self: str(tmp_path))
+    )
+    monkeypatch.setenv("MEMPALACE_STARTUP_INTEGRITY_MAX_MB", "1")
+    monkeypatch.setattr(
+        repair,
+        "sqlite_integrity_errors",
+        lambda _p: pytest.fail("quick_check must not run for an oversized DB"),
+    )
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", False)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", [])
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_no_verdict_reason", "")
+
+    payload = mcp_server._sqlite_integrity_payload()
+
+    assert payload["checked"] is False
+    assert payload["ok"] is None
+    assert "no quick_check has run" in payload["reason"]
+    # The build is still named: it is a property of this process, not a claim
+    # that this build produced a verdict.
+    assert payload["sqlite_version"] == sqlite3.sqlite_version
+    # The counting fields must agree with the absence of a verdict rather than
+    # report a clean count, which is the same misread in another field: #1931's
+    # not-applicable shape asserts these too.
+    assert payload["error_count"] == 0
+    assert payload["errors"] == []
+    assert payload["palace"] == str(tmp_path)
+    assert payload["sqlite_path"] == str(tmp_path / "chroma.sqlite3")
+
+    # Write tools gate on recorded errors, not on `ok`, so nothing is newly
+    # refused by reporting the absence of a verdict.
+    assert mcp_server._mcp_sqlite_integrity_refusal(1, "mempalace_add_drawer") is None
+
+
+def test_skip_reason_states_a_size_that_exceeds_the_limit(monkeypatch, tmp_path):
+    """The reason must show the comparison it reports, not round it away.
+
+    Whole megabytes rendered a 1.4 MB database against a 1 MB limit as "is 1 MB,
+    over the 1 MB limit" — a sentence that contradicts itself, and the operator
+    reading it has no way to see why the probe was skipped. The limit is parsed
+    as a float, so a sub-megabyte one produced "0 MB, over the 0 MB limit".
+    """
+    from mempalace import mcp_server
+
+    (tmp_path / "chroma.sqlite3").write_bytes(b"\0" * int(1.4 * 1024 * 1024))
+    monkeypatch.setattr(mcp_server, "_is_chroma_backend", lambda: True)
+    monkeypatch.setattr(mcp_server, "_selected_backend_name", lambda: "chroma")
+    monkeypatch.setattr(
+        type(mcp_server._config), "palace_path", property(lambda self: str(tmp_path))
+    )
+    monkeypatch.setenv("MEMPALACE_STARTUP_INTEGRITY_MAX_MB", "1")
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", False)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", [])
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_no_verdict_reason", "")
+
+    mcp_server._refresh_sqlite_integrity_status()
+    reason = mcp_server._sqlite_integrity_payload()["reason"]
+
+    size, limit = re.findall(r"([\d.]+) MB", reason)[:2]
+    assert float(size) > float(limit), reason
+    assert size != limit, reason
+
+
+def test_skip_records_its_reason_before_the_rest_of_the_state():
+    """The size-skip must record *why* before it records that a check happened.
+
+    A reader landing between those two assignments sees `checked: True` with an
+    empty error list and no reason, which `_sqlite_integrity_payload` renders as
+    `ok: true` — the clean verdict nobody produced. The window is two adjacent
+    assignments wide with no call in between, so nothing single-threaded can
+    observe it; the reader that would is a `/statusz` request on another thread
+    of the ThreadingHTTPServer while `mempalace_reconnect` refreshes. The order
+    itself is checkable, so it is checked here rather than raced for.
+    """
+    import ast
+    import inspect
+
+    from mempalace import mcp_server
+
+    tree = ast.parse(inspect.getsource(mcp_server._refresh_sqlite_integrity_status_locked))
+
+    def assigned_names(node):
+        return [
+            target.id
+            for stmt in node
+            if isinstance(stmt, ast.Assign)
+            for target in stmt.targets
+            if isinstance(target, ast.Name)
+        ]
+
+    def records_a_reason(node):
+        """True only where the branch sets a reason, not where it clears one.
+
+        The branch for "no palace, or not a chroma backend" also touches this
+        global, but to empty it, and there the order is harmless: a reader
+        catching the half-done state sees the previous skip's reason, which is
+        an absent verdict rather than a clean one.
+        """
+        return any(
+            isinstance(stmt, ast.Assign)
+            and any(
+                isinstance(t, ast.Name) and t.id == "_sqlite_integrity_no_verdict_reason"
+                for t in stmt.targets
+            )
+            and not (isinstance(stmt.value, ast.Constant) and stmt.value.value == "")
+            for stmt in node
+        )
+
+    skip_branches = [
+        node.body
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and records_a_reason(node.body)
+        and "_sqlite_integrity_checked" in assigned_names(node.body)
+    ]
+    assert skip_branches, "the size-skip branch must set the reason and the checked flag"
+
+    for body in skip_branches:
+        names = assigned_names(body)
+        assert names.index("_sqlite_integrity_no_verdict_reason") < names.index(
+            "_sqlite_integrity_checked"
+        ), f"reason must be recorded first, got {names}"
+
+
+def test_integrity_failure_log_names_the_sqlite_build(monkeypatch, tmp_path, caplog):
+    """The server-log record of a dirty palace names the build that found it.
+
+    This line is what an operator pastes into a report, and #2240 is a report
+    where the same palace read clean on one build and malformed on another.
+    """
+    from mempalace import mcp_server, repair
+
+    (tmp_path / "chroma.sqlite3").write_bytes(b"\0" * 1024)
+    monkeypatch.setattr(mcp_server, "_is_chroma_backend", lambda: True)
+    monkeypatch.setattr(
+        type(mcp_server._config), "palace_path", property(lambda self: str(tmp_path))
+    )
+    monkeypatch.setattr(
+        repair,
+        "sqlite_integrity_errors",
+        lambda _p: ["malformed inverted index for FTS5 table main.embedding_fulltext_search"],
+    )
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", False)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", [])
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_no_verdict_reason", "")
+
+    with caplog.at_level(logging.ERROR, logger="mempalace_mcp"):
+        mcp_server._refresh_sqlite_integrity_status()
+
+    failures = [
+        r.getMessage() for r in caplog.records if "integrity check failed" in r.getMessage()
+    ]
+    assert failures, "a dirty palace must be logged"
+    assert sqlite3.sqlite_version in failures[-1]
+    assert str(tmp_path) in failures[-1]
+
+
+def test_rendered_mb_keeps_the_two_values_apart():
+    """_rendered_mb widens precision only as far as it has to."""
+    from mempalace import mcp_server
+
+    mb = 1024 * 1024
+    assert mcp_server._rendered_mb(1954 * mb, 512 * mb) == ("1954", "512")
+    assert mcp_server._rendered_mb(int(1.4 * mb), mb) == ("1.4", "1.0")
+    assert mcp_server._rendered_mb(int(0.6 * mb), int(0.5 * mb)) == ("0.6", "0.5")
+    size, limit = mcp_server._rendered_mb(int(1.04 * mb), mb)
+    assert float(size) > float(limit)
+
+
+def test_sqlite_integrity_payload_never_reads_clean_mid_refresh(monkeypatch, tmp_path):
+    """A reader must not catch a half-updated skip state and call it clean.
+
+    `_sqlite_integrity_payload` reads the integrity globals without holding
+    `_sqlite_integrity_refresh_lock`, and `_ensure_sqlite_integrity_status`
+    short-circuits on `_sqlite_integrity_checked`, which an earlier skip has
+    already set to True. A refresh that cleared the reason before re-deriving
+    it would leave a window showing `checked: true, ok: true` — the verdict
+    nobody produced. Reachable in the server: `mempalace_reconnect` refreshes
+    while a GET /statusz runs on another thread of the ThreadingHTTPServer.
+
+    The window is opened deterministically by reading the payload from inside
+    the `os.path.getsize` call the reason is derived from, rather than by
+    racing threads.
+    """
+    from mempalace import mcp_server
+
+    (tmp_path / "chroma.sqlite3").write_bytes(b"\0" * (2 * 1024 * 1024))
+    monkeypatch.setattr(mcp_server, "_is_chroma_backend", lambda: True)
+    monkeypatch.setattr(mcp_server, "_selected_backend_name", lambda: "chroma")
+    monkeypatch.setattr(
+        type(mcp_server._config), "palace_path", property(lambda self: str(tmp_path))
+    )
+    monkeypatch.setenv("MEMPALACE_STARTUP_INTEGRITY_MAX_MB", "1")
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", False)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", [])
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_no_verdict_reason", "")
+
+    mcp_server._refresh_sqlite_integrity_status()
+    assert mcp_server._sqlite_integrity_payload()["ok"] is None, "setup: must be in the skip state"
+
+    seen = {}
+    real_getsize = os.path.getsize
+
+    def _peek(path):
+        seen["mid_refresh"] = mcp_server._sqlite_integrity_payload()
+        return real_getsize(path)
+
+    monkeypatch.setattr(os.path, "getsize", _peek)
+    mcp_server._refresh_sqlite_integrity_status()
+
+    mid = seen["mid_refresh"]
+    assert mid["ok"] is None, f"a reader saw ok={mid['ok']!r} while the refresh was in flight"
+    assert mid["checked"] is False
 
 
 def test_refresh_sqlite_integrity_status_runs_when_under_limit(monkeypatch, tmp_path):
@@ -6452,6 +6797,7 @@ def test_refresh_sqlite_integrity_status_runs_when_under_limit(monkeypatch, tmp_
     monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", False)
     monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", [])
     monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_no_verdict_reason", "")
 
     mcp_server._refresh_sqlite_integrity_status()
 
@@ -6480,6 +6826,7 @@ def test_startup_integrity_size_gate_disabled_with_zero(monkeypatch, tmp_path):
     monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", False)
     monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", [])
     monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_no_verdict_reason", "")
 
     mcp_server._refresh_sqlite_integrity_status()
 
@@ -6512,6 +6859,9 @@ def test_sqlite_integrity_refusal_handles_none_palace_path(monkeypatch):
     assert result["error"]["data"]["palace"] == ""
     assert result["error"]["data"]["sqlite_path"] == ""
     assert result["error"]["data"]["tool"] == "mempalace_kg_add"
+    # #2240: this is the payload an operator pastes into a report, so it names
+    # the build behind the verdict too.
+    assert result["error"]["data"]["sqlite_version"] == sqlite3.sqlite_version
 
 
 # os.chmod on Windows only toggles the read-only attribute, so a file dropped to
