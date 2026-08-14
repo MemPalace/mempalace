@@ -113,7 +113,7 @@ def test_install_shutdown_signal_handlers_routes_term_to_system_exit():
 
 def _patch_mcp_server(monkeypatch, config, kg):
     """Patch the mcp_server module globals to use test fixtures."""
-    from mempalace import mcp_server
+    from mempalace import mcp_server, gossip as gossip_mod
 
     monkeypatch.setattr(mcp_server, "_config", config)
     # Accept varargs because production ``_get_kg`` now takes an optional
@@ -129,6 +129,9 @@ def _patch_mcp_server(monkeypatch, config, kg):
 def _unexpected_client_read(*_a, **_k):
     """Tripwire for paths that must stay off the chroma client (and HNSW)."""
     raise AssertionError("chroma collection opened — this path must read sqlite")
+    # Use the example gossip topology for tests so the default install is not
+    # forced to carry project-specific names.
+    monkeypatch.setattr(gossip_mod, "DEFAULT_GOSSIP_CONFIG", gossip_mod.EXAMPLE_GOSSIP_CONFIG)
 
 
 def _get_collection(palace_path, create=False):
@@ -5736,6 +5739,15 @@ def test_read_only_refuses_every_daemon_write_tool():
 
     assert service.WRITE_TOOLS <= mcp_server._READ_ONLY_REFUSED_TOOLS
     assert "mempalace_hook_settings" in service.WRITE_TOOLS
+
+
+def test_gossip_tool_classified_as_write():
+    """mempalace_gossip is a mutation and must be classified as a write tool."""
+    from mempalace import mcp_server, service
+
+    assert "mempalace_gossip" in mcp_server._MUTATING_TOOLS
+    assert "mempalace_gossip" in service.WRITE_TOOLS
+    assert service.classify_tool("mempalace_gossip") == "write"
 
 
 def test_peer_writer_guard_does_not_gate_hook_settings(monkeypatch):
