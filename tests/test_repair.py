@@ -1,6 +1,7 @@
 """Tests for mempalace.repair — scan, prune, and rebuild HNSW index."""
 
 import errno
+import logging
 import os
 import sqlite3
 import sys
@@ -3211,6 +3212,81 @@ def test_errors_are_isolated_fts5_classification():
     assert not repair._errors_are_isolated_fts5([fts_new, page])
 
 
+def test_errors_are_isolated_fts5_declines_checksum_mismatch():
+    """`fts5: checksum mismatch` must NOT authorize a rebuild.
+
+    The canonical predicate already declines this; the test pins that it stays
+    declined, because widening the predicate to the whole `fts5:` prefix — the
+    obvious way to cover a new SQLite wording — would accept it.
+
+    It says the index and the content table disagree, not which of the two is
+    damaged, and a rebuild reads FROM content. Measured on SQLite 3.51.2:
+    editing eight bytes inside `%_content` (same length, same token count, so
+    `%_docsize` and the totals record stay valid) produces exactly this
+    message while the inverted index still holds the original token, and
+    single-byte damage to an index leaf produces the same string for nearly
+    every flip that registers at all. Accepting it would rebuild the index
+    from whichever side is damaged and leave quick_check clean either way.
+    """
+    assert not repair._errors_are_isolated_fts5(
+        ['fts5: checksum mismatch for table "embedding_fulltext_search"']
+    )
+    # Nor does it become acceptable next to a wording that is.
+    assert not repair._errors_are_isolated_fts5(
+        [
+            "malformed inverted index for FTS5 table main.embedding_fulltext_search",
+            'fts5: checksum mismatch for table "embedding_fulltext_search"',
+        ]
+    )
+
+
+def test_errors_are_isolated_fts5_rejects_non_fts5_and_probe_failure():
+    """Everything quick_check did not report against the index keeps aborting.
+
+    The probe-failure row matters most: sqlite_integrity_errors returns
+    ``PRAGMA quick_check failed: ...`` when the check could not run at all.
+    Classifying that as an isolated FTS5 fault would rebuild an index over a
+    database whose state was never established, so the match is anchored and
+    a wrapped copy of a known phrasing no longer slips through.
+    """
+    assert not repair._errors_are_isolated_fts5(
+        ["PRAGMA quick_check failed: database disk image is malformed"]
+    )
+    assert not repair._errors_are_isolated_fts5(
+        ["PRAGMA quick_check failed: file is not a database"]
+    )
+    # Anchoring: the probe's own failure carrying a known phrasing inside it.
+    assert not repair._errors_are_isolated_fts5(
+        [
+            "PRAGMA quick_check failed: malformed inverted index for FTS5 table "
+            "main.embedding_fulltext_search"
+        ]
+    )
+    assert not repair._errors_are_isolated_fts5(
+        ['PRAGMA quick_check failed: fts5: corruption found reading blob 1 from table "x"']
+    )
+    # The multi-line b-tree report quick_check emits for page damage.
+    assert not repair._errors_are_isolated_fts5(
+        ["*** in database main ***\nTree 4 page 89 cell 51: Offset 48879 out of range 144..4092"]
+    )
+    assert not repair._errors_are_isolated_fts5(["database disk image is malformed"])
+    # "fts5" has to be the module prefix, not an incidental mention.
+    assert not repair._errors_are_isolated_fts5(["row 3 missing from index fts5_shadow_idx"])
+    # Two more rows real SQLite emits for a damaged chroma palace, neither of
+    # which a rebuild could fix: dropping a shadow table yields the first on
+    # 3.45.1 and the second when the vtable constructor fails without a message
+    # of its own. Both must keep aborting.
+    assert not repair._errors_are_isolated_fts5(
+        [
+            "unable to validate the inverted index for FTS5 table "
+            "main.embedding_fulltext_search: SQL logic error"
+        ]
+    )
+    assert not repair._errors_are_isolated_fts5(
+        ["PRAGMA quick_check failed: vtable constructor failed: embedding_fulltext_search"]
+    )
+
+
 def test_maybe_autoheal_fts5_index_heals_isolated_corruption(tmp_path):
     palace = _make_fts5_palace(tmp_path, corrupt=True)
     sqlite_path = tmp_path / "chroma.sqlite3"
@@ -3238,6 +3314,289 @@ def test_maybe_autoheal_fts5_index_leaves_non_fts5_errors_untouched(tmp_path):
         remaining = repair.maybe_autoheal_fts5_index(palace, page_errors, progress=lambda *_: None)
     assert remaining == page_errors
     lock.assert_not_called()
+
+
+def test_maybe_autoheal_fts5_index_declines_checksum_mismatch_without_writing(tmp_path):
+    """The checksum-mismatch wording must not reach the rebuild.
+
+    Canonical declines this too; the guard pins that no future widening of the
+    predicate lets it through. The wording is passed explicitly rather than
+    read back from quick_check, because the builds measured here produce it
+    only from 3.51.2: that is what makes this hold on a runner linked against
+    any SQLite instead of one.
+    """
+    palace = _make_fts5_palace(tmp_path, corrupt=True)
+    errors = ['fts5: checksum mismatch for table "embedding_fulltext_search"']
+
+    with patch("mempalace.palace.mine_palace_lock") as lock:
+        remaining = repair.maybe_autoheal_fts5_index(palace, errors, progress=lambda *_: None)
+
+    assert remaining == errors
+    lock.assert_not_called()
+
+
+def test_maybe_autoheal_fts5_index_reports_why_it_declined(tmp_path):
+    """Declining used to be silent, which is why this class stayed invisible."""
+    palace = _make_fts5_palace(tmp_path, corrupt=False)
+    page_errors = ["Page 4 of B-tree 12345: database disk image is malformed"]
+
+    messages: list[str] = []
+    with patch("mempalace.palace.mine_palace_lock") as lock:
+        remaining = repair.maybe_autoheal_fts5_index(palace, page_errors, progress=messages.append)
+
+    assert remaining == page_errors
+    lock.assert_not_called()
+    joined = "\n".join(messages)
+    assert "Not auto-healing" in joined
+    # The build that produced the verdict is named, so a bug report carries it.
+    assert sqlite3.sqlite_version in joined
+
+
+def test_maybe_autoheal_fts5_index_does_not_claim_quick_check_reported(tmp_path):
+    """A probe that could not run did not "report an error".
+
+    sqlite_integrity_errors returns ``PRAGMA quick_check failed: ...`` when the
+    check itself raised. A decline message that says quick_check reported
+    something is false there, and a diagnostic that guesses is worth less than
+    none.
+    """
+    palace = _make_fts5_palace(tmp_path, corrupt=False)
+    probe_failure = ["PRAGMA quick_check failed: database disk image is malformed"]
+
+    messages: list[str] = []
+    assert (
+        repair.maybe_autoheal_fts5_index(palace, probe_failure, progress=messages.append)
+        == probe_failure
+    )
+    joined = "\n".join(messages)
+    assert "Not auto-healing" in joined
+    assert "quick_check reported" not in joined
+
+
+def test_maybe_autoheal_fts5_index_explains_a_missing_database(tmp_path):
+    """The accepted-but-no-database path used to return silently too.
+
+    The errors are passed in rather than produced by deleting the file:
+    ``sqlite_integrity_errors`` leaves its connection open, and Windows
+    refuses to unlink a file another handle still holds.
+    """
+    errors = ["malformed inverted index for FTS5 table main.embedding_fulltext_search"]
+    assert repair._errors_are_isolated_fts5(errors), "must reach the missing-database branch"
+
+    messages: list[str] = []
+    with patch("mempalace.palace.mine_palace_lock") as lock:
+        remaining = repair.maybe_autoheal_fts5_index(
+            str(tmp_path), errors, progress=messages.append
+        )
+
+    assert remaining == errors
+    lock.assert_not_called()
+    joined = "\n".join(messages)
+    assert "Not auto-healing" in joined
+    assert "not there to rebuild" in joined
+
+
+def test_maybe_autoheal_fts5_index_says_nothing_when_there_is_nothing_to_heal(tmp_path):
+    """An empty error list is not a declined heal, so it must not claim one."""
+    palace = _make_fts5_palace(tmp_path, corrupt=False)
+
+    messages: list[str] = []
+    assert repair.maybe_autoheal_fts5_index(palace, [], progress=messages.append) == []
+    assert messages == []
+
+
+def test_maybe_autoheal_fts5_index_clean_verdict_names_the_sqlite_build(tmp_path):
+    """The heal's own "clean" is a verdict, and nothing else on this path names
+    the build that produced it: a successful heal prints no abort banner.
+
+    #2240 asks for exactly this. A build that cannot detect a given FTS5 fault
+    reports the same clean as one that can, so "quick_check is clean" without a
+    version is the claim the issue says cannot be evaluated.
+    """
+    palace = _make_fts5_palace(tmp_path, corrupt=True)
+    errors = repair.sqlite_integrity_errors(palace)
+
+    messages: list[str] = []
+    assert repair.maybe_autoheal_fts5_index(palace, errors, progress=messages.append) == []
+
+    joined = "\n".join(messages)
+    assert "quick_check is clean" in joined
+    assert sqlite3.sqlite_version in joined
+
+
+def test_maybe_autoheal_fts5_index_dirty_after_rebuild_names_the_sqlite_build(
+    tmp_path, monkeypatch
+):
+    """So does the opposite outcome, and for the reason #2240 raises third:
+    a rebuild issued by one SQLite can leave state another build rejects, so
+    which build rebuilt and re-checked is the fact that makes the verdict
+    actionable.
+
+    The re-check is stubbed rather than reproduced: leaving an index dirty
+    through a real rebuild is the very asymmetry the issue reports and could
+    not be reproduced here.
+    """
+    palace = _make_fts5_palace(tmp_path, corrupt=True)
+    errors = repair.sqlite_integrity_errors(palace)
+    assert repair._errors_are_isolated_fts5(errors), "must reach the rebuild"
+
+    monkeypatch.setattr(repair, "sqlite_integrity_errors", lambda _path: list(errors))
+
+    messages: list[str] = []
+    remaining = repair.maybe_autoheal_fts5_index(palace, errors, progress=messages.append)
+
+    assert remaining == errors
+    joined = "\n".join(messages)
+    assert "did not clear quick_check" in joined
+    assert sqlite3.sqlite_version in joined
+
+
+def test_vacuum_and_rebuild_fts5_strict_clean_verdict_names_the_sqlite_build(tmp_path):
+    """The post-recovery check states a clean verdict too, and it is the only
+    integrity evidence a `--mode from-sqlite` run prints."""
+    sqlite_path = tmp_path / "chroma.sqlite3"
+    with closing(sqlite3.connect(str(sqlite_path))) as conn:
+        conn.execute(
+            "CREATE VIRTUAL TABLE embedding_fulltext_search"
+            " USING fts5(string_value, tokenize='unicode61')"
+        )
+        conn.execute("INSERT INTO embedding_fulltext_search(string_value) VALUES('hello world')")
+        conn.commit()
+
+    messages: list[str] = []
+    repair._vacuum_and_rebuild_fts5(str(tmp_path), strict=True, progress=messages.append)
+
+    joined = "\n".join(messages)
+    assert "quick_check is clean" in joined
+    assert sqlite3.sqlite_version in joined
+
+
+def test_vacuum_and_rebuild_fts5_strict_dirty_verdict_names_the_sqlite_build(tmp_path, monkeypatch):
+    """The failing half of that check names the build too.
+
+    Reaching this branch with a genuinely damaged database is not practical:
+    the rebuild this function runs first leaves quick_check clean whichever
+    side was damaged — the same property that keeps `fts5: checksum mismatch`
+    out of the classifier. The probe is stubbed instead, so what is under test
+    is the message, which a caller renders verbatim.
+    """
+    sqlite_path = tmp_path / "chroma.sqlite3"
+    with closing(sqlite3.connect(str(sqlite_path))) as conn:
+        conn.execute(
+            "CREATE VIRTUAL TABLE embedding_fulltext_search"
+            " USING fts5(string_value, tokenize='unicode61')"
+        )
+        conn.commit()
+
+    real_connect = sqlite3.connect
+
+    class _Rows:
+        def fetchall(self):
+            return [("*** in database main *** Page 4: btreeInitPage() returns error code 11",)]
+
+    class _Conn:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def execute(self, sql, *args):
+            if sql.strip().lower().startswith("pragma quick_check"):
+                return _Rows()
+            return self._inner.execute(sql, *args)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    monkeypatch.setattr(repair.sqlite3, "connect", lambda *a, **kw: _Conn(real_connect(*a, **kw)))
+
+    with pytest.raises(sqlite3.DatabaseError) as excinfo:
+        repair._vacuum_and_rebuild_fts5(str(tmp_path), strict=True, progress=lambda _m: None)
+
+    message = str(excinfo.value)
+    assert "post-recovery quick_check failed" in message
+    assert sqlite3.sqlite_version in message
+    assert "btreeInitPage" in message
+
+
+def test_resolve_preflight_dry_run_preview_names_the_sqlite_build(tmp_path):
+    """The accepted preview predicts a heal off the same classifier, so it is
+    worth no more than the build that classified. Both dry-run branches name it
+    or neither is trustworthy."""
+    palace = _make_fts5_palace(tmp_path, corrupt=False)
+    fts_errors = ["malformed inverted index for FTS5 table main.embedding_fulltext_search"]
+
+    messages: list[str] = []
+    assert (
+        repair.resolve_repair_preflight_errors(
+            palace, fts_errors, dry_run=True, progress=messages.append
+        )
+        == []
+    )
+
+    joined = "\n".join(messages)
+    assert "DRY RUN" in joined
+    assert sqlite3.sqlite_version in joined
+
+
+def test_resolve_preflight_dry_run_explains_a_declined_heal(tmp_path):
+    """A preview explains the same decision without reading as the run itself.
+
+    Both paths must speak — that is the gap this change closes — but a preview
+    that is byte-for-byte the run it predicts defeats ``--dry-run``: the
+    operator cannot tell from the output whether anything happened.
+    """
+    palace = _make_fts5_palace(tmp_path, corrupt=False)
+    page_errors = ["Page 4 of B-tree 12345: database disk image is malformed"]
+
+    preview: list[str] = []
+    remaining = repair.resolve_repair_preflight_errors(
+        palace, page_errors, dry_run=True, progress=preview.append
+    )
+    real: list[str] = []
+    repair.resolve_repair_preflight_errors(palace, page_errors, dry_run=False, progress=real.append)
+
+    assert remaining == page_errors
+    preview_text = "".join(preview)
+    real_text = "".join(real)
+    assert "DRY RUN" in preview_text
+    assert "DRY RUN" not in real_text
+    assert preview_text != real_text
+    for text in (preview_text, real_text):
+        assert "auto-heal" in text
+        assert "confined" in text
+        assert sqlite3.sqlite_version in text
+
+
+def test_declined_heal_message_renders_as_one_log_record(tmp_path, caplog):
+    """The decline text is shared with ``progress=logger.warning`` (#2240).
+
+    ``_validate_palace_fts5_after_mine`` passes ``logger.warning`` as
+    ``progress`` so the MCP process does not print into its JSON-RPC stream. A
+    message that opens with a newline renders there as a bare
+    ``WARNING:mempalace_mcp:`` header above an empty line, which reads as a
+    truncated record rather than an explanation.
+    """
+    palace = _make_fts5_palace(tmp_path, corrupt=False)
+    page_errors = ["Page 4 of B-tree 12345: database disk image is malformed"]
+
+    logger = logging.getLogger("mempalace_mcp")
+    with caplog.at_level(logging.WARNING, logger="mempalace_mcp"):
+        repair.maybe_autoheal_fts5_index(palace, page_errors, progress=logger.warning)
+
+    assert caplog.records, "the decline must be logged, not swallowed"
+    message = caplog.records[-1].getMessage()
+    assert not message.startswith("\n")
+    assert message.splitlines()[0].strip().startswith("Not auto-healing")
+
+
+def test_print_sqlite_integrity_abort_names_the_sqlite_build(tmp_path, capsys):
+    """A clean-vs-dirty verdict is only as good as the linked SQLite (#2240)."""
+    repair.print_sqlite_integrity_abort(
+        str(tmp_path),
+        ["malformed inverted index for FTS5 table main.embedding_fulltext_search"],
+    )
+    out = capsys.readouterr().out
+    assert sqlite3.sqlite_version in out
+    assert "ABORT: SQLite-layer corruption detected" in out
 
 
 def test_maybe_autoheal_fts5_index_skips_when_palace_is_being_mined(tmp_path):

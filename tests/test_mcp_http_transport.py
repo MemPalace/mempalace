@@ -253,6 +253,31 @@ def test_healthz_ok(http_server):
     assert body == b"ok\n"
 
 
+def test_statusz_ok_distinguishes_absent_verdict_from_failed_one(http_server, monkeypatch):
+    """`ok: null` means no integrity verdict exists, not that one came back bad.
+
+    It is the answer for a non-chroma backend (#1931) and for a palace above
+    the startup-probe size limit — the palace in #2240 is about four times the
+    default. Collapsing it with ``bool()`` reported every such server as
+    unhealthy, which is a negative verdict nobody produced.
+    """
+    port, _ = http_server
+
+    monkeypatch.setattr(
+        mcp,
+        "_sqlite_integrity_payload",
+        lambda: {"checked": False, "ok": None, "errors": [], "reason": "probe skipped"},
+    )
+    assert json.loads(_get(port, "/statusz")[1])["ok"] is True
+
+    monkeypatch.setattr(
+        mcp,
+        "_sqlite_integrity_payload",
+        lambda: {"checked": True, "ok": False, "errors": ["malformed inverted index"]},
+    )
+    assert json.loads(_get(port, "/statusz")[1])["ok"] is False
+
+
 def test_statusz_reports_machine_readable_server_and_client_state(http_server, monkeypatch):
     monkeypatch.setattr(mcp, "_sqlite_integrity_payload", lambda: {"ok": True, "errors": []})
     port, _ = http_server

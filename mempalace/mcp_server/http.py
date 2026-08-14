@@ -292,9 +292,10 @@ def _http_status_payload(httpd) -> dict:
         os.path.abspath(os.path.expanduser(_config.palace_path)) if _config.palace_path else ""
     )
     return {
-        # `ok` is None in the two cases the payload reports as an absent
-        # verdict: a non-chroma backend (#1931), and a chroma palace with no
-        # database file yet. That is an absence, not a failure, and collapsing
+        # `ok` is None in the three cases the payload reports as an absent
+        # verdict: a non-chroma backend (#1931), a chroma palace with no
+        # database file yet (#2290), and a palace above the startup probe's
+        # size limit (#2240). That is an absence, not a failure, and collapsing
         # it with bool() would report a freshly installed server as unhealthy.
         # A missing key is not one of those cases and still fails closed.
         "ok": integrity.get("ok", False) is not False,
