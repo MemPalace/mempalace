@@ -553,6 +553,27 @@ class TestIdempotentRetry:
         ).encode()
         assert proxy._is_retry_safe(body)
 
+    def test_invalid_json_shape_is_not_retried(self):
+        """Malformed JSON-RPC is not safe to retry."""
+        import mempalace_mcp_proxy as proxy
+
+        body = b'not json'
+        assert not proxy._is_retry_safe(body)
+
+    def test_missing_jsonrpc_field_is_not_retried(self):
+        import mempalace_mcp_proxy as proxy
+
+        body = json.dumps({"id": 1, "method": "tools/list", "params": {}}).encode()
+        assert not proxy._is_retry_safe(body)
+
+    def test_tools_call_without_name_is_not_retried(self):
+        import mempalace_mcp_proxy as proxy
+
+        body = json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {}}
+        ).encode()
+        assert not proxy._is_retry_safe(body)
+
     def test_hook_settings_with_args_not_retried(self):
         """mempalace_hook_settings with arguments writes config and must not replay."""
         import mempalace_mcp_proxy as proxy
@@ -776,6 +797,8 @@ class TestEndToEnd:
             proxy._circuit["state"] = "closed"
 
             # Ensure the handler is reachable so we can test the boundary.
+            old_forward = proxy._forward_to_upstream
+
             async def fake_forward(*args, **kwargs):
                 return None, 202, None
 
@@ -816,6 +839,132 @@ class TestEndToEnd:
             finally:
                 proxy.ALLOWED_HOSTS = old_hosts
                 proxy.ALLOWED_ORIGINS = old_origins
+                proxy._forward_to_upstream = old_forward
+                await client.close()
+
+        self._run_client(test)
+
+    def test_handler_rejects_malformed_jsonrpc(self):
+        """The POST handler validates JSON-RPC envelope and returns 400."""
+        import mempalace_mcp_proxy as proxy
+        from aiohttp import web
+        from aiohttp.test_utils import TestClient, TestServer
+
+        async def test():
+            proxy._circuit["failures"] = 0
+            proxy._circuit["state"] = "closed"
+
+            # Upstream should not be reached for invalid requests.
+            class NoOpClient:
+                is_closed = False
+                calls = 0
+
+                async def aclose(self):
+                    pass
+
+                async def post(self, *args, **kwargs):
+                    NoOpClient.calls += 1
+                    raise AssertionError("upstream should not be called")
+
+            proxy._http_client = NoOpClient()
+
+            app = web.Application()
+            app.router.add_post("/mcp", proxy.handle_mcp_post)
+            server = TestServer(app, port=0)
+            client = TestClient(server, loop=asyncio.get_event_loop())
+            await client.start_server()
+
+            port = client.server.port
+            old_hosts = proxy.ALLOWED_HOSTS
+            proxy.ALLOWED_HOSTS = frozenset({f"127.0.0.1:{port}", "localhost", "127.0.0.1"})
+
+            try:
+                # Missing jsonrpc version.
+                bad = json.dumps({"id": 1, "method": "tools/list", "params": {}}).encode()
+                resp = await client.post("/mcp", data=bad)
+                assert resp.status == 400
+                payload = await resp.json()
+                assert payload["error"]["code"] == -32700
+                assert NoOpClient.calls == 0
+
+                # tools/call missing name.
+                bad = json.dumps(
+                    {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {}}
+                ).encode()
+                resp = await client.post("/mcp", data=bad)
+                assert resp.status == 400
+                assert NoOpClient.calls == 0
+            finally:
+                proxy.ALLOWED_HOSTS = old_hosts
+                await client.close()
+
+        self._run_client(test)
+
+    def test_handler_does_not_retry_mutating_tool(self):
+        """A write tool failing upstream is only attempted once through the real handler."""
+        import mempalace_mcp_proxy as proxy
+        from aiohttp import web
+        from aiohttp.test_utils import TestClient, TestServer
+
+        write_body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "mempalace_diary_write",
+                    "arguments": {"content": "test"},
+                },
+            }
+        ).encode()
+
+        async def test():
+            proxy._circuit["failures"] = 0
+            proxy._circuit["state"] = "closed"
+            old_forward = proxy._forward_to_upstream
+
+            class FakeResponse:
+                def __init__(self, status_code, content):
+                    self.status_code = status_code
+                    self.content = content
+                    self.text = content.decode("utf-8")
+
+                def json(self):
+                    return json.loads(self.content)
+
+            class CountingClient:
+                is_closed = False
+                calls = 0
+
+                async def aclose(self):
+                    pass
+
+                async def post(self, *args, **kwargs):
+                    CountingClient.calls += 1
+                    return FakeResponse(500, b"{}")
+
+            old_client = proxy._http_client
+            proxy._http_client = CountingClient()
+
+            app = web.Application()
+            app.router.add_post("/mcp", proxy.handle_mcp_post)
+            server = TestServer(app, port=0)
+            client = TestClient(server, loop=asyncio.get_event_loop())
+            await client.start_server()
+
+            port = client.server.port
+            old_hosts = proxy.ALLOWED_HOSTS
+            proxy.ALLOWED_HOSTS = frozenset({f"127.0.0.1:{port}", "localhost", "127.0.0.1"})
+
+            try:
+                resp = await client.post("/mcp", data=write_body)
+                assert resp.status == 500
+                assert CountingClient.calls == 1, "mutating tool must not be retried"
+            finally:
+                proxy.ALLOWED_HOSTS = old_hosts
+                proxy._forward_to_upstream = old_forward
+                if old_client is not None:
+                    proxy._http_client = old_client
                 await client.close()
 
         self._run_client(test)
