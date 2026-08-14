@@ -132,8 +132,14 @@ fi
 _MEMPAL_PARSE_MARKER=$(printf '%s\n' "$_mempal_parsed" | sed -n '1p')
 SESSION_ID=$(printf '%s\n' "$_mempal_parsed" | sed -n '2p')
 TRANSCRIPT_PATH=$(printf '%s\n' "$_mempal_parsed" | sed -n '3p')
+# Line 4 is the destination wing, already resolved by hook_shell: the slug
+# derived from the payload's cwd when `hooks.wing_from_cwd` is enabled, and
+# empty otherwise. The shell deliberately holds no slug or config logic —
+# empty simply means "mine with no --wing", i.e. today's default.
+MINE_WING=$(printf '%s\n' "$_mempal_parsed" | sed -n '4p')
 SESSION_ID="${SESSION_ID:-unknown}"
 TRANSCRIPT_PATH="${TRANSCRIPT_PATH:-}"
+MINE_WING="${MINE_WING:-}"
 
 # Defense-in-depth: if INPUT was non-empty but Python never reached the
 # print() calls (sentinel missing), parsing silently failed. Surface the
@@ -181,9 +187,17 @@ echo "[$(date '+%H:%M:%S')] PRE-COMPACT triggered for session $SESSION_ID" >> "$
 # independent targets — both run if both are set:
 #   1. TRANSCRIPT_PATH (from Claude Code) → parent dir, --mode convos
 #   2. MEMPAL_DIR → --mode projects
+# $MINE_WING is passed as a separate quoted argument rather than spliced
+# into one command string, so a wing can never word-split into extra flags.
+# The two branches differ only by that argument.
 if is_valid_transcript_path "$TRANSCRIPT_PATH" && [ -f "$TRANSCRIPT_PATH" ]; then
-    "$MEMPAL_PYTHON_BIN" -m mempalace mine "$(dirname "$TRANSCRIPT_PATH")" --mode convos \
-        >> "$STATE_DIR/hook.log" 2>&1
+    if [ -n "$MINE_WING" ]; then
+        "$MEMPAL_PYTHON_BIN" -m mempalace mine "$(dirname "$TRANSCRIPT_PATH")" --mode convos \
+            --wing "$MINE_WING" >> "$STATE_DIR/hook.log" 2>&1
+    else
+        "$MEMPAL_PYTHON_BIN" -m mempalace mine "$(dirname "$TRANSCRIPT_PATH")" --mode convos \
+            >> "$STATE_DIR/hook.log" 2>&1
+    fi
 elif [ -n "$TRANSCRIPT_PATH" ]; then
     echo "[$(date '+%H:%M:%S')] Skipping missing or invalid transcript path after normalization: $TRANSCRIPT_PATH" \
         >> "$STATE_DIR/hook.log"
