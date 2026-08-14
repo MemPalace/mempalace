@@ -733,7 +733,7 @@ class GossipAnalytics:
 
     def _active_triples(self, as_of: str = None) -> list[dict]:
         """Return gossip triples active at ``as_of`` (or now)."""
-        reference = as_of or datetime.now(timezone.utc).isoformat()
+        reference = as_of or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         triples = self.kg.query_gossip_triples(as_of=reference)
         return [
             t
@@ -797,7 +797,7 @@ class GossipAnalytics:
         self, chatter_nodes: list[ChatterNode], config: dict[str, Any], as_of: str = None
     ) -> dict[str, Any]:
         """Return gossip network health metrics as of one reference timestamp."""
-        reference = as_of or datetime.now(timezone.utc).isoformat()
+        reference = as_of or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         triples = self._active_triples(as_of=reference)
         total = len(triples)
         expired = [
