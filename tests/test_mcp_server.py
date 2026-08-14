@@ -605,6 +605,150 @@ class TestColdStartDiagnostics:
 
 
 class TestHandleRequest:
+    def test_official_sdk_owns_protocol_server(self):
+        """The protocol entrypoint is the official low-level MCP Server."""
+        from mcp.server import Server
+        from mempalace import mcp_server
+
+        assert isinstance(mcp_server._MCP_SDK_SERVER, Server)
+
+    def test_official_sdk_refreshes_idle_clock_for_every_stdio_message(self, monkeypatch):
+        """SDK-owned ping/initialize/notifications pass through activity middleware."""
+        import anyio
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server.time, "monotonic", lambda: 123.0)
+        monkeypatch.setattr(mcp_server, "_last_request_time", 0.0)
+        assert mcp_server._sdk_refresh_idle_activity in mcp_server._MCP_SDK_SERVER.middleware
+
+        async def exercise():
+            async def call_next(ctx):
+                return ctx
+
+            marker = object()
+            result = await mcp_server._sdk_refresh_idle_activity(marker, call_next)
+            assert result is marker
+
+        anyio.run(exercise)
+        assert mcp_server._last_request_time == 123.0
+
+    def test_official_sdk_stdio_handshake_and_tools_list(self):
+        """Exercise the real SDK client/server handshake over stdio."""
+        import anyio
+        from mcp import ClientSession
+        from mcp.client.stdio import StdioServerParameters, stdio_client
+
+        async def exercise():
+            server = StdioServerParameters(
+                command=sys.executable,
+                args=["-m", "mempalace.mcp_server"],
+                env=os.environ.copy(),
+            )
+            async with stdio_client(server) as (read_stream, write_stream):
+                async with ClientSession(read_stream, write_stream) as session:
+                    initialized = await session.initialize()
+                    assert initialized.server_info.name == "mempalace"
+                    tools = await session.list_tools()
+                    assert "mempalace_search" in {tool.name for tool in tools.tools}
+
+        anyio.run(exercise)
+
+    def test_official_sdk_read_only_hides_and_refuses_writes(self, monkeypatch):
+        import anyio
+        import mcp.types as mcp_types
+        from mcp.shared.exceptions import MCPError
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "_READ_ONLY", True)
+
+        async def exercise():
+            listed = await mcp_server._sdk_list_tools(None, None)
+            names = {tool.name for tool in listed.tools}
+            assert "mempalace_add_drawer" not in names
+            params = mcp_types.CallToolRequestParams(
+                name="mempalace_add_drawer", arguments={"content": "x"}
+            )
+            with pytest.raises(MCPError) as exc_info:
+                await mcp_server._sdk_call_http_tool(None, params)
+            assert exc_info.value.error.code == -32003
+
+        anyio.run(exercise)
+
+    def test_official_sdk_stdio_callbacks_proxy_live_hub(self, monkeypatch):
+        import socket
+        import threading
+        import time
+
+        import anyio
+        import mcp.types as mcp_types
+        import uvicorn
+        from mempalace import mcp_server
+
+        app, state = mcp_server._build_sdk_http_app("127.0.0.1", 0)
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        sock.listen()
+        port = sock.getsockname()[1]
+        state.server_address = ("127.0.0.1", port)
+        server = uvicorn.Server(uvicorn.Config(app, log_config=None, log_level="warning"))
+        thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
+        thread.start()
+        for _ in range(100):
+            if server.started:
+                break
+            time.sleep(0.02)
+        monkeypatch.setattr(
+            mcp_server,
+            "_hub_proxy_target",
+            lambda: (f"http://127.0.0.1:{port}", {}),
+        )
+
+        async def exercise():
+            listed = await mcp_server._sdk_list_stdio_tools(None, None)
+            assert "mempalace_get_aaak_spec" in {tool.name for tool in listed.tools}
+            result = await mcp_server._sdk_call_stdio_tool(
+                None,
+                mcp_types.CallToolRequestParams(name="mempalace_get_aaak_spec", arguments={}),
+            )
+            assert "AAAK" in result.content[0].text
+
+        try:
+            anyio.run(exercise)
+        finally:
+            server.should_exit = True
+            thread.join(timeout=5)
+
+    def test_official_sdk_tool_results_errors_and_concurrency(self):
+        import anyio
+        import mcp.types as mcp_types
+        from mcp.shared.exceptions import MCPError
+        from mempalace import mcp_server
+
+        async def exercise():
+            results = []
+
+            async def call_spec():
+                result = await mcp_server._sdk_call_http_tool(
+                    None,
+                    mcp_types.CallToolRequestParams(name="mempalace_get_aaak_spec", arguments={}),
+                )
+                results.append(result.content[0].text)
+
+            async with anyio.create_task_group() as group:
+                group.start_soon(call_spec)
+                group.start_soon(call_spec)
+            assert len(results) == 2
+            assert all("AAAK" in result for result in results)
+            with pytest.raises(MCPError) as exc_info:
+                await mcp_server._sdk_call_http_tool(
+                    None,
+                    mcp_types.CallToolRequestParams(name="does_not_exist", arguments={}),
+                )
+            assert exc_info.value.code == -32601
+            assert exc_info.value.message == "Unknown tool: does_not_exist"
+
+        anyio.run(exercise)
+
     def test_initialize(self):
         from mempalace.mcp_server import handle_request
 

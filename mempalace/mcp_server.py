@@ -58,6 +58,12 @@ from pathlib import Path  # noqa: E402
 from typing import Optional  # noqa: E402
 from urllib.parse import urlparse  # noqa: E402
 
+import anyio  # noqa: E402
+import mcp.types as mcp_types  # noqa: E402
+from mcp.server import Server as MCPServer  # noqa: E402
+from mcp.server.stdio import stdio_server  # noqa: E402
+from mcp.shared.exceptions import MCPError  # noqa: E402
+
 from .config import (  # noqa: E402
     MempalaceConfig,
     sanitize_kg_value,
@@ -6423,6 +6429,227 @@ def handle_request(request):
     }
 
 
+def _sdk_visible_tools() -> list[mcp_types.Tool]:
+    """Expose the established tool catalog through the official SDK types."""
+    return [
+        mcp_types.Tool(
+            name=name,
+            description=tool["description"],
+            inputSchema=tool["input_schema"],
+        )
+        for name, tool in TOOLS.items()
+        if not (_READ_ONLY and name in _READ_ONLY_REFUSED_TOOLS)
+    ]
+
+
+async def _sdk_list_tools(_ctx, _params) -> mcp_types.ListToolsResult:
+    global _last_request_time
+    _last_request_time = time.monotonic()
+    return mcp_types.ListToolsResult(tools=_sdk_visible_tools())
+
+
+async def _sdk_list_stdio_tools(_ctx, _params) -> mcp_types.ListToolsResult:
+    global _last_request_time
+    _last_request_time = time.monotonic()
+    target = _hub_proxy_target()
+    if target is None:
+        return mcp_types.ListToolsResult(tools=_sdk_visible_tools())
+    import httpx2
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamable_http_client
+
+    base_url, headers = target
+    try:
+        async with httpx2.AsyncClient(headers=headers, timeout=_HUB_PROXY_TIMEOUT_S) as client:
+            async with streamable_http_client(
+                f"{base_url}/mcp", http_client=client, terminate_on_close=False
+            ) as streams:
+                async with ClientSession(streams[0], streams[1]) as session:
+                    await session.initialize()
+                    return await session.list_tools()
+    except Exception as exc:
+        logger.warning("Hub at %s unreachable (%s); listing local tools", base_url, exc)
+        return mcp_types.ListToolsResult(tools=_sdk_visible_tools())
+
+
+def _execute_sdk_tool(tool_name: str, supplied_args: dict) -> object:
+    """Execute one tool without any JSON-RPC or transport concerns."""
+    import inspect
+
+    if tool_name not in TOOLS:
+        raise MCPError(code=-32601, message=f"Unknown tool: {tool_name}")
+    tool_args = dict(supplied_args)
+    schema_props = TOOLS[tool_name]["input_schema"].get("properties", {})
+    handler = TOOLS[tool_name]["handler"]
+    try:
+        accepts_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in inspect.signature(handler).parameters.values()
+        )
+    except (ValueError, TypeError):
+        accepts_kwargs = False
+    if not accepts_kwargs:
+        unknown = [
+            key for key in tool_args if key not in schema_props and key != "wait_for_previous"
+        ]
+        if unknown:
+            quoted = ", ".join(f"'{key}'" for key in unknown)
+            word = "parameter" if len(unknown) == 1 else "parameters"
+            raise MCPError(
+                code=-32602,
+                message=f"Unknown {word} {quoted} for tool {tool_name}",
+            )
+        tool_args = {key: value for key, value in tool_args.items() if key in schema_props}
+    for key, value in list(tool_args.items()):
+        declared_type = schema_props.get(key, {}).get("type")
+        try:
+            if declared_type == "integer" and not isinstance(value, int):
+                tool_args[key] = int(value)
+            elif declared_type == "number" and not isinstance(value, (int, float)):
+                tool_args[key] = float(value)
+        except (ValueError, TypeError) as exc:
+            raise MCPError(code=-32602, message=f"Invalid value for parameter '{key}'") from exc
+    tool_args.pop("wait_for_previous", None)
+    refusal = _mcp_tool_preflight_refusal(0, tool_name)
+    if refusal is not None:
+        error = refusal["error"]
+        raise MCPError(code=error["code"], message=error["message"], data=error.get("data"))
+    if tool_name == "mempalace_diary_write" and "content" in tool_args:
+        content = tool_args.pop("content")
+        if tool_args.get("entry") is None:
+            tool_args["entry"] = content
+    try:
+        with _write_stall_watch(tool_name):
+            return _decorate_mcp_tool_result(tool_name, handler(**tool_args))
+    except TypeError as exc:
+        message = str(exc)
+        handler_name = getattr(handler, "__qualname__", None) or getattr(handler, "__name__", "")
+        missing = re.match(
+            r"^([\w\.<>]+)\(\) missing \d+ required "
+            r"(?:positional |keyword-only )?arguments?: (.+)$",
+            message,
+        )
+        if missing and missing.group(1) == handler_name:
+            names = re.findall(r"'(\w+)'", missing.group(2))
+            if names:
+                quoted = ", ".join(f"'{name}'" for name in names)
+                word = "parameter" if len(names) == 1 else "parameters"
+                raise MCPError(
+                    code=-32602,
+                    message=f"Missing required {word} {quoted} for tool {tool_name}",
+                ) from exc
+        logger.exception("Tool error in %s", tool_name)
+        raise MCPError(
+            code=-32000,
+            message="Internal tool error",
+            data={"error_class": type(exc).__name__, "message": str(exc)},
+        ) from exc
+    except MCPError:
+        raise
+    except Exception as exc:
+        logger.exception("Tool error in %s", tool_name)
+        raise MCPError(
+            code=-32000,
+            message="Internal tool error",
+            data={"error_class": type(exc).__name__, "message": str(exc)},
+        ) from exc
+
+
+async def _sdk_dispatch_tool(params, *, use_http_lock: bool) -> mcp_types.CallToolResult:
+    def execute():
+        return _execute_sdk_tool(params.name, params.arguments or {})
+
+    if use_http_lock and params.name not in _HTTP_LOCK_FREE_TOOLS:
+
+        def execute_locked():
+            with _HTTP_REQUEST_LOCK:
+                return execute()
+
+        result = await anyio.to_thread.run_sync(execute_locked)
+    else:
+        result = await anyio.to_thread.run_sync(execute)
+    return mcp_types.CallToolResult(
+        content=[mcp_types.TextContent(text=json.dumps(result, indent=2, ensure_ascii=False))]
+    )
+
+
+async def _sdk_call_stdio_tool(
+    _ctx, params: mcp_types.CallToolRequestParams
+) -> mcp_types.CallToolResult:
+    global _last_request_time
+    _last_request_time = time.monotonic()
+    target = _hub_proxy_target()
+    if target is not None:
+        import httpx2
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamable_http_client
+
+        base_url, headers = target
+        result = None
+        try:
+            async with httpx2.AsyncClient(headers=headers, timeout=_HUB_PROXY_TIMEOUT_S) as client:
+                async with streamable_http_client(
+                    f"{base_url}/mcp", http_client=client, terminate_on_close=False
+                ) as streams:
+                    async with ClientSession(streams[0], streams[1]) as session:
+                        await session.initialize()
+                        result = await session.call_tool(params.name, params.arguments or {})
+            return result
+        except Exception as exc:
+            if result is not None:
+                logger.warning(
+                    "Ignoring hub session teardown failure after successful call: %s", exc
+                )
+                return result
+            if params.name not in _MUTATING_TOOLS:
+                logger.warning(
+                    "Hub at %s unreachable (%s); handling request locally", base_url, exc
+                )
+                return await _sdk_dispatch_tool(params, use_http_lock=False)
+            raise MCPError(
+                code=-32000,
+                message=f"palace hub proxy failed: {exc}",
+                data={
+                    "hub": base_url,
+                    "hint": (
+                        "The palace hub did not complete this request. Mutating tools "
+                        "are not replayed locally; check the hub process, then retry."
+                    ),
+                },
+            ) from exc
+    return await _sdk_dispatch_tool(params, use_http_lock=False)
+
+
+async def _sdk_call_http_tool(
+    _ctx, params: mcp_types.CallToolRequestParams
+) -> mcp_types.CallToolResult:
+    global _last_request_time
+    _last_request_time = time.monotonic()
+    return await _sdk_dispatch_tool(params, use_http_lock=True)
+
+
+async def _sdk_refresh_idle_activity(ctx, call_next):
+    """Count every SDK-owned request and notification as client activity."""
+    global _last_request_time
+    _last_request_time = time.monotonic()
+    return await call_next(ctx)
+
+
+_MCP_SDK_SERVER = MCPServer(
+    "mempalace",
+    version=__version__,
+    on_list_tools=_sdk_list_stdio_tools,
+    on_call_tool=_sdk_call_stdio_tool,
+)
+_MCP_SDK_SERVER.middleware.insert(0, _sdk_refresh_idle_activity)
+_MCP_SDK_HTTP_SERVER = MCPServer(
+    "mempalace",
+    version=__version__,
+    on_list_tools=_sdk_list_tools,
+    on_call_tool=_sdk_call_http_tool,
+)
+
+
 def _restore_stdout():
     """Restore real stdout for MCP JSON-RPC output (see issue #225)."""
     global _REAL_STDOUT, _REAL_STDOUT_FD
@@ -6930,6 +7157,58 @@ def _http_record_request(httpd, handler, status: int) -> None:
             and hmac.compare_digest(
                 handler.headers.get("Authorization", ""), f"Bearer {httpd.auth_token}"
             )
+        )
+        httpd.recent_clients[client_id] = entry
+        overflow = len(httpd.recent_clients) - _HTTP_RECENT_CLIENT_LIMIT
+        if overflow > 0:
+            oldest = sorted(
+                httpd.recent_clients.items(),
+                key=lambda item: item[1].get("last_seen_monotonic", 0.0),
+            )
+            for stale_id, _entry in oldest[:overflow]:
+                httpd.recent_clients.pop(stale_id, None)
+
+
+def _record_sdk_http_request(httpd, scope: dict, headers: dict, status: int) -> None:
+    """Record the same status/client metadata for the SDK ASGI transport."""
+    now = time.time()
+    peer = (scope.get("client") or ("", 0))[0]
+    forwarded_for = headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
+    real_ip = headers.get("x-real-ip", "").strip()
+    peer_hint = forwarded_for or real_ip or peer
+    tailnet_user = headers.get("tailscale-user-login", "").strip()
+    user_agent = headers.get("user-agent", "").strip()
+    host_header = headers.get("host", "").strip()
+    basis = "|".join([peer_hint, tailnet_user, user_agent, host_header])
+    client_id = hashlib.sha256(basis.encode("utf-8", "replace")).hexdigest()[:16]
+    identity = {
+        "client_id": client_id,
+        "peer": peer,
+        "peer_hint": peer_hint,
+        "host": host_header,
+        "user_agent": user_agent[:160],
+        "tailscale_user": tailnet_user[:160],
+    }
+    with httpd.stats_lock:
+        httpd.request_count += 1
+        httpd.status_counts[str(status)] = httpd.status_counts.get(str(status), 0) + 1
+        entry = dict(httpd.recent_clients.get(client_id, identity))
+        entry.update(identity)
+        entry.update(
+            {
+                "last_seen": datetime.now().isoformat(),
+                "last_seen_monotonic": now,
+                "request_count": int(entry.get("request_count", 0)) + 1,
+                "last_method": scope.get("method", ""),
+                "last_path": scope.get("path", ""),
+                "last_status": status,
+                "authenticated": bool(
+                    httpd.auth_token
+                    and hmac.compare_digest(
+                        headers.get("authorization", ""), f"Bearer {httpd.auth_token}"
+                    )
+                ),
+            }
         )
         httpd.recent_clients[client_id] = entry
         overflow = len(httpd.recent_clients) - _HTTP_RECENT_CLIENT_LIMIT
@@ -7657,21 +7936,281 @@ def _build_http_server(host: str, port: int):
     return httpd
 
 
-def _serve_http(host: str, port: int) -> None:
-    """Serve JSON-RPC over HTTP in-process.
+def _build_sdk_http_app(host: str, port: int):  # noqa: C901
+    """Build the official SDK Streamable HTTP application.
 
-    This transport intentionally reuses the same ``handle_request`` dispatcher
-    as stdio. The only change is the framing layer: HTTP mode avoids a
-    long-lived stdout pipe for operators who run MemPalace behind an HTTP MCP
-    client/proxy for days at a time.
+    MemPalace keeps its deployment-specific health and authentication policy
+    outside the protocol server.  MCP parsing, initialization, sessions,
+    notifications, and JSON-RPC framing are exclusively SDK-owned.
     """
+    from types import SimpleNamespace
+
+    from mcp.server.transport_security import TransportSecuritySettings
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
+    from starlette.routing import Route
+
+    auth_token = os.environ.get("MEMPALACE_MCP_HTTP_TOKEN", "").strip()
+    if (
+        not _http_is_loopback(host)
+        and not auth_token
+        and not _truthy_env(_HTTP_ALLOW_INSECURE_NO_TOKEN_ENV)
+    ):
+        raise ValueError(
+            "MEMPALACE_MCP_HTTP_TOKEN is required when binding MCP HTTP to a "
+            f"non-loopback host. Set {_HTTP_ALLOW_INSECURE_NO_TOKEN_ENV}=1 only "
+            "when a trusted fronting layer provides access control."
+        )
+
+    tls_cert, _tls_key = _resolve_tls_paths()
+    state = SimpleNamespace(
+        scheme="https" if tls_cert else "http",
+        bind_host=host,
+        server_address=(host, port),
+        started_at=datetime.now().isoformat(),
+        started_monotonic=time.monotonic(),
+        stats_lock=threading.Lock(),
+        request_count=0,
+        status_counts={},
+        recent_clients={},
+        auth_token=auth_token,
+        sse_lock=threading.Lock(),
+        sse_clients=0,
+        sse_max_clients=_sse_max_clients(),
+    )
+
+    async def healthz(_request: Request) -> Response:
+        return PlainTextResponse("ok\n")
+
+    async def statusz(request: Request) -> Response:
+        if auth_token and not hmac.compare_digest(
+            request.headers.get("Authorization", ""), f"Bearer {auth_token}"
+        ):
+            return Response(status_code=401)
+        return JSONResponse(_http_status_payload(state))
+
+    async def sync_route(request: Request) -> Response:
+        path = request.url.path
+        try:
+            if path == "/sync/version_vector":
+                replica_id = await anyio.to_thread.run_sync(
+                    lambda: _call_logstream(lambda ls: ls.replica_id)
+                )
+                vector = await anyio.to_thread.run_sync(
+                    lambda: _call_logstream(lambda ls: ls.version_vector())
+                )
+                profile = await anyio.to_thread.run_sync(_node_profile)
+                profiles = await anyio.to_thread.run_sync(_known_profiles_snapshot)
+                return JSONResponse(
+                    {
+                        "replica_id": replica_id,
+                        "version_vector": vector,
+                        "profile": profile,
+                        "profiles": profiles,
+                    }
+                )
+            if path == "/sync/ops":
+                origin = request.query_params.get("origin", "")
+                after = int(request.query_params.get("after", "0"))
+                limit = int(request.query_params.get("limit", "500"))
+                events = await anyio.to_thread.run_sync(
+                    lambda: _call_logstream(
+                        lambda ls: ls.list_ops(origin, after_seq=after, limit=limit)
+                    )
+                )
+                return JSONResponse({"origin": origin, "events": events, "count": len(events)})
+            if path == "/sync/artifact":
+                artifact_id = request.query_params.get("id", "")
+                artifact = await anyio.to_thread.run_sync(
+                    lambda: _call_logstream(lambda ls: ls.get_artifact(artifact_id))
+                )
+                return (
+                    JSONResponse({"artifact": artifact})
+                    if artifact is not None
+                    else JSONResponse(
+                        {"error": f"artifact {artifact_id!r} not found"}, status_code=404
+                    )
+                )
+            return JSONResponse(await anyio.to_thread.run_sync(_mesh_peers_payload))
+        except (ValueError, TypeError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
+    async def logstream_stream(request: Request) -> Response:
+        filters = {
+            key: request.query_params.get(key)
+            for key in (
+                "stream",
+                "room",
+                "type",
+                "to_agent",
+                "from_agent",
+                "correlation_id",
+                "status",
+            )
+        }
+        cursor = request.query_params.get("since_event_id") or request.headers.get("Last-Event-ID")
+
+        def list_after(after_id):
+            return _call_logstream(
+                lambda ls: ls.list_events(
+                    since_event_id=after_id, limit=_SSE_BATCH_LIMIT, **filters
+                )
+            )
+
+        try:
+            if cursor is None:
+                cursor = await anyio.to_thread.run_sync(
+                    lambda: _call_logstream(lambda ls: ls.latest_event_id())
+                )
+            if cursor:
+                await anyio.to_thread.run_sync(list_after, cursor)
+            else:
+                await anyio.to_thread.run_sync(
+                    lambda: _call_logstream(lambda ls: ls.list_events(limit=1, **filters))
+                )
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        if not _sse_acquire_slot(state):
+            return Response(status_code=503, headers={"Retry-After": "5"})
+
+        async def stream():
+            import random
+
+            nonlocal cursor
+            global _last_request_time
+            last_write = time.monotonic()
+            try:
+                while not await request.is_disconnected():
+                    _last_request_time = time.monotonic()
+                    events = (
+                        await anyio.to_thread.run_sync(list_after, cursor)
+                        if cursor
+                        else await anyio.to_thread.run_sync(
+                            lambda: _call_logstream(
+                                lambda ls: ls.list_events(limit=_SSE_BATCH_LIMIT, **filters)
+                            )
+                        )
+                    )
+                    for event in events:
+                        cursor = event["id"]
+                        last_write = time.monotonic()
+                        yield f"id: {event['id']}\nevent: logstream\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+                    if not events and time.monotonic() - last_write >= _SSE_HEARTBEAT_S:
+                        yield ": ping\n\n"
+                        last_write = time.monotonic()
+                    await anyio.sleep(_SSE_POLL_BASE_S + random.random() * _SSE_POLL_JITTER_S)
+            finally:
+                _sse_release_slot(state)
+
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    security = TransportSecuritySettings(
+        # Host pinning protects browser-reachable loopback servers. Our
+        # non-loopback binds are local Kubernetes services, where kubelet,
+        # ClusterIP, and ingress legitimately rewrite Host; those paths remain
+        # protected by bearer authentication and Origin validation.
+        enable_dns_rebinding_protection=_http_is_loopback(host),
+        allowed_hosts=(
+            sorted(_http_allowed_host_values(host, port))
+            if port
+            else ["127.0.0.1:*", "localhost:*", "[::1]:*"]
+        ),
+        allowed_origins=["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"],
+    )
+    app = _MCP_SDK_HTTP_SERVER.streamable_http_app(
+        streamable_http_path="/mcp",
+        json_response=True,
+        max_request_body_size=_HTTP_MAX_REQUEST_BYTES,
+        transport_security=security,
+        host=host,
+        custom_starlette_routes=[
+            Route("/healthz", healthz, methods=["GET"]),
+            Route("/statusz", statusz, methods=["GET"]),
+            Route("/logstream/stream", logstream_stream, methods=["GET"]),
+            Route("/sync/version_vector", sync_route, methods=["GET"]),
+            Route("/sync/ops", sync_route, methods=["GET"]),
+            Route("/sync/artifact", sync_route, methods=["GET"]),
+            Route("/sync/peers", sync_route, methods=["GET"]),
+        ],
+    )
+
+    class _BearerMiddleware:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+
+        async def __call__(self, scope, receive, send):
+            global _last_request_time
+            status = 500
+            if scope["type"] == "http":
+                headers = {
+                    key.decode("latin-1").lower(): value.decode("latin-1")
+                    for key, value in scope.get("headers", [])
+                }
+                allowed_hosts = {value.lower() for value in _http_allowed_host_values(host, port)}
+                if port == 0:
+                    allowed_hosts.update(
+                        f"{name}:*" for name in ("127.0.0.1", "localhost", "[::1]")
+                    )
+                requested_host = headers.get("host", "").lower()
+                host_allowed = requested_host in allowed_hosts or any(
+                    pattern.endswith(":*") and requested_host.startswith(pattern[:-1])
+                    for pattern in allowed_hosts
+                )
+                if _http_is_loopback(host) and not host_allowed:
+                    await send({"type": "http.response.start", "status": 403, "headers": []})
+                    await send({"type": "http.response.body", "body": b""})
+                    _record_sdk_http_request(state, scope, headers, 403)
+                    return
+                origin = headers.get("origin")
+                if origin and not _http_origin_allowed(origin):
+                    await send({"type": "http.response.start", "status": 403, "headers": []})
+                    await send({"type": "http.response.body", "body": b""})
+                    _record_sdk_http_request(state, scope, headers, 403)
+                    return
+                _last_request_time = time.monotonic()
+            if scope["type"] == "http" and scope.get("path") != "/healthz" and auth_token:
+                if not hmac.compare_digest(
+                    headers.get("authorization", ""), f"Bearer {auth_token}"
+                ):
+                    await send({"type": "http.response.start", "status": 401, "headers": []})
+                    await send({"type": "http.response.body", "body": b""})
+                    _record_sdk_http_request(state, scope, headers, 401)
+                    return
+
+            async def record_send(message):
+                nonlocal status
+                if message["type"] == "http.response.start":
+                    status = message["status"]
+                await send(message)
+
+            await self.wrapped(scope, receive, record_send)
+            if scope["type"] == "http":
+                _record_sdk_http_request(state, scope, headers, status)
+
+    return _BearerMiddleware(app), state
+
+
+def _serve_http(host: str, port: int) -> None:
+    """Serve MCP using the official SDK's Streamable HTTP transport."""
+    import socket
+
+    listener = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET)
     try:
-        httpd = _build_http_server(host, port)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind((host, port))
+        listener.listen()
+        bound_port = listener.getsockname()[1]
+        app, httpd = _build_sdk_http_app(host, bound_port)
     except (OSError, ValueError) as exc:
+        listener.close()
         logger.error("Failed to start MCP HTTP server on %s:%s: %s", host, port, exc)
         sys.exit(1)
 
-    bound_port = httpd.server_address[1]
+    httpd.server_address = (host, bound_port)
 
     # Register this process as the palace's hub so local short-lived writers
     # (save hooks, plain `mempalace mine`) forward their writes here instead
@@ -7715,27 +8254,44 @@ def _serve_http(host: str, port: int) -> None:
     # RFC 004 step 0: converge with peer replicas when peers.json exists.
     _start_peer_sync_thread()
 
-    with httpd:
-        logger.info(
-            "MemPalace MCP HTTP server listening on %s://%s:%s/mcp%s%s",
-            getattr(httpd, "scheme", "http"),
-            host,
-            bound_port,
-            " (TLS)" if getattr(httpd, "scheme", "http") == "https" else "",
-            " (read-only)" if _READ_ONLY else "",
-        )
-        try:
-            httpd.serve_forever(poll_interval=0.5)
-        except KeyboardInterrupt:
-            logger.info("MemPalace MCP HTTP server shutting down")
-        finally:
-            if _registered_palace:
-                try:
-                    from . import server_registry
+    logger.info(
+        "MemPalace MCP HTTP server listening on %s://%s:%s/mcp%s%s",
+        getattr(httpd, "scheme", "http"),
+        host,
+        bound_port,
+        " (TLS)" if getattr(httpd, "scheme", "http") == "https" else "",
+        " (read-only)" if _READ_ONLY else "",
+    )
+    try:
+        import uvicorn
 
-                    server_registry.clear_serverinfo(_registered_palace)
-                except Exception:
-                    logger.debug("Failed to clear hub serverinfo", exc_info=True)
+        tls_cert, tls_key = _resolve_tls_paths()
+        import ssl
+
+        config = uvicorn.Config(
+            app,
+            host=host,
+            port=bound_port,
+            ssl_certfile=tls_cert,
+            ssl_keyfile=tls_key,
+            ssl_version=ssl.PROTOCOL_TLS_SERVER,
+            log_config=None,
+        )
+        config.load()
+        if config.ssl is not None:
+            config.ssl.minimum_version = ssl.TLSVersion.TLSv1_2
+        uvicorn.Server(config).run(sockets=[listener])
+    except KeyboardInterrupt:
+        logger.info("MemPalace MCP HTTP server shutting down")
+    finally:
+        listener.close()
+        if _registered_palace:
+            try:
+                from . import server_registry
+
+                server_registry.clear_serverinfo(_registered_palace)
+            except Exception:
+                logger.debug("Failed to clear hub serverinfo", exc_info=True)
 
 
 def _startup_preflight() -> None:
@@ -7919,52 +8475,19 @@ def _run_stdio_loop() -> None:
     # call is not blocking.
     _start_write_stall_watchdog()
 
-    while True:
-        try:
-            line = sys.stdin.readline()
-        except KeyboardInterrupt:
-            break
-        except OSError as exc:
-            # An orphaned pty/pipe surfaces as EIO/EBADF here instead of a
-            # clean EOF — same meaning: the client is gone. Never loop on
-            # it: an orphaned stdio server holding the mine_palace flock
-            # blocked all palace writes for hours (2026-07-10 outage).
-            logger.info("stdin read failed (%s) -- client disconnected, shutting down", exc)
-            break
-        if not line:
-            logger.info("stdin EOF -- client disconnected, shutting down")
-            break
+    async def _serve() -> None:
+        async with stdio_server() as (read_stream, write_stream):
+            await _MCP_SDK_SERVER.run(
+                read_stream,
+                write_stream,
+                _MCP_SDK_SERVER.create_initialization_options(),
+            )
 
-        line = line.strip()
-        if not line:
-            continue
-
-        payload = None
-        try:
-            request = json.loads(line)
-            response = _dispatch_stdio_request(request)
-            if response is not None:
-                payload = json.dumps(response, ensure_ascii=False)
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            logger.error(f"Server error: {e}")
-            continue
-
-        if payload is None:
-            continue
-        try:
-            sys.stdout.write(payload + "\n")
-            sys.stdout.flush()
-        except KeyboardInterrupt:
-            break
-        except (BrokenPipeError, OSError) as exc:
-            # The client's read end is gone; every future response write
-            # would fail the same way, so treat it like stdin EOF and
-            # shut down instead of swallowing it in the generic handler.
-            logger.info("stdout write failed (%s) -- client disconnected, shutting down", exc)
-            _drop_broken_stdout()
-            break
+    try:
+        anyio.run(_serve)
+        logger.info("stdin EOF -- client disconnected, shutting down")
+    except (BrokenPipeError, OSError) as exc:
+        logger.info("stdio transport closed (%s) -- client disconnected", exc)
 
 
 def _run_http_loop() -> None:

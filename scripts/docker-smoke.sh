@@ -110,12 +110,56 @@ echo "  drawer returned verbatim"
 echo "== 5/5  MCP server over stdio =="
 # The README's MCP client config runs the image with -i and speaks JSON-RPC on
 # stdin/stdout. Drive a real handshake and one tool call.
-mcp_out="$(printf '%s\n' \
-    '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}' \
-    '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
-    '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
-    '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"mempalace_search","arguments":{"query":"GraphQL"}}}' \
-    | docker run -i --rm -v "$VOLUME:/data" "$IMAGE" mcp 2>/dev/null)"
+# Keep stdin open until the final response arrives. Closing it immediately after
+# writing all requests lets the SDK correctly treat EOF as disconnect and cancel
+# a still-running tool call before its response is flushed.
+mcp_out="$(IMAGE="$IMAGE" VOLUME="$VOLUME" python3 <<'PY'
+import json
+import os
+import subprocess
+import sys
+import threading
+
+requests = [
+    {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "smoke", "version": "0"}}},
+    {"jsonrpc": "2.0", "method": "notifications/initialized"},
+    {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+    {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "mempalace_search", "arguments": {"query": "GraphQL"}}},
+]
+proc = subprocess.Popen(
+    ["docker", "run", "-i", "--rm", "-v", f"{os.environ['VOLUME']}:/data", os.environ["IMAGE"], "mcp"],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.DEVNULL,
+    text=True,
+    bufsize=1,
+)
+timer = threading.Timer(30, proc.kill)
+timer.start()
+try:
+    for request in requests:
+        proc.stdin.write(json.dumps(request) + "\n")
+    proc.stdin.flush()
+    seen = set()
+    for line in proc.stdout:
+        print(line, end="")
+        try:
+            message = json.loads(line)
+        except ValueError:
+            continue
+        if message.get("id") in {1, 2, 3}:
+            seen.add(message["id"])
+        if seen == {1, 2, 3}:
+            break
+    if seen != {1, 2, 3}:
+        sys.exit(f"missing MCP responses: {sorted({1, 2, 3} - seen)}")
+finally:
+    timer.cancel()
+    if proc.stdin:
+        proc.stdin.close()
+    proc.wait(timeout=10)
+PY
+)"
 
 # The transcript goes to a file and the parser reads it via argv: the heredoc
 # already occupies this command's stdin.

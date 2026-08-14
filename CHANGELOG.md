@@ -10,6 +10,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [3.7.0+oc.1] — 2026-08-13
+
+### Changed
+
+- MCP stdio and Streamable HTTP protocol handling now use the official MCP Python SDK v2. The fork release requires Python 3.10 or newer; MemPalace tool schemas, policy gates, remote-server routes, and deployment security contracts remain compatible.
+
+---
+
 ## [3.7.0] — 2026-08-11
 
 ### Features

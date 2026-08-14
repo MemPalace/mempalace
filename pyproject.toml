@@ -1,9 +1,9 @@
 [project]
 name = "mempalace"
-version = "3.7.0"
+version = "3.7.0+oc.1"
 description = "Give your AI a memory — mine projects and conversations into a searchable palace. No API key required."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = "MIT"
 authors = [
     {name = "milla-jovovich"},
@@ -17,7 +17,6 @@ classifiers = [
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -27,6 +26,7 @@ classifiers = [
     "Topic :: Utilities",
 ]
 dependencies = [
+    "mcp>=2,<3",
     "chromadb>=1.5.4,<2",
     "pyyaml>=6.0,<7",
     "tomli>=2.0.0; python_version < '3.11'",
@@ -126,7 +126,7 @@ multilingual = []
 # Binary-format extraction for `mempalace mine --mode extract`. Per-format
 # transformer routing: striprtf for .rtf, MarkItDown for .pdf/.docx/.pptx/
 # .xlsx/.epub. MarkItDown requires Python ≥ 3.10 (env marker ensures it
-# only installs where supported; Python 3.9 users still get RTF coverage).
+# only installs where supported; other platforms still get RTF coverage).
 extract = [
     "striprtf>=0.0.27",
     # Per PR #1555 review (Igor): bare ``markitdown`` is enough to import
@@ -163,7 +163,7 @@ packages = ["mempalace"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py39"
+target-version = "py310"
 # "*.md": ruff 0.16 began formatting Python inside markdown fences, which
 # pulls ~96 docs into scope and reflows hand-aligned example code (the
 # column-aligned field comments in docs/rfcs/002 are deliberate). Docs are
