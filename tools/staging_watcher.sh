@@ -140,23 +140,21 @@ build_batch_manifest() {
 verify_mined() {
     local processed_dir="$STAGING_DIR/processed"
     local manifest="$STAGING_DIR/.batch_manifest"
-    local sample_file
-    sample_file=$(find "$processed_dir" -type f ! -name 'mempalace.yaml' 2>/dev/null | shuf -n 1)
 
-    if [[ -z "$sample_file" ]]; then
-        log "Verify FAILED: no files to sample"
+    if [[ ! -s "$manifest" ]]; then
+        log "Verify FAILED: batch manifest is empty or missing"
         return 1
     fi
 
-    log "Verify: checking searchability of $sample_file against $manifest"
+    log "Verify: checking searchability of all processed files against $manifest"
 
-    if ! "$PYTHON_BIN" "$VERIFY_SCRIPT" "$PALACE_PATH" "$sample_file" "$manifest" "$MEMPALACE_BIN" \
+    if ! "$PYTHON_BIN" "$VERIFY_SCRIPT" "$PALACE_PATH" "$manifest" "$manifest" "$MEMPALACE_BIN" \
         >> "$LOG_FILE" 2>&1; then
-        log "Verify FAILED: mined content not searchable for $sample_file"
+        log "Verify FAILED: one or more processed files are not searchable"
         return 1
     fi
 
-    log "Verify: $sample_file searchable and matched in current batch"
+    log "Verify: all processed files are searchable and in the current batch"
     return 0
 }
 
@@ -174,9 +172,15 @@ archive_files() {
     local batch_date
     batch_date=$(date '+%Y-%m-%d_%H%M%S')
     local batch_archive="$ARCHIVE_DIR/$batch_date"
-    mkdir -p "$batch_archive"
+    local batch_archive_tmp="$ARCHIVE_DIR/.tmp.$batch_date.$$"
 
-    local manifest="$batch_archive/MANIFEST.txt"
+    # Build into a temporary directory and atomically rename on success.
+    # This ensures that an incomplete archive is never visible at the final
+    # path and that any archive error aborts before staging is cleared.
+    rm -rf "$batch_archive_tmp"
+    mkdir -p "$batch_archive_tmp"
+
+    local manifest="$batch_archive_tmp/MANIFEST.txt"
     {
         echo "# MemPalace Archive Manifest"
         echo "# Batch: $batch_date"
@@ -193,13 +197,14 @@ archive_files() {
         [[ -z "$rel_path" ]] && continue
         [[ "$rel_path" == .DS_Store || "$rel_path" == mempalace.yaml ]] && continue
 
-        local archive_name="$batch_archive/${rel_path}.gz"
+        local archive_name="$batch_archive_tmp/${rel_path}.gz"
         mkdir -p "$(dirname "$archive_name")"
 
         # Refuse to overwrite a duplicate archive path (failsafe even though
         # the relative path should now be unique under the staging tree).
         if [[ -e "$archive_name" ]]; then
             log "Archive FAILED: duplicate path would overwrite $archive_name"
+            rm -rf "$batch_archive_tmp"
             return 1
         fi
 
@@ -210,7 +215,18 @@ archive_files() {
         fi
         filesize=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo "0")
 
-        gzip -c "$file" > "$archive_name"
+        if ! gzip -c "$file" > "$archive_name"; then
+            log "Archive FAILED: gzip error for $file"
+            rm -rf "$batch_archive_tmp"
+            return 1
+        fi
+
+        # Validate the compressed file before committing the manifest entry.
+        if ! gunzip -t "$archive_name" >/dev/null 2>&1; then
+            log "Archive FAILED: gzip validation failed for $archive_name"
+            rm -rf "$batch_archive_tmp"
+            return 1
+        fi
 
         echo "file: $rel_path" >> "$manifest"
         echo "  sha256: $checksum" >> "$manifest"
@@ -222,6 +238,27 @@ archive_files() {
     done < <(find "$STAGING_DIR" -type f \
         ! -name '.DS_Store' ! -name 'mempalace.yaml' \
         ! -path '*/processed/*' -print0)
+
+    if [[ $file_count -eq 0 ]]; then
+        log "Archive FAILED: no files to archive"
+        rm -rf "$batch_archive_tmp"
+        return 1
+    fi
+
+    # Validate the manifest exists and has content.
+    if [[ ! -s "$manifest" ]]; then
+        log "Archive FAILED: manifest is empty or missing"
+        rm -rf "$batch_archive_tmp"
+        return 1
+    fi
+
+    # Atomic rename: a complete, validated archive becomes visible at the
+    # final path only after every file has been compressed and checked.
+    if ! mv "$batch_archive_tmp" "$batch_archive"; then
+        log "Archive FAILED: could not move temporary archive to $batch_archive"
+        rm -rf "$batch_archive_tmp"
+        return 1
+    fi
 
     log "Archived $file_count files to $batch_archive"
 }
@@ -256,8 +293,16 @@ process_batch() {
     fi
 
     compress_palace
-    archive_files
-    clear_staging
+
+    if ! archive_files; then
+        log "ABORT: archive failed — files left for inspection"
+        return 1
+    fi
+
+    if ! clear_staging; then
+        log "ABORT: clear_staging failed — archive is at $ARCHIVE_DIR but staging may be dirty"
+        return 1
+    fi
 
     log "=== Batch complete ==="
     return 0

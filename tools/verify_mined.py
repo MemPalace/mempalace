@@ -71,55 +71,84 @@ def run_search(mempalace_bin: str, palace_path: str, query: str, source_file: st
     return json.loads(result.stdout)
 
 
-def main() -> int:
-    if len(sys.argv) < 4:
-        print(
-            "usage: verify_mined.py <palace_path> <sample_file> <manifest_file> [mempalace_bin]",
-            file=sys.stderr,
-        )
-        return 2
-
-    palace_path = sys.argv[1]
-    sample_file = Path(sys.argv[2]).resolve()
-    manifest_file = Path(sys.argv[3])
-    mempalace_bin = sys.argv[4] if len(sys.argv) > 4 else "mempalace"
-
+def verify_one(
+    palace_path: str,
+    sample_file: Path,
+    manifest: set[str],
+    mempalace_bin: str,
+) -> bool:
+    """Return True if *sample_file* is searchable and its hits are in *manifest*."""
     snippet = extract_snippet(sample_file)
     if not snippet:
-        print("verify_mined: could not extract a usable snippet", file=sys.stderr)
-        return 1
+        print(f"verify_mined: could not extract a usable snippet from {sample_file}", file=sys.stderr)
+        return False
 
-    manifest = load_manifest(manifest_file)
     if str(sample_file) not in manifest:
-        print("verify_mined: sample file not in batch manifest", file=sys.stderr)
-        return 1
+        print(f"verify_mined: {sample_file} not in batch manifest", file=sys.stderr)
+        return False
 
     try:
         data = run_search(mempalace_bin, palace_path, snippet, str(sample_file))
     except subprocess.CalledProcessError as e:
         print(f"verify_mined: search failed with exit {e.returncode}", file=sys.stderr)
-        return 1
+        return False
     except json.JSONDecodeError as e:
         print(f"verify_mined: could not parse search JSON: {e}", file=sys.stderr)
-        return 1
+        return False
 
     results = data.get("results", [])
     if not results:
-        print("verify_mined: search returned no results", file=sys.stderr)
-        return 1
+        print(f"verify_mined: search returned no results for {sample_file}", file=sys.stderr)
+        return False
 
     for hit in results:
         hit_source = hit.get("source_file", "")
         if hit_source and hit_source in manifest:
-            # The batch contained this source; verify it matches the sample we
-            # actually queried. This is the fail-closed guard: even if the
-            # search returned an unrelated matching drawer from another batch,
-            # its source_file would not be in the manifest (or would not match
-            # the sample file we filtered by), so we refuse to proceed.
             if Path(hit_source).resolve() == sample_file:
-                return 0
+                return True
 
-    print("verify_mined: search hit source_file not in batch manifest", file=sys.stderr)
+    print(f"verify_mined: search hit source_file not in batch manifest for {sample_file}", file=sys.stderr)
+    return False
+
+
+def main() -> int:
+    if len(sys.argv) < 4:
+        print(
+            "usage: verify_mined.py <palace_path> <sample_file|manifest_file> <manifest_file> [mempalace_bin]",
+            file=sys.stderr,
+        )
+        return 2
+
+    palace_path = sys.argv[1]
+    sample_arg = Path(sys.argv[2])
+    manifest_file = Path(sys.argv[3])
+    mempalace_bin = sys.argv[4] if len(sys.argv) > 4 else "mempalace"
+
+    manifest = load_manifest(manifest_file)
+    if not manifest:
+        print("verify_mined: manifest is empty or missing", file=sys.stderr)
+        return 1
+
+    # If the second argument is the manifest itself, verify every entry.
+    if sample_arg.resolve() == manifest_file.resolve():
+        failures = 0
+        for item in sorted(manifest):
+            sample_file = Path(item).resolve()
+            if not sample_file.exists():
+                print(f"verify_mined: manifest entry missing on disk: {item}", file=sys.stderr)
+                failures += 1
+                continue
+            if not verify_one(palace_path, sample_file, manifest, mempalace_bin):
+                failures += 1
+        if failures:
+            print(f"verify_mined: {failures} manifest entries failed verification", file=sys.stderr)
+            return 1
+        return 0
+
+    # Backward-compatible single-sample verification.
+    sample_file = sample_arg.resolve()
+    if verify_one(palace_path, sample_file, manifest, mempalace_bin):
+        return 0
     return 1
 
 
