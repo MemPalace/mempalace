@@ -95,6 +95,7 @@ WRITE_TOOLS = frozenset(
         "mempalace_create_tunnel",
         "mempalace_delete_tunnel",
         "mempalace_delete_hallway",
+        "mempalace_gossip",
         "mempalace_hook_settings",
     }
 )
