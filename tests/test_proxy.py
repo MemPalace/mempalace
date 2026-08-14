@@ -671,3 +671,151 @@ class TestOriginValidation:
         )
         allowed, status, msg = proxy._is_inbound_request_allowed(request)
         assert allowed is True
+
+
+class TestEndToEnd:
+    """End-to-end handler regressions through aiohttp's test client."""
+
+    @staticmethod
+    def _build_fake_upstream(status: int, body: bytes):
+        class FakeResponse:
+            def __init__(self, status_code, content):
+                self.status_code = status_code
+                self.content = content
+                self.text = content.decode("utf-8")
+
+            def json(self):
+                return json.loads(self.content)
+
+        class FakeClient:
+            is_closed = False
+            calls = 0
+
+            async def aclose(self):
+                pass
+
+            async def post(self, *args, **kwargs):
+                FakeClient.calls += 1
+                return FakeResponse(status, body)
+
+        return FakeClient
+
+    def _run_client(self, test_coro):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(test_coro())
+        finally:
+            loop.close()
+
+    def test_repeated_json_5xx_opens_circuit_and_persists_status(self):
+        import mempalace_mcp_proxy as proxy
+        from aiohttp import web
+        from aiohttp.test_utils import TestClient, TestServer
+
+        body = json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+        ).encode()
+        upstream_body = json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "error": {"code": -32000}}
+        ).encode()
+
+        async def test():
+            # Reset proxy state for a clean circuit.
+            proxy._circuit["failures"] = 0
+            proxy._circuit["state"] = "closed"
+            proxy._metrics["requests_failed"] = 0
+            FakeClient = self._build_fake_upstream(503, upstream_body)
+            proxy._http_client = FakeClient()
+
+            app = web.Application()
+            app.router.add_post("/mcp", proxy.handle_mcp_post)
+            server = TestServer(app, port=0)
+            client = TestClient(server, loop=asyncio.get_event_loop())
+            await client.start_server()
+
+            port = client.server.port
+            old_hosts = proxy.ALLOWED_HOSTS
+            proxy.ALLOWED_HOSTS = frozenset({f"127.0.0.1:{port}", "localhost", "127.0.0.1"})
+
+            try:
+                # First request: three upstream 5xx attempts, then 503 downstream.
+                resp = await client.post("/mcp", data=body)
+                assert resp.status == 503
+                payload = await resp.json()
+                assert payload["error"]["code"] == -32000
+
+                # The circuit should now be open.
+                assert proxy._circuit["state"] == "open"
+
+                # Second request: circuit is open, no upstream call, still 503.
+                calls_before = FakeClient.calls
+                resp = await client.post("/mcp", data=body)
+                assert resp.status == 503
+                await resp.release()
+                assert FakeClient.calls == calls_before
+
+                assert proxy._metrics["requests_failed"] >= 1
+            finally:
+                proxy.ALLOWED_HOSTS = old_hosts
+                await client.close()
+
+        self._run_client(test)
+
+    def test_origin_and_host_validation_at_handler(self):
+        import mempalace_mcp_proxy as proxy
+        from aiohttp import web
+        from aiohttp.test_utils import TestClient, TestServer
+
+        body = json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+        ).encode()
+
+        async def test():
+            proxy._circuit["failures"] = 0
+            proxy._circuit["state"] = "closed"
+
+            # Ensure the handler is reachable so we can test the boundary.
+            async def fake_forward(*args, **kwargs):
+                return None, 202, None
+
+            proxy._forward_to_upstream = fake_forward
+
+            app = web.Application()
+            app.router.add_post("/mcp", proxy.handle_mcp_post)
+            server = TestServer(app, port=0)
+            client = TestClient(server, loop=asyncio.get_event_loop())
+            await client.start_server()
+
+            port = client.server.port
+            old_hosts = proxy.ALLOWED_HOSTS
+            old_origins = proxy.ALLOWED_ORIGINS
+            proxy.ALLOWED_HOSTS = frozenset({f"127.0.0.1:{port}", "localhost", "127.0.0.1"})
+            proxy.ALLOWED_ORIGINS = frozenset({f"http://127.0.0.1:{port}"})
+
+            try:
+                # Invalid Origin -> 403.
+                resp = await client.post(
+                    "/mcp",
+                    data=body,
+                    headers={"Origin": "http://evil.example"},
+                )
+                assert resp.status == 403
+
+                # Valid Origin -> 202.
+                resp = await client.post(
+                    "/mcp",
+                    data=body,
+                    headers={"Origin": f"http://127.0.0.1:{port}"},
+                )
+                assert resp.status == 202
+
+                # No Origin, allowed Host -> 202.
+                resp = await client.post("/mcp", data=body)
+                assert resp.status == 202
+            finally:
+                proxy.ALLOWED_HOSTS = old_hosts
+                proxy.ALLOWED_ORIGINS = old_origins
+                await client.close()
+
+        self._run_client(test)
