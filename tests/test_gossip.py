@@ -820,3 +820,91 @@ def test_random_walk_swap_only_picks_off_radius_nodes():
         assert normalize_wing_name("negentropy") not in {
             normalize_wing_name(w) for w in selected[0].gossip_radius
         }
+
+
+def test_gossip_on_gossip_propagates_trending_and_viral():
+    """A meta-gossip pass turns analytics into propagated meta-facts."""
+    kg_path = _temp_db()
+    try:
+        kg = KnowledgeGraph(db_path=kg_path)
+        protocol = GossipProtocol(kg=kg)
+
+        # Seed a topic with enough share to cross the trending threshold.
+        for _ in range(3):
+            protocol.propagate(
+                "audit",
+                "found",
+                "security vulnerability",
+                source_wing="orkid",
+                source_room="contracts",
+                fanout=5,
+                priority="high",
+            )
+
+        # Short interval so the meta pass does not get rate-limited.
+        protocol.config["gossip_on_gossip"]["interval_seconds"] = 0
+        result = protocol.gossip_on_gossip()
+
+        assert result["propagated_count"] >= 1
+        assert result["network_health_label"] in {"healthy", "degraded", "critical"}
+        assert any(
+            f["subject"] == "gossip://meta/topic" and f["predicate"] == "is_trending"
+            for f in result["meta_facts"]
+        )
+
+        # The meta topic should now exist as a gossip-derived triple.
+        triples = kg.query_gossip_triples()
+        assert any(
+            t.get("subject") == "gossip://meta/topic" for t in triples
+        )
+    finally:
+        Path(kg_path).unlink(missing_ok=True)
+
+
+def test_gossip_on_gossip_disabled():
+    """When gossip-on-gossip is disabled, nothing is propagated."""
+    kg_path = _temp_db()
+    try:
+        kg = KnowledgeGraph(db_path=kg_path)
+        protocol = GossipProtocol(kg=kg)
+        protocol.config["gossip_on_gossip"]["enabled"] = False
+
+        protocol.propagate(
+            "audit",
+            "found",
+            "security vulnerability",
+            source_wing="orkid",
+            source_room="contracts",
+            fanout=5,
+            priority="high",
+        )
+
+        result = protocol.gossip_on_gossip()
+        assert result["propagated_count"] == 0
+        assert result["meta_facts"] == []
+    finally:
+        Path(kg_path).unlink(missing_ok=True)
+
+
+def test_gossip_on_gossip_health_hysteresis():
+    """Health labels only propagate after the configured hysteresis passes."""
+    kg_path = _temp_db()
+    try:
+        kg = KnowledgeGraph(db_path=kg_path)
+        protocol = GossipProtocol(kg=kg)
+        protocol.config["gossip_on_gossip"]["interval_seconds"] = 0
+        protocol.config["gossip_on_gossip"]["health_hysteresis_passes"] = 2
+
+        # No triples -> active=0, no expired -> "critical"? Wait: no active and
+        # no expired is "healthy" because there is nothing stale. The default
+        # config has gossip_probability 0.7, so any call would write triples;
+        # to test hysteresis, we run the pass twice with the same (empty) state.
+        result1 = protocol.gossip_on_gossip()
+        result2 = protocol.gossip_on_gossip()
+
+        # First pass: count=1 -> not yet ready. Second pass: count=2 -> ready.
+        assert not result1["network_health_propagated"]
+        assert result2["network_health_propagated"]
+        assert result1["network_health_label"] == result2["network_health_label"]
+    finally:
+        Path(kg_path).unlink(missing_ok=True)

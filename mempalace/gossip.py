@@ -81,6 +81,15 @@ EXAMPLE_GOSSIP_CONFIG: dict[str, Any] = {
     "echo_chamber_reinforcement_count": 3,
     "echo_chamber_attenuation": 0.5,
     "echo_chamber_similarity_threshold": 0.8,
+    "gossip_on_gossip": {
+        "enabled": True,
+        "interval_seconds": 60,
+        "trending_threshold": 0.25,
+        "viral_min_count": 2,
+        "max_trending": 3,
+        "max_viral": 3,
+        "health_hysteresis_passes": 2,
+    },
     "chatter_nodes": [
         {
             "id": "chatter_orkid_tech",
@@ -273,6 +282,11 @@ def _merge_with_default(raw: dict[str, Any]) -> dict[str, Any]:
         merged["topics"] = raw["topics"]
     if "channels" in raw:
         merged["channels"] = raw["channels"]
+    if "gossip_on_gossip" in raw and isinstance(raw["gossip_on_gossip"], dict):
+        merged["gossip_on_gossip"] = {
+            **DEFAULT_GOSSIP_CONFIG["gossip_on_gossip"],
+            **raw["gossip_on_gossip"],
+        }
     return merged
 
 
@@ -427,6 +441,12 @@ class GossipProtocol:
         self._chatter_nodes = [ChatterNode.from_dict(n) for n in self.config["chatter_nodes"]]
         self.kg = kg
         self._kg_path = kg_path
+
+        # State for gossip-on-gossip health hysteresis and rate limiting.
+        self._health_label: Optional[str] = None
+        self._health_label_count: int = 0
+        self._last_propagated_health_label: Optional[str] = None
+        self._last_meta_gossip_at: Optional[datetime] = None
 
     @property
     def chatter_nodes(self) -> list[ChatterNode]:
@@ -913,6 +933,7 @@ class GossipProtocol:
             "echo_chamber_similarity_threshold": self.config.get(
                 "echo_chamber_similarity_threshold", 0.8
             ),
+            "gossip_on_gossip": self.config.get("gossip_on_gossip", {}),
             "chatter_nodes": [asdict(n) for n in self._chatter_nodes],
             "topics": self.config.get("topics", []),
             "channels": self.config.get("channels", {}),
@@ -923,6 +944,128 @@ class GossipProtocol:
         return GossipAnalytics(self._knowledge_graph()).snapshot(
             self._chatter_nodes, self.config, as_of=as_of
         )
+
+    def _gossip_on_gossip_config(self) -> dict[str, Any]:
+        """Return the gossip-on-gossip configuration subsection."""
+        return self.config.get("gossip_on_gossip", DEFAULT_GOSSIP_CONFIG["gossip_on_gossip"])
+
+    def _network_health_label(self, health: dict[str, Any]) -> str:
+        """Map network health metrics to a simple label."""
+        active = health.get("active_triples", 0)
+        expired = health.get("expired_triples", 0)
+        if active == 0:
+            return "critical" if expired > 0 else "healthy"
+        ratio = expired / max(1, active)
+        if ratio > 2.0:
+            return "critical"
+        if ratio > 1.0:
+            return "degraded"
+        return "healthy"
+
+    def _hysteresis_ready(self, label: str) -> bool:
+        """Return True once a new health label has persisted for the configured passes."""
+        if label == self._health_label:
+            self._health_label_count += 1
+        else:
+            self._health_label = label
+            self._health_label_count = 1
+
+        passes = int(self._gossip_on_gossip_config().get("health_hysteresis_passes", 2))
+        return self._health_label_count >= passes and label != self._last_propagated_health_label
+
+    def gossip_on_gossip(self, as_of: str = None) -> dict[str, Any]:
+        """Turn the current analytics snapshot into first-class gossip messages.
+
+        Self-referential propagation is gated by the ``gossip_on_gossip`` config
+        section and by per-metric thresholds. Trending topics, viral facts, and
+        network-health state are written back to the knowledge graph with
+        ``source_file = "gossip://meta"`` so the next analytics pass can observe
+        them too.
+        """
+        gog = self._gossip_on_gossip_config()
+        if not gog.get("enabled", True):
+            return {"meta_facts": [], "network_health_label": None, "propagated_count": 0}
+
+        interval = float(gog.get("interval_seconds", 60))
+        now = datetime.now(timezone.utc)
+        if self._last_meta_gossip_at is not None:
+            elapsed = (now - self._last_meta_gossip_at).total_seconds()
+            if elapsed < interval:
+                return {"meta_facts": [], "network_health_label": None, "propagated_count": 0}
+
+        snapshot = self.analytics(as_of=as_of)
+        gog_cfg = self._gossip_on_gossip_config()
+
+        meta_facts: list[dict[str, Any]] = []
+
+        # Trending topics
+        trending_threshold = float(gog_cfg.get("trending_threshold", 0.25))
+        max_trending = int(gog_cfg.get("max_trending", 3))
+        for t in snapshot["trending_topics"][:max_trending]:
+            if t.get("share", 0.0) >= trending_threshold:
+                meta_facts.append(
+                    {
+                        "subject": "gossip://meta/topic",
+                        "predicate": "is_trending",
+                        "obj": t["topic"],
+                        "priority": "high",
+                        "source_wing": "mempalace",
+                    }
+                )
+
+        # Viral facts
+        viral_min_count = int(gog_cfg.get("viral_min_count", 2))
+        max_viral = int(gog_cfg.get("max_viral", 3))
+        for v in snapshot["viral_facts"][:max_viral]:
+            if v.get("count", 0) >= viral_min_count:
+                fact_key = f"{v['subject']}|{v['predicate']}|{v['object']}"
+                meta_facts.append(
+                    {
+                        "subject": "gossip://meta/fact",
+                        "predicate": "is_viral",
+                        "obj": fact_key,
+                        "priority": "high",
+                        "source_wing": "mempalace",
+                    }
+                )
+
+        # Network health (with hysteresis)
+        health = snapshot["network_health"]
+        health_label = self._network_health_label(health)
+        health_propagated = False
+        if self._hysteresis_ready(health_label):
+            meta_facts.append(
+                {
+                    "subject": "gossip://meta/network",
+                    "predicate": "health",
+                    "obj": health_label,
+                    "priority": "high" if health_label in {"degraded", "critical"} else "medium",
+                    "source_wing": "mempalace",
+                }
+            )
+            self._last_propagated_health_label = health_label
+            health_propagated = True
+
+        propagated = 0
+        for fact in meta_facts:
+            report = self.propagate(
+                fact["subject"],
+                fact["predicate"],
+                fact["obj"],
+                source_wing=fact.get("source_wing"),
+                priority=fact.get("priority"),
+                fanout=None,
+            )
+            propagated += 1 if report.get("triples_written", 0) > 0 else 0
+
+        self._last_meta_gossip_at = now
+
+        return {
+            "meta_facts": meta_facts,
+            "network_health_label": health_label,
+            "network_health_propagated": health_propagated,
+            "propagated_count": propagated,
+        }
 
 
 class GossipAnalytics:
