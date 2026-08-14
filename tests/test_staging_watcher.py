@@ -294,3 +294,71 @@ class TestPreprocessSubdirectories:
             assert (staging / "processed" / "projB" / "notes.md").read_text() == "project B notes\n"
         finally:
             sys.path.pop(0)
+
+
+class TestProcessBatch:
+    """End-to-end batch regressions (fatkobra review)."""
+
+    def test_process_batch_retains_staging_when_verify_fails(self, tmp_path):
+        """If one file mines and another is skipped, staging must not be cleared."""
+        staging = tmp_path / "staging"
+        staging.mkdir()
+        archive = tmp_path / "archive"
+        palace = tmp_path / "palace"
+        log = tmp_path / "watcher.log"
+
+        (staging / "good.md").write_text(
+            "hello world this is the good file\n", encoding="utf-8"
+        )
+        (staging / "bad.md").write_text(
+            "this is the bad file that exceeds chunk cap\n", encoding="utf-8"
+        )
+        archive.mkdir()
+        palace.mkdir()
+
+        fake_mempalace = tmp_path / "mempalace"
+        fake_mempalace.write_text(
+            "#!/usr/bin/env sh\n"
+            "for arg in \"$@\"; do\n"
+            '  if [ "$arg" = "mine" ] || [ "$arg" = "compress" ]; then\n'
+            "    exit 0\n"
+            "  fi\n"
+            "done\n"
+            "source=\"\"\n"
+            "while [ $# -gt 0 ]; do\n"
+            '  if [ "$1" = "--source-file" ]; then source="$2"; fi\n'
+            "  shift\n"
+            "done\n"
+            'if [ "$(basename "$source")" = "good.md" ]; then\n'
+            '  echo \'{"results": [{"source_file": "\'"$source"\'"}]}\'\n'
+            "else\n"
+            '  echo \'{"results": []}\'\n'
+            "fi\n",
+            encoding="utf-8",
+        )
+        fake_mempalace.chmod(0o755)
+
+        env = os.environ.copy()
+        env["STAGING_DIR"] = str(staging)
+        env["ARCHIVE_DIR"] = str(archive)
+        env["PALACE_PATH"] = str(palace)
+        env["LOG_FILE"] = str(log)
+        env["STAGING_WATCHER_TEST_MODE"] = "1"
+        env["MEMPALACE_BIN"] = str(fake_mempalace)
+
+        result = subprocess.run(
+            ["bash", "-c", f"source '{_TOOLS_DIR / 'staging_watcher.sh'}' && process_batch"],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode != 0, result.stderr
+
+        # Staging originals must still be present (cleanup was gated by verify).
+        assert (staging / "good.md").exists()
+        assert (staging / "bad.md").exists()
+
+        # No final archive directory should have been created.
+        final_batches = [d for d in archive.iterdir() if d.is_dir() and not d.name.startswith(".")]
+        assert len(final_batches) == 0
