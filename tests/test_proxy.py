@@ -372,7 +372,7 @@ class TestIdempotentRetry:
 
         return FakeClient(responses), FakeResponse
 
-    def _run_forward(self, body, responses):
+    def _run_forward(self, body, responses, restore_circuit=True):
         import mempalace_mcp_proxy as proxy
 
         client, FakeResponse = self._fake_client(responses)
@@ -393,7 +393,8 @@ class TestIdempotentRetry:
             return result, client.calls
         finally:
             proxy._http_client = old_client
-            proxy._circuit.update(old_circuit)
+            if restore_circuit:
+                proxy._circuit.update(old_circuit)
 
     def test_read_only_tool_is_retried(self):
         """mempalace_search is read-only and may be retried on 5xx."""
@@ -499,3 +500,174 @@ class TestIdempotentRetry:
 
         assert len(calls) == 1
         assert result[1] >= 500
+
+    def test_memories_filed_away_not_retried(self):
+        """mempalace_memories_filed_away deletes state and must not replay."""
+        import mempalace_mcp_proxy as proxy
+
+        body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "mempalace_memories_filed_away"},
+            }
+        ).encode()
+        assert not proxy._is_retry_safe(body)
+
+        _, FakeResponse = self._fake_client([])
+        result, calls = self._run_forward(body, [FakeResponse(500, b"{}")])
+
+        assert len(calls) == 1
+
+    def test_reconnect_not_retried(self):
+        """mempalace_reconnect is not write-free and must not be replayed."""
+        import mempalace_mcp_proxy as proxy
+
+        body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "mempalace_reconnect"},
+            }
+        ).encode()
+        assert not proxy._is_retry_safe(body)
+
+        _, FakeResponse = self._fake_client([])
+        result, calls = self._run_forward(body, [FakeResponse(500, b"{}")])
+
+        assert len(calls) == 1
+
+    def test_hook_settings_without_args_is_retried(self):
+        """mempalace_hook_settings with no arguments is a status query."""
+        import mempalace_mcp_proxy as proxy
+
+        body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "mempalace_hook_settings"},
+            }
+        ).encode()
+        assert proxy._is_retry_safe(body)
+
+    def test_hook_settings_with_args_not_retried(self):
+        """mempalace_hook_settings with arguments writes config and must not replay."""
+        import mempalace_mcp_proxy as proxy
+
+        body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "mempalace_hook_settings",
+                    "arguments": {"desktop_toast": True},
+                },
+            }
+        ).encode()
+        assert not proxy._is_retry_safe(body)
+
+        _, FakeResponse = self._fake_client([])
+        result, calls = self._run_forward(body, [FakeResponse(500, b"{}")])
+
+        assert len(calls) == 1
+
+    def test_final_5xx_with_json_body_is_failure_and_preserves_status(self):
+        """A final 5xx with a JSON body must open the circuit and keep the status."""
+        import mempalace_mcp_proxy as proxy
+
+        body = json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+        ).encode()
+
+        _, FakeResponse = self._fake_client([])
+        result, calls = self._run_forward(
+            body,
+            [
+                FakeResponse(503, b"{}"),
+                FakeResponse(503, b"{}"),
+                FakeResponse(
+                    503,
+                    json.dumps(
+                        {"jsonrpc": "2.0", "id": 1, "error": {"code": -32000}}
+                    ).encode(),
+                ),
+            ],
+            restore_circuit=False,
+        )
+
+        assert result[1] == 503
+        assert proxy._circuit["state"] == "open"
+        assert proxy._metrics["requests_failed"] >= 1
+
+
+class TestOriginValidation:
+    """Origin/Host and inbound token validation."""
+
+    @staticmethod
+    def _mock_request(**headers):
+        class CaseInsensitiveHeaders:
+            def __init__(self, headers):
+                self._headers = {k.lower(): v for k, v in headers.items()}
+
+            def get(self, key, default=None):
+                return self._headers.get(key.lower(), default)
+
+        class MockRequest:
+            def __init__(self, headers):
+                self.headers = CaseInsensitiveHeaders(headers)
+
+        return MockRequest(headers)
+
+    def test_valid_origin_allowed(self):
+        import mempalace_mcp_proxy as proxy
+
+        request = self._mock_request(Origin="http://localhost:8766", Host="localhost:8766")
+        allowed, status, msg = proxy._is_inbound_request_allowed(request)
+        assert allowed is True
+
+    def test_invalid_origin_rejected(self):
+        import mempalace_mcp_proxy as proxy
+
+        request = self._mock_request(Origin="http://evil.example", Host="localhost:8766")
+        allowed, status, msg = proxy._is_inbound_request_allowed(request)
+        assert allowed is False
+        assert status == 403
+
+    def test_no_origin_with_allowed_host_is_accepted(self):
+        import mempalace_mcp_proxy as proxy
+
+        request = self._mock_request(Host="127.0.0.1:8766")
+        allowed, status, msg = proxy._is_inbound_request_allowed(request)
+        assert allowed is True
+
+    def test_no_origin_with_disallowed_host_rejected(self):
+        import mempalace_mcp_proxy as proxy
+
+        request = self._mock_request(Host="evil.example")
+        allowed, status, msg = proxy._is_inbound_request_allowed(request)
+        assert allowed is False
+        assert status == 403
+
+    def test_inbound_token_required(self, monkeypatch):
+        import mempalace_mcp_proxy as proxy
+
+        monkeypatch.setattr(proxy, "INBOUND_TOKEN", "secret-token")
+        request = self._mock_request(Host="127.0.0.1:8766")
+        allowed, status, msg = proxy._is_inbound_request_allowed(request)
+        assert allowed is False
+        assert status == 401
+
+    def test_inbound_token_accepted_when_present(self, monkeypatch):
+        import mempalace_mcp_proxy as proxy
+
+        monkeypatch.setattr(proxy, "INBOUND_TOKEN", "secret-token")
+        request = self._mock_request(
+            Host="127.0.0.1:8766",
+            Authorization="Bearer secret-token",
+        )
+        allowed, status, msg = proxy._is_inbound_request_allowed(request)
+        assert allowed is True

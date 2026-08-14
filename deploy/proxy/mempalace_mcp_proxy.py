@@ -64,6 +64,25 @@ MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "2"))
 SESSION_TTL = float(os.environ.get("SESSION_TTL", "1800"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
+# Inbound request security (Streamable-HTTP / DNS rebinding protection).
+# ALLOWED_ORIGINS: comma-separated list of permitted Origin headers.
+# ALLOWED_HOSTS: comma-separated list of permitted Host headers (no Origin).
+# INBOUND_TOKEN: optional bearer token required for all /mcp endpoints.
+ALLOWED_ORIGINS = frozenset(
+    o.strip()
+    for o in os.environ.get("ALLOWED_ORIGINS", "").split(",")
+    if o.strip()
+)
+ALLOWED_HOSTS = frozenset(
+    h.strip().lower()
+    for h in os.environ.get(
+        "ALLOWED_HOSTS",
+        f"127.0.0.1,127.0.0.1:{PORT},localhost,localhost:{PORT},{HOST}",
+    ).split(",")
+    if h.strip()
+)
+INBOUND_TOKEN = os.environ.get("INBOUND_TOKEN", "")
+
 # ── Idempotency / retry safety ─────────────────────────────────────────────────
 #
 # The proxy must not retry non-idempotent MCP tool calls: if a mutation
@@ -101,9 +120,14 @@ _READ_ONLY_TOOLS = frozenset(
         "mempalace_get_drawer",
         "mempalace_list_drawers",
         "mempalace_diary_read",
+    }
+)
+
+# Tools whose retry safety depends on the request payload.  These are NOT in
+# _READ_ONLY_TOOLS and are evaluated by _is_retry_safe on a per-call basis.
+_CONDITIONALLY_READ_ONLY_TOOLS = frozenset(
+    {
         "mempalace_hook_settings",
-        "mempalace_memories_filed_away",
-        "mempalace_reconnect",
     }
 )
 
@@ -235,7 +259,15 @@ def _is_retry_safe(body: bytes) -> bool:
     if method == "tools/call":
         params = req.get("params") or {}
         tool = params.get("name", "")
-        return tool in _READ_ONLY_TOOLS
+        if tool in _READ_ONLY_TOOLS:
+            return True
+
+        # Request-sensitive retry safety: `mempalace_hook_settings` is read-only
+        # only when called with no arguments (a status query).  Any arguments
+        # mean the caller is mutating configuration and must not be replayed.
+        if tool in _CONDITIONALLY_READ_ONLY_TOOLS:
+            arguments = params.get("arguments") or {}
+            return not arguments
 
     # Notifications and other methods are not retried by default.
     return False
@@ -256,16 +288,44 @@ async def _forward_to_upstream(
         try:
             resp = await client.post(UPSTREAM_URL, content=body, headers=headers)
 
-            if resp.status_code >= 500 and attempt < attempts - 1:
+            if resp.status_code >= 500:
                 last_error = f"Upstream returned {resp.status_code}"
+                circuit_record_failure()
+
+                if _circuit["state"] == "open" or attempt >= attempts - 1:
+                    _metrics["requests_failed"] += 1
+
+                    if resp.content:
+                        try:
+                            payload = resp.json()
+                            return payload, resp.status_code, None
+                        except Exception:
+                            pass
+
+                    return (
+                        {
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "error": {
+                                "code": -32000,
+                                "message": f"Upstream returned {resp.status_code}",
+                                "data": resp.text[:500],
+                            },
+                        },
+                        resp.status_code,
+                        last_error,
+                    )
+
                 log.warning(
                     f"Upstream {resp.status_code} (attempt {attempt + 1}/{attempts}), retrying..."
                 )
                 await asyncio.sleep(0.5 * (attempt + 1))
                 continue
 
-            circuit_record_success()
-            _metrics["requests_success"] += 1
+            # 2xx / 3xx / 4xx are not retried. Record success for 2xx/3xx.
+            if 200 <= resp.status_code < 400:
+                circuit_record_success()
+                _metrics["requests_success"] += 1
 
             # 202 Accepted / 204 No Content — valid for JSON-RPC notifications
             # (notifications have no response body). Return None to signal the
@@ -333,11 +393,51 @@ async def _forward_to_upstream(
     return None, 502, last_error or "All retries exhausted"
 
 
+def _is_inbound_request_allowed(request: web.Request) -> tuple[bool, int, str]:
+    """Validate Origin/Host and inbound bearer token for MCP endpoints.
+
+    - If the request includes an ``Origin`` header, it must match the request
+      ``Host`` or one of ``ALLOWED_ORIGINS``.
+    - If no ``Origin`` is present (non-browser clients), the ``Host`` header
+      must be in ``ALLOWED_HOSTS``.
+    - If ``INBOUND_TOKEN`` is configured, the request must carry a matching
+      ``Authorization: Bearer <token>`` header.
+    """
+    if INBOUND_TOKEN:
+        auth = request.headers.get("Authorization", "")
+        if not auth.startswith("Bearer ") or auth[7:] != INBOUND_TOKEN:
+            return False, 401, "Unauthorized — invalid or missing inbound token"
+
+    origin = request.headers.get("Origin")
+    host = request.headers.get("Host", "").lower()
+
+    if origin:
+        # Browser / cross-origin client: Origin must match Host or the allowlist.
+        if origin in ALLOWED_ORIGINS:
+            return True, 200, ""
+        if origin == f"http://{host}" or origin == f"https://{host}":
+            return True, 200, ""
+        return False, 403, f"Forbidden — Origin {origin!r} not allowed"
+
+    # Non-browser client with no Origin header: restrict by Host.
+    if host not in ALLOWED_HOSTS:
+        return False, 403, f"Forbidden — Host {host!r} not allowed"
+
+    return True, 200, ""
+
+
 # ── Handlers ───────────────────────────────────────────────────────────────────
 
 
 async def handle_mcp_post(request: web.Request) -> web.StreamResponse:
     """Handle POST /mcp — forward JSON-RPC to upstream and wrap response."""
+    allowed, status, msg = _is_inbound_request_allowed(request)
+    if not allowed:
+        return web.json_response(
+            {"jsonrpc": "2.0", "id": None, "error": {"code": -32000, "message": msg}},
+            status=status,
+        )
+
     req_start = time.time()
     request_id = uuid.uuid4().hex[:8]
     _metrics["requests_total"] += 1
@@ -395,11 +495,11 @@ async def handle_mcp_post(request: web.Request) -> web.StreamResponse:
             accept = request.headers.get("Accept", "")
             if "text/event-stream" in accept:
                 return web.Response(
-                    status=202,
+                    status=status,
                     content_type="text/event-stream",
                     headers=notif_headers,
                 )
-            return web.Response(status=202, headers=notif_headers)
+            return web.Response(status=status, headers=notif_headers)
 
         # Actual failure
         _metrics["requests_failed"] += 1
@@ -453,15 +553,23 @@ async def handle_mcp_post(request: web.Request) -> web.StreamResponse:
         sse_body = f"event: message\ndata: {data}\n\n"
         return web.Response(
             body=sse_body,
+            status=status,
             content_type="text/event-stream",
             headers=resp_headers,
         )
     else:
-        return web.json_response(payload, headers=resp_headers)
+        return web.json_response(payload, status=status, headers=resp_headers)
 
 
 async def handle_mcp_get(request: web.Request) -> web.StreamResponse:
     """Handle GET /mcp — SSE keep-alive stream."""
+    allowed, status, msg = _is_inbound_request_allowed(request)
+    if not allowed:
+        return web.json_response(
+            {"jsonrpc": "2.0", "id": None, "error": {"code": -32000, "message": msg}},
+            status=status,
+        )
+
     session_id = request.headers.get("Mcp-Session-Id")
     if not session_id or session_id not in sessions:
         return web.Response(status=400, text="Invalid or missing Mcp-Session-Id")
@@ -488,6 +596,13 @@ async def handle_mcp_get(request: web.Request) -> web.StreamResponse:
 
 async def handle_mcp_delete(request: web.Request) -> web.Response:
     """Handle DELETE /mcp — terminate a session."""
+    allowed, status, msg = _is_inbound_request_allowed(request)
+    if not allowed:
+        return web.json_response(
+            {"jsonrpc": "2.0", "id": None, "error": {"code": -32000, "message": msg}},
+            status=status,
+        )
+
     session_id = request.headers.get("Mcp-Session-Id")
     if session_id and session_id in sessions:
         del sessions[session_id]
