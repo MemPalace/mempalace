@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 import stat
 import subprocess
 import sys
@@ -41,6 +42,7 @@ def test_hook_path_raises_for_path_traversal():
         hook_path("../pyproject.toml")
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows has no POSIX executable bit")
 def test_hook_scripts_are_executable():
     for name in ("mempal_save_hook.sh", "mempal_precompact_hook.sh", "mempal_session_end_hook.sh"):
         p = hook_path(name)
@@ -55,7 +57,7 @@ def test_cli_hooks_path():
         text=True,
     )
     assert result.returncode == 0
-    assert result.stdout.strip().endswith("mempalace/hooks")
+    assert Path(result.stdout.strip()).parts[-2:] == ("mempalace", "hooks")
 
 
 def test_cli_hooks_install_claude():

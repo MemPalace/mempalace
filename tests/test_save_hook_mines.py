@@ -78,9 +78,7 @@ class TestShellHookTranscriptValidation:
 
     @staticmethod
     def _hook_src(name: str) -> str:
-        path = os.path.join(
-            os.path.dirname(os.path.dirname(__file__)), "mempalace", "hooks", name
-        )
+        path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "mempalace", "hooks", name)
         return open(path).read()
 
     @staticmethod
