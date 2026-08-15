@@ -376,3 +376,21 @@ def test_preprocess_directory_empty_content_skipped(tmp_path):
     processed = list((staging / "processed").iterdir())
     assert len(processed) == 1
     assert processed[0].name == "real.py"
+
+
+def test_preprocess_directory_respects_batch_snapshot(tmp_path):
+    """Only files listed in the batch snapshot are preprocessed."""
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    (staging / "claimed.py").write_text("x = 1\ny = 2\nz = 3\n", encoding="utf-8")
+    (staging / "late.py").write_text("a = 1\nb = 2\nc = 3\n", encoding="utf-8")
+
+    snapshot = staging / ".batch_snapshot"
+    # Unit-separator-delimited: rel\x1fsize\x1fmtime\x1fsha256
+    snapshot.write_text("claimed.py\x1f0\x1f0\x1f0\n", encoding="utf-8")
+
+    stats = pp.preprocess_directory(str(staging), max_lines=4000, batch_snapshot=snapshot)
+
+    assert stats["processed"] == 1
+    assert (staging / "processed" / "claimed.py").exists()
+    assert not (staging / "processed" / "late.py").exists()
