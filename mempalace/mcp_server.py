@@ -71,9 +71,13 @@ from .palace_graph import (  # noqa: E402
 )
 
 from .knowledge_graph import KnowledgeGraph  # noqa: E402
+from .taxonomy import validate_wing_room, assert_canonical_set_nonempty  # noqa: E402, SBAI-7040
 
 logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stderr)
 logger = logging.getLogger("mempalace_mcp")
+
+# Startup guard: ensure canonical taxonomy is loaded (SBAI-7040)
+assert_canonical_set_nonempty()
 
 
 def _parse_args():
@@ -601,8 +605,19 @@ def tool_follow_tunnels(wing: str, room: str):
 def tool_add_drawer(
     wing: str, room: str, content: str, source_file: str = None, added_by: str = "mcp"
 ):
-    """File verbatim content into a wing/room. Checks for duplicates first."""
+    """File verbatim content into a wing/room. Checks for duplicates first.
+
+    Wing and room are canonicalized via taxonomy.validate_wing_room() before
+    persistence (SBAI-7040). Unknown wings are rejected with an error.
+    """
     global _metadata_cache
+
+    # Canonicalize wing/room BEFORE sanitization/persistence (SBAI-7040)
+    try:
+        wing, room = validate_wing_room(wing, room)
+    except (ValueError, RuntimeError) as e:
+        return {"success": False, "error": f"taxonomy rejected: {e}"}
+
     try:
         wing = sanitize_name(wing, "wing")
         room = sanitize_name(room, "room")
