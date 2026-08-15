@@ -8523,6 +8523,66 @@ def _drop_broken_stdout() -> None:
         pass
 
 
+class _ExitOnBrokenPipeWriter:
+    """Turn an SDK stdout pipe failure into immediate clean process exit.
+
+    AnyIO cannot cancel its worker thread while the sibling stdin reader is
+    blocked in ``readline()``. If the SDK stdout task raises after the client
+    closes its read end, its task group otherwise waits forever for that stdin
+    thread. Exiting here is safe: a dead protocol channel cannot receive more
+    work, and the OS closes storage handles and releases flocks.
+    """
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    async def write(self, data):
+        try:
+            return await self._stream.write(data)
+        except (BrokenPipeError, OSError) as exc:
+            logger.info("stdio transport closed (%s) -- client disconnected", exc)
+            os._exit(0)
+
+    async def flush(self):
+        try:
+            return await self._stream.flush()
+        except (BrokenPipeError, OSError) as exc:
+            logger.info("stdio transport closed (%s) -- client disconnected", exc)
+            os._exit(0)
+
+
+@contextlib.contextmanager
+def _protected_sdk_stdout():
+    """Yield SDK output while keeping process fd 1 redirected to stderr."""
+
+    _restore_stdout()
+    private_fd = None
+    protocol_file = None
+    try:
+        private_fd = os.dup(1)
+        os.dup2(2, 1)
+        sys.stdout = sys.stderr
+        protocol_file = os.fdopen(
+            private_fd,
+            "w",
+            encoding="utf-8",
+            errors="strict",
+            closefd=False,
+        )
+        yield _ExitOnBrokenPipeWriter(anyio.wrap_file(protocol_file))
+    finally:
+        if private_fd is not None:
+            try:
+                os.dup2(private_fd, 1)
+            except OSError:
+                pass
+            try:
+                os.close(private_fd)
+            except OSError:
+                pass
+        sys.stdout = _REAL_STDOUT
+
+
 # Stdio→hub proxying. When a long-lived HTTP hub (`mempalace serve`) owns
 # this palace, a stdio server spawned by an agent harness must not open its
 # own Chroma handles: it could only ever be a read-only peer (writer lease,
@@ -8629,8 +8689,6 @@ def _dispatch_stdio_request(request: dict):
 
 
 def _run_stdio_loop() -> None:
-    _restore_stdout()
-
     # Force UTF-8 on stdio. MCP JSON-RPC is UTF-8, but Python on Windows
     # defaults stdin/stdout to the system codepage (e.g. cp1251), which
     # corrupts non-ASCII payloads and surfaces as generic -32000 errors on
@@ -8672,12 +8730,13 @@ def _run_stdio_loop() -> None:
     _start_write_stall_watchdog()
 
     async def _serve() -> None:
-        async with stdio_server() as (read_stream, write_stream):
-            await _MCP_SDK_SERVER.run(
-                read_stream,
-                write_stream,
-                _MCP_SDK_SERVER.create_initialization_options(),
-            )
+        with _protected_sdk_stdout() as protocol_stdout:
+            async with stdio_server(stdout=protocol_stdout) as (read_stream, write_stream):
+                await _MCP_SDK_SERVER.run(
+                    read_stream,
+                    write_stream,
+                    _MCP_SDK_SERVER.create_initialization_options(),
+                )
 
     try:
         anyio.run(_serve)
