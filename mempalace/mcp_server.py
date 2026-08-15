@@ -1349,6 +1349,7 @@ def _refresh_vector_disabled_flag() -> None:
     except Exception:
         logger.debug("HNSW capacity probe raised", exc_info=True)
         return
+    previous_capacity_status = _vector_capacity_status
     _vector_capacity_status = info
     if info.get("diverged"):
         if not _vector_disabled:
@@ -1360,6 +1361,20 @@ def _refresh_vector_disabled_flag() -> None:
             )
         _vector_disabled = True
         _vector_disabled_reason = info.get("message", "")
+    elif info.get("repair_recommended"):
+        # Compare the complete verdict rather than only its prose. Two
+        # replaced segments can have the same counts and message but still be
+        # distinct repair events; an unchanged cached verdict should stay
+        # quiet on every subsequent tool call.
+        same_stale_verdict = previous_capacity_status == info
+        if not same_stale_verdict:
+            logger.warning(
+                "HNSW capacity is stale — vector search remains enabled, but "
+                "results may be degraded. %s",
+                info.get("message", "unknown"),
+            )
+        _vector_disabled = False
+        _vector_disabled_reason = ""
     else:
         if _vector_disabled:
             logger.info(

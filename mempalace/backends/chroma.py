@@ -916,8 +916,9 @@ def hnsw_capacity_status(palace_path: str, collection_name: str = "mempalace_dra
     * ``sqlite_count``     — embeddings present in chroma.sqlite3
     * ``hnsw_count``       — elements chromadb's pickle knows about
     * ``divergence``       — ``sqlite_count - hnsw_count`` when both known
-    * ``diverged``         — True when divergence exceeds the threshold
-    * ``status``           — ``"ok"`` | ``"diverged"`` | ``"unknown"``
+    * ``diverged``         — True when sqlite dangerously exceeds HNSW
+    * ``repair_recommended`` — True when either direction needs a rebuild
+    * ``status``           — ``"ok"`` | ``"stale"`` | ``"diverged"`` | ``"unknown"``
     * ``message``          — human-readable summary
 
     Never raises — a probe that throws would defeat the point.
@@ -991,6 +992,7 @@ def _hnsw_capacity_status_uncached(
         "hnsw_count": None,
         "divergence": None,
         "diverged": False,
+        "repair_recommended": False,
         "status": "unknown",
         "message": "",
     }
@@ -1060,6 +1062,7 @@ def _hnsw_capacity_status_uncached(
         if divergence > threshold or stale_below_threshold:
             out["status"] = "diverged"
             out["diverged"] = True
+            out["repair_recommended"] = True
             pct = 100.0 * divergence / max(sqlite_count, 1)
             if divergence > threshold:
                 reason = f"exceeds threshold {threshold:,}"
@@ -1073,13 +1076,25 @@ def _hnsw_capacity_status_uncached(
                 f"({reason}). Vector reads are disabled until "
                 "`mempalace repair` rebuilds it."
             )
+        elif divergence < -threshold:
+            surplus = -divergence
+            out["status"] = "stale"
+            out["repair_recommended"] = True
+            out["message"] = (
+                f"HNSW index holds {hnsw_count:,} elements but sqlite has "
+                f"{sqlite_count:,} embeddings - {surplus:,} extra HNSW elements "
+                f"exceed threshold {threshold:,}. "
+                "They are likely stale entries left by deletes. Vector reads remain "
+                "enabled, but results may be degraded. Run `mempalace repair "
+                "--mode from-sqlite --archive-existing` to rebuild the index."
+            )
         else:
             out["status"] = "ok"
             out["message"] = (
                 f"HNSW {hnsw_count:,} / sqlite {sqlite_count:,} (within flush-lag tolerance)"
             )
             if divergence < 0:
-                out["message"] += " (HNSW has extra flushed elements; treating as safe)"
+                out["message"] += " (HNSW surplus is within delete-lag tolerance)"
 
     except Exception:
         logger.debug("hnsw_capacity_status failed", exc_info=True)

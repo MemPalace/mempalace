@@ -215,6 +215,7 @@ def test_capacity_status_ok_when_balanced(tmp_path):
     info = hnsw_capacity_status(str(tmp_path), COLLECTION)
     assert info["status"] == "ok"
     assert info["diverged"] is False
+    assert info["repair_recommended"] is False
     assert info["sqlite_count"] == 1000
     assert info["hnsw_count"] == 950
 
@@ -227,8 +228,202 @@ def test_capacity_status_flags_severe_divergence(tmp_path):
     info = hnsw_capacity_status(str(tmp_path), COLLECTION)
     assert info["status"] == "diverged"
     assert info["diverged"] is True
+    assert info["repair_recommended"] is True
     assert info["divergence"] == 18_000
     assert "repair" in info["message"].lower()
+
+
+def test_capacity_status_flags_large_hnsw_surplus_as_stale(tmp_path):
+    """Reproduces #2176: deleted HNSW elements must not be reported as OK."""
+    seg = "seg-2176-ghosts"
+    _seed_chroma_db(str(tmp_path), sqlite_count=1_606, segment_id=seg, sync_threshold=2)
+    _write_pickle(str(tmp_path), seg, hnsw_count=9_974)
+
+    info = hnsw_capacity_status(str(tmp_path), COLLECTION)
+
+    assert info["divergence"] == -8_368
+    assert info["threshold"] == 4
+    assert info["status"] == "stale"
+    assert info["diverged"] is False
+    assert info["repair_recommended"] is True
+    assert "stale" in info["message"].lower()
+    assert "delete" in info["message"].lower()
+    assert "from-sqlite" in info["message"]
+
+
+@pytest.mark.parametrize(
+    ("sync_threshold", "surplus", "threshold", "expected_status"),
+    [
+        (2, 4, 4, "ok"),
+        (2, 5, 4, "stale"),
+        (None, 1_999, 2_000, "ok"),
+        (None, 2_000, 2_000, "ok"),
+        (None, 2_001, 2_000, "stale"),
+    ],
+)
+def test_capacity_status_hnsw_surplus_threshold_boundary(
+    tmp_path, sync_threshold, surplus, threshold, expected_status
+):
+    """Surplus must exceed the configured or legacy delete-lag tolerance."""
+    seg = "seg-delete-lag-boundary"
+    _seed_chroma_db(
+        str(tmp_path),
+        sqlite_count=1_606,
+        segment_id=seg,
+        sync_threshold=sync_threshold,
+    )
+    _write_pickle(str(tmp_path), seg, hnsw_count=1_606 + surplus)
+
+    info = hnsw_capacity_status(str(tmp_path), COLLECTION)
+
+    assert info["divergence"] == -surplus
+    assert info["threshold"] == threshold
+    assert info["status"] == expected_status
+    assert info["diverged"] is False
+    assert info["repair_recommended"] is (expected_status == "stale")
+
+
+def test_mcp_probe_keeps_vectors_enabled_for_stale_hnsw_surplus(tmp_path, monkeypatch, caplog):
+    """Ghost surplus degrades results but is not the #1222 crash-risk shape."""
+    from mempalace import mcp_server
+
+    seg = "seg-mcp-2176-ghosts"
+    _seed_chroma_db(str(tmp_path), sqlite_count=1_606, segment_id=seg, sync_threshold=2)
+    _write_pickle(str(tmp_path), seg, hnsw_count=9_974)
+
+    class _Cfg:
+        palace_path = str(tmp_path)
+        collection_name = COLLECTION
+
+    monkeypatch.setattr(mcp_server, "_config", _Cfg())
+    monkeypatch.setattr(mcp_server, "_vector_disabled", True)
+    monkeypatch.setattr(mcp_server, "_vector_disabled_reason", "old divergence")
+    monkeypatch.setattr(mcp_server, "_vector_capacity_status", None)
+
+    mcp_server._refresh_vector_disabled_flag()
+    mcp_server._refresh_vector_disabled_flag()
+
+    observed_search = {}
+
+    def _search(_query, **kwargs):
+        observed_search.update(kwargs)
+        return {"results": []}
+
+    monkeypatch.setattr(mcp_server, "search_memories", _search)
+    assert mcp_server.tool_search("ghost surplus") == {"results": []}
+    assert (
+        mcp_server._mcp_diverged_index_refusal(
+            req_id=2176,
+            tool_name="mempalace_add_drawer",
+        )
+        is None
+    )
+
+    assert mcp_server._vector_disabled is False
+    assert mcp_server._vector_disabled_reason == ""
+    assert observed_search["vector_disabled"] is False
+    assert mcp_server._vector_capacity_status["status"] == "stale"
+    assert mcp_server._vector_capacity_status["repair_recommended"] is True
+    stale_warnings = [
+        record for record in caplog.records if "capacity is stale" in record.getMessage()
+    ]
+    assert len(stale_warnings) == 1
+    assert "within tolerance" not in caplog.text
+    assert "mempalace repair --mode from-sqlite --archive-existing" in caplog.text
+
+
+def test_mcp_probe_tracks_stale_transitions_and_warns_once_per_distinct_verdict(
+    monkeypatch, caplog
+):
+    """State transitions must clear only the crash fence and keep warnings useful."""
+    from mempalace import mcp_server
+
+    stale_message = (
+        "HNSW has deleted entries. Run `mempalace repair --mode from-sqlite "
+        "--archive-existing` to rebuild the index."
+    )
+    diverged = {
+        "segment_id": "seg-danger",
+        "sqlite_count": 30,
+        "hnsw_count": 0,
+        "divergence": 30,
+        "diverged": True,
+        "repair_recommended": True,
+        "status": "diverged",
+        "message": "undersized index",
+    }
+    stale_a = {
+        "segment_id": "seg-stale-a",
+        "sqlite_count": 1_606,
+        "hnsw_count": 9_974,
+        "divergence": -8_368,
+        "diverged": False,
+        "repair_recommended": True,
+        "status": "stale",
+        "message": stale_message,
+    }
+    stale_b = {**stale_a, "segment_id": "seg-stale-b"}
+    ok = {
+        "segment_id": "seg-stale-b",
+        "sqlite_count": 1_606,
+        "hnsw_count": 1_606,
+        "divergence": 0,
+        "diverged": False,
+        "repair_recommended": False,
+        "status": "ok",
+        "message": "within tolerance",
+    }
+    unknown = {
+        "segment_id": "seg-stale-b",
+        "sqlite_count": 1_606,
+        "hnsw_count": None,
+        "divergence": None,
+        "diverged": False,
+        "repair_recommended": False,
+        "status": "unknown",
+        "message": "metadata has not been flushed; leaving vector search enabled",
+    }
+    verdicts = iter(
+        [
+            diverged,
+            stale_a,
+            dict(stale_a),
+            stale_b,
+            ok,
+            dict(stale_a),
+            unknown,
+        ]
+    )
+
+    monkeypatch.setattr(mcp_server, "_is_chroma_backend", lambda: True)
+    monkeypatch.setattr(mcp_server, "hnsw_capacity_status", lambda *_args: next(verdicts))
+    monkeypatch.setattr(mcp_server, "_vector_disabled", False)
+    monkeypatch.setattr(mcp_server, "_vector_disabled_reason", "")
+    monkeypatch.setattr(mcp_server, "_vector_capacity_status", None)
+
+    mcp_server._refresh_vector_disabled_flag()  # diverged
+    assert mcp_server._vector_disabled is True
+    assert mcp_server._vector_disabled_reason == "undersized index"
+
+    mcp_server._refresh_vector_disabled_flag()  # diverged -> stale A
+    assert mcp_server._vector_disabled is False
+    assert mcp_server._vector_disabled_reason == ""
+    mcp_server._refresh_vector_disabled_flag()  # identical stale A
+    mcp_server._refresh_vector_disabled_flag()  # same prose, new segment B
+    mcp_server._refresh_vector_disabled_flag()  # stale -> ok
+    assert mcp_server._vector_disabled is False
+    mcp_server._refresh_vector_disabled_flag()  # ok -> stale A, a new event
+    assert mcp_server._vector_disabled is False
+    mcp_server._refresh_vector_disabled_flag()  # stale -> unknown
+    assert mcp_server._vector_disabled is False
+    assert mcp_server._vector_disabled_reason == ""
+    assert mcp_server._vector_capacity_status["status"] == "unknown"
+
+    stale_warnings = [
+        record for record in caplog.records if "capacity is stale" in record.getMessage()
+    ]
+    assert len(stale_warnings) == 3
+    assert all("from-sqlite --archive-existing" in record.getMessage() for record in stale_warnings)
 
 
 def test_capacity_status_tolerates_flush_lag(tmp_path):
@@ -247,6 +442,7 @@ def test_capacity_status_does_not_flag_unflushed_with_large_sqlite(tmp_path):
     _seed_chroma_db(str(tmp_path), sqlite_count=10_000, segment_id=seg)
     info = hnsw_capacity_status(str(tmp_path), COLLECTION)
     assert info["diverged"] is False
+    assert info["repair_recommended"] is False
     assert info["status"] == "unknown"
     assert info["divergence"] is None
     assert info["hnsw_count"] is None
@@ -280,6 +476,7 @@ def test_mcp_probe_does_not_disable_vectors_for_unflushed_metadata(tmp_path, mon
 def test_capacity_status_quiet_for_empty_palace(tmp_path):
     info = hnsw_capacity_status(str(tmp_path), COLLECTION)
     assert info["diverged"] is False
+    assert info["repair_recommended"] is False
     assert info["status"] == "unknown"
 
 
@@ -605,6 +802,89 @@ def test_repair_status_reports_diverged(tmp_path, capsys):
     assert "mempalace repair --mode from-sqlite --archive-existing" in captured
     assert "Do not re-mine" in captured
     assert out["drawers"]["diverged"] is True
+
+
+def test_repair_status_recommends_rebuild_for_stale_hnsw_surplus(tmp_path, capsys):
+    """#2176: repair-status must distinguish ghost surplus from healthy lag."""
+    from mempalace.repair import status as repair_status
+
+    seg = "seg-status-2176-ghosts"
+    _seed_chroma_db(str(tmp_path), sqlite_count=1_606, segment_id=seg, sync_threshold=2)
+    _write_pickle(str(tmp_path), seg, hnsw_count=9_974)
+
+    out = repair_status(palace_path=str(tmp_path))
+    captured = capsys.readouterr().out
+
+    assert "STALE" in captured
+    assert "mempalace repair --mode from-sqlite --archive-existing" in captured
+    assert "Do not re-mine" in captured
+    assert out["drawers"]["status"] == "stale"
+    assert out["drawers"]["diverged"] is False
+    assert out["drawers"]["repair_recommended"] is True
+
+
+def test_repair_status_detects_ghosts_after_all_sqlite_rows_are_deleted(tmp_path, capsys):
+    """An empty SQLite collection can still retain a stale HNSW segment (#2176)."""
+    from mempalace.repair import status as repair_status
+
+    seg = "seg-status-2176-empty-sqlite"
+    _seed_chroma_db(str(tmp_path), sqlite_count=0, segment_id=seg, sync_threshold=2)
+    _write_pickle(str(tmp_path), seg, hnsw_count=10)
+
+    out = repair_status(palace_path=str(tmp_path))
+    captured = capsys.readouterr().out
+
+    assert "initialized but empty" not in captured
+    assert "STALE" in captured
+    assert "mempalace repair --mode from-sqlite --archive-existing" in captured
+    assert out["drawers"]["status"] == "stale"
+    assert out["drawers"]["repair_recommended"] is True
+
+
+def test_repair_status_does_not_hide_stale_closets_when_drawers_are_empty(
+    tmp_path, monkeypatch, capsys
+):
+    """The empty-drawers shortcut must still surface a damaged sibling index."""
+    from mempalace import repair
+
+    (tmp_path / "chroma.sqlite3").touch()
+    drawers = {
+        "segment_id": "drawers",
+        "sqlite_count": 0,
+        "hnsw_count": 0,
+        "divergence": 0,
+        "diverged": False,
+        "repair_recommended": False,
+        "status": "ok",
+        "message": "drawers are empty",
+    }
+    closets = {
+        "segment_id": "closets",
+        "sqlite_count": 0,
+        "hnsw_count": 10,
+        "divergence": -10,
+        "diverged": False,
+        "repair_recommended": True,
+        "status": "stale",
+        "message": "closets contain deleted entries",
+    }
+
+    monkeypatch.setattr(repair, "sqlite_drawer_count", lambda *_args: 0)
+    monkeypatch.setattr(
+        repair,
+        "hnsw_capacity_status",
+        lambda _path, collection: drawers if collection == COLLECTION else closets,
+    )
+
+    out = repair.status(palace_path=str(tmp_path), collection_name=COLLECTION)
+    captured = capsys.readouterr().out
+
+    assert "initialized but empty" not in captured
+    assert "[closets]" in captured
+    assert "STALE" in captured
+    assert "mempalace repair --mode from-sqlite --archive-existing" in captured
+    assert out["drawers"] == drawers
+    assert out["closets"] == closets
 
 
 def test_repair_status_quiet_on_healthy_palace(tmp_path, capsys):

@@ -2368,12 +2368,15 @@ def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
     # (chromadb version drift, missing tables, locked file). None means fall
     # through and let hnsw_capacity_status report "unknown".
     drawer_row_count = sqlite_drawer_count(palace_path, collection_name)
-    if isinstance(drawer_row_count, int) and drawer_row_count == 0:
-        print("  Palace is initialized but empty (no drawers yet).\n")
-        return {"status": "empty", "message": "palace has no drawers yet"}
-
     drawers = hnsw_capacity_status(palace_path, collection_name)
     closets = hnsw_capacity_status(palace_path, CLOSETS_COLLECTION_NAME)
+
+    repair_recommended = any(
+        info.get("diverged") or info.get("repair_recommended") for info in (drawers, closets)
+    )
+    if isinstance(drawer_row_count, int) and drawer_row_count == 0 and not repair_recommended:
+        print("  Palace is initialized but empty (no drawers yet).\n")
+        return {"status": "empty", "message": "palace has no drawers yet"}
 
     for label, info in (("drawers", drawers), ("closets", closets)):
         print(f"\n  [{label}]")
@@ -2392,13 +2395,14 @@ def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
         if info["message"]:
             print(f"    note:           {info['message']}")
 
-    if drawers["diverged"] or closets["diverged"]:
+    if repair_recommended:
         print(
             "\n  Recommended: rebuild the index from SQLite rather than re-mining:\n"
             "\n      mempalace repair --mode from-sqlite --archive-existing\n"
-            "\n  A diverged index usually means the HNSW segment is out of sync with\n"
-            "  chroma.sqlite3 (for example a failed chromadb HNSW compaction). The\n"
-            "  drawer rows are intact in SQLite, so --mode from-sqlite recovers them.\n"
+            "\n  A diverged or stale index means the HNSW segment is out of sync with\n"
+            "  chroma.sqlite3 (for example missing rows or stale deleted elements). The\n"
+            "  SQLite database remains the source of truth, so --mode from-sqlite\n"
+            "  rebuilds exactly the live rows.\n"
             "  Do not re-mine from source files: that would drop drawers added via\n"
             "  the MCP server and diary entries, which have no source file (#1843)."
         )
