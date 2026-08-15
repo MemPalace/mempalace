@@ -4376,9 +4376,17 @@ def tool_memories_filed_away():
             "count": 0,
             "timestamp": None,
         }
+    error_result = {
+        "status": "error",
+        "message": "\u2726 Journal entry filed in the palace",
+        "count": 0,
+        "timestamp": None,
+    }
     try:
         data = json.loads(ack_file.read_text(encoding="utf-8"))
         ack_file.unlink(missing_ok=True)
+        if not isinstance(data, dict):
+            return error_result
         msgs = data.get("msgs", 0)
         return {
             "status": "ok",
@@ -4388,12 +4396,7 @@ def tool_memories_filed_away():
         }
     except (json.JSONDecodeError, OSError):
         ack_file.unlink(missing_ok=True)
-        return {
-            "status": "error",
-            "message": "\u2726 Journal entry filed in the palace",
-            "count": 0,
-            "timestamp": None,
-        }
+        return error_result
 
 
 # ==================== SETTINGS TOOLS ====================
