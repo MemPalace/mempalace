@@ -1,5 +1,6 @@
 """Tests for the `hallways` CLI command."""
 
+import json
 from argparse import Namespace
 
 import mempalace.hallways as hallways_mod
@@ -72,3 +73,42 @@ def test_explicit_palace_scopes_hallway_listing(monkeypatch, tmp_path):
     cmd_hallways(Namespace(wing="wing_aya", limit=50, palace=str(selected)))
 
     assert calls == [("wing_aya", str(selected))]
+
+
+def test_malformed_stored_count_is_skipped_before_cli_sort(monkeypatch, tmp_path, capsys):
+    hallway_file = tmp_path / "hallways.json"
+    monkeypatch.setattr(
+        hallways_mod,
+        "_get_hallway_file",
+        lambda *args, **kwargs: str(hallway_file),
+    )
+    monkeypatch.setattr(
+        hallways_mod,
+        "_legacy_hallway_file",
+        lambda: str(tmp_path / "legacy-hallways.json"),
+    )
+    valid = {
+        "id": "valid",
+        "wing": "wing_a",
+        "entity_a": "A",
+        "entity_b": "B",
+        "co_occurrence_count": 2,
+        "label": "A <-> B",
+    }
+    malformed = {
+        **valid,
+        "id": "malformed",
+        "co_occurrence_count": "SECRET_BAD_COUNT",
+    }
+    hallway_file.write_text(
+        json.dumps({"schema_version": 1, "hallways": [valid, malformed]}),
+        encoding="utf-8",
+    )
+
+    cmd_hallways(Namespace(wing=None, limit=50, palace=None))
+
+    captured = capsys.readouterr()
+    assert "1 hallway(s)" in captured.out
+    assert "A <-> B" in captured.out
+    assert "SECRET_BAD_COUNT" not in captured.out
+    assert "SECRET_BAD_COUNT" not in captured.err

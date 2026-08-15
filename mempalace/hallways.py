@@ -83,8 +83,50 @@ def _legacy_hallway_file() -> str:
     return os.path.join(os.path.expanduser("~"), ".mempalace", "hallways.json")
 
 
+def _is_valid_hallway_record(record) -> bool:
+    """Return whether ``record`` has the minimum traversable hallway shape.
+
+    Every generated hallway has carried these four string fields since the
+    feature shipped. Other fields are deliberately optional so pre-dynamics
+    records and hand-added metadata remain readable, but a stored count must
+    remain sortable, stored rooms must remain iterable strings, and the full
+    record must be safe for the next UTF-8 save.
+    """
+    if not isinstance(record, dict):
+        return False
+    if not all(
+        isinstance(record.get(field), str) and record[field].strip()
+        for field in ("id", "wing", "entity_a", "entity_b")
+    ):
+        return False
+
+    count = record.get("co_occurrence_count")
+    if "co_occurrence_count" in record and (
+        isinstance(count, bool) or not isinstance(count, (int, float))
+    ):
+        return False
+
+    rooms = record.get("rooms")
+    if "rooms" in record and (
+        not isinstance(rooms, list) or any(not isinstance(room, str) for room in rooms)
+    ):
+        return False
+
+    try:
+        json.dumps(record, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError):
+        return False
+    return True
+
+
 def _load_hallways(config=None) -> list[dict]:
-    """Read all hallway records. Returns ``[]`` if the file is missing or corrupt.
+    """Read valid hallway records. Return ``[]`` if the file is missing or corrupt.
+
+    Both the current ``{"hallways": [...]}`` envelope and the legacy bare
+    list are accepted. Malformed records are skipped centrally so a single
+    bad value cannot crash list, delete, compute, CLI, or MCP consumers. A
+    read never rewrites the sidecar; the next successful mutation naturally
+    persists only the valid records.
 
     Backwards-compatibility: prior to this migration the hallway file was
     hardcoded at ``~/.mempalace/hallways.json`` regardless of the configured
@@ -99,14 +141,46 @@ def _load_hallways(config=None) -> list[dict]:
         try:
             with open(current_hallway_file, encoding="utf-8") as f:
                 raw = json.load(f)
-        except (OSError, json.JSONDecodeError):
-            logger.debug("hallways: load failed, treating as empty", exc_info=True)
+        except (OSError, UnicodeDecodeError, ValueError, RecursionError):
+            # Exception messages from custom JSON decoders can include record
+            # contents. The path is enough to diagnose this read-only fallback.
+            logger.debug(
+                "Hallways file '%s' could not be read or decoded; treating as empty.",
+                current_hallway_file,
+            )
             return []
         if isinstance(raw, dict) and "hallways" in raw:
-            return raw.get("hallways") or []
-        if isinstance(raw, list):
-            return raw
-        return []
+            records = raw.get("hallways")
+        elif isinstance(raw, list):
+            records = raw
+        else:
+            logger.warning(
+                "Hallways file '%s' has top-level type %s; expected a JSON list "
+                "or an object containing one; starting empty.",
+                current_hallway_file,
+                type(raw).__name__,
+            )
+            return []
+
+        if not isinstance(records, list):
+            logger.warning(
+                "Hallways file '%s' has hallway payload type %s; expected a JSON list; "
+                "starting empty.",
+                current_hallway_file,
+                type(records).__name__,
+            )
+            return []
+
+        valid_records = [record for record in records if _is_valid_hallway_record(record)]
+        skipped = len(records) - len(valid_records)
+        if skipped:
+            logger.warning(
+                "Skipped %d malformed hallway record%s from '%s'.",
+                skipped,
+                "" if skipped == 1 else "s",
+                current_hallway_file,
+            )
+        return valid_records
 
     legacy = _legacy_hallway_file()
     if legacy != current_hallway_file and os.path.exists(legacy):
