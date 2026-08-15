@@ -1043,6 +1043,26 @@ def _close_or_defer_writer_lease(
         writer_lease.close()
 
 
+def _enter_daemon_writer_lease(
+    writer_lease: contextlib.ExitStack,
+    palace_path: str,
+    resolved_backend: str,
+) -> None:
+    """Acquire lifetime ownership when the backend requires one writer."""
+    if not backend_requires_single_writer(resolved_backend):
+        return
+
+    try:
+        writer_lease.enter_context(mine_palace_lock(palace_path))
+    except MineAlreadyRunning as exc:
+        raise DaemonError(
+            "writable daemon startup refused: another writer owns "
+            f"local backend {resolved_backend!r} for {palace_path!r}; "
+            "stop the existing writable MCP/direct/daemon owner, or "
+            "route all writes through that owner"
+        ) from exc
+
+
 def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -> None:
     palace_path = canonical_palace_path(palace_path)
     previous_env = {
@@ -1073,16 +1093,11 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
     writer_lease = contextlib.ExitStack()
     try:
         resolved_backend = resolve_backend_name(palace_path, explicit=backend)
-        if backend_requires_single_writer(resolved_backend):
-            try:
-                writer_lease.enter_context(mine_palace_lock(palace_path))
-            except MineAlreadyRunning as exc:
-                raise DaemonError(
-                    "writable daemon startup refused: another writer owns "
-                    f"local backend {resolved_backend!r} for {palace_path!r}; "
-                    "stop the existing writable MCP/direct/daemon owner, or "
-                    "route all writes through that owner"
-                ) from exc
+        _enter_daemon_writer_lease(
+            writer_lease,
+            palace_path,
+            resolved_backend,
+        )
 
         token = ensure_token(palace_path)
         # Backend resolution above is only the ownership decision. Preserve
