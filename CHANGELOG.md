@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Features
+
+- **Config-driven local embedding models: `generic-onnx` backend + `e5-small` preset.** Local embedders were fixed choices (minilm, embeddinggemma) and anything else required standing up an `openai-compat` endpoint. `embedding_model: "generic-onnx"` now runs any HuggingFace-hosted ONNX encoder selected entirely from configuration — repo, ONNX file, pooling, instruction prefixes and the persisted EF identity come from `embedding_onnx_*` keys in `config.json` (each overridable via the matching `MEMPALACE_EMBEDDING_ONNX_*` env var). `embedding_model: "e5-small"` is a bundled preset for `intfloat/multilingual-e5-small`: 384-dim like the default collections, ~120 MB vs embeddinggemma's ~300 MB, and measured on a real 200k-drawer RU-heavy palace at MRR 0.754 vs 0.536 for minilm. Same lazy deps as embeddinggemma — no new requirements; switching models on an existing palace still requires `mempalace repair rebuild-index`. (#1563, #1261, #1663)
+
 ### Bug Fixes
 
 - **`sweep` books a failed `stat` as a failure again.** The non-regular-file gate added in 3.7.1 reads `stat.S_ISREG(f.stat().st_mode)` inside a `try`, and its `except OSError` printed `SKIP` and moved on. A dangling symlink, a symlink loop and a file unlinked between `rglob` and the gate all raise there, and before the gate existed every one of them reached `sweep()` and was booked in `failures` — so `sweep` went from reporting a transcript it could not read to reporting success. A failed probe is now an error, not a benign file type: it is logged, printed as `WARNING`, and appended to `failures`, while a probe that succeeds and says "not regular" still skips silently. (#2221)

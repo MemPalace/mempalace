@@ -748,10 +748,14 @@ class MempalaceConfig:
 
         Values: ``"minilm"`` (ChromaDB's all-MiniLM-L6-v2 — English-only),
         ``"embeddinggemma"`` (multilingual, 100+ languages, default for
-        new installs since onboarding writes the choice), or
-        ``"openai-compat"`` (embeddings served by an OpenAI-compatible
-        ``/v1/embeddings`` endpoint — see ``embedding_api_url`` /
-        ``embedding_api_model`` / ``embedding_api_key``). Read from env
+        new installs since onboarding writes the choice),
+        ``"e5-small"`` (bundled ``intfloat/multilingual-e5-small`` preset —
+        see :mod:`mempalace.generic_onnx_embedding`), ``"generic-onnx"``
+        (any HuggingFace ONNX encoder, driven by the ``embedding_onnx_*``
+        settings), or ``"openai-compat"`` (embeddings served by an
+        OpenAI-compatible ``/v1/embeddings`` endpoint — see
+        ``embedding_api_url`` / ``embedding_api_model`` /
+        ``embedding_api_key``). Read from env
         ``MEMPALACE_EMBEDDING_MODEL`` first, then ``embedding_model`` in
         ``config.json``, then ``"minilm"`` as a back-compat fallback for
         palaces created before onboarding asked the question.
@@ -880,6 +884,132 @@ class MempalaceConfig:
         local endpoints that need no auth).
         """
         return self._resolve_str_setting("MEMPALACE_EMBEDDING_API_KEY", "embedding_api_key")
+
+    def _resolve_prefix_setting(self, env_var: str, config_key: str) -> str:
+        """Resolve a prefix setting: env var > ``config.json`` > ``""``.
+
+        Unlike :meth:`_resolve_str_setting` the value is **not** stripped —
+        instruction prefixes for e5-style models end with a significant
+        space (``"query: "``). A whitespace-only env var still counts as
+        unset so it cannot silently mask the config-file value.
+        """
+        env_val = os.environ.get(env_var)
+        if env_val is not None and env_val.strip():
+            return env_val
+        cfg_val = self._file_config.get(config_key)
+        if isinstance(cfg_val, str):
+            return cfg_val
+        return ""
+
+    @property
+    def embedding_onnx_repo(self):
+        """HuggingFace repo id of the ``generic-onnx`` embedding model.
+
+        Required when ``embedding_model == "generic-onnx"`` (e.g.
+        ``intfloat/multilingual-e5-small``). Resolved from env
+        ``MEMPALACE_EMBEDDING_ONNX_REPO`` first, then ``embedding_onnx_repo``
+        in ``config.json``; ``None`` when unset.
+        """
+        return self._resolve_str_setting("MEMPALACE_EMBEDDING_ONNX_REPO", "embedding_onnx_repo")
+
+    @property
+    def embedding_onnx_file(self):
+        """ONNX graph filename inside the model repo (default ``model.onnx``).
+
+        Pick the fp32 export unless you have measured otherwise — quantized
+        and fp16 exports are not universally faster on CPU execution
+        providers. Env ``MEMPALACE_EMBEDDING_ONNX_FILE`` overrides.
+        """
+        return (
+            self._resolve_str_setting("MEMPALACE_EMBEDDING_ONNX_FILE", "embedding_onnx_file")
+            or "model.onnx"
+        )
+
+    @property
+    def embedding_onnx_subfolder(self):
+        """Repo subfolder holding the ONNX file (default ``onnx``).
+
+        Set to ``"."`` for repos that keep the graph at the repo root.
+        Env ``MEMPALACE_EMBEDDING_ONNX_SUBFOLDER`` overrides.
+        """
+        return (
+            self._resolve_str_setting(
+                "MEMPALACE_EMBEDDING_ONNX_SUBFOLDER", "embedding_onnx_subfolder"
+            )
+            or "onnx"
+        )
+
+    @property
+    def embedding_onnx_pooling(self):
+        """Pooling strategy for the ``generic-onnx`` model: ``mean`` or ``cls``.
+
+        ``mean`` (default) is the attention-masked token average most
+        sentence encoders expect; ``cls`` takes the first token. Values are
+        validated at EF construction time. Env
+        ``MEMPALACE_EMBEDDING_ONNX_POOLING`` overrides.
+        """
+        val = self._resolve_str_setting(
+            "MEMPALACE_EMBEDDING_ONNX_POOLING", "embedding_onnx_pooling"
+        )
+        return val.lower() if val else "mean"
+
+    @property
+    def embedding_onnx_max_len(self) -> int:
+        """Tokenizer truncation length for the ``generic-onnx`` model.
+
+        Defaults to ``512`` (the ceiling for most BERT-lineage encoders).
+        Env ``MEMPALACE_EMBEDDING_ONNX_MAX_LEN`` overrides; non-numeric or
+        non-positive values fall back to the default.
+        """
+        raw = os.environ.get("MEMPALACE_EMBEDDING_ONNX_MAX_LEN")
+        if raw is None:
+            raw = self._file_config.get("embedding_onnx_max_len")
+        try:
+            val = int(str(raw).strip())
+        except (TypeError, ValueError):
+            return 512
+        return val if val > 0 else 512
+
+    @property
+    def embedding_onnx_doc_prefix(self):
+        """Prefix prepended on the indexing path (default ``""``).
+
+        Instruction-tuned retrieval models expect a role marker — e5 uses
+        ``"passage: "`` for documents. The trailing space is significant and
+        preserved; see :meth:`_resolve_prefix_setting`. Env
+        ``MEMPALACE_EMBEDDING_ONNX_DOC_PREFIX`` overrides.
+        """
+        return self._resolve_prefix_setting(
+            "MEMPALACE_EMBEDDING_ONNX_DOC_PREFIX", "embedding_onnx_doc_prefix"
+        )
+
+    @property
+    def embedding_onnx_query_prefix(self):
+        """Prefix prepended on the ``embed_query`` path (default ``""``).
+
+        Only effective for call sites that use ``embed_query``; the current
+        embedding wrapper routes everything through ``__call__``, which
+        applies ``embedding_onnx_doc_prefix`` symmetrically. Env
+        ``MEMPALACE_EMBEDDING_ONNX_QUERY_PREFIX`` overrides.
+        """
+        return self._resolve_prefix_setting(
+            "MEMPALACE_EMBEDDING_ONNX_QUERY_PREFIX", "embedding_onnx_query_prefix"
+        )
+
+    @property
+    def embedding_onnx_ef_name(self):
+        """Identity name persisted on the collection for ``generic-onnx``.
+
+        Defaults to a name derived from repo + ONNX file, so pointing the
+        config at a different model trips the embedder-identity check
+        instead of silently mixing vector spaces. Set it explicitly when
+        changing vector-affecting knobs that the derived name cannot see
+        (pooling, max_len, prefixes). Env
+        ``MEMPALACE_EMBEDDING_ONNX_EF_NAME`` overrides; ``None`` when unset.
+        """
+        return self._resolve_str_setting(
+            "MEMPALACE_EMBEDDING_ONNX_EF_NAME", "embedding_onnx_ef_name"
+        )
 
     @property
     def topic_tunnel_min_count(self):

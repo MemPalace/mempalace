@@ -42,6 +42,7 @@ _REAL_EMBEDDING_TEST_MODULES = {
     "test_embedding",
     "test_embedding_api",
     "test_embeddinggemma",
+    "test_generic_onnx",
 }
 
 
