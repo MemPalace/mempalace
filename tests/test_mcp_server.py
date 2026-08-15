@@ -3046,6 +3046,50 @@ class TestWriteTools:
 
         assert result == {"error": msg}
 
+    def test_tunnel_tools_forward_server_config(self, monkeypatch):
+        """Every tunnel handler must stay scoped to the MCP server's palace."""
+        from mempalace import mcp_server
+
+        config = object()
+        collection = object()
+        seen = {}
+
+        monkeypatch.setattr(mcp_server, "_config", config)
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda: collection)
+
+        def fake_create(*args, config=None, **kwargs):
+            seen["create"] = config
+            return {"id": "tunnel_1"}
+
+        def fake_list(*args, config=None, **kwargs):
+            seen["list"] = config
+            return []
+
+        def fake_delete(*args, config=None, **kwargs):
+            seen["delete"] = config
+            return {"deleted": "tunnel_1"}
+
+        def fake_follow(*args, config=None, **kwargs):
+            seen["follow"] = config
+            return []
+
+        monkeypatch.setattr(mcp_server, "create_tunnel", fake_create)
+        monkeypatch.setattr(mcp_server, "list_tunnels", fake_list)
+        monkeypatch.setattr(mcp_server, "delete_tunnel", fake_delete)
+        monkeypatch.setattr(mcp_server, "follow_tunnels", fake_follow)
+
+        mcp_server.tool_create_tunnel("wing_a", "room_a", "wing_b", "room_b")
+        mcp_server.tool_list_tunnels("wing_a")
+        mcp_server.tool_delete_tunnel("tunnel_1")
+        mcp_server.tool_follow_tunnels("wing_a", "room_a")
+
+        assert seen == {
+            "create": config,
+            "list": config,
+            "delete": config,
+            "follow": config,
+        }
+
     # ── hallway MCP tools (mirror the tunnel pattern) ──
 
     def _seed_hallways(self, monkeypatch, tmp_path):
@@ -3079,6 +3123,47 @@ class TestWriteTools:
         ]
         hallways._save_hallways(seeded)
         return seeded
+
+    def _seed_two_hallway_palaces(self, monkeypatch, tmp_path):
+        """Seed the same hallway ID in selected A and ambient B."""
+        from mempalace import config as config_module
+        from mempalace import hallways, mcp_server
+        from mempalace.config import MempalaceConfig
+
+        config_a = MempalaceConfig(palace_path=tmp_path / "palace-a" / "palace")
+        config_b = MempalaceConfig(palace_path=tmp_path / "palace-b" / "palace")
+        hallway_id = "hallway_wing_shared_X_Y_same"
+        hallways._save_hallways(
+            [{"id": hallway_id, "wing": "wing_shared", "label": "A-only"}],
+            config=config_a,
+        )
+        hallways._save_hallways(
+            [{"id": hallway_id, "wing": "wing_shared", "label": "B-only"}],
+            config=config_b,
+        )
+
+        monkeypatch.setattr(config_module, "MempalaceConfig", lambda *args, **kwargs: config_b)
+        monkeypatch.setattr(mcp_server, "_config", config_a)
+        return config_a, config_b, hallway_id
+
+    def test_tool_list_hallways_reads_only_server_palace(self, monkeypatch, tmp_path):
+        """The MCP-selected palace wins over the ambient config fallback."""
+        from mempalace import hallways, mcp_server
+
+        _, config_b, _ = self._seed_two_hallway_palaces(monkeypatch, tmp_path)
+
+        assert [item["label"] for item in mcp_server.tool_list_hallways()] == ["A-only"]
+        assert [item["label"] for item in hallways.list_hallways(config=config_b)] == ["B-only"]
+
+    def test_tool_delete_hallway_mutates_only_server_palace(self, monkeypatch, tmp_path):
+        """A same-ID hallway in the ambient palace must survive MCP deletion."""
+        from mempalace import hallways, mcp_server
+
+        config_a, config_b, hallway_id = self._seed_two_hallway_palaces(monkeypatch, tmp_path)
+
+        assert mcp_server.tool_delete_hallway(hallway_id) == {"deleted": True}
+        assert hallways.list_hallways(config=config_a) == []
+        assert [item["label"] for item in hallways.list_hallways(config=config_b)] == ["B-only"]
 
     def test_tool_list_hallways_returns_all_without_filter(self, monkeypatch, tmp_path):
         """tool_list_hallways with no wing returns every record."""

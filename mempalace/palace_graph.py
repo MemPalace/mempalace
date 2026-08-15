@@ -737,14 +737,19 @@ def create_tunnel(
     return tunnel
 
 
-def list_tunnels(wing: str = None):
+def list_tunnels(wing: str = None, config=None):
     """List all explicit tunnels, optionally filtered by wing.
 
     Returns tunnels where ``wing`` appears as either source or target
     (tunnels are symmetric, so either endpoint is a valid filter match).
+
+    Args:
+        wing: Optional source or target wing filter.
+        config: Optional ``MempalaceConfig`` selecting the palace tunnel
+            sidecar. Explicit-path callers must pass the matching config.
     """
     norm_wing = _normalize_wing(wing)
-    tunnels = _load_tunnels()
+    tunnels = _load_tunnels(config)
     if norm_wing:
         # Normalize stored wings too: older tunnels.json records hold the
         # underscore form (from the prior write-path normalization), while
@@ -761,12 +766,16 @@ def list_tunnels(wing: str = None):
     return tunnels
 
 
-def delete_tunnel(tunnel_id: str):
-    """Delete an explicit tunnel by ID. Returns ``{"deleted": <id>}``."""
-    with mine_lock(_get_tunnel_file()):
-        tunnels = _load_tunnels()
+def delete_tunnel(tunnel_id: str, config=None):
+    """Delete an explicit tunnel by ID from the selected palace sidecar.
+
+    Returns ``{"deleted": <id>}``.
+    """
+    config = config or MempalaceConfig()
+    with mine_lock(_get_tunnel_file(config)):
+        tunnels = _load_tunnels(config)
         tunnels = [t for t in tunnels if t.get("id") != tunnel_id]
-        _save_tunnels(tunnels)
+        _save_tunnels(tunnels, config)
     return {"deleted": tunnel_id}
 
 
@@ -774,7 +783,9 @@ def follow_tunnels(wing: str, room: str, col=None, config=None):
     """Follow explicit tunnels from a room — returns connected drawers.
 
     Given a location (wing/room), finds all tunnels leading from or to it,
-    and optionally fetches the connected drawer content.
+    and optionally fetches the connected drawer content. ``config`` selects
+    the palace tunnel sidecar; explicit-path callers must pass the matching
+    config.
     """
     # Fall back to raw ``wing`` so an empty/whitespace query string still
     # produces a value to compare with; ``_normalize_wing`` returns ``None``
@@ -782,7 +793,7 @@ def follow_tunnels(wing: str, room: str, col=None, config=None):
     # mempalace.yaml slug (underscore) and an explicit ``--wing`` slug
     # (verbatim) both resolve through the same comparison.
     norm_wing = _normalize_wing(wing) or wing
-    tunnels = _load_tunnels()
+    tunnels = _load_tunnels(config)
     connections = []
 
     for t in tunnels:
