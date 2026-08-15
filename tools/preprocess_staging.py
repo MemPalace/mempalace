@@ -25,10 +25,13 @@ Intended to run as a step in a staging watcher pipeline::
 from __future__ import annotations
 
 import argparse
+import logging
 import re
 import shutil
 import sys
 from pathlib import Path
+
+logger = logging.getLogger("preprocess_staging")
 
 MAX_LINES_DEFAULT = 4000
 
@@ -379,11 +382,41 @@ def preprocess_file(
     return split_file(rel, cleaned, max_lines, output_dir)
 
 
-def preprocess_directory(staging_dir: str, max_lines: int, dry_run: bool = False) -> dict[str, int]:
-    """Preprocess all files in *staging_dir*.
+def _read_batch_snapshot(snapshot_path: Path) -> list[Path] | None:
+    """Parse a batch snapshot file into a list of relative Paths.
 
-    Writes cleaned/split files to ``staging_dir/processed/``.
-    Returns a stats dict.
+    Snapshots are unit-separator-delimited TSV records:
+        rel_path\x1fsize\x1fmtime\x1fsha256\n
+    Only the relative path is used here.
+    """
+    rel_paths: list[Path] = []
+    try:
+        with snapshot_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if not line:
+                    continue
+                rel = line.split("\x1f", 1)[0]
+                if not rel:
+                    continue
+                rel_paths.append(Path(rel))
+    except (OSError, ValueError):
+        return None
+    return rel_paths
+
+
+def preprocess_directory(
+    staging_dir: str,
+    max_lines: int,
+    dry_run: bool = False,
+    batch_snapshot: Path | None = None,
+) -> dict[str, int]:
+    """Preprocess files in *staging_dir*.
+
+    If *batch_snapshot* is provided, only the files listed in the snapshot are
+    preprocessed.  This prevents files that arrive after the batch was claimed
+    from being included in the current run.  Writes cleaned/split files to
+    ``staging_dir/processed/``.  Returns a stats dict.
     """
     staging = Path(staging_dir)
     processed_dir = staging / "processed"
@@ -406,7 +439,16 @@ def preprocess_directory(staging_dir: str, max_lines: int, dry_run: bool = False
         "errors": 0,
     }
 
-    for filepath in sorted(staging.rglob("*")):
+    if batch_snapshot is not None:
+        snapshot_rels = _read_batch_snapshot(batch_snapshot)
+        if snapshot_rels is None:
+            logger.warning("gossip: could not read batch snapshot %s", batch_snapshot)
+            return stats
+        file_iter = (staging / rel for rel in snapshot_rels)
+    else:
+        file_iter = sorted(staging.rglob("*"))
+
+    for filepath in file_iter:
         if not filepath.is_file():
             continue
         # Exclude anything inside the processed/ tree, including nested
@@ -454,9 +496,20 @@ if __name__ == "__main__":
         action="store_true",
         help="Report what would be processed without writing",
     )
+    parser.add_argument(
+        "--batch-snapshot",
+        type=Path,
+        default=None,
+        help="Only preprocess files listed in this snapshot file",
+    )
     args = parser.parse_args()
 
-    stats = preprocess_directory(args.staging_dir, args.max_lines, args.dry_run)
+    stats = preprocess_directory(
+        args.staging_dir,
+        args.max_lines,
+        args.dry_run,
+        batch_snapshot=args.batch_snapshot,
+    )
 
     print("\nPreprocessing complete:")
     print(f"  Total files scanned: {stats['total_files']}")
