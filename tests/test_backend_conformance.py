@@ -5,6 +5,9 @@ built-in local backends. Server-mode backends (qdrant) run the same assertions
 under their own fake/live client in ``test_qdrant_backend.py``.
 """
 
+import importlib.util
+import sqlite3
+
 import pytest
 
 from _backend_conformance import assert_partition_isolation
@@ -13,11 +16,26 @@ from mempalace.backends import PalaceRef
 from mempalace.backends.chroma import ChromaBackend
 from mempalace.backends.sqlite_exact import SQLiteExactBackend
 from mempalace.backends.rust_exact import RustExactBackend
+from mempalace.backends.sqlite_vec import SQLiteVecBackend
+
+# Skipped too when the interpreter's sqlite3 cannot load extensions
+# (macOS python.org / actions builds compile it out).
+_sqlite_vec_available = importlib.util.find_spec("sqlite_vec") is not None and hasattr(
+    sqlite3.Connection, "enable_load_extension"
+)
 
 _LOCAL_BACKENDS = [
     pytest.param(ChromaBackend, id="chroma"),
     pytest.param(SQLiteExactBackend, id="sqlite_exact"),
     pytest.param(RustExactBackend, id="rust_exact"),
+    pytest.param(
+        SQLiteVecBackend,
+        id="sqlite_vec",
+        marks=pytest.mark.skipif(
+            not _sqlite_vec_available,
+            reason="optional sqlite-vec dependency not installed",
+        ),
+    ),
 ]
 
 
