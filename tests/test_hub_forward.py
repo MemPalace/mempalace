@@ -428,6 +428,7 @@ class TestStdioProxy:
 class TestServeHttpRegistersServerinfo:
     def test_serve_http_writes_then_clears_serverinfo(self, isolated_home, monkeypatch):
         from mempalace import mcp_server
+        import uvicorn
 
         palace = str(isolated_home / "palace")
         monkeypatch.setenv("MEMPALACE_PALACE_PATH", palace)
@@ -435,22 +436,28 @@ class TestServeHttpRegistersServerinfo:
 
         class DummyHTTPd:
             scheme = "http"
-            server_address = ("127.0.0.1", 12345)
+            auth_token = None
+            server_address = None
 
-            def __enter__(self):
-                return self
+        async def app(scope, receive, send):
+            pass
 
-            def __exit__(self, *exc):
-                return False
+        def build_app(host, port):
+            return app, DummyHTTPd()
 
-            def serve_forever(self, poll_interval=0.5):
+        class DummyServer:
+            def __init__(self, config):
+                self.config = config
+
+            def run(self, sockets):
                 observed["during"] = server_registry.read_live_serverinfo(palace)
                 raise KeyboardInterrupt
 
-        monkeypatch.setattr(mcp_server, "_build_http_server", lambda h, p: DummyHTTPd())
-        mcp_server._serve_http("127.0.0.1", 12345)
+        monkeypatch.setattr(mcp_server, "_build_sdk_http_app", build_app)
+        monkeypatch.setattr(uvicorn, "Server", DummyServer)
+        mcp_server._serve_http("127.0.0.1", 0)
         assert observed["during"] is not None, "hub must be discoverable while serving"
-        assert observed["during"]["port"] == 12345
+        assert observed["during"]["port"] > 0
         assert observed["during"]["read_only"] is mcp_server._READ_ONLY
         # After shutdown the record is gone — no stale forwarding target.
         assert server_registry.read_live_serverinfo(palace) is None
