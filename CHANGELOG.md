@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Local, model-aware policy-versioned subject routing for drawer-sized project and conversation chunks.
+- Recoverable, exact-root subject refile planning and apply tools with visible ambiguity handling.
+
 ---
 
 ## [3.7.0+oc.1] — 2026-08-13

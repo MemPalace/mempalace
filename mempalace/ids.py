@@ -81,7 +81,16 @@ def make_drawer_id_from_content(wing: str, room: str, content: str) -> str:
 
 
 def make_convo_drawer_id(
-    wing: str, room: str, source_file: str, extract_mode: str, chunk_index: int
+    wing: str,
+    room: str,
+    source_file: str,
+    extract_mode: str,
+    chunk_index: int,
+    *,
+    source_version: str = None,
+    source_chunk_size: int = None,
+    normalize_version: int = None,
+    id_recipe: str = None,
 ) -> str:
     """Drawer ID for the conversation miner path.
 
@@ -89,12 +98,23 @@ def make_convo_drawer_id(
     to '|' for codebase-wide consistency and to remove the Windows-path
     / URL-source edge case that ':' carried.
 
-    Hash input is ``f"{source_file}|{extract_mode}|{chunk_index}"``.
+    Generic sources hash ``source_file``, ``extract_mode``, and ``chunk_index``.
+    Normalized sources also include their complete generation recipe so a
+    replacement can be staged and verified before the last complete
+    generation is retired.
     """
-    return (
-        f"drawer_{wing}_{room}_"
-        f"{_delimited_sha256((source_file, extract_mode, str(chunk_index)), _HASH_TRUNC_DRAWER)}"
-    )
+    parts = (source_file, extract_mode, str(chunk_index))
+    if source_version is not None:
+        parts = (
+            source_file,
+            extract_mode,
+            source_version,
+            str(source_chunk_size),
+            str(normalize_version),
+            str(id_recipe),
+            str(chunk_index),
+        )
+    return f"drawer_{wing}_{room}_{_delimited_sha256(parts, _HASH_TRUNC_DRAWER)}"
 
 
 def make_convo_sentinel_id(source_file: str, extract_mode: str) -> str:

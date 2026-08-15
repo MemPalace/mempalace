@@ -25,6 +25,8 @@ Mines code files, documentation, and notes from a project directory.
     mempalace mine <dir> --mode convos
 
 Mines conversation exports from Claude, ChatGPT, or Slack into the palace.
+An operator pipeline that emits the reviewed normalized-conversation sidecar
+contract must use exchange mode. See `docs/normalized-conversations.md`.
 
 ### General extraction (auto-classify)
 

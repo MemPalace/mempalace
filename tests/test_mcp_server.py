@@ -3425,8 +3425,13 @@ class TestDeleteBySource:
         result = tool_delete_by_source("results_mempal_hybrid_v4_session_1.jsonl")
         assert result["dry_run"] is True
         assert result["closet_match_count"] == 2
-        # Nothing removed — all three closets still present.
-        assert len(closets_col.get(include=[])["ids"]) == 3
+        # The server drains stale Chroma handles after an mtime-triggered
+        # reconnect, so verify through a fresh collection handle.
+        del closets_col
+        from mempalace.palace import get_closets_collection
+
+        fresh_closets = get_closets_collection(palace_path)
+        assert len(fresh_closets.get(include=[])["ids"]) == 3
 
     def test_commit_deletes_only_matching_source(self, monkeypatch, config, palace_path, kg):
         self._seed(monkeypatch, config, palace_path, kg)
@@ -3451,7 +3456,12 @@ class TestDeleteBySource:
         assert result["deleted"] == 2
         assert result["closets_deleted"] == 2
         # The two benchmark closets are gone; the real-client closet survives.
-        remaining = closets_col.get(include=["metadatas"])
+        # Reconnect intentionally invalidates pre-write Chroma handles.
+        del closets_col
+        from mempalace.palace import get_closets_collection
+
+        fresh_closets = get_closets_collection(palace_path)
+        remaining = fresh_closets.get(include=["metadatas"])
         sources = {m["source_file"] for m in remaining["metadatas"]}
         assert sources == {"notes/clients.md"}
 
@@ -4913,6 +4923,34 @@ class TestStructuredErrors:
         assert len(quarantine_calls) == 1, (
             "_get_client should call _prepare_palace_for_open on reconnect"
         )
+
+    def test_get_client_closes_cached_chroma_client_before_mtime_reconnect(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """An in-place database update must not retain the old HNSW client."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        make_minimal_chroma_sqlite(config.palace_path)
+        old_client = MagicMock()
+        new_client = MagicMock()
+        monkeypatch.setattr(mcp_server, "_client_cache", old_client)
+        monkeypatch.setattr(mcp_server, "_collection_cache", MagicMock())
+        monkeypatch.setattr(mcp_server, "_palace_db_inode", 0)
+        monkeypatch.setattr(mcp_server, "_palace_db_mtime", 1.0)
+        monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", lambda: None)
+        monkeypatch.setattr(mcp_server.ChromaBackend, "make_client", lambda _path: new_client)
+
+        reset_calls = []
+
+        def reset():
+            reset_calls.append(True)
+            mcp_server._client_cache = None
+
+        monkeypatch.setattr(mcp_server, "_force_chroma_cache_reset", reset)
+
+        assert mcp_server._get_client() is new_client
+        assert reset_calls == [True]
 
     def test_call_kg_retries_after_concurrent_close(self, monkeypatch):
         """A KG closed mid-handler must trigger a one-shot retry with a fresh

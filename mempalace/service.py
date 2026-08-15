@@ -217,6 +217,7 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
                 limit=limit,
                 dry_run=dry_run,
                 extract_mode=payload.get("extract") or "exchange",
+                subject_routing=bool(payload.get("subject_routing")),
             )
         elif mode == "extract":
             from .format_miner import mine_formats
@@ -243,6 +244,7 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
                 respect_gitignore=not bool(payload.get("no_gitignore")),
                 include_ignored=include_ignored,
                 max_chunks_per_file=payload.get("max_chunks_per_file"),
+                subject_routing=bool(payload.get("subject_routing")),
             )
         else:
             return {"success": False, "error": f"invalid mine mode: {mode}", "exit_code": 2}

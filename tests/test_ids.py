@@ -121,6 +121,26 @@ def test_make_convo_drawer_id_returns_expected_prefix():
     assert result.startswith("drawer_claude_diary_")
 
 
+def test_make_convo_drawer_id_separates_normalized_generation_recipe():
+    base = {
+        "wing": "amber",
+        "room": "communication",
+        "source_file": "/session.md",
+        "extract_mode": "exchange",
+        "chunk_index": 0,
+        "source_version": "sha256:" + ("1" * 64),
+        "source_chunk_size": 800,
+        "normalize_version": 2,
+        "id_recipe": "v3",
+    }
+
+    first = ids.make_convo_drawer_id(**base)
+    changed_size = ids.make_convo_drawer_id(**{**base, "source_chunk_size": 900})
+    changed_normalizer = ids.make_convo_drawer_id(**{**base, "normalize_version": 3})
+
+    assert len({first, changed_size, changed_normalizer}) == 3
+
+
 # ── make_convo_sentinel_id ────────────────────────────────────────────
 
 
