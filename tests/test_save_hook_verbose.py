@@ -15,6 +15,7 @@ class TestSaveHookVerboseMode:
         """Hook must read a MEMPAL_VERBOSE or similar flag."""
         hook_path = os.path.join(
             os.path.dirname(os.path.dirname(__file__)),
+            "mempalace",
             "hooks",
             "mempal_save_hook.sh",
         )
@@ -31,6 +32,7 @@ class TestSaveHookVerboseMode:
         """When verbose, hook should use decision: block so agent writes in chat."""
         hook_path = os.path.join(
             os.path.dirname(os.path.dirname(__file__)),
+            "mempalace",
             "hooks",
             "mempal_save_hook.sh",
         )
