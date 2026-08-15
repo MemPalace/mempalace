@@ -12,10 +12,12 @@ from _backend_conformance import assert_partition_isolation
 from mempalace.backends import PalaceRef
 from mempalace.backends.chroma import ChromaBackend
 from mempalace.backends.sqlite_exact import SQLiteExactBackend
+from mempalace.backends.sqlite_vec import SQLiteVecBackend
 
 _LOCAL_BACKENDS = [
     pytest.param(ChromaBackend, id="chroma"),
     pytest.param(SQLiteExactBackend, id="sqlite_exact"),
+    pytest.param(SQLiteVecBackend, id="sqlite_vec"),
 ]
 
 
