@@ -238,48 +238,52 @@ def cleanup_expired_sessions():
 # ── Request Forwarding ─────────────────────────────────────────────────────────
 
 
-def _is_valid_jsonrpc_request(body: bytes) -> tuple[bool, str | None]:
-    """Validate the JSON-RPC 2.0 envelope and return (ok, error_message).
+def _is_valid_jsonrpc_request(body: bytes) -> tuple[bool, str | None, int]:
+    """Validate the JSON-RPC 2.0 envelope and return (ok, error_message, error_code).
 
     The proxy relies on a well-formed envelope to make retry-safety and
     routing decisions.  Malformed requests are rejected before forwarding.
+
+    Error codes follow JSON-RPC 2.0:
+      - -32700 Parse error: body is not valid JSON.
+      - -32600 Invalid Request: valid JSON but not a valid JSON-RPC request object.
     """
     try:
         req = json.loads(body)
     except Exception as exc:
-        return False, f"Invalid JSON: {exc}"
+        return False, f"Invalid JSON: {exc}", -32700
 
     if not isinstance(req, dict):
-        return False, "JSON-RPC request must be an object"
+        return False, "JSON-RPC request must be an object", -32600
 
     if req.get("jsonrpc") != "2.0":
-        return False, "Invalid or missing jsonrpc version (expected '2.0')"
+        return False, "Invalid or missing jsonrpc version (expected '2.0')", -32600
 
     method = req.get("method")
     if not isinstance(method, str) or not method:
-        return False, "method must be a non-empty string"
+        return False, "method must be a non-empty string", -32600
 
     # id may be absent (notification), but if present must be a valid type.
     if "id" in req and not (
         isinstance(req["id"], (str, int, float)) or req["id"] is None
     ):
-        return False, "id must be a string, number, or null"
+        return False, "id must be a string, number, or null", -32600
 
     params = req.get("params")
     if params is not None and not isinstance(params, (dict, list)):
-        return False, "params must be an object or array"
+        return False, "params must be an object or array", -32600
 
     if method == "tools/call":
         if not isinstance(params, dict):
-            return False, "tools/call requires a params object"
+            return False, "tools/call requires a params object", -32600
         tool = params.get("name")
         if not isinstance(tool, str) or not tool:
-            return False, "tools/call params must contain a non-empty 'name' string"
+            return False, "tools/call params must contain a non-empty 'name' string", -32600
         arguments = params.get("arguments")
         if arguments is not None and not isinstance(arguments, dict):
-            return False, "tools/call 'arguments' must be an object"
+            return False, "tools/call 'arguments' must be an object", -32600
 
-    return True, None
+    return True, None, 0
 
 
 def _is_retry_safe(body: bytes) -> bool:
@@ -290,7 +294,7 @@ def _is_retry_safe(body: bytes) -> bool:
     the mutation twice, so we only retry methods and tools that are proven
     read-only.  Only well-formed JSON-RPC requests can be considered safe.
     """
-    ok, _ = _is_valid_jsonrpc_request(body)
+    ok, _, _ = _is_valid_jsonrpc_request(body)
     if not ok:
         return False
 
@@ -503,7 +507,7 @@ async def handle_mcp_post(request: web.Request) -> web.StreamResponse:
     if session_id:
         headers["Mcp-Session-Id"] = session_id
 
-    is_valid, validation_error = _is_valid_jsonrpc_request(body)
+    is_valid, validation_error, validation_code = _is_valid_jsonrpc_request(body)
     if not is_valid:
         log.warning(f"[{request_id}] Rejected malformed JSON-RPC: {validation_error}")
         _metrics["requests_failed"] += 1
@@ -511,7 +515,7 @@ async def handle_mcp_post(request: web.Request) -> web.StreamResponse:
             {
                 "jsonrpc": "2.0",
                 "id": None,
-                "error": {"code": -32700, "message": validation_error},
+                "error": {"code": validation_code, "message": validation_error},
             },
             status=400,
         )

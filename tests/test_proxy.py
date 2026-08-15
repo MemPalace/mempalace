@@ -879,12 +879,12 @@ class TestEndToEnd:
             proxy.ALLOWED_HOSTS = frozenset({f"127.0.0.1:{port}", "localhost", "127.0.0.1"})
 
             try:
-                # Missing jsonrpc version.
+                # Missing jsonrpc version: valid object, invalid request -> -32600.
                 bad = json.dumps({"id": 1, "method": "tools/list", "params": {}}).encode()
                 resp = await client.post("/mcp", data=bad)
                 assert resp.status == 400
                 payload = await resp.json()
-                assert payload["error"]["code"] == -32700
+                assert payload["error"]["code"] == -32600
                 assert NoOpClient.calls == 0
 
                 # tools/call missing name.
@@ -893,7 +893,124 @@ class TestEndToEnd:
                 ).encode()
                 resp = await client.post("/mcp", data=bad)
                 assert resp.status == 400
+                payload = await resp.json()
+                assert payload["error"]["code"] == -32600
                 assert NoOpClient.calls == 0
+            finally:
+                proxy.ALLOWED_HOSTS = old_hosts
+                await client.close()
+
+        self._run_client(test)
+
+    def test_handler_rejects_non_object_jsonrpc(self):
+        """Non-object valid JSON must be rejected as -32600 Invalid Request, not crash."""
+        import mempalace_mcp_proxy as proxy
+        from aiohttp import web
+        from aiohttp.test_utils import TestClient, TestServer
+
+        async def test():
+            proxy._circuit["failures"] = 0
+            proxy._circuit["state"] = "closed"
+
+            class NoOpClient:
+                is_closed = False
+                calls = 0
+
+                async def aclose(self):
+                    pass
+
+                async def post(self, *args, **kwargs):
+                    NoOpClient.calls += 1
+                    raise AssertionError("upstream should not be called")
+
+            proxy._http_client = NoOpClient()
+
+            app = web.Application()
+            app.router.add_post("/mcp", proxy.handle_mcp_post)
+            server = TestServer(app, port=0)
+            client = TestClient(server, loop=asyncio.get_event_loop())
+            await client.start_server()
+
+            port = client.server.port
+            old_hosts = proxy.ALLOWED_HOSTS
+            proxy.ALLOWED_HOSTS = frozenset({f"127.0.0.1:{port}", "localhost", "127.0.0.1"})
+
+            try:
+                cases = [
+                    (b"null", "null"),
+                    (b'"string"', "string"),
+                    (b"123", "number"),
+                    (b'[{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}, {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}]', "batch array"),
+                ]
+                for body, label in cases:
+                    resp = await client.post("/mcp", data=body)
+                    assert resp.status == 400, f"{label} should be rejected"
+                    payload = await resp.json()
+                    assert payload["error"]["code"] == -32600, f"{label} should return -32600"
+
+                # Invalid JSON itself still returns -32700 parse error.
+                resp = await client.post("/mcp", data=b"not json")
+                assert resp.status == 400
+                payload = await resp.json()
+                assert payload["error"]["code"] == -32700
+
+                assert NoOpClient.calls == 0
+            finally:
+                proxy.ALLOWED_HOSTS = old_hosts
+                await client.close()
+
+        self._run_client(test)
+
+    def test_handler_accepts_normal_single_request(self):
+        """A well-formed single JSON-RPC object reaches the upstream."""
+        import mempalace_mcp_proxy as proxy
+        from aiohttp import web
+        from aiohttp.test_utils import TestClient, TestServer
+
+        body = json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+        ).encode()
+
+        async def test():
+            proxy._circuit["failures"] = 0
+            proxy._circuit["state"] = "closed"
+
+            class FakeResponse:
+                def __init__(self, status_code, content):
+                    self.status_code = status_code
+                    self.content = content
+                    self.text = content.decode("utf-8")
+
+                def json(self):
+                    return json.loads(self.content)
+
+            class CountingClient:
+                is_closed = False
+                calls = 0
+
+                async def aclose(self):
+                    pass
+
+                async def post(self, *args, **kwargs):
+                    CountingClient.calls += 1
+                    return FakeResponse(200, json.dumps({"jsonrpc": "2.0", "id": 1, "result": []}).encode())
+
+            proxy._http_client = CountingClient()
+
+            app = web.Application()
+            app.router.add_post("/mcp", proxy.handle_mcp_post)
+            server = TestServer(app, port=0)
+            client = TestClient(server, loop=asyncio.get_event_loop())
+            await client.start_server()
+
+            port = client.server.port
+            old_hosts = proxy.ALLOWED_HOSTS
+            proxy.ALLOWED_HOSTS = frozenset({f"127.0.0.1:{port}", "localhost", "127.0.0.1"})
+
+            try:
+                resp = await client.post("/mcp", data=body)
+                assert resp.status == 200
+                assert CountingClient.calls == 1
             finally:
                 proxy.ALLOWED_HOSTS = old_hosts
                 await client.close()
