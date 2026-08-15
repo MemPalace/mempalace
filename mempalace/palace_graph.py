@@ -494,6 +494,7 @@ def create_tunnel(
     source_drawer_id: str = None,
     target_drawer_id: str = None,
     kind: str = "explicit",
+    config=None,
 ):
     """Create an explicit (symmetric) tunnel between two locations in the palace.
 
@@ -520,6 +521,9 @@ def create_tunnel(
             topical link where rooms are synthetic ``topic:<name>``
             identifiers). Preserved on the stored dict so readers can
             distinguish real-room traversals from topic connections.
+        config: Optional ``MempalaceConfig`` selecting the palace and its
+            tunnel sidecar. Explicit-path callers must pass the matching
+            config instead of falling back to the ambient default palace.
 
     Returns:
         The stored tunnel dict.
@@ -545,7 +549,7 @@ def create_tunnel(
     # mempalace.yaml from disk; before this change the helpers each
     # instantiated their own, triggering several redundant disk reads per
     # create_tunnel call (flagged by gemini-code-assist on #1469).
-    config = MempalaceConfig()
+    config = config or MempalaceConfig()
 
     # Validate room existence for explicit tunnels only. Use the verbatim wing
     # slugs here so #1504's hyphen-preserving write path remains intact.
@@ -742,6 +746,7 @@ def compute_topic_tunnels(
     topics_by_wing: dict,
     min_count: int = 1,
     label_prefix: str = "shared topic",
+    config=None,
 ) -> list[dict]:
     """Create tunnels for every pair of wings that share >= ``min_count`` topics.
 
@@ -817,6 +822,7 @@ def compute_topic_tunnels(
                     target_room=room,
                     label=f"{label_prefix}: {topic_name}",
                     kind="topic",
+                    config=config,
                 )
                 created.append(tunnel)
     return created
@@ -827,6 +833,7 @@ def topic_tunnels_for_wing(
     topics_by_wing: dict,
     min_count: int = 1,
     label_prefix: str = "shared topic",
+    config=None,
 ) -> list[dict]:
     """Compute topic tunnels involving a single wing.
 
@@ -871,6 +878,7 @@ def topic_tunnels_for_wing(
                 slice_map,
                 min_count=min_count,
                 label_prefix=label_prefix,
+                config=config,
             )
         )
     return created
@@ -880,6 +888,7 @@ def entity_tunnels_for_wing(
     wing: str,
     hallways: list,
     label_prefix: str = "shared entity",
+    config=None,
 ) -> list:
     """Compute entity tunnels involving a single wing.
 
@@ -946,6 +955,7 @@ def entity_tunnels_for_wing(
                 target_room=room,
                 label=f"{label_prefix}: {entity}",
                 kind="entity",
+                config=config,
             )
             created.append(tunnel)
     return created

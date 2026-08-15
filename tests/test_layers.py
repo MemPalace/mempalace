@@ -201,6 +201,27 @@ def test_layer1_importance_from_various_keys():
     assert "ESSENTIAL STORY" in result
 
 
+def test_layer1_breaks_importance_ties_by_filed_at_recency():
+    """Equal-importance drawers surface newest-first instead of insertion order."""
+    docs = ["oldest memory", "newest memory", "middle memory"]
+    metas = [
+        {"room": "moments", "importance": 3, "filed_at": "2026-01-01T00:00:00Z"},
+        {"room": "moments", "importance": 3, "filed_at": "2026-03-01T00:00:00Z"},
+        {"room": "moments", "importance": 3, "filed_at": "2026-02-01T00:00:00Z"},
+    ]
+    mock_col = _mock_chromadb_for_layer(docs, metas)
+
+    with (
+        patch("mempalace.layers.MempalaceConfig") as mock_cfg,
+        patch("mempalace.layers._get_collection", return_value=mock_col),
+    ):
+        mock_cfg.return_value.palace_path = "/fake"
+        result = Layer1(palace_path="/fake").generate()
+
+    assert result.index("newest memory") < result.index("middle memory")
+    assert result.index("middle memory") < result.index("oldest memory")
+
+
 def test_layer1_batch_exception_breaks():
     """If col.get raises on a batch, loop breaks gracefully."""
     mock_col = MagicMock()

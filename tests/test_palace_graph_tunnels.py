@@ -201,6 +201,21 @@ class TestTopicTunnels:
     dedup and persistence with explicit tunnels.
     """
 
+    def test_explicit_config_scopes_persistence_to_selected_palace(self, tmp_path):
+        from mempalace.config import MempalaceConfig
+
+        default_cfg = MempalaceConfig(palace_path=tmp_path / "default" / "palace")
+        selected_cfg = MempalaceConfig(palace_path=tmp_path / "selected" / "palace")
+        topics_by_wing = {"wing_alpha": ["OpenAPI"], "wing_beta": ["OpenAPI"]}
+
+        created = palace_graph.compute_topic_tunnels(
+            topics_by_wing, min_count=1, config=selected_cfg
+        )
+
+        assert len(created) == 1
+        assert palace_graph._load_tunnels(selected_cfg) == created
+        assert palace_graph._load_tunnels(default_cfg) == []
+
     def test_compute_topic_tunnels_creates_link_for_shared_topic(self, tmp_path, monkeypatch):
         _use_tmp_tunnel_file(monkeypatch, tmp_path)
         topics_by_wing = {

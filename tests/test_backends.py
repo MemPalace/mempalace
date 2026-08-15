@@ -509,6 +509,31 @@ def test_chroma_backend_create_true_creates_directory_and_collection(tmp_path):
     client.get_collection("mempalace_drawers")
 
 
+def test_palace_wrapper_embeds_for_chroma(tmp_path, monkeypatch):
+    """Normal Chroma callers should not rely on Chroma's internal ONNX embedder."""
+    import mempalace.backends.embedding_wrapper as embedding_wrapper
+    from mempalace.backends.embedding_wrapper import EmbeddingCollection
+    from mempalace.palace import get_collection
+
+    calls = []
+
+    def fake_embed(texts):
+        texts = list(texts)
+        calls.append(texts)
+        return [[float(len(text)), 1.0, 0.0, 0.0] for text in texts]
+
+    monkeypatch.setattr(embedding_wrapper, "_embed_texts", fake_embed)
+
+    col = get_collection(str(tmp_path), create=True, backend="chroma")
+    assert isinstance(col, EmbeddingCollection)
+
+    col.add(ids=["a"], documents=["alpha"], metadatas=[{"wing": "w"}])
+    result = col.query(query_texts=["alpha"], n_results=1)
+
+    assert result.ids == [["a"]]
+    assert calls == [["alpha"], ["alpha"]]
+
+
 def test_chroma_backend_creates_collection_with_cosine_distance(tmp_path):
     palace_path = tmp_path / "palace"
 
@@ -523,13 +548,12 @@ def test_chroma_backend_creates_collection_with_cosine_distance(tmp_path):
     assert col.metadata.get("hnsw:space") == "cosine"
 
 
-def test_chroma_backend_sets_hnsw_bloat_guard_on_creation(tmp_path):
+def test_chroma_backend_sets_hnsw_write_defaults_on_creation(tmp_path):
     """HNSW batch/sync thresholds must land on freshly-created collection metadata.
 
-    Low thresholds (2/2 per #1579) make chromadb's Rust HNSW segment
-    persist index_metadata and link_lists after any mine of 2+ drawers.
-    Asserting both keys land on the persisted metadata also covers the
-    #1161 "config silently dropped" concern at CI time.
+    That both keys land covers #1161, where the configuration was silently dropped.
+    The values are chromadb's own documented defaults, so a collection this backend
+    creates indexes on the same terms as one chromadb creates itself.
     """
     palace_path = tmp_path / "palace"
 
@@ -541,35 +565,44 @@ def test_chroma_backend_sets_hnsw_bloat_guard_on_creation(tmp_path):
 
     client = chromadb.PersistentClient(path=str(palace_path))
     col = client.get_collection("mempalace_drawers")
-    assert col.metadata.get("hnsw:batch_size") == 2
-    assert col.metadata.get("hnsw:sync_threshold") == 2
+    batch = col.metadata.get("hnsw:batch_size")
+    sync = col.metadata.get("hnsw:sync_threshold")
+    assert batch == 100
+    assert sync == 1000
+    assert batch <= sync, "chromadb permits batch_size <= sync_threshold"
 
 
-def test_chroma_backend_create_collection_sets_hnsw_bloat_guard(tmp_path):
-    """Same guard must apply via the legacy create_collection() path."""
+def test_chroma_backend_create_collection_sets_hnsw_write_defaults(tmp_path):
+    """The same defaults must apply via the legacy create_collection() path."""
     palace_path = tmp_path / "palace"
 
     ChromaBackend().create_collection(str(palace_path), "mempalace_drawers")
 
     client = chromadb.PersistentClient(path=str(palace_path))
     col = client.get_collection("mempalace_drawers")
-    assert col.metadata.get("hnsw:batch_size") == 2
-    assert col.metadata.get("hnsw:sync_threshold") == 2
+    assert col.metadata.get("hnsw:batch_size") == 100
+    assert col.metadata.get("hnsw:sync_threshold") == 1000
 
 
-def test_sub_threshold_mine_persists_hnsw_metadata(tmp_path):
-    """Regression for #1579: small mines must persist HNSW metadata.
+def test_sub_threshold_mine_survives_reopen_and_escapes_quarantine(tmp_path):
+    """Regression for #1579, asserted as the PROPERTY, not the mechanism.
 
-    _HNSW_BLOAT_GUARD sets batch_size=2 and sync_threshold=2 so that any
-    upsert of 2+ records crosses both thresholds, triggering chromadb's
-    _apply_batch and _persist.  Without this, index_metadata and link_lists
-    stay empty and quarantine_stale_hnsw renames the segment on cold open.
+    #1579 is a durability bug: a sub-threshold mine lost its drawers when
+    quarantine_stale_hnsw renamed the segment away on cold open. So assert what
+    the user needs — the drawers read back from a FRESH backend, and quarantine
+    leaves the segment alone.
+
+    Asserting the mechanism instead (index_metadata.pickle present after 3
+    records) only holds at sync_threshold=2, a value chromadb's own parameter
+    validation rejects. Under chromadb's documented thresholds the Rust writer
+    keeps the tail durable WITHOUT a pickle, so
+    the pickle is rightly absent here and asserting on it would fail a healthy
+    palace.
     """
     palace_path = str(tmp_path / "palace")
     backend = ChromaBackend()
     try:
         col = backend.get_collection(palace_path, "mempalace_drawers", create=True)
-
         col.upsert(
             ids=["a", "b", "c"],
             documents=["doc a", "doc b", "doc c"],
@@ -579,34 +612,34 @@ def test_sub_threshold_mine_persists_hnsw_metadata(tmp_path):
     finally:
         backend.close()
 
-    found_healthy_segment = False
-    for entry in (tmp_path / "palace").iterdir():
-        if not entry.is_dir() or entry.name.startswith("."):
-            continue
-        meta = entry / "index_metadata.pickle"
-        link = entry / "link_lists.bin"
-        data = entry / "data_level0.bin"
-        if data.exists() and data.stat().st_size > _HNSW_MISSING_METADATA_DATA_FLOOR:
-            assert meta.exists(), "index_metadata missing after sub-threshold upsert"
-            assert link.exists() and link.stat().st_size > 0, "link_lists empty"
-            assert _segment_appears_healthy(str(entry))
-            found_healthy_segment = True
-
-    assert found_healthy_segment, "no VECTOR segment with data found"
-
-    # stale_seconds=0.0 forces the stage-2 integrity gate (_segment_appears_healthy)
-    # to run on every segment regardless of mtime delta, proving the fix directly.
+    # Quarantine runs on cold open; stale_seconds=0.0 forces the integrity gate
+    # onto every segment regardless of mtime delta, so the gate itself is proven.
     moved = quarantine_stale_hnsw(palace_path, stale_seconds=0.0)
-    assert moved == [], f"quarantine fired on freshly-persisted segment: {moved}"
+    assert moved == [], f"quarantine fired on a healthy sub-threshold segment: {moved}"
+
+    for entry in (tmp_path / "palace").iterdir():
+        if entry.is_dir() and not entry.name.startswith("."):
+            assert _segment_appears_healthy(str(entry))
+
+    # The durability claim: a FRESH backend still finds every drawer, and the
+    # vector index still answers.
+    reopened = ChromaBackend()
+    try:
+        col = reopened.get_collection(palace_path, "mempalace_drawers")
+        assert col.count() == 3, "sub-threshold mine lost drawers across reopen"
+        hits = col.query(query_embeddings=[[0.1] * _TEST_EMBED_DIM], n_results=3)
+        assert len(hits["ids"][0]) == 3, "vector index empty after reopen"
+    finally:
+        reopened.close()
 
 
 def test_single_record_upsert_not_quarantined(tmp_path):
     """A single-record upsert must not trigger quarantine.
 
-    With batch_size=2 chromadb only persists HNSW metadata after the second
-    record.  A one-record segment has no index_metadata.pickle and no
-    link_lists.bin data; _segment_appears_healthy must treat that combination
-    as sub-threshold (never persisted), not as corruption.
+    A one-record segment sits below the HNSW thresholds, so chromadb never
+    persists: no index_metadata.pickle, no link_lists.bin data.
+    _segment_appears_healthy must read that combination as sub-threshold
+    (never persisted), not as corruption.
     """
     palace_path = str(tmp_path / "palace")
     backend = ChromaBackend()
@@ -657,7 +690,7 @@ def test_get_collection_create_true_preserves_existing_metadata(tmp_path):
     backend.get_collection(palace, collection_name="mempalace_drawers", create=True)
     col = backend.get_collection(palace, collection_name="mempalace_drawers", create=True)
     assert col._collection.metadata["hnsw:space"] == "cosine"
-    assert col._collection.metadata.get("hnsw:batch_size") == 2
+    assert col._collection.metadata.get("hnsw:batch_size") == 100
 
 
 def test_fix_blob_seq_ids_converts_blobs_to_integers(tmp_path):
@@ -1825,6 +1858,67 @@ def test_chroma_backend_requarantines_after_inode_replacement(tmp_path, monkeypa
         ("invalid", str(palace)),
         ("stale", str(palace)),
     ]
+
+
+def test_chroma_backend_resets_system_cache_on_inode_change(tmp_path, monkeypatch):
+    """#2028: ``_client`` must drop chromadb's path-keyed ``SharedSystemClient``
+    cache *before* reconstructing ``PersistentClient`` on an inode/mtime change.
+
+    chromadb caches its ``System`` (and live HNSW segment) keyed by path, so a
+    bare reopen reuses the stale segment and persists an outdated index over a
+    peer/rebuild's on-disk changes -- the #2002 data-loss class reached via
+    ``_client`` instead of ``mcp_server._get_client``. The reset must fire only
+    on a genuine external change (not first open) and must precede the reopen.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    (palace / "chroma.sqlite3").write_text("")
+
+    events = []
+
+    # Neutralize the on-disk HNSW pre-checks so the test exercises only the
+    # cache-reset / client-rebuild ordering.
+    for _name in (
+        "_fix_missing_collection_type",
+        "_fix_blob_seq_ids",
+        "quarantine_invalid_hnsw_metadata",
+        "quarantine_stale_hnsw",
+    ):
+        monkeypatch.setattr(f"mempalace.backends.chroma.{_name}", lambda path, *a, **k: [])
+
+    monkeypatch.setattr(ChromaBackend, "_quarantined_paths", set())
+
+    class DummyClient:
+        pass
+
+    def _record_open(path):
+        events.append(("open", path))
+        return DummyClient()
+
+    monkeypatch.setattr("mempalace.backends.chroma.chromadb.PersistentClient", _record_open)
+
+    from chromadb.api.client import SharedSystemClient
+
+    def _record_clear(*args, **kwargs):
+        events.append(("clear", None))
+
+    monkeypatch.setattr(SharedSystemClient, "clear_system_cache", _record_clear)
+
+    backend = ChromaBackend()
+    # ``_db_stat`` is called twice per ``_client`` call (freshness check, then
+    # re-stat after reopen). Same inode on the first call (first open, no prior
+    # freshness -> no reset), changed inode on the second (external change).
+    stats = iter([(1, 1.0), (1, 1.0), (2, 2.0), (2, 2.0)])
+    monkeypatch.setattr(backend, "_db_stat", lambda path: next(stats))
+
+    backend._client(str(palace))  # first open: no external change -> no clear
+    backend._client(str(palace))  # inode 1 -> 2: clear, then reopen
+
+    assert events == [
+        ("open", str(palace)),  # first open, no cache reset
+        ("clear", None),  # #2028: reset fires on the inode change...
+        ("open", str(palace)),  # ...strictly before the PersistentClient reopen
+    ], events
 
 
 def test_explain_ef_mismatch_recognizes_chromadb_conflict():

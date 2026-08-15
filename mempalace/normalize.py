@@ -5,7 +5,8 @@ normalize.py — Convert any chat export format to MemPalace transcript format.
 Supported:
     - Plain text with > markers (pass through)
     - Claude.ai JSON export
-    - ChatGPT conversations.json
+    - ChatGPT conversations.json (a single conversation, or the top-level
+      array of them that a real data export ships)
     - Claude Code JSONL (with tool_use/tool_result block capture)
     - OpenAI Codex CLI JSONL
     - Gemini CLI JSONL (~/.gemini/tmp/<project_hash>/chats/session-*.jsonl)
@@ -18,6 +19,7 @@ Supported:
 No API key. No internet. Everything local.
 """
 
+import errno
 import json
 import os
 import re
@@ -114,25 +116,37 @@ def strip_noise(text: str) -> str:
     return text.strip()
 
 
-def normalize(filepath: str) -> str:
+def _read_transcript_file(filepath: str) -> str:
+    """Read a transcript source file with the same safety checks normalize()
+    and normalize_conversations() both need: no symlinks, regular files only,
+    size-capped, BOM-tolerant.
     """
-    Load a file and normalize to transcript format if it's a chat export.
-    Plain text files pass through unchanged.
-    """
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    # O_NONBLOCK keeps the "not a regular file" check below reachable: a
+    # blocking open of a FIFO waits in the kernel for a writer, so the
+    # S_ISREG test never runs. See ``miner._read_text_no_follow``, including
+    # why the EAGAIN branch re-checks the type and retries without the flag.
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     if os.path.islink(filepath):
         raise IOError(f"Could not read {filepath}: symlinked files are skipped")
     fd = -1
     try:
-        fd = os.open(filepath, flags)
+        try:
+            fd = os.open(filepath, flags)
+        except OSError as exc:
+            if exc.errno != errno.EAGAIN or not stat.S_ISREG(os.lstat(filepath).st_mode):
+                raise
+            fd = os.open(filepath, flags & ~getattr(os, "O_NONBLOCK", 0))
         file_stat = os.fstat(fd)
         if not stat.S_ISREG(file_stat.st_mode):
-            raise IOError(f"Could not read {filepath}: not a regular file")
+            # Text stays prefix-free: this raise is inside the ``try``, so the
+            # ``except OSError`` below composes "Could not read <path>: ...".
+            raise IOError("not a regular file")
         if file_stat.st_size > 500 * 1024 * 1024:  # 500 MB safety limit
-            raise IOError(f"File too large ({file_stat.st_size // (1024 * 1024)} MB): {filepath}")
+            # Prefix-free for the same reason as the branch above.
+            raise IOError(f"file too large ({file_stat.st_size // (1024 * 1024)} MB)")
         with os.fdopen(fd, "r", encoding="utf-8-sig", errors="replace") as f:
             fd = -1
-            content = f.read()
+            return f.read()
     except OSError as e:
         raise IOError(f"Could not read {filepath}: {e}") from e
     finally:
@@ -141,6 +155,14 @@ def normalize(filepath: str) -> str:
                 os.close(fd)
             except OSError:
                 pass
+
+
+def normalize(filepath: str) -> str:
+    """
+    Load a file and normalize to transcript format if it's a chat export.
+    Plain text files pass through unchanged.
+    """
+    content = _read_transcript_file(filepath)
 
     if not content.strip():
         return content
@@ -162,40 +184,96 @@ def normalize(filepath: str) -> str:
     return content
 
 
+def normalize_conversations(filepath: str) -> list:
+    """Like normalize(), but keeps each conversation in a bundle export as a
+    separate string instead of joining them into one.
+
+    A Claude.ai privacy export packs every conversation into a single JSON
+    file, and normalize() joins them with "\\n\\n".join(...) into one blob.
+    That collapses conversation boundaries, so content-hash dedup keyed on
+    the whole file breaks the moment the bundle is re-exported with one new
+    conversation added — the file-level hash changes even though none of
+    the existing conversations did. This returns the pieces un-joined so
+    callers can hash and dedup per conversation instead.
+
+    A ChatGPT data export is a bundle for the same reason: its
+    ``conversations.json`` is an array of conversations, so it splits per
+    conversation too.
+
+    Non-bundle formats (a single Claude Code session, plain text, ...)
+    always normalize to one conversation, so this returns a one-element
+    list for those — identical dedup granularity to before.
+    """
+    content = _read_transcript_file(filepath)
+
+    if not content.strip():
+        return []
+
+    lines = content.split("\n")
+    if sum(1 for line in lines if line.strip().startswith(">")) >= 3:
+        return [content]
+
+    ext = Path(filepath).suffix.lower()
+    if ext in (".json", ".jsonl") or content.strip()[:1] in ("{", "["):
+        split = _try_normalize_json_split(content)
+        if split:
+            return split
+
+    return [content]
+
+
 def _try_normalize_json(content: str) -> Optional[str]:
-    """Try all known JSON chat schemas."""
+    """Try all known JSON chat schemas, joining a multi-conversation bundle
+    into one string. See ``_try_normalize_json_split`` for the unjoined form.
+    """
+    split = _try_normalize_json_split(content)
+    if split is None:
+        return None
+    return "\n\n".join(split)
+
+
+def _try_normalize_json_split(content: str) -> Optional[list]:
+    """Try all known JSON chat schemas, returning each conversation found as
+    a separate list entry (bundle formats) or a single-element list.
+    """
 
     normalized = _try_claude_code_jsonl(content)
     if normalized:
-        return normalized
+        return [normalized]
 
     normalized = _try_codex_jsonl(content)
     if normalized:
-        return normalized
+        return [normalized]
 
     normalized = _try_gemini_jsonl(content)
     if normalized:
-        return normalized
+        return [normalized]
 
     normalized = _try_pi_jsonl(content)
     if normalized:
-        return normalized
+        return [normalized]
 
     try:
         data = json.loads(content)
     except json.JSONDecodeError:
         return None
 
-    for parser in (
-        _try_gemini_json,
-        _try_claude_ai_json,
-        _try_chatgpt_json,
-        _try_continue_json,
-        _try_slack_json,
-    ):
+    normalized = _try_gemini_json(data)
+    if normalized:
+        return [normalized]
+
+    split = _try_claude_ai_json_split(data)
+    if split:
+        return split
+
+    split = _try_chatgpt_export_json_split(data)
+    if split:
+        return split
+
+    for parser in (_try_chatgpt_json, _try_continue_json, _try_slack_json):
         normalized = parser(data)
         if normalized:
-            return normalized
+            return [normalized]
 
     return None
 
@@ -509,6 +587,16 @@ def _try_gemini_json(data) -> Optional[str]:
 
 def _try_claude_ai_json(data) -> Optional[str]:
     """Claude.ai JSON export: flat messages list or privacy export with chat_messages."""
+    split = _try_claude_ai_json_split(data)
+    if split is None:
+        return None
+    return "\n\n".join(split)
+
+
+def _try_claude_ai_json_split(data) -> Optional[list]:
+    """Same as ``_try_claude_ai_json`` but keeps each conversation in a
+    privacy export as its own list entry instead of joining them.
+    """
     if isinstance(data, dict):
         data = data.get("messages", data.get("chat_messages", []))
     if not isinstance(data, list):
@@ -526,13 +614,13 @@ def _try_claude_ai_json(data) -> Optional[str]:
             if len(messages) >= 2:
                 transcripts.append(_messages_to_transcript(messages))
         if transcripts:
-            return "\n\n".join(transcripts)
+            return transcripts
         return None
 
     # Flat messages list
     messages = _collect_claude_messages(data)
     if len(messages) >= 2:
-        return _messages_to_transcript(messages)
+        return [_messages_to_transcript(messages)]
     return None
 
 
@@ -557,8 +645,14 @@ def _collect_claude_messages(items) -> list:
 
 
 def _try_chatgpt_json(data) -> Optional[str]:
-    """ChatGPT conversations.json with mapping tree."""
-    if not isinstance(data, dict) or "mapping" not in data:
+    """ChatGPT conversations.json with mapping tree.
+
+    Every nested shape is type-checked rather than assumed: this parser is
+    reached from ``_try_chatgpt_export_json_split`` for each element of any
+    top-level JSON array, so it must return None on unrelated payloads that
+    merely carry a ``mapping`` key instead of raising.
+    """
+    if not isinstance(data, dict) or not isinstance(data.get("mapping"), dict):
         return None
     mapping = data["mapping"]
     messages = []
@@ -566,6 +660,8 @@ def _try_chatgpt_json(data) -> Optional[str]:
     root_id = None
     fallback_root = None
     for node_id, node in mapping.items():
+        if not isinstance(node, dict):
+            continue
         if node.get("parent") is None:
             if node.get("message") is None:
                 root_id = node_id
@@ -579,22 +675,63 @@ def _try_chatgpt_json(data) -> Optional[str]:
         visited = set()
         while current_id and current_id not in visited:
             visited.add(current_id)
-            node = mapping.get(current_id, {})
+            node = mapping.get(current_id)
+            if not isinstance(node, dict):
+                break
             msg = node.get("message")
-            if msg:
-                role = msg.get("author", {}).get("role", "")
+            if isinstance(msg, dict):
+                author = msg.get("author")
+                role = author.get("role", "") if isinstance(author, dict) else ""
                 content = msg.get("content", {})
-                parts = content.get("parts", []) if isinstance(content, dict) else []
+                parts = content.get("parts") if isinstance(content, dict) else None
+                if not isinstance(parts, list):
+                    parts = []
                 text = " ".join(str(p) for p in parts if isinstance(p, str) and p).strip()
                 if role == "user" and text:
                     messages.append(("user", text))
                 elif role == "assistant" and text:
                     messages.append(("assistant", text))
-            children = node.get("children", [])
-            current_id = children[0] if children else None
+            children = node.get("children")
+            next_id = children[0] if isinstance(children, list) and children else None
+            # Node ids index a dict and a visited set, so anything unhashable
+            # (a nested child object rather than an id) ends the walk.
+            current_id = next_id if isinstance(next_id, str) else None
     if len(messages) >= 2:
         return _messages_to_transcript(messages)
     return None
+
+
+def _try_chatgpt_export_json_split(data) -> Optional[list]:
+    """ChatGPT data export: top-level array of conversation objects.
+
+    The ``conversations.json`` OpenAI ships is an *array*, while
+    ``_try_chatgpt_json`` handles the single conversation object inside it.
+    Without this the whole export falls through to the plain-text path and is
+    chunked as raw JSON: the drawers hold serialized structure sliced at
+    arbitrary offsets, and every speaker turn is gone.
+
+    Each conversation is kept as its own segment rather than concatenated, so
+    per-conversation dedup survives a re-export (see ``normalize_conversations``);
+    the joined form is reached through ``_try_normalize_json``.
+
+    Runs after ``_try_gemini_json`` and ``_try_claude_ai_json_split`` and before
+    the ``_try_chatgpt_json``/``_try_continue_json``/``_try_slack_json`` loop.
+    That position is safe in both directions: Gemini requires a ``role="model"``
+    entry and Claude.ai requires ``chat_messages``/``messages`` on the first
+    element, neither of which a ChatGPT conversation object has, while Slack
+    entries carry no ``mapping`` and Continue.dev sessions are not arrays at
+    all, so this parser declines them and they fall through unchanged.
+    """
+    if not isinstance(data, list):
+        return None
+
+    transcripts = []
+    for convo in data:
+        transcript = _try_chatgpt_json(convo)
+        if transcript:
+            transcripts.append(transcript)
+    # None, not [], so an array of other JSON still reaches the later parsers.
+    return transcripts or None
 
 
 def _try_slack_json(data) -> Optional[str]:

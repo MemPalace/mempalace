@@ -1,5 +1,8 @@
 import math
+import os
 import sqlite3
+import subprocess
+import sys
 import threading
 
 import pytest
@@ -389,6 +392,369 @@ def test_sqlite_exact_close_palace_marks_existing_collections_closed(tmp_path):
     assert not col.health().ok
     with pytest.raises(Exception):
         col.count()
+
+
+def test_sqlite_exact_read_only_open_skips_schema_init_and_refuses_writes(tmp_path):
+    backend, col = _collection(tmp_path)
+    palace = PalaceRef(id=str(tmp_path), local_path=str(tmp_path))
+    col.add(ids=["a"], documents=["doc"], metadatas=[{}], embeddings=[[1, 0]])
+    backend.close_palace(palace)
+
+    db_path = tmp_path / "sqlite_exact.sqlite3"
+    before = db_path.read_bytes()
+    assert not (tmp_path / "sqlite_exact.sqlite3-wal").exists()
+    assert not (tmp_path / "sqlite_exact.sqlite3-shm").exists()
+    db_path.chmod(0o400)
+    tmp_path.chmod(0o500)
+    try:
+        read_only = backend.get_collection(
+            palace=palace,
+            collection_name="mempalace_drawers",
+            create=False,
+            options={"read_only": True},
+        )
+
+        assert read_only.count() == 1
+        assert read_only._handle.read_only is True
+        assert read_only._handle.conn.execute("PRAGMA query_only").fetchone()[0] == 1
+        with pytest.raises(sqlite3.OperationalError):
+            read_only.add(
+                ids=["b"],
+                documents=["blocked"],
+                metadatas=[{}],
+                embeddings=[[1, 0]],
+            )
+        assert not (tmp_path / "sqlite_exact.sqlite3-wal").exists()
+        assert not (tmp_path / "sqlite_exact.sqlite3-shm").exists()
+    finally:
+        tmp_path.chmod(0o700)
+        db_path.chmod(0o600)
+        backend.close_palace(palace)
+    assert db_path.read_bytes() == before
+
+
+def test_sqlite_exact_read_only_open_sees_active_writer_wal(tmp_path):
+    writer_backend, writer = _collection(tmp_path)
+    palace = PalaceRef(id=str(tmp_path), local_path=str(tmp_path))
+    writer.add(ids=["wal-row"], documents=["uncheckpointed"], metadatas=[{}], embeddings=[[1, 0]])
+
+    db_path = tmp_path / "sqlite_exact.sqlite3"
+    wal_path = tmp_path / "sqlite_exact.sqlite3-wal"
+    shm_path = tmp_path / "sqlite_exact.sqlite3-shm"
+    assert wal_path.is_file()
+    assert shm_path.is_file()
+    before = {path: path.read_bytes() for path in (db_path, wal_path, shm_path)}
+    for path in before:
+        path.chmod(0o400)
+    tmp_path.chmod(0o500)
+    try:
+        reader_code = """
+import sys
+from mempalace.backends import PalaceRef
+from mempalace.backends.sqlite_exact import SQLiteExactBackend
+
+backend = SQLiteExactBackend()
+palace = PalaceRef(id=sys.argv[1], local_path=sys.argv[1])
+reader = backend.get_collection(
+    palace=palace,
+    collection_name="mempalace_drawers",
+    create=False,
+    options={"read_only": True},
+)
+print(reader.get(ids=["wal-row"]).documents[0])
+backend.close_palace(palace)
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", reader_code, str(tmp_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "uncheckpointed"
+        assert {path: path.read_bytes() for path in before} == before
+    finally:
+        tmp_path.chmod(0o700)
+        for path in before:
+            path.chmod(0o600)
+        writer_backend.close_palace(palace)
+
+
+def test_sqlite_exact_read_only_reopens_when_wal_appears_after_immutable_open(tmp_path):
+    """An immutable clean-database reader must reopen once a writer starts.
+
+    If a read-only MCP opens a cleanly closed palace before any writer is
+    alive, the connection uses immutable=1. A later daemon/HTTP writer creates
+    WAL sidecars; the cached immutable handle must not keep serving the
+    pre-writer snapshot forever.
+    """
+    writer_backend, writer = _collection(tmp_path)
+    palace = PalaceRef(id=str(tmp_path), local_path=str(tmp_path))
+    writer.add(
+        ids=["seed"],
+        documents=["seed drawer"],
+        metadatas=[{}],
+        embeddings=[[1, 0]],
+    )
+    # Force a full checkpoint so the on-disk database is clean (no WAL) when
+    # the first read-only open happens.
+    with writer._handle.lock:
+        writer._handle.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        writer._handle.conn.commit()
+    writer_backend.close_palace(palace)
+
+    db_path = tmp_path / "sqlite_exact.sqlite3"
+    wal_path = tmp_path / "sqlite_exact.sqlite3-wal"
+    shm_path = tmp_path / "sqlite_exact.sqlite3-shm"
+    assert db_path.is_file()
+    assert not wal_path.exists()
+    assert not shm_path.exists()
+
+    reader_backend = SQLiteExactBackend()
+    first = reader_backend.get_collection(
+        palace=palace,
+        collection_name="mempalace_drawers",
+        create=False,
+        options={"read_only": True},
+    )
+    assert first.count() == 1
+    first_handle = first._handle
+    assert first_handle.immutable is True
+    assert first_handle.read_only is True
+
+    # A peer writer starts after the immutable reader cached its connection.
+    later_writer_backend, later_writer = _collection(tmp_path)
+    later_writer.add(
+        ids=["post-writer"],
+        documents=["written after immutable open"],
+        metadatas=[{}],
+        embeddings=[[0, 1]],
+    )
+    assert wal_path.is_file()
+    assert shm_path.is_file()
+
+    # Same backend instance: cache hit must detect WAL and reopen mode=ro.
+    second = reader_backend.get_collection(
+        palace=palace,
+        collection_name="mempalace_drawers",
+        create=False,
+        options={"read_only": True},
+    )
+    assert first_handle.closed is True
+    assert second._handle is not first_handle
+    assert second._handle.immutable is False
+    assert second.count() == 2
+    got = second.get(ids=["post-writer"])
+    assert got.documents[0] == "written after immutable open"
+
+    later_writer_backend.close_palace(palace)
+    reader_backend.close_palace(palace)
+
+
+def test_sqlite_exact_immutable_reader_keeps_cache_on_partial_wal_sidecar(tmp_path):
+    """A lone -wal or -shm file must not retire the immutable reader.
+
+    Incomplete sidecar pairs are a transient mid-open state; forcing a
+    reconnect would raise from ``_connect_read_only`` and break recall.
+    """
+    writer_backend, writer = _collection(tmp_path)
+    palace = PalaceRef(id=str(tmp_path), local_path=str(tmp_path))
+    writer.add(ids=["seed"], documents=["seed"], metadatas=[{}], embeddings=[[1, 0]])
+    with writer._handle.lock:
+        writer._handle.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        writer._handle.conn.commit()
+    writer_backend.close_palace(palace)
+
+    wal_path = tmp_path / "sqlite_exact.sqlite3-wal"
+    shm_path = tmp_path / "sqlite_exact.sqlite3-shm"
+    assert not wal_path.exists() and not shm_path.exists()
+
+    reader_backend = SQLiteExactBackend()
+    first = reader_backend.get_collection(
+        palace=palace,
+        collection_name="mempalace_drawers",
+        create=False,
+        options={"read_only": True},
+    )
+    first_handle = first._handle
+    assert first_handle.immutable is True
+
+    # Simulate a torn writer open: only one sidecar present.
+    wal_path.write_bytes(b"not-a-real-wal")
+    second = reader_backend.get_collection(
+        palace=palace,
+        collection_name="mempalace_drawers",
+        create=False,
+        options={"read_only": True},
+    )
+    assert second._handle is first_handle
+    assert first_handle.closed is False
+    assert second.count() == 1
+
+    reader_backend.close_palace(palace)
+
+
+def test_sqlite_exact_direct_write_contends_with_palace_owner(tmp_path, monkeypatch):
+    from mempalace.palace import MineAlreadyRunning
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    backend, col = _collection(tmp_path)
+    holder_code = """
+import sys
+from mempalace.palace import mine_palace_lock
+with mine_palace_lock(sys.argv[1]):
+    print("ready", flush=True)
+    sys.stdin.read()
+"""
+    holder = subprocess.Popen(
+        [sys.executable, "-c", holder_code, str(tmp_path)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=os.environ.copy(),
+    )
+    try:
+        assert holder.stdout is not None
+        assert holder.stdout.readline().strip() == "ready"
+        with pytest.raises(MineAlreadyRunning):
+            col.add(ids=["blocked"], documents=["doc"], metadatas=[{}], embeddings=[[1, 0]])
+    finally:
+        if holder.stdin is not None:
+            holder.stdin.close()
+        holder.wait(timeout=10)
+        backend.close()
+
+
+@pytest.mark.parametrize("operation", ["add", "vacuum"])
+def test_sqlite_exact_waiting_thread_reacquires_palace_lease(tmp_path, monkeypatch, operation):
+    """A thread queued on the handle must not inherit stale re-entrant credit.
+
+    Thread A owns both the handle and palace locks. Thread B reaches the handle
+    while A still owns the palace, then pauses immediately after the handle is
+    released. An external process acquires the palace before B continues. B
+    must contend again and refuse both ordinary writes and VACUUM.
+    """
+    from mempalace.palace import MineAlreadyRunning
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    backend, col = _collection(tmp_path)
+    col.add(ids=["seed"], documents=["seed"], metadatas=[{}], embeddings=[[1, 0]])
+
+    release_a = threading.Event()
+    a_ready = threading.Event()
+    b_handle_attempted = threading.Event()
+    b_has_handle = threading.Event()
+    allow_b = threading.Event()
+    writer_ref = {"thread": None}
+
+    class CoordinatedRLock:
+        def __init__(self):
+            self._lock = threading.RLock()
+            self._writer_coordinated = False
+
+        def __enter__(self):
+            is_writer = threading.current_thread() is writer_ref["thread"]
+            if is_writer and not self._writer_coordinated:
+                self._writer_coordinated = True
+                b_handle_attempted.set()
+            self._lock.acquire()
+            if is_writer and self._writer_coordinated and not b_has_handle.is_set():
+                b_has_handle.set()
+                if not allow_b.wait(10):
+                    self._lock.release()
+                    raise AssertionError("timed out waiting to resume writer B")
+            return self
+
+        def __exit__(self, *exc):
+            self._lock.release()
+            return False
+
+    col._handle.lock = CoordinatedRLock()
+    errors = {}
+
+    def owner_a():
+        try:
+            with col._cursor(write=True):
+                a_ready.set()
+                if not release_a.wait(10):
+                    raise AssertionError("timed out waiting to release writer A")
+        except BaseException as exc:  # pragma: no cover - diagnostic path
+            errors["a"] = exc
+
+    if operation == "vacuum":
+        monkeypatch.setattr(
+            col,
+            "maintenance_state",
+            lambda: {"row_count": 1, "page_count": 1, "freelist_pages": 0},
+        )
+
+    def writer_b():
+        try:
+            if operation == "add":
+                col.add(
+                    ids=["writer-b"],
+                    documents=["must not be written"],
+                    metadatas=[{}],
+                    embeddings=[[0, 1]],
+                )
+            else:
+                col.run_maintenance("compact")
+        except BaseException as exc:
+            errors["b"] = exc
+
+    thread_a = threading.Thread(target=owner_a, name="sqlite-owner-a", daemon=True)
+    thread_b = threading.Thread(target=writer_b, name="sqlite-writer-b", daemon=True)
+    writer_ref["thread"] = thread_b
+    holder = None
+    try:
+        thread_a.start()
+        assert a_ready.wait(10), "writer A did not acquire both locks"
+
+        thread_b.start()
+        assert b_handle_attempted.wait(10), "writer B did not reach the handle lock"
+
+        release_a.set()
+        assert b_has_handle.wait(10), "writer B did not acquire the released handle"
+        thread_a.join(timeout=10)
+        assert not thread_a.is_alive(), "writer A did not release the palace lease"
+        assert "a" not in errors
+
+        holder_code = """
+import sys
+from mempalace.palace import mine_palace_lock
+with mine_palace_lock(sys.argv[1]):
+    print("ready", flush=True)
+    sys.stdin.read()
+"""
+        holder = subprocess.Popen(
+            [sys.executable, "-c", holder_code, str(tmp_path)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=os.environ.copy(),
+        )
+        assert holder.stdout is not None
+        assert holder.stdout.readline().strip() == "ready"
+
+        allow_b.set()
+        thread_b.join(timeout=10)
+        assert not thread_b.is_alive(), "writer B did not finish contention"
+        assert isinstance(errors.get("b"), MineAlreadyRunning)
+
+        if operation == "add":
+            assert col.get(ids=["writer-b"]).ids == []
+    finally:
+        release_a.set()
+        allow_b.set()
+        thread_a.join(timeout=10)
+        thread_b.join(timeout=10)
+        if holder is not None:
+            if holder.stdin is not None:
+                holder.stdin.close()
+            holder.wait(timeout=10)
+        backend.close()
 
 
 def test_palace_wrapper_embeds_for_sqlite_exact(tmp_path, monkeypatch):

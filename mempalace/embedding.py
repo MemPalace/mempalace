@@ -1,10 +1,12 @@
 """Embedding function factory with hardware acceleration.
 
-Returns a ChromaDB-compatible embedding function bound to a user-selected
-ONNX Runtime execution provider.
+Returns a ChromaDB-compatible embedding function — either a local ONNX model
+bound to a user-selected ONNX Runtime execution provider, or an
+OpenAI-compatible HTTP ``/v1/embeddings`` endpoint.
 
-Two embedding models are available, selected via ``MEMPALACE_EMBEDDING_MODEL``
-or ``embedding_model`` in ``~/.mempalace/config.json``:
+Three embedding-model options are available, selected via
+``MEMPALACE_EMBEDDING_MODEL`` or ``embedding_model`` in
+``~/.mempalace/config.json``:
 
 * ``minilm`` (default) — ``all-MiniLM-L6-v2``, 384-dim, English-only training.
   ChromaDB's default; what every existing palace was built with.
@@ -15,6 +17,16 @@ or ``embedding_model`` in ``~/.mempalace/config.json``:
   model is lazy-downloaded from HuggingFace on first use. Switching models
   on an existing palace requires ``mempalace repair rebuild-index``
   (different vector space).
+* ``openai-compat`` — embeddings served by any OpenAI-compatible
+  ``/v1/embeddings`` endpoint (LM Studio, llama.cpp, vLLM, Ollama's OpenAI
+  shim, or a self-hosted server) instead of a local ONNX model. Useful for
+  larger / multilingual embedders (e.g. Qwen3-Embedding) or GPU offload.
+  Endpoint settings are read from ``config.json`` as ``embedding_api_url`` /
+  ``embedding_api_model`` / ``embedding_api_key`` (each overridable via the
+  matching ``MEMPALACE_EMBEDDING_API_*`` env var). Vectors are L2-normalized
+  for the cosine collection; the dimension is whatever the server returns, so
+  switching to/from this backend also requires ``mempalace repair
+  rebuild-index``. Stays local when the endpoint is on your machine/LAN.
 
 Supported devices (env ``MEMPALACE_EMBEDDING_DEVICE`` or ``embedding_device``
 in ``~/.mempalace/config.json``):
@@ -31,10 +43,13 @@ rather than hard-failing — mining must still work on a laptop without CUDA.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import threading
 from typing import Optional
+
+from .version import __version__
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +104,7 @@ def _resolve_providers(device: str) -> tuple[list, str]:
     requested = _PROVIDER_MAP.get(device)
     if requested is None:
         if device not in _WARNED:
-            logger.warning("Unknown embedding_device %r — falling back to cpu", device)
+            logger.warning("Unknown embedding_device %r -- falling back to cpu", device)
             _WARNED.add(device)
         return (["CPUExecutionProvider"], "cpu")
 
@@ -216,8 +231,47 @@ _EMBEDDINGGEMMA_MAX_LEN = 2048
 # matches the internal batch size of chromadb's ONNXMiniLM_L6_V2, whose
 # chunked _forward survives the same call sites. embeddinggemma's
 # sentence_embedding output is attention-masked, so sub-batch padding
-# does not change any row's vector.
+# does not change any row's vector. __call__ decides which documents share
+# a sub-batch by size rather than by arrival order (#2104), because the run
+# is priced on that padded length and not on the document count.
 _EMBEDDINGGEMMA_BATCH_SIZE = 32
+
+
+def _sanitize_embeddinggemma_input_ids(tokenizer, input_ids, np):
+    """Replace tokenizer-only IDs that the text ONNX model cannot embed."""
+    model_vocab_size = tokenizer.get_vocab_size(with_added_tokens=False)
+    out_of_range = (input_ids < 0) | (input_ids >= model_vocab_size)
+
+    if not np.any(out_of_range):
+        return input_ids
+
+    unknown_token_id = tokenizer.token_to_id("<unk>")
+    if unknown_token_id is None or not 0 <= unknown_token_id < model_vocab_size:
+        raise RuntimeError(
+            "EmbeddingGemma tokenizer produced token IDs outside the ONNX "
+            "text vocabulary, but no valid <unk> token is available"
+        )
+
+    invalid_ids = sorted({int(token_id) for token_id in input_ids[out_of_range]})
+    warning_key = (
+        "embeddinggemma-out-of-range-token-ids",
+        model_vocab_size,
+        tuple(invalid_ids),
+    )
+
+    if warning_key not in _WARNED:
+        logger.warning(
+            "EmbeddingGemma tokenizer produced token IDs outside the ONNX "
+            "text vocabulary (size=%d): %s; remapping to <unk> (%d)",
+            model_vocab_size,
+            invalid_ids,
+            unknown_token_id,
+        )
+        _WARNED.add(warning_key)
+
+    sanitized = input_ids.copy()
+    sanitized[out_of_range] = unknown_token_id
+    return sanitized
 
 
 class EmbeddinggemmaONNX:
@@ -319,6 +373,33 @@ class EmbeddinggemmaONNX:
             self._session = session
 
     def __call__(self, input: str | list[str] | None) -> list[list[float]]:  # noqa: A002 — ChromaDB EF protocol
+        """Embed ``input``, returning one vector per document in input order.
+
+        Documents are grouped by size before the sub-batch split. The
+        tokenizer pads every row of a sub-batch to the longest sequence in
+        it, and attention cost per layer is batch x heads x length^2, so one
+        long document drags a whole sub-batch up to its own length. Without
+        grouping the bill is set by arrival order: a verbatim transcript
+        whose long tool results sit between one-line replies pays the long
+        length for nearly every row (#2104).
+
+        An input that fits a single sub-batch is left in arrival order: every
+        row pads to the same width either way, so the keys would buy nothing
+        on the one-document search path.
+
+        Regrouping does not change what a row means. The model's
+        ``sentence_embedding`` output is attention-masked, so padding never
+        enters a row's values; what does move is float32 rounding, because a
+        different padded width changes the reduction order inside the GEMMs.
+        Measured against the same documents embedded in arrival order, that
+        residual peaks at one float32 ULP (1.2e-07 absolute, cosine
+        0.99999992).
+
+        The key is UTF-8 byte length rather than character count: this model
+        is multilingual, and bytes per token vary far less across scripts
+        than characters per token do. The sort is stable, so equal-size
+        documents keep arrival order and the split stays reproducible.
+        """
         if isinstance(input, str):
             # A bare string would be iterated character by character below,
             # silently producing one garbage vector per character.
@@ -330,16 +411,28 @@ class EmbeddinggemmaONNX:
             return []
         self._lazy_load()
         np = self._np
-        embeddings: list[list[float]] = []
-        # Tokenize and run per sub-batch, not over the whole input: padding
-        # is to the longest sequence in the sub-batch, and the ONNX runtime
-        # only ever holds batch_size rows of attention buffers at a time
-        # (#1770).
-        for start in range(0, len(input), self._batch_size):
-            chunk = input[start : start + self._batch_size]
-            texts = [_EMBEDDINGGEMMA_PREFIX + t for t in chunk]
+        # One sub-batch pads identically whatever the order, so the sort is
+        # only worth its keys once the input splits into several.
+        order: range | list[int] = range(len(input))
+        if len(input) > self._batch_size:
+            order = sorted(range(len(input)), key=lambda i: len(input[i].encode("utf-8")))
+        # Row i is filled by the sub-batch that carries document i. ``order``
+        # is a permutation of every index, so no placeholder survives; callers
+        # (ChromaDB included) zip the result against their ids positionally.
+        embeddings: list[list[float] | None] = [None] * len(input)
+        # Tokenize and run per sub-batch, not over the whole input: the ONNX
+        # runtime only ever holds batch_size rows of attention buffers at a
+        # time (#1770).
+        for start in range(0, len(order), self._batch_size):
+            idxs = order[start : start + self._batch_size]
+            texts = [_EMBEDDINGGEMMA_PREFIX + input[i] for i in idxs]
             encs = self._tokenizer.encode_batch(texts)
             input_ids = np.asarray([e.ids for e in encs], dtype=np.int64)
+            input_ids = _sanitize_embeddinggemma_input_ids(
+                self._tokenizer,
+                input_ids,
+                np,
+            )
             attention_mask = np.asarray([e.attention_mask for e in encs], dtype=np.int64)
             outputs = self._session.run(
                 None, {"input_ids": input_ids, "attention_mask": attention_mask}
@@ -348,7 +441,16 @@ class EmbeddinggemmaONNX:
             # L2-normalize so cosine similarity == dot product (matches what the
             # MTEB methodology assumes; ChromaDB's distance is configured for it).
             norms = np.linalg.norm(sent_emb, axis=1, keepdims=True) + 1e-12
-            embeddings.extend((sent_emb / norms).tolist())
+            rows = (sent_emb / norms).tolist()
+            if len(rows) != len(idxs):
+                # zip would truncate silently and leave a None in the result,
+                # which only surfaces far downstream in the caller's array
+                # conversion. Fail on the sub-batch that came back short.
+                raise RuntimeError(
+                    f"embeddinggemma returned {len(rows)} rows for a {len(idxs)}-document sub-batch"
+                )
+            for row_index, row in zip(idxs, rows):
+                embeddings[row_index] = row
         return embeddings
 
     def embed_query(self, input: list[str]) -> list[list[float]]:  # noqa: A002 — ChromaDB EF protocol
@@ -358,6 +460,165 @@ class EmbeddinggemmaONNX:
     def embed_documents(self, input: list[str]) -> list[list[float]]:  # noqa: A002
         """Embed a batch of documents (ChromaDB EF protocol)."""
         return self(input)
+
+
+# ── OpenAI-compatible embedding API ──────────────────────────────────────
+# Fetch embeddings from an OpenAI-compatible ``/v1/embeddings`` server
+# (LM Studio, llama.cpp, vLLM, Ollama's OpenAI shim, or any compatible
+# endpoint) instead of running a model locally. Selected by
+# ``embedding_model == "openai-compat"``. Connection settings (URL, model,
+# optional key) are resolved by :class:`~mempalace.config.MempalaceConfig`
+# as the single source of truth — see ``embedding_api_url`` /
+# ``embedding_api_model`` / ``embedding_api_key`` (each env-overridable).
+_EF_API_BATCH = 64
+_EF_API_TIMEOUT = 120
+
+
+class EmbeddingAPIError(RuntimeError):
+    """Raised when the embedding API is unreachable or returns an invalid body.
+
+    Module-specific subclass mirroring ``llm_client.LLMError`` so callers can
+    distinguish embedding-endpoint failures; subclasses ``RuntimeError`` so
+    existing ``except RuntimeError`` paths still catch it.
+    """
+
+
+class OpenAICompatEmbeddingFunction:
+    """ChromaDB-compatible EF backed by an OpenAI-compatible ``/v1/embeddings``
+    endpoint (LM Studio, llama.cpp, vLLM, Ollama's OpenAI shim, etc.).
+
+    Selected via ``embedding_model == "openai-compat"``. Vectors are produced
+    server-side and fetched over HTTP, which changes the vector space — so
+    ``name()`` encodes the model id: ChromaDB persists the EF name on the
+    collection and rejects mismatched reads, the signal to run ``mempalace
+    repair rebuild-index`` after changing model/endpoint. stdlib ``urllib``
+    only, no new dependency.
+    """
+
+    def __init__(self, base_url: str, model: str, api_key: Optional[str] = None):
+        self._url = self._resolve_url(base_url)
+        self._model = model
+        self._api_key = api_key
+
+    @staticmethod
+    def _resolve_url(base_url: str) -> str:
+        """Accept a base host, a ``/v1`` base, or a full endpoint URL.
+
+        Mirrors ``llm_client.OpenAICompatProvider._resolve_url`` so both sides
+        treat an ``http://host:port`` endpoint the same way.
+        """
+        url = base_url.rstrip("/")
+        if url.endswith("/embeddings"):
+            return url
+        if url.endswith("/v1"):
+            return f"{url}/embeddings"
+        return f"{url}/v1/embeddings"
+
+    def name(self) -> str:
+        # Encode the model so switching it changes the persisted EF identity
+        # and forces a rebuild_index (vectors from a different model/space are
+        # not interchangeable). ChromaDB compares this on every read.
+        return f"openai_compat_emb_{self._model}".replace("/", "_")
+
+    def embed_query(self, input):  # noqa: A002 — ChromaDB EF protocol uses `input`
+        # ChromaDB 1.5 dispatches query embedding through embed_query (add uses
+        # __call__). Mirror the EmbeddingFunction protocol default: same path.
+        return self(input)
+
+    def __call__(self, input):  # noqa: A002 — ChromaDB EF protocol uses `input`
+        import http.client
+        import json
+        from urllib.error import HTTPError, URLError
+        from urllib.request import Request, urlopen
+
+        headers = {
+            "Content-Type": "application/json",
+            # Some hosted (Cloudflare-fronted) endpoints 403 the default
+            # ``Python-urllib`` User-Agent — send our own (see issue #1570).
+            "User-Agent": f"mempalace/{__version__}",
+        }
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+
+        out: list = []
+        texts = list(input)
+        for start in range(0, len(texts), _EF_API_BATCH):
+            batch = texts[start : start + _EF_API_BATCH]
+            # encoding_format=float is explicit so a server that defaults to
+            # base64 doesn't hand back strings we'd mis-parse as vectors.
+            payload = {"model": self._model, "input": batch, "encoding_format": "float"}
+            req = Request(self._url, data=json.dumps(payload).encode("utf-8"), headers=headers)
+            try:
+                with urlopen(req, timeout=_EF_API_TIMEOUT) as resp:
+                    data = json.loads(resp.read())
+            # ValueError covers an invalid/missing URL scheme and json.JSONDecodeError;
+            # http.client.HTTPException covers low-level protocol faults (BadStatusLine,
+            # IncompleteRead) common with local/overloaded servers.
+            except (HTTPError, URLError, OSError, http.client.HTTPException, ValueError) as e:
+                raise EmbeddingAPIError(
+                    f"Embedding API request to {self._url} failed: {e}. Check that the "
+                    f"server is reachable and MEMPALACE_EMBEDDING_API_URL / embedding_api_url "
+                    f"is correct."
+                ) from e
+            out.extend(self._vectors_from_response(data, len(batch)))
+        return out
+
+    def _vectors_from_response(self, data, n: int) -> list:
+        """Validate one ``/v1/embeddings`` response and return L2-normed vectors.
+
+        Guards every way a non-conformant server could corrupt the store
+        silently: a missing/short ``data`` array, response ``index`` values
+        that aren't the contiguous ``0..n-1`` batch positions (sorting then
+        zipping positionally would otherwise misalign vectors with texts), and
+        malformed / ragged / base64 embedding payloads. All failures raise
+        :class:`EmbeddingAPIError` naming the endpoint rather than a cryptic
+        numpy error — a silent wrong result would break the 100%-recall promise.
+        """
+        import numpy as np
+
+        if not isinstance(data, dict):
+            raise EmbeddingAPIError(
+                f"Embedding API at {self._url} returned a non-object response: {data}"
+            )
+        rows = data.get("data")
+        if not isinstance(rows, list):
+            raise EmbeddingAPIError(
+                f"Embedding API at {self._url} returned no 'data' array: {data.get('error', data)}"
+            )
+        if len(rows) != n:
+            raise EmbeddingAPIError(
+                f"Embedding API at {self._url} returned {len(rows)} embeddings for {n} inputs"
+            )
+        # The endpoint may return rows out of order — sort by index, then
+        # require the indices to be exactly 0..n-1 so positional alignment is
+        # provably correct (a server using absolute or duplicate indices would
+        # otherwise pass the count check yet map vectors to the wrong texts).
+        try:
+            rows = sorted(rows, key=lambda d: d.get("index", -1))
+            indices = [r.get("index") for r in rows]
+        except AttributeError as e:
+            raise EmbeddingAPIError(
+                f"Embedding API at {self._url} returned non-object rows: {e}"
+            ) from e
+        if indices != list(range(n)):
+            raise EmbeddingAPIError(
+                f"Embedding API at {self._url} returned non-contiguous or duplicate "
+                f"'index' values; cannot align embeddings with inputs"
+            )
+        try:
+            arr = np.asarray([r["embedding"] for r in rows], dtype=np.float32)
+        except (KeyError, TypeError, ValueError) as e:
+            raise EmbeddingAPIError(
+                f"Embedding API at {self._url} returned malformed embeddings: {e}"
+            ) from e
+        if arr.ndim != 2:
+            raise EmbeddingAPIError(
+                f"Embedding API at {self._url} returned non-vector embeddings (shape {arr.shape})"
+            )
+        # L2-normalize so cosine == dot product (collection uses
+        # hnsw:space=cosine), matching EmbeddinggemmaONNX above.
+        norms = np.linalg.norm(arr, axis=1, keepdims=True) + 1e-12
+        return (arr / norms).tolist()
 
 
 def get_embedding_function(device: Optional[str] = None, model: Optional[str] = None):
@@ -376,6 +637,41 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
             device = cfg.embedding_device
         if model is None:
             model = cfg.embedding_model
+
+    # OpenAI-compatible embedding API: bypasses local ONNX entirely. Checked
+    # before device→provider resolution since it needs no hardware accelerator.
+    if model == "openai-compat":
+        from .config import MempalaceConfig
+
+        cfg = MempalaceConfig()
+        url = cfg.embedding_api_url
+        if not url:
+            raise ValueError(
+                "embedding_model='openai-compat' requires an endpoint — set "
+                "embedding_api_url in ~/.mempalace/config.json or the "
+                "MEMPALACE_EMBEDDING_API_URL env var (e.g. http://host:port)"
+            )
+        api_model = cfg.embedding_api_model
+        if not api_model:
+            raise ValueError(
+                "embedding_model='openai-compat' requires a model — set "
+                "embedding_api_model in ~/.mempalace/config.json or the "
+                "MEMPALACE_EMBEDDING_API_MODEL env var"
+            )
+        api_key = cfg.embedding_api_key
+        # Include a fingerprint of the key (never the raw secret) so a token
+        # rotation busts the cache in long-lived processes (e.g. MCP server).
+        key_fp = hashlib.sha256((api_key or "").encode("utf-8")).hexdigest()[:16]
+        cache_key = ("openai-compat", url, api_model, key_fp)
+        cached = _EF_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        ef = OpenAICompatEmbeddingFunction(base_url=url, model=api_model, api_key=api_key)
+        _EF_CACHE[cache_key] = ef
+        logger.info(
+            "Embedding function initialized (openai-compat url=%s model=%s)", url, api_model
+        )
+        return ef
 
     providers, effective = _resolve_providers(device)
     cache_key = (model, tuple(providers))
@@ -406,15 +702,21 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
 
 
 def describe_device(device: Optional[str] = None) -> str:
-    """Return a short human-readable label for the resolved device.
+    """Return a short human-readable label for the resolved embedding backend.
 
-    Used by the miner CLI header so users can see at a glance whether GPU
-    acceleration actually engaged.
+    Used by the miner CLI header / MCP status so users can see at a glance
+    whether GPU acceleration engaged — or, for the ``openai-compat`` backend,
+    that embeddings are served by a remote endpoint rather than local hardware
+    (in which case the ``embedding_device`` accelerator label is irrelevant).
     """
     if device is None:
         from .config import MempalaceConfig
 
-        device = MempalaceConfig().embedding_device
+        cfg = MempalaceConfig()
+        if cfg.embedding_model == "openai-compat":
+            url = cfg.embedding_api_url
+            return f"openai-compat ({url})" if url else "openai-compat"
+        device = cfg.embedding_device
     _, effective = _resolve_providers(device)
     return effective
 

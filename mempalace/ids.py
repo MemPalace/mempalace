@@ -108,6 +108,27 @@ def make_convo_sentinel_id(source_file: str, extract_mode: str) -> str:
     return f"_reg_{_delimited_sha256((source_file, extract_mode), _HASH_TRUNC_DRAWER)}"
 
 
+def make_exchange_drawer_id(
+    wing: str, room: str, source_file: str, filed_at: str, content: str
+) -> str:
+    """Drawer ID for a single verbatim conversation exchange.
+
+    Used by live agent integrations (e.g. Hermes) and their backfills via
+    ``convo_miner.file_conversation_exchange``. Hashes the FULL content,
+    not a prefix — prefix hashing collided on common openings ("User: hi
+    can you help me with…") and ChromaDB's upsert silently overwrote the
+    earlier drawer. ``filed_at`` is included so genuinely repeated
+    exchanges stay distinct drawers (verbatim always — repetition is
+    signal, not noise).
+
+    Hash input is ``f"{source_file}|{filed_at}|{content}"``.
+    """
+    return (
+        f"drawer_{wing}_{room}_"
+        f"{_delimited_sha256((source_file, filed_at, content), _HASH_TRUNC_DRAWER)}"
+    )
+
+
 def make_triple_id(
     sub_id: str, predicate: str, obj_id: str, valid_from: str, recorded_at: str
 ) -> str:

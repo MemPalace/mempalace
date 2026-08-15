@@ -1535,9 +1535,10 @@ class TestDrawerGrepExpansion:
         ``source_file + chunk_index`` pulls chunks from both groups as if
         they were sequential neighbors, corrupting the enriched text.
         Scoping by ``parent_drawer_id`` when present keeps each logical
-        group isolated. (``tool_diary_write`` chunks tag a different key
-        (``parent_entry_id``) and are written without ``source_file``, so
-        they never reach this enrichment path.)
+        group isolated. (``tool_diary_write`` chunks are written without
+        ``source_file``, so they never reach this enrichment path at all --
+        it returns early on the missing key -- regardless of which
+        parent-id key they carry.)
         """
         col = get_collection(palace_path)
         source = "shared.log"
@@ -1711,7 +1712,12 @@ class TestDrawerGrepExpansion:
         )
 
         result = search_memories("JWT authentication", palace_path)
-        assert result["results"]
+        # Surface the full envelope when search fails (Windows CI has flaked
+        # with KeyError on a bare ``result["results"]`` after a mid-query
+        # error dict that lacked the key).
+        assert "results" in result, f"search envelope missing results: {result!r}"
+        assert result["results"], f"hybrid search returned no hits: {result!r}"
+        assert "error" not in result, f"hybrid search failed: {result!r}"
         boosted = [h for h in result["results"] if h["matched_via"] == "drawer+closet"]
         assert boosted, "hybrid search should mark the closet-agreeing source"
         top = boosted[0]

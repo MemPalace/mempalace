@@ -7,6 +7,9 @@ Supported harnesses: claude-code, codex (extensible to cursor, gemini, etc.)
 """
 
 import hashlib
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 import json
 import os
 import re
@@ -18,6 +21,13 @@ from pathlib import Path
 from typing import Optional
 
 from mempalace.config import MempalaceConfig
+from mempalace.write_routing import (
+    ResolvedWriteRoutingPolicy,
+    WriteRoutingDecision,
+    WriteRoutingError,
+    WriteRoutingPolicy,
+    choose_write_route,
+)
 
 SAVE_INTERVAL = 15
 STATE_DIR = Path.home() / ".mempalace" / "hook_state"
@@ -510,6 +520,11 @@ def _spawn_mine(cmd: list) -> None:
 
 
 def _hooks_daemon_enabled() -> bool:
+    """Legacy compatibility helper for the pre-policy hook setting.
+
+    New hook write paths use ``resolve_write_routing("hooks")``. This
+    helper remains for callers/tests that still inspect ``hooks.daemon``.
+    """
     try:
         return MempalaceConfig().hook_use_daemon is True
     except Exception:
@@ -527,11 +542,9 @@ def _daemon_mine_dedupe_key(source: str, mode: str) -> str:
 def _daemon_available() -> bool:
     """True iff a daemon is already running for the configured palace.
 
-    This is a fast localhost health check, not a spawn: the 500ms hook budget
-    forbids auto-starting a python subprocess from a hook (cold start is
-    ~15s). Daemon mode for hooks requires the user to have started the daemon
-    explicitly via `mempalace daemon start`; when it isn't up, hooks fall back
-    to the existing direct (in-process / spawn) path instead of blocking.
+    This is a fast localhost health check, not a spawn: the hook time budget
+    forbids cold-starting a long-lived daemon. ``prefer`` may fall back to the
+    direct path when this returns false; ``require`` must block the write.
     """
     from .daemon import HOOK_PROBE_TIMEOUT, get_client_if_running
 
@@ -542,6 +555,143 @@ def _daemon_available() -> bool:
         )
     except Exception:
         return False
+
+
+@dataclass(frozen=True)
+class HookWriteRouting:
+    """One hook invocation's resolved routing state."""
+
+    decision: Optional[WriteRoutingDecision]
+    source: str
+    error: Optional[str] = None
+
+    @property
+    def use_daemon(self) -> bool:
+        return self.decision is not None and self.decision.use_daemon
+
+    @property
+    def blocked(self) -> bool:
+        return self.error is not None or (self.decision is not None and self.decision.blocked)
+
+    @property
+    def notice(self) -> str:
+        if self.error is not None:
+            return (
+                "MemPalace hook writes were skipped because write-routing "
+                f"configuration is invalid: {self.error}. No direct ChromaDB "
+                "fallback was attempted."
+            )
+        if self.blocked:
+            return (
+                "MemPalace hook writes were skipped because routing is set to "
+                "'require' but the local daemon is unavailable. Start it with "
+                "`mempalace daemon start`; no direct ChromaDB fallback was attempted."
+            )
+        return ""
+
+
+_HOOK_WRITE_ROUTING_CONTEXT = ContextVar(
+    "mempalace_hook_write_routing",
+    default=None,
+)
+
+
+def _resolve_configured_hook_policy() -> ResolvedWriteRoutingPolicy:
+    """Resolve the new policy, with legacy-object compatibility."""
+
+    config = MempalaceConfig()
+    resolver = getattr(config, "resolve_write_routing", None)
+    if callable(resolver):
+        resolved = resolver("hooks")
+        if isinstance(resolved, ResolvedWriteRoutingPolicy):
+            return resolved
+
+    # Compatibility for older/custom config objects and existing tests that
+    # expose only the pre-policy ``hook_use_daemon`` property.
+    policy = (
+        WriteRoutingPolicy.PREFER
+        if getattr(config, "hook_use_daemon", False) is True
+        else WriteRoutingPolicy.DIRECT
+    )
+    return ResolvedWriteRoutingPolicy(
+        policy=policy,
+        source="legacy hook_use_daemon",
+    )
+
+
+def _compute_hook_write_routing() -> HookWriteRouting:
+    """Resolve hook policy and probe daemon liveness at most once."""
+
+    try:
+        resolved = _resolve_configured_hook_policy()
+    except WriteRoutingError as exc:
+        routing = HookWriteRouting(
+            decision=None,
+            source="configuration-error",
+            error=str(exc),
+        )
+        _log(routing.notice)
+        return routing
+    except Exception as exc:
+        # Preserve the historical save-on-config-read-failure behavior. An
+        # explicitly invalid routing value raises WriteRoutingError above and
+        # fails closed; an unrelated config I/O/runtime failure falls back to
+        # direct so a final checkpoint is not silently lost.
+        _log(f"WARNING: could not resolve hook write routing: {exc}; defaulting to direct")
+        resolved = ResolvedWriteRoutingPolicy(
+            policy=WriteRoutingPolicy.DIRECT,
+            source="config-unavailable fallback",
+        )
+
+    daemon_available = False
+    if resolved.policy is not WriteRoutingPolicy.DIRECT:
+        daemon_available = _daemon_available()
+
+    decision = choose_write_route(
+        resolved.policy,
+        daemon_available=daemon_available,
+        daemon_can_start=False,
+    )
+    routing = HookWriteRouting(
+        decision=decision,
+        source=resolved.source,
+    )
+
+    if decision.policy is not WriteRoutingPolicy.DIRECT:
+        _log(
+            "Hook write routing: "
+            f"policy={decision.policy.value} source={resolved.source} "
+            f"target={decision.target.value} reason={decision.reason}"
+        )
+
+    return routing
+
+
+def _current_hook_write_routing() -> HookWriteRouting:
+    routing = _HOOK_WRITE_ROUTING_CONTEXT.get()
+    if routing is not None:
+        return routing
+    return _compute_hook_write_routing()
+
+
+@contextmanager
+def _hook_write_routing_context():
+    """Share one policy resolution and one daemon probe across a hook fire."""
+
+    routing = _compute_hook_write_routing()
+    token = _HOOK_WRITE_ROUTING_CONTEXT.set(routing)
+    try:
+        yield routing
+    finally:
+        _HOOK_WRITE_ROUTING_CONTEXT.reset(token)
+
+
+def _log_hook_write_blocked(routing: HookWriteRouting, operation: str) -> None:
+    _log(f"{routing.notice} Operation skipped: {operation}.")
+
+
+def _blocked_hook_output(routing: HookWriteRouting) -> dict:
+    return {"systemMessage": routing.notice}
 
 
 def _submit_daemon_job(
@@ -573,7 +723,31 @@ def _submit_daemon_job(
         wait=wait,
         auto_start=False,
         timeout=timeout,
+        # A job refused the palace lock is deferred, not failed (#2014), so it
+        # is never terminal while the holder lives. The waiting callers below
+        # wait on purpose, but a parked job cannot reach the state they wait
+        # for: they would burn the whole timeout and then report a failure that
+        # did not happen. Take the parked job back instead; the daemon still
+        # runs it once the lock frees.
+        stop_on_lock_deferral=True,
     )
+
+
+def _job_deferred_by_lock(job: dict) -> bool:
+    """True when the daemon parked this job behind the palace write lock.
+
+    Imported lazily like ``submit_job`` above: only callers that actually reach
+    the daemon pay for the module, and by this point it is already loaded.
+    """
+    from .daemon import job_deferred_by_lock
+
+    return job_deferred_by_lock(job)
+
+
+def _lock_deferral_reason(job: dict) -> str:
+    """Operator-facing reason a job is parked, for the hook log."""
+    reason = (job.get("error") or {}).get("message") or "the palace write lock is held"
+    return f"{reason} (job {job.get('id')} stays queued and runs when the holder exits)"
 
 
 def _maybe_auto_ingest():
@@ -592,9 +766,15 @@ def _maybe_auto_ingest():
     targets = _get_mine_targets()
     if not targets:
         return
+
+    routing = _current_hook_write_routing()
+    if routing.blocked:
+        _log_hook_write_blocked(routing, "project auto-ingest")
+        return
+
     for mine_dir, mode in targets:
         try:
-            if _hooks_daemon_enabled() and _daemon_available():
+            if routing.use_daemon:
                 try:
                     _submit_daemon_job(
                         "mine",
@@ -626,11 +806,17 @@ def _mine_sync():
     targets = _get_mine_targets()
     if not targets:
         return
+
+    routing = _current_hook_write_routing()
+    if routing.blocked:
+        _log_hook_write_blocked(routing, "synchronous project mine")
+        return
+
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     log_path = STATE_DIR / "hook.log"
     for mine_dir, mode in targets:
         try:
-            if _hooks_daemon_enabled() and _daemon_available():
+            if routing.use_daemon:
                 try:
                     job = _submit_daemon_job(
                         "mine",
@@ -640,7 +826,12 @@ def _mine_sync():
                         timeout=60,
                     )
                     result = job.get("result") or {}
-                    if job.get("state") != "succeeded" or not result.get("success", True):
+                    if _job_deferred_by_lock(job):
+                        # Parked behind the palace lock, not failed: the daemon
+                        # runs it once the holder exits. Saying "failed" here
+                        # would be the false report #2014 is about.
+                        _log(f"Daemon sync mine deferred: {_lock_deferral_reason(job)}")
+                    elif job.get("state") != "succeeded" or not result.get("success", True):
                         _log(f"Daemon sync mine failed: {result.get('error', job.get('error'))}")
                 except Exception as exc:
                     # Daemon accepted context — don't fall back (would double-mine).
@@ -773,11 +964,23 @@ def _save_diary_direct(
     the agent wrote to, so project-derived wings stay discoverable.
 
     Returns {"count": N, "themes": [...]} on success, {"count": 0} on failure.
+    A daemon lock deferral also returns {"count": 0}: nothing is filed yet, but
+    the entry is queued and the daemon files it once the holder exits, so the
+    checkpoint marker is deliberately not advanced.
     """
     messages = _extract_recent_messages(transcript_path)
     if not messages:
         _log("No recent messages to save")
         return {"count": 0}
+
+    routing = _current_hook_write_routing()
+    if routing.blocked:
+        _log_hook_write_blocked(routing, "diary checkpoint")
+        return {
+            "count": 0,
+            "routing_blocked": True,
+            "routing_message": routing.notice,
+        }
 
     themes = _extract_themes(messages)
 
@@ -790,7 +993,7 @@ def _save_diary_direct(
     )
 
     try:
-        if _hooks_daemon_enabled() and _daemon_available():
+        if routing.use_daemon:
             try:
                 job = _submit_daemon_job(
                     "diary_write",
@@ -822,6 +1025,12 @@ def _save_diary_direct(
                 if toast:
                     _desktop_toast(f"Checkpoint saved - {len(messages)} messages archived")
                 return {"count": len(messages), "themes": themes}
+            if _job_deferred_by_lock(job):
+                # Queued behind the palace lock: the entry is held and the daemon
+                # files it once the holder exits. Not a failure, and not a reason
+                # to re-file it here -- that would duplicate verbatim content.
+                _log(f"Daemon diary checkpoint deferred: {_lock_deferral_reason(job)}")
+                return {"count": 0}
             _log(f"Daemon diary checkpoint failed: {result.get('error', job.get('error'))}")
             return {"count": 0}
 
@@ -870,18 +1079,23 @@ def _ingest_transcript(transcript_path: str):
     except Exception:
         return
 
+    routing = _current_hook_write_routing()
+    if routing.blocked:
+        _log_hook_write_blocked(routing, "transcript ingest")
+        return
+
     try:
-        if _hooks_daemon_enabled() and _daemon_available():
+        if routing.use_daemon:
             try:
                 _submit_daemon_job(
                     "mine",
                     {
-                        "source": str(path.parent),
+                        "source": str(path),
                         "mode": "convos",
                         "wing": "sessions",
                         "agent": "mempalace",
                     },
-                    dedupe_key=_daemon_mine_dedupe_key(str(path.parent), "convos"),
+                    dedupe_key=_daemon_mine_dedupe_key(str(path), "convos"),
                     wait=False,
                 )
                 _log(f"Transcript ingest submitted to daemon: {path.name}")
@@ -899,7 +1113,7 @@ def _ingest_transcript(transcript_path: str):
                 "-m",
                 "mempalace",
                 "mine",
-                str(path.parent),
+                str(path),
                 "--mode",
                 "convos",
                 "--wing",
@@ -1012,6 +1226,12 @@ def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
                 cwd_norm = cwd.replace("\\", "/").rstrip("/")
                 if not cwd_norm:
                     continue
+                # A cwd inside "<project>/.claude/worktrees/<wt>" (a git
+                # worktree) belongs to <project>, not the ephemeral worktree
+                # directory -- otherwise every worktree spawns its own wing.
+                _wt_marker = "/.claude/worktrees/"
+                if _wt_marker in cwd_norm:
+                    cwd_norm = cwd_norm.split(_wt_marker, 1)[0]
                 project = cwd_norm.rsplit("/", 1)[-1]
                 if project:
                     return f"wing_{_safe_wing_slug(project)}"
@@ -1132,64 +1352,70 @@ def hook_stop(data: dict, harness: str):
     _log(f"Session {session_id}: {exchange_count} exchanges, {since_last} since last save")
 
     if since_last >= SAVE_INTERVAL and exchange_count > 0:
-        _log(f"TRIGGERING SAVE at exchange {exchange_count}")
+        with _hook_write_routing_context() as routing:
+            if routing.blocked:
+                _log_hook_write_blocked(routing, "stop-hook checkpoint")
+                _output(_blocked_hook_output(routing))
+                return
 
-        # Read hook settings from config
-        try:
-            config = MempalaceConfig()
-            silent = config.hook_silent_save
-            toast = config.hook_desktop_toast
-        except Exception:
-            silent = True
-            toast = False
+            _log(f"TRIGGERING SAVE at exchange {exchange_count}")
 
-        project_wing = _wing_from_transcript_path(transcript_path)
+            # Read hook settings from config
+            try:
+                config = MempalaceConfig()
+                silent = config.hook_silent_save
+                toast = config.hook_desktop_toast
+            except Exception:
+                silent = True
+                toast = False
 
-        if silent:
-            # Save directly via Python API — systemMessage renders in terminal
-            result = {"count": 0}
-            if transcript_path:
-                result = _save_diary_direct(
-                    transcript_path,
-                    session_id,
-                    wing=project_wing,
-                    toast=toast,
-                    agent_name=_diary_agent_for_harness(harness),
-                )
-                _ingest_transcript(transcript_path)
-            _maybe_auto_ingest()
-            # Only advance save marker after successful save
-            count = result.get("count", 0)
-            if count > 0:
+            project_wing = _wing_from_transcript_path(transcript_path)
+
+            if silent:
+                # Save directly via Python API — systemMessage renders in terminal
+                result = {"count": 0}
+                if transcript_path:
+                    result = _save_diary_direct(
+                        transcript_path,
+                        session_id,
+                        wing=project_wing,
+                        toast=toast,
+                        agent_name=_diary_agent_for_harness(harness),
+                    )
+                    _ingest_transcript(transcript_path)
+                _maybe_auto_ingest()
+                # Only advance save marker after successful save
+                count = result.get("count", 0)
+                if count > 0:
+                    try:
+                        last_save_file.write_text(str(exchange_count), encoding="utf-8")
+                    except OSError:
+                        pass
+                    themes = result.get("themes", [])
+                    if themes:
+                        tag = " \u2014 " + ", ".join(themes)
+                    else:
+                        tag = ""
+                    _output(
+                        {
+                            "systemMessage": f"\u2726 {count} memories woven into the palace{tag}",
+                        }
+                    )
+                else:
+                    _output({})
+            else:
+                # Legacy: block and ask Claude to save via MCP tools.
+                # Marker advances before confirmed save — best-effort; if Claude
+                # fails to save, the checkpoint is lost but won't retry endlessly.
                 try:
                     last_save_file.write_text(str(exchange_count), encoding="utf-8")
                 except OSError:
                     pass
-                themes = result.get("themes", [])
-                if themes:
-                    tag = " \u2014 " + ", ".join(themes)
-                else:
-                    tag = ""
-                _output(
-                    {
-                        "systemMessage": f"\u2726 {count} memories woven into the palace{tag}",
-                    }
-                )
-            else:
-                _output({})
-        else:
-            # Legacy: block and ask Claude to save via MCP tools.
-            # Marker advances before confirmed save — best-effort; if Claude
-            # fails to save, the checkpoint is lost but won't retry endlessly.
-            try:
-                last_save_file.write_text(str(exchange_count), encoding="utf-8")
-            except OSError:
-                pass
-            if transcript_path:
-                _ingest_transcript(transcript_path)
-            _maybe_auto_ingest()
-            reason = STOP_BLOCK_REASON + f" Write diary entry to wing={project_wing}."
-            _output({"decision": "block", "reason": reason})
+                if transcript_path:
+                    _ingest_transcript(transcript_path)
+                _maybe_auto_ingest()
+                reason = STOP_BLOCK_REASON + f" Write diary entry to wing={project_wing}."
+                _output({"decision": "block", "reason": reason})
     else:
         _output({})
 
@@ -1206,6 +1432,14 @@ def hook_session_start(data: dict, harness: str):
 
     # Initialize session state directory
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Surface a required-daemon problem at session start instead of waiting
+    # until the first save is due. Hooks still never cold-start the daemon.
+    with _hook_write_routing_context() as routing:
+        if routing.blocked:
+            _log_hook_write_blocked(routing, "session-start readiness check")
+            _output(_blocked_hook_output(routing))
+            return
 
     # Pass through — no blocking on session start
     _output({})
@@ -1305,16 +1539,22 @@ def hook_session_end(data: dict, harness: str):
         # short-circuit + upsert). ``reason`` is intentionally not branched on:
         # every clean-exit reason (incl. ``/clear`` / ``resume``) warrants the
         # flush. Order matches ``hook_stop``.
-        if valid_transcript:
-            _save_diary_direct(
-                valid_transcript,
-                session_id,
-                wing=_wing_from_transcript_path(valid_transcript),
-                toast=toast,
-                agent_name=_diary_agent_for_harness(harness),
-            )
-            _ingest_transcript(valid_transcript)
-        _maybe_auto_ingest()
+        with _hook_write_routing_context() as routing:
+            if routing.blocked:
+                _log_hook_write_blocked(routing, "session-end flush")
+                _output(_blocked_hook_output(routing))
+                return
+
+            if valid_transcript:
+                _save_diary_direct(
+                    valid_transcript,
+                    session_id,
+                    wing=_wing_from_transcript_path(valid_transcript),
+                    toast=toast,
+                    agent_name=_diary_agent_for_harness(harness),
+                )
+                _ingest_transcript(valid_transcript)
+            _maybe_auto_ingest()
 
         _output({})
     finally:
@@ -1341,14 +1581,20 @@ def hook_precompact(data: dict, harness: str):
 
     _log(f"PRE-COMPACT triggered for session {session_id}")
 
-    # Capture tool output via our normalize path before compaction loses it
-    if transcript_path:
-        _ingest_transcript(transcript_path)
+    with _hook_write_routing_context() as routing:
+        if routing.blocked:
+            _log_hook_write_blocked(routing, "precompact flush")
+            _output(_blocked_hook_output(routing))
+            return
 
-    # Mine MEMPAL_DIR synchronously so project data lands before
-    # compaction proceeds. Transcript convos were already kicked off
-    # above via _ingest_transcript.
-    _mine_sync()
+        # Capture tool output via our normalize path before compaction loses it
+        if transcript_path:
+            _ingest_transcript(transcript_path)
+
+        # Mine MEMPAL_DIR synchronously so project data lands before
+        # compaction proceeds. Transcript convos were already kicked off
+        # above via _ingest_transcript.
+        _mine_sync()
 
     _output({})
 

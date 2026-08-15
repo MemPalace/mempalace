@@ -150,17 +150,25 @@ def test_helper_raises_on_page_mangled_sqlite(tmp_path):
     assert "malformed" in combined or "quick_check failed" in combined
 
 
-def test_helper_raises_on_fts5_segment_corruption(tmp_path):
-    """The reporter-shaped failure: FTS5 inverted index malformed, main pages OK."""
+def test_helper_auto_heals_fts5_segment_corruption(tmp_path):
+    """The reporter-shaped failure: FTS5 inverted index malformed, main pages
+    OK. This is exactly the isolated-FTS5 condition
+    ``maybe_autoheal_fts5_index`` (#1926/#1928) rebuilds in place, so the
+    validator must return silently (healed) rather than raise.
+    """
+    import sqlite3
+    from contextlib import closing
+
     palace = tmp_path / "palace"
     _build_palace_with_drawer(palace)
     _corrupt_fts5_segment(palace / "chroma.sqlite3")
 
-    with pytest.raises(MineValidationError) as exc_info:
-        _validate_palace_fts5_after_mine(str(palace))
+    # Must not raise: isolated FTS5 corruption is auto-healed before the
+    # validator would otherwise raise MineValidationError.
+    assert _validate_palace_fts5_after_mine(str(palace)) is None
 
-    err = exc_info.value
-    assert "fts5" in " ".join(err.errors).lower()
+    with closing(sqlite3.connect(str(palace / "chroma.sqlite3"))) as conn:
+        assert conn.execute("PRAGMA quick_check").fetchall() == [("ok",)]
 
 
 # ── 3. cmd_mine surfaces MineValidationError as exit-1 + banner ─────
@@ -246,11 +254,25 @@ def test_validate_skipped_on_dry_run(tmp_path, monkeypatch):
 
 
 def test_full_chain_raises_through_mine_impl(tmp_path, monkeypatch):
-    """Run a real mine, corrupt FTS5 mid-process, re-mine. The validator
-    inside _mine_impl must raise MineValidationError as the explicit source
-    (spy verifies). The new `except MineValidationError: raise` clause in
-    miner._mine_impl bypasses the partial-progress "Mine aborted" banner so
-    cmd_mine prints the single, authoritative recovery message.
+    """Run a real mine, then force the validator to raise on the re-mine.
+    The validator inside _mine_impl must raise MineValidationError as the
+    explicit source (spy verifies). The new `except MineValidationError:
+    raise` clause in miner._mine_impl bypasses the partial-progress "Mine
+    aborted" banner so cmd_mine prints the single, authoritative recovery
+    message.
+
+    The validator is monkeypatched to raise directly rather than corrupting
+    the real sqlite file: page-level (non-isolated) corruption severe
+    enough to make quick_check report non-FTS5 errors is also severe enough
+    that ChromaDB's own Rust bindings panic just opening the file for the
+    re-mine's ``get_collection()`` call -- before this test's own validator
+    ever runs. That's a real, useful thing to know (native panic rather
+    than a catchable Python exception, on a sufficiently corrupted file),
+    but it's a different failure mode than what this test is about: proving
+    _mine_impl's exception-passthrough logic runs cleanly when the
+    validator raises. Isolated FTS5-only corruption is covered separately
+    by test_full_chain_auto_heals_isolated_fts5_corruption below, and would
+    never reach this raise path at all now that it's auto-healed.
     """
     from mempalace import miner as miner_mod
     from mempalace import palace as palace_mod
@@ -269,17 +291,20 @@ def test_full_chain_raises_through_mine_impl(tmp_path, monkeypatch):
         dry_run=False,
     )
 
-    _corrupt_fts5_segment(palace / "chroma.sqlite3")
+    # Second mine needs new content to process, else file_already_mined's
+    # mtime check short-circuits before the validator ever runs.
+    (src / "big.md").write_text("lorem ipsum dolor " * 200)
 
     # Spy on the validator so we can prove IT was the raise-source, not
     # some other exception masquerading as MineValidationError.
     called = []
-    real_validator = palace_mod._validate_palace_fts5_after_mine
+    real_errors = ["malformed inverted index for FTS5 table main.embedding_fulltext_search"]
 
     def _validator_spy(path):
         called.append(path)
-        return real_validator(path)
+        raise MineValidationError(path, real_errors)
 
+    monkeypatch.setattr(palace_mod, "_validate_palace_fts5_after_mine", _validator_spy)
     monkeypatch.setattr(miner_mod, "_validate_palace_fts5_after_mine", _validator_spy)
 
     with pytest.raises(MineValidationError) as exc_info:
@@ -293,15 +318,15 @@ def test_full_chain_raises_through_mine_impl(tmp_path, monkeypatch):
         )
 
     assert called == [str(palace)], f"validator must be the raise-source; spy recorded: {called}"
-    assert "fts5" in " ".join(exc_info.value.errors).lower()
+    assert list(exc_info.value.errors) == real_errors
     assert exc_info.value.palace_path == str(palace)
 
 
-def test_mine_impl_does_not_print_partial_summary_on_validation_error(tmp_path, capsys):
-    """When _validate_palace_fts5_after_mine raises, miner._mine_impl must
-    NOT print the "Mine aborted by exception" partial-progress banner that
-    `except Exception` adds. That banner is reserved for true mid-loop
-    failures and would double-up with cmd_mine's recovery banner.
+def test_full_chain_auto_heals_isolated_fts5_corruption(tmp_path):
+    """Run a real mine, corrupt only the FTS5 index (main pages intact),
+    re-mine. The full _mine_impl chain must auto-heal and succeed silently
+    -- not raise -- since this is exactly the isolated condition
+    maybe_autoheal_fts5_index rebuilds in place (#1926/#1928).
     """
     from mempalace import miner as miner_mod
 
@@ -318,7 +343,164 @@ def test_mine_impl_does_not_print_partial_summary_on_validation_error(tmp_path, 
         limit=0,
         dry_run=False,
     )
+
     _corrupt_fts5_segment(palace / "chroma.sqlite3")
+
+    # Editing big.md so the re-mine has new content to process (otherwise
+    # file_already_mined's mtime check would short-circuit before the
+    # validator ever runs).
+    (src / "big.md").write_text("lorem ipsum dolor " * 200)
+
+    # Must not raise: the corruption is healed before mine_impl returns.
+    miner_mod.mine(
+        project_dir=str(src),
+        palace_path=str(palace),
+        wing_override=None,
+        agent="mempalace",
+        limit=0,
+        dry_run=False,
+    )
+
+
+def test_validator_suppresses_raise_when_autoheal_clears(tmp_path, monkeypatch):
+    """Build-independent companion to test_full_chain_auto_heals_isolated_fts5_corruption.
+
+    _corrupt_fts5_segment pytest.skips on SQLite builds that refuse direct
+    FTS5 shadow-table writes, so on those builds the auto-heal wiring is
+    never actually exercised. Stubbing sqlite_integrity_errors and
+    maybe_autoheal_fts5_index directly (rather than fabricating real
+    corruption) proves the wiring in _validate_palace_fts5_after_mine itself,
+    deterministically, on every build.
+    """
+    from mempalace import repair as repair_mod
+
+    palace = tmp_path / "palace"
+    _build_palace_with_drawer(palace)
+
+    fts_error = ["malformed inverted index for FTS5 table main.embedding_fulltext_search"]
+    heal_calls = []
+
+    monkeypatch.setattr(repair_mod, "sqlite_integrity_errors", lambda _p: list(fts_error))
+
+    def _fake_heal(palace_path, errors, **_kwargs):
+        heal_calls.append((palace_path, tuple(errors)))
+        return []  # healed: no remaining errors
+
+    monkeypatch.setattr(repair_mod, "maybe_autoheal_fts5_index", _fake_heal)
+
+    _validate_palace_fts5_after_mine(str(palace))  # must not raise
+
+    assert heal_calls == [(str(palace), tuple(fts_error))]
+
+
+def test_validator_passes_logger_progress_not_print_to_autoheal(tmp_path, monkeypatch, capsys):
+    """The actual review-comment fix (gemini-code-assist, PR #1928): this
+    validator runs inside the MCP server process too (mcp_server.tool_mine ->
+    miner.mine), where stdout is the JSON-RPC transport. maybe_autoheal_fts5_index
+    defaults to progress=print, so _validate_palace_fts5_after_mine must
+    override it with a logging call instead -- otherwise a healed mine would
+    print raw progress text onto the transport stream mid-response.
+
+    The two tests above only prove the suppress/raise wiring and would pass
+    even if this line still defaulted to print (they mock
+    maybe_autoheal_fts5_index entirely, discarding whatever kwargs it's
+    called with). This test instead captures the actual kwargs passed and
+    invokes the captured progress callable, asserting nothing lands on stdout.
+
+    Deliberately not pinned to logger.info specifically: which severity level
+    is used is a verbosity choice, not a correctness requirement -- the bug
+    was "raw print() to stdout", not "wrong log level". Asserting equality to
+    one specific level method would make the test fail on a reasonable future
+    change (e.g. to logger.debug) that doesn't reintroduce the actual bug.
+    """
+    from mempalace import repair as repair_mod
+    from mempalace.palace import logger as palace_logger
+
+    palace = tmp_path / "palace"
+    _build_palace_with_drawer(palace)
+
+    fts_error = ["malformed inverted index for FTS5 table main.embedding_fulltext_search"]
+    captured_kwargs = {}
+
+    monkeypatch.setattr(repair_mod, "sqlite_integrity_errors", lambda _p: list(fts_error))
+
+    def _fake_heal(palace_path, errors, **kwargs):
+        captured_kwargs.update(kwargs)
+        kwargs.get("progress", print)("probe progress message")
+        return []
+
+    monkeypatch.setattr(repair_mod, "maybe_autoheal_fts5_index", _fake_heal)
+
+    _validate_palace_fts5_after_mine(str(palace))
+
+    progress = captured_kwargs.get("progress")
+    assert progress is not None
+    assert progress is not print
+    # Any severity is fine; what matters is that it's a bound method of this
+    # module's own logger (routed through logging), not the raw print builtin.
+    assert getattr(progress, "__self__", None) is palace_logger
+    out, _ = capsys.readouterr()
+    assert out == ""
+
+
+def test_validator_still_raises_when_autoheal_cannot_clear(tmp_path, monkeypatch):
+    """Auto-heal is a best-effort first attempt, not a reason to swallow real
+    corruption: when maybe_autoheal_fts5_index can't clear the condition
+    (broader corruption, lock contention, rebuild failure), the validator
+    must still raise. Same build-independence rationale as the test above.
+    """
+    from mempalace import repair as repair_mod
+
+    palace = tmp_path / "palace"
+    _build_palace_with_drawer(palace)
+
+    errors = ["database disk image is malformed"]
+    monkeypatch.setattr(repair_mod, "sqlite_integrity_errors", lambda _p: list(errors))
+    monkeypatch.setattr(
+        repair_mod, "maybe_autoheal_fts5_index", lambda palace_path, errs, **_kwargs: errs
+    )
+
+    with pytest.raises(MineValidationError):
+        _validate_palace_fts5_after_mine(str(palace))
+
+
+def test_mine_impl_does_not_print_partial_summary_on_validation_error(
+    tmp_path, capsys, monkeypatch
+):
+    """When _validate_palace_fts5_after_mine raises, miner._mine_impl must
+    NOT print the "Mine aborted by exception" partial-progress banner that
+    `except Exception` adds. That banner is reserved for true mid-loop
+    failures and would double-up with cmd_mine's recovery banner.
+
+    The validator is monkeypatched to raise directly rather than corrupting
+    the real sqlite file -- see test_full_chain_raises_through_mine_impl's
+    docstring for why real non-isolated corruption isn't usable here
+    (ChromaDB's own Rust bindings panic opening a sufficiently corrupted
+    file, before this test's validator would ever run).
+    """
+    from mempalace import miner as miner_mod
+    from mempalace import palace as palace_mod
+
+    palace = tmp_path / "palace"
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "big.md").write_text("lorem ipsum " * 200)
+
+    miner_mod.mine(
+        project_dir=str(src),
+        palace_path=str(palace),
+        wing_override=None,
+        agent="mempalace",
+        limit=0,
+        dry_run=False,
+    )
+    (src / "big.md").write_text("lorem ipsum dolor " * 200)
+
+    def _raise(path):
+        raise MineValidationError(path, ["malformed inverted index for FTS5 table"])
+
+    monkeypatch.setattr(palace_mod, "_validate_palace_fts5_after_mine", _raise)
+    monkeypatch.setattr(miner_mod, "_validate_palace_fts5_after_mine", _raise)
 
     with pytest.raises(MineValidationError):
         miner_mod.mine(
@@ -525,28 +707,32 @@ def test_mine_formats_keyboard_interrupt_skips_validator(tmp_path, monkeypatch):
 
 
 def test_mine_formats_full_chain_raises_when_fts5_corrupt(tmp_path, monkeypatch):
-    """End-to-end: a palace with corrupted FTS5 + real mine_formats call
-    must propagate MineValidationError from `_validate_palace_fts5_after_mine`.
-    Mirrors `test_full_chain_raises_through_mine_impl` for the extract path.
+    """End-to-end: mine_formats must propagate MineValidationError from
+    `_validate_palace_fts5_after_mine`. Mirrors
+    `test_full_chain_raises_through_mine_impl` for the extract path.
     Empty source dir is sufficient: the for-loop iterates zero times, the
-    `else` branch runs, validation fires on the pre-corrupted sqlite.
+    `else` branch runs, validation fires on the (mock-corrupted) sqlite.
+
+    The validator is monkeypatched to raise directly rather than corrupting
+    the real sqlite file -- see test_full_chain_raises_through_mine_impl's
+    docstring for why real non-isolated corruption isn't usable here
+    (ChromaDB's own Rust bindings panic opening a sufficiently corrupted
+    file, before this test's validator would ever run).
     """
     from mempalace import format_miner as format_mod
-    from mempalace import palace as palace_mod
 
     palace = tmp_path / "palace"
     _build_palace_with_drawer(palace)
-    _corrupt_fts5_segment(palace / "chroma.sqlite3")
 
     src = tmp_path / "docs"
     src.mkdir()
 
     called = []
-    real_validator = palace_mod._validate_palace_fts5_after_mine
+    real_errors = ["malformed inverted index for FTS5 table main.embedding_fulltext_search"]
 
     def _validator_spy(path):
         called.append(path)
-        return real_validator(path)
+        raise MineValidationError(path, real_errors)
 
     monkeypatch.setattr(format_mod, "_validate_palace_fts5_after_mine", _validator_spy)
 
@@ -561,5 +747,31 @@ def test_mine_formats_full_chain_raises_when_fts5_corrupt(tmp_path, monkeypatch)
         )
 
     assert called == [str(palace)], f"validator must be the raise-source; spy recorded: {called}"
-    assert "fts5" in " ".join(exc_info.value.errors).lower()
+    assert list(exc_info.value.errors) == real_errors
     assert exc_info.value.palace_path == str(palace)
+
+
+def test_mine_formats_full_chain_auto_heals_isolated_fts5_corruption(tmp_path):
+    """End-to-end for the extract path: isolated FTS5-only corruption must
+    be auto-healed by `_validate_palace_fts5_after_mine`, not raise.
+    Mirrors `test_full_chain_auto_heals_isolated_fts5_corruption` for the
+    project-miner path (#1926/#1928).
+    """
+    from mempalace import format_miner as format_mod
+
+    palace = tmp_path / "palace"
+    _build_palace_with_drawer(palace)
+    _corrupt_fts5_segment(palace / "chroma.sqlite3")
+
+    src = tmp_path / "docs"
+    src.mkdir()
+
+    # Must not raise: the corruption is healed before mine_formats returns.
+    format_mod.mine_formats(
+        format_dir=str(src),
+        palace_path=str(palace),
+        wing="testwing",
+        agent="mempalace",
+        limit=0,
+        dry_run=False,
+    )
