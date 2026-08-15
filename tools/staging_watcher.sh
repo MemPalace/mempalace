@@ -7,13 +7,20 @@
 #   preprocess → mine → verify → compress → gzip → archive
 #
 # When files arrive and stabilize (no writes for DEBOUNCE_SECONDS):
-#   1. Preprocess: strip boilerplate, split files >4000 lines
-#   2. Mine processed files into the palace
-#   3. Verify a sample of mined content is searchable
-#   4. Compress: run mempalace compress (AAAK dialect)
-#   5. Gzip original files and move to archive/YYYY-MM-DD_HHMMSS/
-#   6. Write manifest with checksums + file list
-#   7. Clear staging (ready for next batch)
+#   1. Claim an immutable batch snapshot.
+#   2. Preprocess only the claimed files (strip boilerplate, split >4000 lines).
+#   3. Mine processed files into the palace.
+#   4. Verify a sample of mined content is searchable.
+#   5. Compress: run mempalace compress (AAAK dialect).
+#   6. Gzip original files from the batch snapshot and move to archive/YYYY-MM-DD_HHMMSS/.
+#   7. Write manifest with checksums + file list.
+#   8. Clear only the claimed batch from staging (ready for next batch).
+#
+# The batch snapshot is captured after the debounce period completes.  Every
+# later destructive phase (archive, clear) operates on that exact snapshot and
+# verifies that each file is still the same file (size, mtime, sha256) before
+# acting on it.  Files that arrive after the snapshot remain in staging for the
+# next run.
 #
 # Usage:
 #   ./staging_watcher.sh /path/to/staging /path/to/palace
@@ -40,6 +47,7 @@ LOG_FILE="$LOG_DIR/staging-watcher.log"
 DEBOUNCE_SECONDS="${DEBOUNCE_SECONDS:-30}"
 MIN_FILES="${MIN_FILES:-1}"
 MAX_LINES="${MAX_LINES:-4000}"
+BATCH_SNAPSHOT="${BATCH_SNAPSHOT:-$STAGING_DIR/.batch_snapshot}"
 
 mkdir -p "$LOG_DIR" "$ARCHIVE_DIR" "$STAGING_DIR"
 
@@ -47,27 +55,115 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
 }
 
-count_files() {
-    find "$STAGING_DIR" -type f \
+# List all files that should participate in the batch.  Excludes dotfiles,
+# .DS_Store, *.tmp, mempalace.yaml, and anything inside a processed/ tree.
+find_batch_files() {
+    local target="${1:-$STAGING_DIR}"
+    find "$target" -type f \
         ! -name '.DS_Store' ! -name '*.tmp' \
         ! -name 'mempalace.yaml' ! -path '*/processed/*' \
-        2>/dev/null | wc -l
+        ! -name '.batch_manifest' ! -name '.batch_snapshot' \
+        2>/dev/null
+}
+
+# Return the size of a file in bytes.  Works on GNU and BSD stat.
+file_size() {
+    local f="$1"
+    local size
+    size=$(stat -c%s "$f" 2>/dev/null) || size=$(stat -f%z "$f" 2>/dev/null) || size=""
+    printf '%s' "$size"
+}
+
+# Return the mtime of a file as a Unix timestamp.  Works on GNU and BSD stat.
+file_mtime() {
+    local f="$1"
+    local mtime
+    mtime=$(stat -c%Y "$f" 2>/dev/null) || mtime=$(stat -f%m "$f" 2>/dev/null) || mtime=""
+    printf '%s' "$mtime"
+}
+
+# Return the sha256 of a file.  Prefers sha256sum, falls back to shasum.
+file_sha256() {
+    local f="$1"
+    local hash
+    hash=$(sha256sum "$f" 2>/dev/null | awk '{print $1}')
+    if [[ -z "$hash" ]]; then
+        hash=$(shasum -a 256 "$f" 2>/dev/null | awk '{print $1}')
+    fi
+    printf '%s' "$hash"
+}
+
+count_files() {
+    find_batch_files "$STAGING_DIR" | wc -l
+}
+
+# Write a TSV snapshot of the current staging tree to stdout.
+# Columns: relative_path size mtime sha256 (all paths are relative to target).
+snapshot_staging() {
+    local target="${1:-$STAGING_DIR}"
+    local f rel size mtime hash
+    while IFS= read -r -d '' f; do
+        rel="${f#$target/}"
+        size=$(file_size "$f")
+        mtime=$(file_mtime "$f")
+        hash=$(file_sha256 "$f")
+        # Use the field separator 0x1F (Unit Separator) so paths with spaces
+        # and tabs do not break parsing.
+        printf '%s\x1f%s\x1f%s\x1f%s\n' "$rel" "$size" "$mtime" "$hash"
+    done < <(find "$target" -type f \
+        ! -name '.DS_Store' ! -name '*.tmp' \
+        ! -name 'mempalace.yaml' ! -path '*/processed/*' \
+        ! -name '.batch_snapshot' ! -name '.batch_manifest' \
+        -print0 | sort -z)
+}
+
+# Return a single hash that represents the current state of the staging tree.
+# Any change to file count, paths, sizes, or mtimes produces a different hash.
+fingerprint_staging() {
+    local target="${1:-$STAGING_DIR}"
+    snapshot_staging "$target" | sha256sum | awk '{print $1}'
 }
 
 wait_for_stable() {
-    local last_count=-1
+    local last_fingerprint=""
     local stable=0
+    local current_fingerprint
+    local current_count
     while [[ $stable -lt $DEBOUNCE_SECONDS ]]; do
-        local current_count
+        current_fingerprint=$(fingerprint_staging "$STAGING_DIR")
         current_count=$(count_files)
-        if [[ "$current_count" -eq "$last_count" && "$current_count" -ge $MIN_FILES ]]; then
+        if [[ "$current_fingerprint" == "$last_fingerprint" && "$current_count" -ge $MIN_FILES ]]; then
             stable=$((stable + 5))
         else
             stable=0
-            last_count=$current_count
+            last_fingerprint="$current_fingerprint"
         fi
         sleep 5
     done
+}
+
+# Capture an immutable snapshot of the current stable batch and persist it.
+# The snapshot is the source of truth for archive and clear operations.
+claim_batch() {
+    local snapshot
+    snapshot=$(snapshot_staging "$STAGING_DIR")
+    if [[ -z "$snapshot" ]]; then
+        log "Claim FAILED: no files to batch"
+        return 1
+    fi
+    printf '%s\n' "$snapshot" > "$BATCH_SNAPSHOT"
+    log "Claimed batch: $(grep -c '^' "$BATCH_SNAPSHOT" 2>/dev/null || wc -l < "$BATCH_SNAPSHOT") files -> $BATCH_SNAPSHOT"
+    return 0
+}
+
+# Read one snapshot record into the caller's variables: _rel, _size, _mtime, _hash.
+# $1 = the unit-separator-delimited line.
+parse_snapshot_line() {
+    local line="$1"
+    _rel=$(printf '%s' "$line" | cut -d $'\x1f' -f1)
+    _size=$(printf '%s' "$line" | cut -d $'\x1f' -f2)
+    _mtime=$(printf '%s' "$line" | cut -d $'\x1f' -f3)
+    _hash=$(printf '%s' "$line" | cut -d $'\x1f' -f4)
 }
 
 preprocess_staging() {
@@ -75,7 +171,12 @@ preprocess_staging() {
     file_count=$(count_files)
     log "Preprocessing $file_count files (strip boilerplate, split >$MAX_LINES lines)..."
 
-    if "$PYTHON_BIN" "$PREPROCESS_SCRIPT" "$STAGING_DIR" --max-lines "$MAX_LINES" >> "$LOG_FILE" 2>&1; then
+    local extra_args=()
+    if [[ -s "$BATCH_SNAPSHOT" ]]; then
+        extra_args=(--batch-snapshot "$BATCH_SNAPSHOT")
+    fi
+
+    if "$PYTHON_BIN" "$PREPROCESS_SCRIPT" "$STAGING_DIR" --max-lines "$MAX_LINES" "${extra_args[@]}" >> "$LOG_FILE" 2>&1; then
         local processed_count
         processed_count=$(find "$STAGING_DIR/processed" -type f ! -name 'mempalace.yaml' 2>/dev/null | wc -l)
         # Copy mempalace.yaml into processed/ so the miner uses correct wing routing
@@ -134,7 +235,7 @@ build_batch_manifest() {
     local processed_dir="$STAGING_DIR/processed"
     local manifest="$STAGING_DIR/.batch_manifest"
     find "$processed_dir" -type f ! -name 'mempalace.yaml' -print > "$manifest" 2>/dev/null
-    log "Built batch manifest with $(wc -l < "$manifest" | xargs) processed files"
+    log "Built batch manifest with $(wc -l < "$manifest" 2>/dev/null | xargs) processed files"
 }
 
 verify_mined() {
@@ -175,8 +276,6 @@ archive_files() {
     local batch_archive_tmp="$ARCHIVE_DIR/.tmp.$batch_date.$$"
 
     # Build into a temporary directory and atomically rename on success.
-    # This ensures that an incomplete archive is never visible at the final
-    # path and that any archive error aborts before staging is cleared.
     rm -rf "$batch_archive_tmp"
     mkdir -p "$batch_archive_tmp"
 
@@ -190,30 +289,56 @@ archive_files() {
         echo ""
     } > "$manifest"
 
+    # Use the claimed batch snapshot when available.  If it does not exist,
+    # fall back to the current staging tree for direct function testing and
+    # legacy callers.
+    local snapshot_file="$BATCH_SNAPSHOT"
+    if [[ ! -s "$snapshot_file" ]]; then
+        snapshot_file="$STAGING_DIR/.batch_snapshot"
+        if [[ ! -s "$snapshot_file" ]]; then
+            snapshot_staging "$STAGING_DIR" > "$snapshot_file"
+        fi
+    fi
+
     local file_count=0
-    while IFS= read -r -d '' file; do
-        local rel_path
-        rel_path="${file#$STAGING_DIR/}"
+    local line
+    while IFS= read -r line; do
+        parse_snapshot_line "$line"
+        local rel_path="$_rel"
+        local expected_size="$_size"
+        local expected_mtime="$_mtime"
+        local expected_hash="$_hash"
+
         [[ -z "$rel_path" ]] && continue
         [[ "$rel_path" == .DS_Store || "$rel_path" == mempalace.yaml ]] && continue
+        [[ "$rel_path" == .batch_snapshot || "$rel_path" == .batch_manifest ]] && continue
+
+        local file="$STAGING_DIR/$rel_path"
+
+        if [[ ! -e "$file" ]]; then
+            log "Archive SKIP: $rel_path no longer exists"
+            continue
+        fi
+
+        local current_size current_mtime current_hash
+        current_size=$(file_size "$file")
+        current_mtime=$(file_mtime "$file")
+        current_hash=$(file_sha256 "$file")
+
+        if [[ "$current_size" != "$expected_size" || "$current_mtime" != "$expected_mtime" || "$current_hash" != "$expected_hash" ]]; then
+            log "Archive SKIP: $rel_path changed since batch was claimed (size/mtime/hash)"
+            continue
+        fi
 
         local archive_name="$batch_archive_tmp/${rel_path}.gz"
         mkdir -p "$(dirname "$archive_name")"
 
-        # Refuse to overwrite a duplicate archive path (failsafe even though
-        # the relative path should now be unique under the staging tree).
+        # Refuse to overwrite a duplicate archive path.
         if [[ -e "$archive_name" ]]; then
             log "Archive FAILED: duplicate path would overwrite $archive_name"
             rm -rf "$batch_archive_tmp"
             return 1
         fi
-
-        local checksum filesize
-        checksum=$(sha256sum "$file" 2>/dev/null | awk '{print $1}')
-        if [[ -z "$checksum" ]]; then
-            checksum=$(shasum -a 256 "$file" 2>/dev/null | awk '{print $1}')
-        fi
-        filesize=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo "0")
 
         if ! gzip -c "$file" > "$archive_name"; then
             log "Archive FAILED: gzip error for $file"
@@ -229,15 +354,13 @@ archive_files() {
         fi
 
         echo "file: $rel_path" >> "$manifest"
-        echo "  sha256: $checksum" >> "$manifest"
-        echo "  size: $filesize bytes" >> "$manifest"
+        echo "  sha256: $current_hash" >> "$manifest"
+        echo "  size: $current_size bytes" >> "$manifest"
         echo "  archived: ${rel_path}.gz" >> "$manifest"
         echo "" >> "$manifest"
 
         file_count=$((file_count + 1))
-    done < <(find "$STAGING_DIR" -type f \
-        ! -name '.DS_Store' ! -name 'mempalace.yaml' \
-        ! -path '*/processed/*' -print0)
+    done < "$snapshot_file"
 
     if [[ $file_count -eq 0 ]]; then
         log "Archive FAILED: no files to archive"
@@ -245,15 +368,12 @@ archive_files() {
         return 1
     fi
 
-    # Validate the manifest exists and has content.
     if [[ ! -s "$manifest" ]]; then
         log "Archive FAILED: manifest is empty or missing"
         rm -rf "$batch_archive_tmp"
         return 1
     fi
 
-    # Atomic rename: a complete, validated archive becomes visible at the
-    # final path only after every file has been compressed and checked.
     if ! mv "$batch_archive_tmp" "$batch_archive"; then
         log "Archive FAILED: could not move temporary archive to $batch_archive"
         rm -rf "$batch_archive_tmp"
@@ -264,16 +384,59 @@ archive_files() {
 }
 
 clear_staging() {
-    find "$STAGING_DIR" -type f \
-        ! -name '.DS_Store' ! -name 'mempalace.yaml' -delete 2>/dev/null
+    # Delete only the files listed in the batch snapshot and verify identity
+    # before deleting.  Files that arrived after the snapshot or that changed
+    # while the pipeline ran are left for the next batch.
+    local snapshot_file="$BATCH_SNAPSHOT"
+    if [[ ! -s "$snapshot_file" ]]; then
+        snapshot_file="$STAGING_DIR/.batch_snapshot"
+    fi
+
+    if [[ -s "$snapshot_file" ]]; then
+        local line
+        while IFS= read -r line; do
+            parse_snapshot_line "$line"
+            local rel_path="$_rel"
+            local expected_size="$_size"
+            local expected_mtime="$_mtime"
+            local expected_hash="$_hash"
+
+            [[ -z "$rel_path" ]] && continue
+            [[ "$rel_path" == .DS_Store || "$rel_path" == mempalace.yaml ]] && continue
+            [[ "$rel_path" == .batch_snapshot || "$rel_path" == .batch_manifest ]] && continue
+
+            local file="$STAGING_DIR/$rel_path"
+            if [[ ! -e "$file" ]]; then
+                continue
+            fi
+
+            local current_size current_mtime current_hash
+            current_size=$(file_size "$file")
+            current_mtime=$(file_mtime "$file")
+            current_hash=$(file_sha256 "$file")
+
+            if [[ "$current_size" == "$expected_size" && "$current_mtime" == "$expected_mtime" && "$current_hash" == "$expected_hash" ]]; then
+                rm -f "$file"
+            else
+                log "Clear SKIP: $rel_path changed since batch was claimed, leaving for next run"
+            fi
+        done < "$snapshot_file"
+    fi
+
     rm -rf "$STAGING_DIR/processed" 2>/dev/null || true
-    # Remove any empty subdirectories left behind after file deletion.
+    rm -f "$STAGING_DIR/.batch_snapshot" 2>/dev/null || true
+    rm -f "$STAGING_DIR/.batch_manifest" 2>/dev/null || true
     find "$STAGING_DIR" -mindepth 1 -type d -empty -not -path "*/processed" -delete 2>/dev/null || true
     log "Staging cleared (ready for next batch)"
 }
 
 process_batch() {
     log "=== Processing batch ==="
+
+    if ! claim_batch; then
+        log "ABORT: could not claim batch"
+        return 1
+    fi
 
     if ! preprocess_staging; then
         log "ABORT: preprocess failed — files left for retry"
@@ -308,7 +471,7 @@ process_batch() {
     return 0
 }
 
-# ── Main loop ───────────────────────────────────────────────────────────
+# ── Main loop ────────────────────────────────────────────────────────────────
 
 if [[ -z "${STAGING_WATCHER_TEST_MODE:-}" ]]; then
     log "=== staging_watcher started ==="
