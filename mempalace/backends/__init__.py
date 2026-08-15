@@ -53,6 +53,7 @@ from .registry import (
 )
 from .rust_exact import RustExactBackend, RustExactCollection
 from .sqlite_exact import SQLiteExactBackend, SQLiteExactCollection
+from .sqlite_vec import SQLiteVecBackend, SQLiteVecCollection
 
 register("rust_exact", RustExactBackend)
 
@@ -86,6 +87,8 @@ __all__ = [
     "RustExactCollection",
     "SQLiteExactBackend",
     "SQLiteExactCollection",
+    "SQLiteVecBackend",
+    "SQLiteVecCollection",
     "UnsupportedCapabilityError",
     "UnsupportedFilterError",
     "UnsupportedMaintenanceKindError",
