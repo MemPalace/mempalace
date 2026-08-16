@@ -9,6 +9,74 @@ if __name__ != "mempalace.mcp_server":
 MAX_RESPONSE_CHARS = max(1000, env_int("MEMPALACE_MAX_RESPONSE_CHARS", 50000))
 
 
+def _fit_response(result, *, tool_name: Optional[str]) -> tuple[object, str]:
+    """Return ``(payload, serialized_text)`` guaranteed to fit ``MAX_RESPONSE_CHARS``.
+
+    Degrades *structurally*, never textually. Slicing already-serialized JSON at
+    a character offset hands the caller text that no longer parses — a worse
+    failure for a program calling ``json.loads`` than for a human reading it,
+    and it can cut a drawer's stored text mid-word. Instead:
+
+    * dict payloads carrying a list: drop whole items off the end of the largest
+      list until the payload fits, reporting the omission in the same
+      ``total`` / ``truncated`` / ``truncation_notice`` shape ``_cap_facts`` already uses;
+    * anything else (or a payload still too large once the list is exhausted):
+      replaced with a structured "response too large" object.
+
+    Either way the response parses as valid JSON at every size.
+    """
+    text = json.dumps(result, indent=2, ensure_ascii=False)
+    if len(text) <= MAX_RESPONSE_CHARS:
+        return result, text
+
+    original_chars = len(text)
+
+    if isinstance(result, dict):
+        lists = [(k, v) for k, v in result.items() if isinstance(v, list) and v]
+        if lists:
+            key, items = max(lists, key=lambda kv: len(kv[1]))
+            # Serialized length grows monotonically with the item count, so the
+            # largest prefix that still fits can be found by bisection.
+            best: Optional[tuple[dict, str]] = None
+            lo, hi = 1, len(items)
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                trial = dict(result)
+                trial[key] = items[:mid]
+                # Keep a sibling count field consistent with what actually ships
+                # rather than leaving it describing the untruncated list.
+                if isinstance(trial.get("count"), int) and trial["count"] == len(items):
+                    trial["count"] = mid
+                trial["total"] = len(items)
+                trial["truncated"] = True
+                trial["truncation_notice"] = (
+                    f"{len(items) - mid} more item(s) omitted (showing first {mid} of "
+                    f"{len(items)}); the full response was {original_chars} chars, over "
+                    f"the {MAX_RESPONSE_CHARS}-char cap — narrow your query"
+                )
+                trial_text = json.dumps(trial, indent=2, ensure_ascii=False)
+                if len(trial_text) <= MAX_RESPONSE_CHARS:
+                    best = (trial, trial_text)
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+            if best is not None:
+                return best
+
+    payload = {
+        "error": "response_too_large",
+        "tool": tool_name,
+        "size_chars": original_chars,
+        "cap_chars": MAX_RESPONSE_CHARS,
+        "truncated": True,
+        "truncation_notice": (
+            f"Response was {original_chars} chars, over the {MAX_RESPONSE_CHARS}-char "
+            "cap, and could not be reduced by dropping whole items. Narrow your query."
+        ),
+    }
+    return payload, json.dumps(payload, indent=2, ensure_ascii=False)
+
+
 def _internal_tool_error(
     req_id, tool_name: str, exc: BaseException = None, include_message: bool = False
 ) -> dict:
@@ -683,20 +751,16 @@ def _tool_result_is_error(result) -> bool:
     )
 
 
-def _tool_call_response(req_id, result) -> dict:
+def _tool_call_response(req_id, result, tool_name: Optional[str] = None) -> dict:
     """The JSON-RPC response carrying a tool's result as MCP text content."""
-    text = json.dumps(result, indent=2, ensure_ascii=False)
     # Backstop against any tool returning an oversized payload that
     # would overflow the caller's context (one real incident: a broad
     # kg_query returned ~675K chars). Per-tool caps (e.g. _cap_facts)
     # handle the common cases gracefully; this is the last line of
-    # defense for everything else. Truncation is announced, not silent.
-    if len(text) > MAX_RESPONSE_CHARS:
-        text = (
-            text[:MAX_RESPONSE_CHARS]
-            + f"\n\n... [response truncated: {len(text)} chars exceeded the "
-            + f"{MAX_RESPONSE_CHARS}-char cap; narrow your query]"
-        )
+    # defense for everything else. _fit_response drops whole items or
+    # substitutes a structured object, so the result stays valid JSON
+    # at every size, and truncation is announced rather than silent.
+    _, text = _fit_response(result, tool_name=tool_name)
     tool_result = {"content": [{"type": "text", "text": text}]}
     if _tool_result_is_error(result):
         tool_result["isError"] = True
@@ -1079,7 +1143,9 @@ def handle_request(request):
         }
     if method == "tools/call":
         refusal, result = call_tool(req_id, params)
-        return refusal if refusal is not None else _tool_call_response(req_id, result)
+        if refusal is not None:
+            return refusal
+        return _tool_call_response(req_id, result, tool_name=params.get("name"))
 
     # Notifications (missing id) must never get a response
     if req_id is None:
