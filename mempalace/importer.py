@@ -22,11 +22,17 @@ Import semantics:
 Malformed input is counted and reported, never fatal: a partially corrupted
 export should import everything that survives, loudly. Metadata values that
 the backend cannot store (non-scalars) are dropped, not treated as malformed.
+
+Non-regular entries carrying a ``.jsonl`` name — a FIFO, socket, device node
+or directory — are refused by type rather than opened, so an import never
+blocks in the kernel waiting for a writer (#2221, #2244).
 """
 
+import errno
 import glob
 import json
 import os
+import stat
 
 from .palace import get_collection
 
@@ -35,6 +41,46 @@ from .palace import get_collection
 _SCALAR_TYPES = (str, int, float, bool)
 
 _ADD_BATCH_SIZE = 500
+
+
+def _open_regular_text(path):
+    """Open ``path`` for UTF-8 text reading, refusing anything but a regular file.
+
+    Mirrors ``miner._read_text_no_follow``'s guard (#2221, #2244). ``O_NONBLOCK``
+    is what makes the ``S_ISREG`` test below reachable: opening a FIFO for reading
+    parks in the kernel until a writer shows up, so a plain ``open()`` on a named
+    pipe named ``*.jsonl`` never raises — it hangs, and the caller's ``except
+    OSError`` cannot see it. ``O_NOFOLLOW`` keeps a symlinked entry from reading
+    through to a target outside the import tree, matching the ``_reject_symlink``
+    posture the exporter already applies on the write side.
+
+    Returns an open text-mode file object, or ``None`` when the entry is not a
+    regular file — the caller books that exactly like an unreadable one.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    fd = -1
+    try:
+        try:
+            fd = os.open(path, flags)
+        except OSError as exc:
+            # A reader that breaks a write lease gets EAGAIN when it passes
+            # O_NONBLOCK, where a blocking open waits out lease-break-time and
+            # succeeds. The kernel grants leases on regular files only, so
+            # re-check the type and then read it the way a plain open would.
+            if exc.errno != errno.EAGAIN or not stat.S_ISREG(os.lstat(path).st_mode):
+                raise
+            fd = os.open(path, flags & ~getattr(os, "O_NONBLOCK", 0))
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        f = os.fdopen(fd, "r", encoding="utf-8")
+        fd = -1
+        return f
+    finally:
+        if fd != -1:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 def _sanitize_metadata(meta) -> dict:
@@ -157,24 +203,33 @@ def import_palace(palace_path: str, input_dir: str, dry_run: bool = False) -> di
         # import; idempotent re-import picks up a repaired file cleanly.
         triples: list = []
         try:
-            with open(path, encoding="utf-8") as f:
-                for lineno, raw in enumerate(f, 1):
-                    raw = raw.strip()
-                    if not raw:
-                        continue
-                    parsed = _parse_line(raw)
-                    if parsed is None:
-                        stats["malformed"] += 1
-                        if len(malformed_examples) < 5:
-                            malformed_examples.append(f"{path}:{lineno}")
-                        continue
-                    doc_id, document, meta = parsed
-                    if doc_id in seen_ids:
-                        continue
-                    seen_ids.add(doc_id)
-                    triples.append((doc_id, document, meta))
+            handle = _open_regular_text(path)
+            if handle is None:
+                # A FIFO, socket, device node or directory carrying a .jsonl
+                # name. Booked like any other unreadable input — the point of
+                # the guard is that we get here at all instead of blocking.
+                stats["malformed"] += 1
+                if len(malformed_examples) < 5:
+                    malformed_examples.append(f"{path} (not a regular file)")
+            else:
+                with handle as f:
+                    for lineno, raw in enumerate(f, 1):
+                        raw = raw.strip()
+                        if not raw:
+                            continue
+                        parsed = _parse_line(raw)
+                        if parsed is None:
+                            stats["malformed"] += 1
+                            if len(malformed_examples) < 5:
+                                malformed_examples.append(f"{path}:{lineno}")
+                            continue
+                        doc_id, document, meta = parsed
+                        if doc_id in seen_ids:
+                            continue
+                        seen_ids.add(doc_id)
+                        triples.append((doc_id, document, meta))
         except (OSError, UnicodeDecodeError) as exc:
-            # Unreadable input: a directory named *.jsonl, permissions,
+            # Unreadable input: permissions, a symlink refused by O_NOFOLLOW,
             # bad UTF-8, I/O errors. Count it and continue.
             stats["malformed"] += 1
             if len(malformed_examples) < 5:

@@ -8,9 +8,11 @@ malformed lines without aborting.
 import json
 import os
 import shutil
+import signal
 import tempfile
 from pathlib import Path
 
+import pytest
 import yaml
 
 from mempalace.exporter import export_palace_jsonl
@@ -166,6 +168,53 @@ def test_import_dry_run_writes_nothing():
         # A dry run must not create the palace.
         assert not os.path.isdir(palace_path)
     finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX FIFO support required")
+def test_import_skips_a_fifo_without_blocking():
+    """A named pipe carrying a .jsonl name must be refused by type, not opened.
+
+    Opening a FIFO for reading parks in the kernel until a writer appears, so a
+    regression here does not raise — it hangs forever. The alarm bounds that
+    into a failure rather than a stuck CI job. Same guard class as #2221/#2244
+    on the ingest side.
+    """
+    tmpdir = tempfile.mkdtemp()
+    old_handler = None
+    try:
+        export_dir = Path(tmpdir) / "export" / "wing"
+        export_dir.mkdir(parents=True)
+        good = {"id": "drawer-1", "document": "hello world", "metadata": {"wing": "w"}}
+        (export_dir / "room.jsonl").write_text(json.dumps(good) + "\n", encoding="utf-8")
+        os.mkfifo(str(export_dir / "pipe.jsonl"))
+
+        # NOT an OSError subclass, deliberately: TimeoutError is one, and the
+        # importer's own `except (OSError, UnicodeDecodeError)` would swallow
+        # the alarm, book it as malformed, and let every assertion below pass
+        # against the very hang this test exists to catch.
+        class _Blocked(Exception):
+            pass
+
+        def _blocked(_signum, _frame):
+            raise _Blocked("import blocked opening a non-regular file")
+
+        old_handler = signal.signal(signal.SIGALRM, _blocked)
+        signal.alarm(15)
+        try:
+            result = import_palace(
+                os.path.join(tmpdir, "palace"), str(export_dir.parent), dry_run=True
+            )
+        finally:
+            signal.alarm(0)
+
+        # The real line still imports; the pipe is booked as unreadable, not read.
+        assert result["imported"] == 1
+        assert result["malformed"] == 1
+        assert result["files"] == 2
+    finally:
+        if old_handler is not None:
+            signal.signal(signal.SIGALRM, old_handler)
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
