@@ -308,6 +308,114 @@ def test_import_reports_wholly_discarded_metadata():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_reexport_prunes_stale_room_files():
+    """A room that no longer exists must not survive in the export tree.
+
+    Import walks every *.jsonl without consulting the manifest, so a stale room
+    file is not a cosmetic git wrinkle — the next device re-imports it and the
+    deleted drawers come back.
+    """
+    tmpdir = tempfile.mkdtemp()
+    try:
+        palace_path = _setup_palace(tmpdir)
+        out = os.path.join(tmpdir, "export")
+        export_palace_jsonl(palace_path, out)
+
+        # A room file from a previous export whose room is now gone.
+        stale = Path(out) / "alpha" / "retired.jsonl"
+        stale.write_text(
+            json.dumps({"id": "ghost-1", "document": "deleted", "metadata": {"wing": "alpha"}})
+            + "\n",
+            encoding="utf-8",
+        )
+        orphan_wing = Path(out) / "gamma"
+        orphan_wing.mkdir()
+        (orphan_wing / "old.jsonl").write_text("{}\n", encoding="utf-8")
+
+        export_palace_jsonl(palace_path, out)
+
+        assert not stale.exists(), "stale room file survived a re-export"
+        assert not orphan_wing.exists(), "emptied wing directory survived a re-export"
+        assert (Path(out) / "alpha" / "backend.jsonl").is_file(), "live room was pruned"
+
+        # And the ghost cannot come back through import.
+        target = os.path.join(tmpdir, "palace_b")
+        result = import_palace(target, out)
+        ids = get_collection(target).get(include=[])["ids"]
+        assert "ghost-1" not in ids
+        assert result["imported"] > 0
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_export_never_prunes_a_directory_it_did_not_write():
+    """Pruning is gated on a prior manifest — a first export deletes nothing."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        palace_path = _setup_palace(tmpdir)
+        out = os.path.join(tmpdir, "someones_dir")
+        os.makedirs(os.path.join(out, "alpha"))
+        bystander = Path(out) / "alpha" / "not-ours.jsonl"
+        bystander.write_text("{}\n", encoding="utf-8")
+
+        export_palace_jsonl(palace_path, out)  # no export-manifest.json existed
+
+        assert bystander.exists(), "a first export deleted a file it did not write"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_empty_palace_leaves_a_previous_export_alone(capsys):
+    """Zero drawers is also what a failed palace open looks like — do not prune."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        palace_path = _setup_palace(tmpdir)
+        out = os.path.join(tmpdir, "export")
+        export_palace_jsonl(palace_path, out)
+        survivor = Path(out) / "alpha" / "backend.jsonl"
+        assert survivor.is_file()
+
+        empty_palace = os.path.join(tmpdir, "empty_palace")
+        export_palace_jsonl(empty_palace, out)
+
+        assert survivor.is_file(), "a zero-drawer palace wiped a good export"
+        assert "WARNING" in capsys.readouterr().out
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_import_holds_the_writer_lease(monkeypatch):
+    """A real import takes mine_palace_lock; a dry run must not."""
+    import contextlib as _ctx
+
+    import mempalace.importer as importer_mod
+
+    taken = []
+
+    @_ctx.contextmanager
+    def _spy(path):
+        taken.append(path)
+        yield
+
+    monkeypatch.setattr(importer_mod, "mine_palace_lock", _spy)
+
+    tmpdir = tempfile.mkdtemp()
+    try:
+        export_dir = Path(tmpdir) / "export" / "wing"
+        export_dir.mkdir(parents=True)
+        line = {"id": "d-1", "document": "hello", "metadata": {"wing": "w"}}
+        (export_dir / "room.jsonl").write_text(json.dumps(line) + "\n", encoding="utf-8")
+        palace_path = os.path.join(tmpdir, "palace")
+
+        import_palace(palace_path, str(export_dir.parent), dry_run=True)
+        assert taken == [], "a dry run took the writer lease"
+
+        import_palace(palace_path, str(export_dir.parent))
+        assert taken == [palace_path], "a real import did not take the writer lease"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def test_import_rejects_non_directory():
     tmpdir = tempfile.mkdtemp()
     try:
