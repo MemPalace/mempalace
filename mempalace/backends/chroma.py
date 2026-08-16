@@ -870,20 +870,7 @@ def _pickle_signature(palace_path: str, segment_id: Optional[str]) -> tuple[int,
 def hnsw_segment_signature(
     palace_path: str, collection_name: str = "mempalace_drawers"
 ) -> Optional[tuple]:
-    """Fingerprint the VECTOR segment's on-disk files, or ``None`` if unresolvable.
-
-    Returns ``(segment_id, ((name, inode, mtime_ns, size), ...))`` over every
-    file in the segment directory. ``None`` means the segment id could not be
-    resolved (no palace, unreadable database, no VECTOR segment row) — there
-    is then nothing on disk to key a cached verdict on.
-
-    Cheap: one small sqlite read plus a stat per segment file — no chromadb
-    import, and the segment itself is never loaded, which is exactly the
-    operation callers use this signature to avoid repeating (#1222-class
-    segfaults). The segment id is resolved fresh on every call, so a repair
-    or re-mine that rewrites the segment — or re-points the collection at a
-    new one — changes the signature immediately.
-    """
+    """Fingerprint the VECTOR segment's on-disk files, or ``None`` if unresolvable."""
     segment_id = _vector_segment_id(palace_path, collection_name)
     if not segment_id:
         return None

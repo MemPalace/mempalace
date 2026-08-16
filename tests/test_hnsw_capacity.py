@@ -185,15 +185,12 @@ def test_hnsw_segment_signature_tracks_segment_files(tmp_path):
     sig = hnsw_segment_signature(str(tmp_path), COLLECTION)
     assert sig is not None
     assert sig[0] == seg
-    # Same files, untouched -> identical signature.
     assert hnsw_segment_signature(str(tmp_path), COLLECTION) == sig
 
-    # A size change on a segment file invalidates the signature.
     (seg_dir / "data_level0.bin").write_bytes(b"abcdef")
     resized = hnsw_segment_signature(str(tmp_path), COLLECTION)
     assert resized != sig
 
-    # A newly flushed segment file invalidates it too.
     (seg_dir / "header.bin").write_bytes(b"x")
     assert hnsw_segment_signature(str(tmp_path), COLLECTION) != resized
 

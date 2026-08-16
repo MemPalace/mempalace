@@ -124,11 +124,6 @@ def test_chromadb_open_crashes_true_on_timeout(monkeypatch):
 
 
 # ── Probe verdict cache ────────────────────────────────────────────────
-#
-# The probe costs an interpreter spawn plus a chromadb import, which does
-# not fit the search latency budget on a healthy palace. The verdict is
-# cached keyed on the HNSW segment's (inode, mtime_ns, size) signature and
-# re-probed only when the segment changes underneath it.
 
 
 @pytest.fixture
@@ -167,24 +162,21 @@ def test_open_probe_reprobes_when_segment_changes(probe_spy):
     assert searcher._chromadb_open_crashes("/p", "drawers") is False
     assert probe_spy["calls"] == 1
 
-    # The segment was rewritten underneath us (e.g. mempalace repair).
     probe_spy["signature"] = ("seg-1", (("data_level0.bin", 7, 200, 8192),))
     assert searcher._chromadb_open_crashes("/p", "drawers") is False
     assert probe_spy["calls"] == 2
 
 
 def test_open_probe_caches_unsafe_verdict(probe_spy):
-    """An unsafe verdict is cached too; a corrupt palace is not re-probed
-    per search while its segment stays untouched."""
-    probe_spy["returncode"] = -11  # death by SIGSEGV
+    """An unsafe verdict is cached too — no re-probe while the segment is untouched."""
+    probe_spy["returncode"] = -11
     assert searcher._chromadb_open_crashes("/p", "drawers") is True
     assert searcher._chromadb_open_crashes("/p", "drawers") is True
     assert probe_spy["calls"] == 1
 
 
 def test_open_probe_uncached_without_signature(monkeypatch, probe_spy):
-    """No resolvable segment -> nothing on disk to key a verdict on ->
-    probe every call, matching the pre-cache behaviour."""
+    """No resolvable segment means no cache key: probe every call."""
     probe_spy["signature"] = None
     assert searcher._chromadb_open_crashes("/p", "drawers") is False
     assert searcher._chromadb_open_crashes("/p", "drawers") is False
@@ -192,8 +184,7 @@ def test_open_probe_uncached_without_signature(monkeypatch, probe_spy):
 
 
 def test_open_probe_cache_ages_out(monkeypatch, probe_spy):
-    """The max-age ceiling forces a re-probe even when the signature is
-    unchanged — a backstop for filesystems with coarse timestamps."""
+    """The max-age ceiling forces a re-probe even with an unchanged signature."""
     now = {"t": 1000.0}
     monkeypatch.setattr(searcher.time, "monotonic", lambda: now["t"])
 

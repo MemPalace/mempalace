@@ -604,12 +604,6 @@ def _print_search_results_bm25_only(
     print()
 
 
-# A healthy palace is the overwhelmingly common case, so the open probe runs
-# once per unique segment state and the verdict is reused while the segment's
-# files are unchanged on disk. Freshness comes from an (inode, mtime_ns, size)
-# signature per segment file rather than a wall-clock TTL;
-# _OPEN_PROBE_CACHE_MAX_AGE_SECONDS is only a backstop for filesystems with
-# coarse timestamps — the same shape as the capacity cache (#1471).
 _OPEN_PROBE_CACHE_MAX_AGE_SECONDS = 10.0
 _OPEN_PROBE_CACHE_MAX_ENTRIES = 32
 _open_probe_cache: dict = {}
@@ -626,16 +620,6 @@ def _chromadb_open_crashes(palace_path: str, collection_name: str) -> bool:
     exception, which the in-process open re-raises as a catchable,
     diagnosable error — that is treated as safe so the caller keeps its
     normal error path.
-
-    The verdict is cached per ``(palace_path, collection_name)``, keyed on
-    :func:`mempalace.backends.chroma.hnsw_segment_signature` — an
-    ``(inode, mtime_ns, size)`` fingerprint of the segment's files. A probe
-    costs a full interpreter spawn plus chromadb import, which does not fit
-    the search latency budget on a healthy palace; the crash verdict can
-    only change when the segment changes underneath it, so a cached verdict
-    is fresh exactly until the signature says otherwise. A palace whose
-    segment cannot be resolved (``None`` signature) has no files to key a
-    verdict on and is probed every call, matching the pre-cache behaviour.
     """
     from .backends.chroma import hnsw_segment_signature
 
@@ -654,10 +638,6 @@ def _chromadb_open_crashes(palace_path: str, collection_name: str) -> bool:
     crashes = _probe_chromadb_open(palace_path, collection_name)
 
     if signature is not None:
-        # Cache only when the files snapshot taken before the probe still
-        # matches afterwards: an external write landing mid-probe (repair, a
-        # peer mine) must fall through uncached rather than pin a verdict the
-        # disk no longer supports.
         if hnsw_segment_signature(palace_path, collection_name) == signature:
             if len(_open_probe_cache) >= _OPEN_PROBE_CACHE_MAX_ENTRIES:
                 _open_probe_cache.clear()
@@ -666,13 +646,7 @@ def _chromadb_open_crashes(palace_path: str, collection_name: str) -> bool:
 
 
 def _probe_chromadb_open(palace_path: str, collection_name: str) -> bool:
-    """Run the throwaway-subprocess open probe. See :func:`_chromadb_open_crashes`.
-
-    The timeout only has to bound "does opening this segfault": importing
-    chromadb and opening the collection takes seconds even cold, and a
-    timeout is already treated as unsafe, so a short bound keeps a wedged
-    open from stalling a single search for minutes.
-    """
+    """Run the throwaway-subprocess open probe. See :func:`_chromadb_open_crashes`."""
     probe = (
         "import sys\n"
         "from mempalace.palace import get_collection\n"
@@ -688,9 +662,6 @@ def _probe_chromadb_open(palace_path: str, collection_name: str) -> bool:
         )
     except (subprocess.TimeoutExpired, OSError):
         return True
-    # Negative return code = killed by a signal (e.g. -SIGSEGV): uncatchable
-    # in-process, so the vector path is unsafe. Exit code 1+ is an ordinary
-    # exception the in-process open surfaces as a proper diagnostic.
     return proc.returncode < 0
 
 
