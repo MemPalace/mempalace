@@ -221,6 +221,15 @@ def normalize_conversations(filepath: str) -> list:
         return [content]
 
     ext = Path(filepath).suffix.lower()
+
+    # An Aider history holds one conversation, so this is always a one-element
+    # list. It still has to run here: convo_miner ingests through this function,
+    # never through normalize().
+    if ext == ".md" and Path(filepath).name == ".aider.chat.history.md":
+        normalized = _try_aider_md(content)
+        if normalized:
+            return [normalized]
+
     if ext in (".json", ".jsonl") or content.strip()[:1] in ("{", "["):
         split = _try_normalize_json_split(content)
         if split:
