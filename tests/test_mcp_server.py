@@ -42,6 +42,44 @@ def _get_collection(palace_path, create=False):
 
 
 class TestHandleRequest:
+    def test_bad_arguments_return_invalid_params_not_internal_error(self):
+        """A caller's argument mistake must be legible over the wire.
+
+        Regression: unbindable args raised TypeError inside the call, which the
+        blanket handler flattened to -32000 'Internal tool error' while the real
+        traceback went to stderr (which MCP hosts discard). Undiagnosable.
+        """
+        from mempalace.mcp_server import handle_request
+
+        resp = handle_request(
+            {
+                "method": "tools/call",
+                "id": 1,
+                "params": {"name": "mempalace_search", "arguments": {}},
+            }
+        )
+        assert resp["error"]["code"] == -32602
+        assert "mempalace_search" in resp["error"]["message"]
+        # the actual missing parameter is named, not swallowed
+        assert "query" in resp["error"]["message"]
+
+    def test_handler_internal_typeerror_still_reports_internal_error(self, monkeypatch):
+        """Only *binding* failures become -32602; bugs inside a handler stay -32000."""
+        import mempalace.mcp_server as srv
+
+        def boom(query: str = "x", **kwargs):
+            raise TypeError("exploded inside the body")
+
+        monkeypatch.setitem(srv.TOOLS["mempalace_search"], "handler", boom)
+        resp = srv.handle_request(
+            {
+                "method": "tools/call",
+                "id": 1,
+                "params": {"name": "mempalace_search", "arguments": {"query": "q"}},
+            }
+        )
+        assert resp["error"]["code"] == -32000
+
     def test_initialize(self):
         from mempalace.mcp_server import handle_request
 
@@ -637,6 +675,69 @@ class TestDiaryTools:
         assert r["total"] == 1
         assert r["entries"][0]["topic"] == "architecture"
         assert "authentication" in r["entries"][0]["content"]
+
+    def test_diary_write_defaults_agent_name_to_harness(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """Omitting agent_name must not fail — it falls back to the env identity.
+
+        Regression: agent_name was required, so omitting it raised TypeError in the
+        dispatcher and surfaced as an opaque -32000 'Internal tool error'.
+        """
+        monkeypatch.delenv("MEMPALACE_MODEL", raising=False)
+        monkeypatch.setenv("MEMPALACE_HARNESS", "claude-code")
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_diary_write, tool_diary_read
+
+        w = tool_diary_write(entry="No agent_name supplied.")
+        assert w["success"] is True
+        assert w["agent"] == "claude-code"
+
+        # and the reader defaults to the same identity, so it finds that entry
+        r = tool_diary_read()
+        assert r["total"] == 1
+        assert "No agent_name supplied." in r["entries"][0]["content"]
+
+    def test_diary_write_prefers_model_over_harness(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        monkeypatch.setenv("MEMPALACE_MODEL", "claude-opus-5")
+        monkeypatch.setenv("MEMPALACE_HARNESS", "claude-code")
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_diary_write
+
+        assert tool_diary_write(entry="x")["agent"] == "claude-opus-5"
+
+    def test_diary_write_requires_entry(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_diary_write
+
+        w = tool_diary_write(agent_name="TestAgent")
+        assert w["success"] is False
+        assert "entry" in w["error"]
+
+    def test_diary_read_finds_wing_written_by_spaced_agent_name(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """Reader and writer must derive the same wing.
+
+        Writer canonicalizes ("Claude Opus 5" -> claude-opus-5); the reader used to
+        do its own ad-hoc lower/underscore mangling (-> claude_opus_5) and so read
+        from a wing the writer never wrote to.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_diary_write, tool_diary_read
+
+        tool_diary_write(agent_name="Claude Opus 5", entry="spaced name entry")
+        r = tool_diary_read(agent_name="Claude Opus 5")
+        assert r["total"] == 1
+        assert "spaced name entry" in r["entries"][0]["content"]
 
     def test_diary_read_empty(self, monkeypatch, config, palace_path, kg):
         _patch_mcp_server(monkeypatch, config, kg)

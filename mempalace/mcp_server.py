@@ -945,14 +945,29 @@ def tool_kg_stats():
 # ==================== AGENT DIARY ====================
 
 
-def tool_diary_write(agent_name: str, entry: str, topic: str = "general", model: str = None):
+def _default_agent_name() -> str:
+    """Fall back to the writer's identity from the environment when the caller
+    omits agent_name. MEMPALACE_MODEL is only set by the OpenAI adapter, so the
+    harness (set by every host install) is the practical default."""
+    return _config.model or _config.harness or "unknown"
+
+
+def tool_diary_write(
+    agent_name: str = None, entry: str = None, topic: str = "general", model: str = None
+):
     """
     Write a diary entry for this agent. Each agent gets its own wing
     with a diary room. Entries are timestamped and accumulate over time.
 
     This is the agent's personal journal — observations, thoughts,
     what it worked on, what it noticed, what it thinks matters.
+
+    agent_name defaults to the environment's model/harness identity.
     """
+    if entry is None:
+        return {"success": False, "error": "entry is required"}
+    if agent_name is None:
+        agent_name = _default_agent_name()
     try:
         agent_name = sanitize_name(agent_name, "agent_name")
         entry = sanitize_content(entry)
@@ -1019,17 +1034,24 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", model:
         return {"success": False, "error": str(e)}
 
 
-def tool_diary_read(agent_name: str, last_n: int = 10):
+def tool_diary_read(agent_name: str = None, last_n: int = 10):
     """
     Read an agent's recent diary entries. Returns the last N entries
     in chronological order — the agent's personal journal.
+
+    agent_name defaults to the environment's model/harness identity.
     """
+    if agent_name is None:
+        agent_name = _default_agent_name()
     try:
         agent_name = sanitize_name(agent_name, "agent_name")
     except ValueError as e:
         return {"error": str(e)}
     last_n = max(1, min(last_n, 100))
-    wing = f"wing_{agent_name.lower().replace(' ', '_')}"
+    # Must match tool_diary_write's wing derivation exactly, or the reader looks
+    # in a wing the writer never wrote to (e.g. "Claude Opus 5" -> wing_claude_opus_5
+    # on read vs wing_claude-opus-5 on write).
+    wing = f"wing_{_wr.canonicalize_agent(agent_name)}"
     col = _get_collection()
     if not col:
         return _no_palace()
@@ -1540,7 +1562,7 @@ TOOLS = {
             "properties": {
                 "agent_name": {
                     "type": "string",
-                    "description": "Your name — each agent gets their own diary wing",
+                    "description": "Your name — each agent gets their own diary wing (optional; defaults to the server's model/harness identity)",
                 },
                 "entry": {
                     "type": "string",
@@ -1552,7 +1574,7 @@ TOOLS = {
                 },
                 "model": {"type": "string", "description": "Override the model for this entry (default: server env)"},
             },
-            "required": ["agent_name", "entry"],
+            "required": ["entry"],
         },
         "handler": tool_diary_write,
     },
@@ -1563,14 +1585,14 @@ TOOLS = {
             "properties": {
                 "agent_name": {
                     "type": "string",
-                    "description": "Your name — each agent gets their own diary wing",
+                    "description": "Your name — each agent gets their own diary wing (optional; defaults to the server's model/harness identity)",
                 },
                 "last_n": {
                     "type": "integer",
                     "description": "Number of recent entries to read (default: 10)",
                 },
             },
-            "required": ["agent_name"],
+            "required": [],
         },
         "handler": tool_diary_read,
     },
@@ -1675,6 +1697,7 @@ def handle_request(request):
         import inspect
 
         schema_props = TOOLS[tool_name]["input_schema"].get("properties", {})
+        sig = None
         try:
             handler = TOOLS[tool_name]["handler"]
             sig = inspect.signature(handler)
@@ -1702,8 +1725,22 @@ def handle_request(request):
                     "id": req_id,
                     "error": {"code": -32602, "message": f"Invalid value for parameter '{key}'"},
                 }
+        tool_args.pop("wait_for_previous", None)
+        # Validate argument binding BEFORE calling, so a caller's mistake returns a
+        # legible -32602 instead of being flattened into an opaque -32000 whose only
+        # traceback goes to stderr (which MCP hosts discard). Binding is checked here
+        # rather than by catching TypeError around the call, so a genuine TypeError
+        # raised inside a handler body is still reported as an internal error.
+        if sig is not None:
+            try:
+                sig.bind(**tool_args)
+            except TypeError as e:
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {"code": -32602, "message": f"Invalid arguments for {tool_name}: {e}"},
+                }
         try:
-            tool_args.pop("wait_for_previous", None)
             result = TOOLS[tool_name]["handler"](**tool_args)
             return {
                 "jsonrpc": "2.0",
