@@ -20,12 +20,22 @@ Import semantics:
   rather than an overwrite.
 
 Malformed input is counted and reported, never fatal: a partially corrupted
-export should import everything that survives, loudly. Metadata values that
-the backend cannot store (non-scalars) are dropped, not treated as malformed.
+export should import everything that survives, loudly. Non-scalar metadata
+values are dropped rather than treated as malformed, but they are COUNTED and
+reported in ``metadata_dropped``. The drop is a property of this import path,
+not of every backend — Chroma rejects non-scalars at write time, ``sqlite_exact``
+does not, so an export taken from a palace that allowed nested metadata loses
+it here and the operator is told rather than left to discover it.
 
 Non-regular entries carrying a ``.jsonl`` name — a FIFO, socket, device node
 or directory — are refused by type rather than opened, so an import never
-blocks in the kernel waiting for a writer (#2221, #2244).
+blocks in the kernel waiting for a writer (#2221, #2244). Entries that resolve
+outside ``input_dir`` (reached through a symlinked directory, which recursive
+glob follows) are refused for the same reason the exporter refuses a symlinked
+output tree. That containment check is resolve-then-open, so it stops a symlink
+that is *sitting* in the tree, not one swapped in between the check and the
+open; closing that race would need per-component ``openat`` walking, which v1
+does not do. An import source you do not control is out of scope either way.
 """
 
 import errno
@@ -41,6 +51,26 @@ from .palace import get_collection
 _SCALAR_TYPES = (str, int, float, bool)
 
 _ADD_BATCH_SIZE = 500
+
+
+def _path_within_root(path: str, root: str) -> bool:
+    """True when ``path`` resolves inside ``root``.
+
+    ``O_NOFOLLOW`` guards only the FINAL component, and
+    ``glob.glob(..., recursive=True)`` traverses symlinked directories — so a
+    symlinked leaf is refused while a regular file reached *through* a
+    symlinked directory pointing outside the tree is not. Resolving both ends
+    is what closes that, and it is why ``miner._read_text_no_follow`` pairs
+    its no-follow open with the same containment test rather than relying on
+    the open flags alone.
+    """
+    try:
+        real_root = os.path.realpath(root)
+        real_path = os.path.realpath(path)
+        return os.path.commonpath([real_root, real_path]) == real_root
+    except (OSError, ValueError):
+        # ValueError: paths on different drives (Windows) share no common path.
+        return False
 
 
 def _open_regular_text(path):
@@ -83,19 +113,39 @@ def _open_regular_text(path):
                 pass
 
 
-def _sanitize_metadata(meta) -> dict:
-    """Keep only scalar-valued metadata entries; guarantee a non-empty dict."""
+def _sanitize_metadata(meta):
+    """Keep only scalar-valued metadata entries; guarantee a non-empty dict.
+
+    Returns ``(clean, dropped)``. ``dropped`` is reported rather than
+    discarded silently: Chroma rejects non-scalars at write time, but it is
+    not the only backend — ``sqlite_exact`` serializes metadata with an
+    unrestricted ``json.dumps``, so a palace on that backend can hold a list
+    or a nested dict, the exporter writes it out raw, and this filter would
+    otherwise drop it on the way back in without a word. A lossy round trip
+    is a legitimate outcome; a lossy round trip nobody is told about is not.
+
+    The drop is a property of THIS import path, not of every backend — do not
+    report it to the user as a backend limitation.
+    """
+    if meta is None:
+        # Absent, not discarded — nothing was lost, so nothing is reported.
+        return {"imported_without_metadata": True}, 0
     if not isinstance(meta, dict):
-        meta = {}
+        # A list or a bare scalar where an object was expected is discarded
+        # WHOLE. Replacing it with {} before counting (as this did until the
+        # review caught it) reports zero drops for a total loss — the exact
+        # silent-loss class the counter exists to end.
+        return {"imported_without_metadata": True}, 1
     clean = {k: v for k, v in meta.items() if isinstance(k, str) and isinstance(v, _SCALAR_TYPES)}
+    dropped = len(meta) - len(clean)
     if not clean:
         # Chroma rejects empty metadata dicts; record provenance instead.
         clean = {"imported_without_metadata": True}
-    return clean
+    return clean, dropped
 
 
 def _parse_line(raw: str):
-    """Parse one JSONL line into an (id, document, metadata) triple, or None.
+    """Parse one line into ``(id, document, metadata, dropped)``, or None.
 
     ``RecursionError`` guards against pathological deeply-nested-but-valid
     JSON, which would otherwise abort the whole import.
@@ -110,7 +160,8 @@ def _parse_line(raw: str):
     document = obj.get("document")
     if not isinstance(doc_id, str) or not doc_id or not isinstance(document, str):
         return None
-    return doc_id, document, _sanitize_metadata(obj.get("metadata"))
+    meta, dropped = _sanitize_metadata(obj.get("metadata"))
+    return doc_id, document, meta, dropped
 
 
 def _add_batch(col, batch, stats):
@@ -167,7 +218,7 @@ def import_palace(palace_path: str, input_dir: str, dry_run: bool = False) -> di
 
     Returns:
         Stats dict: {"files": N, "imported": N, "skipped_existing": N,
-        "malformed": N}
+        "malformed": N, "metadata_dropped": N}
     """
     if not os.path.isdir(input_dir):
         raise ValueError(f"import source is not a directory: {input_dir!r}")
@@ -177,11 +228,23 @@ def import_palace(palace_path: str, input_dir: str, dry_run: bool = False) -> di
     )
     if not jsonl_files:
         print(f"  No .jsonl files found under {input_dir} — nothing to import.")
-        return {"files": 0, "imported": 0, "skipped_existing": 0, "malformed": 0}
+        return {
+            "files": 0,
+            "imported": 0,
+            "skipped_existing": 0,
+            "malformed": 0,
+            "metadata_dropped": 0,
+        }
 
     col = None if dry_run else get_collection(palace_path)
 
-    stats = {"files": 0, "imported": 0, "skipped_existing": 0, "malformed": 0}
+    stats = {
+        "files": 0,
+        "imported": 0,
+        "skipped_existing": 0,
+        "malformed": 0,
+        "metadata_dropped": 0,
+    }
     seen_ids: set = set()  # dedup across files within this run
     pending: list = []
     malformed_examples: list = []
@@ -201,6 +264,15 @@ def import_palace(palace_path: str, input_dir: str, dry_run: bool = False) -> di
         # flush (which would be miscounted as malformed input and leave the
         # batch pending). Lines parsed before a mid-file read error still
         # import; idempotent re-import picks up a repaired file cleanly.
+        if not _path_within_root(path, input_dir):
+            # Reached through a symlinked directory that leaves the import
+            # tree. Refused for the same reason the exporter refuses a
+            # symlinked output dir: an import must not read outside the tree
+            # it was pointed at.
+            stats["malformed"] += 1
+            if len(malformed_examples) < 5:
+                malformed_examples.append(f"{path} (outside the import tree)")
+            continue
         triples: list = []
         try:
             handle = _open_regular_text(path)
@@ -223,10 +295,11 @@ def import_palace(palace_path: str, input_dir: str, dry_run: bool = False) -> di
                             if len(malformed_examples) < 5:
                                 malformed_examples.append(f"{path}:{lineno}")
                             continue
-                        doc_id, document, meta = parsed
+                        doc_id, document, meta, dropped = parsed
                         if doc_id in seen_ids:
                             continue
                         seen_ids.add(doc_id)
+                        stats["metadata_dropped"] += dropped
                         triples.append((doc_id, document, meta))
         except (OSError, UnicodeDecodeError) as exc:
             # Unreadable input: permissions, a symlink refused by O_NOFOLLOW,
@@ -242,6 +315,12 @@ def import_palace(palace_path: str, input_dir: str, dry_run: bool = False) -> di
         _flush_batch(pending)
         pending.clear()
 
+    if stats["metadata_dropped"]:
+        print(
+            f"  Note: {stats['metadata_dropped']} metadata value(s) were dropped — "
+            f"this import path stores scalar values only. An export taken from a "
+            f"backend that allows nested metadata does not round-trip them here."
+        )
     if stats["imported"] and not dry_run:
         print(
             f"  Note: exports do not include embeddings — {stats['imported']} imported "

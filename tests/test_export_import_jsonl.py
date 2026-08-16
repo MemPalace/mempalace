@@ -218,6 +218,96 @@ def test_import_skips_a_fifo_without_blocking():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_import_refuses_entries_outside_the_tree():
+    """A symlinked DIRECTORY is traversed by recursive glob; O_NOFOLLOW cannot see it.
+
+    `glob.glob(..., recursive=True)` follows symlinked directories, and
+    O_NOFOLLOW only guards the final component — so without a containment
+    check a regular file living outside the import tree is imported as if it
+    belonged to it. The symlinked leaf is refused by O_NOFOLLOW; the file
+    reached *through* the symlinked dir is what this test is about.
+    """
+    tmpdir = tempfile.mkdtemp()
+    try:
+        export_dir = Path(tmpdir) / "export" / "wing"
+        export_dir.mkdir(parents=True)
+        inside = {"id": "inside-1", "document": "in the tree", "metadata": {"wing": "w"}}
+        (export_dir / "room.jsonl").write_text(json.dumps(inside) + "\n", encoding="utf-8")
+
+        outside = Path(tmpdir) / "elsewhere"
+        outside.mkdir()
+        stray = {"id": "outside-1", "document": "not in the tree", "metadata": {"wing": "w"}}
+        (outside / "stray.jsonl").write_text(json.dumps(stray) + "\n", encoding="utf-8")
+        try:
+            os.symlink(str(outside), str(export_dir / "linked_dir"))
+        except (OSError, NotImplementedError, AttributeError) as exc:
+            # Windows has os.symlink but refuses it without privileges, so
+            # hasattr() is not a usable guard — the attempt is.
+            pytest.skip(f"symlink creation unavailable: {exc}")
+
+        result = import_palace(os.path.join(tmpdir, "palace"), str(export_dir.parent), dry_run=True)
+        # The stray file is globbed (glob follows the symlinked dir) but refused.
+        assert result["imported"] == 1, "a file outside the import tree was imported"
+        assert result["malformed"] == 1
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_import_reports_dropped_non_scalar_metadata():
+    """Non-scalar metadata is dropped, but never silently.
+
+    Chroma rejects non-scalars at write time, but `sqlite_exact` serializes
+    metadata with an unrestricted json.dumps — so a palace on that backend can
+    hold a list, the exporter writes it out raw, and this filter drops it on
+    the way back in. That is a legitimate lossy round trip; an unreported one
+    is not.
+    """
+    tmpdir = tempfile.mkdtemp()
+    try:
+        export_dir = Path(tmpdir) / "export" / "wing"
+        export_dir.mkdir(parents=True)
+        line = {
+            "id": "drawer-1",
+            "document": "hello",
+            "metadata": {"wing": "w", "tags": ["a", "b"], "nested": {"k": "v"}},
+        }
+        (export_dir / "room.jsonl").write_text(json.dumps(line) + "\n", encoding="utf-8")
+
+        result = import_palace(os.path.join(tmpdir, "palace"), str(export_dir.parent), dry_run=True)
+        assert result["imported"] == 1
+        assert result["metadata_dropped"] == 2, "the list and the dict must both be counted"
+        assert result["malformed"] == 0, "a droppable value is not malformed input"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_import_reports_wholly_discarded_metadata():
+    """A non-dict `metadata` is discarded WHOLE and must still be counted.
+
+    Replacing a non-dict with {} before counting reports zero drops for a
+    total loss — the same silent-loss class the counter exists to end, one
+    level up. An ABSENT metadata key is a different thing: nothing was lost,
+    so nothing is reported.
+    """
+    tmpdir = tempfile.mkdtemp()
+    try:
+        export_dir = Path(tmpdir) / "export" / "wing"
+        export_dir.mkdir(parents=True)
+        discarded = {"id": "d-1", "document": "hello", "metadata": ["lost-a", "lost-b"]}
+        absent = {"id": "d-2", "document": "hello"}
+        (export_dir / "room.jsonl").write_text(
+            json.dumps(discarded) + "\n" + json.dumps(absent) + "\n", encoding="utf-8"
+        )
+
+        result = import_palace(os.path.join(tmpdir, "palace"), str(export_dir.parent), dry_run=True)
+        assert result["imported"] == 2
+        assert result["metadata_dropped"] == 1, (
+            "the discarded list must be counted, the absent key must not"
+        )
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def test_import_rejects_non_directory():
     tmpdir = tempfile.mkdtemp()
     try:
