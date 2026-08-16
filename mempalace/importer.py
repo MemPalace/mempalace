@@ -44,7 +44,7 @@ import json
 import os
 import stat
 
-from .palace import get_collection
+from .palace import get_collection, mine_palace_lock
 
 # Chroma metadata values must be scalars; anything else on a line is dropped
 # rather than failing the whole import.
@@ -203,41 +203,15 @@ def _add_batch(col, batch, stats):
                     raise
 
 
-def import_palace(palace_path: str, input_dir: str, dry_run: bool = False) -> dict:
-    """Merge JSONL drawers from ``input_dir`` into the palace at ``palace_path``.
+def _import_into(col, jsonl_files, input_dir, dry_run: bool) -> dict:
+    """Walk ``jsonl_files`` and file every drawer not already present.
 
-    Args:
-        palace_path: Palace directory. Created (with its collection) on a
-            first import to a fresh machine — unless ``dry_run`` is set.
-        input_dir: Directory tree containing ``*.jsonl`` export files.
-        dry_run: Parse-only preview. Reports what the export contains without
-            opening (or creating) the palace at all — opening a local backend
-            is itself a write, and a true preview must not touch it. The
-            existing-id dedup therefore runs only at real import time; a dry
-            run counts every parsed drawer as importable.
-
-    Returns:
-        Stats dict: {"files": N, "imported": N, "skipped_existing": N,
-        "malformed": N, "metadata_dropped": N}
+    Split out of :func:`import_palace` so the writer lease has an explicit,
+    readable scope: the caller holds the lock around this whole call, because
+    batches are flushed DURING the walk rather than after it, so a lease that
+    covered only the final flush would not serialize the adds it exists to
+    protect. ``col`` is ``None`` on a dry run and no lease is taken.
     """
-    if not os.path.isdir(input_dir):
-        raise ValueError(f"import source is not a directory: {input_dir!r}")
-
-    jsonl_files = sorted(
-        glob.glob(os.path.join(glob.escape(input_dir), "**", "*.jsonl"), recursive=True)
-    )
-    if not jsonl_files:
-        print(f"  No .jsonl files found under {input_dir} — nothing to import.")
-        return {
-            "files": 0,
-            "imported": 0,
-            "skipped_existing": 0,
-            "malformed": 0,
-            "metadata_dropped": 0,
-        }
-
-    col = None if dry_run else get_collection(palace_path)
-
     stats = {
         "files": 0,
         "imported": 0,
@@ -343,3 +317,53 @@ def import_palace(palace_path: str, input_dir: str, dry_run: bool = False) -> di
     if malformed_examples:
         print("  Malformed input at: " + ", ".join(malformed_examples))
     return stats
+
+
+def import_palace(palace_path: str, input_dir: str, dry_run: bool = False) -> dict:
+    """Merge JSONL drawers from ``input_dir`` into the palace at ``palace_path``.
+
+    Args:
+        palace_path: Palace directory. Created (with its collection) on a
+            first import to a fresh machine — unless ``dry_run`` is set.
+        input_dir: Directory tree containing ``*.jsonl`` export files.
+        dry_run: Parse-only preview. Reports what the export contains without
+            opening (or creating) the palace at all — opening a local backend
+            is itself a write, and a true preview must not touch it. The
+            existing-id dedup therefore runs only at real import time; a dry
+            run counts every parsed drawer as importable.
+
+    Returns:
+        Stats dict: {"files": N, "imported": N, "skipped_existing": N,
+        "malformed": N, "metadata_dropped": N}
+    """
+    if not os.path.isdir(input_dir):
+        raise ValueError(f"import source is not a directory: {input_dir!r}")
+
+    jsonl_files = sorted(
+        glob.glob(os.path.join(glob.escape(input_dir), "**", "*.jsonl"), recursive=True)
+    )
+    if not jsonl_files:
+        print(f"  No .jsonl files found under {input_dir} — nothing to import.")
+        return {
+            "files": 0,
+            "imported": 0,
+            "skipped_existing": 0,
+            "malformed": 0,
+            "metadata_dropped": 0,
+        }
+
+    if dry_run:
+        # A dry run never opens the palace, so there is nothing to serialize
+        # against and no lease to take — taking one would create the palace
+        # directory the preview promises not to touch.
+        return _import_into(None, jsonl_files, input_dir, True)
+
+    # One writer lease across the whole walk, matching the adapter write path
+    # in `cli.py`: batches are added as files are read, and the existence check
+    # and the add are not one atomic operation, so a concurrent miner can file
+    # an id between them. The module docstring already claimed `mine`'s
+    # single-writer expectations; this is what makes that true rather than
+    # aspirational.
+    with mine_palace_lock(palace_path):
+        col = get_collection(palace_path)
+        return _import_into(col, jsonl_files, input_dir, False)
