@@ -217,6 +217,51 @@ def _quote_content(text: str) -> str:
     return "\n> ".join(lines)
 
 
+def _prune_stale_exports(output_dir: str, written: set) -> int:
+    """Remove ``*.jsonl`` files a PREVIOUS export left behind. Returns the count.
+
+    Re-exporting rewrites the rooms that still exist and used to leave the rest
+    in place. That is not only a cosmetic git-diff wrinkle: import walks every
+    ``*.jsonl`` under the tree without consulting the manifest, so a room whose
+    last drawer was deleted would be re-imported on the next device and the
+    drawer would come back.
+
+    Two safety properties, both deliberate:
+
+    * The caller passes ``had_manifest`` from BEFORE the manifest is rewritten,
+      so this only ever deletes inside a directory we can prove was already one
+      of our own exports. Pointing ``export`` at an arbitrary directory removes
+      nothing on the first run.
+    * Only regular files are unlinked, and symlinks are skipped rather than
+      followed — the same posture ``_reject_symlink`` applies on the write side.
+    """
+    removed = 0
+    for root, _dirs, files in os.walk(output_dir):
+        for name in files:
+            if not name.endswith(".jsonl"):
+                continue
+            path = os.path.join(root, name)
+            if os.path.abspath(path) in written:
+                continue
+            if os.path.islink(path) or not os.path.isfile(path):
+                continue
+            try:
+                os.unlink(path)
+                removed += 1
+            except OSError:
+                pass
+    # Drop wing directories the prune emptied; never the output root itself.
+    for root, _dirs, _files in os.walk(output_dir, topdown=False):
+        if os.path.abspath(root) == os.path.abspath(output_dir):
+            continue
+        try:
+            if not os.listdir(root):
+                os.rmdir(root)
+        except OSError:
+            pass
+    return removed
+
+
 def export_palace_jsonl(palace_path: str, output_dir: str) -> dict:
     """Export all palace drawers as JSONL files organized by wing/room.
 
@@ -236,6 +281,14 @@ def export_palace_jsonl(palace_path: str, output_dir: str) -> dict:
     room, no timestamps), so re-exporting an unchanged palace produces a
     byte-identical tree and therefore an empty git diff.
 
+    Re-exporting into an existing export also PRUNES room files that no longer
+    correspond to a room in the palace, so a deleted drawer does not survive in
+    a stale file and get re-imported on another device. Pruning is gated on a
+    previous ``export-manifest.json`` being present, so exporting into an
+    unrelated directory never deletes anything, and it is skipped when the
+    palace reports zero drawers — an empty count is also what a palace that
+    failed to open looks like, and that path warns instead.
+
     Streams drawers in paginated batches like :func:`export_palace`, but
     buffers the grouped drawers in memory so each file can be written fully
     sorted; memory is proportional to the total exported text. Wing/room
@@ -245,11 +298,26 @@ def export_palace_jsonl(palace_path: str, output_dir: str) -> dict:
     Returns:
         Stats dict: {"wings": N, "rooms": N, "drawers": N}
     """
-    col = get_collection(palace_path)
+    # A pure read: ask the backend not to run schema init, migrations or
+    # metadata writes. (`create` is left at its default — flipping it changes
+    # what exporting a not-yet-existing palace does, which is a separate call.)
+    col = get_collection(palace_path, read_only=True)
     total = col.count()
+
+    manifest_path = os.path.join(output_dir, "export-manifest.json")
+    had_manifest = os.path.isfile(manifest_path)
 
     if total == 0:
         print("  Palace is empty — nothing to export.")
+        if had_manifest:
+            # Deliberately NOT pruned. An empty count is also what a palace that
+            # failed to open looks like, and silently deleting a good export on
+            # that reading is far worse than leaving a stale one in place.
+            print(
+                f"  WARNING: {output_dir} still holds a previous export. It was left "
+                f"untouched because this palace reports zero drawers — delete it by "
+                f"hand if the palace really is empty, or it will re-import elsewhere."
+            )
         return {"wings": 0, "rooms": 0, "drawers": 0}
 
     _reject_symlink(output_dir, "output_dir")
@@ -281,6 +349,7 @@ def export_palace_jsonl(palace_path: str, output_dir: str) -> dict:
 
     total_drawers = 0
     room_count = 0
+    written: set = set()
     for wing in sorted(grouped):
         wing_dir = os.path.join(output_dir, wing)
         _reject_symlink(wing_dir, f"wing directory {wing!r}")
@@ -297,11 +366,17 @@ def export_palace_jsonl(palace_path: str, output_dir: str) -> dict:
                 for doc_id in sorted(drawers):
                     f.write(json.dumps(drawers[doc_id], ensure_ascii=False, sort_keys=True))
                     f.write("\n")
+            written.add(os.path.abspath(room_path))
             room_count += 1
             total_drawers += len(drawers)
         print(
             f"  {wing}: {len(grouped[wing])} rooms, {sum(len(r) for r in grouped[wing].values())} drawers"
         )
+
+    if had_manifest:
+        pruned = _prune_stale_exports(output_dir, written)
+        if pruned:
+            print(f"  Pruned {pruned} stale room file(s) from the previous export")
 
     manifest = {
         "format_version": 1,
@@ -309,7 +384,6 @@ def export_palace_jsonl(palace_path: str, output_dir: str) -> dict:
         "rooms": room_count,
         "drawers": total_drawers,
     }
-    manifest_path = os.path.join(output_dir, "export-manifest.json")
     with _safe_open_for_write(manifest_path, "w") as f:
         f.write(json.dumps(manifest, indent=2, sort_keys=True))
         f.write("\n")
