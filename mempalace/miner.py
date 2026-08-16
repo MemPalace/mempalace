@@ -1863,6 +1863,7 @@ def mine(
         return _mine_impl(
             project_dir,
             palace_path,
+            config_dir=config_dir,
             wing_override=wing_override,
             agent=agent,
             limit=limit,
@@ -1880,6 +1881,7 @@ def mine(
         return _mine_impl(
             project_dir,
             palace_path,
+            config_dir=config_dir,
             wing_override=wing_override,
             agent=agent,
             limit=limit,
@@ -1894,6 +1896,7 @@ def mine(
 def _mine_impl(
     project_dir: str,
     palace_path: str,
+    config_dir: str = None,
     wing_override: str = None,
     agent: str = "mempalace",
     limit: int = 0,
