@@ -162,6 +162,29 @@ class TestColdStartDiagnostics:
     """
 
     @staticmethod
+    def _clean_home_env(tmp_path, *, with_palace: bool = False) -> dict:
+        """Env overrides pinning HOME to a dir that does (not) hold ``.mempalace``.
+
+        ``_run_main`` inherits the session environment, so without this these
+        cases depend on whether some earlier test happened to create the palace
+        root under the redirected HOME — the default-logfile handler attaches
+        only when ``~/.mempalace`` already exists, which made the outcome
+        order-dependent. Pinning HOME per test keeps each case deterministic
+        and lets both branches be asserted explicitly.
+        """
+        home = tmp_path / ("home_with_palace" if with_palace else "home_clean")
+        home.mkdir(exist_ok=True)
+        if with_palace:
+            (home / ".mempalace").mkdir(exist_ok=True)
+        drive, tail = os.path.splitdrive(str(home))
+        return {
+            "HOME": str(home),
+            "USERPROFILE": str(home),
+            "HOMEDRIVE": drive or "C:",
+            "HOMEPATH": tail or str(home),
+        }
+
+    @staticmethod
     def _run_main(env_overrides: dict, extra_code: str = "", timeout: int = 30):
         env = {
             k: v
@@ -186,7 +209,7 @@ class TestColdStartDiagnostics:
 
     def test_log_file_unset_attaches_only_stream_handler(self, tmp_path):
         marker = tmp_path / "handlers.txt"
-        env_overrides = {"MEMPALACE_LOG_FILE": None}
+        env_overrides = {"MEMPALACE_LOG_FILE": None, **self._clean_home_env(tmp_path)}
         extra = (
             "import logging, pathlib\n"
             "from mempalace import mcp_server  # noqa: F401 — triggers _init_logging()\n"
@@ -201,7 +224,8 @@ class TestColdStartDiagnostics:
 
     def test_log_file_empty_string_attaches_only_stream_handler(self, tmp_path):
         marker = tmp_path / "handlers.txt"
-        env_overrides = {"MEMPALACE_LOG_FILE": "   "}  # whitespace counts as unset after .strip()
+        # whitespace counts as unset after .strip()
+        env_overrides = {"MEMPALACE_LOG_FILE": "   ", **self._clean_home_env(tmp_path)}
         extra = (
             "import logging, pathlib\n"
             "from mempalace import mcp_server  # noqa: F401\n"
@@ -213,6 +237,49 @@ class TestColdStartDiagnostics:
         result = self._run_main(env_overrides, extra_code=extra)
         assert result.returncode == 0, f"stderr={result.stderr!r}"
         assert marker.read_text().split(",") == ["StreamHandler"], marker.read_text()
+
+    def test_log_file_unset_attaches_file_handler_when_palace_exists(self, tmp_path):
+        """With no MEMPALACE_LOG_FILE, an *existing* ~/.mempalace gets the default log.
+
+        This is the other half of the branch the two tests above pin shut, and
+        the reason the default is safe: it rides on a palace root that is
+        already there rather than bringing one into existence.
+        """
+        marker = tmp_path / "handlers.txt"
+        env_overrides = {
+            "MEMPALACE_LOG_FILE": None,
+            **self._clean_home_env(tmp_path, with_palace=True),
+        }
+        extra = (
+            "import logging, pathlib\n"
+            "from mempalace import mcp_server  # noqa: F401 — triggers _init_logging()\n"
+            f"pathlib.Path({str(marker)!r}).write_text("
+            "','.join(type(h).__name__ for h in logging.getLogger().handlers)"
+            ")\n"
+            "raise SystemExit(0)\n"
+        )
+        result = self._run_main(env_overrides, extra_code=extra)
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
+        assert marker.read_text().split(",") == [
+            "StreamHandler",
+            "FileHandler",
+        ], marker.read_text()
+        log_path = tmp_path / "home_with_palace" / ".mempalace" / "mcp_server.log"
+        assert log_path.exists(), "default logfile was not written into the palace root"
+
+    def test_log_file_unset_never_creates_the_palace_root(self, tmp_path):
+        """#1676 kill-switch: a missing ~/.mempalace must survive importing the server.
+
+        A missing palace root is the documented way to disable autosave/mining
+        hooks. If the default-logfile path created it, importing the MCP server
+        would silently re-arm hooks the operator deliberately turned off.
+        """
+        env_overrides = {"MEMPALACE_LOG_FILE": None, **self._clean_home_env(tmp_path)}
+        result = self._run_main(env_overrides)
+        assert result.returncode == 0, f"stderr={result.stderr!r}"
+        assert not (tmp_path / "home_clean" / ".mempalace").exists(), (
+            "importing mcp_server created the palace root, re-arming the kill-switch"
+        )
 
     def test_log_file_set_attaches_file_handler_and_persists_startup_line(self, tmp_path):
         log_path = tmp_path / "mcp.log"
@@ -523,7 +590,9 @@ class TestColdStartDiagnostics:
             ")\n"
             "raise SystemExit(0)\n"
         )
-        result = self._run_main({"MEMPALACE_LOG_FILE": None}, extra_code=extra)
+        result = self._run_main(
+            {"MEMPALACE_LOG_FILE": None, **self._clean_home_env(tmp_path)}, extra_code=extra
+        )
         assert result.returncode == 0, f"stderr={result.stderr!r}"
         state = marker.read_text()
         # Root logger must remain exactly as the host configured it.
@@ -3839,7 +3908,9 @@ class TestKGTools:
 
         assert result["success"] is True, f"invalidate rejected long object: {result}"
 
-    def test_kg_invalidate_long_object_write_path_unaffected(self, monkeypatch, config, palace_path, kg):
+    def test_kg_invalidate_long_object_write_path_unaffected(
+        self, monkeypatch, config, palace_path, kg
+    ):
         """Write-path object validation is unchanged by the invalidate fix.
 
         tool_kg_add still enforces MAX_NAME_LENGTH on the object field so that
