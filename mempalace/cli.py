@@ -17,6 +17,7 @@ Commands:
     mempalace mine <dir> --mode convos    Mine conversation exports
     mempalace mine <dir> --mode extract   Mine binary office documents (PDF/DOCX/etc.)
     mempalace mine <source> --source NAME Mine through a registered source adapter
+    mempalace unmine <source-file>         Remove filed data for one exact source (dry-run first)
     mempalace search "query"              Find anything, exact words
     mempalace mcp                         Show MCP setup command
     mempalace wake-up                     Show L0 + L1 wake-up context
@@ -1157,6 +1158,63 @@ def cmd_sync(args):
             f"\n  Removed {report['removed_drawers']} drawers, {report['removed_closets']} closets."
         )
 
+    print(f"\n{'=' * 55}\n")
+
+
+def cmd_unmine(args):
+    """Remove all filed data associated with one exact source path."""
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    source_file = os.path.abspath(os.path.expanduser(args.source_file))
+
+    if not os.path.isdir(palace_path):
+        print(f"\n  No palace found at {palace_path}")
+        return
+
+    from .palace import MineAlreadyRunning
+    from .sync import unmine_source
+    from .wal import _wal_log
+
+    print(f"\n{'=' * 55}")
+    print("  MemPalace Unmine -- Source-scoped removal")
+    print(f"{'=' * 55}")
+    print(f"  Palace:  {palace_path}")
+    print(f"  Source:  {source_file}")
+    print(f"  Wing:    {args.wing or 'all wings'}")
+    print(f"  Mode:    {'DRY RUN (no deletions)' if args.dry_run else 'APPLY'}")
+    print(f"{'-' * 55}\n")
+
+    try:
+        report = unmine_source(
+            palace_path=palace_path,
+            source_file=source_file,
+            wing=args.wing,
+            dry_run=args.dry_run,
+            wal_log=_wal_log,
+        )
+    except MineAlreadyRunning as exc:
+        print(f"mempalace: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except ValueError as exc:
+        print(f"mempalace: {exc}", file=sys.stderr)
+        sys.exit(2)
+    except Exception as exc:
+        print(f"mempalace: unmine failed: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    wings = ", ".join(report["affected_wings"]) if report["affected_wings"] else "none"
+    print(f"  Matched drawers: {report['matched_drawers']}")
+    print(f"  Matched closets: {report['matched_closets']}")
+    print(f"  Affected wings:  {wings}")
+
+    if args.dry_run:
+        if report["matched_drawers"] or report["matched_closets"]:
+            print("\n  Re-run with --apply to remove exactly this source.")
+        else:
+            print("\n  Nothing filed from that source path.")
+    else:
+        print(
+            f"\n  Removed {report['removed_drawers']} drawers, {report['removed_closets']} closets."
+        )
     print(f"\n{'=' * 55}\n")
 
 
@@ -2676,6 +2734,27 @@ def main():
         help="With --daemon, return a job id immediately instead of waiting",
     )
 
+    # unmine
+    p_unmine = sub.add_parser(
+        "unmine",
+        help="Remove all filed data for one exact source path (dry-run by default)",
+    )
+    p_unmine.add_argument("source_file", help="Source file path stored on the filed drawers")
+    p_unmine.add_argument("--wing", default=None, help="Limit removal to one wing")
+    p_unmine.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        default=True,
+        help="Preview only (default)",
+    )
+    p_unmine.add_argument(
+        "--apply",
+        dest="dry_run",
+        action="store_false",
+        help="Actually remove matching drawers and closets",
+    )
+
     # search
     p_search = sub.add_parser("search", help="Find anything, exact words")
     p_search.add_argument("query", help="What to search for")
@@ -3165,6 +3244,7 @@ def main():
         "search": cmd_search,
         "sweep": cmd_sweep,
         "sync": cmd_sync,
+        "unmine": cmd_unmine,
         "mcp": cmd_mcp,
         "serve": cmd_serve,
         "compress": cmd_compress,

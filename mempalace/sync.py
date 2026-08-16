@@ -42,6 +42,17 @@ class SyncReport(TypedDict):
     by_source: dict[str, int]
 
 
+class UnmineReport(TypedDict):
+    source_file: str
+    wing: Optional[str]
+    matched_drawers: int
+    matched_closets: int
+    removed_drawers: int
+    removed_closets: int
+    affected_wings: list[str]
+    dry_run: bool
+
+
 def _resolve_project_root(source_file: Path, project_roots: list) -> Optional[Path]:
     """Return the longest project_root that source_file lives under.
 
@@ -184,20 +195,132 @@ def _normalize_project_dirs(project_dirs) -> list:
     return sorted(resolved, key=lambda p: (-len(str(p)), str(p)))
 
 
-def _delete_in_batches(col, ids: list, batch_size: int, wal_log: Optional[Callable]):
-    """Delete drawer IDs in batches, optionally logging each batch to WAL."""
+def _delete_in_batches(
+    col,
+    ids: list,
+    batch_size: int,
+    wal_log: Optional[Callable],
+    *,
+    operation: str = "sync_prune",
+    params: Optional[dict] = None,
+):
+    """Delete IDs in batches, optionally logging each batch to WAL."""
     deleted = 0
     for i in range(0, len(ids), batch_size):
         chunk = ids[i : i + batch_size]
         col.delete(ids=chunk)
         deleted += len(chunk)
         if wal_log is not None:
+            wal_params = dict(params or {})
+            wal_params["first_id"] = chunk[0]
             wal_log(
-                "sync_prune",
-                {"first_id": chunk[0]},
+                operation,
+                wal_params,
                 {"removed_count": len(chunk)},
             )
     return deleted
+
+
+def _source_where(source_file: str, wing: Optional[str]):
+    if wing:
+        return {"$and": [{"source_file": source_file}, {"wing": wing}]}
+    return {"source_file": source_file}
+
+
+def _matching_source_rows(col, source_file: str, wing: Optional[str]) -> tuple[list[str], set[str]]:
+    """Return IDs and observed wings for one exact source-file match."""
+    ids: list[str] = []
+    wings: set[str] = set()
+    offset = 0
+    where = _source_where(source_file, wing)
+    while True:
+        batch = col.get(
+            where=where,
+            limit=_BATCH,
+            offset=offset,
+            include=["metadatas"],
+        )
+        batch_ids = batch.get("ids") or []
+        metadatas = batch.get("metadatas") or []
+        if not batch_ids:
+            break
+        ids.extend(batch_ids)
+        for meta in metadatas:
+            value = (meta or {}).get("wing")
+            if isinstance(value, str) and value:
+                wings.add(value)
+        offset += len(batch_ids)
+    return ids, wings
+
+
+def unmine_source(
+    palace_path: str,
+    source_file: str,
+    wing: Optional[str] = None,
+    dry_run: bool = True,
+    batch_size: int = _BATCH,
+    wal_log: Optional[Callable] = None,
+) -> UnmineReport:
+    """Remove every drawer and closet filed from one exact source path.
+
+    Dry-run is the default. The operation is source-scoped rather than
+    content-scoped on purpose: it gives operators a precise recovery path
+    for accidental/duplicate mines without defining a global policy for when
+    repeated text is semantically redundant. ``wing`` can further narrow a
+    source that was intentionally filed into more than one wing.
+
+    Registry sentinels are ordinary drawer rows carrying ``source_file`` and
+    are removed too, so a later mine of the source is not falsely skipped.
+    """
+    if not source_file:
+        raise ValueError("source_file must be a non-empty path")
+
+    with mine_palace_lock(palace_path):
+        col = get_collection(palace_path, create=False)
+        drawer_ids, affected_wings = _matching_source_rows(col, source_file, wing)
+
+        closets_col = None
+        closet_ids: list[str] = []
+        try:
+            closets_col = get_closets_collection(palace_path, create=False)
+        except Exception as exc:
+            logger.debug("Unmine closet lookup skipped (collection unavailable): %s", exc)
+        if closets_col is not None:
+            closet_ids, closet_wings = _matching_source_rows(closets_col, source_file, wing)
+            affected_wings.update(closet_wings)
+
+        report: UnmineReport = {
+            "source_file": source_file,
+            "wing": wing,
+            "matched_drawers": len(drawer_ids),
+            "matched_closets": len(closet_ids),
+            "removed_drawers": 0,
+            "removed_closets": 0,
+            "affected_wings": sorted(affected_wings),
+            "dry_run": dry_run,
+        }
+        if dry_run:
+            return report
+
+        wal_params = {"source_file": source_file}
+        if wing:
+            wal_params["wing"] = wing
+        report["removed_drawers"] = _delete_in_batches(
+            col,
+            drawer_ids,
+            batch_size,
+            wal_log,
+            operation="unmine_source",
+            params=wal_params,
+        )
+        if closets_col is not None:
+            report["removed_closets"] = _delete_in_batches(
+                closets_col,
+                closet_ids,
+                batch_size,
+                None,
+            )
+        return report
 
 
 def sync_palace(
@@ -317,5 +440,7 @@ def sync_palace(
 __all__ = [
     "MineAlreadyRunning",
     "SyncReport",
+    "UnmineReport",
     "sync_palace",
+    "unmine_source",
 ]

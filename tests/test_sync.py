@@ -1489,3 +1489,133 @@ class TestServiceRunSyncReport:
         assert "Removed 3 drawers, 2 closets" in out
         assert "Top sources removed" in out
         assert "Re-run with --apply" not in out
+
+
+class TestUnmineSource:
+    def _seed(self, tmp_dir, palace_path):
+        source = str((Path(tmp_dir) / "duplicate-export.md").resolve())
+        other = str((Path(tmp_dir) / "keep.md").resolve())
+
+        client = chromadb.PersistentClient(path=palace_path)
+        drawers = client.get_or_create_collection(
+            "mempalace_drawers", metadata={"hnsw:space": "cosine"}
+        )
+        drawers.add(
+            ids=["dup_0", "dup_1", "dup_registry", "keep_0"],
+            documents=["duplicate a", "duplicate b", "[registry] dup", "keep"],
+            embeddings=[
+                [1.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [3.0, 0.0, 0.0],
+                [4.0, 0.0, 0.0],
+            ],
+            metadatas=[
+                {"wing": "demo", "room": "notes", "source_file": source},
+                {"wing": "demo", "room": "notes", "source_file": source},
+                {
+                    "wing": "demo",
+                    "room": "_registry",
+                    "source_file": source,
+                    "ingest_mode": "registry",
+                },
+                {"wing": "demo", "room": "notes", "source_file": other},
+            ],
+        )
+        closets = client.get_or_create_collection(
+            "mempalace_closets", metadata={"hnsw:space": "cosine"}
+        )
+        closets.add(
+            ids=["dup_closet", "keep_closet"],
+            documents=["duplicate pointer", "keep pointer"],
+            embeddings=[[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+            metadatas=[
+                {"wing": "demo", "room": "notes", "source_file": source},
+                {"wing": "demo", "room": "notes", "source_file": other},
+            ],
+        )
+        del client
+        return source, other
+
+    def test_dry_run_reports_exact_source_without_mutating(self, tmp_dir, palace_path):
+        from mempalace.sync import unmine_source
+
+        source, _ = self._seed(tmp_dir, palace_path)
+        report = unmine_source(palace_path, source, dry_run=True)
+
+        assert report["matched_drawers"] == 3
+        assert report["matched_closets"] == 1
+        assert report["removed_drawers"] == 0
+        assert report["removed_closets"] == 0
+        assert report["affected_wings"] == ["demo"]
+
+        client = chromadb.PersistentClient(path=palace_path)
+        try:
+            drawers = client.get_collection("mempalace_drawers")
+            closets = client.get_collection("mempalace_closets")
+            assert set(drawers.get(include=[])["ids"]) == {
+                "dup_0",
+                "dup_1",
+                "dup_registry",
+                "keep_0",
+            }
+            assert set(closets.get(include=[])["ids"]) == {"dup_closet", "keep_closet"}
+        finally:
+            del client
+
+    def test_apply_removes_drawers_registry_and_closets_for_source_only(self, tmp_dir, palace_path):
+        from mempalace.sync import unmine_source
+
+        source, _ = self._seed(tmp_dir, palace_path)
+        wal_events = []
+
+        report = unmine_source(
+            palace_path,
+            source,
+            dry_run=False,
+            wal_log=lambda *args: wal_events.append(args),
+        )
+
+        assert report["removed_drawers"] == 3
+        assert report["removed_closets"] == 1
+        assert wal_events
+        assert wal_events[0][0] == "unmine_source"
+        assert wal_events[0][1]["source_file"] == source
+
+        client = chromadb.PersistentClient(path=palace_path)
+        try:
+            drawers = client.get_collection("mempalace_drawers")
+            closets = client.get_collection("mempalace_closets")
+            assert set(drawers.get(include=[])["ids"]) == {"keep_0"}
+            assert set(closets.get(include=[])["ids"]) == {"keep_closet"}
+        finally:
+            del client
+
+    def test_wing_scope_preserves_same_source_in_other_wing(self, tmp_dir, palace_path):
+        from mempalace.sync import unmine_source
+
+        source = str((Path(tmp_dir) / "shared.md").resolve())
+        client = chromadb.PersistentClient(path=palace_path)
+        drawers = client.get_or_create_collection(
+            "mempalace_drawers", metadata={"hnsw:space": "cosine"}
+        )
+        drawers.add(
+            ids=["demo_copy", "other_copy"],
+            documents=["same", "same"],
+            embeddings=[[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+            metadatas=[
+                {"wing": "demo", "room": "notes", "source_file": source},
+                {"wing": "other", "room": "notes", "source_file": source},
+            ],
+        )
+        del client
+
+        report = unmine_source(palace_path, source, wing="demo", dry_run=False)
+        assert report["removed_drawers"] == 1
+        assert report["affected_wings"] == ["demo"]
+
+        client = chromadb.PersistentClient(path=palace_path)
+        try:
+            drawers = client.get_collection("mempalace_drawers")
+            assert set(drawers.get(include=[])["ids"]) == {"other_copy"}
+        finally:
+            del client
