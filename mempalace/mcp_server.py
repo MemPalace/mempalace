@@ -3619,11 +3619,17 @@ def tool_list_drawers(
         return {"error": str(e)}
 
 
-def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, room: str = None):
+def tool_update_drawer(
+    drawer_id: str,
+    content: str = None,
+    wing: str = None,
+    room: str = None,
+    updated_by: str = None,
+):
     """Update an existing logical drawer's content and/or metadata."""
     global _metadata_cache
 
-    if content is None and wing is None and room is None:
+    if content is None and wing is None and room is None and updated_by is None:
         return {"success": True, "drawer_id": drawer_id, "noop": True}
 
     col = _get_collection()
@@ -3663,18 +3669,23 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
             if room.lower() != str(old_meta.get("room") or "").lower():
                 new_meta["room"] = room
 
-        _wal_log(
-            "update_drawer",
-            {
-                "drawer_id": drawer_id,
-                "old_wing": old_meta.get("wing", ""),
-                "old_room": old_meta.get("room", ""),
-                "new_wing": new_meta.get("wing", ""),
-                "new_room": new_meta.get("room", ""),
-                "content_changed": content is not None,
-                "content_preview": new_doc[:200] if content is not None else None,
-            },
-        )
+        if updated_by is not None:
+            updated_by = strip_lone_surrogates(updated_by)
+            new_meta["updated_by"] = updated_by
+
+        wal_params = {
+            "drawer_id": drawer_id,
+            "old_wing": old_meta.get("wing", ""),
+            "old_room": old_meta.get("room", ""),
+            "new_wing": new_meta.get("wing", ""),
+            "new_room": new_meta.get("room", ""),
+            "content_changed": content is not None,
+            "content_preview": new_doc[:200] if content is not None else None,
+        }
+        if updated_by is not None:
+            wal_params["updated_by"] = updated_by
+
+        _wal_log("update_drawer", wal_params)
 
         chunk_size = max(1, int(getattr(_config, "chunk_size", 800) or 800))
         should_chunk = bool(record.get("chunked")) or len(new_doc) > chunk_size
@@ -5222,7 +5233,7 @@ TOOLS = {
         "handler": tool_list_drawers,
     },
     "mempalace_update_drawer": {
-        "description": "Update an existing drawer's content and/or metadata (wing, room). Fetches existing drawer first; returns error if not found.",
+        "description": "Update an existing drawer's content and/or metadata (wing, room, editor identity). Fetches existing drawer first; returns error if not found.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -5238,6 +5249,10 @@ TOOLS = {
                 "room": {
                     "type": "string",
                     "description": "New room (optional — omit to keep existing)",
+                },
+                "updated_by": {
+                    "type": "string",
+                    "description": "Who is editing this drawer (optional)",
                 },
             },
             "required": ["drawer_id"],
