@@ -15,6 +15,7 @@ import subprocess
 import pytest
 
 from mempalace import config, searcher
+from mempalace.backends import chroma as chroma_backend
 
 
 def _canned_lexical_result():
@@ -116,7 +117,89 @@ def test_chromadb_open_crashes_true_on_timeout(monkeypatch):
     """A hung open (TimeoutExpired) is treated as unsafe."""
 
     def boom(*a, **k):
-        raise subprocess.TimeoutExpired(cmd="probe", timeout=120)
+        raise subprocess.TimeoutExpired(cmd="probe", timeout=15)
 
     monkeypatch.setattr(searcher.subprocess, "run", boom)
     assert searcher._chromadb_open_crashes("/p", "drawers") is True
+
+
+# ── Probe verdict cache ────────────────────────────────────────────────
+#
+# The probe costs an interpreter spawn plus a chromadb import, which does
+# not fit the search latency budget on a healthy palace. The verdict is
+# cached keyed on the HNSW segment's (inode, mtime_ns, size) signature and
+# re-probed only when the segment changes underneath it.
+
+
+@pytest.fixture
+def probe_spy(monkeypatch):
+    """Count subprocess probes and control the segment signature."""
+    state = {
+        "signature": ("seg-1", (("data_level0.bin", 7, 100, 4096),)),
+        "calls": 0,
+        "returncode": 0,
+    }
+
+    def fake_run(*a, **k):
+        state["calls"] += 1
+        return subprocess.CompletedProcess(a, state["returncode"])
+
+    monkeypatch.setattr(searcher.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        chroma_backend,
+        "hnsw_segment_signature",
+        lambda *a, **k: state["signature"],
+    )
+    searcher._open_probe_cache.clear()
+    yield state
+    searcher._open_probe_cache.clear()
+
+
+def test_open_probe_cached_while_segment_unchanged(probe_spy):
+    """A healthy palace pays the probe once, then hits the cache."""
+    assert searcher._chromadb_open_crashes("/p", "drawers") is False
+    assert searcher._chromadb_open_crashes("/p", "drawers") is False
+    assert probe_spy["calls"] == 1
+
+
+def test_open_probe_reprobes_when_segment_changes(probe_spy):
+    """A changed segment file invalidates the cached verdict."""
+    assert searcher._chromadb_open_crashes("/p", "drawers") is False
+    assert probe_spy["calls"] == 1
+
+    # The segment was rewritten underneath us (e.g. mempalace repair).
+    probe_spy["signature"] = ("seg-1", (("data_level0.bin", 7, 200, 8192),))
+    assert searcher._chromadb_open_crashes("/p", "drawers") is False
+    assert probe_spy["calls"] == 2
+
+
+def test_open_probe_caches_unsafe_verdict(probe_spy):
+    """An unsafe verdict is cached too; a corrupt palace is not re-probed
+    per search while its segment stays untouched."""
+    probe_spy["returncode"] = -11  # death by SIGSEGV
+    assert searcher._chromadb_open_crashes("/p", "drawers") is True
+    assert searcher._chromadb_open_crashes("/p", "drawers") is True
+    assert probe_spy["calls"] == 1
+
+
+def test_open_probe_uncached_without_signature(monkeypatch, probe_spy):
+    """No resolvable segment -> nothing on disk to key a verdict on ->
+    probe every call, matching the pre-cache behaviour."""
+    probe_spy["signature"] = None
+    assert searcher._chromadb_open_crashes("/p", "drawers") is False
+    assert searcher._chromadb_open_crashes("/p", "drawers") is False
+    assert probe_spy["calls"] == 2
+
+
+def test_open_probe_cache_ages_out(monkeypatch, probe_spy):
+    """The max-age ceiling forces a re-probe even when the signature is
+    unchanged — a backstop for filesystems with coarse timestamps."""
+    now = {"t": 1000.0}
+    monkeypatch.setattr(searcher.time, "monotonic", lambda: now["t"])
+
+    assert searcher._chromadb_open_crashes("/p", "drawers") is False
+    assert probe_spy["calls"] == 1
+
+    now["t"] += searcher._OPEN_PROBE_CACHE_MAX_AGE_SECONDS + 1
+    assert searcher._chromadb_open_crashes("/p", "drawers") is False
+    assert probe_spy["calls"] == 2
