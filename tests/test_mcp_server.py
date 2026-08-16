@@ -7825,3 +7825,116 @@ class TestSearchDateFilters:
         assert "before" in schema["properties"]
         assert schema["properties"]["since"]["type"] == "string"
         assert schema["properties"]["before"]["type"] == "string"
+
+
+class TestOversizedResponseBackstop:
+    """The MAX_RESPONSE_CHARS backstop must degrade structurally, not textually.
+
+    Slicing already-serialized JSON at a character offset produces text that no
+    longer parses, so a caller doing json.loads gets a decode error instead of a
+    smaller result — and a drawer's stored text can be cut mid-word. Every case
+    below asserts the shipped payload is still valid JSON.
+    """
+
+    def _fit(self, monkeypatch, result, cap=800, tool_name="mempalace_kg_query"):
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "MAX_RESPONSE_CHARS", cap)
+        return mcp_server._fit_response(result, tool_name=tool_name)
+
+    def test_small_response_passes_through_untouched(self, monkeypatch):
+        payload = {"entity": "x", "facts": [{"a": 1}], "count": 1}
+        result, text = self._fit(monkeypatch, payload)
+        assert result is payload
+        assert json.loads(text) == payload
+
+    def test_oversized_list_payload_stays_valid_json(self, monkeypatch):
+        payload = {
+            "entity": "hub",
+            "facts": [{"object": "y" * 200, "i": i} for i in range(200)],
+            "count": 200,
+        }
+        result, text = self._fit(monkeypatch, payload)
+        # The whole point: it must still parse.
+        parsed = json.loads(text)
+        assert parsed["truncated"] is True
+        assert parsed["total"] == 200
+        assert 0 < len(parsed["facts"]) < 200
+        assert "narrow your query" in parsed["notice"]
+
+    def test_kept_items_are_whole_never_sliced(self, monkeypatch):
+        """Every fact that ships must be intact — truncation drops, never cuts."""
+        facts = [{"object": "z" * 200, "i": i} for i in range(200)]
+        payload = {"entity": "hub", "facts": facts, "count": 200}
+        _result, text = self._fit(monkeypatch, payload)
+        parsed = json.loads(text)
+        for i, fact in enumerate(parsed["facts"]):
+            assert fact == facts[i], "a surviving fact was altered, not merely dropped"
+
+    def test_count_field_matches_what_actually_ships(self, monkeypatch):
+        payload = {
+            "entity": "hub",
+            "facts": [{"object": "q" * 200, "i": i} for i in range(200)],
+            "count": 200,
+        }
+        _result, text = self._fit(monkeypatch, payload)
+        parsed = json.loads(text)
+        assert parsed["count"] == len(parsed["facts"])
+
+    def test_result_fits_under_the_cap(self, monkeypatch):
+        payload = {"facts": [{"object": "w" * 200} for _ in range(200)]}
+        _result, text = self._fit(monkeypatch, payload, cap=900)
+        assert len(text) <= 900
+
+    def test_unshrinkable_payload_becomes_structured_object(self, monkeypatch):
+        """No list to drop from -> structured error, still valid JSON."""
+        payload = {"drawer": "m" * 5000}
+        _result, text = self._fit(monkeypatch, payload, cap=800, tool_name="mempalace_get_drawer")
+        parsed = json.loads(text)
+        assert parsed["error"] == "response_too_large"
+        assert parsed["tool"] == "mempalace_get_drawer"
+        assert parsed["truncated"] is True
+        assert parsed["cap_chars"] == 800
+        assert parsed["size_chars"] > 800
+
+    def test_stored_text_is_never_cut_mid_word(self, monkeypatch):
+        """A drawer's text either ships whole or does not ship at all."""
+        body = "the quick brown fox " * 400
+        payload = {"drawers": [{"id": i, "content": body} for i in range(20)]}
+        _result, text = self._fit(monkeypatch, payload, cap=3000)
+        parsed = json.loads(text)
+        for drawer in parsed.get("drawers", []):
+            assert drawer["content"] == body, "drawer content was truncated mid-value"
+
+    def test_non_dict_payload_still_valid_json(self, monkeypatch):
+        _result, text = self._fit(monkeypatch, ["item" * 500 for _ in range(50)], cap=800)
+        json.loads(text)  # must not raise
+
+    def test_dispatch_response_is_parseable_end_to_end(self, monkeypatch):
+        """Through the real chokepoint: the text field must always json.loads."""
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "MAX_RESPONSE_CHARS", 700)
+        monkeypatch.setitem(
+            mcp_server.TOOLS,
+            "mempalace_kg_stats",
+            {
+                **mcp_server.TOOLS["mempalace_kg_stats"],
+                "handler": lambda: {
+                    "facts": [{"object": "v" * 200, "i": i} for i in range(100)],
+                    "count": 100,
+                },
+            },
+        )
+        resp = mcp_server.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "tools/call",
+                "params": {"name": "mempalace_kg_stats", "arguments": {}},
+            }
+        )
+        text = resp["result"]["content"][0]["text"]
+        assert len(text) <= 700
+        parsed = json.loads(text)
+        assert parsed["truncated"] is True
