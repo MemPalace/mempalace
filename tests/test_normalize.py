@@ -96,6 +96,28 @@ def test_aider_md(tmp_path):
     assert "Sure, here's a test file." in result
 
 
+def test_aider_md_via_conversations(tmp_path):
+    """The miner path: an Aider history normalizes to one conversation."""
+    f = tmp_path / ".aider.chat.history.md"
+    f.write_text(
+        "#### How do I add a new route?\n\n"
+        "You can add a new route by creating a file in the `routes/` directory.\n\n"
+        "#### Can you also add tests for it?\n\n"
+        "Sure, here's a test file.\n"
+    )
+    conversations = normalize_conversations(str(f))
+    assert len(conversations) == 1
+    assert conversations[0].startswith("> How do I add a new route?")
+    assert "Sure, here's a test file." in conversations[0]
+
+
+def test_aider_conversations_rejects_generic_md(tmp_path):
+    """A regular .md file with #### headings passes through unparsed."""
+    f = tmp_path / "CONTRIBUTING.md"
+    f.write_text("#### Setup\n\nRun uv sync.\n\n#### Tests\n\nRun pytest.\n")
+    assert normalize_conversations(str(f)) == [f.read_text()]
+
+
 def test_normalize_whitespace_only(tmp_path):
     f = tmp_path / "ws.txt"
     f.write_text("   \n  \n  ")
