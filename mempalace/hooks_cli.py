@@ -1599,6 +1599,40 @@ def hook_precompact(data: dict, harness: str):
     _output({})
 
 
+_AUTO_SAVE_HOOK_CONFIG_KEYS = {
+    "stop": "stop",
+    "precompact": "pre_compact",
+    "session-end": "session_end",
+}
+
+
+def _hook_auto_save_enabled(hook_name: str) -> bool:
+    """Return effective auto-save enablement for one dispatched hook.
+
+    ``hooks.auto_save`` and ``MEMPALACE_HOOKS_AUTO_SAVE`` remain the master
+    switch. Individual ``hooks.stop``, ``hooks.pre_compact``, and
+    ``hooks.session_end`` booleans may opt out independently. Missing or
+    non-boolean per-hook values preserve the historical enabled behavior.
+    """
+    config_key = _AUTO_SAVE_HOOK_CONFIG_KEYS.get(hook_name)
+    if config_key is None:
+        return True
+    try:
+        config = MempalaceConfig()
+        if not config.hooks_auto_save:
+            return False
+        file_config = getattr(config, "_file_config", {})
+        hooks = file_config.get("hooks", {}) if isinstance(file_config, dict) else {}
+        if not isinstance(hooks, dict):
+            return True
+        value = hooks.get(config_key, True)
+        return value if isinstance(value, bool) else True
+    except Exception:
+        # Preserve the existing save-on-config-read-failure behavior: a broken
+        # config read must not silently suppress memory capture.
+        return True
+
+
 def run_hook(hook_name: str, harness: str):
     """Main entry point: read stdin JSON, dispatch to hook handler."""
     try:
@@ -1618,5 +1652,16 @@ def run_hook(hook_name: str, harness: str):
     if handler is None:
         print(f"Unknown hook: {hook_name}", file=sys.stderr)
         sys.exit(1)
+
+    if not _hook_auto_save_enabled(hook_name):
+        if hook_name == "session-end":
+            try:
+                parsed = _parse_harness_input(data, harness)
+                session_id = parsed["session_id"]
+            except Exception:
+                session_id = "unknown"
+            _clear_session_last_save(session_id)
+        _output({})
+        return
 
     handler(data, harness)
