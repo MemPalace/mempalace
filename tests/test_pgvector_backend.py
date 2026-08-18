@@ -16,6 +16,7 @@ from mempalace.backends import (
     PalaceRef,
     available_backends,
 )
+from mempalace.backends.base import UnsupportedCapabilityError
 from mempalace.backends.pgvector import (
     PgVectorBackend,
     _PgVectorClient,
@@ -43,6 +44,7 @@ class _FakePgVectorClient:
         self.tables: dict = {}
         self.query_calls: list = []
         self.scroll_calls: list = []
+        self.facet_calls: list = []
         _FakePgVectorClient.instances.append(self)
 
     def ping(self):
@@ -141,6 +143,19 @@ class _FakePgVectorClient:
 
     def count_rows(self, table):
         return len(self.tables.get(table, {"rows": {}})["rows"])
+
+    def facet_counts(self, table, *, field, where=None, limit=1000):
+        self.facet_calls.append((table, field, where, limit))
+        counts: dict[str, int] = {}
+        for row in self._filtered(table, where):
+            meta = row.get("metadata") or {}
+            value = meta.get(field)
+            if value is None:
+                continue
+            key = str(value)
+            counts[key] = counts.get(key, 0) + 1
+        ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        return dict(ordered[:limit])
 
     def drop_table(self, table):
         self.tables.pop(table, None)
@@ -1060,3 +1075,97 @@ def test_strip_lone_surrogates_reuses_config_util():
     cleaned = strip_lone_surrogates(raw)
     assert chr(0xD800) not in cleaned
     assert json.loads(cleaned) == {"k": f"v{chr(0xFFFD)}w"}
+
+
+def test_pgvector_backend_advertises_supports_metadata_facets():
+    assert "supports_metadata_facets" in PgVectorBackend.capabilities
+
+
+def test_pgvector_facet_counts(tmp_path, fake_pgvector):
+    _backend, col = _collection(tmp_path)
+    col.upsert(
+        ids=["1", "2", "3", "4"],
+        documents=["a", "b", "c", "d"],
+        metadatas=[
+            {"wing": "alpha"},
+            {"wing": "alpha"},
+            {"wing": "beta"},
+            {"wing": "gamma"},
+        ],
+        embeddings=[[1, 0], [1, 0], [1, 0], [1, 0]],
+    )
+    assert col.facet_counts("wing") == {
+        "alpha": 2,
+        "beta": 1,
+        "gamma": 1,
+    }
+
+
+def test_pgvector_facet_counts_where(tmp_path, fake_pgvector):
+    _backend, col = _collection(tmp_path)
+    col.upsert(
+        ids=["1", "2", "3"],
+        documents=["a", "b", "c"],
+        metadatas=[
+            {"wing": "engineering", "room": "backend"},
+            {"wing": "engineering", "room": "frontend"},
+            {"wing": "design", "room": "ux"},
+        ],
+        embeddings=[[1, 0], [1, 0], [1, 0]],
+    )
+    assert col.facet_counts("room", where={"wing": "engineering"}) == {
+        "backend": 1,
+        "frontend": 1,
+    }
+
+
+def test_pgvector_facet_counts_rejects_local_filters(tmp_path, fake_pgvector):
+    _backend, col = _collection(tmp_path)
+    with pytest.raises(UnsupportedCapabilityError):
+        col.facet_counts(
+            "room",
+            where={"$or": [{"wing": "a"}, {"wing": "b"}]},
+        )
+
+
+def test_pgvector_facet_counts_ignores_missing_metadata(tmp_path, fake_pgvector):
+    """Rows without the faceted field are excluded — mcp_server reconciles them
+    into the ``unknown`` bucket via ``count(*) - sum(facet_values)``. Mirrors
+    Qdrant's facet semantics."""
+    _backend, col = _collection(tmp_path)
+    col.upsert(
+        ids=["1", "2", "3"],
+        documents=["a", "b", "c"],
+        metadatas=[
+            {"wing": "alpha"},
+            {"wing": "beta"},
+            {},
+        ],
+        embeddings=[[1, 0], [1, 0], [1, 0]],
+    )
+    assert col.facet_counts("wing") == {"alpha": 1, "beta": 1}
+
+
+def test_pgvector_facet_counts_empty_collection(tmp_path, fake_pgvector):
+    """An empty/unmaterialized collection returns ``{}`` rather than raising —
+    matches Qdrant; gives ``mempalace_status`` a clean zero-state path."""
+    _backend, col = _collection(tmp_path)
+    assert col.facet_counts("wing") == {}
+
+
+def test_pgvector_facet_counts_passes_filter_to_sql_layer(tmp_path, fake_pgvector):
+    """Pushdown filters reach the SQL layer (proves the where path goes through
+    ``_where_to_sql``, not the local ``_matches_where`` post-filter)."""
+    _backend, col = _collection(tmp_path)
+    col.upsert(
+        ids=["1"],
+        documents=["doc"],
+        metadatas=[{"wing": "engineering", "room": "backend"}],
+        embeddings=[[1, 0]],
+    )
+    col.facet_counts("room", where={"wing": "engineering"})
+    client = fake_pgvector.instances[0]
+    assert len(client.facet_calls) == 1
+    _table, field, where, _limit = client.facet_calls[0]
+    assert field == "room"
+    assert where == {"wing": "engineering"}

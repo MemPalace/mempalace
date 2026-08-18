@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import unicodedata
 from pathlib import Path
 from typing import Callable, Iterator, Optional, TextIO, Union
 
@@ -79,25 +80,140 @@ _HIGH_CONFIDENCE_RUN = re.compile(
     rf")+"
 )
 
+# A single mojibake unit, so a chained run can be told apart from a lone
+# two-character window.
+_MOJIBAKE_UNIT = re.compile(
+    rf"[ÂÃ][{_CONTINUATION_CLASS}]"
+    rf"|â[{_CONTINUATION_CLASS}]{{2}}"
+    rf"|ð[{_CONTINUATION_CLASS}]{{3}}"
+    rf"|ï[{_CONTINUATION_CLASS}]{{2}}"
+)
+
+# Continuation bytes whose CP1252 character is typographic punctuation that
+# legitimately follows a letter in prose.
+#
+# The [ÂÃ] alternative above is only TWO characters wide, and Portuguese,
+# Vietnamese and Turkish really do end all-caps words in Ã/Â — IRMÃ, MAÇÃ,
+# MANHÃ, AMANHÃ, BÃO, NHÃ, HÂLÂ, IMÂ. Prose then puts a closing quote,
+# guillemet, ellipsis or dash straight after, and every one of those lives in
+# the continuation class. "«MAÇÃ»." and "“IRMÃ”" therefore match a shape that is
+# also perfectly clean text, and repairing them collapses two characters into
+# one — silently, and reported as a success.
+#
+# This is the same argument that already excluded Ä/Å as lead characters, applied
+# to the continuation side. The wider â/ð/ï windows are 3-4 characters and no
+# clean text produces those shapes, so they keep the full class.
+_PROSE_PUNCTUATION = frozenset(
+    _cp1252_character(byte_value)
+    for byte_value in (
+        0x82,  # ‚ single low-9 quotation mark
+        0x84,  # „ double low-9 quotation mark
+        0x85,  # … horizontal ellipsis
+        0x8B,  # ‹ single left-pointing angle quotation mark
+        0x91,  # ' left single quotation mark
+        0x92,  # ' right single quotation mark
+        0x93,  # " left double quotation mark
+        0x94,  # " right double quotation mark
+        0x95,  # • bullet
+        0x96,  # – en dash
+        0x97,  # — em dash
+        0x9B,  # › single right-pointing angle quotation mark
+        0xAB,  # « left-pointing double angle quotation mark
+        0xBB,  # » right-pointing double angle quotation mark
+    )
+)
+
+
+def _is_text_character(
+    character: str,
+) -> bool:
+    """Reject decode products that are invisible control characters.
+
+    Â followed by 0x80-0x9F decodes to exactly the C1 control block, so
+    "İMÂ… edildi." becomes "İM\\u0085 edildi." — visible text swapped for an
+    invisible control and reported as a repair. Natural text contains no C1
+    controls, so refusing these costs nothing.
+
+    Cf (format) stays allowed: U+FEFF is the legitimate product of the "ï»¿"
+    BOM run and U+200D joins emoji sequences.
+    """
+    if character in "\t\n\r":
+        return True
+
+    return unicodedata.category(character) not in {
+        "Cc",
+        "Cs",
+        "Cn",
+    }
+
+
+def _is_ambiguous_window(
+    candidate: str,
+) -> bool:
+    """True for the one shape clean prose can also produce.
+
+    A lone [ÂÃ] followed by prose punctuation. Chained units ("aÃ§Ã£o") and the
+    3-4 character â/ð/ï windows cannot occur in clean text, so they stay
+    unconditional.
+    """
+    units = _MOJIBAKE_UNIT.findall(candidate) or [candidate]
+
+    if len(units) > 1 or units[0][0] not in "ÂÃ":
+        return False
+
+    return units[0][1] in _PROSE_PUNCTUATION
+
+
+def _preceded_by_lowercase(
+    text: str,
+    start: int,
+) -> bool:
+    """Evidence that the run is mojibake rather than clean prose.
+
+    Mojibaked letters sit INSIDE a word, so a lowercase letter runs straight into
+    the lead: "coÃ»te", "NoÃ«l", "catalàÂ»". The false-positive family is the
+    exact opposite — an ALL-CAPS word whose final letter genuinely is Ã/Â, as in
+    IRMÃ”, MAÇÃ», MANHÃ…, HÂLÂ», IMÂ». Clean prose does not put a lowercase
+    letter directly before an uppercase Ã/Â.
+
+    Deliberately local. Inferring "this drawer is mojibake" from a run elsewhere
+    in the text destroys clean prose in a MIXED drawer, and drawers are mixed by
+    construction because the miner concatenates several sources into one.
+    """
+    return start > 0 and text[start - 1].isalpha() and text[start - 1].islower()
+
 
 def _decode_high_confidence_run(
     match: re.Match,
+    text: str,
 ) -> str:
     candidate = match.group(0)
 
     try:
-        return _encode_mojibake_candidate(candidate).decode("utf-8")
+        decoded = _encode_mojibake_candidate(candidate).decode("utf-8")
     except (
         UnicodeEncodeError,
         UnicodeDecodeError,
     ):
         return candidate
 
+    if not decoded or not all(_is_text_character(character) for character in decoded):
+        return candidate
+
+    # An ambiguous window is repaired only on positive local evidence. With no
+    # evidence the text is returned untouched: a missed repair costs nothing
+    # because the drawer is unchanged and the tool can be re-run, while a wrong
+    # repair destroys good text irrecoverably.
+    if _is_ambiguous_window(candidate) and not _preceded_by_lowercase(text, match.start()):
+        return candidate
+
+    return decoded
+
 
 def repair_mojibake_once(text: str) -> str:
     """Repair one layer of high-confidence UTF-8-as-CP1252 mojibake."""
     return _HIGH_CONFIDENCE_RUN.sub(
-        _decode_high_confidence_run,
+        lambda match: _decode_high_confidence_run(match, text),
         text,
     )
 

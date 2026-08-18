@@ -1,12 +1,14 @@
 import json
 import os
 import stat
+import unicodedata
 
 import pytest
 
 from mempalace.encoding_repair import (
     repair_collection,
     repair_mojibake,
+    repair_mojibake_once,
     restore_collection,
 )
 
@@ -102,6 +104,56 @@ AMBIGUOUS_CASES = [
 ]
 
 
+# An UPPERCASE Ã/Â ending a word, followed by ordinary typographic punctuation.
+# Portuguese, Vietnamese and Turkish produce this constantly, and it matches the
+# same two-character shape as mojibake — so it must survive untouched (#2193).
+CLEAN_UPPERCASE_LEAD = [
+    "“IRMÃ” é o título do filme.",
+    "«MAÇÃ».",
+    "O prémio «AMANHÃ» foi entregue.",
+    "MANHÃ… tarde e noite.",
+    "A palavra “LÃ” significa wool.",
+    "TÍTULO: “A IRMÃ”, de 1998.",
+    "IRMÃ–MÃE: a relação central.",
+    "NÃO! disse a IRMÃ.",
+    "BÃO số 5 đổ bộ.",
+    "“NHÃ”: nghĩa là nhà.",
+    "“HÂLÂ” bekliyoruz.",
+    "İMÂ… edildi.",
+    "HÂLÂ—yine de.",
+    "HÂLÂ» ve zarar.",
+    "IMÂ« edildi.",
+    "IRMÃ”, MAÇÃ» e MANHÃ… juntas.",
+]
+
+
+# A single drawer holding genuine mojibake AND clean prose. The miner
+# concatenates several sources into one drawer, so this is the normal case, not
+# a corner case: repairing the damaged half must not corrupt the clean half.
+MIXED_DRAWERS = [
+    (
+        "cafÃ© e «MAÇÃ».",
+        "café e «MAÇÃ».",
+    ),
+    (
+        "MÃ¼nchen. A IRMÃ” chegou.",
+        "München. A IRMÃ” chegou.",
+    ),
+    (
+        "EspaÃ±a e MANHÃ… fria.",
+        "España e MANHÃ… fria.",
+    ),
+    (
+        "aÃ§Ã£o «AMANHÃ» hoje.",
+        "ação «AMANHÃ» hoje.",
+    ),
+    (
+        "Copyright Â© 2026 — IRMÃ” Ltda.",
+        "Copyright © 2026 — IRMÃ” Ltda.",
+    ),
+]
+
+
 @pytest.mark.parametrize(
     "text",
     CLEAN_MULTILINGUAL,
@@ -140,6 +192,88 @@ def test_repair_is_idempotent():
     repaired = repair_mojibake("cafÃ© â†’ done")
 
     assert repair_mojibake(repaired) == repaired
+
+
+@pytest.mark.parametrize(
+    "text",
+    CLEAN_UPPERCASE_LEAD,
+)
+def test_preserves_clean_uppercase_lead_prose(
+    text,
+):
+    """An all-caps word ending in Ã/Â is prose, not mojibake (#2193)."""
+    assert repair_mojibake(text) == text
+
+
+@pytest.mark.parametrize(
+    (
+        "damaged",
+        "expected",
+    ),
+    MIXED_DRAWERS,
+)
+def test_repairs_damaged_half_without_corrupting_clean_half(
+    damaged,
+    expected,
+):
+    """Corroboration must stay local: one damaged run does not condemn the drawer."""
+    assert repair_mojibake(damaged) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    CLEAN_UPPERCASE_LEAD + CLEAN_MULTILINGUAL,
+)
+def test_repair_never_emits_control_characters(
+    text,
+):
+    """ "İMÂ… edildi." must not become "İM\\u0085 edildi." — visible text for a control."""
+    repaired = repair_mojibake(text)
+
+    assert not [
+        character
+        for character in repaired
+        if unicodedata.category(character) == "Cc" and character not in "\t\n\r"
+    ]
+
+
+def test_repair_does_not_destroy_its_own_correct_output():
+    """The multi-pass loop repaired correctly on pass 1 and corrupted on pass 2 (#2193)."""
+    clean = "“IRMÃ” é o título."
+    damaged = "".join(
+        chr(byte_value)
+        if byte_value in (0x81, 0x8D, 0x8F, 0x90, 0x9D)
+        else bytes([byte_value]).decode("cp1252")
+        for byte_value in clean.encode("utf-8")
+    )
+
+    first_pass = repair_mojibake_once(damaged)
+
+    assert first_pass == clean
+    assert repair_mojibake_once(first_pass) == clean
+    assert repair_mojibake(damaged) == clean
+
+
+@pytest.mark.parametrize(
+    (
+        "damaged",
+        "expected",
+    ),
+    [
+        ("coÃ»te", "coûte"),
+        ("NoÃ«l", "Noël"),
+        ("brÃ»lÃ©e", "brûlée"),
+        # NBSP is the continuation byte for à, so the guillemet run chains onto
+        # it and is repaired as part of a multi-unit run.
+        ("catalÃ Â»", "català»"),
+    ],
+)
+def test_still_repairs_ambiguous_window_with_local_evidence(
+    damaged,
+    expected,
+):
+    """A lowercase letter running into the lead proves corruption — repair it."""
+    assert repair_mojibake(damaged) == expected
 
 
 def test_rejects_invalid_max_passes():

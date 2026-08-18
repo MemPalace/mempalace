@@ -1535,9 +1535,10 @@ class TestDrawerGrepExpansion:
         ``source_file + chunk_index`` pulls chunks from both groups as if
         they were sequential neighbors, corrupting the enriched text.
         Scoping by ``parent_drawer_id`` when present keeps each logical
-        group isolated. (``tool_diary_write`` chunks tag a different key
-        (``parent_entry_id``) and are written without ``source_file``, so
-        they never reach this enrichment path.)
+        group isolated. (``tool_diary_write`` chunks are written without
+        ``source_file``, so they never reach this enrichment path at all --
+        it returns early on the missing key -- regardless of which
+        parent-id key they carry.)
         """
         col = get_collection(palace_path)
         source = "shared.log"

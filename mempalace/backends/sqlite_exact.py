@@ -1078,6 +1078,7 @@ class SQLiteExactBackend(BaseBackend):
         **kwargs,
     ) -> SQLiteExactCollection:
         palace, collection_name, create, read_only = self._normalize_args(args, kwargs)
+        self.require_namespace_support(palace)
         palace_path = palace.local_path
         if palace_path is None:
             raise PalaceNotFoundError("SQLiteExactBackend requires PalaceRef.local_path")

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import functools
 import os
 import sys
 from typing import Any
@@ -18,6 +19,36 @@ from .config import MempalaceConfig
 
 _EXPLICIT_BACKEND_ENV = "MEMPALACE_BACKEND_EXPLICIT"
 _PALACE_PATH_ENV = "MEMPALACE_PALACE_PATH"
+
+
+def _restores_palace_env(fn):
+    """Restore ``MEMPALACE_PALACE_PATH`` after the call that stamped it.
+
+    Each ``run_*`` entrypoint sets the variable so downstream config resolution sees THIS
+    call's palace. In the daemon that costs nothing — one call, one process. In any process
+    that makes two calls it leaks: ``config.py`` reads this variable with priority OVER the
+    config file, so the first call's palace silently becomes the second caller's, and a
+    tmpdir palace that has since been removed reads back as ``PalaceNotFoundError`` from an
+    unrelated code path.
+
+    ``daemon.py`` already saves and restores exactly these keys around its own dispatch.
+    This gives the service entrypoints the same discipline.
+    """
+
+    @functools.wraps(fn)
+    def _wrapped(*args, **kwargs):
+        previous = os.environ.get(_PALACE_PATH_ENV)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            if previous is None:
+                os.environ.pop(_PALACE_PATH_ENV, None)
+            else:
+                os.environ[_PALACE_PATH_ENV] = previous
+
+    return _wrapped
+
+
 _BACKEND_ENV = "MEMPALACE_BACKEND"
 # Env vars a job may mutate via _apply_backend / palace_path injection. They are
 # snapshotted per job and restored afterward so a job that switches the backend
@@ -140,6 +171,7 @@ def execute_job(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+@_restores_palace_env
 def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
     """Run the same mine operation as the CLI, without daemon transport concerns."""
     palace_path = os.path.abspath(
@@ -149,13 +181,14 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
     _apply_backend(payload.get("backend"))
 
     source = payload.get("source") or payload.get("dir")
+    source_adapter = payload.get("source_adapter")
     mode = payload.get("mode") or "projects"
     wing = payload.get("wing")
     agent = payload.get("agent") or "mempalace"
     limit = int(payload.get("limit") or 0)
     dry_run = bool(payload.get("dry_run"))
 
-    if payload.get("redetect_origin"):
+    if payload.get("redetect_origin") and not source_adapter:
         from .cli import _run_pass_zero
 
         _run_pass_zero(project_dir=source, palace_dir=palace_path, llm_provider=None)
@@ -164,7 +197,16 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
     from .palace import MineAlreadyRunning, MineValidationError
 
     try:
-        if mode == "convos":
+        if source_adapter:
+            from .cli import mine_source_adapter
+
+            mine_source_adapter(
+                source_name=source_adapter,
+                source_path=source,
+                palace_path=palace_path,
+                dry_run=dry_run,
+            )
+        elif mode == "convos":
             from .convo_miner import mine_convos
 
             mine_convos(
@@ -229,9 +271,17 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         return {"success": False, "error": f"mine failed: {exc}", "exit_code": 1}
 
-    return {"success": True, "kind": "mine", "mode": mode, "dry_run": dry_run, "exit_code": 0}
+    result_mode = "source" if source_adapter else mode
+    return {
+        "success": True,
+        "kind": "mine",
+        "mode": result_mode,
+        "dry_run": dry_run,
+        "exit_code": 0,
+    }
 
 
+@_restores_palace_env
 def run_sync(payload: dict[str, Any]) -> dict[str, Any]:
     """Run sync and render the same operator-facing summary shape as the CLI."""
     palace_path = os.path.abspath(
@@ -273,7 +323,7 @@ def run_sync(payload: dict[str, Any]) -> dict[str, Any]:
     dry_run = bool(payload.get("dry_run", True))
 
     print(f"\n{'=' * 55}")
-    print("  MemPalace Sync — Gitignore-aware drawer prune")
+    print("  MemPalace Sync -- Gitignore-aware drawer prune")
     print(f"{'=' * 55}")
     print(f"  Palace:   {palace_path}")
     if payload.get("wing"):
@@ -337,6 +387,7 @@ def run_sync(payload: dict[str, Any]) -> dict[str, Any]:
     return {"success": True, "report": report, "exit_code": 0}
 
 
+@_restores_palace_env
 def run_diary_write(payload: dict[str, Any]) -> dict[str, Any]:
     palace_path = payload.get("palace_path")
     if palace_path:

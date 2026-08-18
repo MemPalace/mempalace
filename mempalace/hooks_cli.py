@@ -1226,6 +1226,12 @@ def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
                 cwd_norm = cwd.replace("\\", "/").rstrip("/")
                 if not cwd_norm:
                     continue
+                # A cwd inside "<project>/.claude/worktrees/<wt>" (a git
+                # worktree) belongs to <project>, not the ephemeral worktree
+                # directory -- otherwise every worktree spawns its own wing.
+                _wt_marker = "/.claude/worktrees/"
+                if _wt_marker in cwd_norm:
+                    cwd_norm = cwd_norm.split(_wt_marker, 1)[0]
                 project = cwd_norm.rsplit("/", 1)[-1]
                 if project:
                     return f"wing_{_safe_wing_slug(project)}"

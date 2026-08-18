@@ -30,6 +30,7 @@ Usage (from CLI):
 """
 
 import argparse
+import errno
 import os
 import shutil
 import sqlite3
@@ -62,10 +63,29 @@ def _no_follow_flag() -> int:
     return getattr(os, "O_NOFOLLOW", 0)
 
 
+def _non_blocking_flag() -> int:
+    """Return O_NONBLOCK, or 0 where the platform has no such flag (Windows).
+
+    Without it the ``S_ISREG`` refusal in ``_open_regular_file_no_follow``
+    is unreachable for a FIFO: opening one for reading blocks in the kernel
+    until a writer appears, so ``repair`` would wedge instead of refusing.
+    """
+    return getattr(os, "O_NONBLOCK", 0)
+
+
 def _open_regular_file_no_follow(path: str) -> int:
     if os.path.islink(path):
         raise RuntimeError(f"Refusing symlinked file: {path}")
-    fd = os.open(path, os.O_RDONLY | _no_follow_flag())
+    flags = os.O_RDONLY | _no_follow_flag() | _non_blocking_flag()
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        # EAGAIN here is a write-lease break, which the kernel grants on
+        # regular files only, so re-check the type and open the way this
+        # helper did before the flag existed. Anything else propagates.
+        if exc.errno != errno.EAGAIN or not stat.S_ISREG(os.lstat(path).st_mode):
+            raise
+        fd = os.open(path, flags & ~_non_blocking_flag())
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
@@ -531,7 +551,7 @@ def prune_corrupt(palace_path=None, confirm=False, collection_name: Optional[str
     bad_file = os.path.join(palace_path, "corrupt_ids.txt")
 
     if not os.path.exists(bad_file):
-        print("  No corrupt_ids.txt found — run scan first.")
+        print("  No corrupt_ids.txt found -- run scan first.")
         return
 
     with open(bad_file) as f:
@@ -539,7 +559,7 @@ def prune_corrupt(palace_path=None, confirm=False, collection_name: Optional[str
     print(f"  {len(bad_ids):,} corrupt IDs queued for deletion")
 
     if not confirm:
-        print("\n  DRY RUN — no deletions performed.")
+        print("\n  DRY RUN -- no deletions performed.")
         print("  Re-run with --confirm to actually delete.")
         return
 
@@ -577,7 +597,7 @@ def prune_corrupt(palace_path=None, confirm=False, collection_name: Optional[str
     after = col.count()
     print(f"\n  Deleted: {deleted:,}")
     print(f"  Failed:  {failed:,}")
-    print(f"  Collection size: {before:,} → {after:,}")
+    print(f"  Collection size: {before:,} -> {after:,}")
 
 
 # ChromaDB's ``collection.get()`` enforces an internal default ``limit``
@@ -1130,7 +1150,7 @@ def rebuild_index(
         return
 
     progress(f"\n{'=' * 55}")
-    progress("  MemPalace Repair — Index Rebuild")
+    progress("  MemPalace Repair -- Index Rebuild")
     progress(f"{'=' * 55}\n")
     progress(f" Palace: {palace_path}")
 
@@ -1167,7 +1187,31 @@ def rebuild_index(
         progress(index_read_recovery_guidance())
         return
 
-    backend = ChromaBackend()
+    # Hold the palace writer lease for the complete snapshot -> rebuild/swap
+    # -> cleanup cycle. A writer landing after the snapshot but before the
+    # rebuilt collection becomes authoritative would otherwise be lost from
+    # the rebuilt index and recreate SQLite/HNSW divergence.
+    from .palace import mine_palace_lock
+
+    with mine_palace_lock(palace_path):
+        _rebuild_index_under_lease(
+            backend=ChromaBackend(),
+            palace_path=palace_path,
+            collection_name=collection_name,
+            confirm_truncation_ok=confirm_truncation_ok,
+            progress=progress,
+        )
+
+
+def _rebuild_index_under_lease(
+    *,
+    backend,
+    palace_path: str,
+    collection_name: str,
+    confirm_truncation_ok: bool,
+    progress: Callable[[str], None],
+):
+    """Run rebuild_index's snapshot/rebuild body under its writer lease."""
     try:
         col = backend.get_collection(palace_path, collection_name)
         total = col.count()
@@ -1646,7 +1690,7 @@ def rebuild_from_sqlite(
     in_place = source_palace == dest_palace
 
     print(f"\n{'=' * 55}")
-    print("  MemPalace Repair — Rebuild from SQLite")
+    print("  MemPalace Repair -- Rebuild from SQLite")
     print(f"{'=' * 55}\n")
     print(f"  Source: {source_palace}")
     print(f"  Dest:   {dest_palace}")
@@ -1715,6 +1759,21 @@ def rebuild_from_sqlite(
         )
 
 
+def _print_unreadable_count_refusal(*, collection_name: str, palace_path: str) -> None:
+    """Refuse to preview a collection whose SQLite row count cannot be read.
+
+    Fail closed: inventing 0 would hide an unreadable source and make the
+    operator believe a real run would upsert nothing (review note on #1654 /
+    #2095). Shared by both previews so the wording cannot drift apart.
+    """
+    print(
+        f"\n  Cannot preview [{collection_name}]: SQLite row count is unreadable "
+        f"at {os.path.join(palace_path, 'chroma.sqlite3')}.\n"
+        "  Fix source readability (schema, lock, permissions) and re-run "
+        "--dry-run; refusing to invent zero counts."
+    )
+
+
 def _preview_rebuild_from_sqlite(
     *,
     source_palace: str,
@@ -1726,7 +1785,7 @@ def _preview_rebuild_from_sqlite(
     Never archives, locks, or writes. Returns ``{}`` if SQLite counts are
     unreadable so a broken preview cannot look like a successful zero-row plan.
     """
-    print("\n  DRY RUN — no changes will be made.")
+    print("\n  DRY RUN -- no changes will be made.")
     if in_place:
         print(
             f"  Would archive {dest_palace} → "
@@ -1739,15 +1798,7 @@ def _preview_rebuild_from_sqlite(
     for cname in _recoverable_collections():
         n = sqlite_drawer_count(source_palace, cname)
         if n is None:
-            # Fail closed: inventing 0 would hide an unreadable source and
-            # make the operator believe a real rebuild would upsert nothing
-            # (review note on #1654 / #2095).
-            print(
-                f"\n  Cannot preview [{cname}]: SQLite row count is unreadable "
-                f"at {os.path.join(source_palace, 'chroma.sqlite3')}.\n"
-                "  Fix source readability (schema, lock, permissions) and re-run "
-                "--dry-run; refusing to invent zero counts."
-            )
+            _print_unreadable_count_refusal(collection_name=cname, palace_path=source_palace)
             return {}
         counts[cname] = n
         print(f"  [{cname}] would re-embed and upsert {n} rows")
@@ -1756,6 +1807,116 @@ def _preview_rebuild_from_sqlite(
     )
     print(f"{'=' * 55}\n")
     return counts
+
+
+def _preview_legacy_repair(
+    *,
+    palace_path: str,
+    collection_name: str,
+    confirm_truncation_ok: bool = False,
+) -> dict[str, int]:
+    """Read-only preview for the default (legacy) ``repair`` path (``dry_run=True``).
+
+    Never opens a chromadb client, takes a lock, or writes. Opening a client is
+    itself a write to ``chroma.sqlite3``, so the row count comes from the
+    read-only SQLite ground truth :func:`check_extraction_safety` already
+    trusts. That is a different source than the real run rebuilds from (it
+    re-files what the chromadb collection layer returns), so the plan below
+    states the ``#1208`` contingency rather than promising the number.
+
+    ``confirm_truncation_ok`` mirrors the real run's flag: it switches that
+    contingency off, so the preview has to say the guard is disabled rather
+    than promise an abort that would not happen.
+
+    Returns ``{}`` when the count is unreadable so a broken preview cannot look
+    like a valid plan (#1654, #2095, #2133).
+    """
+    print("\n  DRY RUN -- no changes will be made.")
+    n = sqlite_drawer_count(palace_path, collection_name)
+    if n is None:
+        _print_unreadable_count_refusal(collection_name=collection_name, palace_path=palace_path)
+        print(f"{'=' * 55}\n")
+        return {}
+
+    if n == 0:
+        # The real run stops at ``total == 0`` with "Nothing to repair.", or —
+        # when the collection is absent altogether — at the index-read error
+        # that points to --mode from-sqlite. Neither backs up nor rebuilds, so
+        # promising a backup and a VACUUM here would describe a run that does
+        # not happen.
+        print(
+            f"  [{collection_name}] chroma.sqlite3 holds no rows. A real run would report\n"
+            "  nothing to repair, or an index read error, and change nothing."
+        )
+        print(f"{'=' * 55}\n")
+        return {collection_name: 0}
+
+    backup_path = os.path.normpath(palace_path) + ".backup"
+    if confirm_truncation_ok:
+        print(
+            f"  [{collection_name}] chroma.sqlite3 holds {n} rows, and --confirm-truncation-ok\n"
+            "  is set, so the #1208 truncation guard is DISABLED. A real run would re-file\n"
+            f"  whatever the chromadb collection layer returns, even if that is fewer than {n}\n"
+            "  rows, and the difference would be destroyed. It would, in order:"
+        )
+    else:
+        print(
+            f"  [{collection_name}] chroma.sqlite3 holds {n} rows. A real run would extract them\n"
+            "  through the chromadb collection layer first and abort without changes if that\n"
+            f"  returns fewer than {n} (#1208 truncation guard). It would then, in order:"
+        )
+    if os.path.exists(backup_path):
+        print(f"    1. DELETE the existing backup at {backup_path} -- or refuse outright")
+        print("       if it is not a palace -- and copy the live palace in its place")
+    else:
+        print(f"    1. copy the palace directory to {backup_path}")
+    print(f"    2. DELETE the live '{collection_name}' collection and re-file the extracted rows")
+    print("       into a fresh one, staged and verified in a temp collection first")
+    print("    3. rebuild the FTS5 index and VACUUM chroma.sqlite3")
+    print("\n  Without --yes it would ask for confirmation before step 1.")
+    print("  Re-run without --dry-run to execute.")
+    print(f"{'=' * 55}\n")
+    return {collection_name: n}
+
+
+def resolve_repair_preflight_errors(
+    palace_path: str,
+    errors: list[str],
+    *,
+    dry_run: bool,
+    progress=print,
+) -> list[str]:
+    """Return the quick_check errors that still block a repair.
+
+    A real run heals an isolated malformed FTS5 inverted index in place and
+    carries on (#1596). ``--dry-run`` must not perform that write, so it
+    classifies the errors with the same :func:`_errors_are_isolated_fts5`
+    predicate the real path gates on: an isolated FTS5 error is reported and
+    cleared, anything broader still aborts. Without this a preview would print
+    the ABORT banner — offline ``sqlite3 .recover``, recreate the FTS5 table —
+    for a palace the tool repairs by itself.
+
+    The prediction is deliberately the optimistic branch, and it is stated as
+    an attempt rather than a promise: the real heal still returns the errors
+    unchanged when another process holds the mine lock, when the rebuild
+    raises, or when ``quick_check`` is still dirty afterwards. A dry run cannot
+    tell those apart without taking the lock and writing, which is exactly what
+    it must not do, so the wording names them instead.
+    """
+    if not errors:
+        return errors
+    if not dry_run:
+        return maybe_autoheal_fts5_index(palace_path, errors, progress=progress)
+    if _errors_are_isolated_fts5(errors):
+        progress(
+            "\n  DRY RUN — quick_check reports an isolated FTS5 inverted-index error.\n"
+            "  A real run would attempt an in-place rebuild of that index from the\n"
+            "  intact content table and continue if it succeeds; it aborts instead if\n"
+            "  another process holds the mine lock or the rebuild leaves quick_check\n"
+            "  dirty. This preview leaves the index untouched."
+        )
+        return []
+    return errors
 
 
 def _rebuild_from_sqlite_locked(
@@ -1778,7 +1939,7 @@ def _rebuild_from_sqlite_locked(
     if in_place:
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         archive_path = f"{dest_palace}.pre-rebuild-{ts}"
-        print(f"  Archiving {dest_palace} → {archive_path}")
+        print(f"  Archiving {dest_palace} -> {archive_path}")
         # os.rename, NOT shutil.move. When any file inside the palace is
         # held open by another process (MCP server, a running mine, another
         # harness), renaming the directory fails atomically UP FRONT on
@@ -1907,7 +2068,7 @@ def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
     palace_path = palace_path or _get_palace_path()
     collection_name = collection_name or _drawers_collection_name()
     print(f"\n{'=' * 55}")
-    print("  MemPalace Repair — Status")
+    print("  MemPalace Repair -- Status")
     print(f"{'=' * 55}\n")
     print(f"  Palace: {palace_path}")
 
@@ -2124,7 +2285,7 @@ def repair_max_seq_id(
     }
 
     print(f"\n{'=' * 55}")
-    print("  MemPalace Repair — max_seq_id Un-poison")
+    print("  MemPalace Repair -- max_seq_id Un-poison")
     print(f"{'=' * 55}\n")
     print(f"  Palace:  {palace_path}")
     if segment:
@@ -2175,10 +2336,10 @@ def repair_max_seq_id(
     source = "sidecar" if from_sidecar else "heuristic (collection MAX)"
     print(f"    clean-value source   {source}")
     for seg_id, old_val, new_val in plan:
-        print(f"    {seg_id}  {old_val}  →  {new_val}")
+        print(f"    {seg_id}  {old_val}  ->  {new_val}")
 
     if dry_run:
-        print("\n  DRY RUN — no rows modified.\n" + "=" * 55 + "\n")
+        print("\n  DRY RUN -- no rows modified.\n" + "=" * 55 + "\n")
         return result
 
     if not plan:

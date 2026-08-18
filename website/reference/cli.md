@@ -134,7 +134,20 @@ Rebuild palace vector index from stored data. Fixes segfaults after database cor
 mempalace repair
 ```
 
-Creates a backup at `<palace_path>.backup` before rebuilding.
+Creates a backup at `<palace_path>.backup` before rebuilding, replacing any backup already there.
+
+| Flag | Description |
+|------|-------------|
+| `rebuild-index` | Positional alias for `--mode from-sqlite --archive-existing` |
+| `--mode` | `legacy` (default), `max-seq-id`, or `from-sqlite` |
+| `--dry-run` | Print what the repair would do and exit without modifying the palace |
+| `--yes` | Skip confirmation for destructive changes |
+| `--backup` | Back up SQLite before mutation (default: on) |
+| `--source` | Source palace for `--mode from-sqlite` (defaults to `--palace`) |
+| `--archive-existing` | Rename the existing palace to `<palace>.pre-rebuild-<timestamp>` first |
+| `--segment` | Segment UUID filter for `--mode max-seq-id` |
+| `--from-sidecar` | Pre-corruption `chroma.sqlite3` to copy clean `max_seq_id` values from |
+| `--confirm-truncation-ok` | Override the truncation safety guard. Disables the abort that protects you when the collection layer returns fewer drawers than SQLite holds |
 
 ## `mempalace mcp`
 
@@ -171,3 +184,46 @@ mempalace instructions mine
 mempalace instructions help
 mempalace instructions status
 ```
+
+## `mempalace logstream`
+
+Agent coordination events — delegate work, wait for replies, acknowledge
+outcomes (RFC 003). Operates on `logstream.sqlite3` in the palace directory;
+safe to run alongside a live hub. See [Agent Logstream](/concepts/agent-logstream).
+
+```bash
+mempalace logstream append --type task.request --stream project/myapp \
+  --room delegation --from-agent mac --to-agent windows \
+  --correlation-id task_123 --body "Please fix the flaky test."
+
+mempalace logstream list --stream project/myapp --room delegation --json
+mempalace logstream wait --correlation-id task_123 --type patch.ready \
+  --timeout-ms 300000 --json
+mempalace logstream ack evt_... --from-agent mac --status applied
+```
+
+| Subcommand | Description |
+|------------|-------------|
+| `append` | Append an immutable event (`--type`, `--stream`, `--room`, `--from-agent` required; `--body`/`--body-file`, `--artifact-id` repeatable) |
+| `list` | List events, oldest first (all routing fields as filters, `--since-event-id`, `--limit`) |
+| `wait` | Long-poll until a match or timeout (`--timeout-ms`, max 300000; exits `2` on timeout) |
+| `ack` | Append an `event.ack` for an event (`--from-agent` required, `--status`, `--body`) |
+| `sync` | Pull missing events/artifacts from peer replicas (`--peer URL --token T`, or all peers in `peers.json`) |
+
+All subcommands accept `--json` for scriptable output.
+
+## `mempalace artifact`
+
+Exact artifact exchange for agent handoffs — unified diffs, files, logs.
+Content is stored verbatim with a SHA-256.
+
+```bash
+git diff | mempalace artifact put --kind patch --created-by windows --json
+mempalace artifact get art_... | git apply --3way
+mempalace artifact get art_... --out /tmp/handoff.patch
+```
+
+| Subcommand | Description |
+|------------|-------------|
+| `put` | Store content (`--kind patch\|file\|log\|json\|note`, `--created-by` required; `--content`, `--file`, or stdin) |
+| `get` | Print exact content to stdout, or `--out FILE`; `--json` for metadata |
