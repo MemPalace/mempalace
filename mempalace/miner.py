@@ -84,7 +84,7 @@ def _read_text_no_follow(filepath: Path, root: Path) -> Optional[tuple[str, floa
             # A reader that breaks a write lease gets EAGAIN when it passes
             # O_NONBLOCK, where a blocking open waits out lease-break-time
             # and succeeds. The kernel grants leases on regular files only
-            # (F_SETLEASE on a pipe gives ENXIO), so re-check the type and
+            # (F_SETLEASE on a pipe fails EINVAL), so re-check the type and
             # then read it the way this code did before the flag existed;
             # dropping it would silently lose a file that used to be mined.
             if exc.errno != errno.EAGAIN or not stat.S_ISREG(os.lstat(filepath).st_mode):

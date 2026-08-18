@@ -188,13 +188,15 @@ _GRADLE_ROOT_PROJECT_NAME_PATTERNS = [
 
 
 def _parse_gradle_root_project_name(path: Path) -> Optional[str]:
-    # ``_parse_gradle`` reaches this with a SIBLING path it constructs itself
-    # (``build.gradle`` next to ``settings.gradle``), which the manifest walk
-    # never vetted. Opening a FIFO for reading blocks in the kernel until a
-    # writer appears; ``is_file()`` stats instead and never blocks.
-    if not path.is_file():
-        return None
     try:
+        # Reached two ways: with the walk-vetted manifest path, and from
+        # ``_parse_gradle`` with a ``settings.gradle`` sibling it builds next
+        # to a vetted ``build.gradle`` — that one no walk ever saw. Opening a
+        # FIFO for reading blocks in the kernel until a writer appears;
+        # ``is_file()`` stats instead. It goes inside this ``try``, which
+        # already absorbs the PermissionError an unsearchable parent raises.
+        if not path.is_file():
+            return None
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
@@ -431,7 +433,10 @@ def _collect_manifest_names(repo_root: Path) -> list[tuple[str, str, Path]]:
             # Every parser below opens the path. A FIFO named
             # ``package.json`` would park that open in the kernel until a
             # writer appears; ``is_file()`` stats instead and never blocks.
-            if not manifest_path.is_file():
+            # ``os.path.isfile`` rather than ``Path.is_file``: each parser
+            # swallows OSError itself, so the gate must swallow it too — an
+            # unsearchable directory used to yield "no name", not a traceback.
+            if not os.path.isfile(manifest_path):
                 continue
             name = parser(manifest_path)
             if name:

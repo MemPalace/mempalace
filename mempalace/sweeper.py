@@ -356,7 +356,14 @@ def sweep_directory(dir_path: str, palace_path: str) -> dict:
         try:
             regular = stat.S_ISREG(f.stat().st_mode)
         except OSError as exc:
-            print(f"  SKIP: {f.name} (stat error: {exc.strerror or exc})", file=sys.stderr)
+            # A stat that FAILS is a real error, not a benign type. A dangling
+            # symlink, a symlink loop and a file unlinked between rglob and
+            # here all land here, and every one of them used to reach ``open``
+            # and be booked below. Keep booking them, or ``sweep`` reports
+            # success on a transcript it could not read.
+            logger.error("sweeper: stat failed on %s: %s", f, exc)
+            print(f"  WARNING: stat failed on {f}: {exc}", file=sys.stderr)
+            failures.append({"file": str(f), "error": str(exc)})
             continue
         if not regular:
             print(f"  SKIP: {f.name} (not a regular file)", file=sys.stderr)

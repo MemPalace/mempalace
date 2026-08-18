@@ -224,6 +224,18 @@ def split_file(filepath, output_dir, dry_run=False):
         if dry_run:
             print(f"  [{i + 1}/{len(boundaries) - 1}] {name}  ({len(chunk)} lines)")
         else:
+            # The gate in ``main`` covers the files the glob listed; this name
+            # is built here, so nothing has vetted it. Opening a pre-existing
+            # FIFO for writing blocks in the kernel until a reader appears.
+            # ``lexists`` rather than ``exists``: the latter follows the link
+            # and so answers False for a DANGLING symlink, and writing through
+            # one creates the target instead — a chunk landing wherever the
+            # link points, outside the output directory entirely.
+            # ``os.path`` rather than ``Path``: neither call can raise, so a
+            # write that fails still fails at ``write_text`` as it always did.
+            if os.path.lexists(out_path) and not os.path.isfile(out_path):
+                print(f"  SKIP: {name} (not a regular file)")
+                continue
             out_path.write_text("".join(chunk), encoding="utf-8")
             print(f"  + {name}  ({len(chunk)} lines)")
 

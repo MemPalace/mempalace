@@ -40,10 +40,11 @@ from mempalace.hook_shell import count_human_messages
 from mempalace.llm_refine import collect_corpus_text
 from mempalace.miner import _read_text_no_follow, load_config, mine, scan_project
 from mempalace.normalize import _read_transcript_file
-from mempalace.project_scanner import _collect_manifest_names
+from mempalace.project_scanner import _collect_manifest_names, _parse_gradle
 from mempalace.repair import _copy_file_no_follow, _open_regular_file_no_follow
 from mempalace.room_detector_local import detect_rooms_local
 from mempalace.split_mega_files import main as split_main
+from mempalace.split_mega_files import split_file
 from mempalace.sweeper import parse_claude_jsonl, sweep_directory
 
 # ``os.mkfifo`` and ``SIGALRM`` are both POSIX-only. Windows has no FIFO in
@@ -52,6 +53,17 @@ from mempalace.sweeper import parse_claude_jsonl, sweep_directory
 posix_only = pytest.mark.skipif(
     not hasattr(os, "mkfifo") or not hasattr(signal, "SIGALRM"),
     reason="requires POSIX FIFOs and SIGALRM",
+)
+
+# Root holds CAP_DAC_OVERRIDE and walks straight into a directory with no
+# ``x`` bit, so the file each test walls off stays readable and the assertion
+# below breaks: the state these tests need cannot be built as root, they do
+# not merely pass vacuously there. ``tests/test_backups.py`` gates the same
+# way and additionally excludes Windows, which it has to because it carries
+# no ``posix_only``; every use here already sits under ``posix_only``.
+needs_unprivileged_posix = pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="directory permission bits do not gate root",
 )
 
 TIMEOUT_SECONDS = 10.0
@@ -357,6 +369,104 @@ def test_split_mega_files_skips_fifo(tmp_path, capsys, monkeypatch):
 
 
 @posix_only
+def test_split_file_skips_a_fifo_at_its_own_output_name(tmp_path, capsys):
+    """The walk gate covers the source; the output name is built here.
+
+    ``split_file`` synthesises each per-session filename from the transcript
+    and writes it into the source directory, so nothing has vetted that path.
+    A pre-existing FIFO sitting at one of those names turned the write into a
+    blocking open — the same hang, in the one path the discovery gate cannot
+    reach.
+    """
+    session = "Claude Code v1.0\n" + "content line\n" * 14 + "\n" * 5
+    source = write_regular(tmp_path, "real.txt", session * 2)
+    planned = split_file(str(source), None, dry_run=True)
+    assert len(planned) >= 2, "fixture must produce at least two output files"
+    blocked = Path(planned[0])
+    os.mkfifo(blocked)
+
+    with hard_timeout(TIMEOUT_SECONDS, "split_file writing over a FIFO output"):
+        written = split_file(str(source), None, dry_run=False)
+
+    out = capsys.readouterr().out
+    assert f"SKIP: {blocked.name} (not a regular file)" in out
+    assert blocked not in written
+    # The pipe must cost only its own chunk: every other session still lands.
+    assert len(written) == len(planned) - 1
+    assert all(path.is_file() for path in written)
+
+
+@posix_only
+def test_split_file_skips_a_dangling_symlink_at_its_own_output_name(tmp_path, capsys):
+    """A broken link at an output name must not redirect the write.
+
+    ``os.path.exists`` follows the link and answers False for a dangling one,
+    so the type gate would wave it through — and ``write_text`` then CREATES
+    the target, landing a chunk wherever the link points instead of in the
+    output directory. The gate has to ask about the link itself.
+    """
+    session = "Claude Code v1.0\n" + "content line\n" * 14 + "\n" * 5
+    source = write_regular(tmp_path, "real.txt", session * 2)
+    planned = split_file(str(source), None, dry_run=True)
+    assert len(planned) >= 2, "fixture must produce at least two output files"
+    blocked = Path(planned[0])
+    outside = tmp_path / "outside" / "victim.txt"
+    outside.parent.mkdir()
+    os.symlink(outside, blocked)
+    assert not outside.exists(), "the link must dangle before the run"
+
+    with hard_timeout(TIMEOUT_SECONDS, "split_file writing over a dangling symlink"):
+        written = split_file(str(source), None, dry_run=False)
+
+    out = capsys.readouterr().out
+    assert f"SKIP: {blocked.name} (not a regular file)" in out
+    assert blocked not in written
+    assert not outside.exists(), "a chunk was written through the link, outside the output dir"
+    assert len(written) == len(planned) - 1
+
+
+@posix_only
+@needs_unprivileged_posix
+def test_collect_manifest_names_survives_an_unreadable_directory(tmp_path):
+    """The type gate must not turn a skipped manifest into a crash.
+
+    ``os.walk`` lists the children of a directory with ``r`` but no ``x``,
+    and stating one of them raises ``PermissionError``. Each parser already
+    swallowed that through its own ``except OSError``, so the gate in front
+    of them has to swallow it too — otherwise ``mempalace init`` gains a
+    traceback where it used to report no manifest name.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "package.json").write_text('{"name": "inner"}', encoding="utf-8")
+    os.chmod(repo, 0o444)
+    try:
+        with hard_timeout(TIMEOUT_SECONDS, "_collect_manifest_names over an unreadable dir"):
+            found = _collect_manifest_names(repo)
+    finally:
+        os.chmod(repo, 0o755)
+    assert found == []
+
+
+@posix_only
+@needs_unprivileged_posix
+def test_parse_gradle_survives_an_unreadable_directory(tmp_path):
+    """The sibling ``settings.gradle`` is stat'd inside the parser's own try."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    build = repo / "build.gradle"
+    build.write_text("plugins { id 'java' }\n", encoding="utf-8")
+    os.chmod(repo, 0o444)
+    try:
+        with hard_timeout(TIMEOUT_SECONDS, "_parse_gradle over an unreadable dir"):
+            name = _parse_gradle(build)
+    finally:
+        os.chmod(repo, 0o755)
+    # Falls back to the directory name, exactly as it did before the gate.
+    assert name == "repo"
+
+
+@posix_only
 def test_format_miner_extract_text_does_not_block_on_fifo(tmp_path):
     """``mine --mode extract`` was already immune — its zero-size gate fires
     first, because a FIFO stats as 0 bytes. Pinned so a future reshuffle of
@@ -584,6 +694,34 @@ def test_sweep_directory_skips_a_fifo_without_booking_a_failure(tmp_path, capsys
     assert "SKIP: piped.jsonl (not a regular file)" in capsys.readouterr().err
 
 
+@posix_only
+def test_sweep_directory_still_books_a_stat_failure_as_a_failure(tmp_path, capsys):
+    """A pipe is nothing to sweep; a stat that FAILS is a real error.
+
+    The type gate has to tell those apart. A dangling symlink, a symlink loop
+    and a file unlinked between ``rglob`` and the gate all raise from
+    ``stat`` — and every one of them used to reach ``open`` inside ``sweep``
+    and be booked. Swallowing them would flip ``mempalace sweep`` from exit 2
+    to exit 0 on a transcript it could not read.
+    """
+    convos = tmp_path / "convos"
+    convos.mkdir()
+    write_regular(
+        convos,
+        "real.jsonl",
+        '{"type": "user", "sessionId": "s1", "uuid": "u1", '
+        '"timestamp": "2026-01-01T00:00:00Z", '
+        '"message": {"role": "user", "content": "hello"}}\n',
+    )
+    os.symlink(convos / "gone.jsonl", convos / "dangling.jsonl")
+    with hard_timeout(TIMEOUT_SECONDS, "sweep_directory over a dangling symlink"):
+        result = sweep_directory(str(convos), str(tmp_path / "palace"))
+    # ``cli.cmd_sweep`` turns a non-empty ``failures`` into ``sys.exit(2)``.
+    assert [Path(entry["file"]).name for entry in result["failures"]] == ["dangling.jsonl"]
+    assert result["files_succeeded"] == 1
+    assert "stat failed" in capsys.readouterr().err
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # O_NONBLOCK must not drop a regular file the blocking open would have read
 # ─────────────────────────────────────────────────────────────────────────
@@ -645,6 +783,7 @@ def test_read_text_no_follow_does_not_retry_eagain_on_a_fifo(tmp_path, monkeypat
 
 
 @posix_only
+@needs_unprivileged_posix
 def test_gather_origin_samples_survives_an_unreadable_directory(tmp_path):
     """The type gate must not turn a skipped file into a crash.
 
