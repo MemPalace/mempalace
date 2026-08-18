@@ -1,0 +1,27 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run mempalace hook run --hook stop --harness grok",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run mempalace hook run --hook precompact --harness grok",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

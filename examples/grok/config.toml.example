@@ -1,0 +1,7 @@
+[mcp_servers.mempalace]
+command = "uv"
+args = ["run", "mempalace-mcp"]
+enabled = true
+startup_timeout_sec = 30
+tool_timeout_sec = 120
+description = "MemPalace local MCP server"

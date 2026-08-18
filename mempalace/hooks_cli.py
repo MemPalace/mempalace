@@ -3,7 +3,7 @@ Hook logic for MemPalace — Python implementation of session-start, stop, sessi
 
 Reads JSON from stdin, outputs JSON to stdout.
 Supported hooks: session-start, stop, session-end, precompact
-Supported harnesses: claude-code, codex (extensible to cursor, gemini, etc.)
+Supported harnesses: claude-code, codex, grok (extensible to cursor, gemini, etc.)
 """
 
 import hashlib
@@ -1130,7 +1130,7 @@ def _ingest_transcript(transcript_path: str):
         _log(f"transcript ingest hook failed: {exc}")
 
 
-SUPPORTED_HARNESSES = {"claude-code", "codex"}
+SUPPORTED_HARNESSES = {"claude-code", "codex", "grok"}
 
 
 def _diary_agent_for_harness(harness: str) -> str:
@@ -1152,6 +1152,14 @@ def _parse_harness_input(data: dict, harness: str) -> dict:
     if harness not in SUPPORTED_HARNESSES:
         print(f"Unknown harness: {harness}", file=sys.stderr)
         sys.exit(1)
+    if harness == "grok":
+        return {
+            "session_id": _sanitize_session_id(
+                str(data.get("sessionId", data.get("session_id", "unknown")))
+            ),
+            "stop_hook_active": data.get("stopHookActive", data.get("stop_hook_active", False)),
+            "transcript_path": str(data.get("transcriptPath", data.get("transcript_path", ""))),
+        }
     return {
         "session_id": _sanitize_session_id(str(data.get("session_id", "unknown"))),
         "stop_hook_active": data.get("stop_hook_active", False),

@@ -1,0 +1,7 @@
+{
+  "hookEventName": "PreCompact",
+  "sessionId": "grok-local-smoke-test",
+  "cwd": "C:/Users/example/src/mempalace-grok-debug",
+  "workspaceRoot": "C:/Users/example/src/mempalace-grok-debug",
+  "transcriptPath": ""
+}
