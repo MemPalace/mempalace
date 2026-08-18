@@ -106,7 +106,7 @@ def time_it(fn: Callable[[], None], warmup: int = 1, runs: int = 3) -> dict:
     }
 
 
-def bench_onnx_default(chunks: List[str], batch_size: int) -> dict:
+def bench_onnx_default(chunks: List[str], batch_size: int, runs: int) -> dict:
     """ChromaDB's ONNXMiniLM_L6_V2 with default providers (current mempalace)."""
     from chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2 import ONNXMiniLM_L6_V2
 
@@ -118,10 +118,10 @@ def bench_onnx_default(chunks: List[str], batch_size: int) -> dict:
         for i in range(0, len(chunks), batch_size):
             _ = ef(chunks[i : i + batch_size])
 
-    return time_it(fn)
+    return time_it(fn, runs=runs)
 
 
-def bench_onnx_cpu_only(chunks: List[str], batch_size: int) -> dict:
+def bench_onnx_cpu_only(chunks: List[str], batch_size: int, runs: int) -> dict:
     from chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2 import ONNXMiniLM_L6_V2
 
     ef = ONNXMiniLM_L6_V2(preferred_providers=["CPUExecutionProvider"])
@@ -131,10 +131,10 @@ def bench_onnx_cpu_only(chunks: List[str], batch_size: int) -> dict:
         for i in range(0, len(chunks), batch_size):
             _ = ef(chunks[i : i + batch_size])
 
-    return time_it(fn)
+    return time_it(fn, runs=runs)
 
 
-def bench_onnx_coreml(chunks: List[str], batch_size: int) -> dict:
+def bench_onnx_coreml(chunks: List[str], batch_size: int, runs: int) -> dict:
     """Explicitly force CoreML — expected to raise or silently fall back."""
     try:
         import onnxruntime
@@ -154,12 +154,12 @@ def bench_onnx_coreml(chunks: List[str], batch_size: int) -> dict:
             for i in range(0, len(chunks), batch_size):
                 _ = ef(chunks[i : i + batch_size])
 
-        return time_it(fn)
+        return time_it(fn, runs=runs)
     except Exception as e:
         return {"error": str(e)[:120]}
 
 
-def bench_sentence_transformers(chunks: List[str], batch_size: int, device: str) -> dict:
+def bench_sentence_transformers(chunks: List[str], batch_size: int, device: str, runs: int) -> dict:
     try:
         from sentence_transformers import SentenceTransformer
     except ImportError:
@@ -176,7 +176,7 @@ def bench_sentence_transformers(chunks: List[str], batch_size: int, device: str)
     def fn():
         _ = model.encode(chunks, batch_size=batch_size, show_progress_bar=False)
 
-    return time_it(fn)
+    return time_it(fn, runs=runs)
 
 
 # ---- main ---------------------------------------------------------------
@@ -219,11 +219,26 @@ def main():
         return
 
     backends = [
-        ("onnx_default", lambda: bench_onnx_default(chunks, args.batch_size)),
-        ("onnx_cpu_only", lambda: bench_onnx_cpu_only(chunks, args.batch_size)),
-        ("onnx_coreml", lambda: bench_onnx_coreml(chunks, args.batch_size)),
-        ("st_cpu", lambda: bench_sentence_transformers(chunks, args.batch_size, "cpu")),
-        ("st_mps", lambda: bench_sentence_transformers(chunks, args.batch_size, "mps")),
+        (
+            "onnx_default",
+            lambda: bench_onnx_default(chunks, args.batch_size, args.runs),
+        ),
+        (
+            "onnx_cpu_only",
+            lambda: bench_onnx_cpu_only(chunks, args.batch_size, args.runs),
+        ),
+        (
+            "onnx_coreml",
+            lambda: bench_onnx_coreml(chunks, args.batch_size, args.runs),
+        ),
+        (
+            "st_cpu",
+            lambda: bench_sentence_transformers(chunks, args.batch_size, "cpu", args.runs),
+        ),
+        (
+            "st_mps",
+            lambda: bench_sentence_transformers(chunks, args.batch_size, "mps", args.runs),
+        ),
     ]
 
     results = {}
