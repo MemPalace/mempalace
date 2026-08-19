@@ -416,6 +416,22 @@ _MCP_WRITER_LOCK_ERROR = ""
 _MCP_WRITER_ATEXIT_REGISTERED = False
 _MCP_ALLOW_PEER_WRITER_ENV = "MEMPALACE_MCP_ALLOW_PEER_WRITER"
 
+# Writer-lease idle release (fork patch 2026-08-19; upstream candidate).
+#
+# The lease above is otherwise held for the life of the process, so an
+# orphaned-but-alive stdio server (client machine rebooted; tailscale SSH
+# never delivered EOF) keeps every peer session read-only for hours
+# (observed twice on 2026-08-19). Acquisition is already self-healing per
+# mutating call, so the lease can be dropped whenever this process has not
+# written for a while: the next mutating call transparently re-acquires.
+# The in-flight counter stops the watchdog from releasing (and closing
+# storage handles) under a running chroma-touching request.
+_MCP_WRITER_IDLE_MINUTES_ENV = "MEMPALACE_MCP_WRITER_IDLE_MINUTES"
+_MCP_WRITER_IDLE_MINUTES_DEFAULT = 10.0
+_MCP_WRITER_STATE_LOCK = threading.RLock()
+_MCP_WRITER_INFLIGHT = 0
+_last_mutating_time: float = time.monotonic()
+
 _MUTATING_TOOLS = frozenset(
     {
         "mempalace_kg_add",
@@ -690,6 +706,12 @@ def _discard_mcp_storage_handles() -> None:
 
 
 def _release_mcp_writer_lock() -> None:
+    """Thread-safe wrapper: release under _MCP_WRITER_STATE_LOCK."""
+    with _MCP_WRITER_STATE_LOCK:
+        _release_mcp_writer_lock_unlocked()
+
+
+def _release_mcp_writer_lock_unlocked() -> None:
     """Close writable handles and release this process's palace lease."""
 
     global _MCP_WRITER_LOCK_CM, _MCP_WRITER_READ_ONLY
@@ -709,6 +731,12 @@ def _release_mcp_writer_lock() -> None:
 
 
 def _acquire_mcp_writer_lock() -> tuple[bool, str]:
+    """Thread-safe wrapper: acquire under _MCP_WRITER_STATE_LOCK."""
+    with _MCP_WRITER_STATE_LOCK:
+        return _acquire_mcp_writer_lock_unlocked()
+
+
+def _acquire_mcp_writer_lock_unlocked() -> tuple[bool, str]:
     """Acquire this process's per-palace MCP writer lease.
 
     Returns (True, "") when this process may write. Returns (False, reason)
@@ -788,6 +816,8 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     _MCP_WRITER_READ_ONLY = False
     _MCP_WRITER_LOCK_FAILED = False
     _MCP_WRITER_LOCK_ERROR = ""
+    global _last_mutating_time
+    _last_mutating_time = time.monotonic()
     return True, ""
 
 
@@ -804,7 +834,10 @@ def _mcp_peer_writer_refusal(req_id, tool_name: str):
         "id": req_id,
         "error": {
             "code": -32001,
-            "message": "Peer MCP writer active; this server is read-only for mutating tools",
+            "message": (
+                "Peer MCP writer active; this server is read-only for mutating tools"
+                + (f" [{reason}]" if reason else "")
+            ),
             "data": {
                 "tool": tool_name,
                 "palace": _config.palace_path,
@@ -6630,7 +6663,7 @@ def handle_request(request):
             if "entry" not in tool_args or tool_args["entry"] is None:
                 tool_args["entry"] = content_val
         try:
-            with _write_stall_watch(tool_name):
+            with _writer_inflight(tool_name), _write_stall_watch(tool_name):
                 result = _decorate_mcp_tool_result(
                     tool_name, TOOLS[tool_name]["handler"](**tool_args)
                 )
@@ -6980,6 +7013,81 @@ def _start_write_stall_watchdog() -> None:
                 os._exit(_WRITE_STALL_EXIT_CODE)
 
     t = threading.Thread(target=_watchdog, name="mcp-write-stall-watchdog", daemon=True)
+    t.start()
+
+
+def _writer_idle_release_secs() -> float:
+    """Writer-lease idle-release threshold in seconds (0 = disabled)."""
+    raw = os.environ.get(_MCP_WRITER_IDLE_MINUTES_ENV, "")
+    if raw:
+        try:
+            minutes = float(raw)
+        except ValueError:
+            return _MCP_WRITER_IDLE_MINUTES_DEFAULT * 60
+        return max(0.0, minutes) * 60
+    return _MCP_WRITER_IDLE_MINUTES_DEFAULT * 60
+
+
+@contextlib.contextmanager
+def _writer_inflight(tool_name: str):
+    """Track chroma-touching tool calls so the idle-release watchdog never
+    drops the writer lease (and its storage handles) under a running call.
+
+    Counts every tool except the logstream set (own sqlite database, exempt
+    from the lease); only completed calls to _MUTATING_TOOLS refresh the
+    write-idle clock."""
+    global _MCP_WRITER_INFLIGHT, _last_mutating_time
+    if tool_name in _HTTP_LOCK_FREE_TOOLS:
+        yield
+        return
+    with _MCP_WRITER_STATE_LOCK:
+        _MCP_WRITER_INFLIGHT += 1
+    try:
+        yield
+    finally:
+        with _MCP_WRITER_STATE_LOCK:
+            _MCP_WRITER_INFLIGHT -= 1
+            if tool_name in _MUTATING_TOOLS:
+                _last_mutating_time = time.monotonic()
+
+
+def _maybe_release_idle_writer(idle_secs: float) -> bool:
+    """Release the writer lease if held, write-idle past idle_secs, and no
+    chroma-touching call is in flight. Returns True when released."""
+    with _MCP_WRITER_STATE_LOCK:
+        if _MCP_WRITER_LOCK_CM is None or _MCP_WRITER_INFLIGHT > 0:
+            return False
+        idle = time.monotonic() - _last_mutating_time
+        if idle < idle_secs:
+            return False
+        logger.info(
+            "writer lease idle for %.1f min (limit %.1f min); releasing so "
+            "peer sessions can write.",
+            idle / 60,
+            idle_secs / 60,
+        )
+        _release_mcp_writer_lock_unlocked()
+        return True
+
+
+def _start_writer_idle_release_watchdog() -> None:
+    """Drop an idle writer lease so peer sessions stop seeing read-only
+    refusals. Set MEMPALACE_MCP_WRITER_IDLE_MINUTES=0 to disable (pre-patch
+    behavior: lease held until process exit)."""
+    timeout = _writer_idle_release_secs()
+    if timeout <= 0:
+        return
+    check_interval = min(30.0, timeout / 4)
+
+    def _watchdog() -> None:
+        while True:
+            time.sleep(check_interval)
+            try:
+                _maybe_release_idle_writer(timeout)
+            except Exception:
+                logger.exception("writer idle-release check failed")
+
+    t = threading.Thread(target=_watchdog, name="mcp-writer-idle-release", daemon=True)
     t.start()
 
 
@@ -8243,6 +8351,7 @@ def _run_stdio_loop() -> None:
     # Idle auto-exit: release ChromaDB file handles from stale servers
     # that outlived their Claude Code session (#1552).
     _start_idle_exit_watchdog()
+    _start_writer_idle_release_watchdog()
 
     # Say so when a chromadb write stops coming back, from a thread the stuck
     # call is not blocking.
@@ -8321,6 +8430,7 @@ def _run_http_loop() -> None:
         # soon as the process is alive.
         _refresh_vector_disabled_flag()
         _start_idle_exit_watchdog()
+        _start_writer_idle_release_watchdog()
         _start_write_stall_watchdog()
 
         raw_warmup = os.environ.get("MEMPALACE_EAGER_WARMUP", "").strip().lower()
