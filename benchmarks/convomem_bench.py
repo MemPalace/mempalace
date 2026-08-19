@@ -70,13 +70,13 @@ def download_evidence_file(category, subpath, cache_dir):
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
 
     if os.path.exists(cache_path):
-        with open(cache_path) as f:
+        with open(cache_path, encoding="utf-8") as f:
             return json.load(f)
 
     print(f"    Downloading: {category}/{subpath}...")
     try:
         urllib.request.urlretrieve(url, cache_path)
-        with open(cache_path) as f:
+        with open(cache_path, encoding="utf-8") as f:
             return json.load(f)
     except Exception as e:
         print(f"    Failed to download {url}: {e}")
@@ -89,7 +89,7 @@ def discover_files(category, cache_dir):
     cache_path = os.path.join(cache_dir, f"{category}_filelist.json")
 
     if os.path.exists(cache_path):
-        with open(cache_path) as f:
+        with open(cache_path, encoding="utf-8") as f:
             return json.load(f)
 
     try:
@@ -100,7 +100,7 @@ def discover_files(category, cache_dir):
                 f["path"].split(f"{category}/")[1] for f in files if f["path"].endswith(".json")
             ]
             os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-            with open(cache_path, "w") as f:
+            with open(cache_path, "w", encoding="utf-8") as f:
                 json.dump(paths, f)
             return paths
     except Exception as e:
@@ -236,13 +236,13 @@ def run_benchmark(categories, limit_per_cat, top_k, mode, cache_dir, out_file):
     print(f"  Limit/cat:   {limit_per_cat}")
     print(f"  Top-k:       {top_k}")
     print(f"  Mode:        {mode}")
-    print(f"{'─' * 60}")
+    print(f"{'-' * 60}")
     print("\n  Loading data from HuggingFace...\n")
 
     items = load_evidence_items(categories, limit_per_cat, cache_dir)
 
     print(f"\n  Total items: {len(items)}")
-    print(f"{'─' * 60}\n")
+    print(f"{'-' * 60}\n")
 
     all_recall = []
     per_category = defaultdict(list)
@@ -302,7 +302,7 @@ def run_benchmark(categories, limit_per_cat, top_k, mode, cache_dir, out_file):
     print(f"\n{'=' * 60}\n")
 
     if out_file:
-        with open(out_file, "w") as f:
+        with open(out_file, "w", encoding="utf-8") as f:
             json.dump(results_log, f, indent=2)
         print(f"  Results saved to: {out_file}")
 

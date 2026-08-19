@@ -119,6 +119,8 @@ def _patch_mcp_server(monkeypatch, config, kg):
     # Accept varargs because production ``_get_kg`` now takes an optional
     # canonical_path; ``_call_kg`` passes the captured key through.
     monkeypatch.setattr(mcp_server, "_get_kg", lambda *a, **kw: kg)
+    monkeypatch.setattr(mcp_server, "_taxonomy_cache", None)
+    monkeypatch.setattr(mcp_server, "_taxonomy_cache_time", 0.0)
 
 
 def _get_collection(palace_path, create=False):

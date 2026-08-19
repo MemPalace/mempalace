@@ -1598,6 +1598,57 @@ def _query_drawers_with_filter_fallback(
         }
 
 
+def _backend_capabilities(col) -> frozenset:
+    backend = getattr(col, "_backend", None)
+    if backend is None:
+        inner = getattr(col, "_inner", None)
+        backend = getattr(inner, "_backend", None) if inner is not None else None
+    caps = getattr(backend, "capabilities", None) if backend is not None else None
+    return caps if isinstance(caps, (set, frozenset)) else frozenset()
+
+
+def _closet_boosts(closets_col, *, query: str, n_results: int, where: dict) -> dict:
+    """Best-per-source closet hits used as a rank boost, never a gate.
+
+    sqlite_exact (and any lexical backend) uses FTS instead of a second
+    exact-cosine scan over the closet collection — closets are pointer
+    lines, so BM25 is the better signal anyway.
+    """
+    boosts: dict = {}
+    n_hits = max(1, n_results * 2)
+    if "supports_lexical_search" in _backend_capabilities(closets_col):
+        result = closets_col.lexical_search(query=query, n_results=n_hits, where=where or None)
+        hits = getattr(result, "hits", None) or []
+        for rank, hit in enumerate(hits):
+            meta = hit.metadata or {}
+            source = meta.get("source_file", "")
+            if source and source not in boosts:
+                preview = (hit.document or "")[:200]
+                boosts[source] = (rank, 0.0, preview)
+        return boosts
+
+    ckwargs = {
+        "query_texts": [query],
+        "n_results": n_hits,
+        "include": ["documents", "metadatas", "distances"],
+    }
+    if where:
+        ckwargs["where"] = where
+    closet_results = closets_col.query(**ckwargs)
+    for rank, (cdoc, cmeta, cdist) in enumerate(
+        zip(
+            _first_or_empty(closet_results, "documents"),
+            _first_or_empty(closet_results, "metadatas"),
+            _first_or_empty(closet_results, "distances"),
+        )
+    ):
+        cmeta = cmeta or {}
+        source = cmeta.get("source_file", "")
+        if source and source not in boosts:
+            boosts[source] = (rank, cdist, (cdoc or "")[:200])
+    return boosts
+
+
 def search_memories(
     query: str,
     palace_path: str,
@@ -1725,25 +1776,9 @@ def search_memories(
     closet_boost_by_source: dict = {}  # source_file -> (rank, closet_dist, preview)
     try:
         closets_col = get_closets_collection(palace_path, create=False)
-        ckwargs = {
-            "query_texts": [query],
-            "n_results": n_results * 2,
-            "include": ["documents", "metadatas", "distances"],
-        }
-        if where:
-            ckwargs["where"] = where
-        closet_results = closets_col.query(**ckwargs)
-        for rank, (cdoc, cmeta, cdist) in enumerate(
-            zip(
-                _first_or_empty(closet_results, "documents"),
-                _first_or_empty(closet_results, "metadatas"),
-                _first_or_empty(closet_results, "distances"),
-            )
-        ):
-            cmeta = cmeta or {}
-            source = cmeta.get("source_file", "")
-            if source and source not in closet_boost_by_source:
-                closet_boost_by_source[source] = (rank, cdist, cdoc[:200])
+        closet_boost_by_source = _closet_boosts(
+            closets_col, query=query, n_results=n_results, where=where
+        )
     except Exception:
         # No closets yet — hybrid degrades to pure drawer search.
         logger.debug("Closet collection unavailable; using drawer-only search", exc_info=True)

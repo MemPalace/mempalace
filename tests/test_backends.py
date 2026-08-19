@@ -18,6 +18,7 @@ from mempalace.backends import (
     available_backends,
     get_backend,
 )
+from mempalace.backends import chroma as chroma_module
 from mempalace.backends.chroma import (
     ChromaBackend,
     ChromaCollection,
@@ -453,6 +454,174 @@ def test_chroma_cache_picks_up_db_created_after_first_open(tmp_path):
     refreshed = backend._client(str(palace_path))
     assert refreshed is not sentinel
     assert backend._freshness[str(palace_path)] != (0, 0.0)
+
+
+def _count_persistent_clients(monkeypatch):
+    """Patch ``chromadb.PersistentClient`` with a counting passthrough.
+
+    Returns the list whose length is the number of constructions so far.
+    """
+    built = []
+    real = chromadb.PersistentClient
+
+    def counting(*args, **kwargs):
+        built.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(chromadb, "PersistentClient", counting)
+    return built
+
+
+def test_chroma_client_cache_survives_its_own_writes(tmp_path, monkeypatch):
+    """Opening several collections must not rebuild the client each time.
+
+    Regression for the unbounded-memory bug: ``PersistentClient(...)`` writes
+    to ``chroma.sqlite3``, so an mtime stamp taken at construction time was
+    already stale by the time the *next* open checked it. A search opens
+    ``mempalace_drawers`` then ``mempalace_closets``, so the first open
+    invalidated the cache for the second, and every search rebuilt the client
+    and reloaded both HNSW segments -- ~440 MB per collection on a large
+    palace, never released, until the server sat on multiple GB.
+
+    The invariant that matters is construction *count*: one client for a
+    palace that nothing else is writing to, no matter how many opens.
+    """
+    palace_path = tmp_path / "palace"
+    palace_path.mkdir()
+    ref = PalaceRef(id=str(palace_path), local_path=str(palace_path))
+    backend = ChromaBackend()
+    built = _count_persistent_clients(monkeypatch)
+
+    # A tmp palace with no drawers opens in well under the 0.01s epsilon, so
+    # its own writes land inside a single mtime tick and the bug stays hidden.
+    # Model the real palace instead: push the mtime forward from inside
+    # get_collection (_pin_hnsw_threads is the last step before the restamp)
+    # so every open leaves the DB visibly newer than the stamp that preceded
+    # it -- which is exactly what a 165k-drawer palace does on its own.
+    real_pin = chroma_module._pin_hnsw_threads
+
+    def pin_and_touch(collection):
+        result = real_pin(collection)
+        db_file = palace_path / "chroma.sqlite3"
+        if db_file.is_file():
+            st = db_file.stat()
+            os.utime(db_file, (st.st_atime, st.st_mtime + 1))
+        return result
+
+    monkeypatch.setattr(chroma_module, "_pin_hnsw_threads", pin_and_touch)
+
+    try:
+        for _ in range(3):
+            for name in ("mempalace_drawers", "mempalace_closets"):
+                backend.get_collection(palace=ref, collection_name=name, create=True)
+        assert len(built) == 1, f"rebuilt the client {len(built)} times for one palace"
+    finally:
+        backend.close()
+
+
+def test_chroma_collection_write_does_not_rebuild_client(tmp_path, monkeypatch):
+    """Filing a drawer must not make the next open reload the index.
+
+    A write through ChromaCollection moves chroma.sqlite3's mtime, which is
+    the same signal _client() reads to detect an external change. Without a
+    re-baseline the file-then-search cycle -- the hot path for hook-driven
+    filing -- rebuilt the client on every iteration and reloaded every HNSW
+    segment it had already paid for.
+    """
+    palace_path = tmp_path / "palace"
+    palace_path.mkdir()
+    ref = PalaceRef(id=str(palace_path), local_path=str(palace_path))
+    backend = ChromaBackend()
+    built = _count_persistent_clients(monkeypatch)
+
+    try:
+        col = backend.get_collection(palace=ref, collection_name="mempalace_drawers", create=True)
+        assert len(built) == 1
+
+        for i in range(3):
+            col.upsert(documents=[f"doc {i}"], ids=[f"id{i}"], metadatas=[{"k": "v"}])
+            backend.get_collection(palace=ref, collection_name="mempalace_drawers", create=True)
+        assert len(built) == 1, f"a write forced {len(built) - 1} client rebuild(s)"
+    finally:
+        backend.close()
+
+
+def test_chroma_client_cache_still_rebuilds_on_external_write(tmp_path, monkeypatch):
+    """Re-stamping our own writes must not blind the cache to somebody else's.
+
+    The memory fix works by treating the freshness stat as "the DB as this
+    backend last left it". That is only safe if a genuine external change --
+    a peer sync, a concurrent ``mine``, a restore -- still forces the rebuild
+    that #2002/#2028 rely on to avoid serving a stale HNSW segment.
+    """
+    palace_path = tmp_path / "palace"
+    palace_path.mkdir()
+    ref = PalaceRef(id=str(palace_path), local_path=str(palace_path))
+    backend = ChromaBackend()
+    built = _count_persistent_clients(monkeypatch)
+
+    try:
+        backend.get_collection(palace=ref, collection_name="mempalace_drawers", create=True)
+        assert len(built) == 1
+
+        # Somebody else writes the palace. Move the mtime well past the 0.01s
+        # epsilon so the change is unambiguous on coarse-grained filesystems.
+        db_file = palace_path / "chroma.sqlite3"
+        st = db_file.stat()
+        os.utime(db_file, (st.st_atime, st.st_mtime + 60))
+
+        backend.get_collection(palace=ref, collection_name="mempalace_drawers", create=True)
+        assert len(built) == 2, "external write did not invalidate the cached client"
+    finally:
+        backend.close()
+
+
+def test_chroma_restamp_ignores_uncached_palace(tmp_path):
+    """``_restamp`` must not resurrect a stamp for an evicted palace.
+
+    ``close_palace`` can race an in-flight ``get_collection``; if the restamp
+    that follows re-added a freshness entry with no client behind it, the next
+    open would compare against a stamp it never earned.
+    """
+    palace_path = tmp_path / "palace"
+    palace_path.mkdir()
+    (palace_path / "chroma.sqlite3").write_bytes(b"")
+
+    backend = ChromaBackend()
+    backend._restamp(str(palace_path))
+    assert str(palace_path) not in backend._freshness
+
+
+def test_chroma_client_rebuild_closes_displaced_client(tmp_path, monkeypatch):
+    """A rebuild must close the client it replaces, not just drop the reference.
+
+    The displaced client pins its own copy of every HNSW segment it opened;
+    dict eviction alone leaves that native memory allocated for the life of
+    the process.
+    """
+    palace_path = tmp_path / "palace"
+    palace_path.mkdir()
+    db_file = palace_path / "chroma.sqlite3"
+    db_file.write_bytes(b"")
+    st = db_file.stat()
+
+    closed = []
+
+    class _Sentinel:
+        def close(self):
+            closed.append(1)
+
+    backend = ChromaBackend()
+    backend._clients[str(palace_path)] = _Sentinel()
+    backend._freshness[str(palace_path)] = (st.st_ino, st.st_mtime)
+    # External write forces the rebuild branch.
+    os.utime(db_file, (st.st_atime, st.st_mtime + 60))
+
+    try:
+        backend._client(str(palace_path))
+        assert closed == [1], "displaced client was dropped without being closed"
+    finally:
+        backend.close()
 
 
 def test_base_collection_update_default_rejects_mismatched_lengths():

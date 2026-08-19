@@ -548,6 +548,188 @@ class TestSyncOverHttp:
             local.close()
 
 
+class TestPublishedEstate:
+    """The estate has to be readable from processes that do not sync.
+
+    The peer sync loop only runs under ``--transport http``, but
+    ``mempalace_mesh_peers`` is available in every transport -- including the
+    stdio servers agents actually connect through. Those processes have a
+    permanently empty ``_PEER_SYNC_STATE``, so before the hub published its
+    estate they answered with peers carrying a name and a url and nothing
+    else, and ``origin_profiles`` holding only this node, while the hub next
+    door knew reachability, vectors and profiles for every peer.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolated_home(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+    @pytest.fixture(autouse=True)
+    def _clean_estate_state(self):
+        from mempalace import mcp_server as mcp
+
+        mcp._KNOWN_PROFILES.clear()
+        mcp._node_profile_cache.clear()
+        mcp._PEER_SYNC_STATE.clear()
+        yield
+        mcp._KNOWN_PROFILES.clear()
+        mcp._node_profile_cache.clear()
+        mcp._PEER_SYNC_STATE.clear()
+
+    def _write_peers(self, palace_path, name="w", url="http://peer.example:8765"):
+        with open(os.path.join(palace_path, "peers.json"), "w", encoding="utf-8") as f:
+            json.dump({"peers": [{"name": name, "url": url, "token": "S3CRET"}]}, f)
+
+    def _sync_round(self, mcp, palace_path, name="w", url="http://peer.example:8765"):
+        """One successful round, then publish, exactly as the loop does."""
+        mcp._record_peer_sync(
+            {
+                "peer_name": name,
+                "peer_url": url,
+                "peer_replica": "rep_bbbbbbbbbbbb",
+                "pulled_events": 3,
+                "pulled_artifacts": 0,
+                "remote_version_vector": {"rep_bbbbbbbbbbbb": 7},
+                "remote_profile": {"roles": ["replica"], "advertised_at": "2026-07-03T01:00:00Z"},
+                "remote_profiles": {
+                    "rep_cccccccccccc": {
+                        "roles": ["agents"],
+                        "advertised_at": "2026-07-03T00:30:00Z",
+                    }
+                },
+            }
+        )
+        mcp._publish_mesh_state(palace_path)
+
+    def test_non_syncing_process_sees_the_published_estate(self, server, palace_path):
+        """The regression: a process with no sync loop must still report status."""
+        _port, mcp = server
+        self._write_peers(palace_path)
+        self._sync_round(mcp, palace_path)
+
+        # Become a process that never syncs — the stdio server's situation.
+        mcp._PEER_SYNC_STATE.clear()
+        mcp._KNOWN_PROFILES.clear()
+
+        payload = mcp._mesh_peers_payload()
+        (peer,) = payload["peers"]
+        assert peer["reachable"] is True
+        assert peer["replica_id"] == "rep_bbbbbbbbbbbb"
+        assert peer["remote_version_vector"] == {"rep_bbbbbbbbbbbb": 7}
+        assert peer["last_pulled_events"] == 3
+        assert payload["origin_profiles"]["rep_bbbbbbbbbbbb"]["roles"] == ["replica"]
+        assert payload["origin_profiles"]["rep_cccccccccccc"]["roles"] == ["agents"]
+        assert payload["estate_source"]["in_process"] is False
+        assert payload["estate_source"]["writer_alive"] is True
+        assert payload["estate_source"]["published_at"]
+
+    def test_published_estate_names_origins_that_would_read_as_transitive(
+        self, server, palace_path
+    ):
+        """A peer whose replica_id is only known via the estate is not 'unnamed'.
+
+        ``unnamed_origins`` means "seen in the log but not configured as a
+        peer". Without the published estate a non-syncing process cannot map
+        a configured peer to its replica_id, so a perfectly ordinary peer was
+        reported as an origin known only transitively.
+        """
+        _port, mcp = server
+        self._write_peers(palace_path)
+        self._sync_round(mcp, palace_path)
+        mcp._PEER_SYNC_STATE.clear()
+        mcp._KNOWN_PROFILES.clear()
+
+        mcp._call_logstream(
+            lambda ls: ls.append_event(
+                type="status.update", stream="s", room="r", from_agent="a", body="x"
+            )
+        )
+        payload = mcp._mesh_peers_payload()
+        assert "rep_bbbbbbbbbbbb" not in payload["unnamed_origins"]
+
+    def test_in_process_state_wins_over_the_published_file(self, server, palace_path):
+        """The syncing process trusts itself: its own round is fresher than disk."""
+        _port, mcp = server
+        self._write_peers(palace_path)
+        self._sync_round(mcp, palace_path)
+
+        # The hub's own next round finds the peer down. The stale file still
+        # says reachable; the live process must report what it just observed.
+        mcp._record_peer_sync({"peer_name": "w", "error": "connection refused"})
+        payload = mcp._mesh_peers_payload()
+        (peer,) = payload["peers"]
+        assert peer["reachable"] is False
+        assert peer["last_error"] == "connection refused"
+        assert payload["estate_source"]["in_process"] is True
+
+    def test_published_estate_never_carries_peer_tokens(self, server, palace_path):
+        """peers.json tokens must not reach a file other processes read."""
+        from mempalace import server_registry
+
+        _port, mcp = server
+        self._write_peers(palace_path)
+        self._sync_round(mcp, palace_path)
+
+        raw = server_registry.mesh_state_path(palace_path).read_text(encoding="utf-8")
+        assert "S3CRET" not in raw
+        mcp._PEER_SYNC_STATE.clear()
+        assert "S3CRET" not in json.dumps(mcp._mesh_peers_payload())
+
+    def test_published_estate_is_private_and_atomic(self, server, palace_path):
+        """0600, and no partial file left behind for a concurrent reader."""
+        from mempalace import server_registry
+
+        _port, mcp = server
+        self._write_peers(palace_path)
+        self._sync_round(mcp, palace_path)
+
+        path = server_registry.mesh_state_path(palace_path)
+        if os.name != "nt":  # Windows does not carry POSIX mode bits
+            assert oct(path.stat().st_mode & 0o777) == "0o600"
+        leftovers = [p.name for p in path.parent.iterdir() if p.name.endswith(".tmp")]
+        assert leftovers == []
+
+    def test_dead_writer_is_reported_as_not_alive(self, server, palace_path):
+        """A crashed hub leaves a last-known-good estate, flagged as stale."""
+        from mempalace import server_registry
+
+        _port, mcp = server
+        self._write_peers(palace_path)
+        self._sync_round(mcp, palace_path)
+
+        path = server_registry.mesh_state_path(palace_path)
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record["pid"] = 2**31 - 1  # a pid that cannot be running
+        path.write_text(json.dumps(record), encoding="utf-8")
+
+        mcp._PEER_SYNC_STATE.clear()
+        payload = mcp._mesh_peers_payload()
+        (peer,) = payload["peers"]
+        # Still shown — "last seen as" beats a blank node — but marked stale.
+        assert peer["reachable"] is True
+        assert payload["estate_source"]["writer_alive"] is False
+
+    def test_missing_or_malformed_estate_degrades_quietly(self, server, palace_path):
+        """No hub has ever published, or the file is corrupt: no traceback."""
+        from mempalace import server_registry
+
+        _port, mcp = server
+        self._write_peers(palace_path)
+
+        payload = mcp._mesh_peers_payload()
+        (peer,) = payload["peers"]
+        assert peer["name"] == "w"
+        assert payload["estate_source"]["published_at"] is None
+
+        path = server_registry.mesh_state_path(palace_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{not json", encoding="utf-8")
+        payload = mcp._mesh_peers_payload()
+        assert payload["peers"][0]["name"] == "w"
+        assert payload["estate_source"]["writer_alive"] is False
+
+
 class TestNodeProfile:
     """The self-described node profile (estate truth, never UI guesses):
     pure derivation, advertisement on /sync/version_vector, transit relay
