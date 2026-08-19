@@ -26,8 +26,12 @@ _PEM_BEGIN = r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----"
 _PATTERNS = [
     # Complete PEM block.
     (re.compile(_PEM_BEGIN + r"[\s\S]*?-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----"), _REDACTED),
-    # Truncated PEM block: header plus a long base64 run, escaped \n included.
-    (re.compile(_PEM_BEGIN + r"(?:\\n|[A-Za-z0-9+/=\s]){40,}"), _REDACTED),
+    # Truncated PEM block: header plus a long base64 run, no END marker.
+    # Backslashes are part of the run because transcripts nest JSON: a newline
+    # inside a key arrives as \n, and once the JSON is itself embedded in JSON
+    # it arrives as \\n. Matching only a single escape stops at the second
+    # backslash and leaves the body in place.
+    (re.compile(_PEM_BEGIN + r"[A-Za-z0-9+/=\s\\n]{40,}"), _REDACTED),
     # JSON private_key field, whether or not the body looks like PEM.
     (
         re.compile(r'"private_key"\s*:\s*"(?:\\.|[^"\\]){40,}"'),

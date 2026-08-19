@@ -36,13 +36,25 @@ def test_truncated_pem_block_is_still_redacted():
     assert "NOTAREALKEY" not in out
 
 
-def test_escaped_newline_pem_inside_json_is_redacted():
+@pytest.mark.parametrize("escape", ["\\n", "\\\\n"])
+def test_escaped_newline_pem_inside_json_is_redacted_at_any_escape_depth(escape):
+    # A key inside JSON carries \n; the same JSON embedded in another JSON
+    # document carries \\n. Both have to be redacted.
     text = (
-        '{"private_key": "-----BEGIN PRIVATE KEY-----\\n'
+        '{"private_key": "-----BEGIN PRIVATE KEY-----'
+        + escape
         + _B64
-        + '\\n-----END PRIVATE KEY-----\\n"}'
+        + escape
+        + '-----END PRIVATE KEY-----"}'
     )
     out = redact_secrets(text)
+    assert "NOTAREALKEY" not in out
+
+
+def test_truncated_double_escaped_block_is_redacted():
+    text = "-----BEGIN PRIVATE KEY-----\\\\n" + _B64
+    out = redact_secrets(text)
+    assert REDACTED in out
     assert "NOTAREALKEY" not in out
 
 
