@@ -28,6 +28,7 @@ import hashlib
 import json
 import logging
 import os
+import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,10 @@ _WILDCARD_HOSTS = {"0.0.0.0", "::", "[::]"}
 
 def _canonical(palace_path: str) -> str:
     return os.path.abspath(os.path.realpath(os.path.expanduser(palace_path)))
+
+
+def _utc_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
 def server_state_dir(palace_path: str) -> Path:
@@ -86,6 +91,81 @@ def write_serverinfo(palace_path: str, *, host: str, port: int, scheme: str, rea
         json.dump(payload, fh)
         fh.write("\n")
     return path
+
+
+def mesh_state_path(palace_path: str) -> Path:
+    return server_state_dir(palace_path) / "mesh_state.json"
+
+
+def write_mesh_state(palace_path: str, *, peers: dict, profiles: dict) -> Path:
+    """Publish the hub's mesh estate so other local processes can read it.
+
+    The estate — which peers answered last round, their version vectors and
+    advertised profiles — is built by the peer sync loop, and that loop only
+    runs in the HTTP transport. Every other process for this palace (the
+    stdio MCP servers agents actually connect through, the CLI) has the same
+    ``mempalace_mesh_peers`` tool and an empty in-memory estate behind it, so
+    without this file they answer "two peers, no status at all" while the hub
+    next door knows the whole picture.
+
+    0600 like the token and the serverinfo. The contents are not secret —
+    peers.json tokens never reach the estate — but the directory convention
+    is "private to the user".
+    """
+    path = mesh_state_path(palace_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(str(path.parent), 0o700)
+    except OSError:
+        pass
+    payload = {
+        "pid": os.getpid(),
+        "written_at": _utc_now(),
+        "peers": peers,
+        "profiles": profiles,
+    }
+    # Write-and-rename: readers in other processes must never observe a
+    # half-serialized estate, and this file is rewritten every sync round.
+    tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+            fh.write("\n")
+        os.replace(str(tmp), str(path))
+    except BaseException:
+        try:
+            os.unlink(str(tmp))
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def read_mesh_state(palace_path: str) -> dict:
+    """Return the published estate for this palace.
+
+    Always a dict with ``peers``/``profiles`` mappings so callers can merge
+    without None-checks; empty when no hub has published yet or the file is
+    unreadable. ``writer_alive`` reports whether the publishing process is
+    still running — a crashed hub leaves a last-known-good estate that is
+    worth showing but must not be read as live.
+    """
+    empty = {"peers": {}, "profiles": {}, "written_at": None, "writer_alive": False}
+    try:
+        state = json.loads(mesh_state_path(palace_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return empty
+    if not isinstance(state, dict):
+        return empty
+    peers = state.get("peers")
+    profiles = state.get("profiles")
+    return {
+        "peers": peers if isinstance(peers, dict) else {},
+        "profiles": profiles if isinstance(profiles, dict) else {},
+        "written_at": state.get("written_at"),
+        "writer_alive": _pid_alive(state.get("pid")),
+    }
 
 
 def clear_serverinfo(palace_path: str) -> None:

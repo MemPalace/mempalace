@@ -4850,7 +4850,7 @@ TOOLS = {
         "handler": tool_graph_stats,
     },
     "mempalace_mesh_peers": {
-        "description": "Mesh estate snapshot (RFC 004): this replica's identity, version vector and node profile; each configured peer's reachability, last sync outcome, remote version vector and advertised profile; origins known only transitively; and origin_profiles keyed by replica_id. Exactly the GET /sync/peers payload — tokens are never included.",
+        "description": "Mesh estate snapshot (RFC 004): this replica's identity, version vector and node profile; each configured peer's reachability, last sync outcome, remote version vector and advertised profile; origins known only transitively; origin_profiles keyed by replica_id; and estate_source saying whether the peer status was observed in this process or published by the palace's hub (with published_at and whether that hub is still alive). Exactly the GET /sync/peers payload — tokens are never included.",
         "input_schema": {"type": "object", "properties": {}},
         "handler": tool_mesh_peers,
     },
@@ -7230,15 +7230,58 @@ def _merge_known_profiles(profiles: dict) -> None:
         _KNOWN_PROFILES[origin] = profile
 
 
-def _known_profiles_snapshot() -> dict:
-    """Every origin profile this node can vouch for having seen — learned
-    ones first, own fresh self-profile last so it always wins for self."""
-    snapshot = dict(_KNOWN_PROFILES)
+def _known_profiles_snapshot(published: dict = None) -> dict:
+    """Every origin profile this node can vouch for having seen.
+
+    Published profiles first (the hub's, when this process is not the one
+    syncing), then any learned in this process, then our own fresh
+    self-profile last so it always wins for self.
+    """
+    if published is None:
+        published = _published_mesh_state()
+    snapshot = dict(published.get("profiles") or {})
+    snapshot.update(_KNOWN_PROFILES)
     try:
         snapshot[_call_logstream(lambda ls: ls.replica_id)] = _node_profile()
     except Exception:
         logger.debug("node profile: self profile unavailable", exc_info=True)
     return snapshot
+
+
+def _publish_mesh_state(palace_path: str) -> None:
+    """Write this process's estate where other local processes can read it.
+
+    The sync loop runs only in the HTTP transport, so without this the stdio
+    MCP servers agents connect through answer ``mempalace_mesh_peers`` from a
+    permanently empty ``_PEER_SYNC_STATE`` -- peers with a name and a url and
+    nothing else, and ``origin_profiles`` holding only this node. Never fatal:
+    a publish failure costs other processes their estate view, not this
+    process's convergence.
+    """
+    from . import server_registry
+
+    try:
+        server_registry.write_mesh_state(
+            palace_path,
+            peers=dict(_PEER_SYNC_STATE),
+            profiles=dict(_KNOWN_PROFILES),
+        )
+    except Exception:
+        logger.debug("mesh state publish failed", exc_info=True)
+
+
+def _published_mesh_state() -> dict:
+    """Read the estate published by this palace's hub, if any."""
+    from . import server_registry
+
+    palace_path = getattr(_config, "palace_path", None)
+    if not palace_path:
+        return {"peers": {}, "profiles": {}, "written_at": None, "writer_alive": False}
+    try:
+        return server_registry.read_mesh_state(palace_path)
+    except Exception:
+        logger.debug("mesh state read failed", exc_info=True)
+        return {"peers": {}, "profiles": {}, "written_at": None, "writer_alive": False}
 
 
 def _record_peer_sync(stats: dict) -> None:
@@ -7294,11 +7337,18 @@ def _mesh_peers_payload() -> dict:
         configured = load_peers(getattr(_config, "palace_path", None) or "")
     except (ValueError, TypeError):
         configured = []
+    # The peer sync loop lives in the HTTP transport, so in every other
+    # process _PEER_SYNC_STATE is empty and the only honest source is what
+    # the hub published. Prefer our own state when we have it (this process
+    # is the one syncing, so it is fresher than anything on disk) and fall
+    # back to the published estate per peer.
+    published = _published_mesh_state()
+    published_peers = published.get("peers") or {}
     named_origins = {replica_id}
     peers = []
     for peer in configured:
         name = peer.get("name") or peer["url"]
-        state = dict(_PEER_SYNC_STATE.get(name) or {})
+        state = dict(_PEER_SYNC_STATE.get(name) or published_peers.get(name) or {})
         state.pop("url", None)  # peers.json is authoritative for the url
         if state.get("replica_id"):
             named_origins.add(state["replica_id"])
@@ -7316,8 +7366,17 @@ def _mesh_peers_payload() -> dict:
         "unnamed_origins": sorted(set(local_vector) - named_origins),
         # Every self-described profile known here, keyed by replica_id —
         # including profiles of unnamed origins relayed through carriers.
-        "origin_profiles": _known_profiles_snapshot(),
+        "origin_profiles": _known_profiles_snapshot(published),
         "sync_interval_s": _peer_sync_interval_s(),
+        # Where the peer status above came from. in_process means this
+        # process runs the sync loop; otherwise the estate was published by
+        # the hub at published_at, and writer_alive says whether that hub is
+        # still running (a dead hub leaves a last-known-good reading).
+        "estate_source": {
+            "in_process": bool(_PEER_SYNC_STATE),
+            "published_at": published.get("written_at"),
+            "writer_alive": published.get("writer_alive", False),
+        },
     }
 
 
@@ -7369,6 +7428,9 @@ def _start_peer_sync_thread() -> None:
                             stats["pulled_events"],
                             stats["pulled_artifacts"],
                         )
+                # Publish once per round, not per peer: the estate is only
+                # coherent after every configured peer has been attempted.
+                _publish_mesh_state(palace_path)
                 malformed_logged = False
             except ValueError as exc:
                 if not malformed_logged:
