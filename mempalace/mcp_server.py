@@ -7163,7 +7163,13 @@ _KNOWN_PROFILES: dict = {}
 _NODE_PROFILE_TTL_S = 60.0
 _node_profile_cache: dict = {}
 
-_ACCELERATOR_NAMES = {"cuda": "CUDA", "dml": "DirectML", "coreml": "CoreML", "cpu": "CPU"}
+_ACCELERATOR_NAMES = {
+    "cuda": "CUDA",
+    "dml": "DirectML",
+    "coreml": "CoreML",
+    "mps": "MPS",
+    "cpu": "CPU",
+}
 
 
 def _node_profile() -> dict:
@@ -7193,13 +7199,14 @@ def _node_profile() -> dict:
         logger.debug("node profile: logstream authorship unavailable", exc_info=True)
     accelerator = None
     try:
-        from .embedding import _resolve_providers, current_model_name
+        from .embedding import _resolve_providers_for_model, current_model_name
 
         device = getattr(_config, "embedding_device", None) or "auto"
-        _providers, effective = _resolve_providers(device)
+        model = current_model_name()
+        _providers, effective = _resolve_providers_for_model(device, model)
         accelerator = {
             "provider": _ACCELERATOR_NAMES.get(effective, effective),
-            "embedder": current_model_name(),
+            "embedder": model,
         }
         roles.append("compute")
     except Exception:
