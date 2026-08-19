@@ -1595,15 +1595,27 @@ class ChromaCollection(BaseCollection):
     directly without going through ``ChromaBackend``.
     """
 
-    def __init__(self, collection, palace_path: Optional[str] = None):
+    def __init__(self, collection, palace_path: Optional[str] = None, backend=None):
         self._collection = collection
         self._palace_path = palace_path
+        # Owning ChromaBackend, when this collection came through one. Used
+        # only to re-baseline that backend's freshness stat after our writes
+        # (see _write_lock). None for directly-constructed test doubles.
+        self._backend = backend
 
     @contextlib.contextmanager
     def _write_lock(self):
         """Acquire ``mine_palace_lock`` for the configured palace, if any.
 
         No-op (yields immediately) when ``self._palace_path`` is None.
+
+        On exit, re-baselines the owning backend's client-cache freshness stat.
+        A write moves ``chroma.sqlite3``'s mtime, and that stat is how
+        :meth:`ChromaBackend._client` detects an *external* change; without the
+        re-baseline our own upsert looks like somebody else's write and the
+        next collection open rebuilds the client, reloading every HNSW segment
+        it had already paid for. That made the file-a-drawer-then-search cycle
+        reload the whole index each time.
         """
         if self._palace_path is None:
             yield
@@ -1612,7 +1624,11 @@ class ChromaCollection(BaseCollection):
         from ..palace import mine_palace_lock
 
         with mine_palace_lock(self._palace_path):
-            yield
+            try:
+                yield
+            finally:
+                if self._backend is not None:
+                    self._backend._restamp(self._palace_path)
 
     # ------------------------------------------------------------------
     # Writes
@@ -2327,6 +2343,18 @@ class ChromaBackend(BaseBackend):
                 # change. Gated on genuine external change (not first open) so
                 # cold opens never pay the global-evict cost.
                 _clear_chroma_system_cache()
+            # Release the client we are about to displace. Each live
+            # PersistentClient pins its own copy of every HNSW segment it has
+            # opened (``max_elements * size_data_per_element`` bytes -- ~440 MB
+            # per collection on a 165k-drawer palace), and neither dict
+            # eviction nor _clear_chroma_system_cache() returns that native
+            # memory. Dropping it here keeps a long-lived server flat across
+            # rebuilds instead of accumulating one orphaned index set per
+            # external change. Any ChromaCollection handed out before this
+            # point is invalidated -- which is the intent: the rebuild only
+            # fires when the palace changed underneath us, and serving the
+            # pre-change segment is the stale-index class of #2002/#2028.
+            _close_client(self._clients.pop(palace_path, None))
             ChromaBackend._prepare_palace_for_open(palace_path)
             cached = chromadb.PersistentClient(path=palace_path)
             self._clients[palace_path] = cached
@@ -2335,6 +2363,40 @@ class ChromaBackend(BaseBackend):
             # may still be (0, 0.0) on first open.
             self._freshness[palace_path] = self._db_stat(palace_path)
         return cached
+
+    def _restamp(self, palace_path: str) -> None:
+        """Re-baseline the freshness stat after this backend's own writes.
+
+        Opening a ``chromadb.PersistentClient`` writes to ``chroma.sqlite3``,
+        and so do the collection opens that follow it, so the mtime this cache
+        keys on moves *while we are using it*. Stamping only at
+        client-construction time (as :meth:`_client` does above) therefore left
+        the recorded value stale the moment the surrounding operation finished
+        its own writes, and the next ``_client()`` call read our own footprint
+        as an external change.
+
+        The effect was a cache that essentially never hit: a single search
+        opens ``mempalace_drawers`` and then ``mempalace_closets``, and the
+        first open bumped the mtime that the second one checked, so every
+        search rebuilt the client and reloaded both HNSW segments.
+
+        Stamping again once the operation is done makes the recorded value mean
+        "``chroma.sqlite3`` as this backend last left it", so a later
+        difference is genuinely somebody else's write.
+
+        Trade-off: an external write that lands *while* one of our operations
+        is in flight is absorbed into the new stamp and will not trigger a
+        rebuild until the next change. That window is one collection open wide.
+        It cannot be closed with mtime alone, and ``PRAGMA data_version`` does
+        not help -- it reports writes by any other *connection*, and chromadb's
+        own connection is foreign to a probe connection, so our own opens would
+        register as external there too.
+
+        No-ops when the path has no cached client, so an eviction that races
+        the operation (``close_palace``) is not resurrected as a stale stamp.
+        """
+        if palace_path in self._freshness:
+            self._freshness[palace_path] = self._db_stat(palace_path)
 
     # ------------------------------------------------------------------
     # Public static helpers (legacy; prefer :meth:`get_collection`)
@@ -2476,7 +2538,11 @@ class ChromaBackend(BaseBackend):
                     raise ValueError(explanation) from e
                 raise
         _pin_hnsw_threads(collection)
-        return ChromaCollection(collection, palace_path=palace_path)
+        # Our own client construction and collection open just wrote to
+        # chroma.sqlite3; re-baseline so the next _client() call does not read
+        # that as an external change and rebuild the client.
+        self._restamp(palace_path)
+        return ChromaCollection(collection, palace_path=palace_path, backend=self)
 
     def close_palace(self, palace) -> None:
         """Drop cached handles for ``palace`` and release its SQLite file lock.
@@ -2538,6 +2604,7 @@ class ChromaBackend(BaseBackend):
     def delete_collection(self, palace_path: str, collection_name: str) -> None:
         """Delete ``collection_name`` from the palace at ``palace_path``."""
         self._client(palace_path).delete_collection(collection_name)
+        self._restamp(palace_path)
 
     def create_collection(
         self, palace_path: str, collection_name: str, hnsw_space: str = "cosine"
@@ -2550,7 +2617,8 @@ class ChromaBackend(BaseBackend):
             metadata=_hnsw_creation_metadata({"hnsw_space": hnsw_space}),
             **ef_kwargs,
         )
-        return ChromaCollection(collection, palace_path=palace_path)
+        self._restamp(palace_path)
+        return ChromaCollection(collection, palace_path=palace_path, backend=self)
 
 
 def _normalize_get_collection_args(args, kwargs):
