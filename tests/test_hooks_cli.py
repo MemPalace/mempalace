@@ -1666,6 +1666,57 @@ def test_parse_harness_input_valid():
     assert result["stop_hook_active"] is True
 
 
+def test_parse_harness_input_cursor_conversation_id():
+    result = _parse_harness_input(
+        {
+            "conversation_id": "conv-456",
+            "transcript_path": "/tmp/cursor.jsonl",
+            "loop_count": 0,
+            "status": "completed",
+        },
+        "cursor",
+    )
+    assert result["session_id"] == "conv-456"
+    assert result["transcript_path"] == "/tmp/cursor.jsonl"
+    assert result["stop_hook_active"] is False
+
+
+def test_parse_harness_input_cursor_loop_count_implies_active():
+    result = _parse_harness_input(
+        {
+            "conversation_id": "conv-789",
+            "loop_count": 2,
+        },
+        "cursor",
+    )
+    assert result["session_id"] == "conv-789"
+    assert result["stop_hook_active"] is True
+
+
+def test_parse_harness_input_cursor_loop_count_string_does_not_crash():
+    """Cursor may JSON-encode loop_count as a string; casting must not TypeError."""
+    result = _parse_harness_input(
+        {
+            "conversation_id": "conv-str",
+            "loop_count": "1",
+        },
+        "cursor",
+    )
+    assert result["session_id"] == "conv-str"
+    assert result["stop_hook_active"] is True
+
+
+def test_parse_harness_input_cursor_loop_count_invalid_defaults_inactive():
+    result = _parse_harness_input(
+        {
+            "conversation_id": "conv-bad",
+            "loop_count": "not-a-number",
+        },
+        "cursor",
+    )
+    assert result["stop_hook_active"] is False
+
+
 # --- hook_stop with OSError on write ---
 
 

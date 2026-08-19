@@ -25,6 +25,8 @@ Then in Cursor: <kbd>Cmd</kbd>-<kbd>Shift</kbd>-<kbd>P</kbd> → **Developer: Re
 
 Once published, install via the Cursor marketplace panel and select `mempalace`. Required-plugin distribution from a team marketplace is also supported.
 
+Maintainers: submit / re-submit this public repo at [cursor.com/marketplace/publish](https://cursor.com/marketplace/publish) after merging marketplace-ready changes.
+
 ## Post-Install Setup
 
 After installing the plugin, run the `init` command in a Cursor chat:
@@ -96,6 +98,19 @@ command -v mempalace-mcp
 ```
 
 If it isn't, run `/init` (or `mempalace install` from a terminal) — `mempalace-mcp` is installed alongside the `mempalace` package.
+
+### Troubleshooting: GUI PATH (macOS / Linux)
+
+Cursor launched from a GUI (Dock, Spotlight, launcher) often does **not** inherit shell profile PATH entries such as `~/.local/bin`, where `uv tool install` places `mempalace` / `mempalace-mcp`. Symptoms: MCP server fails to spawn (`ENOENT`), or optional hooks log that the CLI is not on PATH.
+
+Fixes (pick one):
+
+1. Install so the binaries land somewhere already on the GUI PATH, or
+2. Symlink into a directory Cursor can see, e.g. `/usr/local/bin`, or
+3. Launch Cursor from a terminal (`cursor .`) so it inherits your shell PATH, or
+4. Verify with `command -v mempalace-mcp` in a shell, then confirm the same path is visible to Cursor (Settings → Features → MCP / plugin logs).
+
+`uv tool install mempalace` remains the recommended install; just ensure its bin dir is on Cursor's effective PATH.
 
 ## Hooks (optional)
 

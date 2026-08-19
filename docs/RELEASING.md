@@ -13,7 +13,7 @@ config pointing at a binary that was never installed — exactly what broke
 v3.3.2 ([#1093](https://github.com/MemPalace/mempalace/issues/1093)).
 
 ```bash
-grep -r mempalace-mcp pyproject.toml .claude-plugin .codex-plugin
+grep -r mempalace-mcp pyproject.toml .claude-plugin .codex-plugin .cursor-plugin
 ```
 
 Expected on a healthy `develop` (post-[#340](https://github.com/MemPalace/mempalace/pull/340)) — one line per file:
@@ -22,6 +22,7 @@ Expected on a healthy `develop` (post-[#340](https://github.com/MemPalace/mempal
 pyproject.toml:mempalace-mcp = "mempalace.mcp_server:main"
 .claude-plugin/plugin.json:      "command": "mempalace-mcp"
 .codex-plugin/plugin.json:      "command": "mempalace-mcp"
+.cursor-plugin/mcp.json:      "command": "mempalace-mcp"
 .claude-plugin/.mcp.json:    "command": "mempalace-mcp"
 ```
 
@@ -65,6 +66,8 @@ Done once per project; both steps require PyPI owner / GitHub admin rights.
    stays green (it is the single source of truth at `mempalace/version.py`,
    mirrored in `pyproject.toml`, `.claude-plugin/marketplace.json`,
    `.claude-plugin/plugin.json`, and `.codex-plugin/plugin.json`).
+   (`.cursor-plugin/plugin.json` intentionally omits a hardcoded `version`
+   field — see `tests/test_cursor_plugin_manifest.py`.)
 2. Land everything for the release on `develop`, then merge `develop → main`.
    Releases publish **only from `main`** — the workflow refuses any tag whose
    commit is not an ancestor of `main`. Don't commit the bump directly to

@@ -1,5 +1,6 @@
 {
   "name": "mempalace",
+  "displayName": "MemPalace",
   "description": "Give your AI a memory — mine projects and conversations into a searchable palace. 36 MCP tools, slash commands, and a guided skill for Cursor.",
   "author": {
     "name": "milla-jovovich"
@@ -7,6 +8,7 @@
   "homepage": "https://github.com/MemPalace/mempalace",
   "repository": "https://github.com/MemPalace/mempalace",
   "license": "MIT",
+  "logo": ".cursor-plugin/assets/logo.svg",
   "keywords": [
     "memory",
     "ai",
@@ -14,6 +16,13 @@
     "mcp",
     "chromadb",
     "palace",
-    "search"
+    "search",
+    "verbatim"
+  ],
+  "category": "developer-tools",
+  "tags": [
+    "memory",
+    "mcp",
+    "hooks"
   ]
 }

@@ -27,6 +27,23 @@
 # shebang. The `# shellcheck shell=bash` directive above tells
 # shellcheck to treat it as bash when run standalone.
 
+# ── GUI PATH bootstrap ────────────────────────────────────────────────
+#
+# Cursor launched from a Dock/Spotlight/launcher often inherits a minimal
+# PATH that omits ~/.local/bin (where `uv tool install` places
+# mempalace / mempalace-mcp). Prepend common user-local bins so
+# `command -v mempalace` succeeds without requiring a terminal launch.
+# Keep existing PATH entries after so system tools still win on collision.
+case ":${PATH}:" in
+    *":$HOME/.local/bin:"*) ;;
+    *) PATH="$HOME/.local/bin:$PATH" ;;
+esac
+case ":${PATH}:" in
+    *":$HOME/.cargo/bin:"*) ;;
+    *) PATH="$HOME/.cargo/bin:$PATH" ;;
+esac
+export PATH
+
 # ── State directory + log path ────────────────────────────────────────
 #
 # Honour MEMPAL_STATE_DIR (additive override introduced for Cursor)

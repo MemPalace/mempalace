@@ -2083,6 +2083,8 @@ def cmd_mcp(args):
     print("MemPalace MCP quick setup:")
     print(f"  claude mcp add mempalace -- {server_cmd}")
     print(f"  codex mcp add mempalace -- {server_cmd}")
+    print("  Cursor: install the MemPalace plugin (Settings → Plugins), or add to")
+    print('  ~/.cursor/mcp.json: {"mcpServers":{"mempalace":{"command":"mempalace-mcp"}}}')
     print("\nRun the server directly:")
     print(f"  {server_cmd}")
 
@@ -2757,7 +2759,7 @@ def main():
     p_hook_run.add_argument(
         "--harness",
         required=True,
-        choices=["claude-code", "codex"],
+        choices=["claude-code", "codex", "cursor"],
         help="Harness type (determines stdin JSON format)",
     )
 
