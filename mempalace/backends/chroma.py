@@ -39,6 +39,40 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 
+def _sqlite_integrity_errors(palace_path: str) -> list[str]:
+    """Module-level shim for :func:`mempalace.repair.sqlite_integrity_errors`,
+    filtered to the signals the quarantine gate can act on safely.
+
+    Deferred to avoid a circular import (repair.py imports from this module).
+    Exposed at module scope so tests can monkeypatch it without having to
+    reach into ``repair``'s namespace directly.
+
+    The underlying helper returns two qualitatively different shapes:
+
+    * **Real page-level corruption** — ``PRAGMA quick_check`` opened the
+      DB and returned messages like ``"row X is corrupt"`` or
+      ``"*** in database main ***"``. These come back as rows. This is
+      the signal ``quarantine_stale_hnsw`` should act on.
+    * **Couldn't-even-open cases** — the SQLite file is missing, locked,
+      mid-checkpoint, a test-fixture placeholder, or genuinely not a
+      SQLite file at all. These raise ``sqlite3.Error`` and surface as
+      ``"PRAGMA quick_check failed: <reason>"`` entries.
+
+    Treating the second bucket as corruption causes false-positive
+    quarantines whenever the SQLite layer can't be probed — including
+    #1716's all-layer-0 regression test, whose fixture writes a
+    placeholder ``chroma.sqlite3`` because it only cares about the HNSW
+    segment. The quarantine decision must not fire on "unknown". Filter
+    the couldn't-open bucket out here; if SQLite is genuinely so
+    corrupted it can't be opened, the next chromadb client open will
+    raise a real diagnostic on its own.
+    """
+    from ..repair import sqlite_integrity_errors  # noqa: PLC0415
+
+    raw = sqlite_integrity_errors(palace_path)
+    return [e for e in raw if not e.startswith("PRAGMA quick_check failed:")]
+
+
 _REQUIRED_OPERATORS = frozenset({"$eq", "$ne", "$in", "$nin", "$and", "$or", "$contains"})
 _OPTIONAL_OPERATORS = frozenset({"$gt", "$gte", "$lt", "$lte"})
 _SUPPORTED_OPERATORS = _REQUIRED_OPERATORS | _OPTIONAL_OPERATORS
@@ -512,16 +546,59 @@ def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> lis
 
         # Stage 2: integrity gate. Mtime drift alone is not corruption because
         # Chroma flushes HNSW asynchronously. A healthy metadata file proves the
-        # ordinary stale-by-mtime case is just flush lag.
+        # ordinary stale-by-mtime case is just flush lag — but only if the SQLite
+        # layer is also clean and HNSW element counts match SQLite's ground truth.
+        sq_errors: list[str] = []
+        count_diverged = False
+        hnsw_cnt: Optional[int] = None
+        sqlite_cnt: Optional[int] = None
         if not payload_corrupt and _segment_appears_healthy(seg_dir):
-            logger.info(
-                "HNSW mtime gap %.0fs on %s exceeds threshold but segment "
-                "metadata and payload size are intact — flush-lag, not "
-                "corruption. Leaving in place.",
-                sqlite_mtime - hnsw_mtime,
-                seg_dir,
-            )
-            continue
+            # --- Deep integrity check (only reached on anomalous mtime gap) ---
+            # 1. SQLite quick_check: catches page-level corruption that would
+            #    cause ChromaDB to crash or silently return garbage.
+            sq_errors = _sqlite_integrity_errors(palace_path)
+
+            # 2. Count cross-check: HNSW id_to_label vs SQLite embeddings.
+            #    segment directory name IS the segment UUID in ChromaDB's layout.
+            seg_id = name  # name is already the UUID from the enclosing loop
+            hnsw_cnt = _hnsw_element_count(palace_path, seg_id)
+            sqlite_cnt = _sqlite_embedding_count_for_segment(palace_path, seg_id)
+
+            if hnsw_cnt is not None and sqlite_cnt is not None:
+                divergence = sqlite_cnt - hnsw_cnt
+                # Use the same tolerance already established for hnsw_capacity_status:
+                # max(FALLBACK_FLOOR, FRACTION * sqlite_cnt). Anything past that is
+                # real divergence, not expected async-flush lag.
+                threshold = max(
+                    _HNSW_DIVERGENCE_FALLBACK_FLOOR,
+                    int(sqlite_cnt * _HNSW_DIVERGENCE_FRACTION),
+                )
+                count_diverged = divergence > threshold
+
+            if sq_errors or count_diverged:
+                # Corruption signal wins — fall through to the quarantine path below.
+                err_summary = (
+                    f"SQLite errors: {sq_errors[:3]}"
+                    if sq_errors
+                    else f"HNSW count {hnsw_cnt} vs SQLite count {sqlite_cnt}"
+                )
+                logger.warning(
+                    "HNSW mtime gap %.0fs on %s with integrity failure — "
+                    "treating as corruption, quarantining. (%s)",
+                    sqlite_mtime - hnsw_mtime,
+                    seg_dir,
+                    err_summary,
+                )
+                # Do NOT continue — fall through to the rename/quarantine block.
+            else:
+                logger.info(
+                    "HNSW mtime gap %.0fs on %s exceeds threshold but segment "
+                    "metadata and payload size are intact — flush-lag, not "
+                    "corruption. Leaving in place.",
+                    sqlite_mtime - hnsw_mtime,
+                    seg_dir,
+                )
+                continue
 
         stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         target = f"{seg_dir}.drift-{stamp}"
@@ -531,10 +608,20 @@ def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> lis
                 f"link_lists.bin/data_level0.bin ratio {payload_ratio:.1f}x "
                 f"exceeds {_HNSW_LINK_TO_DATA_MAX_RATIO:.1f}x"
             )
+        elif sq_errors:
+            reason = (
+                f"sqlite {sqlite_mtime - hnsw_mtime:.0f}s newer than HNSW, "
+                f"SQLite integrity errors: {sq_errors[:3]}"
+            )
+        elif count_diverged:
+            reason = (
+                f"sqlite {sqlite_mtime - hnsw_mtime:.0f}s newer than HNSW, "
+                f"HNSW element count {hnsw_cnt} vs SQLite count {sqlite_cnt}"
+            )
         else:
             reason = (
                 f"sqlite {sqlite_mtime - hnsw_mtime:.0f}s newer than HNSW "
-                "and integrity check failed"
+                "and metadata sniff-test failed"
             )
 
         try:
@@ -1201,6 +1288,34 @@ def _sqlite_wing_room_counts(
         wing_rooms[wing][room] += int(n)
         total += int(n)
     return total, wing_rooms
+
+
+def _sqlite_embedding_count_for_segment(palace_path: str, segment_id: str) -> Optional[int]:
+    """Count embeddings in chroma.sqlite3 for a specific VECTOR segment UUID.
+
+    Used by :func:`quarantine_stale_hnsw` to cross-check the HNSW
+    ``id_to_label`` count against the SQLite ground truth for exactly
+    the segment under examination, without needing to resolve its
+    collection name first.
+
+    Returns ``None`` when the palace DB is absent, unreadable, or the
+    segment UUID is not found.
+    """
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM embeddings WHERE segment_id = ?",
+                (segment_id,),
+            ).fetchone()
+            return int(row[0]) if row and row[0] is not None else None
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
 
 
 def _pin_hnsw_threads(collection) -> None:
