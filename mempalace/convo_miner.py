@@ -17,6 +17,7 @@ from datetime import datetime
 from collections import defaultdict
 
 from .normalize import normalize
+from .secret_redact import redact_secrets
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
@@ -351,13 +352,20 @@ def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extr
                 if extract_mode == "general":
                     room_counts_delta[chunk_room] += 1
                 drawer_id = f"drawer_{wing}_{chunk_room}_{hashlib.sha256((source_file + str(chunk['chunk_index'])).encode()).hexdigest()[:24]}"
-                batch_docs.append(chunk["content"])
+                # Strip credentials before the chunk is embedded. Transcripts
+                # routinely contain real secrets (a service-account JSON echoed
+                # to a shell, an auth header in a curl command), and once a
+                # chunk lands in the vector store the secret is durable: it
+                # persists on disk, is returned by search, and is copied into
+                # every export and backup.
+                content = redact_secrets(chunk["content"])
+                batch_docs.append(content)
                 batch_ids.append(drawer_id)
                 batch_metas.append(
                     {
                         "wing": wing,
                         "room": chunk_room,
-                        "hall": _detect_hall_cached(chunk["content"]),
+                        "hall": _detect_hall_cached(content),
                         "source_file": source_file,
                         "chunk_index": chunk["chunk_index"],
                         "added_by": agent,
