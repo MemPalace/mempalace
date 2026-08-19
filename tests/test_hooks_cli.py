@@ -20,6 +20,7 @@ from mempalace.hooks_cli import (
     _extract_recent_messages,
     _get_mine_targets,
     _hooks_daemon_enabled,
+    _is_harness_boilerplate,
     _log,
     _maybe_auto_ingest,
     _mempalace_python,
@@ -254,6 +255,168 @@ def test_extract_recent_messages_skips_commands(tmp_path):
     msgs = _extract_recent_messages(str(transcript))
     assert len(msgs) == 1
     assert msgs[0] == "real msg"
+
+
+def test_extract_recent_messages_skips_harness_boilerplate(tmp_path):
+    """Harness-injected role=user text must not become the checkpoint summary."""
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            {
+                "message": {
+                    "role": "user",
+                    "content": "<local-command-caveat>Caveat: the messages below...",
+                }
+            },
+            {
+                "message": {
+                    "role": "user",
+                    "content": "<task-notification>\n<task-id>abc</task-id>\n",
+                }
+            },
+            {
+                "message": {
+                    "role": "user",
+                    "content": "[SYSTEM NOTIFICATION - NOT USER INPUT] background task done",
+                }
+            },
+            {
+                "message": {
+                    "role": "user",
+                    "content": "Base directory for this skill: /skills/example",
+                }
+            },
+            {"message": {"role": "user", "content": "why is wake-up showing old drawers"}},
+        ],
+    )
+    assert _extract_recent_messages(str(transcript)) == ["why is wake-up showing old drawers"]
+
+
+def test_extract_recent_messages_skips_boilerplate_in_list_content(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            {
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "<task-notification>done</...>"}],
+                }
+            },
+            {
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "ship the fix"}],
+                }
+            },
+        ],
+    )
+    assert _extract_recent_messages(str(transcript)) == ["ship the fix"]
+
+
+def test_extract_recent_messages_skips_boilerplate_in_codex_format(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "[SYSTEM NOTIFICATION - NOT USER INPUT] agent finished",
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "review the diff"},
+            },
+        ],
+    )
+    assert _extract_recent_messages(str(transcript)) == ["review the diff"]
+
+
+def test_extract_recent_messages_keeps_text_mentioning_a_marker_word(tmp_path):
+    """Only the literal wrappers are filtered, not ordinary talk about them."""
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": "the task notification arrived late"}}],
+    )
+    assert _extract_recent_messages(str(transcript)) == ["the task notification arrived late"]
+
+
+def test_extract_recent_messages_keeps_long_message_quoting_a_wrapper(tmp_path):
+    """Regression: a wrapper quoted deep in genuine prose is not boilerplate.
+
+    Taken from a real transcript: a 7.7k-character message that discusses how
+    background events arrive, quoting the literal tag around 5k characters in.
+    Matching the marker anywhere threw the whole message away even though the
+    first 200 characters, the only part the checkpoint keeps, are pure prose.
+    """
+    real_text = (
+        "the deck should keep a persistent watcher instead of polling, so arm one "
+        "now with persistent true and let it idle between runs. "
+    )
+    real_text += "Padding out the body the way a long design message runs on. " * 90
+    real_text += "Its events arrive as <task-notification> messages and wake this loop."
+    assert len(real_text) > 5000
+    assert real_text.index("<task-notification>") > 5000
+
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(transcript, [{"message": {"role": "user", "content": real_text}}])
+
+    msgs = _extract_recent_messages(str(transcript))
+    assert len(msgs) == 1
+    assert msgs[0].startswith("the deck should keep a persistent watcher")
+
+
+def test_extract_recent_messages_skips_additional_harness_wrappers(tmp_path):
+    """Wrappers seen leading real transcripts but missing from the first pass."""
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            {"message": {"role": "user", "content": "<local-command-stdout>Set model to opus"}},
+            {"message": {"role": "user", "content": "<command-name>/dira</command-name>"}},
+            {"message": {"role": "user", "content": "[Request interrupted by user for tool use]"}},
+            {
+                "message": {
+                    "role": "user",
+                    "content": "[Image: original 2880x1458, displayed at 2000x1013.]",
+                }
+            },
+            {"message": {"role": "user", "content": "now wire the checkpoint to the deck"}},
+        ],
+    )
+    assert _extract_recent_messages(str(transcript)) == ["now wire the checkpoint to the deck"]
+
+
+def test_is_harness_boilerplate_is_anchored_to_the_message_opening():
+    """The unit contract: a leading wrapper is boilerplate, a quote is not."""
+    assert _is_harness_boilerplate("<system-reminder>do the thing</system-reminder>")
+    assert _is_harness_boilerplate("   \n <task-notification>done</task-notification>")
+    assert not _is_harness_boilerplate("x" * 400 + "<system-reminder>quoted</system-reminder>")
+
+
+def test_is_harness_boilerplate_keeps_a_wrapper_quoted_inside_the_kept_window():
+    """A quote at offset 20 is inside the 200 characters the checkpoint keeps.
+
+    Bounding the match to a leading window instead of anchoring it is not
+    enough: this message's wrapper sits well inside that window, and every
+    character of it is text the checkpoint would store. Position, not
+    proximity, is what separates an injection from prose about one.
+    """
+    quoted = (
+        "The harness sends <task-notification> blocks to wake the loop, so the "
+        "stop hook has to ignore them when it composes the recent line."
+    )
+    offset = quoted.index("<task-notification>")
+    assert 0 < offset < 200 and len(quoted) < 200  # entirely inside the kept window
+    assert not _is_harness_boilerplate(quoted)
+
+    # ...and the same wrapper genuinely opening the message is still caught.
+    assert _is_harness_boilerplate("<task-notification>" + quoted)
 
 
 def test_extract_recent_messages_missing_file():
