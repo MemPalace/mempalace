@@ -1909,23 +1909,27 @@ def _tool_status_via_sqlite() -> dict:
 
 
 def _sqlite_taxonomy():
-    """Fast wing→room tally straight from ``chroma.sqlite3`` (#1748 / #1379).
+    """Fast wing→room tally from the backend's sqlite metadata (#1748 / #1379).
 
     Returns ``(total, {wing: {room: count}})`` or ``None`` to signal the
-    caller to fall back to the ChromaDB client pagination path. ``None`` means
-    a non-chroma backend, a missing/unbootstrapped palace, or a sqlite error —
-    exactly the cases ``backends.chroma._sqlite_wing_room_counts`` already
-    handles for the CLI ``miner.status()``. The point is to answer the
-    overview tools from the relational metadata without cold-loading the HNSW
-    index, which costs tens of seconds per call on large palaces and is what
-    times them out under the MCP host limit.
+    caller to fall back to the collection pagination path. ``None`` means
+    an unsupported backend, a missing/unbootstrapped palace, or a sqlite error.
+    Chroma reads ``chroma.sqlite3`` so status does not cold-load HNSW.
+    sqlite_exact reads ``sqlite_exact.sqlite3`` with one ``json_extract``
+    GROUP BY so status does not page every metadata row.
     """
-    if not _is_chroma_backend():
-        return None
+    counts = None
     try:
-        from .backends.chroma import _sqlite_wing_room_counts
+        if _is_chroma_backend():
+            from .backends.chroma import _sqlite_wing_room_counts
 
-        counts = _sqlite_wing_room_counts(_config.palace_path, _config.collection_name)
+            counts = _sqlite_wing_room_counts(_config.palace_path, _config.collection_name)
+        elif _selected_backend_name() == "sqlite_exact":
+            from .backends.sqlite_exact import sqlite_wing_room_counts
+
+            counts = sqlite_wing_room_counts(_config.palace_path, _config.collection_name)
+        else:
+            return None
     except Exception:
         logger.debug("sqlite taxonomy fast path failed; falling back", exc_info=True)
         return None

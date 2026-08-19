@@ -3,6 +3,9 @@
 This backend is intentionally simple and local-first. It is a correctness
 backend, not a high-throughput ANN backend: vectors are stored as float32
 blobs and query uses exact cosine distance over the matching collection.
+Unfiltered query() ranks from the embedding column only (vectorized numpy),
+hydrates the top-k documents afterwards, and caches the matrix on the
+long-lived handle so a hub does not re-read every blob on the next search.
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ from .base import (
     PalaceNotFoundError,
     PalaceRef,
     QueryResult,
+    UnsupportedCapabilityError,
     UnsupportedFilterError,
     _IncludeSpec,
 )
@@ -210,6 +214,122 @@ def _matches_where(meta: dict, where: Optional[dict]) -> bool:
     return True
 
 
+_FACET_FIELD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_CACHED_META_KEYS = frozenset({"wing", "room", "source_file"})
+
+
+def _where_uses_only_cached_keys(where: Optional[dict]) -> bool:
+    """True when ``where`` can be evaluated against the cached wing/room/source_file."""
+    if not where:
+        return True
+    if not isinstance(where, dict):
+        return False
+    if list(where.keys()) == ["$and"]:
+        return all(_where_uses_only_cached_keys(child) for child in (where["$and"] or []))
+    for key, expected in where.items():
+        if key.startswith("$") or key not in _CACHED_META_KEYS or isinstance(expected, dict):
+            return False
+    return True
+
+
+def _equality_where_sql(where: Optional[dict]) -> Optional[tuple[str, list]]:
+    """Push equality / ``$and``-of-equality filters into SQL, else ``None``.
+
+    ``None`` means the filter needs the Python ``_matches_where`` path
+    (``$or``, comparisons, ``$contains``, non-identifier keys).
+    """
+    if not where:
+        return "1=1", []
+    if not isinstance(where, dict):
+        return None
+    if list(where.keys()) == ["$and"]:
+        clauses = []
+        params: list = []
+        for child in where["$and"] or []:
+            part = _equality_where_sql(child)
+            if part is None:
+                return None
+            sql, child_params = part
+            clauses.append(f"({sql})")
+            params.extend(child_params)
+        return (" AND ".join(clauses) if clauses else "1=1"), params
+    clauses = []
+    params = []
+    for key, expected in where.items():
+        if key.startswith("$") or isinstance(expected, dict) or not _FACET_FIELD_RE.match(key):
+            return None
+        clauses.append(f"json_extract(metadata_json, '$.{key}') = ?")
+        params.append(expected)
+    return (" AND ".join(clauses) if clauses else "1=1"), params
+
+
+def _cosine_distances(mat: np.ndarray, query: np.ndarray) -> np.ndarray:
+    """Exact cosine distance (1 - cos) for every row of ``mat`` vs ``query``."""
+    q = np.asarray(query, dtype=np.float32)
+    if mat.size == 0:
+        return np.zeros((0,), dtype=np.float32)
+    q_norm = float(np.linalg.norm(q))
+    norms = np.linalg.norm(mat, axis=1)
+    denom = norms * q_norm
+    dots = mat @ q
+    cos = np.zeros(dots.shape, dtype=np.float32)
+    np.divide(dots, denom, out=cos, where=denom > 0)
+    np.clip(cos, -1.0, 1.0, out=cos)
+    return 1.0 - cos
+
+
+def sqlite_wing_room_counts(
+    palace_path: str, collection_name: str
+) -> Optional[tuple[int, dict[str, dict[str, int]]]]:
+    """Tally drawers by wing/room from ``sqlite_exact.sqlite3`` without paging.
+
+    Returns ``(total, {wing: {room: count}})`` or ``None`` when the read
+    cannot be trusted. ``None``/missing wing-or-room values are stored as
+    ``"?"`` so ``mcp_server._sqlite_taxonomy`` can map them to ``"unknown"``.
+    """
+    db_path = os.path.join(palace_path, _DB_FILENAME)
+    if not os.path.isfile(db_path):
+        return None
+    try:
+        db_uri = Path(db_path).resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(db_uri, uri=True)
+        try:
+            conn.execute("PRAGMA busy_timeout=2000")
+            row = conn.execute(
+                "SELECT id FROM collections WHERE name = ?",
+                (collection_name,),
+            ).fetchone()
+            if row is None:
+                return None
+            collection_id = int(row[0])
+            total_row = conn.execute(
+                "SELECT COUNT(*) FROM documents WHERE collection_id = ?",
+                (collection_id,),
+            ).fetchone()
+            total = int(total_row[0]) if total_row and total_row[0] is not None else 0
+            wing_rooms: dict[str, dict[str, int]] = {}
+            for wing, room, n in conn.execute(
+                """
+                SELECT json_extract(metadata_json, '$.wing'),
+                       json_extract(metadata_json, '$.room'),
+                       COUNT(*)
+                FROM documents
+                WHERE collection_id = ?
+                GROUP BY 1, 2
+                """,
+                (collection_id,),
+            ):
+                wkey = "?" if wing is None else str(wing)
+                rkey = "?" if room is None else str(room)
+                dest = wing_rooms.setdefault(wkey, {})
+                dest[rkey] = dest.get(rkey, 0) + int(n)
+            return total, wing_rooms
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+
 def _matches_where_document(document: str, where_document: Optional[dict]) -> bool:
     if not where_document:
         return True
@@ -267,12 +387,23 @@ class _SQLiteExactHandle:
         # never see, so the backend must reopen once those files appear.
         self.immutable = immutable
         self.closed = False
+        # collection_id -> (ids, float32 matrix, mini-metadata). Filled lazily
+        # by query() so a long-lived hub does not re-read every embedding blob
+        # on the next search. Mini-metadata is wing/room/source_file for
+        # in-memory equality filters. Cleared on any write.
+        self._vector_cache: dict[int, tuple[list[str], np.ndarray, list[dict]]] = {}
 
 
 class SQLiteExactCollection(BaseCollection):
-    def __init__(self, handle: _SQLiteExactHandle, collection_name: str):
+    def __init__(
+        self,
+        handle: _SQLiteExactHandle,
+        collection_name: str,
+        backend: Optional[SQLiteExactBackend] = None,
+    ):
         self._handle = handle
         self._collection_name = collection_name
+        self._backend = backend
         self._closed = False
 
     def _ensure_open(self) -> None:
@@ -310,6 +441,8 @@ class SQLiteExactCollection(BaseCollection):
                 raise
             else:
                 self._handle.conn.commit()
+                if write:
+                    self._handle._vector_cache.clear()
             finally:
                 cur.close()
 
@@ -599,38 +732,53 @@ class SQLiteExactCollection(BaseCollection):
         outer_metas: list[list[dict]] = []
         outer_dists: list[list[float]] = []
         outer_embeds: list[list[list[float]]] = []
+        n_results = max(0, int(n_results))
 
         with self._cursor() as cur:
             collection_id = self._collection_id(cur)
             expected_dim = self._collection_dimension(cur, collection_id)
-            rows = self._rows(cur, where=where, where_document=where_document)
-            row_vectors = [(row, _decode_array(row["embedding"])) for row in rows]
+            ids, mat = self._rank_vectors(
+                cur, collection_id, where=where, where_document=where_document
+            )
 
-        for query_vector in query_embeddings:
-            q = _as_vector_array(query_vector)
-            if expected_dim is not None and int(q.size) != expected_dim:
-                raise DimensionMismatchError(
-                    f"sqlite_exact collection {self._collection_name!r} expects "
-                    f"embedding dimension {expected_dim}, got {int(q.size)}"
-                )
-            q_norm = float(np.linalg.norm(q))
-            scored = []
-            for row, vec in row_vectors:
-                if vec is None or vec.size != q.size:
+            for query_vector in query_embeddings:
+                q = _as_vector_array(query_vector)
+                if expected_dim is not None and int(q.size) != expected_dim:
+                    raise DimensionMismatchError(
+                        f"sqlite_exact collection {self._collection_name!r} expects "
+                        f"embedding dimension {expected_dim}, got {int(q.size)}"
+                    )
+                if mat.size == 0 or n_results == 0:
+                    outer_ids.append([])
+                    outer_docs.append([])
+                    outer_metas.append([])
+                    outer_dists.append([])
+                    if spec.embeddings:
+                        outer_embeds.append([])
                     continue
-                denom = q_norm * float(np.linalg.norm(vec))
-                cos = 0.0 if denom <= 0 else float(np.dot(q, vec) / denom)
-                distance = 1.0 - max(-1.0, min(1.0, cos))
-                scored.append((distance, row, vec))
-            scored.sort(key=lambda item: item[0])
-            top = scored[:n_results]
-
-            outer_ids.append([row["id"] for _, row, _ in top])
-            outer_docs.append([row["document"] for _, row, _ in top] if spec.documents else [])
-            outer_metas.append([row["metadata"] for _, row, _ in top] if spec.metadatas else [])
-            outer_dists.append([float(dist) for dist, _, _ in top] if spec.distances else [])
-            if spec.embeddings:
-                outer_embeds.append([vec.astype(float).tolist() for _, _, vec in top])
+                if mat.shape[1] != q.size:
+                    raise DimensionMismatchError(
+                        f"sqlite_exact collection {self._collection_name!r} expects "
+                        f"embedding dimension {int(mat.shape[1])}, got {int(q.size)}"
+                    )
+                dist = _cosine_distances(mat, q)
+                k = min(n_results, int(dist.size))
+                order = np.argsort(dist, kind="mergesort")[:k]
+                top_ids = [ids[int(i)] for i in order]
+                docs_by_id: dict[str, str] = {}
+                metas_by_id: dict[str, dict] = {}
+                if spec.documents or spec.metadatas:
+                    docs_by_id, metas_by_id = self._hydrate(cur, collection_id, top_ids, spec)
+                outer_ids.append(top_ids)
+                outer_docs.append(
+                    [docs_by_id.get(doc_id, "") for doc_id in top_ids] if spec.documents else []
+                )
+                outer_metas.append(
+                    [metas_by_id.get(doc_id, {}) for doc_id in top_ids] if spec.metadatas else []
+                )
+                outer_dists.append([float(dist[i]) for i in order] if spec.distances else [])
+                if spec.embeddings:
+                    outer_embeds.append([mat[int(i)].astype(float).tolist() for i in order])
 
         return QueryResult(
             ids=outer_ids,
@@ -639,6 +787,111 @@ class SQLiteExactCollection(BaseCollection):
             distances=outer_dists,
             embeddings=outer_embeds if spec.embeddings else None,
         )
+
+    def _rank_vectors(
+        self,
+        cur,
+        collection_id: int,
+        *,
+        where,
+        where_document,
+    ) -> tuple[list[str], np.ndarray]:
+        """Load (ids, embedding matrix) for exact cosine ranking.
+
+        The full embedding matrix is cached on the handle after the first
+        scan so later searches — filtered or not — do not re-read blobs.
+        Equality filters then restrict by id; other filters fall back to
+        ``_rows`` only to decide membership.
+        """
+        _validate_where(where)
+        _validate_where(where_document)
+        expected = self._collection_dimension(cur, collection_id)
+        empty = np.zeros((0, expected or 0), dtype=np.float32)
+        cached = self._handle._vector_cache.get(collection_id)
+        if cached is None:
+            cached = self._load_all_vectors(cur, collection_id, expected)
+            self._handle._vector_cache[collection_id] = cached
+        ids, mat, metas = cached
+        if not where and not where_document:
+            return ids, mat
+        if mat.size == 0:
+            return ids, mat
+        if where_document or not _where_uses_only_cached_keys(where):
+            wanted = {
+                row["id"] for row in self._rows(cur, where=where, where_document=where_document)
+            }
+            keep = [i for i, doc_id in enumerate(ids) if doc_id in wanted]
+        else:
+            keep = [i for i, meta in enumerate(metas) if _matches_where(meta, where)]
+        if not keep:
+            return [], empty if mat.size == 0 else np.zeros((0, mat.shape[1]), dtype=np.float32)
+        idx = np.array(keep, dtype=np.intp)
+        return [ids[i] for i in keep], mat[idx]
+
+    def _load_all_vectors(
+        self, cur, collection_id: int, expected: Optional[int]
+    ) -> tuple[list[str], np.ndarray, list[dict]]:
+        rows = cur.execute(
+            """
+            SELECT id, embedding,
+                   json_extract(metadata_json, '$.wing'),
+                   json_extract(metadata_json, '$.room'),
+                   json_extract(metadata_json, '$.source_file')
+            FROM documents
+            WHERE collection_id = ?
+            ORDER BY rowid
+            """,
+            (collection_id,),
+        ).fetchall()
+        ids: list[str] = []
+        vecs: list[np.ndarray] = []
+        metas: list[dict] = []
+        for doc_id, blob, wing, room, source_file in rows:
+            vec = _decode_array(blob)
+            if vec is None:
+                continue
+            if expected is not None and vec.size != expected:
+                continue
+            ids.append(doc_id)
+            vecs.append(vec)
+            meta = {}
+            if wing is not None:
+                meta["wing"] = wing
+            if room is not None:
+                meta["room"] = room
+            if source_file is not None:
+                meta["source_file"] = source_file
+            metas.append(meta)
+        if not vecs:
+            return ids, np.zeros((0, expected or 0), dtype=np.float32), metas
+        return ids, np.stack(vecs), metas
+
+    def _hydrate(self, cur, collection_id: int, ids: list[str], spec) -> tuple[dict, dict]:
+        docs: dict[str, str] = {}
+        metas: dict[str, dict] = {}
+        if not ids:
+            return docs, metas
+        cols = ["id"]
+        if spec.documents:
+            cols.append("document")
+        if spec.metadatas:
+            cols.append("metadata_json")
+        for start in range(0, len(ids), 900):
+            chunk = ids[start : start + 900]
+            placeholders = ",".join("?" for _ in chunk)
+            for row in cur.execute(
+                f"SELECT {', '.join(cols)} FROM documents "
+                f"WHERE collection_id = ? AND id IN ({placeholders})",
+                (collection_id, *chunk),
+            ):
+                doc_id = row[0]
+                idx = 1
+                if spec.documents:
+                    docs[doc_id] = row[idx] or ""
+                    idx += 1
+                if spec.metadatas:
+                    metas[doc_id] = _json_loads(row[idx])
+        return docs, metas
 
     def get(
         self,
@@ -712,6 +965,36 @@ class SQLiteExactCollection(BaseCollection):
                 (collection_id,),
             ).fetchone()
             return int(row[0]) if row else 0
+
+    def facet_counts(
+        self,
+        field: str,
+        where: Optional[dict] = None,
+        limit: int = 1000,
+    ) -> dict[str, int]:
+        _validate_where(where)
+        if not _FACET_FIELD_RE.match(field):
+            raise UnsupportedCapabilityError(f"facet field {field!r} is not a JSON key")
+        push = _equality_where_sql(where)
+        if push is None:
+            raise UnsupportedCapabilityError("facet_counts does not support local-only filters")
+        extra_sql, params = push
+        with self._cursor() as cur:
+            collection_id = self._collection_id(cur)
+            rows = cur.execute(
+                f"""
+                SELECT json_extract(metadata_json, '$.{field}') AS k, COUNT(*)
+                FROM documents
+                WHERE collection_id = ?
+                  AND json_extract(metadata_json, '$.{field}') IS NOT NULL
+                  AND ({extra_sql})
+                GROUP BY 1
+                ORDER BY 2 DESC, 1
+                LIMIT ?
+                """,
+                (collection_id, *params, int(limit)),
+            ).fetchall()
+        return {str(key): int(count) for key, count in rows if key is not None}
 
     def lexical_search(self, *, query: str, n_results: int = 10, where: Optional[dict] = None):
         _validate_where(where)
@@ -872,6 +1155,7 @@ class SQLiteExactBackend(BaseBackend):
             "supports_embeddings_passthrough",
             "supports_embeddings_out",
             "supports_metadata_filters",
+            "supports_metadata_facets",
             "supports_lexical_search",
             "local_mode",
         }
@@ -1101,7 +1385,7 @@ class SQLiteExactBackend(BaseBackend):
                         (collection_name, _utcnow()),
                     )
                     handle.conn.commit()
-        return SQLiteExactCollection(handle, collection_name)
+        return SQLiteExactCollection(handle, collection_name, backend=self)
 
     @staticmethod
     def _normalize_args(args, kwargs):

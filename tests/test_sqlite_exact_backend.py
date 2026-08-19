@@ -1,5 +1,6 @@
 import math
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -986,3 +987,197 @@ def test_concurrent_first_open_single_connection_no_leak(tmp_path, monkeypatch):
     backend.close()
     with pytest.raises(sqlite3.ProgrammingError):
         created[0].execute("SELECT 1")
+
+
+def test_sqlite_exact_backend_advertises_supports_metadata_facets():
+    assert "supports_metadata_facets" in SQLiteExactBackend.capabilities
+
+
+def test_sqlite_exact_collection_exposes_backend(tmp_path):
+    backend, col = _collection(tmp_path)
+    assert col._backend is backend
+    from mempalace.backends.embedding_wrapper import EmbeddingCollection
+
+    wrapped = EmbeddingCollection(col)
+    assert wrapped._backend is backend
+    assert "supports_metadata_facets" in wrapped._backend.capabilities
+
+
+def test_sqlite_exact_facet_counts(tmp_path):
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["1", "2", "3", "4"],
+        documents=["a", "b", "c", "d"],
+        metadatas=[
+            {"wing": "alpha"},
+            {"wing": "alpha"},
+            {"wing": "beta"},
+            {"wing": "gamma"},
+        ],
+        embeddings=[[1, 0], [1, 0], [1, 0], [1, 0]],
+    )
+    assert col.facet_counts("wing") == {
+        "alpha": 2,
+        "beta": 1,
+        "gamma": 1,
+    }
+
+
+def test_sqlite_exact_facet_counts_where(tmp_path):
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["1", "2", "3"],
+        documents=["a", "b", "c"],
+        metadatas=[
+            {"wing": "engineering", "room": "backend"},
+            {"wing": "engineering", "room": "frontend"},
+            {"wing": "design", "room": "ux"},
+        ],
+        embeddings=[[1, 0], [1, 0], [1, 0]],
+    )
+    assert col.facet_counts("room", where={"wing": "engineering"}) == {
+        "backend": 1,
+        "frontend": 1,
+    }
+
+
+def test_sqlite_exact_facet_counts_rejects_local_filters(tmp_path):
+    _backend, col = _collection(tmp_path)
+    with pytest.raises(UnsupportedCapabilityError):
+        col.facet_counts(
+            "room",
+            where={"$or": [{"wing": "a"}, {"wing": "b"}]},
+        )
+
+
+def test_sqlite_exact_facet_counts_ignores_missing_metadata(tmp_path):
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["1", "2", "3"],
+        documents=["a", "b", "c"],
+        metadatas=[
+            {"wing": "alpha"},
+            {"wing": "beta"},
+            {},
+        ],
+        embeddings=[[1, 0], [1, 0], [1, 0]],
+    )
+    assert col.facet_counts("wing") == {"alpha": 1, "beta": 1}
+
+
+def test_sqlite_exact_facet_counts_empty_collection(tmp_path):
+    _backend, col = _collection(tmp_path)
+    assert col.facet_counts("wing") == {}
+
+
+def test_sqlite_exact_query_unfiltered_does_not_load_documents_for_ranking(tmp_path):
+    """Unfiltered query ranks from id+embedding only, then hydrates top-k."""
+    _backend, col = _collection(tmp_path)
+    _seed(col, 6)
+
+    statements = []
+    conn = col._handle.conn
+    conn.set_trace_callback(statements.append)
+    try:
+        result = col.query(
+            query_embeddings=[[5.0, 1.0]],
+            n_results=2,
+            include=["documents", "metadatas", "distances"],
+        )
+    finally:
+        conn.set_trace_callback(None)
+
+    assert result.ids[0][0] == "d5"
+    ranking = [
+        s
+        for s in statements
+        if "FROM documents" in s and "embedding" in s and "ORDER BY rowid" in s
+    ]
+    assert ranking, statements
+    for sql in ranking:
+        select_list = sql.split("FROM documents", 1)[0]
+        assert "embedding" in select_list
+        # Ranking may json_extract metadata keys but must not load the
+        # verbatim document column for every row.
+        assert re.search(r"\bdocument\b", select_list) is None
+
+
+def test_sqlite_exact_query_respects_equality_where(tmp_path):
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["keep", "drop"],
+        documents=["keep me", "drop me"],
+        metadatas=[{"wing": "keep"}, {"wing": "drop"}],
+        embeddings=[[1.0, 0.0], [1.0, 0.0]],
+    )
+    ranked = col.query(
+        query_embeddings=[[1.0, 0.0]],
+        n_results=5,
+        where={"wing": "keep"},
+        include=["documents", "metadatas", "distances"],
+    )
+    assert ranked.ids[0] == ["keep"]
+    assert ranked.documents[0] == ["keep me"]
+
+
+def test_sqlite_exact_query_where_uses_cached_matrix(tmp_path):
+    """After the first scan, equality filters slice the cached matrix."""
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["keep", "drop"],
+        documents=["keep me", "drop me"],
+        metadatas=[{"wing": "keep"}, {"wing": "drop"}],
+        embeddings=[[1.0, 0.0], [0.0, 1.0]],
+    )
+    col.query(query_embeddings=[[1.0, 0.0]], n_results=2)
+    ranked = col.query(
+        query_embeddings=[[1.0, 0.0]],
+        n_results=5,
+        where={"wing": "keep"},
+        include=["documents"],
+    )
+    assert ranked.ids[0] == ["keep"]
+    assert ranked.documents[0] == ["keep me"]
+
+
+def test_sqlite_exact_query_cache_invalidates_on_add(tmp_path):
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["old"],
+        documents=["old"],
+        metadatas=[{}],
+        embeddings=[[0.0, 1.0]],
+    )
+    first = col.query(query_embeddings=[[1.0, 0.0]], n_results=1)
+    assert first.ids[0] == ["old"]
+
+    col.add(
+        ids=["new"],
+        documents=["new"],
+        metadatas=[{}],
+        embeddings=[[1.0, 0.0]],
+    )
+    second = col.query(query_embeddings=[[1.0, 0.0]], n_results=1)
+    assert second.ids[0] == ["new"]
+
+
+def test_sqlite_exact_wing_room_counts(tmp_path):
+    from mempalace.backends.sqlite_exact import sqlite_wing_room_counts
+
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["1", "2", "3"],
+        documents=["a", "b", "c"],
+        metadatas=[
+            {"wing": "alpha", "room": "notes"},
+            {"wing": "alpha", "room": "code"},
+            {"wing": "beta", "room": "notes"},
+        ],
+        embeddings=[[1, 0], [1, 0], [1, 0]],
+    )
+
+    total, wing_rooms = sqlite_wing_room_counts(str(tmp_path), "mempalace_drawers")
+    assert total == 3
+    assert wing_rooms["alpha"]["notes"] == 1
+    assert wing_rooms["alpha"]["code"] == 1
+    assert wing_rooms["beta"]["notes"] == 1
