@@ -255,6 +255,186 @@ def _hnsw_creation_metadata(options: Optional[dict]) -> dict:
     return md
 
 
+def _caller_vector_schema(options: Optional[dict]):
+    """Build an embedding-function-free schema for caller vectors."""
+    opts = options if isinstance(options, dict) else {}
+
+    def option_int(
+        name: str,
+        default: int,
+    ) -> int:
+        value = opts.get(name)
+        return default if value is None else int(value)
+
+    hnsw_options: dict[str, Any] = {
+        "num_threads": option_int(
+            "num_threads",
+            1,
+        ),
+        "batch_size": option_int(
+            "batch_size",
+            _HNSW_WRITE_DEFAULTS["hnsw:batch_size"],
+        ),
+        "sync_threshold": option_int(
+            "sync_threshold",
+            _HNSW_WRITE_DEFAULTS["hnsw:sync_threshold"],
+        ),
+    }
+
+    for option in (
+        "ef_construction",
+        "max_neighbors",
+    ):
+        if opts.get(option) is not None:
+            hnsw_options[option] = int(opts[option])
+
+    return chromadb.Schema().create_index(
+        config=chromadb.VectorIndexConfig(
+            embedding_function=None,
+            hnsw=chromadb.HnswIndexConfig(**hnsw_options),
+            space=str(opts.get("hnsw_space") or "cosine"),
+        )
+    )
+
+
+def _collection_vector_index_config(
+    collection,
+):
+    """Return Chroma's live #embedding vector config, if available."""
+    try:
+        values = collection.schema.keys.get("#embedding")
+        vector_index = values.float_list.vector_index
+
+        if vector_index is None:
+            return None
+
+        return vector_index.config
+    except (
+        AttributeError,
+        KeyError,
+        TypeError,
+    ):
+        return None
+
+
+def _caller_vector_embedding_sources(
+    collection,
+) -> list[str]:
+    """Return active or unverifiable Chroma embedding sources."""
+    sources: list[str] = []
+    missing = object()
+
+    client_embedding_function = getattr(
+        collection,
+        "_embedding_function",
+        missing,
+    )
+
+    if client_embedding_function is missing:
+        sources.append("client-unavailable")
+    elif client_embedding_function is not None:
+        sources.append("client")
+
+    configuration = getattr(
+        collection,
+        "configuration",
+        missing,
+    )
+
+    if not isinstance(
+        configuration,
+        dict,
+    ):
+        sources.append("configuration-unavailable")
+    elif configuration.get("embedding_function") is not None:
+        sources.append("configuration")
+
+    vector_config = _collection_vector_index_config(collection)
+
+    if vector_config is None:
+        sources.append("schema-unavailable")
+    elif (
+        getattr(
+            vector_config,
+            "embedding_function",
+            None,
+        )
+        is not None
+    ):
+        sources.append("schema")
+
+    return sources
+
+
+def _require_caller_vector_collection(
+    collection,
+) -> None:
+    """Fail closed unless every live Chroma embedding source is disabled."""
+    sources = _caller_vector_embedding_sources(collection)
+
+    if not sources:
+        return
+
+    raise ValueError(
+        "caller-vector mode requires an "
+        "embedding-function-free Chroma collection; "
+        "active or unverifiable sources: "
+        f"{', '.join(sources)}. "
+        "Create a new caller-vector collection or rebuild "
+        "this collection with an EF-free schema."
+    )
+
+
+def _read_collection_schema(
+    connection,
+    collection_name: str,
+) -> Optional[dict]:
+    """Read a collection's persisted schema_str when supported."""
+    columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(collections)").fetchall()
+    }
+
+    if "schema_str" not in columns:
+        return None
+
+    row = connection.execute(
+        """
+        SELECT schema_str
+        FROM collections
+        WHERE name = ?
+        """,
+        (collection_name,),
+    ).fetchone()
+
+    if not row or not row[0]:
+        return None
+
+    try:
+        schema = json.loads(row[0])
+    except (
+        TypeError,
+        json.JSONDecodeError,
+    ):
+        return None
+
+    return schema if isinstance(schema, dict) else None
+
+
+def _schema_hnsw_config(
+    schema: Optional[dict],
+) -> Optional[dict]:
+    """Return the persisted #embedding HNSW configuration."""
+    try:
+        hnsw = schema["keys"]["#embedding"]["float_list"]["vector_index"]["config"].get("hnsw")
+    except (
+        KeyError,
+        TypeError,
+    ):
+        return None
+
+    return hnsw if isinstance(hnsw, dict) else None
+
+
 # Below this size, data_level0.bin is too small for a meaningful HNSW graph.
 # Used by _hnsw_link_lists_is_usable_for_payload (empty link_lists is fine
 # when data is trivially small) and _missing_dimensionality_appears_recoverable
@@ -715,73 +895,119 @@ _HNSW_DIVERGENCE_FRACTION = 0.10
 _HNSW_PERSISTENT_DIVERGENCE_GRACE_SECONDS = 300.0
 
 
-def _read_sync_threshold(palace_path: str, collection_name: str) -> int:
-    """Return the ``hnsw:sync_threshold`` for a collection, or 1000 default.
+def _read_sync_threshold(
+    palace_path: str,
+    collection_name: str,
+) -> int:
+    """Read sync_threshold from legacy metadata or schema_str."""
+    db_path = os.path.join(
+        palace_path,
+        "chroma.sqlite3",
+    )
 
-    The configured sync_threshold drives chromadb's HNSW flush cadence —
-    larger values mean fewer, bigger flushes (less index-bloat risk per
-    PR #1191) but also larger steady-state lag between
-    ``index_metadata.pickle`` and the live sqlite count. The divergence
-    probe scales its tolerance to ``2 × sync_threshold`` so that lag is
-    not mistaken for corruption.
-
-    Falls back to 1000 (chromadb's own default) if the collection has no
-    explicit setting — matches what older mempalace palaces were created
-    with before PR #1191.
-    """
-    db_path = os.path.join(palace_path, "chroma.sqlite3")
     if not os.path.isfile(db_path):
         return 1000
+
     try:
-        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+        connection = sqlite3.connect(
+            sqlite_read_uri(db_path),
+            uri=True,
+        )
+
         try:
-            cur = conn.cursor()
-            cur.execute(
-                """
-                SELECT cm.int_value
-                FROM collection_metadata cm
-                JOIN collections c ON cm.collection_id = c.id
-                WHERE c.name = ? AND cm.key = 'hnsw:sync_threshold'
-                """,
-                (collection_name,),
-            )
-            row = cur.fetchone()
+            try:
+                row = connection.execute(
+                    """
+                    SELECT cm.int_value
+                    FROM collection_metadata cm
+                    JOIN collections c
+                      ON cm.collection_id = c.id
+                    WHERE c.name = ?
+                      AND cm.key = 'hnsw:sync_threshold'
+                    """,
+                    (collection_name,),
+                ).fetchone()
+            except sqlite3.Error:
+                row = None
+
             if row and row[0] is not None:
                 return int(row[0])
+
+            hnsw = _schema_hnsw_config(
+                _read_collection_schema(
+                    connection,
+                    collection_name,
+                )
+            )
+
+            if hnsw is not None and hnsw.get("sync_threshold") is not None:
+                return int(hnsw["sync_threshold"])
+
             return 1000
         finally:
-            conn.close()
+            connection.close()
     except Exception:
-        logger.debug("_read_sync_threshold failed", exc_info=True)
+        logger.debug(
+            "_read_sync_threshold failed",
+            exc_info=True,
+        )
         return 1000
 
 
-def _collection_has_sync_threshold_metadata(palace_path: str, collection_name: str) -> bool:
-    """Return True when the collection explicitly stores hnsw:sync_threshold."""
+def _collection_has_sync_threshold_metadata(
+    palace_path: str,
+    collection_name: str,
+) -> bool:
+    """Return True when metadata or schema stores sync_threshold."""
+    db_path = os.path.join(
+        palace_path,
+        "chroma.sqlite3",
+    )
 
-    db_path = os.path.join(palace_path, "chroma.sqlite3")
     if not os.path.isfile(db_path):
         return False
 
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        connection = sqlite3.connect(
+            sqlite_read_uri(db_path),
+            uri=True,
+        )
+
         try:
-            row = conn.execute(
-                """
-                SELECT 1
-                  FROM collection_metadata cm
-                  JOIN collections c ON cm.collection_id = c.id
-                 WHERE c.name = ?
-                   AND cm.key = 'hnsw:sync_threshold'
-                 LIMIT 1
-                """,
-                (collection_name,),
-            ).fetchone()
-            return row is not None
+            try:
+                row = connection.execute(
+                    """
+                    SELECT 1
+                    FROM collection_metadata cm
+                    JOIN collections c
+                      ON cm.collection_id = c.id
+                    WHERE c.name = ?
+                      AND cm.key = 'hnsw:sync_threshold'
+                    LIMIT 1
+                    """,
+                    (collection_name,),
+                ).fetchone()
+            except sqlite3.Error:
+                row = None
+
+            if row is not None:
+                return True
+
+            hnsw = _schema_hnsw_config(
+                _read_collection_schema(
+                    connection,
+                    collection_name,
+                )
+            )
+
+            return hnsw is not None and "sync_threshold" in hnsw
         finally:
-            conn.close()
+            connection.close()
     except Exception:
-        logger.debug("_collection_has_sync_threshold_metadata failed", exc_info=True)
+        logger.debug(
+            "_collection_has_sync_threshold_metadata failed",
+            exc_info=True,
+        )
         return False
 
 
@@ -1678,6 +1904,9 @@ class ChromaCollection(BaseCollection):
         return [_sanitize(d) if isinstance(d, str) else d for d in documents]
 
     def add(self, *, documents, ids, metadatas=None, embeddings=None):
+        if getattr(self, "_require_embeddings", False) and embeddings is None:
+            raise ValueError("caller-vector collection requires explicit embeddings")
+
         kwargs: dict[str, Any] = {
             "documents": self._sanitize_documents_for_chromadb(documents),
             "ids": ids,
@@ -1691,6 +1920,9 @@ class ChromaCollection(BaseCollection):
             self._collection.add(**kwargs)
 
     def upsert(self, *, documents, ids, metadatas=None, embeddings=None):
+        if getattr(self, "_require_embeddings", False) and embeddings is None:
+            raise ValueError("caller-vector collection requires explicit embeddings")
+
         kwargs: dict[str, Any] = {
             "documents": self._sanitize_documents_for_chromadb(documents),
             "ids": ids,
@@ -1711,8 +1943,16 @@ class ChromaCollection(BaseCollection):
         metadatas=None,
         embeddings=None,
     ):
+        if (
+            getattr(self, "_require_embeddings", False)
+            and documents is not None
+            and embeddings is None
+        ):
+            raise ValueError("caller-vector collection requires explicit embeddings")
+
         if documents is None and metadatas is None and embeddings is None:
             raise ValueError("update requires at least one of documents, metadatas, embeddings")
+
         kwargs: dict[str, Any] = {"ids": ids}
         if documents is not None:
             kwargs["documents"] = self._sanitize_documents_for_chromadb(documents)
@@ -1737,6 +1977,9 @@ class ChromaCollection(BaseCollection):
         where_document=None,
         include=None,
     ) -> QueryResult:
+        if getattr(self, "_require_embeddings", False) and query_texts is not None:
+            raise ValueError("caller-vector collection requires query_embeddings")
+
         _validate_where(where)
         _validate_where(where_document)
 
@@ -2121,19 +2364,39 @@ class ChromaCollection(BaseCollection):
 
     @property
     def distance_metric(self) -> str:
-        """Report this collection's actual space from ``hnsw:space``.
+        """Report HNSW space from legacy metadata or live schema."""
+        metadata_space = str(
+            self.metadata.get(
+                "hnsw:space",
+                "",
+            )
+            or ""
+        ).lower()
 
-        MemPalace sets ``hnsw:space=cosine`` on every creation path, so a
-        healthy palace reports ``"cosine"``. When the key is absent, empty, or
-        an unrecognized value, the collection is genuinely using Chroma's HNSW
-        default — **L2** (Euclidean) — because cosine was never set on it. We
-        report ``"l2"`` in that case so core ranking maps the distances
-        correctly; reporting ``"cosine"`` here would reintroduce the
-        floor-every-result-to-zero misranking this property exists to fix.
-        """
-        space = str(self.metadata.get("hnsw:space", "") or "").lower()
-        if space in ("cosine", "l2", "ip"):
-            return space
+        if metadata_space in (
+            "cosine",
+            "l2",
+            "ip",
+        ):
+            return metadata_space
+
+        vector_config = _collection_vector_index_config(self._collection)
+        schema_space = str(
+            getattr(
+                vector_config,
+                "space",
+                "",
+            )
+            or ""
+        ).lower()
+
+        if schema_space in (
+            "cosine",
+            "l2",
+            "ip",
+        ):
+            return schema_space
+
         return "l2"
 
     # ------------------------------------------------------------------
@@ -2431,6 +2694,7 @@ class ChromaBackend(BaseBackend):
         """
         palace_ref, collection_name, create, options = _normalize_get_collection_args(args, kwargs)
         self.require_namespace_support(palace_ref)
+        caller_vectors = bool(options and options.get("caller_vectors", False))
 
         palace_path = palace_ref.local_path
         if palace_path is None:
@@ -2448,18 +2712,37 @@ class ChromaBackend(BaseBackend):
 
         client = self._client(palace_path)
 
-        ef = self._resolve_embedding_function()
-        ef_kwargs = {"embedding_function": ef} if ef is not None else {}
+        if caller_vectors:
+            # Passing None explicitly prevents Chroma's client default EF.
+            ef_kwargs = {
+                "embedding_function": None,
+            }
+        else:
+            ef = self._resolve_embedding_function()
+            ef_kwargs = (
+                {
+                    "embedding_function": ef,
+                }
+                if ef is not None
+                else {}
+            )
 
         if create:
             try:
                 collection = client.get_collection(collection_name, **ef_kwargs)
             except _ChromaNotFoundError:
-                collection = client.create_collection(
-                    collection_name,
-                    metadata=_hnsw_creation_metadata(options),
-                    **ef_kwargs,
-                )
+                if caller_vectors:
+                    collection = client.create_collection(
+                        collection_name,
+                        schema=_caller_vector_schema(options),
+                        embedding_function=None,
+                    )
+                else:
+                    collection = client.create_collection(
+                        collection_name,
+                        metadata=_hnsw_creation_metadata(options),
+                        **ef_kwargs,
+                    )
             except ValueError as e:
                 explanation = self._explain_ef_mismatch(e, palace_path)
                 if explanation:
@@ -2475,8 +2758,16 @@ class ChromaBackend(BaseBackend):
                 if explanation:
                     raise ValueError(explanation) from e
                 raise
-        _pin_hnsw_threads(collection)
-        return ChromaCollection(collection, palace_path=palace_path)
+        if caller_vectors:
+            _require_caller_vector_collection(collection)
+        else:
+            _pin_hnsw_threads(collection)
+        wrapped = ChromaCollection(
+            collection,
+            palace_path=palace_path,
+        )
+        wrapped._require_embeddings = caller_vectors
+        return wrapped
 
     def close_palace(self, palace) -> None:
         """Drop cached handles for ``palace`` and release its SQLite file lock.
