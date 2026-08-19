@@ -1276,7 +1276,7 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
     normalized = transcript_path.replace("\\", "/")
 
     # 2. Fallback — encoded project folder under .claude/projects/
-    match = re.search(r"/\.claude/projects/-([^/]+)", normalized)
+    match = re.search(r"/\.claude/projects/(?:-|[a-zA-Z]--)([^/]+)", normalized)
     if match:
         encoded = match.group(1)
         # Strip platform user-home prefix so the wing isn't dominated by

@@ -370,6 +370,35 @@ def test_stop_hook_derives_wing_from_transcript_path(tmp_path):
     )
 
 
+def test_stop_hook_derives_wing_from_transcript_path_windows(tmp_path):
+    """When transcript path looks like a Windows Claude Code path, wing is derived from it."""
+    project_dir = tmp_path / ".claude" / "projects" / "D--Code-BLM-blm-cadastral-returns-tools"
+    project_dir.mkdir(parents=True)
+    transcript = project_dir / "session.jsonl"
+
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
+    )
+
+    save_result = {"count": 15, "themes": []}
+
+    with patch("mempalace.hooks_cli._save_diary_direct", return_value=save_result) as mock_save:
+        _capture_hook_output(
+            hook_stop,
+            {"session_id": "test", "stop_hook_active": False, "transcript_path": str(transcript)},
+            state_dir=tmp_path,
+        )
+
+    mock_save.assert_called_once_with(
+        str(transcript),
+        "test",
+        wing="wing_code_blm_blm_cadastral_returns_tools",
+        toast=False,
+        agent_name="claude",
+    )
+
+
 def test_stop_hook_tracks_save_point(tmp_path):
     transcript = tmp_path / "t.jsonl"
     _write_transcript(
