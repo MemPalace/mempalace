@@ -832,7 +832,7 @@ def handle_request(request):
             if "entry" not in tool_args or tool_args["entry"] is None:
                 tool_args["entry"] = content_val
         try:
-            with _write_stall_watch(tool_name):
+            with _writer_inflight(tool_name), _write_stall_watch(tool_name):
                 result = _decorate_mcp_tool_result(
                     tool_name, TOOLS[tool_name]["handler"](**tool_args)
                 )
@@ -1178,6 +1178,81 @@ def _start_write_stall_watchdog() -> None:
                 os._exit(_WRITE_STALL_EXIT_CODE)
 
     t = threading.Thread(target=_watchdog, name="mcp-write-stall-watchdog", daemon=True)
+    t.start()
+
+
+def _writer_idle_release_secs() -> float:
+    """Writer-lease idle-release threshold in seconds (0 = disabled)."""
+    raw = os.environ.get(_MCP_WRITER_IDLE_MINUTES_ENV, "")
+    if raw:
+        try:
+            minutes = float(raw)
+        except ValueError:
+            return _MCP_WRITER_IDLE_MINUTES_DEFAULT * 60
+        return max(0.0, minutes) * 60
+    return _MCP_WRITER_IDLE_MINUTES_DEFAULT * 60
+
+
+@contextlib.contextmanager
+def _writer_inflight(tool_name: str):
+    """Track chroma-touching tool calls so the idle-release watchdog never
+    drops the writer lease (and its storage handles) under a running call.
+
+    Counts every tool except the HTTP lock-free set (logstream, knowledge
+    graph and process-local tools, none of which touch Chroma); only
+    completed calls to _MUTATING_TOOLS refresh the write-idle clock."""
+    global _MCP_WRITER_INFLIGHT, _last_mutating_time
+    if tool_name in _HTTP_LOCK_FREE_TOOLS:
+        yield
+        return
+    with _MCP_WRITER_STATE_LOCK:
+        _MCP_WRITER_INFLIGHT += 1
+    try:
+        yield
+    finally:
+        with _MCP_WRITER_STATE_LOCK:
+            _MCP_WRITER_INFLIGHT -= 1
+            if tool_name in _MUTATING_TOOLS:
+                _last_mutating_time = time.monotonic()
+
+
+def _maybe_release_idle_writer(idle_secs: float) -> bool:
+    """Release the writer lease if held, write-idle past idle_secs, and no
+    chroma-touching call is in flight. Returns True when released."""
+    with _MCP_WRITER_STATE_LOCK:
+        if _MCP_WRITER_LOCK_CM is None or _MCP_WRITER_INFLIGHT > 0:
+            return False
+        idle = time.monotonic() - _last_mutating_time
+        if idle < idle_secs:
+            return False
+        logger.info(
+            "writer lease idle for %.1f min (limit %.1f min); releasing so "
+            "peer sessions can write.",
+            idle / 60,
+            idle_secs / 60,
+        )
+        _release_mcp_writer_lock_unlocked()
+        return True
+
+
+def _start_writer_idle_release_watchdog() -> None:
+    """Drop an idle writer lease so peer sessions stop seeing read-only
+    refusals. Set MEMPALACE_MCP_WRITER_IDLE_MINUTES=0 to disable (lease held
+    until process exit)."""
+    timeout = _writer_idle_release_secs()
+    if timeout <= 0:
+        return
+    check_interval = min(30.0, timeout / 4)
+
+    def _watchdog() -> None:
+        while True:
+            time.sleep(check_interval)
+            try:
+                _maybe_release_idle_writer(timeout)
+            except Exception:
+                logger.exception("writer idle-release check failed")
+
+    t = threading.Thread(target=_watchdog, name="mcp-writer-idle-release", daemon=True)
     t.start()
 
 

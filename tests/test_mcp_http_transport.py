@@ -638,6 +638,7 @@ def _patch_http_startup(monkeypatch, events):
     monkeypatch.setattr(mcp, "_refresh_vector_disabled_flag", lambda: None)
     monkeypatch.setattr(mcp, "_start_idle_exit_watchdog", lambda: None)
     monkeypatch.setattr(mcp, "_start_write_stall_watchdog", lambda: None)
+    monkeypatch.setattr(mcp, "_start_writer_idle_release_watchdog", lambda: None)
     monkeypatch.setattr(mcp, "_serve_http", lambda host, port: events.append("serve"))
 
 
