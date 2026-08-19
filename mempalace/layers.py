@@ -87,28 +87,47 @@ class Layer1:
 
     MAX_DRAWERS = 15  # at most 15 moments in wake-up
     MAX_CHARS = 3200  # hard cap on total L1 text (~800 tokens)
-    MAX_SCAN = 2000  # don't scan more than this for L1 generation
+    MAX_SCAN = 2000  # size of the candidate window pulled for L1 generation
 
     def __init__(self, palace_path: str = None, wing: str = None):
         cfg = MempalaceConfig()
         self.palace_path = palace_path or cfg.palace_path
         self.wing = wing
 
-    def generate(self) -> str:
-        """Pull top drawers from ChromaDB and format as compact L1 text."""
-        try:
-            col = _get_collection(self.palace_path, create=False)
-        except Exception:
-            return "## L1 — No palace found. Run: mempalace mine <dir>"
+    def _fetch_candidates(self, col) -> tuple[list, list]:
+        """Fetch the L1 candidate window: the MAX_SCAN most recently filed drawers.
 
-        # Fetch all drawers in batches to avoid SQLite variable limit (~999)
+        Uses the backend's ``get_recent`` capability, which pushes
+        ``ORDER BY filed_at DESC LIMIT n`` into storage where the backend can
+        (pgvector today) and otherwise falls back to the scan-then-sort default
+        in ``BaseCollection``. That default is what this method used to do
+        inline, so backends without pushdown behave exactly as before.
+
+        Third-party collections predating ``get_recent`` (or any backend error)
+        degrade to the inline paged scan below rather than failing wake-up.
+        """
+        where = {"wing": self.wing} if self.wing else None
+        getter = getattr(col, "get_recent", None)
+        if getter is not None:
+            try:
+                result = getter(
+                    limit=self.MAX_SCAN,
+                    where=where,
+                    order_field="filed_at",
+                    include=["documents", "metadatas"],
+                )
+                return list(result.documents or []), list(result.metadatas or [])
+            except Exception:
+                pass  # capability missing or backend hiccup — page it manually
+
+        # Fetch in batches to avoid SQLite variable limit (~999)
         _BATCH = 500
         docs, metas = [], []
         offset = 0
         while True:
             kwargs = {"include": ["documents", "metadatas"], "limit": _BATCH, "offset": offset}
-            if self.wing:
-                kwargs["where"] = {"wing": self.wing}
+            if where:
+                kwargs["where"] = where
             try:
                 batch = col.get(**kwargs)
             except Exception:
@@ -122,6 +141,16 @@ class Layer1:
             offset += len(batch_docs)
             if len(batch_docs) < _BATCH or len(docs) >= self.MAX_SCAN:
                 break
+        return docs, metas
+
+    def generate(self) -> str:
+        """Pull top drawers from the palace and format as compact L1 text."""
+        try:
+            col = _get_collection(self.palace_path, create=False)
+        except Exception:
+            return "## L1 — No palace found. Run: mempalace mine <dir>"
+
+        docs, metas = self._fetch_candidates(col)
 
         if not docs:
             return "## L1 — No memories yet."
@@ -136,6 +165,10 @@ class Layer1:
         # newest first. This keeps importance as the primary key for the day a
         # scoring pass populates it, while making the "recent filing" half of
         # the promise true today with data we already have.
+        # The candidate window this sorts is now the MAX_SCAN *most recently
+        # filed* drawers rather than the first MAX_SCAN the backend happened to
+        # hand back, so on a palace larger than MAX_SCAN the newest drawers are
+        # actually in the running (#1630's known limitation).
         scored = []
         for doc, meta in zip(docs, metas):
             meta = meta or {}
