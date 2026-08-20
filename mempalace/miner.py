@@ -289,7 +289,7 @@ def load_config(project_dir: str) -> dict:
             print(f"ERROR: No mempalace.yaml found in {project_dir}")
             print(f"Run: mempalace init {project_dir}")
             sys.exit(1)
-    with open(config_path) as f:
+    with open(config_path, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
