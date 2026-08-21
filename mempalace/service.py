@@ -364,6 +364,7 @@ def run_sync(payload: dict[str, Any]) -> dict[str, Any]:
     print(f"  Kept:           {report['kept']}")
     print(f"  Gitignored:     {report['gitignored']}  {removed_suffix}")
     print(f"  Missing:        {report['missing']}  {removed_suffix}")
+    print(f"  Unreachable:    {report['unreachable']}  (kept)")
     print(f"  No source:      {report['no_source']}  (kept)")
     print(f"  Out of scope:   {report['out_of_scope']}  (kept)")
 

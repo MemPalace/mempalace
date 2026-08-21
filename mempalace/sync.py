@@ -12,6 +12,7 @@ Usage:
 """
 
 import logging
+import os
 from collections import defaultdict
 from pathlib import Path
 from typing import Callable, Optional, TypedDict
@@ -34,6 +35,7 @@ class SyncReport(TypedDict):
     kept: int
     gitignored: int
     missing: int
+    unreachable: int
     no_source: int
     out_of_scope: int
     removed_drawers: int
@@ -96,12 +98,37 @@ def _is_registry_row(meta: dict, drawer_id: str) -> bool:
     return False
 
 
+def _looks_unmounted(path: Path) -> bool:
+    """Return True if ``path`` appears to live on a not-currently-mounted volume.
+
+    A source file on a volume that is configured as a mount point but not
+    mounted right now fails ``stat`` with ``ENOENT`` — the same errno as a
+    genuinely deleted file. The distinguishing signal is an ancestor directory
+    that (a) exists, (b) is a mount point, and (c) is not the filesystem root
+    (the root is always a mount point and must never count).
+    """
+    cursor = path.parent
+    try:
+        while True:
+            if cursor.exists():
+                return cursor != Path(cursor.anchor) and os.path.ismount(cursor)
+            if cursor.parent == cursor:
+                return False
+            cursor = cursor.parent
+    except OSError:
+        # If we cannot walk the ancestors, fall back to the documented
+        # "ENOENT means deleted" behaviour rather than silently disabling
+        # the prune feature.
+        return False
+
+
 def _classify_drawer(
     meta: dict, matcher_cache: dict, project_roots: list, drawer_id: str = ""
 ) -> str:
     """Classify a drawer by its source_file metadata.
 
-    Returns one of: kept, gitignored, missing, no_source, out_of_scope.
+    Returns one of: kept, gitignored, missing, unreachable, no_source,
+    out_of_scope. Only ``gitignored`` and ``missing`` are pruned on apply.
     """
     # Defensive: main loop filters registry rows; this guards direct callers.
     if _is_registry_row(meta, drawer_id):
@@ -120,8 +147,40 @@ def _classify_drawer(
     if root is None:
         return "out_of_scope"
 
-    if not src.exists():
+    # ``Path.exists()`` conflates every stat failure with "gone", which made
+    # sync prune drawers whose source was merely unreachable (a path component
+    # that is a regular file, an unreadable directory, or a volume that is
+    # configured but not mounted). Stat the file directly and only treat a
+    # true ENOENT as a deletion.
+    try:
+        src.stat()
+    except FileNotFoundError:
+        # ENOENT — the file (or an ancestor) is absent. This is normally the
+        # "deleted" case we prune for, but an unmounted volume also surfaces
+        # as ENOENT even though the data still exists. Never prune those.
+        if _looks_unmounted(src):
+            logger.warning("sync: keeping drawer, source is on an unmounted volume: %s", src)
+            return "unreachable"
         return "missing"
+    except NotADirectoryError:
+        # A path component is a regular file, not a directory. The source may
+        # still exist; pruning here would destroy data we could not verify.
+        logger.warning(
+            "sync: keeping drawer, source path has a non-directory component: %s", src
+        )
+        return "unreachable"
+    except PermissionError:
+        # EACCES/EPERM — we cannot prove the file is gone, so keep it.
+        logger.warning("sync: keeping drawer, source is not readable: %s", src)
+        return "unreachable"
+    except OSError as exc:
+        # ELOOP, EIO, ENAMETOOLONG, ... — unverifiable, keep.
+        logger.warning(
+            "sync: keeping drawer, source could not be stat'ed (errno %s): %s",
+            exc.errno,
+            src,
+        )
+        return "unreachable"
 
     matchers = _ancestor_matchers(src, root, matcher_cache)
     if matchers and is_gitignored(src, matchers, is_dir=False):
@@ -238,6 +297,7 @@ def sync_palace(
         "kept": 0,
         "gitignored": 0,
         "missing": 0,
+        "unreachable": 0,
         "no_source": 0,
         "out_of_scope": 0,
     }
