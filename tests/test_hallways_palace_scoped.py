@@ -18,7 +18,7 @@ from unittest.mock import MagicMock, patch
 
 with patch.dict("sys.modules", {"chromadb": MagicMock()}):
     from mempalace import hallways as hallways_mod
-    from mempalace.config import DEFAULT_PALACE_PATH, MempalaceConfig
+    from mempalace.config import MempalaceConfig
 
 
 # =============================================================================
@@ -28,8 +28,13 @@ with patch.dict("sys.modules", {"chromadb": MagicMock()}):
 
 class TestHallwayFileResolution:
     def test_default_hallway_file_is_sibling_of_default_palace(self):
+        # The default palace now lives at ``<config_dir>/palace`` because the
+        # config dir follows the XDG Base Directory spec (#46), so its hallway
+        # sibling resolves to ``<config_dir>/hallways.json``. DEFAULT_PALACE_PATH
+        # is the frozen legacy constant and is no longer the default base, so the
+        # expectation is derived from the resolved ``config_dir`` instead.
         cfg = MempalaceConfig()
-        expected = os.path.join(os.path.dirname(DEFAULT_PALACE_PATH), "hallways.json")
+        expected = os.path.join(cfg.config_dir, "hallways.json")
         assert cfg.hallway_file == expected
         assert hallways_mod._get_hallway_file(cfg) == expected
 
