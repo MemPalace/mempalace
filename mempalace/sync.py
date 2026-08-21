@@ -34,6 +34,7 @@ class SyncReport(TypedDict):
     kept: int
     gitignored: int
     missing: int
+    unreachable: int
     no_source: int
     out_of_scope: int
     removed_drawers: int
@@ -101,7 +102,8 @@ def _classify_drawer(
 ) -> str:
     """Classify a drawer by its source_file metadata.
 
-    Returns one of: kept, gitignored, missing, no_source, out_of_scope.
+    Returns one of: kept, gitignored, missing, unreachable, no_source,
+    out_of_scope. Only ``gitignored`` and ``missing`` are pruned on apply.
     """
     # Defensive: main loop filters registry rows; this guards direct callers.
     if _is_registry_row(meta, drawer_id):
@@ -114,14 +116,58 @@ def _classify_drawer(
     src = Path(source_file)
     if not src.is_absolute():
         return "no_source"
-    src = src.resolve(strict=False)
+
+    # ``resolve(strict=False)`` is not fully exception-free: a symlink loop
+    # raises ``RuntimeError`` up to Python 3.12, and an unencodable path (an
+    # embedded NUL, surrogate escapes) raises ``ValueError``. Neither means the
+    # source was deleted — it means the path cannot be resolved right now — so
+    # keep the drawer instead of ending the whole sync run on the first one.
+    try:
+        src = src.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError) as exc:
+        logger.warning(
+            "sync: keeping drawer, source path cannot be resolved (%s): %s",
+            type(exc).__name__,
+            source_file,
+        )
+        return "unreachable"
 
     root = _resolve_project_root(src, project_roots)
     if root is None:
         return "out_of_scope"
 
-    if not src.exists():
+    # ``Path.exists()`` conflates every stat failure with "gone", which made
+    # sync prune drawers whose source was merely unreachable (a path component
+    # that is a regular file, or an unreadable directory). Stat the file
+    # directly and only treat a true ENOENT as a deletion.
+    try:
+        src.stat()
+    except FileNotFoundError:
+        # ENOENT — the file (or an ancestor) is absent. This is the "deleted"
+        # case we prune for. Note that an unmounted volume also surfaces as
+        # ENOENT even though the data still exists, and no filesystem call
+        # separates the two (#2320); that case needs corroboration from the
+        # palace's own record rather than a per-file errno.
         return "missing"
+    except NotADirectoryError:
+        # A path component is a regular file, not a directory. The source may
+        # still exist; pruning here would destroy data we could not verify.
+        logger.warning(
+            "sync: keeping drawer, source path has a non-directory component: %s", src
+        )
+        return "unreachable"
+    except PermissionError:
+        # EACCES/EPERM — we cannot prove the file is gone, so keep it.
+        logger.warning("sync: keeping drawer, source is not readable: %s", src)
+        return "unreachable"
+    except (OSError, ValueError) as exc:
+        # ELOOP, EIO, ENAMETOOLONG, embedded NUL, ... — unverifiable, keep.
+        logger.warning(
+            "sync: keeping drawer, source could not be stat'ed (%s): %s",
+            type(exc).__name__,
+            src,
+        )
+        return "unreachable"
 
     matchers = _ancestor_matchers(src, root, matcher_cache)
     if matchers and is_gitignored(src, matchers, is_dir=False):
@@ -238,6 +284,7 @@ def sync_palace(
         "kept": 0,
         "gitignored": 0,
         "missing": 0,
+        "unreachable": 0,
         "no_source": 0,
         "out_of_scope": 0,
     }

@@ -671,6 +671,7 @@ class TestSyncPalace:
             "kept",
             "gitignored",
             "missing",
+            "unreachable",
             "no_source",
             "out_of_scope",
             "removed_drawers",
@@ -1010,6 +1011,49 @@ class TestSyncPalace:
         assert call_count["n"] == 1, (
             f"cache miss: expected 1 _classify_drawer call (4 cache hits), got {call_count['n']}"
         )
+
+    def test_unreachable_non_directory_component_kept(self, tmp_path):
+        """A source whose path has a regular file as a directory component must
+        classify as 'unreachable' (kept), never 'missing' (pruned)."""
+        from mempalace import sync as sync_mod
+
+        blocker = tmp_path / "file.txt"
+        blocker.write_text("not a directory")
+        source = blocker / "sub.py"  # blocker is a file → stat raises ENOTDIR
+
+        meta = {"source_file": str(source)}
+        result = sync_mod._classify_drawer(meta, {}, [str(tmp_path)], "d1")
+        assert result == "unreachable"
+
+    def test_unreachable_symlink_loop_kept(self, tmp_path):
+        """A symlink loop must classify as 'unreachable' (kept), never end the
+        run. On <=3.12 ``resolve(strict=False)`` raises ``RuntimeError`` before
+        ``stat``; on 3.13+ the loop reaches ``stat`` as ``OSError`` (ELOOP).
+        Either way the drawer must be kept."""
+        import os
+
+        from mempalace import sync as sync_mod
+
+        if os.name == "nt":
+            pytest.skip("symlinks unavailable on Windows")
+
+        loop = tmp_path / "loop"
+        loop.symlink_to(loop)
+        source = loop / "sub.py"  # walking this hits the loop
+
+        meta = {"source_file": str(source)}
+        result = sync_mod._classify_drawer(meta, {}, [str(tmp_path)], "d1")
+        assert result == "unreachable"
+
+    def test_unreachable_unencodable_path_kept(self, tmp_path):
+        """A source_file the platform cannot encode (embedded NUL) must classify
+        as 'unreachable' (kept), never end the run."""
+        from mempalace import sync as sync_mod
+
+        bad = str(tmp_path / "sub.py") + "\x00tail"
+        meta = {"source_file": bad}
+        result = sync_mod._classify_drawer(meta, {}, [str(tmp_path)], "d1")
+        assert result == "unreachable"
 
     def test_closet_batch_purge_single_call(self, synced_world, monkeypatch):
         """Batched $in closet purge: one delete() call across all removable
@@ -1430,6 +1474,7 @@ class TestServiceRunSyncReport:
             "kept": 1,
             "gitignored": 2,
             "missing": 1,
+            "unreachable": 0,
             "no_source": 1,
             "out_of_scope": 1,
             "removed_drawers": 0,
