@@ -1025,6 +1025,36 @@ class TestSyncPalace:
         result = sync_mod._classify_drawer(meta, {}, [str(tmp_path)], "d1")
         assert result == "unreachable"
 
+    def test_unreachable_symlink_loop_kept(self, tmp_path):
+        """A symlink loop must classify as 'unreachable' (kept), never end the
+        run. On <=3.12 ``resolve(strict=False)`` raises ``RuntimeError`` before
+        ``stat``; on 3.13+ the loop reaches ``stat`` as ``OSError`` (ELOOP).
+        Either way the drawer must be kept."""
+        import os
+
+        from mempalace import sync as sync_mod
+
+        if os.name == "nt":
+            pytest.skip("symlinks unavailable on Windows")
+
+        loop = tmp_path / "loop"
+        loop.symlink_to(loop)
+        source = loop / "sub.py"  # walking this hits the loop
+
+        meta = {"source_file": str(source)}
+        result = sync_mod._classify_drawer(meta, {}, [str(tmp_path)], "d1")
+        assert result == "unreachable"
+
+    def test_unreachable_unencodable_path_kept(self, tmp_path):
+        """A source_file the platform cannot encode (embedded NUL) must classify
+        as 'unreachable' (kept), never end the run."""
+        from mempalace import sync as sync_mod
+
+        bad = str(tmp_path / "sub.py") + "\x00tail"
+        meta = {"source_file": bad}
+        result = sync_mod._classify_drawer(meta, {}, [str(tmp_path)], "d1")
+        assert result == "unreachable"
+
     def test_closet_batch_purge_single_call(self, synced_world, monkeypatch):
         """Batched $in closet purge: one delete() call across all removable
         source files, not N. Wraps the real collection so chromadb still

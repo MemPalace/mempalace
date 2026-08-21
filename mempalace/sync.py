@@ -12,7 +12,6 @@ Usage:
 """
 
 import logging
-import os
 from collections import defaultdict
 from pathlib import Path
 from typing import Callable, Optional, TypedDict
@@ -98,30 +97,6 @@ def _is_registry_row(meta: dict, drawer_id: str) -> bool:
     return False
 
 
-def _looks_unmounted(path: Path) -> bool:
-    """Return True if ``path`` appears to live on a not-currently-mounted volume.
-
-    A source file on a volume that is configured as a mount point but not
-    mounted right now fails ``stat`` with ``ENOENT`` — the same errno as a
-    genuinely deleted file. The distinguishing signal is an ancestor directory
-    that (a) exists, (b) is a mount point, and (c) is not the filesystem root
-    (the root is always a mount point and must never count).
-    """
-    cursor = path.parent
-    try:
-        while True:
-            if cursor.exists():
-                return cursor != Path(cursor.anchor) and os.path.ismount(cursor)
-            if cursor.parent == cursor:
-                return False
-            cursor = cursor.parent
-    except OSError:
-        # If we cannot walk the ancestors, fall back to the documented
-        # "ENOENT means deleted" behaviour rather than silently disabling
-        # the prune feature.
-        return False
-
-
 def _classify_drawer(
     meta: dict, matcher_cache: dict, project_roots: list, drawer_id: str = ""
 ) -> str:
@@ -141,7 +116,21 @@ def _classify_drawer(
     src = Path(source_file)
     if not src.is_absolute():
         return "no_source"
-    src = src.resolve(strict=False)
+
+    # ``resolve(strict=False)`` is not fully exception-free: a symlink loop
+    # raises ``RuntimeError`` up to Python 3.12, and an unencodable path (an
+    # embedded NUL, surrogate escapes) raises ``ValueError``. Neither means the
+    # source was deleted — it means the path cannot be resolved right now — so
+    # keep the drawer instead of ending the whole sync run on the first one.
+    try:
+        src = src.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError) as exc:
+        logger.warning(
+            "sync: keeping drawer, source path cannot be resolved (%s): %s",
+            type(exc).__name__,
+            source_file,
+        )
+        return "unreachable"
 
     root = _resolve_project_root(src, project_roots)
     if root is None:
@@ -149,18 +138,16 @@ def _classify_drawer(
 
     # ``Path.exists()`` conflates every stat failure with "gone", which made
     # sync prune drawers whose source was merely unreachable (a path component
-    # that is a regular file, an unreadable directory, or a volume that is
-    # configured but not mounted). Stat the file directly and only treat a
-    # true ENOENT as a deletion.
+    # that is a regular file, or an unreadable directory). Stat the file
+    # directly and only treat a true ENOENT as a deletion.
     try:
         src.stat()
     except FileNotFoundError:
-        # ENOENT — the file (or an ancestor) is absent. This is normally the
-        # "deleted" case we prune for, but an unmounted volume also surfaces
-        # as ENOENT even though the data still exists. Never prune those.
-        if _looks_unmounted(src):
-            logger.warning("sync: keeping drawer, source is on an unmounted volume: %s", src)
-            return "unreachable"
+        # ENOENT — the file (or an ancestor) is absent. This is the "deleted"
+        # case we prune for. Note that an unmounted volume also surfaces as
+        # ENOENT even though the data still exists, and no filesystem call
+        # separates the two (#2320); that case needs corroboration from the
+        # palace's own record rather than a per-file errno.
         return "missing"
     except NotADirectoryError:
         # A path component is a regular file, not a directory. The source may
@@ -173,11 +160,11 @@ def _classify_drawer(
         # EACCES/EPERM — we cannot prove the file is gone, so keep it.
         logger.warning("sync: keeping drawer, source is not readable: %s", src)
         return "unreachable"
-    except OSError as exc:
-        # ELOOP, EIO, ENAMETOOLONG, ... — unverifiable, keep.
+    except (OSError, ValueError) as exc:
+        # ELOOP, EIO, ENAMETOOLONG, embedded NUL, ... — unverifiable, keep.
         logger.warning(
-            "sync: keeping drawer, source could not be stat'ed (errno %s): %s",
-            exc.errno,
+            "sync: keeping drawer, source could not be stat'ed (%s): %s",
+            type(exc).__name__,
             src,
         )
         return "unreachable"
