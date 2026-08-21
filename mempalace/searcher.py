@@ -13,11 +13,14 @@ import functools
 import logging
 import math
 import os
+import hashlib
 import re
 import sqlite3
 from datetime import timedelta
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
+from urllib.request import url2pathname
 
 from .backends import (
     BackendError,
@@ -805,6 +808,7 @@ def _bm25_only_via_sqlite(
     stop_words: frozenset = frozenset(),
     since_dt=None,
     before_dt=None,
+    verify_authority: bool = False,
 ) -> dict:
     """BM25-only search reading drawers directly from chroma.sqlite3.
 
@@ -1007,6 +1011,7 @@ def _bm25_only_via_sqlite(
     # Apply wing/room filters in Python (FTS5 candidates may include
     # entries from other wings).
     candidates = []
+    authority_cache: dict[tuple[str, str, int, int], dict] = {}
     for d in drawers.values():
         meta = d["metadata"]
         if wing and meta.get("wing") != wing:
@@ -1039,6 +1044,9 @@ def _bm25_only_via_sqlite(
                 # multiple chunks. Stripped before this helper returns.
                 "_source_file_full": full_source,
                 "_chunk_index": meta.get("chunk_index"),
+                "authority": resolve_authority_status(
+                    meta, verify=verify_authority, cache=authority_cache
+                ),
             }
         )
 
@@ -1207,6 +1215,93 @@ _CANDIDATE_MERGERS = {
 }
 
 
+def _local_authority_path(uri: str) -> Optional[Path]:
+    """Resolve an absolute path or local file URI without losing escaped characters."""
+    if uri.startswith("file:"):
+        parsed = urlsplit(uri)
+        if parsed.scheme != "file" or parsed.netloc not in {"", "localhost"}:
+            return None
+        return Path(url2pathname(parsed.path)).expanduser()
+    path = Path(uri).expanduser()
+    return path if path.is_absolute() else None
+
+
+def resolve_authority_status(
+    metadata: dict,
+    *,
+    verify: bool = False,
+    cache: Optional[dict[tuple[str, str, int, int], dict]] = None,
+) -> dict:
+    """Return a stable authority envelope for a search hit.
+
+    The PoC deliberately supports only local file authorities. Unknown schemes
+    remain ``unverified`` so retrieval never upgrades an unsupported authority
+    to current by assumption.
+    """
+    uri = str((metadata or {}).get("authority_uri") or "")
+    version = str((metadata or {}).get("authority_version") or "")
+    declared = str((metadata or {}).get("authority_status") or "")
+    result = {"uri": uri, "version": version, "status": declared or "unverified"}
+    if not uri or not version:
+        result["reason"] = "missing_authority" if not uri else "missing_version"
+        return result
+    if declared in {"stale", "superseded", "historical"}:
+        result["reason"] = f"declared_{declared}"
+        return result
+    if not verify:
+        result["status"] = declared or "unverified"
+        result["reason"] = "verification_not_requested"
+        return result
+
+    path = _local_authority_path(uri)
+    if path is None:
+        result["status"] = "unverified"
+        result["reason"] = "unsupported_authority_uri"
+        return result
+    if not path.is_file():
+        result["status"] = "stale"
+        result["reason"] = "authority_missing"
+        return result
+    stat = path.stat()
+    cache_key = (uri, version, stat.st_mtime_ns, stat.st_size)
+    if cache is not None and cache_key in cache:
+        return dict(cache[cache_key])
+    if version.startswith("mtime_ns:"):
+        actual = f"mtime_ns:{stat.st_mtime_ns}"
+    elif version.startswith("sha256:"):
+        actual = f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}"
+    else:
+        result["status"] = "unverified"
+        result["reason"] = "unsupported_authority_version"
+        return result
+    result["actual_version"] = actual
+    result["status"] = "current" if actual == version else "stale"
+    result["reason"] = "authority_matches" if actual == version else "authority_changed"
+    if cache is not None:
+        cache[cache_key] = dict(result)
+    return result
+
+
+def _deduplicate_ranked_hits(hits: list[dict]) -> list[dict]:
+    """Collapse repeated logical hits while preserving distinct source sections."""
+    deduplicated = []
+    seen = set()
+    for hit in hits:
+        source = hit.get("_source_file_full") or hit.get("source_path") or hit.get("source_file")
+        parent = hit.get("_parent_drawer_id") or ""
+        if hit.get("drawer_index") is not None:
+            key = ("hydrated", source, parent, hit.get("drawer_index"))
+        elif source and hit.get("_chunk_index") is not None:
+            key = ("chunk", source, parent, hit.get("_chunk_index"))
+        else:
+            key = ("text", source, hit.get("text"))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduplicated.append(hit)
+    return deduplicated
+
+
 def _validate_candidate_strategy(strategy: str) -> None:
     """Raise ``ValueError`` for unknown strategies.
 
@@ -1292,9 +1387,10 @@ def _finalize_candidate_hits(
             ),
         )
 
-    hits = _hybrid_rank(
+    ranked = _hybrid_rank(
         hits, query, metric=_metric_for_collection(drawers_col), stop_words=stop_words
-    )[:n_results]
+    )
+    hits = _deduplicate_ranked_hits(ranked)[:n_results]
     for h in hits:
         h.pop("_sort_key", None)
         h.pop("_source_file_full", None)
@@ -1381,6 +1477,7 @@ def _window_and_fallback_gate(
     collection_name,
     source_file,
     stop_words: frozenset = frozenset(),
+    verify_authority: bool = False,
 ):
     """Front gate for ``search_memories``: parse the window, route the fallback.
 
@@ -1414,6 +1511,7 @@ def _window_and_fallback_gate(
                 since_dt=since_dt,
                 before_dt=before_dt,
                 stop_words=stop_words,
+                verify_authority=verify_authority,
             ),
         )
     return since_dt, before_dt, active, None
@@ -1449,6 +1547,7 @@ def _vector_disabled_with_window(
     since_dt,
     before_dt,
     stop_words: frozenset = frozenset(),
+    verify_authority: bool = False,
 ) -> dict:
     """Run the BM25-only route and echo the raw window strings.
 
@@ -1467,6 +1566,7 @@ def _vector_disabled_with_window(
         since_dt=since_dt,
         before_dt=before_dt,
         stop_words=stop_words,
+        verify_authority=verify_authority,
     )
     if "filters" in result:
         result["filters"]["since"] = since
@@ -1486,6 +1586,7 @@ def _vector_disabled_search(
     stop_words: frozenset = frozenset(),
     since_dt=None,
     before_dt=None,
+    verify_authority: bool = False,
 ) -> dict:
     try:
         backend_name = resolve_backend_name(palace_path)
@@ -1511,6 +1612,7 @@ def _vector_disabled_search(
         stop_words=stop_words,
         since_dt=since_dt,
         before_dt=before_dt,
+        verify_authority=verify_authority,
     )
 
 
@@ -1663,6 +1765,7 @@ def search_memories(
     candidate_strategy: str = "vector",
     collection_name: str = None,
     lang: Optional[str] = None,
+    verify_authority: bool = False,
 ) -> dict:
     """Programmatic search — returns a dict instead of printing.
 
@@ -1695,6 +1798,8 @@ def search_memories(
             detects a divergence that would segfault chromadb on segment
             load.
         candidate_strategy: How candidates for the hybrid re-rank are gathered.
+        verify_authority: Resolve local-file authority version tokens and mark
+            results current or stale. Disabled by default to keep search cheap.
 
             * ``"vector"`` (default) — preserves historical behavior: top
               ``n_results * 3`` rows from the vector index are the rerank pool.
@@ -1739,6 +1844,7 @@ def search_memories(
         collection_name=collection_name,
         source_file=source_file,
         stop_words=stop_words,
+        verify_authority=verify_authority,
     )
     if short_circuit is not None:
         return short_circuit
@@ -1790,6 +1896,7 @@ def search_memories(
     CLOSET_DISTANCE_CAP = 1.5  # cosine dist > 1.5 = too weak to use as signal
 
     scored: list = []
+    authority_cache: dict[tuple[str, str, int, int], dict] = {}
     drawer_docs = _first_or_empty(drawer_results, "documents")
     stored_drawer_ids = _aligned_query_ids(drawer_results, len(drawer_docs))
     for stored_drawer_id, doc, meta, dist in zip(
@@ -1845,6 +1952,9 @@ def search_memories(
             "_source_file_full": source,
             "_chunk_index": meta.get("chunk_index"),
             "_parent_drawer_id": meta.get("parent_drawer_id"),
+            "authority": resolve_authority_status(
+                meta, verify=verify_authority, cache=authority_cache
+            ),
         }
         if closet_preview:
             entry["closet_preview"] = closet_preview

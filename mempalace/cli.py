@@ -33,6 +33,7 @@ Examples:
 
 import argparse
 import contextlib
+import json
 import os
 import shlex
 import sys
@@ -1058,6 +1059,27 @@ def cmd_sync(args):
     """Prune drawers whose source files are gitignored, deleted, or moved (#1252)."""
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
 
+    changed_set = None
+    manifest_path = getattr(args, "manifest", None)
+    if manifest_path:
+        if not args.dir:
+            print("mempalace: sync --manifest requires a project root argument", file=sys.stderr)
+            sys.exit(2)
+        try:
+            with open(os.path.expanduser(manifest_path), encoding="utf-8") as handle:
+                changed_set = json.load(handle)
+            if not isinstance(changed_set, dict):
+                raise ValueError("manifest must be a JSON object")
+            changed_set = {
+                "changed": changed_set.get("changed") or [],
+                "deleted": changed_set.get("deleted") or [],
+            }
+            if not all(isinstance(value, list) for value in changed_set.values()):
+                raise ValueError("manifest changed/deleted values must be arrays")
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"mempalace: invalid changed-set manifest: {exc}", file=sys.stderr)
+            sys.exit(2)
+
     if getattr(args, "background", False) and not getattr(args, "daemon", False):
         print("mempalace: --background requires --daemon", file=sys.stderr)
         sys.exit(2)
@@ -1069,6 +1091,9 @@ def cmd_sync(args):
             "wing": args.wing,
             "dry_run": args.dry_run,
         }
+        if changed_set is not None:
+            payload["changed_set"] = changed_set
+            payload["agent"] = getattr(args, "agent", "mempalace")
         _submit_daemon_cli_job("sync", payload, args, background=getattr(args, "background", False))
         return
 
@@ -1077,6 +1102,7 @@ def cmd_sync(args):
     from .backends import detect_backend_for_path
     from .palace import _backend_artifact_label, resolve_backend_name
     from .sync import sync_palace
+    from .changed_set import sync_changed_sources
 
     if not os.path.isdir(palace_path):
         print(f"\n  No palace found at {palace_path}")
@@ -1116,6 +1142,21 @@ def cmd_sync(args):
     print(f"{'-' * 55}\n")
 
     try:
+        if changed_set is not None:
+            report = sync_changed_sources(
+                palace_path=palace_path,
+                project_root=project_dirs[0],
+                changed=changed_set["changed"],
+                deleted=changed_set["deleted"],
+                wing=args.wing,
+                agent=getattr(args, "agent", "mempalace"),
+                dry_run=args.dry_run,
+            )
+            print(
+                f"  Changed-set: changed={report['changed']} deleted={report['deleted']} "
+                f"reindexed={report['reindexed']} drawers_added={report['drawers_added']}"
+            )
+            return
         report = sync_palace(
             palace_path=palace_path,
             project_dirs=project_dirs,
@@ -2898,6 +2939,11 @@ def main():
         help="Project root to sync (optional; auto-detects from drawer metadata)",
     )
     p_sync.add_argument("--wing", default=None, help="Limit to one wing")
+    p_sync.add_argument(
+        "--manifest",
+        help="JSON changed-set with project-relative changed/deleted arrays; requires dir",
+    )
+    p_sync.add_argument("--agent", default="mempalace", help="Agent recorded on reindexed drawers")
     p_sync.add_argument(
         "--root",
         action="append",

@@ -9,8 +9,43 @@ import pytest
 
 from _chroma_palace_helper import make_minimal_chroma_sqlite
 
-from mempalace import daemon
-from mempalace import service
+from mempalace import daemon, service
+
+
+@pytest.mark.parametrize("disconnect", [BrokenPipeError, ConnectionResetError])
+def test_json_response_swallows_client_disconnect_without_second_write(disconnect):
+    class _DeadSocket:
+        def __init__(self):
+            self.writes = 0
+
+        def write(self, _body):
+            self.writes += 1
+            raise disconnect("client disconnected")
+
+    class _Handler:
+        def __init__(self):
+            self.wfile = _DeadSocket()
+            self.close_connection = False
+            self.statuses = []
+
+        def send_response(self, status):
+            self.statuses.append(status)
+
+        def send_header(self, *_args):
+            pass
+
+        def end_headers(self):
+            pass
+
+    handler = _Handler()
+
+    written = daemon._json_response(handler, 200, {"ok": True})
+
+    assert written is False
+    assert handler.wfile.writes == 1
+    assert handler.statuses == [200]
+    assert handler.close_connection is True
+
 
 _LOCK_CONTENDER = """
 from mempalace.palace import MineAlreadyRunning, mine_palace_lock
@@ -167,6 +202,27 @@ def test_daemon_holds_local_backend_writer_lease_for_lifetime(tmp_path, monkeypa
         timeout=10,
     )
     assert released.returncode == 0
+
+
+def test_two_independent_clients_enqueue_through_one_writer(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_execute(kind, payload):
+        calls.append((kind, payload["name"]))
+        return {"success": True, "exit_code": 0}
+
+    first, thread, palace, holders = _start_server(tmp_path, monkeypatch, fake_execute)
+    second = daemon.DaemonClient(str(palace))
+    try:
+        job_a = first.submit("mcp_tool", {"name": "agent-a"})
+        job_b = second.submit("mcp_tool", {"name": "agent-b"})
+
+        assert job_a["id"] != job_b["id"]
+        assert first.wait(job_a["id"], timeout=5)["state"] == "succeeded"
+        assert second.wait(job_b["id"], timeout=5)["state"] == "succeeded"
+        assert calls == [("mcp_tool", "agent-a"), ("mcp_tool", "agent-b")]
+    finally:
+        _stop_server(first, thread, holders)
 
 
 def test_submit_job_uses_client_and_waits(monkeypatch, tmp_path):
@@ -908,6 +964,92 @@ def test_failure_that_is_not_a_lease_refusal_stays_terminal(tmp_path, monkeypatc
         _stop_server(client, thread, holders)
 
 
+def test_file_ingress_coalesces_newest_queued_version_and_delete_wins_tie(tmp_path):
+    store = daemon.QueueStore(tmp_path / "queue.sqlite3")
+    first = store.enqueue(
+        "sync",
+        {"changed_set": {"changed": ["src/a.py"], "deleted": []}, "hash": "old"},
+        coalesce_key="project:src/a.py",
+        source_version=10,
+    )
+    newer = store.enqueue(
+        "sync",
+        {"changed_set": {"changed": ["src/a.py"], "deleted": []}, "hash": "new"},
+        coalesce_key="project:src/a.py",
+        source_version=11,
+    )
+    deleted = store.enqueue(
+        "sync",
+        {"changed_set": {"changed": [], "deleted": ["src/a.py"]}},
+        coalesce_key="project:src/a.py",
+        source_version=11,
+        tombstone=True,
+    )
+
+    assert first.id == newer.id == deleted.id
+    queued = store.get(first.id)
+    assert queued.payload["changed_set"]["deleted"] == ["src/a.py"]
+
+
+def test_file_ingress_keeps_one_successor_behind_running_generation(tmp_path):
+    store = daemon.QueueStore(tmp_path / "queue.sqlite3")
+    first = store.enqueue(
+        "sync",
+        {"generation": 1},
+        coalesce_key="project:src/a.py",
+        source_version=1,
+    )
+    assert store.claim_next().id == first.id
+
+    successor = store.enqueue(
+        "sync",
+        {"generation": 2},
+        coalesce_key="project:src/a.py",
+        source_version=2,
+    )
+    latest = store.enqueue(
+        "sync",
+        {"generation": 3},
+        coalesce_key="project:src/a.py",
+        source_version=3,
+    )
+
+    assert successor.id == latest.id
+    assert successor.id != first.id
+    assert store.get(successor.id).payload["generation"] == 3
+
+
+def test_expired_job_lease_is_requeued_and_heartbeat_renews_it(tmp_path, monkeypatch):
+    store = daemon.QueueStore(tmp_path / "queue.sqlite3")
+    job = store.enqueue("sync", {"generation": 1})
+    claimed = store.claim_next()
+    assert claimed.id == job.id
+    assert store.heartbeat(job.id, claimed.lease_token) is True
+
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE jobs SET lease_expires_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00+00:00", job.id),
+        )
+
+    assert store.recover_expired_leases() == 1
+    assert store.get(job.id).state == "queued"
+
+    reclaimed = store.claim_next()
+    assert reclaimed.lease_token != claimed.lease_token
+    assert store.heartbeat(job.id, claimed.lease_token) is False
+    store.finish(
+        job.id,
+        state="succeeded",
+        result={"stale": True},
+        only_if_running=True,
+        lease_token=claimed.lease_token,
+    )
+    still_running = store.get(job.id)
+    assert still_running.state == "running"
+    assert still_running.result is None
+
+
 def test_claim_next_does_not_reclaim_running_job(tmp_path, monkeypatch):
     """The conditional UPDATE (WHERE state='queued') means a job already
     flipped to 'running' cannot be claimed again — the cross-process
@@ -1377,6 +1519,45 @@ def test_safe_defer_swallows_store_errors_and_leaves_the_job_running(tmp_path, m
     monkeypatch.setattr(runtime.store, "defer", _boom)
     runtime._safe_defer(job.id, error={"error_class": daemon.LOCK_REFUSAL_ERROR_CLASS})
     assert runtime.store.get(job.id).state == "running"
+
+
+def test_run_sync_dispatches_changed_set_without_full_scan(tmp_path, monkeypatch):
+    import mempalace.changed_set as changed_set_module
+    from mempalace import service
+
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    make_minimal_chroma_sqlite(palace)
+    project = tmp_path / "project"
+    project.mkdir()
+    captured = {}
+
+    def fake_sync(**kwargs):
+        captured.update(kwargs)
+        return {
+            "changed": 1,
+            "deleted": 1,
+            "ignored": 0,
+            "reindexed": 1,
+            "drawers_added": 2,
+            "dry_run": False,
+        }
+
+    monkeypatch.setattr(changed_set_module, "sync_changed_sources", fake_sync)
+    result = service.run_sync(
+        {
+            "palace_path": str(palace),
+            "dir": str(project),
+            "wing": "demo",
+            "dry_run": False,
+            "changed_set": {"changed": ["a.py"], "deleted": ["old.py"]},
+        }
+    )
+
+    assert result["success"] is True
+    assert captured["project_root"] == str(project)
+    assert captured["changed"] == ["a.py"]
+    assert captured["deleted"] == ["old.py"]
 
 
 # --- post-merge review follow-ups (Copilot review on #1826) ---

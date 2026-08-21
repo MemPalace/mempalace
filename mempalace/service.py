@@ -76,6 +76,8 @@ READ_TOOLS = frozenset(
         "mempalace_list_drawers",
         "mempalace_diary_read",
         "mempalace_memories_filed_away",
+        "mempalace_job_status",
+        "mempalace_get_jobs",
         "mempalace_kg_query",
         "mempalace_kg_stats",
         "mempalace_kg_timeline",
@@ -88,6 +90,8 @@ WRITE_TOOLS = frozenset(
         "mempalace_checkpoint",
         "mempalace_delete_by_source",
         "mempalace_delete_drawer",
+        "mempalace_delete_by_source",
+        "mempalace_supersede_drawer",
         "mempalace_update_drawer",
         "mempalace_diary_write",
         "mempalace_kg_add",
@@ -321,6 +325,34 @@ def run_sync(payload: dict[str, Any]) -> dict[str, Any]:
     project_dirs.extend(os.path.expanduser(str(root)) for root in payload.get("root") or [])
     project_dirs = project_dirs or None
     dry_run = bool(payload.get("dry_run", True))
+    ingress = payload.get("ingress") or {}
+    if ingress and not ingress.get("deleted"):
+        import hashlib
+
+        source = ingress.get("canonical_path")
+        try:
+            stat = os.stat(source)
+            if int(stat.st_mtime_ns) != int(ingress.get("source_version") or 0):
+                return {
+                    "success": False,
+                    "error": "source changed after enqueue; submit its newer generation",
+                    "error_class": "StaleSourceVersion",
+                    "exit_code": 1,
+                }
+            digest = hashlib.sha256()
+            with open(source, "rb") as file_handle:
+                for chunk in iter(lambda: file_handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            ingress = dict(ingress)
+            ingress["content_hash"] = digest.hexdigest()
+            ingress["hash_state"] = "computed_by_worker"
+        except OSError as exc:
+            return {
+                "success": False,
+                "error": f"could not read queued source: {exc}",
+                "error_class": type(exc).__name__,
+                "exit_code": 1,
+            }
 
     print(f"\n{'=' * 55}")
     print("  MemPalace Sync -- Gitignore-aware drawer prune")
@@ -337,9 +369,24 @@ def run_sync(payload: dict[str, Any]) -> dict[str, Any]:
     print(f"{'-' * 55}\n")
 
     try:
+        from .changed_set import sync_changed_sources
         from .sync import sync_palace
         from .wal import _wal_log
 
+        changed_set = payload.get("changed_set")
+        if changed_set is not None:
+            if not project_dirs:
+                raise ValueError("changed-set sync requires a project root")
+            report = sync_changed_sources(
+                palace_path=palace_path,
+                project_root=project_dirs[0],
+                changed=changed_set.get("changed") or [],
+                deleted=changed_set.get("deleted") or [],
+                wing=payload.get("wing"),
+                agent=payload.get("agent") or "mempalace",
+                dry_run=dry_run,
+            )
+            return {"success": True, "report": report, "ingress": ingress, "exit_code": 0}
         report = sync_palace(
             palace_path=palace_path,
             project_dirs=project_dirs,

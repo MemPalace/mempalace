@@ -769,15 +769,18 @@ def _build_date_line_segment(drawer_metas):
     return f"{date_part}:L{line_start}-L{line_end}"
 
 
-def purge_file_closets(closets_col, source_file: str) -> None:
+def purge_file_closets(closets_col, source_file: str, wing: Optional[str] = None) -> None:
     """Delete every closet associated with ``source_file``.
 
     Call this before ``upsert_closet_lines`` on a re-mine so stale topics
     from a prior schema/version don't survive in the closet collection.
     Mirrors the drawer-purge step in process_file().
     """
+    where: dict[str, object] = {"source_file": source_file}
+    if wing:
+        where = {"$and": [{"source_file": source_file}, {"wing": wing}]}
     try:
-        closets_col.delete(where={"source_file": source_file})
+        closets_col.delete(where=where)
     except Exception:
         logger.debug("Closet purge failed for %s", source_file, exc_info=True)
 
@@ -1434,6 +1437,7 @@ def file_already_mined(
     source_file: str,
     check_mtime: bool = False,
     extract_mode: Optional[str] = None,
+    wing: Optional[str] = None,
 ) -> bool:
     """Check if a file has already been filed in the palace.
 
@@ -1486,8 +1490,11 @@ def file_already_mined(
         # been seen so far toward that group's own chunk_total (#21).
         group_counts: dict = {}
         while True:
+            where: dict[str, object] = {"source_file": source_file}
+            if wing:
+                where = {"$and": [{"source_file": source_file}, {"wing": wing}]}
             results = collection.get(
-                where={"source_file": source_file},
+                where=where,
                 limit=1000,
                 offset=offset,
                 include=["metadatas"],

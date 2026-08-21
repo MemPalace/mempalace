@@ -79,6 +79,10 @@ def _lock_defer_backoff_seconds() -> float:
 
 # Override via env for operators; tests patch the module attribute directly.
 LOCK_DEFER_BACKOFF_SECONDS = _lock_defer_backoff_seconds()
+
+
+JOB_LEASE_SECONDS = 30.0
+JOB_HEARTBEAT_SECONDS = 5.0
 MAX_BODY_BYTES = 1 << 20  # 1 MiB cap on request bodies (auth-gated DoS guard)
 SHUTDOWN_DRAIN_SECONDS = 10.0
 # Terminal jobs are kept for diagnostics then pruned so the queue DB (which
@@ -111,6 +115,10 @@ class DaemonError(RuntimeError):
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _lease_deadline() -> str:
+    return (datetime.now(timezone.utc) + timedelta(seconds=JOB_LEASE_SECONDS)).isoformat()
 
 
 def canonical_palace_path(path: str | None = None) -> str:
@@ -256,6 +264,7 @@ class Job:
     result: dict[str, Any] | None
     error: dict[str, Any] | None
     attempts: int
+    lease_token: str | None
 
 
 class QueueStore:
@@ -309,12 +318,30 @@ class QueueStore:
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state, priority)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_dedupe ON jobs(dedupe_key, state)")
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+            for name, ddl in (
+                ("coalesce_key", "TEXT"),
+                ("source_version", "INTEGER"),
+                ("tombstone", "INTEGER NOT NULL DEFAULT 0"),
+                ("heartbeat_at", "TEXT"),
+                ("lease_expires_at", "TEXT"),
+                ("lease_token", "TEXT"),
+            ):
+                if name not in columns:
+                    conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {ddl}")
             # Unique partial index: at most one queued/running job per dedupe_key.
             # Enforces the dedupe invariant across processes (TOCTOU-safe); finished
             # jobs drop out of the index so a later identical enqueue is allowed.
             conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_dedupe_active "
                 "ON jobs(dedupe_key) WHERE state IN ('queued', 'running')"
+            )
+            # A running file event may already have been read by the worker, so
+            # only queued successors coalesce. This permits exactly one newer
+            # generation to wait behind an in-flight generation.
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_coalesce_queued "
+                "ON jobs(coalesce_key) WHERE state = 'queued' AND coalesce_key IS NOT NULL"
             )
         # The queue DB holds verbatim payloads (diary text, source paths) — lock it
         # down to owner-only regardless of the invoking user's umask. The WAL/SHM
@@ -381,12 +408,57 @@ class QueueStore:
             cur = conn.execute(
                 """
                 UPDATE jobs
-                SET state = 'queued', started_at = NULL
+                SET state = 'queued', started_at = NULL, heartbeat_at = NULL,
+                    lease_expires_at = NULL, lease_token = NULL
                 WHERE state = 'running' AND attempts < ?
                 """,
                 (MAX_ATTEMPTS,),
             )
             return int(cur.rowcount or 0)
+
+    def recover_expired_leases(self) -> int:
+        """Requeue retryable jobs whose worker stopped renewing its lease."""
+
+        now = _now()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE jobs
+                SET state = 'failed', finished_at = ?, lease_expires_at = NULL,
+                    error_json = COALESCE(error_json, ?)
+                WHERE state = 'running' AND lease_expires_at < ? AND attempts >= ?
+                """,
+                (
+                    now,
+                    json.dumps(
+                        {"error_class": "LeaseExpired", "message": "job lease expired"},
+                        ensure_ascii=False,
+                    ),
+                    now,
+                    MAX_ATTEMPTS,
+                ),
+            )
+            cur = conn.execute(
+                """
+                UPDATE jobs
+                SET state = 'queued', started_at = NULL, heartbeat_at = NULL,
+                    lease_expires_at = NULL, lease_token = NULL
+                WHERE state = 'running' AND lease_expires_at < ? AND attempts < ?
+                """,
+                (now, MAX_ATTEMPTS),
+            )
+            return int(cur.rowcount or 0)
+
+    def heartbeat(self, job_id: str, lease_token: str) -> bool:
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE jobs SET heartbeat_at = ?, lease_expires_at = ?
+                WHERE id = ? AND state = 'running' AND lease_token = ?
+                """,
+                (_now(), _lease_deadline(), job_id, lease_token),
+            )
+            return cur.rowcount == 1
 
     def enqueue(
         self,
@@ -395,7 +467,19 @@ class QueueStore:
         *,
         dedupe_key: str | None = None,
         priority: int = 0,
+        coalesce_key: str | None = None,
+        source_version: int | None = None,
+        tombstone: bool = False,
     ) -> Job:
+        if coalesce_key:
+            return self.enqueue_coalesced(
+                kind,
+                payload,
+                coalesce_key=coalesce_key,
+                source_version=int(source_version or 0),
+                tombstone=tombstone,
+                priority=priority,
+            )
         payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         with self._lock, self._connect() as conn:
             if dedupe_key:
@@ -451,7 +535,80 @@ class QueueStore:
             row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
             return self._row_to_job(row)
 
+    def enqueue_coalesced(
+        self,
+        kind: str,
+        payload: dict[str, Any],
+        *,
+        coalesce_key: str,
+        source_version: int,
+        tombstone: bool,
+        priority: int = 0,
+    ) -> Job:
+        """Atomically retain the newest queued event for one canonical file.
+
+        A delete wins ties so a stale changed event cannot resurrect a file.
+        A newer version may replace a tombstone, covering delete-then-recreate.
+        Running work is immutable; a single queued successor is coalesced behind it.
+        """
+
+        payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE coalesce_key = ? AND state = 'queued' LIMIT 1",
+                (coalesce_key,),
+            ).fetchone()
+            if row is not None:
+                old_version = int(row["source_version"] or 0)
+                old_tombstone = bool(row["tombstone"])
+                replace = source_version > old_version or (
+                    source_version == old_version and tombstone and not old_tombstone
+                )
+                if replace:
+                    conn.execute(
+                        """
+                        UPDATE jobs
+                        SET kind = ?, payload_json = ?, priority = ?, source_version = ?,
+                            tombstone = ?, created_at = ?
+                        WHERE id = ? AND state = 'queued'
+                        """,
+                        (
+                            kind,
+                            payload_json,
+                            int(priority),
+                            int(source_version),
+                            int(tombstone),
+                            _now(),
+                            row["id"],
+                        ),
+                    )
+                current = conn.execute("SELECT * FROM jobs WHERE id = ?", (row["id"],)).fetchone()
+                return self._row_to_job(current)
+
+            job_id = uuid.uuid4().hex
+            conn.execute(
+                """
+                INSERT INTO jobs (
+                    id, kind, payload_json, state, priority, created_at, attempts,
+                    coalesce_key, source_version, tombstone
+                ) VALUES (?, ?, ?, 'queued', ?, ?, 0, ?, ?, ?)
+                """,
+                (
+                    job_id,
+                    kind,
+                    payload_json,
+                    int(priority),
+                    _now(),
+                    coalesce_key,
+                    int(source_version),
+                    int(tombstone),
+                ),
+            )
+            row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            return self._row_to_job(row)
+
     def claim_next(self, *, exclude: set[str] | None = None) -> Job | None:
+
         # Atomic across processes: the UPDATE only fires if the row is still
         # 'queued'. If two daemon processes SELECT the same row, the first to
         # UPDATE it flips state to 'running' (rowcount=1); the second's UPDATE
@@ -499,14 +656,16 @@ class QueueStore:
             job_id = next((r["id"] for r in candidates if r["id"] not in exclude), None)
             if job_id is None:
                 return None
+            lease_token = uuid.uuid4().hex
             cur = conn.execute(
                 """
                 UPDATE jobs
-                SET state = 'running', started_at = ?, attempts = attempts + 1,
+                SET state = 'running', started_at = ?, heartbeat_at = ?,
+                    lease_expires_at = ?, lease_token = ?, attempts = attempts + 1,
                     error_json = NULL
                 WHERE id = ? AND state = 'queued'
                 """,
-                (_now(), job_id),
+                (_now(), _now(), _lease_deadline(), lease_token, job_id),
             )
             if cur.rowcount != 1:
                 # Lost the race to another process — nothing to run this iteration.
@@ -522,6 +681,7 @@ class QueueStore:
         result: dict[str, Any] | None = None,
         error: dict[str, Any] | None = None,
         only_if_running: bool = False,
+        lease_token: str | None = None,
     ) -> Job:
         # ``only_if_running`` guards the worker's finish against a lost race with
         # shutdown's cancel: if the active job was already flipped to 'cancelled'
@@ -529,21 +689,27 @@ class QueueStore:
         # 'succeeded'/'failed' (which would un-cancel a job recover_running must
         # not re-run). The conditional UPDATE makes the worker's finish a no-op in
         # that window instead of relying on process-exit timing.
-        where = "WHERE id = ?" + (" AND state = 'running'" if only_if_running else "")
+        where = "WHERE id = ?"
+        if only_if_running:
+            where += " AND state = 'running' AND lease_token = ?"
         with self._lock, self._connect() as conn:
+            params = [
+                state,
+                _now(),
+                json.dumps(result or {}, ensure_ascii=False),
+                json.dumps(error or {}, ensure_ascii=False) if error else None,
+                job_id,
+            ]
+            if only_if_running:
+                params.append(lease_token)
             conn.execute(
                 f"""
                 UPDATE jobs
-                SET state = ?, finished_at = ?, result_json = ?, error_json = ?
+                SET state = ?, finished_at = ?, result_json = ?, error_json = ?,
+                    heartbeat_at = NULL, lease_expires_at = NULL, lease_token = NULL
                 {where}
                 """,
-                (
-                    state,
-                    _now(),
-                    json.dumps(result or {}, ensure_ascii=False),
-                    json.dumps(error or {}, ensure_ascii=False) if error else None,
-                    job_id,
-                ),
+                params,
             )
             row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
             return self._row_to_job(row)
@@ -641,6 +807,7 @@ class QueueStore:
             result=_loads(row["result_json"]),
             error=_loads(row["error_json"]),
             attempts=int(row["attempts"]),
+            lease_token=row["lease_token"],
         )
 
 
@@ -689,6 +856,7 @@ class DaemonRuntime:
         self.shutdown_event = threading.Event()
         self.worker_wake = threading.Event()
         self.active_job_id: str | None = None
+        self.active_lease_token: str | None = None
         self.worker_thread: threading.Thread | None = None
         # job_id -> monotonic deadline before which a lock-refused job is not
         # re-claimed (#2014). Worker-owned; only _worker_loop touches it.
@@ -713,11 +881,26 @@ class DaemonRuntime:
     def worker_alive(self) -> bool:
         return self.worker_thread is not None and self.worker_thread.is_alive()
 
-    def _safe_finish(self, job_id: str, *, state: str, result: dict, error: dict | None) -> None:
+    def _safe_finish(
+        self,
+        job_id: str,
+        lease_token: str,
+        *,
+        state: str,
+        result: dict,
+        error: dict | None,
+    ) -> None:
         try:
             # only_if_running: if shutdown already cancelled this job, don't
             # resurrect it. A finish failure must not kill the worker regardless.
-            self.store.finish(job_id, state=state, result=result, error=error, only_if_running=True)
+            self.store.finish(
+                job_id,
+                state=state,
+                result=result,
+                error=error,
+                only_if_running=True,
+                lease_token=lease_token,
+            )
         except Exception:  # noqa: BLE001 - a finish failure must not kill the worker
             pass
 
@@ -750,6 +933,7 @@ class DaemonRuntime:
         from .service import execute_job
 
         while not self.shutdown_event.is_set():
+            self.store.recover_expired_leases()
             try:
                 job = self.store.claim_next(exclude=self._cooling_job_ids())
             except Exception:  # noqa: BLE001 - sqlite/disk errors must not kill the worker
@@ -760,6 +944,20 @@ class DaemonRuntime:
                 self.worker_wake.clear()
                 continue
             self.active_job_id = job.id
+            self.active_lease_token = job.lease_token
+            heartbeat_stop = threading.Event()
+
+            def _heartbeat() -> None:
+                while not heartbeat_stop.wait(JOB_HEARTBEAT_SECONDS):
+                    if not self.store.heartbeat(job.id, job.lease_token or ""):
+                        return
+
+            heartbeat_thread = threading.Thread(
+                target=_heartbeat,
+                name=f"mempalace-job-heartbeat-{job.id[:8]}",
+                daemon=True,
+            )
+            heartbeat_thread.start()
             try:
                 payload = dict(job.payload)
                 # Override, never trust the client: an authenticated request for
@@ -797,7 +995,9 @@ class DaemonRuntime:
                     continue
                 state = "succeeded" if ok else "failed"
                 error = None if ok else {"message": result.get("error", "job failed")}
-                self._safe_finish(job.id, state=state, result=result, error=error)
+                self._safe_finish(
+                    job.id, job.lease_token or "", state=state, result=result, error=error
+                )
             except (Exception, SystemExit) as exc:
                 # SystemExit is BaseException, not Exception — catching it here is
                 # deliberate. Without it, a sys.exit() in a dependency would slip
@@ -807,23 +1007,41 @@ class DaemonRuntime:
                 # same BaseException-slip-past semantics, documented in comments.)
                 self._safe_finish(
                     job.id,
+                    job.lease_token or "",
                     state="failed",
                     result={"success": False, "exit_code": 1},
                     error={"error_class": type(exc).__name__, "message": str(exc)},
                 )
             finally:
+                heartbeat_stop.set()
+                heartbeat_thread.join(timeout=1.0)
                 self.active_job_id = None
+                self.active_lease_token = None
 
 
-def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
+def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> bool:
+    """Write one JSON response, treating a disconnected client as normal.
+
+    Poll clients use short deadlines and can disappear after the server has
+    prepared a response. Propagating EPIPE/connection-reset into ``do_GET``
+    makes its generic error handler attempt a second response on the same dead
+    socket, producing a second traceback. Consume only disconnect errors here;
+    all real response-generation failures still propagate.
+    """
+
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    handler.send_response(status)
-    handler.send_header("Content-Type", "application/json; charset=utf-8")
-    handler.send_header("Content-Length", str(len(body)))
-    handler.send_header("Connection", "close")
-    handler.end_headers()
-    handler.wfile.write(body)
-    handler.close_connection = True
+    try:
+        handler.send_response(status)
+        handler.send_header("Content-Type", "application/json; charset=utf-8")
+        handler.send_header("Content-Length", str(len(body)))
+        handler.send_header("Connection", "close")
+        handler.end_headers()
+        handler.wfile.write(body)
+        return True
+    except (BrokenPipeError, ConnectionResetError):
+        return False
+    finally:
+        handler.close_connection = True
 
 
 def _restore_server_process_state(previous_env: dict[str, str | None], previous_umask: int) -> None:
@@ -1006,6 +1224,9 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
                         body.get("payload") or {},
                         dedupe_key=body.get("dedupe_key"),
                         priority=int(body.get("priority") or 0),
+                        coalesce_key=body.get("coalesce_key"),
+                        source_version=body.get("source_version"),
+                        tombstone=bool(body.get("tombstone")),
                     )
                     runtime.worker_wake.set()
                 except Exception as exc:  # noqa: BLE001 - client gets structured failure
@@ -1082,9 +1303,11 @@ def _drain_and_cleanup(
     if worker is not None:
         worker.join(timeout=SHUTDOWN_DRAIN_SECONDS)
     active = runtime.active_job_id
-    if active:
+    active_lease_token = runtime.active_lease_token
+    if active and active_lease_token:
         runtime._safe_finish(
             active,
+            active_lease_token,
             state="cancelled",
             result={"success": False, "exit_code": 1},
             error={"message": "cancelled by daemon shutdown"},
@@ -1182,11 +1405,22 @@ class DaemonClient:
         *,
         dedupe_key: str | None = None,
         priority: int = 0,
+        coalesce_key: str | None = None,
+        source_version: int | None = None,
+        tombstone: bool = False,
     ) -> dict[str, Any]:
         return self.request(
             "POST",
             "/jobs",
-            {"kind": kind, "payload": payload, "dedupe_key": dedupe_key, "priority": priority},
+            {
+                "kind": kind,
+                "payload": payload,
+                "dedupe_key": dedupe_key,
+                "priority": priority,
+                "coalesce_key": coalesce_key,
+                "source_version": source_version,
+                "tombstone": tombstone,
+            },
         )["job"]
 
     def get_job(self, job_id: str) -> dict[str, Any]:

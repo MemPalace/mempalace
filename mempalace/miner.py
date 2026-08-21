@@ -59,11 +59,13 @@ def _path_within_root(path: Path, root: Path) -> bool:
 
 
 def _read_text_no_follow(filepath: Path, root: Path) -> Optional[tuple[str, float]]:
-    """Read ``filepath`` and return ``(content, mtime)`` from the SAME
-    ``fstat()`` call that validated the file, so callers never need a
-    separate, later ``os.path.getmtime()`` that could observe a file
-    modified in between (see #22: a stale re-stat lets appended content
-    be silently and permanently skipped)."""
+    """Read ``filepath`` and return ``(content, mtime)``.
+
+    ``mtime`` comes from the SAME ``fstat()`` call that validated the file,
+    so callers never need a separate, later ``os.path.getmtime()`` that
+    could observe a file modified in between (see #22: a stale re-stat
+    lets appended content be silently and permanently skipped).
+    """
     if not _path_within_root(filepath, root):
         return None
     # O_NONBLOCK is what makes the S_ISREG check below reachable. Opening a
@@ -94,9 +96,11 @@ def _read_text_no_follow(filepath: Path, root: Path) -> Optional[tuple[str, floa
         if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_FILE_SIZE:
             return None
         mtime = st.st_mtime
-        with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as f:
+        with os.fdopen(fd, "rb") as f:
             fd = -1
-            return f.read(), mtime
+            raw_content = f.read()
+        content = raw_content.decode("utf-8", errors="replace")
+        return content, mtime
     except OSError:
         return None
     finally:
@@ -1400,6 +1404,8 @@ def _build_drawer_metadata(
     line_end: Optional[int] = None,
     content_date: Optional[str] = None,
     chunk_total: Optional[int] = None,
+    authority_uri: Optional[str] = None,
+    authority_version: Optional[str] = None,
 ) -> dict:
     """Build the metadata dict for one drawer without upserting.
 
@@ -1444,6 +1450,10 @@ def _build_drawer_metadata(
         metadata["content_date"] = content_date
     if chunk_total is not None:
         metadata["chunk_total"] = chunk_total
+    if authority_uri:
+        metadata["authority_uri"] = authority_uri
+    if authority_version:
+        metadata["authority_version"] = authority_version
     metadata["hall"] = detect_hall(content)
     entities = _extract_entities_for_metadata(content)
     if entities:
@@ -1494,6 +1504,7 @@ def process_file(
     chunk_overlap: int = None,
     min_chunk_size: int = None,
     max_chunks_per_file: Optional[int] = None,
+    force_reindex: bool = False,
 ) -> tuple:
     """Read, chunk, route, and file one file.
 
@@ -1508,14 +1519,21 @@ def process_file(
 
     # Skip if already filed
     source_file = str(filepath)
-    if not dry_run and file_already_mined(collection, source_file, check_mtime=True):
+    if (
+        not dry_run
+        and not force_reindex
+        and file_already_mined(collection, source_file, check_mtime=True, wing=wing)
+    ):
         return 0, "general", None
 
     read_result = _read_text_no_follow(filepath, project_path)
     if read_result is None:
         return 0, "general", None
-    content, read_mtime = read_result
-
+    if len(read_result) == 3:
+        content, read_mtime, authority_version = read_result
+    else:
+        content, read_mtime = read_result
+        authority_version = f"sha256:{hashlib.sha256(content.encode('utf-8')).hexdigest()}"
     content = content.strip()
     if len(content) < effective_min:
         return 0, "general", None
@@ -1553,7 +1571,9 @@ def process_file(
     # both delete, and both insert — creating duplicates or losing data.
     with mine_lock(source_file):
         # Re-check after acquiring lock — another agent may have just finished
-        if file_already_mined(collection, source_file, check_mtime=True):
+        if not force_reindex and file_already_mined(
+            collection, source_file, check_mtime=True, wing=wing
+        ):
             return 0, room, None
 
         # Purge stale drawers for this file before re-inserting the fresh chunks.
@@ -1570,7 +1590,7 @@ def process_file(
         # leaves the old drawers' stored mtime untouched, so the next mine
         # still sees a mismatch against the current on-disk mtime and retries.
         try:
-            collection.delete(where={"source_file": source_file})
+            collection.delete(where={"$and": [{"source_file": source_file}, {"wing": wing}]})
         except Exception as exc:
             print(
                 f"  ! [skip] {filepath.name[:50]:50} stale-drawer purge failed "
@@ -1578,7 +1598,6 @@ def process_file(
                 f"on the next mine",
                 file=sys.stderr,
             )
-            logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
             return 0, room, None
 
         # source_mtime is the mtime paired with the content actually read
@@ -1595,6 +1614,7 @@ def process_file(
         # mtime hierarchy. Returns None when nothing usable found → caller
         # falls back to filed_at downstream.
         file_content_date = _extract_content_date(source_file, content)
+        authority_uri = filepath.expanduser().resolve().as_uri()
 
         drawers_added = 0
         # Accumulate drawer metadata across batches so the closet emitter
@@ -1627,6 +1647,8 @@ def process_file(
                             line_end=chunk.get("line_end"),
                             content_date=file_content_date,
                             chunk_total=len(chunks),
+                            authority_uri=authority_uri,
+                            authority_version=authority_version,
                         )
                     )
                 assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
@@ -1692,6 +1714,8 @@ def process_file(
                 "drawer_count": drawers_added,
                 "filed_at": datetime.now().isoformat(),
                 "normalize_version": NORMALIZE_VERSION,
+                "authority_uri": authority_uri,
+                "authority_version": authority_version,
             }
             if entities:
                 closet_meta["entities"] = entities

@@ -345,10 +345,10 @@ _last_request_time: float = time.monotonic()
 
 # MCP startup/open SQLite integrity gate (#1818).
 #
-# The peer-writer guard prevents new concurrent writers, but an MCP server can
-# still start against a palace that was already left corrupt by a prior writer
-# crash/kill. Run the existing read-only SQLite quick_check once on startup/open
-# and fail loudly instead of silently serving a malformed FTS5/HNSW index.
+# The daemon queue serializes current writes, but a server can still open a
+# palace left corrupt by an earlier writer crash. Run the existing read-only
+# SQLite quick_check once on startup/open and fail loudly instead of silently
+# serving a malformed FTS5/HNSW index.
 _sqlite_integrity_checked = False
 _sqlite_integrity_errors: list[str] = []
 _sqlite_integrity_check_error = ""
@@ -408,6 +408,12 @@ _MCP_WRITER_LOCK_ERROR = ""
 _MCP_WRITER_ATEXIT_REGISTERED = False
 _MCP_ALLOW_PEER_WRITER_ENV = "MEMPALACE_MCP_ALLOW_PEER_WRITER"
 
+
+_MCP_WRITE_WAIT_SECONDS = 1.0
+
+
+# Write tools share the daemon queue and are the only tools disabled by the
+# explicit server read-only mode.
 _MUTATING_TOOLS = frozenset(
     {
         "mempalace_kg_add",
@@ -420,6 +426,7 @@ _MUTATING_TOOLS = frozenset(
         "mempalace_delete_drawer",
         "mempalace_checkpoint",
         "mempalace_delete_by_source",
+        "mempalace_supersede_drawer",
         "mempalace_mine",
         "mempalace_sync",
         "mempalace_update_drawer",
@@ -805,6 +812,210 @@ def _mcp_peer_writer_refusal(req_id, tool_name: str):
             },
         },
     }
+
+
+def _daemon_job_payload(tool_name: str, tool_args: dict) -> tuple[str, dict, bool]:
+    """Translate an MCP mutation into one daemon-queue job.
+
+    The bool marks maintenance work that must return immediately. Ordinary
+    writes get a very short compatibility wait, then degrade to the same job
+    handle rather than holding the MCP request open behind a busy writer.
+    """
+
+    if tool_name == "mempalace_mine":
+        return "mine", dict(tool_args), True
+    if tool_name == "mempalace_sync":
+        payload = {
+            "dir": tool_args.get("project_dir"),
+            "wing": tool_args.get("wing"),
+            "agent": tool_args.get("agent") or "mempalace",
+            "dry_run": not bool(tool_args.get("apply")),
+        }
+        if "changed" in tool_args or "deleted" in tool_args:
+            payload["changed_set"] = {
+                "changed": tool_args.get("changed") or [],
+                "deleted": tool_args.get("deleted") or [],
+            }
+        return "sync", payload, True
+    return "mcp_tool", {"name": tool_name, "arguments": dict(tool_args)}, False
+
+
+def _accepted_daemon_job(job: dict) -> dict:
+    return {
+        "success": True,
+        "accepted": True,
+        "job_id": job.get("id"),
+        "state": job.get("state", "queued"),
+    }
+
+
+def _file_ingress_event(project_dir: str, path: str, *, deleted: bool) -> tuple[str, int, dict]:
+    """Build a stable, versioned event for one repository-relative file."""
+
+    import hashlib
+
+    project = os.path.realpath(os.path.abspath(os.path.expanduser(project_dir)))
+    candidate = os.path.realpath(os.path.join(project, path))
+    if os.path.commonpath((project, candidate)) != project:
+        raise ValueError(f"changed-set path escapes project_dir: {path!r}")
+    rel = os.path.relpath(candidate, project).replace(os.sep, "/")
+    project_id = hashlib.sha256(os.path.normcase(project).encode("utf-8")).hexdigest()[:24]
+    key = f"file:{project_id}:{os.path.normcase(rel)}"
+    if deleted:
+        return (
+            key,
+            time.time_ns(),
+            {
+                "canonical_path": candidate,
+                "relative_path": rel,
+                "deleted": True,
+                "content_hash": None,
+            },
+        )
+    stat = os.stat(candidate)
+    return (
+        key,
+        int(stat.st_mtime_ns),
+        {
+            "canonical_path": candidate,
+            "relative_path": rel,
+            "deleted": False,
+            "source_version": int(stat.st_mtime_ns),
+            "size": int(stat.st_size),
+            "content_hash": None,
+            "hash_state": "deferred_to_worker",
+        },
+    )
+
+
+def _submit_file_sync_jobs(client, tool_args: dict) -> dict:
+    project_dir = tool_args.get("project_dir")
+    if not project_dir:
+        raise ValueError("changed-set sync requires project_dir")
+    jobs = []
+    events = [*((path, False) for path in tool_args.get("changed") or [])]
+    events.extend((path, True) for path in tool_args.get("deleted") or [])
+    for path, deleted in events:
+        key, version, ingress = _file_ingress_event(project_dir, path, deleted=deleted)
+        rel = ingress["relative_path"]
+        payload = {
+            "dir": project_dir,
+            "wing": tool_args.get("wing"),
+            "agent": tool_args.get("agent") or "mempalace",
+            "dry_run": not bool(tool_args.get("apply")),
+            "changed_set": {
+                "changed": [] if deleted else [rel],
+                "deleted": [rel] if deleted else [],
+            },
+            "ingress": ingress,
+        }
+        job = client.submit(
+            "sync",
+            payload,
+            coalesce_key=key,
+            source_version=version,
+            tombstone=deleted,
+        )
+        jobs.append({"id": job.get("id"), "state": job.get("state"), "path": rel})
+    return {
+        "success": True,
+        "accepted": True,
+        "job_id": jobs[0]["id"] if len(jobs) == 1 else None,
+        "job_ids": [job["id"] for job in jobs],
+        "jobs": jobs,
+    }
+
+
+def _submit_mcp_mutation(tool_name: str, tool_args: dict) -> dict:
+    """Submit every MCP mutation to the palace's single daemon writer.
+
+    Multiple MCP sessions remain independent readers while one per-palace
+    daemon serializes writes. Mine/sync return an accepted job handle and
+    callers continue without routine polling.
+    Small writes preserve the historical immediate-result shape when they
+    finish inside a one-second budget; queue contention never blocks longer.
+    """
+
+    from .daemon import DaemonError, ensure_client
+
+    kind, payload, return_immediately = _daemon_job_payload(tool_name, tool_args)
+    backend = os.environ.get("MEMPALACE_BACKEND_EXPLICIT")
+    try:
+        client = ensure_client(_config.palace_path, backend=backend, auto_start=True)
+        if tool_name == "mempalace_sync" and ("changed" in tool_args or "deleted" in tool_args):
+            return _submit_file_sync_jobs(client, tool_args)
+        job = client.submit(kind, payload)
+        if return_immediately:
+            return _accepted_daemon_job(job)
+        try:
+            finished = client.wait(job["id"], timeout=_MCP_WRITE_WAIT_SECONDS)
+        except DaemonError as exc:
+            if "timed out waiting" in str(exc).lower():
+                return _accepted_daemon_job(job)
+            raise
+    except (DaemonError, OSError, ValueError) as exc:
+        return {
+            "success": False,
+            "error": f"daemon writer unavailable: {exc}",
+            "error_class": type(exc).__name__,
+        }
+
+    result = finished.get("result") or {}
+    if not isinstance(result, dict):
+        result = {"success": finished.get("state") == "succeeded", "value": result}
+    result = dict(result)
+    result["daemon_job"] = {"id": finished.get("id"), "state": finished.get("state")}
+    if finished.get("state") != "succeeded":
+        result.setdefault("success", False)
+        error = finished.get("error") or {}
+        result.setdefault("error", error.get("message", "daemon write failed"))
+    return result
+
+
+def _sanitized_job(job: dict) -> dict:
+    """Return daemon job metadata without exposing its queued payload."""
+
+    job = dict(job)
+    job.pop("payload", None)
+    state = job.get("state")
+    terminal = state in {"succeeded", "failed", "cancelled"}
+    job["success"] = True
+    job["status"] = state if terminal else "pending"
+    job["terminal"] = terminal
+    return job
+
+
+def tool_job_status(job_id: str):
+    """Return one sanitized daemon job state for targeted diagnosis."""
+
+    from .daemon import DaemonError, get_client_if_running
+
+    try:
+        client = get_client_if_running(_config.palace_path, health_timeout=0.5)
+        if client is None:
+            return {"success": False, "error": "daemon writer is not running"}
+        return _sanitized_job(client.get_job(job_id))
+    except DaemonError as exc:
+        return {"success": False, "error": str(exc), "error_class": type(exc).__name__}
+
+
+def tool_get_jobs():
+    """Return active daemon jobs for debugging, without queued payloads."""
+
+    from .daemon import DaemonError, get_client_if_running
+
+    try:
+        client = get_client_if_running(_config.palace_path, health_timeout=0.5)
+        if client is None:
+            return {"success": True, "jobs": [], "count": 0}
+        jobs = [
+            _sanitized_job(job)
+            for job in client.list_jobs(limit=100)
+            if job.get("state") in {"queued", "running"}
+        ]
+        return {"success": True, "jobs": jobs, "count": len(jobs)}
+    except DaemonError as exc:
+        return {"success": False, "error": str(exc), "error_class": type(exc).__name__}
 
 
 def _startup_integrity_size_limit_bytes() -> int:
@@ -2088,7 +2299,6 @@ def tool_status():
     # is detected so status stays reachable.
     db_exists = _backend_db_exists()
     _refresh_vector_disabled_flag()
-
     if _vector_disabled:
         return _tool_status_via_sqlite()
 
@@ -2377,6 +2587,8 @@ def tool_search(
     max_distance: float = 1.5,
     min_similarity: float = None,
     context: str = None,
+    verify_authority: bool = False,
+    include_superseded: bool = False,
 ):
     limit = max(1, min(limit, _MAX_RESULTS))
     try:
@@ -2410,6 +2622,7 @@ def tool_search(
         max_distance=dist,
         vector_disabled=_vector_disabled,
         collection_name=_config.collection_name,
+        verify_authority=bool(verify_authority),
     )
     if _is_transient_index_error(result):
         # Post-bulk-write HNSW flush window (#1315): drop caches, give
@@ -2430,6 +2643,7 @@ def tool_search(
             max_distance=dist,
             vector_disabled=_vector_disabled,
             collection_name=_config.collection_name,
+            verify_authority=bool(verify_authority),
         )
         if not _is_transient_index_error(result):
             result["index_recovered"] = True
@@ -2447,6 +2661,14 @@ def tool_search(
         }
     if context:
         result["context_received"] = True
+    if isinstance(result.get("results"), list):
+        if not include_superseded:
+            result["results"] = [
+                hit
+                for hit in result["results"]
+                if (hit.get("authority") or {}).get("status") != "superseded"
+            ]
+        result["count"] = len(result["results"])
     return result
 
 
@@ -2987,7 +3209,15 @@ def _build_chunk_rows(drawer_id: str, content: str, meta: dict, chunk_size: int)
 
 
 def tool_add_drawer(
-    wing: str, room: str, content: str, source_file: str = None, added_by: str = "mcp"
+    wing: str,
+    room: str,
+    content: str,
+    source_file: str = None,
+    added_by: str = "mcp",
+    authority_uri: str = None,
+    authority_version: str = None,
+    memory_kind: str = None,
+    decision_key: str = None,
 ):
     """File verbatim content into a wing/room. Checks for duplicates first.
 
@@ -3009,6 +3239,10 @@ def tool_add_drawer(
         if source_file:
             source_file = strip_lone_surrogates(source_file)
         added_by = strip_lone_surrogates(added_by)
+        authority_uri = strip_lone_surrogates(authority_uri or "")
+        authority_version = strip_lone_surrogates(authority_version or "")
+        memory_kind = sanitize_name(memory_kind, "memory_kind") if memory_kind else ""
+        decision_key = strip_lone_surrogates(decision_key or "").strip()
     except ValueError as e:
         return {"success": False, "error": str(e)}
 
@@ -3039,6 +3273,15 @@ def tool_add_drawer(
         "filed_at": datetime.now().isoformat(),
         "id_recipe": ID_RECIPE,
     }
+    if authority_uri:
+        base_meta["authority_uri"] = authority_uri
+    if authority_version:
+        base_meta["authority_version"] = authority_version
+    if memory_kind:
+        base_meta["memory_kind"] = memory_kind
+    if decision_key:
+        base_meta["decision_key"] = decision_key
+        base_meta["authority_status"] = "current"
 
     # Idempotency. Three cases to detect a prior committed write:
     # (a) Single-doc path: drawer_id row exists (the only id used).
@@ -3122,6 +3365,79 @@ def tool_add_drawer(
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+def tool_supersede_drawer(
+    supersedes_id: str,
+    decision_key: str,
+    wing: str,
+    room: str,
+    content: str,
+    source_file: str = None,
+    added_by: str = "mcp",
+    authority_uri: str = None,
+    authority_version: str = None,
+    memory_kind: str = "decision",
+):
+    """Add a new decision drawer and explicitly mark its predecessor superseded."""
+    global _metadata_cache
+    col = _get_collection()
+    if not col:
+        return _collection_error_or_no_palace()
+    old = _logical_drawer_record(col, supersedes_id)
+    if old is None:
+        return {"success": False, "error": f"Drawer not found: {supersedes_id}"}
+    old_key = str((old.get("metadata") or {}).get("decision_key") or "")
+    if not decision_key or old_key != decision_key:
+        return {
+            "success": False,
+            "error": "supersession requires the same non-empty decision_key as the predecessor",
+        }
+
+    added = tool_add_drawer(
+        wing=wing,
+        room=room,
+        content=content,
+        source_file=source_file,
+        added_by=added_by,
+        authority_uri=authority_uri,
+        authority_version=authority_version,
+        memory_kind=memory_kind,
+        decision_key=decision_key,
+    )
+    if not added.get("success"):
+        return added
+    replacement_id = added["drawer_id"]
+    if replacement_id == supersedes_id:
+        return {"success": False, "error": "replacement content resolves to predecessor drawer id"}
+
+    updated_metas = []
+    for metadata in old["metadatas"]:
+        updated_metas.append(
+            {
+                **_safe_meta(metadata),
+                "authority_status": "superseded",
+                "superseded_by": replacement_id,
+            }
+        )
+    col = _get_collection()
+    if not col:
+        return _collection_error_or_no_palace()
+    col.upsert(ids=old["ids"], documents=old["documents"], metadatas=updated_metas)
+    _wal_log(
+        "supersede_drawer",
+        {
+            "drawer_id": supersedes_id,
+            "superseded_by": replacement_id,
+            "decision_key": decision_key,
+        },
+    )
+    _metadata_cache = None
+    return {
+        **added,
+        "supersedes_id": supersedes_id,
+        "decision_key": decision_key,
+    }
 
 
 def tool_delete_drawer(drawer_id: str):
@@ -3564,8 +3880,15 @@ def tool_delete_by_source(source_file: str, dry_run: bool = True):
         return {"success": False, "error": str(e)}
 
 
-def tool_sync(project_dir: str = None, wing: str = None, apply: bool = False):
-    """Prune drawers whose source files are gitignored, missing, or moved (#1252)."""
+def tool_sync(
+    project_dir: str = None,
+    wing: str = None,
+    apply: bool = False,
+    changed: Optional[list[str]] = None,
+    deleted: Optional[list[str]] = None,
+    agent: str = "mempalace",
+):
+    """Sync a full project scope or an explicit repository changed set."""
     global _metadata_cache
     from .daemon import LOCK_REFUSAL_ERROR_CLASS
     from .palace import MineAlreadyRunning
@@ -3577,13 +3900,28 @@ def tool_sync(project_dir: str = None, wing: str = None, apply: bool = False):
     project_dirs = [project_dir] if project_dir else None
     try:
         try:
-            report = sync_palace(
-                palace_path=_config.palace_path,
-                project_dirs=project_dirs,
-                wing=wing,
-                dry_run=not apply,
-                wal_log=_wal_log,
-            )
+            if changed is not None or deleted is not None:
+                if not project_dir:
+                    raise ValueError("changed-set sync requires project_dir")
+                from .changed_set import sync_changed_sources
+
+                report = sync_changed_sources(
+                    palace_path=_config.palace_path,
+                    project_root=project_dir,
+                    changed=changed or [],
+                    deleted=deleted or [],
+                    wing=wing,
+                    agent=agent,
+                    dry_run=not apply,
+                )
+            else:
+                report = sync_palace(
+                    palace_path=_config.palace_path,
+                    project_dirs=project_dirs,
+                    wing=wing,
+                    dry_run=not apply,
+                    wal_log=_wal_log,
+                )
             return {"success": True, **report}
         # Order matters: typed handlers must precede the bare Exception
         # below, otherwise MineAlreadyRunning and ValueError fall into the
@@ -4508,15 +4846,34 @@ def tool_checkpoint(items, diary=None, dedup_threshold=0.9, added_by=None):
                 {"item": item, "error": "wing, room, content must be non-empty strings"}
             )
             continue
-        dup = tool_check_duplicate(content, threshold=dedup_threshold)
-        if dup.get("is_duplicate"):
-            out["duplicates"].append({"room": room, "matches": dup.get("matches", [])})
-            continue
+        # Explicit version transitions must not be blocked by semantic dedup:
+        # replacement decisions are often intentionally similar to predecessors.
+        if not item.get("supersedes_id"):
+            dup = tool_check_duplicate(content, threshold=dedup_threshold)
+            if dup.get("is_duplicate"):
+                out["duplicates"].append({"room": room, "matches": dup.get("matches", [])})
+                continue
         # On a dedup error (genuine index failure — content is guaranteed a
         # string by the guard above) we still file rather than drop the
         # memory: verbatim recall is the priority and add_drawer's own
         # idempotency blocks exact duplicates.
-        res = tool_add_drawer(wing=wing, room=room, content=content, added_by=resolved_added_by)
+        common = {
+            "wing": wing,
+            "room": room,
+            "content": content,
+            "added_by": resolved_added_by,
+            "authority_uri": item.get("authority_uri"),
+            "authority_version": item.get("authority_version"),
+            "memory_kind": item.get("memory_kind"),
+            "decision_key": item.get("decision_key"),
+        }
+        if item.get("supersedes_id"):
+            res = tool_supersede_drawer(
+                supersedes_id=item["supersedes_id"],
+                **common,
+            )
+        else:
+            res = tool_add_drawer(**common)
         if res.get("success"):
             out["added"].append(res)
         else:
@@ -5080,6 +5437,14 @@ TOOLS = {
                     "type": "string",
                     "description": "Background context for the search (optional). NOT used for embedding — only for future re-ranking.",
                 },
+                "verify_authority": {
+                    "type": "boolean",
+                    "description": "Verify file:// or absolute-path authority version tokens. Adds current/stale/unverified status to each result.",
+                },
+                "include_superseded": {
+                    "type": "boolean",
+                    "description": "Include explicitly superseded decision drawers (default false)",
+                },
             },
             "required": ["query"],
         },
@@ -5116,6 +5481,22 @@ TOOLS = {
                 },
                 "source_file": {"type": "string", "description": "Where this came from (optional)"},
                 "added_by": {"type": "string", "description": "Who is filing this (default: mcp)"},
+                "authority_uri": {
+                    "type": "string",
+                    "description": "Canonical local file path or file:// URI (optional)",
+                },
+                "authority_version": {
+                    "type": "string",
+                    "description": "sha256:<hex> or mtime_ns:<integer> token (optional)",
+                },
+                "memory_kind": {
+                    "type": "string",
+                    "description": "Memory class such as decision, finding, or preference (optional)",
+                },
+                "decision_key": {
+                    "type": "string",
+                    "description": "Stable logical key for a versioned decision (optional)",
+                },
             },
             "required": ["wing", "room", "content"],
         },
@@ -5141,6 +5522,11 @@ TOOLS = {
                                 "type": "string",
                                 "description": "Verbatim content to store",
                             },
+                            "authority_uri": {"type": "string"},
+                            "authority_version": {"type": "string"},
+                            "memory_kind": {"type": "string"},
+                            "decision_key": {"type": "string"},
+                            "supersedes_id": {"type": "string"},
                         },
                         "required": ["wing", "room", "content"],
                     },
@@ -5171,6 +5557,26 @@ TOOLS = {
         },
         "handler": tool_checkpoint,
     },
+    "mempalace_supersede_drawer": {
+        "description": "Create a replacement decision and explicitly preserve its predecessor as superseded history.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "supersedes_id": {"type": "string"},
+                "decision_key": {"type": "string"},
+                "wing": {"type": "string"},
+                "room": {"type": "string"},
+                "content": {"type": "string"},
+                "source_file": {"type": "string"},
+                "added_by": {"type": "string"},
+                "authority_uri": {"type": "string"},
+                "authority_version": {"type": "string"},
+                "memory_kind": {"type": "string"},
+            },
+            "required": ["supersedes_id", "decision_key", "wing", "room", "content"],
+        },
+        "handler": tool_supersede_drawer,
+    },
     "mempalace_delete_drawer": {
         "description": "Delete a drawer by ID. Irreversible.",
         "input_schema": {
@@ -5187,10 +5593,9 @@ TOOLS = {
             "Mine a directory into the palace — the MCP equivalent of `mempalace mine`. "
             "mode='projects' (default) ingests code/docs; mode='convos' ingests chat "
             "transcripts; mode='extract' ingests office documents (PDF/DOCX/RTF, requires "
-            "the mempalace[extract] extra). Runs synchronously and returns the miner's "
-            "summary as `output`. The palace write lock is automatic; a concurrent mine "
-            "returns a structured already-running error. Orphan cleanup is separate — use "
-            "mempalace_sync."
+            "the mempalace[extract] extra). Queues work on the single palace writer and "
+            "returns immediately with an accepted job id. Orphan cleanup "
+            "is separate — use mempalace_sync."
         ),
         "input_schema": {
             "type": "object",
@@ -5255,7 +5660,7 @@ TOOLS = {
         "handler": tool_delete_by_source,
     },
     "mempalace_sync": {
-        "description": "Prune drawers whose source files are gitignored, deleted, or moved. Returns dry-run report by default; pass apply=true to commit deletions.",
+        "description": "Queue an explicit changed-set sync or stale-drawer prune on the single palace writer. Accepted work is fire-and-forget; inspect jobs only after an error or suspected stall.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -5266,11 +5671,44 @@ TOOLS = {
                 "wing": {"type": "string", "description": "Limit to one wing (optional)"},
                 "apply": {
                     "type": "boolean",
-                    "description": "Actually delete drawers; default is dry-run preview",
+                    "description": "Apply reindex/deletion writes; default is dry-run preview",
+                },
+                "changed": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Repository-relative files to reindex; requires project_dir. Gitignored files are purged instead of reindexed.",
+                },
+                "deleted": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Repository-relative files to remove; requires project_dir",
+                },
+                "agent": {
+                    "type": "string",
+                    "description": "Agent recorded on reindexed drawers (default: mempalace)",
                 },
             },
         },
         "handler": tool_sync,
+    },
+    "mempalace_job_status": {
+        "description": "Inspect one background job after an enqueue error or suspected stall. Non-terminal jobs report status=pending. Never returns the queued verbatim request payload.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "job_id": {
+                    "type": "string",
+                    "description": "Job id returned by a mutating MCP tool",
+                },
+            },
+            "required": ["job_id"],
+        },
+        "handler": tool_job_status,
+    },
+    "mempalace_get_jobs": {
+        "description": "Debug active queued/running MemPalace jobs. Call only after an enqueue error or suspected stall; accepted writes are otherwise fire-and-forget.",
+        "input_schema": {"type": "object", "properties": {}},
+        "handler": tool_get_jobs,
     },
     "mempalace_get_drawer": {
         "description": "Fetch a single drawer by ID — returns full content and metadata.",
@@ -5716,7 +6154,7 @@ def _mcp_read_only_refusal(req_id, tool_name: str):
     """Refuse state-changing tools when the server runs in read-only mode (#1877).
 
     Read-only is an operator-set server mode (``--read-only`` /
-    ``MEMPALACE_MCP_READ_ONLY``), distinct from the dynamic peer-writer lock:
+    ``MEMPALACE_MCP_READ_ONLY``), distinct from daemon write serialization:
     it is an unconditional gate so a shared team server can expose recall
     without write access. Enforced at dispatch, not merely hidden from
     tools/list, so a client that calls a mutating tool by name is still refused.
@@ -6347,14 +6785,194 @@ def _decorate_mcp_tool_result(tool_name: str, result):
     return result
 
 
+def _missing_required_tool_args(tool_name: str, tool_args: dict) -> list[str]:
+    missing = [
+        name
+        for name in TOOLS[tool_name]["input_schema"].get("required", [])
+        if tool_args.get(name) is None
+    ]
+    if tool_name == "mempalace_diary_write" and tool_args.get("entry") is None:
+        missing.append("entry")
+    return missing
+
+
+def _dispatch_mcp_tool(req_id, tool_name: str, tool_args: dict):
+    from .service import classify_tool
+
+    preflight_error = _mcp_tool_preflight_refusal(req_id, tool_name)
+    if preflight_error is not None:
+        return None, preflight_error
+    classification = classify_tool(tool_name)
+    if classification == "write" or tool_name in {"mempalace_mine", "mempalace_sync"}:
+        return _submit_mcp_mutation(tool_name, tool_args), None
+    result = _decorate_mcp_tool_result(tool_name, TOOLS[tool_name]["handler"](**tool_args))
+    return result, None
+
+
+def _mcp_error_response(req_id, code: int, message: str) -> dict:
+    """Build a JSON-RPC error response for dispatcher validation failures."""
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {"code": code, "message": message},
+    }
+
+
+def _mcp_tool_success_response(req_id, result) -> dict:
+    """Wrap a successful tool result in the MCP JSON-RPC envelope."""
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": {
+            "content": [{"type": "text", "text": json.dumps(result, indent=2, ensure_ascii=False)}]
+        },
+    }
+
+
+def _prepare_mcp_tool_call(req_id, params):
+    """Validate, normalize, and authorize one ``tools/call`` request."""
+    if not isinstance(params, dict) or "name" not in params:
+        return (
+            None,
+            None,
+            _mcp_error_response(
+                req_id, -32602, "Invalid params: 'name' is required for tools/call"
+            ),
+        )
+
+    tool_name = params.get("name")
+    tool_args = params.get("arguments") or {}
+    if tool_name not in TOOLS:
+        return None, None, _mcp_error_response(req_id, -32601, f"Unknown tool: {tool_name}")
+
+    # Enforce operator read-only mode before argument validation or daemon
+    # submission. A hidden write tool must consistently report its access
+    # denial rather than leaking a secondary schema error.
+    read_only_error = _mcp_read_only_refusal(req_id, tool_name)
+    if read_only_error is not None:
+        return None, None, read_only_error
+
+    # Whitelist arguments to declared schema properties only. Prevents callers
+    # from spoofing internal params like added_by/source_file. Skip filtering if
+    # handler explicitly accepts **kwargs; default to filtering on inspect
+    # failure (safe fallback).
+    import inspect
+
+    schema_props = TOOLS[tool_name]["input_schema"].get("properties", {})
+    try:
+        handler = TOOLS[tool_name]["handler"]
+        sig = inspect.signature(handler)
+        accepts_var_keyword = any(
+            param.kind == inspect.Parameter.VAR_KEYWORD for param in sig.parameters.values()
+        )
+    except (ValueError, TypeError):
+        accepts_var_keyword = False
+    if not accepts_var_keyword:
+        # An unknown kwarg here is almost always a wrong parameter *name*
+        # (e.g. text= instead of content=). Silently dropping it makes the
+        # cause surface only indirectly as a later "Missing required 'X'",
+        # so name it explicitly — symmetric with the missing-required path
+        # below. wait_for_previous is an internal transport kwarg in no tool
+        # schema; it is popped before dispatch further down, so it must not be
+        # reported as unknown here.
+        unknown = [
+            key for key in tool_args if key not in schema_props and key != "wait_for_previous"
+        ]
+        if unknown:
+            quoted = ", ".join(f"'{key}'" for key in unknown)
+            word = "parameter" if len(unknown) == 1 else "parameters"
+            logger.debug("Tool %s: unknown %s %s", tool_name, word, quoted)
+            return (
+                None,
+                None,
+                _mcp_error_response(
+                    req_id, -32602, f"Unknown {word} {quoted} for tool {tool_name}"
+                ),
+            )
+        tool_args = {key: value for key, value in tool_args.items() if key in schema_props}
+
+    # MCP JSON transport may deliver integers as floats or strings; ChromaDB
+    # and Python slicing require native int.
+    for key, value in list(tool_args.items()):
+        prop_schema = schema_props.get(key, {})
+        declared_type = prop_schema.get("type")
+        try:
+            if declared_type == "integer" and not isinstance(value, int):
+                tool_args[key] = int(value)
+            elif declared_type == "number" and not isinstance(value, (int, float)):
+                tool_args[key] = float(value)
+        except (ValueError, TypeError):
+            return (
+                None,
+                None,
+                _mcp_error_response(req_id, -32602, f"Invalid value for parameter '{key}'"),
+            )
+    tool_args.pop("wait_for_previous", None)
+
+    # 'content' is an accepted alias for diary_write's 'entry' (callers often
+    # reuse add_drawer's 'content' name). Map it before dispatch so a
+    # content-only call still satisfies the required 'entry' parameter while
+    # the signature-based missing-parameter diagnostic (-32602) keeps working.
+    # 'entry' wins if both are supplied.
+    if tool_name == "mempalace_diary_write" and "content" in tool_args:
+        content_val = tool_args.pop("content")
+        # Only fill from the alias when the caller did not supply 'entry' at
+        # all (or passed it as null). An explicit entry — even "" — wins.
+        if "entry" not in tool_args or tool_args["entry"] is None:
+            tool_args["entry"] = content_val
+    missing = _missing_required_tool_args(tool_name, tool_args)
+    if missing:
+        quoted = ", ".join(f"'{name}'" for name in missing)
+        word = "parameter" if len(missing) == 1 else "parameters"
+        return (
+            None,
+            None,
+            _mcp_error_response(
+                req_id, -32602, f"Missing required {word} {quoted} for tool {tool_name}"
+            ),
+        )
+    return tool_name, tool_args, None
+
+
+def _run_mcp_tool_call(req_id, tool_name: str, tool_args: dict):
+    """Dispatch a prepared tool call and translate handler failures to JSON-RPC."""
+    try:
+        result, preflight_error = _dispatch_mcp_tool(req_id, tool_name, tool_args)
+        if preflight_error is not None:
+            return preflight_error
+        return _mcp_tool_success_response(req_id, result)
+    except TypeError as exc:
+        # Qualname match prevents leaking internal helper/param names raised
+        # inside the handler body — see test_handler_internal_signature_shape_stays_generic.
+        message = str(exc)
+        handler = TOOLS[tool_name]["handler"]
+        handler_qn = getattr(handler, "__qualname__", None) or getattr(handler, "__name__", "")
+        # Qualname can include "<locals>" for nested defs and "<lambda>" for
+        # lambdas — accept Python's TypeError emit verbatim.
+        missing_match = re.match(
+            r"^([\w\.<>]+)\(\) missing \d+ required "
+            r"(?:positional |keyword-only )?arguments?: (.+)$",
+            message,
+        )
+        if missing_match and missing_match.group(1) == handler_qn:
+            names = re.findall(r"'(\w+)'", missing_match.group(2))
+            if names:
+                quoted = ", ".join(f"'{name}'" for name in names)
+                word = "parameter" if len(names) == 1 else "parameters"
+                logger.debug("Tool %s: missing required %s %s", tool_name, word, quoted)
+                return _mcp_error_response(
+                    req_id, -32602, f"Missing required {word} {quoted} for tool {tool_name}"
+                )
+        return _internal_tool_error(req_id, tool_name, exc)
+    except Exception as exc:
+        return _internal_tool_error(req_id, tool_name, exc)
+
+
 def handle_request(request):
+    """Route one JSON-RPC request to MCP initialization, discovery, or a tool."""
     global _last_request_time
     if not isinstance(request, dict):
-        return {
-            "jsonrpc": "2.0",
-            "id": None,
-            "error": {"code": -32600, "message": "Invalid Request"},
-        }
+        return _mcp_error_response(None, -32600, "Invalid Request")
     _last_request_time = time.monotonic()
     method = request.get("method") or ""
     params = request.get("params") or {}
@@ -6376,10 +6994,10 @@ def handle_request(request):
                 "serverInfo": {"name": "mempalace", "version": __version__},
             },
         }
-    elif method == "ping":
+    if method == "ping":
         return {"jsonrpc": "2.0", "id": req_id, "result": {}}
-    elif method.startswith("notifications/"):
-        # Notifications (no id) never get a response per JSON-RPC spec
+    if method.startswith("notifications/"):
+        # Notifications (no id) never get a response per JSON-RPC spec.
         return None
     elif method == "tools/list":
         # In read-only mode, hide the refused tools so clients don't advertise
@@ -6532,12 +7150,9 @@ def handle_request(request):
 
     # Notifications (missing id) must never get a response
     if req_id is None:
+        # Notifications (missing id) must never get a response.
         return None
-    return {
-        "jsonrpc": "2.0",
-        "id": req_id,
-        "error": {"code": -32601, "message": f"Unknown method: {method}"},
-    }
+    return _mcp_error_response(req_id, -32601, f"Unknown method: {method}")
 
 
 def _restore_stdout():
