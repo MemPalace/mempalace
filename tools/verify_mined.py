@@ -80,7 +80,9 @@ def verify_one(
     """Return True if *sample_file* is searchable and its hits are in *manifest*."""
     snippet = extract_snippet(sample_file)
     if not snippet:
-        print(f"verify_mined: could not extract a usable snippet from {sample_file}", file=sys.stderr)
+        print(
+            f"verify_mined: could not extract a usable snippet from {sample_file}", file=sys.stderr
+        )
         return False
 
     if str(sample_file) not in manifest:
@@ -107,7 +109,10 @@ def verify_one(
             if Path(hit_source).resolve() == sample_file:
                 return True
 
-    print(f"verify_mined: search hit source_file not in batch manifest for {sample_file}", file=sys.stderr)
+    print(
+        f"verify_mined: search hit source_file not in batch manifest for {sample_file}",
+        file=sys.stderr,
+    )
     return False
 
 

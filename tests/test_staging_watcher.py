@@ -25,7 +25,9 @@ def _write_snapshot(staging: Path, rels: list[str]) -> Path:
     return snapshot
 
 
-def _run_bash_function(func: str, env: dict, staging: Path, check: bool = False) -> subprocess.CompletedProcess:
+def _run_bash_function(
+    func: str, env: dict, staging: Path, check: bool = False
+) -> subprocess.CompletedProcess:
     """Source staging_watcher.sh and call a single function."""
     tools_dir = Path(__file__).resolve().parent.parent / "tools"
     full_env = os.environ.copy()
@@ -40,6 +42,7 @@ def _run_bash_function(func: str, env: dict, staging: Path, check: bool = False)
         text=True,
         check=check,
     )
+
 
 # tools/ is not a package
 _TOOLS_DIR = Path(__file__).resolve().parent.parent / "tools"
@@ -341,9 +344,7 @@ class TestProcessBatch:
         palace = tmp_path / "palace"
         log = tmp_path / "watcher.log"
 
-        (staging / "good.md").write_text(
-            "hello world this is the good file\n", encoding="utf-8"
-        )
+        (staging / "good.md").write_text("hello world this is the good file\n", encoding="utf-8")
         (staging / "bad.md").write_text(
             "this is the bad file that exceeds chunk cap\n", encoding="utf-8"
         )
@@ -353,12 +354,12 @@ class TestProcessBatch:
         fake_mempalace = tmp_path / "mempalace"
         fake_mempalace.write_text(
             "#!/usr/bin/env sh\n"
-            "for arg in \"$@\"; do\n"
+            'for arg in "$@"; do\n'
             '  if [ "$arg" = "mine" ] || [ "$arg" = "compress" ]; then\n'
             "    exit 0\n"
             "  fi\n"
             "done\n"
-            "source=\"\"\n"
+            'source=""\n'
             "while [ $# -gt 0 ]; do\n"
             '  if [ "$1" = "--source-file" ]; then source="$2"; fi\n'
             "  shift\n"
@@ -366,7 +367,7 @@ class TestProcessBatch:
             'if [ "$(basename "$source")" = "good.md" ]; then\n'
             '  echo \'{"results": [{"source_file": "\'"$source"\'"}]}\'\n'
             "else\n"
-            '  echo \'{"results": []}\'\n'
+            "  echo '{\"results\": []}'\n"
             "fi\n",
             encoding="utf-8",
         )
