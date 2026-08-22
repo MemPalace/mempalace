@@ -276,7 +276,9 @@ def _merge_with_default(raw: dict[str, Any]) -> dict[str, Any]:
     return merged
 
 
-def load_gossip_config(path: Optional[str] = None, config: MempalaceConfig = None) -> dict[str, Any]:
+def load_gossip_config(
+    path: Optional[str] = None, config: MempalaceConfig = None
+) -> dict[str, Any]:
     """Load gossip configuration from ``path`` or the default location.
 
     If the file does not exist, the default configuration is returned and
@@ -383,7 +385,9 @@ class GossipMessage:
     def is_expired(self) -> bool:
         return (datetime.now(timezone.utc) - self._started_at).total_seconds() > self.ttl_seconds
 
-    def child(self, wing: str, room: Optional[str] = None, node_id: Optional[str] = None) -> GossipMessage:
+    def child(
+        self, wing: str, room: Optional[str] = None, node_id: Optional[str] = None
+    ) -> GossipMessage:
         """Return a copy with incremented hop count and updated path."""
         new_path = list(self.path)
         if node_id:
@@ -423,7 +427,9 @@ class GossipProtocol:
         config: Optional[dict[str, Any]] = None,
     ):
         self.mempalace_config = mempalace_config
-        self.config = config if config is not None else load_gossip_config(config_path, mempalace_config)
+        self.config = (
+            config if config is not None else load_gossip_config(config_path, mempalace_config)
+        )
         self._chatter_nodes = [ChatterNode.from_dict(n) for n in self.config["chatter_nodes"]]
         self.kg = kg
         self._kg_path = kg_path
@@ -456,9 +462,7 @@ class GossipProtocol:
             return "general", priority
         return "general", "normal"
 
-    def _get_hallway_context(
-        self, message: GossipMessage
-    ) -> tuple[dict[str, float], set[str]]:
+    def _get_hallway_context(self, message: GossipMessage) -> tuple[dict[str, float], set[str]]:
         """Return (room_scores, related_entities) derived from within-wing hallways.
 
         Hallways are entity-pair co-occurrence records built at mine time. When a
@@ -470,9 +474,7 @@ class GossipProtocol:
         if not message.source_wing:
             return {}, set()
         try:
-            hallways = list_hallways(
-                wing=message.source_wing, config=self.mempalace_config
-            )
+            hallways = list_hallways(wing=message.source_wing, config=self.mempalace_config)
         except Exception:
             logger.debug("gossip: could not load hallways", exc_info=True)
             return {}, set()
@@ -537,8 +539,7 @@ class GossipProtocol:
         off_radius = [
             n
             for n in self._chatter_nodes
-            if n not in selected
-            and source not in {normalize_wing_name(w) for w in n.gossip_radius}
+            if n not in selected and source not in {normalize_wing_name(w) for w in n.gossip_radius}
         ]
         if not off_radius:
             return selected
@@ -568,9 +569,7 @@ class GossipProtocol:
         """
         params = self._channel_params(message)
         fanout = (
-            fanout
-            if fanout is not None
-            else params.get("fanout", self.config.get("fanout", 5))
+            fanout if fanout is not None else params.get("fanout", self.config.get("fanout", 5))
         )
         noise_tolerance = float(params.get("noise_tolerance", 0.2))
         room_scores, related_entities = self._get_hallway_context(message)
@@ -587,17 +586,13 @@ class GossipProtocol:
                 # co-occurrence rooms are in different namespaces, so we match
                 # rooms to the node's ``rooms`` list rather than to ``hall``.
                 if room_scores and node.rooms:
-                    overlaps = set(room_scores.keys()) & {
-                        r.lower() for r in node.rooms
-                    }
+                    overlaps = set(room_scores.keys()) & {r.lower() for r in node.rooms}
                     for room in overlaps:
                         score += room_scores[room]
 
                 # Also boost if a related entity matches a specialty.
                 if related_entities and node.specialties:
-                    overlaps = related_entities & {
-                        s.lower() for s in node.specialties
-                    }
+                    overlaps = related_entities & {s.lower() for s in node.specialties}
                     score += min(0.3, len(overlaps) * 0.1)
 
             score = max(0.0, min(2.0, score))
@@ -668,12 +663,8 @@ class GossipProtocol:
         Each path entry is either a node id or ``node_id:message_text``.  The
         similarity threshold determines whether a prior visit counts as an echo.
         """
-        threshold = float(
-            self.config.get("echo_chamber_similarity_threshold", 0.8)
-        )
-        reinforcement_count = int(
-            self.config.get("echo_chamber_reinforcement_count", 3)
-        )
+        threshold = float(self.config.get("echo_chamber_similarity_threshold", 0.8))
+        reinforcement_count = int(self.config.get("echo_chamber_reinforcement_count", 3))
         attenuation = float(self.config.get("echo_chamber_attenuation", 0.5))
 
         current_text = message.text
@@ -807,9 +798,7 @@ class GossipProtocol:
                     )
                     report["triples_written"] += 1
                     node_report["successful_targets"] += 1
-                    node_report["targets"].append(
-                        {"wing": target_wing, "room": target_room}
-                    )
+                    node_report["targets"].append({"wing": target_wing, "room": target_room})
                     any_success = True
                     children.append(message.child(target_wing, target_room, node_id=node.id))
                 except Exception as exc:
@@ -869,9 +858,7 @@ class GossipProtocol:
 
         # Preserve explicit caller arguments over channel defaults.
         final_max_hops = (
-            max_hops
-            if max_hops is not None
-            else params.get("max_hops", preliminary.max_hops)
+            max_hops if max_hops is not None else params.get("max_hops", preliminary.max_hops)
         )
 
         message = GossipMessage(
@@ -907,9 +894,7 @@ class GossipProtocol:
             "echo_chamber_reinforcement_count": self.config.get(
                 "echo_chamber_reinforcement_count", 3
             ),
-            "echo_chamber_attenuation": self.config.get(
-                "echo_chamber_attenuation", 0.5
-            ),
+            "echo_chamber_attenuation": self.config.get("echo_chamber_attenuation", 0.5),
             "echo_chamber_similarity_threshold": self.config.get(
                 "echo_chamber_similarity_threshold", 0.8
             ),
@@ -949,20 +934,12 @@ class GossipAnalytics:
         """Return gossip triples active at ``as_of`` (or now)."""
         reference = as_of or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         triples = self.kg.query_gossip_triples(as_of=reference)
-        return [
-            t
-            for t in triples
-            if t.get("valid_to") is None or t["valid_to"] > reference
-        ]
+        return [t for t in triples if t.get("valid_to") is None or t["valid_to"] > reference]
 
-    def trending_topics(
-        self, n: int = 5, as_of: str = None
-    ) -> list[dict[str, Any]]:
+    def trending_topics(self, n: int = 5, as_of: str = None) -> list[dict[str, Any]]:
         """Return the top N topics by active gossip triple count."""
         triples = self._active_triples(as_of=as_of)
-        topic_counts = Counter(
-            self._parse_topic(t.get("source_file")) for t in triples
-        )
+        topic_counts = Counter(self._parse_topic(t.get("source_file")) for t in triples)
         total = max(1, sum(topic_counts.values()))
         ranked = topic_counts.most_common(n)
         return [
@@ -974,9 +951,7 @@ class GossipAnalytics:
             for topic, count in ranked
         ]
 
-    def viral_facts(
-        self, min_count: int = 2, as_of: str = None
-    ) -> list[dict[str, Any]]:
+    def viral_facts(self, min_count: int = 2, as_of: str = None) -> list[dict[str, Any]]:
         """Return facts that appear in multiple gossip triples (viral content).
 
         Facts are identified by the original (subject, predicate, object) so that
@@ -1023,9 +998,7 @@ class GossipAnalytics:
             and t["valid_from"] <= reference
         ]
 
-        by_topic = Counter(
-            self._parse_topic(t.get("source_file")) for t in triples
-        )
+        by_topic = Counter(self._parse_topic(t.get("source_file")) for t in triples)
 
         return {
             "active_triples": total,
@@ -1047,9 +1020,7 @@ class GossipAnalytics:
         return {
             "trending_topics": self.trending_topics(as_of=as_of),
             "viral_facts": self.viral_facts(as_of=as_of),
-            "network_health": self.network_health(
-                chatter_nodes, config, as_of=as_of
-            ),
+            "network_health": self.network_health(chatter_nodes, config, as_of=as_of),
         }
 
 
@@ -1102,9 +1073,7 @@ class GossipDaemon:
             priority=priority,
             topic=detected_topic,
             ttl_seconds=self.protocol.config.get("ttl_seconds", 60),
-            max_hops=max_hops
-            if max_hops is not None
-            else self.protocol.config.get("max_hops", 3),
+            max_hops=max_hops if max_hops is not None else self.protocol.config.get("max_hops", 3),
         )
         with self._lock:
             self._queue.append(message)
@@ -1169,11 +1138,7 @@ class GossipDaemon:
         # that concurrent schedulers may have added.
         with self._lock:
             available = max(0, self.max_requeue - len(self._queue))
-            kept = [
-                c
-                for c in children
-                if not c.is_expired() and c.hops < c.max_hops
-            ][:available]
+            kept = [c for c in children if not c.is_expired() and c.hops < c.max_hops][:available]
             for c in kept:
                 self._queue.append(c)
         report["children_queued"] = len(kept)

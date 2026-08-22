@@ -125,13 +125,14 @@ def _patch_mcp_server(monkeypatch, config, kg):
 
     invalidate_graph_cache()
 
+    # Use the example gossip topology for tests so the default install is not
+    # forced to carry project-specific names.
+    monkeypatch.setattr(gossip_mod, "DEFAULT_GOSSIP_CONFIG", gossip_mod.EXAMPLE_GOSSIP_CONFIG)
+
 
 def _unexpected_client_read(*_a, **_k):
     """Tripwire for paths that must stay off the chroma client (and HNSW)."""
     raise AssertionError("chroma collection opened — this path must read sqlite")
-    # Use the example gossip topology for tests so the default install is not
-    # forced to carry project-specific names.
-    monkeypatch.setattr(gossip_mod, "DEFAULT_GOSSIP_CONFIG", gossip_mod.EXAMPLE_GOSSIP_CONFIG)
 
 
 def _get_collection(palace_path, create=False):
