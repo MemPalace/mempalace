@@ -140,6 +140,62 @@ def test_no_handoff_while_a_request_is_being_dispatched(leased, monkeypatch):
     assert mcp_server._maybe_hand_off_writer_lease() is True
 
 
+def _handoff_verdict_while_dispatching(monkeypatch, tool_name: str) -> bool:
+    """Run one request through _dispatch_locally and probe the handoff.
+
+    The probe runs on the *main* thread while the request is in flight on
+    another, because that is the real topology: the watchdog is a separate
+    thread, and the dispatch lock is reentrant — probing from the dispatching
+    thread itself would take its own credit and prove nothing.
+    """
+    entered = threading.Event()
+    release = threading.Event()
+
+    def fake_handle_request(request):
+        entered.set()
+        release.wait(timeout=10)
+        return {"ok": True}
+
+    monkeypatch.setattr(mcp_server, "handle_request", fake_handle_request)
+
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": tool_name, "arguments": {}},
+    }
+    t = threading.Thread(target=lambda: mcp_server._dispatch_locally(request))
+    t.start()
+    try:
+        assert entered.wait(timeout=5)
+        return mcp_server._maybe_hand_off_writer_lease()
+    finally:
+        release.set()
+        t.join(timeout=10)
+
+
+def test_logstream_tools_dispatch_without_blocking_the_handoff(leased, monkeypatch):
+    """A five-minute event_wait must not sit in front of every handoff.
+
+    Logstream tools reach only logstream.sqlite3, so they dispatch outside the
+    lock on both transports. Without that exemption one agent's long-poll would
+    defer the baton for as long as it polls.
+    """
+    monkeypatch.setattr(palace_mod, "palace_lock_wanted", lambda path: True)
+
+    assert _handoff_verdict_while_dispatching(monkeypatch, "mempalace_event_wait") is True
+    assert leased.exited is True
+
+
+def test_chroma_touching_tools_still_hold_the_dispatch_lock(leased, monkeypatch):
+    """The exemption is one set of tools, not the policy: anything that can
+    reach Chroma keeps the barrier that stops handles closing under it."""
+    monkeypatch.setattr(palace_mod, "palace_lock_wanted", lambda path: True)
+
+    assert _handoff_verdict_while_dispatching(monkeypatch, "mempalace_search") is False
+    assert leased.exited is False
+
+
 def test_no_handoff_while_a_write_frame_is_active(leased, monkeypatch):
     monkeypatch.setattr(palace_mod, "palace_lock_wanted", lambda path: True)
     key = palace_mod.palace_lock_key(mcp_server._config.palace_path)

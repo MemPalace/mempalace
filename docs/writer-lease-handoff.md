@@ -73,6 +73,16 @@ The dispatch lock covers the other direction: reads serve from cached storage
 handles *without* taking the palace lock, so closing those handles under a
 running request would be a use-after-close.
 
+One class of request is deliberately outside that lock, on both transports:
+the logstream tools in `_HTTP_LOCK_FREE_TOOLS` reach only `logstream.sqlite3`,
+never Chroma or the KG (they are exempt from the writer lease for the same
+reason). Serializing them would put a five-minute `mempalace_event_wait`
+long-poll in front of every handoff — the watchdog would find the dispatch lock
+held for minutes by a call that touches no storage at all. `_dispatch_locally`
+is the single place that policy lives; if the lock is narrowed further (#1984),
+whatever replaces it must still exclude the watchdog for every request that
+*does* touch storage.
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -132,6 +142,21 @@ Took the writer lease for /srv/palace after 3.0s in the queue
 
 Rising `handoffs_granted` with no useful work between them means the lease is
 thrashing — raise `MEMPALACE_WRITER_MIN_HOLD_SECONDS`.
+
+## When one server is the better answer
+
+The handoff makes several direct writers on one palace workable; it does not
+make them the best shape. `mempalace serve` (HTTP) is one process owning the
+storage with several clients talking to it: there is no cross-process lease at
+all, concurrent writes from different sessions simply serialize inside the
+server, and none of the knobs on this page apply. The hub proxy makes that the
+default experience for stdio clients too — `_dispatch_stdio_request` forwards to
+a live hub when one is configured, and the local path below only runs when there
+is none.
+
+Prefer the single server where you control the deployment. The handoff is for
+everywhere you do not: stdio sessions started by an editor or an agent harness,
+a hook-driven mine on someone's laptop, mixed versions across a fleet.
 
 ## Interaction with the daemon
 

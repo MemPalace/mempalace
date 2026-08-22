@@ -7414,24 +7414,41 @@ def _sse_max_clients() -> int:
         return _SSE_MAX_CLIENTS_DEFAULT
 
 
-def _http_dispatch(request):
-    """Dispatch one JSON-RPC request with the transport's locking policy.
+def _request_is_lock_free(request) -> bool:
+    """True for the tools that may run outside the dispatch lock.
 
-    The global request lock preserves the single-process / single-palace-
-    handle behavior stdio deployments rely on. Logstream tools are the one
-    exception: they never touch Chroma/KG state and carry their own database
-    lock, and serializing them would let one agent's event_wait long-poll
-    (up to 5 minutes) starve the whole hub.
+    They reach only ``logstream.sqlite3`` — an independent WAL database with
+    its own locking and no Chroma/KG in-memory state — which is also why they
+    sit in ``_PEER_WRITER_EXEMPT_TOOLS``. Every handler in the set goes through
+    ``_call_logstream``.
     """
-    if (
+    return (
         isinstance(request, dict)
         and request.get("method") == "tools/call"
         and isinstance(request.get("params"), dict)
         and request["params"].get("name") in _HTTP_LOCK_FREE_TOOLS
-    ):
+    )
+
+
+def _dispatch_locally(request):
+    """Handle one JSON-RPC request in this process under the locking policy.
+
+    The dispatch lock preserves the single-process / single-palace-handle
+    behavior both transports rely on, and it is what keeps the writer-lease
+    handoff watchdog from closing storage handles under a running request.
+    Logstream tools are the one exception: they never touch Chroma/KG state and
+    carry their own database lock, so serializing them would let one agent's
+    five-minute ``event_wait`` long-poll starve the hub — and, in stdio, defer
+    every writer-lease handoff behind that same long-poll.
+    """
+    if _request_is_lock_free(request):
         return handle_request(request)
-    with _HTTP_REQUEST_LOCK:
+    with _REQUEST_DISPATCH_LOCK:
         return handle_request(request)
+
+
+# Kept as the HTTP transport's name for the shared policy.
+_http_dispatch = _dispatch_locally
 
 
 def _http_handle_get(handler) -> None:
@@ -8058,7 +8075,7 @@ def _build_http_server(host: str, port: int):
                 self._send_json(400, _json_rpc_parse_error())
                 return
 
-            # Locking policy lives in _http_dispatch: global lock for
+            # Locking policy lives in _dispatch_locally: dispatch lock for
             # Chroma-touching tools, lock-free for logstream tools.
             response = _http_dispatch(request)
 
@@ -8290,7 +8307,7 @@ def _dispatch_stdio_request(request: dict):
 
     target = _hub_proxy_target()
     if target is None:
-        return handle_request(request)
+        return _dispatch_locally(request)
     base_url, headers = target
     try:
         return _forward_request_to_hub(base_url, headers, request)
@@ -8298,7 +8315,7 @@ def _dispatch_stdio_request(request: dict):
         reached_hub = isinstance(exc, urllib.error.HTTPError)
         if not reached_hub and not _request_is_mutating(request):
             logger.warning("Hub at %s unreachable (%s); handling request locally", base_url, exc)
-            return handle_request(request)
+            return _dispatch_locally(request)
         if request.get("id") is None:
             return None
         return {
