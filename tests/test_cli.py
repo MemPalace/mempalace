@@ -195,7 +195,15 @@ def test_cmd_search_sanitizes_a_contaminated_query_and_says_so(mock_config_cls, 
 def test_cmd_search_error_exits(mock_config_cls):
     mock_config_cls.return_value.palace_path = "/fake/palace"
     args = argparse.Namespace(
-        palace=None, query="q", wing=None, room=None, source_file=None, json=False, results=5, since=None, before=None
+        palace=None,
+        query="q",
+        wing=None,
+        room=None,
+        source_file=None,
+        json=False,
+        results=5,
+        since=None,
+        before=None,
     )
     from mempalace.searcher import SearchError
 
