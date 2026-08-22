@@ -37,10 +37,13 @@ class TestSchemaValidation:
             "properties": {"entity": {"type": "string"}},
             "required": ["entity"],
         }
-        errors = module.validate_against_schema({
-            "entity": "Max",
-            "entitty": "Max",
-        }, schema)
+        errors = module.validate_against_schema(
+            {
+                "entity": "Max",
+                "entitty": "Max",
+            },
+            schema,
+        )
         assert "unknown field: entitty" in errors
 
     def test_wrong_type(self):
@@ -71,11 +74,9 @@ class TestConfigDiscovery:
         home.mkdir()
         config_dir = home / ".config" / "devin"
         config_dir.mkdir(parents=True)
-        (config_dir / "mcp_config.json").write_text(json.dumps({
-            "mcpServers": {
-                "mempalace": {"url": "http://localhost:8766/mcp"}
-            }
-        }))
+        (config_dir / "mcp_config.json").write_text(
+            json.dumps({"mcpServers": {"mempalace": {"url": "http://localhost:8766/mcp"}}})
+        )
 
         monkeypatch.setenv("HOME", str(home))
         # Force Path.home() to re-evaluate the env var.
@@ -91,16 +92,12 @@ class TestConfigDiscovery:
         home.mkdir()
         config_dir = home / ".config" / "devin"
         config_dir.mkdir(parents=True)
-        (config_dir / "mcp_config.json").write_text(json.dumps({
-            "mcpServers": {
-                "mempalace": {"url": "http://old:8766/mcp"}
-            }
-        }))
-        (config_dir / "config.json").write_text(json.dumps({
-            "mcpServers": {
-                "mempalace": {"url": "http://new:8766/mcp"}
-            }
-        }))
+        (config_dir / "mcp_config.json").write_text(
+            json.dumps({"mcpServers": {"mempalace": {"url": "http://old:8766/mcp"}}})
+        )
+        (config_dir / "config.json").write_text(
+            json.dumps({"mcpServers": {"mempalace": {"url": "http://new:8766/mcp"}}})
+        )
 
         monkeypatch.setenv("HOME", str(home))
         os.environ["HOME"] = str(home)
@@ -136,9 +133,7 @@ class _McpJsonRpcHandler(BaseHTTPRequestHandler):
                             "description": "A test tool",
                             "inputSchema": {
                                 "type": "object",
-                                "properties": {
-                                    "name": {"type": "string"}
-                                },
+                                "properties": {"name": {"type": "string"}},
                                 "required": ["name"],
                             },
                         }
@@ -204,11 +199,9 @@ class TestHttpToolList:
             home.mkdir()
             config_dir = home / ".config" / "devin"
             config_dir.mkdir(parents=True)
-            (config_dir / "mcp_config.json").write_text(json.dumps({
-                "mcpServers": {
-                    "testserver": {"url": f"http://127.0.0.1:{port}/mcp"}
-                }
-            }))
+            (config_dir / "mcp_config.json").write_text(
+                json.dumps({"mcpServers": {"testserver": {"url": f"http://127.0.0.1:{port}/mcp"}}})
+            )
 
             monkeypatch.setenv("HOME", str(home))
             os.environ["HOME"] = str(home)
@@ -218,14 +211,16 @@ class TestHttpToolList:
             cache_dir.mkdir(parents=True, exist_ok=True)
             (cache_dir / "testserver.json").unlink(missing_ok=True)
 
-            stdin = json.dumps({
-                "tool_name": "mcp_call_tool",
-                "tool_input": {
-                    "server_name": "testserver",
-                    "tool_name": "test_tool",
-                    "arguments": {},
-                },
-            })
+            stdin = json.dumps(
+                {
+                    "tool_name": "mcp_call_tool",
+                    "tool_input": {
+                        "server_name": "testserver",
+                        "tool_name": "test_tool",
+                        "arguments": {},
+                    },
+                }
+            )
             proc = subprocess.run(
                 [sys.executable, str(HOOK_PATH)],
                 input=stdin,
