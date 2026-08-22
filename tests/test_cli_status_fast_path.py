@@ -60,11 +60,13 @@ class TestFastPath:
     def test_uses_get_all_metadata(self, _stub_deps, monkeypatch, capsys):
         from mempalace import miner
 
-        col = _make_collection_with_get_all([
-            {"wing": "sessions", "room": "technical"},
-            {"wing": "sessions", "room": "planning"},
-            {"wing": "knowledge", "room": "decisions"},
-        ])
+        col = _make_collection_with_get_all(
+            [
+                {"wing": "sessions", "room": "technical"},
+                {"wing": "sessions", "room": "planning"},
+                {"wing": "knowledge", "room": "decisions"},
+            ]
+        )
         monkeypatch.setattr(miner, "_open_collection_or_explain", lambda p: col)
 
         miner.status("/fake/palace")
@@ -86,10 +88,12 @@ class TestFastPath:
     def test_handles_none_metadata(self, _stub_deps, monkeypatch, capsys):
         from mempalace import miner
 
-        col = _make_collection_with_get_all([
-            {"wing": "sessions", "room": "technical"},
-            None,
-        ])
+        col = _make_collection_with_get_all(
+            [
+                {"wing": "sessions", "room": "technical"},
+                None,
+            ]
+        )
         monkeypatch.setattr(miner, "_open_collection_or_explain", lambda p: col)
 
         miner.status("/fake/palace")
