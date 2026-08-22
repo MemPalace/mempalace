@@ -557,7 +557,7 @@ class TestIdempotentRetry:
         """Malformed JSON-RPC is not safe to retry."""
         import mempalace_mcp_proxy as proxy
 
-        body = b'not json'
+        body = b"not json"
         assert not proxy._is_retry_safe(body)
 
     def test_missing_jsonrpc_field_is_not_retried(self):
@@ -612,9 +612,7 @@ class TestIdempotentRetry:
                 FakeResponse(503, b"{}"),
                 FakeResponse(
                     503,
-                    json.dumps(
-                        {"jsonrpc": "2.0", "id": 1, "error": {"code": -32000}}
-                    ).encode(),
+                    json.dumps({"jsonrpc": "2.0", "id": 1, "error": {"code": -32000}}).encode(),
                 ),
             ],
             restore_circuit=False,
@@ -737,9 +735,7 @@ class TestEndToEnd:
         body = json.dumps(
             {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
         ).encode()
-        upstream_body = json.dumps(
-            {"jsonrpc": "2.0", "id": 1, "error": {"code": -32000}}
-        ).encode()
+        upstream_body = json.dumps({"jsonrpc": "2.0", "id": 1, "error": {"code": -32000}}).encode()
 
         async def test():
             # Reset proxy state for a clean circuit.
@@ -940,7 +936,10 @@ class TestEndToEnd:
                     (b"null", "null"),
                     (b'"string"', "string"),
                     (b"123", "number"),
-                    (b'[{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}, {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}]', "batch array"),
+                    (
+                        b'[{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}, {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}]',
+                        "batch array",
+                    ),
                 ]
                 for body, label in cases:
                     resp = await client.post("/mcp", data=body)
@@ -993,7 +992,9 @@ class TestEndToEnd:
 
                 async def post(self, *args, **kwargs):
                     CountingClient.calls += 1
-                    return FakeResponse(200, json.dumps({"jsonrpc": "2.0", "id": 1, "result": []}).encode())
+                    return FakeResponse(
+                        200, json.dumps({"jsonrpc": "2.0", "id": 1, "result": []}).encode()
+                    )
 
             proxy._http_client = CountingClient()
 
